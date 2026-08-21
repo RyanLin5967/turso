@@ -422,10 +422,19 @@ pub fn check_differential(
                 Some(sqlite_error),
             ));
         }
+        // EXPERIMENT (not upstream): still skip, because the skip is load-bearing -- a
+        // statement only one engine accepts would desync the databases if it wrote, and
+        // the generator does legitimately emit SQL one engine rejects. But log the
+        // ONE-SIDED cases loudly and separately: the counter upstream lumps them in with
+        // mutual rejections, so the reportable half is invisible. Turning these into
+        // OracleResult::Fail was tried first and ends the run on the generator's own
+        // malformed SQL, which is why this only measures.
         (QueryResult::Error(turso_error), _) => {
+            tracing::warn!("ONE-SIDED PREPARE: turso rejected, sqlite accepted: {stmt} | turso: {turso_error}");
             return OracleResult::Skipped(format_skipped_statement(stmt, Some(turso_error), None));
         }
         (_, QueryResult::Error(sqlite_error)) => {
+            tracing::warn!("ONE-SIDED PREPARE: sqlite rejected, turso accepted: {stmt} | sqlite: {sqlite_error}");
             return OracleResult::Skipped(format_skipped_statement(stmt, None, Some(sqlite_error)));
         }
         _ => {}
