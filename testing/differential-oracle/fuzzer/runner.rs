@@ -510,10 +510,13 @@ impl Fuzzer {
     fn shrink_and_write(&self, state_dump: &str, executed_sql: &[String], failing_sql: &str) {
         // The executed statements double as a replay script. Skip comment
         // lines (skipped/warning markers) the runner interleaves.
-        let history: String = executed_sql
-            .iter()
-            .filter(|s| !s.trim_start().starts_with("--"))
-            .map(|s| format!("{s};\n"))
+        let history: String = std::iter::once("ATTACH ':memory:' AS aux;\n".to_string())
+            .chain(
+                executed_sql
+                    .iter()
+                    .filter(|s| !s.trim_start().starts_with("--"))
+                    .map(|s| format!("{s};\n")),
+            )
             .collect();
         match crate::shrink::shrink_statement(state_dump, &history, failing_sql) {
             Ok(Some(minimized)) => {
