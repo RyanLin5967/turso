@@ -108,6 +108,8 @@ pub trait SqlGenerator {
 pub struct SqlGenBackend {
     ctx: sql_gen::Context,
     policy: Policy,
+    /// AUDIT ONLY: index of the next statement handed out by the injection hook.
+    audit_step: usize,
 }
 
 fn disable_alter_actions_that_revalidate_schema(policy: &mut Policy) {
@@ -188,12 +190,174 @@ impl SqlGenBackend {
         policy.update_config.subquery_from_probability = 0.0;
         policy.update_config.target_alias_probability = 0.2;
         policy.update_config.from_set_reference_probability = 0.5;
-        Self { ctx, policy }
+        Self {
+            ctx,
+            policy,
+            audit_step: 0,
+        }
+    }
+}
+
+/// AUDIT ONLY. Replaces random generation with a fixed script so the fuzzer
+/// runs one statement whose divergence is already known:
+///   step 0  CREATE TABLE zz(id INTEGER PRIMARY KEY, a INTEGER)
+///   step 1  INSERT INTO zz VALUES (1, 10)
+///   step 2+ SELECT count(a) FROM zz LIMIT 0            (mode A)
+///           SELECT count(a) FROM zz ORDER BY id ASC LIMIT 0  (mode B)
+/// Turso emits one row for both; SQLite emits none for both.
+/// The has_unordered_limit flag is computed by the SAME four lines the normal
+/// path uses, from a real AST -- nothing is hand-set.
+fn audit_injected_statement(
+    step: usize,
+    mode: &str,
+    schema: &sql_gen::Schema,
+) -> GeneratedStatement {
+    use sql_gen::ast::{
+        ColumnRef, FromClause, FunctionCallExpr, JoinClause, JoinType, OrderByItem, OrderDirection,
+        SelectColumn, SelectStmt, Stmt,
+    };
+    use sql_gen::Expr;
+    let ddl = |sql: &str| GeneratedStatement {
+        sql: sql.to_string(),
+        is_ddl: true,
+        mutates_data: false,
+        has_unordered_limit: false,
+        unordered_limit_reason: None,
+    };
+    let dml = |sql: &str| GeneratedStatement {
+        sql: sql.to_string(),
+        is_ddl: false,
+        mutates_data: true,
+        has_unordered_limit: false,
+        unordered_limit_reason: None,
+    };
+    if mode == "C" {
+        // The reachable case: LIMIT 10 on a cross join with OFFSET 1.
+        let select = match step {
+            0 => return ddl("CREATE TABLE aa(x INTEGER)"),
+            1 => return ddl("CREATE TABLE bb(y INTEGER)"),
+            2 => return dml("INSERT INTO aa VALUES (1),(2)"),
+            3 => return dml("INSERT INTO bb VALUES (10),(20),(30)"),
+            _ => SelectStmt {
+                with_clause: None,
+                distinct: false,
+                columns: vec![SelectColumn {
+                    expr: Expr::ColumnRef(ColumnRef {
+                        table: None,
+                        column: "x".to_string(),
+                    }),
+                    alias: None,
+                }],
+                from: Some(FromClause {
+                    table: "aa".to_string(),
+                    alias: None,
+                }),
+                joins: vec![JoinClause {
+                    join_type: JoinType::Cross,
+                    table: "bb".to_string(),
+                    alias: None,
+                    constraint: None,
+                }],
+                where_clause: None,
+                group_by: None,
+                compounds: vec![],
+                order_by: vec![],
+                limit: Some(10),
+                offset: Some(1),
+            },
+        };
+        let stmt = Stmt::Select(select);
+        let has_unordered_limit =
+            stmt.has_unordered_limit() || stmt.non_unique_order_by_reason(schema).is_some();
+        let unordered_limit_reason = stmt
+            .unordered_limit_reason()
+            .or_else(|| stmt.non_unique_order_by_reason(schema))
+            .map(str::to_string);
+        return GeneratedStatement {
+            sql: stmt.to_string(),
+            is_ddl: false,
+            mutates_data: false,
+            has_unordered_limit,
+            unordered_limit_reason,
+        };
+    }
+    match step {
+        0 => GeneratedStatement {
+            sql: "CREATE TABLE zz(id INTEGER PRIMARY KEY, a INTEGER)".to_string(),
+            is_ddl: true,
+            mutates_data: false,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+        },
+        1 => GeneratedStatement {
+            sql: "INSERT INTO zz VALUES (1, 10)".to_string(),
+            is_ddl: false,
+            mutates_data: true,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+        },
+        _ => {
+            let mut select = SelectStmt {
+                with_clause: None,
+                distinct: false,
+                columns: vec![SelectColumn {
+                    expr: Expr::FunctionCall(FunctionCallExpr {
+                        name: "count".to_string(),
+                        args: vec![Expr::ColumnRef(ColumnRef {
+                            table: None,
+                            column: "a".to_string(),
+                        })],
+                        filter: None,
+                    }),
+                    alias: None,
+                }],
+                from: Some(FromClause {
+                    table: "zz".to_string(),
+                    alias: None,
+                }),
+                joins: vec![],
+                where_clause: None,
+                group_by: None,
+                compounds: vec![],
+                order_by: vec![],
+                limit: Some(0),
+                offset: None,
+            };
+            if mode == "B" {
+                select.order_by = vec![OrderByItem {
+                    expr: Expr::ColumnRef(ColumnRef {
+                        table: None,
+                        column: "id".to_string(),
+                    }),
+                    direction: OrderDirection::Asc,
+                    nulls: None,
+                }];
+            }
+            let stmt = Stmt::Select(select);
+            let has_unordered_limit =
+                stmt.has_unordered_limit() || stmt.non_unique_order_by_reason(schema).is_some();
+            let unordered_limit_reason = stmt
+                .unordered_limit_reason()
+                .or_else(|| stmt.non_unique_order_by_reason(schema))
+                .map(str::to_string);
+            GeneratedStatement {
+                sql: stmt.to_string(),
+                is_ddl: false,
+                mutates_data: false,
+                has_unordered_limit,
+                unordered_limit_reason,
+            }
+        }
     }
 }
 
 impl SqlGenerator for SqlGenBackend {
     fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
+        if let Ok(mode) = std::env::var("ORACLE_AUDIT_INJECT") {
+            let step = self.audit_step;
+            self.audit_step += 1;
+            return Ok(audit_injected_statement(step, &mode, schema));
+        }
         let mut policy = self.policy.clone();
         if !schema.triggers.is_empty() || schema_has_a_shadowed_table_name(schema) {
             // SQLite re-resolves every stored index and trigger during a table
