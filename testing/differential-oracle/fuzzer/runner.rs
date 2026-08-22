@@ -956,3 +956,144 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod skeptic_tests {
+    use super::*;
+
+    fn new_fuzzer() -> Fuzzer {
+        let config = SimConfig {
+            seed: 12345,
+            num_tables: 1,
+            columns_per_table: 3,
+            num_statements: 10,
+            verbose: false,
+            keep_files: false,
+            generator: GeneratorKind::default(),
+            coverage: false,
+            tree_mode: TreeMode::default(),
+            mvcc: false,
+            window_function_probability: 0.0,
+            recursive_cte_focus: false,
+            weight_profile: WeightProfile::default(),
+        };
+        Fuzzer::new(config).expect("fuzzer built")
+    }
+
+    fn both(f: &Fuzzer, sql: &str) {
+        let t = DifferentialOracle::execute_turso(&f.turso_conn, sql);
+        let s = DifferentialOracle::execute_sqlite(&f.sqlite_conn, sql);
+        println!("    both[{sql}] turso={t:?} sqlite={s:?}");
+    }
+
+    fn turso_only(f: &Fuzzer, sql: &str) {
+        let t = DifferentialOracle::execute_turso(&f.turso_conn, sql);
+        println!("    turso_only[{sql}] -> {t:?}");
+    }
+
+    fn sqlite_only(f: &Fuzzer, sql: &str) {
+        let s = DifferentialOracle::execute_sqlite(&f.sqlite_conn, sql);
+        println!("    sqlite_only[{sql}] -> {s:?}");
+    }
+
+    fn dump_stored_sql(f: &Fuzzer) {
+        let q = "SELECT sql FROM sqlite_master WHERE name='t'";
+        println!(
+            "    stored sql turso : {:?}",
+            DifferentialOracle::execute_turso(&f.turso_conn, q)
+        );
+        println!(
+            "    stored sql sqlite: {:?}",
+            DifferentialOracle::execute_sqlite(&f.sqlite_conn, q)
+        );
+    }
+
+    fn report(f: &Fuzzer, label: &str) -> bool {
+        let r = f.introspect_and_verify_schemas();
+        match &r {
+            Ok(_) => println!("    >>> {label}: introspect_and_verify_schemas = Ok (BLIND)"),
+            Err(e) => println!("    >>> {label}: introspect_and_verify_schemas = Err: {e}"),
+        }
+        r.is_ok()
+    }
+
+    // ---------- BLIND SPOT CASES ----------
+
+    #[test]
+    fn blind_lost_collation_after_drop_column() {
+        let f = new_fuzzer();
+        both(&f, "CREATE TABLE t(a INTEGER, c TEXT UNIQUE COLLATE NOCASE)");
+        both(&f, "ALTER TABLE t DROP COLUMN a");
+        dump_stored_sql(&f);
+        let mut stats = SimStats::default();
+        let mut sqls: Vec<String> = Vec::new();
+        let ic = f.run_integrity_check(&mut stats, &mut sqls);
+        println!(
+            "    integrity_check -> {:?}",
+            ic.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
+        );
+        assert!(ic.is_ok(), "integrity_check is also blind here");
+        assert!(report(&f, "lost COLLATE NOCASE"));
+    }
+
+    #[test]
+    fn blind_lost_type_arguments_after_add_column() {
+        let f = new_fuzzer();
+        both(&f, "CREATE TABLE t(a INTEGER, b TEXT)");
+        both(&f, "ALTER TABLE t ADD COLUMN c VARCHAR(10)");
+        dump_stored_sql(&f);
+        assert!(report(&f, "lost VARCHAR(10) -> VARCHAR"));
+    }
+
+    #[test]
+    fn blind_declared_type_differs_in_introspected_schema() {
+        let f = new_fuzzer();
+        both(&f, "CREATE TABLE t(a INTEGER, c \"INTEGER[]\")");
+        dump_stored_sql(&f);
+        let ts = SchemaIntrospector::from_turso_with_attached(&f.turso_conn).unwrap();
+        let ss = SchemaIntrospector::from_sqlite_with_attached(&f.sqlite_conn).unwrap();
+        for (eng, sc) in [("turso ", &ts), ("sqlite", &ss)] {
+            for t in sc.tables.iter() {
+                for c in t.columns.iter() {
+                    println!("    {eng} column {:?} type {:?}", c.name, c.data_type);
+                }
+            }
+        }
+        assert!(report(&f, "introspected DataType differs"));
+    }
+
+    // ---------- CONTROLS: the same call MUST fire ----------
+
+    #[test]
+    fn control_column_rename_on_turso_only_is_caught() {
+        let f = new_fuzzer();
+        both(&f, "CREATE TABLE t(a INTEGER, b TEXT)");
+        turso_only(&f, "ALTER TABLE t RENAME COLUMN a TO z");
+        assert!(!report(&f, "CONTROL rename on turso only"));
+    }
+
+    #[test]
+    fn control_same_blind_ddl_plus_rename_is_caught() {
+        let f = new_fuzzer();
+        both(&f, "CREATE TABLE t(a INTEGER, c TEXT UNIQUE COLLATE NOCASE)");
+        both(&f, "ALTER TABLE t DROP COLUMN a");
+        sqlite_only(&f, "ALTER TABLE t RENAME COLUMN c TO c2");
+        assert!(!report(&f, "CONTROL same DDL + rename on sqlite only"));
+    }
+
+    #[test]
+    fn control_extra_index_on_sqlite_only_is_caught() {
+        let f = new_fuzzer();
+        both(&f, "CREATE TABLE t(a INTEGER, b TEXT)");
+        sqlite_only(&f, "CREATE INDEX ix ON t(b)");
+        assert!(!report(&f, "CONTROL extra index on sqlite only"));
+    }
+
+    #[test]
+    fn control_extra_table_on_turso_only_is_caught() {
+        let f = new_fuzzer();
+        both(&f, "CREATE TABLE t(a INTEGER, b TEXT)");
+        turso_only(&f, "CREATE TABLE extra(q INTEGER)");
+        assert!(!report(&f, "CONTROL extra table on turso only"));
+    }
+}
