@@ -125,8 +125,33 @@ impl Oracle for DifferentialOracle {
                 OracleResult::Pass
             }
             (QueryResult::Ok, QueryResult::Ok) => OracleResult::Pass,
-            (QueryResult::Error(turso_err), QueryResult::Error(_sqlite_err)) => {
-                // Both errored - this is acceptable (both rejected invalid SQL)
+            (QueryResult::Error(turso_err), QueryResult::Error(sqlite_err)) => {
+                // Both errored. Usually that is agreement: two engines rejecting the same
+                // invalid SQL. It is NOT agreement when Turso's error says its own
+                // invariant broke, because that is a bug whatever SQLite thinks of the
+                // statement.
+                //
+                // Demonstrated: `SELECT DISTINCT count(*) FROM t UNION;` makes Turso
+                // report "Corrupt database: Reference to undefined or unresolved label in
+                // HashDistinct" while SQLite reports a syntax error, and this arm scored
+                // it a Pass -- differential_probe said "0 diverged", exit 0. Drop the
+                // trailing UNION and the identical internal error is reported, because
+                // then only one side errors. One token decided whether a corruption
+                // message was surfaced or swallowed.
+                //
+                // Deliberately a narrow list of internal-failure markers rather than an
+                // allowlist of acceptable errors: enumerating everything SQLite may
+                // legitimately reject is not tractable, while "the engine says its own
+                // invariant broke" is a small and stable set. The fuller fix is to
+                // compare error CLASSES on both sides; this covers the case that is never
+                // acceptable in either direction.
+                if is_internal_failure(turso_err) {
+                    return OracleResult::Fail(format!(
+                        "Turso reported an internal failure. SQLite rejected the statement \
+                         for its own reasons, which does not excuse it:\n  SQL: {stmt}\n  \
+                         Turso: {turso_err}\n  SQLite: {sqlite_err}"
+                    ));
+                }
                 tracing::debug!("Both databases errored on: {stmt}: {turso_err}");
                 OracleResult::Pass
             }
@@ -443,6 +468,24 @@ pub fn check_differential(
     DifferentialOracle::verify_table_snapshots(turso_conn, sqlite_conn, schema, stmt)
 }
 
+/// True if this Turso error reports a broken internal invariant rather than a rejection of
+/// the statement. Such an error is a bug even when SQLite also refuses the statement, so it
+/// must not be absorbed by the both-errored arm.
+///
+/// Kept narrow on purpose. "not yet implemented" and similar are deliberately absent: they
+/// are honest limitations, and treating them as failures would end runs on unimplemented
+/// features rather than on bugs.
+pub fn is_internal_failure(err: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "Corrupt database",
+        "undefined or unresolved label",
+        "internal error",
+        "assertion failed",
+        "panicked",
+    ];
+    MARKERS.iter().any(|marker| err.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -626,6 +669,45 @@ mod tests {
                 assert!(reason.contains("SQLite error=None"));
             }
             other => panic!("expected skipped statement, got {other:?}"),
+        }
+    }
+
+    /// A run that compared nothing must not report success. Before this, `-n 0` printed
+    /// PASSED with zero statements executed and exited 0.
+    #[test]
+    fn a_run_that_executed_nothing_is_not_a_success() {
+        let mut stats = crate::runner::SimStats::default();
+        assert!(
+            !stats.is_success(),
+            "zero statements executed must not be a pass"
+        );
+        stats.statements_executed = 1;
+        assert!(stats.is_success(), "one clean statement is a pass");
+        stats.oracle_failures = 1;
+        assert!(!stats.is_success(), "a failure is still a failure");
+    }
+
+    /// Turso's own invariant violations must not hide behind a SQLite rejection.
+    #[test]
+    fn internal_failures_are_not_agreement() {
+        for err in [
+            "Corrupt database: Reference to undefined or unresolved label in HashDistinct: 5",
+            "internal error: entered unreachable code",
+            "assertion failed: count > 0",
+        ] {
+            assert!(is_internal_failure(err), "should be internal: {err}");
+        }
+        for err in [
+            "no such table: t",
+            "near \";\": syntax error",
+            "datatype mismatch",
+            "FOREIGN KEY constraint failed",
+            "parser stack overflow",
+        ] {
+            assert!(
+                !is_internal_failure(err),
+                "legitimate rejection must stay agreement: {err}"
+            );
         }
     }
 }

@@ -162,7 +162,17 @@ pub fn query_results_differ(a: &QueryResult, b: &QueryResult) -> bool {
             !sql_gen_prop::result::diff_results(ra, rb).is_empty()
         }
         (QueryResult::Ok, QueryResult::Ok) => false,
-        (QueryResult::Error(_), QueryResult::Error(_)) => false,
+        // Both errored is usually agreement, EXCEPT when Turso's error says its own
+        // invariant broke. differential_probe compares through this function and not
+        // through oracle.rs, so fixing only the oracle left the probe still reporting
+        // "0 diverged" and exiting 0 on
+        // `SELECT DISTINCT count(*) FROM t UNION;` -- Turso "Corrupt database:
+        // Reference to undefined or unresolved label in HashDistinct" against a SQLite
+        // syntax error. The unit tests passed; only running the binary caught it. Both
+        // comparators need the same rule or the tool every finding rests on stays blind.
+        (QueryResult::Error(turso_err), QueryResult::Error(_)) => {
+            crate::oracle::is_internal_failure(turso_err)
+        }
         // Ok vs empty Rows means the same thing here: no differing rows.
         (QueryResult::Ok, QueryResult::Rows(r)) | (QueryResult::Rows(r), QueryResult::Ok) => {
             !r.is_empty()

@@ -21,6 +21,26 @@ pub fn generate_literal_with_config(
         return Literal::Null;
     }
 
+    // Boundary values are drawn HERE rather than inside generate_integer/generate_real,
+    // because those two guarantee their result lies inside config.int_min..int_max and
+    // test_generate_integer_range / test_generate_real_range assert exactly that. The
+    // boundary table has to leave that window -- every value worth testing is outside a
+    // sensible ordinary-value range -- so it hooks one level up and leaves the contract
+    // intact. A config opts out with boundary_value_probability: 0.0.
+    if ctx.gen_bool_with_prob(config.boundary_value_probability) {
+        match data_type {
+            DataType::Integer => {
+                let idx = ctx.gen_range(BOUNDARY_INTEGERS.len());
+                return Literal::Integer(BOUNDARY_INTEGERS[idx]);
+            }
+            DataType::Real => {
+                let idx = ctx.gen_range(BOUNDARY_REALS.len());
+                return Literal::Real(BOUNDARY_REALS[idx]);
+            }
+            _ => {}
+        }
+    }
+
     match data_type {
         DataType::Integer => generate_integer(ctx, config),
         DataType::Real => generate_real(ctx, config),
@@ -32,6 +52,58 @@ pub fn generate_literal_with_config(
         }
     }
 }
+
+/// Integers where numeric behaviour changes: the i64 and i32 edges, the float-exactness edge
+/// at 2^53, byte and word boundaries, and the small values that decide truthiness and
+/// division. A table rather than a wider range because repeating a small set is what makes
+/// two operands in one statement EQUAL -- the condition typeof(min(1, 1.0)) needs, which a
+/// uniform draw essentially never produces.
+const BOUNDARY_INTEGERS: &[i64] = &[
+    0,
+    1,
+    -1,
+    2,
+    -2,
+    10,
+    127,
+    128,
+    255,
+    256,
+    32767,
+    32768,
+    65535,
+    65536,
+    2147483647,            // i32::MAX
+    -2147483648,           // i32::MIN
+    2147483648,
+    4294967295,            // u32::MAX
+    4294967296,
+    9007199254740992,      // 2^53, above which f64 cannot hold every integer
+    -9007199254740992,
+    9223372036854775807,   // i64::MAX
+    -9223372036854775808,  // i64::MIN, where negation overflows
+];
+
+/// Reals chosen for where formatting, affinity and rounding change behaviour, rather than as
+/// a uniform sample of the number line.
+const BOUNDARY_REALS: &[f64] = &[
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    0.1,
+    2.0,
+    1e-300,
+    1e300,
+    5e-324,                    // smallest subnormal
+    2.2250738585072014e-308,   // smallest normal
+    1.7976931348623157e308,    // f64::MAX
+    9007199254740993.0,        // 2^53 + 1, not representable
+    9223372036854775807.0,     // i64::MAX as a real
+    1e15,
+    1e16,                      // either side of 15 significant digits
+];
 
 /// Generate an integer literal.
 pub fn generate_integer(ctx: &mut Context, config: &LiteralConfig) -> Literal {
@@ -336,5 +408,106 @@ mod tests {
         if let Literal::Text(s) = generate_text(&mut ctx, &config) {
             assert!(s.chars().all(|c| c.is_ascii_digit()));
         }
+    }
+
+    /// The table must be REACHABLE through the dispatcher, or this change does nothing. An
+    /// earlier version filtered the table through int_min/int_max, which dropped every value
+    /// above a million and made the patch a no-op; this assertion is what caught it.
+    ///
+    /// Note i64::MIN.abs() panics in debug, which this test also learned the hard way --
+    /// hence unsigned_abs.
+    #[test]
+    fn boundary_values_are_reachable_through_the_dispatcher() {
+        let mut ctx = Context::new_with_seed(20260822);
+        let cfg = LiteralConfig::default();
+        let mut beyond_window = false;
+        let mut saw_i64_max = false;
+        let mut saw_i64_min = false;
+        for _ in 0..4000 {
+            if let Literal::Integer(v) =
+                generate_literal_with_config(&mut ctx, DataType::Integer, &cfg)
+            {
+                if v.unsigned_abs() > 1_000_000 {
+                    beyond_window = true;
+                }
+                if v == i64::MAX {
+                    saw_i64_max = true;
+                }
+                if v == i64::MIN {
+                    saw_i64_min = true;
+                }
+            }
+        }
+        assert!(
+            beyond_window,
+            "no integer outside +/-1e6 in 4000 draws -- the table is unreachable"
+        );
+        assert!(saw_i64_max && saw_i64_min, "the i64 edges were never drawn");
+    }
+
+    /// Reals too, including the ones a uniform +/-1e6 draw can never produce.
+    #[test]
+    fn boundary_reals_are_reachable() {
+        let mut ctx = Context::new_with_seed(4242);
+        let cfg = LiteralConfig::default();
+        let mut saw_tiny = false;
+        let mut saw_huge = false;
+        let mut saw_integral = false;
+        for _ in 0..4000 {
+            if let Literal::Real(v) = generate_literal_with_config(&mut ctx, DataType::Real, &cfg) {
+                if v != 0.0 && v.abs() < 1e-100 {
+                    saw_tiny = true;
+                }
+                if v.abs() > 1e100 {
+                    saw_huge = true;
+                }
+                if v == 1.0 || v == 0.0 {
+                    saw_integral = true;
+                }
+            }
+        }
+        assert!(saw_tiny, "no subnormal/tiny real drawn");
+        assert!(saw_huge, "no very large real drawn");
+        assert!(saw_integral, "no small integral real drawn");
+    }
+
+    /// Opting out must be honoured exactly, so callers needing small values keep relying on
+    /// the window.
+    #[test]
+    fn opting_out_keeps_every_value_inside_the_window() {
+        let mut ctx = Context::new_with_seed(99);
+        let small = LiteralConfig::small_integers();
+        assert_eq!(small.boundary_value_probability, 0.0);
+        for _ in 0..4000 {
+            if let Literal::Integer(v) =
+                generate_literal_with_config(&mut ctx, DataType::Integer, &small)
+            {
+                assert!(
+                    v >= small.int_min && v <= small.int_max,
+                    "{v} escaped the configured window"
+                );
+            }
+        }
+    }
+
+    /// The reason for a table rather than a wider range: repeated values let two operands in
+    /// one statement be equal, which is what typeof(min(1, 1.0)) needs.
+    #[test]
+    fn the_same_value_recurs_often_enough_to_pair_up() {
+        use std::collections::HashMap;
+        let mut ctx = Context::new_with_seed(7);
+        let cfg = LiteralConfig::default();
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for _ in 0..4000 {
+            if let Literal::Integer(v) =
+                generate_literal_with_config(&mut ctx, DataType::Integer, &cfg)
+            {
+                *counts.entry(v).or_default() += 1;
+            }
+        }
+        assert!(
+            counts.values().any(|&c| c > 10),
+            "no value recurred, so two operands will never be equal"
+        );
     }
 }
