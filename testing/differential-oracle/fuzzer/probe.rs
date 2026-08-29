@@ -68,8 +68,11 @@ fn main() -> Result<()> {
         }
         let (turso, sqlite) = pair.run_both(stmt);
         let statement_diverges = query_results_differ(&turso, &sqlite);
-        let show = if stmt.len() > 160 {
-            format!("{}...", &stmt[..160])
+        // Truncate by characters, not bytes: `&stmt[..160]` panics when byte 160 lands
+        // inside a multi-byte character, and generated string literals can be non-ASCII
+        // (StringCharset::Unicode).
+        let show = if stmt.chars().count() > 160 {
+            format!("{}...", stmt.chars().take(160).collect::<String>())
         } else {
             stmt.to_string()
         };

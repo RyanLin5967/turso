@@ -916,12 +916,17 @@ impl LiteralConfig {
     }
 
     /// Create config for positive integers only.
+    ///
+    /// Opts out of the boundary table, like `small_integers`: that table ignores the
+    /// configured window by design and contains negative values, so a config promising
+    /// non-negative numbers would otherwise return them about a quarter of the time.
     pub fn positive_integers() -> Self {
         Self {
             int_min: 0,
             int_max: 1_000_000,
             real_min: 0.0,
             real_max: 1_000_000.0,
+            boundary_value_probability: 0.0,
             ..Default::default()
         }
     }

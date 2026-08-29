@@ -568,4 +568,24 @@ mod tests {
             "no value recurred, so two operands will never be equal"
         );
     }
+
+    /// The sibling of `opting_out_keeps_every_value_inside_the_window`. `small_integers`
+    /// was given the opt-out and a test; `positive_integers` was given neither, so a config
+    /// whose whole promise is "non-negative" returned negatives about a quarter of the time.
+    #[test]
+    fn positive_integers_stay_positive() {
+        let cfg = LiteralConfig::positive_integers();
+        assert_eq!(cfg.boundary_value_probability, 0.0);
+        let mut ctx = Context::new_with_seed(31337);
+        for _ in 0..4000 {
+            if let Literal::Integer(v) =
+                generate_literal_with_config(&mut ctx, DataType::Integer, &cfg)
+            {
+                assert!(v >= 0, "{v} is negative from a positive-integers config");
+            }
+            if let Literal::Real(v) = generate_literal_with_config(&mut ctx, DataType::Real, &cfg) {
+                assert!(v >= 0.0, "{v} is negative from a positive-integers config");
+            }
+        }
+    }
 }
