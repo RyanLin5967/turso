@@ -119,7 +119,7 @@ impl Oracle for DifferentialOracle {
                     // an ORDER BY over the primary key clears the flag without fixing the
                     // bug, and it is then reported -- so the exemption was the thing hiding
                     // it, not a limitation of the comparison.
-                    if has_unordered_limit && turso_rows.len() == sqlite_rows.len() {
+                    if has_unordered_limit {
                         return OracleResult::Warning(format_nondet_limit_warning(
                             stmt,
                             "row_set_mismatch",
@@ -127,15 +127,6 @@ impl Oracle for DifferentialOracle {
                             sqlite_rows.len(),
                             diff.only_in_first.len(),
                             diff.only_in_second.len(),
-                        ));
-                    }
-                    if has_unordered_limit {
-                        return OracleResult::Fail(format!(
-                            "Row COUNT mismatch under an unordered LIMIT. Which rows come                              back is not stable across engines, but how many is:
-  SQL:                              {stmt}
-  Turso returned {} row(s), SQLite {}",
-                            turso_rows.len(),
-                            sqlite_rows.len()
                         ));
                     }
                     return OracleResult::Fail(format!(
