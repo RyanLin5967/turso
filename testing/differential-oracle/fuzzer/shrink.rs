@@ -1065,7 +1065,8 @@ pub fn shrink_statement(
                 // rather than discarding it, and say so, because that is worth noticing.
                 if best.is_some() {
                     tracing::warn!(
-                        "Shrink pass {pass} no longer reproduces the divergence; keeping the                          previous pass's result"
+                        "Shrink pass {pass} no longer reproduces the divergence; \
+                         keeping the previous pass's result"
                     );
                 }
                 break;
@@ -1084,6 +1085,20 @@ fn shrink_one_pass(
     history_sql: &str,
     failing_sql: &str,
 ) -> Result<Option<Minimized>> {
+    // VERIFICATION-ONLY fault injection, not for merge. Forces this pass and every
+    // later one to report "no divergence", so shrink_statement's keep-the-earlier-
+    // result arm can be exercised on demand instead of waited for.
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static PASS: AtomicUsize = AtomicUsize::new(0);
+        let n = PASS.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(k) = std::env::var("SHRINK_FAIL_FROM_PASS").unwrap_or_default().parse::<usize>() {
+            if n >= k {
+                tracing::warn!("INJECT: forcing pass {n} to return None");
+                return Ok(None);
+            }
+        }
+    }
     let mut state_sql = state_sql;
     let mut baseline = {
         let pair = EnginePair::build(state_sql)?;
