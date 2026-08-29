@@ -1026,6 +1026,64 @@ pub fn shrink_statement(
     history_sql: &str,
     failing_sql: &str,
 ) -> Result<Option<Minimized>> {
+    // MAX_CANDIDATES bounds ONE pass. A pass that ends by exhausting that budget has not
+    // reached this algorithm's own fixpoint -- it just ran out of attempts, and whatever it
+    // had at that moment is what gets written.
+    //
+    // Measured on a real production shrink (fuzzer seed 102261, its 21950-byte failing
+    // statement replayed against its own state dump): pass 1 reproduced the shipped log line
+    // exactly, "21950 -> 2354 bytes in 800 attempts", stopping at the cap. Feeding that
+    // output straight back in reached 823 bytes in 680 attempts -- under the cap, so a
+    // genuine stop-on-no-progress -- and a third pass left it at 823. The delivered artifact
+    // was 2.86x the size the same code reaches when simply asked again.
+    //
+    // So iterate until a pass changes nothing. Raising MAX_CANDIDATES instead would make
+    // every shrink slower without a fixpoint guarantee; this pays only for inputs that
+    // actually had more to give.
+    let mut best: Option<Minimized> = None;
+    for pass in 1..=MAX_SHRINK_PASSES {
+        let (state_in, stmt_in) = match &best {
+            None => (state_sql, failing_sql),
+            Some(m) => (m.state_sql.as_str(), m.statement.as_str()),
+        };
+        let before = state_in.len() + stmt_in.len();
+        match shrink_one_pass(state_in, history_sql, stmt_in)? {
+            Some(next) => {
+                let after = next.state_sql.len() + next.statement.len();
+                let progressed = after < before;
+                best = Some(next);
+                if !progressed {
+                    tracing::info!("Shrink reached a fixpoint after {pass} pass(es)");
+                    break;
+                }
+                tracing::info!("Shrink pass {pass}: {before} -> {after} bytes");
+            }
+            None => {
+                // The first pass finding nothing means the divergence does not reproduce at
+                // all, which is a real answer. A LATER pass finding nothing means this pass
+                // lost a divergence the previous one still had -- keep the earlier result
+                // rather than discarding it, and say so, because that is worth noticing.
+                if best.is_some() {
+                    tracing::warn!(
+                        "Shrink pass {pass} no longer reproduces the divergence; keeping the                          previous pass's result"
+                    );
+                }
+                break;
+            }
+        }
+    }
+    return Ok(best);
+}
+
+/// How many times to re-enter the shrinker before giving up on further progress. A bound
+/// rather than a `while`, so a pathological input cannot loop forever.
+const MAX_SHRINK_PASSES: usize = 8;
+
+fn shrink_one_pass(
+    state_sql: &str,
+    history_sql: &str,
+    failing_sql: &str,
+) -> Result<Option<Minimized>> {
     let mut state_sql = state_sql;
     let mut baseline = {
         let pair = EnginePair::build(state_sql)?;
