@@ -73,15 +73,15 @@ const BOUNDARY_INTEGERS: &[i64] = &[
     32768,
     65535,
     65536,
-    2147483647,            // i32::MAX
-    -2147483648,           // i32::MIN
+    2147483647,  // i32::MAX
+    -2147483648, // i32::MIN
     2147483648,
-    4294967295,            // u32::MAX
+    4294967295, // u32::MAX
     4294967296,
-    9007199254740992,      // 2^53, above which f64 cannot hold every integer
+    9007199254740992, // 2^53, above which f64 cannot hold every integer
     -9007199254740992,
-    9223372036854775807,   // i64::MAX
-    -9223372036854775808,  // i64::MIN, where negation overflows
+    9223372036854775807,  // i64::MAX
+    -9223372036854775808, // i64::MIN, where negation overflows
 ];
 
 /// Reals chosen for where formatting, affinity and rounding change behaviour, rather than as
@@ -96,13 +96,13 @@ const BOUNDARY_REALS: &[f64] = &[
     2.0,
     1e-300,
     1e300,
-    5e-324,                    // smallest subnormal
-    2.2250738585072014e-308,   // smallest normal
-    1.7976931348623157e308,    // f64::MAX
-    9007199254740993.0,        // 2^53 + 1, not representable
-    9223372036854775807.0,     // i64::MAX as a real
+    5e-324,                  // smallest subnormal
+    2.2250738585072014e-308, // smallest normal
+    1.7976931348623157e308,  // f64::MAX
+    9007199254740993.0,      // 2^53 + 1, not representable
+    9223372036854775807.0,   // i64::MAX as a real
     1e15,
-    1e16,                      // either side of 15 significant digits
+    1e16, // either side of 15 significant digits
 ];
 
 /// Generate an integer literal.
