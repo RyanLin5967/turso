@@ -15,6 +15,9 @@ pub struct GeneratedStatement {
     pub is_ddl: bool,
     pub mutates_data: bool,
     pub has_unordered_limit: bool,
+    /// Only this statement's own LIMIT, not one inside a subquery. The row-count rule
+    /// applies to the first and not the second.
+    pub has_top_level_unordered_limit: bool,
     pub unordered_limit_reason: Option<String>,
 }
 
@@ -223,6 +226,7 @@ impl SqlGenerator for SqlGenBackend {
         );
         let has_unordered_limit =
             stmt.has_unordered_limit() || stmt.non_unique_order_by_reason(schema).is_some();
+        let has_top_level_unordered_limit = stmt.has_top_level_unordered_limit();
         let unordered_limit_reason = stmt
             .unordered_limit_reason()
             .or_else(|| stmt.non_unique_order_by_reason(schema))
@@ -232,6 +236,7 @@ impl SqlGenerator for SqlGenBackend {
             is_ddl,
             mutates_data,
             has_unordered_limit,
+            has_top_level_unordered_limit,
             unordered_limit_reason,
         })
     }
@@ -321,11 +326,13 @@ impl SqlGenerator for PropTestBackend {
                 | sql_gen_prop::StatementKind::Delete
         );
         let has_unordered_limit = stmt.has_unordered_limit();
+        let has_top_level_unordered_limit = stmt.has_top_level_unordered_limit();
         Ok(GeneratedStatement {
             sql,
             is_ddl,
             mutates_data,
             has_unordered_limit,
+            has_top_level_unordered_limit,
             unordered_limit_reason: None,
         })
     }

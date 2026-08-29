@@ -75,6 +75,14 @@ impl fmt::Display for Stmt {
 impl Stmt {
     /// Returns true if this statement contains any SELECT with LIMIT but no ORDER BY,
     /// including in subqueries within expressions.
+    /// See `SelectStmt::has_top_level_unordered_limit`.
+    pub fn has_top_level_unordered_limit(&self) -> bool {
+        match self {
+            Stmt::Select(s) => s.has_top_level_unordered_limit(),
+            _ => false,
+        }
+    }
+
     pub fn has_unordered_limit(&self) -> bool {
         self.unordered_limit_reason().is_some()
     }
@@ -120,6 +128,25 @@ impl Stmt {
 }
 
 impl SelectStmt {
+    /// Whether THIS select's own LIMIT is unordered — no recursion into CTEs or
+    /// subqueries.
+    ///
+    /// A top-level unordered LIMIT leaves *which* rows come back undefined but not *how
+    /// many*: `LIMIT n` still yields `min(n, count)` on any engine. A LIMIT nested inside
+    /// a subquery is different — it can legitimately change the outer row count too — so
+    /// the oracle's row-count rule applies only to the first.
+    pub fn has_top_level_unordered_limit(&self) -> bool {
+        if self.limit.is_none() {
+            return false;
+        }
+        if self.order_by.is_empty() {
+            return true;
+        }
+        self.order_by
+            .iter()
+            .all(|item| !item.expr.contains_column_ref())
+    }
+
     /// Returns true if this SELECT or any nested subquery has a potentially
     /// non-deterministic LIMIT result set.
     ///

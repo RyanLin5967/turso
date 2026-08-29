@@ -266,6 +266,25 @@ impl SelectStatement {
     ///   among ties.
     ///
     /// The check recurses into subqueries within expressions (e.g., `NOT IN (SELECT ... LIMIT 1)`).
+    /// Whether THIS select's own LIMIT is unordered — no recursion into subqueries.
+    ///
+    /// The distinction matters to the oracle. A top-level unordered LIMIT leaves *which*
+    /// rows come back undefined but not *how many*: `LIMIT n` still yields
+    /// `min(n, count)` on any engine. A LIMIT inside a subquery is different — the
+    /// subquery picking a different row can legitimately change the outer result's row
+    /// count too, so nothing about the outer count is guaranteed.
+    pub fn has_top_level_unordered_limit(&self) -> bool {
+        if self.limit.is_none() {
+            return false;
+        }
+        if self.order_by.is_empty() {
+            return true;
+        }
+        self.order_by
+            .iter()
+            .all(|item| !item.expr.contains_column_ref())
+    }
+
     pub fn has_unordered_limit(&self) -> bool {
         if self.limit.is_some() {
             if self.order_by.is_empty() {

@@ -98,6 +98,11 @@ impl Oracle for DifferentialOracle {
         sqlite_result: &QueryResult,
     ) -> OracleResult {
         let has_unordered_limit = stmt.has_unordered_limit;
+        // Only a TOP-LEVEL unordered LIMIT guarantees a stable row count. When the
+        // LIMIT is inside a subquery the subquery may pick a different row on each
+        // engine, which can legitimately change the outer count too -- so the count
+        // rule below must not apply there.
+        let count_is_guaranteed = stmt.has_top_level_unordered_limit;
 
         match (turso_result, sqlite_result) {
             (QueryResult::Rows(turso_rows), QueryResult::Rows(sqlite_rows)) => {
@@ -119,7 +124,9 @@ impl Oracle for DifferentialOracle {
                     // an ORDER BY over the primary key clears the flag without fixing the
                     // bug, and it is then reported -- so the exemption was the thing hiding
                     // it, not a limitation of the comparison.
-                    if has_unordered_limit && turso_rows.len() == sqlite_rows.len() {
+                    if has_unordered_limit
+                        && (turso_rows.len() == sqlite_rows.len() || !count_is_guaranteed)
+                    {
                         return OracleResult::Warning(format_nondet_limit_warning(
                             stmt,
                             "row_set_mismatch",
@@ -131,9 +138,9 @@ impl Oracle for DifferentialOracle {
                     }
                     if has_unordered_limit {
                         return OracleResult::Fail(format!(
-                            "Row COUNT mismatch under an unordered LIMIT. Which rows come                              back is not stable across engines, but how many is:
-  SQL:                              {stmt}
-  Turso returned {} row(s), SQLite {}",
+                            "Row COUNT mismatch under an unordered LIMIT. Which rows come back is \
+                             not stable across engines, but how many is:\n  SQL: {stmt}\n  \
+                             Turso returned {} row(s), SQLite {}",
                             turso_rows.len(),
                             sqlite_rows.len()
                         ));
@@ -184,18 +191,22 @@ impl Oracle for DifferentialOracle {
                 "SQLite errored but Turso succeeded:\n  SQL: {stmt}\n  Error: {sqlite_err}"
             )),
             (QueryResult::Rows(rows), QueryResult::Ok) => {
-                // No has_unordered_limit exemption here, deliberately. Reaching this arm
-                // means one side returned rows and the other returned none, which IS a
-                // row-count divergence -- the exact thing an unordered LIMIT does not
-                // excuse, so the exemption that used to sit here could only ever fire
-                // on a real bug.
-                //
-                // This is where `SELECT count(a) FROM t LIMIT 0` lands (Turso 1 row,
-                // SQLite 0), because execute_sqlite maps an empty result to
-                // QueryResult::Ok and never to Rows(vec![]). Comparing lengths in the
-                // (Rows, Rows) arm alone left that case passing, one match arm over.
+                // Rows on one side and none on the other is a COUNT divergence, which a
+                // top-level unordered LIMIT does not excuse -- this is where
+                // `SELECT count(a) FROM t LIMIT 0` lands (Turso 1 row, SQLite 0), because
+                // execute_sqlite maps an empty result to Ok and never to Rows(vec![]).
+                // A LIMIT inside a subquery is a different matter and still only warns.
                 if rows.is_empty() {
                     OracleResult::Pass
+                } else if has_unordered_limit && !count_is_guaranteed {
+                    OracleResult::Warning(format_nondet_limit_warning(
+                        stmt,
+                        "rows_vs_ok",
+                        rows.len(),
+                        0,
+                        rows.len(),
+                        0,
+                    ))
                 } else {
                     OracleResult::Fail(format!(
                         "Turso returned {} rows but SQLite returned no rows:\n  SQL: {stmt}",
@@ -204,18 +215,17 @@ impl Oracle for DifferentialOracle {
                 }
             }
             (QueryResult::Ok, QueryResult::Rows(rows)) => {
-                // No has_unordered_limit exemption here, deliberately. Reaching this arm
-                // means one side returned rows and the other returned none, which IS a
-                // row-count divergence -- the exact thing an unordered LIMIT does not
-                // excuse, so the exemption that used to sit here could only ever fire
-                // on a real bug.
-                //
-                // This is where `SELECT count(a) FROM t LIMIT 0` lands (Turso 1 row,
-                // SQLite 0), because execute_sqlite maps an empty result to
-                // QueryResult::Ok and never to Rows(vec![]). Comparing lengths in the
-                // (Rows, Rows) arm alone left that case passing, one match arm over.
                 if rows.is_empty() {
                     OracleResult::Pass
+                } else if has_unordered_limit && !count_is_guaranteed {
+                    OracleResult::Warning(format_nondet_limit_warning(
+                        stmt,
+                        "ok_vs_rows",
+                        0,
+                        rows.len(),
+                        0,
+                        rows.len(),
+                    ))
                 } else {
                     OracleResult::Fail(format!(
                         "SQLite returned {} rows but Turso returned no rows:\n  SQL: {stmt}",
@@ -500,13 +510,21 @@ pub fn check_differential(
 /// are honest limitations, and treating them as failures would end runs on unimplemented
 /// features rather than on bugs.
 pub fn is_internal_failure(err: &str) -> bool {
+    // Matched case-insensitively and against what the engine ACTUALLY renders. The first
+    // version of this list was written from memory and was nearly inert: LimboError
+    // renders `#[error("Internal error: {0}")]` with a capital I, `str::contains` is
+    // case-sensitive, so the lowercase "internal error" marker never fired. And
+    // "assertion failed" / "panicked" never appear in a QueryResult::Error at all --
+    // runner.rs catches panics through catch_unwind and reports them as a separate Err,
+    // so those two markers could not match by construction. Effectively a five-marker
+    // list was doing the work of one.
     const MARKERS: &[&str] = &[
-        "Corrupt database",
-        "undefined or unresolved label",
+        "corrupt database",
         "internal error",
-        "assertion failed",
-        "panicked",
+        "undefined or unresolved label",
+        "unreachable code",
     ];
+    let err = err.to_ascii_lowercase();
     MARKERS.iter().any(|marker| err.contains(marker))
 }
 
@@ -565,6 +583,8 @@ mod tests {
             is_ddl: false,
             mutates_data: false,
             has_unordered_limit: true,
+
+            has_top_level_unordered_limit: true,
             unordered_limit_reason: Some("limit_order_by_scalar_subquery".to_string()),
         };
         let turso = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(1)])]);
@@ -633,6 +653,8 @@ mod tests {
             is_ddl: false,
             mutates_data: true,
             has_unordered_limit: false,
+
+            has_top_level_unordered_limit: false,
             unordered_limit_reason: None,
         };
 
@@ -682,6 +704,8 @@ mod tests {
             is_ddl: false,
             mutates_data: true,
             has_unordered_limit: false,
+
+            has_top_level_unordered_limit: false,
             unordered_limit_reason: None,
         };
 
@@ -712,12 +736,21 @@ mod tests {
     }
 
     /// Turso's own invariant violations must not hide behind a SQLite rejection.
+    ///
+    /// The strings below are what the engine ACTUALLY renders, not invented ones. An
+    /// earlier version of this test asserted on "assertion failed" and "panicked", which
+    /// never reach a QueryResult::Error at all -- runner.rs catches panics through
+    /// catch_unwind and reports them separately -- so the test passed while the marker
+    /// list it was checking was largely inert.
     #[test]
     fn internal_failures_are_not_agreement() {
+        // Verified against tursodb: SELECT DISTINCT count(*) FROM t emits the first of
+        // these. LimboError renders `#[error("Internal error: {0}")]`, capital I, which is
+        // why the match is case-insensitive.
         for err in [
             "Corrupt database: Reference to undefined or unresolved label in HashDistinct: 5",
-            "internal error: entered unreachable code",
-            "assertion failed: count > 0",
+            "Internal error: entered unreachable code",
+            "internal error: entered unreachable code: state is ReadHeader",
         ] {
             assert!(is_internal_failure(err), "should be internal: {err}");
         }
@@ -727,6 +760,8 @@ mod tests {
             "datatype mismatch",
             "FOREIGN KEY constraint failed",
             "parser stack overflow",
+            "integer overflow",
+            "not yet implemented: window functions",
         ] {
             assert!(
                 !is_internal_failure(err),
@@ -747,6 +782,8 @@ mod tests {
             is_ddl: false,
             mutates_data: false,
             has_unordered_limit: true,
+
+            has_top_level_unordered_limit: true,
             unordered_limit_reason: Some("limit_without_order_by".to_string()),
         };
         let rows =
@@ -773,8 +810,10 @@ mod tests {
         // And with the flag clear, a count mismatch fails as it always did.
         let ordered = GeneratedStatement {
             has_unordered_limit: false,
+
+            has_top_level_unordered_limit: false,
             unordered_limit_reason: None,
-            ..stmt.clone()
+            ..stmt
         };
         assert!(matches!(
             oracle.check(&ordered, &rows(3), &rows(5)),
@@ -794,6 +833,8 @@ mod tests {
             is_ddl: false,
             mutates_data: false,
             has_unordered_limit: true,
+
+            has_top_level_unordered_limit: true,
             unordered_limit_reason: Some("limit_without_order_by".to_string()),
         };
         let one_row = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(0)])]);

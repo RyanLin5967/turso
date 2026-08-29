@@ -114,6 +114,14 @@ impl SqlStatement {
     ///
     /// Such queries may return different rows between database implementations
     /// since the order is undefined.
+    /// See `SelectStatement::has_top_level_unordered_limit`.
+    pub fn has_top_level_unordered_limit(&self) -> bool {
+        match self {
+            SqlStatement::Select(s) => s.has_top_level_unordered_limit(),
+            _ => false,
+        }
+    }
+
     pub fn has_unordered_limit(&self) -> bool {
         match self {
             SqlStatement::Select(s) => s.has_unordered_limit(),

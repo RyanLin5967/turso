@@ -109,8 +109,19 @@ impl EnginePair {
         let t = DifferentialOracle::execute_turso(&self.turso, sql);
         let s = DifferentialOracle::execute_sqlite(&self.sqlite, sql);
         match (&t, &s) {
-            // Both rejected the candidate; not a divergence.
-            (QueryResult::Error(_), QueryResult::Error(_)) => None,
+            // Both rejected the candidate. Usually not a divergence -- except when Turso's
+            // error says its own invariant broke, which the oracle now Fails on. Without
+            // the same rule here, every internal-failure finding reaches shrink_and_write,
+            // classifies as "no divergence" against both the state dump and the history,
+            // and is reported unminimized. This was the FOURTH copy of a policy whose own
+            // comment in probe.rs counted three; all four now call one function.
+            (QueryResult::Error(te), QueryResult::Error(_)) => {
+                if crate::oracle::is_internal_failure(te) {
+                    Some(Divergence::TursoErr(error_prefix(te)))
+                } else {
+                    None
+                }
+            }
             (QueryResult::Error(te), _) => Some(Divergence::TursoErr(error_prefix(te))),
             (_, QueryResult::Error(se)) => Some(Divergence::SqliteErr(error_prefix(se))),
             _ => {
@@ -1085,7 +1096,7 @@ pub fn shrink_statement(
             }
         }
     }
-    return Ok(best);
+    Ok(best)
 }
 
 /// How many times to re-enter the shrinker before giving up on further progress. A bound

@@ -220,6 +220,31 @@ fn fuzzer_main() -> Result<()> {
                             break;
                         }
                     }
+                    // A zero-statement iteration is not a pass, and this is the path CI
+                    // uses (.github/workflows/rust.yml runs `... loop 10`). Guarding only
+                    // run_single left the higher-volume path able to report green having
+                    // compared nothing -- the exact failure the guard exists to close.
+                    Ok(stats) if stats.statements_executed == 0 => {
+                        let record = FailureRecord {
+                            iteration: iteration + 1,
+                            seed: args.seed,
+                            error: "no statements were executed, so nothing was compared"
+                                .to_string(),
+                            statements_executed: 0,
+                            oracle_failures: 0,
+                            warnings: stats.warnings,
+                            config: ConfigRecord::from_args(&args),
+                        };
+                        tracing::error!(
+                            "Iteration {} executed nothing (seed {})",
+                            iteration + 1,
+                            args.seed
+                        );
+                        failures.push(record);
+                        if !collecting {
+                            break;
+                        }
+                    }
                     Ok(_) => {}
                 }
 

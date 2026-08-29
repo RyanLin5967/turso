@@ -433,7 +433,6 @@ mod tests {
         let mut ctx = Context::new_with_seed(20260822);
         let cfg = LiteralConfig::default();
         let mut beyond_window = false;
-        let mut saw_i64_max = false;
         let mut saw_i64_min = false;
         for _ in 0..4000 {
             if let Literal::Integer(v) =
@@ -441,9 +440,6 @@ mod tests {
             {
                 if v.unsigned_abs() > 1_000_000 {
                     beyond_window = true;
-                }
-                if v == i64::MAX {
-                    saw_i64_max = true;
                 }
                 if v == i64::MIN {
                     saw_i64_min = true;
@@ -454,7 +450,15 @@ mod tests {
             beyond_window,
             "no integer outside +/-1e6 in 4000 draws -- the table is unreachable"
         );
-        assert!(saw_i64_max && saw_i64_min, "the i64 edges were never drawn");
+        // i64::MAX is deliberately absent from the table -- a row holding it in an
+        // INTEGER PRIMARY KEY makes later NULL-key inserts pick a rowid at random, which
+        // the harness scores as a divergence. i64::MIN is safe: it cannot become the
+        // max rowid.
+        assert!(saw_i64_min, "i64::MIN was never drawn");
+        assert!(
+            !BOUNDARY_INTEGERS.contains(&i64::MAX),
+            "i64::MAX must stay out of the table: it manufactures random rowids"
+        );
     }
 
     /// Reals too, including the ones a uniform +/-1e6 draw can never produce.
