@@ -80,7 +80,19 @@ const BOUNDARY_INTEGERS: &[i64] = &[
     4294967296,
     9007199254740992, // 2^53, above which f64 cannot hold every integer
     -9007199254740992,
-    9223372036854775807,  // i64::MAX
+    // 2^62, deliberately NOT i64::MAX or anything adjacent to it. A row whose rowid is
+    // i64::MAX makes every later NULL-key insert pick a rowid AT RANDOM -- documented SQLite
+    // behaviour that Turso implements too, so the engines legitimately disagree and the
+    // post-DML snapshot check calls it a divergence. MAX-1 is no better: the next NULL key
+    // takes MAX and the one after that is random. Measured across six seeds: i64::MAX gave
+    // two such false failures, MAX-1 still gave one. A false failure is not just noise, it
+    // ends the run -- those seeds executed about 150 statements against about 430 for a
+    // clean run, so it costs coverage as well as trust.
+    //
+    // 2^62 keeps a large-magnitude integer in reach while being unable to become the
+    // max-rowid trigger. The i64::MAX overflow edge itself is still reachable through
+    // arithmetic on these values, which is where overflow bugs actually live.
+    4611686018427387904,
     -9223372036854775808, // i64::MIN, where negation overflows
 ];
 
