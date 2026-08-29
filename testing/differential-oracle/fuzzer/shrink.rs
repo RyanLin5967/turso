@@ -1041,7 +1041,13 @@ pub fn shrink_statement(
     // every shrink slower without a fixpoint guarantee; this pays only for inputs that
     // actually had more to give.
     let mut best: Option<Minimized> = None;
-    for pass in 1..=MAX_SHRINK_PASSES {
+    // VERIFICATION-ONLY: let the bound be lowered, so it can be shown firing rather
+    // than assumed. Every real case here stops on no-progress well before 8.
+    let max_passes = std::env::var("SHRINK_MAX_PASSES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(MAX_SHRINK_PASSES);
+    for pass in 1..=max_passes {
         let (state_in, stmt_in) = match &best {
             None => (state_sql, failing_sql),
             Some(m) => (m.state_sql.as_str(), m.statement.as_str()),
@@ -1057,6 +1063,12 @@ pub fn shrink_statement(
                     break;
                 }
                 tracing::info!("Shrink pass {pass}: {before} -> {after} bytes");
+                if pass == max_passes {
+                    tracing::warn!(
+                        "Shrink stopped at the {max_passes}-pass bound while still \
+                         making progress; this result is not a fixpoint"
+                    );
+                }
             }
             None => {
                 // The first pass finding nothing means the divergence does not reproduce at
