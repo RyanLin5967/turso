@@ -22,6 +22,10 @@ path = "custom_types_fuzzer.rs"
 name = "differential_probe"
 path = "probe.rs"
 
+[[bin]]
+name = "shrink_harness"
+path = "shrink_harness.rs"
+
 [lib]
 path = "lib.rs"
 
