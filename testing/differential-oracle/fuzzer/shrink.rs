@@ -1065,7 +1065,8 @@ pub fn shrink_statement(
                 // rather than discarding it, and say so, because that is worth noticing.
                 if best.is_some() {
                     tracing::warn!(
-                        "Shrink pass {pass} no longer reproduces the divergence; keeping the                          previous pass's result"
+                        "Shrink pass {pass} no longer reproduces the divergence; \
+                         keeping the previous pass's result"
                     );
                 }
                 break;

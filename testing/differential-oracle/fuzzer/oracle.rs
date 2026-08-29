@@ -747,9 +747,8 @@ mod tests {
             has_unordered_limit: true,
             unordered_limit_reason: Some("limit_without_order_by".to_string()),
         };
-        let rows = |n: i64| {
-            QueryResult::Rows((0..n).map(|i| Row(vec![SqlValue::Integer(i)])).collect())
-        };
+        let rows =
+            |n: i64| QueryResult::Rows((0..n).map(|i| Row(vec![SqlValue::Integer(i)])).collect());
         let oracle = DifferentialOracle;
 
         // Different COUNT under an unordered LIMIT: a bug, and must fail.

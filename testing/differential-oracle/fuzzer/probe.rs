@@ -20,7 +20,7 @@
 use std::io::Read;
 
 use anyhow::Result;
-use differential_fuzzer::oracle::{is_internal_failure, QueryResult};
+use differential_fuzzer::oracle::{QueryResult, is_internal_failure};
 use differential_fuzzer::shrink::{EnginePair, query_results_differ};
 
 fn brief(result: &QueryResult) -> String {
