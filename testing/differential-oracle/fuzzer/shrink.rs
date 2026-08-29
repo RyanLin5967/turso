@@ -1099,7 +1099,9 @@ fn has_recursive_cte(stmt: &Stmt) -> bool {
     struct FindRecursive(bool);
     impl Visitor for FindRecursive {
         fn select(&mut self, select: &mut Select) -> bool {
-            self.0 = select.with.as_ref().is_some_and(|w| w.recursive);
+            if is_recursive(&select.with) {
+                self.0 = true;
+            }
             self.0
         }
     }
