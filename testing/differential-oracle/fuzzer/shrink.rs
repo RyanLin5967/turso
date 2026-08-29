@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use turso_core::{Database, SqliteDialect};
@@ -109,12 +110,10 @@ impl EnginePair {
         let t = DifferentialOracle::execute_turso(&self.turso, sql);
         let s = DifferentialOracle::execute_sqlite(&self.sqlite, sql);
         match (&t, &s) {
-            // Both rejected the candidate. Usually not a divergence -- except when Turso's
-            // error says its own invariant broke, which the oracle now Fails on. Without
-            // the same rule here, every internal-failure finding reaches shrink_and_write,
-            // classifies as "no divergence" against both the state dump and the history,
-            // and is reported unminimized. This was the FOURTH copy of a policy whose own
-            // comment in probe.rs counted three; all four now call one function.
+            // Both rejected the candidate: agreement, unless Turso's error says its own
+            // invariant broke. The oracle fails on those, so shrinking has to match it --
+            // otherwise an internal-failure finding classifies as "no divergence" against
+            // both the state dump and the history, and gets reported unminimized.
             (QueryResult::Error(te), QueryResult::Error(_)) => {
                 if crate::oracle::is_internal_failure(te) {
                     Some(Divergence::TursoErr(error_prefix(te)))
@@ -173,14 +172,10 @@ pub fn query_results_differ(a: &QueryResult, b: &QueryResult) -> bool {
             !sql_gen_prop::result::diff_results(ra, rb).is_empty()
         }
         (QueryResult::Ok, QueryResult::Ok) => false,
-        // Both errored is usually agreement, EXCEPT when Turso's error says its own
-        // invariant broke. differential_probe compares through this function and not
-        // through oracle.rs, so fixing only the oracle left the probe still reporting
-        // "0 diverged" and exiting 0 on
-        // `SELECT DISTINCT count(*) FROM t UNION;` -- Turso "Corrupt database:
-        // Reference to undefined or unresolved label in HashDistinct" against a SQLite
-        // syntax error. The unit tests passed; only running the binary caught it. Both
-        // comparators need the same rule or the tool every finding rests on stays blind.
+        // Both errored is agreement, unless Turso's error says its own invariant broke.
+        // differential_probe compares through this function rather than through
+        // oracle.rs, so both comparators need the same rule or the probe reports
+        // "0 diverged" and exits 0 on a real internal failure.
         (QueryResult::Error(turso_err), QueryResult::Error(_)) => {
             crate::oracle::is_internal_failure(turso_err)
         }
@@ -948,17 +943,39 @@ fn push_candidate(cand: &Stmt, original: &str, seen: &mut HashSet<String>, out: 
 
 // --- driver -------------------------------------------------------------
 
+/// When a shrink must stop regardless of how much reduction is left. Every
+/// candidate rebuilds both engines and replays the whole state script, so the
+/// attempt budgets bound the number of candidates but not the wall clock.
+/// Whatever a shrink holds when time runs out still reproduces the divergence,
+/// so stopping early ships a larger `minimized.sql` rather than none.
+#[derive(Clone, Copy)]
+struct Deadline(Instant);
+
+impl Deadline {
+    fn after(budget: Duration) -> Self {
+        Self(Instant::now() + budget)
+    }
+
+    fn expired(self) -> bool {
+        Instant::now() >= self.0
+    }
+}
+
 /// Repeatedly apply the first candidate edit that `judge` accepts, until no
-/// edit is accepted or the attempt budget runs out.
-fn shrink_with(initial: &str, mut judge: impl FnMut(&str) -> Result<bool>) -> Result<String> {
+/// edit is accepted, the attempt budget runs out, or `deadline` passes.
+fn shrink_with(
+    initial: &str,
+    deadline: Deadline,
+    mut judge: impl FnMut(&str) -> Result<bool>,
+) -> Result<String> {
     let mut current = initial.to_string();
     let mut attempts = 0usize;
     let mut progress = true;
-    while progress && attempts < MAX_CANDIDATES {
+    while progress && attempts < MAX_CANDIDATES && !deadline.expired() {
         progress = false;
         for candidate in candidates(&current) {
             attempts += 1;
-            if attempts >= MAX_CANDIDATES {
+            if attempts >= MAX_CANDIDATES || deadline.expired() {
                 break;
             }
             if judge(&candidate)? {
@@ -978,9 +995,11 @@ fn shrink_with(initial: &str, mut judge: impl FnMut(&str) -> Result<bool>) -> Re
 
 /// Classic ddmin-style list reduction: repeatedly try dropping chunks of
 /// lines from the state script, keeping a deletion when `judge` still accepts
-/// the remaining script. Halves the chunk size down to single lines.
+/// the remaining script. Halves the chunk size down to single lines, and stops
+/// early once `deadline` passes.
 fn reduce_state_lines(
     state_sql: &str,
+    deadline: Deadline,
     mut judge: impl FnMut(&str) -> Result<bool>,
 ) -> Result<String> {
     let mut lines: Vec<&str> = state_sql
@@ -992,7 +1011,7 @@ fn reduce_state_lines(
     loop {
         let mut i = 0;
         let mut deleted_any = false;
-        while i < lines.len() && attempts < MAX_CANDIDATES {
+        while i < lines.len() && attempts < MAX_CANDIDATES && !deadline.expired() {
             let end = (i + chunk).min(lines.len());
             let mut candidate: Vec<&str> = Vec::with_capacity(lines.len());
             candidate.extend_from_slice(&lines[..i]);
@@ -1006,7 +1025,7 @@ fn reduce_state_lines(
                 i = end;
             }
         }
-        if attempts >= MAX_CANDIDATES || (chunk == 1 && !deleted_any) {
+        if attempts >= MAX_CANDIDATES || deadline.expired() || (chunk == 1 && !deleted_any) {
             break;
         }
         chunk = (chunk / 2).max(1);
@@ -1037,77 +1056,111 @@ pub fn shrink_statement(
     history_sql: &str,
     failing_sql: &str,
 ) -> Result<Option<Minimized>> {
-    // MAX_CANDIDATES bounds ONE pass. A pass that ends by exhausting that budget has not
-    // reached this algorithm's own fixpoint -- it just ran out of attempts, and whatever it
-    // had at that moment is what gets written.
-    //
-    // Measured on a real production shrink (fuzzer seed 102261, its 21950-byte failing
-    // statement replayed against its own state dump): pass 1 reproduced the shipped log line
-    // exactly, "21950 -> 2354 bytes in 800 attempts", stopping at the cap. Feeding that
-    // output straight back in reached 823 bytes in 680 attempts -- under the cap, so a
-    // genuine stop-on-no-progress -- and a third pass left it at 823. The delivered artifact
-    // was 2.86x the size the same code reaches when simply asked again.
-    //
-    // So iterate until a pass changes nothing. Raising MAX_CANDIDATES instead would make
-    // every shrink slower without a fixpoint guarantee; this pays only for inputs that
-    // actually had more to give.
+    let deadline = Deadline::after(SHRINK_TIME_BUDGET);
+    shrink_passes(state_sql, failing_sql, deadline, |state_in, stmt_in| {
+        shrink_one_pass(state_in, history_sql, stmt_in, deadline)
+    })
+}
+
+/// How many times to re-enter the shrinker before giving up on further
+/// progress. A bound rather than a `while`, so a pathological input cannot
+/// loop forever.
+const MAX_SHRINK_PASSES: usize = 8;
+
+/// Wall clock the whole shrink may spend. The fuzzer jobs in
+/// `.github/workflows/rust.yml` are capped at 30 minutes and the run that
+/// failed has already spent part of that, so the shrink takes a fixed slice
+/// and leaves the rest for writing the artifact. One pass is measured at about
+/// a minute against a 200-line state script and five against a 1000-line one
+/// (debug build), so this is several passes on a small reproduction and rather
+/// less than one on a large one.
+const SHRINK_TIME_BUDGET: Duration = Duration::from_secs(6 * 60);
+
+/// Re-enter `run_pass` until it stops making the reproduction smaller.
+/// `MAX_CANDIDATES` bounds one pass, so a pass that ends by exhausting that
+/// budget stopped on the budget rather than on the algorithm's own fixpoint,
+/// and feeding its output back in reduces further.
+///
+/// Each pass starts from the smallest reproduction so far, and that only moves
+/// to a strictly smaller one. A pass that has to fall back to the statement
+/// history returns an artifact on a different basis, which is routinely larger
+/// than the one it replaced; the smaller reproduction is the one worth
+/// keeping, and a pass that cannot beat it is the signal to stop.
+fn shrink_passes(
+    state_sql: &str,
+    failing_sql: &str,
+    deadline: Deadline,
+    mut run_pass: impl FnMut(&str, &str) -> Result<Option<PassResult>>,
+) -> Result<Option<Minimized>> {
     let mut best: Option<Minimized> = None;
     for pass in 1..=MAX_SHRINK_PASSES {
+        if pass > 1 && deadline.expired() {
+            tracing::warn!(
+                "Shrink ran out of its {SHRINK_TIME_BUDGET:?} budget after {} pass(es); \
+                 this result is not a fixpoint",
+                pass - 1
+            );
+            break;
+        }
         let (state_in, stmt_in) = match &best {
             None => (state_sql, failing_sql),
             Some(m) => (m.state_sql.as_str(), m.statement.as_str()),
         };
-        let before = state_in.len() + stmt_in.len();
-        match shrink_one_pass(state_in, history_sql, stmt_in)? {
-            Some(next) => {
-                let after = next.state_sql.len() + next.statement.len();
-                let progressed = after < before;
-                best = Some(next);
-                if !progressed {
-                    tracing::info!("Shrink reached a fixpoint after {pass} pass(es)");
-                    break;
-                }
-                tracing::info!("Shrink pass {pass}: {before} -> {after} bytes");
-                if pass == MAX_SHRINK_PASSES {
-                    // Stopping here is the same failure this loop exists to fix, one
-                    // level up: a pass budget ran out while the statement was still
-                    // getting smaller, so what gets written is not the fixpoint. Say
-                    // so, because the alternative is a log that looks like a clean
-                    // finish. Not seen on any real case so far -- every one has
-                    // stopped on no-progress within three passes.
-                    tracing::warn!(
-                        "Shrink stopped at the {MAX_SHRINK_PASSES}-pass bound while still \
-                         making progress; this result is not a fixpoint"
-                    );
-                }
+        let Some(next) = run_pass(state_in, stmt_in)? else {
+            // Nothing on the FIRST pass means the divergence does not reproduce at
+            // all, which is a real answer. A later pass finding nothing means this
+            // pass lost a divergence the previous one still had -- keep the earlier
+            // result rather than discarding it, and say so.
+            if best.is_some() {
+                tracing::warn!(
+                    "Shrink pass {pass} no longer reproduces the divergence; \
+                     keeping the previous pass's result"
+                );
             }
-            None => {
-                // The first pass finding nothing means the divergence does not reproduce at
-                // all, which is a real answer. A LATER pass finding nothing means this pass
-                // lost a divergence the previous one still had -- keep the earlier result
-                // rather than discarding it, and say so, because that is worth noticing.
-                if best.is_some() {
-                    tracing::warn!(
-                        "Shrink pass {pass} no longer reproduces the divergence; \
-                         keeping the previous pass's result"
-                    );
-                }
-                break;
-            }
+            break;
+        };
+        // Measure against what the pass actually shrank. A pass that switched to the
+        // statement history reduced the history, so comparing its output with the
+        // state dump it was handed compares unrelated quantities.
+        let before = best.as_ref().map_or(next.input_len, artifact_len);
+        let after = artifact_len(&next.minimized);
+        let progressed = after < before;
+        if progressed || best.is_none() {
+            best = Some(next.minimized);
+        }
+        if !progressed {
+            tracing::info!("Shrink reached a fixpoint after {pass} pass(es)");
+            break;
+        }
+        tracing::info!("Shrink pass {pass}: {before} -> {after} bytes");
+        if pass == MAX_SHRINK_PASSES {
+            tracing::warn!(
+                "Shrink stopped at the {MAX_SHRINK_PASSES}-pass bound while still \
+                 making progress; this result is not a fixpoint"
+            );
         }
     }
     Ok(best)
 }
 
-/// How many times to re-enter the shrinker before giving up on further progress. A bound
-/// rather than a `while`, so a pathological input cannot loop forever.
-const MAX_SHRINK_PASSES: usize = 8;
+/// What one pass produced, and the size of what it actually reduced.
+struct PassResult {
+    minimized: Minimized,
+    /// Length of the state script and statement this pass started from, on
+    /// whichever basis it chose, so the driver can compare like with like.
+    input_len: usize,
+}
+
+fn artifact_len(minimized: &Minimized) -> usize {
+    minimized.state_sql.len() + minimized.statement.len()
+}
 
 fn shrink_one_pass(
     state_sql: &str,
     history_sql: &str,
     failing_sql: &str,
-) -> Result<Option<Minimized>> {
+    deadline: Deadline,
+) -> Result<Option<PassResult>> {
     let mut state_sql = state_sql;
     let mut baseline = {
         let pair = EnginePair::build(state_sql)?;
@@ -1129,12 +1182,13 @@ fn shrink_one_pass(
         );
         return Ok(None);
     };
+    let input_len = state_sql.len() + failing_sql.len();
     tracing::info!(
         "Shrinking {} byte statement ({original:?})",
         failing_sql.len()
     );
 
-    let statement = shrink_with(failing_sql, |candidate| {
+    let statement = shrink_with(failing_sql, deadline, |candidate| {
         // Fresh engines per attempt: a DML candidate that ran on both engines
         // would otherwise contaminate the next attempt's state.
         let pair = EnginePair::build(state_sql)?;
@@ -1142,7 +1196,7 @@ fn shrink_one_pass(
     })?;
 
     // With the statement fixed, drop every state line it does not need.
-    let state_sql = reduce_state_lines(state_sql, |candidate_state| {
+    let state_sql = reduce_state_lines(state_sql, deadline, |candidate_state| {
         let pair = EnginePair::build(candidate_state)?;
         Ok(matches_divergence(&original, pair.classify(&statement)))
     })?;
@@ -1150,9 +1204,12 @@ fn shrink_one_pass(
         "State script reduced to {} lines",
         state_sql.lines().count()
     );
-    Ok(Some(Minimized {
-        state_sql,
-        statement,
+    Ok(Some(PassResult {
+        minimized: Minimized {
+            state_sql,
+            statement,
+        },
+        input_len,
     }))
 }
 
@@ -1164,6 +1221,24 @@ mod tests {
     /// hand-written spacing.
     fn norm(sql: &str) -> String {
         parse_one(sql).expect("test SQL must parse").to_string()
+    }
+
+    /// A deadline no test can reach, so a test that expects work to happen
+    /// still exercises the real `Deadline::after` rather than a stub.
+    fn no_deadline() -> Deadline {
+        Deadline::after(Duration::from_secs(3600))
+    }
+
+    /// A deadline that has already passed.
+    fn out_of_time() -> Deadline {
+        Deadline::after(Duration::ZERO)
+    }
+
+    fn minimized(state_sql: &str, statement: &str) -> Minimized {
+        Minimized {
+            state_sql: state_sql.to_string(),
+            statement: statement.to_string(),
+        }
     }
 
     #[test]
@@ -1254,7 +1329,7 @@ mod tests {
         // be simplified away.
         let sql = "SELECT ABS(CASE WHEN LENGTH('hello world') THEN 123456 \
                    ELSE UPPER('junk') END), COALESCE(999999, X'DEADBEEF') FROM t";
-        let out = shrink_with(sql, |cand| Ok(cand.contains("ABS"))).unwrap();
+        let out = shrink_with(sql, no_deadline(), |cand| Ok(cand.contains("ABS"))).unwrap();
         assert!(out.contains("ABS"), "{out}");
         assert!(!out.contains("CASE"), "{out}");
         assert!(!out.contains("hello world"), "{out}");
@@ -1265,7 +1340,7 @@ mod tests {
     #[test]
     fn shrink_loop_terminates_when_everything_is_accepted() {
         let sql = "SELECT MAX(1, MIN(2, 3)), 'literal', X'AB' FROM t";
-        let out = shrink_with(sql, |_| Ok(true)).unwrap();
+        let out = shrink_with(sql, no_deadline(), |_| Ok(true)).unwrap();
         assert!(out.len() < sql.len(), "{out}");
     }
 
@@ -1285,7 +1360,7 @@ mod tests {
         let state = "CREATE TABLE t(x);\nINSERT INTO t VALUES (1);\n\
                      CREATE TABLE junk(y);\nINSERT INTO junk VALUES (2);\n\
                      CREATE INDEX i ON junk(y);";
-        let out = reduce_state_lines(state, |cand| {
+        let out = reduce_state_lines(state, no_deadline(), |cand| {
             Ok(cand.contains("CREATE TABLE t(x);") && cand.contains("INSERT INTO t VALUES (1);"))
         })
         .unwrap();
@@ -1293,5 +1368,189 @@ mod tests {
             out, "CREATE TABLE t(x);\nINSERT INTO t VALUES (1);",
             "{out}"
         );
+    }
+
+    /// Build a pass whose result is `state`/`statement`, reporting that it
+    /// started from `input_len` bytes.
+    fn pass_result(state_sql: &str, statement: &str, input_len: usize) -> PassResult {
+        PassResult {
+            minimized: minimized(state_sql, statement),
+            input_len,
+        }
+    }
+
+    /// A pass that shrank exactly what it was handed, on the same basis.
+    fn shrank(state_in: &str, stmt_in: &str, statement: &str) -> PassResult {
+        pass_result(state_in, statement, state_in.len() + stmt_in.len())
+    }
+
+    #[test]
+    fn each_pass_re_enters_the_shrinker_with_the_previous_pass_result() {
+        // Halve the statement each pass; the statement stops changing at one
+        // byte, which is the fixpoint.
+        let mut inputs: Vec<String> = Vec::new();
+        let out = shrink_passes("S", "aaaaaaaa", no_deadline(), |state_in, stmt_in| {
+            inputs.push(stmt_in.to_string());
+            let half = &stmt_in[..stmt_in.len().div_ceil(2)];
+            Ok(Some(shrank(state_in, stmt_in, half)))
+        })
+        .unwrap()
+        .expect("a reproducing pass must yield a result");
+        assert_eq!(
+            inputs,
+            ["aaaaaaaa", "aaaa", "aa", "a"],
+            "each pass must start from the previous pass's output, not the original"
+        );
+        assert_eq!(out.statement, "a");
+    }
+
+    #[test]
+    fn a_pass_that_switches_to_the_history_is_measured_against_the_history() {
+        // The production shape: the state dump does not reproduce, so pass 1
+        // shrinks the much larger statement history instead. Its output is
+        // bigger than the dump it was handed, yet it is real progress and
+        // there is more to give.
+        let dump = "CREATE TABLE t(x);";
+        let history = "h".repeat(20_000);
+        let mut passes = 0;
+        let out = shrink_passes(dump, "SELECT 1 FROM t", no_deadline(), |_, stmt_in| {
+            passes += 1;
+            Ok(Some(match passes {
+                1 => pass_result(&"h".repeat(2000), stmt_in, history.len() + stmt_in.len()),
+                2 => pass_result(&"h".repeat(800), stmt_in, 2000 + stmt_in.len()),
+                _ => pass_result(&"h".repeat(800), stmt_in, 800 + stmt_in.len()),
+            }))
+        })
+        .unwrap()
+        .expect("a reproducing pass must yield a result");
+        assert_eq!(
+            passes, 3,
+            "pass 1's output is larger than the state dump it was handed, which is not a fixpoint"
+        );
+        assert_eq!(out.state_sql.len(), 800);
+    }
+
+    #[test]
+    fn a_pass_that_comes_back_larger_does_not_replace_the_smaller_result() {
+        let mut passes = 0;
+        let out = shrink_passes(
+            "state-dump",
+            "SELECT 1",
+            no_deadline(),
+            |state_in, stmt_in| {
+                passes += 1;
+                Ok(Some(match passes {
+                    1 => shrank(state_in, stmt_in, "S"),
+                    // Fell back to the history: still a reproduction, but a bigger one.
+                    _ => pass_result(&"h".repeat(5000), "SELECT 1", 20_000),
+                }))
+            },
+        )
+        .unwrap()
+        .expect("a reproducing pass must yield a result");
+        assert_eq!(passes, 2);
+        assert_eq!(
+            (out.state_sql.as_str(), out.statement.as_str()),
+            ("state-dump", "S"),
+            "the smaller reproduction must survive a later, larger pass"
+        );
+    }
+
+    #[test]
+    fn the_pass_bound_stops_a_shrink_that_is_still_making_progress() {
+        let original = "a".repeat(100);
+        let mut passes = 0;
+        let out = shrink_passes("S", &original, no_deadline(), |state_in, stmt_in| {
+            passes += 1;
+            Ok(Some(shrank(state_in, stmt_in, &stmt_in[1..])))
+        })
+        .unwrap()
+        .expect("a reproducing pass must yield a result");
+        assert_eq!(
+            passes, MAX_SHRINK_PASSES,
+            "an always-shrinking input must stop at the pass bound"
+        );
+        assert_eq!(out.statement.len(), original.len() - MAX_SHRINK_PASSES);
+    }
+
+    #[test]
+    fn a_later_pass_losing_the_divergence_keeps_the_previous_result() {
+        let mut passes = 0;
+        let out = shrink_passes(
+            "state-dump",
+            "SELECT 1 FROM t",
+            no_deadline(),
+            |state_in, stmt_in| {
+                passes += 1;
+                if passes == 1 {
+                    return Ok(Some(shrank(state_in, stmt_in, "SELECT 1")));
+                }
+                Ok(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(passes, 2);
+        let out = out.expect("losing the divergence on pass 2 must not discard pass 1's result");
+        assert_eq!(
+            (out.state_sql.as_str(), out.statement.as_str()),
+            ("state-dump", "SELECT 1")
+        );
+    }
+
+    #[test]
+    fn no_divergence_on_the_first_pass_yields_nothing() {
+        let mut passes = 0;
+        let out = shrink_passes("state-dump", "SELECT 1", no_deadline(), |_, _| {
+            passes += 1;
+            Ok(None)
+        })
+        .unwrap();
+        assert_eq!(passes, 1);
+        assert!(
+            out.is_none(),
+            "nothing reproduced, so there is nothing to write"
+        );
+    }
+
+    #[test]
+    fn an_expired_deadline_stops_the_loop_but_keeps_the_first_result() {
+        let mut passes = 0;
+        let out = shrink_passes("S", "aaaaaaaa", out_of_time(), |state_in, stmt_in| {
+            passes += 1;
+            Ok(Some(shrank(state_in, stmt_in, &stmt_in[1..])))
+        })
+        .unwrap()
+        .expect("running out of time must still return the pass that did run");
+        assert_eq!(passes, 1, "a second pass must not start after the deadline");
+        assert_eq!(out.statement, "aaaaaaa");
+    }
+
+    #[test]
+    fn an_expired_deadline_stops_the_candidate_loop() {
+        let sql = "SELECT MAX(1, MIN(2, 3)), 'literal', X'AB' FROM t";
+        let mut judged = 0;
+        let out = shrink_with(sql, out_of_time(), |_| {
+            judged += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(judged, 0, "no candidate may be built after the deadline");
+        assert_eq!(out, sql, "the unshrunk statement still reproduces");
+    }
+
+    #[test]
+    fn an_expired_deadline_stops_the_state_reduction() {
+        let state = "CREATE TABLE t(x);\nINSERT INTO t VALUES (1);\nCREATE TABLE junk(y);";
+        let mut judged = 0;
+        let out = reduce_state_lines(state, out_of_time(), |_| {
+            judged += 1;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(
+            judged, 0,
+            "no candidate state may be replayed after the deadline"
+        );
+        assert_eq!(out, state, "the unreduced state script still reproduces");
     }
 }
