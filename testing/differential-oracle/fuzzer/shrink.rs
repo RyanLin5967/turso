@@ -1340,11 +1340,11 @@ fn shrink_passes(
         let before = best.as_ref().map_or(next.input_len, artifact_len);
         let after = artifact_len(&next.minimized);
         let progressed = after < before;
-        // A pass that reports a different starting size from the one it was handed
-        // did not reduce the artifact this loop is tracking; it reduced the other
-        // script. Its result is comparable to nothing the loop has, so a failure to
-        // beat the best is not the algorithm running out of edits.
-        let switched_basis = best.as_ref().is_some_and(|b| next.input_len != artifact_len(b));
+        // A pass that fell back to the statement history did not reduce the artifact
+        // this loop is tracking; it reduced the other script. Its result is comparable
+        // to nothing the loop holds, so failing to beat the best is not the algorithm
+        // running out of edits.
+        let switched_basis = best.is_some() && next.basis == Basis::History;
         // A first pass that reduced nothing still produced the only reproduction there is.
         if progressed || best.is_none() {
             best = Some(next.minimized);
@@ -1355,7 +1355,7 @@ fn shrink_passes(
             stop = if deadline.expired() {
                 Stop::OutOfTime
             } else if switched_basis {
-                Stop::SwitchedBasisAndGrew
+                Stop::SwitchedBasisAndDidNotShrink
             } else {
                 Stop::Fixpoint
             };
@@ -1377,9 +1377,9 @@ fn shrink_passes(
              pass {completed}",
             completed + 1
         ),
-        Stop::SwitchedBasisAndGrew => tracing::warn!(
-            "Shrink pass {completed} reduced the other script and came back bigger than \
-             pass {}'s result; keeping the smaller one. No pass reached a fixpoint",
+        Stop::SwitchedBasisAndDidNotShrink => tracing::warn!(
+            "Shrink pass {completed} reduced the statement history and came back no \
+             smaller than pass {}'s result; keeping that one. No pass reached a fixpoint",
             completed - 1
         ),
         Stop::NoReproduction => {}
@@ -1400,12 +1400,11 @@ enum Stop {
     OutOfTime,
     /// A later pass stopped reproducing the divergence; an earlier result is kept.
     LostDivergence,
-    /// A later pass reduced the other script -- the statement history rather than the
-    /// state dump, or the reverse -- and its result is bigger than the one already
-    /// held, so the earlier, smaller one is kept. The pass before it was still making
-    /// progress and this one measured a different artifact, so nothing here reached a
+    /// A later pass fell back to the statement history and came back no smaller than
+    /// the result already held, which is kept. The pass before it was still making
+    /// progress and this one measured a different script, so nothing here reached a
     /// fixpoint.
-    SwitchedBasisAndGrew,
+    SwitchedBasisAndDidNotShrink,
     /// The first pass reproduced nothing, so there is nothing to minimize.
     NoReproduction,
 }
@@ -1416,6 +1415,20 @@ struct PassResult {
     /// Length of the state script and statement this pass started from, on
     /// whichever basis it chose, so the driver can compare like with like.
     input_len: usize,
+    /// Which of the two scripts this pass reduced. The driver cannot infer it
+    /// from `input_len`: a history that happens to be the same length as the
+    /// state script it replaced reads as no switch at all, and the pass loop
+    /// would then log a fixpoint no pass reached.
+    basis: Basis,
+}
+
+/// Which script a pass reduced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Basis {
+    /// The state script the driver handed the pass.
+    Handed,
+    /// The statement history, because the handed script stopped reproducing.
+    History,
 }
 
 fn artifact_len(minimized: &Minimized) -> usize {
@@ -1429,10 +1442,10 @@ fn choose_basis<'a>(
     state_sql: &'a str,
     history_sql: &'a str,
     failing_sql: &str,
-) -> Result<Option<(&'a str, Divergence)>> {
+) -> Result<Option<(&'a str, Divergence, Basis)>> {
     let pair = EnginePair::build(state_sql)?;
     if let Some(divergence) = pair.classify(failing_sql) {
-        return Ok(Some((state_sql, divergence)));
+        return Ok(Some((state_sql, divergence, Basis::Handed)));
     }
     let pair = EnginePair::build(history_sql)?;
     let Some(divergence) = pair.classify(failing_sql) else {
@@ -1441,7 +1454,7 @@ fn choose_basis<'a>(
     tracing::info!(
         "Divergence needs the statement history; shrinking against it instead of the state dump"
     );
-    Ok(Some((history_sql, divergence)))
+    Ok(Some((history_sql, divergence, Basis::History)))
 }
 
 fn shrink_one_pass(
@@ -1450,7 +1463,7 @@ fn shrink_one_pass(
     failing_sql: &str,
     deadline: &Deadline,
 ) -> Result<Option<PassResult>> {
-    let Some((basis, original)) = choose_basis(state_sql, history_sql, failing_sql)? else {
+    let Some((basis, original, which)) = choose_basis(state_sql, history_sql, failing_sql)? else {
         tracing::info!(
             "Shrink skipped: divergence reproduces on neither the rebuilt state nor the statement history"
         );
@@ -1458,6 +1471,7 @@ fn shrink_one_pass(
     };
     Ok(Some(shrink_against(
         basis,
+        which,
         &original,
         failing_sql,
         deadline,
@@ -1469,6 +1483,7 @@ fn shrink_one_pass(
 /// from the one this pass rejected.
 fn shrink_against(
     basis: &str,
+    which: Basis,
     original: &Divergence,
     failing_sql: &str,
     deadline: &Deadline,
@@ -1501,6 +1516,7 @@ fn shrink_against(
             statement,
         },
         input_len,
+        basis: which,
     })
 }
 
@@ -1663,17 +1679,28 @@ mod tests {
     }
 
     /// Build a pass whose result is `state`/`statement`, reporting that it
-    /// started from `input_len` bytes.
-    fn pass_result(state_sql: &str, statement: &str, input_len: usize) -> PassResult {
+    /// started from `input_len` bytes of `basis`.
+    fn pass_result(
+        state_sql: &str,
+        statement: &str,
+        input_len: usize,
+        basis: Basis,
+    ) -> PassResult {
         PassResult {
             minimized: minimized(state_sql, statement),
             input_len,
+            basis,
         }
     }
 
     /// A pass that shrank exactly what it was handed, on the same basis.
     fn shrank(state_in: &str, stmt_in: &str, statement: &str) -> PassResult {
-        pass_result(state_in, statement, state_in.len() + stmt_in.len())
+        pass_result(
+            state_in,
+            statement,
+            state_in.len() + stmt_in.len(),
+            Basis::Handed,
+        )
     }
 
     #[test]
@@ -1709,9 +1736,26 @@ mod tests {
         let (out, stop) = shrink_passes(dump, "SELECT 1 FROM t", &no_deadline(), |_, stmt_in| {
             passes += 1;
             Ok(Some(match passes {
-                1 => pass_result(&"h".repeat(2000), stmt_in, history.len() + stmt_in.len()),
-                2 => pass_result(&"h".repeat(800), stmt_in, 2000 + stmt_in.len()),
-                _ => pass_result(&"h".repeat(800), stmt_in, 800 + stmt_in.len()),
+                // Pass 1 falls back to the history; passes 2 and 3 reduce the history
+                // they are then handed, which is no longer a switch.
+                1 => pass_result(
+                    &"h".repeat(2000),
+                    stmt_in,
+                    history.len() + stmt_in.len(),
+                    Basis::History,
+                ),
+                2 => pass_result(
+                    &"h".repeat(800),
+                    stmt_in,
+                    2000 + stmt_in.len(),
+                    Basis::Handed,
+                ),
+                _ => pass_result(
+                    &"h".repeat(800),
+                    stmt_in,
+                    800 + stmt_in.len(),
+                    Basis::Handed,
+                ),
             }))
         })
         .unwrap();
@@ -1736,7 +1780,7 @@ mod tests {
                 Ok(Some(match passes {
                     1 => shrank(state_in, stmt_in, "S"),
                     // Fell back to the history: still a reproduction, but a bigger one.
-                    _ => pass_result(&"h".repeat(5000), "SELECT 1", 20_000),
+                    _ => pass_result(&"h".repeat(5000), "SELECT 1", 20_000, Basis::History),
                 }))
             },
         )
@@ -1744,7 +1788,7 @@ mod tests {
         let out = out.expect("a reproducing pass must yield a result");
         assert_eq!(
             (passes, stop),
-            (2, Stop::SwitchedBasisAndGrew),
+            (2, Stop::SwitchedBasisAndDidNotShrink),
             "pass 1 was still shrinking and pass 2 measured a different script, so \
              nothing here is a fixpoint"
         );
@@ -1752,6 +1796,35 @@ mod tests {
             (out.state_sql.as_str(), out.statement.as_str()),
             ("state-dump", "S"),
             "the smaller reproduction must survive a later, larger pass"
+        );
+    }
+
+    #[test]
+    fn a_history_pass_that_lands_on_the_same_size_is_not_a_fixpoint() {
+        // The driver cannot read "which script did you reduce?" out of a length. This
+        // pass falls back to the history and its result happens to weigh exactly what
+        // the driver already holds, so a length comparison sees no switch and no
+        // shrink -- and calls that a fixpoint no pass reached.
+        let mut passes = 0;
+        let (out, stop) = shrink_passes(
+            "state-dump",
+            "SELECT 1",
+            &no_deadline(),
+            |state_in, stmt_in| {
+                passes += 1;
+                Ok(Some(match passes {
+                    1 => shrank(state_in, stmt_in, "S"),
+                    _ => pass_result("state-dum", "SS", 11, Basis::History),
+                }))
+            },
+        )
+        .unwrap();
+        let out = out.expect("a reproducing pass must yield a result");
+        assert_eq!((passes, stop), (2, Stop::SwitchedBasisAndDidNotShrink));
+        assert_eq!(
+            (out.state_sql.as_str(), out.statement.as_str()),
+            ("state-dump", "S"),
+            "a tie on a different script must not replace the result already held"
         );
     }
 
@@ -2101,6 +2174,7 @@ mod tests {
             let pass_start = Instant::now();
             let out = shrink_against(
                 &state,
+                Basis::Handed,
                 &Divergence::ResultMismatch,
                 &statement,
                 &no_deadline(),
