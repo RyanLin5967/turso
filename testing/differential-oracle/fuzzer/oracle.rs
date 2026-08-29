@@ -184,17 +184,18 @@ impl Oracle for DifferentialOracle {
                 "SQLite errored but Turso succeeded:\n  SQL: {stmt}\n  Error: {sqlite_err}"
             )),
             (QueryResult::Rows(rows), QueryResult::Ok) => {
+                // No has_unordered_limit exemption here, deliberately. Reaching this arm
+                // means one side returned rows and the other returned none, which IS a
+                // row-count divergence -- the exact thing an unordered LIMIT does not
+                // excuse, so the exemption that used to sit here could only ever fire
+                // on a real bug.
+                //
+                // This is where `SELECT count(a) FROM t LIMIT 0` lands (Turso 1 row,
+                // SQLite 0), because execute_sqlite maps an empty result to
+                // QueryResult::Ok and never to Rows(vec![]). Comparing lengths in the
+                // (Rows, Rows) arm alone left that case passing, one match arm over.
                 if rows.is_empty() {
                     OracleResult::Pass
-                } else if has_unordered_limit {
-                    OracleResult::Warning(format_nondet_limit_warning(
-                        stmt,
-                        "rows_vs_ok",
-                        rows.len(),
-                        0,
-                        rows.len(),
-                        0,
-                    ))
                 } else {
                     OracleResult::Fail(format!(
                         "Turso returned {} rows but SQLite returned no rows:\n  SQL: {stmt}",
@@ -203,17 +204,18 @@ impl Oracle for DifferentialOracle {
                 }
             }
             (QueryResult::Ok, QueryResult::Rows(rows)) => {
+                // No has_unordered_limit exemption here, deliberately. Reaching this arm
+                // means one side returned rows and the other returned none, which IS a
+                // row-count divergence -- the exact thing an unordered LIMIT does not
+                // excuse, so the exemption that used to sit here could only ever fire
+                // on a real bug.
+                //
+                // This is where `SELECT count(a) FROM t LIMIT 0` lands (Turso 1 row,
+                // SQLite 0), because execute_sqlite maps an empty result to
+                // QueryResult::Ok and never to Rows(vec![]). Comparing lengths in the
+                // (Rows, Rows) arm alone left that case passing, one match arm over.
                 if rows.is_empty() {
                     OracleResult::Pass
-                } else if has_unordered_limit {
-                    OracleResult::Warning(format_nondet_limit_warning(
-                        stmt,
-                        "ok_vs_rows",
-                        0,
-                        rows.len(),
-                        0,
-                        rows.len(),
-                    ))
                 } else {
                     OracleResult::Fail(format!(
                         "SQLite returned {} rows but Turso returned no rows:\n  SQL: {stmt}",
@@ -777,6 +779,44 @@ mod tests {
         assert!(matches!(
             oracle.check(&ordered, &rows(3), &rows(5)),
             OracleResult::Fail(_)
+        ));
+    }
+
+    /// The shape the (Rows, Rows) test above cannot reach. `execute_sqlite` maps an empty
+    /// result to `QueryResult::Ok`, never `Rows(vec![])`, so
+    /// `SELECT count(a) FROM t LIMIT 0` -- Turso 1 row, SQLite 0 -- arrives as (Rows, Ok)
+    /// and used to be excused by has_unordered_limit. One side having rows and the other
+    /// none is always a count divergence, so there is nothing for the exemption to excuse.
+    #[test]
+    fn rows_versus_no_rows_is_always_a_count_divergence() {
+        let stmt = GeneratedStatement {
+            sql: "SELECT count(a) FROM t LIMIT 0".to_string(),
+            is_ddl: false,
+            mutates_data: false,
+            has_unordered_limit: true,
+            unordered_limit_reason: Some("limit_without_order_by".to_string()),
+        };
+        let one_row = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(0)])]);
+        let oracle = DifferentialOracle;
+
+        assert!(
+            matches!(
+                oracle.check(&stmt, &one_row, &QueryResult::Ok),
+                OracleResult::Fail(_)
+            ),
+            "turso 1 row vs sqlite none must fail even under an unordered LIMIT"
+        );
+        assert!(
+            matches!(
+                oracle.check(&stmt, &QueryResult::Ok, &one_row),
+                OracleResult::Fail(_)
+            ),
+            "the mirror direction must fail too"
+        );
+        // Both empty is still agreement.
+        assert!(matches!(
+            oracle.check(&stmt, &QueryResult::Rows(vec![]), &QueryResult::Ok),
+            OracleResult::Pass
         ));
     }
 }
