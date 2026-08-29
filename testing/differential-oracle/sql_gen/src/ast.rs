@@ -1803,15 +1803,18 @@ impl fmt::Display for Literal {
         match self {
             Literal::Null => write!(f, "NULL"),
             Literal::Integer(i) => write!(f, "{i}"),
+            // `{r:?}` rather than `{r}`: Display drops the decimal point on an integral
+            // f64, so 1.0 would reach SQL as `1` and typeof() would say 'integer'. Debug
+            // keeps the point and uses exponent notation, which also stops 5e-324 from
+            // becoming a 326-character literal.
             Literal::Real(r) => {
                 if r.is_infinite() || r.is_nan() {
                     write!(f, "NULL")
                 } else {
-                    write!(f, "{r}")
+                    write!(f, "{r:?}")
                 }
             }
             Literal::Text(s) => {
-                // Escape single quotes
                 let escaped = s.replace('\'', "''");
                 write!(f, "'{escaped}'")
             }
@@ -2360,6 +2363,54 @@ mod tests {
         assert_eq!(Literal::Text("hello".to_string()).to_string(), "'hello'");
         assert_eq!(Literal::Text("it's".to_string()).to_string(), "'it''s'");
         assert_eq!(Literal::Blob(vec![0xDE, 0xAD]).to_string(), "X'DEAD'");
+    }
+
+    /// A real must reach SQL still looking like a real. Display drops the decimal point on
+    /// an integral f64, which turns the literal into an INTEGER the moment it is parsed --
+    /// silently deleting every integral entry of the boundary table, negative zero included.
+    #[test]
+    fn integral_reals_keep_their_decimal_point() {
+        assert_eq!(Literal::Real(0.0).to_string(), "0.0");
+        assert_eq!(Literal::Real(-0.0).to_string(), "-0.0");
+        assert_eq!(Literal::Real(1.0).to_string(), "1.0");
+        assert_eq!(Literal::Real(-1.0).to_string(), "-1.0");
+        assert_eq!(Literal::Real(2.0).to_string(), "2.0");
+        assert_eq!(Literal::Real(1e15).to_string(), "1000000000000000.0");
+        assert_eq!(
+            Literal::Real(9007199254740993.0).to_string(),
+            "9007199254740992.0"
+        );
+    }
+
+    /// The same rendering keeps extreme reals short. Display expands them positionally:
+    /// 5e-324 becomes 326 characters, and every statement, state dump and shrink artifact
+    /// that draws one carries all of them.
+    #[test]
+    fn extreme_reals_render_in_exponent_form() {
+        assert_eq!(Literal::Real(1e-300).to_string(), "1e-300");
+        assert_eq!(Literal::Real(1e300).to_string(), "1e300");
+        assert_eq!(Literal::Real(5e-324).to_string(), "5e-324");
+        assert_eq!(Literal::Real(1e16).to_string(), "1e16");
+        assert_eq!(
+            Literal::Real(2.2250738585072014e-308).to_string(),
+            "2.2250738585072014e-308"
+        );
+        assert_eq!(
+            Literal::Real(f64::MAX).to_string(),
+            "1.7976931348623157e308"
+        );
+        assert_eq!(
+            Literal::Real(9223372036854775807.0).to_string(),
+            "9.223372036854776e18"
+        );
+    }
+
+    /// SQL has no literal for either, so they become NULL rather than an unparseable `inf`.
+    #[test]
+    fn non_finite_reals_render_as_null() {
+        assert_eq!(Literal::Real(f64::INFINITY).to_string(), "NULL");
+        assert_eq!(Literal::Real(f64::NEG_INFINITY).to_string(), "NULL");
+        assert_eq!(Literal::Real(f64::NAN).to_string(), "NULL");
     }
 
     #[test]
