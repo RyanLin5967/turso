@@ -67,19 +67,7 @@ fn main() -> Result<()> {
             continue;
         }
         let (turso, sqlite) = pair.run_both(stmt);
-        let statement_diverges = match (&turso, &sqlite) {
-            // Third copy of the both-errored rule in this crate, after oracle.rs
-            // check_query and shrink.rs query_results_differ. Fixing the first two left
-            // this one blind and the probe still exited 0 on the demonstration case, which
-            // is the argument for hoisting the policy into one function rather than
-            // repeating it: a blind spot fixed in two of three places is still a blind
-            // spot, and nothing in the type system says these three must agree.
-            (QueryResult::Error(turso_err), QueryResult::Error(_)) => {
-                is_internal_failure(turso_err)
-            }
-            (QueryResult::Error(_), _) | (_, QueryResult::Error(_)) => true,
-            _ => query_results_differ(&turso, &sqlite),
-        };
+        let statement_diverges = query_results_differ(&turso, &sqlite);
         let show = if stmt.len() > 160 {
             format!("{}...", &stmt[..160])
         } else {

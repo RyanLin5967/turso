@@ -107,19 +107,10 @@ impl Oracle for DifferentialOracle {
                     // For non-deterministic LIMIT queries, the result set may legitimately differ
                     // since the chosen rows are not stable across engines. Return a warning instead
                     // of failure.
-                    // An unordered LIMIT genuinely does not fix WHICH rows come back,
-                    // so a differing row set is not a bug. It does fix HOW MANY: `LIMIT n`
-                    // must return min(n, count) rows on both engines whatever it picks. The
-                    // counts were already being passed into the warning text and never
-                    // compared, so a row-count divergence was reported as PASSED.
-                    //
-                    // Two verified Turso bugs have exactly this shape:
-                    //   SELECT x FROM aa CROSS JOIN bb LIMIT 10 OFFSET 1  -> 3 rows vs 5
-                    //   SELECT count(a) FROM t LIMIT 0                     -> 1 row  vs 0
-                    // Both set has_unordered_limit, so both passed. Writing the second with
-                    // an ORDER BY over the primary key clears the flag without fixing the
-                    // bug, and it is then reported -- so the exemption was the thing hiding
-                    // it, not a limitation of the comparison.
+                    // An unordered LIMIT leaves WHICH rows come back undefined, never HOW
+                    // MANY: `LIMIT n` yields min(n, count) on any engine. Only a top-level
+                    // LIMIT with none nested below it guarantees that, which is what
+                    // count_is_guaranteed carries.
                     if has_unordered_limit
                         && (turso_rows.len() == sqlite_rows.len() || !count_is_guaranteed)
                     {
@@ -151,25 +142,9 @@ impl Oracle for DifferentialOracle {
             }
             (QueryResult::Ok, QueryResult::Ok) => OracleResult::Pass,
             (QueryResult::Error(turso_err), QueryResult::Error(sqlite_err)) => {
-                // Both errored. Usually that is agreement: two engines rejecting the same
-                // invalid SQL. It is NOT agreement when Turso's error says its own
-                // invariant broke, because that is a bug whatever SQLite thinks of the
-                // statement.
-                //
-                // Demonstrated: `SELECT DISTINCT count(*) FROM t UNION;` makes Turso
-                // report "Corrupt database: Reference to undefined or unresolved label in
-                // HashDistinct" while SQLite reports a syntax error, and this arm scored
-                // it a Pass -- differential_probe said "0 diverged", exit 0. Drop the
-                // trailing UNION and the identical internal error is reported, because
-                // then only one side errors. One token decided whether a corruption
-                // message was surfaced or swallowed.
-                //
-                // Deliberately a narrow list of internal-failure markers rather than an
-                // allowlist of acceptable errors: enumerating everything SQLite may
-                // legitimately reject is not tractable, while "the engine says its own
-                // invariant broke" is a small and stable set. The fuller fix is to
-                // compare error CLASSES on both sides; this covers the case that is never
-                // acceptable in either direction.
+                // Both errored is usually agreement -- two engines rejecting the same
+                // invalid SQL. It is not when Turso's error says its own invariant broke,
+                // which is a bug whatever SQLite makes of the statement.
                 if is_internal_failure(turso_err) {
                     return OracleResult::Fail(format!(
                         "Turso reported an internal failure. SQLite rejected the statement \
@@ -187,11 +162,9 @@ impl Oracle for DifferentialOracle {
                 "SQLite errored but Turso succeeded:\n  SQL: {stmt}\n  Error: {sqlite_err}"
             )),
             (QueryResult::Rows(rows), QueryResult::Ok) => {
-                // Rows on one side and none on the other is a COUNT divergence, which a
-                // top-level unordered LIMIT does not excuse -- this is where
-                // `SELECT count(a) FROM t LIMIT 0` lands (Turso 1 row, SQLite 0), because
-                // execute_sqlite maps an empty result to Ok and never to Rows(vec![]).
-                // A LIMIT inside a subquery is a different matter and still only warns.
+                // Rows on one side and none on the other is a COUNT divergence. SQLite's
+                // empty result arrives as Ok, never Rows(vec![]), so this is where a
+                // 1-row-against-0 divergence lands. A nested LIMIT still only warns.
                 if rows.is_empty() {
                     OracleResult::Pass
                 } else if has_unordered_limit && !count_is_guaranteed {
@@ -526,14 +499,9 @@ pub fn check_differential(
 /// are honest limitations, and treating them as failures would end runs on unimplemented
 /// features rather than on bugs.
 pub fn is_internal_failure(err: &str) -> bool {
-    // Matched case-insensitively and against what the engine ACTUALLY renders. The first
-    // version of this list was written from memory and was nearly inert: LimboError
-    // renders `#[error("Internal error: {0}")]` with a capital I, `str::contains` is
-    // case-sensitive, so the lowercase "internal error" marker never fired. And
-    // "assertion failed" / "panicked" never appear in a QueryResult::Error at all --
-    // runner.rs catches panics through catch_unwind and reports them as a separate Err,
-    // so those two markers could not match by construction. Effectively a five-marker
-    // list was doing the work of one.
+    // Matched case-insensitively: LimboError renders `Internal error: {0}` with a capital
+    // I. Panics never appear here -- runner.rs catches them through catch_unwind and
+    // reports them separately -- so panic markers would be dead weight.
     const MARKERS: &[&str] = &[
         "corrupt database",
         "internal error",
