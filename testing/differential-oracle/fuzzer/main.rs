@@ -336,17 +336,13 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
 
 fn run_single(args: &Args) -> Result<()> {
     let stats = run_single_inner(args)?;
-    if stats.oracle_failures > 0 {
-        std::process::exit(1);
-    }
-    // Nothing compared is not a pass. This has to be the exit code and not only the
-    // printed verdict, because callers and CI gate on the exit code and would otherwise
-    // read a collapsed run as green.
-    if stats.statements_executed == 0 {
-        tracing::error!(
-            "No statements were executed, so nothing was compared -- refusing to report \
-             success. Check the generator config and the skip counters."
-        );
+    if !stats.is_success() {
+        if stats.statements_executed == 0 {
+            tracing::error!(
+                "No statements were executed, so nothing was compared -- refusing to report \
+                 success. Check the generator config and the skip counters."
+            );
+        }
         std::process::exit(1);
     }
     Ok(())

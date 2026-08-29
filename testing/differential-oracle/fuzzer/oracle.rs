@@ -502,12 +502,7 @@ pub fn is_internal_failure(err: &str) -> bool {
     // Matched case-insensitively: LimboError renders `Internal error: {0}` with a capital
     // I. Panics never appear here -- runner.rs catches them through catch_unwind and
     // reports them separately -- so panic markers would be dead weight.
-    const MARKERS: &[&str] = &[
-        "corrupt database",
-        "internal error",
-        "undefined or unresolved label",
-        "unreachable code",
-    ];
+    const MARKERS: &[&str] = &["corrupt database", "internal error"];
     let err = err.to_ascii_lowercase();
     MARKERS.iter().any(|marker| err.contains(marker))
 }

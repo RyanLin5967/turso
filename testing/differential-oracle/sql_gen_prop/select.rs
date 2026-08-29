@@ -256,16 +256,6 @@ pub struct SelectStatement {
 }
 
 impl SelectStatement {
-    /// Returns true if this SELECT or any nested subquery has a potentially
-    /// non-deterministic LIMIT result set.
-    ///
-    /// This includes:
-    /// - `LIMIT` without `ORDER BY`
-    /// - `LIMIT` with `ORDER BY` terms that are all constant expressions
-    ///   (for example `ORDER BY ZEROBLOB(10)`), which leaves row ordering undefined
-    ///   among ties.
-    ///
-    /// The check recurses into subqueries within expressions (e.g., `NOT IN (SELECT ... LIMIT 1)`).
     /// Whether this select has a LIMIT of its own, ordered or not.
     ///
     /// This, not "is the LIMIT unordered", is what makes a row COUNT predictable:
@@ -305,6 +295,16 @@ impl SelectStatement {
             .all(|item| !item.expr.contains_column_ref())
     }
 
+    /// Returns true if this SELECT or any nested subquery has a potentially
+    /// non-deterministic LIMIT result set.
+    ///
+    /// This includes:
+    /// - `LIMIT` without `ORDER BY`
+    /// - `LIMIT` with `ORDER BY` terms that are all constant expressions
+    ///   (for example `ORDER BY ZEROBLOB(10)`), which leaves row ordering undefined
+    ///   among ties.
+    ///
+    /// The check recurses into subqueries within expressions (e.g., `NOT IN (SELECT ... LIMIT 1)`).
     pub fn has_unordered_limit(&self) -> bool {
         if self.limit.is_some() {
             if self.order_by.is_empty() {

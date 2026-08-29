@@ -110,11 +110,7 @@ impl fmt::Display for SqlStatement {
 }
 
 impl SqlStatement {
-    /// Returns true if this is a SELECT statement with LIMIT but no ORDER BY.
-    ///
-    /// Such queries may return different rows between database implementations
-    /// since the order is undefined.
-    /// See the select-level versions.
+    /// See `SelectStatement::has_top_level_limit`.
     pub fn has_top_level_limit(&self) -> bool {
         match self {
             SqlStatement::Select(s) => s.has_top_level_limit(),
@@ -137,6 +133,11 @@ impl SqlStatement {
         }
     }
 
+    /// Returns true if this is a SELECT statement with LIMIT but no ORDER BY, including
+    /// in nested subqueries.
+    ///
+    /// Such queries may return different rows between database implementations since the
+    /// order is undefined.
     pub fn has_unordered_limit(&self) -> bool {
         match self {
             SqlStatement::Select(s) => s.has_unordered_limit(),
