@@ -2140,6 +2140,33 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_database_name_starts_from_an_empty_database() {
+        let _turn = pair_test_turn();
+        // Reusing a name reopens a path `turso_core`'s registry has already seen. If
+        // that reopen shared anything with the pair that held the name last, the state
+        // script would land on top of the previous replay -- exactly the contamination
+        // a name per pair existed to prevent, arriving through the back door. `classify`
+        // compares every table's contents on both engines, so a Turso side carrying two
+        // rows where SQLite carries one shows up as a divergence here.
+        let state = "CREATE TABLE t(x);\nINSERT INTO t VALUES (1);\n";
+        let mut minted = None;
+        for round in 0..8 {
+            let pair = EnginePair::build(state).unwrap();
+            let now = database_names_minted();
+            assert_eq!(
+                *minted.get_or_insert(now),
+                now,
+                "round {round} must reuse the name, or this test proves nothing"
+            );
+            assert_eq!(
+                pair.classify("SELECT count(*) FROM t"),
+                None,
+                "round {round} saw the previous pair's rows"
+            );
+        }
+    }
+
+    #[test]
     fn a_database_name_is_reused_only_once_its_pair_is_gone() {
         let _turn = pair_test_turn();
         let state = "CREATE TABLE t(x);\n";
