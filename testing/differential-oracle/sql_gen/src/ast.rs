@@ -73,9 +73,7 @@ impl fmt::Display for Stmt {
 }
 
 impl Stmt {
-    /// Returns true if this statement contains any SELECT with LIMIT but no ORDER BY,
-    /// including in subqueries within expressions.
-    /// See the select-level versions.
+    /// See `SelectStmt::has_top_level_limit`.
     pub fn has_top_level_limit(&self) -> bool {
         match self {
             Stmt::Select(s) => s.has_top_level_limit(),
@@ -98,6 +96,8 @@ impl Stmt {
         }
     }
 
+    /// Returns true if this statement contains any SELECT with LIMIT but no ORDER BY,
+    /// including in subqueries within expressions.
     pub fn has_unordered_limit(&self) -> bool {
         self.unordered_limit_reason().is_some()
     }
@@ -153,14 +153,29 @@ impl SelectStmt {
         self.limit.is_some()
     }
 
-    /// Whether a LIMIT appears anywhere BELOW this select — in a CTE body, a subquery, or
-    /// an expression.
+    /// Whether an unordered LIMIT appears anywhere BELOW this select — a CTE body, a
+    /// subquery in a column or the WHERE clause, a compound arm.
     ///
     /// A nested unordered LIMIT can legitimately change the outer row count: the subquery
     /// picks a different row on each engine and the outer filter then keeps a different
-    /// number of rows. So the count rule must not apply when one is present.
+    /// number of rows. So the oracle's count rule must not apply when one is present.
+    ///
+    /// This has to be its own traversal, not `has_unordered_limit() &&
+    /// !has_top_level_unordered_limit()`. That subtraction is structurally blind whenever
+    /// the top-level LIMIT is itself unordered: `unordered_limit_reason` returns at the
+    /// top-level check before it ever reaches the subqueries, so both halves are true and
+    /// the difference is always false. It reported "no nesting" for every `LIMIT n` without
+    /// an `ORDER BY`, which is precisely the case the count rule then fires on.
     pub fn has_nested_unordered_limit(&self) -> bool {
-        self.has_unordered_limit() && !self.has_top_level_unordered_limit()
+        self.nested_unordered_limit_reason().is_some()
+    }
+
+    /// `unordered_limit_reason` with this select's OWN limit skipped. Everything below is
+    /// reached exactly as the full version reaches it, so the two cannot drift.
+    fn nested_unordered_limit_reason(&self) -> Option<&'static str> {
+        let mut without_own_limit = self.clone();
+        without_own_limit.limit = None;
+        without_own_limit.unordered_limit_reason()
     }
 
     /// Whether THIS select's own LIMIT is unordered — no recursion into CTEs or
@@ -3196,6 +3211,62 @@ mod tests {
         assert_eq!(
             outer.non_unique_order_by_reason(&schema),
             Some("limit_non_unique_order_by")
+        );
+    }
+
+    /// Build a bare `SELECT <expr> FROM t` with the given LIMIT.
+    fn select_with(where_clause: Option<Expr>, limit: Option<u64>) -> SelectStmt {
+        SelectStmt {
+            with_clause: None,
+            distinct: false,
+            columns: vec![SelectColumn {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "a".to_string(),
+                }),
+                alias: None,
+            }],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause,
+            group_by: None,
+            compounds: vec![],
+            order_by: vec![],
+            limit,
+            offset: None,
+        }
+    }
+
+    /// The predicate the oracle's row-count rule turns on, tested on the shape that broke it.
+    ///
+    /// An earlier version derived nesting as `has_unordered_limit() &&
+    /// !has_top_level_unordered_limit()`. That is always false when the top-level LIMIT is
+    /// itself unordered, because `unordered_limit_reason` returns at the top-level check
+    /// before reaching any subquery — so it reported "nothing nested" for every `LIMIT n`
+    /// without an `ORDER BY`, which is exactly where the count rule fires.
+    #[test]
+    fn a_nested_limit_is_seen_even_when_the_outer_limit_is_also_unordered() {
+        let inner = select_with(None, Some(1));
+        let outer = select_with(Some(Expr::Subquery(Box::new(inner))), Some(10));
+
+        assert!(outer.has_top_level_limit(), "the outer LIMIT is present");
+        assert!(
+            outer.has_unordered_limit(),
+            "the outer LIMIT has no ORDER BY, so this is true and used to mask the nesting"
+        );
+        assert!(
+            outer.has_nested_unordered_limit(),
+            "the inner LIMIT 1 must be seen even though the outer LIMIT is unordered too"
+        );
+
+        let bare = select_with(None, Some(10));
+        assert!(bare.has_top_level_limit());
+        assert!(
+            !bare.has_nested_unordered_limit(),
+            "a bare top-level LIMIT has nothing nested below it"
         );
     }
 }

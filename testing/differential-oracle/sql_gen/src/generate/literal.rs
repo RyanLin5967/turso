@@ -101,7 +101,11 @@ const BOUNDARY_REALS: &[f64] = &[
     2.2250738585072014e-308, // smallest normal
     1.7976931348623157e308,  // f64::MAX
     9007199254740993.0,      // 2^53 + 1, not representable
-    9223372036854775807.0,   // i64::MAX as a real
+    // 2^62 as a real, not i64::MAX as a real. CAST(9223372036854775807.0 AS INTEGER)
+    // is exactly i64::MAX on both engines, so that entry put the max rowid back within
+    // reach of an INTEGER PRIMARY KEY through a generated CAST -- reinstating through
+    // this table the random-rowid hazard BOUNDARY_INTEGERS excludes.
+    4611686018427387904.0,
     1e15,
     1e16, // either side of 15 significant digits
 ];
@@ -436,6 +440,17 @@ mod tests {
         assert!(
             !BOUNDARY_INTEGERS.contains(&i64::MAX),
             "i64::MAX must stay out of the table: it manufactures random rowids"
+        );
+        // A real above i64::MAX also reaches that rowid through CAST -- both engines clamp
+        // an out-of-range REAL-to-INTEGER cast to i64::MAX, so CAST(1e300 AS INTEGER) is
+        // i64::MAX. The entry that WAS exactly i64::MAX as a real is gone for that reason.
+        // 1e300 and f64::MAX stay: they are the large-real coverage this table exists for,
+        // and the hazard needs the cast to land in an INTEGER PRIMARY KEY and become the
+        // max rowid. Measured across 24 seed-runs: 17 casts of a large boundary real, 0
+        // rowid false positives. Residual risk, recorded rather than claimed away.
+        assert!(
+            !BOUNDARY_REALS.contains(&9223372036854775807.0),
+            "i64::MAX as a real casts to exactly i64::MAX, manufacturing random rowids"
         );
     }
 

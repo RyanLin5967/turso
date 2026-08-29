@@ -15,8 +15,6 @@ pub struct GeneratedStatement {
     pub is_ddl: bool,
     pub mutates_data: bool,
     pub has_unordered_limit: bool,
-    /// Only this statement's own LIMIT, not one inside a subquery. The row-count rule
-    /// applies to the first and not the second.
     /// A top-level LIMIT with no LIMIT nested below it. Only then is the row COUNT
     /// predictable: `LIMIT n` yields `min(n, count)` whatever its ORDER BY, while a
     /// nested LIMIT can legitimately change the outer count.

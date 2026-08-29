@@ -224,7 +224,7 @@ fn fuzzer_main() -> Result<()> {
                     // uses (.github/workflows/rust.yml runs `... loop 10`). Guarding only
                     // run_single left the higher-volume path able to report green having
                     // compared nothing -- the exact failure the guard exists to close.
-                    Ok(stats) if stats.statements_executed == 0 => {
+                    Ok(stats) if !stats.is_success() => {
                         let record = FailureRecord {
                             iteration: iteration + 1,
                             seed: args.seed,

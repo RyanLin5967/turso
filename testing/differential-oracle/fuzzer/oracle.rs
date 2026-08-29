@@ -444,7 +444,7 @@ pub fn check_differential(
     let sqlite_explain = DifferentialOracle::execute_sqlite(sqlite_conn, &explain_sql);
     match (&turso_explain, &sqlite_explain) {
         (QueryResult::Error(turso_error), QueryResult::Error(sqlite_error)) => {
-            if is_internal_failure(&turso_error) {
+            if is_internal_failure(turso_error) {
                 return OracleResult::Fail(format!(
                     "Turso reported an internal failure while preparing; SQLite \
                      rejected the statement for its own reasons:\n  SQL: {stmt}\n  \
@@ -465,7 +465,7 @@ pub fn check_differential(
             // "Corrupt database: Reference to undefined or unresolved label", so the gate
             // fires before check() ever runs. Only differential_probe, which has no
             // EXPLAIN gate, ever reached it.
-            if is_internal_failure(&turso_error) {
+            if is_internal_failure(turso_error) {
                 return OracleResult::Fail(format!(
                     "Turso reported an internal failure while preparing:\n  SQL: {stmt}\n  \
                      Turso: {turso_error}"
