@@ -1057,6 +1057,18 @@ pub fn shrink_statement(
                     break;
                 }
                 tracing::info!("Shrink pass {pass}: {before} -> {after} bytes");
+                if pass == MAX_SHRINK_PASSES {
+                    // Stopping here is the same failure this loop exists to fix, one
+                    // level up: a pass budget ran out while the statement was still
+                    // getting smaller, so what gets written is not the fixpoint. Say
+                    // so, because the alternative is a log that looks like a clean
+                    // finish. Not seen on any real case so far -- every one has
+                    // stopped on no-progress within three passes.
+                    tracing::warn!(
+                        "Shrink stopped at the {MAX_SHRINK_PASSES}-pass bound while still \
+                         making progress; this result is not a fixpoint"
+                    );
+                }
             }
             None => {
                 // The first pass finding nothing means the divergence does not reproduce at
