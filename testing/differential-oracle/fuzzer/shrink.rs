@@ -15,8 +15,8 @@
 //! valid, and edits cannot be confused by quotes or keywords inside literals.
 
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -70,22 +70,18 @@ impl EnginePair {
     /// artifacts, and the baseline check below decides whether the replayed
     /// state is good enough to shrink against.
     pub fn build(state_sql: &str) -> Result<Self> {
-        // A distinct database name per pair. Two Turso databases opened under the same
-        // name share storage even with separate in-memory IO, so while two pairs were
-        // alive each Turso side saw the state script replayed twice against a SQLite
-        // side that saw it once -- a ResultMismatch on statements the engines agree on.
-        static NEXT_DB: AtomicU64 = AtomicU64::new(0);
-        let name = format!("shrink-{}.db", NEXT_DB.fetch_add(1, Ordering::Relaxed));
+        let lease = NameLease::claim();
         let io = Arc::new(MemorySimIO::new(0));
         let opts = turso_core::DatabaseOpts::new().with_attach(true);
         let turso_db = Database::open_file_with_flags(
             io,
-            &name,
+            &lease.name(),
             turso_core::OpenFlags::default(),
             opts,
             None,
             Arc::new(SqliteDialect),
         )?;
+        lease.hold(&turso_db);
         let turso = turso_db.connect()?;
         let sqlite = rusqlite::Connection::open_in_memory()?;
         for stmt in state_sql.lines() {
@@ -171,6 +167,94 @@ impl EnginePair {
         }
         false
     }
+}
+
+/// One entry per database name this process has minted for an `EnginePair`,
+/// holding a weak handle to the `Database` opened under it. Slot `i` is the
+/// name `shrink-{i}.db`, and it is handed out again only once that `Database`
+/// is gone.
+///
+/// Two properties have to hold at once, and one name per pair only gives the
+/// first of them:
+///
+/// * No two *live* pairs may share a name. `Database::open` keys a
+///   process-wide registry on the path, so a second pair opening a name that
+///   is still live gets handed the first pair's `Database` -- the state script
+///   is then replayed into it twice while that pair's SQLite side saw it once,
+///   which manufactures a `ResultMismatch` on statements the engines agree on.
+/// * The number of distinct names must stay bounded. That same registry keeps
+///   a `Weak` per key and never prunes, and a live `Weak` holds the whole
+///   `Database` allocation open after the value inside it is dropped. A name
+///   per candidate therefore stranded one `Database` per candidate -- up to
+///   1600 per shrink pass, times eight passes, times every failing iteration
+///   of `loop N`.
+///
+/// Reusing a dead name satisfies both: the registry's `Weak` for it can no
+/// longer upgrade, so the reopen builds a fresh `Database` rather than sharing
+/// one, and the key count stops at the number of pairs alive at the same time.
+static DATABASE_NAMES: Mutex<Vec<NameSlot>> = Mutex::new(Vec::new());
+
+enum NameSlot {
+    /// A pair is being built on this name. Not free even though no `Database`
+    /// exists yet.
+    Building,
+    /// A pair was built on this name; free again once the handle is dead.
+    Held(Weak<Database>),
+}
+
+/// Holds one name for as long as a pair needs it. Dropping the lease before
+/// [`NameLease::hold`] runs -- the open failed -- frees the name immediately.
+struct NameLease(usize);
+
+impl NameLease {
+    fn claim() -> Self {
+        let mut slots = lock_database_names();
+        let free = slots
+            .iter()
+            .position(|slot| matches!(slot, NameSlot::Held(db) if db.strong_count() == 0));
+        match free {
+            Some(index) => {
+                slots[index] = NameSlot::Building;
+                Self(index)
+            }
+            None => {
+                slots.push(NameSlot::Building);
+                Self(slots.len() - 1)
+            }
+        }
+    }
+
+    fn name(&self) -> String {
+        format!("shrink-{}.db", self.0)
+    }
+
+    /// Tie the name to the database opened under it, so it comes free again
+    /// when that database is dropped and not before.
+    fn hold(&self, db: &Arc<Database>) {
+        lock_database_names()[self.0] = NameSlot::Held(Arc::downgrade(db));
+    }
+}
+
+impl Drop for NameLease {
+    fn drop(&mut self) {
+        let mut slots = lock_database_names();
+        if matches!(slots[self.0], NameSlot::Building) {
+            slots[self.0] = NameSlot::Held(Weak::new());
+        }
+    }
+}
+
+/// A test that panics mid-build poisons the pool; the remaining tests still
+/// need names, and a poisoned pool is not a corrupt one.
+fn lock_database_names() -> std::sync::MutexGuard<'static, Vec<NameSlot>> {
+    DATABASE_NAMES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How many distinct database names the shrinker has minted, which is also how
+/// many keys it has added to `turso_core`'s process-wide database registry.
+#[cfg(test)]
+fn database_names_minted() -> usize {
+    lock_database_names().len()
 }
 
 pub fn query_results_differ(a: &QueryResult, b: &QueryResult) -> bool {
@@ -545,46 +629,77 @@ fn apply_clause_action(site: &mut Site<'_>, action: ClauseDrop) {
     }
 }
 
+/// What one walk over a statement reports: expressions, selects, or both.
+///
+/// The expression edits and the recursive-CTE guard that has to see them run
+/// over this same traversal. They used to run over two -- the guard over
+/// `walk_sites`, the edits over `walk_exprs` -- and `walk_exprs` reaches
+/// strictly more selects, so a `WITH RECURSIVE` inside an `EXISTS`, a scalar
+/// subquery or an `IN (SELECT ...)` was invisible to the guard and editable by
+/// the edits.
+trait Visitor {
+    /// Returning `true` stops the walk.
+    fn expr(&mut self, _e: &mut Expr) -> bool {
+        false
+    }
+
+    /// Returning `true` stops the walk.
+    fn select(&mut self, _select: &mut Select) -> bool {
+        false
+    }
+}
+
 /// Pre-order walk over every expression in the statement, including inside
 /// subqueries and CTE bodies. `f` returning `true` stops the walk (used to
 /// apply an edit at one position).
 fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
+    struct Exprs<'f>(&'f mut dyn FnMut(&mut Expr) -> bool);
+    impl Visitor for Exprs<'_> {
+        fn expr(&mut self, e: &mut Expr) -> bool {
+            (self.0)(e)
+        }
+    }
+    walk_stmt(stmt, &mut Exprs(f))
+}
+
+/// Pre-order walk over the whole statement, reporting to `v`.
+fn walk_stmt(stmt: &mut Stmt, v: &mut dyn Visitor) -> bool {
     match stmt {
-        Stmt::Select(select) => walk_select(select, f),
+        Stmt::Select(select) => walk_select(select, v),
         Stmt::Insert {
             body, returning, ..
         } => {
             if let InsertBody::Select(select, _) = body {
-                if walk_select(select, f) {
+                if walk_select(select, v) {
                     return true;
                 }
             }
-            walk_result_columns(returning, f)
+            walk_result_columns(returning, v)
         }
         Stmt::Update(update) => {
             if let Some(with) = &mut update.with {
                 for cte in &mut with.ctes {
-                    if walk_select(&mut cte.select, f) {
+                    if walk_select(&mut cte.select, v) {
                         return true;
                     }
                 }
             }
             for set in &mut update.sets {
-                if walk_expr(&mut set.expr, f) {
+                if walk_expr(&mut set.expr, v) {
                     return true;
                 }
             }
             if let Some(from) = &mut update.from {
-                if walk_from(from, f) {
+                if walk_from(from, v) {
                     return true;
                 }
             }
             if let Some(w) = &mut update.where_clause {
-                if walk_expr(w, f) {
+                if walk_expr(w, v) {
                     return true;
                 }
             }
-            walk_result_columns(&mut update.returning, f)
+            walk_result_columns(&mut update.returning, v)
         }
         Stmt::Delete {
             with,
@@ -594,17 +709,17 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
         } => {
             if let Some(with) = with {
                 for cte in &mut with.ctes {
-                    if walk_select(&mut cte.select, f) {
+                    if walk_select(&mut cte.select, v) {
                         return true;
                     }
                 }
             }
             if let Some(w) = where_clause {
-                if walk_expr(w, f) {
+                if walk_expr(w, v) {
                     return true;
                 }
             }
-            walk_result_columns(returning, f)
+            walk_result_columns(returning, v)
         }
         _ => false,
     }
@@ -612,14 +727,14 @@ fn walk_exprs(stmt: &mut Stmt, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
 
 fn walk_limit(
     limit: &mut Option<turso_parser::ast::Limit>,
-    f: &mut dyn FnMut(&mut Expr) -> bool,
+    v: &mut dyn Visitor,
 ) -> bool {
     if let Some(limit) = limit {
-        if walk_expr(&mut limit.expr, f) {
+        if walk_expr(&mut limit.expr, v) {
             return true;
         }
         if let Some(offset) = &mut limit.offset {
-            if walk_expr(offset, f) {
+            if walk_expr(offset, v) {
                 return true;
             }
         }
@@ -627,10 +742,10 @@ fn walk_limit(
     false
 }
 
-fn walk_result_columns(columns: &mut [ResultColumn], f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
+fn walk_result_columns(columns: &mut [ResultColumn], v: &mut dyn Visitor) -> bool {
     for rc in columns {
         if let ResultColumn::Expr(expr, _) = rc {
-            if walk_expr(expr, f) {
+            if walk_expr(expr, v) {
                 return true;
             }
         }
@@ -638,31 +753,34 @@ fn walk_result_columns(columns: &mut [ResultColumn], f: &mut dyn FnMut(&mut Expr
     false
 }
 
-fn walk_select(select: &mut Select, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
+fn walk_select(select: &mut Select, v: &mut dyn Visitor) -> bool {
+    if v.select(select) {
+        return true;
+    }
     if let Some(with) = &mut select.with {
         for cte in &mut with.ctes {
-            if walk_select(&mut cte.select, f) {
+            if walk_select(&mut cte.select, v) {
                 return true;
             }
         }
     }
-    if walk_one_select(&mut select.body.select, f) {
+    if walk_one_select(&mut select.body.select, v) {
         return true;
     }
     for compound in &mut select.body.compounds {
-        if walk_one_select(&mut compound.select, f) {
+        if walk_one_select(&mut compound.select, v) {
             return true;
         }
     }
     for sc in &mut select.order_by {
-        if walk_expr(&mut sc.expr, f) {
+        if walk_expr(&mut sc.expr, v) {
             return true;
         }
     }
-    walk_limit(&mut select.limit, f)
+    walk_limit(&mut select.limit, v)
 }
 
-fn walk_one_select(one: &mut OneSelect, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
+fn walk_one_select(one: &mut OneSelect, v: &mut dyn Visitor) -> bool {
     match one {
         OneSelect::Select {
             columns,
@@ -671,27 +789,27 @@ fn walk_one_select(one: &mut OneSelect, f: &mut dyn FnMut(&mut Expr) -> bool) ->
             group_by,
             ..
         } => {
-            if walk_result_columns(columns, f) {
+            if walk_result_columns(columns, v) {
                 return true;
             }
             if let Some(from) = from {
-                if walk_from(from, f) {
+                if walk_from(from, v) {
                     return true;
                 }
             }
             if let Some(w) = where_clause {
-                if walk_expr(w, f) {
+                if walk_expr(w, v) {
                     return true;
                 }
             }
             if let Some(gb) = group_by {
                 for e in &mut gb.exprs {
-                    if walk_expr(e, f) {
+                    if walk_expr(e, v) {
                         return true;
                     }
                 }
                 if let Some(h) = &mut gb.having {
-                    if walk_expr(h, f) {
+                    if walk_expr(h, v) {
                         return true;
                     }
                 }
@@ -701,7 +819,7 @@ fn walk_one_select(one: &mut OneSelect, f: &mut dyn FnMut(&mut Expr) -> bool) ->
         OneSelect::Values(rows) => {
             for row in rows {
                 for e in row {
-                    if walk_expr(e, f) {
+                    if walk_expr(e, v) {
                         return true;
                     }
                 }
@@ -713,17 +831,17 @@ fn walk_one_select(one: &mut OneSelect, f: &mut dyn FnMut(&mut Expr) -> bool) ->
 
 fn walk_from(
     from: &mut turso_parser::ast::FromClause,
-    f: &mut dyn FnMut(&mut Expr) -> bool,
+    v: &mut dyn Visitor,
 ) -> bool {
-    if walk_select_table(&mut from.select, f) {
+    if walk_select_table(&mut from.select, v) {
         return true;
     }
     for join in &mut from.joins {
-        if walk_select_table(&mut join.table, f) {
+        if walk_select_table(&mut join.table, v) {
             return true;
         }
         if let Some(turso_parser::ast::JoinConstraint::On(e)) = &mut join.constraint {
-            if walk_expr(e, f) {
+            if walk_expr(e, v) {
                 return true;
             }
         }
@@ -731,40 +849,40 @@ fn walk_from(
     false
 }
 
-fn walk_select_table(table: &mut SelectTable, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
+fn walk_select_table(table: &mut SelectTable, v: &mut dyn Visitor) -> bool {
     match table {
         SelectTable::Table(..) => false,
         SelectTable::TableCall(_, args, _) => {
             for a in args {
-                if walk_expr(a, f) {
+                if walk_expr(a, v) {
                     return true;
                 }
             }
             false
         }
-        SelectTable::Select(select, _) => walk_select(select, f),
-        SelectTable::Sub(from, _) => walk_from(from, f),
+        SelectTable::Select(select, _) => walk_select(select, v),
+        SelectTable::Sub(from, _) => walk_from(from, v),
     }
 }
 
-fn walk_expr(e: &mut Expr, f: &mut dyn FnMut(&mut Expr) -> bool) -> bool {
-    if f(e) {
+fn walk_expr(e: &mut Expr, v: &mut dyn Visitor) -> bool {
+    if v.expr(e) {
         return true;
     }
     // Subquery-carrying variants recurse through the select walker; everything
     // else recurses through its expression children.
     match e {
-        Expr::Exists(select) | Expr::Subquery(select) => return walk_select(select, f),
+        Expr::Exists(select) | Expr::Subquery(select) => return walk_select(select, v),
         Expr::InSelect { lhs, rhs, .. } => {
-            if walk_expr(lhs, f) {
+            if walk_expr(lhs, v) {
                 return true;
             }
-            return walk_select(rhs, f);
+            return walk_select(rhs, v);
         }
         _ => {}
     }
     for child in expr_children(e) {
-        if walk_expr(child, f) {
+        if walk_expr(child, v) {
             return true;
         }
     }
@@ -951,6 +1069,14 @@ fn candidates(sql: &str) -> Vec<String> {
 }
 
 /// `true` when any part of `stmt` is a `WITH RECURSIVE`.
+///
+/// Runs over [`walk_stmt`], the traversal the expression edits use. That
+/// traversal reaches every select `walk_sites` reaches and more -- the selects
+/// under `EXISTS`, a scalar subquery or `IN (SELECT ...)`, and the FROM
+/// subqueries of compound arms -- so one walk covers both families of edit. A
+/// guard on the narrower walk missed, for instance, the `WITH RECURSIVE`
+/// inside `SELECT 1 FROM t WHERE EXISTS (WITH RECURSIVE ...)`, and the edits
+/// went on to replace that CTE's stopping condition with `1`.
 fn has_recursive_cte(stmt: &Stmt) -> bool {
     fn is_recursive(with: &Option<With>) -> bool {
         with.as_ref().is_some_and(|w| w.recursive)
@@ -960,18 +1086,17 @@ fn has_recursive_cte(stmt: &Stmt) -> bool {
         Stmt::Update(update) if is_recursive(&update.with) => return true,
         _ => {}
     }
-    let mut found = false;
-    let mut probe = stmt.clone();
-    walk_sites(&mut probe, &mut |site| {
-        if let Site::Outer(select) = site {
-            if is_recursive(&select.with) {
-                found = true;
-                return true;
-            }
+
+    struct FindRecursive(bool);
+    impl Visitor for FindRecursive {
+        fn select(&mut self, select: &mut Select) -> bool {
+            self.0 = select.with.as_ref().is_some_and(|w| w.recursive);
+            self.0
         }
-        false
-    });
-    found
+    }
+    let mut find = FindRecursive(false);
+    walk_stmt(&mut stmt.clone(), &mut find);
+    find.0
 }
 
 /// Render a candidate and keep it when it is new and strictly shorter, which
@@ -990,16 +1115,45 @@ fn push_candidate(cand: &Stmt, original: &str, seen: &mut HashSet<String>, out: 
 /// attempt budgets bound the number of candidates but not the wall clock.
 /// Whatever a shrink holds when time runs out still reproduces the divergence,
 /// so stopping early ships a larger `minimized.sql` rather than none.
-#[derive(Clone, Copy)]
-struct Deadline(Instant);
+struct Deadline {
+    at: Instant,
+    /// Expire after this many `expired()` calls instead of at `at`.
+    ///
+    /// Only tests set it. A test that wants a sweep cut in the middle cannot
+    /// say so in milliseconds: `candidates` parses, clones, renders and
+    /// de-duplicates the whole list before the first check, and in a debug
+    /// build on a loaded machine that alone can outlast any budget small
+    /// enough to cut the sweep -- so the sweep stops having judged nothing and
+    /// the test fails on a machine, not on a bug.
+    checks_allowed: Option<usize>,
+    checks_done: AtomicUsize,
+}
 
 impl Deadline {
     fn after(budget: Duration) -> Self {
-        Self(Instant::now() + budget)
+        Self {
+            at: Instant::now() + budget,
+            checks_allowed: None,
+            checks_done: AtomicUsize::new(0),
+        }
     }
 
-    fn expired(self) -> bool {
-        Instant::now() >= self.0
+    /// A deadline that passes once `judges` candidates have been checked
+    /// against it, whatever the clock says.
+    #[cfg(test)]
+    fn after_judging(judges: usize) -> Self {
+        Self {
+            at: Instant::now() + Duration::from_secs(3600),
+            checks_allowed: Some(judges),
+            checks_done: AtomicUsize::new(0),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        if let Some(allowed) = self.checks_allowed {
+            return self.checks_done.fetch_add(1, Ordering::Relaxed) >= allowed;
+        }
+        Instant::now() >= self.at
     }
 }
 
@@ -1007,7 +1161,7 @@ impl Deadline {
 /// edit is accepted, the attempt budget runs out, or `deadline` passes.
 fn shrink_with(
     initial: &str,
-    deadline: Deadline,
+    deadline: &Deadline,
     mut judge: impl FnMut(&str) -> Result<bool>,
 ) -> Result<String> {
     let mut current = initial.to_string();
@@ -1041,7 +1195,7 @@ fn shrink_with(
 /// early once `deadline` passes.
 fn reduce_state_lines(
     state_sql: &str,
-    deadline: Deadline,
+    deadline: &Deadline,
     mut judge: impl FnMut(&str) -> Result<bool>,
 ) -> Result<String> {
     let mut lines: Vec<&str> = state_sql
@@ -1099,8 +1253,8 @@ pub fn shrink_statement(
     failing_sql: &str,
 ) -> Result<Option<Minimized>> {
     let deadline = Deadline::after(SHRINK_TIME_BUDGET);
-    let (best, _) = shrink_passes(state_sql, failing_sql, deadline, |state_in, stmt_in| {
-        shrink_one_pass(state_in, history_sql, stmt_in, deadline)
+    let (best, _) = shrink_passes(state_sql, failing_sql, &deadline, |state_in, stmt_in| {
+        shrink_one_pass(state_in, history_sql, stmt_in, &deadline)
     })?;
     Ok(best)
 }
@@ -1134,7 +1288,7 @@ const SHRINK_TIME_BUDGET: Duration = Duration::from_secs(6 * 60);
 fn shrink_passes(
     state_sql: &str,
     failing_sql: &str,
-    deadline: Deadline,
+    deadline: &Deadline,
     mut run_pass: impl FnMut(&str, &str) -> Result<Option<PassResult>>,
 ) -> Result<(Option<Minimized>, Stop)> {
     let mut best: Option<Minimized> = None;
@@ -1167,6 +1321,11 @@ fn shrink_passes(
         let before = best.as_ref().map_or(next.input_len, artifact_len);
         let after = artifact_len(&next.minimized);
         let progressed = after < before;
+        // A pass that reports a different starting size from the one it was handed
+        // did not reduce the artifact this loop is tracking; it reduced the other
+        // script. Its result is comparable to nothing the loop has, so a failure to
+        // beat the best is not the algorithm running out of edits.
+        let switched_basis = best.as_ref().is_some_and(|b| next.input_len != artifact_len(b));
         // A first pass that reduced nothing still produced the only reproduction there is.
         if progressed || best.is_none() {
             best = Some(next.minimized);
@@ -1176,6 +1335,8 @@ fn shrink_passes(
             // exactly like a fixpoint and is not one.
             stop = if deadline.expired() {
                 Stop::OutOfTime
+            } else if switched_basis {
+                Stop::SwitchedBasisAndGrew
             } else {
                 Stop::Fixpoint
             };
@@ -1197,6 +1358,11 @@ fn shrink_passes(
              pass {completed}",
             completed + 1
         ),
+        Stop::SwitchedBasisAndGrew => tracing::warn!(
+            "Shrink pass {completed} reduced the other script and came back bigger than \
+             pass {}'s result; keeping the smaller one. No pass reached a fixpoint",
+            completed - 1
+        ),
         Stop::NoReproduction => {}
     }
     Ok((best, stop))
@@ -1215,6 +1381,12 @@ enum Stop {
     OutOfTime,
     /// A later pass stopped reproducing the divergence; an earlier result is kept.
     LostDivergence,
+    /// A later pass reduced the other script -- the statement history rather than the
+    /// state dump, or the reverse -- and its result is bigger than the one already
+    /// held, so the earlier, smaller one is kept. The pass before it was still making
+    /// progress and this one measured a different artifact, so nothing here reached a
+    /// fixpoint.
+    SwitchedBasisAndGrew,
     /// The first pass reproduced nothing, so there is nothing to minimize.
     NoReproduction,
 }
@@ -1257,7 +1429,7 @@ fn shrink_one_pass(
     state_sql: &str,
     history_sql: &str,
     failing_sql: &str,
-    deadline: Deadline,
+    deadline: &Deadline,
 ) -> Result<Option<PassResult>> {
     let Some((basis, original)) = choose_basis(state_sql, history_sql, failing_sql)? else {
         tracing::info!(
@@ -1280,7 +1452,7 @@ fn shrink_against(
     basis: &str,
     original: &Divergence,
     failing_sql: &str,
-    deadline: Deadline,
+    deadline: &Deadline,
 ) -> Result<PassResult> {
     let input_len = basis.len() + failing_sql.len();
     tracing::info!(
@@ -1429,7 +1601,7 @@ mod tests {
         // be simplified away.
         let sql = "SELECT ABS(CASE WHEN LENGTH('hello world') THEN 123456 \
                    ELSE UPPER('junk') END), COALESCE(999999, X'DEADBEEF') FROM t";
-        let out = shrink_with(sql, no_deadline(), |cand| Ok(cand.contains("ABS"))).unwrap();
+        let out = shrink_with(sql, &no_deadline(), |cand| Ok(cand.contains("ABS"))).unwrap();
         assert!(out.contains("ABS"), "{out}");
         assert!(!out.contains("CASE"), "{out}");
         assert!(!out.contains("hello world"), "{out}");
@@ -1440,7 +1612,7 @@ mod tests {
     #[test]
     fn shrink_loop_terminates_when_everything_is_accepted() {
         let sql = "SELECT MAX(1, MIN(2, 3)), 'literal', X'AB' FROM t";
-        let out = shrink_with(sql, no_deadline(), |_| Ok(true)).unwrap();
+        let out = shrink_with(sql, &no_deadline(), |_| Ok(true)).unwrap();
         assert!(out.len() < sql.len(), "{out}");
     }
 
@@ -1460,7 +1632,7 @@ mod tests {
         let state = "CREATE TABLE t(x);\nINSERT INTO t VALUES (1);\n\
                      CREATE TABLE junk(y);\nINSERT INTO junk VALUES (2);\n\
                      CREATE INDEX i ON junk(y);";
-        let out = reduce_state_lines(state, no_deadline(), |cand| {
+        let out = reduce_state_lines(state, &no_deadline(), |cand| {
             Ok(cand.contains("CREATE TABLE t(x);") && cand.contains("INSERT INTO t VALUES (1);"))
         })
         .unwrap();
@@ -1489,7 +1661,7 @@ mod tests {
         // Halve the statement each pass; the statement stops changing at one
         // byte, which is the fixpoint.
         let mut inputs: Vec<String> = Vec::new();
-        let (out, stop) = shrink_passes("S", "aaaaaaaa", no_deadline(), |state_in, stmt_in| {
+        let (out, stop) = shrink_passes("S", "aaaaaaaa", &no_deadline(), |state_in, stmt_in| {
             inputs.push(stmt_in.to_string());
             let half = &stmt_in[..stmt_in.len().div_ceil(2)];
             Ok(Some(shrank(state_in, stmt_in, half)))
@@ -1514,7 +1686,7 @@ mod tests {
         let dump = "CREATE TABLE t(x);";
         let history = "h".repeat(20_000);
         let mut passes = 0;
-        let (out, stop) = shrink_passes(dump, "SELECT 1 FROM t", no_deadline(), |_, stmt_in| {
+        let (out, stop) = shrink_passes(dump, "SELECT 1 FROM t", &no_deadline(), |_, stmt_in| {
             passes += 1;
             Ok(Some(match passes {
                 1 => pass_result(&"h".repeat(2000), stmt_in, history.len() + stmt_in.len()),
@@ -1538,7 +1710,7 @@ mod tests {
         let (out, stop) = shrink_passes(
             "state-dump",
             "SELECT 1",
-            no_deadline(),
+            &no_deadline(),
             |state_in, stmt_in| {
                 passes += 1;
                 Ok(Some(match passes {
@@ -1550,7 +1722,12 @@ mod tests {
         )
         .unwrap();
         let out = out.expect("a reproducing pass must yield a result");
-        assert_eq!((passes, stop), (2, Stop::Fixpoint));
+        assert_eq!(
+            (passes, stop),
+            (2, Stop::SwitchedBasisAndGrew),
+            "pass 1 was still shrinking and pass 2 measured a different script, so \
+             nothing here is a fixpoint"
+        );
         assert_eq!(
             (out.state_sql.as_str(), out.statement.as_str()),
             ("state-dump", "S"),
@@ -1562,7 +1739,7 @@ mod tests {
     fn the_pass_bound_stops_a_shrink_that_is_still_making_progress() {
         let original = "a".repeat(100);
         let mut passes = 0;
-        let (out, stop) = shrink_passes("S", &original, no_deadline(), |state_in, stmt_in| {
+        let (out, stop) = shrink_passes("S", &original, &no_deadline(), |state_in, stmt_in| {
             passes += 1;
             Ok(Some(shrank(state_in, stmt_in, &stmt_in[1..])))
         })
@@ -1582,7 +1759,7 @@ mod tests {
         let (out, stop) = shrink_passes(
             "state-dump",
             "SELECT 1 FROM t",
-            no_deadline(),
+            &no_deadline(),
             |state_in, stmt_in| {
                 passes += 1;
                 if passes == 1 {
@@ -1603,7 +1780,7 @@ mod tests {
     #[test]
     fn no_divergence_on_the_first_pass_yields_nothing() {
         let mut passes = 0;
-        let (out, stop) = shrink_passes("state-dump", "SELECT 1", no_deadline(), |_, _| {
+        let (out, stop) = shrink_passes("state-dump", "SELECT 1", &no_deadline(), |_, _| {
             passes += 1;
             Ok(None)
         })
@@ -1618,7 +1795,7 @@ mod tests {
     #[test]
     fn an_expired_deadline_stops_the_loop_but_keeps_the_first_result() {
         let mut passes = 0;
-        let (out, stop) = shrink_passes("S", "aaaaaaaa", out_of_time(), |state_in, stmt_in| {
+        let (out, stop) = shrink_passes("S", "aaaaaaaa", &out_of_time(), |state_in, stmt_in| {
             passes += 1;
             Ok(Some(shrank(state_in, stmt_in, &stmt_in[1..])))
         })
@@ -1636,7 +1813,7 @@ mod tests {
     fn an_expired_deadline_stops_the_candidate_loop() {
         let sql = "SELECT MAX(1, MIN(2, 3)), 'literal', X'AB' FROM t";
         let mut judged = 0;
-        let out = shrink_with(sql, out_of_time(), |_| {
+        let out = shrink_with(sql, &out_of_time(), |_| {
             judged += 1;
             Ok(true)
         })
@@ -1649,7 +1826,7 @@ mod tests {
     fn an_expired_deadline_stops_the_state_reduction() {
         let state = "CREATE TABLE t(x);\nINSERT INTO t VALUES (1);\nCREATE TABLE junk(y);";
         let mut judged = 0;
-        let out = reduce_state_lines(state, out_of_time(), |_| {
+        let out = reduce_state_lines(state, &out_of_time(), |_| {
             judged += 1;
             Ok(true)
         })
@@ -1670,7 +1847,7 @@ mod tests {
         let (out, stop) = shrink_passes(
             "state-dump",
             "SELECT 1",
-            no_deadline(),
+            &no_deadline(),
             |state_in, stmt_in| {
                 passes += 1;
                 Ok(Some(shrank(state_in, stmt_in, stmt_in)))
@@ -1694,7 +1871,7 @@ mod tests {
         let (out, stop) = shrink_passes(
             "state-dump",
             "SELECT 1",
-            out_of_time(),
+            &out_of_time(),
             |state_in, stmt_in| {
                 passes += 1;
                 Ok(Some(shrank(state_in, stmt_in, stmt_in)))
@@ -1716,13 +1893,12 @@ mod tests {
         let sweep = candidates(sql).len();
         assert!(sweep > 20, "the sweep must be long enough to cut: {sweep}");
         let mut judged = 0;
-        let out = shrink_with(sql, Deadline::after(Duration::from_millis(20)), |_| {
+        let out = shrink_with(sql, &Deadline::after_judging(5), |_| {
             judged += 1;
-            std::thread::sleep(Duration::from_millis(5));
             Ok(false)
         })
         .unwrap();
-        assert!(judged > 0, "the sweep must start");
+        assert_eq!(judged, 5, "the deadline must cut the sweep at the fifth judge");
         assert!(
             judged < sweep,
             "the deadline must cut the sweep short: judged {judged} of {sweep}"
@@ -1735,21 +1911,19 @@ mod tests {
 
     #[test]
     fn the_state_reduction_stops_partway_when_the_deadline_passes() {
-        // Rejecting every deletion makes ddmin try 74 candidates over this script.
+        // Rejecting every deletion leaves ddmin far more than five candidates to try.
         let state: String = (0..40)
             .map(|i| format!("CREATE TABLE t{i}(x);\n"))
             .collect();
         let mut judged = 0;
-        let out = reduce_state_lines(&state, Deadline::after(Duration::from_millis(20)), |_| {
+        let out = reduce_state_lines(&state, &Deadline::after_judging(5), |_| {
             judged += 1;
-            std::thread::sleep(Duration::from_millis(5));
             Ok(false)
         })
         .unwrap();
-        assert!(judged > 0, "the reduction must start");
-        assert!(
-            judged < 20,
-            "the deadline must cut the reduction short: {judged}"
+        assert_eq!(
+            judged, 5,
+            "the deadline must cut the reduction at the fifth judge"
         );
         assert_eq!(
             out.lines().count(),
@@ -1757,6 +1931,11 @@ mod tests {
             "nothing was deleted, so every line survives"
         );
     }
+
+    /// A `WITH RECURSIVE` whose arm stops at `n < 3`, for splicing into a
+    /// larger statement.
+    const RECURSIVE: &str =
+        "WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n<3) SELECT n FROM r";
 
     #[test]
     fn a_recursive_cte_is_never_edited() {
@@ -1777,7 +1956,74 @@ mod tests {
     }
 
     #[test]
+    fn a_recursive_cte_inside_an_expression_subquery_is_never_edited() {
+        // The guard used to run over walk_sites, which never visits a select that only
+        // an expression reaches. Every statement here parses, the guard said no
+        // recursive CTE, and the edits then replaced `n < 3` with `1`.
+        for sql in [
+            format!("SELECT 1 FROM t WHERE EXISTS ({RECURSIVE})"),
+            format!("SELECT ({RECURSIVE}) FROM t"),
+            format!("SELECT 1 FROM t WHERE a IN ({RECURSIVE})"),
+            format!("SELECT 1 FROM t WHERE NOT EXISTS (SELECT 1 FROM ({RECURSIVE}))"),
+            format!("SELECT 1 FROM t UNION ALL SELECT 1 FROM t WHERE EXISTS ({RECURSIVE})"),
+            format!("SELECT 1 FROM t UNION ALL SELECT 1 FROM ({RECURSIVE})"),
+            format!("INSERT INTO t SELECT 1 FROM u WHERE EXISTS ({RECURSIVE})"),
+            format!("UPDATE t SET x = ({RECURSIVE})"),
+            format!("DELETE FROM t WHERE EXISTS ({RECURSIVE})"),
+            format!("SELECT 1 FROM t ORDER BY ({RECURSIVE})"),
+            format!("SELECT 1 FROM t LIMIT ({RECURSIVE})"),
+        ] {
+            let stmt = parse_one(&sql).unwrap_or_else(|| panic!("test SQL must parse: {sql}"));
+            assert!(has_recursive_cte(&stmt), "guard missed: {sql}");
+            // Render through the parser first: a statement handed to the shrinker comes
+            // from the generator already normalized, and `push_candidate` keeps only
+            // renderings shorter than their input, so hand-written spacing hides edits.
+            let normalized = norm(&sql);
+            assert!(
+                candidates(&normalized).is_empty(),
+                "{normalized} -> {:?}",
+                candidates(&normalized)
+            );
+        }
+    }
+
+    #[test]
+    fn the_exact_statement_the_guard_used_to_miss_produces_no_endless_candidate() {
+        let sql = norm(&format!("SELECT 1 FROM t WHERE EXISTS ({RECURSIVE})"));
+        // Before the guard walked the same traversal as the edits, this sweep offered
+        // `WHERE n`, `WHERE 3`, `WHERE 1` and `WHERE ''` in place of `WHERE n < 3`.
+        // Each keeps the recursive arm and removes what stops it, and the candidate
+        // then spins inside a single classify call that the deadline never re-enters.
+        for endless in ["WHERE n)", "WHERE 3)", "WHERE 1)", "WHERE '')"] {
+            assert!(
+                !candidates(&sql).iter().any(|c| c.contains(endless)),
+                "candidate keeping the recursive arm without its guard: {endless}"
+            );
+        }
+        assert!(candidates(&sql).is_empty(), "{:?}", candidates(&sql));
+    }
+
+    #[test]
+    fn a_plain_cte_inside_an_expression_subquery_still_shrinks() {
+        // The guard must not swallow every subquery, only the recursive ones.
+        let sql = norm("SELECT 1 FROM t WHERE EXISTS (WITH c(x) AS (SELECT 1) \
+                        SELECT x FROM c WHERE x AND x)");
+        assert!(!candidates(&sql).is_empty());
+    }
+
+    /// The database-name pool is process-wide and `cargo test` runs this module
+    /// in parallel, so the tests that count names take turns.
+    static ONE_PAIR_TEST_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    fn pair_test_turn() -> std::sync::MutexGuard<'static, ()> {
+        ONE_PAIR_TEST_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
     fn two_live_engine_pairs_do_not_contaminate_each_other() {
+        let _turn = pair_test_turn();
         // Both pairs replay the same state script. While they shared a database name,
         // each Turso side saw that script applied twice and reported a mismatch against
         // its own SQLite side, for a statement the engines agree on.
@@ -1794,6 +2040,104 @@ mod tests {
             first.classify(sql),
             None,
             "nor the first pair the second pair's"
+        );
+    }
+
+    /// Wall clock for one shrink pass, which is where the numbers quoted on
+    /// `SHRINK_TIME_BUDGET` come from.
+    ///
+    /// Measures the most expensive shape a pass has: no candidate is accepted,
+    /// so the statement sweep runs to the end of its candidate list and ddmin
+    /// runs down to single lines, and every one of those attempts rebuilds
+    /// both engines and replays the whole state script. Ignored by default --
+    /// it takes minutes. Re-measure with
+    /// `cargo test -p differential-fuzzer --lib measure_one_shrink_pass -- \
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "minutes of wall clock; run by hand to re-measure SHRINK_TIME_BUDGET"]
+    fn measure_one_shrink_pass() {
+        let _turn = pair_test_turn();
+        let statement = norm(
+            "SELECT a, MAX(b, c) FROM t WHERE a AND b OR LENGTH(c) < 5 \
+             GROUP BY a HAVING COUNT(*) > 1 ORDER BY a DESC, b LIMIT 3",
+        );
+        for lines in [200usize, 1000] {
+            let state = state_script(lines);
+            const BUILDS: u32 = 10;
+            let build_start = Instant::now();
+            for _ in 0..BUILDS {
+                drop(EnginePair::build(&state).unwrap());
+            }
+            let per_build = build_start.elapsed() / BUILDS;
+            println!("{lines}-line state script: EnginePair::build {per_build:?}");
+
+            let pass_start = Instant::now();
+            let out = shrink_against(
+                &state,
+                &Divergence::ResultMismatch,
+                &statement,
+                &no_deadline(),
+            )
+            .unwrap();
+            println!(
+                "{lines}-line state script: one pass {:?} ({} statement candidates, \
+                 state reduced to {} of {lines} lines)",
+                pass_start.elapsed(),
+                candidates(&statement).len(),
+                out.minimized.state_sql.lines().count(),
+            );
+        }
+    }
+
+    fn state_script(lines: usize) -> String {
+        let mut script = String::from("CREATE TABLE t(a, b, c);\n");
+        for i in 1..lines {
+            script.push_str(&format!(
+                "INSERT INTO t VALUES ({i}, {}, 'row{i}');\n",
+                i * 3 % 17
+            ));
+        }
+        script
+    }
+
+    #[test]
+    fn building_pairs_one_at_a_time_mints_one_database_name() {
+        let _turn = pair_test_turn();
+        // Every distinct name is a key `turso_core`'s registry inserts and never
+        // removes, and the `Weak` it stores there keeps the whole `Database`
+        // allocation alive. A name per pair meant a stranded `Database` per shrink
+        // candidate, thousands per shrink.
+        let state = "CREATE TABLE t(x);\nINSERT INTO t VALUES (1);\n";
+        let before = database_names_minted();
+        for _ in 0..64 {
+            drop(EnginePair::build(state).unwrap());
+        }
+        assert_eq!(
+            database_names_minted(),
+            before.max(1),
+            "64 pairs built one at a time must reuse a single name"
+        );
+    }
+
+    #[test]
+    fn a_database_name_is_reused_only_once_its_pair_is_gone() {
+        let _turn = pair_test_turn();
+        let state = "CREATE TABLE t(x);\n";
+        let first = EnginePair::build(state).unwrap();
+        let after_first = database_names_minted();
+        let second = EnginePair::build(state).unwrap();
+        assert!(
+            database_names_minted() > after_first,
+            "a second live pair must not take the first pair's name"
+        );
+        let peak = database_names_minted();
+        drop(first);
+        drop(second);
+        drop(EnginePair::build(state).unwrap());
+        assert_eq!(
+            database_names_minted(),
+            peak,
+            "a name whose pair is gone must be handed out again"
         );
     }
 }
