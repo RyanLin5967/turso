@@ -16,17 +16,13 @@ pub fn generate_literal_with_config(
     data_type: DataType,
     config: &LiteralConfig,
 ) -> Literal {
-    // Check for NULL generation
     if ctx.gen_bool_with_prob(config.null_probability) {
         return Literal::Null;
     }
 
-    // Boundary values are drawn HERE rather than inside generate_integer/generate_real,
-    // because those two guarantee their result lies inside config.int_min..int_max and
-    // test_generate_integer_range / test_generate_real_range assert exactly that. The
-    // boundary table has to leave that window -- every value worth testing is outside a
-    // sensible ordinary-value range -- so it hooks one level up and leaves the contract
-    // intact. A config opts out with boundary_value_probability: 0.0.
+    // Drawn here, not inside generate_integer/generate_real: those two must keep every
+    // result inside config.int_min..int_max, and the whole point of the boundary table is
+    // to leave that window. boundary_value_probability: 0.0 opts out.
     if ctx.gen_bool_with_prob(config.boundary_value_probability) {
         match data_type {
             DataType::Integer => {
@@ -80,18 +76,11 @@ const BOUNDARY_INTEGERS: &[i64] = &[
     4294967296,
     9007199254740992, // 2^53, above which f64 cannot hold every integer
     -9007199254740992,
-    // 2^62, deliberately NOT i64::MAX or anything adjacent to it. A row whose rowid is
-    // i64::MAX makes every later NULL-key insert pick a rowid AT RANDOM -- documented SQLite
-    // behaviour that Turso implements too, so the engines legitimately disagree and the
-    // post-DML snapshot check calls it a divergence. MAX-1 is no better: the next NULL key
-    // takes MAX and the one after that is random. Measured across six seeds: i64::MAX gave
-    // two such false failures, MAX-1 still gave one. A false failure is not just noise, it
-    // ends the run -- those seeds executed about 150 statements against about 430 for a
-    // clean run, so it costs coverage as well as trust.
-    //
-    // 2^62 keeps a large-magnitude integer in reach while being unable to become the
-    // max-rowid trigger. The i64::MAX overflow edge itself is still reachable through
-    // arithmetic on these values, which is where overflow bugs actually live.
+    // 2^62, deliberately NOT i64::MAX nor anything adjacent. A row whose rowid is i64::MAX
+    // makes every later NULL-key insert pick a rowid AT RANDOM -- documented SQLite behaviour
+    // that Turso implements too, so both engines are right while disagreeing and the post-DML
+    // snapshot check ends the run on a false divergence. MAX-1 only delays it by one insert.
+    // The overflow edge stays reachable through arithmetic on these values.
     4611686018427387904,
     -9223372036854775808, // i64::MIN, where negation overflows
 ];
@@ -346,9 +335,7 @@ mod tests {
 
     #[test]
     fn blobs_are_valid_utf8() {
-        // Casting a blob with invalid UTF-8 to TEXT keeps the bytes in SQLite
-        // but becomes replacement characters in Turso, so generated blobs must
-        // stay valid UTF-8 for the two engines to agree.
+        // Invalid UTF-8 cast to TEXT keeps its bytes in SQLite and becomes U+FFFD in Turso.
         let mut ctx = Context::new_with_seed(7);
         let config = default_config();
         for _ in 0..200 {
@@ -422,12 +409,7 @@ mod tests {
         }
     }
 
-    /// The table must be REACHABLE through the dispatcher, or this change does nothing. An
-    /// earlier version filtered the table through int_min/int_max, which dropped every value
-    /// above a million and made the patch a no-op; this assertion is what caught it.
-    ///
-    /// Note i64::MIN.abs() panics in debug, which this test also learned the hard way --
-    /// hence unsigned_abs.
+    /// The table must be reachable through the dispatcher, or it may as well not exist.
     #[test]
     fn boundary_values_are_reachable_through_the_dispatcher() {
         let mut ctx = Context::new_with_seed(20260822);
@@ -450,10 +432,6 @@ mod tests {
             beyond_window,
             "no integer outside +/-1e6 in 4000 draws -- the table is unreachable"
         );
-        // i64::MAX is deliberately absent from the table -- a row holding it in an
-        // INTEGER PRIMARY KEY makes later NULL-key inserts pick a rowid at random, which
-        // the harness scores as a divergence. i64::MIN is safe: it cannot become the
-        // max rowid.
         assert!(saw_i64_min, "i64::MIN was never drawn");
         assert!(
             !BOUNDARY_INTEGERS.contains(&i64::MAX),
@@ -485,6 +463,55 @@ mod tests {
         assert!(saw_tiny, "no subnormal/tiny real drawn");
         assert!(saw_huge, "no very large real drawn");
         assert!(saw_integral, "no small integral real drawn");
+    }
+
+    #[test]
+    fn every_boundary_real_renders_as_sql_that_is_still_real() {
+        for &v in BOUNDARY_REALS {
+            let sql = Literal::Real(v).to_string();
+            assert!(
+                renders_as_a_real(&sql),
+                "{v:?} renders as `{sql}`, which is not lexically a real literal"
+            );
+            assert!(
+                sql.len() <= 40,
+                "{v:?} renders as {} characters, bloating every statement that draws it",
+                sql.len()
+            );
+        }
+    }
+
+    /// Negative zero is the entry the old rendering destroyed most completely: it left as
+    /// `-0`, an integer literal, so the real boundary it exists for was never reached. What
+    /// is asserted is the SQL text -- both engines print `-0.0` back as `0.0`, so the sign
+    /// itself is not observable from a query.
+    #[test]
+    fn negative_zero_keeps_its_sign_through_the_dispatcher() {
+        let mut ctx = Context::new_with_seed(4242);
+        let cfg = LiteralConfig::default();
+        let mut saw_negative_zero = false;
+        for _ in 0..4000 {
+            if let Literal::Real(v) = generate_literal_with_config(&mut ctx, DataType::Real, &cfg) {
+                let sql = Literal::Real(v).to_string();
+                assert!(
+                    renders_as_a_real(&sql),
+                    "generated real {v:?} renders as `{sql}`, not a real literal"
+                );
+                if v == 0.0 && v.is_sign_negative() {
+                    saw_negative_zero = true;
+                    assert_eq!(sql, "-0.0", "negative zero lost its sign in rendering");
+                }
+            }
+        }
+        assert!(saw_negative_zero, "negative zero was never drawn");
+    }
+
+    /// The test that inspects `Literal::Real(v)` cannot see this: reaching the generator is
+    /// only half of it, the value still has to survive rendering. A digit string past
+    /// i64::MAX is the one case both engines still read as a real, so what is enforced here
+    /// is the lexical shape: it must not look like an integer.
+    fn renders_as_a_real(sql: &str) -> bool {
+        sql.contains('.') || sql.contains('e') || sql.contains('E')
     }
 
     /// Opting out must be honoured exactly, so callers needing small values keep relying on
