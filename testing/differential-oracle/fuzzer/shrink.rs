@@ -734,10 +734,7 @@ fn walk_stmt(stmt: &mut Stmt, v: &mut dyn Visitor) -> bool {
     }
 }
 
-fn walk_limit(
-    limit: &mut Option<turso_parser::ast::Limit>,
-    v: &mut dyn Visitor,
-) -> bool {
+fn walk_limit(limit: &mut Option<turso_parser::ast::Limit>, v: &mut dyn Visitor) -> bool {
     if let Some(limit) = limit {
         if walk_expr(&mut limit.expr, v) {
             return true;
@@ -838,10 +835,7 @@ fn walk_one_select(one: &mut OneSelect, v: &mut dyn Visitor) -> bool {
     }
 }
 
-fn walk_from(
-    from: &mut turso_parser::ast::FromClause,
-    v: &mut dyn Visitor,
-) -> bool {
+fn walk_from(from: &mut turso_parser::ast::FromClause, v: &mut dyn Visitor) -> bool {
     if walk_select_table(&mut from.select, v) {
         return true;
     }
@@ -1682,12 +1676,7 @@ mod tests {
 
     /// Build a pass whose result is `state`/`statement`, reporting that it
     /// started from `input_len` bytes of `basis`.
-    fn pass_result(
-        state_sql: &str,
-        statement: &str,
-        input_len: usize,
-        basis: Basis,
-    ) -> PassResult {
+    fn pass_result(state_sql: &str, statement: &str, input_len: usize, basis: Basis) -> PassResult {
         PassResult {
             minimized: minimized(state_sql, statement),
             input_len,
@@ -1993,7 +1982,10 @@ mod tests {
             Ok(false)
         })
         .unwrap();
-        assert_eq!(judged, 5, "the deadline must cut the sweep at the fifth judge");
+        assert_eq!(
+            judged, 5,
+            "the deadline must cut the sweep at the fifth judge"
+        );
         assert!(
             judged < sweep,
             "the deadline must cut the sweep short: judged {judged} of {sweep}"
@@ -2108,8 +2100,10 @@ mod tests {
     #[test]
     fn a_plain_cte_inside_an_expression_subquery_still_shrinks() {
         // The guard must not swallow every subquery, only the recursive ones.
-        let sql = norm("SELECT 1 FROM t WHERE EXISTS (WITH c(x) AS (SELECT 1) \
-                        SELECT x FROM c WHERE x AND x)");
+        let sql = norm(
+            "SELECT 1 FROM t WHERE EXISTS (WITH c(x) AS (SELECT 1) \
+                        SELECT x FROM c WHERE x AND x)",
+        );
         assert!(!candidates(&sql).is_empty());
     }
 
