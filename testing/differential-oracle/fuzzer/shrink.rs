@@ -257,6 +257,15 @@ fn database_names_minted() -> usize {
     lock_database_names().len()
 }
 
+/// How many of those names a live pair is holding right now.
+#[cfg(test)]
+fn database_names_in_use() -> usize {
+    lock_database_names()
+        .iter()
+        .filter(|slot| !matches!(slot, NameSlot::Held(db) if db.strong_count() == 0))
+        .count()
+}
+
 pub fn query_results_differ(a: &QueryResult, b: &QueryResult) -> bool {
     match (a, b) {
         (QueryResult::Rows(ra), QueryResult::Rows(rb)) => {
@@ -1265,10 +1274,20 @@ pub fn shrink_statement(
 const MAX_SHRINK_PASSES: usize = 8;
 
 /// Wall clock the whole shrink may spend: a fifth of the 30-minute cap on the
-/// fuzzer jobs in `.github/workflows/rust.yml`. One pass is measured at about a
-/// minute against a 200-line state script and five against a 1000-line one
-/// (debug build), so this is several passes on a small reproduction and about
-/// one on a large one.
+/// fuzzer jobs in `.github/workflows/rust.yml`.
+///
+/// What a pass costs is set by how many candidates it judges times how long
+/// one `EnginePair::build` takes, because every candidate rebuilds both
+/// engines and replays the whole state script. The `measure_one_shrink_pass`
+/// test below timed a build at 19 ms against a 200-line state script and 90 ms
+/// against a 1000-line one, and timed a whole pass over a 33-candidate
+/// statement at 7.5 s and 83 s (debug build, `cargo test -p differential-fuzzer
+/// --lib measure_one_shrink_pass -- --ignored --nocapture`, Apple M5 Pro,
+/// 2026-08-29, load average 18 -- an idle machine would be faster). A pass over
+/// a real failing statement judges more: at worst `MAX_CANDIDATES` statement
+/// candidates plus `MAX_CANDIDATES` state deletions, so about 30 s on a
+/// 200-line script and about two and a half minutes on a 1000-line one. This
+/// budget is therefore several passes either way.
 ///
 /// It bounds the shrink, not the job: the run that failed has already spent an
 /// unknown part of the cap, and nothing here can see how much is left, so a
@@ -1618,6 +1637,7 @@ mod tests {
 
     #[test]
     fn shrink_statement_returns_none_without_divergence() {
+        let _turn = pair_test_turn();
         // Same statement behaves identically on both engines, so there is
         // nothing to shrink against.
         let state = "CREATE TABLE t(x);\nINSERT INTO t VALUES (1);\n";
@@ -2123,20 +2143,30 @@ mod tests {
     fn a_database_name_is_reused_only_once_its_pair_is_gone() {
         let _turn = pair_test_turn();
         let state = "CREATE TABLE t(x);\n";
+        assert_eq!(
+            database_names_in_use(),
+            0,
+            "the turn lock must leave no other pair alive"
+        );
         let first = EnginePair::build(state).unwrap();
-        let after_first = database_names_minted();
         let second = EnginePair::build(state).unwrap();
-        assert!(
-            database_names_minted() > after_first,
+        assert_eq!(
+            database_names_in_use(),
+            2,
             "a second live pair must not take the first pair's name"
         );
-        let peak = database_names_minted();
+        let minted = database_names_minted();
         drop(first);
         drop(second);
+        assert_eq!(
+            database_names_in_use(),
+            0,
+            "dropping a pair must free its name"
+        );
         drop(EnginePair::build(state).unwrap());
         assert_eq!(
             database_names_minted(),
-            peak,
+            minted,
             "a name whose pair is gone must be handed out again"
         );
     }
