@@ -1992,6 +1992,13 @@ mod tests {
             format!("DELETE FROM t WHERE EXISTS ({RECURSIVE})"),
             format!("SELECT 1 FROM t ORDER BY ({RECURSIVE})"),
             format!("SELECT 1 FROM t LIMIT ({RECURSIVE})"),
+            format!("INSERT INTO t VALUES (({RECURSIVE}))"),
+            format!("UPDATE t SET x = 1 WHERE EXISTS ({RECURSIVE})"),
+            format!("SELECT 1 FROM (SELECT 1 FROM t WHERE EXISTS ({RECURSIVE}))"),
+            format!("SELECT 1 FROM t JOIN ({RECURSIVE}) ON 1"),
+            format!("SELECT 1 FROM t WHERE a IN (SELECT 1 FROM u WHERE b IN ({RECURSIVE}))"),
+            format!("SELECT 1 FROM t GROUP BY a HAVING EXISTS ({RECURSIVE})"),
+            format!("DELETE FROM t WHERE a IN (SELECT n FROM ({RECURSIVE}))"),
         ] {
             let stmt = parse_one(&sql).unwrap_or_else(|| panic!("test SQL must parse: {sql}"));
             assert!(has_recursive_cte(&stmt), "guard missed: {sql}");
