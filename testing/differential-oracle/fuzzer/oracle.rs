@@ -184,13 +184,11 @@ impl Oracle for DifferentialOracle {
                 "SQLite errored but Turso succeeded:\n  SQL: {stmt}\n  Error: {sqlite_err}"
             )),
             (QueryResult::Rows(rows), QueryResult::Ok) => {
-                // execute_sqlite reports an EMPTY result set as Ok, not as Rows(vec![]),
-                // so "SQLite returned nothing" arrives here rather than in the arm above.
-                // Past the is_empty check one side has rows and the other has none, which
-                // is always a row-COUNT divergence -- so the unordered-LIMIT exemption
-                // that used to sit here could only ever fire on the one thing an unordered
-                // LIMIT does not excuse. `SELECT count(a) FROM t LIMIT 0` lands here:
-                // Turso emits one row, SQLite none, and it was reported as PASSED.
+                // execute_sqlite reports an empty result set as Ok, never as Rows(vec![]),
+                // so "SQLite returned nothing" arrives here and not in the arm above.
+                // Past this is_empty check the counts always differ, so the unordered-LIMIT
+                // exemption that used to sit here could only ever fire on a count
+                // divergence, which an unordered LIMIT does not excuse.
                 if rows.is_empty() {
                     OracleResult::Pass
                 } else {
@@ -201,9 +199,7 @@ impl Oracle for DifferentialOracle {
                 }
             }
             (QueryResult::Ok, QueryResult::Rows(rows)) => {
-                // The mirror image of the arm above, and the same reasoning: past the
-                // is_empty check the counts always differ, so an unordered LIMIT does not
-                // excuse it.
+                // The mirror image of the arm above, for the same reason.
                 if rows.is_empty() {
                     OracleResult::Pass
                 } else {
