@@ -17,7 +17,10 @@ pub struct GeneratedStatement {
     pub has_unordered_limit: bool,
     /// Only this statement's own LIMIT, not one inside a subquery. The row-count rule
     /// applies to the first and not the second.
-    pub has_top_level_unordered_limit: bool,
+    /// A top-level LIMIT with no LIMIT nested below it. Only then is the row COUNT
+    /// predictable: `LIMIT n` yields `min(n, count)` whatever its ORDER BY, while a
+    /// nested LIMIT can legitimately change the outer count.
+    pub count_is_guaranteed: bool,
     pub unordered_limit_reason: Option<String>,
 }
 
@@ -226,7 +229,7 @@ impl SqlGenerator for SqlGenBackend {
         );
         let has_unordered_limit =
             stmt.has_unordered_limit() || stmt.non_unique_order_by_reason(schema).is_some();
-        let has_top_level_unordered_limit = stmt.has_top_level_unordered_limit();
+        let count_is_guaranteed = stmt.has_top_level_limit() && !stmt.has_nested_unordered_limit();
         let unordered_limit_reason = stmt
             .unordered_limit_reason()
             .or_else(|| stmt.non_unique_order_by_reason(schema))
@@ -236,7 +239,7 @@ impl SqlGenerator for SqlGenBackend {
             is_ddl,
             mutates_data,
             has_unordered_limit,
-            has_top_level_unordered_limit,
+            count_is_guaranteed,
             unordered_limit_reason,
         })
     }
@@ -326,13 +329,13 @@ impl SqlGenerator for PropTestBackend {
                 | sql_gen_prop::StatementKind::Delete
         );
         let has_unordered_limit = stmt.has_unordered_limit();
-        let has_top_level_unordered_limit = stmt.has_top_level_unordered_limit();
+        let count_is_guaranteed = stmt.has_top_level_limit() && !stmt.has_nested_unordered_limit();
         Ok(GeneratedStatement {
             sql,
             is_ddl,
             mutates_data,
             has_unordered_limit,
-            has_top_level_unordered_limit,
+            count_is_guaranteed,
             unordered_limit_reason: None,
         })
     }

@@ -98,11 +98,7 @@ impl Oracle for DifferentialOracle {
         sqlite_result: &QueryResult,
     ) -> OracleResult {
         let has_unordered_limit = stmt.has_unordered_limit;
-        // Only a TOP-LEVEL unordered LIMIT guarantees a stable row count. When the
-        // LIMIT is inside a subquery the subquery may pick a different row on each
-        // engine, which can legitimately change the outer count too -- so the count
-        // rule below must not apply there.
-        let count_is_guaranteed = stmt.has_top_level_unordered_limit;
+        let count_is_guaranteed = stmt.count_is_guaranteed;
 
         match (turso_result, sqlite_result) {
             (QueryResult::Rows(turso_rows), QueryResult::Rows(sqlite_rows)) => {
@@ -475,6 +471,13 @@ pub fn check_differential(
     let sqlite_explain = DifferentialOracle::execute_sqlite(sqlite_conn, &explain_sql);
     match (&turso_explain, &sqlite_explain) {
         (QueryResult::Error(turso_error), QueryResult::Error(sqlite_error)) => {
+            if is_internal_failure(&turso_error) {
+                return OracleResult::Fail(format!(
+                    "Turso reported an internal failure while preparing; SQLite \
+                     rejected the statement for its own reasons:\n  SQL: {stmt}\n  \
+                     Turso: {turso_error}"
+                ));
+            }
             return OracleResult::Skipped(format_skipped_statement(
                 stmt,
                 Some(turso_error),
@@ -482,6 +485,19 @@ pub fn check_differential(
             ));
         }
         (QueryResult::Error(turso_error), _) => {
+            // An internal invariant violation during prepare is a bug whatever SQLite
+            // thinks of the statement, so it must not be filed under "skipped". Without
+            // this the rule below is unreachable from the fuzzer for the whole
+            // prepare-time class: EXPLAIN SELECT DISTINCT count(*) FROM t itself returns
+            // "Corrupt database: Reference to undefined or unresolved label", so the gate
+            // fires before check() ever runs. Only differential_probe, which has no
+            // EXPLAIN gate, ever reached it.
+            if is_internal_failure(&turso_error) {
+                return OracleResult::Fail(format!(
+                    "Turso reported an internal failure while preparing:\n  SQL: {stmt}\n  \
+                     Turso: {turso_error}"
+                ));
+            }
             return OracleResult::Skipped(format_skipped_statement(stmt, Some(turso_error), None));
         }
         (_, QueryResult::Error(sqlite_error)) => {
@@ -584,7 +600,7 @@ mod tests {
             mutates_data: false,
             has_unordered_limit: true,
 
-            has_top_level_unordered_limit: true,
+            count_is_guaranteed: true,
             unordered_limit_reason: Some("limit_order_by_scalar_subquery".to_string()),
         };
         let turso = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(1)])]);
@@ -654,7 +670,7 @@ mod tests {
             mutates_data: true,
             has_unordered_limit: false,
 
-            has_top_level_unordered_limit: false,
+            count_is_guaranteed: false,
             unordered_limit_reason: None,
         };
 
@@ -705,7 +721,7 @@ mod tests {
             mutates_data: true,
             has_unordered_limit: false,
 
-            has_top_level_unordered_limit: false,
+            count_is_guaranteed: false,
             unordered_limit_reason: None,
         };
 
@@ -783,7 +799,7 @@ mod tests {
             mutates_data: false,
             has_unordered_limit: true,
 
-            has_top_level_unordered_limit: true,
+            count_is_guaranteed: true,
             unordered_limit_reason: Some("limit_without_order_by".to_string()),
         };
         let rows =
@@ -811,7 +827,7 @@ mod tests {
         let ordered = GeneratedStatement {
             has_unordered_limit: false,
 
-            has_top_level_unordered_limit: false,
+            count_is_guaranteed: false,
             unordered_limit_reason: None,
             ..stmt
         };
@@ -834,7 +850,7 @@ mod tests {
             mutates_data: false,
             has_unordered_limit: true,
 
-            has_top_level_unordered_limit: true,
+            count_is_guaranteed: true,
             unordered_limit_reason: Some("limit_without_order_by".to_string()),
         };
         let one_row = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(0)])]);

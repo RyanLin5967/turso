@@ -75,6 +75,21 @@ impl fmt::Display for Stmt {
 impl Stmt {
     /// Returns true if this statement contains any SELECT with LIMIT but no ORDER BY,
     /// including in subqueries within expressions.
+    /// See the select-level versions.
+    pub fn has_top_level_limit(&self) -> bool {
+        match self {
+            Stmt::Select(s) => s.has_top_level_limit(),
+            _ => false,
+        }
+    }
+
+    pub fn has_nested_unordered_limit(&self) -> bool {
+        match self {
+            Stmt::Select(s) => s.has_nested_unordered_limit(),
+            _ => false,
+        }
+    }
+
     /// See `SelectStmt::has_top_level_unordered_limit`.
     pub fn has_top_level_unordered_limit(&self) -> bool {
         match self {
@@ -128,6 +143,26 @@ impl Stmt {
 }
 
 impl SelectStmt {
+    /// Whether this select has a LIMIT of its own, ordered or not.
+    ///
+    /// This, not "is the LIMIT unordered", is what makes a row COUNT predictable:
+    /// `LIMIT n` yields `min(n, count)` on any engine whatever its ORDER BY. Keying the
+    /// oracle's count rule on unorderedness left the largest category --
+    /// `LIMIT n ORDER BY <non-unique column>` -- still excused.
+    pub fn has_top_level_limit(&self) -> bool {
+        self.limit.is_some()
+    }
+
+    /// Whether a LIMIT appears anywhere BELOW this select — in a CTE body, a subquery, or
+    /// an expression.
+    ///
+    /// A nested unordered LIMIT can legitimately change the outer row count: the subquery
+    /// picks a different row on each engine and the outer filter then keeps a different
+    /// number of rows. So the count rule must not apply when one is present.
+    pub fn has_nested_unordered_limit(&self) -> bool {
+        self.has_unordered_limit() && !self.has_top_level_unordered_limit()
+    }
+
     /// Whether THIS select's own LIMIT is unordered — no recursion into CTEs or
     /// subqueries.
     ///
