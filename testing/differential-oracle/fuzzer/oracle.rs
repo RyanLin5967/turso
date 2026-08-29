@@ -106,7 +106,20 @@ impl Oracle for DifferentialOracle {
                     // For non-deterministic LIMIT queries, the result set may legitimately differ
                     // since the chosen rows are not stable across engines. Return a warning instead
                     // of failure.
-                    if has_unordered_limit {
+                    // An unordered LIMIT genuinely does not fix WHICH rows come back,
+                    // so a differing row set is not a bug. It does fix HOW MANY: `LIMIT n`
+                    // must return min(n, count) rows on both engines whatever it picks. The
+                    // counts were already being passed into the warning text and never
+                    // compared, so a row-count divergence was reported as PASSED.
+                    //
+                    // Two verified Turso bugs have exactly this shape:
+                    //   SELECT x FROM aa CROSS JOIN bb LIMIT 10 OFFSET 1  -> 3 rows vs 5
+                    //   SELECT count(a) FROM t LIMIT 0                     -> 1 row  vs 0
+                    // Both set has_unordered_limit, so both passed. Writing the second with
+                    // an ORDER BY over the primary key clears the flag without fixing the
+                    // bug, and it is then reported -- so the exemption was the thing hiding
+                    // it, not a limitation of the comparison.
+                    if has_unordered_limit && turso_rows.len() == sqlite_rows.len() {
                         return OracleResult::Warning(format_nondet_limit_warning(
                             stmt,
                             "row_set_mismatch",
@@ -114,6 +127,15 @@ impl Oracle for DifferentialOracle {
                             sqlite_rows.len(),
                             diff.only_in_first.len(),
                             diff.only_in_second.len(),
+                        ));
+                    }
+                    if has_unordered_limit {
+                        return OracleResult::Fail(format!(
+                            "Row COUNT mismatch under an unordered LIMIT. Which rows come                              back is not stable across engines, but how many is:
+  SQL:                              {stmt}
+  Turso returned {} row(s), SQLite {}",
+                            turso_rows.len(),
+                            sqlite_rows.len()
                         ));
                     }
                     return OracleResult::Fail(format!(
@@ -709,5 +731,53 @@ mod tests {
                 "legitimate rejection must stay agreement: {err}"
             );
         }
+    }
+    /// An unordered LIMIT excuses WHICH rows come back, never HOW MANY. `LIMIT n` must
+    /// return min(n, count) rows on both engines whatever it picks, so a count mismatch is
+    /// a real bug even when the flag is set. Two verified Turso bugs have this shape --
+    /// `... CROSS JOIN ... LIMIT 10 OFFSET 1` gives 3 rows against 5, and
+    /// `SELECT count(a) FROM t LIMIT 0` gives 1 against 0 -- and both were reported as
+    /// PASSED before this.
+    #[test]
+    fn unordered_limit_excuses_which_rows_but_not_how_many() {
+        let stmt = GeneratedStatement {
+            sql: "SELECT x FROM aa CROSS JOIN bb LIMIT 10 OFFSET 1".to_string(),
+            is_ddl: false,
+            mutates_data: false,
+            has_unordered_limit: true,
+            unordered_limit_reason: Some("limit_without_order_by".to_string()),
+        };
+        let rows = |n: i64| {
+            QueryResult::Rows((0..n).map(|i| Row(vec![SqlValue::Integer(i)])).collect())
+        };
+        let oracle = DifferentialOracle;
+
+        // Different COUNT under an unordered LIMIT: a bug, and must fail.
+        match oracle.check(&stmt, &rows(3), &rows(5)) {
+            OracleResult::Fail(msg) => {
+                assert!(msg.contains("Row COUNT mismatch"), "{msg}");
+                assert!(msg.contains("3 row(s)") && msg.contains("5"), "{msg}");
+            }
+            other => panic!("count mismatch must fail, got {other:?}"),
+        }
+
+        // Same count, different rows: still legitimately a warning, not a failure.
+        let a = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(1)])]);
+        let b = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(2)])]);
+        assert!(
+            matches!(oracle.check(&stmt, &a, &b), OracleResult::Warning(_)),
+            "same count with different rows is what the exemption is for"
+        );
+
+        // And with the flag clear, a count mismatch fails as it always did.
+        let ordered = GeneratedStatement {
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+            ..stmt.clone()
+        };
+        assert!(matches!(
+            oracle.check(&ordered, &rows(3), &rows(5)),
+            OracleResult::Fail(_)
+        ));
     }
 }
