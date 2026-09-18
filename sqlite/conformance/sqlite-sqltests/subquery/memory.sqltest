@@ -1594,3 +1594,19 @@ test from-subquery-outer-ref-in-correlated-subquery {
 expect {
     2
 }
+
+# A result column alias belongs to the query that declares it, so it shadows a
+# same-named column of an enclosing scope in WHERE and in ORDER BY.
+@cross-check-integrity
+test subquery-alias-shadows-outer-scope-column {
+    create table o(q int);
+    create table t(a int, b int);
+    insert into o values (2);
+    insert into t values (1,30),(2,20),(3,10);
+    select 'where', (select b as q from t where q > 15 limit 1) from o;
+    select 'orderby', (select b as q from t order by abs(q) limit 1) from o;
+}
+expect {
+    where|30
+    orderby|10
+}

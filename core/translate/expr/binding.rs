@@ -178,6 +178,21 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
 
+                    if match_result.is_none()
+                        && binding_behavior == BindingBehavior::TryCanonicalColumnsFirst
+                    {
+                        if let Some(result_columns) = result_columns {
+                            for result_column in result_columns.iter() {
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Then check outer query references, if we still didn't find something.
                     // Normally finding multiple matches for a non-qualified column is an error (column x is ambiguous)
                     // but in the case of subqueries, the inner query takes precedence.
@@ -240,19 +255,6 @@ pub fn bind_and_rewrite_expr<'a>(
                         };
                         referenced_tables.mark_column_used(table_id, col_idx);
                         return Ok(WalkControl::Continue);
-                    }
-
-                    if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
-                        if let Some(result_columns) = result_columns {
-                            for result_column in result_columns.iter() {
-                                if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
-                                        *expr = result_column.expr.clone();
-                                        return Ok(WalkControl::Continue);
-                                    }
-                                }
-                            }
-                        }
                     }
 
                     // SQLite DQS misfeature: double-quoted identifiers fall back to string literals
