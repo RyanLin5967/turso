@@ -5116,6 +5116,25 @@ pub mod tests {
     }
 
     #[test]
+    fn test_rewrite_view_sql_numeric_new_name_keeps_quotes() {
+        let schema = schema_with_table("CREATE TABLE t (a, b)");
+        let view_sql = "CREATE VIEW v AS SELECT b FROM t WHERE b > 2";
+
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "2024")
+                .unwrap()
+                .expect("view should be rewritten");
+
+        assert!(
+            rewritten
+                .sql
+                .contains("SELECT \"2024\" FROM t WHERE \"2024\" > 2"),
+            "{}",
+            rewritten.sql
+        );
+    }
+
+    #[test]
     fn test_rewrite_view_sql_select_table_branch() {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT s.x FROM (SELECT b AS x FROM t) AS s";

@@ -263,3 +263,55 @@ fn test_alter_table_add_column_preserves_collation_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+#[test]
+fn test_alter_table_rename_column_to_numeric_name_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_rename_col_numeric_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a INTEGER, CHECK(a > 0))")
+            .unwrap();
+        conn.execute("CREATE INDEX ix ON t(a)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT a FROM t WHERE a > 2")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1),(5),(9)").unwrap();
+        conn.execute("ALTER TABLE t RENAME COLUMN a TO \"2024\"")
+            .unwrap();
+
+        let table_sql: Vec<(i64,)> = conn
+            .exec_rows("SELECT sql LIKE '%(\"2024\" > 0)%' FROM sqlite_schema WHERE name = 't'");
+        assert_eq!(table_sql, vec![(1,)], "CHECK must keep the quoted name");
+
+        let view_sql: Vec<(i64,)> =
+            conn.exec_rows("SELECT sql LIKE '%\"2024\" > 2%' FROM sqlite_schema WHERE name = 'v'");
+        assert_eq!(view_sql, vec![(1,)], "view must keep the quoted name");
+
+        let index_sql: Vec<(i64,)> =
+            conn.exec_rows("SELECT sql LIKE '%(\"2024\")%' FROM sqlite_schema WHERE name = 'ix'");
+        assert_eq!(index_sql, vec![(1,)], "index must keep the quoted name");
+
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+        let view_rows: Vec<(i64,)> = conn.exec_rows("SELECT * FROM v ORDER BY 1");
+        assert_eq!(view_rows, vec![(5,), (9,)]);
+
+        let err = conn.execute("INSERT INTO t VALUES(-7)");
+        assert!(err.is_err(), "CHECK must still reject -7 after reopen");
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT \"2024\" FROM t ORDER BY 1");
+        assert_eq!(rows, vec![(1,), (5,), (9,)]);
+
+        conn.close().unwrap();
+    }
+}

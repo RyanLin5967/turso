@@ -5490,6 +5490,28 @@ mod tests {
     }
 
     #[test]
+    fn digit_leading_identifier_round_trips_as_identifier() {
+        assert_eq!(Name::exact("2024".to_owned()).as_ident(), "\"2024\"");
+        assert_eq!(Name::exact("c2024".to_owned()).as_ident(), "c2024");
+
+        let sql = format!("SELECT {} FROM t", Expr::Id(Name::exact("2024".to_owned())));
+        let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+        let Cmd::Stmt(Stmt::Select(select)) = cmd else {
+            panic!("expected SELECT, got {sql}");
+        };
+        let OneSelect::Select { columns, .. } = &select.body.select else {
+            panic!("expected simple SELECT, got {sql}");
+        };
+        let ResultColumn::Expr(expr, _) = &columns[0] else {
+            panic!("expected expression column, got {sql}");
+        };
+        assert!(
+            matches!(expr.as_ref(), Expr::Id(parsed) if parsed.as_str() == "2024"),
+            "{sql} parsed as {expr:?}"
+        );
+    }
+
+    #[test]
     fn test_variable_index_bounds() {
         for sql in ["SELECT ?0", "SELECT ?250001"] {
             let mut p = Parser::new(sql.as_bytes());
