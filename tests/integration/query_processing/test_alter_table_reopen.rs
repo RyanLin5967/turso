@@ -263,3 +263,49 @@ fn test_alter_table_add_column_preserves_collation_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+#[test]
+fn test_alter_table_rename_to_digit_leading_name_stays_quoted_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_rename_to_digit_leading.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a)").unwrap();
+        conn.execute("CREATE TABLE u(a)").unwrap();
+        conn.execute("CREATE INDEX i ON t(a)").unwrap();
+        conn.execute("ALTER TABLE t RENAME TO \"1a\"").unwrap();
+
+        let tbl: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = '1a'");
+        assert_eq!(tbl, vec![("CREATE TABLE \"1a\" (a)".to_string(),)]);
+
+        let idx: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'i'");
+        assert_eq!(idx, vec![("CREATE INDEX i ON \"1a\" (a)".to_string(),)]);
+
+        conn.execute("ALTER TABLE u RENAME TO \"b c\"").unwrap();
+        let after: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM sqlite_schema WHERE name = 'b c'");
+        assert_eq!(after, vec![(1,)]);
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        let names: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema ORDER BY name");
+        assert_eq!(
+            names,
+            vec![
+                ("1a".to_string(),),
+                ("b c".to_string(),),
+                ("i".to_string(),)
+            ]
+        );
+
+        conn.execute("INSERT INTO \"1a\" VALUES (7)").unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM \"1a\"");
+        assert_eq!(rows, vec![(7,)]);
+        conn.close().unwrap();
+    }
+}
