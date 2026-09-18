@@ -179,7 +179,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
         );
 
     // UPSERT is multi-write because DO UPDATE modifies an existing row.
-    // AUTOINCREMENT is multi-write because sqlite_sequence is updated before constraint checks.
+    // AUTOINCREMENT is multi-write because sqlite_sequence is updated.
     if !inserting_multiple_rows
         && !has_triggers
         && !any_replace
