@@ -52,6 +52,38 @@ expect {
     1|-1
 }
 
+# https://github.com/tursodatabase/turso/issues/8721
+# Only a bare identifier in ORDER BY takes the output alias; once the name sits
+# inside an expression it resolves against the FROM clause first, and falls back
+# to the alias only when no table supplies the name.
+@cross-check-integrity
+test orderby_alias_inside_expression_binds_to_column {
+    CREATE TABLE t(a INT, b INT);
+    CREATE TABLE d(k INT PRIMARY KEY, v INT);
+    INSERT INTO t VALUES (1,30),(2,20),(3,10);
+    SELECT 'expr', b AS a FROM t ORDER BY abs(a);
+    SELECT 'arith', b AS a FROM t ORDER BY a+0;
+    SELECT 'bare', b AS a FROM t ORDER BY a;
+    SELECT 'aliasonly', b AS x FROM t ORDER BY abs(x);
+    INSERT OR REPLACE INTO d SELECT 1, b AS a FROM t ORDER BY abs(a);
+    SELECT 'replace', k||'='||v FROM d;
+}
+expect {
+    expr|30
+    expr|20
+    expr|10
+    arith|30
+    arith|20
+    arith|10
+    bare|10
+    bare|20
+    bare|30
+    aliasonly|10
+    aliasonly|20
+    aliasonly|30
+    replace|1=10
+}
+
 @cross-check-integrity
 test order_by_ambiguous_column {
     CREATE TABLE a(id INT, value INT);
