@@ -1851,6 +1851,7 @@ impl Limbo {
         WHERE type='table' AND sql NOT NULL
         ORDER BY tbl_name = 'sqlite_sequence', rowid
     "#;
+        let mut first_error: Option<LimboError> = None;
         if let Some(mut rows) = conn.query(q_tables)? {
             rows.run_with_row_callback(|row| {
                 let name: &str = row.get::<&str>(0)?;
@@ -1865,15 +1866,25 @@ impl Limbo {
                 }
                 let ddl: &str = row.get::<&str>(1)?;
                 writeln!(out, "{ddl};").map_err(|e| io_error(e, "write"))?;
-                Self::dump_table_from_conn(&conn, out, name, &mut progress)?;
+                if let Err(e) = Self::dump_table_from_conn(&conn, out, name, &mut progress) {
+                    writeln!(out, "/****** ERROR: {e} ******/")
+                        .map_err(|e| io_error(e, "write"))?;
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
                 progress.on(name);
                 Ok(())
             })?;
         }
         Self::dump_sqlite_sequence(&conn, out)?;
         Self::dump_schema_objects(&conn, out, &mut progress)?;
-        Self::exec_all_conn(&conn, "COMMIT")?;
+        let committed = Self::exec_all_conn(&conn, "COMMIT");
         writeln!(out, "COMMIT;")?;
+        if let Some(e) = first_error {
+            return Err(e.into());
+        }
+        committed?;
         Ok(())
     }
 
