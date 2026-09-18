@@ -730,12 +730,17 @@ fn prepare_one_select_plan(
                         "ORDER BY",
                     )?;
 
+                    let binding_behavior = if order_by_term_is_bare_identifier(&o.expr) {
+                        BindingBehavior::TryResultColumnsFirst
+                    } else {
+                        BindingBehavior::TryCanonicalColumnsFirst
+                    };
                     bind_and_rewrite_expr(
                         &mut o.expr,
                         Some(&mut plan.table_references),
                         Some(&plan.result_columns),
                         resolver,
-                        BindingBehavior::TryResultColumnsFirst,
+                        binding_behavior,
                     )?;
                     let had_agg = resolve_window_and_aggregate_functions(
                         &o.expr,
@@ -1177,6 +1182,17 @@ fn add_vtab_predicates_to_where_clause(
         &mut plan.where_clause,
         resolver,
     )
+}
+
+fn order_by_term_is_bare_identifier(order_by_expr: &ast::Expr) -> bool {
+    match order_by_expr {
+        ast::Expr::Id(_) => true,
+        ast::Expr::Collate(inner, _) => order_by_term_is_bare_identifier(inner),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            order_by_term_is_bare_identifier(&exprs[0])
+        }
+        _ => false,
+    }
 }
 
 /// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.

@@ -52,6 +52,35 @@ expect {
     1|-1
 }
 
+# https://github.com/tursodatabase/turso/issues/8721
+@cross-check-integrity
+test orderby_alias_inside_expression_binds_to_column {
+    CREATE TABLE t(a INT, b INT);
+    INSERT INTO t VALUES (1,30),(2,20),(3,10);
+    SELECT 'expr', b AS a FROM t ORDER BY abs(a);
+    SELECT 'bare', b AS a FROM t ORDER BY a;
+    SELECT 'paren', b AS a FROM t ORDER BY (a);
+    SELECT 'collate', b AS a FROM t ORDER BY a COLLATE BINARY;
+    SELECT 'alias', b AS x FROM t ORDER BY abs(x);
+}
+expect {
+    expr|30
+    expr|20
+    expr|10
+    bare|10
+    bare|20
+    bare|30
+    paren|10
+    paren|20
+    paren|30
+    collate|10
+    collate|20
+    collate|30
+    alias|10
+    alias|20
+    alias|30
+}
+
 @cross-check-integrity
 test order_by_ambiguous_column {
     CREATE TABLE a(id INT, value INT);
