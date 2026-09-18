@@ -1,0 +1,27 @@
+@database :memory:
+
+# https://github.com/tursodatabase/turso/issues/8716
+@cross-check-integrity
+test like-literal-pattern-column-escape {
+    CREATE TABLE t(s TEXT, e TEXT);
+    INSERT INTO t VALUES('a','#');
+    SELECT s LIKE 'a' ESCAPE e FROM t;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test like-literal-pattern-subquery-escape {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, s TEXT);
+    CREATE TABLE c(esc TEXT);
+    INSERT INTO u VALUES(1,'a%'),(2,'ax'),(3,'b');
+    INSERT INTO c VALUES('#');
+    DELETE FROM u WHERE s NOT LIKE 'a#%' ESCAPE (SELECT esc FROM c);
+    SELECT count(*) FROM u;
+    SELECT 'a%b' LIKE 'a#%b' ESCAPE (SELECT '#');
+}
+expect {
+    1
+    1
+}
