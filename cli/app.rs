@@ -36,8 +36,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    io_error, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags, QueryMode,
-    SqliteDialect, Statement, Value,
+    format_float_for_quote, io_error, Connection, Database, EqpFormat, LimboError, Numeric,
+    OpenFlags, QueryMode, SqliteDialect, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -2026,7 +2026,9 @@ impl Limbo {
         match v {
             Value::Null => out.write_all(b"NULL"),
             Value::Numeric(Numeric::Integer(i)) => out.write_all(format!("{i}").as_bytes()),
-            Value::Numeric(Numeric::Float(f)) => write!(out, "{}", f64::from(*f)).map(|_| ()),
+            Value::Numeric(Numeric::Float(f)) => {
+                out.write_all(format_float_for_quote(f64::from(*f)).as_bytes())
+            }
             Value::Text(s) => {
                 out.write_all(b"'")?;
                 let bytes = s.value.as_bytes();
@@ -2419,6 +2421,27 @@ fn normalize_db_path(db_file: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turso_core::NonNan;
+
+    fn dumped(value: &Value) -> String {
+        let mut out = Vec::new();
+        Limbo::write_sql_value_from_value(&mut out, value).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn real(value: f64) -> Value {
+        Value::Numeric(Numeric::Float(NonNan::new(value).unwrap()))
+    }
+
+    #[test]
+    fn test_dump_real_keeps_decimal_point() {
+        assert_eq!(dumped(&real(5.0)), "5.0");
+        assert_eq!(dumped(&real(-7.0)), "-7.0");
+        assert_eq!(dumped(&real(0.0)), "0.0");
+        assert_eq!(dumped(&real(2.5)), "2.5");
+        assert_eq!(dumped(&real(1e20)), "1.0e+20");
+        assert_eq!(dumped(&Value::Numeric(Numeric::Integer(5))), "5");
+    }
 
     #[test]
     fn test_normalize_db_path_adds_file_prefix_for_query_params() {
