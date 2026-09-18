@@ -1898,3 +1898,71 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     Ok(())
 }
+
+#[turso_macros::test]
+pub fn insert_or_fail_constraint_failure_does_not_move_autoincrement_sequence(
+    limbo: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = limbo.db.connect()?;
+    for sql in [
+        "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b INTEGER CHECK(b > 0))",
+        "CREATE TABLE u (a INTEGER PRIMARY KEY AUTOINCREMENT, b INTEGER CHECK(b > 0))",
+    ] {
+        conn.execute(sql)?;
+    }
+
+    conn.execute("INSERT OR FAIL INTO t VALUES (7, 0)")
+        .unwrap_err();
+    conn.execute("INSERT OR FAIL INTO t(b) VALUES (0)")
+        .unwrap_err();
+    conn.execute("INSERT INTO t(b) VALUES (1)")?;
+
+    conn.execute("INSERT OR IGNORE INTO u VALUES (7, 0)")?;
+    conn.execute("INSERT INTO u(b) VALUES (1)")?;
+
+    assert_that!(limbo_exec_rows(&conn, "SELECT a FROM t")).is_equal_to(vec![row![1]]);
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT seq FROM sqlite_sequence WHERE name = 't'"
+    ))
+    .is_equal_to(vec![row![1]]);
+
+    assert_that!(limbo_exec_rows(&conn, "SELECT a FROM u")).is_equal_to(vec![row![8]]);
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT seq FROM sqlite_sequence WHERE name = 'u'"
+    ))
+    .is_equal_to(vec![row![8]]);
+
+    Ok(())
+}
+
+#[turso_macros::test]
+pub fn insert_or_fail_multi_row_does_not_burn_rejected_rowids(
+    limbo: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = limbo.db.connect()?;
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b INTEGER CHECK(b > 0))")?;
+
+    conn.execute("INSERT OR FAIL INTO t VALUES (3, 1), (20, 0), (5, 1)")
+        .unwrap_err();
+
+    assert_that!(limbo_exec_rows(&conn, "SELECT a FROM t")).is_equal_to(vec![row![3]]);
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT count(*) FROM sqlite_sequence WHERE name = 't'"
+    ))
+    .is_equal_to(vec![row![0]]);
+
+    conn.execute("DELETE FROM t")?;
+    conn.execute("INSERT INTO t(b) VALUES (1)")?;
+
+    assert_that!(limbo_exec_rows(&conn, "SELECT a FROM t")).is_equal_to(vec![row![1]]);
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT seq FROM sqlite_sequence WHERE name = 't'"
+    ))
+    .is_equal_to(vec![row![1]]);
+
+    Ok(())
+}
