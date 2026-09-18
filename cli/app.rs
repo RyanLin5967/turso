@@ -36,8 +36,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    format_float_for_quote, io_error, Connection, Database, EqpFormat, LimboError, Numeric,
-    OpenFlags, QueryMode, SqliteDialect, Statement, Value,
+    io_error, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags, QueryMode,
+    SqliteDialect, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -2027,7 +2027,16 @@ impl Limbo {
             Value::Null => out.write_all(b"NULL"),
             Value::Numeric(Numeric::Integer(i)) => out.write_all(format!("{i}").as_bytes()),
             Value::Numeric(Numeric::Float(f)) => {
-                out.write_all(format_float_for_quote(f64::from(*f)).as_bytes())
+                let value = f64::from(*f);
+                if value.is_infinite() {
+                    out.write_all(if value.is_sign_negative() {
+                        b"-9.0e+999".as_slice()
+                    } else {
+                        b"9.0e+999".as_slice()
+                    })
+                } else {
+                    out.write_all(format!("{value:?}").as_bytes())
+                }
             }
             Value::Text(s) => {
                 out.write_all(b"'")?;
@@ -2439,8 +2448,28 @@ mod tests {
         assert_eq!(dumped(&real(-7.0)), "-7.0");
         assert_eq!(dumped(&real(0.0)), "0.0");
         assert_eq!(dumped(&real(2.5)), "2.5");
-        assert_eq!(dumped(&real(1e20)), "1.0e+20");
+        assert_eq!(dumped(&real(1e20)), "1e20");
         assert_eq!(dumped(&Value::Numeric(Numeric::Integer(5))), "5");
+    }
+
+    #[test]
+    fn test_dump_real_round_trips() {
+        for value in [
+            7.761117632285041e178,
+            1.0e-300,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            355.0 / 113.0,
+        ] {
+            let text = dumped(&real(value));
+            assert_eq!(text.parse::<f64>().unwrap().to_bits(), value.to_bits(), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_dump_real_infinite() {
+        assert_eq!(dumped(&real(f64::INFINITY)), "9.0e+999");
+        assert_eq!(dumped(&real(f64::NEG_INFINITY)), "-9.0e+999");
     }
 
     #[test]
