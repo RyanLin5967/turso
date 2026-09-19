@@ -306,8 +306,10 @@ fn test_alter_table_rename_column_to_numeric_name_reopen() {
         let view_rows: Vec<(i64,)> = conn.exec_rows("SELECT * FROM v ORDER BY 1");
         assert_eq!(view_rows, vec![(5,), (9,)]);
 
-        let err = conn.execute("INSERT INTO t VALUES(-7)");
-        assert!(err.is_err(), "CHECK must still reject -7 after reopen");
+        let err = conn
+            .execute("INSERT INTO t VALUES(-7)")
+            .expect_err("CHECK must still reject -7 after reopen");
+        assert!(err.to_string().contains("CHECK"), "unexpected error: {err}");
 
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT \"2024\" FROM t ORDER BY 1");
         assert_eq!(rows, vec![(1,), (5,), (9,)]);
@@ -358,6 +360,97 @@ fn test_alter_table_rename_to_digit_leading_name_stays_quoted_on_reopen() {
         conn.execute("INSERT INTO \"1a\" VALUES (7)").unwrap();
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM \"1a\"");
         assert_eq!(rows, vec![(7,)]);
+        conn.close().unwrap();
+    }
+}
+
+#[test]
+fn test_alter_table_add_column_keeps_table_primary_key_names_quoted_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_add_col_table_pk_quoted.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(\"2024\" INTEGER, \"b c\", PRIMARY KEY(\"2024\", \"b c\"))")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN c").unwrap();
+
+        let sql: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+        assert_eq!(
+            sql,
+            vec![(
+                "CREATE TABLE t (\"2024\" INTEGER, \"b c\", c, PRIMARY KEY (\"2024\", \"b c\"))"
+                    .to_string(),
+            )]
+        );
+
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+        conn.execute("INSERT INTO t VALUES (2, 'y', 'z')").unwrap();
+        let rows: Vec<(i64, String)> =
+            conn.exec_rows("SELECT \"2024\", \"b c\" FROM t ORDER BY \"2024\"");
+        assert_eq!(rows, vec![(1, "x".to_string()), (2, "y".to_string())]);
+
+        conn.close().unwrap();
+    }
+}
+
+#[test]
+fn test_alter_table_add_column_keeps_foreign_key_names_quoted_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_add_col_fk_quoted.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE \"1a\"(\"3 c\" INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE ch(\"2b\", FOREIGN KEY (\"2b\") REFERENCES \"1a\" (\"3 c\"))")
+            .unwrap();
+        conn.execute("INSERT INTO \"1a\" VALUES (1)").unwrap();
+        conn.execute("INSERT INTO ch VALUES (1)").unwrap();
+        conn.execute("ALTER TABLE ch ADD COLUMN z").unwrap();
+
+        let sql: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'ch'");
+        assert_eq!(
+            sql,
+            vec![(
+                "CREATE TABLE ch (\"2b\", z, FOREIGN KEY (\"2b\") REFERENCES \"1a\"(\"3 c\"))"
+                    .to_string(),
+            )]
+        );
+
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+        let fk: Vec<(String, String, String)> =
+            conn.exec_rows("SELECT \"table\", \"from\", \"to\" FROM pragma_foreign_key_list('ch')");
+        assert_eq!(
+            fk,
+            vec![("1a".to_string(), "2b".to_string(), "3 c".to_string())]
+        );
+
+        conn.execute("INSERT INTO ch VALUES (1, 'z')").unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT \"2b\" FROM ch ORDER BY 1");
+        assert_eq!(rows, vec![(1,), (1,)]);
+
         conn.close().unwrap();
     }
 }
