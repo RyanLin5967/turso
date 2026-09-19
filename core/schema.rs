@@ -3653,7 +3653,7 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(&col.0);
+                sql.push_str(&quote_ident(&col.0));
             }
             sql.push(')');
         }
@@ -3664,18 +3664,20 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(col);
+                sql.push_str(&quote_ident(col));
             }
             sql.push_str(") REFERENCES ");
-            sql.push_str(&fk.parent_table);
-            sql.push('(');
-            for (i, col) in fk.parent_columns.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
+            sql.push_str(&quote_ident(&fk.parent_table));
+            if !fk.parent_columns.is_empty() {
+                sql.push('(');
+                for (i, col) in fk.parent_columns.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&quote_ident(col));
                 }
-                sql.push_str(col);
+                sql.push(')');
             }
-            sql.push(')');
 
             // Add ON DELETE/UPDATE actions, NoAction is default so just make empty in that case
             if fk.on_delete != RefAct::NoAction {
