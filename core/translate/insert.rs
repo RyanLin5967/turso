@@ -2093,15 +2093,13 @@ fn bind_insert(
             upsert = upsert_opt.take();
         }
     }
-    if let ResolveType::Ignore = on_conflict {
-        program.set_resolve_type(ResolveType::Ignore);
+    program.set_resolve_type(on_conflict);
+    if matches!(on_conflict, ResolveType::Ignore) && upsert.is_none() {
         upsert.replace(Box::new(ast::Upsert {
             do_clause: UpsertDo::Nothing,
             index: None,
             next: None,
         }));
-    } else {
-        program.set_resolve_type(on_conflict);
     }
     while let Some(mut upsert_opt) = upsert.take() {
         if let UpsertDo::Set {
@@ -3149,6 +3147,10 @@ fn emit_unique_index_check(
                     });
                 }
             }
+        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
         }
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)

@@ -4065,6 +4065,51 @@ fn test_statement_or_overrides_ddl_insert_or_ignore_dual_conflict(tmp_db: TempDa
     );
 }
 
+#[turso_macros::test]
+fn test_statement_or_ignore_keeps_upsert_do_update_arm(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    run_fk_constraint_case(
+        "INSERT OR IGNORE keeps ON CONFLICT DO UPDATE arm",
+        &[
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER)",
+            "CREATE TABLE log(n INTEGER)",
+            "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO log VALUES(new.b); END",
+        ],
+        &["INSERT INTO t VALUES(1, 1)"],
+        "INSERT OR IGNORE INTO t VALUES(1, 10) ON CONFLICT(a) DO UPDATE SET b = excluded.b",
+        "SELECT a, b, changes(), (SELECT count(*) FROM log) FROM t ORDER BY a",
+    );
+}
+
+#[turso_macros::test]
+fn test_statement_or_ignore_upsert_untargeted_conflict_still_skips(tmp_db: TempDatabase) {
+    drop(tmp_db);
+    run_fk_constraint_case(
+        "INSERT OR IGNORE with DO UPDATE arm targeting another constraint",
+        &["CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER UNIQUE)"],
+        &["INSERT INTO t VALUES(1, 1)", "INSERT INTO t VALUES(2, 2)"],
+        "INSERT OR IGNORE INTO t VALUES(3, 2) ON CONFLICT(a) DO UPDATE SET b = excluded.b",
+        "SELECT a, b, changes() FROM t ORDER BY a",
+    );
+}
+
+#[turso_macros::test]
+fn test_statement_or_ignore_upsert_returning_emits_updated_row(tmp_db: TempDatabase) {
+    let limbo_conn = tmp_db.connect_limbo();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER)",
+        "INSERT INTO t VALUES(1, 1)",
+    ] {
+        limbo_conn.execute(sql).unwrap();
+        sqlite_conn.execute_batch(sql).unwrap();
+    }
+    let sql = "INSERT OR IGNORE INTO t VALUES(1, 10) ON CONFLICT(a) DO UPDATE SET b = excluded.b RETURNING a, b";
+    let sqlite_rows = sqlite_exec_rows(&sqlite_conn, sql);
+    assert_eq!(sqlite_rows.len(), 1, "oracle produced no RETURNING row");
+    assert_eq!(limbo_exec_rows(&limbo_conn, sql), sqlite_rows);
+}
+
 // ---------------------------------------------------------------------------
 // Gap 3: BEFORE trigger modifying SET values causing constraint violation
 // ---------------------------------------------------------------------------
