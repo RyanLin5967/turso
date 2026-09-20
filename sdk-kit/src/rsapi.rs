@@ -1855,6 +1855,27 @@ mod tests {
         }
     }
 
+    /// A rowid datatype mismatch must stay classified. There is no
+    /// TURSO_MISMATCH in this ABI, so it maps to TURSO_CONSTRAINT — the code
+    /// it carried before it became its own `LimboError` variant. Without an
+    /// arm for it the generic fallthrough declassifies it to TURSO_ERROR,
+    /// which is what the Python and Rust bindings surface to callers.
+    #[test]
+    fn type_mismatch_is_not_declassified_to_a_generic_error() {
+        for error in [
+            TursoError::from(LimboError::TypeMismatch),
+            TursoError::from(Box::new(LimboError::TypeMismatch)),
+        ] {
+            assert!(matches!(error, TursoError::Constraint(_)), "{error:?}");
+            assert!(matches!(
+                error.to_capi_code(),
+                c::turso_status_code_t::TURSO_CONSTRAINT
+            ));
+            assert_eq!(error.to_string(), "datatype mismatch");
+        }
+    }
+
+
     fn config_with_features(features: Option<&str>) -> TursoDatabaseConfig {
         TursoDatabaseConfig {
             path: ":memory:".to_string(),

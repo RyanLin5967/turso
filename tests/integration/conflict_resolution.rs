@@ -4761,3 +4761,323 @@ fn test_update_replace_deferred_fk_multiple_children(tmp_db: TempDatabase) {
         "SELECT * FROM parent ORDER BY id",
     );
 }
+/// A rowid or LIMIT datatype mismatch is SQLITE_MISMATCH, not a constraint
+/// violation, so it must leave an open explicit transaction alone. The
+/// statement here is a read-only `SELECT` whose LIMIT is not an integer: it
+/// writes nothing, so it can only ever end the transaction by mistake.
+///
+/// Measured on /usr/bin/sqlite3 3.51.0: the SELECT fails with
+/// "datatype mismatch (20)", the row an earlier statement wrote is still
+/// visible inside the transaction, a later INSERT joins the same transaction,
+/// and COMMIT succeeds with both rows.
+///
+/// Without the `LimboError::TypeMismatch` arm in `Program::abort` the error
+/// reaches the catch-all, whose `TxnCleanup::None` branch rolls back any open
+/// explicit transaction on any error. That discarded the earlier row, made
+/// COMMIT fail with "no transaction is active", and left the later INSERT to
+/// commit durably outside the user's transaction.
+#[turso_macros::test]
+fn test_type_mismatch_keeps_explicit_transaction_open(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+    let label = "type_mismatch_keeps_txn_open";
+    let ddl = "CREATE TABLE t(x)";
+
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    limbo_conn.execute(ddl).unwrap();
+
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite_conn.execute_batch(ddl).unwrap();
+
+    for stmt in ["BEGIN", "INSERT INTO t VALUES (1)"] {
+        limbo_try_exec(&limbo_conn, stmt)
+            .unwrap_or_else(|e| panic!("[{label}] limbo failed on {stmt}: {e}"));
+        sqlite_try_exec(&sqlite_conn, stmt)
+            .unwrap_or_else(|e| panic!("[{label}] sqlite failed on {stmt}: {e}"));
+    }
+
+    let bad_limit = "SELECT 1 LIMIT 'a'";
+    let limbo_err = limbo_try_exec(&limbo_conn, bad_limit)
+        .expect_err("[{label}] a non-integer LIMIT must fail");
+    assert!(
+        limbo_err.contains("datatype mismatch"),
+        "[{label}] expected a datatype mismatch, got: {limbo_err}"
+    );
+    sqlite_try_exec(&sqlite_conn, bad_limit).expect_err("sqlite must reject a non-integer LIMIT");
+
+    // The failed statement wrote nothing and must not have taken the
+    // transaction with it: sqlite3 3.51.0 still sees the row from the INSERT.
+    let inside = limbo_exec_rows(&limbo_conn, "SELECT x FROM t ORDER BY x");
+    assert_eq!(
+        inside,
+        vec![vec![rusqlite::types::Value::Integer(1)]],
+        "[{label}] the open transaction lost the row an earlier statement wrote"
+    );
+    assert_eq!(
+        inside,
+        sqlite_exec_rows(&sqlite_conn, "SELECT x FROM t ORDER BY x"),
+        "[{label}] diverged from sqlite inside the transaction"
+    );
+
+    // The transaction is still the user's to finish, and the next statement
+    // joins it rather than committing on its own.
+    limbo_try_exec(&limbo_conn, "INSERT INTO t VALUES (2)")
+        .unwrap_or_else(|e| panic!("[{label}] limbo could not continue the transaction: {e}"));
+    limbo_try_exec(&limbo_conn, "COMMIT")
+        .unwrap_or_else(|e| panic!("[{label}] limbo could not commit the transaction: {e}"));
+    sqlite_try_exec(&sqlite_conn, "INSERT INTO t VALUES (2)").unwrap();
+    sqlite_try_exec(&sqlite_conn, "COMMIT").unwrap();
+
+    let expected = vec![
+        vec![rusqlite::types::Value::Integer(1)],
+        vec![rusqlite::types::Value::Integer(2)],
+    ];
+    let final_rows = limbo_exec_rows(&limbo_conn, "SELECT x FROM t ORDER BY x");
+    assert_eq!(
+        final_rows, expected,
+        "[{label}] committed transaction lost rows"
+    );
+    assert_eq!(
+        final_rows,
+        sqlite_exec_rows(&sqlite_conn, "SELECT x FROM t ORDER BY x"),
+        "[{label}] diverged from sqlite after COMMIT"
+    );
+
+    let db_path = limbo_db.path.clone();
+    drop(limbo_conn);
+    drop(limbo_db);
+    let ic = sqlite_integrity_check(&db_path);
+    assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    Ok(())
+}
+
+/// How much of a half-written statement survives a rowid datatype mismatch
+/// inside an explicit transaction depends on the statement's conflict clause,
+/// and the transaction itself survives all of them.
+///
+/// SQLite only opens a statement journal when the statement may ABORT
+/// (`sqlite3HaltConstraint` calls `sqlite3MayAbort` for `OE_Abort` alone), so
+/// only ABORT — which is also the default — undoes the rows written before
+/// the mismatch. Every expected row count below was measured on
+/// /usr/bin/sqlite3 3.51.0 with this exact script.
+#[turso_macros::test]
+fn test_type_mismatch_in_transaction_across_conflict_clauses(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    // (conflict clause, rows kept from the failing statement)
+    let cases: [(&str, i64); 6] = [
+        ("", 0),
+        ("OR ABORT", 0),
+        ("OR FAIL", 2),
+        ("OR ROLLBACK", 2),
+        ("OR IGNORE", 2),
+        ("OR REPLACE", 2),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for (clause, kept) in cases {
+        let label = format!(
+            "type_mismatch_in_txn__{}",
+            if clause.is_empty() {
+                "plain"
+            } else {
+                &clause[3..]
+            }
+        );
+        let ddl = ["CREATE TABLE v(x INTEGER PRIMARY KEY, y)", "CREATE INDEX iy ON v(y)"];
+
+        let limbo_db = TempDatabase::builder()
+            .with_db_name(format!("{label}.db"))
+            .build();
+        let limbo_conn = limbo_db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        for stmt in ddl {
+            limbo_conn.execute(stmt).unwrap();
+            sqlite_conn.execute_batch(stmt).unwrap();
+        }
+
+        for stmt in ["BEGIN", "INSERT INTO v VALUES (100, 's')"] {
+            limbo_try_exec(&limbo_conn, stmt).unwrap();
+            sqlite_try_exec(&sqlite_conn, stmt).unwrap();
+        }
+
+        let conflict_sql = format!(
+            "INSERT {clause} INTO v VALUES (1, 'p'), (2, 'q'), ('a', 'r'), (3, 't')"
+        );
+        if let Err(e) = exec_and_compare(&label, &sqlite_conn, &limbo_conn, &conflict_sql) {
+            failures.push(e);
+        }
+
+        // 1 for the row an earlier statement wrote, plus whatever the failing
+        // statement kept. The table scan and the index must agree.
+        let expected_inside = vec![vec![rusqlite::types::Value::Integer(1 + kept)]];
+        for probe in [
+            "SELECT count(*) FROM v",
+            "SELECT count(*) FROM v WHERE y IN ('s', 'p', 'q', 't')",
+        ] {
+            let got = limbo_exec_rows(&limbo_conn, probe);
+            if got != expected_inside {
+                failures.push(format!(
+                    "[{label}] inside the transaction `{probe}` gave {got:?}, sqlite3 3.51.0 gives {expected_inside:?}"
+                ));
+            }
+            let sqlite_got = sqlite_exec_rows(&sqlite_conn, probe);
+            if got != sqlite_got {
+                failures.push(format!(
+                    "[{label}] `{probe}` diverged from sqlite: limbo={got:?} sqlite={sqlite_got:?}"
+                ));
+            }
+        }
+
+        // The transaction is still open and still the user's to commit.
+        if let Err(e) = limbo_try_exec(&limbo_conn, "COMMIT") {
+            failures.push(format!("[{label}] COMMIT failed: {e}"));
+        }
+        sqlite_try_exec(&sqlite_conn, "COMMIT").unwrap();
+
+        if let Some(e) = compare_tables(
+            &label,
+            &sqlite_conn,
+            &limbo_conn,
+            "SELECT x, y FROM v ORDER BY x",
+        ) {
+            failures.push(e);
+        }
+
+        let db_path = limbo_db.path.clone();
+        drop(limbo_conn);
+        drop(limbo_db);
+        let ic = sqlite_integrity_check(&db_path);
+        if ic != "ok" {
+            failures.push(format!("[{label}] integrity_check: {ic}"));
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "{} failure(s) in the in-transaction datatype-mismatch matrix:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+    Ok(())
+}
+
+/// When a datatype mismatch keeps the rows written before it, the index
+/// method writes staged for those rows have to be kept too. Aborting them
+/// while the rows stay leaves a custom index that cannot find rows the table
+/// still holds, which no amount of conflict-clause bookkeeping would show up
+/// in a plain table scan.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_type_mismatch_keeps_index_method_writes_for_kept_rows(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let label = "type_mismatch_keeps_index_method_writes";
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fx ON d USING fts(body)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    limbo_try_exec(
+        &conn,
+        "INSERT OR FAIL INTO d VALUES (1, 'alpha'), (2, 'beta'), ('x', 'gamma')",
+    )
+    .expect_err("a rowid datatype mismatch must fail");
+    conn.execute("COMMIT").unwrap();
+
+    let kept = vec![
+        vec![rusqlite::types::Value::Integer(1)],
+        vec![rusqlite::types::Value::Integer(2)],
+    ];
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM d ORDER BY id"),
+        kept,
+        "[{label}] OR FAIL inside a transaction keeps the rows before the mismatch"
+    );
+    for (term, id) in [("alpha", 1i64), ("beta", 2)] {
+        let sql = format!("SELECT id FROM d WHERE fts_match(body, '{term}')");
+        assert_eq!(
+            limbo_exec_rows(&conn, &sql),
+            vec![vec![rusqlite::types::Value::Integer(id)]],
+            "[{label}] the index method lost a row the table kept: {sql}"
+        );
+    }
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM d WHERE fts_match(body, 'gamma')"),
+        Vec::<Vec<rusqlite::types::Value>>::new(),
+        "[{label}] the index method kept a row the statement never wrote"
+    );
+
+    // The autocommit half is the other direction: nothing is kept there, so
+    // the staged index-method writes must be discarded with the rows. A
+    // lookup that still finds them is an index holding rows the table does
+    // not have.
+    conn.execute("CREATE TABLE e(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX ex ON e USING fts(body)").unwrap();
+    limbo_try_exec(
+        &conn,
+        "INSERT OR FAIL INTO e VALUES (1, 'delta'), (2, 'epsilon'), ('x', 'zeta')",
+    )
+    .expect_err("a rowid datatype mismatch must fail");
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM e ORDER BY id"),
+        Vec::<Vec<rusqlite::types::Value>>::new(),
+        "[{label}] the autocommit statement must leave no rows behind"
+    );
+    for term in ["delta", "epsilon", "zeta"] {
+        let sql = format!("SELECT id FROM e WHERE fts_match(body, '{term}')");
+        assert_eq!(
+            limbo_exec_rows(&conn, &sql),
+            Vec::<Vec<rusqlite::types::Value>>::new(),
+            "[{label}] the index method kept a row the table discarded: {sql}"
+        );
+    }
+    Ok(())
+}
+
+/// `changes()` reads 0 after a statement that failed on a datatype mismatch,
+/// in autocommit and inside a transaction alike. Measured on
+/// /usr/bin/sqlite3 3.51.0.
+#[turso_macros::test]
+fn test_changes_is_zero_after_type_mismatch(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+    let label = "changes_after_type_mismatch";
+    let limbo_db = TempDatabase::builder()
+        .with_db_name(format!("{label}.db"))
+        .build();
+    let limbo_conn = limbo_db.connect_limbo();
+    limbo_conn
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    limbo_conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert_eq!(
+        limbo_exec_rows(&limbo_conn, "SELECT changes()"),
+        vec![vec![rusqlite::types::Value::Integer(1)]],
+        "[{label}] a successful INSERT should report one change"
+    );
+
+    limbo_try_exec(&limbo_conn, "INSERT OR FAIL INTO t VALUES (2), ('a')")
+        .expect_err("a rowid datatype mismatch must fail");
+    assert_eq!(
+        limbo_exec_rows(&limbo_conn, "SELECT changes()"),
+        vec![vec![rusqlite::types::Value::Integer(0)]],
+        "[{label}] changes() must be 0 after a datatype mismatch"
+    );
+    assert_eq!(
+        limbo_exec_rows(&limbo_conn, "SELECT count(*) FROM t"),
+        vec![vec![rusqlite::types::Value::Integer(1)]],
+        "[{label}] the autocommit statement must leave no rows behind"
+    );
+    Ok(())
+}
+
