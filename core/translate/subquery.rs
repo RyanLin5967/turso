@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::alloc::{TryClone, TursoSliceExt};
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
@@ -1371,9 +1371,183 @@ fn eqp_subquery_info(
     })
 }
 
+fn tables_read_by_expr(expr: &ast::Expr) -> Option<HashSet<TableInternalId>> {
+    let mut tables = HashSet::default();
+    let mut opaque = false;
+    let _ = walk_expr(expr, &mut |e| {
+        match e {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                tables.insert(*table);
+            }
+            ast::Expr::SubqueryResult { .. } => opaque = true,
+            _ => {}
+        }
+        Ok::<WalkControl, crate::LimboError>(WalkControl::Continue)
+    });
+    (!opaque).then_some(tables)
+}
+
+/// The columns of `source` that an unconsumed top-level `=` term compares to a
+/// value read from outside `source`. Empty when there is no such term, which is
+/// also what a probe on an expression rather than on a bare column yields:
+/// sqlite has no index to build over one of those either.
+fn equality_probed_source_columns(
+    where_clause: &[WhereTerm],
+    source: TableInternalId,
+) -> HashSet<usize> {
+    let mut probed = HashSet::default();
+    for term in where_clause {
+        if term.consumed {
+            continue;
+        }
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = &term.expr else {
+            continue;
+        };
+        let (Some(lhs_tables), Some(rhs_tables)) =
+            (tables_read_by_expr(lhs), tables_read_by_expr(rhs))
+        else {
+            continue;
+        };
+        let source_column = |probe: &ast::Expr, value_tables: &HashSet<TableInternalId>| {
+            let ast::Expr::Column { table, column, .. } = unwrap_parens(probe).ok()? else {
+                return None;
+            };
+            (*table == source && !value_tables.is_empty() && !value_tables.contains(&source))
+                .then_some(*column)
+        };
+        if let Some(column) =
+            source_column(lhs, &rhs_tables).or_else(|| source_column(rhs, &lhs_tables))
+        {
+            probed.insert(column);
+        }
+    }
+    probed
+}
+
+/// Whether the result column at `index` of this plan is produced by a window
+/// function. Sqlite builds no automatic index over such a column, so a probe on
+/// one leaves the source on the per-probe path.
+fn result_column_is_window_output(plan: &Plan, index: usize) -> bool {
+    let Plan::Select(select) = plan else {
+        return true;
+    };
+    let Some(result_column) = select.result_columns.get(index) else {
+        return true;
+    };
+    let mut found = false;
+    let _ = walk_expr(
+        &result_column.expr,
+        &mut |e: &ast::Expr| -> Result<WalkControl> {
+            if let ast::Expr::FunctionCall { filter_over, .. }
+            | ast::Expr::FunctionCallStar { filter_over, .. } = e
+            {
+                if filter_over.over_clause.is_some() {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+    found
+}
+
+/// Whether this FROM source is one SQLite is measured to keep for the whole
+/// statement instead of rebuilding it for every probe.
+///
+/// The boundary SQLite actually draws is visible in its own query plan: it
+/// keeps a re-entered FROM source exactly when the plan for the statement says
+/// `SEARCH (subquery-N) USING AUTOMATIC COVERING INDEX`, because that index is
+/// built once under `OP_Once` and the co-routine behind it is then never
+/// re-run. A source with no automatic index over it is re-initialized per
+/// probe and keeps reading rows the same statement has already written. That
+/// decision is cost-based, driven by SQLite's row estimates, so it cannot be
+/// reproduced exactly here.
+///
+/// This predicate is therefore an allowlist, not a model. It fires only for
+/// the one family measured to carry the automatic index: a window source that
+/// neither groups nor aggregates, carries no LIMIT, and is probed by equality
+/// on a column the window did not produce. Measured against sqlite 3.51.0 on
+/// statements that write the table the source reads, that family is kept, and
+/// kept alike at 4, 2000 and 3000 rows, while each of these is rebuilt per
+/// probe and so stays off the list:
+///
+/// - a source the enclosing query folds into itself, filter or no filter.
+/// - the same window source probed by a range rather than by equality.
+/// - the same window source probed on the window function's own output column.
+/// - a window source carrying a LIMIT at or below its estimated row count.
+///
+/// Everything outside the family keeps the per-probe behaviour it already had,
+/// which for some shapes is a divergence this leaves in place rather than one
+/// it introduces: sqlite does keep a DISTINCT source, an ORDER BY source, a
+/// compound source, a window nested one layer down, and a window source with a
+/// LIMIT above its row estimate. The clauses here are not laws about those
+/// features. SQLite's choice moves with the probe and the row estimates, and
+/// the same feature lands on either side depending on them, which is why this
+/// is drawn narrow rather than made to track the boundary.
+fn kept_for_whole_statement_by_sqlite(plan: &Plan, probed_columns: &HashSet<usize>) -> bool {
+    let Plan::Select(select) = plan else {
+        return false;
+    };
+    select.window.is_some()
+        && !select_is_off_the_allowlist(select)
+        && !probed_columns.is_empty()
+        && !probed_columns
+            .iter()
+            .any(|column| result_column_is_window_output(plan, *column))
+}
+
+/// Whether this SELECT carries anything that puts it outside the measured
+/// allowlist, anywhere that still belongs to the same source. Planning a
+/// window rewrites the SELECT into nested layers and pushes FROM, WHERE,
+/// GROUP BY and HAVING down into the innermost one, so reading the outermost
+/// layer alone reports a grouped source as ungrouped.
+fn select_is_off_the_allowlist(select: &SelectPlan) -> bool {
+    if select.group_by.is_some()
+        || !select.aggregates.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+    {
+        return true;
+    }
+    select
+        .table_references
+        .joined_tables()
+        .iter()
+        .any(|joined| match &joined.table {
+            Table::FromClauseSubquery(nested) => plan_is_off_the_allowlist(&nested.plan),
+            _ => false,
+        })
+}
+
+fn plan_is_off_the_allowlist(plan: &Plan) -> bool {
+    match plan {
+        Plan::Select(select) => select_is_off_the_allowlist(select),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            left.iter()
+                .any(|(select, _)| select_is_off_the_allowlist(select))
+                || select_is_off_the_allowlist(right_most)
+        }
+        // Anything else reaching here is not a plain source read, so keep it on
+        // the per-probe path rather than freezing rows it may not own.
+        _ => true,
+    }
+}
+
+/// `at_kept_probe_site` says the source sits where SQLite is measured to build
+/// its automatic covering index once for the statement: inside a re-entry that
+/// runs per outer row, probed by equality against a value from outside the
+/// source, in a write statement that applies its writes as one forward pass.
+/// A statement that defers its writes instead (RETURNING, triggers, FK
+/// cascades, a prematerialized write set) carries no such index in SQLite and
+/// re-reads the source per probe.
 fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
+    at_kept_probe_site: bool,
+    probed_columns: &HashSet<usize>,
 ) -> FromClauseSubqueryExecutionMode {
     let needs_materialized_seek = matches!(
         operation,
@@ -1403,6 +1577,12 @@ fn choose_from_clause_subquery_execution_mode(
         _ if from_clause_subquery.requires_table_materialization() => {
             FromClauseSubqueryExecutionMode::MaterializedTable
         }
+        _ if at_kept_probe_site
+            && kept_for_whole_statement_by_sqlite(&from_clause_subquery.plan, probed_columns)
+            && !plan_is_correlated(&from_clause_subquery.plan) =>
+        {
+            FromClauseSubqueryExecutionMode::MaterializedTable
+        }
         _ => FromClauseSubqueryExecutionMode::Coroutine,
     }
 }
@@ -1414,6 +1594,7 @@ pub fn emit_from_clause_subqueries(
     t_ctx: &mut TranslateCtx,
     tables: &mut TableReferences,
     join_order: &[JoinOrderMember],
+    where_clause: &[WhereTerm],
 ) -> Result<()> {
     if tables.joined_tables().is_empty() {
         emit_explain!(program, false, EqpDetail::ConstantRow);
@@ -1451,9 +1632,13 @@ pub fn emit_from_clause_subqueries(
         let table_reference = &mut tables.joined_tables_mut()[table_index];
         let execution_mode = match &table_reference.table {
             Table::FromClauseSubquery(from_clause_subquery) => {
+                let probed_columns =
+                    equality_probed_source_columns(where_clause, table_reference.internal_id);
                 Some(choose_from_clause_subquery_execution_mode(
                     &table_reference.op,
                     from_clause_subquery.as_ref(),
+                    program.in_reentrant_scope() && !program.write_statement_is_multi_pass(),
+                    &probed_columns,
                 ))
             }
             _ => None,
@@ -1727,54 +1912,59 @@ fn emit_indexed_materialized_subquery(
         is_table: false,
     });
 
-    match plan {
-        Plan::Select(select_plan) => {
-            let mut metadata = Box::new(TranslateCtx {
-                labels_main_loop: (0..select_plan.joined_tables().len())
-                    .map(|_| LoopLabels::new(program))
-                    .collect(),
-                label_main_loop_end: None,
-                meta_group_by: None,
-                meta_left_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_sort: None,
-                reg_agg_start: None,
-                reg_nonagg_emit_once_flag: None,
-                reg_result_cols_start: None,
-                limit_ctx: None,
-                reg_offset: None,
-                reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
-                non_aggregate_expressions: Vec::new(),
-                agg_leaf_columns: Vec::new(),
-                cdc_cursor_id: None,
-                meta_window: None,
-                meta_in_seeks: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                materialized_build_inputs: HashMap::default(),
-                hash_table_contexts: HashMap::default(),
-                unsafe_testing: t_ctx.unsafe_testing,
-            });
-            metadata.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
-            emit_query(program, select_plan, &mut metadata)?;
+    program.with_suspended_reentrant_scope(build_end.is_some(), |program| -> Result<()> {
+        match plan {
+            Plan::Select(select_plan) => {
+                let mut metadata = Box::new(TranslateCtx {
+                    labels_main_loop: (0..select_plan.joined_tables().len())
+                        .map(|_| LoopLabels::new(program))
+                        .collect(),
+                    label_main_loop_end: None,
+                    meta_group_by: None,
+                    meta_left_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_sort: None,
+                    reg_agg_start: None,
+                    reg_nonagg_emit_once_flag: None,
+                    reg_result_cols_start: None,
+                    limit_ctx: None,
+                    reg_offset: None,
+                    reg_limit_offset_sum: None,
+                    resolver: t_ctx.resolver.fork(),
+                    non_aggregate_expressions: Vec::new(),
+                    agg_leaf_columns: Vec::new(),
+                    cdc_cursor_id: None,
+                    meta_window: None,
+                    meta_in_seeks: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    materialized_build_inputs: HashMap::default(),
+                    hash_table_contexts: HashMap::default(),
+                    unsafe_testing: t_ctx.unsafe_testing,
+                });
+                metadata.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
+                emit_query(program, select_plan, &mut metadata)?;
+            }
+            Plan::CompoundSelect { .. } => {
+                let resolver = t_ctx.resolver.fork();
+                emit_program_for_compound_select(program, &resolver, plan)?;
+            }
+            Plan::RecursiveCte(_) => {
+                unreachable!(
+                    "recursive CTEs require table-backed materialization for indexed access"
+                )
+            }
+            Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+            }
         }
-        Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan)?;
-        }
-        Plan::RecursiveCte(_) => {
-            unreachable!("recursive CTEs require table-backed materialization for indexed access")
-        }
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
-        }
-    }
+        Ok(())
+    })?;
 
     if let Some(build_end) = build_end {
         program.preassign_label_to_next_insn(build_end);
@@ -1840,54 +2030,57 @@ fn emit_materialized_subquery_table(
     }
 
     // Emit the subquery - it will insert rows into the ephemeral table
-    match plan {
-        Plan::Select(select_plan) => {
-            let mut metadata = Box::new(TranslateCtx {
-                labels_main_loop: (0..select_plan.joined_tables().len())
-                    .map(|_| LoopLabels::new(program))
-                    .collect(),
-                label_main_loop_end: None,
-                meta_group_by: None,
-                meta_left_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_sort: None,
-                reg_agg_start: None,
-                reg_nonagg_emit_once_flag: None,
-                reg_result_cols_start: None,
-                limit_ctx: None,
-                reg_offset: None,
-                reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
-                non_aggregate_expressions: Vec::new(),
-                agg_leaf_columns: Vec::new(),
-                cdc_cursor_id: None,
-                meta_window: None,
-                meta_in_seeks: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                materialized_build_inputs: HashMap::default(),
-                hash_table_contexts: HashMap::default(),
-                unsafe_testing: t_ctx.unsafe_testing,
-            });
-            metadata.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
-            emit_query(program, select_plan, &mut metadata)?;
+    program.with_suspended_reentrant_scope(build_end.is_some(), |program| -> Result<()> {
+        match plan {
+            Plan::Select(select_plan) => {
+                let mut metadata = Box::new(TranslateCtx {
+                    labels_main_loop: (0..select_plan.joined_tables().len())
+                        .map(|_| LoopLabels::new(program))
+                        .collect(),
+                    label_main_loop_end: None,
+                    meta_group_by: None,
+                    meta_left_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_sort: None,
+                    reg_agg_start: None,
+                    reg_nonagg_emit_once_flag: None,
+                    reg_result_cols_start: None,
+                    limit_ctx: None,
+                    reg_offset: None,
+                    reg_limit_offset_sum: None,
+                    resolver: t_ctx.resolver.fork(),
+                    non_aggregate_expressions: Vec::new(),
+                    agg_leaf_columns: Vec::new(),
+                    cdc_cursor_id: None,
+                    meta_window: None,
+                    meta_in_seeks: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    materialized_build_inputs: HashMap::default(),
+                    hash_table_contexts: HashMap::default(),
+                    unsafe_testing: t_ctx.unsafe_testing,
+                });
+                metadata.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
+                emit_query(program, select_plan, &mut metadata)?;
+            }
+            Plan::CompoundSelect { .. } => {
+                let resolver = t_ctx.resolver.fork();
+                emit_program_for_compound_select(program, &resolver, plan)?;
+            }
+            Plan::RecursiveCte(recursive_cte) => {
+                super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?;
+            }
+            Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+            }
         }
-        Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan)?;
-        }
-        Plan::RecursiveCte(recursive_cte) => {
-            super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?;
-        }
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
-        }
-    }
+        Ok(())
+    })?;
 
     if let Some(build_end) = build_end {
         program.preassign_label_to_next_insn(build_end);
@@ -1981,7 +2174,7 @@ pub fn emit_non_from_clause_subquery(
             }
         };
 
-        match query_type {
+        program.with_reentrant_scope(is_correlated, |program| match query_type {
             SubqueryType::Exists { result_reg, .. } => {
                 let subroutine_reg = program.alloc_register();
                 program.emit_insn(Insn::BeginSubrtn {
@@ -1997,13 +2190,14 @@ pub fn emit_non_from_clause_subquery(
                     return_reg: subroutine_reg,
                     can_fallthrough: true,
                 });
+                Ok(())
             }
             SubqueryType::In { cursor_id, .. } => {
                 program.emit_insn(Insn::OpenEphemeral {
                     cursor_id: *cursor_id,
                     is_table: false,
                 });
-                emit_plan(program)?;
+                emit_plan(program)
             }
             SubqueryType::RowValue {
                 result_reg_start,
@@ -2025,8 +2219,9 @@ pub fn emit_non_from_clause_subquery(
                     return_reg: subroutine_reg,
                     can_fallthrough: true,
                 });
+                Ok(())
             }
-        }
+        })?;
         // Pop the parent explain for LIST/SCALAR SUBQUERY annotations.
         if !matches!(query_type, SubqueryType::Exists { .. }) {
             program.pop_current_parent_explain();
