@@ -27,7 +27,7 @@ use crate::{
         expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
-            plan_has_outer_scope_dependency, plan_is_correlated,
+            plan_blocks_flattening, plan_has_outer_scope_dependency, plan_is_correlated,
             select_plan_has_outer_scope_dependency, ColumnUsedMask, EvalAt, JoinOrderMember,
             JoinedTable, NonFromClauseSubquery, OuterQueryReference, Plan, SubqueryEvalPhase,
             SubqueryOrigin, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
@@ -1443,7 +1443,16 @@ fn choose_from_clause_subquery_execution_mode(
         _ if from_clause_subquery.requires_table_materialization() => {
             FromClauseSubqueryExecutionMode::MaterializedTable
         }
-        _ if probed_once_per_outer_row && !plan_is_correlated(&from_clause_subquery.plan) => {
+        // A derived table that the statement probes by equality once per outer row, and
+        // that cannot be folded into the query reading it, is built once for the whole
+        // statement. Every read then sees the same rows, which is what SQLite produces
+        // for these shapes. Restricting this to unflattenable plans matters: a plan that
+        // does fold in is read row by row in SQLite, so materializing it would hand back
+        // a stale snapshot of a table the statement is still writing.
+        _ if probed_once_per_outer_row
+            && plan_blocks_flattening(&from_clause_subquery.plan)
+            && !plan_is_correlated(&from_clause_subquery.plan) =>
+        {
             FromClauseSubqueryExecutionMode::MaterializedTable
         }
         _ => FromClauseSubqueryExecutionMode::Coroutine,

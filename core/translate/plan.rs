@@ -3795,6 +3795,38 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
     }
 }
 
+/// Returns true when a FROM-clause subquery cannot be folded into the query that
+/// reads it, so its rows have to be produced by a separate pipeline.
+///
+/// This mirrors the shapes SQLite refuses to flatten and then builds once into an
+/// automatic index. The set was measured against sqlite 3.51.0 with a derived table
+/// over the same table an UPDATE is writing: a window, GROUP BY, DISTINCT or compound
+/// derived table is built once and every row of the UPDATE reads that one build, while
+/// a plain or ORDER BY derived table is folded in and reads the half-written table.
+///
+/// LIMIT and OFFSET deliberately do NOT count as blocking. SQLite's choice for those
+/// follows its row estimate rather than the clause: with the same derived table,
+/// LIMIT 1 and LIMIT 2 keep reading the half-written table while LIMIT 100 does not.
+/// Treating them as blocked would change answers SQLite still computes row by row.
+pub fn plan_blocks_flattening(plan: &Plan) -> bool {
+    match plan {
+        Plan::Select(select_plan) => select_plan_blocks_flattening(select_plan),
+        Plan::CompoundSelect { limit, offset, .. } => limit.is_none() && offset.is_none(),
+        // Recursive CTEs already force a table-backed materialization of their own,
+        // and DELETE/UPDATE plans cannot appear as a FROM-clause subquery.
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
+fn select_plan_blocks_flattening(plan: &SelectPlan) -> bool {
+    if plan.limit.is_some() || plan.offset.is_some() {
+        return false;
+    }
+    plan.window.is_some()
+        || plan.group_by.is_some()
+        || matches!(plan.distinctness, Distinctness::Distinct { .. })
+}
+
 fn select_plan_has_outer_scope_dependency_with_tables(
     plan: &SelectPlan,
     accessible_table_ids: &mut Vec<TableInternalId>,
