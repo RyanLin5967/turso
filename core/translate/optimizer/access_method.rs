@@ -21,6 +21,7 @@ use crate::translate::plan::{
     plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, NonFromClauseSubquery,
     Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
+use crate::translate::Resolver;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -768,6 +769,7 @@ pub fn find_best_access_method_for_join_order(
             input_cardinality,
             base_row_count,
             params,
+            planning_context.resolver,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
@@ -824,6 +826,7 @@ fn find_best_access_method_for_btree(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    resolver: Option<&Resolver>,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
     let best = choose_best_btree_candidate(
@@ -1036,6 +1039,7 @@ fn find_best_access_method_for_btree(
             best_cost_with_filters,
             lhs_mask,
             analyze_stats,
+            resolver,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
@@ -1060,6 +1064,7 @@ fn find_best_access_method_for_btree(
             best_cost_with_filters,
             lhs_mask,
             analyze_stats,
+            resolver,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,

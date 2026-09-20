@@ -690,6 +690,7 @@ pub fn constraints_from_where_clause(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: Option<&Resolver>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -756,7 +757,7 @@ pub fn constraints_from_where_clause(
                 let cmp_aff = operator
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
-                    .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
+                    .map(|_| comparison_affinity(lhs, rhs, Some(table_references), resolver));
                 // A WHERE term must not constrain the loop of a table that an
                 // outer join can null-extend, with two exceptions below.
                 // Consuming the term into the access path filters that table's
@@ -1018,7 +1019,7 @@ pub fn constraints_from_where_clause(
                 let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
                 // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
                 // is the LHS column's affinity; the RHS literals are not folded.
-                let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
+                let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), resolver));
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -2142,14 +2143,27 @@ pub(crate) fn summarize_binary_term_for_index(
     rowid_alias_column: Option<usize>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    resolver: Option<&Resolver>,
 ) -> Option<IndexableTermSummary> {
     let BinaryTermIndexInfo {
+        lhs,
+        rhs,
         operator,
         table_col_pos,
         constraining_expr,
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+
+    if operator.as_ast_operator().is_some_and(|op| op.is_comparison()) {
+        let cmp_aff = comparison_affinity(lhs, rhs, Some(table_references), resolver);
+        let col_aff = table_col_pos
+            .and_then(|pos| table_reference.columns().get(pos))
+            .map(|col| col.affinity());
+        if col_aff.is_some_and(|col_aff| !col_aff.index_affinity_ok(cmp_aff)) {
+            return None;
+        }
+    }
 
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2201,6 +2215,7 @@ pub(crate) fn analyze_binary_term_for_index(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: Option<&Resolver>,
 ) -> Option<AnalyzedTerm> {
     let BinaryTermIndexInfo {
         lhs,
@@ -2263,7 +2278,7 @@ pub(crate) fn analyze_binary_term_for_index(
     // Compute the affinity for the constraining expression
     let affinity = if let Some(ast_op) = operator.as_ast_operator() {
         if ast_op.is_comparison() && table_col_pos.is_some() {
-            comparison_affinity(lhs, rhs, Some(table_references), None)
+            comparison_affinity(lhs, rhs, Some(table_references), resolver)
         } else {
             Affinity::Blob
         }

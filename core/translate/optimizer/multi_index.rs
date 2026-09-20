@@ -30,6 +30,7 @@ use crate::translate::plan::{
     UnionBranchPrePostFilters, WhereTerm,
 };
 use crate::translate::planner::{table_mask_from_expr, TableMask};
+use crate::translate::Resolver;
 use crate::Result;
 use std::sync::Arc;
 use turso_macros::turso_assert_eq;
@@ -153,6 +154,7 @@ fn get_table_local_constraints_for_branch(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: Option<&Resolver>,
 ) -> crate::Result<(Vec<WhereTerm>, TableConstraints)> {
     let synthetic_where_terms = exprs
         .iter()
@@ -170,6 +172,7 @@ fn get_table_local_constraints_for_branch(
         subqueries,
         schema,
         params,
+        resolver,
     )?
     .into_iter()
     .find(|constraints| constraints.table_id == table_reference.internal_id)
@@ -186,7 +189,7 @@ fn get_table_local_constraints_for_branch(
         constraint.constraining_expr = Some(constraint.get_constraining_expr(
             &synthetic_where_terms,
             Some(table_references),
-            None,
+            resolver,
         ));
     }
     Ok((synthetic_where_terms, table_constraints))
@@ -535,6 +538,7 @@ fn estimate_residual_expr_selectivity(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: Option<&Resolver>,
 ) -> f64 {
     let Ok(expr) = crate::translate::expr::unwrap_parens(expr) else {
         return params.sel_other;
@@ -550,6 +554,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             ) * estimate_residual_expr_selectivity(
                 rhs,
                 rhs_table,
@@ -558,6 +563,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
         }
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
@@ -569,6 +575,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             );
             let rhs_selectivity = estimate_residual_expr_selectivity(
                 rhs,
@@ -578,6 +585,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             );
             1.0 - (1.0 - lhs_selectivity) * (1.0 - rhs_selectivity)
         }
@@ -590,6 +598,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
         }
         _ => {
@@ -602,6 +611,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             ) else {
                 return params.sel_other;
             };
@@ -630,6 +640,7 @@ fn estimate_multi_or_residual_selectivity(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: Option<&Resolver>,
 ) -> f64 {
     residual_exprs
         .iter()
@@ -642,6 +653,7 @@ fn estimate_multi_or_residual_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
         })
         .product::<f64>()
@@ -664,6 +676,7 @@ fn evaluate_multi_index_branches(
     input_cardinality: f64,
     params: &CostModelParams,
     best_cost: Cost,
+    resolver: Option<&Resolver>,
 ) -> Result<Option<AccessMethod>> {
     let mut branch_costs = Vec::with_capacity(branches.len());
     let mut branch_rows = Vec::with_capacity(branches.len());
@@ -696,6 +709,7 @@ fn evaluate_multi_index_branches(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
         } else {
             1.0
@@ -804,6 +818,7 @@ fn multi_index_can_consume_term(
 /// 2. Each term is individually indexable
 /// 3. No single composite index already covers multiple terms more directly
 /// 4. At least two distinct indexes participate in the final branch set
+#[expect(clippy::too_many_arguments)]
 fn analyze_and_terms_for_multi_index(
     table_reference: &JoinedTable,
     where_clause: &[WhereTerm],
@@ -812,6 +827,7 @@ fn analyze_and_terms_for_multi_index(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: Option<&Resolver>,
 ) -> Option<AndClauseDecomposition> {
     let table_id = table_reference.internal_id;
     let indexes = available_indexes.indexes_for_table(table_reference.internal_id);
@@ -845,6 +861,7 @@ fn analyze_and_terms_for_multi_index(
             rowid_alias_column,
             table_references,
             subqueries,
+            resolver,
         ) else {
             continue;
         };
@@ -936,6 +953,7 @@ fn analyze_and_terms_for_multi_index(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
             .expect("multi-index prepass accepted a term that full analysis rejected");
 
@@ -975,6 +993,7 @@ pub fn consider_multi_index_union(
     best_cost: Cost,
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
+    resolver: Option<&Resolver>,
 ) -> Result<Option<AccessMethod>> {
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
@@ -1026,6 +1045,7 @@ pub fn consider_multi_index_union(
                         subqueries,
                         schema,
                         params,
+                        resolver,
                     )
                     .ok()
                 else {
@@ -1092,6 +1112,7 @@ pub fn consider_multi_index_union(
             input_cardinality,
             params,
             best_cost,
+            resolver,
         )? {
             return Ok(Some(access_method));
         }
@@ -1119,6 +1140,7 @@ pub fn consider_multi_index_intersection(
     best_cost: Cost,
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
+    resolver: Option<&Resolver>,
 ) -> Result<Option<AccessMethod>> {
     let Some(decomposition) = analyze_and_terms_for_multi_index(
         rhs_table,
@@ -1128,6 +1150,7 @@ pub fn consider_multi_index_intersection(
         subqueries,
         schema,
         params,
+        resolver,
     ) else {
         return Ok(None);
     };
@@ -1212,6 +1235,7 @@ pub fn consider_multi_index_intersection(
         input_cardinality,
         params,
         best_cost,
+        resolver,
     )
 }
 
@@ -1510,6 +1534,7 @@ mod tests {
             Cost(f64::INFINITY),
             &lhs_mask,
             &AnalyzeStats::default(),
+            None,
         )
         .unwrap();
 
@@ -1592,6 +1617,7 @@ mod tests {
             Cost(f64::INFINITY),
             &TableMask::default(),
             &AnalyzeStats::default(),
+            None,
         )
         .unwrap()
         .expect("rowid and secondary-index terms should be eligible for intersection");
@@ -1765,6 +1791,7 @@ mod tests {
             Cost(f64::INFINITY),
             &lhs_mask,
             &AnalyzeStats::default(),
+            None,
         )
         .unwrap()
         .expect("compound OR branches should produce a multi-index union");
@@ -1902,6 +1929,7 @@ mod tests {
             Cost(f64::INFINITY),
             &lhs_mask,
             &AnalyzeStats::default(),
+            None,
         )
         .unwrap()
         .expect("plain OR branches should produce a multi-index union");
@@ -1919,6 +1947,7 @@ mod tests {
             Cost(f64::INFINITY),
             &lhs_mask,
             &AnalyzeStats::default(),
+            None,
         )
         .unwrap()
         .expect("residual-filtered OR branches should still produce a multi-index union");

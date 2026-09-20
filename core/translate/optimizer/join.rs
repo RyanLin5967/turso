@@ -14,6 +14,7 @@ use super::{
 };
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::translate::plan::BitSet;
+use crate::translate::Resolver;
 use crate::{
     schema::Schema,
     stats::AnalyzeStats,
@@ -40,7 +41,7 @@ use crate::{
     LimboError, Result,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 /// Small bag of planner context that needs to flow through join enumeration.
 ///
 /// Keeping this as a struct avoids threading more ad-hoc parameters through the
@@ -49,6 +50,7 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub maybe_order_target: Option<&'a OrderTarget>,
     /// Stop growing a join plan after it costs more than another query form.
     pub cost_limit: Option<Cost>,
+    pub resolver: Option<&'a Resolver<'a>>,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -58,6 +60,7 @@ impl<'a> JoinPlanningContext<'a> {
         Self {
             maybe_order_target,
             cost_limit: None,
+            resolver: None,
         }
     }
 }
@@ -2498,6 +2501,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
         let mut access_methods = Vec::new();
@@ -2567,6 +2571,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -2684,6 +2689,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )?;
         let base_table_rows =
             [1.0, 1_000_000.0, 10.0, 10.0].map(RowCountEstimate::HardcodedFallback);
@@ -2949,6 +2955,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -2992,6 +2999,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -3047,6 +3055,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -3131,6 +3140,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
         // SELECT * FROM test_table WHERE id = 42
@@ -3227,6 +3237,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -3412,6 +3423,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -3541,6 +3553,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -3682,6 +3695,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -3784,6 +3798,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -3915,6 +3930,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -4028,6 +4044,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -4156,6 +4173,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -4333,6 +4351,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -4430,6 +4449,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -4531,6 +4551,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
         let method = try_hash_join_access_method(
@@ -4572,6 +4593,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
         assert!(!can_replace_build_index_with_hash(&constraints[1], false));
