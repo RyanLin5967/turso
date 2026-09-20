@@ -4427,7 +4427,7 @@ impl Wal for WalFile {
 
         for (idx, page) in pages.iter().enumerate() {
             let page_id = page.get().id;
-            let plain = page.get_contents().as_ptr();
+            let plain = page.get_contents().as_mut();
 
             // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
             // however it might not be present in this batch so we cannot assert its presence
@@ -4535,7 +4535,7 @@ impl Wal for WalFile {
         for page in pages.iter() {
             tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
             let page_id = page.get().id;
-            let plain = page.get_contents().as_ptr();
+            let plain = page.get_contents().as_mut();
 
             let frame_db_size = 0; // this method is not used for the commit path
             let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
@@ -6413,7 +6413,7 @@ pub mod test {
 
     fn page_with_pattern(page_id: i64, seed: u8, buffer_pool: &Arc<BufferPool>) -> PageRef {
         let page = allocate_new_page(page_id, buffer_pool);
-        for (idx, byte) in page.get_contents().as_ptr().iter_mut().enumerate() {
+        for (idx, byte) in page.get_contents().as_mut().iter_mut().enumerate() {
             *byte = seed.wrapping_add(idx as u8).wrapping_add(page_id as u8);
         }
         page
@@ -6556,7 +6556,7 @@ pub mod test {
             .unwrap();
         let expected = pages
             .iter()
-            .map(|page| page.get_contents().as_ptr().to_vec())
+            .map(|page| page.get_contents().as_mut().to_vec())
             .collect::<Vec<_>>();
 
         let file = wal.wal_file().unwrap();
@@ -6637,7 +6637,7 @@ pub mod test {
             assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
             assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
             assert_eq!(page.wal_tag_pair(), ((idx + 1) as u64, 0));
-            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+            assert_eq!(page.get_contents().as_mut(), expected[idx].as_slice());
         }
     }
 
@@ -6662,7 +6662,7 @@ pub mod test {
         io.wait_for_completion(c).unwrap();
 
         for (idx, page) in target_pages.iter().enumerate() {
-            assert_eq!(page.get_contents().as_ptr(), expected[idx].as_slice());
+            assert_eq!(page.get_contents().as_mut(), expected[idx].as_slice());
         }
     }
 
@@ -6692,7 +6692,7 @@ pub mod test {
         let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let source_page = page_with_pattern(32, 0x10, &buffer_pool);
-        let expected = source_page.get_contents().as_ptr().to_vec();
+        let expected = source_page.get_contents().as_mut().to_vec();
 
         let completion = wal
             .append_frames_vectored(vec![source_page], PageSize::new(page_size).unwrap())
@@ -6704,7 +6704,7 @@ pub mod test {
             .read_frames_batch(1, &[target_page.clone()], buffer_pool, None)
             .unwrap();
         io.wait_for_completion(completion).unwrap();
-        assert_eq!(target_page.get_contents().as_ptr(), expected.as_slice());
+        assert_eq!(target_page.get_contents().as_mut(), expected.as_slice());
     }
 
     #[test]
@@ -6974,7 +6974,7 @@ pub mod test {
             assert!(page.is_loaded(), "page {} should be loaded", page.get().id);
             assert!(!page.is_locked(), "page {} lock leaked", page.get().id);
             assert_eq!(page.wal_tag_pair(), ((idx + 2) as u64, 0));
-            assert_eq!(page.get_contents().as_ptr(), expected[idx + 1].as_slice());
+            assert_eq!(page.get_contents().as_mut(), expected[idx + 1].as_slice());
         }
     }
 
@@ -7003,7 +7003,7 @@ pub mod test {
 
         for (idx, page) in target_pages.iter().enumerate() {
             assert_eq!(
-                page.get_contents().as_ptr(),
+                page.get_contents().as_mut(),
                 expected[idx].as_slice(),
                 "frame-order read should preserve page {} contents",
                 page.get().id

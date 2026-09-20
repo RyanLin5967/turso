@@ -83,7 +83,7 @@ impl HeaderRef {
     pub fn borrow(&self) -> &DatabaseHeader {
         // TODO: Instead of erasing mutability, implement `get_mut_contents` and return a shared reference.
         let content = self.0.get_contents();
-        bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE])
+        bytemuck::from_bytes::<DatabaseHeader>(&content.as_mut()[0..DatabaseHeader::SIZE])
     }
 }
 
@@ -99,7 +99,7 @@ impl HeaderRefMut {
 
     pub fn borrow_mut(&self) -> &mut DatabaseHeader {
         let content = self.0.get_contents();
-        bytemuck::from_bytes_mut::<DatabaseHeader>(&mut content.as_ptr()[0..DatabaseHeader::SIZE])
+        bytemuck::from_bytes_mut::<DatabaseHeader>(&mut content.as_mut()[0..DatabaseHeader::SIZE])
     }
 
     /// Get a reference to the underlying page
@@ -155,9 +155,43 @@ impl PageInner {
         }
     }
     /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
+    /// Read the page's bytes. **Cannot write through this.**
+    ///
+    /// # Why this was split
+    ///
+    /// This used to be `as_ptr(&self) -> &mut [u8]` with `#[allow(clippy::mut_from_ref)]`, and that
+    /// single signature is the reason nobody could say what writes a page. Reads and writes were
+    /// indistinguishable at all ~90 call sites, so every attempt to enumerate the writers was a
+    /// grep over names — which is exactly how the equivalent claim about SQLite's
+    /// `sqlite3PagerWrite` came out as 8 sites when the real number was 42.
+    ///
+    /// Splitting it makes the question answerable by the compiler instead of by a sweep: a write
+    /// cannot go through `as_slice`, so every write must name [`PageInner::as_mut`]. That is the
+    /// enumeration, and it is complete by construction rather than believed.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        self.buffer
+            .as_ref()
+            .expect("buffer not loaded")
+            .as_slice()
+    }
+
+    /// Obtain the page's bytes **for writing**. This is the single door a copy-on-write hook needs.
+    ///
+    /// ⚠ **This still returns `&mut` from `&self`, and that is not fixed here.** The whole engine
+    /// passes `&Page` and `&PageInner` around, so removing the unsoundness means changing every
+    /// borrow in the btree, which is a different and much larger change. What IS fixed is that the
+    /// unsoundness now has ONE NAME and one home: `as_slice` cannot write, so any future CoW hook
+    /// placed here sees every write that goes through the accessor, and the compiler proves there
+    /// is no other way through it.
+    ///
+    /// ⚠ **What it still does NOT see**, stated here rather than discovered later: a wholesale
+    /// buffer install (`inner.buffer = Some(..)` on page load), a buffer `take()` on eviction, and
+    /// the checkpoint checksum write-back, which mutates the bytes through a CLONED `Arc<Buffer>`
+    /// after the page is already clean. Those are below this accessor and need their own seams.
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    pub fn as_ptr(&self) -> &mut [u8] {
+    pub fn as_mut(&self) -> &mut [u8] {
         self.buffer
             .as_ref()
             .expect("buffer not loaded")
@@ -178,14 +212,14 @@ impl PageInner {
     /// Read a u8 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u8(&self, pos: usize) -> u8 {
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         buf[self.offset() + pos]
     }
 
     /// Read a u16 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u16(&self, pos: usize) -> u16 {
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         let offset = self.offset();
         u16::from_be_bytes([buf[offset + pos], buf[offset + pos + 1]])
     }
@@ -193,7 +227,7 @@ impl PageInner {
     /// Read a u32 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u32(&self, pos: usize) -> u32 {
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         read_u32(buf, self.offset() + pos)
     }
 
@@ -201,7 +235,7 @@ impl PageInner {
     #[inline]
     fn write_u8(&self, pos: usize, value: u8) {
         tracing::trace!("write_u8(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         buf[self.offset() + pos] = value;
     }
 
@@ -209,7 +243,7 @@ impl PageInner {
     #[inline]
     fn write_u16(&self, pos: usize, value: u16) {
         tracing::trace!("write_u16(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         let offset = self.offset();
         buf[offset + pos..offset + pos + 2].copy_from_slice(&value.to_be_bytes());
     }
@@ -218,7 +252,7 @@ impl PageInner {
     #[inline]
     fn write_u32(&self, pos: usize, value: u32) {
         tracing::trace!("write_u32(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         let offset = self.offset();
         buf[offset + pos..offset + pos + 4].copy_from_slice(&value.to_be_bytes());
     }
@@ -231,28 +265,28 @@ impl PageInner {
     /// Read a u16 from the page content at the given absolute offset (no db header offset).
     #[inline]
     pub fn read_u16_no_offset(&self, pos: usize) -> u16 {
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         u16::from_be_bytes([buf[pos], buf[pos + 1]])
     }
 
     /// Read a u32 from the page content at the given absolute offset (no db header offset).
     #[inline]
     pub fn read_u32_no_offset(&self, pos: usize) -> u32 {
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
     }
 
     /// Write a u16 at the given absolute offset (no db header offset).
     pub fn write_u16_no_offset(&self, pos: usize, value: u16) {
         tracing::trace!("write_u16_no_offset(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         buf[pos..pos + 2].copy_from_slice(&value.to_be_bytes());
     }
 
     /// Write a u32 at the given absolute offset (no db header offset).
     pub fn write_u32_no_offset(&self, pos: usize, value: u32) {
         tracing::trace!("write_u32_no_offset(pos={}, value={})", pos, value);
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         buf[pos..pos + 4].copy_from_slice(&value.to_be_bytes());
     }
 
@@ -364,7 +398,7 @@ impl PageInner {
     pub fn rightmost_pointer_raw(&self) -> crate::Result<Option<*mut u8>> {
         match self.page_type()? {
             PageType::IndexInterior | PageType::TableInterior => Ok(Some(unsafe {
-                self.as_ptr()
+                self.as_mut()
                     .as_mut_ptr()
                     .add(self.offset() + BTREE_RIGHTMOST_PTR)
             })),
@@ -375,7 +409,7 @@ impl PageInner {
     #[inline]
     pub fn cell_get(&self, idx: usize, usable_size: usize) -> crate::Result<BTreeCell> {
         tracing::trace!("cell_get(idx={})", idx);
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
 
         let ncells = self.cell_count();
         turso_assert_less_than!(idx, ncells,
@@ -393,7 +427,7 @@ impl PageInner {
     #[inline(always)]
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -411,7 +445,7 @@ impl PageInner {
             self.page_type(),
             Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
         ));
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -432,7 +466,7 @@ impl PageInner {
     #[inline(always)]
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -457,7 +491,7 @@ impl PageInner {
         idx: usize,
         usable_size: usize,
     ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_offset = self.read_u16(cell_pointer) as usize;
@@ -592,7 +626,7 @@ impl PageInner {
         min_local: usize,
         page_type: PageType,
     ) -> crate::Result<(usize, usize)> {
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
@@ -672,7 +706,7 @@ impl PageInner {
     }
 
     pub fn write_database_header(&self, header: &DatabaseHeader) {
-        let buf = self.as_ptr();
+        let buf = self.as_mut();
         buf[0..DatabaseHeader::SIZE].copy_from_slice(bytemuck::bytes_of(header));
     }
 
@@ -1923,7 +1957,7 @@ impl Pager {
             let page_id = page.get().id as u32;
             let contents = page.get_contents();
             let buffer = self.buffer_pool.allocate(page_size + 4);
-            let contents_buffer = contents.as_ptr();
+            let contents_buffer = contents.as_mut();
             turso_assert!(
                 contents_buffer.len() == page_size,
                 "contents buffer length should be equal to page size"
@@ -2457,7 +2491,7 @@ impl Pager {
                     let page_content = ptrmap_page.get_contents();
                     let ptrmap_pg_no = page_content.id;
 
-                    let full_buffer_slice: &[u8] = page_content.as_ptr();
+                    let full_buffer_slice: &[u8] = page_content.as_mut();
 
                     // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
                     // The actual page data starts at page_content.offset() within the full_buffer_slice.
@@ -2560,7 +2594,7 @@ impl Pager {
                     let page_content = ptrmap_page.get_contents();
                     let ptrmap_pg_no = page_content.id;
 
-                    let full_buffer_slice = page_content.as_ptr();
+                    let full_buffer_slice = page_content.as_mut();
 
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
                         return Err(LimboError::InternalError(format!(
@@ -2716,7 +2750,7 @@ impl Pager {
 
         // setup overflow page
         let contents = page.get_contents();
-        let buf = contents.as_ptr();
+        let buf = contents.as_mut();
         buf.fill(0);
 
         Ok(IOResult::Done(page))
@@ -4507,7 +4541,7 @@ impl Pager {
         )?;
         if let Some(page) = self.cache_get(header.page_number as usize)? {
             let content = page.get_contents();
-            content.as_ptr().copy_from_slice(raw_page);
+            content.as_mut().copy_from_slice(raw_page);
             turso_assert!(
                 page.get().id == header.page_number as usize,
                 "page has unexpected id"
@@ -5539,7 +5573,7 @@ impl Pager {
                         "Freelist trunk page has overflow cells",
                         { "page_id": trunk_page.get().id }
                     );
-                    trunk_page.get_contents().as_ptr().fill(0);
+                    trunk_page.get_contents().as_mut().fill(0);
                     let page_key = PageCacheKey::new(trunk_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
@@ -5573,7 +5607,7 @@ impl Pager {
                         "Freelist leaf page has overflow cells",
                         { "page_id": leaf_page.get().id }
                     );
-                    leaf_page.get_contents().as_ptr().fill(0);
+                    leaf_page.get_contents().as_mut().fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
@@ -5590,7 +5624,7 @@ impl Pager {
                     // Shift left all the other leaf pages in the trunk page and subtract 1 from the leaf count
                     let remaining_leaves_count = (*number_of_freelist_leaves - 1) as usize;
                     {
-                        let buf = page_contents.as_ptr();
+                        let buf = page_contents.as_mut();
                         // use copy within the same page
                         let offset_remaining_leaves_start =
                             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + FREELIST_LEAF_PTR_SIZE;
