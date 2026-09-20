@@ -1,0 +1,284 @@
+@database :memory:
+
+# Regression coverage for https://github.com/tursodatabase/turso/issues/8739:
+# an index on an expression stores its keys in the index column's collation,
+# but the seek was taken for any comparison on that expression, including one
+# carrying a different explicit COLLATE. The BINARY index answered a NOCASE
+# test, so rows were missed one way round and matched the other, and the range
+# DELETE below removed every row in the table.
+#
+# Every expectation here was produced by sqlite3 3.51.0.
+
+setup expr-index-collation-schema {
+    CREATE TABLE t(a TEXT, c INTEGER);
+    CREATE INDEX ix ON t(lower(a));
+    INSERT INTO t VALUES('A',1),('a',2),('b',3);
+}
+
+@setup expr-index-collation-schema
+test expr-index-collation-eq {
+    SELECT c FROM t WHERE lower(a) = 'A' COLLATE NOCASE;
+}
+expect {
+    1
+    2
+}
+
+@setup expr-index-collation-schema
+test expr-index-collation-range {
+    SELECT c FROM t WHERE lower(a) > 'A' COLLATE NOCASE;
+}
+expect {
+    3
+}
+
+@setup expr-index-collation-schema
+test expr-index-collation-range-delete {
+    DELETE FROM t WHERE lower(a) > 'A' COLLATE NOCASE;
+    SELECT c FROM t;
+}
+expect {
+    1
+    2
+}
+
+@setup expr-index-collation-schema
+test expr-index-collation-range-update {
+    UPDATE t SET c = c + 100 WHERE lower(a) > 'A' COLLATE NOCASE;
+    SELECT a, c FROM t ORDER BY c;
+}
+expect {
+    A|1
+    a|2
+    b|103
+}
+
+# The COLLATE can sit on a scalar subquery operand instead of a literal.
+@setup expr-index-collation-schema
+test expr-index-collation-subquery-operand {
+    SELECT c FROM t WHERE lower(a) = (SELECT 'A') COLLATE NOCASE;
+}
+expect {
+    1
+    2
+}
+
+# Nothing here may block the index when the collations do agree: without an
+# explicit COLLATE both sides are BINARY and the seek is still correct.
+@setup expr-index-collation-schema
+test expr-index-collation-binary-eq-still-matches {
+    SELECT c FROM t WHERE lower(a) = 'a';
+}
+expect {
+    1
+    2
+}
+
+@setup expr-index-collation-schema
+test expr-index-collation-binary-range-still-matches {
+    SELECT c FROM t WHERE lower(a) > 'a';
+}
+expect {
+    3
+}
+
+setup expr-index-collation-substr-schema {
+    CREATE TABLE s(a TEXT, c INTEGER);
+    CREATE INDEX sx ON s(substr(a,1,1));
+    INSERT INTO s VALUES('A',1),('a',2),('b',3);
+}
+
+@setup expr-index-collation-substr-schema
+test expr-index-collation-substr-eq {
+    SELECT c FROM s WHERE substr(a,1,1) = 'A' COLLATE NOCASE;
+}
+expect {
+    1
+    2
+}
+
+@setup expr-index-collation-substr-schema
+test expr-index-collation-substr-range {
+    SELECT c FROM s WHERE substr(a,1,1) > 'A' COLLATE NOCASE;
+}
+expect {
+    3
+}
+
+setup expr-index-collation-concat-schema {
+    CREATE TABLE k(a TEXT, c INTEGER);
+    CREATE INDEX kx ON k(a||'');
+    INSERT INTO k VALUES('A',1),('a',2),('b',3);
+}
+
+@setup expr-index-collation-concat-schema
+test expr-index-collation-concat-range-delete {
+    DELETE FROM k WHERE a||'' > 'A' COLLATE NOCASE;
+    SELECT c FROM k;
+}
+expect {
+    1
+    2
+}
+
+setup expr-index-collation-partial-schema {
+    CREATE TABLE p(a TEXT, c INTEGER);
+    CREATE INDEX px ON p(lower(a)) WHERE c > 0;
+    INSERT INTO p VALUES('A',1),('a',2),('b',3);
+}
+
+@setup expr-index-collation-partial-schema
+test expr-index-collation-partial-eq {
+    SELECT c FROM p WHERE lower(a) = 'A' COLLATE NOCASE AND c > 0;
+}
+expect {
+    1
+    2
+}
+
+@setup expr-index-collation-partial-schema
+test expr-index-collation-partial-range-delete {
+    DELETE FROM p WHERE lower(a) > 'A' COLLATE NOCASE AND c > 0;
+    SELECT c FROM p;
+}
+expect {
+    1
+    2
+}
+
+setup expr-index-collation-multicol-schema {
+    CREATE TABLE m(a TEXT, b TEXT, c INTEGER);
+    CREATE INDEX mx ON m(lower(a), b);
+    INSERT INTO m VALUES('A','p',1),('a','q',2),('b','r',3);
+}
+
+@setup expr-index-collation-multicol-schema
+test expr-index-collation-multicol-eq {
+    SELECT c FROM m WHERE lower(a) = 'A' COLLATE NOCASE AND b = 'p';
+}
+expect {
+    1
+}
+
+@setup expr-index-collation-multicol-schema
+test expr-index-collation-multicol-range {
+    SELECT c FROM m WHERE lower(a) > 'A' COLLATE NOCASE;
+}
+expect {
+    3
+}
+
+# The mismatch also runs the other way: an expression index declaring its own
+# NOCASE must not answer a BINARY comparison on the same expression.
+setup expr-index-collation-own-schema {
+    CREATE TABLE o(a TEXT, c INTEGER);
+    CREATE INDEX ox ON o(lower(a) COLLATE NOCASE);
+    INSERT INTO o VALUES('A',1),('a',2),('B',3),('b',4);
+}
+
+@setup expr-index-collation-own-schema
+test expr-index-collation-own-nocase-matches {
+    SELECT c FROM o WHERE lower(a) COLLATE NOCASE = 'B';
+}
+expect {
+    3
+    4
+}
+
+@setup expr-index-collation-own-schema
+test expr-index-collation-own-binary-range {
+    SELECT c FROM o WHERE lower(a) > 'B';
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+# The index expression can sit on the right of the comparison, and the mismatch
+# reaches IS and BETWEEN as well as the plain comparison operators.
+setup expr-index-collation-null-schema {
+    CREATE TABLE n(a TEXT, c INTEGER);
+    CREATE INDEX nx ON n(lower(a));
+    INSERT INTO n VALUES('A',1),('a',2),('b',3),(NULL,4);
+}
+
+@setup expr-index-collation-null-schema
+test expr-index-collation-reversed-operand-eq {
+    SELECT c FROM n WHERE 'A' COLLATE NOCASE = lower(a) ORDER BY c;
+}
+expect {
+    1
+    2
+}
+
+@setup expr-index-collation-null-schema
+test expr-index-collation-reversed-operand-range-delete {
+    DELETE FROM n WHERE 'A' COLLATE NOCASE < lower(a);
+    SELECT c FROM n ORDER BY c;
+}
+expect {
+    1
+    2
+    4
+}
+
+@setup expr-index-collation-null-schema
+test expr-index-collation-is-operator {
+    SELECT c FROM n WHERE lower(a) IS 'A' COLLATE NOCASE ORDER BY c;
+}
+expect {
+    1
+    2
+}
+
+@setup expr-index-collation-null-schema
+test expr-index-collation-between {
+    SELECT c FROM n WHERE lower(a) BETWEEN 'A' COLLATE NOCASE AND 'b' ORDER BY c;
+}
+expect {
+    1
+    2
+    3
+}
+
+# An expression index that declares NOCASE still loses its rows when the other
+# operand asks for RTRIM, so the mismatch is between two named collations and
+# not only against the BINARY default.
+setup expr-index-collation-rtrim-schema {
+    CREATE TABLE r(a TEXT, c INTEGER);
+    CREATE INDEX rx ON r(lower(a) COLLATE NOCASE);
+    INSERT INTO r VALUES('B',1),('b ',2),('b',3),('A',4);
+}
+
+@setup expr-index-collation-rtrim-schema
+test expr-index-collation-rtrim-vs-nocase-eq {
+    SELECT c FROM r WHERE 'b' COLLATE RTRIM = lower(a) COLLATE NOCASE ORDER BY c;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup expr-index-collation-rtrim-schema
+test expr-index-collation-rtrim-vs-nocase-range-delete {
+    DELETE FROM r WHERE 'b' COLLATE RTRIM < lower(a) COLLATE NOCASE;
+    SELECT c FROM r ORDER BY c;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@setup expr-index-collation-rtrim-schema
+test expr-index-collation-own-nocase-still-matches {
+    SELECT c FROM r WHERE lower(a) COLLATE NOCASE = 'b' ORDER BY c;
+}
+expect {
+    1
+    3
+}
