@@ -24,7 +24,7 @@ use crate::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
             emit_guarded_fk_decrement, emit_skip_if_any_null, fk_child_index_probe_ok,
             fk_compare_terms, fk_probe_affinity_string, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, table_scan_match_any, ForeignKeyActions,
+            open_read_index, open_read_table, table_scan_match_any, FkProbeKind, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -943,6 +943,25 @@ pub fn translate_insert(
             database_id,
             &fk_layout,
         )?;
+
+        // Repair deferred counters for children that reference this NEW parent
+        // key. SQLite does both halves of this in `sqlite3FkCheck`, called from
+        // `sqlite3GenerateConstraintChecks` BEFORE the row is written and before
+        // any AFTER trigger fires, so its scan sees neither the row being
+        // inserted nor anything a trigger goes on to add. Emitting it here says
+        // the same thing. Run after the row instead and a self-referential table
+        // whose AFTER INSERT trigger inserts a second row repays a count against
+        // that second row, and an orphan commits.
+        // For REPLACE: the delete in the preflight phase increments counters
+        // above, and that runs earlier still, so those are repaid here too.
+        emit_parent_side_fk_decrement_on_insert(
+            program,
+            &btree_table,
+            &insertion,
+            on_replace,
+            resolver,
+            database_id,
+        )?;
     }
 
     // Emit deferred index inserts for cases where preflight only checked constraints
@@ -1050,20 +1069,6 @@ pub fn translate_insert(
             )?;
         }
         program.preassign_label_to_next_insn(after_trigger_done);
-    }
-
-    if has_fks {
-        // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
-        // For REPLACE: delete increments counters above; the insert path should try to repay
-        // them, even for immediate/self-ref FKs.
-        emit_parent_side_fk_decrement_on_insert(
-            program,
-            &btree_table,
-            &insertion,
-            on_replace,
-            resolver,
-            database_id,
-        )?;
     }
 
     if !is_mvcc {
@@ -4266,18 +4271,25 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&child_tbl.name).cloned().collect()
         });
-        let compares = fk_compare_terms(child_tbl, child_cols, parent_table, &pref.parent_cols)?;
+        let compares = fk_compare_terms(
+            child_tbl,
+            child_cols,
+            parent_table,
+            &pref.parent_cols,
+            FkProbeKind::Counter,
+        )?;
         let idx = indices
             .iter()
             .find(|ix| fk_child_index_probe_ok(ix, child_tbl, child_cols, &compares));
 
-        // This runs after the row is written, but SQLite runs the matching
-        // scan in `sqlite3FkCheck` before the insert, so its scan never sees
-        // the row being inserted. When the table is its own child, skip that
-        // row here for the same reason: whether the new row is its own parent
-        // was already settled on the child side, by an uncoerced comparison of
-        // the two values in the row, and repaying that count here from the
-        // same row would answer the question a second time and differently.
+        // The caller emits this before the row is written, so the scan below
+        // does not see it, which is what SQLite's scan does. The exclusion is
+        // kept for REPLACE, whose preflight phase can already have written this
+        // row's index entries by the time the check runs: whether the new row
+        // is its own parent was settled on the child side, by an uncoerced
+        // comparison of the two values in the row, and repaying that count here
+        // from the same row would answer the question a second time and
+        // differently.
         let self_exclude_rowid = is_self_ref.then(|| insertion.key_register());
 
         if let Some(ix) = idx {

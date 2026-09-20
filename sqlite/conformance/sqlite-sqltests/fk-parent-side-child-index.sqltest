@@ -129,3 +129,112 @@ test fk-parent-delete-both-columns-nocase {
 }
 expect error {
 }
+
+# A RESTRICT action and the counting scan do not compare the same way, and
+# SQLite runs both. The action's trigger term is OLD.<parent column>, which
+# carries no affinity of its own unless it is a rowid, so the comparison falls
+# back to the child column's affinity; the counting scan names the parent
+# column, so it sees both.
+
+@cross-check-integrity
+test fk-restrict-compares-stored-values-uncoerced {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER UNIQUE, pad TEXT);
+    CREATE TABLE c(x TEXT REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(2,'z');
+    INSERT INTO c VALUES('2.0');
+    BEGIN;
+    DELETE FROM p;
+    DELETE FROM c;
+    COMMIT;
+    SELECT count(*) FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+    0
+}
+
+@cross-check-integrity
+test fk-restrict-still-counts-what-the-scan-finds {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER UNIQUE, pad TEXT);
+    CREATE TABLE c(x TEXT REFERENCES p(id) ON DELETE RESTRICT);
+    INSERT INTO p VALUES(2,'z');
+    INSERT INTO c VALUES('2.0');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-restrict-on-rowid-parent-compares-numerically {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(2);
+    INSERT INTO c VALUES('2.0');
+    BEGIN;
+    DELETE FROM p;
+    DELETE FROM c;
+    COMMIT;
+}
+expect error {
+}
+
+# The parent-side repayment for an INSERT has to run where SQLite runs it, in
+# sqlite3FkCheck before the row is written, or an AFTER INSERT trigger on a
+# self-referential table can hand it a row to repay a count against.
+
+@cross-check-integrity
+test fk-self-ref-insert-trigger-cannot-repay-its-own-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER REFERENCES t(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t(a,b) VALUES(new.a+100, new.a); END;
+    INSERT INTO t(a,b) VALUES(1,5);
+}
+expect error {
+}
+
+# Widened allowlist: a descending index and a partial index whose predicate the
+# equality already implies both answer the same question as the scan.
+
+@cross-check-integrity
+test fk-parent-delete-desc-child-index-still-refuses {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    CREATE INDEX ic ON c(x DESC);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-partial-index-implied-by-equality {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    CREATE INDEX ic ON c(x) WHERE x IS NOT NULL;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO c VALUES(NULL);
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-partial-index-on-other-column-not-implied {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id), y INTEGER);
+    CREATE INDEX ic ON c(x) WHERE y IS NOT NULL;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c(x,y) VALUES(1,NULL);
+    DELETE FROM p;
+}
+expect error {
+}
