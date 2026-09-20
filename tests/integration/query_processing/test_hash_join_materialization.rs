@@ -450,3 +450,63 @@ WHERE build_side.name = 'keep' ORDER BY probe_side.v";
     ];
     assert_eq!(rows, expected);
 }
+
+#[test]
+// Regression test where a correlated scalar subquery over a hash join answered
+// every outer row with the first row's result, because the hash build applied a
+// predicate naming an outer column. Expected values come from sqlite3 3.51.0.
+fn hash_join_build_skips_outer_query_correlation() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    for stmt in [
+        "CREATE TABLE t(id INT)",
+        "CREATE TABLE u(id INT, v INT)",
+        "CREATE TABLE w(v INT, x TEXT)",
+        "INSERT INTO t VALUES(1),(2),(3)",
+        "INSERT INTO u VALUES(1,10),(2,20),(3,30)",
+        "INSERT INTO w VALUES(10,'a'),(20,'b'),(30,'c')",
+    ] {
+        limbo_exec_rows(&conn, stmt);
+    }
+
+    let outer_on_left =
+        "SELECT t.id, (SELECT w.x FROM u JOIN w ON u.v = w.v WHERE t.id = u.id) FROM t ORDER BY t.id";
+    let outer_on_right =
+        "SELECT t.id, (SELECT w.x FROM u JOIN w ON u.v = w.v WHERE u.id = t.id) FROM t ORDER BY t.id";
+
+    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {outer_on_left}"));
+    assert!(
+        explain_rows.iter().any(|row| row
+            .get(1)
+            .and_then(value_as_text)
+            .is_some_and(|op| op == "HashBuild")),
+        "expected the subquery to be planned as a hash join"
+    );
+
+    let expected: Vec<Vec<Value>> = vec![
+        vec![Value::Integer(1), Value::Text("a".to_string())],
+        vec![Value::Integer(2), Value::Text("b".to_string())],
+        vec![Value::Integer(3), Value::Text("c".to_string())],
+    ];
+    assert_eq!(limbo_exec_rows(&conn, outer_on_left), expected);
+    assert_eq!(limbo_exec_rows(&conn, outer_on_right), expected);
+
+    let comma_join =
+        "SELECT t.id, (SELECT w.x FROM u, w WHERE u.v = w.v AND t.id = u.id) FROM t ORDER BY t.id";
+    assert_eq!(limbo_exec_rows(&conn, comma_join), expected);
+
+    let counting =
+        "SELECT t.id, (SELECT count(*) FROM u JOIN w ON u.v = w.v WHERE t.id > u.id) FROM t ORDER BY t.id";
+    let expected_counts: Vec<Vec<Value>> = vec![
+        vec![Value::Integer(1), Value::Integer(0)],
+        vec![Value::Integer(2), Value::Integer(1)],
+        vec![Value::Integer(3), Value::Integer(2)],
+    ];
+    assert_eq!(limbo_exec_rows(&conn, counting), expected_counts);
+
+    limbo_exec_rows(&conn, "CREATE INDEX i ON u(v)");
+    assert_eq!(limbo_exec_rows(&conn, outer_on_left), expected);
+    assert_eq!(limbo_exec_rows(&conn, counting), expected_counts);
+}
