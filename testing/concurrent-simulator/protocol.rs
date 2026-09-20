@@ -136,6 +136,11 @@ pub fn limbo_error_to_kind(err: &LimboError) -> &'static str {
         LimboError::TableLocked => "TableLocked",
         LimboError::InvalidArgument(_) => "InvalidArgument",
         LimboError::Constraint(_) => "Constraint",
+        // A rowid or LIMIT datatype mismatch travelled as `Constraint` until
+        // it was given its own variant. Without an arm here it serialises as
+        // "Other" and the receiver rebuilds it as an `InternalError`, so the
+        // error changes class across the process boundary.
+        LimboError::TypeMismatch => "TypeMismatch",
         LimboError::Corrupt(_) => "Corrupt",
         LimboError::ReadOnly => "ReadOnly",
         LimboError::Interrupt => "Interrupt",
@@ -168,6 +173,7 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "TableLocked" => LimboError::TableLocked,
         "InvalidArgument" => LimboError::InvalidArgument(message.to_string()),
         "Constraint" => LimboError::Constraint(message.to_string()),
+        "TypeMismatch" => LimboError::TypeMismatch,
         "Corrupt" => LimboError::Corrupt(message.to_string()),
         "ReadOnly" => LimboError::ReadOnly,
         "Interrupt" => LimboError::Interrupt,
@@ -236,16 +242,23 @@ mod tests {
                 LimboError::Corrupt("c".into()),
                 |e| matches!(e, LimboError::Corrupt(m) if m == "c"),
             ),
+            (
+                LimboError::Constraint("UNIQUE constraint failed".into()),
+                |e| matches!(e, LimboError::Constraint(m) if m == "UNIQUE constraint failed"),
+            ),
+            // A rowid or LIMIT datatype mismatch used to travel as
+            // `Constraint` and round-tripped intact. As its own unit variant
+            // it needs its own kind, or it serialises as "Other" and comes
+            // back as an `InternalError`.
+            (LimboError::TypeMismatch, |e| {
+                matches!(e, LimboError::TypeMismatch)
+            }),
         ];
         for (orig, predicate) in cases {
             let kind = limbo_error_to_kind(orig);
-            let msg = match orig {
-                LimboError::ParseError(s) | LimboError::TxError(s) | LimboError::Corrupt(s) => {
-                    s.clone()
-                }
-                LimboError::SequenceExhausted { name, .. } => name.clone(),
-                _ => String::new(),
-            };
+            // The same serializer the worker uses, rather than a second copy
+            // of its rules that could drift away from it.
+            let msg = limbo_error_to_message(orig);
             let reconstructed = error_kind_to_limbo_error(kind, &msg);
             assert!(
                 predicate(&reconstructed),

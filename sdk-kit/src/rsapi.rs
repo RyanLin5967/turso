@@ -1861,7 +1861,7 @@ mod tests {
     }
 
     /// A rowid datatype mismatch must stay classified. There is no
-    /// TURSO_MISMATCH in this ABI, so it maps to TURSO_CONSTRAINT — the code
+    /// TURSO_MISMATCH in this ABI, so it maps to TURSO_CONSTRAINT, the code
     /// it carried before it became its own `LimboError` variant. Without an
     /// arm for it the generic fallthrough declassifies it to TURSO_ERROR,
     /// which is what the Python and Rust bindings surface to callers.

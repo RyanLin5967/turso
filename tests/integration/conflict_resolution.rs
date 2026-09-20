@@ -2182,8 +2182,9 @@ fn test_type_mismatch_keeps_explicit_transaction_open(tmp_db: TempDatabase) -> a
     }
 
     let bad_limit = "SELECT 1 LIMIT 'a'";
-    let limbo_err = limbo_try_exec(&limbo_conn, bad_limit)
-        .expect_err("[{label}] a non-integer LIMIT must fail");
+    let Err(limbo_err) = limbo_try_exec(&limbo_conn, bad_limit) else {
+        panic!("[{label}] a non-integer LIMIT must fail");
+    };
     assert!(
         limbo_err.contains("datatype mismatch"),
         "[{label}] expected a datatype mismatch, got: {limbo_err}"
@@ -2242,7 +2243,7 @@ fn test_type_mismatch_keeps_explicit_transaction_open(tmp_db: TempDatabase) -> a
 ///
 /// SQLite only opens a statement journal when the statement may ABORT
 /// (`sqlite3HaltConstraint` calls `sqlite3MayAbort` for `OE_Abort` alone), so
-/// only ABORT — which is also the default — undoes the rows written before
+/// only ABORT, which is also the default, undoes the rows written before
 /// the mismatch. Every expected row count below was measured on
 /// /usr/bin/sqlite3 3.51.0 with this exact script.
 #[turso_macros::test]
@@ -2556,9 +2557,22 @@ fn test_type_mismatch_keeps_index_method_writes_for_kept_rows(
     Ok(())
 }
 
-/// `changes()` reads 0 after a statement that failed on a datatype mismatch,
-/// in autocommit and inside a transaction alike. Measured on
-/// /usr/bin/sqlite3 3.51.0.
+/// `changes()` reads 0 after a *writing* statement that failed on a datatype
+/// mismatch, and is left completely alone by a *read-only* one. This error
+/// class is the only one that both kinds of statement can raise, so it is the
+/// only one where the difference is observable.
+///
+/// Measured on /usr/bin/sqlite3 3.51.0, with `.bail off` so the script
+/// continues past each error:
+///   INSERT INTO t VALUES(1);            changes() -> 1
+///   INSERT OR FAIL INTO t VALUES(2,'a') changes() -> 0
+///   INSERT INTO t VALUES(3);            changes() -> 1
+///   SELECT 1 LIMIT 'a';                 changes() -> 1   (unchanged)
+///   SELECT 1 LIMIT 1 OFFSET 'a';        changes() -> 1   (unchanged)
+///
+/// Both halves are here on purpose: an implementation that resets the counter
+/// unconditionally passes the first half and fails the second, and one that
+/// never resets it passes the second and fails the first.
 #[turso_macros::test]
 fn test_changes_is_zero_after_type_mismatch(tmp_db: TempDatabase) -> anyhow::Result<()> {
     drop(tmp_db);
@@ -2589,6 +2603,25 @@ fn test_changes_is_zero_after_type_mismatch(tmp_db: TempDatabase) -> anyhow::Res
         vec![vec![rusqlite::types::Value::Integer(1)]],
         "[{label}] the autocommit statement must leave no rows behind"
     );
+
+    // A read-only statement never writes the change counter, so a mismatch
+    // raised by the LIMIT/OFFSET integer check has to leave it reading what
+    // the last INSERT set.
+    limbo_conn.execute("INSERT INTO t VALUES (3)").unwrap();
+    for read_only in ["SELECT 1 LIMIT 'a'", "SELECT 1 LIMIT 1 OFFSET 'a'"] {
+        let Err(err) = limbo_try_exec(&limbo_conn, read_only) else {
+            panic!("[{label}] {read_only} must fail");
+        };
+        assert!(
+            err.contains("datatype mismatch"),
+            "[{label}] {read_only} expected a datatype mismatch, got: {err}"
+        );
+        assert_eq!(
+            limbo_exec_rows(&limbo_conn, "SELECT changes()"),
+            vec![vec![rusqlite::types::Value::Integer(1)]],
+            "[{label}] {read_only} wrote the change counter, but it never writes rows"
+        );
+    }
     Ok(())
 }
 

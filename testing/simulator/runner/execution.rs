@@ -332,7 +332,13 @@ fn finish_turso_query(
                 }
                 ExecutionContinuation::NextInteractionOutsideThisProperty
             }
-            LimboError::Constraint(_) => {
+            // A rowid or LIMIT datatype mismatch is a rejection the shadow
+            // model is expected to predict, exactly like a constraint
+            // violation, and it carried `LimboError::Constraint` until it was
+            // given its own variant. Without this it falls to the catch-all
+            // below, which ends the whole simulation run as a hard failure
+            // rather than cross-checking the rejection and carrying on.
+            LimboError::Constraint(_) | LimboError::TypeMismatch => {
                 let shadow_result =
                     interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
                 if shadow_result.is_ok() {
