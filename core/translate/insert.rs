@@ -22,9 +22,9 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_compare_affinities,
-            index_preserves_compare_affinity, index_probe, index_scan_match_any, open_read_index,
-            open_read_table, table_scan_match_any, ForeignKeyActions,
+            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_child_index_probe_ok,
+            fk_compare_terms, fk_probe_affinity_string, index_probe, index_scan_match_any,
+            open_read_index, open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -4266,17 +4266,19 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&child_tbl.name).cloned().collect()
         });
-        let compare_affinities =
-            fk_compare_affinities(child_tbl, child_cols, parent_table, &pref.parent_cols)?;
-        let idx = indices.iter().find(|ix| {
-            ix.columns.len() == child_cols.len()
-                && ix
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-                && index_preserves_compare_affinity(ix, child_tbl, &compare_affinities)
-        });
+        let compares = fk_compare_terms(child_tbl, child_cols, parent_table, &pref.parent_cols)?;
+        let idx = indices
+            .iter()
+            .find(|ix| fk_child_index_probe_ok(ix, child_tbl, child_cols, &compares));
+
+        // This runs after the row is written, but SQLite runs the matching
+        // scan in `sqlite3FkCheck` before the insert, so its scan never sees
+        // the row being inserted. When the table is its own child, skip that
+        // row here for the same reason: whether the new row is its own parent
+        // was already settled on the child side, by an uncoerced comparison of
+        // the two values in the row, and repaying that count here from the
+        // same row would answer the question a second time and differently.
+        let self_exclude_rowid = is_self_ref.then(|| insertion.key_register());
 
         if let Some(ix) = idx {
             let icur = open_read_index(program, ix, database_id);
@@ -4293,17 +4295,24 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program.emit_insn(Insn::Affinity {
                     start_reg: probe_start,
                     count,
-                    affinities: build_index_affinity_string(ix, child_tbl),
+                    affinities: fk_probe_affinity_string(ix, child_tbl, &compares),
                 });
             }
 
             // Decrement once per matching child row
-            index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
-                let next = p.allocate_label();
-                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
-                p.preassign_label_to_next_insn(next);
-                Ok(())
-            })?;
+            index_scan_match_any(
+                program,
+                icur,
+                probe_start,
+                n_cols,
+                self_exclude_rowid,
+                |p| {
+                    let next = p.allocate_label();
+                    emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                    p.preassign_label_to_next_insn(next);
+                    Ok(())
+                },
+            )?;
         } else {
             // fallback scan :(
             table_scan_match_any(
@@ -4311,8 +4320,8 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 child_tbl,
                 child_cols,
                 new_pk_start,
-                &compare_affinities,
-                None,
+                &compares,
+                self_exclude_rowid,
                 database_id,
                 |p| {
                     let next = p.allocate_label();

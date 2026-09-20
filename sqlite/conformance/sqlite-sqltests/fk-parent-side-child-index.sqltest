@@ -1,0 +1,131 @@
+@database :memory:
+
+# The parent-side foreign key check counts child rows that reference the parent
+# key being removed or changed. It may probe a child index instead of scanning
+# the child table only when the probe answers the same question the comparison
+# does. Every expectation below was measured on sqlite3 3.51.0.
+# See: https://github.com/tursodatabase/turso/issues/8708
+
+@cross-check-integrity
+test fk-parent-delete-child-key-other-storage-class {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES('1');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-child-key-behind-partial-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    CREATE INDEX ic ON c(x) WHERE x > 5;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-child-index-other-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id NUM PRIMARY KEY);
+    CREATE TABLE c(x NUM REFERENCES p(id));
+    CREATE INDEX ic ON c(x COLLATE NOCASE);
+    INSERT INTO p VALUES('abc');
+    INSERT INTO p VALUES('ABC');
+    INSERT INTO c VALUES('ABC');
+    DELETE FROM p WHERE id = 'abc';
+    SELECT quote(id) FROM p;
+}
+expect {
+    'ABC'
+}
+
+@cross-check-integrity
+test fk-parent-delete-uses-parent-key-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES('a');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-key-update-nets-children-of-new-key {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p(k INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(k));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO c VALUES(2);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET k = 2 WHERE k = 1;
+    SELECT k FROM p;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test fk-parent-delete-does-not-coerce-unconverted-key {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p(a BLOB PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    CREATE INDEX ic ON c(x);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES('1');
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p;
+    SELECT count(*) FROM p;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-parent-delete-parent-nocase-child-plain-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    CREATE INDEX ic ON c(x);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES('a');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-parent-nocase-index-nocase {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    CREATE INDEX ic ON c(x COLLATE NOCASE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES('a');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-both-columns-nocase {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(x TEXT COLLATE NOCASE REFERENCES p(a));
+    CREATE INDEX ic ON c(x);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES('a');
+    DELETE FROM p;
+}
+expect error {
+}
