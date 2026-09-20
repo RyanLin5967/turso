@@ -24,7 +24,8 @@ use crate::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
             emit_guarded_fk_decrement, emit_skip_if_any_null, fk_child_index_probe_ok,
             fk_compare_terms, fk_probe_affinity_string, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, table_scan_match_any, ForeignKeyActions,
+            open_read_index, open_read_table, table_scan_match_any, FkCompareKind,
+            ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -982,6 +983,29 @@ pub fn translate_insert(
         table_name: table_name.to_string(),
     });
 
+    if has_fks {
+        // Repair deferred counters for children referencing this NEW parent key.
+        // For REPLACE: delete increments counters above; the insert path should try to repay
+        // them, even for immediate/self-ref FKs.
+        //
+        // This must run before the AFTER INSERT triggers, not after them.
+        // SQLite calls `sqlite3FkCheck` from `sqlite3Insert` between
+        // `sqlite3GenerateConstraintChecks` and `sqlite3CompleteInsertion`, so
+        // its scan of the child table cannot see a row an AFTER trigger has not
+        // inserted yet. Running it after the triggers let a self-referential
+        // table repay a count out of a row the trigger had just added, which
+        // silently committed an orphan. Each trigger body's own INSERT still
+        // repairs what it should, through its own copy of this code.
+        emit_parent_side_fk_decrement_on_insert(
+            program,
+            &btree_table,
+            &insertion,
+            on_replace,
+            resolver,
+            database_id,
+        )?;
+    }
+
     // Fire AFTER INSERT triggers
     let relevant_after_triggers = get_triggers_including_temp(
         resolver,
@@ -1050,20 +1074,6 @@ pub fn translate_insert(
             )?;
         }
         program.preassign_label_to_next_insn(after_trigger_done);
-    }
-
-    if has_fks {
-        // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
-        // For REPLACE: delete increments counters above; the insert path should try to repay
-        // them, even for immediate/self-ref FKs.
-        emit_parent_side_fk_decrement_on_insert(
-            program,
-            &btree_table,
-            &insertion,
-            on_replace,
-            resolver,
-            database_id,
-        )?;
     }
 
     if !is_mvcc {
@@ -4266,7 +4276,15 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&child_tbl.name).cloned().collect()
         });
-        let compares = fk_compare_terms(child_tbl, child_cols, parent_table, &pref.parent_cols)?;
+        // This is SQLite's `sqlite3FkCheck` counter scan, never the RESTRICT
+        // action trigger, so it always compares with the parent affinity.
+        let compares = fk_compare_terms(
+            child_tbl,
+            child_cols,
+            parent_table,
+            &pref.parent_cols,
+            FkCompareKind::Counter,
+        )?;
         let idx = indices
             .iter()
             .find(|ix| fk_child_index_probe_ok(ix, child_tbl, child_cols, &compares));

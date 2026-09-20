@@ -836,6 +836,347 @@ fn test_parent_delete_probes_plain_child_index_instead_of_scanning(
 }
 
 #[turso_macros::test]
+fn test_deferred_restrict_compares_the_stored_values_without_coercion(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // RESTRICT is SQLite's action trigger, whose search term is
+    // `OLD.<parent col> = <child col>`. An OLD reference carries no affinity,
+    // so the comparison takes the child column's, which here is BLOB: the
+    // stored integer 1 and the stored text '1' are not equal and RESTRICT does
+    // not fire. The counter scan still coerces and raises a deferred count,
+    // which re-inserting the parent repays. sqlite3 3.51.0 commits this
+    // transaction and ends with two parent rows.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id NUMERIC PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE c(x REFERENCES p(id) ON DELETE RESTRICT ON UPDATE RESTRICT \
+         DEFERRABLE INITIALLY DEFERRED)",
+    )?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES('1')")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("UPDATE p SET id = 99")?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("COMMIT")?;
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            2,
+            "RESTRICT must not fire on a child key the comparison leaves unconverted"
+        );
+    })?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM c", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "child row must survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_deferred_restrict_uses_the_child_column_affinity(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // The mirror of the test above: only the PARENT side of the RESTRICT
+    // comparison contributes no affinity. The child column is INTEGER, so the
+    // comparison is numeric, the parent's stored text '1' is coerced, and
+    // RESTRICT does fire. Nothing else in this transaction can raise before
+    // COMMIT, so the error can only be RESTRICT's. sqlite3 3.51.0 refuses the
+    // DELETE and leaves the parent row.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id TEXT PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE c(x INTEGER REFERENCES p(id) ON DELETE RESTRICT \
+         DEFERRABLE INITIALLY DEFERRED)",
+    )?;
+    conn.execute("INSERT INTO p VALUES('1')")?;
+    conn.execute("INSERT INTO c VALUES(1)")?;
+
+    conn.execute("BEGIN")?;
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "RESTRICT must fire on a child key the child column's affinity matches"
+    );
+    let _ = conn.execute("ROLLBACK");
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "parent row must survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_deferred_restrict_on_a_rowid_parent_key_coerces(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // A rowid parent key is an integer comparison on both sides, so RESTRICT
+    // coerces here even though the child column has BLOB affinity. sqlite3
+    // 3.51.0 refuses the DELETE.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE c(x BLOB REFERENCES p(id) ON DELETE RESTRICT \
+         DEFERRABLE INITIALLY DEFERRED)",
+    )?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES('1')")?;
+
+    conn.execute("BEGIN")?;
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "RESTRICT must fire: a rowid parent key compares as an integer"
+    );
+    let _ = conn.execute("ROLLBACK");
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_deferred_restrict_on_a_non_rowid_parent_key_does_not_coerce(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // The mirror: the same parent key as `id INTEGER UNIQUE` is an ordinary
+    // column, so the RESTRICT comparison takes the child column's BLOB
+    // affinity and does not coerce. sqlite3 3.51.0 commits this transaction
+    // with one parent row.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id INTEGER UNIQUE)")?;
+    conn.execute(
+        "CREATE TABLE c(x BLOB REFERENCES p(id) ON DELETE RESTRICT \
+         DEFERRABLE INITIALLY DEFERRED)",
+    )?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES('1')")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("DELETE FROM p")?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("COMMIT")?;
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "the transaction must commit");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_after_insert_trigger_row_cannot_repay_a_deferred_count(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // The first row is an orphan: no parent key 5 exists. The AFTER INSERT
+    // trigger then adds a row whose own key references the first row, and
+    // that row must not be allowed to repay the orphan's count, because
+    // SQLite runs `sqlite3FkCheck` for the outer insert before the row is
+    // written and therefore long before the trigger body runs. sqlite3 3.51.0
+    // refuses the INSERT and leaves the table empty.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT REFERENCES t(a) \
+         DEFERRABLE INITIALLY DEFERRED)",
+    )?;
+    conn.execute(
+        "CREATE TRIGGER tr AFTER INSERT ON t WHEN (SELECT count(*) FROM t) < 3 \
+         BEGIN INSERT INTO t VALUES(new.a + 100, new.a); END",
+    )?;
+
+    assert!(
+        conn.execute("INSERT INTO t VALUES(1, 5)").is_err(),
+        "the orphan must not be repaid out of a row the AFTER trigger inserted"
+    );
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM t", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 0, "no row may survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_before_insert_trigger_row_still_repays_a_deferred_count(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // The mirror of the test above. A BEFORE INSERT trigger runs ahead of
+    // `sqlite3FkCheck`, so the row it writes IS visible to the scan and does
+    // repay the count it raised for itself. sqlite3 3.51.0 accepts this
+    // INSERT and keeps both rows.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER REFERENCES t(a) \
+         DEFERRABLE INITIALLY DEFERRED)",
+    )?;
+    conn.execute(
+        "CREATE TRIGGER tr BEFORE INSERT ON t WHEN new.a = 1 \
+         BEGIN INSERT INTO t VALUES(2, 1); END",
+    )?;
+
+    conn.execute("INSERT INTO t VALUES(1, NULL)")?;
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM t", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 2, "both rows must survive");
+    })?;
+
+    Ok(())
+}
+
+/// Roots that `EXPLAIN <sql>` opens for reading, in order.
+fn explained_read_roots(conn: &Arc<Connection>, sql: &str) -> Vec<i64> {
+    limbo_exec_rows(conn, sql)
+        .iter()
+        .filter(|insn| matches!(&insn[1], rusqlite::types::Value::Text(op) if op == "OpenRead"))
+        .filter_map(|insn| match insn[3] {
+            rusqlite::types::Value::Integer(v) => Some(v),
+            _ => None,
+        })
+        .collect()
+}
+
+fn schema_root(conn: &Arc<Connection>, name: &str) -> i64 {
+    let rows = limbo_exec_rows(
+        conn,
+        &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{name}'"),
+    );
+    match rows[0][0] {
+        rusqlite::types::Value::Integer(v) => v,
+        ref other => panic!("rootpage for {name} was {other:?}"),
+    }
+}
+
+#[turso_macros::test]
+fn test_parent_delete_probes_a_descending_child_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // A descending index answers the same equality question an ascending one
+    // does; only the order of the entries differs, and the probe never reads
+    // that order. Falling back to a child-table scan here is a full scan
+    // SQLite does not pay.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x INTEGER REFERENCES p(id))")?;
+    conn.execute("CREATE INDEX ic ON c(x DESC)")?;
+
+    let child_table_root = schema_root(&conn, "c");
+    let child_index_root = schema_root(&conn, "ic");
+    let read_roots = explained_read_roots(&conn, "EXPLAIN DELETE FROM p");
+
+    assert!(
+        read_roots.contains(&child_index_root),
+        "the parent-side check must probe the descending child index, opened roots: {read_roots:?}"
+    );
+    assert!(
+        !read_roots.contains(&child_table_root),
+        "the parent-side check must not scan the child table, opened roots: {read_roots:?}"
+    );
+
+    // And it must still get the answer right: sqlite3 3.51.0 refuses this
+    // DELETE and keeps both rows.
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES(1)")?;
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "parent delete must be refused while the child row references it"
+    );
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "parent row must survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_parent_delete_probes_a_partial_child_index_the_key_implies(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // The probe only ever seeks a parent key with no NULL in it, and a child
+    // row with a NULL foreign key column references nothing, so every row the
+    // probe could match satisfies `x IS NOT NULL`. The index omits no row the
+    // scan would have found.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x INTEGER REFERENCES p(id))")?;
+    conn.execute("CREATE INDEX ic ON c(x) WHERE x IS NOT NULL")?;
+
+    let child_table_root = schema_root(&conn, "c");
+    let child_index_root = schema_root(&conn, "ic");
+    let read_roots = explained_read_roots(&conn, "EXPLAIN DELETE FROM p");
+
+    assert!(
+        read_roots.contains(&child_index_root),
+        "the parent-side check must probe the implied partial index, opened roots: {read_roots:?}"
+    );
+    assert!(
+        !read_roots.contains(&child_table_root),
+        "the parent-side check must not scan the child table, opened roots: {read_roots:?}"
+    );
+
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO p VALUES(2)")?;
+    conn.execute("INSERT INTO c VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES(NULL)")?;
+    conn.execute("DELETE FROM p WHERE id = 2")?;
+    assert!(
+        conn.execute("DELETE FROM p WHERE id = 1").is_err(),
+        "the referenced parent row must still be protected"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_parent_delete_scans_for_a_partial_child_index_it_cannot_prove(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // `x > 5` is not implied by the equality, so the index omits rows the scan
+    // would find and the check must not use it. This is the shape of #8708.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x INTEGER REFERENCES p(id))")?;
+    conn.execute("CREATE INDEX ic ON c(x) WHERE x > 5")?;
+
+    let child_table_root = schema_root(&conn, "c");
+    let child_index_root = schema_root(&conn, "ic");
+    let read_roots = explained_read_roots(&conn, "EXPLAIN DELETE FROM p");
+
+    assert!(
+        read_roots.contains(&child_table_root),
+        "the parent-side check must scan the child table, opened roots: {read_roots:?}"
+    );
+    assert!(
+        !read_roots.contains(&child_index_root),
+        "the parent-side check must not probe an unproven partial index, opened roots: {read_roots:?}"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
 /// Test that a large delete statement containing a foreign key constraint violation
 /// is properly rolled back.
 fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> anyhow::Result<()> {

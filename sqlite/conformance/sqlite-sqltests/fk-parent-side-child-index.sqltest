@@ -129,3 +129,139 @@ test fk-parent-delete-both-columns-nocase {
 }
 expect error {
 }
+
+# RESTRICT is SQLite's action trigger, not the counter scan, and its search
+# term `OLD.<parent col> = <child col>` takes no affinity from the parent side.
+# So the comparison is the child column's, here BLOB, and the stored 1 and the
+# stored '1' are not equal. The counter scan still coerces, and re-inserting
+# the parent repays what it counted.
+@cross-check-integrity
+test fk-deferred-restrict-does-not-coerce-the-stored-child-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id NUMERIC PRIMARY KEY);
+    CREATE TABLE c(x REFERENCES p(id) ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES('1');
+    BEGIN;
+    UPDATE p SET id=99;
+    INSERT INTO p VALUES(1);
+    COMMIT;
+    SELECT count(*) FROM p;
+}
+expect {
+    2
+}
+
+# The mirror: the child column's affinity is INTEGER here, so the RESTRICT
+# comparison does coerce the parent's stored text and does fire. Only the
+# parent side of that comparison contributes nothing. Nothing else in the
+# statement can raise an error before COMMIT, so the error is RESTRICT's.
+@cross-check-integrity
+test fk-deferred-restrict-uses-the-child-column-affinity {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id TEXT PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES('1');
+    INSERT INTO c VALUES(1);
+    BEGIN;
+    DELETE FROM p;
+}
+expect error {
+}
+
+# The parent-side repayment for an insert is SQLite's `sqlite3FkCheck`, which
+# runs before the row is written and therefore before any AFTER INSERT
+# trigger. A row the trigger adds must not repay the orphan the outer row
+# created.
+@cross-check-integrity
+test fk-deferred-self-after-insert-trigger-row-cannot-repay {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT REFERENCES t(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN (SELECT count(*) FROM t) < 3 BEGIN INSERT INTO t VALUES(new.a+100, new.a); END;
+    INSERT INTO t VALUES(1, 5);
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-through-descending-child-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    CREATE INDEX ic ON c(x DESC);
+    INSERT INTO p VALUES(1),(2),(3),(4);
+    INSERT INTO c VALUES(1),(2),(2),(3),(3),(3),(NULL);
+    DELETE FROM p WHERE id=4;
+    DELETE FROM c WHERE x=2;
+    DELETE FROM p WHERE id=2;
+    SELECT group_concat(id) FROM (SELECT id FROM p ORDER BY id);
+}
+expect {
+    1,3
+}
+
+@cross-check-integrity
+test fk-parent-delete-through-partial-child-index-the-key-implies {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    CREATE INDEX ic ON c(x) WHERE x IS NOT NULL;
+    INSERT INTO p VALUES(1),(2);
+    INSERT INTO c VALUES(1),(NULL);
+    DELETE FROM p WHERE id=2;
+    SELECT count(*) FROM p;
+}
+expect {
+    1
+}
+
+# The mirror: a BEFORE INSERT trigger runs ahead of `sqlite3FkCheck`, so the
+# row it writes IS visible to the scan and does repay the count it raised for
+# itself.
+@cross-check-integrity
+test fk-deferred-self-before-insert-trigger-row-repays {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER REFERENCES t(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER tr BEFORE INSERT ON t WHEN new.a = 1 BEGIN INSERT INTO t VALUES(2, 1); END;
+    INSERT INTO t VALUES(1, NULL);
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+# A rowid parent key is an integer comparison on both sides, so RESTRICT does
+# coerce here even though the child column has BLOB affinity. Replacing the
+# rowid with `id INTEGER UNIQUE` makes the same statement commit, which is the
+# test below.
+@cross-check-integrity
+test fk-deferred-restrict-on-a-rowid-parent-key-coerces {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x BLOB REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES('1');
+    BEGIN;
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-deferred-restrict-on-a-non-rowid-parent-key-does-not-coerce {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER UNIQUE);
+    CREATE TABLE c(x BLOB REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES('1');
+    BEGIN;
+    DELETE FROM p;
+    SELECT 'mid=' || (SELECT count(*) FROM p);
+    INSERT INTO p VALUES(1);
+    COMMIT;
+    SELECT 'end=' || count(*) FROM p;
+}
+expect {
+    mid=0
+    end=1
+}
