@@ -2111,6 +2111,39 @@ fn test_update_or_fail_partial_success_in_txn(tmp_db: TempDatabase) -> anyhow::R
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_insert_or_fail_fk_violation_discards_prior_rows(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+    run_fk_constraint_case(
+        "insert_or_fail_fk_violation",
+        &[
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
+        ],
+        &["INSERT INTO parent VALUES(1)"],
+        "INSERT OR FAIL INTO child VALUES(1, 1), (2, 7)",
+        "SELECT * FROM child ORDER BY id",
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_insert_or_fail_rowid_type_mismatch_discards_prior_rows(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+    run_fk_constraint_case(
+        "insert_or_fail_rowid_type_mismatch",
+        &["CREATE TABLE t(x INTEGER PRIMARY KEY)"],
+        &[],
+        "INSERT OR FAIL INTO t VALUES(1), ('a')",
+        "SELECT * FROM t ORDER BY x",
+    );
+    Ok(())
+}
+
 /// A BEFORE INSERT trigger runs an `UPDATE OR FAIL` that conflicts. The FAIL
 /// belongs to the trigger's UPDATE, not to the outer INSERT, so it must govern
 /// how much is rolled back: SQLite keeps the changes made before the conflict

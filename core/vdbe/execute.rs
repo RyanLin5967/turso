@@ -3788,7 +3788,10 @@ pub fn halt(
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
         // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
-        if program.resolve_type == ResolveType::Fail && can_autocommit_now {
+        if program.resolve_type == ResolveType::Fail
+            && can_autocommit_now
+            && !matches!(error, LimboError::ForeignKeyConstraint(_))
+        {
             // Check for immediate FK violations - FK errors don't respect ON CONFLICT
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
@@ -7169,7 +7172,7 @@ pub fn op_decr_jump_zero(
             }
         }
         Register::Value(_) | Register::Record(_) => {
-            bail_constraint_error!("datatype mismatch");
+            return Err(LimboError::TypeMismatch.into());
         }
         Register::Aggregate(_) => {
             mark_unlikely();
@@ -13543,7 +13546,7 @@ pub fn op_must_be_int(
             state.pc = target_pc.as_offset_int();
             return Ok(InsnFunctionStepResult::Step);
         }
-        bail_constraint_error!("datatype mismatch");
+        return Err(LimboError::TypeMismatch.into());
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -20198,7 +20201,7 @@ mod tests {
             Ok(_) => panic!("non-integer register must fail"),
             Err(err) => err,
         };
-        assert!(matches!(*err, LimboError::Constraint(message) if message == "datatype mismatch"));
+        assert!(matches!(*err, LimboError::TypeMismatch));
         assert_eq!(state.pc, 0);
     }
 

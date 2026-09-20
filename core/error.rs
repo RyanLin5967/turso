@@ -59,6 +59,8 @@ pub enum LimboError {
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
     ForeignKeyConstraint(String),
+    #[error("datatype mismatch")]
+    TypeMismatch,
     #[error("{1}")]
     Raise(turso_parser::ast::ResolveType, String),
     #[error("RaiseIgnore")]
@@ -176,6 +178,7 @@ impl LimboError {
             Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
+            Self::TypeMismatch => 20,
             Self::NotADB => 26,
             Self::BlobHandleExpired => 4,
             _ => 1,
