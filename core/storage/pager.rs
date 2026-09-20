@@ -81,30 +81,91 @@ impl HeaderRef {
     }
 
     pub fn borrow(&self) -> &DatabaseHeader {
-        // TODO: Instead of erasing mutability, implement `get_mut_contents` and return a shared reference.
         let content = self.0.get_contents();
-        bytemuck::from_bytes::<DatabaseHeader>(&content.as_mut()[0..DatabaseHeader::SIZE])
+        bytemuck::from_bytes::<DatabaseHeader>(&content.as_slice()[0..DatabaseHeader::SIZE])
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct HeaderRefMut(PageRef);
+pub struct HeaderRefMut(PageRef, WriteTicket);
 
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
         let page = return_if_io!(pager.read_header_page());
-        pager.add_dirty(&page)?;
-        Ok(IOResult::Done(Self(page)))
+        let wt = pager.add_dirty(&page)?;
+        Ok(IOResult::Done(Self(page, wt)))
     }
 
     pub fn borrow_mut(&self) -> &mut DatabaseHeader {
         let content = self.0.get_contents();
-        bytemuck::from_bytes_mut::<DatabaseHeader>(&mut content.as_mut()[0..DatabaseHeader::SIZE])
+        bytemuck::from_bytes_mut::<DatabaseHeader>(
+            &mut content.as_mut(&self.1)[0..DatabaseHeader::SIZE],
+        )
     }
 
     /// Get a reference to the underlying page
     pub fn page(&self) -> &PageRef {
         &self.0
+    }
+}
+
+/// Proof that a copy-on-write decision has been made for the page about to be written.
+///
+/// # What this buys
+///
+/// [`PageInner::as_mut`] — the one door a page write can go through — now *requires* one of
+/// these. The only way to obtain one is [`Pager::add_dirty`], which is where the CoW decision
+/// is made (`subjournal_page_if_required`). So "every page-buffer write was preceded by a
+/// copy-on-write decision" stops being a comment that a sweep has to re-verify and becomes a
+/// property the type checker enforces on every build.
+///
+/// # Why the field is a private `()`
+///
+/// The tuple field is private to this module, so `btree.rs` — or any other caller — *cannot*
+/// mint a ticket. It can only receive one, which means it can only write a page downstream of
+/// an `add_dirty` that actually ran. Making the unsafe state unrepresentable beats documenting
+/// it: there is no way to spell a write without the decision.
+///
+/// # What it deliberately does NOT prove
+///
+/// The ticket is not tied to a *particular* page: holding one for page A permits writing page
+/// B. Closing that gap means a lifetime/branded index, which the probe for this change showed
+/// would turn an additive argument-threading job into a whole-engine borrow refactor. What is
+/// proven is that *a* CoW decision happened on this path, which is the property that was
+/// previously only asserted in prose. The three seams below `as_mut` that it still cannot see
+/// are listed on [`PageInner::as_mut`].
+///
+/// `Clone` is deliberate and does not weaken the guarantee: duplicating a ticket still requires
+/// already holding one, so it cannot be forged — only passed on, which a `&WriteTicket` allows
+/// anyway.
+#[derive(Debug, Clone)]
+pub struct WriteTicket(());
+
+impl WriteTicket {
+    /// Mint a ticket for a write that provably has no prior content to preserve, so there is
+    /// nothing for copy-on-write to decide.
+    ///
+    /// This is the *only* bypass of [`Pager::add_dirty`], and it is private to this module on
+    /// purpose: the complete list of exemptions is `grep -n 'no_cow_required' core/storage/pager.rs`
+    /// and cannot grow outside this file. Every call site must justify itself in a comment.
+    ///
+    /// Two shapes qualify, and nothing else should be added without the same argument:
+    /// - a page constructed locally and not yet published to the page cache (database bootstrap),
+    ///   where no other reference to the buffer exists and its prior bytes are uninitialised;
+    /// - refreshing a cached page's bytes to match a WAL frame that has *already* been durably
+    ///   written, which is a cache update rather than a logical page write.
+    fn no_cow_required() -> Self {
+        Self(())
+    }
+
+    /// Test-only ticket source.
+    ///
+    /// Gated on `cfg(test)`, so it does not exist in a production build: unit tests that build a
+    /// bare page outside any pager can still write it, without widening the exemption list that
+    /// [`WriteTicket::no_cow_required`] documents.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self(())
     }
 }
 
@@ -191,7 +252,7 @@ impl PageInner {
     /// after the page is already clean. Those are below this accessor and need their own seams.
     #[inline]
     #[allow(clippy::mut_from_ref)]
-    pub fn as_mut(&self) -> &mut [u8] {
+    pub fn as_mut(&self, _t: &WriteTicket) -> &mut [u8] {
         self.buffer
             .as_ref()
             .expect("buffer not loaded")
@@ -212,14 +273,14 @@ impl PageInner {
     /// Read a u8 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u8(&self, pos: usize) -> u8 {
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         buf[self.offset() + pos]
     }
 
     /// Read a u16 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u16(&self, pos: usize) -> u16 {
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         let offset = self.offset();
         u16::from_be_bytes([buf[offset + pos], buf[offset + pos + 1]])
     }
@@ -227,32 +288,32 @@ impl PageInner {
     /// Read a u32 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u32(&self, pos: usize) -> u32 {
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         read_u32(buf, self.offset() + pos)
     }
 
     /// Write a u8 to the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
-    fn write_u8(&self, pos: usize, value: u8) {
+    fn write_u8(&self, pos: usize, value: u8, wt: &WriteTicket) {
         tracing::trace!("write_u8(pos={}, value={})", pos, value);
-        let buf = self.as_mut();
+        let buf = self.as_mut(wt);
         buf[self.offset() + pos] = value;
     }
 
     /// Write a u16 to the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
-    fn write_u16(&self, pos: usize, value: u16) {
+    fn write_u16(&self, pos: usize, value: u16, wt: &WriteTicket) {
         tracing::trace!("write_u16(pos={}, value={})", pos, value);
-        let buf = self.as_mut();
+        let buf = self.as_mut(wt);
         let offset = self.offset();
         buf[offset + pos..offset + pos + 2].copy_from_slice(&value.to_be_bytes());
     }
 
     /// Write a u32 to the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
-    fn write_u32(&self, pos: usize, value: u32) {
+    fn write_u32(&self, pos: usize, value: u32, wt: &WriteTicket) {
         tracing::trace!("write_u32(pos={}, value={})", pos, value);
-        let buf = self.as_mut();
+        let buf = self.as_mut(wt);
         let offset = self.offset();
         buf[offset + pos..offset + pos + 4].copy_from_slice(&value.to_be_bytes());
     }
@@ -265,54 +326,54 @@ impl PageInner {
     /// Read a u16 from the page content at the given absolute offset (no db header offset).
     #[inline]
     pub fn read_u16_no_offset(&self, pos: usize) -> u16 {
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         u16::from_be_bytes([buf[pos], buf[pos + 1]])
     }
 
     /// Read a u32 from the page content at the given absolute offset (no db header offset).
     #[inline]
     pub fn read_u32_no_offset(&self, pos: usize) -> u32 {
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
     }
 
     /// Write a u16 at the given absolute offset (no db header offset).
-    pub fn write_u16_no_offset(&self, pos: usize, value: u16) {
+    pub fn write_u16_no_offset(&self, pos: usize, value: u16, wt: &WriteTicket) {
         tracing::trace!("write_u16_no_offset(pos={}, value={})", pos, value);
-        let buf = self.as_mut();
+        let buf = self.as_mut(wt);
         buf[pos..pos + 2].copy_from_slice(&value.to_be_bytes());
     }
 
     /// Write a u32 at the given absolute offset (no db header offset).
-    pub fn write_u32_no_offset(&self, pos: usize, value: u32) {
+    pub fn write_u32_no_offset(&self, pos: usize, value: u32, wt: &WriteTicket) {
         tracing::trace!("write_u32_no_offset(pos={}, value={})", pos, value);
-        let buf = self.as_mut();
+        let buf = self.as_mut(wt);
         buf[pos..pos + 4].copy_from_slice(&value.to_be_bytes());
     }
 
-    pub fn write_page_type(&self, value: u8) {
-        self.write_u8(BTREE_PAGE_TYPE, value);
+    pub fn write_page_type(&self, value: u8, wt: &WriteTicket) {
+        self.write_u8(BTREE_PAGE_TYPE, value, wt);
     }
 
-    pub fn write_rightmost_ptr(&self, value: u32) {
-        self.write_u32(BTREE_RIGHTMOST_PTR, value);
+    pub fn write_rightmost_ptr(&self, value: u32, wt: &WriteTicket) {
+        self.write_u32(BTREE_RIGHTMOST_PTR, value, wt);
     }
 
-    pub fn write_first_freeblock(&self, value: u16) {
-        self.write_u16(BTREE_FIRST_FREEBLOCK, value);
+    pub fn write_first_freeblock(&self, value: u16, wt: &WriteTicket) {
+        self.write_u16(BTREE_FIRST_FREEBLOCK, value, wt);
     }
 
-    pub fn write_freeblock(&self, offset: u16, size: u16, next_block: Option<u16>) {
-        self.write_freeblock_next_ptr(offset, next_block.unwrap_or(0));
-        self.write_freeblock_size(offset, size);
+    pub fn write_freeblock(&self, offset: u16, size: u16, next_block: Option<u16>, wt: &WriteTicket) {
+        self.write_freeblock_next_ptr(offset, next_block.unwrap_or(0), wt);
+        self.write_freeblock_size(offset, size, wt);
     }
 
-    pub fn write_freeblock_size(&self, offset: u16, size: u16) {
-        self.write_u16_no_offset(offset as usize + 2, size);
+    pub fn write_freeblock_size(&self, offset: u16, size: u16, wt: &WriteTicket) {
+        self.write_u16_no_offset(offset as usize + 2, size, wt);
     }
 
-    pub fn write_freeblock_next_ptr(&self, offset: u16, next_block: u16) {
-        self.write_u16_no_offset(offset as usize, next_block);
+    pub fn write_freeblock_next_ptr(&self, offset: u16, next_block: u16, wt: &WriteTicket) {
+        self.write_u16_no_offset(offset as usize, next_block, wt);
     }
 
     pub fn read_freeblock(&self, offset: u16) -> (u16, u16) {
@@ -322,18 +383,18 @@ impl PageInner {
         )
     }
 
-    pub fn write_cell_count(&self, value: u16) {
-        self.write_u16(BTREE_CELL_COUNT, value);
+    pub fn write_cell_count(&self, value: u16, wt: &WriteTicket) {
+        self.write_u16(BTREE_CELL_COUNT, value, wt);
     }
 
-    pub fn write_cell_content_area(&self, value: usize) {
+    pub fn write_cell_content_area(&self, value: usize, wt: &WriteTicket) {
         turso_debug_assert!(value <= PageSize::MAX as usize);
         let value = value as u16;
-        self.write_u16(BTREE_CELL_CONTENT_AREA, value);
+        self.write_u16(BTREE_CELL_CONTENT_AREA, value, wt);
     }
 
-    pub fn write_fragmented_bytes_count(&self, value: u8) {
-        self.write_u8(BTREE_FRAGMENTED_BYTES_COUNT, value);
+    pub fn write_fragmented_bytes_count(&self, value: u8, wt: &WriteTicket) {
+        self.write_u8(BTREE_FRAGMENTED_BYTES_COUNT, value, wt);
     }
 
     #[inline]
@@ -395,10 +456,10 @@ impl PageInner {
     }
 
     #[inline]
-    pub fn rightmost_pointer_raw(&self) -> crate::Result<Option<*mut u8>> {
+    pub fn rightmost_pointer_raw(&self, wt: &WriteTicket) -> crate::Result<Option<*mut u8>> {
         match self.page_type()? {
             PageType::IndexInterior | PageType::TableInterior => Ok(Some(unsafe {
-                self.as_mut()
+                self.as_mut(wt)
                     .as_mut_ptr()
                     .add(self.offset() + BTREE_RIGHTMOST_PTR)
             })),
@@ -409,7 +470,7 @@ impl PageInner {
     #[inline]
     pub fn cell_get(&self, idx: usize, usable_size: usize) -> crate::Result<BTreeCell> {
         tracing::trace!("cell_get(idx={})", idx);
-        let buf = self.as_mut();
+        let buf = self.as_slice();
 
         let ncells = self.cell_count();
         turso_assert_less_than!(idx, ncells,
@@ -427,7 +488,7 @@ impl PageInner {
     #[inline(always)]
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -445,7 +506,7 @@ impl PageInner {
             self.page_type(),
             Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
         ));
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -466,7 +527,7 @@ impl PageInner {
     #[inline(always)]
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -491,7 +552,7 @@ impl PageInner {
         idx: usize,
         usable_size: usize,
     ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_offset = self.read_u16(cell_pointer) as usize;
@@ -626,7 +687,7 @@ impl PageInner {
         min_local: usize,
         page_type: PageType,
     ) -> crate::Result<(usize, usize)> {
-        let buf = self.as_mut();
+        let buf = self.as_slice();
         turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
@@ -705,8 +766,8 @@ impl PageInner {
         self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
     }
 
-    pub fn write_database_header(&self, header: &DatabaseHeader) {
-        let buf = self.as_mut();
+    pub fn write_database_header(&self, header: &DatabaseHeader, wt: &WriteTicket) {
+        let buf = self.as_mut(wt);
         buf[0..DatabaseHeader::SIZE].copy_from_slice(bytemuck::bytes_of(header));
     }
 
@@ -1957,7 +2018,7 @@ impl Pager {
             let page_id = page.get().id as u32;
             let contents = page.get_contents();
             let buffer = self.buffer_pool.allocate(page_size + 4);
-            let contents_buffer = contents.as_mut();
+            let contents_buffer = contents.as_slice();
             turso_assert!(
                 contents_buffer.len() == page_size,
                 "contents buffer length should be equal to page size"
@@ -2491,7 +2552,7 @@ impl Pager {
                     let page_content = ptrmap_page.get_contents();
                     let ptrmap_pg_no = page_content.id;
 
-                    let full_buffer_slice: &[u8] = page_content.as_mut();
+                    let full_buffer_slice: &[u8] = page_content.as_slice();
 
                     // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
                     // The actual page data starts at page_content.offset() within the full_buffer_slice.
@@ -2590,11 +2651,11 @@ impl Pager {
                     offset_in_ptrmap_page,
                 } => {
                     turso_assert!(ptrmap_page.is_loaded(), "page should be loaded");
-                    self.add_dirty(&ptrmap_page)?;
+                    let wt = self.add_dirty(&ptrmap_page)?;
                     let page_content = ptrmap_page.get_contents();
                     let ptrmap_pg_no = page_content.id;
 
-                    let full_buffer_slice = page_content.as_mut();
+                    let full_buffer_slice = page_content.as_mut(&wt);
 
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
                         return Err(LimboError::InternalError(format!(
@@ -2637,7 +2698,8 @@ impl Pager {
         };
         #[cfg(not(feature = "autovacuum"))]
         {
-            let page = return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
+            let (page, _wt) =
+                return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
             Ok(IOResult::Done(page.get().id as u32))
         }
 
@@ -2648,7 +2710,7 @@ impl Pager {
                 AutoVacuumMode::from(self.auto_vacuum_mode.load(Ordering::SeqCst));
             match auto_vacuum_mode {
                 AutoVacuumMode::None => {
-                    let page =
+                    let (page, _wt) =
                         return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
                     Ok(IOResult::Done(page.get().id as u32))
                 }
@@ -2689,7 +2751,7 @@ impl Pager {
                             }
                             BtreeCreateVacuumFullState::AllocatePage { root_page_num } => {
                                 //  root_page_num here is the desired root page
-                                let page = return_if_io!(self.do_allocate_page(
+                                let (page, _wt) = return_if_io!(self.do_allocate_page(
                                     page_type,
                                     0,
                                     BtreePageAllocMode::Exact(root_page_num),
@@ -2744,16 +2806,16 @@ impl Pager {
     /// Allocate a new overflow page.
     /// This is done when a cell overflows and new space is needed.
     // FIXME: handle no room in page cache
-    pub fn allocate_overflow_page(&self) -> Result<IOResult<PageRef>> {
-        let page = return_if_io!(self.allocate_page());
+    pub fn allocate_overflow_page(&self) -> Result<IOResult<(PageRef, WriteTicket)>> {
+        let (page, wt) = return_if_io!(self.allocate_page());
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
         let contents = page.get_contents();
-        let buf = contents.as_mut();
+        let buf = contents.as_mut(&wt);
         buf.fill(0);
 
-        Ok(IOResult::Done(page))
+        Ok(IOResult::Done((page, wt)))
     }
 
     /// Allocate a new page to the btree via the pager.
@@ -2764,21 +2826,21 @@ impl Pager {
         page_type: PageType,
         offset: usize,
         _alloc_mode: BtreePageAllocMode,
-    ) -> Result<IOResult<PageRef>> {
-        let page = return_if_io!(self.allocate_page());
+    ) -> Result<IOResult<(PageRef, WriteTicket)>> {
+        let (page, wt) = return_if_io!(self.allocate_page());
         #[cfg(debug_assertions)]
         turso_assert_eq!(
             offset,
             page.get_contents().offset(),
             "offset doesn't match computed offset for page"
         );
-        btree_init_page(&page, page_type, offset, self.usable_space());
+        btree_init_page(&page, page_type, offset, self.usable_space(), &wt);
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().id,
             page.get_contents().page_type().ok()
         );
-        Ok(IOResult::Done(page))
+        Ok(IOResult::Done((page, wt)))
     }
 
     /// The "usable size" of a database page is the page size specified by the 2-byte integer at offset 16
@@ -2842,7 +2904,11 @@ impl Pager {
             inner.buffer = Some(Arc::new(Buffer::new_temporary(size.get() as usize)));
         }
 
-        page.get_contents().write_database_header(&header);
+        // `page` was constructed two statements ago with a fresh temporary buffer and is not in
+        // the page cache: nothing else references it and its prior bytes are uninitialised, so
+        // there is no content for copy-on-write to preserve.
+        let wt = WriteTicket::no_cow_required();
+        page.get_contents().write_database_header(&header, &wt);
         page.set_loaded();
         page.clear_wal_tag();
 
@@ -2851,6 +2917,7 @@ impl Pager {
             PageType::TableLeaf,
             DatabaseHeader::SIZE,
             (size.get() - header.reserved_space as u32) as usize,
+            &wt,
         );
 
         self.init_page_1.store(Some(page));
@@ -3523,7 +3590,10 @@ impl Pager {
         Ok(page_cache.resize(capacity))
     }
 
-    pub fn add_dirty(&self, page: &Page) -> Result<()> {
+    /// Make the copy-on-write decision for `page` and return the [`WriteTicket`] that permits
+    /// writing it. This is the *only* source of tickets, which is what makes the decision
+    /// unskippable: see [`WriteTicket`].
+    pub fn add_dirty(&self, page: &Page) -> Result<WriteTicket> {
         turso_assert!(
             page.is_loaded(),
             "page must be loaded in add_dirty() so its contents can be subjournaled",
@@ -3543,7 +3613,7 @@ impl Pager {
             self.page_cache.write().notify_page_dirty(key);
         }
         page.set_dirty();
-        Ok(())
+        Ok(WriteTicket(()))
     }
 
     pub fn wal_state(&self) -> Result<WalState> {
@@ -4541,7 +4611,12 @@ impl Pager {
         )?;
         if let Some(page) = self.cache_get(header.page_number as usize)? {
             let content = page.get_contents();
-            content.as_mut().copy_from_slice(raw_page);
+            // The frame is already durably in the WAL (`write_frame_raw` above); this only brings
+            // the cached copy in line with it. Marking the page dirty here would schedule a
+            // spurious write-back of bytes the WAL already owns.
+            content
+                .as_mut(&WriteTicket::no_cow_required())
+                .copy_from_slice(raw_page);
             turso_assert!(
                 page.get().id == header.page_number as usize,
                 "page has unexpected id"
@@ -5281,16 +5356,18 @@ impl Pager {
                             trunk_page.get().id == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
-                        self.add_dirty(&trunk_page)?;
+                        let wt = self.add_dirty(&trunk_page)?;
 
                         trunk_page_contents.write_u32_no_offset(
                             FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                             number_of_leaf_pages + 1,
+                            &wt,
                         );
                         trunk_page_contents.write_u32_no_offset(
                             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR
                                 + (number_of_leaf_pages as usize * FREELIST_LEAF_PTR_SIZE),
                             page_id as u32,
+                            &wt,
                         );
 
                         // Unpin page before finishing - it's added to freelist
@@ -5304,16 +5381,19 @@ impl Pager {
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     // If we get here, need to make this page a new trunk
                     turso_assert!(page.get().id == page_id, "page has unexpected id");
-                    self.add_dirty(page)?;
+                    let wt = self.add_dirty(page)?;
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
                     let contents = page.get_contents();
                     // Point to previous trunk
-                    contents
-                        .write_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, trunk_page_id);
+                    contents.write_u32_no_offset(
+                        FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
+                        trunk_page_id,
+                        &wt,
+                    );
                     // Zero leaf count
-                    contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0);
+                    contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0, &wt);
                     // Update page 1 to point to new trunk
                     header.freelist_trunk_page = (page_id as u32).into();
                     // Unpin page before finishing - it's now a trunk page
@@ -5364,8 +5444,12 @@ impl Pager {
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
                 let page = allocate_new_page(1, &self.buffer_pool);
 
+                // Page 1 was just constructed here and is not in the page cache yet: no other
+                // reference exists and its previous bytes are uninitialised, so there is no
+                // prior content for copy-on-write to preserve.
+                let wt = WriteTicket::no_cow_required();
                 let contents = page.get_contents();
-                contents.write_database_header(&default_header);
+                contents.write_database_header(&default_header, &wt);
 
                 let page1 = page;
                 // Create the sqlite_schema table, for this we just need to create the btree page
@@ -5378,6 +5462,7 @@ impl Pager {
                     DatabaseHeader::SIZE,
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
+                    &wt,
                 );
                 let c = begin_write_btree_page(self, &page1)?;
 
@@ -5449,7 +5534,7 @@ impl Pager {
     ///        or allocate a new page.
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
+    pub fn allocate_page(&self) -> Result<IOResult<(PageRef, WriteTicket)>> {
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
@@ -5566,14 +5651,14 @@ impl Pager {
                     // Update the database's first freelist trunk page to the next trunk page (may be 0 if there are no more trunk pages).
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
-                    self.add_dirty(trunk_page)?;
+                    let wt = self.add_dirty(trunk_page)?;
                     // zero out the page
                     turso_assert!(
                         trunk_page.get_contents().overflow_cells.is_empty(),
                         "Freelist trunk page has overflow cells",
                         { "page_id": trunk_page.get().id }
                     );
-                    trunk_page.get_contents().as_mut().fill(0);
+                    trunk_page.get_contents().as_mut(&wt).fill(0);
                     let page_key = PageCacheKey::new(trunk_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
@@ -5587,7 +5672,7 @@ impl Pager {
                     trunk_page.unpin();
                     let trunk_page = trunk_page.clone();
                     *state = AllocatePageState::Start;
-                    return Ok(IOResult::Done(trunk_page));
+                    return Ok(IOResult::Done((trunk_page, wt)));
                 }
                 AllocatePageState::ReuseFreelistLeaf {
                     trunk_page,
@@ -5600,14 +5685,14 @@ impl Pager {
                         { "page_id": leaf_page.get().id }
                     );
                     let page_contents = trunk_page.get_contents();
-                    self.add_dirty(leaf_page)?;
+                    let leaf_wt = self.add_dirty(leaf_page)?;
                     // zero out the page
                     turso_assert!(
                         leaf_page.get_contents().overflow_cells.is_empty(),
                         "Freelist leaf page has overflow cells",
                         { "page_id": leaf_page.get().id }
                     );
-                    leaf_page.get_contents().as_mut().fill(0);
+                    leaf_page.get_contents().as_mut(&leaf_wt).fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id);
                     {
                         let page_cache = self.page_cache.read();
@@ -5619,12 +5704,12 @@ impl Pager {
                     }
 
                     // Mark trunk page dirty BEFORE modifying it so subjournal captures original content
-                    self.add_dirty(trunk_page)?;
+                    let trunk_wt = self.add_dirty(trunk_page)?;
 
                     // Shift left all the other leaf pages in the trunk page and subtract 1 from the leaf count
                     let remaining_leaves_count = (*number_of_freelist_leaves - 1) as usize;
                     {
-                        let buf = page_contents.as_mut();
+                        let buf = page_contents.as_mut(&trunk_wt);
                         // use copy within the same page
                         let offset_remaining_leaves_start =
                             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + FREELIST_LEAF_PTR_SIZE;
@@ -5639,6 +5724,7 @@ impl Pager {
                     page_contents.write_u32_no_offset(
                         FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                         remaining_leaves_count as u32,
+                        &trunk_wt,
                     );
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
@@ -5647,7 +5733,7 @@ impl Pager {
                     leaf_page.unpin();
                     let leaf_page = leaf_page.clone();
                     *state = AllocatePageState::Start;
-                    return Ok(IOResult::Done(leaf_page));
+                    return Ok(IOResult::Done((leaf_page, leaf_wt)));
                 }
                 AllocatePageState::AllocateNewPage { current_db_size } => {
                     let mut new_db_size = *current_db_size + 1;
@@ -5677,7 +5763,7 @@ impl Pager {
                     let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
                     {
                         // setup page and add to cache
-                        self.add_dirty(&page)?;
+                        let wt = self.add_dirty(&page)?;
 
                         let page_key = PageCacheKey::new(page.get().id as usize);
                         self.page_cache
@@ -5685,7 +5771,7 @@ impl Pager {
                             .force_insert_page(page_key, page.clone())?;
                         header.database_size = new_db_size.into();
                         *state = AllocatePageState::Start;
-                        return Ok(IOResult::Done(page));
+                        return Ok(IOResult::Done((page, wt)));
                     }
                 }
             }
@@ -5956,7 +6042,10 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
         )));
     }
 
-    page.get_contents().write_database_header(&default_header);
+    // Same as above: a locally constructed page 1 that has not been published to the page
+    // cache, so there are no prior bytes to preserve.
+    let wt = WriteTicket::no_cow_required();
+    page.get_contents().write_database_header(&default_header, &wt);
     page.set_loaded();
     page.clear_wal_tag();
 
@@ -5965,6 +6054,7 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
         PageType::TableLeaf,
         DatabaseHeader::SIZE, // offset of 100 bytes
         (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
+        &wt,
     );
 
     page
@@ -6292,7 +6382,7 @@ mod tests {
             .collect();
         assert_eq!(held.len(), CAP, "cache should be at capacity");
 
-        let page = pager.io.block(|| pager.allocate_page()).unwrap();
+        let (page, _wt) = pager.io.block(|| pager.allocate_page()).unwrap();
         assert_eq!(page.get().id, 6);
         assert!(
             pager.page_cache.read().len() > CAP,
