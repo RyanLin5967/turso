@@ -1579,7 +1579,7 @@ fn choose_from_clause_subquery_execution_mode(
         }
         _ if at_kept_probe_site
             && kept_for_whole_statement_by_sqlite(&from_clause_subquery.plan, probed_columns)
-            && !plan_is_correlated(&from_clause_subquery.plan) =>
+            && true =>
         {
             FromClauseSubqueryExecutionMode::MaterializedTable
         }
