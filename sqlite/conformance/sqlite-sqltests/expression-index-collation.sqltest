@@ -1,0 +1,191 @@
+@database :memory:
+
+# Regression tests for #8739: an index on an expression stores its keys in the
+# index column's collation, so a seek over those keys is only valid when the
+# comparison itself uses that collation. Turso checked this for plain column
+# index entries but not for expression ones, so `lower(a) = 'A' COLLATE NOCASE`
+# was answered by a BINARY seek over the `lower(a)` keys. Equality missed the
+# matching rows, the same seek the other way round returned rows the predicate
+# excludes, and a range DELETE built on it removed the whole table.
+#
+# The comparison and the index column both default to BINARY when neither
+# declares a collation, so the check disqualifies the index in both directions
+# rather than only when the comparison names a collation.
+
+setup mixed-case-expr-index {
+    CREATE TABLE t(a TEXT, c INTEGER);
+    INSERT INTO t VALUES('A',1),('a',2),('b',3);
+    CREATE INDEX ix ON t(lower(a));
+}
+
+@setup mixed-case-expr-index
+@cross-check-integrity
+test expr-index-nocase-equality {
+    SELECT c FROM t WHERE lower(a) = 'A' COLLATE NOCASE ORDER BY c;
+}
+expect {
+1
+2
+}
+
+@setup mixed-case-expr-index
+@cross-check-integrity
+test expr-index-nocase-range {
+    SELECT c FROM t WHERE lower(a) > 'A' COLLATE NOCASE ORDER BY c;
+}
+expect {
+3
+}
+
+@setup mixed-case-expr-index
+@cross-check-integrity
+test expr-index-nocase-range-delete {
+    DELETE FROM t WHERE lower(a) > 'A' COLLATE NOCASE;
+    SELECT a, c FROM t ORDER BY c;
+}
+expect {
+A|1
+a|2
+}
+
+@setup mixed-case-expr-index
+@cross-check-integrity
+test expr-index-nocase-range-update {
+    UPDATE t SET c = c + 100 WHERE lower(a) > 'A' COLLATE NOCASE;
+    SELECT a, c FROM t ORDER BY a, c;
+}
+expect {
+A|1
+a|2
+b|103
+}
+
+# A comparison that does not name a collation is BINARY, which is what the
+# index column stores, so the seek stays available and must keep returning
+# the same rows it did before.
+@setup mixed-case-expr-index
+@cross-check-integrity
+test expr-index-binary-equality-still-seeks {
+    SELECT c FROM t WHERE lower(a) = 'a' ORDER BY c;
+}
+expect {
+1
+2
+}
+
+@setup mixed-case-expr-index
+@cross-check-integrity
+test expr-index-binary-range-still-seeks {
+    SELECT c FROM t WHERE lower(a) > 'a' ORDER BY c;
+}
+expect {
+3
+}
+
+# The same mismatch reached through a correlated subquery and through a
+# scalar subquery on the right hand side, rather than a bare literal.
+@setup mixed-case-expr-index
+@cross-check-integrity
+test expr-index-nocase-correlated-exists {
+    SELECT c FROM t x WHERE EXISTS (SELECT 1 FROM t y WHERE lower(y.a) = 'A' COLLATE NOCASE AND y.c = x.c) ORDER BY c;
+}
+expect {
+1
+2
+}
+
+@setup mixed-case-expr-index
+@cross-check-integrity
+test expr-index-nocase-scalar-subquery-rhs {
+    SELECT c FROM t WHERE lower(a) = (SELECT 'A') COLLATE NOCASE ORDER BY c;
+}
+expect {
+1
+2
+}
+
+@setup mixed-case-expr-index
+@cross-check-integrity
+test expr-index-nocase-other-functions {
+    SELECT c FROM t WHERE substr(a,1,1) = 'A' COLLATE NOCASE ORDER BY c;
+}
+expect {
+1
+2
+}
+
+# A partial expression index reaches the same seek, so the range DELETE it
+# drives took every row the partial index covered.
+setup partial-expr-index {
+    CREATE TABLE t(a TEXT, c INTEGER);
+    INSERT INTO t VALUES('A',1),('a',2),('b',3),('C',4);
+    CREATE INDEX ix ON t(lower(a)) WHERE c < 4;
+}
+
+@setup partial-expr-index
+@cross-check-integrity
+test partial-expr-index-nocase-equality {
+    SELECT c FROM t WHERE lower(a) = 'A' COLLATE NOCASE AND c < 4 ORDER BY c;
+}
+expect {
+1
+2
+}
+
+@setup partial-expr-index
+@cross-check-integrity
+test partial-expr-index-nocase-range-delete {
+    DELETE FROM t WHERE lower(a) > 'A' COLLATE NOCASE AND c < 4;
+    SELECT c FROM t ORDER BY c;
+}
+expect {
+1
+2
+4
+}
+
+# A column that declares NOCASE does not give the expression index that
+# collation: the key is still BINARY, so an explicit NOCASE comparison must
+# not seek it.
+setup declared-nocase-column-expr-index {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, c INTEGER);
+    INSERT INTO t VALUES('A',1),('a',2),('b',3);
+    CREATE INDEX ix ON t(lower(a));
+}
+
+@setup declared-nocase-column-expr-index
+@cross-check-integrity
+test declared-nocase-column-expr-index-nocase-equality {
+    SELECT c FROM t WHERE lower(a) = 'A' COLLATE NOCASE ORDER BY c;
+}
+expect {
+1
+2
+}
+
+@setup declared-nocase-column-expr-index
+@cross-check-integrity
+test declared-nocase-column-expr-index-binary-equality {
+    SELECT c FROM t WHERE lower(a) = 'A' ORDER BY c;
+}
+expect {
+}
+
+# A COLLATE inside the indexed expression belongs to the expression, not to
+# the index key, so the key stays BINARY while the comparison resolves to
+# NOCASE.
+setup inner-collate-expr-index {
+    CREATE TABLE t(a TEXT, c INTEGER);
+    INSERT INTO t VALUES('A',1),('a',2),('b',3);
+    CREATE INDEX ix ON t(lower(a COLLATE NOCASE));
+}
+
+@setup inner-collate-expr-index
+@cross-check-integrity
+test inner-collate-expr-index-equality {
+    SELECT c FROM t WHERE lower(a COLLATE NOCASE) = 'A' ORDER BY c;
+}
+expect {
+1
+2
+}
