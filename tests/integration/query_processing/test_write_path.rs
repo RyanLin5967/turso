@@ -622,6 +622,220 @@ fn test_parent_delete_skips_child_index_that_changes_the_comparison(
 }
 
 #[turso_macros::test]
+fn test_parent_delete_sees_child_key_behind_partial_index(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // A partial index holds only the rows its WHERE clause admits, so a probe
+    // of it cannot stand in for the scan of the whole child table. sqlite3
+    // 3.51.0 refuses this DELETE and leaves p=1 c=1.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x INTEGER REFERENCES p(id))")?;
+    conn.execute("CREATE INDEX ic ON c(x) WHERE x > 5")?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES(1)")?;
+
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "parent delete must be refused: the child row is outside the partial index"
+    );
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "parent row must survive");
+    })?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM c", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "child row must survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_parent_delete_ignores_child_index_with_other_collation(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // The index orders x case-insensitively, so probing it for 'abc' reaches
+    // the stored 'ABC' that the check's own comparison would not match.
+    // sqlite3 3.51.0 allows this DELETE and leaves p=1 c=1.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id NUM PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x NUM REFERENCES p(id))")?;
+    conn.execute("CREATE INDEX ic ON c(x COLLATE NOCASE)")?;
+    conn.execute("INSERT INTO p VALUES('abc')")?;
+    conn.execute("INSERT INTO p VALUES('ABC')")?;
+    conn.execute("INSERT INTO c VALUES('ABC')")?;
+
+    conn.execute("DELETE FROM p WHERE id = 'abc'")?;
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            1,
+            "only the unreferenced parent row is removed"
+        );
+    })?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM c", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "child row must survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_parent_delete_compares_with_parent_key_collation(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // The parent key column is NOCASE, so 'a' references 'A'. sqlite3 3.51.0
+    // refuses this DELETE and leaves p=1 c=1.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(a TEXT COLLATE NOCASE PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x TEXT REFERENCES p(a))")?;
+    conn.execute("INSERT INTO p VALUES('A')")?;
+    conn.execute("INSERT INTO c VALUES('a')")?;
+
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "parent delete must be refused: the child key equals the parent key under NOCASE"
+    );
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "parent row must survive");
+    })?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM c", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "child row must survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_parent_delete_does_not_coerce_key_the_comparison_leaves_alone(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Neither column has numeric affinity, so the check compares the parent's
+    // stored integer against the child's stored text unconverted and finds no
+    // reference. Seeking the TEXT-affinity child index must not coerce the
+    // key on the way in. sqlite3 3.51.0 allows this DELETE, leaving p=0 c=1.
+    conn.execute("PRAGMA foreign_keys = OFF")?;
+    conn.execute("CREATE TABLE p(a BLOB PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x TEXT REFERENCES p(a))")?;
+    conn.execute("CREATE INDEX ic ON c(x)")?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES('1')")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
+
+    conn.execute("DELETE FROM p")?;
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            0,
+            "the parent row is unreferenced"
+        );
+    })?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM c", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "child row must survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_parent_key_update_nets_children_of_the_new_key(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // The child row at 2 was orphaned while the checks were off, and moving
+    // the parent key from 1 to 2 gives it a parent at the same time as it
+    // takes one away from the child at 1. sqlite3 3.51.0 nets the two and
+    // allows the statement, leaving p=2 and both child rows in place.
+    conn.execute("PRAGMA foreign_keys = OFF")?;
+    conn.execute("CREATE TABLE p(k INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x INTEGER REFERENCES p(k))")?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES(2)")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
+
+    conn.execute("UPDATE p SET k = 2 WHERE k = 1")?;
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT k FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 2, "the parent key must move");
+    })?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM c", |row| {
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            2,
+            "both child rows must survive"
+        );
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_parent_delete_probes_plain_child_index_instead_of_scanning(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // A plain index on a TEXT child column referencing a TEXT parent column is
+    // usable: it compares the same way the check does. The probe must open the
+    // index and never the child table.
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(a TEXT PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x TEXT REFERENCES p(a))")?;
+    conn.execute("CREATE INDEX ic ON c(x)")?;
+
+    let root_of = |name: &str| -> i64 {
+        let rows = limbo_exec_rows(
+            &conn,
+            &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{name}'"),
+        );
+        match rows[0][0] {
+            rusqlite::types::Value::Integer(v) => v,
+            ref other => panic!("rootpage for {name} was {other:?}"),
+        }
+    };
+    let child_table_root = root_of("c");
+    let child_index_root = root_of("ic");
+
+    let plan = limbo_exec_rows(&conn, "EXPLAIN DELETE FROM p");
+    let read_roots: Vec<i64> = plan
+        .iter()
+        .filter(|insn| matches!(&insn[1], rusqlite::types::Value::Text(op) if op == "OpenRead"))
+        .filter_map(|insn| match insn[3] {
+            rusqlite::types::Value::Integer(v) => Some(v),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        read_roots.contains(&child_index_root),
+        "the parent-side check must probe the child index, opened roots: {read_roots:?}"
+    );
+    assert!(
+        !read_roots.contains(&child_table_root),
+        "the parent-side check must not scan the child table, opened roots: {read_roots:?}"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
 /// Test that a large delete statement containing a foreign key constraint violation
 /// is properly rolled back.
 fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> anyhow::Result<()> {
