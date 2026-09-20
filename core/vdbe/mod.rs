@@ -3532,8 +3532,10 @@ impl Program {
                 // `TxnCleanup::None` branch rolls back any open explicit
                 // transaction on any error, which for this error class
                 // discards rows that earlier, fully successful statements
-                // committed to it. `changes()` reads 0 after a mismatch in
-                // sqlite3 3.51.0, in autocommit and in a transaction alike.
+                // committed to it. A DML statement that hits a mismatch leaves
+                // `changes()` reading 0 in sqlite3 3.51.0, in autocommit and
+                // in a transaction alike, even under OR FAIL where the rows
+                // written before it survive.
                 Some(LimboError::TypeMismatch) => {
                     if must_rollback_tx_if_needed {
                         // `keeps_prior_changes` left the staged index-method
@@ -3557,7 +3559,19 @@ impl Program {
                             );
                         }
                     }
-                    self.connection.set_changes(0);
+                    // This error class is the only one in this match that a
+                    // READ-ONLY statement can raise: the LIMIT/OFFSET integer
+                    // check and the FTS LIMIT path both reach it from a plain
+                    // SELECT. sqlite only writes the change counter from a
+                    // statement that carries OP_ChngCntOn, which is what
+                    // `change_cnt_on` mirrors, so a failed SELECT must leave
+                    // `changes()` at whatever the last DML statement set.
+                    // Measured on /usr/bin/sqlite3 3.51.0:
+                    // `INSERT INTO t VALUES(1); SELECT 1 LIMIT 'a';
+                    //  SELECT changes()` reads 1, not 0.
+                    if self.change_cnt_on {
+                        self.connection.set_changes(0);
+                    }
                 }
                 // Constraint and RAISE errors: behavior depends on the effective resolve type.
                 // For normal constraints, the resolve type comes from the statement (ON CONFLICT).
