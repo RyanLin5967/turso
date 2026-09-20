@@ -17,6 +17,7 @@ use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, Subquer
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, break_predicate_at_and_boundaries, parse_from,
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
+    ROWID_STRS,
 };
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
@@ -1865,7 +1866,7 @@ fn process_having_clause(
     // inside an aggregate function's arguments resolves to an alias whose original expression
     // has EP_Agg, SQLite reports "misuse of aliased aggregate X".
     for expr in predicates.iter() {
-        check_aliased_aggregate_misuse(expr, result_columns)?;
+        check_aliased_aggregate_misuse(expr, table_references, result_columns)?;
     }
 
     for expr in predicates.iter_mut() {
@@ -1874,7 +1875,7 @@ fn process_having_clause(
             Some(table_references),
             Some(result_columns),
             resolver,
-            BindingBehavior::TryResultColumnsFirst,
+            BindingBehavior::TryCanonicalColumnsFirst,
         )?;
         resolve_window_and_aggregate_functions(
             expr,
@@ -1892,6 +1893,7 @@ fn process_having_clause(
 /// reference aliases of aggregate result columns (SQLite ticket #2526).
 fn check_aliased_aggregate_misuse(
     expr: &ast::Expr,
+    table_references: &TableReferences,
     result_columns: &[ResultSetColumn],
 ) -> Result<()> {
     use crate::translate::expr::{walk_expr, WalkControl};
@@ -1905,7 +1907,7 @@ fn check_aliased_aggregate_misuse(
                 );
                 if is_agg {
                     for arg in args.iter() {
-                        find_aliased_aggregate_ref(arg, result_columns)?;
+                        find_aliased_aggregate_ref(arg, table_references, result_columns)?;
                     }
                     return Ok(WalkControl::SkipChildren);
                 }
@@ -1926,17 +1928,27 @@ fn check_aliased_aggregate_misuse(
 }
 
 /// Check if an expression (inside an aggregate's arguments) contains an identifier
-/// that matches an alias of an aggregate result column.
-fn find_aliased_aggregate_ref(expr: &ast::Expr, result_columns: &[ResultSetColumn]) -> Result<()> {
+/// that resolves to an alias of an aggregate result column.
+fn find_aliased_aggregate_ref(
+    expr: &ast::Expr,
+    table_references: &TableReferences,
+    result_columns: &[ResultSetColumn],
+) -> Result<()> {
     use crate::translate::expr::{walk_expr, WalkControl};
 
     walk_expr(expr, &mut |e| {
         if let Expr::Id(id) = e {
             let normalized = normalize_ident(id.as_str());
+            if names_table_column(table_references, &normalized) {
+                return Ok(WalkControl::Continue);
+            }
             for rc in result_columns.iter() {
                 if let Some(alias) = &rc.alias {
-                    if alias.eq_ignore_ascii_case(&normalized) && rc.contains_aggregates {
-                        crate::bail_parse_error!("misuse of aliased aggregate {}", normalized);
+                    if alias.eq_ignore_ascii_case(&normalized) {
+                        if rc.contains_aggregates {
+                            crate::bail_parse_error!("misuse of aliased aggregate {}", normalized);
+                        }
+                        break;
                     }
                 }
             }
@@ -1944,4 +1956,22 @@ fn find_aliased_aggregate_ref(expr: &ast::Expr, result_columns: &[ResultSetColum
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+fn names_table_column(table_references: &TableReferences, normalized_id: &str) -> bool {
+    let is_rowid = ROWID_STRS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(normalized_id));
+    table_references.joined_tables().iter().any(|t| {
+        t.table.columns().iter().any(|c| {
+            c.name
+                .as_ref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(normalized_id))
+        }) || (is_rowid
+            && match &t.table {
+                Table::BTree(btree) => btree.has_rowid,
+                Table::Virtual(_) => true,
+                _ => false,
+            })
+    })
 }

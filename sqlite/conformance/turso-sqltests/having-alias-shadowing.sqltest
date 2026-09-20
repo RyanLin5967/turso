@@ -1,0 +1,149 @@
+@database :memory:
+
+test having-shadowing-alias-resolves-to-table-column {
+    CREATE TABLE h1 (k TEXT, n INTEGER);
+    INSERT INTO h1 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    SELECT k, sum(n) AS n FROM h1 GROUP BY k HAVING n >= 10 ORDER BY k;
+}
+expect {
+    b|20
+}
+
+test having-alias-matching-no-column-stays-visible {
+    CREATE TABLE h2 (k TEXT, n INTEGER);
+    INSERT INTO h2 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    SELECT k, sum(n) AS s FROM h2 GROUP BY k HAVING s >= 10 ORDER BY k;
+}
+expect {
+    a|12
+    b|20
+}
+
+test having-shadowing-alias-inside-aggregate-argument {
+    CREATE TABLE h3 (k TEXT, n INTEGER);
+    INSERT INTO h3 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    SELECT k, sum(n) AS n FROM h3 GROUP BY k HAVING sum(n) >= 10 ORDER BY k;
+}
+expect {
+    a|12
+    b|20
+}
+
+test having-aliased-aggregate-matching-no-column-is-misuse {
+    CREATE TABLE h4 (k TEXT, n INTEGER);
+    INSERT INTO h4 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    SELECT k, sum(n) AS m FROM h4 GROUP BY k HAVING max(m + 5) < 10;
+}
+expect error {
+    misuse of aliased aggregate m
+}
+
+test having-shadowing-alias-qualified-reference {
+    CREATE TABLE h5 (k TEXT, n INTEGER);
+    INSERT INTO h5 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    SELECT k, sum(n) AS n FROM h5 GROUP BY k HAVING h5.n >= 10 ORDER BY k;
+}
+expect {
+    b|20
+}
+
+test having-non-aggregate-shadowing-alias {
+    CREATE TABLE h8 (k TEXT, n INTEGER);
+    INSERT INTO h8 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    SELECT k, k AS n, sum(n) FROM h8 GROUP BY k HAVING n >= 10 ORDER BY k;
+}
+expect {
+    b|b|20
+}
+
+test having-shadowing-alias-drives-delete {
+    CREATE TABLE h6 (k TEXT, n INTEGER);
+    INSERT INTO h6 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    DELETE FROM h6 WHERE k IN (SELECT k FROM (SELECT k, sum(n) AS n FROM h6 GROUP BY k HAVING n >= 10));
+    SELECT count(*) FROM h6;
+}
+expect {
+    3
+}
+
+test order-by-shadowing-alias-still-resolves-to-alias {
+    CREATE TABLE h7 (k TEXT, n INTEGER);
+    INSERT INTO h7 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    SELECT k, sum(n) AS n FROM h7 GROUP BY k ORDER BY n DESC;
+}
+expect {
+    b|20
+    a|12
+}
+
+test having-alias-not-shadowed-by-outer-scope-column {
+    CREATE TABLE acct (id INTEGER, total INTEGER);
+    CREATE TABLE tx (id INTEGER, amt INTEGER);
+    INSERT INTO acct VALUES (1, 500), (2, 500);
+    INSERT INTO tx VALUES (1, 10), (1, 20), (2, 300);
+    DELETE FROM acct WHERE EXISTS (SELECT sum(amt) AS total FROM tx WHERE tx.id = acct.id GROUP BY tx.id HAVING total >= 100);
+    SELECT id, total FROM acct;
+}
+expect {
+    1|500
+}
+
+test having-aliased-aggregate-misuse-with-outer-scope-column {
+    CREATE TABLE o2 (m INTEGER);
+    CREATE TABLE i2 (k TEXT, x INTEGER);
+    INSERT INTO o2 VALUES (100);
+    INSERT INTO i2 VALUES ('a', 3), ('a', 4), ('b', 20);
+    SELECT (SELECT sum(x) AS m FROM i2 GROUP BY k HAVING max(m + 5) < 10) FROM o2;
+}
+expect error {
+    misuse of aliased aggregate m
+}
+
+test having-aliased-aggregate-named-rowid-is-not-misuse {
+    CREATE TABLE z (k TEXT, n INTEGER);
+    INSERT INTO z VALUES ('a', 3), ('a', 4), ('b', 20);
+    SELECT k, sum(n) AS rowid FROM z GROUP BY k HAVING max(rowid + 5) < 10 ORDER BY k;
+}
+expect {
+    a|7
+    b|20
+}
+
+test where-alias-not-shadowed-by-outer-scope-column {
+    CREATE TABLE ow (s INTEGER);
+    CREATE TABLE iw (x INTEGER);
+    INSERT INTO ow VALUES (100);
+    INSERT INTO iw VALUES (3), (7);
+    SELECT (SELECT x AS s FROM iw WHERE s > 5) FROM ow;
+}
+expect {
+    7
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test having-aliased-aggregate-named-rowid-without-rowid-is-misuse {
+    CREATE TABLE wr1 (k TEXT PRIMARY KEY, n INTEGER) WITHOUT ROWID;
+    INSERT INTO wr1 VALUES ('a', 3), ('b', 20);
+    SELECT k, sum(n) AS rowid FROM wr1 GROUP BY k HAVING max(rowid + 5) < 100;
+}
+expect error {
+    misuse of aliased aggregate rowid
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test having-alias-named-rowid-without-rowid-resolves-to-alias {
+    CREATE TABLE wr2 (k TEXT PRIMARY KEY, n INTEGER) WITHOUT ROWID;
+    INSERT INTO wr2 VALUES ('a', 3), ('b', 20);
+    SELECT k, sum(n) AS rowid FROM wr2 GROUP BY k HAVING rowid >= 10;
+}
+expect {
+    b|20
+}
+
+test having-duplicate-alias-uses-the-first-one {
+    CREATE TABLE d1 (k TEXT, n INTEGER);
+    INSERT INTO d1 VALUES ('a', 3), ('a', 4), ('b', 20);
+    SELECT k AS z, sum(n) AS z FROM d1 GROUP BY k HAVING max(z) < 10;
+}
+expect {
+}

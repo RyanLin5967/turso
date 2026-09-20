@@ -160,11 +160,10 @@ pub fn bind_and_rewrite_expr<'a>(
                                     joined_tables.len() != 1
                                 })?
                             {
-                                if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", id.as_str());
+                                if btree.has_rowid {
+                                    *expr = row_id_expr;
+                                    return Ok(WalkControl::Continue);
                                 }
-                                *expr = row_id_expr;
-                                return Ok(WalkControl::Continue);
                             }
                         } else if let Table::Virtual(_) = &joined_table.table {
                             if let Some(row_id_expr) =
@@ -174,6 +173,21 @@ pub fn bind_and_rewrite_expr<'a>(
                             {
                                 *expr = row_id_expr;
                                 return Ok(WalkControl::Continue);
+                            }
+                        }
+                    }
+
+                    if match_result.is_none()
+                        && binding_behavior == BindingBehavior::TryCanonicalColumnsFirst
+                    {
+                        if let Some(result_columns) = result_columns {
+                            for result_column in result_columns.iter() {
+                                if let Some(alias) = &result_column.alias {
+                                    if alias.eq_ignore_ascii_case(&normalized_id) {
+                                        *expr = result_column.expr.clone();
+                                        return Ok(WalkControl::Continue);
+                                    }
+                                }
                             }
                         }
                     }
@@ -240,19 +254,6 @@ pub fn bind_and_rewrite_expr<'a>(
                         };
                         referenced_tables.mark_column_used(table_id, col_idx);
                         return Ok(WalkControl::Continue);
-                    }
-
-                    if binding_behavior == BindingBehavior::TryCanonicalColumnsFirst {
-                        if let Some(result_columns) = result_columns {
-                            for result_column in result_columns.iter() {
-                                if let Some(alias) = &result_column.alias {
-                                    if alias.eq_ignore_ascii_case(&normalized_id) {
-                                        *expr = result_column.expr.clone();
-                                        return Ok(WalkControl::Continue);
-                                    }
-                                }
-                            }
-                        }
                     }
 
                     // SQLite DQS misfeature: double-quoted identifiers fall back to string literals
