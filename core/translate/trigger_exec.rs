@@ -787,7 +787,27 @@ pub fn get_triggers_including_temp(
     updated_column_indices: Option<ColumnMask>,
     table: &BTreeTable,
 ) -> Vec<Arc<Trigger>> {
-    let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
+    let (mut triggers, own_triggers) = get_triggers_including_temp_split(
+        resolver,
+        database_id,
+        event,
+        time,
+        updated_column_indices,
+        table,
+    );
+    triggers.extend(own_triggers);
+    triggers
+}
+
+pub fn get_triggers_including_temp_split(
+    resolver: &Resolver,
+    database_id: usize,
+    event: TriggerEvent,
+    time: TriggerTime,
+    updated_column_indices: Option<ColumnMask>,
+    table: &BTreeTable,
+) -> (Vec<Arc<Trigger>>, Vec<Arc<Trigger>>) {
+    let own_triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
         get_relevant_triggers_type_and_time(
             s,
             event.clone(),
@@ -805,8 +825,9 @@ pub fn get_triggers_including_temp(
         })
         .collect()
     });
+    let mut temp_triggers: Vec<Arc<Trigger>> = Vec::new();
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
-        let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
+        let found: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
             get_relevant_triggers_type_and_time(s, event, time, updated_column_indices, table)
                 .filter(|trigger| match trigger.target_database_id {
                     // Explicit qualifier: include if it matches this database.
@@ -826,13 +847,13 @@ pub fn get_triggers_including_temp(
         // oldest-first at the front. Mirror that exactly: push each temp
         // trigger onto the front in the same newest-first walk. The order is
         // observable whenever one trigger's changes feed another.
-        let mut list: std::collections::VecDeque<Arc<Trigger>> = triggers.into();
-        for trigger in temp_triggers {
+        let mut list: std::collections::VecDeque<Arc<Trigger>> = std::collections::VecDeque::new();
+        for trigger in found {
             list.push_front(trigger);
         }
-        triggers = list.into();
+        temp_triggers = list.into();
     }
-    triggers
+    (temp_triggers, own_triggers)
 }
 
 /// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.

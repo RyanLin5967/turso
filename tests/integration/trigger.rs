@@ -2088,3 +2088,47 @@ fn test_changes_after_foreign_key_failure_reset_to_zero(db: TempDatabase) {
     let total_changes: Vec<(i64,)> = conn.exec_rows("SELECT total_changes()");
     assert_eq!(total_changes, vec![(2,)]);
 }
+
+#[turso_macros::test()]
+fn test_insert_returning_subquery_sees_state_before_after_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE u(a INTEGER)").unwrap();
+    conn.execute("INSERT INTO u VALUES (1)").unwrap();
+    conn.execute("CREATE TRIGGER ai AFTER INSERT ON t BEGIN UPDATE u SET a = a + 1; END")
+        .unwrap();
+
+    let single: Vec<(i64, i64)> =
+        conn.exec_rows("INSERT INTO t VALUES (1) RETURNING a, (SELECT a FROM u)");
+    assert_eq!(single, vec![(1, 1)]);
+
+    let multi: Vec<(i64, i64)> =
+        conn.exec_rows("INSERT INTO t VALUES (2), (3) RETURNING a, (SELECT a FROM u)");
+    assert_eq!(multi, vec![(2, 2), (3, 2)]);
+
+    let final_u: Vec<(i64,)> = conn.exec_rows("SELECT a FROM u");
+    assert_eq!(final_u, vec![(4,)]);
+}
+
+#[turso_macros::test()]
+fn test_insert_returning_subquery_sees_temp_trigger_write(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE u(a INTEGER)").unwrap();
+    conn.execute("INSERT INTO u VALUES (1)").unwrap();
+    conn.execute("CREATE TRIGGER am AFTER INSERT ON t BEGIN UPDATE u SET a = a + 10; END")
+        .unwrap();
+    conn.execute("CREATE TEMP TRIGGER at AFTER INSERT ON t BEGIN UPDATE u SET a = a + 100; END")
+        .unwrap();
+
+    let single: Vec<(i64, i64)> =
+        conn.exec_rows("INSERT INTO t VALUES (1) RETURNING a, (SELECT a FROM u)");
+    assert_eq!(single, vec![(1, 101)]);
+
+    let final_u: Vec<(i64,)> = conn.exec_rows("SELECT a FROM u");
+    assert_eq!(final_u, vec![(111,)]);
+}

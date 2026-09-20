@@ -37,7 +37,8 @@ use crate::{
             plan_subqueries_from_returning,
         },
         trigger_exec::{
-            fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
+            fire_trigger, get_triggers_including_temp, get_triggers_including_temp_split,
+            has_triggers_including_temp, TriggerContext,
         },
         upsert::{
             collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
@@ -982,7 +983,7 @@ pub fn translate_insert(
     });
 
     // Fire AFTER INSERT triggers
-    let relevant_after_triggers = get_triggers_including_temp(
+    let (temp_after_triggers, own_after_triggers) = get_triggers_including_temp_split(
         resolver,
         database_id,
         TriggerEvent::Insert,
@@ -990,8 +991,8 @@ pub fn translate_insert(
         None,
         &btree_table,
     );
-    let has_after_triggers = !relevant_after_triggers.is_empty();
-    if has_after_triggers {
+    let has_after_triggers = !temp_after_triggers.is_empty() || !own_after_triggers.is_empty();
+    let trigger_ctx_after = if has_after_triggers {
         compute_virtual_columns(
             program,
             &ctx.table.columns_topo_sort()?,
@@ -1016,33 +1017,109 @@ pub fn translate_insert(
             .chain(std::iter::once(key_reg))
             .collect();
         // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
-        let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
-            TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers_after),
-                None,
-                override_conflict,
-            )
-        } else if !matches!(ctx.on_conflict, ResolveType::Abort) {
-            TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers_after),
-                None,
-                ctx.on_conflict,
-            )
-        } else {
-            TriggerContext::new_after(btree_table.clone(), Some(new_registers_after), None)
-        };
-        // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
-        // not skip post-row work (FK counters, autoincrement, CDC, RETURNING).
-        // Use a label that falls through to the next instruction after the trigger loop.
-        let after_trigger_done = program.allocate_label();
-        for trigger in relevant_after_triggers {
+        Some(
+            if let Some(override_conflict) = program.trigger_conflict_override {
+                TriggerContext::new_after_with_override_conflict(
+                    btree_table.clone(),
+                    Some(new_registers_after),
+                    None,
+                    override_conflict,
+                )
+            } else if !matches!(ctx.on_conflict, ResolveType::Abort) {
+                TriggerContext::new_after_with_override_conflict(
+                    btree_table.clone(),
+                    Some(new_registers_after),
+                    None,
+                    ctx.on_conflict,
+                )
+            } else {
+                TriggerContext::new_after(btree_table.clone(), Some(new_registers_after), None)
+            },
+        )
+    } else {
+        None
+    };
+
+    // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
+    // not skip post-row work (FK counters, autoincrement, CDC).
+    // Use a label that falls through to the next instruction after the trigger loop.
+    let after_trigger_done = trigger_ctx_after.as_ref().map(|_| program.allocate_label());
+
+    if let (Some(trigger_ctx_after), Some(after_trigger_done)) =
+        (trigger_ctx_after.as_ref(), after_trigger_done)
+    {
+        for trigger in temp_after_triggers {
             fire_trigger(
                 program,
                 resolver,
                 trigger,
-                &trigger_ctx_after,
+                trigger_ctx_after,
+                connection,
+                database_id,
+                after_trigger_done,
+            )?;
+        }
+    }
+
+    if !returning_subqueries.is_empty() {
+        let target_table = table_references
+            .joined_tables()
+            .first()
+            .expect("INSERT RETURNING target table must exist");
+        let cache_state = seed_returning_row_image_in_cache(
+            program,
+            &table_references,
+            insertion.first_col_register(),
+            insertion.key_register(),
+            resolver,
+            &btree_table.column_layout()?,
+        )?;
+        let result: Result<()> = (|| {
+            for subquery in returning_subqueries
+                .iter_mut()
+                .filter(|s| !s.has_been_evaluated())
+            {
+                let rerun_for_target_scan =
+                    subquery.reads_table(target_table.database_id, target_table.table.get_name());
+                let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+                emit_non_from_clause_subquery(
+                    program,
+                    resolver,
+                    *subquery_plan,
+                    &subquery.query_type,
+                    subquery.correlated || rerun_for_target_scan,
+                    true,
+                )?;
+            }
+            Ok(())
+        })();
+        restore_returning_row_image_in_cache(resolver, cache_state);
+        result?;
+    }
+
+    // Emit RETURNING results if specified
+    if !result_columns.is_empty() {
+        emit_returning_results(
+            program,
+            &table_references,
+            &result_columns,
+            insertion.first_col_register(),
+            insertion.key_register(),
+            resolver,
+            ctx.returning_buffer.as_ref(),
+            &btree_table.column_layout()?,
+        )?;
+    }
+
+    if let (Some(trigger_ctx_after), Some(after_trigger_done)) =
+        (trigger_ctx_after.as_ref(), after_trigger_done)
+    {
+        for trigger in own_after_triggers {
+            fire_trigger(
+                program,
+                resolver,
+                trigger,
+                trigger_ctx_after,
                 connection,
                 database_id,
                 after_trigger_done,
@@ -1136,55 +1213,6 @@ pub fn translate_insert(
         )?;
     }
 
-    if !returning_subqueries.is_empty() {
-        let target_table = table_references
-            .joined_tables()
-            .first()
-            .expect("INSERT RETURNING target table must exist");
-        let cache_state = seed_returning_row_image_in_cache(
-            program,
-            &table_references,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            resolver,
-            &btree_table.column_layout()?,
-        )?;
-        let result: Result<()> = (|| {
-            for subquery in returning_subqueries
-                .iter_mut()
-                .filter(|s| !s.has_been_evaluated())
-            {
-                let rerun_for_target_scan =
-                    subquery.reads_table(target_table.database_id, target_table.table.get_name());
-                let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-                emit_non_from_clause_subquery(
-                    program,
-                    resolver,
-                    *subquery_plan,
-                    &subquery.query_type,
-                    subquery.correlated || rerun_for_target_scan,
-                    true,
-                )?;
-            }
-            Ok(())
-        })();
-        restore_returning_row_image_in_cache(resolver, cache_state);
-        result?;
-    }
-
-    // Emit RETURNING results if specified
-    if !result_columns.is_empty() {
-        emit_returning_results(
-            program,
-            &table_references,
-            &result_columns,
-            insertion.first_col_register(),
-            insertion.key_register(),
-            resolver,
-            ctx.returning_buffer.as_ref(),
-            &btree_table.column_layout()?,
-        )?;
-    }
     program.emit_insn(Insn::Goto {
         target_pc: ctx.loop_labels.row_done,
     });
