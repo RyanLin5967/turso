@@ -576,21 +576,36 @@ fn fk_compares_equal(a: &[FkCompare], b: &[FkCompare]) -> bool {
 
 /// Which parent-side check is being compiled.
 ///
-/// The two do not compare the same way, and SQLite builds them in two different
-/// places. The counting scan is `fkScanChildren` (src/fkey.c), whose search term
-/// names the parent COLUMN, so the `=` sees the parent column's affinity. A
-/// RESTRICT action is a trigger built by `fkActionTrigger`, whose search term is
-/// `OLD.<parent column> = <child column>`; `OLD.x` is a `TK_TRIGGER` node, and
-/// `sqlite3ExprAffinity` has no case for `TK_TRIGGER`, so it returns that node's
-/// empty `affExpr` and `sqlite3CompareAffinity` falls back to the child column's
-/// affinity alone. The one exception is a rowid parent key, where `lookupName`
-/// stamps `affExpr = SQLITE_AFF_INTEGER` on the `OLD.rowid` node, which makes the
-/// comparison numeric again. `sqlite3ExprCollSeq` does have a `TK_TRIGGER` case,
-/// so both forms take the parent column's collating sequence.
+/// SQLite runs both for the same foreign key and builds them in two different
+/// places, and they do not compare the same way. The counting scan is
+/// `fkScanChildren` (src/fkey.c), whose search term names the parent COLUMN, so
+/// the `=` sees the parent column's affinity; that is the comparison this change
+/// corrects. A RESTRICT action is a trigger built by `fkActionTrigger`, and its
+/// comparison is deliberately LEFT ALONE here: it keeps comparing the stored
+/// values with no coercion and binary collation, which is what every
+/// parent-side check did before this change.
 ///
-/// Measured against /usr/bin/sqlite3 3.51.0: with `p(id INTEGER UNIQUE)` holding
-/// 2 and a TEXT child column holding '2.0', `ON DELETE RESTRICT` does not fire,
-/// while the same shape with `p(id INTEGER PRIMARY KEY)` does.
+/// Leaving it alone is not a claim that it matches SQLite. It does not.
+/// Measured on /usr/bin/sqlite3 3.51.0: `p(k BLOB UNIQUE)` holding 2 with a TEXT
+/// child column holding '2' raises `FOREIGN KEY constraint failed` on
+/// `DELETE FROM p` under `ON DELETE RESTRICT`, and this engine allows it, before
+/// and after this change.
+///
+/// The reason for leaving it is that `fkActionTrigger` opens with
+///
+/// ```text
+/// if( action==OE_Restrict && (db->flags & SQLITE_DeferFKs) ) return 0;
+/// ```
+///
+/// so RESTRICT degrades to NO ACTION whenever `PRAGMA defer_foreign_keys` is on.
+/// Measured on sqlite3 3.51.0: inside `BEGIN; PRAGMA defer_foreign_keys=ON;`, a
+/// `DELETE FROM p` that RESTRICT would otherwise refuse succeeds, and the COMMIT
+/// fails instead. This engine does not implement that pragma (COMPAT.md lists it
+/// as unsupported), so modelling the trigger's affinity without also modelling
+/// the flag that switches the trigger off refuses statements SQLite allows:
+/// measured at 32 of 36,864 cases in the deferred grid described in the commit
+/// message, every one of them with the pragma set. Implementing RESTRICT's real
+/// comparison belongs with implementing that pragma.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum FkProbeKind {
     /// The scan that maintains the immediate and deferred violation counters.
@@ -624,29 +639,27 @@ pub(super) fn fk_compare_terms(
                 .get_column(ccol)
                 .map(|(_, c)| c.affinity())
                 .ok_or_else(|| LimboError::InternalError(format!("child col {ccol} missing")))?;
-            let (parent_aff, parent_is_rowid, parent_coll) = match parent_tbl.get_column(pcol) {
-                Some((_, c)) => (
-                    c.affinity(),
-                    parent_tbl.has_rowid && c.is_rowid_alias(),
-                    c.collation(),
-                ),
+            // See `FkProbeKind`: a RESTRICT action keeps comparing the stored
+            // values, which is what every parent-side check did before this
+            // change. `Affinity::Blob` is the no-coercion case, and it is what
+            // an `Eq` with no affinity in its flags already resolves to.
+            if matches!(kind, FkProbeKind::Restrict) {
+                return Ok(FkCompare {
+                    affinity: Affinity::Blob,
+                    collation: CollationSeq::Binary,
+                });
+            }
+            let (parent_aff, parent_coll) = match parent_tbl.get_column(pcol) {
+                Some((_, c)) => (c.affinity(), c.collation()),
                 None if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) => {
                     // A rowid reference is always an integer comparison, and a
                     // collating sequence never applies to integers.
-                    (Affinity::Integer, true, CollationSeq::Binary)
+                    (Affinity::Integer, CollationSeq::Binary)
                 }
                 None => return Err(LimboError::InternalError(format!("col {pcol} missing"))),
             };
-            // A RESTRICT trigger's parent term carries no affinity of its own
-            // unless it is a rowid, so the comparison is left to the child
-            // column alone. See `FkProbeKind`.
-            let parent_side_aff = match kind {
-                FkProbeKind::Counter => parent_aff,
-                FkProbeKind::Restrict if parent_is_rowid => Affinity::Integer,
-                FkProbeKind::Restrict => Affinity::None,
-            };
             Ok(FkCompare {
-                affinity: comparison_affinity(child_aff, parent_side_aff, None, None),
+                affinity: comparison_affinity(child_aff, parent_aff, None, None),
                 collation: parent_coll,
             })
         })

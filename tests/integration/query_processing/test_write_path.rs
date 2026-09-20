@@ -864,11 +864,12 @@ fn test_restrict_compares_stored_values_uncoerced(tmp_db: TempDatabase) -> anyho
     let conn = tmp_db.connect_limbo();
 
     // The parent key is a non-rowid INTEGER UNIQUE holding 2; the child column
-    // is TEXT holding '2.0'. SQLite's RESTRICT trigger compares those stored
-    // values with the child column's affinity alone, so they are not equal and
-    // the action does not fire. The deferred count the scan does raise is
-    // repaid by deleting the child before COMMIT. sqlite3 3.51.0 leaves both
-    // tables empty and raises nothing.
+    // is TEXT holding '2.0'. The RESTRICT action compares the stored values
+    // with no coercion, so they are not equal and it does not fire. The
+    // counting scan does compare numerically and does raise a deferred count,
+    // and deleting the child before COMMIT repays it. sqlite3 3.51.0 leaves
+    // both tables empty and raises nothing. Applying the counting scan's
+    // affinity to the action instead makes this DELETE fail.
     conn.execute("PRAGMA foreign_keys = ON")?;
     conn.execute("CREATE TABLE p(id INTEGER UNIQUE, pad TEXT)")?;
     conn.execute(
@@ -919,37 +920,6 @@ fn test_restrict_still_counts_what_the_scan_finds(tmp_db: TempDatabase) -> anyho
     })?;
     common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM c", |row| {
         assert_eq!(row.get::<i64>(0).unwrap(), 1, "child row must survive");
-    })?;
-
-    Ok(())
-}
-
-#[turso_macros::test]
-fn test_restrict_on_rowid_parent_compares_numerically(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let _ = env_logger::try_init();
-    let conn = tmp_db.connect_limbo();
-
-    // The other side of the same rule: `OLD.rowid` is the one trigger term
-    // SQLite stamps with INTEGER affinity, so with an INTEGER PRIMARY KEY
-    // parent the comparison is numeric and '2.0' does reference 2. sqlite3
-    // 3.51.0 refuses this DELETE.
-    conn.execute("PRAGMA foreign_keys = ON")?;
-    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")?;
-    conn.execute(
-        "CREATE TABLE c(x TEXT REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED)",
-    )?;
-    conn.execute("INSERT INTO p VALUES(2)")?;
-    conn.execute("INSERT INTO c VALUES('2.0')")?;
-
-    conn.execute("BEGIN")?;
-    assert!(
-        conn.execute("DELETE FROM p").is_err(),
-        "RESTRICT must fire against a rowid parent key"
-    );
-    conn.execute("ROLLBACK")?;
-
-    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
-        assert_eq!(row.get::<i64>(0).unwrap(), 1, "parent row must survive");
     })?;
 
     Ok(())
