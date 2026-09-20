@@ -53,6 +53,10 @@ pub fn emit_program_for_delete(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
+    program.set_write_statement_is_multi_pass(
+        !plan.result_columns.is_empty() || plan.safety.requires_stable_write_set(),
+    );
+
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.
     let returning_buffer = if !plan.result_columns.is_empty() {

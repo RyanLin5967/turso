@@ -105,6 +105,10 @@ pub fn emit_program_for_update(
     program
         .flags
         .set_has_statement_conflict(plan.or_conflict.is_some());
+    program.set_write_statement_is_multi_pass(
+        plan.returning.as_ref().is_some_and(|r| !r.is_empty())
+            || plan.safety.requires_stable_write_set(),
+    );
 
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.

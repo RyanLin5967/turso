@@ -111,7 +111,13 @@ pub fn emit_query<'a>(
     }
 
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
-    emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
+    emit_from_clause_subqueries(
+        program,
+        t_ctx,
+        &mut plan.table_references,
+        &plan.join_order,
+        &plan.where_clause,
+    )?;
 
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.

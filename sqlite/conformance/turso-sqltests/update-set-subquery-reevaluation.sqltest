@@ -1,0 +1,453 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/8734
+
+test update-set-window-rank-subquery {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE t SET v = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM t) WHERE iid = t.id);
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-set-window-total-subquery {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO u VALUES(1,1),(2,2),(3,3);
+    UPDATE u SET v = (SELECT q FROM (SELECT id AS iid, sum(v) OVER () AS q FROM u) WHERE iid = u.id);
+    SELECT id, v FROM u ORDER BY id;
+}
+expect {
+    1|6
+    2|6
+    3|6
+}
+
+test update-set-window-cte-rewrite {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE t SET v = (WITH r AS (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM t) SELECT q FROM r WHERE iid = t.id);
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-set-window-column-not-read-by-window {
+    CREATE TABLE w(id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
+    INSERT INTO w VALUES(1,1,0),(2,2,0),(3,3,0),(4,4,0);
+    UPDATE w SET y = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY x DESC) AS q FROM w) WHERE iid = w.id);
+    SELECT id, y FROM w ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-set-range-matched-subquery-sees-earlier-writes {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO h VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE h SET v = (SELECT count(*) FROM (SELECT DISTINCT v AS lv FROM h) WHERE lv <= h.id) * 5;
+    SELECT id, v FROM h ORDER BY id;
+}
+expect {
+    1|5
+    2|5
+    3|5
+    4|5
+}
+
+test update-set-scalar-subquery-sees-earlier-writes {
+    CREATE TABLE d(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO d VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE d SET v = (SELECT sum(q) FROM (SELECT v AS q FROM d) WHERE q <= d.v);
+    SELECT id, v FROM d ORDER BY id;
+}
+expect {
+    1|1
+    2|3
+    3|7
+    4|8
+}
+
+# A source the enclosing query can fold into itself is read again for every
+# probe, so it keeps seeing the rows written before it. Expectations below are
+# from sqlite 3.51.0.
+
+test update-set-flattenable-eq-probe-sees-earlier-writes {
+    CREATE TABLE f(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO f VALUES(1,5),(2,5),(3,5),(4,5);
+    UPDATE f SET v = v + (SELECT count(*) FROM (SELECT v AS q FROM f) WHERE q = f.v);
+    SELECT id, v FROM f ORDER BY id;
+}
+expect {
+    1|9
+    2|8
+    3|7
+    4|6
+}
+
+test update-set-grouped-eq-probe-sees-earlier-writes {
+    CREATE TABLE g(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO g VALUES(1,5),(2,5),(3,5),(4,5);
+    UPDATE g SET v = v + (SELECT count(*) FROM (SELECT max(v) AS q, id AS k FROM g GROUP BY id) WHERE q = g.v);
+    SELECT id, v FROM g ORDER BY id;
+}
+expect {
+    1|9
+    2|8
+    3|7
+    4|6
+}
+
+test update-set-grouped-window-eq-probe-sees-earlier-writes {
+    CREATE TABLE gw(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO gw VALUES(1,5),(2,5),(3,5),(4,5);
+    UPDATE gw SET v = v + (SELECT count(*) FROM (SELECT max(v) AS q, id AS k, row_number() OVER () AS z FROM gw GROUP BY id) WHERE q = gw.v);
+    SELECT id, v FROM gw ORDER BY id;
+}
+expect {
+    1|9
+    2|8
+    3|7
+    4|6
+}
+
+test update-set-window-range-probe-sees-earlier-writes {
+    CREATE TABLE rg(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO rg VALUES(1,5),(2,5),(3,5),(4,5);
+    UPDATE rg SET v = v + (SELECT count(*) FROM (SELECT v AS q, row_number() OVER () AS z FROM rg) WHERE q <= rg.v);
+    SELECT id, v FROM rg ORDER BY id;
+}
+expect {
+    1|9
+    2|8
+    3|7
+    4|6
+}
+
+test update-set-eq-probe-over-trigger-written-table {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE m(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO s VALUES(1,0),(2,0),(3,0),(4,0);
+    INSERT INTO m VALUES(1,5),(2,5),(3,5),(4,5);
+    CREATE TRIGGER tr AFTER UPDATE ON s BEGIN UPDATE m SET v = 99 WHERE id = new.id; END;
+    UPDATE s SET v = (SELECT count(*) FROM (SELECT v AS q FROM m) WHERE q = s.v + 5);
+    SELECT id, v FROM s ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-set-eq-probe-returning-sees-earlier-writes {
+    CREATE TABLE r(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO r VALUES(1,5),(2,5),(3,5),(4,5);
+    UPDATE r SET v = v + (SELECT count(*) FROM (SELECT v AS q FROM r) WHERE q = r.v) RETURNING id, v;
+}
+expect {
+    1|9
+    2|8
+    3|7
+    4|6
+}
+
+test update-set-flattenable-eq-probe-plain-outer {
+    CREATE TABLE n(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO n VALUES(1,2),(2,3),(3,4),(4,5);
+    UPDATE n SET v = (SELECT k FROM (SELECT v AS q, id AS k FROM n) WHERE q = n.id);
+    SELECT id, coalesce(v,-1) FROM n ORDER BY id;
+}
+expect {
+    1|-1
+    2|-1
+    3|-1
+    4|-1
+}
+
+test update-set-window-eq-probe-plain-outer {
+    CREATE TABLE nw(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO nw VALUES(1,2),(2,3),(3,4),(4,5);
+    UPDATE nw SET v = (SELECT k FROM (SELECT v AS q, id AS k, row_number() OVER () AS z FROM nw) WHERE q = nw.id);
+    SELECT id, coalesce(v,-1) FROM nw ORDER BY id;
+}
+expect {
+    1|-1
+    2|1
+    3|2
+    4|3
+}
+
+# A source that reads an outer column has a different answer per probe, so it
+# is never kept for the statement. Frozen at the first probe it would return
+# nothing for the rows after it.
+
+test update-set-correlated-window-eq-probe {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO c VALUES(1,1),(2,2),(3,3);
+    UPDATE c SET v = (SELECT q FROM (SELECT ic.id AS iid, row_number() OVER (ORDER BY ic.v DESC) AS q FROM c AS ic WHERE ic.v <= c.v) WHERE iid = c.id);
+    SELECT id, coalesce(v,-1) FROM c ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+    3|1
+}
+
+# A window source is kept for the statement only where sqlite builds its
+# automatic covering index over it. A statement that defers its writes, or a
+# source that restricts its own row count, carries no such index in sqlite and
+# is read again for every probe. Expectations below are from sqlite 3.51.0.
+
+test update-set-window-eq-probe-with-returning {
+    CREATE TABLE rw(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO rw VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE rw SET v = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM rw) WHERE iid = rw.id) RETURNING id, v;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test update-set-window-eq-probe-over-trigger-written-table {
+    CREATE TABLE sw(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE mw(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO sw VALUES(1,0),(2,0),(3,0),(4,0);
+    INSERT INTO mw VALUES(1,5),(2,5),(3,5),(4,5);
+    CREATE TRIGGER trw AFTER UPDATE ON sw BEGIN UPDATE mw SET v = 99 WHERE id = new.id; END;
+    UPDATE sw SET v = (SELECT count(*) FROM (SELECT v AS q, row_number() OVER () AS z FROM mw) WHERE q = sw.v + 5);
+    SELECT id, v FROM sw ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-set-window-eq-probe-with-limit {
+    CREATE TABLE lw(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO lw VALUES(1,5),(2,5),(3,5),(4,5);
+    UPDATE lw SET v = v + (SELECT count(*) FROM (SELECT v AS q, row_number() OVER () AS z FROM lw LIMIT 4) WHERE q = lw.v);
+    SELECT id, v FROM lw ORDER BY id;
+}
+expect {
+    1|9
+    2|8
+    3|7
+    4|6
+}
+
+test delete-returning-window-eq-probe {
+    CREATE TABLE dw(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO dw VALUES(1,1),(2,2),(3,3),(4,4);
+    DELETE FROM dw WHERE id <= 2 RETURNING id, coalesce((SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM dw) WHERE iid = dw.id), -1);
+}
+expect {
+    1|-1
+    2|-1
+}
+
+test update-or-replace-window-eq-probe {
+    CREATE TABLE pw(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO pw VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE OR REPLACE pw SET v = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM pw) WHERE iid = pw.id);
+    SELECT id, v FROM pw ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test update-window-eq-probe-with-subquery-in-where {
+    CREATE TABLE qw(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO qw VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE qw SET v = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM qw) WHERE iid = qw.id) WHERE id IN (SELECT id FROM qw);
+    SELECT id, v FROM qw ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test update-window-eq-probe-mutating-its-own-scan-key {
+    CREATE TABLE kw(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE INDEX kw_v ON kw(v);
+    INSERT INTO kw VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE kw SET v = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM kw) WHERE iid = kw.id) WHERE v > 0;
+    SELECT id, v FROM kw ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|1
+}
+
+test update-window-eq-probe-inside-a-trigger-body {
+    CREATE TABLE sb(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE mb(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO mb VALUES(1,1),(2,2),(3,3),(4,4);
+    CREATE TRIGGER trb AFTER INSERT ON sb BEGIN
+        UPDATE mb SET v = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM mb) WHERE iid = mb.id);
+    END;
+    INSERT INTO sb VALUES(1,1);
+    SELECT id, v FROM mb ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-or-ignore-window-eq-probe {
+    CREATE TABLE iw(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO iw VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE OR IGNORE iw SET v = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM iw) WHERE iid = iw.id);
+    SELECT id, v FROM iw ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-window-eq-probe-on-the-window-output-column {
+    CREATE TABLE ow(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO ow VALUES(1,1),(2,1),(3,1),(4,1);
+    UPDATE ow SET v = (SELECT count(*) FROM (SELECT id AS a, sum(v) OVER (ORDER BY id) AS q FROM ow) WHERE q = ow.id) * 7;
+    SELECT id, v FROM ow ORDER BY id;
+}
+expect {
+    1|7
+    2|0
+    3|0
+    4|0
+}
+
+# A probe whose comparison affinity would rewrite the source column carries no
+# automatic covering index in sqlite, so the source is read again per probe.
+# Expectations below are from sqlite 3.51.0.
+
+test update-set-window-eq-probe-text-column-integer-value {
+    CREATE TABLE ta(id INTEGER PRIMARY KEY, k TEXT, v INTEGER);
+    INSERT INTO ta VALUES(1,'1',1),(2,'2',2),(3,'3',3),(4,'4',4);
+    UPDATE ta SET v = (SELECT q FROM (SELECT k AS kk, row_number() OVER (ORDER BY v DESC) AS q FROM ta) WHERE kk = ta.id);
+    SELECT id, coalesce(v,-1) FROM ta ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test update-set-window-eq-probe-value-on-the-left {
+    CREATE TABLE tb(id INTEGER PRIMARY KEY, k TEXT, v INTEGER);
+    INSERT INTO tb VALUES(1,'1',1),(2,'2',2),(3,'3',3),(4,'4',4);
+    UPDATE tb SET v = (SELECT q FROM (SELECT k AS kk, row_number() OVER (ORDER BY v DESC) AS q FROM tb) WHERE tb.id = kk);
+    SELECT id, coalesce(v,-1) FROM tb ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test update-set-window-eq-probe-blob-column-integer-value {
+    CREATE TABLE tc(id INTEGER PRIMARY KEY, k BLOB, v INTEGER);
+    INSERT INTO tc VALUES(1,1,1),(2,2,2),(3,3,3),(4,4,4);
+    UPDATE tc SET v = (SELECT q FROM (SELECT k AS kk, row_number() OVER (ORDER BY v DESC) AS q FROM tc) WHERE kk = tc.id);
+    SELECT id, coalesce(v,-1) FROM tc ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test update-set-window-eq-probe-untyped-column-integer-value {
+    CREATE TABLE td(id INTEGER PRIMARY KEY, k, v INTEGER);
+    INSERT INTO td VALUES(1,1,1),(2,2,2),(3,3,3),(4,4,4);
+    UPDATE td SET v = (SELECT q FROM (SELECT k AS kk, row_number() OVER (ORDER BY v DESC) AS q FROM td) WHERE kk = td.id);
+    SELECT id, coalesce(v,-1) FROM td ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test update-set-window-eq-probe-text-column-real-value {
+    CREATE TABLE te(id INTEGER PRIMARY KEY, k TEXT, r REAL, v INTEGER);
+    INSERT INTO te VALUES(1,'1.0',1.0,1),(2,'2.0',2.0,2),(3,'3.0',3.0,3),(4,'4.0',4.0,4);
+    UPDATE te SET v = (SELECT q FROM (SELECT k AS kk, row_number() OVER (ORDER BY v DESC) AS q FROM te) WHERE kk = te.r);
+    SELECT id, coalesce(v,-1) FROM te ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test update-set-window-eq-probe-on-a-computed-column {
+    CREATE TABLE tf(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO tf VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE tf SET v = (SELECT q FROM (SELECT id+0 AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM tf) WHERE iid = tf.id);
+    SELECT id, coalesce(v,-1) FROM tf ORDER BY id;
+}
+expect {
+    1|4
+    2|4
+    3|4
+    4|4
+}
+
+test update-set-window-eq-probe-integer-column-text-value {
+    CREATE TABLE tg(id INTEGER PRIMARY KEY, k TEXT, v INTEGER);
+    INSERT INTO tg VALUES(1,'1',1),(2,'2',2),(3,'3',3),(4,'4',4);
+    UPDATE tg SET v = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM tg) WHERE iid = tg.k);
+    SELECT id, coalesce(v,-1) FROM tg ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-set-window-eq-probe-real-column-integer-value {
+    CREATE TABLE th(id INTEGER PRIMARY KEY, k REAL, v INTEGER);
+    INSERT INTO th VALUES(1,1.0,1),(2,2.0,2),(3,3.0,3),(4,4.0,4);
+    UPDATE th SET v = (SELECT q FROM (SELECT k AS kk, row_number() OVER (ORDER BY v DESC) AS q FROM th) WHERE kk = th.id);
+    SELECT id, coalesce(v,-1) FROM th ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}

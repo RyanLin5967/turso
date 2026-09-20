@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::alloc::{TryClone, TursoSliceExt};
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
@@ -1371,9 +1371,140 @@ fn eqp_subquery_info(
     })
 }
 
+fn tables_read_by_expr(expr: &ast::Expr) -> Option<HashSet<TableInternalId>> {
+    let mut tables = HashSet::default();
+    let mut opaque = false;
+    let _ = walk_expr(expr, &mut |e| {
+        match e {
+            ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } => {
+                tables.insert(*table);
+            }
+            ast::Expr::SubqueryResult { .. } => opaque = true,
+            _ => {}
+        }
+        Ok::<WalkControl, crate::LimboError>(WalkControl::Continue)
+    });
+    (!opaque).then_some(tables)
+}
+
+fn equality_probed_source_columns(
+    where_clause: &[WhereTerm],
+    source: TableInternalId,
+    tables: &TableReferences,
+) -> HashSet<usize> {
+    let mut probed = HashSet::default();
+    for term in where_clause {
+        if term.consumed {
+            continue;
+        }
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = &term.expr else {
+            continue;
+        };
+        let (Some(lhs_tables), Some(rhs_tables)) =
+            (tables_read_by_expr(lhs), tables_read_by_expr(rhs))
+        else {
+            continue;
+        };
+        let source_column = |probe: &ast::Expr, value_tables: &HashSet<TableInternalId>| {
+            let ast::Expr::Column { table, column, .. } = unwrap_parens(probe).ok()? else {
+                return None;
+            };
+            (*table == source && !value_tables.is_empty() && !value_tables.contains(&source))
+                .then_some(*column)
+        };
+        let Some((column, probe)) = source_column(lhs, &rhs_tables)
+            .map(|column| (column, lhs.as_ref()))
+            .or_else(|| source_column(rhs, &lhs_tables).map(|column| (column, rhs.as_ref())))
+        else {
+            continue;
+        };
+        let column_affinity = get_expr_affinity(probe, Some(tables), None);
+        if column_affinity.index_affinity_ok(comparison_affinity(
+            lhs.as_ref(),
+            rhs.as_ref(),
+            Some(tables),
+            None,
+        )) {
+            probed.insert(column);
+        }
+    }
+    probed
+}
+
+fn result_column_is_window_output(plan: &Plan, index: usize) -> bool {
+    let Plan::Select(select) = plan else {
+        return true;
+    };
+    let Some(result_column) = select.result_columns.get(index) else {
+        return true;
+    };
+    let mut found = false;
+    let _ = walk_expr(
+        &result_column.expr,
+        &mut |e: &ast::Expr| -> Result<WalkControl> {
+            if let ast::Expr::FunctionCall { filter_over, .. }
+            | ast::Expr::FunctionCallStar { filter_over, .. } = e
+            {
+                if filter_over.over_clause.is_some() {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+    found
+}
+
+fn kept_for_whole_statement_by_sqlite(plan: &Plan, probed_columns: &HashSet<usize>) -> bool {
+    let Plan::Select(select) = plan else {
+        return false;
+    };
+    select.window.is_some()
+        && !select_is_off_the_allowlist(select)
+        && !probed_columns.is_empty()
+        && !probed_columns
+            .iter()
+            .any(|column| result_column_is_window_output(plan, *column))
+}
+
+fn select_is_off_the_allowlist(select: &SelectPlan) -> bool {
+    if select.group_by.is_some()
+        || !select.aggregates.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+    {
+        return true;
+    }
+    select
+        .table_references
+        .joined_tables()
+        .iter()
+        .any(|joined| match &joined.table {
+            Table::FromClauseSubquery(nested) => plan_is_off_the_allowlist(&nested.plan),
+            _ => false,
+        })
+}
+
+fn plan_is_off_the_allowlist(plan: &Plan) -> bool {
+    match plan {
+        Plan::Select(select) => select_is_off_the_allowlist(select),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            left.iter()
+                .any(|(select, _)| select_is_off_the_allowlist(select))
+                || select_is_off_the_allowlist(right_most)
+        }
+        _ => true,
+    }
+}
+
 fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
+    at_kept_probe_site: bool,
+    probed_columns: &HashSet<usize>,
 ) -> FromClauseSubqueryExecutionMode {
     let needs_materialized_seek = matches!(
         operation,
@@ -1403,6 +1534,12 @@ fn choose_from_clause_subquery_execution_mode(
         _ if from_clause_subquery.requires_table_materialization() => {
             FromClauseSubqueryExecutionMode::MaterializedTable
         }
+        _ if at_kept_probe_site
+            && kept_for_whole_statement_by_sqlite(&from_clause_subquery.plan, probed_columns)
+            && !plan_is_correlated(&from_clause_subquery.plan) =>
+        {
+            FromClauseSubqueryExecutionMode::MaterializedTable
+        }
         _ => FromClauseSubqueryExecutionMode::Coroutine,
     }
 }
@@ -1414,6 +1551,7 @@ pub fn emit_from_clause_subqueries(
     t_ctx: &mut TranslateCtx,
     tables: &mut TableReferences,
     join_order: &[JoinOrderMember],
+    where_clause: &[WhereTerm],
 ) -> Result<()> {
     if tables.joined_tables().is_empty() {
         emit_explain!(program, false, EqpDetail::ConstantRow);
@@ -1448,12 +1586,25 @@ pub fn emit_from_clause_subqueries(
         .try_collect()?;
 
     for table_index in visit_order {
+        let probed_columns = {
+            let table_reference = &tables.joined_tables()[table_index];
+            match &table_reference.table {
+                Table::FromClauseSubquery(_) => equality_probed_source_columns(
+                    where_clause,
+                    table_reference.internal_id,
+                    tables,
+                ),
+                _ => HashSet::default(),
+            }
+        };
         let table_reference = &mut tables.joined_tables_mut()[table_index];
         let execution_mode = match &table_reference.table {
             Table::FromClauseSubquery(from_clause_subquery) => {
                 Some(choose_from_clause_subquery_execution_mode(
                     &table_reference.op,
                     from_clause_subquery.as_ref(),
+                    program.in_reentrant_scope() && !program.write_statement_is_multi_pass(),
+                    &probed_columns,
                 ))
             }
             _ => None,
@@ -1727,54 +1878,59 @@ fn emit_indexed_materialized_subquery(
         is_table: false,
     });
 
-    match plan {
-        Plan::Select(select_plan) => {
-            let mut metadata = Box::new(TranslateCtx {
-                labels_main_loop: (0..select_plan.joined_tables().len())
-                    .map(|_| LoopLabels::new(program))
-                    .collect(),
-                label_main_loop_end: None,
-                meta_group_by: None,
-                meta_left_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_sort: None,
-                reg_agg_start: None,
-                reg_nonagg_emit_once_flag: None,
-                reg_result_cols_start: None,
-                limit_ctx: None,
-                reg_offset: None,
-                reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
-                non_aggregate_expressions: Vec::new(),
-                agg_leaf_columns: Vec::new(),
-                cdc_cursor_id: None,
-                meta_window: None,
-                meta_in_seeks: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                materialized_build_inputs: HashMap::default(),
-                hash_table_contexts: HashMap::default(),
-                unsafe_testing: t_ctx.unsafe_testing,
-            });
-            metadata.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
-            emit_query(program, select_plan, &mut metadata)?;
+    program.with_suspended_reentrant_scope(build_end.is_some(), |program| -> Result<()> {
+        match plan {
+            Plan::Select(select_plan) => {
+                let mut metadata = Box::new(TranslateCtx {
+                    labels_main_loop: (0..select_plan.joined_tables().len())
+                        .map(|_| LoopLabels::new(program))
+                        .collect(),
+                    label_main_loop_end: None,
+                    meta_group_by: None,
+                    meta_left_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_sort: None,
+                    reg_agg_start: None,
+                    reg_nonagg_emit_once_flag: None,
+                    reg_result_cols_start: None,
+                    limit_ctx: None,
+                    reg_offset: None,
+                    reg_limit_offset_sum: None,
+                    resolver: t_ctx.resolver.fork(),
+                    non_aggregate_expressions: Vec::new(),
+                    agg_leaf_columns: Vec::new(),
+                    cdc_cursor_id: None,
+                    meta_window: None,
+                    meta_in_seeks: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    materialized_build_inputs: HashMap::default(),
+                    hash_table_contexts: HashMap::default(),
+                    unsafe_testing: t_ctx.unsafe_testing,
+                });
+                metadata.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
+                emit_query(program, select_plan, &mut metadata)?;
+            }
+            Plan::CompoundSelect { .. } => {
+                let resolver = t_ctx.resolver.fork();
+                emit_program_for_compound_select(program, &resolver, plan)?;
+            }
+            Plan::RecursiveCte(_) => {
+                unreachable!(
+                    "recursive CTEs require table-backed materialization for indexed access"
+                )
+            }
+            Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+            }
         }
-        Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan)?;
-        }
-        Plan::RecursiveCte(_) => {
-            unreachable!("recursive CTEs require table-backed materialization for indexed access")
-        }
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
-        }
-    }
+        Ok(())
+    })?;
 
     if let Some(build_end) = build_end {
         program.preassign_label_to_next_insn(build_end);
@@ -1840,54 +1996,57 @@ fn emit_materialized_subquery_table(
     }
 
     // Emit the subquery - it will insert rows into the ephemeral table
-    match plan {
-        Plan::Select(select_plan) => {
-            let mut metadata = Box::new(TranslateCtx {
-                labels_main_loop: (0..select_plan.joined_tables().len())
-                    .map(|_| LoopLabels::new(program))
-                    .collect(),
-                label_main_loop_end: None,
-                meta_group_by: None,
-                meta_left_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_semi_anti_joins: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                meta_sort: None,
-                reg_agg_start: None,
-                reg_nonagg_emit_once_flag: None,
-                reg_result_cols_start: None,
-                limit_ctx: None,
-                reg_offset: None,
-                reg_limit_offset_sum: None,
-                resolver: t_ctx.resolver.fork(),
-                non_aggregate_expressions: Vec::new(),
-                agg_leaf_columns: Vec::new(),
-                cdc_cursor_id: None,
-                meta_window: None,
-                meta_in_seeks: (0..select_plan.joined_tables().len())
-                    .map(|_| None)
-                    .collect(),
-                materialized_build_inputs: HashMap::default(),
-                hash_table_contexts: HashMap::default(),
-                unsafe_testing: t_ctx.unsafe_testing,
-            });
-            metadata.materialized_build_inputs =
-                emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
-            emit_query(program, select_plan, &mut metadata)?;
+    program.with_suspended_reentrant_scope(build_end.is_some(), |program| -> Result<()> {
+        match plan {
+            Plan::Select(select_plan) => {
+                let mut metadata = Box::new(TranslateCtx {
+                    labels_main_loop: (0..select_plan.joined_tables().len())
+                        .map(|_| LoopLabels::new(program))
+                        .collect(),
+                    label_main_loop_end: None,
+                    meta_group_by: None,
+                    meta_left_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_semi_anti_joins: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    meta_sort: None,
+                    reg_agg_start: None,
+                    reg_nonagg_emit_once_flag: None,
+                    reg_result_cols_start: None,
+                    limit_ctx: None,
+                    reg_offset: None,
+                    reg_limit_offset_sum: None,
+                    resolver: t_ctx.resolver.fork(),
+                    non_aggregate_expressions: Vec::new(),
+                    agg_leaf_columns: Vec::new(),
+                    cdc_cursor_id: None,
+                    meta_window: None,
+                    meta_in_seeks: (0..select_plan.joined_tables().len())
+                        .map(|_| None)
+                        .collect(),
+                    materialized_build_inputs: HashMap::default(),
+                    hash_table_contexts: HashMap::default(),
+                    unsafe_testing: t_ctx.unsafe_testing,
+                });
+                metadata.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &metadata.resolver, select_plan)?;
+                emit_query(program, select_plan, &mut metadata)?;
+            }
+            Plan::CompoundSelect { .. } => {
+                let resolver = t_ctx.resolver.fork();
+                emit_program_for_compound_select(program, &resolver, plan)?;
+            }
+            Plan::RecursiveCte(recursive_cte) => {
+                super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?;
+            }
+            Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+            }
         }
-        Plan::CompoundSelect { .. } => {
-            let resolver = t_ctx.resolver.fork();
-            emit_program_for_compound_select(program, &resolver, plan)?;
-        }
-        Plan::RecursiveCte(recursive_cte) => {
-            super::recursive_cte::emit_recursive_cte(program, &t_ctx.resolver, recursive_cte)?;
-        }
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
-        }
-    }
+        Ok(())
+    })?;
 
     if let Some(build_end) = build_end {
         program.preassign_label_to_next_insn(build_end);
@@ -1981,7 +2140,7 @@ pub fn emit_non_from_clause_subquery(
             }
         };
 
-        match query_type {
+        program.with_reentrant_scope(is_correlated, |program| match query_type {
             SubqueryType::Exists { result_reg, .. } => {
                 let subroutine_reg = program.alloc_register();
                 program.emit_insn(Insn::BeginSubrtn {
@@ -1997,13 +2156,14 @@ pub fn emit_non_from_clause_subquery(
                     return_reg: subroutine_reg,
                     can_fallthrough: true,
                 });
+                Ok(())
             }
             SubqueryType::In { cursor_id, .. } => {
                 program.emit_insn(Insn::OpenEphemeral {
                     cursor_id: *cursor_id,
                     is_table: false,
                 });
-                emit_plan(program)?;
+                emit_plan(program)
             }
             SubqueryType::RowValue {
                 result_reg_start,
@@ -2025,8 +2185,9 @@ pub fn emit_non_from_clause_subquery(
                     return_reg: subroutine_reg,
                     can_fallthrough: true,
                 });
+                Ok(())
             }
-        }
+        })?;
         // Pop the parent explain for LIST/SCALAR SUBQUERY annotations.
         if !matches!(query_type, SubqueryType::Exists { .. }) {
             program.pop_current_parent_explain();
