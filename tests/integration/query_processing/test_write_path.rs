@@ -1898,3 +1898,44 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_upsert_conflict_target_on_replace_constraint(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a UNIQUE ON CONFLICT REPLACE, b)")?;
+    conn.execute("CREATE INDEX i ON t(b)")?;
+    conn.execute("INSERT INTO t(a,b) VALUES('x',1)")?;
+
+    conn.execute("INSERT INTO t(a,b) VALUES('y',2) ON CONFLICT(a) DO UPDATE SET b=9")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM t ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 1], row!["y", 2]]);
+
+    conn.execute("INSERT INTO t(a,b) VALUES('x',3) ON CONFLICT(a) DO NOTHING")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM t ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 1], row!["y", 2]]);
+
+    conn.execute("INSERT INTO t(a,b) VALUES('x',4) ON CONFLICT(a) DO UPDATE SET b=b+40")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM t ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 41], row!["y", 2]]);
+
+    let via_idx = limbo_exec_rows(&conn, "SELECT a FROM t INDEXED BY i WHERE b=41");
+    assert_that!(via_idx).is_equal_to(vec![row!["x"]]);
+
+    conn.execute("CREATE TABLE p(a, b, PRIMARY KEY(a) ON CONFLICT REPLACE)")?;
+    conn.execute("CREATE INDEX pi ON p(b)")?;
+    conn.execute("INSERT INTO p(a,b) VALUES('x',1)")?;
+
+    conn.execute("INSERT INTO p(a,b) VALUES('y',2) ON CONFLICT(a) DO UPDATE SET b=9")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM p ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 1], row!["y", 2]]);
+
+    conn.execute("INSERT INTO p(a,b) VALUES('x',3) ON CONFLICT(a) DO UPDATE SET b=b+70")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM p ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 71], row!["y", 2]]);
+
+    let ic = run_integrity_check(&conn);
+    assert_eq!(ic, "ok", "integrity_check: {ic}");
+
+    Ok(())
+}

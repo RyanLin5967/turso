@@ -3275,10 +3275,11 @@ fn emit_preflight_constraint_checks(
             }
         };
         // REPLACE constraints must sort after all non-REPLACE ones
-        // (schema.rs:add_index + IPK deferral ensure this).
+        // (schema.rs:add_index + IPK deferral ensure this). An upsert sorts by
+        // conflict target instead, and then no constraint resolves as REPLACE.
         if effective == ResolveType::Replace {
             seen_replace = true;
-        } else {
+        } else if preflight.upsert_actions.is_empty() {
             turso_assert!(
                 !seen_replace,
                 "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
@@ -3693,12 +3694,13 @@ fn build_constraints_to_check(
         }
     }
 
-    // Post-condition: when no statement-level override exists, all REPLACE
-    // constraints (by DDL mode) must form a contiguous suffix. When a statement
-    // override exists, all constraints get the same effective mode, so the DDL
-    // ordering is irrelevant.
+    // Post-condition: when no statement-level override and no upsert exist, all
+    // REPLACE constraints (by DDL mode) must form a contiguous suffix. When a
+    // statement override exists, all constraints get the same effective mode, so
+    // the DDL ordering is irrelevant. When an upsert exists, the sort above orders
+    // by conflict target instead and no constraint resolves as REPLACE.
     turso_debug_assert!(
-        has_statement_conflict || {
+        has_statement_conflict || !upsert_actions.is_empty() || {
             let mut saw_replace = false;
             constraints_to_check.iter().all(|(c, _)| {
                 let mode = match c {
