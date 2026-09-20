@@ -13,6 +13,7 @@
 #![recursion_limit = "256"]
 
 pub mod alloc;
+pub mod branch;
 pub mod busy;
 pub mod cdc;
 #[cfg(feature = "cli_only")]
