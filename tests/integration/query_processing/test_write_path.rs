@@ -1898,3 +1898,121 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     Ok(())
 }
+
+#[turso_macros::test]
+fn test_upsert_conflict_target_on_replace_constraint(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a UNIQUE ON CONFLICT REPLACE, b)")?;
+    conn.execute("CREATE INDEX i ON t(b)")?;
+    conn.execute("INSERT INTO t(a,b) VALUES('x',1)")?;
+
+    conn.execute("INSERT INTO t(a,b) VALUES('y',2) ON CONFLICT(a) DO UPDATE SET b=9")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM t ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 1], row!["y", 2]]);
+
+    conn.execute("INSERT INTO t(a,b) VALUES('x',3) ON CONFLICT(a) DO NOTHING")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM t ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 1], row!["y", 2]]);
+
+    conn.execute("INSERT INTO t(a,b) VALUES('x',4) ON CONFLICT(a) DO UPDATE SET b=b+40")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM t ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 41], row!["y", 2]]);
+
+    let via_idx = limbo_exec_rows(&conn, "SELECT a FROM t INDEXED BY i WHERE b=41");
+    assert_that!(via_idx).is_equal_to(vec![row!["x"]]);
+
+    conn.execute("CREATE TABLE p(a, b, PRIMARY KEY(a) ON CONFLICT REPLACE)")?;
+    conn.execute("CREATE INDEX pi ON p(b)")?;
+    conn.execute("INSERT INTO p(a,b) VALUES('x',1)")?;
+
+    conn.execute("INSERT INTO p(a,b) VALUES('y',2) ON CONFLICT(a) DO UPDATE SET b=9")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM p ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 1], row!["y", 2]]);
+
+    conn.execute("INSERT INTO p(a,b) VALUES('x',3) ON CONFLICT(a) DO UPDATE SET b=b+70")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b FROM p ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row!["x", 71], row!["y", 2]]);
+
+    let ic = run_integrity_check(&conn);
+    assert_eq!(ic, "ok", "integrity_check: {ic}");
+
+    Ok(())
+}
+
+/// A constraint the UPSERT clause does not name as its conflict target keeps its
+/// own DDL `ON CONFLICT` behaviour. Expectations measured with /usr/bin/sqlite3
+/// 3.51.0.
+#[turso_macros::test]
+fn test_upsert_non_target_constraint_keeps_ddl_clause(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // REPLACE on a constraint the upsert does not target: the conflicting row is
+    // replaced and the new row lands, secondary index included.
+    conn.execute("CREATE TABLE r(a UNIQUE ON CONFLICT ABORT, b UNIQUE ON CONFLICT REPLACE, c)")?;
+    conn.execute("CREATE INDEX rix ON r(c)")?;
+    conn.execute("INSERT INTO r(a,b,c) VALUES(1,10,100)")?;
+    conn.execute("INSERT INTO r(a,b,c) VALUES(2,20,200)")?;
+    conn.execute("INSERT INTO r(a,b,c) VALUES(99,10,900) ON CONFLICT(a) DO UPDATE SET c=c+1000")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b,c FROM r ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row![2, 20, 200], row![99, 10, 900]]);
+    let via_idx = limbo_exec_rows(&conn, "SELECT a FROM r INDEXED BY rix WHERE c=900");
+    assert_that!(via_idx).is_equal_to(vec![row![99]]);
+
+    // IGNORE on a constraint the upsert does not target: the row is dropped
+    // silently rather than reported as a uniqueness failure.
+    conn.execute("CREATE TABLE g(a UNIQUE ON CONFLICT IGNORE, b UNIQUE ON CONFLICT ABORT, c)")?;
+    conn.execute("INSERT INTO g(a,b,c) VALUES(1,10,100)")?;
+    conn.execute("INSERT INTO g(a,b,c) VALUES(2,20,200)")?;
+    conn.execute("INSERT INTO g(a,b,c) VALUES(1,99,900) ON CONFLICT(b) DO NOTHING")?;
+    conn.execute("INSERT INTO g(a,b,c) VALUES(1,88,800) ON CONFLICT(b) DO UPDATE SET c=c+1000")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b,c FROM g ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row![1, 10, 100], row![2, 20, 200]]);
+
+    // An INTEGER PRIMARY KEY declared REPLACE that the upsert does not target.
+    conn.execute(
+        "CREATE TABLE k(a INTEGER PRIMARY KEY ON CONFLICT REPLACE, b UNIQUE ON CONFLICT ABORT, c)",
+    )?;
+    conn.execute("CREATE INDEX kix ON k(c)")?;
+    conn.execute("INSERT INTO k(a,b,c) VALUES(1,10,100)")?;
+    conn.execute("INSERT INTO k(a,b,c) VALUES(2,20,200)")?;
+    conn.execute("INSERT INTO k(a,b,c) VALUES(1,30,300) ON CONFLICT(b) DO UPDATE SET c=c+1000")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b,c FROM k ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row![1, 30, 300], row![2, 20, 200]]);
+    let via_idx = limbo_exec_rows(&conn, "SELECT a FROM k INDEXED BY kix WHERE c=300");
+    assert_that!(via_idx).is_equal_to(vec![row![1]]);
+
+    // Several rows in one statement, only one of which trips the REPLACE.
+    conn.execute("CREATE TABLE m(a UNIQUE ON CONFLICT REPLACE, b UNIQUE ON CONFLICT ABORT, c)")?;
+    conn.execute("INSERT INTO m(a,b,c) VALUES(1,10,100)")?;
+    conn.execute("INSERT INTO m(a,b,c) VALUES(2,20,200)")?;
+    conn.execute(
+        "INSERT INTO m(a,b,c) VALUES(3,30,300),(1,40,400),(4,50,500) ON CONFLICT(b) DO UPDATE SET c=c+1000",
+    )?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b,c FROM m ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![
+        row![1, 40, 400],
+        row![2, 20, 200],
+        row![3, 30, 300],
+        row![4, 50, 500],
+    ]);
+
+    // A non-target constraint declared ABORT still raises, so honouring the DDL
+    // clause is not a blanket suppression.
+    conn.execute("CREATE TABLE n(a UNIQUE ON CONFLICT REPLACE, b UNIQUE ON CONFLICT ABORT, c)")?;
+    conn.execute("INSERT INTO n(a,b,c) VALUES(1,10,100)")?;
+    conn.execute("INSERT INTO n(a,b,c) VALUES(2,20,200)")?;
+    let res =
+        conn.execute("INSERT INTO n(a,b,c) VALUES(3,10,300) ON CONFLICT(a) DO UPDATE SET c=c+1000");
+    assert!(
+        res.is_err(),
+        "non-target ABORT constraint should still raise, got {res:?}"
+    );
+    let rows = limbo_exec_rows(&conn, "SELECT a,b,c FROM n ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row![1, 10, 100], row![2, 20, 200]]);
+
+    let ic = run_integrity_check(&conn);
+    assert_eq!(ic, "ok", "integrity_check: {ic}");
+
+    Ok(())
+}

@@ -869,8 +869,7 @@ pub fn translate_insert(
     // deferring non-REPLACE indexes to the commit phase (skip_replace_indexes).
     // This mixed-mode detection is unnecessary when a statement override exists,
     // because the override applies uniformly to all constraints.
-    let has_ddl_replace = ctx.statement_on_conflict.is_none()
-        && upsert_actions.is_empty()
+    let ddl_replace_clause_present = ctx.statement_on_conflict.is_none()
         && resolver.with_schema(ctx.database_id, |schema| {
             any_index_or_ipk_has_replace(
                 ctx.table.rowid_alias_conflict_clause,
@@ -879,6 +878,7 @@ pub fn translate_insert(
                     .map(|idx| idx.on_conflict),
             )
         });
+    let has_ddl_replace = ddl_replace_clause_present && upsert_actions.is_empty();
     let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
         || has_ddl_replace;
     let mut preflight_ctx = PreflightCtx {
@@ -970,7 +970,7 @@ pub fn translate_insert(
     // For REPLACE (statement-level or constraint-level), we need to force a seek on the
     // insert, as we may have already deleted the conflicting row and the cursor is not
     // guaranteed to be positioned.
-    if matches!(ctx.on_conflict, ResolveType::Replace) || has_ddl_replace {
+    if matches!(ctx.on_conflict, ResolveType::Replace) || ddl_replace_clause_present {
         insert_flags = insert_flags.require_seek();
     }
     program.emit_insn(Insn::Insert {
@@ -3149,6 +3149,25 @@ fn emit_unique_index_check(
                     });
                 }
             }
+        } else if preflight.on_replace {
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: idx_cursor_id,
+                dest: ctx.conflict_rowid_reg,
+            });
+            emit_replace_delete_conflicting_row(
+                program,
+                resolver,
+                preflight.connection,
+                ctx,
+                preflight.table_references,
+            )?;
+            program.emit_insn(Insn::Goto {
+                target_pc: next_check,
+            });
+        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
         }
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
@@ -3274,19 +3293,24 @@ fn emit_preflight_constraint_checks(
                 ResolvedUpsertTarget::CatchAll => unreachable!(),
             }
         };
+        let routed_to_upsert =
+            position.is_some() || constraints.upsert_catch_all_position.is_some();
         // REPLACE constraints must sort after all non-REPLACE ones
         // (schema.rs:add_index + IPK deferral ensure this).
-        if effective == ResolveType::Replace {
-            seen_replace = true;
-        } else {
-            turso_assert!(
-                !seen_replace,
-                "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
-            );
+        if !routed_to_upsert {
+            if effective == ResolveType::Replace {
+                seen_replace = true;
+            } else {
+                turso_assert!(
+                    !seen_replace,
+                    "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
+                );
+            }
         }
 
-        let effective_on_replace =
-            matches!(effective, ResolveType::Replace) && preflight.upsert_actions.is_empty();
+        let effective_on_replace = matches!(effective, ResolveType::Replace)
+            && !routed_to_upsert
+            && (ctx.statement_on_conflict.is_none() || preflight.upsert_actions.is_empty());
         preflight.on_replace = effective_on_replace;
         preflight.effective_on_conflict = effective;
 
@@ -3693,14 +3717,24 @@ fn build_constraints_to_check(
         }
     }
 
+    let upsert_catch_all_position =
+        if let Some((ResolvedUpsertTarget::CatchAll, ..)) = upsert_actions.last() {
+            Some(upsert_actions.len() - 1)
+        } else {
+            None
+        };
+
     // Post-condition: when no statement-level override exists, all REPLACE
     // constraints (by DDL mode) must form a contiguous suffix. When a statement
     // override exists, all constraints get the same effective mode, so the DDL
     // ordering is irrelevant.
     turso_debug_assert!(
-        has_statement_conflict || {
+        has_statement_conflict || upsert_catch_all_position.is_some() || {
             let mut saw_replace = false;
-            constraints_to_check.iter().all(|(c, _)| {
+            constraints_to_check.iter().all(|(c, position)| {
+                if position.is_some() {
+                    return true;
+                }
                 let mode = match c {
                     ResolvedUpsertTarget::PrimaryKey => {
                         rowid_alias_conflict_clause.unwrap_or(ResolveType::Abort)
@@ -3721,12 +3755,6 @@ fn build_constraints_to_check(
         "constraints must have all REPLACE entries at the end"
     );
 
-    let upsert_catch_all_position =
-        if let Some((ResolvedUpsertTarget::CatchAll, ..)) = upsert_actions.last() {
-            Some(upsert_actions.len() - 1)
-        } else {
-            None
-        };
     ConstraintsToCheck {
         constraints_to_check,
         upsert_catch_all_position,
