@@ -2655,9 +2655,17 @@ impl Program {
                 // back, so auto-retrying can be useful.
                 Some(ProgramStep::Busy)
             }
+            // A datatype mismatch that keeps the rows written before it has to
+            // keep their index-method writes too, or the custom index cannot
+            // find rows the table still holds. Staging them is exactly what
+            // this path already does for FAIL, and it calls abort() with the
+            // original error afterwards, so the transaction outcome is still
+            // decided by that error's own arm there.
             err if (matches!(err, LimboError::Constraint(_))
                 && self.resolve_type == ResolveType::Fail)
-                || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
+                || matches!(err, LimboError::Raise(ResolveType::Fail, _))
+                || (matches!(err, LimboError::TypeMismatch)
+                    && self.resolve_type == ResolveType::Fail) =>
             {
                 state.pending_fail_prepare_error = Some(err);
                 None
@@ -3332,10 +3340,14 @@ impl Program {
         // `program_step` before abort() was called (and, on the autocommit
         // path, already committed by halt()), so discarding cursor state here
         // would deliver a rollback outcome for work that commits below.
+        // A rowid/LIMIT datatype mismatch keeps them under the same rule as
+        // `keeps_statement_savepoint` below, which is where that rule is
+        // explained.
         let keeps_prior_changes = match err {
             Some(LimboError::RaiseIgnore) => true,
             Some(LimboError::Raise(ResolveType::Fail, _)) => true,
             Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
+            Some(LimboError::TypeMismatch) => self.resolve_type == ResolveType::Fail,
             _ => false,
         };
         if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
@@ -3419,14 +3431,40 @@ impl Program {
                 // is rolling back the whole MVCC transaction.
             }
             let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
+            // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
+            // changes made before the error should persist.
+            // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
+            //
+            // A rowid/LIMIT datatype mismatch (SQLITE_MISMATCH) is not a
+            // constraint violation, so ON CONFLICT never resolves it. It gets
+            // exactly the statement-level treatment the constraint error it
+            // replaced already had: released for FAIL, rolled back otherwise.
+            // How much that actually undoes is then decided by whether this
+            // statement opened a statement journal, which `may_abort` in
+            // `translate::stmt_journal` already works out; a rollback without
+            // one is a no-op and the rows stay.
+            //
+            // Do NOT try to shortcut that with the resolve type. An earlier
+            // attempt keyed this on `resolve_type != Abort` and regressed
+            // `INSERT OR REPLACE` into a table with a NOT NULL or CHECK
+            // column, where `constraint_may_abort` opens a journal for
+            // Replace and so the rows before the mismatch must go. Measured
+            // on sqlite3 3.51.0 with `BEGIN; INSERT INTO nd(x) VALUES(100);
+            // INSERT OR REPLACE INTO nd(x) VALUES(1),(2),('a'),(3);` on
+            // `nd(x INTEGER PRIMARY KEY, y TEXT NOT NULL DEFAULT 'd')`:
+            // one row survives, not three.
+            //
+            // In autocommit there is no transaction left to keep them in: the
+            // implicit transaction is rolled back below, so the savepoint is
+            // rolled back with it rather than kept.
+            let keeps_statement_savepoint = (matches!(err, Some(LimboError::Constraint(_)))
+                && self.resolve_type == ResolveType::Fail)
+                || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)))
+                || (matches!(err, Some(LimboError::TypeMismatch))
+                    && self.resolve_type == ResolveType::Fail
+                    && !must_rollback_tx_if_needed);
             if err.is_some() && !pager.is_checkpointing() {
-                // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
-                // changes made before the error should persist.
-                // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
-                    && self.resolve_type == ResolveType::Fail)
-                    || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
-                if !is_fail_constraint {
+                if !keeps_statement_savepoint {
                     if let Err(end_stmt_err) = state.end_statement(
                         &self.connection,
                         pager,
@@ -3481,6 +3519,43 @@ impl Program {
                 Some(LimboError::ForeignKeyConstraint(_)) => {
                     if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
+                    }
+                    self.connection.set_changes(0);
+                }
+                // Rowid/LIMIT datatype mismatches are not constraint
+                // violations, so ON CONFLICT does not resolve them and they
+                // always behave like ABORT for the transaction: the implicit
+                // transaction is rolled back in autocommit — which is what
+                // discards the rows written before the mismatch — and an
+                // explicit transaction survives untouched. Without this arm
+                // the error reaches the catch-all below, whose
+                // `TxnCleanup::None` branch rolls back any open explicit
+                // transaction on any error, which for this error class
+                // discards rows that earlier, fully successful statements
+                // committed to it. `changes()` reads 0 after a mismatch in
+                // sqlite3 3.51.0, in autocommit and in a transaction alike.
+                Some(LimboError::TypeMismatch) => {
+                    if must_rollback_tx_if_needed {
+                        // `keeps_prior_changes` left the staged index-method
+                        // writes alone because an explicit transaction keeps
+                        // the rows they belong to. This transaction does not,
+                        // so they go with it.
+                        execute::index_method_abort_statement_all(state);
+                        self.rollback_current_txn(pager);
+                    } else if keeps_statement_savepoint && !pager.is_checkpointing() {
+                        // Released rather than rolled back, so the rows
+                        // written before the mismatch stay in the transaction.
+                        if let Err(end_stmt_err) = state.end_statement(
+                            &self.connection,
+                            pager,
+                            EndStatement::ReleaseSavepoint,
+                        ) {
+                            capture_abort_error(
+                                &mut abort_error,
+                                end_stmt_err,
+                                "Failed to release statement savepoint during abort",
+                            );
+                        }
                     }
                     self.connection.set_changes(0);
                 }

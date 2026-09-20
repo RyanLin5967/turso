@@ -737,6 +737,11 @@ impl From<LimboError> for TursoError {
             LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
                 TursoError::Constraint(e)
             }
+            // There is no TURSO_MISMATCH status code, and the generic arm
+            // below would declassify a datatype mismatch to TURSO_ERROR.
+            // Constraint is the closest code this ABI has, and the one this
+            // error mapped to before it became its own variant.
+            LimboError::TypeMismatch => TursoError::Constraint(value.to_string()),
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
             e @ (LimboError::DatabaseFull | LimboError::SequenceExhausted { .. }) => {
@@ -1852,6 +1857,26 @@ mod tests {
                 c::turso_status_code_t::TURSO_BUSY_SNAPSHOT
             ));
             assert!(error.to_string().contains("Commit dependency aborted"));
+        }
+    }
+
+    /// A rowid datatype mismatch must stay classified. There is no
+    /// TURSO_MISMATCH in this ABI, so it maps to TURSO_CONSTRAINT — the code
+    /// it carried before it became its own `LimboError` variant. Without an
+    /// arm for it the generic fallthrough declassifies it to TURSO_ERROR,
+    /// which is what the Python and Rust bindings surface to callers.
+    #[test]
+    fn type_mismatch_is_not_declassified_to_a_generic_error() {
+        for error in [
+            TursoError::from(LimboError::TypeMismatch),
+            TursoError::from(Box::new(LimboError::TypeMismatch)),
+        ] {
+            assert!(matches!(error, TursoError::Constraint(_)), "{error:?}");
+            assert!(matches!(
+                error.to_capi_code(),
+                c::turso_status_code_t::TURSO_CONSTRAINT
+            ));
+            assert_eq!(error.to_string(), "datatype mismatch");
         }
     }
 

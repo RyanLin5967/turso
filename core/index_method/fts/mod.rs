@@ -3047,7 +3047,13 @@ impl IndexMethodCursor for FtsCursor {
                     _ => None,
                 };
                 coerced
-                    .ok_or_else(|| LimboError::Constraint("datatype mismatch (19)".to_string()))?
+                    // A non-integer LIMIT is SQLITE_MISMATCH, the same as on
+                    // the non-index-method path, which reaches this through
+                    // `op_must_be_int`. Reporting it as a constraint gave it
+                    // code 19 instead of 20, and the hard-coded "(19)" in the
+                    // message was printed a second time by the caller that
+                    // appends the real code.
+                    .ok_or(LimboError::TypeMismatch)?
             } else {
                 return Err(LimboError::InternalError(
                     "FTS query_start: LIMIT pattern selected but no limit value captured"

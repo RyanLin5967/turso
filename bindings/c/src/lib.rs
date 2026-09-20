@@ -3831,6 +3831,9 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
         LimboError::Constraint(_) | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
+        // A rowid/LIMIT datatype mismatch is SQLITE_MISMATCH, not a
+        // constraint violation: sqlite3 3.51.0 prints "datatype mismatch (20)".
+        LimboError::TypeMismatch => SQLITE_MISMATCH,
         LimboError::DatabaseFull | LimboError::SequenceExhausted { .. } => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
@@ -3908,6 +3911,61 @@ mod tests {
             let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
             assert_eq!(msg, "UNIQUE constraint failed: u.a");
             sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    /// A rowid datatype mismatch is SQLITE_MISMATCH, not SQLITE_CONSTRAINT and
+    /// not the generic SQLITE_ERROR. Measured on /usr/bin/sqlite3 3.51.0:
+    /// `INSERT INTO t VALUES('a')` on `t(x INTEGER PRIMARY KEY)` prints
+    /// "datatype mismatch (20)". Without a `LimboError::TypeMismatch` arm in
+    /// `limbo_err_code` this falls through to SQLITE_ERROR, so both
+    /// sqlite3_step and sqlite3_errcode report 1 for it.
+    #[test]
+    fn test_rowid_type_mismatch_reports_sqlite_mismatch() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(x INTEGER PRIMARY KEY);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO t VALUES ('a')".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_MISMATCH);
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
+            assert_eq!(msg, "datatype mismatch");
+            sqlite3_finalize(stmt);
+
+            // sqlite3_exec routes the same error through set_db_err, so
+            // sqlite3_errcode must agree with what step returned.
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"INSERT INTO t VALUES ('a');".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_MISMATCH
+            );
+            assert_eq!(sqlite3_errcode(db), SQLITE_MISMATCH);
             sqlite3_close(db);
         }
     }

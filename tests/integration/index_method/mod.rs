@@ -780,6 +780,42 @@ fn test_fts_query_input_types(tmp_db: TempDatabase) {
     }
 }
 
+/// A non-integer LIMIT is a datatype mismatch on the index-method query path
+/// too, and it has to be reported the same way as on the ordinary path.
+///
+/// Measured on /usr/bin/sqlite3 3.51.0, `SELECT 1 LIMIT 'a'` reports
+/// "datatype mismatch (20)". This path built the error by hand as a
+/// constraint carrying a hard-coded "(19)" inside the message, so the CLI
+/// printed "datatype mismatch (19) (19)": the wrong class, and the code
+/// twice because the caller appends the real one.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_non_integer_limit_is_a_datatype_mismatch(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fx ON d USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO d VALUES (1, 'alpha beta'), (2, 'beta gamma')")
+        .unwrap();
+
+    let sql = "SELECT id FROM d WHERE fts_match(body, 'beta') LIMIT 'a'";
+    let err = conn
+        .execute(sql)
+        .expect_err("a non-integer LIMIT must fail")
+        .to_string();
+    assert_eq!(
+        err, "datatype mismatch",
+        "the index-method path must report a bare datatype mismatch, got: {err}"
+    );
+
+    // The failed query must not have disturbed the table it read.
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM d"),
+        vec![vec![rusqlite::types::Value::Integer(2)]],
+    );
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
 fn test_fts_bound_query_input_types(tmp_db: TempDatabase) {
