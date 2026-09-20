@@ -1,0 +1,80 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/8734
+
+test update-set-window-rank-subquery {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE t SET v = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM t) WHERE iid = t.id);
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-set-window-total-subquery {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO u VALUES(1,1),(2,2),(3,3);
+    UPDATE u SET v = (SELECT q FROM (SELECT id AS iid, sum(v) OVER () AS q FROM u) WHERE iid = u.id);
+    SELECT id, v FROM u ORDER BY id;
+}
+expect {
+    1|6
+    2|6
+    3|6
+}
+
+test update-set-window-cte-rewrite {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO t VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE t SET v = (WITH r AS (SELECT id AS iid, row_number() OVER (ORDER BY v DESC) AS q FROM t) SELECT q FROM r WHERE iid = t.id);
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-set-window-column-not-read-by-window {
+    CREATE TABLE w(id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
+    INSERT INTO w VALUES(1,1,0),(2,2,0),(3,3,0),(4,4,0);
+    UPDATE w SET y = (SELECT q FROM (SELECT id AS iid, row_number() OVER (ORDER BY x DESC) AS q FROM w) WHERE iid = w.id);
+    SELECT id, y FROM w ORDER BY id;
+}
+expect {
+    1|4
+    2|3
+    3|2
+    4|1
+}
+
+test update-set-range-matched-subquery-sees-earlier-writes {
+    CREATE TABLE h(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO h VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE h SET v = (SELECT count(*) FROM (SELECT DISTINCT v AS lv FROM h) WHERE lv <= h.id) * 5;
+    SELECT id, v FROM h ORDER BY id;
+}
+expect {
+    1|5
+    2|5
+    3|5
+    4|5
+}
+
+test update-set-scalar-subquery-sees-earlier-writes {
+    CREATE TABLE d(id INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO d VALUES(1,1),(2,2),(3,3),(4,4);
+    UPDATE d SET v = (SELECT sum(q) FROM (SELECT v AS q FROM d) WHERE q <= d.v);
+    SELECT id, v FROM d ORDER BY id;
+}
+expect {
+    1|1
+    2|3
+    3|7
+    4|8
+}

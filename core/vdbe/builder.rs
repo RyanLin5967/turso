@@ -305,6 +305,7 @@ pub struct ProgramBuilder {
     pub table_references: TableReferences,
     /// Current parsing nesting level
     nested_level: usize,
+    reentrant_scope_level: usize,
     init_label: BranchOffset,
     start_offset: BranchOffset,
     pub(crate) reg_result_cols_start: Option<usize>,
@@ -715,6 +716,7 @@ impl ProgramBuilder {
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,
+            reentrant_scope_level: 0,
             // These labels will be filled when `prologue()` is called
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
@@ -1946,6 +1948,45 @@ impl ProgramBuilder {
     #[inline]
     pub const fn is_nested(&self) -> bool {
         self.nested_level > 0
+    }
+
+    #[inline]
+    pub fn with_reentrant_scope<T>(
+        &mut self,
+        entered: bool,
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        if entered {
+            self.reentrant_scope_level += 1;
+        }
+        let res = body(self);
+        if entered {
+            self.reentrant_scope_level -= 1;
+        }
+        res
+    }
+
+    #[inline]
+    pub fn with_suspended_reentrant_scope<T>(
+        &mut self,
+        suspended: bool,
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let saved = if suspended {
+            core::mem::take(&mut self.reentrant_scope_level)
+        } else {
+            0
+        };
+        let res = body(self);
+        if suspended {
+            self.reentrant_scope_level = saved;
+        }
+        res
+    }
+
+    #[inline]
+    pub const fn in_reentrant_scope(&self) -> bool {
+        self.reentrant_scope_level > 0
     }
 
     /// Initialize the program with basic setup and return initial metadata and labels
