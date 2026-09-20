@@ -1939,3 +1939,59 @@ fn test_upsert_conflict_target_on_replace_constraint(tmp_db: TempDatabase) -> an
 
     Ok(())
 }
+
+/// A constraint that the UPSERT clause does not name as its conflict target keeps
+/// its own DDL `ON CONFLICT` behaviour. Expectations measured with
+/// /usr/bin/sqlite3 3.51.0.
+#[turso_macros::test]
+fn test_upsert_non_target_constraint_keeps_ddl_clause(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // REPLACE on a constraint the upsert does not target: the conflicting row is
+    // replaced and the new row lands, including in the secondary index.
+    conn.execute("CREATE TABLE r(a UNIQUE ON CONFLICT ABORT, b UNIQUE ON CONFLICT REPLACE, c)")?;
+    conn.execute("CREATE INDEX rix ON r(c)")?;
+    conn.execute("INSERT INTO r(a,b,c) VALUES(1,10,100)")?;
+    conn.execute("INSERT INTO r(a,b,c) VALUES(2,20,200)")?;
+    conn.execute("INSERT INTO r(a,b,c) VALUES(99,10,900) ON CONFLICT(a) DO UPDATE SET c=c+1000")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b,c FROM r ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row![2, 20, 200], row![99, 10, 900]]);
+    let via_idx = limbo_exec_rows(&conn, "SELECT a FROM r INDEXED BY rix WHERE c=900");
+    assert_that!(via_idx).is_equal_to(vec![row![99]]);
+
+    // IGNORE on a constraint the upsert does not target: the row is dropped
+    // silently, not reported as a uniqueness failure.
+    conn.execute("CREATE TABLE g(a UNIQUE ON CONFLICT IGNORE, b UNIQUE ON CONFLICT REPLACE, c)")?;
+    conn.execute("INSERT INTO g(a,b,c) VALUES(1,10,100)")?;
+    conn.execute("INSERT INTO g(a,b,c) VALUES(2,20,200)")?;
+    conn.execute("INSERT INTO g(a,b,c) VALUES(1,99,900) ON CONFLICT(b) DO NOTHING")?;
+    conn.execute("INSERT INTO g(a,b,c) VALUES(1,88,800) ON CONFLICT(b) DO UPDATE SET c=c+1000")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b,c FROM g ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row![1, 10, 100], row![2, 20, 200]]);
+
+    // An INTEGER PRIMARY KEY declared REPLACE that the upsert does not target.
+    conn.execute(
+        "CREATE TABLE k(a INTEGER PRIMARY KEY ON CONFLICT REPLACE, b UNIQUE ON CONFLICT ABORT, c)",
+    )?;
+    conn.execute("CREATE INDEX kix ON k(c)")?;
+    conn.execute("INSERT INTO k(a,b,c) VALUES(1,10,100)")?;
+    conn.execute("INSERT INTO k(a,b,c) VALUES(2,20,200)")?;
+    conn.execute("INSERT INTO k(a,b,c) VALUES(1,99,900) ON CONFLICT(b) DO UPDATE SET c=c+1000")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b,c FROM k ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row![1, 99, 900], row![2, 20, 200]]);
+
+    // Two REPLACE constraints where only one is the conflict target: the other
+    // still replaces, and the REPLACE-last ordering the preflight relies on holds.
+    conn.execute("CREATE TABLE m(a UNIQUE ON CONFLICT REPLACE, b UNIQUE ON CONFLICT REPLACE, c)")?;
+    conn.execute("CREATE INDEX mix ON m(c)")?;
+    conn.execute("INSERT INTO m(a,b,c) VALUES(1,10,100)")?;
+    conn.execute("INSERT INTO m(a,b,c) VALUES(2,20,200)")?;
+    conn.execute("INSERT INTO m(a,b,c) VALUES(99,10,900) ON CONFLICT(a) DO UPDATE SET c=c+1000")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a,b,c FROM m ORDER BY a");
+    assert_that!(rows).is_equal_to(vec![row![2, 20, 200], row![99, 10, 900]]);
+
+    let ic = run_integrity_check(&conn);
+    assert_eq!(ic, "ok", "integrity_check: {ic}");
+
+    Ok(())
+}

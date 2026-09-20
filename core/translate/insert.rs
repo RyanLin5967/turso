@@ -879,6 +879,21 @@ pub fn translate_insert(
                     .map(|idx| idx.on_conflict),
             )
         });
+    // A DDL REPLACE constraint that no UPSERT arm claims still deletes the
+    // conflicting row during preflight, which moves the table cursor. It is not
+    // `has_ddl_replace` (the commit phase must keep writing those index entries,
+    // since preflight does not insert them eagerly on this path), so track it
+    // separately and use it only to force the seek on the final Insert.
+    let upsert_may_delete_for_replace = !upsert_actions.is_empty()
+        && ctx.statement_on_conflict.is_none()
+        && resolver.with_schema(ctx.database_id, |schema| {
+            any_index_or_ipk_has_replace(
+                ctx.table.rowid_alias_conflict_clause,
+                schema
+                    .get_indices(ctx.table.name.as_str())
+                    .map(|idx| idx.on_conflict),
+            )
+        });
     let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
         || has_ddl_replace;
     let mut preflight_ctx = PreflightCtx {
@@ -970,7 +985,10 @@ pub fn translate_insert(
     // For REPLACE (statement-level or constraint-level), we need to force a seek on the
     // insert, as we may have already deleted the conflicting row and the cursor is not
     // guaranteed to be positioned.
-    if matches!(ctx.on_conflict, ResolveType::Replace) || has_ddl_replace {
+    if matches!(ctx.on_conflict, ResolveType::Replace)
+        || has_ddl_replace
+        || upsert_may_delete_for_replace
+    {
         insert_flags = insert_flags.require_seek();
     }
     program.emit_insn(Insn::Insert {
@@ -3149,6 +3167,32 @@ fn emit_unique_index_check(
                     });
                 }
             }
+        } else if preflight.on_replace {
+            // No UPSERT arm claims this constraint and its own DDL clause is
+            // REPLACE, so it behaves exactly as it would without an upsert:
+            // delete the conflicting row and carry on with the remaining checks.
+            // The index entry for the new row is still written by the commit
+            // phase, which does not skip these indexes while an upsert exists.
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: idx_cursor_id,
+                dest: ctx.conflict_rowid_reg,
+            });
+            emit_replace_delete_conflicting_row(
+                program,
+                resolver,
+                preflight.connection,
+                ctx,
+                preflight.table_references,
+            )?;
+            program.emit_insn(Insn::Goto {
+                target_pc: next_check,
+            });
+        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            // Likewise for a DDL clause of IGNORE: drop the row silently rather
+            // than reporting a uniqueness failure the schema asked us to swallow.
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
         }
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
@@ -3275,19 +3319,26 @@ fn emit_preflight_constraint_checks(
             }
         };
         // REPLACE constraints must sort after all non-REPLACE ones
-        // (schema.rs:add_index + IPK deferral ensure this). An upsert sorts by
-        // conflict target instead, and then no constraint resolves as REPLACE.
-        if effective == ResolveType::Replace {
-            seen_replace = true;
-        } else if preflight.upsert_actions.is_empty() {
-            turso_assert!(
-                !seen_replace,
-                "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
-            );
+        // (schema.rs:add_index + IPK deferral ensure this). Constraints an UPSERT
+        // routes to a handler are sorted ahead of that suffix, but they branch to
+        // the handler on conflict and never delete the conflicting row, so they
+        // carry no ordering hazard and take no part in the invariant. Everything
+        // the sort leaves behind them is still in schema order and still must
+        // hold it.
+        let routed_to_upsert =
+            position.is_some() || constraints.upsert_catch_all_position.is_some();
+        if !routed_to_upsert {
+            if effective == ResolveType::Replace {
+                seen_replace = true;
+            } else {
+                turso_assert!(
+                    !seen_replace,
+                    "non-REPLACE constraint after REPLACE constraint — sort order invariant violated"
+                );
+            }
         }
 
-        let effective_on_replace =
-            matches!(effective, ResolveType::Replace) && preflight.upsert_actions.is_empty();
+        let effective_on_replace = matches!(effective, ResolveType::Replace) && !routed_to_upsert;
         preflight.on_replace = effective_on_replace;
         preflight.effective_on_conflict = effective;
 
@@ -3694,15 +3745,27 @@ fn build_constraints_to_check(
         }
     }
 
-    // Post-condition: when no statement-level override and no upsert exist, all
-    // REPLACE constraints (by DDL mode) must form a contiguous suffix. When a
-    // statement override exists, all constraints get the same effective mode, so
-    // the DDL ordering is irrelevant. When an upsert exists, the sort above orders
-    // by conflict target instead and no constraint resolves as REPLACE.
+    let upsert_catch_all_position =
+        if let Some((ResolvedUpsertTarget::CatchAll, ..)) = upsert_actions.last() {
+            Some(upsert_actions.len() - 1)
+        } else {
+            None
+        };
+
+    // Post-condition: when no statement-level override exists, all REPLACE
+    // constraints (by DDL mode) must form a contiguous suffix. When a statement
+    // override exists, all constraints get the same effective mode, so the DDL
+    // ordering is irrelevant. Constraints the sort above moved ahead of that
+    // suffix because an UPSERT routes them to a handler are exempt: on conflict
+    // they branch to the handler instead of deleting the conflicting row. The
+    // constraints left behind them keep schema order and keep the invariant.
     turso_debug_assert!(
-        has_statement_conflict || !upsert_actions.is_empty() || {
+        has_statement_conflict || {
             let mut saw_replace = false;
-            constraints_to_check.iter().all(|(c, _)| {
+            constraints_to_check.iter().all(|(c, pos)| {
+                if pos.is_some() || upsert_catch_all_position.is_some() {
+                    return true;
+                }
                 let mode = match c {
                     ResolvedUpsertTarget::PrimaryKey => {
                         rowid_alias_conflict_clause.unwrap_or(ResolveType::Abort)
@@ -3723,12 +3786,6 @@ fn build_constraints_to_check(
         "constraints must have all REPLACE entries at the end"
     );
 
-    let upsert_catch_all_position =
-        if let Some((ResolvedUpsertTarget::CatchAll, ..)) = upsert_actions.last() {
-            Some(upsert_actions.len() - 1)
-        } else {
-            None
-        };
     ConstraintsToCheck {
         constraints_to_check,
         upsert_catch_all_position,
