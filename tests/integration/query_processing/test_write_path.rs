@@ -591,6 +591,57 @@ fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> an
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_fk_parent_change_finds_child_of_other_storage_class(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x TEXT REFERENCES p(id))")?;
+    conn.execute("INSERT INTO p VALUES (1)")?;
+    conn.execute("INSERT INTO c VALUES ('1')")?;
+    conn.execute("CREATE INDEX ic ON c(x)")?;
+
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "indexed child key '1' must block deleting parent 1"
+    );
+
+    conn.execute("DROP INDEX ic")?;
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "unindexed child key '1' must block deleting parent 1"
+    );
+    assert!(
+        conn.execute("UPDATE p SET id = 2").is_err(),
+        "unindexed child key '1' must block moving parent 1"
+    );
+
+    conn.execute("DELETE FROM c")?;
+    conn.execute("CREATE TABLE c2(x TEXT REFERENCES p(id))")?;
+    conn.execute("INSERT INTO c2 VALUES ('01')")?;
+    conn.execute("CREATE INDEX ic2 ON c2(x)")?;
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "indexed child key '01' must block deleting parent 1"
+    );
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "parent row must survive");
+    })?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT id FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "parent key must be unchanged");
+    })?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM c2", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "child row must survive");
+    })?;
+
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE t (x)")]
 fn test_multiple_statements(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
