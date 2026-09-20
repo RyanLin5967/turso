@@ -521,6 +521,107 @@ fn test_rollback_on_unique_constraint_violation(tmp_db: TempDatabase) -> anyhow:
 }
 
 #[turso_macros::test]
+fn test_parent_delete_sees_child_key_of_other_storage_class(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x TEXT REFERENCES p(id))")?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES('1')")?;
+
+    conn.execute("CREATE INDEX ic ON c(x)")?;
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "parent delete must be refused while a child index exists"
+    );
+
+    conn.execute("DROP INDEX ic")?;
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "parent delete must be refused after the child index is dropped"
+    );
+    assert!(
+        conn.execute("UPDATE p SET id = 2").is_err(),
+        "parent key update must be refused after the child index is dropped"
+    );
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "parent row must survive");
+    })?;
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM c", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "child row must survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_deferred_parent_reinsert_repairs_child_key_of_other_storage_class(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE dp(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE dc(x TEXT REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)")?;
+    conn.execute("INSERT INTO dp VALUES(1)")?;
+    conn.execute("INSERT INTO dc VALUES('1')")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("DELETE FROM dp")?;
+    conn.execute("INSERT INTO dp VALUES(1)")?;
+    conn.execute("COMMIT")?;
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM dp", |row| {
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            1,
+            "reinserted parent must commit"
+        );
+    })?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("DELETE FROM dp")?;
+    assert!(
+        conn.execute("COMMIT").is_err(),
+        "commit must be refused while the child key has no parent"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_parent_delete_skips_child_index_that_changes_the_comparison(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c(x TEXT REFERENCES p(id))")?;
+    conn.execute("CREATE INDEX ic ON c(x)")?;
+    conn.execute("INSERT INTO p VALUES(1)")?;
+    conn.execute("INSERT INTO c VALUES('1.0')")?;
+
+    assert!(
+        conn.execute("DELETE FROM p").is_err(),
+        "parent delete must be refused when the child key matches the parent key numerically"
+    );
+
+    common::run_query_on_row(&tmp_db, &conn, "SELECT count(*) FROM p", |row| {
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "parent row must survive");
+    })?;
+
+    Ok(())
+}
+
+#[turso_macros::test]
 /// Test that a large delete statement containing a foreign key constraint violation
 /// is properly rolled back.
 fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> anyhow::Result<()> {

@@ -8,8 +8,11 @@ use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
-    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
+    translate::{
+        collate::CollationSeq, emitter::Resolver, expr::comparison_affinity, planner::ROWID_STRS,
+    },
     vdbe::{
+        affinity::Affinity,
         builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, Insn, Subprogram},
         BranchOffset, PreparedProgram,
@@ -477,11 +480,13 @@ pub(super) fn emit_skip_if_any_null(
 /// Rows with any NULL FK column do not reference a parent and are ignored. For
 /// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
 /// its old child key is being updated away by the same statement.
-fn table_scan_match_any<F>(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     child_tbl: &Arc<BTreeTable>,
     child_cols: &[String],
     parent_key_start: usize,
+    compare_affinities: &[Affinity],
     self_exclude_rowid: Option<usize>,
     database_id: usize,
     mut on_match: F,
@@ -489,6 +494,15 @@ fn table_scan_match_any<F>(
 where
     F: FnMut(&mut ProgramBuilder) -> Result<()>,
 {
+    let probe_start = program.alloc_registers(child_cols.len());
+    for i in 0..child_cols.len() {
+        program.emit_insn(Insn::Copy {
+            src_reg: parent_key_start + i,
+            dst_reg: probe_start + i,
+            extra_amount: 0,
+        });
+    }
+
     let ccur = open_read_table(program, child_tbl, database_id);
     let done = program.allocate_label();
     program.emit_insn(Insn::Rewind {
@@ -520,9 +534,9 @@ where
         let cont = program.allocate_label();
         program.emit_insn(Insn::Eq {
             lhs: tmp,
-            rhs: parent_key_start + i,
+            rhs: probe_start + i,
             target_pc: cont,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default().with_affinity(compare_affinities[i]),
             collation: Some(CollationSeq::Binary),
         });
         program.emit_insn(Insn::Goto {
@@ -565,6 +579,60 @@ where
     program.preassign_label_to_next_insn(done);
     program.emit_insn(Insn::Close { cursor_id: ccur });
     Ok(())
+}
+
+pub(super) fn fk_compare_affinities(
+    child_tbl: &BTreeTable,
+    child_cols: &[String],
+    parent_tbl: &BTreeTable,
+    parent_cols: &[String],
+) -> Result<Vec<Affinity>> {
+    if child_cols.len() != parent_cols.len() {
+        return Err(LimboError::InternalError(format!(
+            "foreign key on {} has {} child columns and {} parent columns",
+            child_tbl.name,
+            child_cols.len(),
+            parent_cols.len()
+        )));
+    }
+    child_cols
+        .iter()
+        .zip(parent_cols.iter())
+        .map(|(ccol, pcol)| {
+            let child_aff = child_tbl
+                .get_column(ccol)
+                .map(|(_, c)| c.affinity())
+                .ok_or_else(|| LimboError::InternalError(format!("child col {ccol} missing")))?;
+            let parent_aff = match parent_tbl.get_column(pcol) {
+                Some((_, c)) => c.affinity(),
+                None if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) => {
+                    Affinity::Integer
+                }
+                None => return Err(LimboError::InternalError(format!("col {pcol} missing"))),
+            };
+            Ok(comparison_affinity(child_aff, parent_aff, None, None))
+        })
+        .collect()
+}
+
+pub(super) fn index_preserves_compare_affinity(
+    idx: &Index,
+    child_tbl: &BTreeTable,
+    compare_affinities: &[Affinity],
+) -> bool {
+    idx.columns.len() == compare_affinities.len()
+        && idx
+            .columns
+            .iter()
+            .zip(compare_affinities.iter())
+            .all(|(ic, cmp)| {
+                let idx_aff = child_tbl.columns()[ic.pos_in_table].affinity();
+                match *cmp {
+                    Affinity::Text => idx_aff == Affinity::Text,
+                    aff if aff.is_numeric() => idx_aff.is_numeric(),
+                    _ => matches!(idx_aff, Affinity::Blob | Affinity::None),
+                }
+            })
 }
 
 /// Build the index affinity mask string (one char per indexed column).
@@ -940,9 +1008,17 @@ fn emit_fk_parent_key_probe(
         Ok(())
     };
 
-    // Prefer an exact child index on (child_cols...). If the current row must
-    // be excluded, scan only the matching index range so the rowid can be
-    // checked before counting the match.
+    let parent_tbl = resolver
+        .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("parent table {} missing", fk_ref.fk.parent_table))
+        })?;
+    let compare_affinities =
+        fk_compare_affinities(child_tbl, child_cols, &parent_tbl, &fk_ref.parent_cols)?;
+
+    // Prefer an exact child index on (child_cols...) that compares the same way
+    // the scan would. If the current row must be excluded, scan only the
+    // matching index range so the rowid can be checked before counting the match.
     let idx = resolver.with_schema(database_id, |s| {
         s.get_indices(&child_tbl.name)
             .find(|ix| {
@@ -952,6 +1028,7 @@ fn emit_fk_parent_key_probe(
                         .iter()
                         .zip(child_cols.iter())
                         .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
+                    && index_preserves_compare_affinity(ix, child_tbl, &compare_affinities)
             })
             .cloned()
     });
@@ -973,6 +1050,7 @@ fn emit_fk_parent_key_probe(
             child_tbl,
             child_cols,
             parent_key_start,
+            &compare_affinities,
             self_exclude_rowid,
             database_id,
             on_match,
@@ -1410,6 +1488,8 @@ fn emit_fk_delete_parent_existence_check_single(
     emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
 
     let child_cols = &fk_ref.fk.child_columns;
+    let compare_affinities =
+        fk_compare_affinities(&fk_ref.child_table, child_cols, parent_bt, parent_cols)?;
     let child_idx = if !is_self_ref {
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&fk_ref.child_table.name).cloned().collect()
@@ -1421,6 +1501,7 @@ fn emit_fk_delete_parent_existence_check_single(
                     .iter()
                     .zip(child_cols.iter())
                     .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
+                && index_preserves_compare_affinity(idx, &fk_ref.child_table, &compare_affinities)
         })
     } else {
         None
@@ -1456,6 +1537,7 @@ fn emit_fk_delete_parent_existence_check_single(
             &fk_ref.child_table,
             child_cols,
             parent_key_start,
+            &compare_affinities,
             if is_self_ref {
                 Some(parent_rowid_reg)
             } else {
