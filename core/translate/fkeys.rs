@@ -8,8 +8,11 @@ use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
-    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
+    translate::{
+        collate::CollationSeq, emitter::Resolver, expr::comparison_affinity, planner::ROWID_STRS,
+    },
     vdbe::{
+        affinity::Affinity,
         builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, Insn, Subprogram},
         BranchOffset, PreparedProgram,
@@ -296,34 +299,6 @@ pub fn open_read_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>, db: 
     tcur
 }
 
-/// Copy `len` registers starting at `src_start` to a fresh block and apply index affinities.
-/// Returns the destination start register.
-#[inline]
-fn copy_with_affinity(
-    program: &mut ProgramBuilder,
-    src_start: usize,
-    len: usize,
-    idx: &Index,
-    aff_from_tbl: &BTreeTable,
-) -> usize {
-    let dst = program.alloc_registers(len);
-    for i in 0..len {
-        program.emit_insn(Insn::Copy {
-            src_reg: src_start + i,
-            dst_reg: dst + i,
-            extra_amount: 0,
-        });
-    }
-    if let Some(count) = NonZeroUsize::new(len) {
-        program.emit_insn(Insn::Affinity {
-            start_reg: dst,
-            count,
-            affinities: build_index_affinity_string(idx, aff_from_tbl),
-        });
-    }
-    dst
-}
-
 /// Build an unpacked key for opcodes that require adjacent registers; rowid aliases
 /// may resolve outside the compact column block.
 #[inline]
@@ -477,11 +452,13 @@ pub(super) fn emit_skip_if_any_null(
 /// Rows with any NULL FK column do not reference a parent and are ignored. For
 /// self-referential UPDATEs, `self_exclude_rowid` skips the current row when
 /// its old child key is being updated away by the same statement.
-fn table_scan_match_any<F>(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn table_scan_match_any<F>(
     program: &mut ProgramBuilder,
     child_tbl: &Arc<BTreeTable>,
     child_cols: &[String],
     parent_key_start: usize,
+    compares: &[FkCompare],
     self_exclude_rowid: Option<usize>,
     database_id: usize,
     mut on_match: F,
@@ -489,6 +466,15 @@ fn table_scan_match_any<F>(
 where
     F: FnMut(&mut ProgramBuilder) -> Result<()>,
 {
+    let probe_start = program.alloc_registers(child_cols.len());
+    for i in 0..child_cols.len() {
+        program.emit_insn(Insn::Copy {
+            src_reg: parent_key_start + i,
+            dst_reg: probe_start + i,
+            extra_amount: 0,
+        });
+    }
+
     let ccur = open_read_table(program, child_tbl, database_id);
     let done = program.allocate_label();
     program.emit_insn(Insn::Rewind {
@@ -520,10 +506,10 @@ where
         let cont = program.allocate_label();
         program.emit_insn(Insn::Eq {
             lhs: tmp,
-            rhs: parent_key_start + i,
+            rhs: probe_start + i,
             target_pc: cont,
-            flags: CmpInsFlags::default(),
-            collation: Some(CollationSeq::Binary),
+            flags: CmpInsFlags::default().with_affinity(compares[i].affinity),
+            collation: Some(compares[i].collation),
         });
         program.emit_insn(Insn::Goto {
             target_pc: next_row,
@@ -565,6 +551,264 @@ where
     program.preassign_label_to_next_insn(done);
     program.emit_insn(Insn::Close { cursor_id: ccur });
     Ok(())
+}
+
+/// How the parent-side check compares one child/parent foreign key column pair.
+///
+/// SQLite builds the child-side search term in `fkScanChildren` (src/fkey.c) as
+/// `<parent value> = <child column>`, where the parent value is an expression
+/// carrying the parent column's affinity plus an explicit COLLATE naming the
+/// parent column's collating sequence. So the `=` takes its affinity from both
+/// columns by the usual rules, and its collation from the parent column alone.
+#[derive(Clone, Copy)]
+pub(super) struct FkCompare {
+    pub affinity: Affinity,
+    pub collation: CollationSeq,
+}
+
+/// Do two compare vectors ask the same question?
+fn fk_compares_equal(a: &[FkCompare], b: &[FkCompare]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.affinity == y.affinity && x.collation == y.collation)
+}
+
+/// Which parent-side check is being compiled.
+///
+/// The two do not compare the same way, and SQLite builds them in two different
+/// places. The counting scan is `fkScanChildren` (src/fkey.c), whose search term
+/// names the parent COLUMN, so the `=` sees the parent column's affinity. A
+/// RESTRICT action is a trigger built by `fkActionTrigger`, whose search term is
+/// `OLD.<parent column> = <child column>`; `OLD.x` is a `TK_TRIGGER` node, and
+/// `sqlite3ExprAffinity` has no case for `TK_TRIGGER`, so it returns that node's
+/// empty `affExpr` and `sqlite3CompareAffinity` falls back to the child column's
+/// affinity alone. The one exception is a rowid parent key, where `lookupName`
+/// stamps `affExpr = SQLITE_AFF_INTEGER` on the `OLD.rowid` node, which makes the
+/// comparison numeric again. `sqlite3ExprCollSeq` does have a `TK_TRIGGER` case,
+/// so both forms take the parent column's collating sequence.
+///
+/// Measured against /usr/bin/sqlite3 3.51.0: with `p(id INTEGER UNIQUE)` holding
+/// 2 and a TEXT child column holding '2.0', `ON DELETE RESTRICT` does not fire,
+/// while the same shape with `p(id INTEGER PRIMARY KEY)` does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FkProbeKind {
+    /// The scan that maintains the immediate and deferred violation counters.
+    Counter,
+    /// The RESTRICT action's statement-time refusal.
+    Restrict,
+}
+
+/// Resolve the affinity and collation the parent-side check must use for each
+/// foreign key column pair.
+pub(super) fn fk_compare_terms(
+    child_tbl: &BTreeTable,
+    child_cols: &[String],
+    parent_tbl: &BTreeTable,
+    parent_cols: &[String],
+    kind: FkProbeKind,
+) -> Result<Vec<FkCompare>> {
+    if child_cols.len() != parent_cols.len() {
+        return Err(LimboError::InternalError(format!(
+            "foreign key on {} has {} child columns and {} parent columns",
+            child_tbl.name,
+            child_cols.len(),
+            parent_cols.len()
+        )));
+    }
+    child_cols
+        .iter()
+        .zip(parent_cols.iter())
+        .map(|(ccol, pcol)| {
+            let child_aff = child_tbl
+                .get_column(ccol)
+                .map(|(_, c)| c.affinity())
+                .ok_or_else(|| LimboError::InternalError(format!("child col {ccol} missing")))?;
+            let (parent_aff, parent_is_rowid, parent_coll) = match parent_tbl.get_column(pcol) {
+                Some((_, c)) => (
+                    c.affinity(),
+                    parent_tbl.has_rowid && c.is_rowid_alias(),
+                    c.collation(),
+                ),
+                None if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) => {
+                    // A rowid reference is always an integer comparison, and a
+                    // collating sequence never applies to integers.
+                    (Affinity::Integer, true, CollationSeq::Binary)
+                }
+                None => return Err(LimboError::InternalError(format!("col {pcol} missing"))),
+            };
+            // A RESTRICT trigger's parent term carries no affinity of its own
+            // unless it is a rowid, so the comparison is left to the child
+            // column alone. See `FkProbeKind`.
+            let parent_side_aff = match kind {
+                FkProbeKind::Counter => parent_aff,
+                FkProbeKind::Restrict if parent_is_rowid => Affinity::Integer,
+                FkProbeKind::Restrict => Affinity::None,
+            };
+            Ok(FkCompare {
+                affinity: comparison_affinity(child_aff, parent_side_aff, None, None),
+                collation: parent_coll,
+            })
+        })
+        .collect()
+}
+
+/// Is `e` an unaliased reference to one of `cols` on `table`?
+fn fk_where_names_child_col(e: &Expr, table: &str, cols: &[String]) -> bool {
+    let named = |n: &str| cols.iter().any(|c| c.eq_ignore_ascii_case(n));
+    match e {
+        Expr::Id(n) | Expr::Name(n) => named(n.as_str()),
+        Expr::Qualified(ns, col) | Expr::DoublyQualified(_, ns, col) => {
+            ns.as_str().eq_ignore_ascii_case(table) && named(col.as_str())
+        }
+        Expr::Parenthesized(inner) => {
+            inner.len() == 1 && fk_where_names_child_col(&inner[0], table, cols)
+        }
+        _ => false,
+    }
+}
+
+/// Is every row this partial index leaves out a row the equality could not have
+/// matched anyway?
+///
+/// The parent-side check never probes with a NULL: `emit_skip_if_any_null`
+/// abandons the whole check first, because a NULL parent key matches no child
+/// row under SQL comparison semantics. So a child row whose foreign key column
+/// is NULL can never satisfy the equality, and an index that admits exactly the
+/// rows where those columns are not NULL holds every row the scan could have
+/// found. Only that one predicate shape is recognised, as a conjunction over
+/// the foreign key's own child columns; anything else is a predicate whose
+/// implication has not been checked, and the index is not used.
+fn fk_partial_where_implied_by_equality(e: &Expr, table: &str, cols: &[String]) -> bool {
+    match e {
+        Expr::Parenthesized(inner) => {
+            inner.len() == 1 && fk_partial_where_implied_by_equality(&inner[0], table, cols)
+        }
+        Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            fk_partial_where_implied_by_equality(lhs, table, cols)
+                && fk_partial_where_implied_by_equality(rhs, table, cols)
+        }
+        // `x NOT NULL` / `x NOTNULL`
+        Expr::NotNull(inner) => fk_where_names_child_col(inner, table, cols),
+        // `x IS NOT NULL`
+        Expr::Binary(lhs, ast::Operator::IsNot, rhs)
+            if matches!(rhs.as_ref(), Expr::Literal(Literal::Null)) =>
+        {
+            fk_where_names_child_col(lhs, table, cols)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a seek on `idx` answers the same question as the child-table scan
+/// this parent-side check would otherwise run.
+///
+/// This is an allowlist: every property of an index that can move the seek's
+/// answer has to be one that has been checked, so a property nobody thought of
+/// leaves the index unused rather than silently trusted. What is allowed is a
+/// persistent b-tree index over exactly the foreign key's child columns, in
+/// order, with default NULL placement, no index module, no indexed expressions,
+/// whose per-column collating sequence is the one the comparison uses, and whose
+/// per-column affinity passes SQLite's `sqlite3IndexAffinityOk`. A WHERE clause
+/// is allowed only in the one shape the equality already implies. Everything
+/// else falls back to the scan, which is slower but always agrees with the
+/// comparison the check is defined by.
+///
+/// Sort order is not part of the allowlist because it cannot move the answer:
+/// both probes ask only about equality. `index_probe` emits `Found`, which is a
+/// prefix-existence test, and `index_scan_match_any` emits `SeekGE` with
+/// `eq_only` followed by `IdxGT`, which walk the run of equal keys under
+/// whatever order the index's key info defines. Descending order relocates that
+/// run; it does not change what is in it.
+pub(super) fn fk_child_index_probe_ok(
+    idx: &Index,
+    child_tbl: &BTreeTable,
+    child_cols: &[String],
+    compares: &[FkCompare],
+) -> bool {
+    // An index module or an ephemeral index is not a plain ordered b-tree over
+    // the stored column values.
+    if idx.index_method.is_some() || idx.ephemeral {
+        return false;
+    }
+    if let Some(w) = idx.where_clause.as_ref() {
+        if !fk_partial_where_implied_by_equality(w, &idx.table_name, child_cols) {
+            return false;
+        }
+    }
+    if idx.columns.len() != child_cols.len() || idx.columns.len() != compares.len() {
+        return false;
+    }
+    idx.columns
+        .iter()
+        .zip(child_cols.iter())
+        .zip(compares.iter())
+        .all(|((ic, cc), cmp)| {
+            ic.name.eq_ignore_ascii_case(cc)
+                && ic.expr.is_none()
+                && ic.nulls_order.is_none()
+                && ic.collation.unwrap_or(CollationSeq::Binary) == cmp.collation
+                && child_tbl
+                    .columns()
+                    .get(ic.pos_in_table)
+                    .is_some_and(|col| col.affinity().index_affinity_ok(cmp.affinity))
+        })
+}
+
+/// Affinity string for the seek key of a child-index foreign key probe.
+///
+/// Starts from the index affinity and clears any position whose comparison
+/// affinity applies no coercion, the same way SQLite's `codeAllEqualityTerms`
+/// resets that position to `SQLITE_AFF_BLOB`. Without the reset a TEXT index
+/// would coerce a seek key the scan would have compared unconverted.
+pub(super) fn fk_probe_affinity_string(
+    idx: &Index,
+    child_tbl: &BTreeTable,
+    compares: &[FkCompare],
+) -> String {
+    idx.columns
+        .iter()
+        .zip(compares.iter())
+        .map(|(ic, cmp)| {
+            if matches!(cmp.affinity, Affinity::Blob | Affinity::None) {
+                Affinity::Blob.aff_mask()
+            } else {
+                child_tbl
+                    .columns()
+                    .get(ic.pos_in_table)
+                    .map_or(Affinity::Blob, |col| col.affinity())
+                    .aff_mask()
+            }
+        })
+        .collect()
+}
+
+/// Copy a parent key into a fresh register block and coerce it the way the
+/// child-index seek needs. Returns the destination start register.
+fn copy_fk_probe_key(
+    program: &mut ProgramBuilder,
+    src_start: usize,
+    len: usize,
+    idx: &Index,
+    child_tbl: &BTreeTable,
+    compares: &[FkCompare],
+) -> usize {
+    let dst = program.alloc_registers(len);
+    for i in 0..len {
+        program.emit_insn(Insn::Copy {
+            src_reg: src_start + i,
+            dst_reg: dst + i,
+            extra_amount: 0,
+        });
+    }
+    if let Some(count) = NonZeroUsize::new(len) {
+        program.emit_insn(Insn::Affinity {
+            start_reg: dst,
+            count,
+            affinities: fk_probe_affinity_string(idx, child_tbl, compares),
+        });
+    }
+    dst
 }
 
 /// Build the index affinity mask string (one char per indexed column).
@@ -885,6 +1129,57 @@ pub fn emit_fk_parent_deferred_new_key_probes(
     Ok(())
 }
 
+/// Emit one parent-side probe over the child table for `compares`.
+///
+/// Picks a child index when one answers the same question as the scan, and
+/// falls back to the scan otherwise. `on_match` runs once per matching child
+/// row for the scan forms, and once if any row matches for the index-probe
+/// form, which is all a halt or a single count needs.
+#[allow(clippy::too_many_arguments)]
+fn emit_fk_child_probe<F>(
+    program: &mut ProgramBuilder,
+    child_tbl: &Arc<BTreeTable>,
+    child_cols: &[String],
+    parent_key_start: usize,
+    n_cols: usize,
+    compares: &[FkCompare],
+    self_exclude_rowid: Option<usize>,
+    database_id: usize,
+    resolver: &Resolver,
+    on_match: F,
+) -> Result<()>
+where
+    F: FnMut(&mut ProgramBuilder) -> Result<()>,
+{
+    let idx = resolver.with_schema(database_id, |s| {
+        s.get_indices(&child_tbl.name)
+            .find(|ix| fk_child_index_probe_ok(ix, child_tbl, child_cols, compares))
+            .cloned()
+    });
+    let mut on_match = on_match;
+    if let Some(ix) = idx.as_ref() {
+        let icur = open_read_index(program, ix, database_id);
+        let probe = copy_fk_probe_key(program, parent_key_start, n_cols, ix, child_tbl, compares);
+        if self_exclude_rowid.is_some() {
+            index_scan_match_any(program, icur, probe, n_cols, self_exclude_rowid, on_match)?;
+        } else {
+            index_probe(program, icur, probe, n_cols, on_match, |_p| Ok(()))?;
+        }
+    } else {
+        table_scan_match_any(
+            program,
+            child_tbl,
+            child_cols,
+            parent_key_start,
+            compares,
+            self_exclude_rowid,
+            database_id,
+            &mut on_match,
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum ParentProbePass {
     Old,
@@ -907,77 +1202,92 @@ fn emit_fk_parent_key_probe(
 ) -> Result<()> {
     let child_tbl = &fk_ref.child_table;
     let child_cols = &fk_ref.fk.child_columns;
-    let is_deferred = fk_ref.fk.deferred;
     let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
     let skip_probe = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, n_cols, skip_probe);
 
-    let on_match = |p: &mut ProgramBuilder| -> Result<()> {
-        match (is_deferred, pass) {
-            // OLD key referenced by a child: removing/changing this parent key
-            // creates a violation unless a later statement repairs it.
-            (_, ParentProbePass::Old) => {
-                if is_restrict {
-                    // RESTRICT: immediate halt
-                    emit_fk_restrict_halt(p)?;
-                } else {
-                    // NO ACTION: increment counter (checked at statement/transaction end)
-                    emit_fk_violation(p, &fk_ref.fk)?;
-                }
-            }
+    let parent_tbl = resolver
+        .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("parent table {} missing", fk_ref.fk.parent_table))
+        })?;
+    let counter_compares = fk_compare_terms(
+        child_tbl,
+        child_cols,
+        &parent_tbl,
+        &fk_ref.parent_cols,
+        FkProbeKind::Counter,
+    )?;
 
-            // NEW key referenced by a child: this parent key may repair a
-            // deferred orphan. The decrement is guarded because the aggregate
-            // counter does not know which key originally incremented it.
-            (true, ParentProbePass::New) => {
-                let skip = p.allocate_label();
-                emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
-                p.preassign_label_to_next_insn(skip);
-            }
-            // Immediate FK on NEW pass: nothing to cancel; do nothing.
-            (false, ParentProbePass::New) => {}
-        }
-        Ok(())
-    };
-
-    // Prefer an exact child index on (child_cols...). If the current row must
-    // be excluded, scan only the matching index range so the rowid can be
-    // checked before counting the match.
-    let idx = resolver.with_schema(database_id, |s| {
-        s.get_indices(&child_tbl.name)
-            .find(|ix| {
-                ix.columns.len() == child_cols.len()
-                    && ix
-                        .columns
-                        .iter()
-                        .zip(child_cols.iter())
-                        .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-            })
-            .cloned()
-    });
-
-    if let Some(ix) = idx.as_ref() {
-        let icur = open_read_index(program, ix, database_id);
-        let probe = copy_with_affinity(program, parent_key_start, n_cols, ix, child_tbl);
-
-        if self_exclude_rowid.is_some() {
-            index_scan_match_any(program, icur, probe, n_cols, self_exclude_rowid, on_match)?;
-        } else {
-            // FOUND => on_match; NOT FOUND => no-op
-            index_probe(program, icur, probe, n_cols, on_match, |_p| Ok(()))?;
-        }
-    } else {
-        // Table scan fallback
-        table_scan_match_any(
+    let restrict_here = is_restrict && matches!(pass, ParentProbePass::Old);
+    if restrict_here {
+        // SQLite runs both halves: `sqlite3FkActions` builds the RESTRICT
+        // trigger, and `sqlite3FkCheck` still runs the counting scan over the
+        // OLD key for the same foreign key. The two compare differently, so
+        // one can fire while the other does not. Emit the refusal first, so a
+        // statement that RESTRICT rejects never touches a counter.
+        let restrict_compares = fk_compare_terms(
+            child_tbl,
+            child_cols,
+            &parent_tbl,
+            &fk_ref.parent_cols,
+            FkProbeKind::Restrict,
+        )?;
+        emit_fk_child_probe(
             program,
             child_tbl,
             child_cols,
             parent_key_start,
+            n_cols,
+            &restrict_compares,
             self_exclude_rowid,
             database_id,
-            on_match,
+            resolver,
+            emit_fk_restrict_halt,
         )?;
+        // When the two comparisons coincide, the refusal above already covers
+        // every row the counting scan could find, and it halts, so a second
+        // pass would be dead code.
+        if fk_compares_equal(&restrict_compares, &counter_compares) {
+            program.preassign_label_to_next_insn(skip_probe);
+            return Ok(());
+        }
     }
+
+    let on_match = |p: &mut ProgramBuilder| -> Result<()> {
+        match pass {
+            // OLD key referenced by a child: removing/changing this parent key
+            // creates a violation unless a later statement repairs it.
+            ParentProbePass::Old => emit_fk_violation(p, &fk_ref.fk),
+
+            // NEW key referenced by a child: this parent key repairs that
+            // child, so cancel one count. SQLite's `sqlite3FkCheck` scans the
+            // children of the NEW key with a -1 delta and the children of the
+            // OLD key with +1, for the statement counter and the deferred
+            // counter alike, so the statement only fails on the net shortfall.
+            // The decrement is guarded because the aggregate counter does not
+            // know which key originally incremented it.
+            ParentProbePass::New => {
+                let skip = p.allocate_label();
+                emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
+                p.preassign_label_to_next_insn(skip);
+                Ok(())
+            }
+        }
+    };
+
+    emit_fk_child_probe(
+        program,
+        child_tbl,
+        child_cols,
+        parent_key_start,
+        n_cols,
+        &counter_compares,
+        self_exclude_rowid,
+        database_id,
+        resolver,
+        on_match,
+    )?;
 
     program.preassign_label_to_next_insn(skip_probe);
     Ok(())
@@ -1410,64 +1720,57 @@ fn emit_fk_delete_parent_existence_check_single(
     emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
 
     let child_cols = &fk_ref.fk.child_columns;
-    let child_idx = if !is_self_ref {
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(&fk_ref.child_table.name).cloned().collect()
-        });
-        indices.into_iter().find(|idx| {
-            idx.columns.len() == child_cols.len()
-                && idx
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        })
-    } else {
-        None
-    };
+    // The child table is scanned rather than probed for a self-referential
+    // foreign key, because the row being deleted has to be excluded by rowid.
+    let self_exclude_rowid = is_self_ref.then_some(parent_rowid_reg);
+    let counter_compares = fk_compare_terms(
+        &fk_ref.child_table,
+        child_cols,
+        parent_bt,
+        parent_cols,
+        FkProbeKind::Counter,
+    )?;
 
-    // Closure to emit the appropriate violation based on action type
-    let emit_violation = |p: &mut ProgramBuilder| -> Result<()> {
-        if is_restrict {
-            emit_fk_restrict_halt(p)?;
-        } else {
-            emit_fk_violation(p, &fk_ref.fk)?;
-        }
-        Ok(())
-    };
-
-    if let Some(ref idx) = child_idx {
-        let icur = open_read_index(program, idx, database_id);
-        let probe = copy_with_affinity(program, parent_key_start, ncols, idx, &fk_ref.child_table);
-        index_probe(
-            program,
-            icur,
-            probe,
-            ncols,
-            |p| {
-                emit_violation(p)?;
-                Ok(())
-            },
-            |_p| Ok(()),
+    if is_restrict {
+        // Both halves, as in `emit_fk_parent_key_probe`: SQLite's RESTRICT
+        // trigger and its counting scan compare differently, and it runs both.
+        let restrict_compares = fk_compare_terms(
+            &fk_ref.child_table,
+            child_cols,
+            parent_bt,
+            parent_cols,
+            FkProbeKind::Restrict,
         )?;
-    } else {
-        table_scan_match_any(
+        emit_fk_child_probe(
             program,
             &fk_ref.child_table,
             child_cols,
             parent_key_start,
-            if is_self_ref {
-                Some(parent_rowid_reg)
-            } else {
-                None
-            },
+            ncols,
+            &restrict_compares,
+            self_exclude_rowid,
             database_id,
-            |p| {
-                emit_violation(p)?;
-                Ok(())
-            },
+            resolver,
+            emit_fk_restrict_halt,
         )?;
+        if fk_compares_equal(&restrict_compares, &counter_compares) {
+            program.preassign_label_to_next_insn(skip_check);
+            return Ok(());
+        }
     }
+
+    emit_fk_child_probe(
+        program,
+        &fk_ref.child_table,
+        child_cols,
+        parent_key_start,
+        ncols,
+        &counter_compares,
+        self_exclude_rowid,
+        database_id,
+        resolver,
+        |p| emit_fk_violation(p, &fk_ref.fk),
+    )?;
     program.preassign_label_to_next_insn(skip_check);
     Ok(())
 }
