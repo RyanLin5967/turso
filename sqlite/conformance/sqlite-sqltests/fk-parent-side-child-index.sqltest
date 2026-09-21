@@ -1,0 +1,273 @@
+@database :memory:
+
+# The parent-side foreign key check counts child rows that reference the parent
+# key being removed or changed. It may probe a child index instead of scanning
+# the child table only when the probe answers the same question the comparison
+# does. Every expectation below was measured on sqlite3 3.51.0.
+# See: https://github.com/tursodatabase/turso/issues/8708
+
+@cross-check-integrity
+test fk-parent-delete-child-key-other-storage-class {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES('1');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-child-key-behind-partial-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    CREATE INDEX ic ON c(x) WHERE x > 5;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-child-index-other-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id NUM PRIMARY KEY);
+    CREATE TABLE c(x NUM REFERENCES p(id));
+    CREATE INDEX ic ON c(x COLLATE NOCASE);
+    INSERT INTO p VALUES('abc');
+    INSERT INTO p VALUES('ABC');
+    INSERT INTO c VALUES('ABC');
+    DELETE FROM p WHERE id = 'abc';
+    SELECT quote(id) FROM p;
+}
+expect {
+    'ABC'
+}
+
+@cross-check-integrity
+test fk-parent-delete-uses-parent-key-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES('a');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-key-update-nets-children-of-new-key {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p(k INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(k));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO c VALUES(2);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET k = 2 WHERE k = 1;
+    SELECT k FROM p;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test fk-parent-delete-does-not-coerce-unconverted-key {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p(a BLOB PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    CREATE INDEX ic ON c(x);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES('1');
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p;
+    SELECT count(*) FROM p;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-parent-delete-parent-nocase-child-plain-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    CREATE INDEX ic ON c(x);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES('a');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-parent-nocase-index-nocase {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    CREATE INDEX ic ON c(x COLLATE NOCASE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES('a');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-both-columns-nocase {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(x TEXT COLLATE NOCASE REFERENCES p(a));
+    CREATE INDEX ic ON c(x);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES('a');
+    DELETE FROM p;
+}
+expect error {
+}
+
+# A RESTRICT action and the counting scan do not compare the same way, and
+# SQLite runs both. The action's trigger term is OLD.<parent column>, which
+# carries no affinity of its own unless it is a rowid, so the comparison falls
+# back to the child column's affinity; the counting scan names the parent
+# column, so it sees both.
+
+@cross-check-integrity
+test fk-restrict-compares-stored-values-uncoerced {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER UNIQUE, pad TEXT);
+    CREATE TABLE c(x TEXT REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(2,'z');
+    INSERT INTO c VALUES('2.0');
+    BEGIN;
+    DELETE FROM p;
+    DELETE FROM c;
+    COMMIT;
+    SELECT count(*) FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+    0
+}
+
+@cross-check-integrity
+test fk-restrict-still-counts-what-the-scan-finds {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER UNIQUE, pad TEXT);
+    CREATE TABLE c(x TEXT REFERENCES p(id) ON DELETE RESTRICT);
+    INSERT INTO p VALUES(2,'z');
+    INSERT INTO c VALUES('2.0');
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-restrict-on-rowid-parent-compares-numerically {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(2);
+    INSERT INTO c VALUES('2.0');
+    BEGIN;
+    DELETE FROM p;
+    DELETE FROM c;
+    COMMIT;
+}
+expect error {
+}
+
+# The parent-side repayment for an INSERT has to run where SQLite runs it, in
+# sqlite3FkCheck before the row is written, or an AFTER INSERT trigger on a
+# self-referential table can hand it a row to repay a count against.
+
+@cross-check-integrity
+test fk-self-ref-insert-trigger-cannot-repay-its-own-orphan {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER REFERENCES t(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t(a,b) VALUES(new.a+100, new.a); END;
+    INSERT INTO t(a,b) VALUES(1,5);
+}
+expect error {
+}
+
+# Widened allowlist: a descending index and a partial index whose predicate the
+# equality already implies both answer the same question as the scan.
+
+@cross-check-integrity
+test fk-parent-delete-desc-child-index-still-refuses {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    CREATE INDEX ic ON c(x DESC);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-partial-index-implied-by-equality {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id));
+    CREATE INDEX ic ON c(x) WHERE x IS NOT NULL;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    INSERT INTO c VALUES(NULL);
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-delete-partial-index-on-other-column-not-implied {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(id), y INTEGER);
+    CREATE INDEX ic ON c(x) WHERE y IS NOT NULL;
+    INSERT INTO p VALUES(1);
+    INSERT INTO c(x,y) VALUES(1,NULL);
+    DELETE FROM p;
+}
+expect error {
+}
+
+# The parent-side repayment for an INSERT must not skip the row the statement
+# is writing. Under REPLACE the preflight phase can already have written that
+# row's child-index entry, and that entry is the one SQLite's own scan finds,
+# so skipping it withholds a repayment the statement is owed.
+
+@cross-check-integrity
+test fk-self-ref-replace-repays-under-after-insert-trigger {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a BLOB PRIMARY KEY, b BLOB REFERENCES t(a) DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX ib ON t(b);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO t(a,b) VALUES(new.a||'x', new.a); END;
+    INSERT INTO t(a,b) VALUES(1,NULL);
+    INSERT OR REPLACE INTO t(a,b) VALUES(1,1);
+    SELECT quote(a)||':'||quote(b) FROM t;
+}
+expect {
+    1:1
+    '1x':1
+}
+
+@cross-check-integrity
+test fk-self-ref-replace-restrict-does-not-see-its-own-new-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(a TEXT PRIMARY KEY, b TEXT REFERENCES t(a) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED);
+    CREATE INDEX ib ON t(b);
+    INSERT INTO t(a,b) VALUES(1,NULL);
+    INSERT OR REPLACE INTO t(a,b) VALUES(1,1);
+    SELECT quote(a)||':'||quote(b) FROM t;
+}
+expect {
+    '1':'1'
+}

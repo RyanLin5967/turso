@@ -22,8 +22,9 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, ForeignKeyActions,
+            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_child_index_probe_ok,
+            fk_compare_terms, fk_probe_affinity_string, index_probe, index_scan_match_any,
+            open_read_index, open_read_table, table_scan_match_any, FkProbeKind, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -942,6 +943,25 @@ pub fn translate_insert(
             database_id,
             &fk_layout,
         )?;
+
+        // Repair deferred counters for children that reference this NEW parent
+        // key. SQLite does both halves of this in `sqlite3FkCheck`, called from
+        // `sqlite3GenerateConstraintChecks` BEFORE the row is written and before
+        // any AFTER trigger fires, so its scan sees neither the row being
+        // inserted nor anything a trigger goes on to add. Emitting it here says
+        // the same thing. Run after the row instead and a self-referential table
+        // whose AFTER INSERT trigger inserts a second row repays a count against
+        // that second row, and an orphan commits.
+        // For REPLACE: the delete in the preflight phase increments counters
+        // above, and that runs earlier still, so those are repaid here too.
+        emit_parent_side_fk_decrement_on_insert(
+            program,
+            &btree_table,
+            &insertion,
+            on_replace,
+            resolver,
+            database_id,
+        )?;
     }
 
     // Emit deferred index inserts for cases where preflight only checked constraints
@@ -1049,20 +1069,6 @@ pub fn translate_insert(
             )?;
         }
         program.preassign_label_to_next_insn(after_trigger_done);
-    }
-
-    if has_fks {
-        // After the row is actually present, repair deferred counters for children referencing this NEW parent key.
-        // For REPLACE: delete increments counters above; the insert path should try to repay
-        // them, even for immediate/self-ref FKs.
-        emit_parent_side_fk_decrement_on_insert(
-            program,
-            &btree_table,
-            &insertion,
-            on_replace,
-            resolver,
-            database_id,
-        )?;
     }
 
     if !is_mvcc {
@@ -4265,14 +4271,29 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&child_tbl.name).cloned().collect()
         });
-        let idx = indices.iter().find(|ix| {
-            ix.columns.len() == child_cols.len()
-                && ix
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        });
+        let compares = fk_compare_terms(
+            child_tbl,
+            child_cols,
+            parent_table,
+            &pref.parent_cols,
+            FkProbeKind::Counter,
+        )?;
+        let idx = indices
+            .iter()
+            .find(|ix| fk_child_index_probe_ok(ix, child_tbl, child_cols, &compares));
+
+        // The caller emits this before the row is written, so the scan below
+        // does not see it, which is what SQLite's scan does: `sqlite3FkCheck`
+        // runs from `sqlite3GenerateConstraintChecks`, ahead of the row and of
+        // any AFTER trigger.
+        //
+        // No rowid is excluded. Under REPLACE the preflight phase can already
+        // have written this row's index entries, and that entry is the one
+        // SQLite's own scan would find, so skipping it withholds a repayment
+        // the statement is owed: a self-referencing `INSERT OR REPLACE` against
+        // a child index then fails the foreign key that its own new row
+        // satisfies. Measured on sqlite3 3.51.0, which accepts it.
+        let self_exclude_rowid: Option<usize> = None;
 
         if let Some(ix) = idx {
             let icur = open_read_index(program, ix, database_id);
@@ -4289,70 +4310,41 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 program.emit_insn(Insn::Affinity {
                     start_reg: probe_start,
                     count,
-                    affinities: build_index_affinity_string(ix, child_tbl),
+                    affinities: fk_probe_affinity_string(ix, child_tbl, &compares),
                 });
             }
 
             // Decrement once per matching child row
-            index_scan_match_any(program, icur, probe_start, n_cols, None, |p| {
-                let next = p.allocate_label();
-                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
-                p.preassign_label_to_next_insn(next);
-                Ok(())
-            })?;
+            index_scan_match_any(
+                program,
+                icur,
+                probe_start,
+                n_cols,
+                self_exclude_rowid,
+                |p| {
+                    let next = p.allocate_label();
+                    emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                    p.preassign_label_to_next_insn(next);
+                    Ok(())
+                },
+            )?;
         } else {
             // fallback scan :(
-            let ccur = open_read_table(program, child_tbl, database_id);
-            let done = program.allocate_label();
-            program.emit_insn(Insn::Rewind {
-                cursor_id: ccur,
-                pc_if_empty: done,
-            });
-            let loop_top = program.allocate_label();
-            let next_row = program.allocate_label();
-            program.preassign_label_to_next_insn(loop_top);
-
-            for (i, child_name) in child_cols.iter().enumerate() {
-                let (pos, _) = child_tbl.get_column(child_name).ok_or_else(|| {
-                    crate::LimboError::InternalError(format!("child col {child_name} missing"))
-                })?;
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: ccur,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-
-                program.emit_insn(Insn::IsNull {
-                    reg: tmp,
-                    target_pc: next_row,
-                });
-
-                let cont = program.allocate_label();
-                program.emit_insn(Insn::Eq {
-                    lhs: tmp,
-                    rhs: new_pk_start + i,
-                    target_pc: cont,
-                    flags: CmpInsFlags::default().jump_if_null(),
-                    collation: Some(super::collate::CollationSeq::Binary),
-                });
-                program.emit_insn(Insn::Goto {
-                    target_pc: next_row,
-                });
-                program.preassign_label_to_next_insn(cont);
-            }
-            // Matched one child row: guarded decrement of counter
-            emit_guarded_fk_decrement(program, next_row, pref.fk.deferred);
-            program.preassign_label_to_next_insn(next_row);
-            program.emit_insn(Insn::Next {
-                cursor_id: ccur,
-                pc_if_next: loop_top,
-                fullscan: false,
-                is_index: false,
-            });
-            program.preassign_label_to_next_insn(done);
-            program.emit_insn(Insn::Close { cursor_id: ccur });
+            table_scan_match_any(
+                program,
+                child_tbl,
+                child_cols,
+                new_pk_start,
+                &compares,
+                self_exclude_rowid,
+                database_id,
+                |p| {
+                    let next = p.allocate_label();
+                    emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                    p.preassign_label_to_next_insn(next);
+                    Ok(())
+                },
+            )?;
         }
         program.preassign_label_to_next_insn(skip_fk);
     }
