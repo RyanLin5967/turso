@@ -2238,13 +2238,20 @@ fn test_type_mismatch_keeps_explicit_transaction_open(tmp_db: TempDatabase) -> a
 }
 
 /// How much of a half-written statement survives a rowid datatype mismatch
-/// inside an explicit transaction depends on the statement's conflict clause,
-/// and the transaction itself survives all of them.
+/// inside an explicit transaction depends on whether the statement opened a
+/// statement journal, and the transaction itself survives all of them.
 ///
-/// SQLite only opens a statement journal when the statement may ABORT
-/// (`sqlite3HaltConstraint` calls `sqlite3MayAbort` for `OE_Abort` alone), so
-/// only ABORT, which is also the default, undoes the rows written before
-/// the mismatch. Every expected row count below was measured on
+/// On the plain table below the conflict clause decides that on its own: only
+/// ABORT, which is also the default, makes the statement abortable
+/// (`sqlite3HaltConstraint` calls `sqlite3MayAbort` for `OE_Abort`), so only
+/// ABORT undoes the rows written before the mismatch. The clause is not the
+/// whole rule. Anything else that makes the statement abortable opens the
+/// journal too: measured on /usr/bin/sqlite3 3.51.0, the same OR FAIL
+/// statement against a table with a REFERENCES column under
+/// `PRAGMA foreign_keys=ON` keeps 0 of them, not 2, because the FK check is
+/// itself abortable. Turso keeps 2 there, at this commit and at 8d4a589f8
+/// alike, so that shape is not a regression; it is outside #8746 and is not
+/// fixed here. Every expected row count below was measured on
 /// /usr/bin/sqlite3 3.51.0 with this exact script.
 #[turso_macros::test]
 fn test_type_mismatch_in_transaction_across_conflict_clauses(
