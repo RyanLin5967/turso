@@ -24,7 +24,10 @@ use crate::{
             DeletePlan, EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
             ResultSetColumn, Search, TableReferences,
         },
-        subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
+        subquery::{
+            emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
+            subquery_is_evaluated_conditionally,
+        },
         trigger_exec::{fire_trigger, TriggerContext},
     },
     vdbe::{
@@ -55,6 +58,11 @@ pub fn emit_program_for_delete(
 
     program.set_write_statement_is_multi_pass(
         !plan.result_columns.is_empty() || plan.safety.requires_stable_write_set(),
+    );
+    program.set_write_statement_has_conditional_subquery(
+        plan.where_clause
+            .iter()
+            .any(|term| subquery_is_evaluated_conditionally(&term.expr)),
     );
 
     // Open an ephemeral table for buffering RETURNING results.

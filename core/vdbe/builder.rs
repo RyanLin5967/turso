@@ -311,6 +311,12 @@ pub struct ProgramBuilder {
     /// a prematerialized write set. See
     /// `choose_from_clause_subquery_execution_mode`, the only reader.
     write_statement_is_multi_pass: bool,
+    /// Set while emitting a write statement whose SET or WHERE expressions
+    /// reach a subquery through a short-circuiting operator, so SQLite runs
+    /// that subquery for the first time on a later target row than this
+    /// emitter does. See `choose_from_clause_subquery_execution_mode`, the
+    /// only reader.
+    write_statement_has_conditional_subquery: bool,
     init_label: BranchOffset,
     start_offset: BranchOffset,
     pub(crate) reg_result_cols_start: Option<usize>,
@@ -723,6 +729,7 @@ impl ProgramBuilder {
             nested_level: 0,
             reentrant_scope_level: 0,
             write_statement_is_multi_pass: false,
+            write_statement_has_conditional_subquery: false,
             // These labels will be filled when `prologue()` is called
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
@@ -2005,6 +2012,16 @@ impl ProgramBuilder {
     #[inline]
     pub const fn write_statement_is_multi_pass(&self) -> bool {
         self.write_statement_is_multi_pass
+    }
+
+    #[inline]
+    pub const fn set_write_statement_has_conditional_subquery(&mut self, conditional: bool) {
+        self.write_statement_has_conditional_subquery = conditional;
+    }
+
+    #[inline]
+    pub const fn write_statement_has_conditional_subquery(&self) -> bool {
+        self.write_statement_has_conditional_subquery
     }
 
     /// Initialize the program with basic setup and return initial metadata and labels

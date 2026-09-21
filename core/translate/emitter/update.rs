@@ -42,7 +42,10 @@ use crate::{
             SubqueryEvalPhase, TableReferences, UpdatePlan, UpdateSetClause,
         },
         planner::ROWID_STRS,
-        subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
+        subquery::{
+            emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery,
+            subquery_is_evaluated_conditionally,
+        },
         trigger_exec::{
             fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
         },
@@ -108,6 +111,15 @@ pub fn emit_program_for_update(
     program.set_write_statement_is_multi_pass(
         plan.returning.as_ref().is_some_and(|r| !r.is_empty())
             || plan.safety.requires_stable_write_set(),
+    );
+    program.set_write_statement_has_conditional_subquery(
+        plan.set_clauses
+            .iter()
+            .any(|set_clause| subquery_is_evaluated_conditionally(&set_clause.expr))
+            || plan
+                .where_clause
+                .iter()
+                .any(|term| subquery_is_evaluated_conditionally(&term.expr)),
     );
 
     // Open an ephemeral table for buffering RETURNING results.

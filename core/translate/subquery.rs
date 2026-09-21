@@ -1424,6 +1424,67 @@ fn equality_probed_source_columns(
     probed
 }
 
+fn contains_subquery_result(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if matches!(e, ast::Expr::SubqueryResult { .. }) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+/// Whether `expr` reaches a subquery through an operand SQLite may skip.
+/// SQLite runs such a subquery on the first row that actually needs its value,
+/// while this emitter runs it on every row, so the two build a once-per-
+/// statement source from different states of the table being written.
+pub fn subquery_is_evaluated_conditionally(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        let skippable: Vec<&ast::Expr> = match e {
+            ast::Expr::Case {
+                when_then_pairs,
+                else_expr,
+                ..
+            } => when_then_pairs
+                .iter()
+                .enumerate()
+                .flat_map(|(index, (when, then))| {
+                    let mut operands = vec![then.as_ref()];
+                    if index > 0 {
+                        operands.push(when.as_ref());
+                    }
+                    operands
+                })
+                .chain(else_expr.as_deref())
+                .collect(),
+            ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, rhs) => {
+                vec![rhs.as_ref()]
+            }
+            ast::Expr::FunctionCall { name, args, .. }
+                if matches!(
+                    name.as_str().to_ascii_lowercase().as_str(),
+                    "coalesce" | "ifnull" | "iif"
+                ) =>
+            {
+                args.iter().skip(1).map(|arg| arg.as_ref()).collect()
+            }
+            _ => Vec::new(),
+        };
+        if skippable
+            .iter()
+            .any(|operand| contains_subquery_result(operand))
+        {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 /// Whether the result column at `index` of this plan is produced by a window
 /// function. Sqlite builds no automatic index over such a column, so a probe on
 /// one leaves the source on the per-probe path.
@@ -1542,7 +1603,9 @@ fn plan_is_off_the_allowlist(plan: &Plan) -> bool {
 /// source, in a write statement that applies its writes as one forward pass.
 /// A statement that defers its writes instead (RETURNING, triggers, FK
 /// cascades, a prematerialized write set) carries no such index in SQLite and
-/// re-reads the source per probe.
+/// re-reads the source per probe. A statement that reaches the source through
+/// an operand SQLite may skip builds its index on a later target row than this
+/// emitter would, so it is off the site as well.
 fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
@@ -1637,7 +1700,9 @@ pub fn emit_from_clause_subqueries(
                 Some(choose_from_clause_subquery_execution_mode(
                     &table_reference.op,
                     from_clause_subquery.as_ref(),
-                    program.in_reentrant_scope() && !program.write_statement_is_multi_pass(),
+                    program.in_reentrant_scope()
+                        && !program.write_statement_is_multi_pass()
+                        && !program.write_statement_has_conditional_subquery(),
                     &probed_columns,
                 ))
             }
