@@ -2108,4 +2108,125 @@ mod tests {
         let invalid_utf8_key = b"\x9C\x79aaaaaa\xF0\x00";
         assert!(!is_jsonb_blob(invalid_utf8_key));
     }
+
+    fn jsonb_blob_bytes(result: Value) -> Vec<u8> {
+        match result {
+            Value::Blob(blob) => blob.to_vec(),
+            other => panic!("expected a jsonb blob, got {other:?}"),
+        }
+    }
+
+    fn assert_jsonb_blob(result: crate::Result<Value>, sqlite_bytes: &[u8], sqlite_text: &str) {
+        let bytes = jsonb_blob_bytes(result.unwrap());
+        assert_eq!(bytes, sqlite_bytes);
+        let parsed = Jsonb::from_raw_data(&bytes).unwrap();
+        assert_eq!(parsed.to_string().unwrap(), sqlite_text);
+    }
+
+    #[test]
+    fn test_jsonb_insert_append_to_empty_root_array_matches_sqlite() {
+        let json_cache = JsonCacheCell::new();
+        assert_jsonb_blob(
+            jsonb_insert(
+                &[
+                    Value::build_text("[]"),
+                    Value::build_text("$[#]"),
+                    Value::from_i64(1),
+                ],
+                &json_cache,
+            ),
+            &[0x2B, 0x13, 0x31],
+            "[1]",
+        );
+    }
+
+    #[test]
+    fn test_jsonb_insert_two_appends_to_root_array_match_sqlite() {
+        let json_cache = JsonCacheCell::new();
+        assert_jsonb_blob(
+            jsonb_insert(
+                &[
+                    Value::build_text("[]"),
+                    Value::build_text("$[#]"),
+                    Value::from_i64(1),
+                    Value::build_text("$[#]"),
+                    Value::from_i64(2),
+                ],
+                &json_cache,
+            ),
+            &[0x4B, 0x13, 0x31, 0x13, 0x32],
+            "[1,2]",
+        );
+    }
+
+    #[test]
+    fn test_jsonb_set_append_to_root_array_matches_sqlite() {
+        let json_cache = JsonCacheCell::new();
+        assert_jsonb_blob(
+            jsonb_set(
+                &[
+                    Value::build_text("[1]"),
+                    Value::build_text("$[#]"),
+                    Value::from_i64(2),
+                ],
+                &json_cache,
+            ),
+            &[0x4B, 0x13, 0x31, 0x13, 0x32],
+            "[1,2]",
+        );
+    }
+
+    #[test]
+    fn test_jsonb_insert_at_root_array_end_index_matches_sqlite() {
+        let json_cache = JsonCacheCell::new();
+        assert_jsonb_blob(
+            jsonb_insert(
+                &[
+                    Value::build_text("[1,2]"),
+                    Value::build_text("$[2]"),
+                    Value::from_i64(3),
+                ],
+                &json_cache,
+            ),
+            &[0x6B, 0x13, 0x31, 0x13, 0x32, 0x13, 0x33],
+            "[1,2,3]",
+        );
+    }
+
+    #[test]
+    fn test_jsonb_insert_append_past_inline_size_limit_matches_sqlite() {
+        let json_cache = JsonCacheCell::new();
+        let mut expected = vec![0xCB, 0x0C, 0x97];
+        expected.extend_from_slice(&[b'a'; 9]);
+        expected.extend_from_slice(&[0x13, 0x32]);
+        assert_jsonb_blob(
+            jsonb_insert(
+                &[
+                    Value::build_text("[\"aaaaaaaaa\"]"),
+                    Value::build_text("$[#]"),
+                    Value::from_i64(2),
+                ],
+                &json_cache,
+            ),
+            &expected,
+            "[\"aaaaaaaaa\",2]",
+        );
+    }
+
+    #[test]
+    fn test_jsonb_insert_append_to_array_under_object_matches_sqlite() {
+        let json_cache = JsonCacheCell::new();
+        assert_jsonb_blob(
+            jsonb_insert(
+                &[
+                    Value::build_text("{\"t\":[]}"),
+                    Value::build_text("$.t[#]"),
+                    Value::from_i64(1),
+                ],
+                &json_cache,
+            ),
+            &[0x5C, 0x17, 0x74, 0x2B, 0x13, 0x31],
+            "{\"t\":[1]}",
+        );
+    }
 }
