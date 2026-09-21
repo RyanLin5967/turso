@@ -451,6 +451,7 @@ pub struct JoinN {
 struct WhereTermInfo {
     table_mask: TableMask,
     extra_steps: usize,
+    reads_outer_query: bool,
     equal_tables: Option<(TableInternalId, TableInternalId, Option<TableInternalId>)>,
 }
 
@@ -813,20 +814,16 @@ fn join_lhs_and_rhs<'a>(
             // The hash build input is filled once and reused for every row of the enclosing
             // query, so no table in it may be filtered by that query: the build would hold
             // the first outer row's rows for all of them.
-            let build_input_reads_outer_query = lhs.data.iter().any(|(lhs_table_idx, _)| {
-                all_constraints[*lhs_table_idx]
-                    .constraints
-                    .iter()
-                    .any(|constraint| {
-                        let term = &where_clause[constraint.where_clause_pos.0];
-                        expr_references_outer_query(&term.expr, table_references)
-                            || expr_reads_outer_query_through_subquery(
-                                &term.expr,
-                                subqueries,
-                                table_references,
-                            )
-                    })
-            });
+            let build_input_reads_outer_query = || {
+                lhs.data.iter().any(|(lhs_table_idx, _)| {
+                    all_constraints[*lhs_table_idx]
+                        .constraints
+                        .iter()
+                        .any(|constraint| {
+                            where_terms[constraint.where_clause_pos.0].reads_outer_query
+                        })
+                })
+            };
 
             // Eligibility gate: prefer nested-loop when uses a selective probe seek.
             // Probe->build chaining is only allowed when the
@@ -835,7 +832,7 @@ fn join_lhs_and_rhs<'a>(
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
                 && !chaining_across_outer
-                && !build_input_reads_outer_query;
+                && !build_input_reads_outer_query();
 
             tracing::debug!(
                 lhs_table = build_table.table.get_name(),
@@ -2357,6 +2354,12 @@ fn build_where_term_info(
                 // FIXME: The row cost also includes one simple condition. Give row work
                 // and condition work separate costs so this does not need to subtract one.
                 extra_steps: where_expr_steps(&term.expr).saturating_sub(1),
+                reads_outer_query: expr_references_outer_query(&term.expr, table_references)
+                    || expr_reads_outer_query_through_subquery(
+                        &term.expr,
+                        subqueries,
+                        table_references,
+                    ),
                 equal_tables: (!term.consumed)
                     .then(|| tables_in_equal_test(&term.expr))
                     .flatten()
