@@ -124,6 +124,24 @@ pub fn emit_query<'a>(
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
+        if plan.simple_aggregate.is_none() {
+            let mut sole_minmax = None;
+            for (i, agg) in plan.aggregates.iter().enumerate() {
+                if !matches!(
+                    agg.func,
+                    crate::function::AggFunc::Min | crate::function::AggFunc::Max
+                ) {
+                    continue;
+                }
+                if agg.args.len() != 1 || sole_minmax.is_some() {
+                    sole_minmax = None;
+                    break;
+                }
+                sole_minmax = Some(i);
+            }
+            t_ctx.reg_ungrouped_minmax_extreme_flag =
+                sole_minmax.map(|i| (i, program.alloc_register()));
+        }
     }
 
     // Allocate registers for result columns

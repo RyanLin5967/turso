@@ -1,0 +1,312 @@
+@database :memory:
+
+test minmax-bare-column-takes-max-row {
+    CREATE TABLE mb1 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb1 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, max(n), n, m FROM mb1 GROUP BY k ORDER BY k;
+}
+expect {
+    a|5|5|51
+    b|20|20|201
+    c|30|30|301
+}
+
+test minmax-bare-column-takes-min-row {
+    CREATE TABLE mb2 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb2 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, min(n), n, m FROM mb2 GROUP BY k ORDER BY k;
+}
+expect {
+    a|3|3|31
+    b|20|20|201
+    c|1|1|11
+}
+
+test minmax-bare-column-follows-aggregated-column {
+    CREATE TABLE mb3 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb3 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, max(m), n, m FROM mb3 GROUP BY k ORDER BY k;
+}
+expect {
+    a|51|5|51
+    b|201|20|201
+    c|301|30|301
+}
+
+test minmax-bare-column-unaffected-for-sum {
+    CREATE TABLE mb4 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb4 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, sum(n), n, m FROM mb4 GROUP BY k ORDER BY k;
+}
+expect {
+    a|12|5|51
+    b|20|20|201
+    c|31|30|301
+}
+
+test minmax-bare-column-unaffected-for-count {
+    CREATE TABLE mb5 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb5 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, count(n), n, m FROM mb5 GROUP BY k ORDER BY k;
+}
+expect {
+    a|3|5|51
+    b|1|20|201
+    c|2|30|301
+}
+
+test minmax-bare-column-with-second-aggregate {
+    CREATE TABLE mb6 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb6 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, min(n), count(n), n, m FROM mb6 GROUP BY k ORDER BY k;
+}
+expect {
+    a|3|3|3|31
+    b|20|1|20|201
+    c|1|2|1|11
+}
+
+test minmax-bare-column-with-distinct-aggregate {
+    CREATE TABLE mb7 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb7 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, min(DISTINCT n), n, m FROM mb7 GROUP BY k ORDER BY k;
+}
+expect {
+    a|3|3|31
+    b|20|20|201
+    c|1|1|11
+}
+
+test minmax-bare-column-with-filtered-aggregate {
+    CREATE TABLE mb8 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb8 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, min(n) FILTER (WHERE n > 3), n, m FROM mb8 GROUP BY k ORDER BY k;
+}
+expect {
+    a|4|4|41
+    b|20|20|201
+    c|30|30|301
+}
+
+test minmax-bare-column-with-null-arguments {
+    CREATE TABLE mb9 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb9 VALUES ('a', NULL, 1), ('a', 7, 2), ('a', NULL, 3), ('a', 2, 4), ('b', NULL, 5), ('b', NULL, 6);
+    SELECT k, min(n), n, m FROM mb9 GROUP BY k ORDER BY k;
+}
+expect {
+    a|2|2|4
+    b|||6
+}
+
+test minmax-bare-column-all-null-group {
+    CREATE TABLE mb10 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb10 VALUES ('a', NULL, 1), ('a', 7, 2), ('a', NULL, 3), ('a', 2, 4), ('b', NULL, 5), ('b', NULL, 6);
+    SELECT k, max(n), n, m FROM mb10 GROUP BY k ORDER BY k;
+}
+expect {
+    a|7|7|2
+    b|||6
+}
+
+test minmax-bare-column-ungrouped {
+    CREATE TABLE mb11 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb11 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT min(n), n, m FROM mb11;
+}
+expect {
+    1|1|11
+}
+
+test minmax-bare-column-ungrouped-max {
+    CREATE TABLE mb12 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb12 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT max(n), n, m FROM mb12;
+}
+expect {
+    30|30|301
+}
+
+test minmax-having-on-bare-column-max {
+    CREATE TABLE mb13 (k TEXT, n INTEGER);
+    INSERT INTO mb13 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    SELECT k, max(n) AS n FROM mb13 GROUP BY k HAVING n <= 4 ORDER BY k;
+}
+expect {
+
+}
+
+test minmax-having-on-bare-column-min {
+    CREATE TABLE mb14 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb14 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, min(n) AS n FROM mb14 GROUP BY k HAVING n <= 4 ORDER BY k;
+}
+expect {
+    a|3
+    c|1
+}
+
+test minmax-having-alias-shadows-other-column {
+    CREATE TABLE mb15 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb15 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    SELECT k, max(m) AS n FROM mb15 GROUP BY k HAVING n <= 4 ORDER BY k;
+}
+expect {
+
+}
+
+test minmax-having-delete-keeps-rows-max {
+    CREATE TABLE mb16 (k TEXT, n INTEGER);
+    INSERT INTO mb16 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    DELETE FROM mb16 WHERE k IN (SELECT k FROM (SELECT k, max(n) AS n FROM mb16 GROUP BY k HAVING n <= 4));
+    SELECT count(*) FROM mb16;
+}
+expect {
+    4
+}
+
+test minmax-having-delete-keeps-rows-min {
+    CREATE TABLE mb17 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb17 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    DELETE FROM mb17 WHERE k IN (SELECT k FROM (SELECT k, min(n) AS n FROM mb17 GROUP BY k HAVING n >= 10));
+    SELECT k, n FROM mb17 ORDER BY k, n;
+}
+expect {
+    a|3
+    a|4
+    a|5
+    c|1
+    c|30
+}
+
+test minmax-having-update-leaves-rows-alone {
+    CREATE TABLE mb18 (k TEXT, n INTEGER);
+    INSERT INTO mb18 VALUES ('a', 3), ('a', 4), ('a', 5), ('b', 20);
+    UPDATE mb18 SET n = -1 WHERE k IN (SELECT k FROM (SELECT k, max(n) AS n FROM mb18 GROUP BY k HAVING n <= 4));
+    SELECT k, n FROM mb18 ORDER BY k, n;
+}
+expect {
+    a|3
+    a|4
+    a|5
+    b|20
+}
+
+test minmax-having-delete-with-distinct-aggregate {
+    CREATE TABLE mb19 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb19 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    DELETE FROM mb19 WHERE k IN (SELECT k FROM (SELECT k, min(DISTINCT n) AS n FROM mb19 GROUP BY k HAVING n <= 4));
+    SELECT k, n FROM mb19 ORDER BY k, n;
+}
+expect {
+    b|20
+}
+
+test minmax-having-delete-with-filtered-aggregate {
+    CREATE TABLE mb20 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb20 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    DELETE FROM mb20 WHERE k IN (SELECT k FROM (SELECT k, min(n) FILTER (WHERE n > 3) AS n FROM mb20 GROUP BY k HAVING n <= 4));
+    SELECT k, n FROM mb20 ORDER BY k, n;
+}
+expect {
+    b|20
+    c|1
+    c|30
+}
+
+test minmax-having-delete-with-second-aggregate {
+    CREATE TABLE mb21 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb21 VALUES ('a', 5, 51), ('a', 4, 41), ('a', 3, 31), ('c', 30, 301), ('c', 1, 11), ('b', 20, 201);
+    DELETE FROM mb21 WHERE k IN (SELECT k FROM (SELECT k, min(n) AS n, count(n) AS c FROM mb21 GROUP BY k HAVING n = 5));
+    SELECT k, n FROM mb21 ORDER BY k, n;
+}
+expect {
+    a|3
+    a|4
+    a|5
+    b|20
+    c|1
+    c|30
+}
+
+test minmax-bare-column-distinct-repeated-max {
+    CREATE TABLE mb22 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb22 VALUES ('a', 5, 51), ('a', 5, 52), ('a', 9, 53), ('a', 9, 54), ('a', 2, 55), ('b', 20, 201);
+    SELECT k, max(DISTINCT n), n, m FROM mb22 GROUP BY k ORDER BY k;
+}
+expect {
+    a|9|9|54
+    b|20|20|201
+}
+
+test minmax-bare-column-distinct-repeated-min {
+    CREATE TABLE mb23 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb23 VALUES ('a', 5, 51), ('a', 5, 52), ('a', 9, 53), ('a', 9, 54), ('a', 2, 55), ('b', 20, 201);
+    SELECT k, min(DISTINCT n), n, m FROM mb23 GROUP BY k ORDER BY k;
+}
+expect {
+    a|2|2|55
+    b|20|20|201
+}
+
+test minmax-bare-column-distinct-repeated-null {
+    CREATE TABLE mb24 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb24 VALUES ('a', NULL, 51), ('a', 5, 52), ('a', NULL, 53), ('a', 9, 54);
+    SELECT k, min(DISTINCT n), n, m FROM mb24 GROUP BY k ORDER BY k;
+}
+expect {
+    a|5||53
+}
+
+test minmax-having-delete-distinct-repeated-max-keeps-rows {
+    CREATE TABLE mb25 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb25 VALUES ('a', 2, 51), ('a', 9, 52), ('a', 9, 53);
+    DELETE FROM mb25 WHERE k IN (SELECT k FROM (SELECT k, max(DISTINCT n) FROM mb25 GROUP BY k HAVING m = 52));
+    SELECT k, n, m FROM mb25 ORDER BY m;
+}
+expect {
+    a|2|51
+    a|9|52
+    a|9|53
+}
+
+test minmax-having-delete-distinct-repeated-min-keeps-rows {
+    CREATE TABLE mb26 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb26 VALUES ('a', 9, 51), ('a', 2, 52), ('a', 2, 53);
+    DELETE FROM mb26 WHERE k IN (SELECT k FROM (SELECT k, min(DISTINCT n) FROM mb26 GROUP BY k HAVING m = 52));
+    SELECT k, n, m FROM mb26 ORDER BY m;
+}
+expect {
+    a|9|51
+    a|2|52
+    a|2|53
+}
+
+test minmax-having-update-distinct-repeated-max-leaves-rows {
+    CREATE TABLE mb27 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb27 VALUES ('a', 2, 51), ('a', 9, 52), ('a', 9, 53);
+    UPDATE mb27 SET m = -1 WHERE k IN (SELECT k FROM (SELECT k, max(DISTINCT n) AS x, m FROM mb27 GROUP BY k HAVING m = 52));
+    SELECT k, n, m FROM mb27 ORDER BY n, m;
+}
+expect {
+    a|2|51
+    a|9|52
+    a|9|53
+}
+
+test minmax-bare-column-distinct-with-filter-repeated {
+    CREATE TABLE mb28 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb28 VALUES ('a', 5, 51), ('a', 5, 52), ('a', 9, 53), ('a', 1, 54);
+    SELECT k, max(DISTINCT n) FILTER (WHERE n > 2), n, m FROM mb28 GROUP BY k ORDER BY k;
+}
+expect {
+    a|9|9|53
+}
+
+test minmax-bare-column-distinct-ungrouped-repeated {
+    CREATE TABLE mb29 (k TEXT, n INTEGER, m INTEGER);
+    INSERT INTO mb29 VALUES ('a', 2, 51), ('a', 9, 52), ('a', 9, 53);
+    SELECT max(DISTINCT n), n, m FROM mb29;
+}
+expect {
+    9|9|53
+}

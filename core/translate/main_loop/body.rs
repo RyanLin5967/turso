@@ -272,6 +272,7 @@ fn emit_loop_source<'a>(
                         func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
                         comparator,
                         collation: Some(arg_collation),
+                        minmax_extreme_flag: None,
                     }),
                 });
                 program.emit_insn(Insn::Goto {
@@ -290,6 +291,19 @@ fn emit_loop_source<'a>(
             // Instead, we accumulate the intermediate results of all aggreagates, and evaluate any expressions that do not contain aggregates.
             for (i, agg) in plan.aggregates.iter().enumerate() {
                 let reg = start_reg + i;
+
+                if let (Some((minmax_index, reg_minmax_extreme_flag)), Some(reg_seed)) = (
+                    t_ctx.reg_ungrouped_minmax_extreme_flag,
+                    t_ctx.reg_nonagg_emit_once_flag,
+                ) {
+                    if minmax_index == i && agg.filter_expr.is_some() {
+                        program.emit_insn(Insn::Copy {
+                            src_reg: reg_seed,
+                            dst_reg: reg_minmax_extreme_flag,
+                            extra_amount: 0,
+                        });
+                    }
+                }
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -319,6 +333,10 @@ fn emit_loop_source<'a>(
                     reg,
                     &t_ctx.resolver,
                     agg.fraction_reg,
+                    t_ctx
+                        .reg_ungrouped_minmax_extreme_flag
+                        .filter(|(minmax_index, _)| *minmax_index == i)
+                        .map(|(_, reg)| reg),
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -334,11 +352,27 @@ fn emit_loop_source<'a>(
 
             let label_emit_nonagg_only_once = if let Some(flag) = t_ctx.reg_nonagg_emit_once_flag {
                 let if_label = program.allocate_label();
-                program.emit_insn(Insn::If {
-                    reg: flag,
-                    target_pc: if_label,
-                    jump_if_null: false,
-                });
+                if let Some((_, reg_minmax_extreme_flag)) = t_ctx.reg_ungrouped_minmax_extreme_flag
+                {
+                    let label_load = program.allocate_label();
+                    program.emit_insn(Insn::IfNot {
+                        reg: flag,
+                        target_pc: label_load,
+                        jump_if_null: true,
+                    });
+                    program.emit_insn(Insn::If {
+                        reg: reg_minmax_extreme_flag,
+                        target_pc: if_label,
+                        jump_if_null: false,
+                    });
+                    program.preassign_label_to_next_insn(label_load);
+                } else {
+                    program.emit_insn(Insn::If {
+                        reg: flag,
+                        target_pc: if_label,
+                        jump_if_null: false,
+                    });
+                }
                 Some(if_label)
             } else {
                 None
