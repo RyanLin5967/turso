@@ -357,6 +357,7 @@ pub struct AggStepData {
     /// Collation for comparison-based aggregates (MIN/MAX), resolved at
     /// translation time from the argument expression.
     pub collation: Option<CollationSeq>,
+    pub minmax_extreme_flag: Option<usize>,
 }
 
 /// Data for ArrayEncode instruction (boxed to keep Insn small).

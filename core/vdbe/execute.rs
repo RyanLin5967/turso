@@ -7380,7 +7380,7 @@ fn update_agg_payload(
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
     comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
-) -> Result<()> {
+) -> Result<bool> {
     match func {
         AggFunc::Count => {
             // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
@@ -7408,7 +7408,7 @@ fn update_agg_payload(
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
             let [sum_val, r_err_val, count_val, ..] = payload.as_mut_slice() else {
@@ -7418,7 +7418,7 @@ fn update_agg_payload(
                 ));
             };
             if matches!(*sum_val, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let r_err = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
@@ -7477,7 +7477,7 @@ fn update_agg_payload(
                 *count = count.checked_add(1).or_overflow()?;
             }
             if matches!(*acc, Value::Null) && sum_state.approx {
-                return Ok(());
+                return Ok(false);
             }
             match arg {
                 Value::Null => {}
@@ -7545,11 +7545,11 @@ fn update_agg_payload(
         }
         AggFunc::Min | AggFunc::Max => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(matches!(payload[0], Value::Null));
             }
             if matches!(payload[0], Value::Null) {
                 payload[0].try_clone_from(arg)?;
-                return Ok(());
+                return Ok(true);
             }
             use std::cmp::Ordering;
             let comparator = comparator()?;
@@ -7568,11 +7568,13 @@ fn update_agg_payload(
             };
             if should_update {
                 payload[0].try_clone_from(arg)?;
+                return Ok(true);
             }
+            return Ok(false);
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let [acc, count_slot, first_separator_len_slot, separator_lengths_slot, ..] =
                 payload.as_mut_slice()
@@ -7663,7 +7665,7 @@ fn update_agg_payload(
             // SQLite skips rows whose object label is SQL NULL. A NULL value is
             // still encoded as JSON null, so only the key is filtered here.
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             ensure_blob_arg_is_jsonb(value.as_value_ref())?;
             let mut key_vec = convert_dbtype_to_raw_jsonb(arg, Conv::ToString)?;
@@ -7731,7 +7733,7 @@ fn update_agg_payload(
             vec.append(&mut data);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Max limit of aggregate Vecs we keep around to reuse their allocations. This is a very naive
@@ -9006,7 +9008,9 @@ pub fn op_agg_step(
                 }
             }
             AggFunc::Min | AggFunc::Max
-                if data.comparator.is_none() && data.collation.is_none_or(|c| !c.is_custom()) =>
+                if data.minmax_extreme_flag.is_none()
+                    && data.comparator.is_none()
+                    && data.collation.is_none_or(|c| !c.is_custom()) =>
             {
                 if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
                     state.registers[data.col]
@@ -9043,6 +9047,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
         func,
         comparator,
         collation,
+        minmax_extreme_flag,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
@@ -9122,7 +9127,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     };
 
     // Step the aggregate
-    match func {
+    let extreme_replaced = match func {
         AggFunc::External(_) => {
             // External aggregates use FFI and need special handling
             let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
@@ -9170,6 +9175,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 state.registers[*acc_reg].set_value(Value::Null);
                 return Err(err.into());
             }
+            false
         }
         _ => {
             let maybe_arg2 = match func {
@@ -9212,9 +9218,14 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 payload,
                 current_collation,
                 comparator_factory,
-            )?;
+            )?
         }
     };
+
+    if let Some(flag_reg) = minmax_extreme_flag {
+        state.registers[*flag_reg] =
+            Register::Value(Value::from_i64(if extreme_replaced { 0 } else { 1 }));
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

@@ -76,6 +76,7 @@ pub struct GroupByRegisters {
     /// The comparison result is used to determine if the current row belongs to the same group as the previous row
     /// Each group by expression has a corresponding register
     pub reg_group_exprs_cmp: usize,
+    pub reg_minmax_extreme_flag: Option<(usize, usize)>,
 }
 
 // Metadata for handling GROUP BY operations
@@ -122,6 +123,8 @@ impl EmitGroupBy {
 
         let reg_subrtn_acc_output_return_offset = program.alloc_register();
         let reg_data_in_acc_flag = program.alloc_register();
+        let minmax_agg_index = sole_minmax_aggregate_index(plan, group_by, t_ctx);
+        let reg_minmax_extreme_flag = minmax_agg_index.map(|i| (i, program.alloc_register()));
         let reg_abort_flag = program.alloc_register();
         let reg_group_exprs_cmp = program.alloc_registers(group_by.exprs.len());
 
@@ -266,6 +269,7 @@ impl EmitGroupBy {
                 reg_group_exprs_cmp,
                 reg_subrtn_acc_clear_return_offset,
                 reg_group_by_source_cols_start,
+                reg_minmax_extreme_flag,
             },
         });
         Ok(())
@@ -403,6 +407,36 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
         }
     }
     Ok(leaf_columns)
+}
+
+fn sole_minmax_aggregate_index(
+    plan: &SelectPlan,
+    group_by: &GroupBy,
+    t_ctx: &TranslateCtx,
+) -> Option<usize> {
+    let mut found = None;
+    for (i, agg) in plan.aggregates.iter().enumerate() {
+        if !matches!(
+            agg.func,
+            crate::function::AggFunc::Min | crate::function::AggFunc::Max
+        ) {
+            continue;
+        }
+        if agg.args.len() != 1 || found.is_some() {
+            return None;
+        }
+        found = Some(i);
+    }
+    let has_bare_expression = t_ctx
+        .non_aggregate_expressions
+        .iter()
+        .skip(group_by.exprs.len())
+        .any(|(_, in_result_columns)| *in_result_columns);
+    if has_bare_expression {
+        found
+    } else {
+        None
+    }
 }
 
 fn collect_non_aggregate_expressions<'a>(
@@ -771,6 +805,17 @@ pub fn group_by_process_single_group(
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
 
+                if let Some((minmax_index, reg_minmax_extreme_flag)) =
+                    registers.reg_minmax_extreme_flag
+                {
+                    if minmax_index == i {
+                        program.emit_insn(Insn::Integer {
+                            value: 1,
+                            dest: reg_minmax_extreme_flag,
+                        });
+                    }
+                }
+
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
                     let label = program.allocate_label();
@@ -801,6 +846,10 @@ pub fn group_by_process_single_group(
                     agg_result_reg,
                     &t_ctx.resolver,
                     agg.fraction_reg,
+                    registers
+                        .reg_minmax_extreme_flag
+                        .filter(|(minmax_index, _)| *minmax_index == i)
+                        .map(|(_, reg)| reg),
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -824,6 +873,17 @@ pub fn group_by_process_single_group(
                     .reg_agg_start
                     .expect("aggregate registers must be initialized");
                 let agg_result_reg = agg_start_reg + i;
+
+                if let Some((minmax_index, reg_minmax_extreme_flag)) =
+                    registers.reg_minmax_extreme_flag
+                {
+                    if minmax_index == i {
+                        program.emit_insn(Insn::Integer {
+                            value: 1,
+                            dest: reg_minmax_extreme_flag,
+                        });
+                    }
+                }
 
                 // FILTER: skip AggStep if filter condition is false
                 let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
@@ -856,6 +916,10 @@ pub fn group_by_process_single_group(
                     agg_result_reg,
                     &t_ctx.resolver,
                     agg.fraction_reg,
+                    registers
+                        .reg_minmax_extreme_flag
+                        .filter(|(minmax_index, _)| *minmax_index == i)
+                        .map(|(_, reg)| reg),
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx
@@ -879,11 +943,26 @@ pub fn group_by_process_single_group(
         program.offset(),
         "don't emit group columns if continuing existing group",
     );
-    program.emit_insn(Insn::If {
-        target_pc: labels.label_acc_indicator_set_flag_true,
-        reg: registers.reg_data_in_acc_flag,
-        jump_if_null: false,
-    });
+    if let Some((_, reg_minmax_extreme_flag)) = registers.reg_minmax_extreme_flag {
+        let label_load_non_aggregate_exprs = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            target_pc: label_load_non_aggregate_exprs,
+            reg: registers.reg_data_in_acc_flag,
+            jump_if_null: true,
+        });
+        program.emit_insn(Insn::If {
+            target_pc: labels.label_acc_indicator_set_flag_true,
+            reg: reg_minmax_extreme_flag,
+            jump_if_null: false,
+        });
+        program.preassign_label_to_next_insn(label_load_non_aggregate_exprs);
+    } else {
+        program.emit_insn(Insn::If {
+            target_pc: labels.label_acc_indicator_set_flag_true,
+            reg: registers.reg_data_in_acc_flag,
+            jump_if_null: false,
+        });
+    }
 
     // Read non-aggregate columns from the current row
     match row_source {
