@@ -26,6 +26,13 @@
 //! [`Journal::flush`] syncs the arena BEFORE it writes and syncs the buffered records, and records
 //! are only ever written by a flush. A record on disk therefore never names a slot whose bytes are
 //! not already durable, even if the OS writes the log page early.
+//!
+//! # One store per set of files
+//!
+//! A journal holds an exclusive `flock` on the log for its whole life (review N1; LevelDB's `LOCK`
+//! file), taken before it reads, truncates or discards anything, so a second store over the same
+//! files — in this process or another — is refused at open instead of interleaving its appends
+//! with the first one's. See `lock_exclusive` for why `flock` and for its blind spots.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -36,7 +43,11 @@ use crate::{LimboError, Result};
 
 const LOG_MAGIC: &[u8; 8] = b"TFBRLOG1";
 const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
-const FORMAT_VERSION: u32 = 1;
+/// 2: `SnapBranch::lease_deadline_ms` became deadline + 1, with 0 meaning "no lease" (review R7).
+/// Version 1 stored the deadline itself and could not tell a deadline of 0 from none, so a version
+/// 1 snapshot read by this code would come back with every deadline 1 ms early. Another version is
+/// refused, never reinterpreted.
+const FORMAT_VERSION: u32 = 2;
 const LOG_HEADER_LEN: usize = 32;
 const FRAME_HEADER_LEN: usize = 8;
 /// Compact once the log is larger than this and larger than twice the last snapshot, so the log is
@@ -399,11 +410,22 @@ pub(crate) struct Journal {
 
 impl Journal {
     /// Start a fresh durable store: a new log at generation 0, and no snapshot.
+    ///
+    /// Refused while another journal holds the log (review N1), and over files that hold state:
+    /// the caller found nothing recoverable when it opened, so state here was written since by
+    /// another store instance, and starting it over would destroy that store's branches.
     pub(crate) fn create(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
-        if files.snap.exists() {
-            std::fs::remove_file(&files.snap).map_err(|e| io_error(e, "remove branch snapshot"))?;
+        // Lock before touching anything, so a refused create has truncated nothing.
+        let mut file = open_rw(&files.log, false)?;
+        lock_exclusive(&file, &files.log)?;
+        let existing = read_all(&mut file)?;
+        if files.snap.exists() || !matches!(parse_log_header(&existing), Ok(None)) {
+            return Err(LimboError::LockingError(format!(
+                "branch files next to {} gained state after this branch store opened: another \
+                 store instance wrote them",
+                files.log.display()
+            )));
         }
-        let file = open_rw(&files.log, true)?;
         let mut journal = Journal {
             file,
             files: files.clone(),
@@ -426,6 +448,10 @@ impl Journal {
     /// Reopen an existing store. `Ok(None)` means the files hold no state at all (a crash while
     /// the log was being created, before its header was durable): the store starts empty.
     pub(crate) fn recover(files: &BranchFiles, sync: bool) -> Result<Option<Recovered>> {
+        // Lock before reading or discarding anything (review N1): the temp snapshot removed below
+        // could be a live store's compaction in flight.
+        let mut file = open_rw(&files.log, false)?;
+        lock_exclusive(&file, &files.log)?;
         let snapshot = if files.snap.exists() {
             Some(read_snapshot(&files.snap)?)
         } else {
@@ -436,9 +462,8 @@ impl Journal {
         if tmp.exists() {
             std::fs::remove_file(&tmp).map_err(|e| io_error(e, "remove stale branch snapshot"))?;
         }
-        let mut file = open_rw(&files.log, false)?;
         let bytes = read_all(&mut file)?;
-        let header = parse_log_header(&bytes);
+        let header = parse_log_header(&bytes)?;
 
         let (page_size, generation, snapshot_state, snapshot_len) = match (snapshot, header) {
             (None, None) => return Ok(None),
@@ -506,7 +531,8 @@ impl Journal {
                 return Err(corrupt("log generation is ahead of the snapshot"));
             }
             // An older generation (a compaction crashed after its rename, before the log reset)
-            // or a torn header: nothing in it is newer than the snapshot.
+            // or a torn header: nothing in it is newer than the snapshot. (A whole header of
+            // another format version never gets here: `parse_log_header` refused it.)
             _ => journal.reset_log(generation)?,
         }
         Ok(Some(Recovered {
@@ -574,10 +600,10 @@ impl Journal {
 
     fn write_pending(&self, arena: &mut Arena) -> Result<()> {
         // Append only where this journal believes the log ends. A log that is longer than that was
-        // written by another journal over the same files (a store that outlived its database past
-        // a reopen): writing at the stale offset would cut the other's records off at the next
-        // recovery, so refuse — reading the file's state, not trusting the in-memory length
-        // (review R8).
+        // written by someone else: writing at the stale offset would cut their records off at the
+        // next recovery, so refuse — reading the file's state, not trusting the in-memory length
+        // (review R8). On unix the log lock keeps a second JOURNAL out (N1); this check remains
+        // the guard on other targets and against a writer that never asks for the lock.
         let on_disk = self
             .file
             .metadata()
@@ -688,23 +714,65 @@ impl Journal {
     }
 }
 
-/// `(page_size, generation)` if the header is whole and valid.
-fn parse_log_header(bytes: &[u8]) -> Option<(u32, u64)> {
-    let h = bytes.get(..LOG_HEADER_LEN)?;
+/// `Some((page_size, generation))` if the header is whole and valid, `None` if it is torn (a crash
+/// before it was durable). A whole header of ANOTHER format version is an error, not a torn one:
+/// taking it for torn would start an empty store over it, or reset its log.
+fn parse_log_header(bytes: &[u8]) -> Result<Option<(u32, u64)>> {
+    let Some(h) = bytes.get(..LOG_HEADER_LEN) else {
+        return Ok(None);
+    };
     if &h[0..8] != LOG_MAGIC {
-        return None;
+        return Ok(None);
     }
-    let crc = u32::from_le_bytes(h[24..28].try_into().ok()?);
-    if crc32c::crc32c(&h[..24]) != crc {
-        return None;
+    let field = |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap());
+    if crc32c::crc32c(&h[..24]) != field(24) {
+        return Ok(None);
     }
-    let version = u32::from_le_bytes(h[8..12].try_into().ok()?);
+    let version = field(8);
     if version != FORMAT_VERSION {
-        return None;
+        return Err(corrupt(&format!(
+            "log format version {version}; this build reads version {FORMAT_VERSION}"
+        )));
     }
-    let page_size = u32::from_le_bytes(h[12..16].try_into().ok()?);
-    let generation = u64::from_le_bytes(h[16..24].try_into().ok()?);
-    Some((page_size, generation))
+    let generation = u64::from_le_bytes(h[16..24].try_into().unwrap());
+    Ok(Some((field(12), generation)))
+}
+
+/// Hold an exclusive advisory lock on the branch log for as long as `file` stays open (review N1):
+/// one branch store per set of branch files, in this process or another. A second store is
+/// refused at open instead of racing the first one's appends.
+///
+/// `flock(2)`, not `fcntl`: an `fcntl` lock belongs to the PROCESS, so two stores in one process
+/// (`Database::do_open`, which skips the registry, or a reopen inside the registry's `Weak`
+/// window) would both get it. An `flock` lock belongs to the open file description.
+///
+/// BLIND SPOTS: non-unix targets take no lock, and `write_pending`'s length check is their only
+/// guard. The lock is advisory, so a writer that never asks is not stopped (the length check
+/// again). On Linux over NFS, `flock` is emulated with `fcntl` locks (flock(2), recalled, not
+/// verified here), which two stores in one process would share.
+fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(LimboError::LockingError(
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    format!(
+                        "branch log {} is held by another branch store (a second Database over \
+                         the same file, in this process or another); close that one first",
+                        path.display()
+                    )
+                } else {
+                    format!("cannot lock branch log {}: {err}", path.display())
+                },
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (file, path);
+    Ok(())
 }
 
 /// `(page_size, generation, state, file_len)`. A snapshot is only ever put in place by a rename
@@ -862,6 +930,10 @@ mod tests {
     /// R8. A second journal over the same log (a store that outlived its database past a reopen)
     /// must not append at its own stale offset, which would cut the other's later records off at
     /// the next recovery: the stale writer is refused.
+    /// ⚠ Non-unix only since review N1: on unix the second journal below is refused at recover by
+    /// the log lock, so this schedule cannot arise there. Its guard, the length check, is kept
+    /// under test on unix by `a_journal_refuses_to_append_after_its_log_grew_under_it`.
+    #[cfg(not(unix))]
     #[test]
     fn a_stale_journal_does_not_write_over_a_newer_one() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -877,6 +949,42 @@ mod tests {
 
         stale.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
         assert!(stale.flush(&mut arena).is_err(), "a stale journal wrote over a newer one");
+        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        assert_eq!(
+            records,
+            vec![
+                Record::Fork { child: 1, parent: 0 },
+                Record::Release { branch: 1 }
+            ]
+        );
+    }
+
+    /// R8's length check where N1's lock leaves it reachable: a writer that never asks for the
+    /// lock appends a whole frame. The journal must refuse to append over it.
+    #[test]
+    fn a_journal_refuses_to_append_after_its_log_grew_under_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut arena = Arena::new(512);
+        let mut journal = Journal::create(&files, 512, false).unwrap();
+        journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        journal.flush(&mut arena).unwrap();
+
+        let mut payload = Vec::new();
+        Record::Release { branch: 1 }.encode(&mut payload);
+        let mut frame = Vec::new();
+        put_u32(&mut frame, payload.len() as u32);
+        put_u32(&mut frame, crc32c::crc32c(&payload));
+        frame.extend_from_slice(&payload);
+        {
+            use std::io::Write;
+            let mut foreign = OpenOptions::new().append(true).open(&files.log).unwrap();
+            foreign.write_all(&frame).unwrap();
+        }
+
+        journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+        assert!(journal.flush(&mut arena).is_err(), "a journal appended over bytes it did not write");
+        drop(journal);
         let records = Journal::recover(&files, false).unwrap().expect("state").records;
         assert_eq!(
             records,

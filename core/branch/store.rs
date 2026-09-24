@@ -56,9 +56,14 @@
 //! What survives a CRASH of the database process is the clock as last stamped. Stamps ride on
 //! flushes that happen anyway while a lease is outstanding: every branch commit, every fork,
 //! renewal, release and expiry pass that writes a record, and a clean close; a pass with nothing
-//! due also queues a stamp (at most one per second) for the next flush to carry. So a crash loses
-//! the open time since the last flush — bounded by the gap between operations that write, not by
-//! how long ago someone last called `expire_branches`. It extends leases, never shortens one.
+//! due also queues a stamp (at most one per second) for the next flush to carry. A TRUNK commit
+//! stamps too, at most once per second, flushing for the stamp alone when it has no pre-image to
+//! make durable (review N2: otherwise a trunk-only workload never advanced the durable clock). So
+//! a crash loses the open time since the last stamped flush — bounded by the gap between commits
+//! of any kind, not by how long ago someone last called `expire_branches`. It extends leases,
+//! never shortens one. The clock tracks what is QUEUED and what is DURABLE separately (review N3):
+//! a queued stamp dies with the process, so the close and `expire_branches` compare with the
+//! durable one.
 //!
 //! # Durability (see `journal.rs` for the files and their prior art)
 //!
@@ -113,6 +118,10 @@ pub(crate) struct BranchStore {
     /// commit. The commit's barrier reads this without the lock, so a trunk commit with nothing to
     /// make durable pays one atomic load.
     unsynced: AtomicBool,
+    /// Whether a durable store has any lease outstanding. A trunk commit's barrier reads it without
+    /// the lock, so a trunk with no leases still pays one load for the stamp (review N2). A stale
+    /// `true` costs one lock; a stale `false` misses one stamp, which only lengthens leases.
+    leases_outstanding: AtomicBool,
 }
 
 struct StoreInner {
@@ -151,8 +160,11 @@ struct LeaseClock {
     /// Test-only: real time no longer moves the clock (`Database::branch_lease_clock_freeze`), so
     /// a test can hit "same millisecond" orderings deterministically.
     frozen: bool,
-    /// The largest value written to the journal.
-    stamped_ms: u64,
+    /// The largest reading buffered in, or written to, the journal.
+    queued_ms: u64,
+    /// The largest reading a successful flush (or snapshot) has made durable. `queued_ms` is never
+    /// behind it; a reading between the two dies with the process (review N3).
+    durable_ms: u64,
 }
 
 impl LeaseClock {
@@ -162,7 +174,8 @@ impl LeaseClock {
             opened: Instant::now(),
             advanced_ms: 0,
             frozen: false,
-            stamped_ms: 0,
+            queued_ms: 0,
+            durable_ms: 0,
         }
     }
 
@@ -190,7 +203,18 @@ impl LeaseClock {
     /// Recovery saw the clock at `ms`. The clock only moves forward.
     fn recovered(&mut self, ms: u64) {
         self.base_ms = self.base_ms.max(ms);
-        self.stamped_ms = self.stamped_ms.max(ms);
+        self.queued_ms = self.queued_ms.max(ms);
+        self.durable_ms = self.durable_ms.max(ms);
+    }
+
+    /// A record carrying the reading `ms` is about to be buffered.
+    fn queued(&mut self, ms: u64) {
+        self.queued_ms = self.queued_ms.max(ms);
+    }
+
+    /// A flush succeeded: every buffered reading is durable.
+    fn flushed(&mut self) {
+        self.durable_ms = self.queued_ms;
     }
 }
 
@@ -474,6 +498,7 @@ impl BranchStore {
             trunk_children: AtomicUsize::new(inner.trunk.lineage.children.len()),
             inner: Mutex::new(inner),
             unsynced: AtomicBool::new(false),
+            leases_outstanding: AtomicBool::new(false),
         };
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
@@ -482,6 +507,7 @@ impl BranchStore {
         {
             let mut inner = store.inner.lock();
             store.expire(&mut inner, Stamp::No)?;
+            store.sync_lease_flag(&inner);
         }
         Ok(store)
     }
@@ -493,6 +519,14 @@ impl BranchStore {
     fn sync_trunk_children(&self, inner: &StoreInner) {
         self.trunk_children
             .store(inner.trunk.lineage.children.len(), Ordering::Release);
+    }
+
+    /// Call after anything that adds or removes a lease.
+    fn sync_lease_flag(&self, inner: &StoreInner) {
+        self.leases_outstanding.store(
+            inner.journal.is_some() && !inner.leases.is_empty(),
+            Ordering::Release,
+        );
     }
 
     /// Whether any branch state exists at all, including one kept alive only by a live child.
@@ -508,6 +542,7 @@ impl BranchStore {
             journal,
             arena,
             failpoint,
+            lease,
             ..
         } = inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
@@ -518,6 +553,7 @@ impl BranchStore {
             journal.buffer(record)?;
         }
         journal.flush(arena)?;
+        lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         Ok(())
     }
@@ -539,6 +575,7 @@ impl BranchStore {
         // `apply_lease` keeps the later of this and any earlier deadline: the ONE guard that a
         // deadline never moves back, and the one replay also runs (review R9).
         let deadline = now.saturating_add(millis(ttl));
+        inner.lease.queued(now);
         self.log(
             &mut inner,
             Record::Lease {
@@ -548,7 +585,7 @@ impl BranchStore {
             },
         )?;
         inner.apply_lease(id, deadline);
-        inner.lease.stamped_ms = inner.lease.stamped_ms.max(now);
+        self.sync_lease_flag(&inner);
         Ok(())
     }
 
@@ -556,6 +593,15 @@ impl BranchStore {
     /// spent open survives a restart even if nothing expired.
     pub(crate) fn expire_now(&self) -> Result<Expired> {
         let mut inner = self.inner.lock();
+        // A fail-stopped pass reaps nothing and stamps nothing: an empty `Expired` would say
+        // "nothing was due" when the truth is "could not run" (review N4).
+        if inner.poisoned() {
+            return Err(LimboError::InternalError(
+                "branch store is fail-stopped after an I/O failure; the expiry pass cannot make a \
+                 release durable until the database is reopened"
+                    .to_string(),
+            ));
+        }
         Ok(self.expire(&mut inner, Stamp::Flush)?.0)
     }
 
@@ -582,17 +628,19 @@ impl BranchStore {
                 match stamp {
                     Stamp::No => {}
                     Stamp::Queue => {
-                        if now >= inner.lease.stamped_ms.saturating_add(STAMP_EVERY_MS) {
+                        if now >= inner.lease.queued_ms.saturating_add(STAMP_EVERY_MS) {
                             if let Some(journal) = inner.journal.as_mut() {
                                 journal.buffer(&Record::Clock { now_ms: now })?;
-                                inner.lease.stamped_ms = now;
+                                inner.lease.queued(now);
                             }
                         }
                     }
                     Stamp::Flush => {
-                        if now > inner.lease.stamped_ms {
+                        // Against what is DURABLE: a stamp only queued at this same instant is
+                        // still in the buffer, and this flush is what carries it (review N3).
+                        if now > inner.lease.durable_ms {
+                            inner.lease.queued(now);
                             self.log(inner, Record::Clock { now_ms: now })?;
-                            inner.lease.stamped_ms = now;
                         }
                     }
                 }
@@ -605,8 +653,8 @@ impl BranchStore {
             .map(|id| Record::Release { branch: id.0 })
             .collect();
         records.push(Record::Clock { now_ms: now });
+        inner.lease.queued(now);
         self.log_all(inner, records)?;
-        inner.lease.stamped_ms = inner.lease.stamped_ms.max(now);
         let mut freed = Vec::new();
         for &id in &due {
             inner.apply_release(id, &mut freed);
@@ -614,6 +662,7 @@ impl BranchStore {
         let freed_pages = freed.len();
         inner.release_slots(freed);
         self.sync_trunk_children(inner);
+        self.sync_lease_flag(inner);
         self.maybe_compact(inner);
         Ok((
             Expired {
@@ -645,6 +694,7 @@ impl BranchStore {
             journal,
             arena,
             failpoint,
+            lease,
             ..
         } = inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
@@ -653,6 +703,7 @@ impl BranchStore {
         injected_flush_failure(failpoint, journal)?;
         journal.buffer(&record)?;
         journal.flush(arena)?;
+        lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         Ok(())
     }
@@ -670,11 +721,19 @@ impl BranchStore {
 
     fn compact(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
         let snapshot = inner.snapshot();
-        let StoreInner { journal, arena, .. } = inner;
+        let StoreInner {
+            journal,
+            arena,
+            lease,
+            ..
+        } = inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
         journal.compact(&snapshot, arena, fail_after_rename)?;
+        // The snapshot carries the clock, and it replaced every buffered stamp.
+        lease.queued(snapshot.lease_now_ms);
+        lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         Ok(())
     }
@@ -688,10 +747,14 @@ impl BranchStore {
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
         let id = BranchId(inner.next_id);
         let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now);
+        if let Some((_, stamped)) = lease {
+            inner.lease.queued(stamped);
+        }
         self.log_all(&mut inner, records)?;
         inner.apply_fork(BranchId::TRUNK, id, Some(schema), Handle::Attached)?;
         inner.apply_fork_lease(id, lease);
         self.sync_trunk_children(&inner);
+        self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
         Ok(id)
     }
@@ -714,9 +777,13 @@ impl BranchStore {
         let schema = st.schema.clone();
         let id = BranchId(inner.next_id);
         let (records, lease) = inner.fork_records(id, parent, now);
+        if let Some((_, stamped)) = lease {
+            inner.lease.queued(stamped);
+        }
         self.log_all(&mut inner, records)?;
         inner.apply_fork(parent, id, schema, Handle::Attached)?;
         inner.apply_fork_lease(id, lease);
+        self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
         Ok(id)
     }
@@ -728,10 +795,21 @@ impl BranchStore {
     pub(crate) fn open_conn(&self, id: BranchId) -> Result<Option<Arc<Schema>>> {
         let mut inner = self.inner.lock();
         // Nor is an expired branch openable: the same pass, the same refusal.
-        self.expire(&mut inner, Stamp::Queue)?;
+        let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
+        let poisoned = inner.poisoned();
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.handle.is_released() {
             return Err(reaped(id));
+        }
+        // A fail-stopped pass cannot reap (it cannot make a Release durable), so the refusal that
+        // reaping gives an expired branch is given here instead (review N4). Unexpired branches
+        // stay readable.
+        if poisoned && st.lease.is_some_and(|deadline| deadline <= now) {
+            return Err(LimboError::InvalidArgument(format!(
+                "branch {}'s lease has run out; the branch store is fail-stopped after an I/O \
+                 failure, so it is reaped when the database is reopened",
+                id.0
+            )));
         }
         if st.handle != Handle::Attached {
             return Err(LimboError::InvalidArgument(format!(
@@ -767,19 +845,26 @@ impl BranchStore {
     }
 
     /// The `Branch` handle has gone: release the branch.
-    pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
+    ///
+    /// An error when the release could not be made durable (review N4): the branch is then kept —
+    /// nothing is freed in this process — and comes back, detached, at the next open.
+    pub(crate) fn release_handle(&self, id: BranchId) -> Result<Reaped> {
         let mut inner = self.inner.lock();
         let Some(st) = inner.branches.get(&id) else {
-            return Reaped {
+            return Ok(Reaped {
                 freed_pages: 0,
                 deferred: false,
-            };
+            });
         };
-        if st.handle.is_released() {
-            return Reaped {
-                freed_pages: 0,
-                deferred: true,
-            };
+        match st.handle {
+            Handle::Released => {
+                return Ok(Reaped {
+                    freed_pages: 0,
+                    deferred: true,
+                })
+            }
+            Handle::ReleasePending => return Err(fail_stopped(id, "no release")),
+            Handle::Attached | Handle::Detached => {}
         }
         if let Err(e) = self.log(&mut inner, Record::Release { branch: id.0 }) {
             // The release is not durable, so nothing may be freed — now or ever in this process:
@@ -789,21 +874,23 @@ impl BranchStore {
             if let Some(st) = inner.branches.get_mut(&id) {
                 st.handle = Handle::ReleasePending;
             }
-            return Reaped {
-                freed_pages: 0,
-                deferred: true,
-            };
+            return Err(LimboError::InternalError(format!(
+                "branch {} was not released durably ({e}); it is kept, and comes back at the next \
+                 open",
+                id.0
+            )));
         }
         let mut freed = Vec::new();
         inner.apply_release(id, &mut freed);
         let freed_pages = freed.len();
         inner.release_slots(freed);
         self.sync_trunk_children(&inner);
+        self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
-        Reaped {
+        Ok(Reaped {
             freed_pages,
             deferred: inner.branches.contains_key(&id),
-        }
+        })
     }
 
     /// Detach a live branch from its handle without releasing it.
@@ -985,21 +1072,52 @@ impl BranchStore {
 
     /// Make every buffered trunk pre-image durable. `Pager::commit_wal` calls this before it writes
     /// a single frame, so a trunk commit is never durable ahead of the pre-images it overwrote.
+    ///
+    /// While a lease is outstanding it also stamps the lease clock, at most once per
+    /// `STAMP_EVERY_MS` (review N2), and flushes a stamp still only queued.
     pub(crate) fn durability_barrier(&self) -> Result<()> {
-        if !self.unsynced.load(Ordering::Acquire) {
+        if !self.unsynced.load(Ordering::Acquire)
+            && !self.leases_outstanding.load(Ordering::Acquire)
+        {
             return Ok(());
         }
         let mut inner = self.inner.lock();
+        // Re-read under the lock: `first_write_trunk` sets it while holding it.
+        let unsynced = self.unsynced.load(Ordering::Acquire);
         let StoreInner {
             journal,
             arena,
             failpoint,
             orphans,
+            lease,
+            leases,
             ..
         } = &mut *inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
+        if !unsynced {
+            // Only stamps are at stake: the buffer holds nothing else without `unsynced`. A trunk
+            // commit that needs no pre-image does not fail because its stamp could not be written;
+            // a lost stamp lengthens leases and loses no data.
+            if journal.is_poisoned() || leases.is_empty() {
+                return Ok(());
+            }
+            let now = lease.now_ms();
+            if now >= lease.queued_ms.saturating_add(STAMP_EVERY_MS) {
+                journal.buffer(&Record::Clock { now_ms: now })?;
+                lease.queued(now);
+            }
+            if lease.queued_ms > lease.durable_ms {
+                match journal.flush(arena) {
+                    Ok(()) => lease.flushed(),
+                    Err(e) => {
+                        tracing::warn!("branch lease clock not stamped at a trunk commit: {e}")
+                    }
+                }
+            }
+            return Ok(());
+        }
         if *failpoint == Some(BranchFailpoint::BarrierBeforeRecords) {
             *failpoint = None;
             *orphans = journal.pending_slots.clone();
@@ -1009,7 +1127,15 @@ impl BranchStore {
                     .to_string(),
             ));
         }
+        if !leases.is_empty() {
+            let now = lease.now_ms();
+            if now >= lease.queued_ms.saturating_add(STAMP_EVERY_MS) {
+                journal.buffer(&Record::Clock { now_ms: now })?;
+                lease.queued(now);
+            }
+        }
         journal.flush(arena)?;
+        lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         self.maybe_compact(&mut inner);
         Ok(())
@@ -1085,9 +1211,9 @@ impl BranchStore {
         // so a crash cannot lose the open time an agent spent committing (review R2).
         if !inner.leases.is_empty() {
             let now = inner.lease.now_ms();
-            if now > inner.lease.stamped_ms {
+            if now > inner.lease.queued_ms {
                 records.push(Record::Clock { now_ms: now });
-                inner.lease.stamped_ms = now;
+                inner.lease.queued(now);
             }
         }
         self.log_all(&mut inner, records)?;
@@ -1194,7 +1320,9 @@ impl Drop for BranchStore {
         let mut inner = self.inner.lock();
         let now = inner.lease.now_ms();
         // With no lease outstanding the clock's value constrains nothing, so a close writes nothing.
-        if !inner.leases.is_empty() && now > inner.lease.stamped_ms {
+        // Compared with what is DURABLE: a stamp only queued dies here with the journal (N3).
+        if !inner.leases.is_empty() && now > inner.lease.durable_ms {
+            inner.lease.queued(now);
             if let Err(e) = self.log(&mut inner, Record::Clock { now_ms: now }) {
                 tracing::debug!("branch lease clock not stamped at close: {e}");
             }
@@ -1266,11 +1394,11 @@ impl StoreInner {
         (records, lease)
     }
 
-    /// Apply the lease `fork_records` logged for a new branch, if any.
+    /// Apply the lease `fork_records` logged for a new branch, if any. (Its clock reading was
+    /// queued before the flush that carried it.)
     fn apply_fork_lease(&mut self, id: BranchId, lease: Option<(u64, u64)>) {
-        if let Some((deadline, now)) = lease {
+        if let Some((deadline, _)) = lease {
             self.apply_lease(id, deadline);
-            self.lease.stamped_ms = self.lease.stamped_ms.max(now);
         }
     }
 
@@ -1315,10 +1443,21 @@ impl StoreInner {
         match &self.files {
             None => self.arena = Some(Arena::new(page_size)),
             Some(files) => {
-                // Files that exist here held no recoverable state (`Journal::recover` said so):
-                // start them over.
-                self.arena = Some(Arena::open_file(&files.arena, page_size, true, &[])?);
-                self.journal = Some(Journal::create(files, page_size, self.sync)?);
+                // Files that exist here held no recoverable state when this store opened
+                // (`Journal::recover` said so): start them over. The journal first: it takes the
+                // log's lock and refuses files another store has written since (review N1), and
+                // the arena must not be truncated before that refusal. It is kept even if the
+                // arena then fails to open, so a retry does not take its own fresh log header for
+                // another store's state.
+                if self.journal.is_none() {
+                    self.journal = Some(Journal::create(files, page_size, self.sync)?);
+                }
+                let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
+                // The journal's create synced the directory before the arena file existed.
+                if self.sync {
+                    super::journal::fsync_dir_of(&files.arena)?;
+                }
+                self.arena = Some(arena);
             }
         }
         Ok(())

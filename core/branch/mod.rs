@@ -253,10 +253,12 @@ impl Branch {
         Ok(Branch::new(self.db.clone(), id))
     }
 
-    /// Release this branch. Dropping the handle does the same; this form reports what was freed.
+    /// Release this branch. Dropping the handle does the same; this form reports what was freed,
+    /// and an error when the release could not be made durable (the branch is then kept, and comes
+    /// back at the next open).
     pub fn reap(mut self) -> Result<Reaped> {
         self.released = true;
-        Ok(self.db.branches.release_handle(self.id))
+        self.db.branches.release_handle(self.id)
     }
 
     /// Grant or extend this branch's lease to `ttl` past now on the lease clock. A deadline only
@@ -285,7 +287,8 @@ impl Branch {
 impl Drop for Branch {
     fn drop(&mut self) {
         if !self.released {
-            self.db.branches.release_handle(self.id);
+            // A drop cannot report; the store has already logged a release that failed.
+            let _ = self.db.branches.release_handle(self.id);
         }
     }
 }
