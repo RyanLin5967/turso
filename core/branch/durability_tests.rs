@@ -1636,7 +1636,8 @@ fn a_failed_stamp_flush_keeps_the_trunk_commit_and_fail_stops_the_store() {
 /// Review 4 C1 and C6. The store-level half of the fork gate: a forked child holding a whole
 /// `Database` must write nothing — not the arena (a slot from its copy of the free list is the
 /// parent's next slot), not the log — and its refusals must name the fork, not an I/O failure.
-/// Runs alone in a fresh process (see `fork_driver`).
+/// Runs alone in a fresh process (see `fork_driver`). Gate: `cfg(unix)` — see `fork_driver` for why
+/// no narrower gate is needed (Android included).
 #[cfg(unix)]
 #[test]
 fn a_forked_child_cannot_write_through_an_inherited_database() {

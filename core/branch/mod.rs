@@ -543,6 +543,13 @@ impl Database {
 /// every descriptor of the process, so a child forked beside other running tests holds their
 /// journal locks until it exits, and a neighbour that drops a store and relocks its log inside that
 /// window fails. In a process that runs one test there is no neighbour.
+///
+/// GATE: `cfg(unix)`, and nothing narrower is needed. The tests close no descriptors (the fresh
+/// process has no neighbour whose lock a child could hold), so `getdtablesize`, which Android's
+/// libc lacks, is no longer called anywhere. Every libc call they make — `fork`, `waitpid`,
+/// `WIFEXITED`/`WEXITSTATUS`, `kill`, `_exit` — is declared for every unix target in libc 0.2.186,
+/// Android included (READ: `src/unix/mod.rs`'s unconditional `extern` block, and
+/// `src/unix/linux_like/mod.rs`).
 #[cfg(all(test, unix))]
 pub(crate) mod fork_driver {
     use std::path::{Path, PathBuf};

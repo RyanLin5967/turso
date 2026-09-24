@@ -1125,6 +1125,7 @@ mod tests {
     /// child's copy of a live journal is under the parent's lock. It must refuse to write — or the
     /// two processes interleave appends under one lock, and a torn frame cuts every later record.
     /// (Review 4 C8: it runs alone in a fresh process, so the fork duplicates no neighbour's lock.)
+    /// Gate: `cfg(unix)` — see `fork_driver` for why no narrower gate is needed (Android included).
     #[cfg(unix)]
     #[test]
     fn a_forked_child_cannot_write_through_an_inherited_journal() {
