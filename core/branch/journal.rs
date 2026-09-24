@@ -887,6 +887,66 @@ mod tests {
         );
     }
 
+    /// N1. Two journals must never be live on one log at once — not even for the window between a
+    /// Database's last reference and its pager's drop, nor through `Database::do_open`, which skips
+    /// the registry. The second is refused at open while the first lives, and admitted after.
+    #[test]
+    fn a_second_journal_on_one_log_is_refused_while_the_first_lives() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut arena = Arena::new(512);
+        let mut first = Journal::create(&files, 512, false).unwrap();
+        first.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        first.flush(&mut arena).unwrap();
+
+        assert!(Journal::recover(&files, false).is_err(), "a second journal recovered a live log");
+        assert!(Journal::create(&files, 512, false).is_err(), "a second journal re-created a live log");
+        // The refused create must not have truncated the live log on its way to being refused.
+        first.buffer(&Record::Release { branch: 1 }).unwrap();
+        first.flush(&mut arena).unwrap();
+        drop(first);
+        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        assert_eq!(
+            records,
+            vec![
+                Record::Fork { child: 1, parent: 0 },
+                Record::Release { branch: 1 }
+            ]
+        );
+    }
+
+    /// R7 made a snapshot field mean deadline + 1. A log or snapshot of another format version
+    /// must be REFUSED, not read with the wrong meaning — and not taken for a torn header, which
+    /// would silently start an empty store over it.
+    #[test]
+    fn a_log_or_snapshot_of_another_format_version_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let other = FORMAT_VERSION.wrapping_sub(1);
+        let mut header = Vec::new();
+        header.extend_from_slice(LOG_MAGIC);
+        put_u32(&mut header, other);
+        put_u32(&mut header, 512);
+        put_u64(&mut header, 0);
+        let crc = crc32c::crc32c(&header);
+        put_u32(&mut header, crc);
+        put_u32(&mut header, 0);
+        std::fs::write(&files.log, &header).unwrap();
+        assert!(Journal::recover(&files, false).is_err(), "a log of another version was accepted");
+
+        std::fs::remove_file(&files.log).unwrap();
+        let mut snap = Vec::new();
+        snap.extend_from_slice(SNAP_MAGIC);
+        put_u32(&mut snap, other);
+        put_u32(&mut snap, 512);
+        put_u64(&mut snap, 1);
+        SnapshotState::default().encode(&mut snap);
+        let crc = crc32c::crc32c(&snap);
+        put_u32(&mut snap, crc);
+        std::fs::write(&files.snap, &snap).unwrap();
+        assert!(Journal::recover(&files, false).is_err(), "a snapshot of another version was accepted");
+    }
+
     #[test]
     fn lease_and_clock_records_round_trip() {
         for record in [

@@ -960,7 +960,10 @@ fn a_release_whose_log_failed_frees_nothing_now_or_later() {
         assert_eq!(in_use(&db), held, "the interior's close freed pages the journal still names");
         let c1c = c1.connect().unwrap();
         drop(c1); // this Release fails too: the journal is fail-stopped
-        drop(c1c); // exit 2: the child's close climbs to the interior
+        // Not the climb exit: c1's own Release fails too (the journal is fail-stopped), so c1 is
+        // ReleasePending and its close returns at c1. The climb from a DURABLY released child is
+        // `a_durable_child_release_climbing_to_a_pending_interior_frees_nothing_of_it`.
+        drop(c1c);
         assert_eq!(in_use(&db), held, "a child's climb retired the interior");
 
         // And the fail-stopped store takes no write that could reuse a slot.
@@ -1053,6 +1056,7 @@ fn a_crash_image_keeps_the_open_time_a_branch_commit_stamped() {
     doomed.lease(Duration::from_secs(10)).unwrap();
     set(&doomed.connect().unwrap(), 150, "doomed");
     let doomed_slots = doomed.owned_slots();
+    assert!(!doomed_slots.is_empty(), "the doomed branch owns no page: its membership loop is vacuous");
     let doomed_id = doomed.into_id(); // the crashed agent
     let x = trunk.fork_branch().unwrap();
     let xc = x.connect().unwrap(); // connected BEFORE the deadline: no pass runs after it
@@ -1110,6 +1114,7 @@ fn an_interior_expired_under_its_own_open_connection_keeps_reading_its_own_pages
     let pc = p.connect().unwrap();
     set(&pc, 7, "p-pre");
     let pre: BTreeSet<u32> = p.owned_slots().into_iter().collect();
+    assert!(!pre.is_empty(), "the interior owns no pre-fork page: its membership loop is vacuous");
     let c = p.fork().unwrap();
     c.lease(Duration::from_secs(1000)).unwrap();
     set(&pc, 60, "p-post");
@@ -1220,4 +1225,193 @@ fn a_commit_open_across_the_poisoning_writes_no_slot() {
         len_before,
         "the commit wrote its page into the arena before its record failed"
     );
+}
+
+// ---- Re-review lane_turso_rereview.md @ 6c7ec0d: N1-N4, the climb exit, R7's format version ----
+
+/// The climb R1's main test does not reach: a child released DURABLY while its connection was open,
+/// BEFORE the journal failed, and closed after the interior's own release failed. Its close climbs
+/// to a ReleasePending interior, which must keep everything.
+#[test]
+fn a_durable_child_release_climbing_to_a_pending_interior_frees_nothing_of_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let p = trunk.fork_branch().unwrap();
+    set(&p.connect().unwrap(), 7, "p-pre");
+    let c1 = p.fork().unwrap();
+    let c2 = p.fork().unwrap();
+    {
+        let pc = p.connect().unwrap();
+        set(&pc, 60, "p-post");
+        set(&pc, 110, "p-post");
+    }
+    let c1c = c1.connect().unwrap();
+    drop(c1); // durable Release; deferred because c1c is open
+    let held = in_use(&db);
+    db.branch_failpoint(Some(BranchFailpoint::LogFlushFails));
+    drop(p); // the interior's Release fails: ReleasePending
+    drop(c1c); // c1 is freed (durably released), and its close climbs to P
+    assert_eq!(in_use(&db), held, "a durable child's climb retired a pending interior");
+    drop(c2);
+}
+
+/// N2. Trunk commits must stamp the lease clock too: a workload that writes ONLY the trunk would
+/// otherwise never make open time durable, and a crash would keep an abandoned leased branch alive.
+#[test]
+fn a_crash_image_keeps_the_open_time_trunk_commits_stamped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let abandoned = trunk.fork_branch().unwrap();
+    abandoned.lease(Duration::from_secs(10)).unwrap();
+    let abandoned_id = abandoned.into_id();
+    // The first write of this page after the fork buffers its pre-image, so that commit's barrier
+    // flushes anyway. The ones after the deadline rewrite the same page in the same epoch: nothing
+    // is buffered, and the barrier's fast path is the path under test (INFERRED: no hook exposes
+    // `unsynced`; the test is red on the unfixed code either way).
+    set(&trunk, 150, "trunk-first");
+    db.branch_lease_clock_advance(Duration::from_secs(11));
+    // Only the trunk is written after the deadline: no fork, connect, renew or expiry call.
+    set(&trunk, 150, "trunk-again");
+    set(&trunk, 150, "trunk-again-2");
+    let image = crash_image(&path, dir.path());
+
+    let crashed = open_at(&image, durable()).unwrap();
+    assert!(
+        !crashed.branch_ids().contains(&abandoned_id),
+        "trunk-only traffic left the lease clock unstamped, and the abandoned branch survived"
+    );
+}
+
+/// N3, clean-close half. A stamp that was only QUEUED (by a pass) is not durable; a clean close
+/// must still write it even when the clock has not moved since it was queued.
+#[test]
+fn a_queued_stamp_is_not_lost_at_a_clean_close() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        db.branch_lease_clock_freeze();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        let b = trunk.fork_branch().unwrap();
+        b.lease(Duration::from_secs(10)).unwrap();
+        db.branch_lease_clock_advance(Duration::from_secs(2));
+        drop(b.connect().unwrap()); // its pass QUEUES a stamp at exactly 2 s
+        let _ = b.into_id(); // then the close happens at the same (frozen) instant
+    }
+    let db = reopen(&path, incarnation);
+    assert!(
+        db.branch_lease_now() >= Duration::from_secs(2),
+        "the queued stamp died with the journal at a clean close: clock {:?}",
+        db.branch_lease_now()
+    );
+}
+
+/// N3, explicit-flush half. `expire_branches` promises a durable stamp; one QUEUED at the same
+/// instant must not make it skip the flush.
+#[test]
+fn expire_branches_flushes_a_stamp_that_was_only_queued() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    db.branch_lease_clock_freeze();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    b.lease(Duration::from_secs(10)).unwrap();
+    db.branch_lease_clock_advance(Duration::from_secs(2));
+    drop(b.connect().unwrap()); // queues a stamp at 2 s
+    db.expire_branches().unwrap(); // must flush it
+    let image = crash_image(&path, dir.path());
+    let crashed = open_at(&image, durable()).unwrap();
+    assert!(
+        crashed.branch_lease_now() >= Duration::from_secs(2),
+        "expire_branches returned without making the stamp durable: clock {:?}",
+        crashed.branch_lease_now()
+    );
+    drop(b);
+}
+
+/// N4. On a fail-stopped store the expiry pass cannot make a Release durable. It must SAY so,
+/// not report "nothing was due".
+#[test]
+fn a_fail_stopped_store_refuses_to_report_an_empty_expiry() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    let d = trunk.fork_branch().unwrap();
+    b.lease(Duration::from_secs(5)).unwrap();
+    db.branch_failpoint(Some(BranchFailpoint::LogFlushFails));
+    drop(d); // poisons
+    db.branch_lease_clock_advance(Duration::from_secs(6));
+    assert!(db.expire_branches().is_err(), "a fail-stopped pass reported an empty expiry");
+    drop(b);
+}
+
+/// N4. Nor may a fail-stopped store open a branch whose lease has run out: the pass that would have
+/// reaped it cannot run, so the connect must refuse on its own.
+#[test]
+fn a_fail_stopped_store_does_not_open_an_expired_branch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    let d = trunk.fork_branch().unwrap();
+    b.lease(Duration::from_secs(5)).unwrap();
+    db.branch_failpoint(Some(BranchFailpoint::LogFlushFails));
+    drop(d); // poisons
+    db.branch_lease_clock_advance(Duration::from_secs(6));
+    assert!(b.connect().is_err(), "an expired branch was opened on a fail-stopped store");
+}
+
+/// N4. A reap whose Release could not be made durable did not happen durably: it is an error, not
+/// a "deferred" success.
+#[test]
+fn a_reap_that_is_not_durable_is_an_error() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    db.branch_failpoint(Some(BranchFailpoint::LogFlushFails));
+    assert!(b.reap().is_err(), "a reap that is not durable reported success");
+}
+
+/// N1. A second branch store over the same files — a reopen inside the registry's `Weak` window,
+/// or `Database::do_open`, which skips the registry — must refuse at open while the first lives,
+/// and open once it has gone.
+#[test]
+fn a_second_store_over_live_branch_files_refuses_at_open() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    set(&b.connect().unwrap(), 3, "b");
+    let durability = BranchDurability::Durable { sync: true };
+    assert!(
+        store::BranchStore::open(durability, None, path.to_str().unwrap()).is_err(),
+        "a second store opened over a live store's branch log"
+    );
+    let b_id = b.into_id();
+    drop(trunk);
+    drop(db);
+    let second = store::BranchStore::open(durability, None, path.to_str().unwrap())
+        .expect("the first store is gone, so its lock is too");
+    assert!(second.ids().contains(&b_id), "the refused open damaged the first store's state");
 }

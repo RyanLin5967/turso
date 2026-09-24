@@ -444,6 +444,13 @@ impl Database {
         self.branches.lease_now()
     }
 
+    /// Stop real time moving the lease clock (it keeps its value; `branch_lease_clock_advance`
+    /// still moves it), so a test can reach same-millisecond orderings deterministically.
+    #[doc(hidden)]
+    pub fn branch_lease_clock_freeze(&self) {
+        self.branches.freeze_lease_clock();
+    }
+
     /// Arm (or clear) a crash failpoint for the durability tests.
     #[doc(hidden)]
     pub fn branch_failpoint(&self, failpoint: Option<BranchFailpoint>) {

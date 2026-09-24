@@ -148,6 +148,9 @@ struct LeaseClock {
     opened: Instant,
     /// Test-only forward motion (`Database::branch_lease_clock_advance`).
     advanced_ms: u64,
+    /// Test-only: real time no longer moves the clock (`Database::branch_lease_clock_freeze`), so
+    /// a test can hit "same millisecond" orderings deterministically.
+    frozen: bool,
     /// The largest value written to the journal.
     stamped_ms: u64,
 }
@@ -158,14 +161,30 @@ impl LeaseClock {
             base_ms: 0,
             opened: Instant::now(),
             advanced_ms: 0,
+            frozen: false,
             stamped_ms: 0,
         }
     }
 
     fn now_ms(&self) -> u64 {
+        let real = if self.frozen {
+            0
+        } else {
+            millis(self.opened.elapsed())
+        };
         self.base_ms
-            .saturating_add(millis(self.opened.elapsed()))
+            .saturating_add(real)
             .saturating_add(self.advanced_ms)
+    }
+
+    /// Stop real time moving the clock, keeping `now` where it is (it must never move back).
+    fn freeze(&mut self) {
+        if !self.frozen {
+            self.advanced_ms = self
+                .advanced_ms
+                .saturating_add(millis(self.opened.elapsed()));
+            self.frozen = true;
+        }
     }
 
     /// Recovery saw the clock at `ms`. The clock only moves forward.
@@ -613,6 +632,11 @@ impl BranchStore {
 
     pub(crate) fn lease_now(&self) -> Duration {
         Duration::from_millis(self.inner.lock().lease.now_ms())
+    }
+
+    /// Stop real time moving the lease clock, for tests.
+    pub(crate) fn freeze_lease_clock(&self) {
+        self.inner.lock().lease.freeze();
     }
 
     /// Append `record` and make it durable before the caller acts on it. A no-op when volatile.
@@ -1692,6 +1716,37 @@ impl StoreInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N1, the lazy door. A store that opened when no branch files existed holds no lock until its
+    /// first fork creates them. If another store created them in between, that first fork must
+    /// refuse — while the other lives (its lock) and after it has gone (its files now hold state):
+    /// "start the files over" is only right for files that held nothing recoverable.
+    #[test]
+    fn a_store_that_opened_before_the_files_existed_does_not_start_them_over() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let durable = BranchDurability::Durable { sync: false };
+        let late = BranchStore::open(durable, None, path).unwrap();
+        {
+            let first = BranchStore::open(durable, None, path).unwrap();
+            let mut inner = first.inner.lock();
+            inner.ensure_backing(512).unwrap();
+            first.log(&mut inner, Record::Release { branch: 7 }).unwrap();
+            drop(inner);
+            assert!(
+                late.inner.lock().ensure_backing(512).is_err(),
+                "a second store created its files over a live store's"
+            );
+        }
+        assert!(
+            late.inner.lock().ensure_backing(512).is_err(),
+            "a store started over files another store had written since it opened"
+        );
+        let files = BranchFiles::for_db(path);
+        let recovered = Journal::recover(&files, false).unwrap().expect("state");
+        assert_eq!(recovered.records, vec![Record::Release { branch: 7 }]);
+    }
 
     /// R7. A deadline of 0 is a real deadline (`lease(ZERO)` at the clock's first millisecond),
     /// and must not come back from a snapshot as "no lease" — which would make the branch
