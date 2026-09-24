@@ -2214,15 +2214,18 @@ fn a_sidecar_refusal_keeps_frames_only_while_the_real_file_does_not_exist() {
     );
     // Review 10 (lead's decision F8; PREREG A5): "no other build or program" left out THIS build's
     // own opens that never create {ours} — one with a custom WAL path writes newer pages into
-    // {real} and leaves {ours} absent. So nothing at all may have opened the database since,
-    // except through {ours}.
+    // {real} and leaves {ours} absent. So nothing at all may have opened the database since.
     assert!(
         err.contains("nothing has opened this database since"),
         "the condition still exempts this build's own opens: {err}"
     );
+    // Review 11 (lead's decision, reversing F8's exemption; PREREG A6): an open of {real} by
+    // SQLite goes through {real}-wal, which IS {ours}, and SQLite deletes it at its last close; so
+    // "except through {ours}" re-admitted exactly the openers review 9 closed. No exemption.
     assert!(
-        err.contains("except through"),
-        "the condition does not name the one open that keeps the frames: {err}"
+        !err.contains("except through"),
+        "the condition exempts opens through {{ours}}, which a program can delete after writing: \
+         {err}"
     );
 }
 
