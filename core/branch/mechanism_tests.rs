@@ -822,3 +822,30 @@ fn a_multi_process_database_is_refused() {
     };
     assert!(err.contains("multi-process"), "{err}");
 }
+
+#[test]
+fn a_rolled_back_branch_ddl_restores_the_branch_schema_not_the_trunks() {
+    // The trunk's schema must DIFFER from the branch's here; with equal schemas, restoring the
+    // wrong one on rollback is indistinguishable from restoring the right one.
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    trunk.execute("CREATE TABLE trunk_only(x)").unwrap();
+
+    let bc = b.connect().unwrap();
+    bc.execute("CREATE TABLE branch_only(y)").unwrap();
+    bc.execute("BEGIN").unwrap();
+    bc.execute("CREATE TABLE rolled_back(z)").unwrap();
+    bc.execute("ROLLBACK").unwrap();
+
+    // Prepare-time checks read the CONNECTION's schema, which is exactly what rollback restored.
+    assert!(bc.prepare("SELECT y FROM branch_only").is_ok(), "rollback lost the branch's table");
+    assert!(bc.prepare("SELECT z FROM rolled_back").is_err(), "rollback kept rolled-back DDL");
+    assert!(
+        bc.prepare("SELECT x FROM trunk_only").is_err(),
+        "rollback installed the TRUNK's schema on a branch connection"
+    );
+    set(&bc, 3, "after-rollback");
+    assert_eq!(value(&bc, 3), Some("after-rollback".to_string()));
+}
