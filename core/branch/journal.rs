@@ -1352,9 +1352,18 @@ mod tests {
             Ok(_) => panic!("a zeroed hole before a whole frame was cut as a torn tail"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("truncate"), "the refusal names no remedy: {err}");
-        assert!(err.contains(&files.log.display().to_string()), "the refusal names no file: {err}");
-        assert!(err.contains(&hole_at.to_string()), "the refusal names no cut point: {err}");
+        // Review 7 item 1 (lead's decision) withdrew the remedy this test first pinned ("truncate it
+        // to {pos}"): with acknowledged records after the hole, truncating drops trunk pre-images
+        // whose commits are durable, and branches then read newer trunk pages silently. Nothing in
+        // the log tells acknowledged records from unacknowledged ones. The safe remedy is to move
+        // ALL THREE branch files aside, and a copy of all three is what a restore needs.
+        assert!(!err.contains("truncate it to"), "the refusal still recommends truncating: {err}");
+        assert!(err.contains("aside"), "the refusal names no safe remedy: {err}");
+        for file in [&files.log, &files.arena, &files.snap] {
+            let file = file.display().to_string();
+            assert!(err.contains(&file), "the refusal does not name {file}: {err}");
+        }
+        assert!(err.contains(&hole_at.to_string()), "the refusal does not say where the hole is: {err}");
     }
 
     /// The premise that makes a zero length torn: no record encodes to an empty payload, because

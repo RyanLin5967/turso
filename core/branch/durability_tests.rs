@@ -2127,6 +2127,14 @@ fn a_sidecar_refusal_names_a_remedy_true_for_its_file() {
 fn a_name_too_long_for_branch_files_opens_volatile() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join(format!("{}.db", "n".repeat(245)));
+    // Review 7 item 5: the premise, asserted — on a filesystem with a larger NAME_MAX this test
+    // would otherwise pass without testing anything.
+    let branch_log = format!("{}-branch-log", path.display());
+    assert_eq!(
+        std::fs::metadata(&branch_log).unwrap_err().raw_os_error(),
+        Some(libc::ENAMETOOLONG),
+        "premise: the branch log's name is too long for this filesystem"
+    );
     let db = open_at(&path, DatabaseOpts::new())
         .unwrap_or_else(|e| panic!("a name too long for branch files refused a volatile open: {e}"));
     seed(&db.connect().unwrap(), 3);
@@ -2157,6 +2165,87 @@ fn a_registry_hit_of_another_branch_durability_is_refused() {
     seed(&unsynced.connect().unwrap(), 3);
     let err = match open_at(&path, durable()) {
         Ok(_) => panic!("a sync: true open received the sync: false instance"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("branch durability"), "refused for another reason: {err}");
+}
+
+// ---- Review 7 (lane_turso_review7.md @ 51196f4) ----
+
+/// Review 7 item 4 (lead's decision). The "keep them" half of the WAL/log remedy must hold only
+/// while the canonical file does NOT exist: any open of the real path creates it, even empty, and
+/// its pages may then be newer than the frames. A 0-byte canonical file must not read as "nothing
+/// was written since".
+#[cfg(unix)]
+#[test]
+fn a_sidecar_refusal_keeps_frames_only_while_the_real_file_does_not_exist() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let real = dir.path().join("real.db");
+    {
+        let db = open_at(&real, DatabaseOpts::new()).unwrap();
+        seed(&db.connect().unwrap(), 5);
+    }
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::fs::write(format!("{}-wal", link.display()), [0x5A; 4096]).unwrap();
+    let err = match open_at(&link, DatabaseOpts::new()) {
+        Ok(_) => panic!("opened past a WAL under another name"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("does not exist"), "the rename is not conditioned on absence: {err}");
+    assert!(err.contains("even empty"), "a 0-byte canonical file could read as untouched: {err}");
+}
+
+/// Review 7 item 2 (lead's decision). A registry hit must not hand a read-write open an instance
+/// opened with ANOTHER default lease: a caller whose branches must never expire would receive one
+/// whose forks are leased and reaped when the lease runs out, silently (and the reverse leaks
+/// branches meant to be temporary).
+#[test]
+fn a_registry_hit_of_another_lease_setting_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("leased.db");
+    let leased = open_at(
+        &path,
+        DatabaseOpts::new().with_branch_lease(Some(Duration::from_secs(60))),
+    )
+    .unwrap();
+    seed(&leased.connect().unwrap(), 3);
+    let err = match open_at(&path, DatabaseOpts::new()) {
+        Ok(_) => panic!("an open with no default lease received the leased instance"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("lease"), "refused for another reason: {err}");
+    drop(leased);
+    open_at(&path, DatabaseOpts::new()).expect("with the leased handle closed, the open works");
+}
+
+/// Open through `Database::open_async`, the registry's second hit path, driving its IO loop.
+fn open_async_at(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let file = io.open_file(path.to_str().unwrap(), OpenFlags::Create, true)?;
+    let options = crate::OpenOptions::new(Arc::new(SqliteDialect))
+        .storage(Arc::new(crate::storage::database::DatabaseFile::new(file)))
+        .db_opts(opts);
+    let mut state = crate::OpenDbAsyncState::new();
+    loop {
+        match Database::open_async(&mut state, io.clone(), path.to_str().unwrap(), &options)? {
+            crate::types::IOResult::Done(db) => return Ok(db),
+            crate::types::IOResult::IO(completion) => completion.wait(&*io)?,
+        }
+    }
+}
+
+/// Review 7 item 5 (lead's decision): the async registry-hit path (`open_async`'s `Ready` arm)
+/// makes the same branch-store check as `Database::open`'s. A guard: green since 4e45e59a7; it is
+/// here to kill the mutant that deletes that call.
+#[test]
+fn an_async_registry_hit_of_another_branch_durability_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("volatile.db");
+    let volatile = open_at(&path, DatabaseOpts::new()).unwrap();
+    seed(&volatile.connect().unwrap(), 3);
+    let err = match open_async_at(&path, durable()) {
+        Ok(_) => panic!("an async durable open received the volatile instance"),
         Err(err) => err.to_string(),
     };
     assert!(err.contains("branch durability"), "refused for another reason: {err}");
