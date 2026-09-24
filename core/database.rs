@@ -518,25 +518,30 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         // written before the database changed under another name would overwrite newer pages.
         return Err(LimboError::InvalidArgument(match holds {
             // "Keep them" needs BOTH conditions (review 8 F1, the lead's decision): {ours} does
-            // not exist — any open of {real} by THIS build with its default WAL creates it, even
-            // empty (review 7 item 4) — AND nothing has opened the database since, by ANY name,
-            // {real} included, except through {ours} (review 9's and review 10 F8's wording, the
-            // lead's). A build that names sidecars from the path as given (earlier fork builds;
-            // upstream Turso for the WAL) opening it through a third name writes newer pages and
-            // leaves {ours} absent; so can a program whose open, even of {real} itself, leaves no
-            // {ours} behind — and so can THIS build's own open with a custom `wal_path`
-            // (`do_open`), which never creates {ours}. Absence proves nothing about those opens.
+            // not exist — any read-write open of {real} by THIS build with its default sidecars
+            // creates it, even empty (review 7 item 4; review 11 finding 4: a read-only open
+            // creates no WAL, and this message also serves the MVCC log) — AND nothing has opened
+            // the database since, by ANY name, {real} included (review 9's wording, the lead's),
+            // with NO exemption. A build that names sidecars from the path as given (earlier fork
+            // builds; upstream Turso for the WAL) opening it through a third name writes newer
+            // pages and leaves {ours} absent; so can a program whose open, even of {real} itself,
+            // leaves no {ours} behind — SQLite's WAL for {real} IS {ours}, and it deletes it at
+            // its last close, which is why review 10 F8's "except through {ours}" was withdrawn
+            // (review 11 finding 1, the lead's reversal) — and so can THIS build's own open with a
+            // custom `wal_path` (`do_open_async`, the sync engine's revert database; the
+            // test-only `do_open`), which never creates {ours}. Absence proves nothing about
+            // those opens.
             Some(what) => format!(
                 "{other} holds {what} that this open would miss: they were written through the \
                  name {given} before sidecars were named from the resolved path, and this \
                  database's file of that kind is {ours}. They belong to whichever database {given} \
                  named when they were written, which may not be this one. To keep them, ALL of \
-                 these must hold: that database was {real}; {ours} does not exist — any open of \
-                 {real} by this build with its default WAL would have created it, even empty; and \
-                 nothing has opened this database since, by any name, {real} included, except \
-                 through {ours} — an open that leaves no {ours} behind can still write pages newer \
-                 than these {what}. Then, with no process using the database, rename {other} to \
-                 {ours}, and the next open reads them. Otherwise, or if you cannot tell, move \
+                 these must hold: that database was {real}; {ours} does not exist — any \
+                 read-write open of {real} by this build with its default sidecars would have \
+                 created it, even empty; and nothing has opened this database since, by any name, \
+                 {real} included — an open that leaves no {ours} behind can still write pages \
+                 newer than these {what}. Then, with no process using the database, rename {other} \
+                 to {ours}, and the next open reads them. Otherwise, or if you cannot tell, move \
                  {other} aside: this database then opens without them",
                 other = other.display(),
                 ours = ours.display()
@@ -1258,7 +1263,8 @@ impl Database {
     ///   branch durability") that an ATTACH has no way to follow;
     /// * a read-write ATTACH that misses registers a volatile, unleased instance, so while it is
     ///   attached, its owner's durable or leased open of that database is refused here ("close
-    ///   the other handle first").
+    ///   the other handle first"). So does a READ-ONLY ATTACH that misses a database with no
+    ///   branch files: this check reads the CALLER's flags (review 11 finding 6).
     ///
     /// A READ-ONLY ATTACH that misses (URI `mode=ro`, or under a read-only main) opens trunk-only
     /// when branch files exist and is not refused; while it is attached, its owner's read-write
