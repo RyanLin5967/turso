@@ -383,3 +383,72 @@ turso_core --lib` gives **2466 passed, 0 failed, 17 ignored**, unchanged.
 mutants**. There are **115**. `OTHER_d`, which drops ", except through {ours}", was added so the
 keeps-frames test's second new assertion ("except through") has a mutant of its own. It is killed
 by that test. Nothing else in A5 changes.
+
+### A6 — 2026-09-24: review 11 — the F8 exemption is withdrawn (appended before any code of it)
+
+Nothing above this amendment changes. Source: `frontier/turso_review11.md` @ artie-research
+`25c29a7` (UNSOUND on one item, at `52df80c7a`), with the lead's decisions. None of these tests has
+been built or run.
+
+**A REVERSAL of review 10's decision F8, by the lead.** A5 adopted "nothing has opened this database
+since, by any name, {real} included, except through {ours}". That wording was the lead's review-10
+decision ("F8, my decision: adopt the wider wording …", quoted verbatim in the lane report), and the
+lead now reverses it.
+- The reason (review 11 finding 1, which the lead checked against `database.rs` ~488-491): SQLite
+  opening `{real}` uses `{real}-wal`, and that IS `{ours}`.
+- So ", except through {ours}" re-admits exactly the openers that delete `{ours}` after writing
+  through it: SQLite at its last close, a manual `rm`, a backup tool. Review 9's decision 2 closed
+  that case.
+- It also contradicted the message's own next clause.
+- The condition is now "nothing has opened this database since, by any name, {real} included",
+  with no exemption.
+
+**Test changes.** They go in the commit right after this amendment, which holds tests only.
+1. `a_sidecar_refusal_keeps_frames_only_while_the_real_file_does_not_exist`: the assertion
+   `err.contains("except through")` is removed (the lead's decision). In its place is the negative
+   `!err.contains("except through")`, whose panic is "the condition exempts opens through {ours},
+   which a program can delete after writing". This is beyond the letter: it gives the withdrawal a
+   red test, and it keeps the exemption from coming back unseen.
+2. No other test changes. The new mutants (below) are killed by existing assertions.
+
+**P28. The red commit (tests only; code `52df80c7a`).** `cargo test -p turso_core --lib branch::`
+gives **116 passed, 1 FAILED**: the keeps-frames test, with a panic containing "exempts opens
+through". The four assertions before it hold at `52df80c7a`.
+
+**P29. The fix commit.** `branch::` gives **117 passed, 0 failed**. The full `cargo test -p
+turso_core --lib` gives **2466 passed, 0 failed, 17 ignored**, unchanged.
+
+**P30. Fire-check at the fix commit: 118 mutants.**
+- Removed: `OTHER_d`, whose assertion is gone.
+- New: `OTHER_e` restores ", except through {ours}", and is killed by the negative assertion.
+- New: `ATT_d` makes an ATTACH skip BOTH registry lookups (`resolve_default_storage`'s
+  `if use_registry {` and `open_async`'s Init lookup). It is killed by the ATTACH test. The test
+  dies in one of two ways, depending on the lock primitive (review 11 finding 2):
+  - the second instance opens, and `ptr_eq` panics "received another instance";
+  - or the second open is refused with a locking error, and the test's final assert lists it.
+
+  Either is KILLED. The mutant's LOG records which one happened, and the batch reads it.
+- New: `LEASE_b` rewords "is open in this process with default branch lease" (the lead's
+  decision). Beyond the letter, `REG_c` rewords "is open in this process with branch durability".
+  Each is killed ONLY by the ATTACH test's negative control ("refused for another reason"). The
+  registry tests' own looser `contains` still pass under them.
+- Re-anchored: `KEEP_a`, `OTHER_a` and `OTHER_b`, to the new text.
+
+**P31. The runner (no cargo).** A subset run (`firecheck_run.py <out> NAME …`) that names an
+unknown mutant is REFUSED, and returns 2. `--self-test` asserts it, and a plant that removes the
+refusal is caught.
+
+**Also in the fix commit, doc and wording only (review 11 findings 4–6):**
+- Condition 2's reason becomes "any read-write open of {real} by this build with its default
+  sidecars would have created it". A read-only open creates no WAL, and the same message serves
+  the MVCC log.
+- The code comment names `do_open_async`, the production custom-WAL open (the sync engine's revert
+  database), as well as the test-only `do_open`.
+- The limitations doc's second bullet also covers a read-only ATTACH that misses a database with
+  no branch files.
+
+**Falsifiers for A6:**
+- In P28, any other failure.
+- In P29, a red ATTACH or keeps-frames test.
+- In P30, `ATT_d` SURVIVED: the ATTACH test does not notice a second instance, and so `ptr_eq` is
+  not live.
