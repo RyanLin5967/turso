@@ -292,6 +292,9 @@ impl BranchStore {
                         for record in &recovered.records {
                             inner.replay(record, &mut ignored)?;
                         }
+                        // A snapshot can hold a released branch that was kept only by an open
+                        // connection; after a restart nothing is open.
+                        inner.collect_released(&mut ignored);
                         let referenced = inner.referenced_slots();
                         inner.arena = Some(Arena::open_file(
                             &files.arena,
@@ -1017,6 +1020,19 @@ impl StoreInner {
                 .expect("a live branch's parent is kept while the branch lives");
             parent.lineage.child_gone(st.fork_epoch, freed);
             id = st.parent;
+        }
+    }
+
+    /// Collect every released branch that nothing reads through any more.
+    fn collect_released(&mut self, freed: &mut Vec<Slot>) {
+        let released: Vec<BranchId> = self
+            .branches
+            .iter()
+            .filter(|(_, st)| st.handle == Handle::Released)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in released {
+            self.collect(id, freed);
         }
     }
 

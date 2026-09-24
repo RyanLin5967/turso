@@ -648,3 +648,32 @@ fn a_garbled_last_record_is_discarded_like_a_short_one() {
     assert_eq!(value(&bc, 7), Some("first".to_string()));
     assert_eq!(value(&bc, 150), Some(original(150)));
 }
+
+#[test]
+fn a_release_deferred_by_an_open_connection_is_still_a_release_after_compaction() {
+    // Dropping a handle while its connection is open logs the release but defers the free. A
+    // compaction in that window snapshots a RELEASED branch; after a restart nothing is open, so
+    // recovery must free it rather than keep it forever.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 50);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        set(&bc, 7, "b");
+        drop(b);
+        assert_eq!(db.branch_stats().live_branches, 1, "the open connection did not defer it");
+        db.branch_compact_now().unwrap();
+        drop(bc);
+        assert_eq!(db.branch_stats().live_branches, 0);
+        assert!(in_use(&db).is_empty());
+    }
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_stats().live_branches, 0, "a released branch came back from a snapshot");
+    assert!(in_use(&db).is_empty(), "its pages came back with it");
+    assert!(db.branch_ids().is_empty());
+}
