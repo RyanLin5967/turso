@@ -452,3 +452,63 @@ refusal is caught.
 - In P29, a red ATTACH or keeps-frames test.
 - In P30, `ATT_d` SURVIVED: the ATTACH test does not notice a second instance, and so `ptr_eq` is
   not live.
+
+### A7 — 2026-09-24: review 12 — four LOWs (appended before any code of it, and before any build of the batch)
+
+Nothing above this amendment changes. Source: `frontier/lane_turso_review12.md` @ artie-research
+`2a6a622` (SOUND-WITH-CAVEATS at `31211030b`), with the lead's decision to fold in all four LOWs
+before BATCH v15's failing-first phase. The head phase was stopped while it was still waiting for
+the build lock, before any cargo ran, so the batch will run at the tip this amendment leads to.
+
+**Errata to A6 (review 12 finding 3).**
+- P28 says "The four assertions before it hold at `52df80c7a`". There are FIVE: "does not exist",
+  "even empty", "by any name", "real.db included" and "nothing has opened this database since".
+  The prediction itself (116/1, the negative assertion's panic) is unchanged.
+- Test change 2 says the new mutants are killed by existing assertions. That is wrong for
+  `OTHER_e`, which is killed by the NEW negative assertion.
+- (Review 12 INFO 5.) A6's "it keeps the exemption from coming back unseen" holds for THAT wording
+  only. A rewording such as "unless it went through {ours}" would pass the negative assertion.
+
+**Finding 1: condition 2's reason is scoped per sidecar.** The same message serves the MVCC log,
+and a read-write open by this build creates the log only while the database header says MVCC. The
+reason becomes "any read-write open of {real} by this build creates its WAL, and, while the database
+is in MVCC mode, its log, even empty". The code comment's two WAL-only statements (SQLite's WAL IS
+`{ours}`; a custom-`wal_path` open never creates `{ours}`) are scoped to the WAL copy. Condition 3,
+unchanged, carries every open that condition 2's reason misses.
+
+**Test change** (the commit right after this amendment, tests only): the keeps-frames test also
+asserts "in MVCC mode" (panic: "condition 2's reason is not scoped to the MVCC log's mode"). This is
+mine, beyond the letter: it gives the correction a red test. No test is added or removed: 118
+`#[test]` attributes, 117 on unix.
+
+**Finding 2: ATT_d is judged by its kill REASON.** P30's "Either is KILLED" is SUPERSEDED. The
+runner (artie-research `6c8db6f`) has `KILL_REASONS`: ATT_d reads KILLED only when the ATTACH
+test's OWN panic says "received another instance", which is `Arc::ptr_eq` firing. A kill by a lock
+refusal reads "KILLED FOR ANOTHER REASON", which is not the expected verdict, so the run exits 1.
+Only a kill through `ptr_eq` closes review 11 finding 2.
+
+**Finding 4: the runner refuses a results path that is not a NEW `.json` file in an existing run
+directory** (exit 2; `6c8db6f`). A mutant name in that slot no longer runs every mutant.
+
+**Not taken: review 12 INFO 6.** Its suggested wording ("… other than opens refused as this one
+was") adds an exemption-shaped clause to the condition the lead just stripped of one. Read
+literally, the present text falls to the safe branch ("if you cannot tell, move … aside"). The
+wording is the lead's to change.
+
+**P32. The red commit (tests only; code `31211030b`).** `cargo test -p turso_core --lib branch::`
+gives **116 passed, 1 FAILED**: the keeps-frames test, with the panic "not scoped to the MVCC log's
+mode". Its six assertions before the new one hold at `31211030b`.
+
+**P33. The fix commit.** `branch::` gives **117 passed, 0 failed**. The full `cargo test -p turso_core
+--lib` gives **2466 passed, 0 failed, 17 ignored**, unchanged.
+
+**P34. Fire-check at the fix commit: 119 mutants.**
+- `KEEP_b`, new, drops ", and, while the database is in MVCC mode, its log,". It is killed by the
+  new assertion.
+- `KEEP_a` and any `OTHER_*` anchor that moved are re-anchored, and the audit reports no problems.
+- ATT_d must read KILLED with its registered reason (above).
+
+**Falsifiers for A7:**
+- In P32, any other failure.
+- In P34, ATT_d reading "KILLED FOR ANOTHER REASON": the ATTACH received a lock refusal, not a
+  second instance, so `ptr_eq` stays unfired.
