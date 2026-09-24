@@ -1906,6 +1906,51 @@ impl StoreInner {
 mod tests {
     use super::*;
 
+    /// Found while fixing review 3 F4: when every branch is gone, nothing refuses a page-size
+    /// change (VACUUM and journal-mode changes are refused only while a branch exists). A store
+    /// with nothing in it must then follow the database to the new page size. Before, its arena's
+    /// old size refused every later fork, across reopens too: recovery opens the arena with the
+    /// log's page size.
+    #[test]
+    fn an_empty_store_follows_the_database_to_a_new_page_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: false }, None, path).unwrap();
+        store.inner.lock().ensure_backing(512).unwrap();
+        store
+            .inner
+            .lock()
+            .ensure_backing(1024)
+            .expect("an empty store refused the database's new page size");
+        {
+            let mut inner = store.inner.lock();
+            store.log(&mut inner, Record::Release { branch: 9 }).unwrap();
+        }
+        drop(store);
+        let recovered = Journal::recover(&BranchFiles::for_db(path), false)
+            .unwrap()
+            .expect("state");
+        assert_eq!(recovered.page_size, 1024, "the store kept the old page size");
+        assert_eq!(recovered.records, vec![Record::Release { branch: 9 }]);
+    }
+
+    /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
+    /// a page-size change, and must keep refusing it.
+    #[test]
+    fn a_store_holding_a_branch_refuses_a_new_page_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: false }, None, path).unwrap();
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(512).unwrap();
+        inner
+            .apply_fork(BranchId::TRUNK, BranchId(1), None, Handle::Detached)
+            .unwrap();
+        assert!(inner.ensure_backing(1024).is_err(), "a store holding a branch changed page size");
+    }
+
     /// Review 3 F4. A journal kept from a first fork whose ARENA failed to open holds only its
     /// header, written for that attempt's page size. A retry at another page size must not append
     /// under the old one: recovery would then open the arena with the wrong page size.
