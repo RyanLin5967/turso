@@ -896,8 +896,13 @@ impl Journal {
 ///   since 1.87, the toolchain is 1.88), and from the long-name errors on Windows (recalled). A
 ///   database file name of 244–250 bytes fits NAME_MAX with its `-wal` and `-tshm` but not with
 ///   `-branch-snap`, which `exist` checks first (243–250 through a symlink, where the refusal also
-///   checks `-branch-arena`), so those files cannot exist. (At 251 bytes the multiprocess probe's
-///   `-tshm` is 256 bytes and the database does not open at all: review 8 F4.)
+///   checks `-branch-arena`), so those files cannot exist. The upper bound 250 holds only where
+///   the multiprocess `-tshm` probe runs — a `host_shared_wal` build (64-bit unix or Windows), an
+///   IO whose `supports_shared_wal_coordination` is true (unix, io_uring and iocp; the trait's
+///   default is false), and a filesystem `path_allows_shared_wal_coordination` accepts: there a
+///   251-byte name's `-tshm` is 256 bytes and the database does not open at all (review 8 F4).
+///   Elsewhere a 251-byte name opens (its `-wal` is 255 bytes), and the range is 244–251 (243–251
+///   through a symlink) (review 9 finding 7b).
 /// * `Unsupported` WITHOUT an OS error: std's unsupported-platform error, which carries no errno.
 ///   wasm32-unknown-unknown's std `fs` is std's `unsupported` backend (READ: std `sys/fs/mod.rs`
 ///   selects it for every target that is neither unix, wasi, windows nor a listed OS), and that
