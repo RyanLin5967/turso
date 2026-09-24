@@ -637,3 +637,163 @@ fn a_reprepared_branch_statement_keeps_the_branch_schema_and_never_publishes_it(
         assert_eq!(rows(&conn, "SELECT count(*) FROM tr1")[0][0].as_int(), Some(0));
     }
 }
+
+#[test]
+fn savepoint_and_statement_rollback_on_a_branch_undo_only_their_own_work() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+
+    bc.execute("BEGIN").unwrap();
+    set(&bc, 10, "kept");
+    bc.execute("SAVEPOINT sp").unwrap();
+    set(&bc, 10, "undone");
+    set(&bc, 11, "undone");
+    bc.execute("ROLLBACK TO sp").unwrap();
+    bc.execute("RELEASE sp").unwrap();
+    // A statement that fails half way: the first row inserts, the second collides.
+    let failed = bc.execute(format!(
+        "INSERT INTO t VALUES (5000, 'partial'), (1, '{}')",
+        original(1)
+    ));
+    assert!(failed.is_err(), "the colliding insert succeeded");
+    bc.execute("COMMIT").unwrap();
+
+    drop(bc);
+    let bc = b.connect().unwrap();
+    assert_eq!(value(&bc, 10), Some("kept".to_string()));
+    assert_eq!(value(&bc, 11), Some(original(11)));
+    assert_eq!(value(&bc, 5000), None, "a failed statement's first row survived");
+    assert_eq!(value(&trunk, 10), Some(original(10)));
+}
+
+#[test]
+fn indexes_and_overflow_pages_branch_like_table_leaves() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE big(id INTEGER PRIMARY KEY, k TEXT, body TEXT)")
+        .unwrap();
+    trunk.execute("CREATE INDEX big_k ON big(k)").unwrap();
+    // `replace(hex(zeroblob(n)), '0', 'a')` is 2n 'a's: a TEXT long enough that every row spills
+    // onto a chain of overflow pages, with a distinguishing last character.
+    let body = |n: usize, tail: &str| format!("replace(hex(zeroblob({n})), '0', 'a') || '{tail}'");
+    trunk.execute("BEGIN").unwrap();
+    for id in 1..=40 {
+        trunk
+            .execute(format!(
+                "INSERT INTO big VALUES ({id}, 'k{id:03}', {})",
+                body(5000, &format!("{}", id % 10))
+            ))
+            .unwrap();
+    }
+    trunk.execute("COMMIT").unwrap();
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+
+    bc.execute(format!("UPDATE big SET k = 'branch', body = {} WHERE id = 7", body(6000, "B")))
+        .unwrap();
+    trunk
+        .execute(format!("UPDATE big SET k = 'trunk', body = {} WHERE id = 8", body(4500, "T")))
+        .unwrap();
+
+    let probe = |conn: &Arc<Connection>, id: i64| -> (String, i64, String) {
+        let r = rows(
+            conn,
+            &format!("SELECT k, length(body), substr(body, -1) FROM big WHERE id = {id}"),
+        );
+        let text = |v: &Value| match v {
+            Value::Text(t) => t.as_str().to_string(),
+            other => panic!("{other:?}"),
+        };
+        (text(&r[0][0]), r[0][1].as_int().unwrap(), text(&r[0][2]))
+    };
+    drop(bc);
+    let bc = b.connect().unwrap();
+    assert_eq!(probe(&bc, 7), ("branch".to_string(), 12001, "B".to_string()));
+    assert_eq!(probe(&bc, 8), ("k008".to_string(), 10001, "8".to_string()));
+    assert_eq!(probe(&trunk, 7), ("k007".to_string(), 10001, "7".to_string()));
+    assert_eq!(probe(&trunk, 8), ("trunk".to_string(), 9001, "T".to_string()));
+    // Lookups by the indexed column, on both sides; integrity_check below also cross-checks
+    // every index entry against its row, which is what catches an index page that branched
+    // differently from its table.
+    let by_k = |conn: &Arc<Connection>, k: &str| {
+        rows(conn, &format!("SELECT id FROM big WHERE k = '{k}'"))
+            .into_iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(by_k(&bc, "branch"), vec![7]);
+    assert_eq!(by_k(&bc, "trunk"), Vec::<i64>::new());
+    assert_eq!(by_k(&bc, "k008"), vec![8]);
+    assert_eq!(by_k(&trunk, "trunk"), vec![8]);
+    assert_eq!(by_k(&trunk, "branch"), Vec::<i64>::new());
+    assert_eq!(by_k(&trunk, "k007"), vec![7]);
+    for conn in [&bc, &trunk] {
+        assert_eq!(rows(conn, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
+    }
+}
+
+#[test]
+fn branches_write_concurrently_with_each_other_and_the_trunk() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 400);
+    const WRITERS: i64 = 6;
+    const ROUNDS: i64 = 40;
+    let branches: Vec<Branch> = (0..WRITERS).map(|_| trunk.fork_branch().unwrap()).collect();
+
+    std::thread::scope(|scope| {
+        for (w, branch) in branches.iter().enumerate() {
+            let w = w as i64;
+            scope.spawn(move || {
+                let conn = branch.connect().unwrap();
+                for round in 0..ROUNDS {
+                    // Every writer rewrites the same rows: only isolation keeps them apart.
+                    let id = 1 + (round * 7) % 400;
+                    exec_retrying_busy(&conn, &format!("UPDATE t SET v = 'w{w}-r{round}' WHERE id = {id}"));
+                }
+            });
+        }
+        let db = db.clone();
+        scope.spawn(move || {
+            let conn = db.connect().unwrap();
+            for round in 0..ROUNDS {
+                let id = 1 + (round * 7) % 400;
+                exec_retrying_busy(&conn, &format!("UPDATE t SET v = 'trunk-r{round}' WHERE id = {id}"));
+            }
+        });
+    });
+
+    for (w, branch) in branches.iter().enumerate() {
+        let conn = branch.connect().unwrap();
+        for round in 0..ROUNDS {
+            let id = 1 + (round * 7) % 400;
+            // A later round can rewrite the same id; the expected value is the LAST round's.
+            let last = (0..ROUNDS).filter(|r| 1 + (r * 7) % 400 == id).max().unwrap();
+            assert_eq!(value(&conn, id), Some(format!("w{w}-r{last}")), "writer {w} row {id}");
+        }
+        assert_eq!(value(&conn, 399), Some(original(399)));
+    }
+    let fresh = db.connect().unwrap();
+    for round in 0..ROUNDS {
+        let id = 1 + (round * 7) % 400;
+        let last = (0..ROUNDS).filter(|r| 1 + (r * 7) % 400 == id).max().unwrap();
+        assert_eq!(value(&fresh, id), Some(format!("trunk-r{last}")));
+    }
+}
+
+/// Concurrent connections share one WAL, so a read-lock acquisition can transiently report Busy;
+/// that is contention, not a verdict, and the statement is retried.
+fn exec_retrying_busy(conn: &Arc<Connection>, sql: &str) {
+    for _ in 0..10_000 {
+        match conn.execute(sql) {
+            Ok(()) => return,
+            Err(LimboError::Busy | LimboError::BusySnapshot) => std::thread::yield_now(),
+            Err(e) => panic!("{sql}: {e}"),
+        }
+    }
+    panic!("{sql}: still Busy after 10,000 attempts");
+}
