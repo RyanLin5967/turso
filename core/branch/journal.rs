@@ -1,0 +1,837 @@
+//! The durable form of the branch store: an operation log, a snapshot, and the file I/O they
+//! share with the arena file. ⚠ UNBUILT when written (no-local-compute rule).
+//!
+//! # Files, next to the database file `<db>`
+//!
+//! * `<db>-branch-arena` — page slots; see [`super::arena`].
+//! * `<db>-branch-log` — a 32-byte header, then frames `[payload_len u32][crc32c(payload) u32]
+//!   [payload]`, all little-endian. Each payload is one [`Record`]. Replay stops at the first frame
+//!   that is short or fails its CRC and truncates the file there: a torn append is exactly a crash
+//!   before that record was durable (LevelDB's log reader; Redis `aof-load-truncated`).
+//! * `<db>-branch-snap` — the whole live state (see [`SnapshotState`]) with a generation number,
+//!   written to a temp file, fsynced and renamed into place. A log belongs to the snapshot with the
+//!   same generation; a log with an OLDER generation is what a crash between the rename and the log
+//!   reset leaves behind, and is ignored (LevelDB MANIFEST rollover, Redis RDB + AOF rewrite).
+//!
+//! # Why a log of OPERATIONS
+//!
+//! Records name what happened (a fork, a commit's page→slot pairs, a trunk pre-image, a release),
+//! not the resulting state. Epochs, children and every branch-side retain/free decision are
+//! re-derived by replaying them through the same store code that made them the first time, so the
+//! log is O(change) per operation — the opposite of the whole-map rewrite ferrodb's D79 measured as
+//! its persistence wall.
+//!
+//! # The ordering rule
+//!
+//! [`Journal::flush`] syncs the arena BEFORE it writes and syncs the buffered records, and records
+//! are only ever written by a flush. A record on disk therefore never names a slot whose bytes are
+//! not already durable, even if the OS writes the log page early.
+
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
+
+use super::arena::{Arena, Slot};
+use crate::error::io_error;
+use crate::{LimboError, Result};
+
+const LOG_MAGIC: &[u8; 8] = b"TFBRLOG1";
+const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
+const FORMAT_VERSION: u32 = 1;
+const LOG_HEADER_LEN: usize = 32;
+const FRAME_HEADER_LEN: usize = 8;
+/// Compact once the log is larger than this and larger than twice the last snapshot, so the log is
+/// never more than a constant factor of the live state and compaction work is amortised O(1).
+const COMPACT_MIN_LOG_BYTES: u64 = 1 << 20;
+
+/// The three files of a durable branch store.
+#[derive(Debug, Clone)]
+pub(crate) struct BranchFiles {
+    pub(crate) arena: PathBuf,
+    pub(crate) log: PathBuf,
+    pub(crate) snap: PathBuf,
+}
+
+impl BranchFiles {
+    pub(crate) fn for_db(db_path: &str) -> Self {
+        Self {
+            arena: PathBuf::from(format!("{db_path}-branch-arena")),
+            log: PathBuf::from(format!("{db_path}-branch-log")),
+            snap: PathBuf::from(format!("{db_path}-branch-snap")),
+        }
+    }
+
+    /// Whether this database has ever had durable branch state.
+    pub(crate) fn exist(&self) -> bool {
+        self.log.exists() || self.snap.exists()
+    }
+
+    fn snap_tmp(&self) -> PathBuf {
+        let mut name = self.snap.clone().into_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    }
+}
+
+/// One entry of the operation log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Record {
+    Fork {
+        child: u64,
+        parent: u64,
+    },
+    /// A branch commit: every dirty page and the fresh slot it was written to.
+    Commit {
+        branch: u64,
+        pages: Vec<(u32, Slot, u32)>,
+    },
+    /// A trunk pre-image kept for the children forked in `[born, died)`.
+    TrunkRetain {
+        page: u32,
+        born: u64,
+        died: u64,
+        slot: Slot,
+        crc: u32,
+    },
+    Release {
+        branch: u64,
+    },
+}
+
+const TAG_FORK: u8 = 1;
+const TAG_COMMIT: u8 = 2;
+const TAG_TRUNK_RETAIN: u8 = 3;
+const TAG_RELEASE: u8 = 4;
+
+impl Record {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Record::Fork { child, parent } => {
+                out.push(TAG_FORK);
+                put_u64(out, *child);
+                put_u64(out, *parent);
+            }
+            Record::Commit { branch, pages } => {
+                out.push(TAG_COMMIT);
+                put_u64(out, *branch);
+                put_u32(out, pages.len() as u32);
+                for &(page, slot, crc) in pages {
+                    put_u32(out, page);
+                    put_u32(out, slot);
+                    put_u32(out, crc);
+                }
+            }
+            Record::TrunkRetain {
+                page,
+                born,
+                died,
+                slot,
+                crc,
+            } => {
+                out.push(TAG_TRUNK_RETAIN);
+                put_u32(out, *page);
+                put_u64(out, *born);
+                put_u64(out, *died);
+                put_u32(out, *slot);
+                put_u32(out, *crc);
+            }
+            Record::Release { branch } => {
+                out.push(TAG_RELEASE);
+                put_u64(out, *branch);
+            }
+        }
+    }
+
+    fn decode(payload: &[u8]) -> Option<Record> {
+        let mut r = Reader::new(payload);
+        let record = match r.u8()? {
+            TAG_FORK => Record::Fork {
+                child: r.u64()?,
+                parent: r.u64()?,
+            },
+            TAG_COMMIT => {
+                let branch = r.u64()?;
+                let n = r.u32()? as usize;
+                let mut pages = Vec::with_capacity(n.min(1 << 16));
+                for _ in 0..n {
+                    pages.push((r.u32()?, r.u32()?, r.u32()?));
+                }
+                Record::Commit { branch, pages }
+            }
+            TAG_TRUNK_RETAIN => Record::TrunkRetain {
+                page: r.u32()?,
+                born: r.u64()?,
+                died: r.u64()?,
+                slot: r.u32()?,
+                crc: r.u32()?,
+            },
+            TAG_RELEASE => Record::Release { branch: r.u64()? },
+            _ => return None,
+        };
+        // Trailing bytes inside a frame whose CRC matched are a format error, not a torn tail.
+        r.at_end().then_some(record)
+    }
+}
+
+/// The whole live state, as a snapshot holds it. Epochs and retained sets are explicit here —
+/// unlike the log, a snapshot is not replayed through the store's decisions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotState {
+    pub(crate) next_id: u64,
+    pub(crate) trunk_epoch: u64,
+    /// (page, born, died, slot, crc)
+    pub(crate) trunk_retained: Vec<(u32, u64, u64, Slot, u32)>,
+    pub(crate) branches: Vec<SnapBranch>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SnapBranch {
+    pub(crate) id: u64,
+    pub(crate) parent: u64,
+    pub(crate) fork_epoch: u64,
+    pub(crate) epoch: u64,
+    pub(crate) released: bool,
+    /// (page, slot, born, crc)
+    pub(crate) current: Vec<(u32, Slot, u64, u32)>,
+    /// (page, born, died, slot, crc)
+    pub(crate) retained: Vec<(u32, u64, u64, Slot, u32)>,
+}
+
+impl SnapshotState {
+    fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.next_id);
+        put_u64(out, self.trunk_epoch);
+        put_retained(out, &self.trunk_retained);
+        put_u64(out, self.branches.len() as u64);
+        for b in &self.branches {
+            put_u64(out, b.id);
+            put_u64(out, b.parent);
+            put_u64(out, b.fork_epoch);
+            put_u64(out, b.epoch);
+            out.push(b.released as u8);
+            put_u64(out, b.current.len() as u64);
+            for &(page, slot, born, crc) in &b.current {
+                put_u32(out, page);
+                put_u32(out, slot);
+                put_u64(out, born);
+                put_u32(out, crc);
+            }
+            put_retained(out, &b.retained);
+        }
+    }
+
+    fn decode(body: &[u8]) -> Option<SnapshotState> {
+        let mut r = Reader::new(body);
+        let next_id = r.u64()?;
+        let trunk_epoch = r.u64()?;
+        let trunk_retained = get_retained(&mut r)?;
+        let n = r.u64()? as usize;
+        let mut branches = Vec::with_capacity(n.min(1 << 20));
+        for _ in 0..n {
+            let id = r.u64()?;
+            let parent = r.u64()?;
+            let fork_epoch = r.u64()?;
+            let epoch = r.u64()?;
+            let released = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let m = r.u64()? as usize;
+            let mut current = Vec::with_capacity(m.min(1 << 16));
+            for _ in 0..m {
+                current.push((r.u32()?, r.u32()?, r.u64()?, r.u32()?));
+            }
+            let retained = get_retained(&mut r)?;
+            branches.push(SnapBranch {
+                id,
+                parent,
+                fork_epoch,
+                epoch,
+                released,
+                current,
+                retained,
+            });
+        }
+        r.at_end().then_some(SnapshotState {
+            next_id,
+            trunk_epoch,
+            trunk_retained,
+            branches,
+        })
+    }
+}
+
+fn put_retained(out: &mut Vec<u8>, retained: &[(u32, u64, u64, Slot, u32)]) {
+    put_u64(out, retained.len() as u64);
+    for &(page, born, died, slot, crc) in retained {
+        put_u32(out, page);
+        put_u64(out, born);
+        put_u64(out, died);
+        put_u32(out, slot);
+        put_u32(out, crc);
+    }
+}
+
+fn get_retained(r: &mut Reader<'_>) -> Option<Vec<(u32, u64, u64, Slot, u32)>> {
+    let n = r.u64()? as usize;
+    let mut v = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        v.push((r.u32()?, r.u64()?, r.u64()?, r.u32()?, r.u32()?));
+    }
+    Some(v)
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let bytes = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(bytes)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos == self.buf.len()
+    }
+}
+
+fn corrupt(what: &str) -> LimboError {
+    LimboError::Corrupt(format!("branch store: {what}"))
+}
+
+/// What reopening the files recovered: the snapshot (if any) and the log records written after
+/// it, in order, plus the journal positioned to append after the last whole record.
+pub(crate) struct Recovered {
+    pub(crate) page_size: usize,
+    pub(crate) snapshot: Option<SnapshotState>,
+    pub(crate) records: Vec<Record>,
+    pub(crate) journal: Journal,
+}
+
+pub(crate) struct Journal {
+    file: File,
+    files: BranchFiles,
+    page_size: u32,
+    generation: u64,
+    /// Bytes of the log that hold whole, durable-or-written records (header included).
+    len: u64,
+    /// Encoded frames not yet written: records wait here until a flush has synced the arena.
+    pending: Vec<u8>,
+    /// Arena slots named by records still in `pending` (the failpoint reports them as orphans).
+    pub(crate) pending_slots: Vec<Slot>,
+    snapshot_len: u64,
+    sync: bool,
+    /// Set by an I/O failure, or a failpoint standing in for a crash. From then on nothing more is
+    /// written: the next process recovers from what is on disk, and nothing this one does can make
+    /// that worse. (Fail-stop on I/O error — the post-"fsyncgate" rule.)
+    poisoned: bool,
+}
+
+impl Journal {
+    /// Start a fresh durable store: a new log at generation 0, and no snapshot.
+    pub(crate) fn create(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
+        if files.snap.exists() {
+            std::fs::remove_file(&files.snap).map_err(|e| io_error(e, "remove branch snapshot"))?;
+        }
+        let file = open_rw(&files.log, true)?;
+        let mut journal = Journal {
+            file,
+            files: files.clone(),
+            page_size: page_size as u32,
+            generation: 0,
+            len: 0,
+            pending: Vec::new(),
+            pending_slots: Vec::new(),
+            snapshot_len: 0,
+            sync,
+            poisoned: false,
+        };
+        journal.reset_log(0)?;
+        if sync {
+            fsync_dir_of(&files.log)?;
+        }
+        Ok(journal)
+    }
+
+    /// Reopen an existing store. `Ok(None)` means the files hold no state at all (a crash while
+    /// the log was being created, before its header was durable): the store starts empty.
+    pub(crate) fn recover(files: &BranchFiles, sync: bool) -> Result<Option<Recovered>> {
+        let snapshot = if files.snap.exists() {
+            Some(read_snapshot(&files.snap)?)
+        } else {
+            None
+        };
+        // A stale temp snapshot is a compaction that never reached its rename: discard it.
+        let tmp = files.snap_tmp();
+        if tmp.exists() {
+            std::fs::remove_file(&tmp).map_err(|e| io_error(e, "remove stale branch snapshot"))?;
+        }
+        let mut file = open_rw(&files.log, false)?;
+        let bytes = read_all(&mut file)?;
+        let header = parse_log_header(&bytes);
+
+        let (page_size, generation, snapshot_state, snapshot_len) = match (snapshot, header) {
+            (None, None) => return Ok(None),
+            (Some((ps, g, state, len)), _) => (ps, g, Some(state), len),
+            (None, Some((ps, g))) => {
+                if g != 0 {
+                    return Err(corrupt("log generation is past 0 but there is no snapshot"));
+                }
+                (ps, 0, None, 0)
+            }
+        };
+
+        let mut journal = Journal {
+            file,
+            files: files.clone(),
+            page_size,
+            generation,
+            len: 0,
+            pending: Vec::new(),
+            pending_slots: Vec::new(),
+            snapshot_len,
+            sync,
+            poisoned: false,
+        };
+
+        let mut records = Vec::new();
+        match header {
+            Some((log_ps, log_gen)) if log_gen == generation => {
+                if log_ps != page_size {
+                    return Err(corrupt("log and snapshot disagree on the page size"));
+                }
+                let mut pos = LOG_HEADER_LEN;
+                loop {
+                    let Some(frame) = bytes.get(pos..pos + FRAME_HEADER_LEN) else {
+                        break;
+                    };
+                    let len = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
+                    let crc = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+                    let start = pos + FRAME_HEADER_LEN;
+                    let Some(payload) = bytes.get(start..start + len) else {
+                        break;
+                    };
+                    if crc32c::crc32c(payload) != crc {
+                        break;
+                    }
+                    let record =
+                        Record::decode(payload).ok_or_else(|| corrupt("undecodable log record"))?;
+                    records.push(record);
+                    pos = start + len;
+                }
+                journal.len = pos as u64;
+                if (pos as u64) < bytes.len() as u64 {
+                    // The torn tail: a record that was never durable. Cut it off so appends resume
+                    // at a frame boundary.
+                    journal
+                        .file
+                        .set_len(pos as u64)
+                        .map_err(|e| io_error(e, "truncate branch log"))?;
+                    if sync {
+                        fsync_file(&journal.file)?;
+                    }
+                }
+            }
+            Some((_, log_gen)) if log_gen > generation => {
+                return Err(corrupt("log generation is ahead of the snapshot"));
+            }
+            // An older generation (a compaction crashed after its rename, before the log reset)
+            // or a torn header: nothing in it is newer than the snapshot.
+            _ => journal.reset_log(generation)?,
+        }
+        Ok(Some(Recovered {
+            page_size: page_size as usize,
+            snapshot: snapshot_state,
+            records,
+            journal,
+        }))
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    fn check_live(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(LimboError::InternalError(
+                "branch store is fail-stopped after an I/O failure or a crash failpoint; reopen \
+                 the database to recover it from disk"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Queue a record. It reaches the file only through [`Journal::flush`].
+    pub(crate) fn buffer(&mut self, record: &Record) -> Result<()> {
+        self.check_live()?;
+        let mut payload = Vec::with_capacity(32);
+        record.encode(&mut payload);
+        put_u32(&mut self.pending, payload.len() as u32);
+        put_u32(&mut self.pending, crc32c::crc32c(&payload));
+        self.pending.extend_from_slice(&payload);
+        match record {
+            Record::TrunkRetain { slot, .. } => self.pending_slots.push(*slot),
+            Record::Commit { pages, .. } => self.pending_slots.extend(pages.iter().map(|p| p.1)),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Make every buffered record durable: arena first, then the records, then the log.
+    pub(crate) fn flush(&mut self, arena: &mut Arena) -> Result<()> {
+        self.check_live()?;
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        match self.write_pending(arena) {
+            Ok(()) => {
+                self.len += self.pending.len() as u64;
+                self.pending.clear();
+                self.pending_slots.clear();
+                Ok(())
+            }
+            Err(e) => {
+                self.poisoned = true;
+                Err(e)
+            }
+        }
+    }
+
+    fn write_pending(&self, arena: &mut Arena) -> Result<()> {
+        if self.sync {
+            arena.sync()?;
+        }
+        write_at(&self.file, &self.pending, self.len)?;
+        if self.sync {
+            fsync_file(&self.file)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn wants_compaction(&self) -> bool {
+        self.len > COMPACT_MIN_LOG_BYTES.max(2 * self.snapshot_len)
+    }
+
+    /// Replace the log with a snapshot of `state`. `fail_after_rename` is the crash failpoint.
+    pub(crate) fn compact(
+        &mut self,
+        state: &SnapshotState,
+        arena: &mut Arena,
+        fail_after_rename: bool,
+    ) -> Result<()> {
+        self.check_live()?;
+        // The snapshot names slots that buffered-but-unwritten records also name; they must be
+        // durable before the snapshot is.
+        if self.sync {
+            arena.sync()?;
+        }
+        let generation = self.generation + 1;
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(SNAP_MAGIC);
+        put_u32(&mut out, FORMAT_VERSION);
+        put_u32(&mut out, self.page_size);
+        put_u64(&mut out, generation);
+        state.encode(&mut out);
+        let crc = crc32c::crc32c(&out);
+        put_u32(&mut out, crc);
+
+        let tmp = self.files.snap_tmp();
+        {
+            let f = open_rw(&tmp, true)?;
+            write_at(&f, &out, 0)?;
+            if self.sync {
+                fsync_file(&f)?;
+            }
+        }
+        std::fs::rename(&tmp, &self.files.snap).map_err(|e| {
+            self.poisoned = true;
+            io_error(e, "rename branch snapshot")
+        })?;
+        // From here the snapshot is the truth; the old log is stale by generation.
+        if self.sync {
+            if let Err(e) = fsync_dir_of(&self.files.snap) {
+                self.poisoned = true;
+                return Err(e);
+            }
+        }
+        if fail_after_rename {
+            self.poisoned = true;
+            return Err(LimboError::InternalError(
+                "failpoint: branch compaction stopped after the snapshot rename".to_string(),
+            ));
+        }
+        self.pending.clear();
+        self.pending_slots.clear();
+        self.snapshot_len = out.len() as u64;
+        if let Err(e) = self.reset_log(generation) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Truncate the log to a bare header for `generation`.
+    fn reset_log(&mut self, generation: u64) -> Result<()> {
+        let mut header = Vec::with_capacity(LOG_HEADER_LEN);
+        header.extend_from_slice(LOG_MAGIC);
+        put_u32(&mut header, FORMAT_VERSION);
+        put_u32(&mut header, self.page_size);
+        put_u64(&mut header, generation);
+        let crc = crc32c::crc32c(&header);
+        put_u32(&mut header, crc);
+        put_u32(&mut header, 0);
+        debug_assert_eq!(header.len(), LOG_HEADER_LEN);
+        self.file
+            .set_len(0)
+            .map_err(|e| io_error(e, "truncate branch log"))?;
+        write_at(&self.file, &header, 0)?;
+        if self.sync {
+            fsync_file(&self.file)?;
+        }
+        self.generation = generation;
+        self.len = LOG_HEADER_LEN as u64;
+        Ok(())
+    }
+
+    pub(crate) fn log_path(&self) -> &Path {
+        &self.files.log
+    }
+}
+
+/// `(page_size, generation)` if the header is whole and valid.
+fn parse_log_header(bytes: &[u8]) -> Option<(u32, u64)> {
+    let h = bytes.get(..LOG_HEADER_LEN)?;
+    if &h[0..8] != LOG_MAGIC {
+        return None;
+    }
+    let crc = u32::from_le_bytes(h[24..28].try_into().ok()?);
+    if crc32c::crc32c(&h[..24]) != crc {
+        return None;
+    }
+    let version = u32::from_le_bytes(h[8..12].try_into().ok()?);
+    if version != FORMAT_VERSION {
+        return None;
+    }
+    let page_size = u32::from_le_bytes(h[12..16].try_into().ok()?);
+    let generation = u64::from_le_bytes(h[16..24].try_into().ok()?);
+    Some((page_size, generation))
+}
+
+/// `(page_size, generation, state, file_len)`. A snapshot is only ever put in place by a rename
+/// of a complete, synced file, so any defect in one is corruption, not a torn write.
+fn read_snapshot(path: &Path) -> Result<(u32, u64, SnapshotState, u64)> {
+    let mut file = File::open(path).map_err(|e| io_error(e, "open branch snapshot"))?;
+    let bytes = read_all(&mut file)?;
+    const HEAD: usize = 8 + 4 + 4 + 8;
+    if bytes.len() < HEAD + 4 || &bytes[0..8] != SNAP_MAGIC {
+        return Err(corrupt("snapshot header"));
+    }
+    let (body, trailer) = bytes.split_at(bytes.len() - 4);
+    if crc32c::crc32c(body) != u32::from_le_bytes(trailer.try_into().unwrap()) {
+        return Err(corrupt("snapshot checksum"));
+    }
+    if u32::from_le_bytes(body[8..12].try_into().unwrap()) != FORMAT_VERSION {
+        return Err(corrupt("snapshot format version"));
+    }
+    let page_size = u32::from_le_bytes(body[12..16].try_into().unwrap());
+    let generation = u64::from_le_bytes(body[16..24].try_into().unwrap());
+    let state = SnapshotState::decode(&body[HEAD..]).ok_or_else(|| corrupt("snapshot body"))?;
+    Ok((page_size, generation, state, bytes.len() as u64))
+}
+
+pub(crate) fn open_rw(path: &Path, truncate: bool) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(truncate)
+        .open(path)
+        .map_err(|e| io_error(e, "open branch file"))
+}
+
+fn read_all(file: &mut File) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| io_error(e, "seek branch file"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| io_error(e, "read branch file"))?;
+    Ok(bytes)
+}
+
+pub(crate) fn write_at(file: &File, bytes: &[u8], offset: u64) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(bytes, offset)
+            .map_err(|e| io_error(e, "write branch file"))
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = file;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|e| io_error(e, "seek branch file"))?;
+        f.write_all(bytes)
+            .map_err(|e| io_error(e, "write branch file"))
+    }
+}
+
+pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(out, offset)
+            .map_err(|e| io_error(e, "read branch file"))
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = file;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|e| io_error(e, "seek branch file"))?;
+        f.read_exact(out)
+            .map_err(|e| io_error(e, "read branch file"))
+    }
+}
+
+/// `fsync(2)`, as Turso's own `FileSyncType::Fsync` — deliberately NOT `F_FULLFSYNC`, which std's
+/// `sync_all` uses on Apple platforms: branch state gets the durability class the trunk gets under
+/// default settings, no stronger and no weaker.
+pub(crate) fn fsync_file(file: &File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        file.sync_all()
+            .map_err(|e| io_error(e, "fsync branch file"))
+    }
+}
+
+/// Make a file's creation or rename durable: on POSIX that is an fsync of its directory.
+pub(crate) fn fsync_dir_of(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let d = File::open(dir).map_err(|e| io_error(e, "open branch directory"))?;
+        fsync_file(&d)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_record_round_trips() {
+        let records = [
+            Record::Fork { child: 7, parent: 0 },
+            Record::Commit {
+                branch: 7,
+                pages: vec![(1, 2, 3), (40, 41, 0xDEAD_BEEF)],
+            },
+            Record::Commit {
+                branch: 8,
+                pages: vec![],
+            },
+            Record::TrunkRetain {
+                page: 9,
+                born: 1,
+                died: 4,
+                slot: 12,
+                crc: 99,
+            },
+            Record::Release { branch: 7 },
+        ];
+        for record in records {
+            let mut payload = Vec::new();
+            record.encode(&mut payload);
+            assert_eq!(Record::decode(&payload), Some(record.clone()));
+            // One byte short, and one byte extra, are both rejected.
+            assert_eq!(Record::decode(&payload[..payload.len() - 1]), None);
+            payload.push(0);
+            assert_eq!(Record::decode(&payload), None);
+        }
+    }
+
+    #[test]
+    fn a_snapshot_state_round_trips() {
+        let state = SnapshotState {
+            next_id: 11,
+            trunk_epoch: 5,
+            trunk_retained: vec![(3, 0, 2, 17, 1234)],
+            branches: vec![
+                SnapBranch {
+                    id: 1,
+                    parent: 0,
+                    fork_epoch: 0,
+                    epoch: 2,
+                    released: false,
+                    current: vec![(4, 5, 1, 6), (9, 10, 0, 11)],
+                    retained: vec![(4, 0, 1, 3, 77)],
+                },
+                SnapBranch {
+                    id: 10,
+                    parent: 1,
+                    fork_epoch: 1,
+                    epoch: 0,
+                    released: true,
+                    current: vec![],
+                    retained: vec![],
+                },
+            ],
+        };
+        let mut body = Vec::new();
+        state.encode(&mut body);
+        assert_eq!(SnapshotState::decode(&body), Some(state));
+        assert_eq!(SnapshotState::decode(&body[..body.len() - 1]), None);
+    }
+}

@@ -195,6 +195,8 @@ fn a_crash_between_allocation_and_publication_leaks_nothing() {
         for slot in &orphans {
             assert!(!published.contains(slot), "an orphan slot was already published");
         }
+        // In this process too: an unpublished commit's slots are free, not held.
+        assert_eq!(in_use(&db), published, "the failed commit's slots are still held");
         assert_eq!(value(&bc, 7), Some("published".to_string()));
         drop(bc);
         b_id = b.into_id();
@@ -545,4 +547,104 @@ fn a_random_workload_survives_repeated_reopens() {
     assert!(db.branch_ids().is_empty());
     assert!(in_use(&db).is_empty());
     integrity_ok(&trunk);
+}
+
+#[test]
+fn a_corrupted_arena_slot_is_an_error_not_a_wrong_page() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let b_id;
+    let slots;
+    let page_size;
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        page_size = rows(&trunk, "PRAGMA page_size")[0][0].as_int().unwrap() as u64;
+        let b = trunk.fork_branch().unwrap();
+        set(&b.connect().unwrap(), 150, "branch");
+        slots = b.owned_slots();
+        assert_eq!(slots.len(), 1, "one in-place UPDATE should own exactly one page");
+        b_id = b.into_id();
+    }
+    // Flip one byte in the middle of the branch's only page.
+    let arena = format!("{}-branch-arena", path.to_str().unwrap());
+    let offset = slots[0] as u64 * page_size + page_size / 2;
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&arena)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        f.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        f.write_all(&byte).unwrap();
+    }
+    let db = reopen(&path, incarnation);
+    let b = db.branch(b_id).unwrap();
+    // The branch's schema is reparsed on connect (page 1 is the trunk's, intact); the damaged page
+    // is the leaf holding row 150, so the read of that row must fail loudly.
+    let bc = b.connect().unwrap();
+    let read = bc
+        .prepare("SELECT v FROM t WHERE id = 150")
+        .and_then(|mut s| s.run_collect_rows());
+    let err = match read {
+        Ok(rows) => panic!("a corrupted branch page was served: {rows:?}"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("checksum"), "{err}");
+    // A page the branch does not own still reads from the trunk.
+    assert_eq!(value(&bc, 7), Some(original(7)));
+}
+
+#[test]
+fn a_garbled_last_record_is_discarded_like_a_short_one() {
+    // A torn sector can leave a frame of the right LENGTH with the wrong bytes; only the CRC can
+    // tell it from a whole record. (The truncation test above is caught by the length alone.)
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let b_id;
+    let after_first;
+    let log;
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        set(&bc, 7, "first");
+        after_first = in_use(&db);
+        set(&bc, 150, "second");
+        drop(bc);
+        log = db.branch_log_path().expect("a durable store has a log file");
+        b_id = b.into_id();
+    }
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&log)
+            .unwrap();
+        let len = f.metadata().unwrap().len();
+        let mut byte = [0u8; 1];
+        f.seek(SeekFrom::Start(len - 1)).unwrap();
+        f.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x5A;
+        f.seek(SeekFrom::Start(len - 1)).unwrap();
+        f.write_all(&byte).unwrap();
+    }
+    let db = reopen(&path, incarnation);
+    assert_eq!(in_use(&db), after_first, "a garbled commit was replayed");
+    let bc = db.branch(b_id).unwrap().connect().unwrap();
+    assert_eq!(value(&bc, 7), Some("first".to_string()));
+    assert_eq!(value(&bc, 150), Some(original(150)));
 }

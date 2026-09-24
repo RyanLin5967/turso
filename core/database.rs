@@ -649,8 +649,14 @@ impl Database {
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
-        let path = path.into();
+        let path: String = path.into();
         let wal_path = wal_path.into();
+        // Before anything else touches the file: a database whose branches are durable must not
+        // be opened with volatile ones (see `BranchStore::open`), and a durable store recovers here.
+        let branches = Arc::new(crate::branch::store::BranchStore::open(
+            opts.branch_durability,
+            &path,
+        )?);
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
@@ -724,7 +730,7 @@ impl Database {
             page_codec_id,
 
             durable_storage: None,
-            branches: Arc::new(crate::branch::store::BranchStore::new()),
+            branches,
         };
 
         db.register_global_builtin_extensions()

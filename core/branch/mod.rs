@@ -53,6 +53,7 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+pub(crate) mod journal;
 pub(crate) mod store;
 
 use crate::error::LimboError;
@@ -152,10 +153,9 @@ pub fn check_branchable(mvcc_enabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// Whether branch state survives the process.
-///
-/// ⚠ SKELETON (UNBUILT): `Durable` is accepted and IGNORED in this commit — the durability tests
-/// in `durability_tests.rs` are written against it and must fail until the mechanism lands.
+/// Whether branch state survives the process. `Durable` (UNBUILT when written) keeps arena pages,
+/// page maps, lineage and releases in files next to the database; see `journal.rs` for the files,
+/// the ordering rules and the prior art they copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BranchDurability {
     /// In memory only: branches die with the process.
@@ -407,32 +407,35 @@ impl Database {
         self.branches.ids()
     }
 
-    /// SKELETON: accepted and ignored.
+    /// Arm (or clear) a crash failpoint for the durability tests.
     #[doc(hidden)]
-    pub fn branch_failpoint(&self, _failpoint: Option<BranchFailpoint>) {}
+    pub fn branch_failpoint(&self, failpoint: Option<BranchFailpoint>) {
+        self.branches.set_failpoint(failpoint);
+    }
 
     /// The arena slots the last triggered failpoint left written but unpublished.
     #[doc(hidden)]
     pub fn branch_failpoint_orphans(&self) -> Vec<u32> {
-        Vec::new()
+        self.branches.failpoint_orphans()
     }
 
-    /// Compact the branch log into a snapshot now. SKELETON: nothing to compact.
+    /// Compact the branch log into a snapshot now. A no-op for volatile branches.
     #[doc(hidden)]
     pub fn branch_compact_now(&self) -> Result<()> {
-        Ok(())
+        self.branches.compact_now()
     }
 
-    /// The branch log file, for tearing its tail in a test. SKELETON: there is none.
+    /// The branch log file, for tearing its tail in a test. `None` for volatile branches, and
+    /// before the first fork of a durable store.
     #[doc(hidden)]
     pub fn branch_log_path(&self) -> Option<std::path::PathBuf> {
-        None
+        self.branches.log_path()
     }
 
     /// Open a connection on branch `id`: an ordinary connection whose pager is bound to the branch
     /// and whose schema is the branch's own.
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
-        let schema = self.branches.open(id)?;
+        let schema = self.branches.open_conn(id)?;
         // Built before anything fallible below, so an error there still closes the branch.
         let binding = BranchBinding {
             store: self.branches.clone(),
@@ -450,6 +453,26 @@ impl Database {
             .block(|| pager.with_header(|header| header.default_page_cache_size))
             .unwrap_or_default()
             .get();
+        let Some(schema) = schema else {
+            // After a reopen nothing about the branch's schema is persisted: parse it from the
+            // branch's own pages. The shared schema is only a placeholder for the parse — it
+            // carries the built-in table-valued functions the parse keeps — and never reaches a
+            // statement: the reparse replaces it before this returns. (If the trunk created
+            // sqlite_stat1 after the fork, the placeholder's stats refresh reads a page the branch
+            // does not have; gather errors are ignored there and the refresh after the reparse
+            // overwrites whatever it found.)
+            let conn = self._connect_with_pager_and_default_cache_size(
+                false,
+                pager,
+                None,
+                default_cache_size,
+                Some(self.clone_schema()),
+            )?;
+            conn.force_reparse_schema_without_publish()?;
+            crate::stats::refresh_analyze_stats(&conn);
+            self.branches.set_schema(id, conn.schema.read().clone())?;
+            return Ok(conn);
+        };
         self._connect_with_pager_and_default_cache_size(
             false,
             pager,

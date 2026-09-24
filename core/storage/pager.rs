@@ -3782,9 +3782,9 @@ impl Pager {
     /// the moment before its first byte changes, and the only place a [`WriteTicket`] is minted,
     /// so no page write can skip it.
     ///
-    /// * On a branch: a page the branch does not own yet is copied into a fresh slot of its own
-    ///   page space; a page it owns that a live child can still see keeps its old slot for that
-    ///   child and gets a fresh one.
+    /// * On a branch: a fresh slot of the branch's own page space is reserved for the page; the
+    ///   commit writes the page there and moves the branch's map to it (the version it replaces is
+    ///   kept for a live child that can still see it, else freed). A rollback returns the slot.
     /// * On the trunk: a page a live branch can still see has its pre-image copied into the arena
     ///   before the write, so neither this commit nor a later checkpoint reaches the branch.
     ///
@@ -3795,15 +3795,11 @@ impl Pager {
         }
         let page_no = page.get().id as u32;
         if let Some(branch) = self.branch.get() {
-            return branch.store.first_write_branch(
-                branch.id,
-                page_no,
-                page.get_contents().as_slice(),
-            );
+            return branch.store.first_write_branch(branch.id, page_no);
         }
         if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() {
-                store.first_write_trunk(page_no, page.get_contents().as_slice());
+                store.first_write_trunk(page_no, page.get_contents().as_slice())?;
             }
         }
         Ok(())
@@ -4415,6 +4411,13 @@ impl Pager {
         // Wait for spill writes before publishing frames
         if let IOResult::IO(c) = self.wait_for_spill_completions()? {
             return Ok(IOResult::IO(c));
+        }
+
+        // Durable branches: every pre-image this transaction retained for a live branch must be
+        // durable before the commit that overwrites its page can be, or a crash after this commit
+        // leaves the branch reading the NEW page. Idempotent across IO re-entry.
+        if let Some(store) = self.branch_store.get() {
+            store.durability_barrier()?;
         }
 
         let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
@@ -6064,6 +6067,9 @@ impl Pager {
             // since we only need to clear the dirty pages that were modified by the write transaction.
             self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
+            if let Some(branch) = self.branch.get() {
+                branch.store.abort_write(branch.id);
+            }
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
