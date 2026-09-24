@@ -48,8 +48,10 @@
 //! open, summed across opens, never read from the wall (see `LeaseClock`). An expiry pass reaps
 //! every branch past its deadline, non-cooperatively and deepest first, through the same release
 //! path as a dropped handle, so an expired interior with a live child is retired, not kept whole.
-//! The pass runs at every fork (so an expired parent is refused, not revived), at every open (so a
-//! crashed agent's branch goes at the next start), and on `Database::expire_branches`.
+//! The pass runs at every fork (so an expired parent is refused, not revived), at every lease
+//! renewal and every connect (so an expired branch is neither renewed nor opened), at every
+//! database open (so a crashed agent's branch goes at the next start), and on
+//! `Database::expire_branches`.
 //!
 //! # Durability (see `journal.rs` for the files and their prior art)
 //!
@@ -448,6 +450,9 @@ impl BranchStore {
     /// but may not move it backwards in time").
     pub(crate) fn set_lease(&self, id: BranchId, ttl: Duration) -> Result<()> {
         let mut inner = self.inner.lock();
+        // A lease that has run out is not renewable: reap first, so a late renewal is refused
+        // rather than reviving the branch.
+        self.expire(&mut inner, false)?;
         let now = inner.lease.now_ms();
         let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
         if st.handle == Handle::Released {
@@ -607,6 +612,8 @@ impl BranchStore {
     /// — a silently stale read, so it is refused.
     pub(crate) fn open_conn(&self, id: BranchId) -> Result<Option<Arc<Schema>>> {
         let mut inner = self.inner.lock();
+        // Nor is an expired branch openable: the same pass, the same refusal.
+        self.expire(&mut inner, false)?;
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.handle == Handle::Released {
             return Err(reaped(id));

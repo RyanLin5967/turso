@@ -873,3 +873,22 @@ fn a_lease_never_moves_backwards() {
     db.branch_lease_clock_advance(Duration::from_secs(60));
     assert_eq!(db.expire_branches().unwrap().reaped, vec![b.id()]);
 }
+
+#[test]
+fn an_expired_branch_is_neither_renewed_nor_opened() {
+    // Every structural operation runs the expiry pass first: a lease that ran out is not revived
+    // by a late renewal, and a branch whose lease ran out cannot be opened.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let a = trunk.fork_branch().unwrap();
+    let b = trunk.fork_branch().unwrap();
+    a.lease(Duration::from_secs(5)).unwrap();
+    b.lease(Duration::from_secs(5)).unwrap();
+    db.branch_lease_clock_advance(Duration::from_secs(6));
+    assert!(a.lease(Duration::from_secs(100)).is_err(), "an expired lease was renewed");
+    assert!(b.connect().is_err(), "an expired branch was opened");
+    assert!(db.branch_ids().is_empty());
+}
