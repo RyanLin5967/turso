@@ -504,6 +504,10 @@ impl BranchStore {
         }
     }
 
+    pub(crate) fn is_trunk_only(&self) -> bool {
+        self.trunk_only
+    }
+
     /// Refuse `what` on a trunk-only store (see `open_with_flags`).
     pub(crate) fn refuse_if_trunk_only(&self, what: &str) -> Result<()> {
         if self.trunk_only {

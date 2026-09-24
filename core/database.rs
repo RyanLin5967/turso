@@ -311,22 +311,30 @@ pub(crate) fn is_memory_like(path: &str) -> bool {
     path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
 }
 
-/// The one path every sidecar file of a file-backed database is named from: its WAL (unless the
-/// caller names one), and its branch log, arena and snapshot. Computed ONCE per open, after the
-/// database file is open (review 4 C3): a symlinked open that named its WAL from the path it was
-/// given, and its branch files from the resolved one, split one database's state across two sets
-/// of files.
+/// The one path every sidecar file of a file-backed database is named from — its WAL (unless the
+/// caller names one), its MVCC logical log (`with_extension("db-log")`), and its branch log, arena
+/// and snapshot — and the one the sync engine names the same files from (`sidecar_wal_path`,
+/// `sidecar_mvcc_log_path`). The open computes it ONCE, after the database file is open, and keeps
+/// it (`Database::sidecar_name`) (review 4 C3, review 5 C3-2 and C3-4): a symlinked open that
+/// named some sidecars from the path it was given and others from the resolved one split one
+/// database's state across two sets of files.
 ///
 /// `Ok(None)` means the path names no file on this filesystem (`NotFound`: storage the caller
-/// supplied, such as a `MemoryIO` name). The WAL then keeps the given name, which lives in that
-/// IO's namespace; branch files, which are always real files, use [`absolute_path`]. Every other
-/// failure to resolve REFUSES the open (review 4 C4): falling back to an unresolved name is how a
-/// symlinked open missed the real path's files.
+/// supplied, such as a `MemoryIO` name). Sidecars then keep the given name, which lives in that
+/// IO's namespace; a DURABLE store's branch files, which are always real files, use
+/// [`absolute_path`] (a volatile store only checks for branch files, and needs no working
+/// directory: review 5 C3-3). Every other failure to resolve REFUSES the open, naming the error
+/// (review 4 C4): falling back to an unresolved name is how a symlinked open missed the real
+/// path's files.
 ///
 /// BLIND SPOTS. The names follow the PATH, while the registry knows the file by (dev, ino):
 /// * a hard link, or a bind mount, has no canonical name, so it names other sidecars;
 /// * a database deleted and recreated at the same path inherits the old one's sidecars, and a
 ///   renamed database leaves them behind for whatever file takes its old name next;
+/// * the database file is opened BEFORE its path is resolved; a link retargeted in between is
+///   caught only if it moves again before `refuse_sidecars_under_another_name` compares the two
+///   identities — closing the window needs the opened descriptor's identity, which Turso's
+///   `File` trait does not expose;
 /// * on non-unix targets nothing is resolved: an existing file's name is only made absolute.
 ///
 /// The `-wal` has always had each of these; SQLite lists hard links and renames among the ways to
@@ -358,6 +366,30 @@ pub(crate) fn sidecar_base(path: &str) -> Result<Option<String>> {
     }
 }
 
+/// The name every sidecar of the database at `path` is derived from: `sidecar_base`, or the path
+/// as given when it names no file on this filesystem or is in memory.
+fn sidecar_name(path: &str) -> Result<String> {
+    if is_memory_like(path) {
+        return Ok(path.to_string());
+    }
+    Ok(sidecar_base(path)?.unwrap_or_else(|| path.to_string()))
+}
+
+/// The WAL the core opens by default for the database at `path` — for code outside the core that
+/// must name the same file, such as the sync engine (review 5 C3-2).
+pub fn sidecar_wal_path(path: &str) -> Result<String> {
+    Ok(format!("{}-wal", sidecar_name(path)?))
+}
+
+/// The MVCC logical log the core opens for the database at `path` (see `sidecar_wal_path`).
+pub fn sidecar_mvcc_log_path(path: &str) -> Result<String> {
+    Path::new(&sidecar_name(path)?)
+        .with_extension("db-log")
+        .into_os_string()
+        .into_string()
+        .map_err(|_| LimboError::InvalidArgument(format!("{path}: its log path is not UTF-8")))
+}
+
 /// `path` made absolute against the working directory NOW, so a later `chdir` cannot move the
 /// files named from it (review 4 C4; the pattern of `stable_lock_path`).
 pub(crate) fn absolute_path(path: &str) -> Result<String> {
@@ -375,49 +407,108 @@ pub(crate) fn absolute_path(path: &str) -> Result<String> {
 }
 
 /// Refuse to open past a sidecar left under a name other than the canonical one (review 4 C3): a
-/// WAL or branch file written through a symlink before sidecars were named from `real`. Opening
-/// would silently miss the frames or the branches it holds. A name that reaches the SAME file — a
-/// symlinked directory, such as macOS's `/var` — resolves to the canonical sidecar and passes.
+/// WAL, MVCC log or branch file written through a symlink before sidecars were named from `real`.
+/// Opening would silently miss what it holds. Two refinements (review 5):
+/// * only a sidecar that can HOLD something is refused (C3-1). A WAL of at most its 32-byte header
+///   — what every clean close leaves, since a Truncate checkpoint never removes the file — and an
+///   empty log or branch file carry nothing to lose: they are left in place, untouched;
+/// * "the same file" is decided by identity, (dev, ino), not by path string (C3-5), so a sidecar
+///   reached through a symlinked directory or a hard link is recognised as the canonical one.
+///
+/// Unix only: elsewhere `sidecar_base` resolves nothing, so no second name can arise.
+#[cfg(unix)]
 fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool) -> Result<()> {
+    /// A WAL no longer than its header holds no frame.
+    const WAL_HEADER_LEN: u64 = 32;
     if given == real {
         return Ok(());
     }
+    // The database itself: the name the file was opened by must still reach the file `real`
+    // names, or a link was retargeted during the open.
+    if !same_file(Path::new(given), Path::new(real))? {
+        return Err(LimboError::InvalidArgument(format!(
+            "{given} no longer names the file {real} it resolved to: the link changed while the \
+             database was being opened"
+        )));
+    }
     let others = crate::branch::journal::BranchFiles::for_db(given);
     let ours = crate::branch::journal::BranchFiles::for_db(real);
-    let mut pairs = vec![
-        (others.log, ours.log),
-        (others.snap, ours.snap),
-        (others.arena, ours.arena),
+    let mvcc_log = |base: &str| Path::new(base).with_extension("db-log");
+    let mut sidecars: Vec<(std::path::PathBuf, std::path::PathBuf, u64)> = vec![
+        (others.log, ours.log, 0),
+        (others.snap, ours.snap, 0),
+        (others.arena, ours.arena, 0),
+        (mvcc_log(given), mvcc_log(real), 0),
     ];
     if !custom_wal {
-        pairs.push((
+        sidecars.push((
             format!("{given}-wal").into(),
             format!("{real}-wal").into(),
+            WAL_HEADER_LEN,
         ));
     }
-    for (other, ours) in pairs {
-        let resolved = match std::fs::canonicalize(&other) {
-            Ok(resolved) => resolved,
+    for (other, ours, holds_nothing_up_to) in sidecars {
+        let len = match std::fs::metadata(&other) {
+            Ok(meta) => meta.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(LimboError::InvalidArgument(format!(
-                    "cannot resolve {} ({e}), which may hold this database's state",
+                    "cannot inspect {} ({e}), which may hold this database's state",
                     other.display()
                 )))
             }
         };
-        let ours_resolved = std::fs::canonicalize(&ours).unwrap_or_else(|_| ours.clone());
-        if resolved != ours_resolved {
-            return Err(LimboError::InvalidArgument(format!(
-                "{} exists, but this database's file of that kind is {}: it was written under \
-                 another name for the same database, and opening would miss what it holds; move \
-                 or remove one of them first",
+        // Nothing in it can be lost: leave it where it is (C3-1).
+        if len <= holds_nothing_up_to {
+            continue;
+        }
+        if same_file(&other, &ours)? {
+            continue;
+        }
+        return Err(LimboError::InvalidArgument(if holds_nothing_up_to == WAL_HEADER_LEN {
+            format!(
+                "{} holds WAL frames, but this database's WAL is {}: they were written through \
+                 the name {given} (before WAL files were named from the resolved path), and \
+                 opening would miss them. To keep them, open the database through {given} once \
+                 with the build that wrote them and close it cleanly, which checkpoints them into \
+                 the database file; then reopen",
                 other.display(),
                 ours.display()
-            )));
-        }
+            )
+        } else {
+            format!(
+                "{} exists and is not empty, but this database's file of that kind is {}: it was \
+                 written under another name for the same database, and opening would miss what it \
+                 holds; move or remove one of them first",
+                other.display(),
+                ours.display()
+            )
+        }));
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn refuse_sidecars_under_another_name(_given: &str, _real: &str, _custom_wal: bool) -> Result<()> {
+    Ok(())
+}
+
+/// Whether `a` and `b` are one file, by (dev, ino). `b` absent is "no".
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let identity = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino()));
+    let a_id = identity(a).map_err(|e| {
+        LimboError::InvalidArgument(format!("cannot inspect {} ({e})", a.display()))
+    })?;
+    match identity(b) {
+        Ok(b_id) => Ok(a_id == b_id),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(LimboError::InvalidArgument(format!(
+            "cannot inspect {} ({e})",
+            b.display()
+        ))),
+    }
 }
 
 /// Creates a read completion for database header reads that checks for short reads.
@@ -646,6 +737,8 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
+    /// What every sidecar is named from: see `sidecar_base`. Computed once, at open.
+    sidecar_name: String,
     wal_path: String,
     pub io: Arc<dyn IO>,
     pub(crate) buffer_pool: Arc<BufferPool>,
@@ -758,6 +851,7 @@ impl Database {
         opts: DatabaseOpts,
         flags: OpenFlags,
         path: impl Into<String>,
+        sidecar_name: &str,
         branch_base: &str,
         wal_path: impl Into<String>,
         io: &Arc<dyn IO>,
@@ -810,6 +904,7 @@ impl Database {
             mv_store,
             mv_store_allocator,
             path,
+            sidecar_name: sidecar_name.to_string(),
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
                 let mut s = Schema::with_options(enable_custom_types, dialect.as_ref())?;
@@ -997,7 +1092,7 @@ impl Database {
         // finds the coordination file the open will use (review 4 C3).
         let wal_path = match wal_path {
             Some(wal_path) => wal_path.to_owned(),
-            None => format!("{}-wal", sidecar_base(path)?.as_deref().unwrap_or(path)),
+            None => sidecar_wal_path(path)?,
         };
         let coordination_path = storage::wal::coordination_path_for_wal_path(&wal_path);
         let Some(authority) =
@@ -1059,6 +1154,20 @@ impl Database {
         _flags: OpenFlags,
         _opts: DatabaseOpts,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    /// A read-write open must never receive a trunk-only instance from the registry (review 5
+    /// C2-1): its connections would be read-only and its branch operations refused.
+    fn check_registry_trunk_only(db: &Database, flags: OpenFlags) -> Result<()> {
+        if db.branches.is_trunk_only() && !flags.contains(OpenFlags::ReadOnly) {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} is open in this process read-only, without its branch store (it has durable \
+                 branches); a read-write open would receive that instance: close the read-only \
+                 handle first",
+                db.path
+            )));
+        }
         Ok(())
     }
 
@@ -1190,6 +1299,7 @@ impl Database {
                             .to_string(),
                     ));
                 }
+                Self::check_registry_trunk_only(&db, options.flags)?;
                 return Ok(Some(db));
             }
         }
@@ -1348,6 +1458,7 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            Self::check_registry_trunk_only(&db, options.flags)?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1535,27 +1646,35 @@ impl Database {
                     };
 
                     // Every sidecar is named from ONE path, computed here, once (review 4 C3).
-                    let (base, branch_base) = if is_memory_like(path) {
-                        (None, path.to_string())
+                    let (sidecar_name, branch_base) = if is_memory_like(path) {
+                        (path.to_string(), path.to_string())
                     } else {
                         let base = sidecar_base(path)?;
                         if let Some(real) = &base {
                             refuse_sidecars_under_another_name(path, real, wal_path.is_some())?;
                         }
+                        let durable = matches!(
+                            opts.branch_durability,
+                            crate::branch::BranchDurability::Durable { .. }
+                        );
                         let branch_base = match &base {
                             Some(real) => real.clone(),
-                            None => absolute_path(path)?,
+                            // Only a durable store writes branch files; a volatile one checks for
+                            // them now, and so needs no working directory (review 5 C3-3).
+                            None if durable => absolute_path(path)?,
+                            None => path.to_string(),
                         };
-                        (base, branch_base)
+                        (base.unwrap_or_else(|| path.to_string()), branch_base)
                     };
                     let wal_path = match wal_path {
                         Some(wal_path) => wal_path.to_string(),
-                        None => format!("{}-wal", base.as_deref().unwrap_or(path)),
+                        None => format!("{sidecar_name}-wal"),
                     };
                     let mut db = Self::new(
                         opts,
                         flags,
                         path,
+                        &sidecar_name,
                         &branch_base,
                         wal_path,
                         &io,
@@ -1960,7 +2079,7 @@ impl Database {
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
                     let log_exists =
-                        journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+                        journal_mode::logical_log_exists(std::path::Path::new(&self.sidecar_name));
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
                     turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
                     *st = HeaderValidationState::Validate {
@@ -2314,7 +2433,7 @@ impl Database {
                     pager.set_schema_cookie(None);
 
                     if open_mv_store {
-                        let canonical_path = self.get_database_canonical_path();
+                        let canonical_path = self.mvcc_log_base();
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                         let mv_store = journal_mode::open_mv_store(
                             self.io.clone(),
@@ -2332,6 +2451,25 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// What the MVCC logical log is named from: the sidecar name (review 5 C3-4), except that an
+    /// in-memory database keeps the empty canonical path it always used.
+    pub(crate) fn mvcc_log_base(&self) -> String {
+        if self.is_in_memory_db() {
+            self.get_database_canonical_path()
+        } else {
+            self.sidecar_name.clone()
+        }
+    }
+
+    pub(crate) fn sidecar_name(&self) -> &str {
+        &self.sidecar_name
+    }
+
+    /// The WAL file this database opened (review 5 C3-2: the sync engine names it from here).
+    pub fn wal_path(&self) -> &str {
+        &self.wal_path
     }
 
     pub fn get_database_canonical_path(&self) -> String {
@@ -2395,11 +2533,12 @@ impl Database {
         self.shared_wal
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
-        if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
+        if self.mvcc_enabled()
+            || journal_mode::logical_log_exists(std::path::Path::new(&self.sidecar_name))
         {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
-                &self.path,
+                &self.sidecar_name,
                 self.open_flags,
                 self.durable_storage.clone(),
                 None,

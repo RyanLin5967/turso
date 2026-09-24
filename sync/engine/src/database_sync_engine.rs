@@ -137,14 +137,15 @@ fn db_size_from_page(page: &[u8]) -> u32 {
 fn is_memory(main_db_path: &str) -> bool {
     main_db_path == ":memory:"
 }
-fn create_main_db_wal_path(main_db_path: &str) -> String {
-    format!("{main_db_path}-wal")
+/// The main database's WAL and MVCC log, named exactly as the core opens them: from the one
+/// resolved path (`turso_core::sidecar_wal_path`; review 5 C3-2). Through a symlinked main path the
+/// core's WAL lives beside the REAL file, and a name built here from the path as given would read
+/// the WAL salt, truncate before a bootstrap, and back up a file the core no longer writes.
+fn create_main_db_wal_path(main_db_path: &str) -> Result<String> {
+    Ok(turso_core::sidecar_wal_path(main_db_path)?)
 }
-fn create_main_db_log_path(main_db_path: &str) -> String {
-    std::path::Path::new(main_db_path)
-        .with_extension("db-log")
-        .to_string_lossy()
-        .to_string()
+fn create_main_db_log_path(main_db_path: &str) -> Result<String> {
+    Ok(turso_core::sidecar_mvcc_log_path(main_db_path)?)
 }
 fn create_revert_db_wal_path(main_db_path: &str) -> String {
     format!("{main_db_path}-wal-revert")
@@ -406,8 +407,8 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
         let is_memory = is_memory(main_db_path);
         let file_specs = [
             (main_db_path.to_string(), "main-db"),
-            (create_main_db_wal_path(main_db_path), "main-wal"),
-            (create_main_db_log_path(main_db_path), "main-log"),
+            (create_main_db_wal_path(main_db_path)?, "main-wal"),
+            (create_main_db_log_path(main_db_path)?, "main-log"),
             (create_revert_db_wal_path(main_db_path), "revert-wal"),
             (create_meta_path(main_db_path), "metadata"),
         ];
@@ -1217,6 +1218,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         tracing::info!("initialize database tape connection: path={}", main_db_path);
         let main_db_io = main_db.io.clone();
         let main_db_file = main_db.db_file.clone();
+        // The WAL the core actually opened for this database (review 5 C3-2).
+        let main_db_wal_path = main_db.wal_path().to_string();
         let main_tape = DatabaseTape::new_with_opts(main_db, tape_opts);
         // Initialize CDC pragma and cache CDC version so iterate_changes() can work
         main_tape.connect(coro).await?;
@@ -1230,7 +1233,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             db_file: main_db_file,
             main_tape,
             main_db_path: main_db_path.to_string(),
-            main_db_wal_path: create_main_db_wal_path(&main_db_path),
+            main_db_wal_path,
             revert_db_wal_path: create_revert_db_wal_path(&main_db_path),
             meta_path: create_meta_path(&main_db_path),
             changes_file: Arc::new(Mutex::new(Some(changes_file))),
@@ -3755,12 +3758,12 @@ mod tests {
             ("main-db", main_path.to_string(), Some(b"main-old")),
             (
                 "main-wal",
-                create_main_db_wal_path(main_path),
+                create_main_db_wal_path(main_path).unwrap(),
                 Some(b"wal-old"),
             ),
             (
                 "main-log",
-                create_main_db_log_path(main_path),
+                create_main_db_log_path(main_path).unwrap(),
                 Some(b"log-old"),
             ),
             ("revert-wal", create_revert_db_wal_path(main_path), None),
@@ -3873,8 +3876,8 @@ mod tests {
                 .await?;
 
                 std::fs::write(&main_path, b"main-new").unwrap();
-                std::fs::write(create_main_db_wal_path(&main_path), b"wal-new").unwrap();
-                std::fs::write(create_main_db_log_path(&main_path), b"log-new").unwrap();
+                std::fs::write(create_main_db_wal_path(&main_path).unwrap(), b"wal-new").unwrap();
+                std::fs::write(create_main_db_log_path(&main_path).unwrap(), b"log-new").unwrap();
                 std::fs::write(create_revert_db_wal_path(&main_path), b"revert-created").unwrap();
                 std::fs::write(create_meta_path(&main_path), b"meta-new").unwrap();
 
@@ -3891,11 +3894,11 @@ mod tests {
 
         assert_eq!(std::fs::read(&main_path).unwrap(), b"main-old");
         assert_eq!(
-            std::fs::read(create_main_db_wal_path(&main_path)).unwrap(),
+            std::fs::read(create_main_db_wal_path(&main_path).unwrap()).unwrap(),
             b"wal-old"
         );
         assert_eq!(
-            std::fs::read(create_main_db_log_path(&main_path)).unwrap(),
+            std::fs::read(create_main_db_log_path(&main_path).unwrap()).unwrap(),
             b"log-old"
         );
         assert!(std::fs::read(create_revert_db_wal_path(&main_path)).is_err());
@@ -4193,7 +4196,8 @@ mod tests {
             db_file,
             main_tape,
             main_db_path: db_temp.path().to_str().unwrap().to_string(),
-            main_db_wal_path: super::create_main_db_wal_path(db_temp.path().to_str().unwrap()),
+            main_db_wal_path: super::create_main_db_wal_path(db_temp.path().to_str().unwrap())
+                .unwrap(),
             revert_db_wal_path: super::create_revert_db_wal_path(db_temp.path().to_str().unwrap()),
             meta_path: meta_temp.path().to_str().unwrap().to_string(),
             changes_file: Arc::new(Mutex::new(None)),
@@ -4367,7 +4371,8 @@ mod tests {
             db_file,
             main_tape,
             main_db_path: db_temp.path().to_str().unwrap().to_string(),
-            main_db_wal_path: super::create_main_db_wal_path(db_temp.path().to_str().unwrap()),
+            main_db_wal_path: super::create_main_db_wal_path(db_temp.path().to_str().unwrap())
+                .unwrap(),
             revert_db_wal_path: super::create_revert_db_wal_path(db_temp.path().to_str().unwrap()),
             meta_path: meta_temp.path().to_str().unwrap().to_string(),
             changes_file: Arc::new(Mutex::new(None)),
@@ -5091,5 +5096,34 @@ mod tests {
                 genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
             }
         }
+    }
+}
+
+/// Review 5 C3-2 (lead's decision): the engine names the main database's WAL and MVCC log exactly as
+/// the core opens them — from one resolved path, through a symlinked main path too. (New API: its
+/// red is its mutant.)
+#[cfg(all(test, unix))]
+mod sidecar_names {
+    use super::{create_main_db_log_path, create_main_db_wal_path};
+
+    #[test]
+    fn main_db_wal_and_log_follow_the_core_through_a_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real.db");
+        std::fs::write(&real, b"").unwrap();
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+        let link = link.to_str().unwrap();
+        assert_eq!(
+            create_main_db_wal_path(link).unwrap(),
+            format!("{}-wal", real.display()),
+            "the engine's main WAL is not the one the core opens"
+        );
+        assert_eq!(
+            create_main_db_log_path(link).unwrap(),
+            real.with_extension("db-log").to_str().unwrap(),
+            "the engine's MVCC log is not the one the core opens"
+        );
     }
 }

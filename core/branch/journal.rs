@@ -87,9 +87,18 @@ impl BranchFiles {
         }
     }
 
-    /// Whether this database has ever had durable branch state.
+    /// Whether these files hold durable branch state: a snapshot, or a log that is not EMPTY. An
+    /// empty log with no snapshot holds nothing — `Journal::recover` says so — and must not make an
+    /// open refuse: a creation that failed to lock leaves exactly that behind (the empty-log
+    /// wedge). A log that cannot even be inspected counts as state: refuse rather than guess.
     pub(crate) fn exist(&self) -> bool {
-        self.log.exists() || self.snap.exists()
+        if self.snap.exists() {
+            return true;
+        }
+        match std::fs::metadata(&self.log) {
+            Ok(meta) => meta.len() > 0,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
     }
 
     fn snap_tmp(&self) -> PathBuf {
@@ -591,7 +600,18 @@ impl Journal {
                     // byte. It needs its own test, because crc32c of nothing is 0 — a zero-filled
                     // header (a file size made durable before its data) passes the CRC below and
                     // would be reported as corruption (review 4 O1).
+                    //
+                    // Torn ONLY if nothing valid follows (review 5 O1-1, the lead's decision): a
+                    // zeroed hole with a whole frame after it means a later write survived and an
+                    // earlier one did not — under macOS plain fsync, possibly an acknowledged one.
+                    // That is Corrupt, loudly, and the log is left as it is.
                     if len == 0 {
+                        if let Some(at) = first_whole_frame_after(&bytes, pos + 1) {
+                            return Err(corrupt(&format!(
+                                "a zeroed region at byte {pos} is followed by a whole record at byte \
+                                 {at}: records after a hole are not a torn tail"
+                            )));
+                        }
                         break;
                     }
                     let start = pos + FRAME_HEADER_LEN;
@@ -707,11 +727,14 @@ impl Journal {
 
     /// Make every buffered record durable: arena first, then the records, then the log.
     pub(crate) fn flush(&mut self, arena: &mut Arena) -> Result<()> {
+        // Taken first, so the failpoint is spent by exactly this call whatever it returns — it
+        // cannot outlive the barrier that armed it (review 5 T-1).
+        let fail_next_write = std::mem::take(&mut self.fail_next_write);
         self.check_live()?;
         if self.pending.is_empty() {
             return Ok(());
         }
-        let written = if std::mem::take(&mut self.fail_next_write) {
+        let written = if fail_next_write {
             Err(LimboError::InternalError(
                 "failpoint: a branch log write failed".to_string(),
             ))
@@ -846,6 +869,22 @@ impl Journal {
     pub(crate) fn log_path(&self) -> &Path {
         &self.files.log
     }
+}
+
+/// The first offset at or after `from` where a whole, valid, decodable frame starts. Frames are
+/// variable-length and the hole's length is unknown, so every offset is tried; an offset whose
+/// length field is zero or runs past the end is rejected before any CRC is computed.
+fn first_whole_frame_after(bytes: &[u8], from: usize) -> Option<usize> {
+    let last = bytes.len().checked_sub(FRAME_HEADER_LEN)?;
+    (from..=last).find(|&at| {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap());
+        let start = at + FRAME_HEADER_LEN;
+        len > 0
+            && bytes.get(start..start.saturating_add(len)).is_some_and(|payload| {
+                crc32c::crc32c(payload) == crc && Record::decode(payload).is_some()
+            })
+    })
 }
 
 /// `Some((page_size, generation))` if the header is whole and valid, `None` if it is torn (a crash

@@ -3573,7 +3573,7 @@ impl Connection {
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                         let mv_store = journal_mode::open_mv_store(
                             init.db.io.clone(),
-                            &init.db.path,
+                            init.db.sidecar_name(),
                             init.db.open_flags,
                             init.db.durable_storage.clone(),
                             enc_ctx,
