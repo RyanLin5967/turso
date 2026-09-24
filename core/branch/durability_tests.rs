@@ -1878,7 +1878,13 @@ fn a_symlinked_database_closed_cleanly_under_the_old_naming_reopens() {
         Ok(_) => panic!("opened past a WAL that holds frames under another name"),
         Err(err) => err.to_string(),
     };
-    assert!(err.contains("checkpoint"), "the refusal must name the safe action: {err}");
+    // Review 6 item 4 (lead's decision) replaced the remedy this line pinned ("open through the
+    // old name and close cleanly, which checkpoints") because close does not always checkpoint and
+    // the link may have been retargeted: the refusal must name a remedy that is true.
+    assert!(
+        err.contains("rename") && err.contains("aside") && !err.contains("open the database through"),
+        "the refusal must name a true remedy, not one acted through the link: {err}"
+    );
 }
 
 /// Review 5 C3-4 (lead's decision): the MVCC logical log is a sidecar too. One found under the
@@ -2068,4 +2074,90 @@ fn a_symlinked_mvcc_database_closed_cleanly_under_the_old_naming_reopens() {
         err.contains("link2.db-log") && err.contains("real.db-log"),
         "the refusal must name both logs: {err}"
     );
+}
+
+// ---- Review 6 (lane_turso_review6.md @ 439a4b3) ----
+
+/// Review 6 item 4 (lead's decision). A refusal of a sidecar under another name must name a remedy
+/// that is TRUE for its kind of file, and must never advise acting through the link, which may
+/// have been retargeted since the file was written. (A clean close does not always checkpoint: not
+/// for MVCC, the sync engine, or a connection whose checkpoints are disabled.)
+#[cfg(unix)]
+#[test]
+fn a_sidecar_refusal_names_a_remedy_true_for_its_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let real = dir.path().join("real.db");
+    {
+        let db = open_at(&real, DatabaseOpts::new()).unwrap();
+        seed(&db.connect().unwrap(), 5);
+    }
+    let refusal = |name: &str, suffix: &str, bytes: &[u8]| {
+        let link = dir.path().join(name);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let sidecar = if suffix == "-log" {
+            link.with_extension("db-log")
+        } else {
+            std::path::PathBuf::from(format!("{}{suffix}", link.display()))
+        };
+        std::fs::write(&sidecar, bytes).unwrap();
+        match open_at(&link, DatabaseOpts::new()) {
+            Ok(_) => panic!("{name}: opened past {} under another name", sidecar.display()),
+            Err(err) => err.to_string(),
+        }
+    };
+    for (name, suffix) in [("wal.db", "-wal"), ("log.db", "-log")] {
+        let err = refusal(name, suffix, &[0x5A; 4096]);
+        assert!(!err.contains("open the database through"), "{name}: a remedy through the link: {err}");
+        assert!(err.contains("rename"), "{name}: no way to keep what it holds: {err}");
+        assert!(err.contains("aside"), "{name}: no way to proceed without it: {err}");
+    }
+    let err = refusal("branch.db", "-branch-log", b"x");
+    assert!(err.contains("aside"), "a branch file's refusal names no remedy: {err}");
+    assert!(
+        !err.contains("remove one of them"),
+        "a branch file's refusal may advise removing this database's own branch files: {err}"
+    );
+}
+
+/// Review 6 item 5 (lead's decision). A database whose file name is 245–251 bytes long has names
+/// that fit NAME_MAX for itself and its `-wal`, but not for `-branch-log`: `stat` fails with
+/// ENAMETOOLONG, which means the branch file cannot exist. A volatile open must not refuse.
+#[cfg(unix)]
+#[test]
+fn a_name_too_long_for_branch_files_opens_volatile() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(format!("{}.db", "n".repeat(245)));
+    let db = open_at(&path, DatabaseOpts::new())
+        .unwrap_or_else(|e| panic!("a name too long for branch files refused a volatile open: {e}"));
+    seed(&db.connect().unwrap(), 3);
+    assert_eq!(value(&db.connect().unwrap(), 2), Some(original(2)));
+}
+
+/// Review 6 item 6 (lead's decision). The process registry must not hand a read-write open an
+/// instance opened with ANOTHER branch durability: a durable caller receiving a volatile instance
+/// forks branches that vanish on a crash, and a `sync: true` caller receiving a `sync: false` one
+/// forks branches that are not synced — both silently. Refused by name, like C2-1.
+#[test]
+fn a_registry_hit_of_another_branch_durability_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("volatile.db");
+    let volatile = open_at(&path, DatabaseOpts::new()).unwrap();
+    seed(&volatile.connect().unwrap(), 3);
+    let err = match open_at(&path, durable()) {
+        Ok(_) => panic!("a durable open received the volatile instance"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("branch durability"), "refused for another reason: {err}");
+    drop(volatile);
+    open_at(&path, durable()).expect("with the volatile handle closed, a durable open works");
+
+    let path = dir.path().join("nosync.db");
+    let nosync = DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: false });
+    let unsynced = open_at(&path, nosync).unwrap();
+    seed(&unsynced.connect().unwrap(), 3);
+    let err = match open_at(&path, durable()) {
+        Ok(_) => panic!("a sync: true open received the sync: false instance"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("branch durability"), "refused for another reason: {err}");
 }

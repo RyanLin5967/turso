@@ -1291,6 +1291,39 @@ mod tests {
         assert_eq!(std::fs::read(&files.log).unwrap(), before, "the refused recovery cut the log");
     }
 
+    /// Review 6 item 6 (lead's decision): the Corrupt refusal of a zeroed hole names its remedy —
+    /// which file, and where to cut it — not just byte offsets.
+    #[test]
+    fn a_zeroed_hole_refusal_names_its_remedy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut arena = Arena::new(512);
+        let mut journal = Journal::create(&files, 512, false).unwrap();
+        journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        journal.flush(&mut arena).unwrap();
+        drop(journal);
+        let hole_at = std::fs::metadata(&files.log).unwrap().len();
+        let mut payload = Vec::new();
+        Record::Release { branch: 1 }.encode(&mut payload);
+        let mut frame = Vec::new();
+        put_u32(&mut frame, payload.len() as u32);
+        put_u32(&mut frame, crc32c::crc32c(&payload));
+        frame.extend_from_slice(&payload);
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().append(true).open(&files.log).unwrap();
+            f.write_all(&[0u8; 25]).unwrap();
+            f.write_all(&frame).unwrap();
+        }
+        let err = match Journal::recover(&files, false) {
+            Ok(_) => panic!("a zeroed hole before a whole frame was cut as a torn tail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("truncate"), "the refusal names no remedy: {err}");
+        assert!(err.contains(&files.log.display().to_string()), "the refusal names no file: {err}");
+        assert!(err.contains(&hole_at.to_string()), "the refusal names no cut point: {err}");
+    }
+
     /// The premise that makes a zero length torn: no record encodes to an empty payload, because
     /// every payload starts with its tag byte.
     #[test]
