@@ -307,3 +307,74 @@ failure, an extra failure, a wrong pass count, and a reason found only in ANOTHE
 
 ⚠ A4 changes this file's sha256 again. A3 already makes the verdict script refuse until someone
 re-reads the file and re-pins it.
+
+### A5 — 2026-09-24: review 10 — decisions F1–F9 (appended before any code of it)
+
+Nothing above this amendment changes; A4's text stays as committed. Source:
+`frontier/lane_turso_review10.md` @ artie-research `049715c` (SOUND-WITH-CAVEATS at `70bd2c410`), with
+the lead's decisions F1–F9. None of these tests has been built or run.
+
+**Erratum to A4 (F9).** A4 says the red commit "holds tests only; its parent is `073b088d2`". Its
+parent is `703b9af9d`, the A4 commit itself (`git log --format='%h %p'`). The code under test is
+`073b088d2`'s either way, so P16 is unaffected.
+
+**Test changes.** They go in the commit right after this amendment, which holds tests only.
+1. `attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused`:
+   - **F2.** The negative control matches each registry refusal's hit-specific phrase,
+     "is open in this process with default branch lease" (`leased.db`) and "is open in this process
+     with branch durability" (`durable.db`), instead of "branch lease" / "branch durability". A
+     registry MISS of a database with durable branch files is refused by `BranchStore::open` with
+     text that also contains "branch durability", but not "is open in this process with".
+   - **F4.** After each successful ATTACH, the test asserts `Arc::ptr_eq` between the held instance
+     and `conn.get_source_database(conn.get_database_id_by_name(alias))`. The panic is "premise:
+     the ATTACH of <name> received another instance, not the registry's". That proves THIS ATTACH
+     hit the registry, not only the lookup just before it.
+2. `a_sidecar_refusal_keeps_frames_only_while_the_real_file_does_not_exist` (**F8**, the lead's
+   wording): it also asserts "nothing has opened this database since" (panic: "the condition still
+   exempts this build's own opens") and "except through" (panic: "the condition does not name the
+   one open that keeps the frames").
+3. `a_name_too_long_for_branch_files_opens_volatile` (**F3**): its doc comment only. `-branch-log`
+   stops fitting at 245 bytes, not 244.
+
+No test is added or removed: there are still 118 `#[test]` attributes under `core/branch/`, 117 of
+which run on unix.
+
+**P23. The red commit (tests only; code `70bd2c410`).** `cargo test -p turso_core --lib branch::`
+gives **116 passed, 1 FAILED**. The failure is the keeps-frames test, and its panic contains
+"exempts this build's own opens". The ATTACH test PASSES: F2's exemption hands the ATTACH the held
+instance (INFERRED, review 10 §2). If `ptr_eq` fails, that is a finding against the exemption or the
+test, and not a test to edit.
+
+**P24. F2's red against the code before F2, with the red commit's test file.** Run `git checkout
+--detach e472b108e && git checkout <red> -- core/branch/durability_tests.rs`, then the ATTACH test
+alone. It gives **1 FAILED**, and its panic matches both `leased\.db: [^|]*is open in this process
+with default branch lease` and `durable\.db: [^|]*is open in this process with branch durability`.
+No panic contains "premise". The `ptr_eq` check runs only after a successful ATTACH, so it never
+runs here. The same patterns replace P17's: the `ff7445f8a` file's panic carries the same registry
+messages, so the stronger patterns also hold for it (INFERRED).
+
+**P25. The fix commit.** `branch::` gives **117 passed, 0 failed**. The full `cargo test -p
+turso_core --lib` gives **2466 passed, 0 failed, 17 ignored**, unchanged.
+
+**P26. Fire-check at the fix commit.**
+- There are **114 mutants**. `OTHER_a` and `OTHER_b` are re-anchored to the F8 wording. `OTHER_c`,
+  new, reverts "nothing has opened" to "no other build or program has opened", and is killed by the
+  keeps-frames test.
+- The audit reports no problems.
+
+**P27. Runner exit mapping (F1), no cargo.**
+- The entry point is `main(argv, env, …) -> int`. `__main__` is `sys.exit(main(…))`, with a fake
+  tree chosen only by `--fake-run <case>`.
+- `--self-test` asserts `main` returns **0** on a clean fake run, **1** with collateral under an
+  expected survivor, **2** with collateral under the canary, and 2 on a dirty tree. It asserts the
+  same three codes as PROCESS exit statuses, through `--fake-run` subprocesses of this very file.
+- `selftest_plants.py` adds three plants, and each must be caught:
+  - r1: the verdict-to-exit mapping forced to 0;
+  - r2: `Refused` mapped to 0;
+  - r1′: `__main__` exiting 0 whatever `main` returns.
+
+**Falsifiers for A5:**
+- In P23, any other failure, or the keeps-frames test failing on another assertion.
+- In P24, a "premise" panic, or either half matching only the old, weaker pattern.
+- In P25, the ATTACH test's `ptr_eq` premise failing: the ATTACH did not receive the held
+  instance.
