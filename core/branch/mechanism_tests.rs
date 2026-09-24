@@ -849,3 +849,52 @@ fn a_rolled_back_branch_ddl_restores_the_branch_schema_not_the_trunks() {
     set(&bc, 3, "after-rollback");
     assert_eq!(value(&bc, 3), Some("after-rollback".to_string()));
 }
+
+/// F4 (research_reclaim-with-live-children.md §5): a released interior branch used to keep every
+/// version until its last child went, including versions no child can read — anything it wrote
+/// after its last fork. Those must be freed at the release itself.
+#[test]
+fn releasing_an_interior_branch_frees_what_no_live_child_can_read() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let base = in_use(&db);
+
+    let p = trunk.fork_branch().unwrap();
+    set(&p.connect().unwrap(), 7, "p-before-fork");
+    let before_fork: BTreeSet<u32> = p.owned_slots().into_iter().collect();
+    let c = p.fork().unwrap();
+    {
+        // S = 3 fresh pages: rows on three leaves other than row 7's, written after the fork.
+        let pc = p.connect().unwrap();
+        for id in [60, 110, 170] {
+            set(&pc, id, "p-after-fork");
+        }
+    }
+    let all: BTreeSet<u32> = p.owned_slots().into_iter().collect();
+    let fresh: BTreeSet<u32> = all.difference(&before_fork).copied().collect();
+    assert_eq!(fresh.len(), 3, "the three writes did not land on three fresh pages");
+
+    let reaped = p.reap().unwrap();
+    assert!(reaped.deferred, "the interior was freed whole while its child lives");
+    assert_eq!(
+        reaped.freed_pages,
+        fresh.len(),
+        "the release kept versions no live child can read"
+    );
+    for slot in &fresh {
+        assert!(db.branch_slot_is_free(*slot), "slot {slot}: written after the fork, still held");
+    }
+    for slot in &before_fork {
+        assert!(!db.branch_slot_is_free(*slot), "slot {slot}: the child reads it, yet it was freed");
+    }
+    let cc = c.connect().unwrap();
+    assert_eq!(value(&cc, 7), Some("p-before-fork".to_string()));
+    for id in [60, 110, 170] {
+        assert_eq!(value(&cc, id), Some(original(id)), "the child saw a write made after its fork");
+    }
+    drop(cc);
+    drop(c);
+    assert_eq!(in_use(&db), base);
+    assert_eq!(db.branch_stats().live_branches, 0);
+}

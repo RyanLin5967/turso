@@ -191,6 +191,15 @@ pub struct Branch {
     released: bool,
 }
 
+/// What a lease-expiry pass reaped.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Expired {
+    /// Branches reaped because their lease ran out, in the order they were reaped.
+    pub reaped: Vec<BranchId>,
+    /// Arena pages the pass returned to the free list.
+    pub freed_pages: usize,
+}
+
 /// What reaping a branch released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaped {
@@ -245,6 +254,14 @@ impl Branch {
     pub fn reap(mut self) -> Result<Reaped> {
         self.released = true;
         Ok(self.db.branches.release_handle(self.id))
+    }
+
+    /// Grant or extend this branch's lease to `ttl` from now on the lease clock.
+    ///
+    /// ⚠ LEASE SKELETON (UNBUILT): accepted and IGNORED in this commit, so the lease tests in
+    /// `durability_tests.rs` fail until the mechanism lands.
+    pub fn lease(&self, _ttl: std::time::Duration) -> Result<()> {
+        Ok(())
     }
 
     /// Detach this branch from its handle WITHOUT releasing it — the branch outlives the handle
@@ -405,6 +422,21 @@ impl Database {
     /// Every unreleased branch, attached or not.
     pub fn branch_ids(&self) -> Vec<BranchId> {
         self.branches.ids()
+    }
+
+    /// Reap every branch whose lease has run out. SKELETON: reaps nothing.
+    pub fn expire_branches(&self) -> Result<Expired> {
+        Ok(Expired::default())
+    }
+
+    /// Move the lease clock forward, for tests. SKELETON: ignored.
+    #[doc(hidden)]
+    pub fn branch_lease_clock_advance(&self, _by: std::time::Duration) {}
+
+    /// The lease clock now. SKELETON: always zero.
+    #[doc(hidden)]
+    pub fn branch_lease_now(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
     }
 
     /// Arm (or clear) a crash failpoint for the durability tests.

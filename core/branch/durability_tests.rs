@@ -677,3 +677,174 @@ fn a_release_deferred_by_an_open_connection_is_still_a_release_after_compaction(
     assert!(in_use(&db).is_empty(), "its pages came back with it");
     assert!(db.branch_ids().is_empty());
 }
+
+// ---- F5: leases. A crashed agent's branch must not pin its ancestors forever. ----
+//
+// The lease clock is the store's own: it advances only while the database is open (Chubby's rule:
+// a stopped timer is equivalent to extending the lease) and is persisted, so a reopen resumes it
+// rather than restarting it at zero or charging the downtime.
+
+use std::time::Duration;
+
+#[test]
+fn an_expired_lease_reaps_a_detached_branch_at_the_next_open() {
+    // The crashed agent: its branch is detached, its lease runs out, and nothing ever releases it.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        b.lease(Duration::from_secs(10)).unwrap();
+        set(&b.connect().unwrap(), 150, "orphaned");
+        assert!(!in_use(&db).is_empty());
+        let _abandoned = b.into_id();
+        db.branch_lease_clock_advance(Duration::from_secs(11));
+    }
+    let db = reopen(&path, incarnation);
+    assert!(db.branch_ids().is_empty(), "an expired, abandoned branch survived the restart");
+    assert!(in_use(&db).is_empty(), "its pages survived the restart");
+}
+
+#[test]
+fn the_lease_timer_stops_while_the_database_is_closed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let b_id;
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        let b = trunk.fork_branch().unwrap();
+        b.lease(Duration::from_secs(10)).unwrap();
+        db.branch_lease_clock_advance(Duration::from_secs(6));
+        assert!(db.expire_branches().unwrap().reaped.is_empty(), "reaped at 6 of 10 s");
+        b_id = b.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    // Resumed, not restarted: the 6 s already spent are still spent...
+    assert!(
+        db.branch_lease_now() >= Duration::from_secs(6),
+        "the lease clock went back to {:?} across a reopen",
+        db.branch_lease_now()
+    );
+    // ...and the time the database was closed was not charged (9 < 10: still alive)...
+    db.branch_lease_clock_advance(Duration::from_secs(3));
+    assert!(db.expire_branches().unwrap().reaped.is_empty(), "reaped at 9 of 10 s");
+    assert_eq!(db.branch_ids(), vec![b_id]);
+    // ...and it does run out (11 > 10).
+    db.branch_lease_clock_advance(Duration::from_secs(2));
+    assert_eq!(db.expire_branches().unwrap().reaped, vec![b_id]);
+    assert!(db.branch_ids().is_empty());
+}
+
+#[test]
+fn an_expired_interior_is_partially_reclaimed_while_its_live_child_reads_through_it() {
+    // The one thing D37 (corrected) leaves this fork to show: in-engine, page-granular, PARTIAL
+    // reclamation of an interior branch when its lease runs out, with a live child below it.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let p_id;
+    let c_id;
+    let kept;
+    let fresh;
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        p.lease(Duration::from_secs(10)).unwrap();
+        set(&p.connect().unwrap(), 7, "p-before-fork");
+        kept = p.owned_slots().into_iter().collect::<BTreeSet<u32>>();
+        let c = p.fork().unwrap();
+        c.lease(Duration::from_secs(100)).unwrap();
+        {
+            let pc = p.connect().unwrap();
+            set(&pc, 60, "p-after-fork");
+            set(&pc, 110, "p-after-fork");
+        }
+        let all: BTreeSet<u32> = p.owned_slots().into_iter().collect();
+        fresh = all.difference(&kept).copied().collect::<BTreeSet<u32>>();
+        assert_eq!(fresh.len(), 2);
+
+        db.branch_lease_clock_advance(Duration::from_secs(11));
+        let expired = db.expire_branches().unwrap();
+        assert_eq!(expired.reaped, vec![p.id()], "only the interior's lease ran out");
+        assert_eq!(expired.freed_pages, fresh.len(), "partial reclamation freed the wrong amount");
+        for slot in &fresh {
+            assert!(db.branch_slot_is_free(*slot), "slot {slot}: unreadable, still held");
+        }
+        for slot in &kept {
+            assert!(!db.branch_slot_is_free(*slot), "slot {slot}: the child reads it, freed");
+        }
+        // The reaped interior takes no new children, and its handle can no longer open it.
+        assert!(p.fork().is_err(), "a reaped interior was forked");
+        assert!(p.connect().is_err(), "a reaped interior was opened");
+        assert_eq!(
+            value(&c.connect().unwrap(), 7),
+            Some("p-before-fork".to_string()),
+            "the live child lost the interior's page it reads"
+        );
+        p_id = p.id();
+        c_id = c.into_id();
+        drop(p);
+    }
+
+    // Across a restart the partial reclamation holds and the child still reads through.
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_ids(), vec![c_id]);
+    assert_eq!(in_use(&db), kept, "a reopen changed what the interior still holds");
+    let c = db.branch(c_id).unwrap();
+    assert_eq!(value(&c.connect().unwrap(), 7), Some("p-before-fork".to_string()));
+    assert_eq!(value(&c.connect().unwrap(), 60), Some(original(60)));
+    assert!(db.branch(p_id).is_err(), "the reaped interior came back");
+
+    // When the child's lease runs out too, the chain goes, the interior's last page with it.
+    let c_id_again = c.into_id();
+    db.branch_lease_clock_advance(Duration::from_secs(100));
+    let expired = db.expire_branches().unwrap();
+    assert_eq!(expired.reaped, vec![c_id_again]);
+    assert!(in_use(&db).is_empty());
+    assert_eq!(db.branch_stats().live_branches, 0);
+}
+
+#[test]
+fn expiry_reaps_deepest_first_and_a_fork_never_revives_an_expired_parent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    let p = trunk.fork_branch().unwrap();
+    p.lease(Duration::from_secs(5)).unwrap();
+    set(&p.connect().unwrap(), 7, "p");
+    let c = p.fork().unwrap();
+    c.lease(Duration::from_secs(5)).unwrap();
+    set(&c.connect().unwrap(), 30, "c");
+    db.branch_lease_clock_advance(Duration::from_secs(6));
+
+    // A fork from an expired (not yet reaped) parent is refused: the fork runs the expiry pass
+    // first, as Neon refuses "create children from expiring branches".
+    assert!(p.fork().is_err(), "forked a child from an expired parent");
+    // That pass reaped both, the child first: the interior then goes whole, not in two steps.
+    assert!(db.branch_ids().is_empty());
+    assert!(in_use(&db).is_empty());
+
+    // Expiry order, observed directly on a fresh chain.
+    let p = trunk.fork_branch().unwrap();
+    p.lease(Duration::from_secs(5)).unwrap();
+    let c = p.fork().unwrap();
+    c.lease(Duration::from_secs(5)).unwrap();
+    let g = c.fork().unwrap();
+    g.lease(Duration::from_secs(5)).unwrap();
+    db.branch_lease_clock_advance(Duration::from_secs(6));
+    let expired = db.expire_branches().unwrap();
+    assert_eq!(expired.reaped, vec![g.id(), c.id(), p.id()], "not deepest first");
+}
