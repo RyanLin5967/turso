@@ -224,7 +224,7 @@ pub(crate) struct SnapBranch {
     pub(crate) fork_epoch: u64,
     pub(crate) epoch: u64,
     pub(crate) released: bool,
-    /// The lease deadline on the lease clock; 0 = no lease.
+    /// The lease deadline on the lease clock PLUS ONE; 0 = no lease (a real deadline may be 0).
     pub(crate) lease_deadline_ms: u64,
     /// (page, slot, born, crc)
     pub(crate) current: Vec<(u32, Slot, u64, u32)>,
@@ -573,6 +573,21 @@ impl Journal {
     }
 
     fn write_pending(&self, arena: &mut Arena) -> Result<()> {
+        // Append only where this journal believes the log ends. A log that is longer than that was
+        // written by another journal over the same files (a store that outlived its database past
+        // a reopen): writing at the stale offset would cut the other's records off at the next
+        // recovery, so refuse — reading the file's state, not trusting the in-memory length
+        // (review R8).
+        let on_disk = self
+            .file
+            .metadata()
+            .map_err(|e| io_error(e, "stat branch log"))?
+            .len();
+        if on_disk != self.len {
+            return Err(corrupt(
+                "the branch log changed under this journal; another store instance wrote it",
+            ));
+        }
         if self.sync {
             arena.sync()?;
         }
