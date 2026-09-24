@@ -10,6 +10,10 @@
 //!   churn      steady N: every cycle forks + writes one branch and reaps a random live one
 //!   churn_hot  churn, plus the trunk rewrites the hot row in every cycle
 //!   pages      every branch writes w pages in one transaction; x axis = N, one block per w
+//!   spread_trunk the `spread` arm's trunk writes with NO branches (amendment 2); x = trunk writes
+//!
+//! `--no-autocheckpoint` disables the trunk connection's WAL auto-actions (auto-checkpoint and WAL
+//! restart), amendment 2. Every state line prints the WAL file's size.
 //!
 //! Every read a sample makes is checked against a model the harness keeps itself (never against
 //! the engine), and the engine's own counts are checked against the workload before a number is
@@ -18,6 +22,7 @@
 //! so a slope can be read against an integer that load cannot move.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,6 +47,7 @@ enum Arm {
     Churn,
     ChurnHot,
     Pages,
+    SpreadTrunk,
 }
 
 struct Args {
@@ -52,6 +58,7 @@ struct Args {
     cycles: usize,
     windows: usize,
     w_list: Vec<usize>,
+    no_autocheckpoint: bool,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -70,6 +77,7 @@ fn parse_args() -> Args {
         cycles: 10_000,
         windows: 10,
         w_list: vec![1],
+        no_autocheckpoint: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -83,6 +91,7 @@ fn parse_args() -> Args {
                     "churn" => Arm::Churn,
                     "churn_hot" => Arm::ChurnHot,
                     "pages" => Arm::Pages,
+                    "spread_trunk" => Arm::SpreadTrunk,
                     other => die(&format!("unknown arm {other}")),
                 })
             }
@@ -92,6 +101,7 @@ fn parse_args() -> Args {
             "--cycles" => args.cycles = val().parse().unwrap_or_else(|_| die("bad --cycles")),
             "--windows" => args.windows = val().parse().unwrap_or_else(|_| die("bad --windows")),
             "--w" => args.w_list = parse_list(&val(), "--w"),
+            "--no-autocheckpoint" => args.no_autocheckpoint = true,
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -182,7 +192,11 @@ fn read_v(conn: &Arc<Connection>, id: i64) -> String {
 }
 
 fn update(conn: &Arc<Connection>, id: i64) {
-    conn.execute(format!("UPDATE t SET v = '{}' WHERE id = {id}", branch_value(id)))
+    update_to(conn, id, &branch_value(id));
+}
+
+fn update_to(conn: &Arc<Connection>, id: i64, value: &str) {
+    conn.execute(format!("UPDATE t SET v = '{value}' WHERE id = {id}"))
         .unwrap();
 }
 
@@ -284,6 +298,7 @@ impl WorkSum {
 
 struct Bench {
     db: Arc<Database>,
+    wal_path: PathBuf,
     trunk: Arc<Connection>,
     model: TrunkModel,
     rng: Rng,
@@ -346,13 +361,14 @@ impl Bench {
         let s = self.db.branch_stats();
         println!(
             "# x={x} live={} arena_in_use={} arena_free={} arena_high_water={} rss_bytes={} \
-             trunk_writes={} {extra}",
+             trunk_writes={} wal_bytes={} {extra}",
             s.live_branches,
             s.arena_slots_in_use,
             s.arena_slots_free,
             s.arena_slots_in_use + s.arena_slots_free,
             rss_bytes(),
-            self.model.writes
+            self.model.writes,
+            std::fs::metadata(&self.wal_path).map_or(0, |m| m.len())
         );
     }
 
@@ -415,6 +431,10 @@ fn main() {
     )
     .unwrap();
     let trunk = db.connect().unwrap();
+    if args.no_autocheckpoint {
+        // Amendment 2: no auto-checkpoint and no WAL restart on the trunk connection.
+        trunk.wal_auto_actions_disable();
+    }
     // Amendment 1: trunk commits do not fsync. The fsync is not the mechanism under test, and the
     // `hot`/`spread`/`churn_hot` arms commit on the trunk once per fork, up to 10^6 times.
     trunk.execute("PRAGMA synchronous = OFF").unwrap();
@@ -442,8 +462,15 @@ fn main() {
     println!(
         "# arm={:?} checkpoints={:?} samples={} seed={:#x} cycles={} windows={} w={:?} \
          trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} page_size={page_size} \
-         trunk_pages={trunk_pages} trunk_synchronous={synchronous}",
-        args.arm, args.checkpoints, args.samples, args.seed, args.cycles, args.windows, args.w_list
+         trunk_pages={trunk_pages} trunk_synchronous={synchronous} no_autocheckpoint={}",
+        args.arm,
+        args.checkpoints,
+        args.samples,
+        args.seed,
+        args.cycles,
+        args.windows,
+        args.w_list,
+        args.no_autocheckpoint
     );
     println!(
         "# clock tick {:.0} ns (Instant); times are microseconds per operation; work columns are \
@@ -462,6 +489,7 @@ fn main() {
 
     let mut bench = Bench {
         db: db.clone(),
+        wal_path: PathBuf::from(format!("{}-wal", path.to_str().unwrap())),
         trunk,
         model: TrunkModel::default(),
         rng: Rng(args.seed),
@@ -472,6 +500,7 @@ fn main() {
         Arm::Chain => arm_chain(&mut bench, &args),
         Arm::Churn | Arm::ChurnHot => arm_churn(&mut bench, &args),
         Arm::Pages => arm_pages(&mut bench, &args),
+        Arm::SpreadTrunk => arm_spread_trunk(&mut bench, &args),
     }
     let end = db.branch_stats();
     if end.live_branches != 0 || end.arena_slots_in_use != 0 {
@@ -668,11 +697,15 @@ fn arm_chain(b: &mut Bench, args: &Args) {
         let (mut fork, mut open, mut first_write, mut reap) =
             (Op::default(), Op::default(), Op::default(), Op::default());
         for i in 0..k {
-            // A fresh child of the tip, at depth d + 1, writing a first-half row.
+            // A fresh child of the tip, at depth d + 1, writing a first-half row. The value is one no
+            // row holds (amendment 2): an UPDATE to an identical payload is skipped by OpInsert's
+            // no-op check, dirties nothing and copies nothing, and chain_row(10^6 + i) is
+            // chain_row(i), a row level i already wrote with branch_value.
             let row = chain_row(1_000_000 + i);
+            let value = format!("c{:0>width$}", i, width = VALUE_LEN - 1);
             let child = b.timed(&mut fork, || tip.branch.fork().unwrap());
             let conn = b.timed(&mut open, || child.connect().unwrap());
-            b.timed(&mut first_write, || update(&conn, row));
+            b.timed(&mut first_write, || update_to(&conn, row, &value));
             drop(conn);
             let reaped = b.timed(&mut reap, || child.reap().unwrap());
             if reaped.deferred || reaped.freed_pages != 1 {
@@ -1027,4 +1060,33 @@ fn arm_pages(b: &mut Bench, args: &Args) {
             }
         }
     }
+}
+
+/// Amendment 2, run e1: the `spread` arm's trunk write sequence with no branch ever forked, so the
+/// branch store is never consulted on a trunk write (`trunk_has_children()` is false). x = trunk
+/// writes committed before the checkpoint's K timed writes.
+fn arm_spread_trunk(b: &mut Bench, args: &Args) {
+    println!("{HEADER}");
+    for &n in &args.checkpoints {
+        while (b.model.writes as usize) < n {
+            b.trunk_write(spread_row(b.model.writes));
+        }
+        let mut tw = Op::default();
+        for _ in 0..args.samples {
+            let row = spread_row(b.model.writes);
+            let g = b.model.record(row);
+            let sql = format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_gen_value(g));
+            b.timed(&mut tw, || b.trunk.execute(sql).unwrap());
+        }
+        let last = spread_row(b.model.writes - 1);
+        if read_v(&b.trunk, last) != b.model.value_at(last, b.model.writes) {
+            not_a_result("the trunk does not read its own last write");
+        }
+        if b.db.branch_stats().live_branches != 0 {
+            not_a_result("a branch exists in the no-branch arm");
+        }
+        b.print_op(n, "trunk_write", &tw);
+        b.print_state(n, "");
+    }
+    b.print_slopes(&args.checkpoints, &["trunk_write"]);
 }

@@ -215,3 +215,47 @@ in one BEGIN … COMMIT.
 **Known limits, stated before the arms run.** Single thread; volatile arena; trunk `synchronous=OFF`;
 one hot row, not a hot set; K = 200; the chain is one chain (N = d); the counters count scans, and a scan's
 cost per element is inferred from Δtime/Δcount, never measured alone.
+
+### Amendment 2 — 2026-09-24T23:49Z: arm b's harness defect; the inconclusive-band re-runs; attribution runs for a2's unpredicted trunk_write step
+
+Recorded after reading a1 (artie-research `bfd5a30`), a2 (`03c5e7e`), b (`2a6433b`), c1 (`b18db94`), c2
+(`306924b`), d_w (`d25145d`), d_N (`a3bdecb`), and before any run below. Amendment 1's predictions do not change.
+
+**1. Arm b refused itself (NOT A RESULT at d=1): a harness defect, fixed.** Sampled child i wrote row
+`chain_row(10^6+i)`, which equals `chain_row(i)` (10^6 ≡ 0 mod 10^4): the row chain level i had already written,
+with the same `branch_value`. Turso's `OpInsert` no-op check (`core/vdbe/execute.rs`, `is_noop_update`) skips the
+physical write of an identical payload, so nothing was dirtied, nothing copied, and the reap freed 0 pages. At d ≥ 2
+every sample i ≤ min(d, 199) would have been such a no-op. Fix: a sampled child writes `c` + its zero-padded index
+(same length; no row holds it). It changes what arm b's `first_write` writes (a real write instead of a no-op) and
+nothing else. Re-run as `b_chain_r2`, same arguments. Also: the runner's progress file printed "rc=0" for b because
+`$(date)` reset `$?`; each raw file's own `# rc=` line is authoritative.
+
+**2. Inconclusive-band re-runs, as amendment 1's rule requires** (flat-predicted ops that landed in (0.10, 0.25)):
+a2 `fork` +0.109 and `reap` +0.108; c1 `reap` +0.214; d_w `fork` +0.202 (slope vs w). Each arm is re-run once with
+`--samples 1000`, other arguments unchanged; the re-run is the reading: `a2_spread_r2`, `c1_churn_r2`, `d_w_r2`.
+For c1, `--samples` does not enter the churn loop (every cycle is timed), so `c1_churn_r2` is a second draw at a
+later moment, identical in design; said here so it is not mistaken for a larger sample.
+
+**3. a2's trunk_write step (unpredicted; the prediction was |slope| < 0.10, measured +0.312).** 10.92 µs at x=10^2,
+then 370–400 µs at every x from 10^3 to 10^6 (local 10^5→10^6 +0.005): a step after ~10^3 trunk commits, absent from
+a1 (10.5–12.6 µs to 10^6) whose trunk rewrites one page. No mechanism is named before these runs. Held beforehand:
+- H1 (the engine, not branching): after the first auto-checkpoint (threshold 1000 frames, `wal.rs` `should_checkpoint`),
+  a trunk commit pays work ∝ the distinct pages the WAL holds (~545 in a2, 1 in a1).
+- H2 (branching): a trunk commit pays for something the branch mechanism adds — per-page retention bookkeeping, or
+  branch connections' WAL read snapshots holding back checkpoint progress so that commits keep re-attempting it.
+
+Runs (K = 200):
+- **e1** `--arm spread_trunk --checkpoints 100,1000,10000`: the same trunk write sequence, no branch ever forked
+  (`first_write_trunk` is never called: `trunk_has_children()` is false).
+- **e2** `--arm spread --no-autocheckpoint --checkpoints 100,1000,10000`: a2 with the trunk connection's WAL auto-actions
+  disabled (`Connection::wal_auto_actions_disable`: no auto-checkpoint, no WAL restart).
+- **e3** profile: `--arm spread --checkpoints 1000,30000` with `/usr/bin/sample <pid> 5` taken during the growth from
+  10^3 to 3·10^4. Its timings are not results; its call tree is attribution evidence.
+- Every state line now prints the WAL file's size (observation only).
+
+Decision rule (a step = trunk_write p50 at x=10^4 ≥ 5× its value at x=10^2):
+- e1 steps → an engine property of Turso's WAL path under a ~545-page write set, independent of branching; reported
+  as such, not as a branching wall.
+- e1 flat and e2 flat → needs branches AND the auto-checkpoint: a branching × checkpoint interaction; e3 names frames.
+- e1 flat and e2 steps → branching, not the checkpoint; e3 names frames.
+Whatever e3 shows is labelled a candidate unless e1/e2 isolate it.
