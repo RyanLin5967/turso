@@ -620,9 +620,10 @@ impl Journal {
                                  records whose trunk commits are durable, and branches forked \
                                  before them would then read newer trunk pages without any error. \
                                  The safe remedy: keep a copy of all three branch files ({log}, \
-                                 {arena}, {snap}) — a restore needs all three — then move all three \
-                                 aside. Every branch is lost; the trunk is intact, because it never \
-                                 depends on branch files",
+                                 {arena}, {snap}) — a restore needs all three, and is safe only \
+                                 while the trunk has not been written since they were moved aside \
+                                 — then move all three aside. Every branch is lost; the trunk is \
+                                 intact, because it never depends on branch files",
                                 log = files.log.display(),
                                 arena = files.arena.display(),
                                 snap = files.snap.display()
@@ -893,9 +894,10 @@ impl Journal {
 /// * a name too long for the filesystem: `ErrorKind::InvalidFilename`, which std maps from
 ///   ENAMETOOLONG and only that errno on unix (review 7 READ std `sys/io/error/unix.rs`; stable
 ///   since 1.87, the toolchain is 1.88), and from the long-name errors on Windows (recalled). A
-///   database file name of 244–251 bytes fits NAME_MAX with its `-wal` but not with `-branch-snap`,
-///   which `exist` checks first (243–251 through a symlink, where the refusal also checks
-///   `-branch-arena`), so those files cannot exist;
+///   database file name of 244–250 bytes fits NAME_MAX with its `-wal` and `-tshm` but not with
+///   `-branch-snap`, which `exist` checks first (243–250 through a symlink, where the refusal also
+///   checks `-branch-arena`), so those files cannot exist. (At 251 bytes the multiprocess probe's
+///   `-tshm` is 256 bytes and the database does not open at all: review 8 F4.)
 /// * `Unsupported` WITHOUT an OS error: std's unsupported-platform error, which carries no errno.
 ///   wasm32-unknown-unknown's std `fs` is std's `unsupported` backend (READ: std `sys/fs/mod.rs`
 ///   selects it for every target that is neither unix, wasi, windows nor a listed OS), and that

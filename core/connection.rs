@@ -1928,13 +1928,16 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
+        // `open_file_with_flags`, marked as an ATTACH's, so a registry hit is not refused for a
+        // durability or lease it has no way to request (review 8 F2).
+        let db = Database::open(
             io.clone(),
             &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
+            crate::OpenOptions::new(dialect)
+                .flags(flags)
+                .db_opts(db_opts)
+                .encryption(encryption_opts.clone())
+                .for_attach(),
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;

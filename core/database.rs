@@ -238,6 +238,9 @@ pub struct OpenOptions {
     /// time and shared by every user of the registered instance; a registry
     /// hit with a different dialect is an error.
     dialect: Arc<dyn Dialect>,
+    /// This open is an ATTACH's: the registry's branch-store check exempts it from durability and
+    /// lease matching (see `check_registry_branch_store`).
+    for_attach: bool,
 }
 
 impl OpenOptions {
@@ -254,7 +257,14 @@ impl OpenOptions {
             durable_storage: None,
             allocator: alloc::DynAllocator::default(),
             dialect,
+            for_attach: false,
         }
+    }
+
+    /// Mark this open as an ATTACH's (review 8 F2).
+    pub(crate) fn for_attach(mut self) -> Self {
+        self.for_attach = true;
+        self
     }
 
     pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {
@@ -448,9 +458,11 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
     // (the name as given, the canonical name, the most bytes that hold nothing, and — for a
     // sidecar an earlier build named from the path as given — what it holds).
     let mut sidecars: Vec<(std::path::PathBuf, std::path::PathBuf, u64, Option<&str>)> = vec![
-        // Branch files keep 0: no build of this fork ever named them from the path as given
+        // Branch files keep 0: no EARLIER build of this fork named them from the path as given
         // (every durable-branch commit before 80d88be66, which first named them from the resolved
-        // path, is UNBUILT), so one found under another name was written that way for real.
+        // path, is UNBUILT), and this build does so only for storage that is not a file here (the
+        // `None if durable => absolute_path` arm at open) — so one found under another name was
+        // written that way for real (review 8 F4).
         (others.log, ours.log, 0, None),
         (others.snap, ours.snap, 0, None),
         (others.arena, ours.arena, 0, None),
@@ -502,19 +514,23 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         // database file's replay boundary; neither ties the file to a path. Why only then: frames
         // written before the database changed under another name would overwrite newer pages.
         return Err(LimboError::InvalidArgument(match holds {
-            // "Keep them" holds only while {ours} does not exist (review 7 item 4, the lead's
-            // decision): any open of {real} creates it, even empty, and its pages may then be newer
-            // than these frames; a 0-byte {ours} must not read as "nothing was written since".
+            // "Keep them" needs BOTH conditions (review 8 F1, the lead's decision): {ours} does
+            // not exist — any open of {real} by THIS build creates it, even empty (review 7 item
+            // 4) — AND nothing else has opened the database under another name since: a build that
+            // names sidecars from the path as given (earlier fork builds; upstream Turso for the
+            // WAL) opening it through a third name writes newer pages and leaves {ours} absent.
             Some(what) => format!(
                 "{other} holds {what} that this open would miss: they were written through the \
                  name {given} before sidecars were named from the resolved path, and this \
                  database's file of that kind is {ours}. They belong to whichever database {given} \
-                 named when they were written, which may not be this one. To keep them: only if \
-                 that database was {real} and {ours} does not exist — any open of {real} since \
-                 would have created it, even empty, and its pages could then be newer than these \
-                 {what} — rename {other} to {ours} with no process using the database, and the \
-                 next open reads them. If {ours} exists, or if you cannot tell, move {other} aside: \
-                 this database then opens without them",
+                 named when they were written, which may not be this one. To keep them, ALL of \
+                 these must hold: that database was {real}; {ours} does not exist — any open of \
+                 {real} by this build would have created it, even empty; and no other build or \
+                 program has opened this database under any other name since — a build that names \
+                 its sidecars from the path as given leaves {ours} absent while it writes pages \
+                 newer than these {what}. Then, with no process using the database, rename \
+                 {other} to {ours}, and the next open reads them. Otherwise, or if you cannot \
+                 tell, move {other} aside: this database then opens without them",
                 other = other.display(),
                 ours = ours.display()
             ),
@@ -1216,11 +1232,17 @@ impl Database {
     /// is the CALLER's discipline, not something this check enforces: read-only is the instance's
     /// flag, so a read-only caller that hits a read-write instance receives read-write connections
     /// (upstream's registry behaviour) and could fork through them.
+    ///
+    /// ATTACH is exempt from the last two as well (review 8 F2, the lead's decision): it opens with
+    /// default options, so it can request neither a durability nor a lease, and it cannot fork the
+    /// attached database — `Connection::fork_branch` forks the connection's MAIN database only.
+    /// Refusing it would refuse an ATTACH its caller has no way to make acceptable.
     fn check_registry_branch_store(
         db: &Database,
         flags: OpenFlags,
         durability: crate::branch::BranchDurability,
         lease: Option<std::time::Duration>,
+        for_attach: bool,
     ) -> Result<()> {
         if db.branches.is_trunk_only() && !flags.contains(OpenFlags::ReadOnly) {
             return Err(LimboError::InvalidArgument(format!(
@@ -1231,6 +1253,7 @@ impl Database {
             )));
         }
         if !flags.contains(OpenFlags::ReadOnly)
+            && !for_attach
             && !db.branches.is_trunk_only()
             && db.opts.branch_durability != durability
         {
@@ -1242,6 +1265,7 @@ impl Database {
             )));
         }
         if !flags.contains(OpenFlags::ReadOnly)
+            && !for_attach
             && !db.branches.is_trunk_only()
             && db.opts.branch_lease != lease
         {
@@ -1388,6 +1412,7 @@ impl Database {
                     options.flags,
                     options.db_opts.branch_durability,
                     options.db_opts.branch_lease,
+                    options.for_attach,
                 )?;
                 return Ok(Some(db));
             }
@@ -1552,6 +1577,7 @@ impl Database {
                                 options.flags,
                                 options.db_opts.branch_durability,
                                 options.db_opts.branch_lease,
+                                options.for_attach,
                             )?;
                             return Ok(IOResult::Done(db));
                         }
