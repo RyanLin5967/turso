@@ -1,4 +1,9 @@
-//! Branch-per-agent isolation for Turso. **Step 1: the refusal.**
+//! Branch-per-agent isolation for Turso.
+//!
+//! * Step 1 (below): the admissibility gate — refuse to branch an MVCC-mode database.
+//! * Steps 2-3 ([`store`], [`arena`]): the copy-on-write decision in `Pager::add_dirty` and the
+//!   per-branch page space it copies into. [`store`] carries the model; the public surface is
+//!   [`Connection::fork_branch`], [`Branch`] and [`Database::branch_stats`].
 //!
 //! # What this is
 //!
@@ -47,9 +52,16 @@
 //! `.db-log` and a version store per agent for zero MVCC edits. That is unmeasured and it abandons
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
+pub(crate) mod arena;
+pub(crate) mod store;
+
 use crate::error::LimboError;
+use crate::storage::pager::{AutoVacuumMode, Pager};
+use crate::storage::wal::WalAutoActions;
 use crate::sync::Arc;
-use crate::{Connection, Database, Result};
+use crate::util::IOExt as _;
+use crate::{Connection, Database, Result, TransactionState};
+use store::BranchStore;
 
 /// The identity of a branch. Distinct from any page or transaction id on purpose: a branch
 /// outlives the transactions that write into it, which is the whole point of the mechanism.
@@ -71,6 +83,12 @@ impl BranchId {
 pub enum Unbranchable {
     /// The database is in `experimental_mvcc` journal mode.
     MvccJournalMode,
+    /// The database has no page 1 yet.
+    Empty,
+    /// The database is encrypted (built-in encryption or an external page codec).
+    Encrypted,
+    /// The database uses auto-vacuum.
+    AutoVacuum,
 }
 
 impl Unbranchable {
@@ -84,6 +102,22 @@ impl Unbranchable {
                  would silently miss every committed-but-uncheckpointed row, share one version \
                  store between branches, and resolve shared root page numbers against a forked \
                  page space. Use journal_mode=wal to branch this database."
+            }
+            Unbranchable::Empty => {
+                "cannot branch an empty database: it has no committed page 1 for a branch to \
+                 start from. Create a table first."
+            }
+            // The two below are NOT shown to be silent failures. They are refused because this
+            // fork has not made their paths branch-aware and has no test of what they would do.
+            Unbranchable::Encrypted => {
+                "cannot branch an encrypted database: branch page copies are held in memory in \
+                 plaintext and a branch connection is opened without the key; neither path has \
+                 been made branch-aware."
+            }
+            Unbranchable::AutoVacuum => {
+                "cannot branch an auto-vacuum database: auto-vacuum relocates pages and \
+                 truncates the database file at commit, and a truncation rewrites what a branch \
+                 reads without passing through the copy-on-write decision."
             }
         }
     }
@@ -110,20 +144,21 @@ pub fn check_branchable(mvcc_enabled: bool) -> Result<()> {
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
 ///
-/// ⚠ STEP-1 SKELETON. This commit carries only the API and the tests that specify it. Every method
-/// below is a deliberate non-implementation — `connect` hands back an ordinary connection to the
-/// SHARED database — so the isolation tests in `isolation_tests.rs` must FAIL against it. They are
-/// committed first so that the mechanism is written against a specification that has already been
-/// seen to fire, rather than a test written afterwards to agree with it.
+/// The handle owns the branch. Dropping it — or calling [`Branch::reap`], which is the same thing
+/// with a report — releases the branch's pages at once, unless something still reads through them:
+/// an open connection on the branch, or a live child forked from it. Then the branch is kept until
+/// the last of those goes, and freed at that moment.
 pub struct Branch {
     db: Arc<Database>,
     id: BranchId,
+    released: bool,
 }
 
 /// What reaping a branch released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaped {
-    /// Arena pages returned to the free list by this call.
+    /// Arena pages returned to the free list by this call: the branch's own, plus any version an
+    /// ancestor was retaining only for it.
     pub freed_pages: usize,
     /// True when the branch could not be freed yet (an open connection or a live child still reads
     /// through it); its pages are freed when the last of those goes away.
@@ -141,65 +176,212 @@ pub struct BranchStats {
     pub arena_slots_free: usize,
 }
 
-static NEXT_STUB_BRANCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 impl Branch {
+    fn new(db: Arc<Database>, id: BranchId) -> Self {
+        Self {
+            db,
+            id,
+            released: false,
+        }
+    }
+
     pub fn id(&self) -> BranchId {
         self.id
     }
 
-    /// Open a connection whose reads and writes see only this branch.
+    /// Open a connection whose reads and writes see only this branch. One at a time: a second
+    /// connection on the same branch is refused (see [`store::BranchStore::open`]).
     pub fn connect(&self) -> Result<Arc<Connection>> {
-        self.db.connect()
+        self.db.connect_branch(self.id)
     }
 
-    /// Fork a child of this branch.
+    /// Fork a child of this branch. Refused with `Busy` while a write transaction is open on it.
+    ///
+    /// No admissibility check here: this branch passed [`check_forkable`] when its root was forked
+    /// from the trunk, and journal-mode changes are refused while any branch exists.
     pub fn fork(&self) -> Result<Branch> {
-        Ok(Branch {
-            db: self.db.clone(),
-            id: BranchId(NEXT_STUB_BRANCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
-        })
+        let id = self.db.branches.fork_branch(self.id)?;
+        Ok(Branch::new(self.db.clone(), id))
     }
 
     /// Release this branch. Dropping the handle does the same; this form reports what was freed.
-    pub fn reap(self) -> Result<Reaped> {
-        Ok(Reaped {
-            freed_pages: 0,
-            deferred: false,
-        })
+    pub fn reap(mut self) -> Result<Reaped> {
+        self.released = true;
+        Ok(self.db.branches.release_handle(self.id))
     }
 
     /// The arena slots this branch currently owns or retains, for membership assertions.
     #[doc(hidden)]
     pub fn owned_slots(&self) -> Vec<u32> {
-        Vec::new()
+        self.db.branches.owned_slots(self.id)
     }
 }
 
+impl Drop for Branch {
+    fn drop(&mut self) {
+        if !self.released {
+            self.db.branches.release_handle(self.id);
+        }
+    }
+}
+
+/// A pager's claim on the branch it serves. It lives exactly as long as the pager, so dropping the
+/// connection — cleanly or not — is what closes the branch for connections and releases a write
+/// lock an abandoned transaction still held. A `Drop`, not a call at `close()`: a connection can go
+/// away without `close()`, and the next writer would then wait on a lock nobody holds.
+pub(crate) struct BranchBinding {
+    pub(crate) store: Arc<BranchStore>,
+    pub(crate) id: BranchId,
+}
+
+impl Drop for BranchBinding {
+    fn drop(&mut self) {
+        self.store.close(self.id);
+    }
+}
+
+/// Every condition under which a fork is refused, in one place. MVCC is the pre-registered one
+/// (see the module doc); the rest are paths this fork has not made branch-aware.
+fn check_forkable(db: &Database, pager: &Pager) -> Result<()> {
+    check_branchable(db.mvcc_enabled())?;
+    if !pager.db_initialized() {
+        return Err(Unbranchable::Empty.into());
+    }
+    if pager.is_encryption_ctx_set() || pager.has_external_page_codec() {
+        return Err(Unbranchable::Encrypted.into());
+    }
+    if pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
+        return Err(Unbranchable::AutoVacuum.into());
+    }
+    Ok(())
+}
+
 impl Connection {
-    /// Fork a branch from whatever this connection is on: the trunk, or the branch it was opened on.
+    /// Fork a branch from whatever this connection is on: the trunk, or the branch it was opened
+    /// on. The branch sees the committed state at the moment of the fork.
     pub fn fork_branch(self: &Arc<Connection>) -> Result<Branch> {
-        Ok(Branch {
-            db: self.db.clone(),
-            id: BranchId(NEXT_STUB_BRANCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
-        })
+        if self.get_tx_state() != TransactionState::None {
+            return Err(LimboError::InvalidArgument(
+                "cannot fork inside a transaction: a branch starts from committed state, so \
+                 commit or roll back first"
+                    .to_string(),
+            ));
+        }
+        let pager = self.pager.load().clone();
+        check_forkable(&self.db, &pager)?;
+        let id = match pager.branch_id() {
+            Some(parent) => self.db.branches.fork_branch(parent)?,
+            None => self.fork_trunk(&pager)?,
+        };
+        Ok(Branch::new(self.db.clone(), id))
+    }
+
+    /// Fork the trunk under its WAL write lock. The lock is the point: a trunk write transaction
+    /// in flight across the fork took its copy decisions for the previous epoch, so the pages it
+    /// commits afterwards would be visible to the new branch. Holding the writer lock means there
+    /// is no such transaction, and the read snapshot it forces is the latest commit.
+    fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
+        const SNAPSHOT_RETRIES: usize = 8;
+        let mut attempt = 0;
+        loop {
+            pager.begin_read_tx()?;
+            let begun = pager
+                .io
+                .block(|| pager.begin_write_tx(WalAutoActions::empty()));
+            match begun {
+                Ok(()) => {}
+                Err(LimboError::BusySnapshot) if attempt < SNAPSHOT_RETRIES => {
+                    pager.end_read_tx();
+                    attempt += 1;
+                    continue;
+                }
+                Err(err) => {
+                    pager.end_read_tx();
+                    return Err(err);
+                }
+            }
+            let forked = self.fork_trunk_locked(pager);
+            pager.end_write_tx();
+            pager.end_read_tx();
+            return forked;
+        }
+    }
+
+    fn fork_trunk_locked(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
+        let cookie = pager
+            .io
+            .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+        // The branch starts with the schema that matches the committed pages it will read. The
+        // connection's own snapshot or the shared one is that schema whenever the cookie agrees;
+        // if neither does, a DDL commit is between publishing its pages and its schema, and the
+        // caller retries rather than fork a branch whose schema disagrees with its pages.
+        let schema = [self.schema.read().clone(), self.db.clone_schema()]
+            .into_iter()
+            .find(|schema| schema.schema_version == cookie)
+            .ok_or(LimboError::SchemaUpdated)?;
+        let page_size = pager.get_page_size_unchecked().get() as usize;
+        self.db.branches.fork_trunk(schema, page_size)
+    }
+
+    /// The branch this connection is open on, if any.
+    pub fn branch_id(&self) -> Option<BranchId> {
+        self.pager.load().branch_id()
     }
 }
 
 impl Database {
     pub fn branch_stats(&self) -> BranchStats {
-        BranchStats::default()
+        self.branches.stats()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
-    pub fn branch_slot_is_free(&self, _slot: u32) -> bool {
-        false
+    pub fn branch_slot_is_free(&self, slot: u32) -> bool {
+        self.branches.slot_is_free(slot)
+    }
+
+    /// Every arena slot currently owned or retained, for membership assertions.
+    #[doc(hidden)]
+    pub fn branch_slots_in_use(&self) -> Vec<u32> {
+        self.branches.slots_in_use()
+    }
+
+    /// Open a connection on branch `id`: an ordinary connection whose pager is bound to the branch
+    /// and whose schema is the branch's own.
+    pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
+        let schema = self.branches.open(id)?;
+        // Built before anything fallible below, so an error there still closes the branch.
+        let binding = BranchBinding {
+            store: self.branches.clone(),
+            id,
+        };
+        let pager = self._init(None, None)?;
+        // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may
+        // survive into the branch's view.
+        pager.clear_page_cache(false);
+        pager.set_schema_cookie(None);
+        pager.bind_branch(binding)?;
+        let pager = Arc::new(pager);
+        let default_cache_size = pager
+            .io
+            .block(|| pager.with_header(|header| header.default_page_cache_size))
+            .unwrap_or_default()
+            .get();
+        self._connect_with_pager_and_default_cache_size(
+            false,
+            pager,
+            None,
+            default_cache_size,
+            Some(schema),
+        )
     }
 }
 
 #[cfg(all(test, feature = "fs"))]
 mod isolation_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod mechanism_tests;
 
 #[cfg(test)]
 mod tests {

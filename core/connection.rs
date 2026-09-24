@@ -1227,7 +1227,13 @@ impl Connection {
             on_disk_schema_version
         };
 
-        let db_schema_version = self.db.schema.lock().schema_version;
+        // A branch compares against, and reparses into, its own schema; it never publishes one.
+        let on_branch = self.branch_id().is_some();
+        let db_schema_version = if on_branch {
+            self.schema.read().schema_version
+        } else {
+            self.db.schema.lock().schema_version
+        };
         tracing::debug!(
             "path: {}, db_schema_version={} vs on_disk_schema_version={}",
             self.db.path,
@@ -1265,8 +1271,10 @@ impl Connection {
 
         reparse_result?;
 
-        let schema = self.schema.read().clone();
-        self.db.update_schema_if_newer(schema);
+        if !on_branch {
+            let schema = self.schema.read().clone();
+            self.db.update_schema_if_newer(schema);
+        }
         Ok(())
     }
 
@@ -1317,7 +1325,7 @@ impl Connection {
 
         reparse_result?;
 
-        if publish {
+        if publish && self.branch_id().is_none() {
             let schema = self.schema.read().clone();
             self.db.update_schema_if_newer(schema);
         }
@@ -1994,6 +2002,11 @@ impl Connection {
         if self.schema_reparse_in_progress() {
             return;
         }
+        // A branch's schema is the branch's own: the shared one describes the TRUNK's pages, and
+        // adopting it would resolve trunk root pages against the branch's page space.
+        if self.branch_id().is_some() {
+            return;
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
         // MVCC checkpoint can publish physical btree roots into the shared
@@ -2074,6 +2087,10 @@ impl Connection {
     }
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+        if self.branch_id().is_some() {
+            // See `maybe_update_schema`: the shared schema is the trunk's.
+            return;
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock().clone();
         if current_schema.schema_version < schema.schema_version
@@ -2465,6 +2482,10 @@ impl Connection {
     /// Publish the connection's current schema snapshot to the shared database
     /// cache after a successful commit so other live connections can refresh.
     pub fn publish_schema_if_newer(&self) {
+        if self.branch_id().is_some() {
+            // A branch's schema describes the branch's pages; the shared one is the trunk's.
+            return;
+        }
         let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema);
     }
@@ -2477,6 +2498,11 @@ impl Connection {
     /// monotonically, otherwise new connections can re-adopt stale metadata.
     #[cfg(feature = "conn_raw_api")]
     pub fn publish_schema_after_external_restore(&self) -> Result<()> {
+        if self.branch_id().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "a branch connection cannot publish its schema as the database's".to_string(),
+            ));
+        }
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
         }
@@ -3589,6 +3615,7 @@ impl Connection {
                                 bootstrap.pager.clone(),
                                 bootstrap.encryption_key.take(),
                                 default_cache_size,
+                                None,
                             )?);
                     }
 
