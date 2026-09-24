@@ -2227,6 +2227,13 @@ fn a_sidecar_refusal_keeps_frames_only_while_the_real_file_does_not_exist() {
         "the condition exempts opens through {{ours}}, which a program can delete after writing: \
          {err}"
     );
+    // Review 12 finding 1 (PREREG A7): the same message serves the MVCC log, which a read-write
+    // open by this build creates only while the database header says MVCC; condition 2's reason
+    // must say so rather than claim every open creates {ours}.
+    assert!(
+        err.contains("in MVCC mode"),
+        "condition 2's reason is not scoped to the MVCC log's mode: {err}"
+    );
 }
 
 /// Review 7 item 2 (lead's decision). A registry hit must not hand a read-write open an instance
