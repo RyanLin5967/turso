@@ -1556,7 +1556,12 @@ impl StoreInner {
                     if fail {
                         self.failpoint = None;
                     }
-                    let mut journal = Journal::open_fresh(files, page_size, self.sync)?;
+                    let fail_lock = self.failpoint == Some(BranchFailpoint::CreateLockFails);
+                    if fail_lock {
+                        self.failpoint = None;
+                    }
+                    let mut journal =
+                        Journal::open_fresh_with(files, page_size, self.sync, fail_lock)?;
                     let started = journal.start(fail);
                     self.journal = Some(journal);
                     started?;

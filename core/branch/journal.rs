@@ -446,8 +446,23 @@ impl Journal {
 
     /// The first half of `create`: lock the log and check it holds no state. Writes nothing.
     pub(crate) fn open_fresh(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
+        Self::open_fresh_with(files, page_size, sync, false)
+    }
+
+    /// `open_fresh`, with the `CreateLockFails` failpoint.
+    pub(crate) fn open_fresh_with(
+        files: &BranchFiles,
+        page_size: usize,
+        sync: bool,
+        fail_lock: bool,
+    ) -> Result<Journal> {
         // Lock before touching anything, so a refused create has truncated nothing.
         let mut file = open_rw(&files.log, false)?;
+        if fail_lock {
+            return Err(LimboError::LockingError(
+                "failpoint: the branch log was created but could not be locked".to_string(),
+            ));
+        }
         lock_exclusive(&file, &files.log)?;
         let existing = read_all(&mut file)?;
         if files.snap.exists() || !matches!(parse_log_header(&existing), Ok(None)) {
@@ -1202,6 +1217,39 @@ mod tests {
         assert_eq!(recovered.records, vec![Record::Fork { child: 1, parent: 0 }]);
         drop(recovered);
         assert_eq!(std::fs::metadata(&files.log).unwrap().len(), whole, "the zero tail was not cut");
+    }
+
+    /// Review 5 O1-1 (lead's decision): a zero length is torn only when nothing valid follows it.
+    /// A zeroed hole with whole frames AFTER it means records written later survived and earlier
+    /// ones did not — under macOS plain fsync, possibly acknowledged ones. That is Corrupt, loudly,
+    /// and the log is left as it was for inspection.
+    #[test]
+    fn a_zeroed_hole_followed_by_whole_frames_is_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut arena = Arena::new(512);
+        let mut journal = Journal::create(&files, 512, false).unwrap();
+        journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        journal.flush(&mut arena).unwrap();
+        drop(journal);
+        let mut payload = Vec::new();
+        Record::Release { branch: 1 }.encode(&mut payload);
+        let mut frame = Vec::new();
+        put_u32(&mut frame, payload.len() as u32);
+        put_u32(&mut frame, crc32c::crc32c(&payload));
+        frame.extend_from_slice(&payload);
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().append(true).open(&files.log).unwrap();
+            f.write_all(&[0u8; 25]).unwrap(); // a lost frame, read back as zeros
+            f.write_all(&frame).unwrap(); // a later frame that survived
+        }
+        let before = std::fs::read(&files.log).unwrap();
+        assert!(
+            Journal::recover(&files, false).is_err(),
+            "a zeroed hole before a whole frame was cut as a torn tail"
+        );
+        assert_eq!(std::fs::read(&files.log).unwrap(), before, "the refused recovery cut the log");
     }
 
     /// The premise that makes a zero length torn: no record encodes to an empty payload, because

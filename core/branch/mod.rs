@@ -185,6 +185,9 @@ pub enum BranchFailpoint {
     CreateFailsAfterHeader,
     /// The next stamp-only flush at a trunk commit's barrier fails as an I/O error would.
     StampFlushFails,
+    /// The next branch-log creation fails to take the log's lock just after creating the file —
+    /// as a filesystem without `flock` would — leaving an empty log behind.
+    CreateLockFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.

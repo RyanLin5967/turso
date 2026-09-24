@@ -1562,6 +1562,10 @@ fn a_read_only_open_of_a_database_with_branches_reads_the_trunk_and_nothing_else
     }
     let log_before = std::fs::read(&log).unwrap();
     let arena_before = std::fs::read(&arena).unwrap();
+    // Review 5 T-1: nor may it create a snapshot or a temp snapshot. Neither exists beforehand.
+    let snap = std::path::PathBuf::from(format!("{}-branch-snap", path.display()));
+    let snap_tmp = std::path::PathBuf::from(format!("{}-branch-snap.tmp", path.display()));
+    assert!(!snap.exists() && !snap_tmp.exists(), "the fixture already has a snapshot");
     let refused = |what: &str, err: Option<String>| {
         let err = err.unwrap_or_else(|| panic!("{what} was allowed on a read-only trunk-only handle"));
         assert!(err.contains("branch store was not opened"), "{what} refused for another reason: {err}");
@@ -1577,6 +1581,8 @@ fn a_read_only_open_of_a_database_with_branches_reads_the_trunk_and_nothing_else
     }
     assert_eq!(std::fs::read(&log).unwrap(), log_before, "a read-only open wrote the branch log");
     assert_eq!(std::fs::read(&arena).unwrap(), arena_before, "a read-only open wrote the arena");
+    assert!(!snap.exists(), "a read-only open wrote a branch snapshot");
+    assert!(!snap_tmp.exists(), "a read-only open left a temp snapshot");
 }
 
 /// Review 3, path identity. The registry knows a database by (dev, ino), but the branch files
@@ -1765,7 +1771,9 @@ fn an_open_past_a_sidecar_under_another_name_is_refused_naming_both() {
 
 /// Review 4 C4. When the database path is not a file on this filesystem (here a `MemoryIO` name),
 /// the branch files — always real files — must still be named from an ABSOLUTE path, or they are
-/// resolved against whatever the working directory is at the first fork.
+/// resolved against whatever the working directory is at the first fork. Gate: `cfg(unix)` — the
+/// relative path is built by stripping the root `/` (review 5 T-1: it panicked on Windows).
+#[cfg(unix)]
 #[test]
 fn branch_files_of_a_relative_path_are_named_absolutely() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1829,4 +1837,169 @@ fn a_path_that_cannot_be_resolved_is_refused_not_used_as_given() {
     let missing = dir.path().join("missing.db");
     assert_eq!(crate::database::sidecar_base(missing.to_str().unwrap()).unwrap(), None);
     assert!(Path::new(&crate::database::absolute_path("relative.db").unwrap()).is_absolute());
+}
+
+// ---- Review 5 (lane_turso_review5.md @ 616a9fd) ----
+
+/// Review 5 C3-1 (lead's decision). Every clean close leaves a 0-byte WAL (a Truncate checkpoint
+/// never removes the file), and code before review 4 named it from the path as given. A symlinked
+/// database closed cleanly that way must reopen: an empty or header-only WAL carries nothing to
+/// lose, so it is left in place and the open proceeds. A WAL that holds frames is still refused,
+/// and the refusal names the safe action.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_database_closed_cleanly_under_the_old_naming_reopens() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let real = dir.path().join("real.db");
+    {
+        let db = open_at(&real, DatabaseOpts::new()).unwrap();
+        seed(&db.connect().unwrap(), 20);
+    }
+    for (name, stale) in [("empty.db", &[][..]), ("header.db", &[0u8; 32][..])] {
+        let link = dir.path().join(name);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let stale_wal = std::path::PathBuf::from(format!("{}-wal", link.display()));
+        std::fs::write(&stale_wal, stale).unwrap();
+        {
+            let db = open_at(&link, DatabaseOpts::new())
+                .unwrap_or_else(|e| panic!("{name}: an empty stale WAL refused the open: {e}"));
+            assert_eq!(value(&db.connect().unwrap(), 3), Some(original(3)));
+        }
+        assert_eq!(
+            std::fs::read(&stale_wal).unwrap(),
+            stale,
+            "{name}: the stale WAL was not left in place, untouched"
+        );
+    }
+    let link = dir.path().join("frames.db");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::fs::write(format!("{}-wal", link.display()), [0x5A; 4096]).unwrap();
+    let err = match open_at(&link, DatabaseOpts::new()) {
+        Ok(_) => panic!("opened past a WAL that holds frames under another name"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("checkpoint"), "the refusal must name the safe action: {err}");
+}
+
+/// Review 5 C3-4 (lead's decision): the MVCC logical log is a sidecar too. One found under the
+/// given name that is not the real path's is refused, naming both.
+#[cfg(unix)]
+#[test]
+fn an_open_past_a_logical_log_under_another_name_is_refused_naming_both() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let real = dir.path().join("real.db");
+    {
+        let db = open_at(&real, DatabaseOpts::new()).unwrap();
+        seed(&db.connect().unwrap(), 20);
+    }
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::fs::write(dir.path().join("link.db-log"), [0x5A; 64]).unwrap();
+    let err = match open_at(&link, DatabaseOpts::new()) {
+        Ok(_) => panic!("opened past a logical log under another name"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("link.db-log") && err.contains("real.db-log"),
+        "the refusal must name both logs: {err}"
+    );
+}
+
+/// Review 5 C3-5 (lead's decision): a sidecar is "the same file" by identity, (dev, ino), not by
+/// canonical path string. A WAL reached under the link's name through a HARD link to the real
+/// path's WAL is the real WAL, holding its frames, and must not be refused.
+#[cfg(unix)]
+#[test]
+fn a_sidecar_hard_linked_to_the_real_one_is_the_same_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("live.db");
+    let db = open_at(&path, DatabaseOpts::new()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    set(&trunk, 3, "in-the-wal");
+    // A copy taken while open: its WAL holds the frames of the last commit.
+    let image = crash_image(&path, dir.path());
+    let image_wal = std::path::PathBuf::from(format!("{}-wal", image.display()));
+    assert!(std::fs::metadata(&image_wal).unwrap().len() > 32, "the WAL holds no frame");
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&image, &link).unwrap();
+    std::fs::hard_link(&image_wal, format!("{}-wal", link.display())).unwrap();
+    let copy = open_at(&link, DatabaseOpts::new())
+        .unwrap_or_else(|e| panic!("a hard link to the real WAL was taken for another WAL: {e}"));
+    assert_eq!(value(&copy.connect().unwrap(), 3), Some("in-the-wal".to_string()));
+}
+
+/// Review 5 C3-3 (lead's decision): a VOLATILE open does not pay for branch files it will never
+/// write. With no working directory to resolve against (as on wasm32-unknown-unknown, or here a
+/// deleted one), a volatile open of a relative non-filesystem name must still open. Runs alone in
+/// a fresh process, because it changes the process's working directory. Gate: `cfg(unix)`.
+#[cfg(unix)]
+#[test]
+fn a_volatile_open_needs_no_working_directory() {
+    use crate::branch::fork_driver;
+    let Some(sentinel) = fork_driver::alone(
+        "branch::durability_tests::a_volatile_open_needs_no_working_directory",
+    ) else {
+        return;
+    };
+    let gone = tempfile::TempDir::new().unwrap();
+    std::env::set_current_dir(gone.path()).unwrap();
+    std::fs::remove_dir(gone.path()).unwrap();
+    assert!(std::env::current_dir().is_err(), "premise: the working directory still resolves");
+    let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        "relative.db",
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap_or_else(|e| panic!("a volatile open needed the working directory: {e}"));
+    seed(&db.connect().unwrap(), 3);
+    fork_driver::finished(&sentinel);
+}
+
+/// Review 5 C2-1 (lead's decision): a read-write open must never inherit a trunk-only instance
+/// from the process registry — its connections would be read-only and its branch operations
+/// refused. It is refused by name until the read-only handle is closed.
+#[test]
+fn a_read_write_open_does_not_inherit_a_trunk_only_instance() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    {
+        let db = open_at(&path, durable()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let ro = open_read_only(&path, DatabaseOpts::new()).unwrap();
+    let err = match open_at(&path, durable()) {
+        Ok(_) => panic!("a read-write open inherited the read-only, trunk-only instance"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("close the read-only handle first"), "refused for another reason: {err}");
+    drop(ro);
+    open_at(&path, durable()).expect("with the read-only handle closed, a read-write open works");
+}
+
+/// The empty-log wedge (queued by the lead): a branch-log creation that fails to lock leaves an
+/// EMPTY log behind. An empty log holds no branch state, so a later read-write VOLATILE open must
+/// not refuse because of it.
+#[test]
+fn an_empty_branch_log_does_not_refuse_a_volatile_open() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    {
+        let db = open_at(&path, durable()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        db.branch_failpoint(Some(BranchFailpoint::CreateLockFails));
+        assert!(trunk.fork_branch().is_err(), "the failpoint did not fire");
+    }
+    let log = std::path::PathBuf::from(format!("{}-branch-log", path.display()));
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), 0, "premise: the failed create left an empty log");
+    let db = open_at(&path, DatabaseOpts::new())
+        .unwrap_or_else(|e| panic!("an empty branch log refused a volatile open: {e}"));
+    assert_eq!(value(&db.connect().unwrap(), 3), Some(original(3)));
 }
