@@ -410,14 +410,16 @@ pub(crate) fn absolute_path(path: &str) -> Result<String> {
 /// WAL, MVCC log or branch file written through a symlink before sidecars were named from `real`.
 /// Opening would silently miss what it holds. Two refinements (review 5):
 /// * only a sidecar that can HOLD something is refused (C3-1). A WAL of at most its 32-byte header
-///   — what every clean close leaves, since a Truncate checkpoint never removes the file — and an
-///   empty log or branch file carry nothing to lose: they are left in place, untouched;
+///   — what every clean close leaves, since a Truncate checkpoint never removes the file — an MVCC
+///   log of at most its `LOG_HDR_SIZE` bootstrap header — what every clean MVCC boot leaves — and
+///   an empty branch file carry nothing to lose: they are left in place, untouched;
 /// * "the same file" is decided by identity, (dev, ino), not by path string (C3-5), so a sidecar
 ///   reached through a symlinked directory or a hard link is recognised as the canonical one.
 ///
 /// Unix only: elsewhere `sidecar_base` resolves nothing, so no second name can arise.
 #[cfg(unix)]
 fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool) -> Result<()> {
+    use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
     /// A WAL no longer than its header holds no frame.
     const WAL_HEADER_LEN: u64 = 32;
     if given == real {
@@ -434,20 +436,35 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
     let others = crate::branch::journal::BranchFiles::for_db(given);
     let ours = crate::branch::journal::BranchFiles::for_db(real);
     let mvcc_log = |base: &str| Path::new(base).with_extension("db-log");
-    let mut sidecars: Vec<(std::path::PathBuf, std::path::PathBuf, u64)> = vec![
-        (others.log, ours.log, 0),
-        (others.snap, ours.snap, 0),
-        (others.arena, ours.arena, 0),
-        (mvcc_log(given), mvcc_log(real), 0),
+    // (the name as given, the canonical name, the most bytes that hold nothing, and — for a
+    // sidecar an earlier build named from the path as given — what it holds).
+    let mut sidecars: Vec<(std::path::PathBuf, std::path::PathBuf, u64, Option<&str>)> = vec![
+        // Branch files keep 0: no build of this fork ever named them from the path as given
+        // (every durable-branch commit before 80d88be66, which first named them from the resolved
+        // path, is UNBUILT), so one found under another name was written that way for real.
+        (others.log, ours.log, 0, None),
+        (others.snap, ours.snap, 0, None),
+        (others.arena, ours.arena, 0, None),
+        // A logical log of at most its bootstrap header holds no transaction: every clean MVCC
+        // boot leaves exactly that, the replay boundary lives in the database file
+        // (`__turso_internal_mvcc_meta`), and the salt regenerates (lead finding on 676a6573f:
+        // C3-1 for the log that C3-2 renamed).
+        (
+            mvcc_log(given),
+            mvcc_log(real),
+            LOG_HDR_SIZE as u64,
+            Some("MVCC log records"),
+        ),
     ];
     if !custom_wal {
         sidecars.push((
             format!("{given}-wal").into(),
             format!("{real}-wal").into(),
             WAL_HEADER_LEN,
+            Some("WAL frames"),
         ));
     }
-    for (other, ours, holds_nothing_up_to) in sidecars {
+    for (other, ours, holds_nothing_up_to, holds) in sidecars {
         let len = match std::fs::metadata(&other) {
             Ok(meta) => meta.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -465,24 +482,23 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         if same_file(&other, &ours)? {
             continue;
         }
-        return Err(LimboError::InvalidArgument(if holds_nothing_up_to == WAL_HEADER_LEN {
-            format!(
-                "{} holds WAL frames, but this database's WAL is {}: they were written through \
-                 the name {given} (before WAL files were named from the resolved path), and \
-                 opening would miss them. To keep them, open the database through {given} once \
-                 with the build that wrote them and close it cleanly, which checkpoints them into \
-                 the database file; then reopen",
+        return Err(LimboError::InvalidArgument(match holds {
+            Some(what) => format!(
+                "{} holds {what}, but this database's file of that kind is {}: they were written \
+                 through the name {given} (before sidecars were named from the resolved path), \
+                 and opening would miss them. To keep them, open the database through {given} \
+                 once with the build that wrote them and close it cleanly, which checkpoints them \
+                 into the database file; then reopen",
                 other.display(),
                 ours.display()
-            )
-        } else {
-            format!(
+            ),
+            None => format!(
                 "{} exists and is not empty, but this database's file of that kind is {}: it was \
                  written under another name for the same database, and opening would miss what it \
                  holds; move or remove one of them first",
                 other.display(),
                 ours.display()
-            )
+            ),
         }));
     }
     Ok(())
