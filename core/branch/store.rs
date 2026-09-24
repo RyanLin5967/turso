@@ -1466,14 +1466,20 @@ impl StoreInner {
     /// Create the arena (and, for a durable store, its files) at the first fork, when the page size
     /// is known.
     fn ensure_backing(&mut self, page_size: usize) -> Result<()> {
-        if let Some(arena) = &self.arena {
-            if arena.page_size() != page_size {
+        if let Some(current) = self.arena.as_ref().map(Arena::page_size) {
+            if current == page_size {
+                return Ok(());
+            }
+            // The database's page size changed. A store that holds nothing follows it; one that
+            // holds a branch or a retained trunk version has pages of the old size and cannot.
+            // (VACUUM and journal-mode changes are refused while a branch exists, so only the
+            // empty case is reachable.)
+            if !self.branches.is_empty() || !self.trunk.lineage.retained.is_empty() {
                 return Err(LimboError::InternalError(format!(
-                    "branch arena holds {}-byte pages but the database now uses {page_size}",
-                    arena.page_size()
+                    "branch arena holds {current}-byte pages but the database now uses {page_size}"
                 )));
             }
-            return Ok(());
+            return self.restart_empty(page_size);
         }
         match &self.files {
             None => self.arena = Some(Arena::new(page_size)),
@@ -1510,6 +1516,35 @@ impl StoreInner {
                 self.arena = Some(arena);
             }
         }
+        Ok(())
+    }
+
+    /// Start an EMPTY store over at a new page size. Durable: an empty snapshot at the new page
+    /// size replaces the log (the snapshot rename is the commit point), and only then is the arena
+    /// truncated. Nothing references a slot before or after, so a crash anywhere in between
+    /// recovers an empty store; an arena file left at the old size only yields free slots, since
+    /// `Arena::open_file` counts whole slots of the recovered page size.
+    fn restart_empty(&mut self, page_size: usize) -> Result<()> {
+        let Some(files) = self.files.clone() else {
+            self.arena = Some(Arena::new(page_size));
+            return Ok(());
+        };
+        let snapshot = self.snapshot();
+        let (Some(journal), Some(arena)) = (self.journal.as_mut(), self.arena.as_mut()) else {
+            return Err(LimboError::InternalError(
+                "a durable branch arena has no journal".to_string(),
+            ));
+        };
+        journal.check_live()?;
+        let old = journal.page_size();
+        journal.set_page_size(page_size);
+        if let Err(e) = journal.compact(&snapshot, arena, false) {
+            journal.set_page_size(old);
+            return Err(e);
+        }
+        self.lease.queued(snapshot.lease_now_ms);
+        self.lease.flushed();
+        self.arena = Some(Arena::open_file(&files.arena, page_size, true, &[])?);
         Ok(())
     }
 

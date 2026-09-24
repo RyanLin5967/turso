@@ -631,6 +631,12 @@ impl Journal {
         self.page_size as usize
     }
 
+    /// The page size the next header or snapshot is written with. Only `restart_empty` changes it,
+    /// immediately before the compaction that writes it.
+    pub(crate) fn set_page_size(&mut self, page_size: usize) {
+        self.page_size = page_size as u32;
+    }
+
     pub(crate) fn poison(&mut self) {
         self.poisoned = true;
     }
