@@ -89,6 +89,8 @@ pub enum Unbranchable {
     Encrypted,
     /// The database uses auto-vacuum.
     AutoVacuum,
+    /// The database was opened with multi-process WAL coordination.
+    MultiProcess,
 }
 
 impl Unbranchable {
@@ -118,6 +120,14 @@ impl Unbranchable {
                 "cannot branch an auto-vacuum database: auto-vacuum relocates pages and \
                  truncates the database file at commit, and a truncation rewrites what a branch \
                  reads without passing through the copy-on-write decision."
+            }
+            // This one IS silent: the branch store and every pre-image it keeps live in this
+            // process, so a trunk write committed by another process takes no copy decision and
+            // a branch reading the trunk's current page would simply see it.
+            Unbranchable::MultiProcess => {
+                "cannot branch a database opened for multi-process WAL access: branches and the \
+                 pre-images that isolate them live in this process only, so another process's \
+                 trunk writes would silently appear in every branch."
             }
         }
     }
@@ -252,6 +262,9 @@ fn check_forkable(db: &Database, pager: &Pager) -> Result<()> {
     }
     if pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
         return Err(Unbranchable::AutoVacuum.into());
+    }
+    if db.opts.enable_multiprocess_wal {
+        return Err(Unbranchable::MultiProcess.into());
     }
     Ok(())
 }

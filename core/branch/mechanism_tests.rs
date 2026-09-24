@@ -797,3 +797,28 @@ fn exec_retrying_busy(conn: &Arc<Connection>, sql: &str) {
     }
     panic!("{sql}: still Busy after 10,000 attempts");
 }
+
+#[test]
+fn a_multi_process_database_is_refused() {
+    // Deliberately no early return if the open fails: a test that skips itself when its premise
+    // is unavailable reports a pass that tested nothing.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("multiprocess.db");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_multiprocess_wal(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("opening with multi-process WAL; if this platform cannot, the refusal is untested");
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 10);
+    let err = match trunk.fork_branch() {
+        Ok(_) => panic!("a multi-process database was branched"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("multi-process"), "{err}");
+}
