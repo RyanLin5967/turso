@@ -2194,6 +2194,14 @@ fn a_sidecar_refusal_keeps_frames_only_while_the_real_file_does_not_exist() {
     };
     assert!(err.contains("does not exist"), "the rename is not conditioned on absence: {err}");
     assert!(err.contains("even empty"), "a 0-byte canonical file could read as untouched: {err}");
+    // Review 8 F1 (lead's decision): absence is evidence only against THIS build's opens. A build
+    // that names the WAL from the path as given (earlier builds, upstream Turso) can open the
+    // database under a third name, write newer pages and leave {ours} absent; so the rename also
+    // needs that nothing else has opened it under another name since.
+    assert!(
+        err.contains("under any other name"),
+        "the rename is not conditioned on no other build's opens under another name: {err}"
+    );
 }
 
 /// Review 7 item 2 (lead's decision). A registry hit must not hand a read-write open an instance
@@ -2249,4 +2257,34 @@ fn an_async_registry_hit_of_another_branch_durability_is_refused() {
         Err(err) => err.to_string(),
     };
     assert!(err.contains("branch durability"), "refused for another reason: {err}");
+}
+
+// ---- Review 8 (lane_turso_review8.md @ 8448139) ----
+
+/// Review 8 F2 (lead's decision). ATTACH opens with default options, so it can request neither a
+/// lease nor a durability, and it cannot fork the attached database (`fork_branch` forks the
+/// connection's MAIN database). So a registry hit on a database this process holds open with a
+/// lease — or durable — must not refuse the ATTACH.
+#[test]
+fn attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let main = open_at(&dir.path().join("main.db"), DatabaseOpts::new()).unwrap();
+    let conn = main.connect().unwrap();
+    for (name, opts) in [
+        (
+            "leased.db",
+            DatabaseOpts::new().with_branch_lease(Some(Duration::from_secs(60))),
+        ),
+        ("durable.db", durable()),
+    ] {
+        let path = dir.path().join(name);
+        let held = open_at(&path, opts).unwrap();
+        seed(&held.connect().unwrap(), 3);
+        let alias = name.trim_end_matches(".db");
+        conn.execute(format!("ATTACH '{}' AS {alias}", path.display()))
+            .unwrap_or_else(|e| panic!("ATTACH of {name}, held open in this process, was refused: {e}"));
+        let found = rows(&conn, &format!("SELECT v FROM {alias}.t WHERE id = 2"));
+        assert_eq!(found, vec![vec![Value::from_text(original(2))]]);
+        drop(held);
+    }
 }

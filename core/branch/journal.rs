@@ -1367,13 +1367,25 @@ mod tests {
         // whose commits are durable, and branches then read newer trunk pages silently. Nothing in
         // the log tells acknowledged records from unacknowledged ones. The safe remedy is to move
         // ALL THREE branch files aside, and a copy of all three is what a restore needs.
-        assert!(!err.contains("truncate it to"), "the refusal still recommends truncating: {err}");
+        // Review 8 F6 (lead's decision: cheap strength nits): no form of truncation, not only the
+        // withdrawn phrase; and the hole's position as "byte {hole_at}", so a random temp-dir name
+        // containing those digits cannot satisfy it.
+        assert!(!err.contains("truncat"), "the refusal still recommends truncating: {err}");
         assert!(err.contains("aside"), "the refusal names no safe remedy: {err}");
         for file in [&files.log, &files.arena, &files.snap] {
             let file = file.display().to_string();
             assert!(err.contains(&file), "the refusal does not name {file}: {err}");
         }
-        assert!(err.contains(&hole_at.to_string()), "the refusal does not say where the hole is: {err}");
+        assert!(
+            err.contains(&format!("byte {hole_at}")),
+            "the refusal does not say where the hole is: {err}"
+        );
+        // Review 8 F3 (lead's decision): a restore of the three files is safe only while the trunk
+        // has not been written since they were moved aside.
+        assert!(
+            err.contains("only while the trunk has not been written"),
+            "the refusal gives no condition for a safe restore: {err}"
+        );
     }
 
     /// The premise that makes a zero length torn: no record encodes to an empty payload, because
