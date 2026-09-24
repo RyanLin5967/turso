@@ -48,7 +48,8 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 use crate::error::LimboError;
-use crate::Result;
+use crate::sync::Arc;
+use crate::{Connection, Database, Result};
 
 /// The identity of a branch. Distinct from any page or transaction id on purpose: a branch
 /// outlives the transactions that write into it, which is the whole point of the mechanism.
@@ -106,6 +107,99 @@ pub fn check_branchable(mvcc_enabled: bool) -> Result<()> {
     }
     Ok(())
 }
+
+/// A live branch: an isolated, writable view of the database as it was when the branch was forked.
+///
+/// ⚠ STEP-1 SKELETON. This commit carries only the API and the tests that specify it. Every method
+/// below is a deliberate non-implementation — `connect` hands back an ordinary connection to the
+/// SHARED database — so the isolation tests in `isolation_tests.rs` must FAIL against it. They are
+/// committed first so that the mechanism is written against a specification that has already been
+/// seen to fire, rather than a test written afterwards to agree with it.
+pub struct Branch {
+    db: Arc<Database>,
+    id: BranchId,
+}
+
+/// What reaping a branch released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reaped {
+    /// Arena pages returned to the free list by this call.
+    pub freed_pages: usize,
+    /// True when the branch could not be freed yet (an open connection or a live child still reads
+    /// through it); its pages are freed when the last of those goes away.
+    pub deferred: bool,
+}
+
+/// A snapshot of the branch arena's accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchStats {
+    /// Branch states that exist, including reaped branches kept alive by a live child.
+    pub live_branches: usize,
+    /// Arena pages owned by some branch (or retained for one).
+    pub arena_slots_in_use: usize,
+    /// Arena pages on the free list.
+    pub arena_slots_free: usize,
+}
+
+static NEXT_STUB_BRANCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl Branch {
+    pub fn id(&self) -> BranchId {
+        self.id
+    }
+
+    /// Open a connection whose reads and writes see only this branch.
+    pub fn connect(&self) -> Result<Arc<Connection>> {
+        self.db.connect()
+    }
+
+    /// Fork a child of this branch.
+    pub fn fork(&self) -> Result<Branch> {
+        Ok(Branch {
+            db: self.db.clone(),
+            id: BranchId(NEXT_STUB_BRANCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        })
+    }
+
+    /// Release this branch. Dropping the handle does the same; this form reports what was freed.
+    pub fn reap(self) -> Result<Reaped> {
+        Ok(Reaped {
+            freed_pages: 0,
+            deferred: false,
+        })
+    }
+
+    /// The arena slots this branch currently owns or retains, for membership assertions.
+    #[doc(hidden)]
+    pub fn owned_slots(&self) -> Vec<u32> {
+        Vec::new()
+    }
+}
+
+impl Connection {
+    /// Fork a branch from whatever this connection is on: the trunk, or the branch it was opened on.
+    pub fn fork_branch(self: &Arc<Connection>) -> Result<Branch> {
+        Ok(Branch {
+            db: self.db.clone(),
+            id: BranchId(NEXT_STUB_BRANCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        })
+    }
+}
+
+impl Database {
+    pub fn branch_stats(&self) -> BranchStats {
+        BranchStats::default()
+    }
+
+    /// Whether `slot` is on the arena free list, for membership assertions.
+    #[doc(hidden)]
+    pub fn branch_slot_is_free(&self, _slot: u32) -> bool {
+        false
+    }
+}
+
+#[cfg(all(test, feature = "fs"))]
+mod isolation_tests;
 
 #[cfg(test)]
 mod tests {
