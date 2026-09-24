@@ -1194,3 +1194,30 @@ fn a_practically_infinite_lease_does_not_wrap_into_a_short_one() {
     assert!(db.expire_branches().unwrap().reaped.is_empty(), "the lease wrapped and ran out");
     assert_eq!(db.branch_ids(), vec![b.id()]);
 }
+
+/// R1, the commit refusal on its own: a transaction with a dirty page, begun before the poisoning,
+/// commits with no further statement in between — so nothing else can refuse first, and only the
+/// commit's own check stands between its page and the arena file.
+#[test]
+fn a_commit_open_across_the_poisoning_writes_no_slot() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    let a = trunk.fork_branch().unwrap();
+    let d = trunk.fork_branch().unwrap();
+    let arena = format!("{}-branch-arena", path.display());
+    let ac = a.connect().unwrap();
+    ac.execute("BEGIN").unwrap();
+    set(&ac, 7, "before-poison");
+    let len_before = std::fs::metadata(&arena).unwrap().len();
+    db.branch_failpoint(Some(BranchFailpoint::LogFlushFails));
+    drop(d); // poisons the journal
+    assert!(ac.execute("COMMIT").is_err(), "a commit succeeded on a fail-stopped store");
+    assert_eq!(
+        std::fs::metadata(&arena).unwrap().len(),
+        len_before,
+        "the commit wrote its page into the arena before its record failed"
+    );
+}
