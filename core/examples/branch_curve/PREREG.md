@@ -196,3 +196,24 @@ Falsifiers for A2:
   branches first;
 - `freed_pages ≠ K`: the harness refuses (`NOT A RESULT`);
 - P14 violated: the no-lease path is not free.
+
+### A3 — 2026-09-24: branch file sizes printed, so P11's space prediction can be judged (appended before any build or run)
+
+Nothing above this amendment changes. P11 predicts the arena file at ≈ page_size × (N + K) bytes
+and the log + snapshot at 30–80 B per live branch, but the harness printed neither size, so no
+run could judge them. From this amendment on, the durable arms (`durable`, `durable-nosync`)
+print one more line at every checkpoint, right after the `# N=` line:
+
+    # files N=<n> arena_bytes=<a> log_bytes=<l> snap_bytes=<s> page_size=<p>
+
+- **Observation only.** Each size is a `stat` of the file, taken after the checkpoint's timed work.
+  No timed path changes, so no existing prediction changes.
+- **A missing file prints 0.** Before the first compaction there is no snapshot. Any other `stat`
+  failure is `NOT A RESULT`.
+
+**Reading, fixed now, before any run.** P11 wrote "≈" and a range without a tolerance, so:
+- "arena ≈ page_size × (N + K)": `arena_bytes / (page_size × (N + K))` in **[0.8, 1.25]** at 10⁶.
+  The arena never shrinks, so free slots left after the sampled reaps count in the file.
+- "log + snapshot 30–80 B per live branch": `(log_bytes + snap_bytes) / N` in **[30, 80]** at 10⁶.
+- Each size is printed at every checkpoint. They are judged at 10⁶ only; below that, the fixed
+  header and the compaction threshold (1 MiB) dominate.

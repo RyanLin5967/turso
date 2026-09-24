@@ -497,6 +497,25 @@ fn main() {
             db.branch_stats().unwrap().arena_slots_free,
             rss as f64 / n as f64
         );
+        if durable {
+            // PREREG A3: P11's file sizes, read after the checkpoint's timed work (observation only).
+            let log = db.branch_log_path().expect("a durable store has a branch log");
+            let log = log.to_str().expect("a UTF-8 branch log path");
+            let base = log
+                .strip_suffix("-branch-log")
+                .expect("the branch log is named <db>-branch-log");
+            let size = |path: &str| match std::fs::metadata(path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => not_a_result(&format!("cannot stat {path}: {e}")),
+            };
+            println!(
+                "# files N={n} arena_bytes={} log_bytes={} snap_bytes={} page_size={page_size}",
+                size(&format!("{base}-branch-arena")),
+                size(log),
+                size(&format!("{base}-branch-snap"))
+            );
+        }
     }
 
     // log-log slope of p50 against N, per op, least squares over every checkpoint.
