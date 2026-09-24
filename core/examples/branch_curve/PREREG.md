@@ -378,3 +378,8 @@ turso_core --lib` gives **2466 passed, 0 failed, 17 ignored**, unchanged.
 - In P24, a "premise" panic, or either half matching only the old, weaker pattern.
 - In P25, the ATTACH test's `ptr_eq` premise failing: the ATTACH did not receive the held
   instance.
+
+**A5 addendum (appended after the fix commit `7e7a841e1`, before any build or run).** P26 said **114
+mutants**. There are **115**. `OTHER_d`, which drops ", except through {ours}", was added so the
+keeps-frames test's second new assertion ("except through") has a mutant of its own. It is killed
+by that test. Nothing else in A5 changes.
