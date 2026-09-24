@@ -148,7 +148,7 @@ fn reopen_sees_every_branchs_own_pages_and_its_ancestors_as_of_each_fork() {
     }
 
     let db = reopen(&path, incarnation);
-    let ids: BTreeSet<BranchId> = db.branch_ids().into_iter().collect();
+    let ids: BTreeSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
     assert_eq!(ids, BTreeSet::from([b_id, c_id]), "branches lost or invented by the reopen");
     // Replay re-executes the retain/free decisions; it must land on exactly the live set.
     assert_eq!(in_use(&db), live, "replay recovered a different set of live arena slots");
@@ -323,7 +323,7 @@ fn reap_after_reopen_frees_retained_versions() {
 
     // The releases were durable: a second reopen finds nothing.
     let db = reopen(&path, incarnation);
-    assert!(db.branch_ids().is_empty(), "a reaped branch came back");
+    assert!(db.branch_ids().unwrap().is_empty(), "a reaped branch came back");
     assert!(in_use(&db).is_empty());
     assert_eq!(value(&db.connect().unwrap(), 7), Some("v2".to_string()));
 }
@@ -390,7 +390,7 @@ fn a_database_with_durable_branches_refuses_to_open_without_them() {
     };
     assert!(err.contains("branch durability"), "{err}");
     let db = reopen(&path, incarnation);
-    assert_eq!(db.branch_ids(), vec![b_id]);
+    assert_eq!(db.branch_ids().unwrap(), vec![b_id]);
 }
 
 #[test]
@@ -556,7 +556,7 @@ fn a_random_workload_survives_repeated_reopens() {
         }
     }
     drop(handles);
-    assert!(db.branch_ids().is_empty());
+    assert!(db.branch_ids().unwrap().is_empty());
     assert!(in_use(&db).is_empty());
     integrity_ok(&trunk);
 }
@@ -678,16 +678,16 @@ fn a_release_deferred_by_an_open_connection_is_still_a_release_after_compaction(
         let bc = b.connect().unwrap();
         set(&bc, 7, "b");
         drop(b);
-        assert_eq!(db.branch_stats().live_branches, 1, "the open connection did not defer it");
+        assert_eq!(db.branch_stats().unwrap().live_branches, 1, "the open connection did not defer it");
         db.branch_compact_now().unwrap();
         drop(bc);
-        assert_eq!(db.branch_stats().live_branches, 0);
+        assert_eq!(db.branch_stats().unwrap().live_branches, 0);
         assert!(in_use(&db).is_empty());
     }
     let db = reopen(&path, incarnation);
-    assert_eq!(db.branch_stats().live_branches, 0, "a released branch came back from a snapshot");
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0, "a released branch came back from a snapshot");
     assert!(in_use(&db).is_empty(), "its pages came back with it");
-    assert!(db.branch_ids().is_empty());
+    assert!(db.branch_ids().unwrap().is_empty());
 }
 
 // ---- F5: leases. A crashed agent's branch must not pin its ancestors forever. ----
@@ -717,7 +717,7 @@ fn an_expired_lease_reaps_a_detached_branch_at_the_next_open() {
         db.branch_lease_clock_advance(Duration::from_secs(11));
     }
     let db = reopen(&path, incarnation);
-    assert!(db.branch_ids().is_empty(), "an expired, abandoned branch survived the restart");
+    assert!(db.branch_ids().unwrap().is_empty(), "an expired, abandoned branch survived the restart");
     assert!(in_use(&db).is_empty(), "its pages survived the restart");
 }
 
@@ -748,11 +748,11 @@ fn the_lease_timer_stops_while_the_database_is_closed() {
     // ...and the time the database was closed was not charged (9 < 10: still alive)...
     db.branch_lease_clock_advance(Duration::from_secs(3));
     assert!(db.expire_branches().unwrap().reaped.is_empty(), "reaped at 9 of 10 s");
-    assert_eq!(db.branch_ids(), vec![b_id]);
+    assert_eq!(db.branch_ids().unwrap(), vec![b_id]);
     // ...and it does run out (11 > 10).
     db.branch_lease_clock_advance(Duration::from_secs(2));
     assert_eq!(db.expire_branches().unwrap().reaped, vec![b_id]);
-    assert!(db.branch_ids().is_empty());
+    assert!(db.branch_ids().unwrap().is_empty());
 }
 
 #[test]
@@ -811,7 +811,7 @@ fn an_expired_interior_is_partially_reclaimed_while_its_live_child_reads_through
 
     // Across a restart the partial reclamation holds and the child still reads through.
     let db = reopen(&path, incarnation);
-    assert_eq!(db.branch_ids(), vec![c_id]);
+    assert_eq!(db.branch_ids().unwrap(), vec![c_id]);
     assert_eq!(in_use(&db), kept, "a reopen changed what the interior still holds");
     let c = db.branch(c_id).unwrap();
     assert_eq!(value(&c.connect().unwrap(), 7), Some("p-before-fork".to_string()));
@@ -824,7 +824,7 @@ fn an_expired_interior_is_partially_reclaimed_while_its_live_child_reads_through
     let expired = db.expire_branches().unwrap();
     assert_eq!(expired.reaped, vec![c_id_again]);
     assert!(in_use(&db).is_empty());
-    assert_eq!(db.branch_stats().live_branches, 0);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0);
 }
 
 #[test]
@@ -846,7 +846,7 @@ fn expiry_reaps_deepest_first_and_a_fork_never_revives_an_expired_parent() {
     // first, as Neon refuses "create children from expiring branches".
     assert!(p.fork().is_err(), "forked a child from an expired parent");
     // That pass reaped both, the child first: the interior then goes whole, not in two steps.
-    assert!(db.branch_ids().is_empty());
+    assert!(db.branch_ids().unwrap().is_empty());
     assert!(in_use(&db).is_empty());
 
     // Expiry order, observed directly on a fresh chain.
@@ -902,7 +902,7 @@ fn an_expired_branch_is_neither_renewed_nor_opened() {
     db.branch_lease_clock_advance(Duration::from_secs(6));
     assert!(a.lease(Duration::from_secs(100)).is_err(), "an expired lease was renewed");
     assert!(b.connect().is_err(), "an expired branch was opened");
-    assert!(db.branch_ids().is_empty());
+    assert!(db.branch_ids().unwrap().is_empty());
 }
 
 #[test]
@@ -918,7 +918,7 @@ fn an_expired_branch_cannot_be_opened_when_connect_is_the_first_operation() {
     b.lease(Duration::from_secs(5)).unwrap();
     db.branch_lease_clock_advance(Duration::from_secs(6));
     assert!(b.connect().is_err(), "an expired branch was opened");
-    assert!(db.branch_ids().is_empty());
+    assert!(db.branch_ids().unwrap().is_empty());
 }
 
 // ---- Review lane_turso_f4f5_review.md @ 56d3252: R1, R2, R3, R4, R6 ----
@@ -988,7 +988,7 @@ fn a_release_whose_log_failed_frees_nothing_now_or_later() {
         c2_id = c2.into_id();
     }
     let db = reopen(&path, incarnation);
-    let ids: BTreeSet<BranchId> = db.branch_ids().into_iter().collect();
+    let ids: BTreeSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
     assert_eq!(ids, BTreeSet::from([p_id, c1_id, c2_id]), "a release that never became durable held");
     assert_eq!(in_use(&db), held, "recovery sees different live slots");
     let pc = db.branch(p_id).unwrap().connect().unwrap();
@@ -1078,7 +1078,7 @@ fn a_crash_image_keeps_the_open_time_a_branch_commit_stamped() {
 
     let crashed = open_at(&image, durable()).unwrap();
     assert!(
-        !crashed.branch_ids().contains(&doomed_id),
+        !crashed.branch_ids().unwrap().contains(&doomed_id),
         "a crash lost the open time, and the expired branch survived the restart"
     );
     for slot in &doomed_slots {
@@ -1193,7 +1193,7 @@ fn the_lease_clock_does_not_charge_the_time_the_database_was_closed() {
         db.expire_branches().unwrap().reaped.is_empty(),
         "the 2.5 s the database was closed were charged to the lease"
     );
-    assert_eq!(db.branch_ids(), vec![b_id]);
+    assert_eq!(db.branch_ids().unwrap(), vec![b_id]);
 }
 
 /// R6. A lease whose millisecond count exceeds u64 must saturate to "practically forever", not
@@ -1209,7 +1209,7 @@ fn a_practically_infinite_lease_does_not_wrap_into_a_short_one() {
     b.lease(Duration::from_secs(18_446_744_073_709_552)).unwrap();
     db.branch_lease_clock_advance(Duration::from_secs(10));
     assert!(db.expire_branches().unwrap().reaped.is_empty(), "the lease wrapped and ran out");
-    assert_eq!(db.branch_ids(), vec![b.id()]);
+    assert_eq!(db.branch_ids().unwrap(), vec![b.id()]);
 }
 
 /// R1, the commit refusal on its own: a transaction with a dirty page, begun before the poisoning,
@@ -1302,7 +1302,7 @@ fn a_crash_image_keeps_the_open_time_trunk_commits_stamped() {
 
     let crashed = open_at(&image, durable()).unwrap();
     assert!(
-        !crashed.branch_ids().contains(&abandoned_id),
+        !crashed.branch_ids().unwrap().contains(&abandoned_id),
         "trunk-only traffic left the lease clock unstamped, and the abandoned branch survived"
     );
 }
@@ -1482,7 +1482,7 @@ fn a_crash_image_keeps_the_open_time_a_trunk_preimage_commit_stamped() {
 
     let crashed = open_at(&image, durable()).unwrap();
     assert!(
-        !crashed.branch_ids().contains(&abandoned_id),
+        !crashed.branch_ids().unwrap().contains(&abandoned_id),
         "a trunk commit's pre-image flush carried no stamp, and the abandoned branch survived"
     );
 }
@@ -1603,7 +1603,7 @@ fn a_symlinked_open_finds_the_real_paths_branch_files() {
         "a volatile open through a symlink ignored the real path's durable branches"
     );
     let db = open_at(&link, durable()).unwrap();
-    assert!(db.branch_ids().contains(&b_id), "a durable open through a symlink lost the branches");
+    assert!(db.branch_ids().unwrap().contains(&b_id), "a durable open through a symlink lost the branches");
 }
 
 /// Review 3 F6. A failed stamp-only flush must not fail the trunk commit that carried it — but
@@ -1792,4 +1792,40 @@ fn branch_files_of_a_relative_path_are_named_absolutely() {
     let log = db.branch_log_path().expect("a durable store has a log");
     assert!(log.is_absolute(), "branch files named from a relative path: {}", log.display());
     drop(b);
+}
+
+/// Review 4 C2: on a trunk-only handle the branch QUERIES refuse too — "no branches" would be a
+/// lie about a database that has them. (New API: its red is its mutant, not an older commit.)
+#[test]
+fn a_trunk_only_handle_refuses_branch_queries() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    {
+        let db = open_at(&path, durable()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let ro = open_read_only(&path, DatabaseOpts::new()).unwrap();
+    assert!(ro.branch_ids().is_err(), "a trunk-only handle listed branches it never opened");
+    assert!(ro.branch_stats().is_err(), "a trunk-only handle reported branch statistics");
+}
+
+/// Review 4 C4: only "no such file" may fall back to the path as given. Any other failure to
+/// resolve — here a symlink loop — refuses, rather than naming sidecars from an unresolved path.
+#[cfg(unix)]
+#[test]
+fn a_path_that_cannot_be_resolved_is_refused_not_used_as_given() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let a = dir.path().join("a.db");
+    let b = dir.path().join("b.db");
+    std::os::unix::fs::symlink(&b, &a).unwrap();
+    std::os::unix::fs::symlink(&a, &b).unwrap();
+    assert!(
+        crate::database::sidecar_base(a.to_str().unwrap()).is_err(),
+        "a path in a symlink loop was used as given"
+    );
+    let missing = dir.path().join("missing.db");
+    assert_eq!(crate::database::sidecar_base(missing.to_str().unwrap()).unwrap(), None);
+    assert!(Path::new(&crate::database::absolute_path("relative.db").unwrap()).is_absolute());
 }

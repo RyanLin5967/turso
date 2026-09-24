@@ -311,6 +311,115 @@ pub(crate) fn is_memory_like(path: &str) -> bool {
     path.starts_with(":memory:") || path.starts_with("file::memory:") || path.is_empty()
 }
 
+/// The one path every sidecar file of a file-backed database is named from: its WAL (unless the
+/// caller names one), and its branch log, arena and snapshot. Computed ONCE per open, after the
+/// database file is open (review 4 C3): a symlinked open that named its WAL from the path it was
+/// given, and its branch files from the resolved one, split one database's state across two sets
+/// of files.
+///
+/// `Ok(None)` means the path names no file on this filesystem (`NotFound`: storage the caller
+/// supplied, such as a `MemoryIO` name). The WAL then keeps the given name, which lives in that
+/// IO's namespace; branch files, which are always real files, use [`absolute_path`]. Every other
+/// failure to resolve REFUSES the open (review 4 C4): falling back to an unresolved name is how a
+/// symlinked open missed the real path's files.
+///
+/// BLIND SPOTS. The names follow the PATH, while the registry knows the file by (dev, ino):
+/// * a hard link, or a bind mount, has no canonical name, so it names other sidecars;
+/// * a database deleted and recreated at the same path inherits the old one's sidecars, and a
+///   renamed database leaves them behind for whatever file takes its old name next;
+/// * on non-unix targets nothing is resolved: an existing file's name is only made absolute.
+///
+/// The `-wal` has always had each of these; SQLite lists hard links and renames among the ways to
+/// corrupt a database.
+pub(crate) fn sidecar_base(path: &str) -> Result<Option<String>> {
+    #[cfg(unix)]
+    {
+        match std::fs::canonicalize(path) {
+            Ok(real) => real.into_os_string().into_string().map(Some).map_err(|_| {
+                LimboError::InvalidArgument(format!(
+                    "{path}: its resolved path is not UTF-8, so its WAL and branch files cannot be \
+                     named from it"
+                ))
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(LimboError::InvalidArgument(format!(
+                "cannot resolve {path} ({e}): refusing to name its WAL and branch files from an \
+                 unresolved path"
+            ))),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if Path::new(path).exists() {
+            absolute_path(path).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// `path` made absolute against the working directory NOW, so a later `chdir` cannot move the
+/// files named from it (review 4 C4; the pattern of `stable_lock_path`).
+pub(crate) fn absolute_path(path: &str) -> Result<String> {
+    let given = Path::new(path);
+    let absolute = if given.is_absolute() {
+        given.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| io_error(e, "resolve the working directory"))?
+            .join(given)
+    };
+    absolute.into_os_string().into_string().map_err(|_| {
+        LimboError::InvalidArgument(format!("{path}: its absolute path is not UTF-8"))
+    })
+}
+
+/// Refuse to open past a sidecar left under a name other than the canonical one (review 4 C3): a
+/// WAL or branch file written through a symlink before sidecars were named from `real`. Opening
+/// would silently miss the frames or the branches it holds. A name that reaches the SAME file — a
+/// symlinked directory, such as macOS's `/var` — resolves to the canonical sidecar and passes.
+fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool) -> Result<()> {
+    if given == real {
+        return Ok(());
+    }
+    let others = crate::branch::journal::BranchFiles::for_db(given);
+    let ours = crate::branch::journal::BranchFiles::for_db(real);
+    let mut pairs = vec![
+        (others.log, ours.log),
+        (others.snap, ours.snap),
+        (others.arena, ours.arena),
+    ];
+    if !custom_wal {
+        pairs.push((
+            format!("{given}-wal").into(),
+            format!("{real}-wal").into(),
+        ));
+    }
+    for (other, ours) in pairs {
+        let resolved = match std::fs::canonicalize(&other) {
+            Ok(resolved) => resolved,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(LimboError::InvalidArgument(format!(
+                    "cannot resolve {} ({e}), which may hold this database's state",
+                    other.display()
+                )))
+            }
+        };
+        let ours_resolved = std::fs::canonicalize(&ours).unwrap_or_else(|_| ours.clone());
+        if resolved != ours_resolved {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} exists, but this database's file of that kind is {}: it was written under \
+                 another name for the same database, and opening would miss what it holds; move \
+                 or remove one of them first",
+                other.display(),
+                ours.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Creates a read completion for database header reads that checks for short reads.
 /// The header is always on page 1, so this function hardcodes that page index.
 fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
@@ -649,6 +758,7 @@ impl Database {
         opts: DatabaseOpts,
         flags: OpenFlags,
         path: impl Into<String>,
+        branch_base: &str,
         wal_path: impl Into<String>,
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
@@ -664,7 +774,7 @@ impl Database {
         let branches = Arc::new(crate::branch::store::BranchStore::open_with_flags(
             opts.branch_durability,
             opts.branch_lease,
-            &path,
+            branch_base,
             flags.contains(OpenFlags::ReadOnly),
         )?);
         let shared_wal = WalFileShared::new_noop();
@@ -883,9 +993,12 @@ impl Database {
         // The coordination file is derived from the WAL path, so probe the
         // configured WAL (not a hard-coded `{path}-wal`) or a custom-WAL open
         // would check the wrong coordination file and miss a live authority.
-        let wal_path = wal_path
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{path}-wal"));
+        // The default WAL is named from `sidecar_base`, exactly as the open names it, so the probe
+        // finds the coordination file the open will use (review 4 C3).
+        let wal_path = match wal_path {
+            Some(wal_path) => wal_path.to_owned(),
+            None => format!("{}-wal", sidecar_base(path)?.as_deref().unwrap_or(path)),
+        };
         let coordination_path = storage::wal::coordination_path_for_wal_path(&wal_path);
         let Some(authority) =
             MappedSharedWalCoordination::open_existing(io, Path::new(&coordination_path), 64)?
@@ -1421,15 +1534,29 @@ impl Database {
                         None
                     };
 
-                    let wal_path = if let Some(wal_path) = wal_path {
-                        wal_path
+                    // Every sidecar is named from ONE path, computed here, once (review 4 C3).
+                    let (base, branch_base) = if is_memory_like(path) {
+                        (None, path.to_string())
                     } else {
-                        &format!("{path}-wal")
+                        let base = sidecar_base(path)?;
+                        if let Some(real) = &base {
+                            refuse_sidecars_under_another_name(path, real, wal_path.is_some())?;
+                        }
+                        let branch_base = match &base {
+                            Some(real) => real.clone(),
+                            None => absolute_path(path)?,
+                        };
+                        (base, branch_base)
+                    };
+                    let wal_path = match wal_path {
+                        Some(wal_path) => wal_path.to_string(),
+                        None => format!("{}-wal", base.as_deref().unwrap_or(path)),
                     };
                     let mut db = Self::new(
                         opts,
                         flags,
                         path,
+                        &branch_base,
                         wal_path,
                         &io,
                         db_file.clone(),

@@ -181,7 +181,7 @@ fn a_reaped_parent_is_kept_while_its_child_reads_through_it() {
 
     drop(c);
     assert_eq!(in_use(&db), before, "the chain was not freed when its last child went");
-    assert_eq!(db.branch_stats().live_branches, 0);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0);
 }
 
 #[test]
@@ -400,8 +400,8 @@ fn a_deep_chain_sees_each_ancestor_as_of_its_own_fork() {
     }
     drop(leaf);
     drop(chain);
-    assert_eq!(db.branch_stats().live_branches, 0);
-    assert_eq!(db.branch_stats().arena_slots_in_use, 0);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0);
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, 0);
 }
 
 #[test]
@@ -587,8 +587,8 @@ fn run_model(seed: u64) {
         }
     }
     drop(handles);
-    assert_eq!(db.branch_stats().live_branches, 0, "seed {seed:#x}: branches leaked");
-    assert_eq!(db.branch_stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0, "seed {seed:#x}: branches leaked");
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
     assert_eq!(rows(&trunk, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
 }
 
@@ -896,7 +896,7 @@ fn releasing_an_interior_branch_frees_what_no_live_child_can_read() {
     drop(cc);
     drop(c);
     assert_eq!(in_use(&db), base);
-    assert_eq!(db.branch_stats().live_branches, 0);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0);
 }
 
 /// `a_branch_transaction_larger_than_its_page_cache_commits_intact` asks for `cache_size = 10`, but

@@ -122,6 +122,9 @@ pub(crate) struct BranchStore {
     /// the lock, so a trunk with no leases still pays one load for the stamp (review N2). A stale
     /// `true` costs one lock; a stale `false` misses one stamp, which only lengthens leases.
     leases_outstanding: AtomicBool,
+    /// A read-only open of a database WITH branch files: the branch store was not opened, and every
+    /// branch operation is refused by name (review 4 C2; see `open_with_flags`).
+    trunk_only: bool,
 }
 
 struct StoreInner {
@@ -288,10 +291,22 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn fail_stopped(id: BranchId, what: &str) -> LimboError {
+/// Why a fail-stopped store refuses, naming the real cause (review 4 C6): a reopen cures an I/O
+/// failure, but not a fork(2) child — its inherited descriptor holds the very lock a reopen needs.
+fn fail_stop_cause(journal: Option<&Journal>) -> String {
+    match journal.and_then(Journal::fork_parent) {
+        Some(pid) => format!(
+            "fail-stopped in this process, a fork(2) child of process {pid}, which opened it: a \
+             branch store is not carried across fork()"
+        ),
+        None => "fail-stopped after an I/O failure, until the database is reopened".to_string(),
+    }
+}
+
+fn fail_stopped(journal: Option<&Journal>, id: BranchId, what: &str) -> LimboError {
     LimboError::InternalError(format!(
-        "branch store is fail-stopped after an I/O failure; branch {} takes {what} until the \
-         database is reopened",
+        "branch store is {}; branch {} takes {what}",
+        fail_stop_cause(journal),
         id.0
     ))
 }
@@ -438,17 +453,27 @@ fn gone(id: BranchId) -> LimboError {
 }
 
 impl BranchStore {
-    /// The store for a database at `db_path`. A durable store recovers whatever its files hold;
-    /// a volatile one refuses a database whose files say it has durable branches, because opened
-    /// volatile, the trunk's writes would skip the pre-image barrier and silently change what
-    /// those branches read.
-    /// `open`, for a database opened with `flags`. A READ-ONLY open is refused a durable store, and
-    /// refused outright when the database has durable branch files (review 3): recovery writes by
-    /// construction — it cuts a torn tail, discards a temp snapshot, and reaps expired leases with
-    /// durable records — so a read-only recovery would be a second, write-free recovery that has to
-    /// agree with the first; and a read-only instance cannot follow a live writer's log, so it would
-    /// have to lock writers out. Neither is worth a reader that could not use the branches anyway.
-    /// A read-only open with no branch files opens as before.
+    /// `open`, for a database opened read-only or not (review 4 C2, the lead's decision; it
+    /// replaces review 3's outright refusal, which made such a database unreadable read-only for
+    /// good, since branch files are never removed).
+    ///
+    /// A READ-ONLY open of a database WITH branch files gets a TRUNK-ONLY store: no recovery (which
+    /// writes: it cuts a torn tail, discards a temp snapshot, and reaps expired leases durably), no
+    /// lock, no branch file read or written, and every branch operation refused by name. Trunk
+    /// reads are safe beside a live writer that holds the branch lock, because:
+    /// * a branch never writes a trunk page. Branch commits go to arena slots, and the trunk's
+    ///   pre-images are COPIES into the arena. The trunk is exactly what Turso's WAL serves, under
+    ///   this reader's own WAL snapshot, as it is beside any writer;
+    /// * this handle reads no branch file, so it cannot see the writer's log or arena mid-append,
+    ///   and it takes no lock, so it blocks no writer;
+    /// * this handle writes no trunk page, so it cannot skip a pre-image the writer's branches need:
+    ///   the connection refuses writes on a read-only database, and a trunk write that got past it
+    ///   is refused here (`first_write_trunk`).
+    ///
+    /// Whether a second PROCESS may read the trunk beside a writer is Turso's own rule, unchanged.
+    ///
+    /// Durable + read-only with NO branch files stays refused: a fork would create them, and
+    /// nothing below the connection refuses a fork on a read-only database.
     pub(crate) fn open_with_flags(
         durability: BranchDurability,
         default_lease: Option<Duration>,
@@ -456,16 +481,44 @@ impl BranchStore {
         read_only: bool,
     ) -> Result<Self> {
         if read_only {
-            let has_files = !crate::is_memory_like(db_path) && BranchFiles::for_db(db_path).exist();
-            if has_files || matches!(durability, BranchDurability::Durable { .. }) {
+            if !crate::is_memory_like(db_path) && BranchFiles::for_db(db_path).exist() {
+                return Ok(Self::trunk_only());
+            }
+            if matches!(durability, BranchDurability::Durable { .. }) {
                 return Err(LimboError::InvalidArgument(format!(
-                    "{db_path}: durable branches need a read-write open (their recovery writes)"
+                    "{db_path}: durable branches need a read-write open: a fork would create \
+                     branch files, and nothing below the connection refuses one when read-only"
                 )));
             }
         }
         Self::open(durability, default_lease, db_path)
     }
 
+    fn trunk_only() -> Self {
+        Self {
+            inner: Mutex::new(StoreInner::fresh(None, false, None)),
+            trunk_children: AtomicUsize::new(0),
+            unsynced: AtomicBool::new(false),
+            leases_outstanding: AtomicBool::new(false),
+            trunk_only: true,
+        }
+    }
+
+    /// Refuse `what` on a trunk-only store (see `open_with_flags`).
+    pub(crate) fn refuse_if_trunk_only(&self, what: &str) -> Result<()> {
+        if self.trunk_only {
+            return Err(LimboError::InvalidArgument(format!(
+                "{what} is refused: this database was opened read-only while it has durable \
+                 branches, so its branch store was not opened (trunk reads only)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The store for a database whose sidecar files are named from `db_path`. A durable store
+    /// recovers whatever its files hold; a volatile one refuses a database whose files say it has
+    /// durable branches, because opened volatile, the trunk's writes would skip the pre-image
+    /// barrier and silently change what those branches read.
     pub(crate) fn open(
         durability: BranchDurability,
         default_lease: Option<Duration>,
@@ -523,6 +576,7 @@ impl BranchStore {
             inner: Mutex::new(inner),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
+            trunk_only: false,
         };
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
@@ -536,8 +590,10 @@ impl BranchStore {
         Ok(store)
     }
 
+    /// A trunk-only store answers yes, so every trunk page write reaches `first_write_trunk` and
+    /// its refusal.
     pub(crate) fn trunk_has_children(&self) -> bool {
-        self.trunk_children.load(Ordering::Acquire) > 0
+        self.trunk_only || self.trunk_children.load(Ordering::Acquire) > 0
     }
 
     fn sync_trunk_children(&self, inner: &StoreInner) {
@@ -556,7 +612,7 @@ impl BranchStore {
     /// Whether any branch state exists at all, including one kept alive only by a live child.
     /// Paths that rewrite the trunk without passing through `add_dirty` refuse while this holds.
     pub(crate) fn has_branches(&self) -> bool {
-        !self.inner.lock().branches.is_empty()
+        self.trunk_only || !self.inner.lock().branches.is_empty()
     }
 
     /// Append `records` and make them durable with ONE flush before the caller acts on any of
@@ -616,15 +672,15 @@ impl BranchStore {
     /// The expiry pass, on demand. Also stamps the lease clock when a lease is outstanding, so time
     /// spent open survives a restart even if nothing expired.
     pub(crate) fn expire_now(&self) -> Result<Expired> {
+        self.refuse_if_trunk_only("the expiry pass")?;
         let mut inner = self.inner.lock();
         // A fail-stopped pass reaps nothing and stamps nothing: an empty `Expired` would say
         // "nothing was due" when the truth is "could not run" (review N4).
         if inner.poisoned() {
-            return Err(LimboError::InternalError(
-                "branch store is fail-stopped after an I/O failure; the expiry pass cannot make a \
-                 release durable until the database is reopened"
-                    .to_string(),
-            ));
+            return Err(LimboError::InternalError(format!(
+                "branch store is {}; the expiry pass cannot make a release durable",
+                fail_stop_cause(inner.journal.as_ref())
+            )));
         }
         Ok(self.expire(&mut inner, Stamp::Flush)?.0)
     }
@@ -820,7 +876,7 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         // Nor is an expired branch openable: the same pass, the same refusal.
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
-        let poisoned = inner.poisoned();
+        let poisoned = inner.poisoned().then(|| fail_stop_cause(inner.journal.as_ref()));
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.handle.is_released() {
             return Err(reaped(id));
@@ -828,12 +884,13 @@ impl BranchStore {
         // A fail-stopped pass cannot reap (it cannot make a Release durable), so the refusal that
         // reaping gives an expired branch is given here instead (review N4). Unexpired branches
         // stay readable.
-        if poisoned && st.lease.is_some_and(|deadline| deadline <= now) {
-            return Err(LimboError::InvalidArgument(format!(
-                "branch {}'s lease has run out; the branch store is fail-stopped after an I/O \
-                 failure, so it is reaped when the database is reopened",
-                id.0
-            )));
+        if let Some(cause) = poisoned {
+            if st.lease.is_some_and(|deadline| deadline <= now) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "branch {}'s lease has run out, and the branch store is {cause}",
+                    id.0
+                )));
+            }
         }
         if st.handle != Handle::Attached {
             return Err(LimboError::InvalidArgument(format!(
@@ -887,7 +944,9 @@ impl BranchStore {
                     deferred: true,
                 })
             }
-            Handle::ReleasePending => return Err(fail_stopped(id, "no release")),
+            Handle::ReleasePending => {
+                return Err(fail_stopped(inner.journal.as_ref(), id, "no release"))
+            }
             Handle::Attached | Handle::Detached => {}
         }
         if let Err(e) = self.log(&mut inner, Record::Release { branch: id.0 }) {
@@ -928,6 +987,7 @@ impl BranchStore {
 
     /// Give a detached branch a handle again. One handle per branch.
     pub(crate) fn attach(&self, id: BranchId) -> Result<()> {
+        self.refuse_if_trunk_only("attaching a branch")?;
         let mut inner = self.inner.lock();
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         match st.handle {
@@ -943,8 +1003,9 @@ impl BranchStore {
         }
     }
 
-    /// Every unreleased branch.
-    pub(crate) fn ids(&self) -> Vec<BranchId> {
+    /// Every unreleased branch. Refused on a trunk-only store, where "none" would be a lie.
+    pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
+        self.refuse_if_trunk_only("listing branches")?;
         let inner = self.inner.lock();
         let mut ids: Vec<BranchId> = inner
             .branches
@@ -953,7 +1014,7 @@ impl BranchStore {
             .map(|(&id, _)| id)
             .collect();
         ids.sort();
-        ids
+        Ok(ids)
     }
 
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
@@ -961,7 +1022,7 @@ impl BranchStore {
         // A fail-stopped store takes no write: a commit would write its pages into the arena
         // before its record failed, possibly into a slot durable state still names (review R1).
         if inner.poisoned() {
-            return Err(fail_stopped(id, "no write transaction"));
+            return Err(fail_stopped(inner.journal.as_ref(), id, "no write transaction"));
         }
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         // A released branch takes no writes: its Release record is already durable, and a commit
@@ -1025,7 +1086,7 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         // A transaction that began before the journal failed may write no further page.
         if inner.poisoned() {
-            return Err(fail_stopped(id, "no page write"));
+            return Err(fail_stopped(inner.journal.as_ref(), id, "no page write"));
         }
         let StoreInner {
             arena, branches, ..
@@ -1048,6 +1109,9 @@ impl BranchStore {
     /// can still see the version about to be overwritten, keep a copy of it for that child. The
     /// record waits in the journal until the trunk's commit barrier makes it durable.
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) -> Result<()> {
+        // The second fence of a trunk-only store, behind the connection's read-only check: this
+        // write would retain no pre-image for the branches on disk.
+        self.refuse_if_trunk_only("a trunk page write")?;
         let mut inner = self.inner.lock();
         let StoreInner {
             arena,
@@ -1062,11 +1126,11 @@ impl BranchStore {
         }
         if trunk.lineage.has_child_in(born, epoch) {
             if journal.as_ref().is_some_and(|j| j.is_poisoned()) {
-                return Err(LimboError::InternalError(
-                    "the trunk would overwrite a page a durable branch reads, but the branch \
-                     store is fail-stopped; reopen the database"
-                        .to_string(),
-                ));
+                return Err(LimboError::InternalError(format!(
+                    "the trunk would overwrite a page a durable branch reads, but the branch store \
+                     is {}",
+                    fail_stop_cause(journal.as_ref())
+                )));
             }
             let arena = arena.as_mut().expect("the trunk has a child, so the arena exists");
             let slot = arena.alloc();
@@ -1135,16 +1199,12 @@ impl BranchStore {
                 lease.queued(now);
             }
             if lease.queued_ms > lease.durable_ms {
-                let flushed = if *failpoint == Some(BranchFailpoint::StampFlushFails) {
+                if *failpoint == Some(BranchFailpoint::StampFlushFails) {
                     *failpoint = None;
-                    journal.poison();
-                    Err(LimboError::InternalError(
-                        "failpoint: the stamp-only branch log flush failed".to_string(),
-                    ))
-                } else {
-                    journal.flush(arena)
-                };
-                match flushed {
+                    // Fails inside `flush`, so the poisoning is `flush`'s own (review 4 C7).
+                    journal.fail_next_write();
+                }
+                match journal.flush(arena) {
                     Ok(()) => lease.flushed(),
                     Err(e) => {
                         tracing::warn!("branch lease clock not stamped at a trunk commit: {e}")
@@ -1183,7 +1243,7 @@ impl BranchStore {
         // Refuse BEFORE any slot is written: after the journal failed, this commit's record can
         // never be durable, so its pages have no business in the arena.
         if inner.poisoned() {
-            return Err(fail_stopped(id, "no commit"));
+            return Err(fail_stopped(inner.journal.as_ref(), id, "no commit"));
         }
         let entries = {
             let StoreInner {
@@ -1283,13 +1343,14 @@ impl BranchStore {
         Ok(true)
     }
 
-    pub(crate) fn stats(&self) -> BranchStats {
+    pub(crate) fn stats(&self) -> Result<BranchStats> {
+        self.refuse_if_trunk_only("branch statistics")?;
         let inner = self.inner.lock();
-        BranchStats {
+        Ok(BranchStats {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
-        }
+        })
     }
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
@@ -1544,7 +1605,18 @@ impl StoreInner {
         }
         self.lease.queued(snapshot.lease_now_ms);
         self.lease.flushed();
-        self.arena = Some(Arena::open_file(&files.arena, page_size, true, &[])?);
+        match Arena::open_file(&files.arena, page_size, true, &[]) {
+            Ok(arena) => self.arena = Some(arena),
+            Err(e) => {
+                // The snapshot and the log header already say the new page size; the arena in
+                // memory still has the old one. Fail-stop rather than run on with the two
+                // disagreeing (review 4 C5): recovery starts from the files, where they agree.
+                if let Some(journal) = self.journal.as_mut() {
+                    journal.poison();
+                }
+                return Err(e);
+            }
+        }
         Ok(())
     }
 

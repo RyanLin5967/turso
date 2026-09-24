@@ -184,7 +184,7 @@ fn reaping_a_branch_frees_its_pages() {
     let (_dir, db) = open_db();
     let trunk = db.connect().unwrap();
     seed(&trunk);
-    let base = db.branch_stats();
+    let base = db.branch_stats().unwrap();
 
     let b = trunk.fork_branch().unwrap();
     let bc = b.connect().unwrap();
@@ -193,7 +193,7 @@ fn reaping_a_branch_frees_its_pages() {
     drop(bc);
 
     let owned = b.owned_slots();
-    let held = db.branch_stats();
+    let held = db.branch_stats().unwrap();
     // The branch really holds pages of its own; a reap that frees nothing is only a pass if there
     // was nothing to free, and that is exactly the case this rules out.
     assert!(!owned.is_empty(), "a branch that wrote owns no pages");
@@ -210,8 +210,8 @@ fn reaping_a_branch_frees_its_pages() {
     for slot in &owned {
         assert!(db.branch_slot_is_free(*slot), "slot {slot} was not freed");
     }
-    assert_eq!(db.branch_stats().arena_slots_in_use, base.arena_slots_in_use);
-    assert_eq!(db.branch_stats().live_branches, base.live_branches);
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, base.arena_slots_in_use);
+    assert_eq!(db.branch_stats().unwrap().live_branches, base.live_branches);
 }
 
 #[test]
@@ -219,7 +219,7 @@ fn dropping_a_branch_frees_its_pages() {
     let (_dir, db) = open_db();
     let trunk = db.connect().unwrap();
     seed(&trunk);
-    let base = db.branch_stats();
+    let base = db.branch_stats().unwrap();
 
     let b = trunk.fork_branch().unwrap();
     let bc = b.connect().unwrap();
@@ -232,8 +232,8 @@ fn dropping_a_branch_frees_its_pages() {
     for slot in &owned {
         assert!(db.branch_slot_is_free(*slot), "slot {slot} was not freed");
     }
-    assert_eq!(db.branch_stats().arena_slots_in_use, base.arena_slots_in_use);
-    assert_eq!(db.branch_stats().live_branches, base.live_branches);
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, base.arena_slots_in_use);
+    assert_eq!(db.branch_stats().unwrap().live_branches, base.live_branches);
 }
 
 #[test]

@@ -312,7 +312,7 @@ fn main() {
         let grow_us = t.elapsed().as_secs_f64() * 1e6;
 
         // Ask the engine, not the harness, what exists.
-        let stats = db.branch_stats();
+        let stats = db.branch_stats().unwrap();
         if stats.live_branches != n {
             not_a_result(&format!("expected {n} live branches, engine has {}", stats.live_branches));
         }
@@ -386,7 +386,7 @@ fn main() {
                 not_a_result(&format!("a sampled reap freed {reaped:?}, expected one page"));
             }
         }
-        if db.branch_stats().live_branches != n || db.branch_stats().arena_slots_in_use != n {
+        if db.branch_stats().unwrap().live_branches != n || db.branch_stats().unwrap().arena_slots_in_use != n {
             not_a_result("sampling did not return the engine to N branches");
         }
 
@@ -420,7 +420,7 @@ fn main() {
                 expired.freed_pages
             ));
         }
-        if db.branch_stats().live_branches != n || db.branch_stats().arena_slots_in_use != n {
+        if db.branch_stats().unwrap().live_branches != n || db.branch_stats().unwrap().arena_slots_in_use != n {
             not_a_result("the expiry pass did not return the engine to N branches");
         }
         // Reported per reaped branch, so it reads against `reap`.
@@ -463,7 +463,7 @@ fn main() {
                     })
                     .collect();
                 attach_all.push(t.elapsed());
-                let stats = db.branch_stats();
+                let stats = db.branch_stats().unwrap();
                 if stats.live_branches != n || stats.arena_slots_in_use != n {
                     not_a_result(&format!(
                         "after a reopen the engine has {stats:?}; expected {n} branches holding \
@@ -493,8 +493,8 @@ fn main() {
         println!(
             "# N={n} grow_total_us={grow_us:.0} arena_pages={} arena_free={} rss_bytes={rss} \
              rss_per_branch={:.0}",
-            db.branch_stats().arena_slots_in_use,
-            db.branch_stats().arena_slots_free,
+            db.branch_stats().unwrap().arena_slots_in_use,
+            db.branch_stats().unwrap().arena_slots_free,
             rss as f64 / n as f64
         );
     }
@@ -532,7 +532,7 @@ fn main() {
         }
     }
     drop(live);
-    let end = db.branch_stats();
+    let end = db.branch_stats().unwrap();
     if end.live_branches != 0 || end.arena_slots_in_use != 0 {
         not_a_result(&format!("teardown leaked: {end:?}"));
     }

@@ -74,21 +74,12 @@ pub(crate) struct BranchFiles {
 }
 
 impl BranchFiles {
-    /// Named from the database file's CANONICAL path (review 3): the registry knows a database by
-    /// (dev, ino), and a symlink to it must find the same branch files, or a volatile open through
-    /// the link is admitted and its trunk writes change what the branches read. A path that does
-    /// not resolve (no file yet) is used as given — the pattern of `stable_lock_path`.
-    ///
-    /// BLIND SPOT: a HARD link has no canonical name, so it still names other files. Turso's own
-    /// `-wal` is named from the path string too, and SQLite lists hard links among the ways to
-    /// corrupt a database.
-    pub(crate) fn for_db(db_path: &str) -> Self {
-        let real = std::fs::canonicalize(db_path).unwrap_or_else(|_| PathBuf::from(db_path));
-        let named = |suffix: &str| {
-            let mut name = real.clone().into_os_string();
-            name.push(suffix);
-            PathBuf::from(name)
-        };
+    /// Named from `base`, which the open computes ONCE for every sidecar, the WAL included
+    /// (`database::sidecar_base`; review 4 C3 — this used to canonicalize on its own, so a
+    /// symlinked open named its branch files and its WAL from two different paths). See there
+    /// for the blind spots: hard links, bind mounts, delete-and-recreate, rename.
+    pub(crate) fn for_db(base: &str) -> Self {
+        let named = |suffix: &str| PathBuf::from(format!("{base}{suffix}"));
         Self {
             arena: named("-branch-arena"),
             log: named("-branch-log"),
@@ -437,6 +428,8 @@ pub(crate) struct Journal {
     /// so no write path runs in the child (review 3 F1; SQLite's rule too — a connection must not
     /// be carried across fork()).
     pid: u32,
+    /// See [`Journal::fail_next_write`].
+    fail_next_write: bool,
 }
 
 impl Journal {
@@ -476,6 +469,7 @@ impl Journal {
             sync,
             poisoned: false,
             pid: std::process::id(),
+            fail_next_write: false,
         })
     }
 
@@ -562,6 +556,7 @@ impl Journal {
             sync,
             poisoned: false,
             pid: std::process::id(),
+            fail_next_write: false,
         };
 
         let mut records = Vec::new();
@@ -577,6 +572,13 @@ impl Journal {
                     };
                     let len = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
                     let crc = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+                    // A zero length is torn, never a record: every payload starts with its tag
+                    // byte. It needs its own test, because crc32c of nothing is 0 — a zero-filled
+                    // header (a file size made durable before its data) passes the CRC below and
+                    // would be reported as corruption (review 4 O1).
+                    if len == 0 {
+                        break;
+                    }
                     let start = pos + FRAME_HEADER_LEN;
                     let Some(payload) = bytes.get(start..start + len) else {
                         break;
@@ -625,6 +627,19 @@ impl Journal {
 
     fn forked(&self) -> bool {
         self.pid != std::process::id()
+    }
+
+    /// The process that opened this journal, when this process is a fork(2) child of it: the
+    /// cause a refusal must name (review 4 C6), since a reopen cannot help while the child holds
+    /// the inherited lock.
+    pub(crate) fn fork_parent(&self) -> Option<u32> {
+        self.forked().then_some(self.pid)
+    }
+
+    /// Fail the next log write as an I/O error would — the `StampFlushFails` failpoint. It fails
+    /// INSIDE `flush`, so the poisoning a test then observes is `flush`'s own (review 4 C7).
+    pub(crate) fn fail_next_write(&mut self) {
+        self.fail_next_write = true;
     }
 
     pub(crate) fn page_size(&self) -> usize {
@@ -681,7 +696,14 @@ impl Journal {
         if self.pending.is_empty() {
             return Ok(());
         }
-        match self.write_pending(arena) {
+        let written = if std::mem::take(&mut self.fail_next_write) {
+            Err(LimboError::InternalError(
+                "failpoint: a branch log write failed".to_string(),
+            ))
+        } else {
+            self.write_pending(arena)
+        };
+        match written {
             Ok(()) => {
                 self.len += self.pending.len() as u64;
                 self.pending.clear();

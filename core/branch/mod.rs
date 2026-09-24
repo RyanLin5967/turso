@@ -336,6 +336,8 @@ impl Connection {
     /// Fork a branch from whatever this connection is on: the trunk, or the branch it was opened
     /// on. The branch sees the committed state at the moment of the fork.
     pub fn fork_branch(self: &Arc<Connection>) -> Result<Branch> {
+        // First: on a read-only handle of a database with branches, nothing below would refuse.
+        self.db.branches.refuse_if_trunk_only("fork")?;
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::InvalidArgument(
                 "cannot fork inside a transaction: a branch starts from committed state, so \
@@ -406,7 +408,8 @@ impl Connection {
 }
 
 impl Database {
-    pub fn branch_stats(&self) -> BranchStats {
+    /// Refused on a read-only handle of a database with branches, whose branch store is not open.
+    pub fn branch_stats(&self) -> Result<BranchStats> {
         self.branches.stats()
     }
 
@@ -429,8 +432,9 @@ impl Database {
         Ok(Branch::new(self.clone(), id))
     }
 
-    /// Every unreleased branch, attached or not.
-    pub fn branch_ids(&self) -> Vec<BranchId> {
+    /// Every unreleased branch, attached or not. Refused on a read-only handle of a database with
+    /// branches, whose branch store is not open: "none" would be a lie there.
+    pub fn branch_ids(&self) -> Result<Vec<BranchId>> {
         self.branches.ids()
     }
 
