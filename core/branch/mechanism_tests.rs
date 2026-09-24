@@ -10,6 +10,10 @@ use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value,
 use std::collections::{BTreeMap, BTreeSet};
 
 fn open_db() -> (tempfile::TempDir, Arc<Database>) {
+    open_db_with(DatabaseOpts::new())
+}
+
+fn open_db_with(opts: DatabaseOpts) -> (tempfile::TempDir, Arc<Database>) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("branching.db");
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
@@ -17,7 +21,7 @@ fn open_db() -> (tempfile::TempDir, Arc<Database>) {
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
-        DatabaseOpts::new(),
+        opts,
         None,
         Arc::new(SqliteDialect),
     )
@@ -303,6 +307,33 @@ fn a_growing_branch_and_a_growing_trunk_do_not_share_new_page_numbers() {
 }
 
 #[test]
+fn a_branch_transaction_larger_than_its_page_cache_commits_intact() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    // A cache far smaller than the transaction: the pager wants to spill dirty pages, and a
+    // branch's pages have nowhere to spill to (the WAL is the trunk's).
+    bc.execute("PRAGMA cache_size = 10").unwrap();
+    bc.execute("BEGIN").unwrap();
+    for id in 1001..=3000 {
+        bc.execute(format!("INSERT INTO t VALUES ({id}, 'big-{id}-{}')", "b".repeat(80)))
+            .unwrap();
+    }
+    bc.execute("COMMIT").unwrap();
+    drop(bc);
+
+    let bc = b.connect().unwrap();
+    let rows_seen = table(&bc);
+    assert_eq!(rows_seen.len(), 2050);
+    assert_eq!(rows_seen[&2500], format!("big-2500-{}", "b".repeat(80)));
+    assert_eq!(rows(&bc, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
+    let trunk_rows = table(&db.connect().unwrap());
+    assert_eq!(trunk_rows.len(), 50, "the branch's big transaction reached the trunk");
+}
+
+#[test]
 fn a_trunk_write_during_an_open_branch_transaction_stays_out_of_it() {
     let (_dir, db) = open_db();
     let trunk = db.connect().unwrap();
@@ -403,13 +434,30 @@ fn forking_inside_a_transaction_is_refused() {
 
 #[test]
 fn paths_that_bypass_the_copy_decision_are_refused_while_branches_exist() {
-    let (_dir, db) = open_db();
+    // VACUUM is refused by the parser unless enabled; without this the VACUUM assertion below
+    // would pass on the parser's refusal and never reach the branch guard.
+    let (_dir, db) = open_db_with(DatabaseOpts::new().with_vacuum(true));
     let trunk = db.connect().unwrap();
     seed(&trunk, 10);
     let b = trunk.fork_branch().unwrap();
     let bc = b.connect().unwrap();
 
-    assert!(bc.execute("PRAGMA wal_checkpoint(TRUNCATE)").is_err());
+    // PRAGMA wal_checkpoint never raises: SQLite's contract reports a failed checkpoint as a row
+    // whose first column (busy) is 1, and `op_checkpoint` maps every error to that. So the
+    // refusal is checked on both surfaces — the pragma's busy flag, and the error text through
+    // the API that does propagate it.
+    let pragma = rows(&bc, "PRAGMA wal_checkpoint(TRUNCATE)");
+    assert_eq!(pragma[0][0].as_int(), Some(1), "checkpoint on a branch ran: {pragma:?}");
+    let api = bc.checkpoint(crate::CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    });
+    assert!(
+        api.as_ref().is_err_and(|e| e.to_string().contains("trunk connection")),
+        "checkpoint on a branch: {api:?}"
+    );
+    // The same pragma on the trunk is not refused: the flag above is the refusal, not noise.
+    let trunk_pragma = rows(&trunk, "PRAGMA wal_checkpoint(TRUNCATE)");
+    assert_eq!(trunk_pragma[0][0].as_int(), Some(0), "{trunk_pragma:?}");
     let vacuum = trunk.execute("VACUUM");
     assert!(
         vacuum.as_ref().is_err_and(|e| e.to_string().contains("copy-on-write")),
