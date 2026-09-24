@@ -50,7 +50,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 
 use super::arena::{Arena, Slot};
-use super::{BranchId, BranchStats, Reaped};
+use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
 use crate::sync::atomic::{AtomicUsize, Ordering};
@@ -74,6 +74,8 @@ struct StoreInner {
     next_id: u64,
     trunk: TrunkState,
     branches: HashMap<BranchId, BranchState>,
+    /// Observation only; see [`BranchWork`].
+    work: BranchWork,
 }
 
 #[derive(Default)]
@@ -140,17 +142,17 @@ impl Lineage {
             .push((page, v.died));
     }
 
-    /// The retained version of `page` visible to a child forked at `f`.
-    fn retained_at(&self, page: u32, f: u64) -> Option<Slot> {
-        self.retained
-            .get(&page)?
-            .iter()
-            .find(|v| v.born <= f && f < v.died)
-            .map(|v| v.slot)
+    /// The retained version of `page` visible to a child forked at `f`. `examined` counts the
+    /// versions compared.
+    fn retained_at(&self, page: u32, f: u64, examined: &mut u64) -> Option<Slot> {
+        let versions = self.retained.get(&page)?;
+        let at = versions.iter().position(|v| v.born <= f && f < v.died);
+        *examined += at.map_or(versions.len(), |i| i + 1) as u64;
+        at.map(|i| versions[i].slot)
     }
 
     /// Detach the child forked at `f` and release every retained version that only it could see.
-    fn child_gone(&mut self, f: u64, arena: &mut Arena) -> usize {
+    fn child_gone(&mut self, f: u64, arena: &mut Arena, work: &mut BranchWork) -> usize {
         let removed = self.children.remove(&f);
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
@@ -163,6 +165,7 @@ impl Lineage {
         };
         let mut dead = Vec::new();
         for (&born, entries) in self.retained_by_born.range((from, Bound::Included(f))) {
+            work.gc_range_entries += entries.len() as u64;
             for &(page, died) in entries {
                 if died > f && hi.is_none_or(|hi| died <= hi) {
                     dead.push((born, page));
@@ -175,6 +178,7 @@ impl Lineage {
                 .iter()
                 .position(|v| v.born == born)
                 .expect("indexed version is listed");
+            work.gc_examined += at as u64 + 1;
             let v = versions.swap_remove(at);
             if versions.is_empty() {
                 self.retained.remove(&page);
@@ -219,6 +223,7 @@ impl BranchStore {
                     written: HashMap::new(),
                 },
                 branches: HashMap::new(),
+                work: BranchWork::default(),
             }),
             trunk_children: AtomicUsize::new(0),
         }
@@ -467,8 +472,13 @@ impl BranchStore {
     /// means the branch sees the trunk's current version, which the caller reads through the
     /// ordinary WAL / database-file path.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
-        let inner = self.inner.lock();
-        let Some(slot) = inner.resolve(id, page)? else {
+        let mut inner = self.inner.lock();
+        let (mut levels, mut examined) = (0, 0);
+        let resolved = inner.resolve(id, page, &mut levels, &mut examined);
+        inner.work.resolve_calls += 1;
+        inner.work.resolve_levels += levels;
+        inner.work.resolve_retained_examined += examined;
+        let Some(slot) = resolved? else {
             return Ok(false);
         };
         out.copy_from_slice(
@@ -487,6 +497,7 @@ impl BranchStore {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
+            work: inner.work,
         }
     }
 
@@ -530,35 +541,49 @@ impl BranchStore {
                 return freed;
             }
             let st = inner.branches.remove(&id).expect("just looked it up");
-            let arena = inner.arena.as_mut().expect("a branch existed, so the arena does");
+            let StoreInner {
+                arena,
+                trunk,
+                branches,
+                work,
+                ..
+            } = &mut *inner;
+            let arena = arena.as_mut().expect("a branch existed, so the arena does");
             for owned in st.current.values() {
                 arena.release(owned.slot);
                 freed += 1;
             }
             freed += st.lineage.release_all(arena).len();
             if st.parent.is_trunk() {
-                freed += inner.trunk.lineage.child_gone(st.fork_epoch, arena);
+                freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
                 return freed;
             }
-            let parent = inner
-                .branches
+            let parent = branches
                 .get_mut(&st.parent)
                 .expect("a live branch's parent is kept while the branch lives");
-            freed += parent.lineage.child_gone(st.fork_epoch, arena);
+            freed += parent.lineage.child_gone(st.fork_epoch, arena, work);
             id = st.parent;
         }
     }
 }
 
 impl StoreInner {
-    fn resolve(&self, id: BranchId, page: u32) -> Result<Option<Slot>> {
+    /// `levels` counts the nodes visited and `examined` the retained versions compared.
+    fn resolve(
+        &self,
+        id: BranchId,
+        page: u32,
+        levels: &mut u64,
+        examined: &mut u64,
+    ) -> Result<Option<Slot>> {
         let mut node = id;
         // A branch sees all of its own versions; its ancestors only as of the fork.
         let mut at = u64::MAX;
         loop {
+            *levels += 1;
             if node.is_trunk() {
-                if let Some(slot) = self.trunk.lineage.retained_at(page, at) {
+                if let Some(slot) = self.trunk.lineage.retained_at(page, at, examined) {
                     return Ok(Some(slot));
                 }
                 let born = self.trunk.written.get(&page).copied().unwrap_or(0);
@@ -579,7 +604,7 @@ impl StoreInner {
                     return Ok(Some(owned.slot));
                 }
             }
-            if let Some(slot) = st.lineage.retained_at(page, at) {
+            if let Some(slot) = st.lineage.retained_at(page, at, examined) {
                 return Ok(Some(slot));
             }
             at = st.fork_epoch;

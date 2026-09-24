@@ -174,6 +174,25 @@ pub struct BranchStats {
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
+    /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
+    pub work: BranchWork,
+}
+
+/// Cumulative counts of the store's per-call work since the database opened. Observation only:
+/// nothing in the mechanism reads them. Each is updated once per call under the lock the call
+/// already holds, from a loop index the call computes anyway, so counting adds no per-element step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchWork {
+    /// Page resolutions against the branch tree (one per branch-pager page read).
+    pub resolve_calls: u64,
+    /// Nodes visited by those resolutions: the branch, each ancestor, and the trunk when reached.
+    pub resolve_levels: u64,
+    /// Retained versions compared while resolving (the scan in `Lineage::retained_at`).
+    pub resolve_retained_examined: u64,
+    /// Retained versions compared while freeing garbage versions (the scan in `child_gone`).
+    pub gc_examined: u64,
+    /// `retained_by_born` entries visited by `child_gone`'s range query.
+    pub gc_range_entries: u64,
 }
 
 impl Branch {

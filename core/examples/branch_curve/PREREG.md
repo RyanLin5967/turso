@@ -96,3 +96,122 @@ printed).
 
 ---
 ## Amendments (append-only)
+
+### Amendment 1 — 2026-09-24T23:31Z: four agent-workload arms, pre-registered before any of them is built or run
+
+Context, recorded before the arms: the smoke and the full curve above ran at `c5caf85d0`, release, no
+compile fix (artie-research `frontier/round10/turso_curve/raw/{build_release,smoke,curve}.txt`, commits
+`7accc8d`, `2e105b7`). Nothing above the line changes; this amendment adds runs, it does not reinterpret.
+
+**What this amendment adds to the tree.**
+
+1. **Work counters in the engine (observation only).** `BranchStats.work: BranchWork` — cumulative
+   `resolve_calls`, `resolve_levels` (nodes visited per resolution), `resolve_retained_examined`
+   (versions compared by `Lineage::retained_at`), `gc_examined` (versions compared by `child_gone`'s
+   `position` scan), `gc_range_entries` (entries visited by `child_gone`'s range query). Each is one add
+   per call (or per range entry) under the lock the call already holds, computed from the index the scan
+   returns — no per-element step is added to any scan. The mechanism never reads them. **Control:** the
+   unchanged `branch_curve` harness is re-run on the instrumented build (10^2..10^6, K=200); P1 must still
+   hold (every |slope| < 0.10). If it does not, the counters perturbed the thing measured and every arm
+   below is re-run without them.
+2. **`core/examples/branch_arms/main.rs`**, one binary, `--arm <name>`. Same instrument as the curve
+   (`Instant` per op, tick printed; RSS from `memory_stats`), same refusal rule (engine counts checked
+   against the workload before a number prints; `NOT A RESULT` + exit 1). Every sampled read is checked
+   against a model the harness keeps itself (the trunk's write history), never against the engine.
+   Beside each op's percentiles it prints that op's engine work per sample. **Trunk commits run with
+   `PRAGMA synchronous = OFF`** in every arm: the fsync is not the mechanism, and arms a/c-hot commit on
+   the trunk up to 10^6 times.
+
+**Pre-registered runs** (each under `lockrun.sh turso-curve`, `timeout 3600`, raw to artie-research
+`frontier/round10/turso_curve/raw/`, committed before it is read):
+
+| run | command (after `branch_arms`) |
+|---|---|
+| control | `branch_curve --checkpoints 100,1000,10000,100000,1000000 --samples 200` |
+| a1 | `--arm hot --checkpoints 100,1000,10000,100000,1000000 --samples 200` |
+| a2 | `--arm spread --checkpoints 100,1000,10000,100000,1000000 --samples 200` |
+| b | `--arm chain --checkpoints 1,3,10,32,100,316,1000 --samples 200` |
+| c1 | `--arm churn --checkpoints 100,1000,10000,100000,1000000 --cycles 2000000 --windows 10` |
+| c2 | `--arm churn_hot --checkpoints 100,1000,10000,100000,1000000 --cycles 100000 --windows 10` |
+| d-w | `--arm pages --w 1,2,4,8,16,32,64 --checkpoints 10000 --samples 200` |
+| d-N | `--arm pages --w 8 --checkpoints 100,1000,10000,100000 --samples 200` |
+
+**Predictions, READ from `core/branch/store.rs` (not measured).** "Slope" = least-squares log-log slope of
+p50 over the run's x grid; "local" = the slope between its last two x values; "counter slope" = the same
+fit on the op's work counter per sample. A **wall** is |p50 slope| ≥ 0.25 (the falsifier above). An op
+predicted flat that lands in (0.10, 0.25) is inconclusive: its arm is re-run once with `--samples 1000`
+and the re-run is the reading. A **break** is any measured value outside the interval pre-registered
+here — including a predicted wall that fails to appear.
+
+**(a) The trunk writes between forks.** Every fork is followed by one autocommit same-length UPDATE on
+the trunk. `first_write_trunk` retains the pre-image iff a live child forked since the page's last trunk
+write — with one write per fork, always — so each trunk write retains exactly ONE page (an in-place
+UPDATE dirties only its leaf; nothing in the commit path rewrites page 1: `database_size` is written only
+by `allocate_page`). The harness asserts `arena_in_use == N + retained` from its own count of trunk writes
+and the engine's per-reap `freed_pages`; a mismatch (e.g. page 1 retained too) is NOT A RESULT.
+- **a1 `hot`: the trunk rewrites row 1 every time.** `trunk.lineage.retained[leaf(1)]` is a `Vec` with
+  one version per live child, in fork order. `retained_at` scans it front to back; `child_gone` finds
+  the dead version with `position` (front to back) and `swap_remove`s it.
+  - `read_hot` (SELECT row 1 on a fresh connection of a random live branch): `ret_examined_per_op` ≈ N/2,
+    counter slope in [0.9, 1.1]. **WALL predicted:** p50 slope in [0.25, 1.0], local in [0.5, 1.05].
+    Derived per-version cost (Δp50/Δexamined, 10^5→10^6) in [0.2, 5] ns.
+  - `reap` (the K sampled branches, the newest, whose versions sit at the Vec's END): `gc_examined_per_op`
+    ≈ N, counter slope in [0.9, 1.1]. **WALL predicted:** p50 slope in [0.25, 1.0], local in [0.5, 1.05].
+  - `trunk_write`: O(log N) BTreeMap insert + amortized Vec push: |slope| < 0.10 (no claim on max: the
+    Vec's doublings copy up to 24 MB).
+  - `fork`, `open`, `first_write`, `read_open`, `read_own`, `read_inh`: |slope| < 0.10 (none touches
+    leaf(1) except by 1-in-545 chance).
+  - Space: arena == 2N (asserted); RSS / N at 10^6 in [8.2, 10.5] KB.
+- **a2 `spread`: the trunk's g-th write rewrites row (37·g mod 20000)+1**, walking every leaf in turn,
+  so each of the ~545 leaves holds ~(N+K)/545 versions.
+  - `read_inh`, `read_hot`, `read_own`: `ret_examined_per_op` grows ∝ N once N ≫ 545: counter slope over
+    the grid ≥ 0.5, and `read_inh`'s at 10^6 in [300, 2000] (one leaf per descent carries versions; the
+    reader's is at a uniform position). **No wall at 10^6:** p50 |slope| < 0.25 for every op (the scan is
+    ~10^3 versions, [0.2, 5] ns each, on top of ~6 µs). This arm exists to show an O(N/leaves) term the
+    timings cannot yet see.
+  - `fork`, `open`, `first_write`, `trunk_write`, `read_open`, `reap`: |slope| < 0.10.
+
+**(b) `chain`: one chain trunk → b1 → … → bd**, each level writing one first-half row and then forking the
+next; x = d ∈ {1, 3, 10, 32, 100, 316, 1000}. `resolve` visits one node per level until one holds the page.
+Sampled `fork`/`open`/`first_write`/`reap` act on a fresh child of the tip (depth d+1); the reads act on
+the tip (depth d) on fresh connections.
+- Resolutions per op (from the descent: page 1 at connect; root, one interior level, leaf per SELECT):
+  `open`/`read_open` 1 (range [1, 2]), each SELECT 3 (range [2, 4]).
+- `levels_per_op` ≈ resolutions × (d+1) for pages no level wrote: `read_inh` ≈ 3(d+1); `read_own`
+  ≈ 2(d+1)+1; `read_anc` (row written by b1) ≈ 3d+2. Counter slope over the grid in [0.85, 1.05] for
+  `open`, `read_open`, `first_write`, `read_own`, `read_inh`, `read_anc`.
+- **WALL predicted** (the design says it: "cost grows with DEPTH"): p50 slope in [0.25, 0.85] and local
+  (316→1000) in [0.5, 1.0] for `first_write`, `read_own`, `read_inh`, `read_anc`; `open` and `read_open`
+  (one resolution) in [0.15, 0.6], a wall only if ≥ 0.25. Derived per-level cost
+  (Δp50/Δlevels, d=1→1000) in [10, 150] ns.
+- `fork`, `reap`: |slope| < 0.10 (neither walks the chain).
+- The cascade: after the grid, every ancestor handle is released (each deferred) and the tip is reaped;
+  that one call frees all d pages (asserted). One sample, printed, no bound.
+
+**(c) Churn at a steady N.** Each cycle forks and writes a new branch and reaps a uniformly random older
+one (the harness's `swap_remove` of a random index).
+- **c1 `churn`** (2·10^6 cycles per N, 10 windows): every op's pooled p50 |slope vs N| < 0.10; drift:
+  for every op at every N, last-window p50 / first-window p50 in [0.75, 1.33]. Space: `arena_in_use == N`
+  and high-water == N+1 at every window (the free list is LIFO; each cycle's reap returns the slot the
+  next cycle takes); RSS at the last window within ±10% of RSS before churn; every reap frees exactly 1.
+- **c2 `churn_hot`** (c1 plus one trunk write of row 1 per cycle; 10^5 cycles per N): each child owns
+  exactly one version of leaf(1), so every reap must free exactly 2 pages and `arena_in_use == 2N` at
+  every window (no retained-version leak under turnover); high-water ≤ 2N+2.
+  - `reap`: `gc_examined_per_op` ≈ N/2 (the victim's version is at a uniformly random position once
+    `swap_remove`s have shuffled the Vec), counter slope in [0.9, 1.1]. **WALL predicted:** p50 slope in
+    [0.25, 1.0].
+  - `read_hot` (every 10th cycle): `ret_examined_per_op` ≈ N/2. **WALL predicted:** [0.25, 1.0].
+  - `fork`, `open`, `first_write`, `trunk_write`, `read_own`: |slope| < 0.10.
+
+**(d) `pages`: each branch writes w rows on w distinct leaves** (rows 312 apart; asserted: arena == N·w)
+in one BEGIN … COMMIT.
+- d-w (N = 10^4, w ∈ {1..64}): `write_w` slope vs w in [0.75, 1.05] (w CoW copies + w commit copies +
+  w statements), per-page cost `write_w`/w at w=64 in [3, 15] µs; `reap` slope vs w in [0.1, 1.05]
+  (w slot releases on a ~0.3 µs base); `fork`, `open`, `read_own` |slope vs w| < 0.10 (a branch's own
+  map is one hash probe at any w).
+- d-N (w = 8, N = 10^2..10^5): every op |slope vs N| < 0.10; `read_own` step ≤ 2× (P2's bound; the arena
+  is 8× larger at each N); RSS / N at 10^5 in [32.8, 44] KB.
+
+**Known limits, stated before the arms run.** Single thread; volatile arena; trunk `synchronous=OFF`;
+one hot row, not a hot set; K = 200; the chain is one chain (N = d); the counters count scans, and a scan's
+cost per element is inferred from Δtime/Δcount, never measured alone.
