@@ -3,6 +3,8 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
+use crate::branch::store::BranchStore;
+use crate::branch::{BranchBinding, BranchId};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
@@ -20,7 +22,7 @@ use crate::sync::atomic::{
     AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use crate::sync::Arc;
-use crate::sync::{Mutex, RwLock};
+use crate::sync::{Mutex, OnceLock, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
@@ -1505,6 +1507,13 @@ pub struct Pager {
     /// Counterpart of SQLite's BtShared.pCursor list; bucketing per root
     /// supplies the BTCF_Multiple fast path (btree.c:9348).
     pub(crate) cursor_registry: Mutex<rustc_hash::FxHashMap<i64, Vec<RegisteredCursor>>>,
+    /// The database's branch store. Every pager built for a database carries it; on a TRUNK
+    /// pager it is what the copy decision in [`Pager::add_dirty`] consults before overwriting a
+    /// page that a live branch can still see.
+    branch_store: OnceLock<Arc<BranchStore>>,
+    /// Set when this pager serves a branch instead of the trunk: reads resolve through the
+    /// branch's page space and commits go to it, never to the WAL.
+    branch: OnceLock<BranchBinding>,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1792,7 +1801,44 @@ impl Pager {
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
+            branch_store: OnceLock::new(),
+            branch: OnceLock::new(),
         })
+    }
+
+    pub(crate) fn set_branch_store(&self, store: Arc<BranchStore>) {
+        let _ = self.branch_store.set(store);
+    }
+
+    /// Bind this pager to a branch. Once, before the pager serves anything: a pager that had
+    /// cached trunk pages must have dropped them first (see `Database::connect_branch`).
+    pub(crate) fn bind_branch(&self, binding: BranchBinding) -> Result<()> {
+        self.branch.set(binding).map_err(|_| {
+            LimboError::InternalError("pager is already bound to a branch".to_string())
+        })
+    }
+
+    /// The branch this pager serves, or `None` for the trunk.
+    pub(crate) fn branch_id(&self) -> Option<BranchId> {
+        self.branch.get().map(|b| b.id)
+    }
+
+    /// Paths that rewrite pages WITHOUT going through `add_dirty` take no copy decision, so they
+    /// would change what a branch reads. They refuse while any branch exists, and on a branch.
+    fn refuse_if_branching(&self, what: &str) -> Result<()> {
+        let on_branch = self.branch.get().is_some();
+        let branches_exist = self.branch_store.get().is_some_and(|s| s.has_branches());
+        if on_branch || branches_exist {
+            return Err(LimboError::InvalidArgument(format!(
+                "{what} rewrites pages without a copy-on-write decision, so it is refused {}",
+                if on_branch {
+                    "on a branch connection"
+                } else {
+                    "while branches of this database exist"
+                }
+            )));
+        }
+        Ok(())
     }
 
     /// Add a cursor to the registry. Called from Cursor::new_btree once the
@@ -3118,6 +3164,13 @@ impl Pager {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
+        if let Some(branch) = self.branch.get() {
+            // A branch's writes go to its own page space, never to the WAL, so it takes the
+            // branch's write lock and leaves the WAL's alone: branches write concurrently with the
+            // trunk and with each other.
+            branch.store.begin_write(branch.id)?;
+            return Ok(IOResult::Done(()));
+        }
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
@@ -3156,6 +3209,7 @@ impl Pager {
     /// VACUUM runs on an existing database, so page 1 must already be allocated
     /// and a WAL must be present.
     pub fn begin_vacuum_blocking_tx(&self) -> Result<IOResult<()>> {
+        self.refuse_if_branching("VACUUM")?;
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
                 "begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
@@ -3184,6 +3238,9 @@ impl Pager {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
+        }
+        if let Some(branch) = self.branch.get() {
+            return self.commit_branch_tx(branch, connection, update_transaction_state);
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
@@ -3266,6 +3323,59 @@ impl Pager {
         }
     }
 
+    /// Commit a branch transaction: copy each dirty page into the slot its copy decision
+    /// allocated, then publish nothing to the WAL. The pages were decided at their first
+    /// `add_dirty`, so a dirty page with no slot behind it is an error, not a fallback.
+    fn commit_branch_tx(
+        &self,
+        branch: &BranchBinding,
+        connection: &Connection,
+        update_transaction_state: bool,
+    ) -> Result<IOResult<()>> {
+        let schema_did_change = matches!(
+            connection.get_tx_state(),
+            TransactionState::Write {
+                schema_did_change: true
+            }
+        );
+        let dirty: Vec<PageRef> = {
+            let dirty_pages = self.dirty_pages.read();
+            let mut cache = self.page_cache.write();
+            let mut pages = Vec::with_capacity(dirty_pages.len() as usize);
+            for page_id in dirty_pages.iter() {
+                // Spilling is off on a branch pager, so a dirty page cannot have been evicted.
+                let page = cache
+                    .peek(&PageCacheKey::new(page_id as usize), false)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "dirty branch page {page_id} is not in the page cache"
+                        ))
+                    })?;
+                pages.push(page);
+            }
+            pages
+        };
+        branch.store.commit_pages(branch.id, &dirty)?;
+        if schema_did_change {
+            branch
+                .store
+                .set_schema(branch.id, connection.schema.read().clone())?;
+        }
+        for page in &dirty {
+            page.clear_dirty();
+        }
+        self.dirty_pages.write().clear();
+        branch.store.end_write(branch.id);
+        if let Some(wal) = self.wal.as_ref() {
+            wal.end_read_tx();
+        }
+        if update_transaction_state {
+            connection.set_tx_state(TransactionState::None);
+        }
+        self.clear_savepoints()?;
+        Ok(IOResult::Done(()))
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback_tx(&self, connection: &Connection) {
         if connection.is_nested_stmt() {
@@ -3288,7 +3398,7 @@ impl Pager {
             // Otherwise, another thread could commit new frames to frame_cache between
             // end_write_tx() and rollback(), and rollback() would incorrectly remove them.
             self.rollback(schema_did_change, connection, is_write);
-            wal.end_write_tx();
+            self.end_write_tx();
         } else {
             self.rollback(schema_did_change, connection, is_write);
         }
@@ -3315,6 +3425,10 @@ impl Pager {
 
     /// End just the write transaction on the WAL, without affecting the read lock.
     pub fn end_write_tx(&self) {
+        if let Some(branch) = self.branch.get() {
+            branch.store.end_write(branch.id);
+            return;
+        }
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -3330,6 +3444,9 @@ impl Pager {
     }
 
     pub fn holds_write_lock(&self) -> bool {
+        if let Some(branch) = self.branch.get() {
+            return branch.store.holds_writer(branch.id);
+        }
         let Some(wal) = self.wal.as_ref() else {
             return false;
         };
@@ -3371,6 +3488,11 @@ impl Pager {
     ) -> Result<(PageRef, Completion)> {
         turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
+        if let Some(branch) = self.branch.get() {
+            if let Some(read) = self.read_branch_page(branch, page_idx, frame_watermark)? {
+                return Ok(read);
+            }
+        }
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
@@ -3487,6 +3609,45 @@ impl Pager {
         }
     }
 
+    /// Read `page_idx` from the branch's page space, if the branch sees a version that lives there.
+    /// `None` means the branch sees the trunk's current version, which the caller reads through
+    /// the ordinary WAL / database-file path under the branch connection's WAL read snapshot.
+    fn read_branch_page(
+        &self,
+        branch: &BranchBinding,
+        page_idx: i64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<(PageRef, Completion)>> {
+        if frame_watermark.is_some() {
+            return Err(LimboError::InternalError(
+                "a branch pager does not read the WAL at an explicit watermark".to_string(),
+            ));
+        }
+        let buf = Arc::new(self.buffer_pool.get_page());
+        if !branch
+            .store
+            .resolve_into(branch.id, page_idx as u32, buf.as_mut_slice())?
+        {
+            return Ok(None);
+        }
+        let page = Arc::new(Page::new(page_idx));
+        page.set_locked();
+        let len = buf.len();
+        let loaded = page.clone();
+        let c = Completion::new_read(buf, move |res| {
+            let Ok((buf, _)) = res else {
+                loaded.clear_locked();
+                return None;
+            };
+            sqlite3_ondisk::finish_read_page(page_idx as usize, buf, loaded.clone());
+            None
+        });
+        // The bytes are already in the buffer: complete the read in place, as an in-memory IO
+        // backend would.
+        c.complete(len as i32);
+        Ok(Some((page, c)))
+    }
+
     fn begin_read_disk_page(
         &self,
         page_idx: usize,
@@ -3599,6 +3760,7 @@ impl Pager {
             "page must be loaded in add_dirty() so its contents can be subjournaled",
             { "page_id": page.get().id }
         );
+        self.copy_on_write_decision(page)?;
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
@@ -3614,6 +3776,37 @@ impl Pager {
         }
         page.set_dirty();
         Ok(WriteTicket(()))
+    }
+
+    /// The branch copy-on-write decision, taken at a page's FIRST `add_dirty` in a transaction:
+    /// the moment before its first byte changes, and the only place a [`WriteTicket`] is minted,
+    /// so no page write can skip it.
+    ///
+    /// * On a branch: a page the branch does not own yet is copied into a fresh slot of its own
+    ///   page space; a page it owns that a live child can still see keeps its old slot for that
+    ///   child and gets a fresh one.
+    /// * On the trunk: a page a live branch can still see has its pre-image copied into the arena
+    ///   before the write, so neither this commit nor a later checkpoint reaches the branch.
+    ///
+    /// A page that is already dirty was decided at its first `add_dirty` in this transaction.
+    fn copy_on_write_decision(&self, page: &Page) -> Result<()> {
+        if page.is_dirty() {
+            return Ok(());
+        }
+        let page_no = page.get().id as u32;
+        if let Some(branch) = self.branch.get() {
+            return branch.store.first_write_branch(
+                branch.id,
+                page_no,
+                page.get_contents().as_slice(),
+            );
+        }
+        if let Some(store) = self.branch_store.get() {
+            if store.trunk_has_children() {
+                store.first_write_trunk(page_no, page.get_contents().as_slice());
+            }
+        }
+        Ok(())
     }
 
     pub fn wal_state(&self) -> Result<WalState> {
@@ -3633,6 +3826,12 @@ impl Pager {
     /// Unlike commit_wal, this function does not commit, checkpoint nor sync the WAL/Database.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn cacheflush(&self) -> Result<IOResult<Vec<Completion>>> {
+        if self.branch.get().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "cacheflush writes dirty pages to the WAL; a branch's pages never go there"
+                    .to_string(),
+            ));
+        }
         let wal = self
             .wal
             .as_ref()
@@ -3912,6 +4111,13 @@ impl Pager {
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn try_spill_dirty_pages(&self) -> Result<IOResult<()>> {
+        if self.branch.get().is_some() {
+            // Spilling writes uncommitted pages to the WAL. A branch's pages never go there, and
+            // writing them into the branch's own slots before commit would make a rollback
+            // unrecoverable, so they stay resident: the capacity is a soft limit (see
+            // `cache_insert`) and the cache admits them over it.
+            return Ok(IOResult::Done(()));
+        }
         loop {
             let state = self.spill_state.read().clone();
             match state {
@@ -4230,6 +4436,11 @@ impl Pager {
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
+        if self.branch.get().is_some() {
+            return Err(LimboError::InternalError(
+                "a branch pager must commit to its branch, never to the WAL".to_string(),
+            ));
+        }
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("commit_wal() called without WAL");
             return Err(LimboError::InternalError(
@@ -4593,6 +4804,7 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+        self.refuse_if_branching("wal_insert_frame")?;
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("wal_insert_frame() called on database without WAL");
             return Err(LimboError::InternalError(
@@ -4768,6 +4980,12 @@ impl Pager {
         clear_page_cache: bool,
         lock_source: CheckpointLockSource,
     ) -> Result<IOResult<CheckpointResult>> {
+        if self.branch.get().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "checkpoint is the trunk's WAL maintenance; run it on a trunk connection"
+                    .to_string(),
+            ));
+        }
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("checkpoint() called on database without WAL");
             return Err(LimboError::InternalError(
@@ -5205,6 +5423,11 @@ impl Pager {
         allowed_auto_actions: WalAutoActions,
         sync_mode: crate::SyncMode,
     ) -> Result<()> {
+        if self.branch.get().is_some() {
+            // A branch connection never wrote the WAL; its shutdown leaves WAL maintenance to the
+            // trunk's connections.
+            return Ok(());
+        }
         let mut attempts = 0;
         {
             let Some(wal) = self.wal.as_ref() else {
@@ -5851,9 +6074,16 @@ impl Pager {
         // Invalidate cached schema cookie since rollback may have restored the database schema cookie
         self.set_schema_cookie(None);
         if schema_did_change {
-            *connection.schema.write() = connection.db.clone_schema();
+            *connection.schema.write() = match self.branch.get() {
+                Some(branch) => branch
+                    .store
+                    .schema(branch.id)
+                    .expect("the branch is open, so it exists"),
+                None => connection.db.clone_schema(),
+            };
         }
-        if is_write {
+        // A branch transaction never appended to the WAL, so there is nothing there to undo.
+        if is_write && self.branch.get().is_none() {
             if let Some(wal) = self.wal.as_ref() {
                 wal.rollback(None);
             }

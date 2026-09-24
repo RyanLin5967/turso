@@ -560,6 +560,10 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+
+    /// Branch page spaces and the copy-on-write bookkeeping between them. Empty (one allocation,
+    /// no arena) until the first fork; see [`crate::branch`].
+    pub(crate) branches: Arc<crate::branch::store::BranchStore>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -713,6 +717,7 @@ impl Database {
             page_codec_id,
 
             durable_storage: None,
+            branches: Arc::new(crate::branch::store::BranchStore::new()),
         };
 
         db.register_global_builtin_extensions()
@@ -2333,6 +2338,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
+            None,
         )
     }
 
@@ -2342,13 +2348,16 @@ impl Database {
         pager: Arc<Pager>,
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
+        // `None`: the database's shared schema. A branch connection passes the branch's own, which
+        // must be in place before `refresh_analyze_stats` below reads through it.
+        schema: Option<Arc<Schema>>,
     ) -> Result<Arc<Connection>> {
         let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
-            schema: RwLock::new(self.schema.lock().clone()),
+            schema: RwLock::new(schema.unwrap_or_else(|| self.schema.lock().clone())),
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
@@ -2997,6 +3006,7 @@ impl Database {
             self.init_lock.clone(),
             self.init_page_1.clone(),
         )?;
+        pager.set_branch_store(self.branches.clone());
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);
