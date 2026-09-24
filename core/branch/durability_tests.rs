@@ -2119,9 +2119,12 @@ fn a_sidecar_refusal_names_a_remedy_true_for_its_file() {
     );
 }
 
-/// Review 6 item 5 (lead's decision). A database whose file name is 245–251 bytes long has names
-/// that fit NAME_MAX for itself and its `-wal`, but not for `-branch-log`: `stat` fails with
-/// ENAMETOOLONG, which means the branch file cannot exist. A volatile open must not refuse.
+/// Review 6 item 5 (lead's decision). A database whose file name is 244–250 bytes long (244–251
+/// where the multiprocess `-tshm` probe does not run; see `journal::cannot_exist`) has names that
+/// fit NAME_MAX for itself and its `-wal`, but not for its branch files — `-branch-snap`, which
+/// `exist` checks first, nor `-branch-log`: `stat` fails with ENAMETOOLONG, which means the branch
+/// file cannot exist. A volatile open must not refuse. This test's name is 248 bytes, inside
+/// every range (review 9 finding 7a).
 #[cfg(unix)]
 #[test]
 fn a_name_too_long_for_branch_files_opens_volatile() {
@@ -2197,10 +2200,17 @@ fn a_sidecar_refusal_keeps_frames_only_while_the_real_file_does_not_exist() {
     // Review 8 F1 (lead's decision): absence is evidence only against THIS build's opens. A build
     // that names the WAL from the path as given (earlier builds, upstream Turso) can open the
     // database under a third name, write newer pages and leave {ours} absent; so the rename also
-    // needs that nothing else has opened it under another name since.
+    // needs that nothing else has opened it since.
+    // Review 9 (lead's decision 2; PREREG A4): "under any other name" left out an open by the REAL
+    // name, which can also leave {ours} absent while it writes newer pages. The condition counts
+    // every name, {real} included.
     assert!(
-        err.contains("under any other name"),
-        "the rename is not conditioned on no other build's opens under another name: {err}"
+        err.contains("by any name"),
+        "the rename is not conditioned on no open since by ANY name: {err}"
+    );
+    assert!(
+        err.contains("real.db included"),
+        "the real name is not counted among the names: {err}"
     );
 }
 
@@ -2265,26 +2275,62 @@ fn an_async_registry_hit_of_another_branch_durability_is_refused() {
 /// lease nor a durability, and it cannot fork the attached database (`fork_branch` forks the
 /// connection's MAIN database). So a registry hit on a database this process holds open with a
 /// lease — or durable — must not refuse the ATTACH.
+///
+/// Review 9 (lead's decisions 1 and 4; PREREG A4). Main opens with ATTACH enabled, as every other
+/// ATTACH test in the tree does: without it, translation refuses the statement before any registry
+/// lookup, and this test was red for that reason at both review-8 commits. Before each ATTACH, a
+/// plain open of the same path with the same default options must be REFUSED. That is the negative
+/// control: it proves the ATTACH is a registry hit (a registry cleared in between would make it a
+/// miss, which succeeds without exercising the exemption), and that the exemption is ATTACH's
+/// alone. Both ATTACHes run before the verdict, so a red names every refused one.
 #[test]
 fn attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused() {
     let dir = tempfile::TempDir::new().unwrap();
-    let main = open_at(&dir.path().join("main.db"), DatabaseOpts::new()).unwrap();
+    let main = open_at(
+        &dir.path().join("main.db"),
+        DatabaseOpts::new().with_attach(true),
+    )
+    .unwrap();
     let conn = main.connect().unwrap();
-    for (name, opts) in [
+    let mut refused = Vec::new();
+    for (name, opts, plain_refusal) in [
         (
             "leased.db",
             DatabaseOpts::new().with_branch_lease(Some(Duration::from_secs(60))),
+            "branch lease",
         ),
-        ("durable.db", durable()),
+        ("durable.db", durable(), "branch durability"),
     ] {
         let path = dir.path().join(name);
         let held = open_at(&path, opts).unwrap();
         seed(&held.connect().unwrap(), 3);
+        match open_at(&path, DatabaseOpts::new()) {
+            Ok(_) => panic!(
+                "premise: a plain open of {name} was not refused, so the ATTACH below would not \
+                 be a registry hit"
+            ),
+            Err(e) => assert!(
+                e.to_string().contains(plain_refusal),
+                "premise: a plain open of {name} was refused for another reason: {e}"
+            ),
+        }
         let alias = name.trim_end_matches(".db");
-        conn.execute(format!("ATTACH '{}' AS {alias}", path.display()))
-            .unwrap_or_else(|e| panic!("ATTACH of {name}, held open in this process, was refused: {e}"));
-        let found = rows(&conn, &format!("SELECT v FROM {alias}.t WHERE id = 2"));
-        assert_eq!(found, vec![vec![Value::from_text(original(2))]]);
+        match conn.execute(format!("ATTACH '{}' AS {alias}", path.display())) {
+            Ok(_) => {
+                let found = rows(&conn, &format!("SELECT v FROM {alias}.t WHERE id = 2"));
+                assert_eq!(
+                    found,
+                    vec![vec![Value::from_text(original(2))]],
+                    "{name}: attached, but read the wrong rows"
+                );
+            }
+            Err(e) => refused.push(format!("{name}: {e}")),
+        }
         drop(held);
     }
+    assert!(
+        refused.is_empty(),
+        "ATTACH of a database held open in this process was refused: {}",
+        refused.join(" | ")
+    );
 }
