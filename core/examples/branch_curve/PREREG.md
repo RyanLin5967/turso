@@ -151,3 +151,48 @@ design says — before believing a flat line, check that the post-reopen asserti
 log actually held N records. `reopen` slope > 1.2 is superlinear recovery: a wall to attribute
 (rehash, BTreeMap inserts, free-set derivation) before naming a mechanism. `reopen_read` slope
 > 0.25: the reparse depends on N.
+
+### A2 — 2026-09-24: F4 (interior reclamation at release) and F5 (leases), appended before any build or run
+
+Nothing above this amendment changes. Source: `frontier/research_reclaim-with-live-children.md`
+§5 F4, F5. The red tests are committed first, at `7518bbcd5`, against a lease skeleton that does
+nothing.
+
+**P12 — F4, test level.** At `7518bbcd5`,
+`releasing_an_interior_branch_frees_what_no_live_child_can_read` fails on its `freed_pages`
+assertion with **0** freed (the release returns early while the interior has a live child).
+After the fix it frees **exactly S = 3**: the pages written after the last fork. The pre-fork
+page the child reads stays held. Both are checked by membership.
+
+**P13 — F5, test level.** At `7518bbcd5` each of the four lease tests fails on its FIRST lease
+assertion. The skeleton's `expire_branches` reaps nothing, and its lease clock reads zero. After
+the fix all four pass, including the one that crosses a reopen with 6 s already spent on the
+clock. That test's thresholds come from the test itself (9 s < 10 s alive, 11 s > 10 s reaped),
+not from calling the store.
+
+**P14 — the existing columns do not move.** No branch in the default runs has a lease. The
+expiry pass that now runs at every fork and every open finds an empty deadline index: one
+`BTreeSet` range on an empty set. Every existing column must still fall inside its P1–P11 band.
+A p50 that moves by more than the run-to-run noise at any N means the pass is not the no-op this
+predicts. Attribute that before reading anything else.
+
+**P15 — new column `expire`, both arms.** At each checkpoint the harness forks K extra branches,
+one page each, gives them a lease, runs the lease clock past it, and times ONE
+`expire_branches()` call. The harness asserts that exactly those K are reaped and exactly K pages
+freed, and that the engine is back at N branches and N pages. The pass costs one range over the
+deadline index plus K ordinary reaps. In the durable arm the K Release records are flushed
+together, so it costs one fsync per pass, not one per branch. Predicted:
+- the p50 of `expire / K` has a slope within **±0.10** over 10²…10⁶;
+- the volatile arm is within **2×** of `reap`;
+- the durable arm is `reap` minus K−1 fsyncs, amortised: **below** `reap` per branch.
+
+⚠ This column measures leaf expiry at depth 1, the only topology this harness builds. It does
+NOT measure the paper's point, partial reclamation of an INTERIOR branch on expiry. That is
+tested (`an_expired_interior_is_partially_reclaimed_while_its_live_child_reads_through_it`), not
+curved, and no claim about its cost at N is made here.
+
+Falsifiers for A2:
+- the `expire / K` slope ≥ 0.25: the pass is not O(log N) per branch; suspect a scan over all
+  branches first;
+- `freed_pages ≠ K`: the harness refuses (`NOT A RESULT`);
+- P14 violated: the no-lease path is not free.
