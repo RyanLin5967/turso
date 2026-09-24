@@ -2003,3 +2003,66 @@ fn an_empty_branch_log_does_not_refuse_a_volatile_open() {
         .unwrap_or_else(|e| panic!("an empty branch log refused a volatile open: {e}"));
     assert_eq!(value(&db.connect().unwrap(), 3), Some(original(3)));
 }
+
+/// Lead finding on 676a6573f (C3-1 for the MVCC log). A clean MVCC boot leaves the logical log at
+/// exactly its bootstrap header, `LOG_HDR_SIZE` bytes, and code before review 5 named that log from
+/// the path as given. A symlinked MVCC database closed cleanly that way must reopen: a header-only
+/// log carries no transaction (the replay boundary lives in the database file), so it is left in
+/// place and the open proceeds. A log that holds a committed frame is still refused, naming both.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_mvcc_database_closed_cleanly_under_the_old_naming_reopens() {
+    use crate::mvcc::persistent_storage::logical_log::LOG_HDR_SIZE;
+    let dir = tempfile::TempDir::new().unwrap();
+    let real = dir.path().join("real.db");
+    let real_log = dir.path().join("real.db-log");
+    let framed = dir.path().join("framed.db-log");
+    {
+        let db = open_at(&real, DatabaseOpts::new()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'kept')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'framed')").unwrap();
+        // Taken while open: this copy of the log holds committed frames.
+        std::fs::copy(&real_log, &framed).unwrap();
+    }
+    // A clean boot, as upstream's own test has it: the log is left at its bootstrap header.
+    drop(open_at(&real, DatabaseOpts::new()).unwrap().connect().unwrap());
+    let header_only = std::fs::read(&real_log).unwrap();
+    assert_eq!(header_only.len(), LOG_HDR_SIZE, "premise: a clean boot leaves a header-only log");
+    assert!(
+        std::fs::metadata(&framed).unwrap().len() > LOG_HDR_SIZE as u64,
+        "premise: the copy taken while open holds a frame"
+    );
+
+    // The old naming: the database was only ever opened through the link, so its log is under the
+    // link's name, and there is none under the real one.
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let stale_log = dir.path().join("link.db-log");
+    std::fs::rename(&real_log, &stale_log).unwrap();
+    {
+        let db = open_at(&link, DatabaseOpts::new())
+            .unwrap_or_else(|e| panic!("a header-only MVCC log under the old name refused the open: {e}"));
+        let rows = rows(&db.connect().unwrap(), "SELECT v FROM t WHERE id = 1");
+        assert_eq!(rows, vec![vec![Value::from_text("kept")]]);
+    }
+    assert_eq!(
+        std::fs::read(&stale_log).unwrap(),
+        header_only,
+        "the stale header-only log was not left in place, untouched"
+    );
+
+    let link2 = dir.path().join("link2.db");
+    std::os::unix::fs::symlink(&real, &link2).unwrap();
+    std::fs::copy(&framed, dir.path().join("link2.db-log")).unwrap();
+    let err = match open_at(&link2, DatabaseOpts::new()) {
+        Ok(_) => panic!("opened past an MVCC log that holds a frame under another name"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("link2.db-log") && err.contains("real.db-log"),
+        "the refusal must name both logs: {err}"
+    );
+}
