@@ -490,6 +490,24 @@ impl BranchStore {
         }
     }
 
+    /// STEP-1-OF-DURABILITY SKELETON: detaching keeps the branch alive in this process and
+    /// nothing is persisted, so a reopen loses it — which the durability tests must catch.
+    pub(crate) fn detach(&self, _id: BranchId) {}
+
+    pub(crate) fn attach(&self, id: BranchId) -> Result<()> {
+        if self.inner.lock().branches.contains_key(&id) {
+            Ok(())
+        } else {
+            Err(gone(id))
+        }
+    }
+
+    pub(crate) fn ids(&self) -> Vec<BranchId> {
+        let mut ids: Vec<BranchId> = self.inner.lock().branches.keys().copied().collect();
+        ids.sort();
+        ids
+    }
+
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
         let inner = self.inner.lock();
         let Some(st) = inner.branches.get(&id) else {

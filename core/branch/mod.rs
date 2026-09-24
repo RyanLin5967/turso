@@ -152,6 +152,33 @@ pub fn check_branchable(mvcc_enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether branch state survives the process.
+///
+/// ⚠ SKELETON (UNBUILT): `Durable` is accepted and IGNORED in this commit — the durability tests
+/// in `durability_tests.rs` are written against it and must fail until the mechanism lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BranchDurability {
+    /// In memory only: branches die with the process.
+    #[default]
+    Volatile,
+    /// Arena pages, page maps, lineage and releases are written to files next to the database and
+    /// recovered at open. `sync: false` writes the files without fsync: a measurement arm, not a
+    /// durability guarantee.
+    Durable { sync: bool },
+}
+
+/// Failure injection for the durability tests.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchFailpoint {
+    /// The next branch commit writes and syncs its slots, then fails before appending its record.
+    CommitAfterSlotsBeforeRecord,
+    /// The next durability barrier (a trunk commit's) fails before writing its records.
+    BarrierBeforeRecords,
+    /// The next compaction fails after renaming the new snapshot, before resetting the log.
+    CompactAfterRenameBeforeLogReset,
+}
+
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
 ///
 /// The handle owns the branch. Dropping it — or calling [`Branch::reap`], which is the same thing
@@ -218,6 +245,15 @@ impl Branch {
     pub fn reap(mut self) -> Result<Reaped> {
         self.released = true;
         Ok(self.db.branches.release_handle(self.id))
+    }
+
+    /// Detach this branch from its handle WITHOUT releasing it — the branch outlives the handle
+    /// (and, with durable branches, the process) until [`Database::branch`] re-attaches it and
+    /// the new handle is reaped or dropped.
+    pub fn into_id(mut self) -> BranchId {
+        self.released = true;
+        self.db.branches.detach(self.id);
+        self.id
     }
 
     /// The arena slots this branch currently owns or retains, for membership assertions.
@@ -359,6 +395,40 @@ impl Database {
         self.branches.slots_in_use()
     }
 
+    /// Re-attach a detached branch — one whose handle went through [`Branch::into_id`], or any
+    /// unreleased branch after a reopen.
+    pub fn branch(self: &Arc<Database>, id: BranchId) -> Result<Branch> {
+        self.branches.attach(id)?;
+        Ok(Branch::new(self.clone(), id))
+    }
+
+    /// Every unreleased branch, attached or not.
+    pub fn branch_ids(&self) -> Vec<BranchId> {
+        self.branches.ids()
+    }
+
+    /// SKELETON: accepted and ignored.
+    #[doc(hidden)]
+    pub fn branch_failpoint(&self, _failpoint: Option<BranchFailpoint>) {}
+
+    /// The arena slots the last triggered failpoint left written but unpublished.
+    #[doc(hidden)]
+    pub fn branch_failpoint_orphans(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// Compact the branch log into a snapshot now. SKELETON: nothing to compact.
+    #[doc(hidden)]
+    pub fn branch_compact_now(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The branch log file, for tearing its tail in a test. SKELETON: there is none.
+    #[doc(hidden)]
+    pub fn branch_log_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Open a connection on branch `id`: an ordinary connection whose pager is bound to the branch
     /// and whose schema is the branch's own.
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
@@ -395,6 +465,9 @@ mod isolation_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod mechanism_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod durability_tests;
 
 #[cfg(test)]
 mod tests {

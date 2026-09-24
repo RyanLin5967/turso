@@ -81,6 +81,8 @@ pub struct DatabaseOpts {
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
+    /// Whether branches (see [`crate::branch`]) survive the process. Volatile by default.
+    pub branch_durability: crate::branch::BranchDurability,
 }
 
 impl DatabaseOpts {
@@ -141,6 +143,11 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    pub fn with_branch_durability(mut self, durability: crate::branch::BranchDurability) -> Self {
+        self.branch_durability = durability;
         self
     }
 
