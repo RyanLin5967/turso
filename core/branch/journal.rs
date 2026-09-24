@@ -902,7 +902,11 @@ impl Journal {
 ///   default is false), and a filesystem `path_allows_shared_wal_coordination` accepts: there a
 ///   251-byte name's `-tshm` is 256 bytes and the database does not open at all (review 8 F4).
 ///   Elsewhere a 251-byte name opens (its `-wal` is 255 bytes), and the range is 244–251 (243–251
-///   through a symlink) (review 9 finding 7b).
+///   through a symlink) (review 9 finding 7b). So is it where the probe runs, for a `do_open` with
+///   a custom `wal_path` (the registry-aware opens refuse one; `do_open_async` takes its storage
+///   ready-made and runs no probe): the probe names its coordination file from the WAL path it is
+///   given (`coordination_path_for_wal_path`), not from the database name, so a short custom WAL
+///   lets a 251-byte name pass it (review 10 F7).
 /// * `Unsupported` WITHOUT an OS error: std's unsupported-platform error, which carries no errno.
 ///   wasm32-unknown-unknown's std `fs` is std's `unsupported` backend (READ: std `sys/fs/mod.rs`
 ///   selects it for every target that is neither unix, wasi, windows nor a listed OS), and that
