@@ -502,24 +502,28 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         // database file's replay boundary; neither ties the file to a path. Why only then: frames
         // written before the database changed under another name would overwrite newer pages.
         return Err(LimboError::InvalidArgument(match holds {
+            // "Keep them" holds only while {ours} does not exist (review 7 item 4, the lead's
+            // decision): any open of {real} creates it, even empty, and its pages may then be newer
+            // than these frames; a 0-byte {ours} must not read as "nothing was written since".
             Some(what) => format!(
                 "{other} holds {what} that this open would miss: they were written through the \
                  name {given} before sidecars were named from the resolved path, and this \
                  database's file of that kind is {ours}. They belong to whichever database {given} \
-                 named when they were written, which may not be this one. If it was {real}, and \
-                 {real} has not been opened under any other name since, then with no process using \
-                 it: move {ours} aside if it exists (it must hold no more than {holds_nothing_up_to} \
-                 bytes; if it holds more, the two histories have diverged and cannot both be kept) \
-                 and rename {other} to {ours}; the next open reads them. Otherwise, or if you \
-                 cannot tell, move {other} aside: this database then opens without them",
+                 named when they were written, which may not be this one. To keep them: only if \
+                 that database was {real} and {ours} does not exist — any open of {real} since \
+                 would have created it, even empty, and its pages could then be newer than these \
+                 {what} — rename {other} to {ours} with no process using the database, and the \
+                 next open reads them. If {ours} exists, or if you cannot tell, move {other} aside: \
+                 this database then opens without them",
                 other = other.display(),
                 ours = ours.display()
             ),
             None => format!(
                 "{} is a branch file under a name this database does not use (its branch files \
-                 are named from {real}, and no build of this fork has named them from the path as \
-                 given), so it is not this database's branch state. Move it aside; this \
-                 database's own branch files are {}",
+                 are named from {real}, and no earlier build of this fork named them from the \
+                 path as given; this build does so only for storage that is not a file here), so \
+                 it is not this database's branch state. Move it aside; this database's own \
+                 branch files are {}",
                 other.display(),
                 ours.display()
             ),
@@ -1203,13 +1207,20 @@ impl Database {
     ///   operations refused;
     /// * an instance of ANOTHER branch durability (review 6 item 6): a durable caller would fork
     ///   branches that vanish on a crash, and a `sync: true` caller branches that are not synced,
-    ///   both silently.
+    ///   both silently;
+    /// * an instance of ANOTHER default lease (review 7 item 2): a caller whose branches must never
+    ///   expire would fork leased ones, reaped when the lease runs out, silently — and the reverse
+    ///   leaks branches meant to be temporary.
     ///
-    /// A read-only open is exempt from the second: it forks nothing, so durability is moot for it.
+    /// A read-only open is exempt from the last two, on the assumption that it forks nothing. That
+    /// is the CALLER's discipline, not something this check enforces: read-only is the instance's
+    /// flag, so a read-only caller that hits a read-write instance receives read-write connections
+    /// (upstream's registry behaviour) and could fork through them.
     fn check_registry_branch_store(
         db: &Database,
         flags: OpenFlags,
         durability: crate::branch::BranchDurability,
+        lease: Option<std::time::Duration>,
     ) -> Result<()> {
         if db.branches.is_trunk_only() && !flags.contains(OpenFlags::ReadOnly) {
             return Err(LimboError::InvalidArgument(format!(
@@ -1228,6 +1239,17 @@ impl Database {
                  {:?}: it would receive that instance, whose branches are not what it asked for; \
                  close the other handle first, or open with the same branch durability",
                 db.path, db.opts.branch_durability, durability
+            )));
+        }
+        if !flags.contains(OpenFlags::ReadOnly)
+            && !db.branches.is_trunk_only()
+            && db.opts.branch_lease != lease
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} is open in this process with default branch lease {:?}, and this open asks \
+                 for {:?}: it would receive that instance, whose forks would be leased otherwise \
+                 than it asked; close the other handle first, or open with the same branch lease",
+                db.path, db.opts.branch_lease, lease
             )));
         }
         Ok(())
@@ -1365,6 +1387,7 @@ impl Database {
                     &db,
                     options.flags,
                     options.db_opts.branch_durability,
+                    options.db_opts.branch_lease,
                 )?;
                 return Ok(Some(db));
             }
@@ -1528,6 +1551,7 @@ impl Database {
                                 &db,
                                 options.flags,
                                 options.db_opts.branch_durability,
+                                options.db_opts.branch_lease,
                             )?;
                             return Ok(IOResult::Done(db));
                         }

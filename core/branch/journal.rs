@@ -607,13 +607,25 @@ impl Journal {
                     // That is Corrupt, loudly, and the log is left as it is.
                     if len == 0 {
                         if let Some(at) = first_whole_frame_after(&bytes, pos + 1) {
+                            // No truncation is offered (review 7 item 1, the lead's decision): it
+                            // is safe only if the records past the hole were never acknowledged,
+                            // and that could be known only if the log marked where each
+                            // acknowledged flush ends — it does not.
                             return Err(corrupt(&format!(
-                                "branch log {}: a zeroed region at byte {pos} is followed by a \
-                                 whole record at byte {at}, so this is not a torn tail, and records \
-                                 after the hole may have been acknowledged. To open the database, \
-                                 keep a copy of the log for inspection, then truncate it to {pos} \
-                                 bytes, which discards the hole and every record after it",
-                                files.log.display()
+                                "branch log {log}: a zeroed region at byte {pos} is followed by a \
+                                 whole record at byte {at}, so this is not a torn tail. The records \
+                                 after the hole may have been acknowledged, and nothing in the log \
+                                 tells acknowledged records from unacknowledged ones, so cutting \
+                                 the log at the hole is not safe: it would drop trunk pre-image \
+                                 records whose trunk commits are durable, and branches forked \
+                                 before them would then read newer trunk pages without any error. \
+                                 The safe remedy: keep a copy of all three branch files ({log}, \
+                                 {arena}, {snap}) — a restore needs all three — then move all three \
+                                 aside. Every branch is lost; the trunk is intact, because it never \
+                                 depends on branch files",
+                                log = files.log.display(),
+                                arena = files.arena.display(),
+                                snap = files.snap.display()
                             )));
                         }
                         break;
@@ -878,29 +890,27 @@ impl Journal {
 /// Whether a failed `stat` of a branch sidecar means the file CANNOT be there (review 6 item 5,
 /// the lead's decision), so it counts as absent:
 /// * `NotFound`;
-/// * a name too long for the filesystem (ENAMETOOLONG): a database file name of 245–251 bytes fits
-///   NAME_MAX with its `-wal`, but not with `-branch-log`, so that file cannot exist;
-/// * `Unsupported`: no filesystem on this platform. wasm32-unknown-unknown's std `fs` is std's
-///   `unsupported` backend (READ: std `sys/fs/mod.rs` selects it for every target that is neither
-///   unix, wasi, windows nor a listed OS), and std's unsupported-platform error is
-///   `ErrorKind::Unsupported` (READ: `io::Error::UNSUPPORTED_PLATFORM`). That this backend's
-///   `stat` returns it is recalled, not read.
+/// * a name too long for the filesystem: `ErrorKind::InvalidFilename`, which std maps from
+///   ENAMETOOLONG and only that errno on unix (review 7 READ std `sys/io/error/unix.rs`; stable
+///   since 1.87, the toolchain is 1.88), and from the long-name errors on Windows (recalled). A
+///   database file name of 244–251 bytes fits NAME_MAX with its `-wal` but not with `-branch-snap`,
+///   which `exist` checks first (243–251 through a symlink, where the refusal also checks
+///   `-branch-arena`), so those files cannot exist;
+/// * `Unsupported` WITHOUT an OS error: std's unsupported-platform error, which carries no errno.
+///   wasm32-unknown-unknown's std `fs` is std's `unsupported` backend (READ: std `sys/fs/mod.rs`
+///   selects it for every target that is neither unix, wasi, windows nor a listed OS), and that
+///   error is `ErrorKind::Unsupported` (READ: `io::Error::UNSUPPORTED_PLATFORM`); that the
+///   backend's `stat` returns it is recalled, not read. On unix `Unsupported` also comes from
+///   ENOSYS or EOPNOTSUPP (a seccomp policy, a filesystem without getattr), which says nothing
+///   about the file — so an OS error is excluded (review 7 item 5).
 ///
 /// Every other error — permission denied, an I/O error, not-a-directory — cannot be told apart
 /// from a file that holds state, so the caller refuses rather than guess.
 pub(crate) fn cannot_exist(e: &std::io::Error) -> bool {
     match e.kind() {
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported => true,
-        _ => {
-            #[cfg(unix)]
-            {
-                e.raw_os_error() == Some(libc::ENAMETOOLONG)
-            }
-            #[cfg(not(unix))]
-            {
-                false
-            }
-        }
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidFilename => true,
+        std::io::ErrorKind::Unsupported => e.raw_os_error().is_none(),
+        _ => false,
     }
 }
 
