@@ -92,13 +92,13 @@ impl BranchFiles {
     /// open refuse: a creation that failed to lock leaves exactly that behind (the empty-log
     /// wedge). A log that cannot even be inspected counts as state: refuse rather than guess.
     pub(crate) fn exist(&self) -> bool {
-        if self.snap.exists() {
-            return true;
-        }
-        match std::fs::metadata(&self.log) {
-            Ok(meta) => meta.len() > 0,
-            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-        }
+        // An empty log holds nothing; a snapshot holds state whatever its size. A file whose
+        // `stat` fails holds state unless the error says it cannot exist (review 6 item 5).
+        let holds = |path: &Path, holds_nothing_up_to: Option<u64>| match std::fs::metadata(path) {
+            Ok(meta) => holds_nothing_up_to.is_none_or(|n| meta.len() > n),
+            Err(e) => !cannot_exist(&e),
+        };
+        holds(&self.snap, None) || holds(&self.log, Some(0))
     }
 
     fn snap_tmp(&self) -> PathBuf {
@@ -608,8 +608,12 @@ impl Journal {
                     if len == 0 {
                         if let Some(at) = first_whole_frame_after(&bytes, pos + 1) {
                             return Err(corrupt(&format!(
-                                "a zeroed region at byte {pos} is followed by a whole record at byte \
-                                 {at}: records after a hole are not a torn tail"
+                                "branch log {}: a zeroed region at byte {pos} is followed by a \
+                                 whole record at byte {at}, so this is not a torn tail, and records \
+                                 after the hole may have been acknowledged. To open the database, \
+                                 keep a copy of the log for inspection, then truncate it to {pos} \
+                                 bytes, which discards the hole and every record after it",
+                                files.log.display()
                             )));
                         }
                         break;
@@ -868,6 +872,35 @@ impl Journal {
 
     pub(crate) fn log_path(&self) -> &Path {
         &self.files.log
+    }
+}
+
+/// Whether a failed `stat` of a branch sidecar means the file CANNOT be there (review 6 item 5,
+/// the lead's decision), so it counts as absent:
+/// * `NotFound`;
+/// * a name too long for the filesystem (ENAMETOOLONG): a database file name of 245–251 bytes fits
+///   NAME_MAX with its `-wal`, but not with `-branch-log`, so that file cannot exist;
+/// * `Unsupported`: no filesystem on this platform. wasm32-unknown-unknown's std `fs` is std's
+///   `unsupported` backend (READ: std `sys/fs/mod.rs` selects it for every target that is neither
+///   unix, wasi, windows nor a listed OS), and std's unsupported-platform error is
+///   `ErrorKind::Unsupported` (READ: `io::Error::UNSUPPORTED_PLATFORM`). That this backend's
+///   `stat` returns it is recalled, not read.
+///
+/// Every other error — permission denied, an I/O error, not-a-directory — cannot be told apart
+/// from a file that holds state, so the caller refuses rather than guess.
+pub(crate) fn cannot_exist(e: &std::io::Error) -> bool {
+    match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported => true,
+        _ => {
+            #[cfg(unix)]
+            {
+                e.raw_os_error() == Some(libc::ENAMETOOLONG)
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        }
     }
 }
 

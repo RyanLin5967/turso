@@ -222,7 +222,8 @@ impl EncryptionOpts {
 pub struct OpenOptions {
     /// Pre-opened database storage for the file at the database path.
     storage: Option<Arc<dyn DatabaseStorage>>,
-    /// WAL file path override. Defaults to `"{path}-wal"`. Only honored by
+    /// WAL file path override. Defaults to `"{name}-wal"`, where `{name}` is the database file's
+    /// resolved path (`sidecar_base`; the path as given when it names no file here). Only honored by
     /// [`Database::do_open`]/[`Database::do_open_async`]; the registry-aware
     /// [`Database::open`]/[`Database::open_async`] reject it, because the
     /// process-wide registry keys on the default WAL for a path.
@@ -261,7 +262,8 @@ impl OpenOptions {
         self
     }
 
-    /// Override the WAL file path (defaults to `"{path}-wal"`). Only honored
+    /// Override the WAL file path (defaults to `"{name}-wal"`, `{name}` being the database file's
+    /// resolved path: see `sidecar_base`). Only honored
     /// by [`Database::do_open`]/[`Database::do_open_async`]; passing it to the
     /// registry-aware entry points is an error.
     pub fn wal_path(mut self, wal_path: impl Into<String>) -> Self {
@@ -410,11 +412,18 @@ pub(crate) fn absolute_path(path: &str) -> Result<String> {
 /// WAL, MVCC log or branch file written through a symlink before sidecars were named from `real`.
 /// Opening would silently miss what it holds. Two refinements (review 5):
 /// * only a sidecar that can HOLD something is refused (C3-1). A WAL of at most its 32-byte header
-///   — what every clean close leaves, since a Truncate checkpoint never removes the file — an MVCC
-///   log of at most its `LOG_HDR_SIZE` bootstrap header — what every clean MVCC boot leaves — and
-///   an empty branch file carry nothing to lose: they are left in place, untouched;
+///   (what a clean close with checkpoints leaves: a Truncate checkpoint never removes the file), an
+///   MVCC log of at most its `LOG_HDR_SIZE` header, and an empty branch file carry nothing to lose:
+///   they are left in place, untouched;
 /// * "the same file" is decided by identity, (dev, ino), not by path string (C3-5), so a sidecar
 ///   reached through a symlinked directory or a hard link is recognised as the canonical one.
+///
+/// Every refusal names a remedy that is TRUE for its kind of file, checked against the code that
+/// reads it, and none acted through `given`, which may have been retargeted since the file was
+/// written (review 6 item 4). The earlier advice, "open through the old name and close cleanly,
+/// which checkpoints", was false where close runs no checkpoint (MVCC, the sync engine, a
+/// connection with checkpoints disabled) and replayed one database's frames onto another when the
+/// link had moved.
 ///
 /// Unix only: elsewhere `sidecar_base` resolves nothing, so no second name can arise.
 #[cfg(unix)]
@@ -445,10 +454,15 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         (others.log, ours.log, 0, None),
         (others.snap, ours.snap, 0, None),
         (others.arena, ours.arena, 0, None),
-        // A logical log of at most its bootstrap header holds no transaction: every clean MVCC
-        // boot leaves exactly that, the replay boundary lives in the database file
-        // (`__turso_internal_mvcc_meta`), and the salt regenerates (lead finding on 676a6573f:
-        // C3-1 for the log that C3-2 renamed).
+        // A logical log of at most `LOG_HDR_SIZE` bytes is its header alone and holds no
+        // transaction: recovery returns at once for it, the replay boundary lives in the database
+        // file (`__turso_internal_mvcc_meta`), and the salt regenerates. A FIRST MVCC bootstrap
+        // that commits nothing leaves exactly that; a checkpoint leaves 0 bytes; commits leave
+        // more, and no close truncates them (review 6 §2 corrected an earlier comment here).
+        // An old-name log comes only from the three paths that named the log from the GIVEN path
+        // before review 5 — the existence check at open, the external restore
+        // (`reload_wal_after_external_restore`) and a fresh ATTACH's conversion to MVCC — since
+        // upstream's Init and journal-mode switch already opened it at the canonical path.
         (
             mvcc_log(given),
             mvcc_log(real),
@@ -467,7 +481,8 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
     for (other, ours, holds_nothing_up_to, holds) in sidecars {
         let len = match std::fs::metadata(&other) {
             Ok(meta) => meta.len(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Absent, or a file that cannot exist (review 6 item 5).
+            Err(e) if crate::branch::journal::cannot_exist(&e) => continue,
             Err(e) => {
                 return Err(LimboError::InvalidArgument(format!(
                     "cannot inspect {} ({e}), which may hold this database's state",
@@ -482,20 +497,29 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         if same_file(&other, &ours)? {
             continue;
         }
+        // Why a rename keeps them: WAL recovery validates frames against the WAL file's own
+        // header (salts and checksum chain), and MVCC recovery replays the log's records above the
+        // database file's replay boundary; neither ties the file to a path. Why only then: frames
+        // written before the database changed under another name would overwrite newer pages.
         return Err(LimboError::InvalidArgument(match holds {
             Some(what) => format!(
-                "{} holds {what}, but this database's file of that kind is {}: they were written \
-                 through the name {given} (before sidecars were named from the resolved path), \
-                 and opening would miss them. To keep them, open the database through {given} \
-                 once with the build that wrote them and close it cleanly, which checkpoints them \
-                 into the database file; then reopen",
-                other.display(),
-                ours.display()
+                "{other} holds {what} that this open would miss: they were written through the \
+                 name {given} before sidecars were named from the resolved path, and this \
+                 database's file of that kind is {ours}. They belong to whichever database {given} \
+                 named when they were written, which may not be this one. If it was {real}, and \
+                 {real} has not been opened under any other name since, then with no process using \
+                 it: move {ours} aside if it exists (it must hold no more than {holds_nothing_up_to} \
+                 bytes; if it holds more, the two histories have diverged and cannot both be kept) \
+                 and rename {other} to {ours}; the next open reads them. Otherwise, or if you \
+                 cannot tell, move {other} aside: this database then opens without them",
+                other = other.display(),
+                ours = ours.display()
             ),
             None => format!(
-                "{} exists and is not empty, but this database's file of that kind is {}: it was \
-                 written under another name for the same database, and opening would miss what it \
-                 holds; move or remove one of them first",
+                "{} is a branch file under a name this database does not use (its branch files \
+                 are named from {real}, and no build of this fork has named them from the path as \
+                 given), so it is not this database's branch state. Move it aside; this \
+                 database's own branch files are {}",
                 other.display(),
                 ours.display()
             ),
@@ -519,7 +543,7 @@ fn same_file(a: &Path, b: &Path) -> Result<bool> {
     })?;
     match identity(b) {
         Ok(b_id) => Ok(a_id == b_id),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) if crate::branch::journal::cannot_exist(&e) => Ok(false),
         Err(e) => Err(LimboError::InvalidArgument(format!(
             "cannot inspect {} ({e})",
             b.display()
@@ -1173,15 +1197,37 @@ impl Database {
         Ok(())
     }
 
-    /// A read-write open must never receive a trunk-only instance from the registry (review 5
-    /// C2-1): its connections would be read-only and its branch operations refused.
-    fn check_registry_trunk_only(db: &Database, flags: OpenFlags) -> Result<()> {
+    /// A read-write open must never receive, from the registry, an instance whose branch store is
+    /// not the one it asked for:
+    /// * a trunk-only instance (review 5 C2-1): its connections are read-only and its branch
+    ///   operations refused;
+    /// * an instance of ANOTHER branch durability (review 6 item 6): a durable caller would fork
+    ///   branches that vanish on a crash, and a `sync: true` caller branches that are not synced,
+    ///   both silently.
+    ///
+    /// A read-only open is exempt from the second: it forks nothing, so durability is moot for it.
+    fn check_registry_branch_store(
+        db: &Database,
+        flags: OpenFlags,
+        durability: crate::branch::BranchDurability,
+    ) -> Result<()> {
         if db.branches.is_trunk_only() && !flags.contains(OpenFlags::ReadOnly) {
             return Err(LimboError::InvalidArgument(format!(
                 "{} is open in this process read-only, without its branch store (it has durable \
                  branches); a read-write open would receive that instance: close the read-only \
                  handle first",
                 db.path
+            )));
+        }
+        if !flags.contains(OpenFlags::ReadOnly)
+            && !db.branches.is_trunk_only()
+            && db.opts.branch_durability != durability
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} is open in this process with branch durability {:?}, and this open asks for \
+                 {:?}: it would receive that instance, whose branches are not what it asked for; \
+                 close the other handle first, or open with the same branch durability",
+                db.path, db.opts.branch_durability, durability
             )));
         }
         Ok(())
@@ -1315,7 +1361,11 @@ impl Database {
                             .to_string(),
                     ));
                 }
-                Self::check_registry_trunk_only(&db, options.flags)?;
+                Self::check_registry_branch_store(
+                    &db,
+                    options.flags,
+                    options.db_opts.branch_durability,
+                )?;
                 return Ok(Some(db));
             }
         }
@@ -1474,7 +1524,11 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
-                            Self::check_registry_trunk_only(&db, options.flags)?;
+                            Self::check_registry_branch_store(
+                                &db,
+                                options.flags,
+                                options.db_opts.branch_durability,
+                            )?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
