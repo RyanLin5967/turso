@@ -535,6 +535,82 @@ impl Database {
     }
 }
 
+/// fork(2) tests run ALONE, in a fresh process of this test binary (review 4 C8). `fork` duplicates
+/// every descriptor of the process, so a child forked beside other running tests holds their
+/// journal locks until it exits, and a neighbour that drops a store and relocks its log inside that
+/// window fails. In a process that runs one test there is no neighbour.
+#[cfg(all(test, unix))]
+pub(crate) mod fork_driver {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    const SENTINEL: &str = "TURSO_BRANCH_FORK_TEST_SENTINEL";
+
+    /// In the harness: run the test whose full name is `name` alone in a fresh process, assert that
+    /// it passed AND that it ran (a filter that matches nothing exits 0), and return `None`. In the
+    /// fresh process: return the sentinel the test hands to [`finished`] as its last act.
+    pub(crate) fn alone(name: &str) -> Option<PathBuf> {
+        if let Some(sentinel) = std::env::var_os(SENTINEL) {
+            return Some(PathBuf::from(sentinel));
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let sentinel = dir.path().join("finished");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--test-threads=1", "--nocapture"])
+            .env(SENTINEL, &sentinel)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{name} did not finish in its own process");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "{name} failed in its own process: {status}");
+        assert!(
+            sentinel.exists(),
+            "the fresh process ran no test named {name}: a run that collected nothing has not passed"
+        );
+        None
+    }
+
+    pub(crate) fn finished(sentinel: &Path) {
+        std::fs::write(sentinel, b"finished").unwrap();
+    }
+
+    /// The exit code of a forked child. Waits at most 60 s; on the deadline it SIGKILLs and reaps
+    /// the child and fails.
+    pub(crate) fn exit_code(pid: libc::pid_t) -> i32 {
+        let mut status = 0;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            // SAFETY: `pid` is this process's child; `status` outlives the call.
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped == pid {
+                break;
+            }
+            assert_eq!(reaped, 0, "waitpid failed");
+            if Instant::now() > deadline {
+                // SAFETY: as above.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                panic!("the forked child did not exit");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(libc::WIFEXITED(status), "the forked child did not exit normally: status {status}");
+        libc::WEXITSTATUS(status)
+    }
+}
+
 #[cfg(all(test, feature = "fs"))]
 mod isolation_tests;
 

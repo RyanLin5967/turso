@@ -1102,10 +1102,16 @@ mod tests {
     /// Review 3 F1. `flock` belongs to the open file description, and fork(2) shares it: a forked
     /// child's copy of a live journal is under the parent's lock. It must refuse to write — or the
     /// two processes interleave appends under one lock, and a torn frame cuts every later record.
+    /// (Review 4 C8: it runs alone in a fresh process, so the fork duplicates no neighbour's lock.)
     #[cfg(unix)]
     #[test]
     fn a_forked_child_cannot_write_through_an_inherited_journal() {
-        use std::os::fd::AsRawFd;
+        use crate::branch::fork_driver;
+        let Some(sentinel) = fork_driver::alone(
+            "branch::journal::tests::a_forked_child_cannot_write_through_an_inherited_journal",
+        ) else {
+            return;
+        };
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         let mut arena = Arena::new(512);
@@ -1114,20 +1120,11 @@ mod tests {
         journal.flush(&mut arena).unwrap();
         // Buffered before the fork, so the child only has to flush it.
         journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
-        let keep = journal.file.as_raw_fd();
         // SAFETY: the child runs only the flush (syscalls and small allocations, which the
         // platform allocators make fork-safe) and then `_exit`; it never returns into the harness.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
-            // Drop the child's copies of every other descriptor first: another test's journal
-            // lock must not outlive its owner through this child (the F1 wedge, on a neighbour).
-            let max = unsafe { libc::getdtablesize() }.min(1 << 16);
-            for fd in 3..max {
-                if fd != keep {
-                    unsafe { libc::close(fd) };
-                }
-            }
             let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if journal.flush(&mut arena).is_ok() {
                     0
@@ -1136,28 +1133,11 @@ mod tests {
                 }
             }))
             .unwrap_or(2);
+            // SAFETY: ends the child without running the harness or any destructor.
             unsafe { libc::_exit(code) };
         }
-        let mut status = 0;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-            if reaped == pid {
-                break;
-            }
-            assert_eq!(reaped, 0, "waitpid failed");
-            if std::time::Instant::now() > deadline {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                    libc::waitpid(pid, &mut status, 0);
-                }
-                panic!("the forked child did not exit");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(libc::WIFEXITED(status), "the child did not exit normally: status {status}");
         assert_eq!(
-            libc::WEXITSTATUS(status),
+            fork_driver::exit_code(pid),
             1,
             "a forked child wrote through its parent's journal (0), or panicked (2)"
         );
@@ -1172,6 +1152,65 @@ mod tests {
                 Record::Fork { child: 2, parent: 0 }
             ]
         );
+        fork_driver::finished(&sentinel);
+    }
+
+    /// Review 4 O1. A crash can leave a file's new SIZE durable before its data, so the tail reads
+    /// as zeros. A zeroed frame header says length 0 with crc 0 — and crc32c of nothing IS 0, so it
+    /// passes the check. It is still a torn tail, and must be cut, not reported as corruption.
+    #[test]
+    fn a_zero_filled_tail_is_torn_not_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut arena = Arena::new(512);
+        let mut journal = Journal::create(&files, 512, false).unwrap();
+        journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        journal.flush(&mut arena).unwrap();
+        drop(journal);
+        let whole = std::fs::metadata(&files.log).unwrap().len();
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().append(true).open(&files.log).unwrap();
+            f.write_all(&[0u8; 64]).unwrap();
+        }
+        let recovered = Journal::recover(&files, false)
+            .expect("a zero tail is a torn write, not corruption")
+            .expect("state");
+        assert_eq!(recovered.records, vec![Record::Fork { child: 1, parent: 0 }]);
+        drop(recovered);
+        assert_eq!(std::fs::metadata(&files.log).unwrap().len(), whole, "the zero tail was not cut");
+    }
+
+    /// The premise that makes a zero length torn: no record encodes to an empty payload, because
+    /// every payload starts with its tag byte.
+    #[test]
+    fn no_record_encodes_to_an_empty_payload() {
+        let records = [
+            Record::Fork { child: 0, parent: 0 },
+            Record::Commit {
+                branch: 0,
+                pages: vec![],
+            },
+            Record::TrunkRetain {
+                page: 0,
+                born: 0,
+                died: 0,
+                slot: 0,
+                crc: 0,
+            },
+            Record::Release { branch: 0 },
+            Record::Lease {
+                branch: 0,
+                deadline_ms: 0,
+                now_ms: 0,
+            },
+            Record::Clock { now_ms: 0 },
+        ];
+        for record in records {
+            let mut payload = Vec::new();
+            record.encode(&mut payload);
+            assert!(!payload.is_empty(), "{record:?} encodes to an empty payload");
+        }
     }
 
     /// Review 3 F6: the other half of R8's length check. A log another writer SHRANK must not be

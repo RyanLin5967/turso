@@ -1941,6 +1941,54 @@ impl StoreInner {
 mod tests {
     use super::*;
 
+    /// Review 4 C2 (the lead's decision): a read-only open of a database WITH branch files opens
+    /// trunk-only — no recovery, no lock — and every branch operation on it is refused. This is the
+    /// second fence behind the VDBE's read-only check: a trunk page write reaching this store is
+    /// refused, because it would retain no pre-image for the branches on disk.
+    #[test]
+    fn a_read_only_store_over_branch_files_is_trunk_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let durable = BranchDurability::Durable { sync: false };
+        {
+            let first = BranchStore::open(durable, None, path).unwrap();
+            first.inner.lock().ensure_backing(512).unwrap();
+        }
+        let ro = BranchStore::open_with_flags(BranchDurability::Volatile, None, path, true)
+            .expect("a read-only open over branch files must open trunk-only");
+        assert!(ro.has_branches(), "VACUUM and journal-mode changes must stay refused");
+        assert!(ro.trunk_has_children(), "every trunk write must reach the refusal below");
+        assert!(ro.first_write_trunk(1, &[0u8; 512]).is_err(), "a trunk-only store took a trunk write");
+        assert!(ro.log_path().is_none(), "a trunk-only store opened the branch log");
+        let _rw = BranchStore::open(durable, None, path).expect("a read-only store must hold no lock");
+    }
+
+    /// Review 4 C5. The empty store's restart moved the snapshot and the log header to the new
+    /// page size; if the arena then cannot be reopened, the store must fail-stop, not keep taking
+    /// records beside an arena of the old size.
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_whose_arena_reopen_fails_fail_stops_the_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: false }, None, path).unwrap();
+        store.inner.lock().ensure_backing(512).unwrap();
+        let files = BranchFiles::for_db(path);
+        // The open arena's file is replaced by a directory: the restart's reopen fails.
+        std::fs::remove_file(&files.arena).unwrap();
+        std::fs::create_dir(&files.arena).unwrap();
+        assert!(store.inner.lock().ensure_backing(1024).is_err(), "the arena reopened over a directory");
+        std::fs::remove_dir(&files.arena).unwrap();
+        let _ = store.inner.lock().ensure_backing(512);
+        let mut inner = store.inner.lock();
+        assert!(
+            store.log(&mut inner, Record::Release { branch: 9 }).is_err(),
+            "a store with a half-done restart took a record"
+        );
+    }
+
     /// Found while fixing review 3 F4: when every branch is gone, nothing refuses a page-size
     /// change (VACUUM and journal-mode changes are refused only while a branch exists). A store
     /// with nothing in it must then follow the database to the new page size. Before, its arena's

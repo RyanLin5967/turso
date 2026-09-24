@@ -1518,11 +1518,14 @@ fn a_failed_log_create_reports_its_own_fail_stop_not_another_store() {
     assert_eq!(value(&b.connect().unwrap(), 3), Some("b".to_string()));
 }
 
-/// Review 3, read-only opens. Recovery writes: it cuts a torn tail, discards a temp snapshot, and
-/// reaps expired leases durably. A read-only open must not recover, so it refuses a database with
-/// durable branches — whatever durability it asks for — and leaves every branch file as it was.
+/// Review 3, read-only opens — REVISED by review 4 C2, the lead's decision (this test's two
+/// "refused" assertions were that earlier spec and are replaced, not weakened). A read-only open
+/// of a database WITH branch files opens without its branch store: no recovery, no lock, no branch
+/// file touched, the trunk readable, and every branch operation refused by name. Durable +
+/// read-only with NO branch files stays refused: a fork would create them, and nothing below the
+/// connection refuses a fork on a read-only database.
 #[test]
-fn a_read_only_open_refuses_durable_branches_and_writes_nothing() {
+fn a_read_only_open_of_a_database_with_branches_reads_the_trunk_and_nothing_else() {
     let dir = tempfile::TempDir::new().unwrap();
     // The control: a read-only open of a database without branch files works at all.
     let plain = dir.path().join("plain.db");
@@ -1534,33 +1537,46 @@ fn a_read_only_open_refuses_durable_branches_and_writes_nothing() {
         let ro = open_read_only(&plain, DatabaseOpts::new()).expect("read-only opens work");
         assert_eq!(value(&ro.connect().unwrap(), 3), Some(original(3)));
     }
+    assert!(
+        open_read_only(&plain, durable()).is_err(),
+        "a read-only open was given a durable store it could fork into"
+    );
 
     let path = dir.path().join("durable.db");
+    let b_id;
     {
         let db = open_at(&path, durable()).unwrap();
         let trunk = db.connect().unwrap();
         seed(&trunk, 20);
         let b = trunk.fork_branch().unwrap();
         set(&b.connect().unwrap(), 3, "b");
-        let _ = b.into_id();
+        b_id = b.into_id();
     }
     let log = std::path::PathBuf::from(format!("{}-branch-log", path.display()));
+    let arena = std::path::PathBuf::from(format!("{}-branch-arena", path.display()));
     // A torn tail: what a read-write recovery cuts off, and a read-only open must leave alone.
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
         f.write_all(&[0xAB; 11]).unwrap();
     }
-    let before = std::fs::read(&log).unwrap();
-    assert!(
-        open_read_only(&path, durable()).is_err(),
-        "a read-only open recovered durable branches"
-    );
-    assert!(
-        open_read_only(&path, DatabaseOpts::new()).is_err(),
-        "a read-only volatile open ignored durable branches"
-    );
-    assert_eq!(std::fs::read(&log).unwrap(), before, "a read-only open wrote the branch log");
+    let log_before = std::fs::read(&log).unwrap();
+    let arena_before = std::fs::read(&arena).unwrap();
+    let refused = |what: &str, err: Option<String>| {
+        let err = err.unwrap_or_else(|| panic!("{what} was allowed on a read-only trunk-only handle"));
+        assert!(err.contains("branch store was not opened"), "{what} refused for another reason: {err}");
+    };
+    for opts in [durable(), DatabaseOpts::new()] {
+        let ro = open_read_only(&path, opts)
+            .expect("a read-only open of a database with branches must still read its trunk");
+        let conn = ro.connect().unwrap();
+        assert_eq!(value(&conn, 3), Some(original(3)), "the trunk read wrong");
+        refused("fork", conn.fork_branch().err().map(|e| e.to_string()));
+        refused("attaching a branch", ro.branch(b_id).err().map(|e| e.to_string()));
+        refused("the expiry pass", ro.expire_branches().err().map(|e| e.to_string()));
+    }
+    assert_eq!(std::fs::read(&log).unwrap(), log_before, "a read-only open wrote the branch log");
+    assert_eq!(std::fs::read(&arena).unwrap(), arena_before, "a read-only open wrote the arena");
 }
 
 /// Review 3, path identity. The registry knows a database by (dev, ino), but the branch files
@@ -1613,4 +1629,167 @@ fn a_failed_stamp_flush_keeps_the_trunk_commit_and_fail_stops_the_store() {
         Err(err) => err.to_string(),
     };
     assert!(err.contains("no write transaction"), "refused for another reason: {err}");
+}
+
+// ---- Review 4 (lane_turso_review4.md @ 059dd56) ----
+
+/// Review 4 C1 and C6. The store-level half of the fork gate: a forked child holding a whole
+/// `Database` must write nothing — not the arena (a slot from its copy of the free list is the
+/// parent's next slot), not the log — and its refusals must name the fork, not an I/O failure.
+/// Runs alone in a fresh process (see `fork_driver`).
+#[cfg(unix)]
+#[test]
+fn a_forked_child_cannot_write_through_an_inherited_database() {
+    use crate::branch::fork_driver;
+    let Some(sentinel) = fork_driver::alone(
+        "branch::durability_tests::a_forked_child_cannot_write_through_an_inherited_database",
+    ) else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    set(&bc, 3, "b");
+    let arena = std::path::PathBuf::from(format!("{}-branch-arena", path.display()));
+    let log = db.branch_log_path().expect("a durable store has a log");
+    let arena_before = std::fs::read(&arena).unwrap();
+    let log_before = std::fs::read(&log).unwrap();
+    // SAFETY: the child runs two statements and `_exit`s; it never returns into the harness.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let refusal = |conn: &Arc<Connection>, sql: &str| conn.execute(sql).err().map(|e| e.to_string());
+            // A branch write, and a trunk write of a page the branch still reads.
+            let on_branch = refusal(&bc, "UPDATE t SET v = 'child' WHERE id = 7");
+            let on_trunk = refusal(&trunk, "UPDATE t SET v = 'child' WHERE id = 150");
+            let mut code = 0;
+            if let Some(err) = on_branch {
+                code |= 1;
+                if err.contains("fork") {
+                    code |= 4;
+                }
+            }
+            if let Some(err) = on_trunk {
+                code |= 2;
+                if err.contains("fork") {
+                    code |= 8;
+                }
+            }
+            code
+        }))
+        .unwrap_or(100);
+        // SAFETY: ends the child without running the harness or any destructor.
+        unsafe { libc::_exit(code) };
+    }
+    let code = fork_driver::exit_code(pid);
+    assert_ne!(code, 100, "the forked child panicked");
+    assert_eq!(code & 3, 3, "a forked child's write was accepted (bits: 1 branch, 2 trunk): {code}");
+    assert_eq!(std::fs::read(&arena).unwrap(), arena_before, "a forked child wrote the parent's arena");
+    assert_eq!(std::fs::read(&log).unwrap(), log_before, "a forked child wrote the parent's log");
+    assert_eq!(code & 12, 12, "a forked child's refusal did not name the fork (bits: 4 branch, 8 trunk): {code}");
+    drop(bc);
+    let bc = b.connect().unwrap();
+    assert_eq!(value(&bc, 3), Some("b".to_string()));
+    integrity_ok(&bc);
+    fork_driver::finished(&sentinel);
+}
+
+/// Review 4 C3 (the lead's decision): every sidecar is named from ONE canonical path computed at
+/// open. A symlinked open must write the real path's WAL — not a WAL of its own that a crash would
+/// leave holding frames the real path never sees.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_open_writes_the_real_paths_wal() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let real = dir.path().join("real.db");
+    {
+        let db = open_at(&real, DatabaseOpts::new()).unwrap();
+        seed(&db.connect().unwrap(), 20);
+    }
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    {
+        let db = open_at(&link, DatabaseOpts::new()).unwrap();
+        set(&db.connect().unwrap(), 3, "via-link");
+        assert!(
+            !Path::new(&format!("{}-wal", link.display())).exists(),
+            "a symlinked open wrote a WAL of its own beside the real path's"
+        );
+    }
+    let db = open_at(&real, DatabaseOpts::new()).unwrap();
+    assert_eq!(value(&db.connect().unwrap(), 3), Some("via-link".to_string()));
+}
+
+/// Review 4 C3. A sidecar already present under a NON-canonical name (a WAL or branch file written
+/// through a link before sidecars were named canonically) is refused, naming both files: opening
+/// past it would silently miss the frames or branches it holds.
+#[cfg(unix)]
+#[test]
+fn an_open_past_a_sidecar_under_another_name_is_refused_naming_both() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let real = dir.path().join("real.db");
+    {
+        let db = open_at(&real, DatabaseOpts::new()).unwrap();
+        seed(&db.connect().unwrap(), 20);
+    }
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::fs::write(format!("{}-wal", link.display()), [0x5A; 4096]).unwrap();
+    let err = match open_at(&link, DatabaseOpts::new()) {
+        Ok(_) => panic!("opened past a WAL under another name"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("link.db-wal") && err.contains("real.db-wal"),
+        "the refusal must name both WAL files: {err}"
+    );
+
+    let link2 = dir.path().join("link2.db");
+    std::os::unix::fs::symlink(&real, &link2).unwrap();
+    std::fs::write(format!("{}-branch-log", link2.display()), b"x").unwrap();
+    let err = match open_at(&link2, DatabaseOpts::new()) {
+        Ok(_) => panic!("opened past a branch log under another name"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("link2.db-branch-log") && err.contains("real.db-branch-log"),
+        "the refusal must name both branch logs: {err}"
+    );
+}
+
+/// Review 4 C4. When the database path is not a file on this filesystem (here a `MemoryIO` name),
+/// the branch files — always real files — must still be named from an ABSOLUTE path, or they are
+/// resolved against whatever the working directory is at the first fork.
+#[test]
+fn branch_files_of_a_relative_path_are_named_absolutely() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // A relative path from the working directory into the temp dir, so nothing lands in the tree.
+    let cwd = std::env::current_dir().unwrap();
+    let mut rel = std::path::PathBuf::new();
+    for _ in 1..cwd.components().count() {
+        rel.push("..");
+    }
+    rel.push(dir.path().join("mem.db").strip_prefix("/").unwrap());
+    let rel = rel.to_str().unwrap().to_string();
+    let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        &rel,
+        OpenFlags::Create,
+        durable(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 5);
+    let b = trunk.fork_branch().unwrap();
+    let log = db.branch_log_path().expect("a durable store has a log");
+    assert!(log.is_absolute(), "branch files named from a relative path: {}", log.display());
+    drop(b);
 }
