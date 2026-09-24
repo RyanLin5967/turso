@@ -2121,10 +2121,10 @@ fn a_sidecar_refusal_names_a_remedy_true_for_its_file() {
 
 /// Review 6 item 5 (lead's decision). A database whose file name is 244–250 bytes long (244–251
 /// where the multiprocess `-tshm` probe does not run; see `journal::cannot_exist`) has names that
-/// fit NAME_MAX for itself and its `-wal`, but not for its branch files — `-branch-snap`, which
-/// `exist` checks first, nor `-branch-log`: `stat` fails with ENAMETOOLONG, which means the branch
-/// file cannot exist. A volatile open must not refuse. This test's name is 248 bytes, inside
-/// every range (review 9 finding 7a).
+/// fit NAME_MAX for itself and its `-wal`, but not for `-branch-snap` (12 bytes), nor, from 245
+/// bytes, for `-branch-log` (11 bytes; review 10 F3): `stat` fails with ENAMETOOLONG, which means
+/// the branch file cannot exist. A volatile open must not refuse. This test's name is 248 bytes,
+/// where neither fits (review 9 finding 7a).
 #[cfg(unix)]
 #[test]
 fn a_name_too_long_for_branch_files_opens_volatile() {
@@ -2212,6 +2212,18 @@ fn a_sidecar_refusal_keeps_frames_only_while_the_real_file_does_not_exist() {
         err.contains("real.db included"),
         "the real name is not counted among the names: {err}"
     );
+    // Review 10 (lead's decision F8; PREREG A5): "no other build or program" left out THIS build's
+    // own opens that never create {ours} — one with a custom WAL path writes newer pages into
+    // {real} and leaves {ours} absent. So nothing at all may have opened the database since,
+    // except through {ours}.
+    assert!(
+        err.contains("nothing has opened this database since"),
+        "the condition still exempts this build's own opens: {err}"
+    );
+    assert!(
+        err.contains("except through"),
+        "the condition does not name the one open that keeps the frames: {err}"
+    );
 }
 
 /// Review 7 item 2 (lead's decision). A registry hit must not hand a read-write open an instance
@@ -2283,6 +2295,12 @@ fn an_async_registry_hit_of_another_branch_durability_is_refused() {
 /// control: it proves the ATTACH is a registry hit (a registry cleared in between would make it a
 /// miss, which succeeds without exercising the exemption), and that the exemption is ATTACH's
 /// alone. Both ATTACHes run before the verdict, so a red names every refused one.
+///
+/// Review 10 (lead's decisions F2 and F4; PREREG A5). The control matches each registry refusal's
+/// hit-specific phrase, "is open in this process with …": a registry MISS of a database with
+/// durable branch files is refused by `BranchStore::open` with text that also says "branch
+/// durability". And after each ATTACH, the attached instance must BE the held one (`Arc::ptr_eq`),
+/// which proves this ATTACH's own lookup hit, not only the lookup just before it.
 #[test]
 fn attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -2297,9 +2315,13 @@ fn attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused() {
         (
             "leased.db",
             DatabaseOpts::new().with_branch_lease(Some(Duration::from_secs(60))),
-            "branch lease",
+            "is open in this process with default branch lease",
         ),
-        ("durable.db", durable(), "branch durability"),
+        (
+            "durable.db",
+            durable(),
+            "is open in this process with branch durability",
+        ),
     ] {
         let path = dir.path().join(name);
         let held = open_at(&path, opts).unwrap();
@@ -2317,6 +2339,11 @@ fn attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused() {
         let alias = name.trim_end_matches(".db");
         match conn.execute(format!("ATTACH '{}' AS {alias}", path.display())) {
             Ok(_) => {
+                let id = conn.get_database_id_by_name(alias).unwrap();
+                assert!(
+                    Arc::ptr_eq(&conn.get_source_database(id), &held),
+                    "premise: the ATTACH of {name} received another instance, not the registry's"
+                );
                 let found = rows(&conn, &format!("SELECT v FROM {alias}.t WHERE id = 2"));
                 assert_eq!(
                     found,
