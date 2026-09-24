@@ -1415,3 +1415,29 @@ fn a_second_store_over_live_branch_files_refuses_at_open() {
         .expect("the first store is gone, so its lock is too");
     assert!(second.ids().contains(&b_id), "the refused open damaged the first store's state");
 }
+
+/// N1, the arena half of the lazy door. A store that opened before any branch file existed takes
+/// no lock until its first fork; that fork must be refused by the live store's log lock BEFORE it
+/// truncates the live store's arena. (Written after the fix: its red state against 417bcea9a is
+/// INFERRED from reading, where `ensure_backing` truncated the arena and then re-created the log.)
+#[test]
+fn a_refused_lazy_create_leaves_the_live_stores_arena_intact() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let durability = BranchDurability::Durable { sync: true };
+    let late = store::BranchStore::open(durability, None, path.to_str().unwrap()).unwrap();
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    set(&b.connect().unwrap(), 3, "b");
+    let schema = trunk.schema.read().clone();
+    assert!(
+        late.fork_trunk(schema, 4096).is_err(),
+        "a second store forked over a live store's branch files"
+    );
+    // A fresh connection has an empty page cache, so this read comes from the arena file.
+    let bc = b.connect().unwrap();
+    assert_eq!(value(&bc, 3), Some("b".to_string()));
+    integrity_ok(&bc);
+}
