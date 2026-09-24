@@ -96,3 +96,58 @@ printed).
 
 ---
 ## Amendments (append-only)
+
+### A1 — 2026-09-24: the durable arm and the REOPEN column (appended before any build or run of it)
+
+Nothing above this amendment changes. The default run (`--durability volatile`) is the run the
+predictions above are about. The lead runs the durable arm SEPARATELY:
+`branch_curve --durability durable --checkpoints 100,1000,10000,100000,1000000` (fsync ON), and,
+as the persistence-cost control ferrodb's D79 used, the same with `--durability durable-nosync`.
+The mechanism measured is the durable branch store of the UNBUILT commits after `c5caf85d0`
+(design: `frontier/lane_turso_branching.md`, "DURABLE BRANCHES").
+
+New columns, per checkpoint, durable arm only (`--reopens R`, default 3):
+
+| op | what is timed |
+|---|---|
+| `reopen` | drop every holder of the `Database`, then `Database::open` + one trunk `connect` — trunk open plus branch-store recovery (snapshot load + log replay + free-set derivation) |
+| `attach_all` | `Database::branch(id)` for all N detached branches |
+| `reopen_read` | `connect` + `SELECT` of its own row on K DISTINCT random branches after the reopen (each first connect reparses that branch's schema) |
+
+The harness asserts after every reopen, from the engine, that N branches and N arena pages came
+back, and that each sampled branch still reads its own write; otherwise `NOT A RESULT`.
+
+**P6 — reopen is LINEAR, by design.** Recovery is eager: every branch map is rebuilt in memory
+(≈ 2 log records per branch — Fork, Commit — or one snapshot entry after a compaction), then the
+free set is derived over the arena's high-water mark. Predicted `reopen` p50 log-log slope over
+10⁴…10⁶: **0.8 to 1.1**. Over the full 10²…10⁶ range a fixed floor (trunk open, WAL recovery,
+header read) dominates the small checkpoints, so the full-range slope is lower: **0.5 to 1.0**.
+Per-branch recovery cost, (reopen(10⁶) − reopen(10⁴)) / (10⁶ − 10⁴): **0.2 to 5 µs per branch**
+(INFERRED: ~60 bytes of log, one crc32c, two or three hash inserts and a BTreeMap insert each).
+⚠ ferrodb's catalog is a B+tree read lazily; a linear Turso line against a flat D65 line compares
+an EAGER design with a LAZY one, not one engine with another, and must be labelled so.
+
+**P7 — `attach_all` is linear:** slope **1.0 ± 0.15**, 50–500 ns per attach (a lock and a lookup).
+
+**P8 — `reopen_read` is flat in N:** slope within **±0.10**, and **1.2× to 5×** the volatile
+`read_open + read_own` at the same N — the difference is the schema reparse.
+
+**P9 — the existing ops in the durable arm stay flat but become fsync-bound.** `fork` = 1 log
+fsync, `first_write` = arena fsync + log fsync, `reap` = 1 log fsync. Slopes within **±0.10**; p50
+of those three dominated by fsync; `read_own`/`read_inh` within **2×** of volatile (an OS-page-cache
+read plus a crc32c instead of a memcpy). `durable-nosync` should sit within 2× of volatile on every
+op; the gap between `durable` and `durable-nosync` IS the fsync cost, not the design.
+
+**P10 — compaction shows only in the tails.** The log is compacted when it exceeds max(1 MiB, 2 ×
+the last snapshot): the op that trips it pays O(live state) once, geometrically rarely. Predicted:
+p50 flat, `max` of fork/first_write/reap growing roughly linearly in N at the checkpoints where a
+compaction landed inside the sample window. A p50 that moves with N is NOT explained by this.
+
+**P11 — space.** Arena file ≈ page_size × (N + K) bytes; log + snapshot ≈ 30–80 B per live
+branch. RSS per branch no longer includes page data: **0.2–1.0 KB per branch** at 10⁶.
+
+Falsifiers for A1: `reopen` slope < 0.5 over 10⁴…10⁶ means recovery is not doing what this
+design says — before believing a flat line, check that the post-reopen assertion ran and that the
+log actually held N records. `reopen` slope > 1.2 is superlinear recovery: a wall to attribute
+(rehash, BTreeMap inserts, free-set derivation) before naming a mechanism. `reopen_read` slope
+> 0.25: the reparse depends on N.

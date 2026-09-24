@@ -20,6 +20,17 @@
 //!   read_inh     SELECT of a row it did not write         (resolves to the trunk's page)
 //!   reap         Branch::reap() of a sampled branch       (frees its one page)
 //!
+//! With `--durability durable` (or `durable-nosync`) the branches are durable and each checkpoint
+//! adds a REOPEN column: every live branch is detached, the database is dropped and reopened
+//! `--reopens` times (recovery replays the branch log), the N handles are re-attached, and K
+//! first-connect-after-reopen reads are timed (each reparses the branch's schema):
+//!
+//!   reopen       Database::open + connect: trunk open + branch-store recovery   (1 per reopen)
+//!   attach_all   re-attach all N detached branches                              (1 per reopen)
+//!   reopen_read  connect + SELECT own row on a random branch after the reopen
+//!
+//! Volatile (the default, and the arm PREREG.md's original predictions are about) has no reopen.
+//!
 //! It REFUSES to print a number it cannot attribute: before each checkpoint it asserts from the
 //! engine that exactly N branches are live and that they hold exactly the arena pages the
 //! workload predicts, and it spot-checks isolation on a random branch. Any mismatch prints
@@ -28,7 +39,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use turso_core::branch::Branch;
+use turso_core::branch::{Branch, BranchDurability, BranchId};
 use turso_core::{
     Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO,
 };
@@ -40,6 +51,8 @@ struct Args {
     checkpoints: Vec<usize>,
     samples: usize,
     seed: u64,
+    durability: BranchDurability,
+    reopens: usize,
 }
 
 fn parse_args() -> Args {
@@ -47,6 +60,8 @@ fn parse_args() -> Args {
         checkpoints: vec![100, 1000],
         samples: 200,
         seed: 0x9E37_79B9_7F4A_7C15,
+        durability: BranchDurability::Volatile,
+        reopens: 3,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -60,6 +75,17 @@ fn parse_args() -> Args {
             }
             "--samples" => args.samples = val().parse().unwrap_or_else(|_| die("bad --samples")),
             "--seed" => args.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
+            "--reopens" => args.reopens = val().parse().unwrap_or_else(|_| die("bad --reopens")),
+            "--durability" => {
+                args.durability = match val().as_str() {
+                    "volatile" => BranchDurability::Volatile,
+                    "durable" => BranchDurability::Durable { sync: true },
+                    "durable-nosync" => BranchDurability::Durable { sync: false },
+                    other => die(&format!(
+                        "--durability must be volatile, durable or durable-nosync, not {other}"
+                    )),
+                }
+            }
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -144,6 +170,40 @@ fn grow_one(trunk: &Arc<Connection>, n: usize) -> Live {
     Live { branch, row }
 }
 
+/// Print one op's percentiles at `n` and keep its p50 for the slope fit.
+fn report(
+    n: usize,
+    op: &'static str,
+    samples: &[std::time::Duration],
+    summary: &mut Vec<(usize, &'static str, f64)>,
+) {
+    let mut us: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+    us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&us, 50.0);
+    println!(
+        "{n}\t{op}\t{}\t{p50:.2}\t{:.2}\t{:.2}\t{:.2}",
+        us.len(),
+        percentile(&us, 90.0),
+        percentile(&us, 99.0),
+        us[us.len() - 1]
+    );
+    summary.push((n, op, p50));
+}
+
+/// Up to `k` distinct indices below `n`, in random order.
+fn distinct_indices(rng: &mut Rng, n: usize, k: usize) -> Vec<usize> {
+    let k = k.min(n);
+    let mut seen = std::collections::HashSet::with_capacity(k);
+    let mut out = Vec::with_capacity(k);
+    while out.len() < k {
+        let i = rng.below(n);
+        if seen.insert(i) {
+            out.push(i);
+        }
+    }
+    out
+}
+
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     let rank = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
     sorted[rank]
@@ -167,21 +227,26 @@ fn clock_tick_ns() -> f64 {
     min as f64
 }
 
-fn main() {
-    let args = parse_args();
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("branch_curve.db");
+fn open_db(path: &std::path::Path, durability: BranchDurability) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file_with_flags(
+    Database::open_file_with_flags(
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
-        DatabaseOpts::new(),
+        DatabaseOpts::new().with_branch_durability(durability),
         None,
         Arc::new(SqliteDialect),
     )
-    .unwrap();
-    let trunk = db.connect().unwrap();
+    .unwrap()
+}
+
+fn main() {
+    let args = parse_args();
+    let durable = matches!(args.durability, BranchDurability::Durable { .. });
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("branch_curve.db");
+    let mut db = open_db(&path, args.durability);
+    let mut trunk = db.connect().unwrap();
     trunk
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -211,8 +276,8 @@ fn main() {
     println!("# branch_curve — Turso fork, per-branch CoW arena");
     println!(
         "# checkpoints={:?} samples={} seed={:#x} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
-         page_size={page_size} trunk_pages={trunk_pages}",
-        args.checkpoints, args.samples, args.seed
+         page_size={page_size} trunk_pages={trunk_pages} durability={:?} reopens={}",
+        args.checkpoints, args.samples, args.seed, args.durability, args.reopens
     );
     println!(
         "# clock tick {:.0} ns (Instant); times below are microseconds per operation",
@@ -330,17 +395,58 @@ fn main() {
             ("read_inh", read_inh),
             ("reap", reap),
         ] {
-            let mut us: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
-            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let p50 = percentile(&us, 50.0);
-            println!(
-                "{n}\t{op}\t{}\t{p50:.2}\t{:.2}\t{:.2}\t{:.2}",
-                us.len(),
-                percentile(&us, 90.0),
-                percentile(&us, 99.0),
-                us[us.len() - 1]
-            );
-            summary.push((n, op, p50));
+            report(n, op, &samples, &mut summary);
+        }
+
+        if durable {
+            let mut reopen = Vec::with_capacity(args.reopens);
+            let mut attach_all = Vec::with_capacity(args.reopens);
+            for _ in 0..args.reopens {
+                let detached: Vec<(BranchId, i64)> = live
+                    .drain(..)
+                    .map(|l| (l.branch.into_id(), l.row))
+                    .collect();
+                // Every holder of the Database is gone, so the open below is a real one.
+                drop(trunk);
+                drop(db);
+                let t = Instant::now();
+                db = open_db(&path, args.durability);
+                trunk = db.connect().unwrap();
+                reopen.push(t.elapsed());
+                let t = Instant::now();
+                live = detached
+                    .into_iter()
+                    .map(|(id, row)| Live {
+                        branch: db.branch(id).unwrap(),
+                        row,
+                    })
+                    .collect();
+                attach_all.push(t.elapsed());
+                let stats = db.branch_stats();
+                if stats.live_branches != n || stats.arena_slots_in_use != n {
+                    not_a_result(&format!(
+                        "after a reopen the engine has {stats:?}; expected {n} branches holding \
+                         {n} pages"
+                    ));
+                }
+            }
+            // The first connect to a branch after a reopen reparses its schema, so each sample is a
+            // DIFFERENT branch: a repeat would time the cached schema instead.
+            let mut reopen_read = Vec::with_capacity(k);
+            for i in distinct_indices(&mut rng, live.len(), k) {
+                let target = &live[i];
+                let t = Instant::now();
+                let conn = target.branch.connect().unwrap();
+                let own = read_v(&conn, target.row);
+                reopen_read.push(t.elapsed());
+                drop(conn);
+                if own != branch_value(target.row) {
+                    not_a_result("after a reopen a branch no longer sees its own write");
+                }
+            }
+            report(n, "reopen", &reopen, &mut summary);
+            report(n, "attach_all", &attach_all, &mut summary);
+            report(n, "reopen_read", &reopen_read, &mut summary);
         }
         let rss = rss_bytes();
         println!(
@@ -363,12 +469,18 @@ fn main() {
             "read_own",
             "read_inh",
             "reap",
+            "reopen",
+            "attach_all",
+            "reopen_read",
         ] {
             let pts: Vec<(f64, f64)> = summary
                 .iter()
                 .filter(|(_, o, _)| *o == op)
                 .map(|&(n, _, p50)| ((n as f64).ln(), p50.ln()))
                 .collect();
+            if pts.len() < 2 {
+                continue;
+            }
             let m = pts.len() as f64;
             let (sx, sy) = pts.iter().fold((0.0, 0.0), |(a, b), (x, y)| (a + x, b + y));
             let (mx, my) = (sx / m, sy / m);
