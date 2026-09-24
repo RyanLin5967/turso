@@ -36,9 +36,20 @@
 //! containing `f` becomes garbage exactly when it also lies strictly between `f`'s neighbouring
 //! live siblings — which is a range query over `retained_by_born`, not a scan.
 //!
-//! A released branch that still has a live child or an open connection is kept (its versions are
-//! still read through); it is freed the moment the last of those goes, and freeing it may in turn
-//! free its parent.
+//! A released branch with an open connection is kept whole until the connection goes. A released
+//! branch with live children is RETIRED (F4, UNBUILT): it keeps exactly the versions some live
+//! child can read — its current versions become retained ones that died at the release epoch, and
+//! any with no live child inside `[born, release)` are freed at the release itself — and it is
+//! freed whole when its last child goes, which may in turn free its parent.
+//!
+//! # Leases (F5, UNBUILT)
+//!
+//! A branch may carry a lease deadline on the store's LEASE CLOCK — time the database has been
+//! open, summed across opens, never read from the wall (see `LeaseClock`). An expiry pass reaps
+//! every branch past its deadline, non-cooperatively and deepest first, through the same release
+//! path as a dropped handle, so an expired interior with a live child is retired, not kept whole.
+//! The pass runs at every fork (so an expired parent is refused, not revived), at every open (so a
+//! crashed agent's branch goes at the next start), and on `Database::expire_branches`.
 //!
 //! # Durability (see `journal.rs` for the files and their prior art)
 //!
@@ -65,13 +76,14 @@
 //! * Resolution walks the ancestor chain: cost grows with DEPTH, not with the number of branches.
 //! * Recovery is eager: every branch map is materialised at open, O(live branch state).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use super::arena::{Arena, Slot};
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
-use super::{BranchDurability, BranchFailpoint, BranchId, BranchStats, Reaped};
+use super::{BranchDurability, BranchFailpoint, BranchId, BranchStats, Expired, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -105,6 +117,50 @@ struct StoreInner {
     branches: HashMap<BranchId, BranchState>,
     failpoint: Option<BranchFailpoint>,
     orphans: Vec<Slot>,
+    lease: LeaseClock,
+    /// Every leased, unreleased branch by deadline: the expiry pass is a range, never a scan.
+    leases: BTreeSet<(u64, BranchId)>,
+    /// The lease a fork is given when `DatabaseOpts::with_branch_lease` sets one.
+    default_lease: Option<Duration>,
+}
+
+/// The lease clock: milliseconds of time the database has been OPEN, summed across every open.
+///
+/// Chubby's rule (§2.9): while the authority is down "the session lease timer is stopped; this is
+/// legal because it is equivalent to extending the client's lease". So the clock is never read
+/// from the wall: it is the value recovered from the journal plus a monotonic `Instant` since this
+/// open. Downtime is not charged, and a wall-clock step (ferrodb's F2) cannot expire anything.
+/// It is persisted by stamping it into `Lease` and `Clock` records; a crash loses only the time
+/// since the last stamp, which extends leases and never shortens one.
+struct LeaseClock {
+    /// The clock recovered at open.
+    base_ms: u64,
+    opened: Instant,
+    /// Test-only forward motion (`Database::branch_lease_clock_advance`).
+    advanced_ms: u64,
+    /// The largest value written to the journal.
+    stamped_ms: u64,
+}
+
+impl LeaseClock {
+    fn new() -> Self {
+        Self {
+            base_ms: 0,
+            opened: Instant::now(),
+            advanced_ms: 0,
+            stamped_ms: 0,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.base_ms + self.opened.elapsed().as_millis() as u64 + self.advanced_ms
+    }
+
+    /// Recovery saw the clock at `ms`. The clock only moves forward.
+    fn recovered(&mut self, ms: u64) {
+        self.base_ms = self.base_ms.max(ms);
+        self.stamped_ms = self.stamped_ms.max(ms);
+    }
 }
 
 #[derive(Default)]
@@ -160,6 +216,36 @@ struct BranchState {
     open: bool,
     /// A write transaction on this branch is in progress.
     writer: bool,
+    /// The lease deadline on the lease clock; `None` = the branch never expires.
+    lease: Option<u64>,
+}
+
+impl BranchState {
+    /// F4. A released branch never reads its own `current` again, never writes, and takes no new
+    /// child. So each current version becomes a retained one that died at the branch's epoch — a
+    /// live child forked at `f` reads it exactly as before, because `born <= f < epoch` — and every
+    /// one that no live child forked inside `[born, epoch)` goes to `freed` NOW rather than when the
+    /// last child goes. That is the interval rule with the free epoch set to the release epoch
+    /// (ferrodb's `retire_arenas_by_rule`); `Lineage::child_gone` then frees the rest incrementally.
+    /// Only for a branch with no open connection: an open one still reads `current` at `u64::MAX`.
+    fn retire_current(&mut self, freed: &mut Vec<Slot>) {
+        let epoch = self.lineage.epoch;
+        for (page, owned) in self.current.drain() {
+            if self.lineage.has_child_in(owned.born, epoch) {
+                self.lineage.retain(
+                    page,
+                    Retained {
+                        born: owned.born,
+                        died: epoch,
+                        slot: owned.slot,
+                        crc: owned.crc,
+                    },
+                );
+            } else {
+                freed.push(owned.slot);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -260,7 +346,11 @@ impl BranchStore {
     /// a volatile one refuses a database whose files say it has durable branches, because opened
     /// volatile, the trunk's writes would skip the pre-image barrier and silently change what
     /// those branches read.
-    pub(crate) fn open(durability: BranchDurability, db_path: &str) -> Result<Self> {
+    pub(crate) fn open(
+        durability: BranchDurability,
+        default_lease: Option<Duration>,
+        db_path: &str,
+    ) -> Result<Self> {
         let memory = crate::is_memory_like(db_path);
         let inner = match durability {
             BranchDurability::Volatile => {
@@ -271,7 +361,7 @@ impl BranchStore {
                          silently change what those branches read"
                     )));
                 }
-                StoreInner::fresh(None, false)
+                StoreInner::fresh(None, false, default_lease)
             }
             BranchDurability::Durable { sync } => {
                 if memory {
@@ -280,7 +370,7 @@ impl BranchStore {
                     ));
                 }
                 let files = BranchFiles::for_db(db_path);
-                let mut inner = StoreInner::fresh(Some(files.clone()), sync);
+                let mut inner = StoreInner::fresh(Some(files.clone()), sync, default_lease);
                 if files.exist() {
                     if let Some(recovered) = Journal::recover(&files, sync)? {
                         if let Some(snapshot) = recovered.snapshot {
@@ -313,6 +403,13 @@ impl BranchStore {
             inner: Mutex::new(inner),
             unsynced: AtomicBool::new(false),
         };
+        // A branch whose lease ran out before the last close (or crash) goes now, with nobody
+        // having to ask: this is what makes a crashed agent's branch temporary. The clock resumed
+        // where it stopped, so nothing expires here that had time left when the database closed.
+        {
+            let mut inner = store.inner.lock();
+            store.expire(&mut inner, false)?;
+        }
         Ok(store)
     }
 
@@ -329,6 +426,103 @@ impl BranchStore {
     /// Paths that rewrite the trunk without passing through `add_dirty` refuse while this holds.
     pub(crate) fn has_branches(&self) -> bool {
         !self.inner.lock().branches.is_empty()
+    }
+
+    /// Append `records` and make them durable with ONE flush before the caller acts on any of
+    /// them. A no-op when volatile.
+    fn log_all(&self, inner: &mut StoreInner, records: Vec<Record>) -> Result<()> {
+        let StoreInner { journal, arena, .. } = inner;
+        let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
+            return Ok(());
+        };
+        for record in &records {
+            journal.buffer(record)?;
+        }
+        journal.flush(arena)?;
+        self.unsynced.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Grant or extend `id`'s lease to `ttl` past the lease clock's now. A deadline only moves
+    /// forward (Chubby §2.8: the master "is free to advance this timeout further into the future,
+    /// but may not move it backwards in time").
+    pub(crate) fn set_lease(&self, id: BranchId, ttl: Duration) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let now = inner.lease.now_ms();
+        let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
+        if st.handle == Handle::Released {
+            return Err(reaped(id));
+        }
+        let deadline = st.lease.unwrap_or(0).max(now.saturating_add(ttl.as_millis() as u64));
+        self.log(
+            &mut inner,
+            Record::Lease {
+                branch: id.0,
+                deadline_ms: deadline,
+                now_ms: now,
+            },
+        )?;
+        inner.apply_lease(id, deadline);
+        inner.lease.stamped_ms = inner.lease.stamped_ms.max(now);
+        Ok(())
+    }
+
+    /// The expiry pass, on demand. Also stamps the lease clock when a lease is outstanding, so time
+    /// spent open survives a restart even if nothing expired.
+    pub(crate) fn expire_now(&self) -> Result<Expired> {
+        let mut inner = self.inner.lock();
+        self.expire(&mut inner, true)
+    }
+
+    /// Reap every branch whose lease has run out — non-cooperatively: attached, detached, or open
+    /// (an open one takes no more writes and is freed when its connection closes). Deepest first,
+    /// so a chain that expires together goes child before parent and each interior is freed whole
+    /// rather than retired and then freed. Each release takes F4's path: an interior with a live
+    /// child keeps exactly the versions that child can read. The Release records are made durable
+    /// together, before anything is freed.
+    fn expire(&self, inner: &mut StoreInner, stamp: bool) -> Result<Expired> {
+        let now = inner.lease.now_ms();
+        let mut due: Vec<BranchId> = inner
+            .leases
+            .range(..=(now, BranchId(u64::MAX)))
+            .map(|&(_, id)| id)
+            .collect();
+        if due.is_empty() {
+            if stamp && !inner.leases.is_empty() && now > inner.lease.stamped_ms {
+                self.log(inner, Record::Clock { now_ms: now })?;
+                inner.lease.stamped_ms = now;
+            }
+            return Ok(Expired::default());
+        }
+        due.sort_by_key(|&id| (std::cmp::Reverse(inner.depth(id)), id));
+        let mut records: Vec<Record> = due
+            .iter()
+            .map(|id| Record::Release { branch: id.0 })
+            .collect();
+        records.push(Record::Clock { now_ms: now });
+        self.log_all(inner, records)?;
+        inner.lease.stamped_ms = inner.lease.stamped_ms.max(now);
+        let mut freed = Vec::new();
+        for &id in &due {
+            inner.apply_release(id, &mut freed);
+        }
+        let freed_pages = freed.len();
+        inner.release_slots(freed);
+        self.sync_trunk_children(inner);
+        self.maybe_compact(inner);
+        Ok(Expired {
+            reaped: due,
+            freed_pages,
+        })
+    }
+
+    /// Move the lease clock forward, for tests. It never moves back.
+    pub(crate) fn advance_lease_clock(&self, by: Duration) {
+        self.inner.lock().lease.advanced_ms += by.as_millis() as u64;
+    }
+
+    pub(crate) fn lease_now(&self) -> Duration {
+        Duration::from_millis(self.inner.lock().lease.now_ms())
     }
 
     /// Append `record` and make it durable before the caller acts on it. A no-op when volatile.
@@ -371,15 +565,12 @@ impl BranchStore {
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
         let mut inner = self.inner.lock();
         inner.ensure_backing(page_size)?;
+        self.expire(&mut inner, false)?;
         let id = BranchId(inner.next_id);
-        self.log(
-            &mut inner,
-            Record::Fork {
-                child: id.0,
-                parent: BranchId::TRUNK.0,
-            },
-        )?;
+        let (records, lease) = inner.fork_records(id, BranchId::TRUNK);
+        self.log_all(&mut inner, records)?;
         inner.apply_fork(BranchId::TRUNK, id, Some(schema), Handle::Attached)?;
+        inner.apply_fork_lease(id, lease);
         self.sync_trunk_children(&inner);
         self.maybe_compact(&mut inner);
         Ok(id)
@@ -389,6 +580,10 @@ impl BranchStore {
     /// the same reason a trunk fork takes the WAL write lock, and refused on a released branch.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         let mut inner = self.inner.lock();
+        // Reap what has expired first, so a parent whose lease ran out is refused rather than
+        // revived by a child that would pin it (Neon refuses to "create children from expiring
+        // branches").
+        self.expire(&mut inner, false)?;
         let st = inner.branches.get(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
             return Err(LimboError::Busy);
@@ -398,14 +593,10 @@ impl BranchStore {
         }
         let schema = st.schema.clone();
         let id = BranchId(inner.next_id);
-        self.log(
-            &mut inner,
-            Record::Fork {
-                child: id.0,
-                parent: parent.0,
-            },
-        )?;
+        let (records, lease) = inner.fork_records(id, parent);
+        self.log_all(&mut inner, records)?;
         inner.apply_fork(parent, id, schema, Handle::Attached)?;
+        inner.apply_fork_lease(id, lease);
         self.maybe_compact(&mut inner);
         Ok(id)
     }
@@ -417,6 +608,9 @@ impl BranchStore {
     pub(crate) fn open_conn(&self, id: BranchId) -> Result<Option<Arc<Schema>>> {
         let mut inner = self.inner.lock();
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        if st.handle == Handle::Released {
+            return Err(reaped(id));
+        }
         if st.handle != Handle::Attached {
             return Err(LimboError::InvalidArgument(format!(
                 "branch {} has no attached handle; attach it with Database::branch first",
@@ -849,12 +1043,27 @@ impl BranchStore {
     }
 }
 
+impl Drop for BranchStore {
+    /// A clean close stamps the lease clock, so the time spent open is not lost with the process.
+    /// (A crash loses the time since the last stamp, which extends leases and never shortens one.)
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock();
+        let now = inner.lease.now_ms();
+        // With no lease outstanding the clock's value constrains nothing, so a close writes nothing.
+        if !inner.leases.is_empty() && now > inner.lease.stamped_ms {
+            if let Err(e) = self.log(&mut inner, Record::Clock { now_ms: now }) {
+                tracing::debug!("branch lease clock not stamped at close: {e}");
+            }
+        }
+    }
+}
+
 fn reaped(id: BranchId) -> LimboError {
     LimboError::InvalidArgument(format!("branch {} has been reaped", id.0))
 }
 
 impl StoreInner {
-    fn fresh(files: Option<BranchFiles>, sync: bool) -> Self {
+    fn fresh(files: Option<BranchFiles>, sync: bool, default_lease: Option<Duration>) -> Self {
         Self {
             arena: None,
             journal: None,
@@ -868,7 +1077,62 @@ impl StoreInner {
             branches: HashMap::new(),
             failpoint: None,
             orphans: Vec::new(),
+            lease: LeaseClock::new(),
+            leases: BTreeSet::new(),
+            default_lease,
         }
+    }
+
+    /// The records a fork writes — the fork, and the default lease if there is one, flushed
+    /// together so a fork is never durable without the lease it was given — and that lease's
+    /// `(deadline, now)`, which the caller applies after the flush.
+    fn fork_records(&self, child: BranchId, parent: BranchId) -> (Vec<Record>, Option<(u64, u64)>) {
+        let mut records = vec![Record::Fork {
+            child: child.0,
+            parent: parent.0,
+        }];
+        let lease = self.default_lease.map(|ttl| {
+            let now = self.lease.now_ms();
+            (now.saturating_add(ttl.as_millis() as u64), now)
+        });
+        if let Some((deadline_ms, now_ms)) = lease {
+            records.push(Record::Lease {
+                branch: child.0,
+                deadline_ms,
+                now_ms,
+            });
+        }
+        (records, lease)
+    }
+
+    /// Apply the lease `fork_records` logged for a new branch, if any.
+    fn apply_fork_lease(&mut self, id: BranchId, lease: Option<(u64, u64)>) {
+        if let Some((deadline, now)) = lease {
+            self.apply_lease(id, deadline);
+            self.lease.stamped_ms = self.lease.stamped_ms.max(now);
+        }
+    }
+
+    fn apply_lease(&mut self, id: BranchId, deadline: u64) {
+        let Some(st) = self.branches.get_mut(&id) else {
+            return;
+        };
+        if let Some(old) = st.lease {
+            self.leases.remove(&(old, id));
+        }
+        let deadline = st.lease.unwrap_or(0).max(deadline);
+        st.lease = Some(deadline);
+        self.leases.insert((deadline, id));
+    }
+
+    /// Ancestors between `id` and the trunk.
+    fn depth(&self, mut id: BranchId) -> usize {
+        let mut depth = 0;
+        while let Some(st) = self.branches.get(&id) {
+            depth += 1;
+            id = st.parent;
+        }
+        depth
     }
 
     /// Create the arena (and, for a durable store, its files) at the first fork, when the page size
@@ -943,6 +1207,7 @@ impl StoreInner {
                 handle,
                 open: false,
                 writer: false,
+                lease: None,
             },
         );
         Ok(())
@@ -992,18 +1257,27 @@ impl StoreInner {
     fn apply_release(&mut self, id: BranchId, freed: &mut Vec<Slot>) {
         if let Some(st) = self.branches.get_mut(&id) {
             st.handle = Handle::Released;
+            if let Some(deadline) = st.lease.take() {
+                self.leases.remove(&(deadline, id));
+            }
         }
         self.collect(id, freed);
     }
 
     /// Free `id` if nothing can reach it any more, then its parent if that freed the parent's last
-    /// reason to exist. Every freed slot goes to `freed`.
+    /// reason to exist; a released `id` that still has live children is retired instead (see
+    /// `BranchState::retire_current`). Every freed slot goes to `freed`.
     fn collect(&mut self, mut id: BranchId, freed: &mut Vec<Slot>) {
         loop {
-            let Some(st) = self.branches.get(&id) else {
+            let Some(st) = self.branches.get_mut(&id) else {
                 return;
             };
-            if st.handle != Handle::Released || st.open || !st.lineage.children.is_empty() {
+            if st.handle != Handle::Released || st.open {
+                return;
+            }
+            if !st.lineage.children.is_empty() {
+                // F4: a released interior keeps only what a live child can still read.
+                st.retire_current(freed);
                 return;
             }
             let st = self.branches.remove(&id).expect("just looked it up");
@@ -1110,6 +1384,23 @@ impl StoreInner {
                 self.apply_release(id, freed);
                 Ok(())
             }
+            Record::Lease {
+                branch,
+                deadline_ms,
+                now_ms,
+            } => {
+                let id = BranchId(*branch);
+                if !self.branches.contains_key(&id) {
+                    return Err(corrupt(gone(id)));
+                }
+                self.apply_lease(id, *deadline_ms);
+                self.lease.recovered(*now_ms);
+                Ok(())
+            }
+            Record::Clock { now_ms } => {
+                self.lease.recovered(*now_ms);
+                Ok(())
+            }
         }
     }
 
@@ -1151,6 +1442,7 @@ impl StoreInner {
                     fork_epoch: st.fork_epoch,
                     epoch: st.lineage.epoch,
                     released: st.handle == Handle::Released,
+                    lease_deadline_ms: st.lease.unwrap_or(0),
                     current,
                     retained: st.lineage.retained_list(),
                 }
@@ -1160,6 +1452,7 @@ impl StoreInner {
         SnapshotState {
             next_id: self.next_id,
             trunk_epoch: self.trunk.lineage.epoch,
+            lease_now_ms: self.lease.now_ms(),
             trunk_retained: self.trunk.lineage.retained_list(),
             branches,
         }
@@ -1168,6 +1461,7 @@ impl StoreInner {
     fn load_snapshot(&mut self, snapshot: SnapshotState) -> Result<()> {
         self.next_id = snapshot.next_id;
         self.trunk.lineage.epoch = snapshot.trunk_epoch;
+        self.lease.recovered(snapshot.lease_now_ms);
         for (page, born, died, slot, crc) in snapshot.trunk_retained {
             self.apply_trunk_retain(
                 page,
@@ -1202,6 +1496,10 @@ impl StoreInner {
                 .map(|(page, slot, born, crc)| (page, Owned { slot, born, crc }))
                 .collect();
             edges.push((BranchId(b.parent), b.fork_epoch, BranchId(b.id)));
+            let lease = (b.lease_deadline_ms != 0 && !b.released).then_some(b.lease_deadline_ms);
+            if let Some(deadline) = lease {
+                self.leases.insert((deadline, BranchId(b.id)));
+            }
             self.branches.insert(
                 BranchId(b.id),
                 BranchState {
@@ -1218,6 +1516,7 @@ impl StoreInner {
                     },
                     open: false,
                     writer: false,
+                    lease,
                 },
             );
         }

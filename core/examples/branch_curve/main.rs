@@ -31,6 +31,10 @@
 //!
 //! Volatile (the default, and the arm PREREG.md's original predictions are about) has no reopen.
 //!
+//! Both arms also time an `expire` column (PREREG amendment A2): K extra one-page branches are
+//! given a lease, the lease clock is run past it, and ONE `Database::expire_branches` call reaps
+//! them; the harness asserts exactly those K were reaped and K pages freed.
+//!
 //! It REFUSES to print a number it cannot attribute: before each checkpoint it asserts from the
 //! engine that exactly N branches are live and that they hold exactly the arena pages the
 //! workload predicts, and it spot-checks isolation on a random branch. Any mismatch prints
@@ -386,6 +390,42 @@ fn main() {
             not_a_result("sampling did not return the engine to N branches");
         }
 
+        // The expire column: K leased one-page branches, their lease run out, one pass.
+        let mut expiring = Vec::with_capacity(k);
+        for i in 0..k {
+            let doomed = grow_one(&trunk, grown + i);
+            // An hour, not a second: the lease clock includes real open time, and forking K
+            // branches must not let the first ones expire (the pass also runs at every fork).
+            doomed
+                .branch
+                .lease(std::time::Duration::from_secs(3600))
+                .unwrap();
+            expiring.push(doomed.branch.id());
+            // Detached: nothing but the lease will ever reap it, as for a crashed agent.
+            let _ = doomed.branch.into_id();
+        }
+        grown += k;
+        db.branch_lease_clock_advance(std::time::Duration::from_secs(7200));
+        let t = Instant::now();
+        let expired = db.expire_branches().unwrap();
+        let expire_elapsed = t.elapsed();
+        let mut reaped_ids = expired.reaped.clone();
+        reaped_ids.sort();
+        expiring.sort();
+        if reaped_ids != expiring || expired.freed_pages != k {
+            not_a_result(&format!(
+                "the expiry pass reaped {} branches and freed {} pages; expected exactly the {k} \
+                 leased ones and {k} pages",
+                expired.reaped.len(),
+                expired.freed_pages
+            ));
+        }
+        if db.branch_stats().live_branches != n || db.branch_stats().arena_slots_in_use != n {
+            not_a_result("the expiry pass did not return the engine to N branches");
+        }
+        // Reported per reaped branch, so it reads against `reap`.
+        let expire_per_branch = vec![expire_elapsed / k as u32];
+
         for (op, samples) in [
             ("fork", fork),
             ("open", open),
@@ -394,6 +434,7 @@ fn main() {
             ("read_own", read_own),
             ("read_inh", read_inh),
             ("reap", reap),
+            ("expire_per_branch", expire_per_branch),
         ] {
             report(n, op, &samples, &mut summary);
         }
@@ -469,6 +510,7 @@ fn main() {
             "read_own",
             "read_inh",
             "reap",
+            "expire_per_branch",
             "reopen",
             "attach_all",
             "reopen_read",

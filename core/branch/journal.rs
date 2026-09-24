@@ -95,12 +95,24 @@ pub(crate) enum Record {
     Release {
         branch: u64,
     },
+    /// A branch's lease deadline on the lease clock, and the clock when it was set.
+    Lease {
+        branch: u64,
+        deadline_ms: u64,
+        now_ms: u64,
+    },
+    /// The lease clock, stamped so a reopen resumes it instead of restarting it at zero.
+    Clock {
+        now_ms: u64,
+    },
 }
 
 const TAG_FORK: u8 = 1;
 const TAG_COMMIT: u8 = 2;
 const TAG_TRUNK_RETAIN: u8 = 3;
 const TAG_RELEASE: u8 = 4;
+const TAG_LEASE: u8 = 5;
+const TAG_CLOCK: u8 = 6;
 
 impl Record {
     fn encode(&self, out: &mut Vec<u8>) {
@@ -138,6 +150,20 @@ impl Record {
                 out.push(TAG_RELEASE);
                 put_u64(out, *branch);
             }
+            Record::Lease {
+                branch,
+                deadline_ms,
+                now_ms,
+            } => {
+                out.push(TAG_LEASE);
+                put_u64(out, *branch);
+                put_u64(out, *deadline_ms);
+                put_u64(out, *now_ms);
+            }
+            Record::Clock { now_ms } => {
+                out.push(TAG_CLOCK);
+                put_u64(out, *now_ms);
+            }
         }
     }
 
@@ -165,6 +191,12 @@ impl Record {
                 crc: r.u32()?,
             },
             TAG_RELEASE => Record::Release { branch: r.u64()? },
+            TAG_LEASE => Record::Lease {
+                branch: r.u64()?,
+                deadline_ms: r.u64()?,
+                now_ms: r.u64()?,
+            },
+            TAG_CLOCK => Record::Clock { now_ms: r.u64()? },
             _ => return None,
         };
         // Trailing bytes inside a frame whose CRC matched are a format error, not a torn tail.
@@ -178,6 +210,8 @@ impl Record {
 pub(crate) struct SnapshotState {
     pub(crate) next_id: u64,
     pub(crate) trunk_epoch: u64,
+    /// The lease clock when the snapshot was taken.
+    pub(crate) lease_now_ms: u64,
     /// (page, born, died, slot, crc)
     pub(crate) trunk_retained: Vec<(u32, u64, u64, Slot, u32)>,
     pub(crate) branches: Vec<SnapBranch>,
@@ -190,6 +224,8 @@ pub(crate) struct SnapBranch {
     pub(crate) fork_epoch: u64,
     pub(crate) epoch: u64,
     pub(crate) released: bool,
+    /// The lease deadline on the lease clock; 0 = no lease.
+    pub(crate) lease_deadline_ms: u64,
     /// (page, slot, born, crc)
     pub(crate) current: Vec<(u32, Slot, u64, u32)>,
     /// (page, born, died, slot, crc)
@@ -200,6 +236,7 @@ impl SnapshotState {
     fn encode(&self, out: &mut Vec<u8>) {
         put_u64(out, self.next_id);
         put_u64(out, self.trunk_epoch);
+        put_u64(out, self.lease_now_ms);
         put_retained(out, &self.trunk_retained);
         put_u64(out, self.branches.len() as u64);
         for b in &self.branches {
@@ -208,6 +245,7 @@ impl SnapshotState {
             put_u64(out, b.fork_epoch);
             put_u64(out, b.epoch);
             out.push(b.released as u8);
+            put_u64(out, b.lease_deadline_ms);
             put_u64(out, b.current.len() as u64);
             for &(page, slot, born, crc) in &b.current {
                 put_u32(out, page);
@@ -223,6 +261,7 @@ impl SnapshotState {
         let mut r = Reader::new(body);
         let next_id = r.u64()?;
         let trunk_epoch = r.u64()?;
+        let lease_now_ms = r.u64()?;
         let trunk_retained = get_retained(&mut r)?;
         let n = r.u64()? as usize;
         let mut branches = Vec::with_capacity(n.min(1 << 20));
@@ -236,6 +275,7 @@ impl SnapshotState {
                 1 => true,
                 _ => return None,
             };
+            let lease_deadline_ms = r.u64()?;
             let m = r.u64()? as usize;
             let mut current = Vec::with_capacity(m.min(1 << 16));
             for _ in 0..m {
@@ -248,6 +288,7 @@ impl SnapshotState {
                 fork_epoch,
                 epoch,
                 released,
+                lease_deadline_ms,
                 current,
                 retained,
             });
@@ -255,6 +296,7 @@ impl SnapshotState {
         r.at_end().then_some(SnapshotState {
             next_id,
             trunk_epoch,
+            lease_now_ms,
             trunk_retained,
             branches,
         })
@@ -803,10 +845,28 @@ mod tests {
     }
 
     #[test]
+    fn lease_and_clock_records_round_trip() {
+        for record in [
+            Record::Lease {
+                branch: 3,
+                deadline_ms: 10_000,
+                now_ms: 2_500,
+            },
+            Record::Clock { now_ms: u64::MAX - 1 },
+        ] {
+            let mut payload = Vec::new();
+            record.encode(&mut payload);
+            assert_eq!(Record::decode(&payload), Some(record.clone()));
+            assert_eq!(Record::decode(&payload[..payload.len() - 1]), None);
+        }
+    }
+
+    #[test]
     fn a_snapshot_state_round_trips() {
         let state = SnapshotState {
             next_id: 11,
             trunk_epoch: 5,
+            lease_now_ms: 90_000,
             trunk_retained: vec![(3, 0, 2, 17, 1234)],
             branches: vec![
                 SnapBranch {
@@ -815,6 +875,7 @@ mod tests {
                     fork_epoch: 0,
                     epoch: 2,
                     released: false,
+                    lease_deadline_ms: 120_000,
                     current: vec![(4, 5, 1, 6), (9, 10, 0, 11)],
                     retained: vec![(4, 0, 1, 3, 77)],
                 },
@@ -824,6 +885,7 @@ mod tests {
                     fork_epoch: 1,
                     epoch: 0,
                     released: true,
+                    lease_deadline_ms: 0,
                     current: vec![],
                     retained: vec![],
                 },

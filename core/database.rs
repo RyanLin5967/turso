@@ -83,6 +83,9 @@ pub struct DatabaseOpts {
     pub(crate) enable_load_extension: bool,
     /// Whether branches (see [`crate::branch`]) survive the process. Volatile by default.
     pub branch_durability: crate::branch::BranchDurability,
+    /// The lease every new branch is given; `None` (the default) forks branches that never
+    /// expire unless `Branch::lease` gives them one.
+    pub branch_lease: Option<std::time::Duration>,
 }
 
 impl DatabaseOpts {
@@ -148,6 +151,11 @@ impl DatabaseOpts {
 
     pub fn with_branch_durability(mut self, durability: crate::branch::BranchDurability) -> Self {
         self.branch_durability = durability;
+        self
+    }
+
+    pub fn with_branch_lease(mut self, lease: Option<std::time::Duration>) -> Self {
+        self.branch_lease = lease;
         self
     }
 
@@ -655,6 +663,7 @@ impl Database {
         // be opened with volatile ones (see `BranchStore::open`), and a durable store recovers here.
         let branches = Arc::new(crate::branch::store::BranchStore::open(
             opts.branch_durability,
+            opts.branch_lease,
             &path,
         )?);
         let shared_wal = WalFileShared::new_noop();

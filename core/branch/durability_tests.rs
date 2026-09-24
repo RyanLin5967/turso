@@ -848,3 +848,28 @@ fn expiry_reaps_deepest_first_and_a_fork_never_revives_an_expired_parent() {
     let expired = db.expire_branches().unwrap();
     assert_eq!(expired.reaped, vec![g.id(), c.id(), p.id()], "not deepest first");
 }
+
+#[test]
+fn a_lease_never_moves_backwards() {
+    // Chubby §2.8: the deadline may be advanced, "but may not [be moved] backwards in time". A
+    // renewal with a SHORTER ttl must not bring the reap closer.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    b.lease(Duration::from_secs(100)).unwrap();
+    b.lease(Duration::from_secs(1)).unwrap();
+    db.branch_lease_clock_advance(Duration::from_secs(5));
+    assert!(
+        db.expire_branches().unwrap().reaped.is_empty(),
+        "a shorter renewal moved the deadline back"
+    );
+    // A LONGER renewal does move it forward.
+    b.lease(Duration::from_secs(200)).unwrap();
+    db.branch_lease_clock_advance(Duration::from_secs(150));
+    assert!(db.expire_branches().unwrap().reaped.is_empty(), "renewal did not extend it");
+    db.branch_lease_clock_advance(Duration::from_secs(60));
+    assert_eq!(db.expire_branches().unwrap().reaped, vec![b.id()]);
+}

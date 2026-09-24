@@ -256,12 +256,11 @@ impl Branch {
         Ok(self.db.branches.release_handle(self.id))
     }
 
-    /// Grant or extend this branch's lease to `ttl` from now on the lease clock.
-    ///
-    /// ⚠ LEASE SKELETON (UNBUILT): accepted and IGNORED in this commit, so the lease tests in
-    /// `durability_tests.rs` fail until the mechanism lands.
-    pub fn lease(&self, _ttl: std::time::Duration) -> Result<()> {
-        Ok(())
+    /// Grant or extend this branch's lease to `ttl` past now on the lease clock. A deadline only
+    /// moves forward. When it passes, the next expiry pass — at a fork, at open, or on
+    /// [`Database::expire_branches`] — reaps the branch whatever holds it; see `store.rs`.
+    pub fn lease(&self, ttl: std::time::Duration) -> Result<()> {
+        self.db.branches.set_lease(self.id, ttl)
     }
 
     /// Detach this branch from its handle WITHOUT releasing it — the branch outlives the handle
@@ -424,19 +423,22 @@ impl Database {
         self.branches.ids()
     }
 
-    /// Reap every branch whose lease has run out. SKELETON: reaps nothing.
+    /// Reap every branch whose lease has run out, deepest first. The same pass also runs at every
+    /// fork and at every open, so calling this is never required for reclamation to happen.
     pub fn expire_branches(&self) -> Result<Expired> {
-        Ok(Expired::default())
+        self.branches.expire_now()
     }
 
-    /// Move the lease clock forward, for tests. SKELETON: ignored.
+    /// Move the lease clock forward, for tests and benchmarks. It never moves back.
     #[doc(hidden)]
-    pub fn branch_lease_clock_advance(&self, _by: std::time::Duration) {}
+    pub fn branch_lease_clock_advance(&self, by: std::time::Duration) {
+        self.branches.advance_lease_clock(by);
+    }
 
-    /// The lease clock now. SKELETON: always zero.
+    /// The lease clock now: time this database has been open, summed across opens.
     #[doc(hidden)]
     pub fn branch_lease_now(&self) -> std::time::Duration {
-        std::time::Duration::ZERO
+        self.branches.lease_now()
     }
 
     /// Arm (or clear) a crash failpoint for the durability tests.
