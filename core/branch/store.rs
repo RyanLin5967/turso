@@ -433,10 +433,16 @@ impl BranchStore {
     /// Append `records` and make them durable with ONE flush before the caller acts on any of
     /// them. A no-op when volatile.
     fn log_all(&self, inner: &mut StoreInner, records: Vec<Record>) -> Result<()> {
-        let StoreInner { journal, arena, .. } = inner;
+        let StoreInner {
+            journal,
+            arena,
+            failpoint,
+            ..
+        } = inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
+        injected_flush_failure(failpoint, journal)?;
         for record in &records {
             journal.buffer(record)?;
         }
@@ -532,10 +538,16 @@ impl BranchStore {
 
     /// Append `record` and make it durable before the caller acts on it. A no-op when volatile.
     fn log(&self, inner: &mut StoreInner, record: Record) -> Result<()> {
-        let StoreInner { journal, arena, .. } = inner;
+        let StoreInner {
+            journal,
+            arena,
+            failpoint,
+            ..
+        } = inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
+        injected_flush_failure(failpoint, journal)?;
         journal.buffer(&record)?;
         journal.flush(arena)?;
         self.unsynced.store(false, Ordering::Release);
@@ -1065,6 +1077,19 @@ impl Drop for BranchStore {
     }
 }
 
+/// The `LogFlushFails` failpoint: fail this record flush as an I/O error would, which poisons the
+/// journal exactly as `Journal::flush` does on a real failure.
+fn injected_flush_failure(failpoint: &mut Option<BranchFailpoint>, journal: &mut Journal) -> Result<()> {
+    if *failpoint == Some(BranchFailpoint::LogFlushFails) {
+        *failpoint = None;
+        journal.poison();
+        return Err(LimboError::InternalError(
+            "failpoint: the branch log flush failed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn reaped(id: BranchId) -> LimboError {
     LimboError::InvalidArgument(format!("branch {} has been reaped", id.0))
 }
@@ -1548,5 +1573,27 @@ impl StoreInner {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R7. A deadline of 0 is a real deadline (`lease(ZERO)` at the clock's first millisecond),
+    /// and must not come back from a snapshot as "no lease" — which would make the branch
+    /// permanent.
+    #[test]
+    fn a_zero_deadline_is_still_a_lease_after_a_snapshot() {
+        let mut live = StoreInner::fresh(None, false, None);
+        let id = BranchId(1);
+        live.apply_fork(BranchId::TRUNK, id, None, Handle::Detached)
+            .unwrap();
+        live.apply_lease(id, 0);
+        let snapshot = live.snapshot();
+        let mut recovered = StoreInner::fresh(None, false, None);
+        recovered.load_snapshot(snapshot).unwrap();
+        assert_eq!(recovered.branches[&id].lease, Some(0), "a 0 deadline read back as no lease");
+        assert!(recovered.leases.contains(&(0, id)), "the deadline index lost it");
     }
 }

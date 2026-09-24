@@ -898,3 +898,34 @@ fn releasing_an_interior_branch_frees_what_no_live_child_can_read() {
     assert_eq!(in_use(&db), base);
     assert_eq!(db.branch_stats().live_branches, 0);
 }
+
+/// `a_branch_transaction_larger_than_its_page_cache_commits_intact` asks for `cache_size = 10`, but
+/// `PRAGMA cache_size` is clamped to `CacheSize::MIN` = 200 pages (translate/pragma.rs
+/// `update_cache_size`), and its ~60 pages never overflow that — so it never reached the spill
+/// path it names. This one sets the 200-page minimum and writes ~20,000 rows (~560 pages) in ONE
+/// transaction, and asserts the page count so the premise cannot silently fail again.
+#[test]
+fn a_branch_transaction_that_really_overflows_the_page_cache_commits_intact() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    bc.execute("PRAGMA cache_size = 200").unwrap();
+    bc.execute("BEGIN").unwrap();
+    for id in 10_001..=30_000 {
+        bc.execute(format!("INSERT INTO t VALUES ({id}, 'big-{id}-{}')", "b".repeat(80)))
+            .unwrap();
+    }
+    bc.execute("COMMIT").unwrap();
+    let pages = rows(&bc, "PRAGMA page_count")[0][0].as_int().unwrap();
+    assert!(pages > 400, "only {pages} pages: the premise (overflow a 200-page cache) did not hold");
+    drop(bc);
+
+    let bc = b.connect().unwrap();
+    let rows_seen = table(&bc);
+    assert_eq!(rows_seen.len(), 20_050);
+    assert_eq!(rows_seen[&15_000], format!("big-15000-{}", "b".repeat(80)));
+    assert_eq!(rows(&bc, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
+    assert_eq!(table(&db.connect().unwrap()).len(), 50, "the branch's transaction reached the trunk");
+}

@@ -844,6 +844,34 @@ mod tests {
         }
     }
 
+    /// R8. A second journal over the same log (a store that outlived its database past a reopen)
+    /// must not append at its own stale offset, which would cut the other's later records off at
+    /// the next recovery: the stale writer is refused.
+    #[test]
+    fn a_stale_journal_does_not_write_over_a_newer_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut arena = Arena::new(512);
+        let mut stale = Journal::create(&files, 512, false).unwrap();
+        stale.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        stale.flush(&mut arena).unwrap();
+
+        let mut fresh = Journal::recover(&files, false).unwrap().expect("state");
+        fresh.journal.buffer(&Record::Release { branch: 1 }).unwrap();
+        fresh.journal.flush(&mut arena).unwrap();
+
+        stale.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+        assert!(stale.flush(&mut arena).is_err(), "a stale journal wrote over a newer one");
+        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        assert_eq!(
+            records,
+            vec![
+                Record::Fork { child: 1, parent: 0 },
+                Record::Release { branch: 1 }
+            ]
+        );
+    }
+
     #[test]
     fn lease_and_clock_records_round_trip() {
         for record in [

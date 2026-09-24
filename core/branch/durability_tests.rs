@@ -908,3 +908,289 @@ fn an_expired_branch_cannot_be_opened_when_connect_is_the_first_operation() {
     assert!(b.connect().is_err(), "an expired branch was opened");
     assert!(db.branch_ids().is_empty());
 }
+
+// ---- Review lane_turso_f4f5_review.md @ 56d3252: R1, R2, R3, R4, R6 ----
+
+/// A crash image: every file of the database, copied while it is still OPEN, under a new name.
+/// Nothing a clean close would write is in it.
+fn crash_image(src: &Path, dir: &Path) -> std::path::PathBuf {
+    let dst = dir.join("crash-image.db");
+    for suffix in ["", "-wal", "-branch-log", "-branch-arena", "-branch-snap"] {
+        let from = std::path::PathBuf::from(format!("{}{suffix}", src.display()));
+        if from.exists() {
+            std::fs::copy(&from, format!("{}{suffix}", dst.display())).unwrap();
+        }
+    }
+    dst
+}
+
+/// R1 (HIGH). A release whose log flush fails is not durable, so nothing may be freed for it —
+/// not at the release, and not later, when its own close or a child's climb reaches it. The
+/// review's schedule reused such a slot and a reopen read Corrupt.
+#[test]
+fn a_release_whose_log_failed_frees_nothing_now_or_later() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let p_id;
+    let c1_id;
+    let c2_id;
+    let held;
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        let pc = p.connect().unwrap();
+        set(&pc, 7, "p-pre");
+        let c1 = p.fork().unwrap();
+        let c2 = p.fork().unwrap();
+        // Written after both forks: no child can read these, so a durable release would free them.
+        set(&pc, 60, "p-post");
+        set(&pc, 110, "p-post");
+        held = in_use(&db);
+        p_id = p.id();
+        c1_id = c1.id();
+
+        db.branch_failpoint(Some(BranchFailpoint::LogFlushFails));
+        drop(p); // its Release record fails: the journal is poisoned and the release not durable
+        assert_eq!(in_use(&db), held, "the failed release freed pages");
+        drop(pc); // exit 1: the interior's own close
+        assert_eq!(in_use(&db), held, "the interior's close freed pages the journal still names");
+        let c1c = c1.connect().unwrap();
+        drop(c1); // this Release fails too: the journal is fail-stopped
+        drop(c1c); // exit 2: the child's close climbs to the interior
+        assert_eq!(in_use(&db), held, "a child's climb retired the interior");
+
+        // And the fail-stopped store takes no write that could reuse a slot.
+        let c2c = c2.connect().unwrap();
+        assert!(
+            c2c.execute("UPDATE t SET v = 'x' WHERE id = 150").is_err(),
+            "a write was accepted on a fail-stopped branch store"
+        );
+        drop(c2c);
+        c2_id = c2.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let ids: BTreeSet<BranchId> = db.branch_ids().into_iter().collect();
+    assert_eq!(ids, BTreeSet::from([p_id, c1_id, c2_id]), "a release that never became durable held");
+    assert_eq!(in_use(&db), held, "recovery sees different live slots");
+    let pc = db.branch(p_id).unwrap().connect().unwrap();
+    assert_eq!(value(&pc, 7), Some("p-pre".to_string()));
+    assert_eq!(value(&pc, 60), Some("p-post".to_string()));
+    assert_eq!(value(&pc, 110), Some("p-post".to_string()));
+    integrity_ok(&pc);
+    drop(pc);
+    let cc = db.branch(c1_id).unwrap().connect().unwrap();
+    assert_eq!(value(&cc, 7), Some("p-pre".to_string()));
+    assert_eq!(value(&cc, 60), Some(original(60)));
+}
+
+/// R1, the refusal half: after the journal is poisoned, a branch write transaction is refused at
+/// its START (not only when its commit record fails, after its pages are already in the arena).
+#[test]
+fn a_poisoned_store_refuses_a_branch_write_transaction_at_its_start() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    let a = trunk.fork_branch().unwrap();
+    let d = trunk.fork_branch().unwrap();
+    db.branch_failpoint(Some(BranchFailpoint::LogFlushFails));
+    drop(d); // poisons the journal
+    let ac = a.connect().unwrap();
+    let err = match ac.execute("UPDATE t SET v = 'x' WHERE id = 7") {
+        Ok(()) => panic!("a write was accepted on a fail-stopped branch store"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("no write transaction"), "refused late, or for another reason: {err}");
+}
+
+/// R1, the other two refusals: a transaction that began BEFORE the poisoning may write no further
+/// page, and its commit writes nothing into the arena file.
+#[test]
+fn a_transaction_open_across_the_poisoning_writes_no_page_and_no_slot() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let a = trunk.fork_branch().unwrap();
+    let d = trunk.fork_branch().unwrap();
+    let arena = format!("{}-branch-arena", path.display());
+    let ac = a.connect().unwrap();
+    ac.execute("BEGIN").unwrap();
+    set(&ac, 7, "before-poison"); // reserves a slot; nothing is written until commit
+    let len_before = std::fs::metadata(&arena).unwrap().len();
+
+    db.branch_failpoint(Some(BranchFailpoint::LogFlushFails));
+    drop(d); // poisons the journal
+    let err = match ac.execute("UPDATE t SET v = 'after-poison' WHERE id = 150") {
+        Ok(()) => panic!("a page write was accepted on a fail-stopped branch store"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("no page write"), "refused for another reason: {err}");
+    assert!(ac.execute("COMMIT").is_err(), "a commit succeeded on a fail-stopped store");
+    assert_eq!(
+        std::fs::metadata(&arena).unwrap().len(),
+        len_before,
+        "a fail-stopped store wrote a page into the arena file"
+    );
+}
+
+/// R2. The lease clock must survive a CRASH, not only a clean close: a branch commit's flush
+/// stamps it. The image is copied while the database is open, so no close ever runs.
+#[test]
+fn a_crash_image_keeps_the_open_time_a_branch_commit_stamped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let doomed = trunk.fork_branch().unwrap();
+    doomed.lease(Duration::from_secs(10)).unwrap();
+    set(&doomed.connect().unwrap(), 150, "doomed");
+    let doomed_slots = doomed.owned_slots();
+    let doomed_id = doomed.into_id(); // the crashed agent
+    let x = trunk.fork_branch().unwrap();
+    let xc = x.connect().unwrap(); // connected BEFORE the deadline: no pass runs after it
+    db.branch_lease_clock_advance(Duration::from_secs(11));
+    set(&xc, 7, "x"); // the only thing that happens past the deadline: a commit
+    let image = crash_image(&path, dir.path());
+
+    let crashed = open_at(&image, durable()).unwrap();
+    assert!(
+        !crashed.branch_ids().contains(&doomed_id),
+        "a crash lost the open time, and the expired branch survived the restart"
+    );
+    for slot in &doomed_slots {
+        assert!(crashed.branch_slot_is_free(*slot), "slot {slot} survived its branch's expiry");
+    }
+    drop(xc);
+}
+
+/// R2, the pass half: an expiry pass with nothing due (here, a fork's) stamps the clock too, and
+/// the fork's own flush makes the stamp durable.
+#[test]
+fn a_crash_image_keeps_the_open_time_a_fork_stamped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    b.lease(Duration::from_secs(10)).unwrap();
+    db.branch_lease_clock_advance(Duration::from_secs(6));
+    let _other = trunk.fork_branch().unwrap(); // its pass has nothing due at 6 of 10 s
+    let image = crash_image(&path, dir.path());
+
+    let crashed = open_at(&image, durable()).unwrap();
+    assert!(
+        crashed.branch_lease_now() >= Duration::from_secs(6),
+        "the crash image's lease clock went back to {:?}",
+        crashed.branch_lease_now()
+    );
+    drop(b);
+}
+
+/// R3. An interior whose lease runs out while its own connection is open: nothing may be retired
+/// until that connection closes, because it still reads its own pages — and after the close,
+/// exactly the pages no child reads are freed.
+#[test]
+fn an_interior_expired_under_its_own_open_connection_keeps_reading_its_own_pages() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let p = trunk.fork_branch().unwrap();
+    p.lease(Duration::from_secs(10)).unwrap();
+    let pc = p.connect().unwrap();
+    set(&pc, 7, "p-pre");
+    let pre: BTreeSet<u32> = p.owned_slots().into_iter().collect();
+    let c = p.fork().unwrap();
+    c.lease(Duration::from_secs(1000)).unwrap();
+    set(&pc, 60, "p-post");
+    set(&pc, 110, "p-post");
+    let post: BTreeSet<u32> = p
+        .owned_slots()
+        .into_iter()
+        .filter(|s| !pre.contains(s))
+        .collect();
+    assert_eq!(post.len(), 2);
+
+    db.branch_lease_clock_advance(Duration::from_secs(11));
+    let expired = db.expire_branches().unwrap();
+    assert_eq!(expired.reaped, vec![p.id()]);
+    assert_eq!(expired.freed_pages, 0, "freed pages while the interior's own connection is open");
+
+    // Make pc re-read through the store, not its page cache: a trunk commit changes the WAL, so
+    // pc's next read transaction clears its cache.
+    set(&trunk, 199, "trunk-moved");
+    assert_eq!(value(&pc, 60), Some("p-post".to_string()), "the open connection lost its own write");
+    assert_eq!(value(&pc, 110), Some("p-post".to_string()), "the open connection lost its own write");
+    assert!(
+        pc.execute("UPDATE t SET v = 'late' WHERE id = 150").is_err(),
+        "an expired branch took a write"
+    );
+    let cc = c.connect().unwrap();
+    assert_eq!(value(&cc, 7), Some("p-pre".to_string()));
+    assert_eq!(value(&cc, 60), Some(original(60)));
+    drop(cc);
+
+    drop(pc); // now the retire runs
+    for slot in &post {
+        assert!(db.branch_slot_is_free(*slot), "slot {slot}: unreadable after the close, still held");
+    }
+    for slot in &pre {
+        assert!(!db.branch_slot_is_free(*slot), "slot {slot}: the child reads it, freed");
+    }
+}
+
+/// R4. The earlier timer test is closed for milliseconds against a 1 s margin, so a clock that
+/// charged downtime would pass it. This one stays closed 2.5 s: a correct clock reads 9 s after
+/// the reopen (alive), a downtime-charging one 11.5 s (reaped).
+#[test]
+fn the_lease_clock_does_not_charge_the_time_the_database_was_closed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let b_id;
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        let b = trunk.fork_branch().unwrap();
+        b.lease(Duration::from_secs(10)).unwrap();
+        db.branch_lease_clock_advance(Duration::from_secs(6));
+        db.expire_branches().unwrap();
+        b_id = b.into_id();
+    }
+    std::thread::sleep(Duration::from_millis(2500));
+    let db = reopen(&path, incarnation);
+    db.branch_lease_clock_advance(Duration::from_secs(3));
+    assert!(
+        db.expire_branches().unwrap().reaped.is_empty(),
+        "the 2.5 s the database was closed were charged to the lease"
+    );
+    assert_eq!(db.branch_ids(), vec![b_id]);
+}
+
+/// R6. A lease whose millisecond count exceeds u64 must saturate to "practically forever", not
+/// wrap: 18,446,744,073,709,552 s wraps to a 384 ms lease under `as u64`.
+#[test]
+fn a_practically_infinite_lease_does_not_wrap_into_a_short_one() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    b.lease(Duration::from_secs(18_446_744_073_709_552)).unwrap();
+    db.branch_lease_clock_advance(Duration::from_secs(10));
+    assert!(db.expire_branches().unwrap().reaped.is_empty(), "the lease wrapped and ran out");
+    assert_eq!(db.branch_ids(), vec![b.id()]);
+}

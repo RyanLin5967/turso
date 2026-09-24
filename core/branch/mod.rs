@@ -177,6 +177,9 @@ pub enum BranchFailpoint {
     BarrierBeforeRecords,
     /// The next compaction fails after renaming the new snapshot, before resetting the log.
     CompactAfterRenameBeforeLogReset,
+    /// The next record flush fails as an I/O error would: the record is not durable and the
+    /// journal fail-stops (poisoned) from then on.
+    LogFlushFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
