@@ -518,31 +518,34 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         // written before the database changed under another name would overwrite newer pages.
         return Err(LimboError::InvalidArgument(match holds {
             // "Keep them" needs BOTH conditions (review 8 F1, the lead's decision): {ours} does
-            // not exist — any read-write open of {real} by THIS build with its default sidecars
-            // creates it, even empty (review 7 item 4; review 11 finding 4: a read-only open
-            // creates no WAL, and this message also serves the MVCC log) — AND nothing has opened
+            // not exist — any read-write open of {real} by THIS build creates its WAL, and its log
+            // only while the database header says MVCC, even empty (review 7 item 4; review 11
+            // finding 4: a read-only open creates neither; review 12 finding 1: this message also
+            // serves the MVCC log, which a WAL-mode open never creates) — AND nothing has opened
             // the database since, by ANY name, {real} included (review 9's wording, the lead's),
-            // with NO exemption. A build that names sidecars from the path as given (earlier fork
-            // builds; upstream Turso for the WAL) opening it through a third name writes newer
-            // pages and leaves {ours} absent; so can a program whose open, even of {real} itself,
-            // leaves no {ours} behind — SQLite's WAL for {real} IS {ours}, and it deletes it at
+            // with NO exemption; condition 3 carries every open that condition 2's reason misses.
+            // A build that names sidecars from the path as given (earlier fork builds; upstream
+            // Turso for the WAL) opening it through a third name writes newer pages and leaves
+            // {ours} absent; so can a program whose open, even of {real} itself, leaves no {ours}
+            // behind — for the WAL copy, SQLite's WAL for {real} IS {ours}, and it deletes it at
             // its last close, which is why review 10 F8's "except through {ours}" was withdrawn
             // (review 11 finding 1, the lead's reversal) — and so can THIS build's own open with a
             // custom `wal_path` (`do_open_async`, the sync engine's revert database; the
-            // test-only `do_open`), which never creates {ours}. Absence proves nothing about
-            // those opens.
+            // test-only `do_open`), which never creates the WAL {ours} (for the log copy, an
+            // MVCC-header open still creates the log at the canonical name). Absence proves
+            // nothing about those opens.
             Some(what) => format!(
                 "{other} holds {what} that this open would miss: they were written through the \
                  name {given} before sidecars were named from the resolved path, and this \
                  database's file of that kind is {ours}. They belong to whichever database {given} \
                  named when they were written, which may not be this one. To keep them, ALL of \
                  these must hold: that database was {real}; {ours} does not exist — any \
-                 read-write open of {real} by this build with its default sidecars would have \
-                 created it, even empty; and nothing has opened this database since, by any name, \
-                 {real} included — an open that leaves no {ours} behind can still write pages \
-                 newer than these {what}. Then, with no process using the database, rename {other} \
-                 to {ours}, and the next open reads them. Otherwise, or if you cannot tell, move \
-                 {other} aside: this database then opens without them",
+                 read-write open of {real} by this build creates its WAL, and, while the database \
+                 is in MVCC mode, its log, even empty; and nothing has opened this database since, \
+                 by any name, {real} included — an open that leaves no {ours} behind can still \
+                 write pages newer than these {what}. Then, with no process using the database, \
+                 rename {other} to {ours}, and the next open reads them. Otherwise, or if you \
+                 cannot tell, move {other} aside: this database then opens without them",
                 other = other.display(),
                 ours = ours.display()
             ),
