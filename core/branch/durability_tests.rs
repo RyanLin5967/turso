@@ -892,3 +892,19 @@ fn an_expired_branch_is_neither_renewed_nor_opened() {
     assert!(b.connect().is_err(), "an expired branch was opened");
     assert!(db.branch_ids().is_empty());
 }
+
+#[test]
+fn an_expired_branch_cannot_be_opened_when_connect_is_the_first_operation() {
+    // Separate from the renewal test on purpose: there the renewal's own pass reaps both branches
+    // first, so a connect that skipped the pass would still be refused and nothing would notice.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20);
+    let b = trunk.fork_branch().unwrap();
+    b.lease(Duration::from_secs(5)).unwrap();
+    db.branch_lease_clock_advance(Duration::from_secs(6));
+    assert!(b.connect().is_err(), "an expired branch was opened");
+    assert!(db.branch_ids().is_empty());
+}
