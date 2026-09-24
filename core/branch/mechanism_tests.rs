@@ -595,3 +595,45 @@ fn run_model(seed: u64) {
 fn seed_table(conn: &Arc<Connection>) {
     seed(conn, 300);
 }
+
+#[test]
+fn a_reprepared_branch_statement_keeps_the_branch_schema_and_never_publishes_it() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    let b = trunk.fork_branch().unwrap();
+
+    // The trunk moves its schema on after the fork...
+    trunk.execute("CREATE TABLE tr1(x)").unwrap();
+    trunk.execute("CREATE TABLE tr2(x)").unwrap();
+
+    let bc = b.connect().unwrap();
+    let mut stale = bc.prepare("SELECT count(*) FROM t").unwrap();
+    // ...and the branch moves its own further, so its cookie passes the trunk's. A statement
+    // prepared before the branch's DDL must be reprepared, which is the path that consults the
+    // shared schema and the path that can publish one.
+    for name in ["b1", "b2", "b3"] {
+        bc.execute(format!("CREATE TABLE {name}(x)")).unwrap();
+    }
+    let counted = stale.run_collect_rows().unwrap();
+    assert_eq!(counted[0][0].as_int(), Some(50), "the reprepared statement read the wrong tree");
+    drop(stale);
+
+    let branch_tables = table_names(&bc);
+    for name in ["b1", "b2", "b3"] {
+        assert!(branch_tables.contains(name), "branch lost its own table {name}");
+    }
+    for name in ["tr1", "tr2"] {
+        assert!(!branch_tables.contains(name), "branch sees the trunk's post-fork {name}");
+        assert!(bc.prepare(format!("SELECT x FROM {name}")).is_err());
+    }
+    for (who, conn) in [("trunk", trunk.clone()), ("fresh trunk", db.connect().unwrap())] {
+        for name in ["b1", "b2", "b3"] {
+            assert!(
+                conn.prepare(format!("SELECT x FROM {name}")).is_err(),
+                "{who} can prepare against the branch's table {name}: the branch schema leaked"
+            );
+        }
+        assert_eq!(rows(&conn, "SELECT count(*) FROM tr1")[0][0].as_int(), Some(0));
+    }
+}
