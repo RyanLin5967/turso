@@ -661,10 +661,11 @@ impl Database {
         let wal_path = wal_path.into();
         // Before anything else touches the file: a database whose branches are durable must not
         // be opened with volatile ones (see `BranchStore::open`), and a durable store recovers here.
-        let branches = Arc::new(crate::branch::store::BranchStore::open(
+        let branches = Arc::new(crate::branch::store::BranchStore::open_with_flags(
             opts.branch_durability,
             opts.branch_lease,
             &path,
+            flags.contains(OpenFlags::ReadOnly),
         )?);
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();

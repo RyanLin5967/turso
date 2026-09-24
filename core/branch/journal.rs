@@ -30,9 +30,20 @@
 //! # One store per set of files
 //!
 //! A journal holds an exclusive `flock` on the log for its whole life (review N1; LevelDB's `LOCK`
-//! file), taken before it reads, truncates or discards anything, so a second store over the same
-//! files — in this process or another — is refused at open instead of interleaving its appends
-//! with the first one's. See `lock_exclusive` for why `flock` and for its blind spots.
+//! file), taken before it reads, truncates or discards anything. What that does and does not
+//! exclude (review 3 F2 corrected an overclaim here):
+//!
+//! * A second store that finds branch state at open is refused at open, in this process or
+//!   another.
+//! * A store that opened BEFORE any branch file existed holds no lock yet. It is refused at its
+//!   first fork instead: `create` refuses files that gained state after it opened.
+//! * The lock fences branch LOGS, not trunk writers. A second `Database` over the same file
+//!   (`Database::do_open`, which skips the registry) that never forks takes no lock, and its trunk
+//!   writes retain no pre-image for the first one's branches. That is the multi-instance hazard
+//!   Turso's registry exists to prevent; the branch store does not add a second fence for it.
+//! * A fork(2) child shares the lock; its journal refuses every write (see `Journal::pid`).
+//!
+//! See `lock_exclusive` for why `flock` and for its blind spots.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -63,11 +74,25 @@ pub(crate) struct BranchFiles {
 }
 
 impl BranchFiles {
+    /// Named from the database file's CANONICAL path (review 3): the registry knows a database by
+    /// (dev, ino), and a symlink to it must find the same branch files, or a volatile open through
+    /// the link is admitted and its trunk writes change what the branches read. A path that does
+    /// not resolve (no file yet) is used as given — the pattern of `stable_lock_path`.
+    ///
+    /// BLIND SPOT: a HARD link has no canonical name, so it still names other files. Turso's own
+    /// `-wal` is named from the path string too, and SQLite lists hard links among the ways to
+    /// corrupt a database.
     pub(crate) fn for_db(db_path: &str) -> Self {
+        let real = std::fs::canonicalize(db_path).unwrap_or_else(|_| PathBuf::from(db_path));
+        let named = |suffix: &str| {
+            let mut name = real.clone().into_os_string();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
         Self {
-            arena: PathBuf::from(format!("{db_path}-branch-arena")),
-            log: PathBuf::from(format!("{db_path}-branch-log")),
-            snap: PathBuf::from(format!("{db_path}-branch-snap")),
+            arena: named("-branch-arena"),
+            log: named("-branch-log"),
+            snap: named("-branch-snap"),
         }
     }
 
@@ -406,6 +431,12 @@ pub(crate) struct Journal {
     /// written: the next process recovers from what is on disk, and nothing this one does can make
     /// that worse. (Fail-stop on I/O error — the post-"fsyncgate" rule.)
     poisoned: bool,
+    /// The process that took the log's lock. A fork(2) child inherits the descriptor, and with it
+    /// the SAME lock (flock belongs to the open file description), so the lock cannot keep the
+    /// child out. This can: a journal whose process is not the one that locked it is fail-stopped,
+    /// so no write path runs in the child (review 3 F1; SQLite's rule too — a connection must not
+    /// be carried across fork()).
+    pid: u32,
 }
 
 impl Journal {
@@ -415,16 +446,13 @@ impl Journal {
     /// the caller found nothing recoverable when it opened, so state here was written since by
     /// another store instance, and starting it over would destroy that store's branches.
     pub(crate) fn create(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
-        Self::create_with(files, page_size, sync, false)
+        let mut journal = Self::open_fresh(files, page_size, sync)?;
+        journal.start(false)?;
+        Ok(journal)
     }
 
-    /// `create`, with the `CreateFailsAfterHeader` failpoint.
-    pub(crate) fn create_with(
-        files: &BranchFiles,
-        page_size: usize,
-        sync: bool,
-        fail_after_header: bool,
-    ) -> Result<Journal> {
+    /// The first half of `create`: lock the log and check it holds no state. Writes nothing.
+    pub(crate) fn open_fresh(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
         // Lock before touching anything, so a refused create has truncated nothing.
         let mut file = open_rw(&files.log, false)?;
         lock_exclusive(&file, &files.log)?;
@@ -436,7 +464,7 @@ impl Journal {
                 files.log.display()
             )));
         }
-        let mut journal = Journal {
+        Ok(Journal {
             file,
             files: files.clone(),
             page_size: page_size as u32,
@@ -447,17 +475,48 @@ impl Journal {
             snapshot_len: 0,
             sync,
             poisoned: false,
-        };
-        journal.reset_log(0)?;
-        if fail_after_header {
+            pid: std::process::id(),
+        })
+    }
+
+    /// The second half of `create`: write the generation-0 header and make its directory entry
+    /// durable. Any failure POISONS the journal and the caller keeps it (review 3 F3): its header
+    /// may already be on disk, and a retry that dropped the journal would find that header and
+    /// blame another store for it. `fail_after_header` is the `CreateFailsAfterHeader` failpoint.
+    pub(crate) fn start(&mut self, fail_after_header: bool) -> Result<()> {
+        let started = self.reset_log(0).and_then(|()| {
+            if fail_after_header {
+                return Err(LimboError::InternalError(
+                    "failpoint: branch log creation stopped after its header".to_string(),
+                ));
+            }
+            if self.sync {
+                fsync_dir_of(&self.files.log)?;
+            }
+            Ok(())
+        });
+        if started.is_err() {
+            self.poisoned = true;
+        }
+        started
+    }
+
+    /// Rewrite the header of a journal that holds NO record for another page size. Only for a
+    /// journal kept from a first fork whose arena failed to open (review 3 F4): its header was
+    /// written for that attempt's page size, and the retry's is the one the arena will use.
+    pub(crate) fn restart(&mut self, page_size: usize) -> Result<()> {
+        self.check_live()?;
+        if self.len != LOG_HEADER_LEN as u64 || !self.pending.is_empty() {
             return Err(LimboError::InternalError(
-                "failpoint: branch log creation stopped after its header".to_string(),
+                "branch log holds records; it cannot change page size".to_string(),
             ));
         }
-        if sync {
-            fsync_dir_of(&files.log)?;
+        self.page_size = page_size as u32;
+        if let Err(e) = self.reset_log(0) {
+            self.poisoned = true;
+            return Err(e);
         }
-        Ok(journal)
+        Ok(())
     }
 
     /// Reopen an existing store. `Ok(None)` means the files hold no state at all (a crash while
@@ -502,6 +561,7 @@ impl Journal {
             snapshot_len,
             sync,
             poisoned: false,
+            pid: std::process::id(),
         };
 
         let mut records = Vec::new();
@@ -558,15 +618,31 @@ impl Journal {
         }))
     }
 
+    /// Whether this journal may write nothing more: an I/O failure, a crash failpoint, or a fork.
     pub(crate) fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned || self.forked()
+    }
+
+    fn forked(&self) -> bool {
+        self.pid != std::process::id()
+    }
+
+    pub(crate) fn page_size(&self) -> usize {
+        self.page_size as usize
     }
 
     pub(crate) fn poison(&mut self) {
         self.poisoned = true;
     }
 
-    fn check_live(&self) -> Result<()> {
+    pub(crate) fn check_live(&self) -> Result<()> {
+        if self.forked() {
+            return Err(LimboError::InternalError(format!(
+                "branch store is fail-stopped in this process: it was opened by process {}, and a \
+                 branch store is not carried across fork(); open the database in this process",
+                self.pid
+            )));
+        }
         if self.poisoned {
             return Err(LimboError::InternalError(
                 "branch store is fail-stopped after an I/O failure or a crash failpoint; reopen \
@@ -764,7 +840,12 @@ fn parse_log_header(bytes: &[u8]) -> Result<Option<(u32, u64)>> {
 /// BLIND SPOTS: non-unix targets take no lock, and `write_pending`'s length check is their only
 /// guard. The lock is advisory, so a writer that never asks is not stopped (the length check
 /// again). On Linux over NFS, `flock` is emulated with `fcntl` locks (flock(2), recalled, not
-/// verified here), which two stores in one process would share.
+/// verified here), which two stores in one process would share. And fork(2) without exec SHARES
+/// the lock with the child (macOS flock(2) NOTES: descriptors duplicated "through dup(2) or
+/// fork(2)" hold "multiple references to a single lock"): the child cannot write (`Journal::pid`
+/// fail-stops it), but while it keeps the descriptor the parent cannot reopen the database — a
+/// wedge inherent to flock and to OFD locks, refused loudly rather than raced. `exec` releases it
+/// (std opens files close-on-exec; recalled, not verified here).
 fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -946,8 +1027,10 @@ mod tests {
     /// must not append at its own stale offset, which would cut the other's later records off at
     /// the next recovery: the stale writer is refused.
     /// ⚠ Non-unix only since review N1: on unix the second journal below is refused at recover by
-    /// the log lock, so this schedule cannot arise there. Its guard, the length check, is kept
-    /// under test on unix by `a_journal_refuses_to_append_after_its_log_grew_under_it`.
+    /// the log lock. (Review 3 F1: a fork(2) child shares that lock, so "cannot arise" was wrong
+    /// until the pid check made the child's journal refuse every write.) Its guard, the length
+    /// check, stays under test on unix: `a_journal_refuses_to_append_after_its_log_grew_under_it`
+    /// and `…_shrank_under_it`.
     #[cfg(not(unix))]
     #[test]
     fn a_stale_journal_does_not_write_over_a_newer_one() {

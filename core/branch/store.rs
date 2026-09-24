@@ -442,6 +442,30 @@ impl BranchStore {
     /// a volatile one refuses a database whose files say it has durable branches, because opened
     /// volatile, the trunk's writes would skip the pre-image barrier and silently change what
     /// those branches read.
+    /// `open`, for a database opened with `flags`. A READ-ONLY open is refused a durable store, and
+    /// refused outright when the database has durable branch files (review 3): recovery writes by
+    /// construction — it cuts a torn tail, discards a temp snapshot, and reaps expired leases with
+    /// durable records — so a read-only recovery would be a second, write-free recovery that has to
+    /// agree with the first; and a read-only instance cannot follow a live writer's log, so it would
+    /// have to lock writers out. Neither is worth a reader that could not use the branches anyway.
+    /// A read-only open with no branch files opens as before.
+    pub(crate) fn open_with_flags(
+        durability: BranchDurability,
+        default_lease: Option<Duration>,
+        db_path: &str,
+        read_only: bool,
+    ) -> Result<Self> {
+        if read_only {
+            let has_files = !crate::is_memory_like(db_path) && BranchFiles::for_db(db_path).exist();
+            if has_files || matches!(durability, BranchDurability::Durable { .. }) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "{db_path}: durable branches need a read-write open (their recovery writes)"
+                )));
+            }
+        }
+        Self::open(durability, default_lease, db_path)
+    }
+
     pub(crate) fn open(
         durability: BranchDurability,
         default_lease: Option<Duration>,
@@ -1099,7 +1123,9 @@ impl BranchStore {
         if !unsynced {
             // Only stamps are at stake: the buffer holds nothing else without `unsynced`. A trunk
             // commit that needs no pre-image does not fail because its stamp could not be written;
-            // a lost stamp lengthens leases and loses no data.
+            // a lost stamp lengthens leases and loses no data. But a failed flush POISONS the
+            // journal, as every failed flush does: from then on every branch write and every trunk
+            // commit that needs a pre-image is refused until the database is reopened.
             if journal.is_poisoned() || leases.is_empty() {
                 return Ok(());
             }
@@ -1455,15 +1481,26 @@ impl StoreInner {
                 // Files that exist here held no recoverable state when this store opened
                 // (`Journal::recover` said so): start them over. The journal first: it takes the
                 // log's lock and refuses files another store has written since (review N1), and
-                // the arena must not be truncated before that refusal. It is kept even if the
-                // arena then fails to open, so a retry does not take its own fresh log header for
-                // another store's state.
+                // the arena must not be truncated before that refusal. Once its lock is taken it is
+                // KEPT, whatever fails after — its own start (poisoned, review 3 F3) or the arena's
+                // open — so a retry never takes this store's own header for another store's state.
                 if self.journal.is_none() {
                     let fail = self.failpoint == Some(BranchFailpoint::CreateFailsAfterHeader);
                     if fail {
                         self.failpoint = None;
                     }
-                    self.journal = Some(Journal::create_with(files, page_size, self.sync, fail)?);
+                    let mut journal = Journal::open_fresh(files, page_size, self.sync)?;
+                    let started = journal.start(fail);
+                    self.journal = Some(journal);
+                    started?;
+                }
+                let journal = self.journal.as_mut().expect("kept above");
+                // A failed start, or a fork(2) child: fail-stop, before the arena is touched.
+                journal.check_live()?;
+                // Kept from an attempt whose arena failed to open, the journal holds only a header
+                // written for THAT attempt's page size (review 3 F4).
+                if journal.page_size() != page_size {
+                    journal.restart(page_size)?;
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
                 // The journal's create synced the directory before the arena file existed.
