@@ -1441,3 +1441,29 @@ fn a_refused_lazy_create_leaves_the_live_stores_arena_intact() {
     assert_eq!(value(&bc, 3), Some("b".to_string()));
     integrity_ok(&bc);
 }
+
+/// N2, the other half of the barrier: a trunk commit that DOES buffer a pre-image (the first write
+/// of a page since the fork) must carry the stamp in that same flush. A workload whose every commit
+/// touches a fresh page never takes the stamp-only path. (Written after the fix: its red state
+/// against 417bcea9a is INFERRED from reading, where that flush carried no `Clock`.)
+#[test]
+fn a_crash_image_keeps_the_open_time_a_trunk_preimage_commit_stamped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let abandoned = trunk.fork_branch().unwrap();
+    abandoned.lease(Duration::from_secs(10)).unwrap();
+    let abandoned_id = abandoned.into_id();
+    db.branch_lease_clock_advance(Duration::from_secs(11));
+    // The only commit after the deadline, and the first write of its page since the fork.
+    set(&trunk, 150, "trunk-first-after-deadline");
+    let image = crash_image(&path, dir.path());
+
+    let crashed = open_at(&image, durable()).unwrap();
+    assert!(
+        !crashed.branch_ids().contains(&abandoned_id),
+        "a trunk commit's pre-image flush carried no stamp, and the abandoned branch survived"
+    );
+}
