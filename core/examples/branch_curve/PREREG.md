@@ -217,3 +217,93 @@ print one more line at every checkpoint, right after the `# N=` line:
 - "log + snapshot 30–80 B per live branch": `(log_bytes + snap_bytes) / N` in **[30, 80]** at 10⁶.
 - Each size is printed at every checkpoint. They are judged at 10⁶ only; below that, the fixed
   header and the compaction threshold (1 MiB) dominate.
+
+### A4 — 2026-09-24: review 9 — the lane's own unlanded tests change (appended before any code of it)
+
+Nothing above this amendment changes. Source: `frontier/lane_turso_review9.md` @ artie-research
+`fb6ec95` (scope addition `5d79013`), with the lead's decisions 1–8. None of these tests has been built
+or run. Review 9 found that the ATTACH test cannot reach the code it tests: its main database has
+ATTACH disabled, so translation refuses the statement before any registry lookup. So the lane's own
+tests change here, before any code.
+
+**Test changes.** They go in the commit right after this amendment, which holds tests only; its
+parent is `073b088d2`.
+1. `attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused`:
+   - main opens with `DatabaseOpts::new().with_attach(true)`, as every other ATTACH test in the
+     tree does (decision 1);
+   - before each ATTACH, a plain `open_at(path, DatabaseOpts::new())` of the same path must be
+     REFUSED, naming "branch lease" (`leased.db`) or "branch durability" (`durable.db`). This is a
+     premise and the negative control: it proves the ATTACH is a registry hit, and that the
+     exemption is ATTACH's alone (decision 4);
+   - both ATTACHes run before the verdict. One panic then lists every refused ATTACH as
+     `<name>: <error>`, joined by ` | `, so a red shows both halves, not only the first.
+2. `a_sidecar_refusal_keeps_frames_only_while_the_real_file_does_not_exist`: the assertion
+   "under any other name" becomes the lead's wording (decision 2). The test asserts "by any name"
+   (panic: "the rename is not conditioned on no open since by ANY name") and "real.db included"
+   (panic: "the real name is not counted among the names").
+3. `a_name_too_long_for_branch_files_opens_volatile`: its doc comment only. The range and the file
+   are corrected (decision 7); no assertion changes.
+
+No test is added or removed, so there are still 118 `#[test]` attributes under `core/branch/`, 117
+of which run on unix.
+
+**P16. The red commit (tests only).** `cargo test -p turso_core --lib branch::` gives **116 passed,
+1 FAILED**. The failure is the keeps-frames test, and its panic contains "by ANY name". The ATTACH
+test PASSES there, because the F2 fix is in `073b088d2` (INFERRED). If it fails, that is a finding
+against the fix or the test. It is not a test to edit.
+
+**P17. F2's red, shown against the code before F2.** Run `git checkout --detach e472b108e && git
+checkout <red> -- core/branch/durability_tests.rs`, then `cargo test -p turso_core --lib
+branch::durability_tests::attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused`.
+It gives **1 FAILED**, and its panic matches both `leased\.db: [^|]*default branch lease` and
+`durable\.db: [^|]*branch durability`. No panic contains "premise": the plain open is refused there
+too, because the lease and durability checks predate F2.
+
+**P18. `e472b108e` as committed.** `branch::` gives **114 passed, 3 FAILED**, and each failure must
+carry its reason:
+- the keeps-frames test: "no other build's opens under another name";
+- the zeroed-hole test: "no condition for a safe restore";
+- the ATTACH test: "ATTACH is an experimental feature". This is the KNOWN WRONG reason (review 9
+  finding 1). It is recorded here, and it is no evidence for F2; P17 carries F2's red.
+
+**P19. The fix commit.** `branch::` gives **117 passed, 0 failed**. The full `cargo test -p
+turso_core --lib` gives **2466 passed, 0 failed, 17 ignored**, the same as BATCH v12, since no test
+is added or removed.
+
+**P20. Fire-check at the fix commit.**
+- There are **113 mutants**: `OTHER_a` is re-anchored to the new wording, and `OTHER_b`, which
+  drops ", {real} included", is new, killed by the keeps-frames test.
+- Killers are matched on the FULL test path as `cargo test` prints it (decision 6). The paths were
+  derived from the source: all 92 distinct killers are placed exactly once, under eight modules,
+  and every module file is declared plainly by its parent.
+- Every named killer passes at baseline (P19).
+
+**P21. Runner self-test, no cargo.** It passes as committed. Each of these plants, in a scratch
+copy, makes it exit non-zero:
+- the earlier p1–p7;
+- p6b, a kill matched by suffix;
+- p8, the exit status computed inline at its call site;
+- p9, the canary check reverted to `verdict == 'SURVIVED'`;
+- matching on the last `::` segment instead of the full path.
+
+The main loop is one function that the self-test drives with canned logs, so these plants are
+exercised where they live (decision 6).
+
+**P22. Step (a)'s reason check, no cargo.** A checker reads a cargo log against a pre-registered
+spec. It requires:
+- exactly the named tests to fail, and the stated number to pass;
+- every failing test's own output section to match each of its reason patterns.
+
+Its self-test passes as committed. It exits non-zero on each plant: a wrong reason, a missing
+failure, an extra failure, a wrong pass count, and a reason found only in ANOTHER test's section.
+
+**Falsifiers for A4:**
+- In P16, any failure other than the keeps-frames test, or that test failing for another reason:
+  the test or the fix is wrong.
+- In P17, a "premise" panic: the ATTACH is not a registry hit at the base, so the test does not
+  exercise the exemption.
+- In P17, only one half refused: the other check does not reach ATTACH at the base.
+- In P19, the ATTACH test red: the F2 fix does not do what `073b088d2` claims.
+
+⚠ A4 changes this file's sha256 again. A3 already makes the verdict script refuse until someone
+re-reads the file and re-pins it.
