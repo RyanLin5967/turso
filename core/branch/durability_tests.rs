@@ -17,6 +17,18 @@ fn durable() -> DatabaseOpts {
     DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: true })
 }
 
+fn open_read_only(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+}
+
 fn open_at(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     Database::open_file_with_flags(
@@ -1251,10 +1263,17 @@ fn a_durable_child_release_climbing_to_a_pending_interior_frees_nothing_of_it() 
     let c1c = c1.connect().unwrap();
     drop(c1); // durable Release; deferred because c1c is open
     let held = in_use(&db);
+    // Review 3 F6: `held` comes from the subject, so pin what it must contain. P's post-fork
+    // pages are what a wrongly retired interior frees (no live child's interval covers them).
+    let p_slots = p.owned_slots();
+    assert!(!p_slots.is_empty(), "the interior owns no page: the climb has nothing to free");
     db.branch_failpoint(Some(BranchFailpoint::LogFlushFails));
     drop(p); // the interior's Release fails: ReleasePending
     drop(c1c); // c1 is freed (durably released), and its close climbs to P
     assert_eq!(in_use(&db), held, "a durable child's climb retired a pending interior");
+    for slot in &p_slots {
+        assert!(!db.branch_slot_is_free(*slot), "slot {slot} of the pending interior was freed");
+    }
     drop(c2);
 }
 
@@ -1466,4 +1485,132 @@ fn a_crash_image_keeps_the_open_time_a_trunk_preimage_commit_stamped() {
         !crashed.branch_ids().contains(&abandoned_id),
         "a trunk commit's pre-image flush carried no stamp, and the abandoned branch survived"
     );
+}
+
+// ---- Review 3 (lane_turso_review3.md @ 387913e) ----
+
+/// Review 3 F3. A branch-log creation that fails after writing its header is this store's own
+/// I/O failure. The retry must report fail-stop — not blame "another store instance" for the
+/// header it wrote itself — and a reopen must recover the created log.
+#[test]
+fn a_failed_log_create_reports_its_own_fail_stop_not_another_store() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        db.branch_failpoint(Some(BranchFailpoint::CreateFailsAfterHeader));
+        assert!(trunk.fork_branch().is_err(), "the failpoint did not fire");
+        let err = match trunk.fork_branch() {
+            Ok(_) => panic!("forked on a store whose log creation failed"),
+            Err(err) => err.to_string(),
+        };
+        assert!(!err.contains("another store"), "blamed another store for its own header: {err}");
+        assert!(err.contains("fail-stopped"), "refused for another reason: {err}");
+    }
+    let db = reopen(&path, incarnation);
+    let trunk = db.connect().unwrap();
+    let b = trunk.fork_branch().expect("a reopen recovers the created log");
+    set(&b.connect().unwrap(), 3, "b");
+    assert_eq!(value(&b.connect().unwrap(), 3), Some("b".to_string()));
+}
+
+/// Review 3, read-only opens. Recovery writes: it cuts a torn tail, discards a temp snapshot, and
+/// reaps expired leases durably. A read-only open must not recover, so it refuses a database with
+/// durable branches — whatever durability it asks for — and leaves every branch file as it was.
+#[test]
+fn a_read_only_open_refuses_durable_branches_and_writes_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // The control: a read-only open of a database without branch files works at all.
+    let plain = dir.path().join("plain.db");
+    {
+        let db = open_at(&plain, DatabaseOpts::new()).unwrap();
+        seed(&db.connect().unwrap(), 5);
+    }
+    {
+        let ro = open_read_only(&plain, DatabaseOpts::new()).expect("read-only opens work");
+        assert_eq!(value(&ro.connect().unwrap(), 3), Some(original(3)));
+    }
+
+    let path = dir.path().join("durable.db");
+    {
+        let db = open_at(&path, durable()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        let b = trunk.fork_branch().unwrap();
+        set(&b.connect().unwrap(), 3, "b");
+        let _ = b.into_id();
+    }
+    let log = std::path::PathBuf::from(format!("{}-branch-log", path.display()));
+    // A torn tail: what a read-write recovery cuts off, and a read-only open must leave alone.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(&[0xAB; 11]).unwrap();
+    }
+    let before = std::fs::read(&log).unwrap();
+    assert!(
+        open_read_only(&path, durable()).is_err(),
+        "a read-only open recovered durable branches"
+    );
+    assert!(
+        open_read_only(&path, DatabaseOpts::new()).is_err(),
+        "a read-only volatile open ignored durable branches"
+    );
+    assert_eq!(std::fs::read(&log).unwrap(), before, "a read-only open wrote the branch log");
+}
+
+/// Review 3, path identity. The registry knows a database by (dev, ino), but the branch files
+/// were named from the path STRING: a volatile open through a symlink found no branch files, was
+/// admitted, and its trunk writes would change what the real path's branches read.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_open_finds_the_real_paths_branch_files() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("real.db");
+    let b_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 20);
+        let b = trunk.fork_branch().unwrap();
+        set(&b.connect().unwrap(), 3, "b");
+        b_id = b.into_id();
+    }
+    let link = dir.path().join("link.db");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(
+        open_at(&link, DatabaseOpts::new()).is_err(),
+        "a volatile open through a symlink ignored the real path's durable branches"
+    );
+    let db = open_at(&link, durable()).unwrap();
+    assert!(db.branch_ids().contains(&b_id), "a durable open through a symlink lost the branches");
+}
+
+/// Review 3 F6. A failed stamp-only flush must not fail the trunk commit that carried it — but
+/// the flush poisoned the journal, so the store is fail-stopped from then on.
+#[test]
+fn a_failed_stamp_flush_keeps_the_trunk_commit_and_fail_stops_the_store() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let b = trunk.fork_branch().unwrap();
+    b.lease(Duration::from_secs(10)).unwrap();
+    set(&trunk, 150, "first"); // the page's pre-image: its barrier takes the pre-image path
+    db.branch_lease_clock_advance(Duration::from_secs(2));
+    db.branch_failpoint(Some(BranchFailpoint::StampFlushFails));
+    // The same page again: nothing to retain, a stamp due — the stamp-only path, and it fails.
+    set(&trunk, 150, "second");
+    assert_eq!(value(&trunk, 150), Some("second".to_string()), "the trunk commit was lost");
+    let bc = b.connect().unwrap();
+    let err = match bc.execute("UPDATE t SET v = 'x' WHERE id = 7") {
+        Ok(()) => panic!("a branch write was accepted after the stamp flush failed"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("no write transaction"), "refused for another reason: {err}");
 }

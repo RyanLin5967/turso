@@ -415,6 +415,16 @@ impl Journal {
     /// the caller found nothing recoverable when it opened, so state here was written since by
     /// another store instance, and starting it over would destroy that store's branches.
     pub(crate) fn create(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
+        Self::create_with(files, page_size, sync, false)
+    }
+
+    /// `create`, with the `CreateFailsAfterHeader` failpoint.
+    pub(crate) fn create_with(
+        files: &BranchFiles,
+        page_size: usize,
+        sync: bool,
+        fail_after_header: bool,
+    ) -> Result<Journal> {
         // Lock before touching anything, so a refused create has truncated nothing.
         let mut file = open_rw(&files.log, false)?;
         lock_exclusive(&file, &files.log)?;
@@ -439,6 +449,11 @@ impl Journal {
             poisoned: false,
         };
         journal.reset_log(0)?;
+        if fail_after_header {
+            return Err(LimboError::InternalError(
+                "failpoint: branch log creation stopped after its header".to_string(),
+            ));
+        }
         if sync {
             fsync_dir_of(&files.log)?;
         }
@@ -993,6 +1008,108 @@ mod tests {
                 Record::Release { branch: 1 }
             ]
         );
+    }
+
+    /// Review 3 F1. `flock` belongs to the open file description, and fork(2) shares it: a forked
+    /// child's copy of a live journal is under the parent's lock. It must refuse to write — or the
+    /// two processes interleave appends under one lock, and a torn frame cuts every later record.
+    #[cfg(unix)]
+    #[test]
+    fn a_forked_child_cannot_write_through_an_inherited_journal() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut arena = Arena::new(512);
+        let mut journal = Journal::create(&files, 512, false).unwrap();
+        journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        journal.flush(&mut arena).unwrap();
+        // Buffered before the fork, so the child only has to flush it.
+        journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+        let keep = journal.file.as_raw_fd();
+        // SAFETY: the child runs only the flush (syscalls and small allocations, which the
+        // platform allocators make fork-safe) and then `_exit`; it never returns into the harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Drop the child's copies of every other descriptor first: another test's journal
+            // lock must not outlive its owner through this child (the F1 wedge, on a neighbour).
+            let max = unsafe { libc::getdtablesize() }.min(1 << 16);
+            for fd in 3..max {
+                if fd != keep {
+                    unsafe { libc::close(fd) };
+                }
+            }
+            let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if journal.flush(&mut arena).is_ok() {
+                    0
+                } else {
+                    1
+                }
+            }))
+            .unwrap_or(2);
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped == pid {
+                break;
+            }
+            assert_eq!(reaped, 0, "waitpid failed");
+            if std::time::Instant::now() > deadline {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                panic!("the forked child did not exit");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(libc::WIFEXITED(status), "the child did not exit normally: status {status}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            1,
+            "a forked child wrote through its parent's journal (0), or panicked (2)"
+        );
+        // The parent is unaffected, and the log holds only what the parent wrote.
+        journal.flush(&mut arena).unwrap();
+        drop(journal);
+        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        assert_eq!(
+            records,
+            vec![
+                Record::Fork { child: 1, parent: 0 },
+                Record::Fork { child: 2, parent: 0 }
+            ]
+        );
+    }
+
+    /// Review 3 F6: the other half of R8's length check. A log another writer SHRANK must not be
+    /// appended to at the stale offset either — that would leave a hole of zeros that stops replay.
+    #[test]
+    fn a_journal_refuses_to_append_after_its_log_shrank_under_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut arena = Arena::new(512);
+        let mut journal = Journal::create(&files, 512, false).unwrap();
+        journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        journal.flush(&mut arena).unwrap();
+        let after_first = std::fs::metadata(&files.log).unwrap().len();
+        journal.buffer(&Record::Release { branch: 1 }).unwrap();
+        journal.flush(&mut arena).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&files.log)
+            .unwrap()
+            .set_len(after_first)
+            .unwrap();
+
+        journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+        assert!(journal.flush(&mut arena).is_err(), "a journal appended past a log that shrank");
+        drop(journal);
+        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        assert_eq!(records, vec![Record::Fork { child: 1, parent: 0 }]);
     }
 
     /// N1. Two journals must never be live on one log at once — not even for the window between a

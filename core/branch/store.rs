@@ -1109,7 +1109,16 @@ impl BranchStore {
                 lease.queued(now);
             }
             if lease.queued_ms > lease.durable_ms {
-                match journal.flush(arena) {
+                let flushed = if *failpoint == Some(BranchFailpoint::StampFlushFails) {
+                    *failpoint = None;
+                    journal.poison();
+                    Err(LimboError::InternalError(
+                        "failpoint: the stamp-only branch log flush failed".to_string(),
+                    ))
+                } else {
+                    journal.flush(arena)
+                };
+                match flushed {
                     Ok(()) => lease.flushed(),
                     Err(e) => {
                         tracing::warn!("branch lease clock not stamped at a trunk commit: {e}")
@@ -1450,7 +1459,11 @@ impl StoreInner {
                 // arena then fails to open, so a retry does not take its own fresh log header for
                 // another store's state.
                 if self.journal.is_none() {
-                    self.journal = Some(Journal::create(files, page_size, self.sync)?);
+                    let fail = self.failpoint == Some(BranchFailpoint::CreateFailsAfterHeader);
+                    if fail {
+                        self.failpoint = None;
+                    }
+                    self.journal = Some(Journal::create_with(files, page_size, self.sync, fail)?);
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
                 // The journal's create synced the directory before the arena file existed.
@@ -1855,6 +1868,31 @@ impl StoreInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 3 F4. A journal kept from a first fork whose ARENA failed to open holds only its
+    /// header, written for that attempt's page size. A retry at another page size must not append
+    /// under the old one: recovery would then open the arena with the wrong page size.
+    #[test]
+    fn a_kept_journal_takes_the_retrys_page_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: false }, None, path).unwrap();
+        let files = BranchFiles::for_db(path);
+        // A directory where the arena file goes: the first attempt's arena open fails.
+        std::fs::create_dir(&files.arena).unwrap();
+        assert!(store.inner.lock().ensure_backing(512).is_err(), "the arena opened over a directory");
+        std::fs::remove_dir(&files.arena).unwrap();
+        store.inner.lock().ensure_backing(1024).unwrap();
+        {
+            let mut inner = store.inner.lock();
+            store.log(&mut inner, Record::Release { branch: 9 }).unwrap();
+        }
+        drop(store);
+        let recovered = Journal::recover(&files, false).unwrap().expect("state");
+        assert_eq!(recovered.page_size, 1024, "the log kept the failed attempt's page size");
+        assert_eq!(recovered.records, vec![Record::Release { branch: 9 }]);
+    }
 
     /// N1, the lazy door. A store that opened when no branch files existed holds no lock until its
     /// first fork creates them. If another store created them in between, that first fork must

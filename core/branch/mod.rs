@@ -180,6 +180,11 @@ pub enum BranchFailpoint {
     /// The next record flush fails as an I/O error would: the record is not durable and the
     /// journal fail-stops (poisoned) from then on.
     LogFlushFails,
+    /// The next creation of the branch log fails after its header is written, before its
+    /// directory is synced — as an fsync failure there would.
+    CreateFailsAfterHeader,
+    /// The next stamp-only flush at a trunk commit's barrier fails as an I/O error would.
+    StampFlushFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
