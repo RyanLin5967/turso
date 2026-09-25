@@ -3774,8 +3774,8 @@ impl Pager {
             #[cfg(test)]
             fw3_test_hook::fire(page_idx);
             let page = Arc::new(Page::new(page_idx));
-            let c = match frame {
-                Some(frame_id) => wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone())?,
+            let issued = match frame {
+                Some(frame_id) => wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone()),
                 None => {
                     page.set_locked();
                     let io_ctx = self.io_ctx.read();
@@ -3784,13 +3784,31 @@ impl Pager {
                         page.clone(),
                         allow_empty_read,
                         &io_ctx,
-                    )?
+                    )
                 }
             };
-            self.io.wait_for_completion(c.clone())?;
+            let read = issued.and_then(|c| self.io.wait_for_completion(c.clone()).map(|()| c));
             walpin::FW3_TRUNK_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let still_trunk = branch.store.sees_trunk(branch.id, page_idx as u32)?;
             let same_generation = wal.fw3_snapshot().map(|s| s.2) == Some(generation);
+            let c = match read {
+                Ok(c) => c,
+                // A restart truncates the log at its next write (and a TRUNCATE checkpoint at
+                // once), and this read holds no mark, so a frame of an older generation can vanish
+                // under it: the read fails instead of returning bytes. The page is then in the
+                // database file; read it again from a fresh snapshot. Any other failure is real.
+                Err(err) => {
+                    #[cfg(test)]
+                    let retry_failed_read = fw3_test_hook::mutant() != 3;
+                    #[cfg(not(test))]
+                    let retry_failed_read = true;
+                    if retry_failed_read && frame.is_some() && !same_generation {
+                        walpin::FW3_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            let still_trunk = branch.store.sees_trunk(branch.id, page_idx as u32)?;
             #[cfg(test)]
             let (still_trunk, same_generation) = fw3_test_hook::mutate(still_trunk, same_generation);
             if still_trunk && same_generation {
@@ -7416,9 +7434,13 @@ pub(crate) mod fw3_test_hook {
             f(page_idx);
         }
     }
-    /// 0: none; 1: the store check always passes; 2: the generation check always passes.
+    /// 0: none; 1: the store check always passes; 2: the generation check always passes; 3: a
+    /// failed frame read is never retried.
     pub(crate) fn set_mutant(m: u8) {
         MUTANT.with(|c| c.set(m));
+    }
+    pub(crate) fn mutant() -> u8 {
+        MUTANT.with(|c| c.get())
     }
     pub(crate) fn mutate(still_trunk: bool, same_generation: bool) -> (bool, bool) {
         match MUTANT.with(|c| c.get()) {

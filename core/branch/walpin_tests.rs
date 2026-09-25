@@ -420,3 +420,45 @@ fn every_trunk_row_survives_checkpoints_under_the_process_switches() {
         walpin::counters()
     );
 }
+
+/// The window, truncation case: the branch finds the leaf in WAL frame 1, and before it reads the
+/// frame a TRUNCATE checkpoint backfills it, restarts the WAL and truncates the file to nothing, so
+/// the read fails for want of bytes (PREREG amendment 6). Returns what the branch read and the
+/// retries it took.
+fn truncation_in_the_window(mutant: u8) -> (Option<String>, u64) {
+    let (_dir, db) = open_db(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    set(&trunk, ROWS, "in-wal-at-fork");
+    let branch = trunk.fork_branch().unwrap();
+    let conn = branch.connect().unwrap();
+    assert_eq!(value(&conn, 1), original(1));
+    let trunk2 = trunk.clone();
+    let db2 = db.clone();
+    fw3_test_hook::set(Box::new(move |_page| {
+        trunk2.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        assert_eq!(db2.walpin_stats().max_frame, 0, "the WAL is empty after TRUNCATE");
+    }));
+    fw3_test_hook::set_mutant(mutant);
+    let before = walpin::counters().fw3_retries;
+    let got = try_value(&conn, ROWS);
+    let retries = walpin::counters().fw3_retries - before;
+    fw3_test_hook::set_mutant(0);
+    (got, retries)
+}
+
+#[test]
+fn fw3_a_wal_truncated_in_the_window_is_retried_not_an_error() {
+    let (got, retries) = truncation_in_the_window(0);
+    assert_eq!(got.as_deref(), Some("in-wal-at-fork"));
+    assert!(retries >= 1, "the failed read was retried");
+}
+
+#[test]
+fn without_the_retry_a_wal_truncated_in_the_window_fails_the_read() {
+    let (got, _) = truncation_in_the_window(3);
+    assert_eq!(
+        got, None,
+        "mutant 3 must fail the read, or this test cannot see the truncation"
+    );
+}
