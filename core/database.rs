@@ -469,6 +469,7 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         (others.log, ours.log, 0, None),
         (others.snap, ours.snap, 0, None),
         (others.arena, ours.arena, 0, None),
+        (others.cat, ours.cat, 0, None),
         // A logical log of at most `LOG_HDR_SIZE` bytes is its header alone and holds no
         // transaction: recovery returns at once for it, the replay boundary lives in the database
         // file (`__turso_internal_mvcc_meta`), and the salt regenerates. A FIRST MVCC bootstrap
@@ -1811,6 +1812,7 @@ impl Database {
                         let durable = matches!(
                             opts.branch_durability,
                             crate::branch::BranchDurability::Durable { .. }
+                                | crate::branch::BranchDurability::Catalog { .. }
                         );
                         let branch_base = match &base {
                             Some(real) => real.clone(),

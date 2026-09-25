@@ -14,7 +14,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 fn durable() -> DatabaseOpts {
-    DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: true })
+    // r11-restart lane: R11_BRANCH_CATALOG=1 runs this whole file against catalog mode.
+    let durability = if std::env::var_os("R11_BRANCH_CATALOG").is_some() {
+        BranchDurability::Catalog { sync: true }
+    } else {
+        BranchDurability::Durable { sync: true }
+    };
+    DatabaseOpts::new().with_branch_durability(durability)
 }
 
 fn open_read_only(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
@@ -927,7 +933,15 @@ fn an_expired_branch_cannot_be_opened_when_connect_is_the_first_operation() {
 /// Nothing a clean close would write is in it.
 fn crash_image(src: &Path, dir: &Path) -> std::path::PathBuf {
     let dst = dir.join("crash-image.db");
-    for suffix in ["", "-wal", "-branch-log", "-branch-arena", "-branch-snap"] {
+    for suffix in [
+        "",
+        "-wal",
+        "-branch-log",
+        "-branch-arena",
+        "-branch-snap",
+        "-branch-cat",
+        "-branch-cat-wal",
+    ] {
         let from = std::path::PathBuf::from(format!("{}{suffix}", src.display()));
         if from.exists() {
             std::fs::copy(&from, format!("{}{suffix}", dst.display())).unwrap();
