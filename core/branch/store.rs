@@ -2881,7 +2881,7 @@ mod sota_tree_tests {
         let mut generation = 0u64;
         let mut kills: HashMap<Kill, u32> = HashMap::new();
         let (mut max_depth, mut lives) = (0, 0);
-        for step in 0..2000 {
+        for step in 0..3000 {
             let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
             // One operation in ten is killed at a failpoint that operation consumes.
             let kill = rng.below(10) == 0;
@@ -3032,13 +3032,6 @@ mod sota_tree_tests {
                 check(&store, "live");
             }
         }
-        for k in KILLS {
-            assert!(
-                kills.get(&k).copied().unwrap_or(0) > 0,
-                "seed {seed:#x}: no kill at {k:?} (kills {kills:?})"
-            );
-        }
-        assert!(max_depth >= 10, "seed {seed:#x}: max depth {max_depth}");
         for n in nodes.iter().filter(|n| n.handle) {
             store.release_handle(n.id).unwrap();
         }
@@ -3048,5 +3041,13 @@ mod sota_tree_tests {
             0,
             "seed {seed:#x}: slots leaked across {lives} recoveries"
         );
+        // The shapes the test exists for must have occurred, or a green run says nothing.
+        for k in KILLS {
+            assert!(
+                kills.get(&k).copied().unwrap_or(0) > 0,
+                "seed {seed:#x}: no kill at {k:?} (kills {kills:?})"
+            );
+        }
+        assert!(max_depth >= 10, "seed {seed:#x}: max depth {max_depth}");
     }
 }
