@@ -253,7 +253,7 @@ pub struct BranchWork {
     /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
     /// index this counted a position scan's comparisons.)
     pub gc_examined: u64,
-    /// `retained_by_born` entries visited by `child_gone`'s range query.
+    /// Index entries (`by_born` and `by_died`) visited by `child_gone`'s garbage query.
     pub gc_range_entries: u64,
 }
 

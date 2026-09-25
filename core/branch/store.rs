@@ -34,7 +34,19 @@
 //! A retained version is garbage once no live child of its node forked inside `[born, died)`.
 //! Removing the child forked at `f` can only make versions containing `f` garbage, and a version
 //! containing `f` becomes garbage exactly when it also lies strictly between `f`'s neighbouring
-//! live siblings — which is a range query over `retained_by_born`, not a scan.
+//! live siblings `lo` and `hi`: `born > lo` and `died <= hi`. The versions are indexed both by
+//! `born` and by `died` — ZFS's deadlists, which key a dead block by the interval that killed it
+//! and split it by birth (round 10's F2, ported from turso `2d2653599`) — so that each side of that
+//! query is a range, not a scan:
+//!
+//! * with no older live sibling (the oldest child, which is whom uniform-TTL lease expiry reaps),
+//!   the garbage is exactly the versions with `died` in `(f, hi]`;
+//! * with no younger one (the newest child), exactly those with `born` in `(lo, f]`;
+//! * with both, each range also holds survivors, and the two are walked in lockstep until the
+//!   shorter one ends (see [`Lineage::garbage`]).
+//!
+//! Both indexes are derived state, rebuilt through [`Lineage::retain`] at replay and at
+//! `load_snapshot`; the log and snapshot formats do not change.
 //!
 //! A released branch with an open connection is kept whole until the connection goes. A released
 //! branch with live children is RETIRED (F4, UNBUILT): it keeps exactly the versions some live
@@ -246,9 +258,15 @@ struct Lineage {
     /// Superseded versions kept because a live child forked while they were current, per page and
     /// ordered by `born` (see "Per-page version order" above).
     retained: HashMap<u32, BTreeMap<u64, Retained>>,
-    /// The same versions keyed by `born`, for the reclamation range query: born -> [(page, died)].
-    retained_by_born: BTreeMap<u64, Vec<(u32, u64)>>,
+    /// The same versions as `(born, page, died)`, for the reclamation range query by birth.
+    by_born: BTreeSet<(u64, u32, u64)>,
+    /// The same versions as `(died, page, born)`, for the reclamation range query by death.
+    by_died: BTreeSet<(u64, u32, u64)>,
 }
+
+/// No page has this number (SQLite's largest is `u32::MAX - 1`; [`Lineage::retain`] refuses it), so
+/// `(e, NO_PAGE, u64::MAX)` sorts after every index entry whose first field is `e`.
+const NO_PAGE: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct Retained {
@@ -398,11 +416,10 @@ impl Lineage {
             "a retained version overlaps an older one of the same page; the born-ordered lookup \
              would return the wrong one"
         );
+        crate::turso_assert!(page != NO_PAGE, "page number u32::MAX is the index sentinel");
         versions.insert(v.born, v);
-        self.retained_by_born
-            .entry(v.born)
-            .or_default()
-            .push((page, v.died));
+        self.by_born.insert((v.born, page, v.died));
+        self.by_died.insert((v.died, page, v.born));
     }
 
     /// The retained version of `page` visible to a child forked at `f`: the born-predecessor of
@@ -420,38 +437,91 @@ impl Lineage {
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
-        // A version containing f is garbage iff its range [born, died) now holds no live child:
-        // born > lo (nothing live below) and died <= hi (nothing live above).
-        let from = match lo {
-            Some(lo) => Bound::Excluded(lo),
-            None => Bound::Unbounded,
-        };
-        let mut dead = Vec::new();
-        for (&born, entries) in self.retained_by_born.range((from, Bound::Included(f))) {
-            work.gc_range_entries += entries.len() as u64;
-            for &(page, died) in entries {
-                if died > f && hi.is_none_or(|hi| died <= hi) {
-                    dead.push((born, page));
-                }
-            }
-        }
-        for &(born, page) in &dead {
+        for (born, page, died) in self.garbage(f, lo, hi, work) {
             let versions = self.retained.get_mut(&page).expect("indexed version is listed");
             let v = versions.remove(&born).expect("indexed version is listed");
             work.gc_examined += 1;
             if versions.is_empty() {
                 self.retained.remove(&page);
             }
-            let by_born = self
-                .retained_by_born
-                .get_mut(&born)
-                .expect("listed version is indexed");
-            by_born.retain(|&(p, _)| p != page);
-            if by_born.is_empty() {
-                self.retained_by_born.remove(&born);
-            }
+            let indexed = self.by_born.remove(&(born, page, died))
+                && self.by_died.remove(&(died, page, born));
+            crate::turso_assert!(indexed, "a released version was missing from an index");
             freed.push(v.slot);
         }
+    }
+
+    /// The versions that held `f` and no other live child, as `(born, page, died)`, once `f` has
+    /// left `children`; `lo` and `hi` are its former neighbours there.
+    ///
+    /// Every retained version holds at least one live child's fork epoch: it is retained only if
+    /// one forked inside it, and this function hands it back the moment the last one goes. So a
+    /// version with `born > lo` and `died <= hi` held `f` and nothing else, and one holding `f`
+    /// that reaches back to `lo` or on to `hi` is still needed. That makes the garbage
+    /// `{born > lo, died <= hi}`, and each index answers one side of it:
+    ///
+    /// * `lo` absent: `died` in `(f, hi]`. Every such version was born at or before `f` (it holds
+    ///   a live child, and there is none below `f`), so every entry the range yields is garbage.
+    ///   This is the oldest child — the victim of uniform-TTL expiry — and the cost is what it frees.
+    /// * `hi` absent: `born` in `(lo, f]`, every entry garbage by the same argument.
+    /// * both: garbage lies in both ranges, and each also yields survivors (versions reaching past
+    ///   `hi`, or back past `lo`). The ranges are walked in lockstep and the first to end is
+    ///   filtered, so the walk costs twice the SMALLER range, never the larger.
+    ///
+    /// `gc_range_entries` counts every entry either range yields.
+    fn garbage(
+        &self,
+        f: u64,
+        lo: Option<u64>,
+        hi: Option<u64>,
+        work: &mut BranchWork,
+    ) -> Vec<(u64, u32, u64)> {
+        // `born` in (lo, f] and `died` in (f, hi], as bounds on the two indexes' first field.
+        let after = |e: u64| (e, NO_PAGE, u64::MAX);
+        let born_from = lo.map_or(Bound::Unbounded, |lo| Bound::Excluded(after(lo)));
+        let born_to = Bound::Included(after(f));
+        let died_from = Bound::Excluded(after(f));
+        let died_to = hi.map_or(Bound::Unbounded, |hi| Bound::Included(after(hi)));
+        let only_f = |born: u64, died: u64| {
+            lo.is_none_or(|lo| born > lo)
+                && born <= f
+                && f < died
+                && hi.is_none_or(|hi| died <= hi)
+        };
+        let mut by_born = self.by_born.range((born_from, born_to));
+        let mut by_died = self
+            .by_died
+            .range((died_from, died_to))
+            .map(|&(died, page, born)| (born, page, died));
+        let mut seen: [Vec<(u64, u32, u64)>; 2] = Default::default();
+        // Which ranges to walk: the one side's own range when a neighbour is missing, else both.
+        let walk = match (lo, hi) {
+            (None, _) => [false, true],
+            (Some(_), None) => [true, false],
+            (Some(_), Some(_)) => [true, true],
+        };
+        let finished = 'walk: loop {
+            for side in 0..2 {
+                if !walk[side] {
+                    continue;
+                }
+                let next = if side == 0 {
+                    by_born.next().copied()
+                } else {
+                    by_died.next()
+                };
+                match next {
+                    Some(v) => {
+                        work.gc_range_entries += 1;
+                        seen[side].push(v);
+                    }
+                    None => break 'walk side,
+                }
+            }
+        };
+        let mut dead = std::mem::take(&mut seen[finished]);
+        dead.retain(|&(born, _, died)| only_f(born, died));
+        dead
     }
 
     fn release_all(self, freed: &mut Vec<Slot>) {
@@ -2284,6 +2354,206 @@ mod sota_helpers {
     }
 }
 
+#[cfg(test)]
+impl Lineage {
+    /// The per-page maps and both indexes hold exactly the same versions.
+    fn check_indexes(&self, what: &str) {
+        let mut from_maps = BTreeSet::new();
+        for (&page, versions) in &self.retained {
+            for (&born, v) in versions {
+                assert_eq!(born, v.born, "{what}: page {page} keyed under the wrong born");
+                from_maps.insert((v.born, page, v.died));
+            }
+        }
+        assert_eq!(from_maps, self.by_born, "{what}: by_born disagrees with the per-page maps");
+        let died: BTreeSet<(u64, u32, u64)> =
+            self.by_died.iter().map(|&(died, page, born)| (born, page, died)).collect();
+        assert_eq!(from_maps, died, "{what}: by_died disagrees with the per-page maps");
+    }
+}
+
+#[cfg(test)]
+impl BranchStore {
+    /// Every lineage's retained versions agree across the per-page maps and both indexes.
+    fn check_indexes(&self) {
+        let inner = self.inner.lock();
+        inner.trunk.lineage.check_indexes("trunk");
+        for (id, st) in &inner.branches {
+            st.lineage.check_indexes(&format!("branch {}", id.0));
+        }
+    }
+}
+
+/// Round 10's F1/F2 tests (turso `2d2653599`, `a3d79b98d`), ported to the durable store: the
+/// store's own entry points against a brute-force model, and the garbage query's cost contract.
+/// Each runs volatile and durable (no sync; the barrier flushes each trunk write's records as a
+/// trunk commit would), and the durable run opens a CRASH IMAGE — every branch file copied while
+/// the store is open, no clean close — at random points and checks that recovery rebuilt the same
+/// retained versions and indexes.
+#[cfg(test)]
+mod sota_index_tests {
+    use super::sota_helpers::{crash_image, image, open_store, Rng, PAGE};
+    use super::*;
+    use std::collections::HashSet;
+
+    const PAGES: u32 = 6;
+
+    /// The trunk's retained-version index against a brute-force model, through the store's own
+    /// entry points, and the garbage query's cost against its contract: a reap with no older live
+    /// sibling, or no younger one, visits exactly the versions it frees, and one with both visits
+    /// 2·|B| index entries if |B| <= |D| and 2·|D| + 1 otherwise.
+    #[test]
+    fn retained_versions_match_a_model_under_forks_rewrites_and_reaps_in_every_order() {
+        for durable in [false, true] {
+            for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+                run(seed, durable);
+            }
+        }
+    }
+
+    fn run(seed: u64, durable: bool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = open_store(durable, dir.path(), "db");
+        let mut rng = Rng(seed);
+        let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut live: Vec<(BranchId, u64, HashMap<u32, u64>)> = Vec::new();
+        let mut history: Vec<(u32, u64, u64)> = Vec::new();
+        let mut written: HashMap<u32, u64> = HashMap::new();
+        let mut epoch = 0u64;
+        let mut generation = 0u64;
+        let (mut freed_oldest, mut freed_newest, mut freed_middle, mut images) = (0, 0, 0, 0);
+        for step in 0..1500 {
+            match rng.below(10) {
+                0..=2 if live.len() < 40 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    live.push((id, epoch, current.clone()));
+                    epoch += 1;
+                }
+                0..=5 => {
+                    for _ in 0..=rng.below(3) {
+                        let page = rng.below(PAGES as u64) as u32;
+                        if store.trunk_has_children() {
+                            let born = written.get(&page).copied().unwrap_or(0);
+                            if born < epoch {
+                                if live.iter().any(|&(_, f, _)| born <= f && f < epoch) {
+                                    history.push((page, born, epoch));
+                                }
+                                written.insert(page, epoch);
+                            }
+                            store.first_write_trunk(page, &image(current[&page])).unwrap();
+                        }
+                        generation += 1;
+                        current.insert(page, generation);
+                    }
+                    // The trunk commit: its barrier makes the buffered pre-image records durable.
+                    store.durability_barrier().unwrap();
+                }
+                _ if !live.is_empty() => {
+                    let at = match rng.below(3) {
+                        0 => 0,
+                        1 => live.len() - 1,
+                        _ => rng.below(live.len() as u64) as usize,
+                    };
+                    let lo = at.checked_sub(1).map(|i| live[i].1);
+                    let hi = live.get(at + 1).map(|c| c.1);
+                    let (id, f, _) = live.remove(at);
+                    let b = history
+                        .iter()
+                        .filter(|&&(_, born, _)| lo.is_none_or(|lo| born > lo) && born <= f)
+                        .count() as u64;
+                    let d = history
+                        .iter()
+                        .filter(|&&(_, _, died)| f < died && hi.is_none_or(|hi| died <= hi))
+                        .count() as u64;
+                    let before = store.stats().unwrap();
+                    let reaped = store.release_handle(id).unwrap();
+                    let after = store.stats().unwrap();
+                    assert!(!reaped.deferred, "seed {seed:#x} step {step}");
+                    assert_eq!(
+                        before.arena_slots_in_use - after.arena_slots_in_use,
+                        reaped.freed_pages,
+                        "seed {seed:#x} step {step}: the reap's report disagrees with the arena"
+                    );
+                    let visited = after.work.gc_range_entries - before.work.gc_range_entries;
+                    let contract = match (lo, hi) {
+                        (None, _) | (_, None) => reaped.freed_pages as u64,
+                        _ if b <= d => 2 * b,
+                        _ => 2 * d + 1,
+                    };
+                    assert_eq!(
+                        visited, contract,
+                        "seed {seed:#x} step {step}: reaping the child forked at {f} (lo {lo:?}, \
+                         hi {hi:?}, |B| {b}, |D| {d}) visited {visited} index entries"
+                    );
+                    if reaped.freed_pages > 0 {
+                        match at {
+                            0 => freed_oldest += 1,
+                            _ if at == live.len() => freed_newest += 1,
+                            _ => freed_middle += 1,
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let alive: HashSet<(u32, u64, u64)> = history
+                .iter()
+                .copied()
+                .filter(|&(_, born, died)| live.iter().any(|&(_, f, _)| born <= f && f < died))
+                .collect();
+            assert_eq!(
+                store.stats().unwrap().arena_slots_in_use,
+                alive.len(),
+                "seed {seed:#x} step {step}: the arena holds a version no live child can see, or \
+                 lost one a live child can"
+            );
+            history.retain(|v| alive.contains(v));
+            store.check_indexes();
+            let check = |s: &BranchStore, what: &str| {
+                let mut buf = vec![0u8; PAGE];
+                for (id, f, view) in &live {
+                    for page in 0..PAGES {
+                        let in_arena = s.resolve_into(*id, page, &mut buf).unwrap();
+                        let got = if in_arena {
+                            u64::from_le_bytes(buf[..8].try_into().unwrap())
+                        } else {
+                            current[&page]
+                        };
+                        assert_eq!(
+                            got, view[&page],
+                            "seed {seed:#x} step {step} {what}: child forked at {f} read the \
+                             wrong page {page}"
+                        );
+                    }
+                }
+            };
+            check(&store, "live");
+            if durable && rng.below(25) == 0 {
+                if rng.below(3) == 0 {
+                    store.compact_now().unwrap();
+                }
+                let recovered = crash_image(dir.path(), "db", "image");
+                images += 1;
+                recovered.check_indexes();
+                assert_eq!(
+                    recovered.slots_in_use(),
+                    store.slots_in_use(),
+                    "seed {seed:#x} step {step}: recovery changed the live slot set"
+                );
+                check(&recovered, "after recovery");
+            }
+        }
+        assert!(
+            freed_oldest > 0 && freed_newest > 0 && freed_middle > 0 && (!durable || images > 10),
+            "seed {seed:#x}: reaps that freed versions: oldest {freed_oldest}, newest \
+             {freed_newest}, middle {freed_middle}; crash images {images}"
+        );
+        for (id, _, _) in live {
+            store.release_handle(id).unwrap();
+        }
+        assert_eq!(store.stats().unwrap().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
+    }
+}
+
 /// Round 10's F4 tree test (turso `a31198dd8`), ported to the durable store and run volatile and
 /// durable: branch TREES — forks from the trunk and from branches, deep chains, trunk writes and
 /// branch commits before and after forking, deferred reaps — against a model in which each branch is
@@ -2431,6 +2701,7 @@ mod sota_tree_tests {
                 }
                 let recovered = crash_image(dir.path(), "db", "image");
                 images += 1;
+                recovered.check_indexes();
                 assert_eq!(
                     recovered.slots_in_use(),
                     store.slots_in_use(),
