@@ -403,6 +403,8 @@ mod tests {
                 enable_without_rowid: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
+                branch_durability: crate::branch::BranchDurability::Volatile,
+                branch_lease: None,
             },
             None,
             Arc::new(SqliteDialect),

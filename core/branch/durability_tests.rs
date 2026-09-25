@@ -485,7 +485,7 @@ fn a_random_workload_survives_repeated_reopens() {
         let live: Vec<usize> = (0..models.len()).filter(|&i| models[i].is_some()).collect();
         let who = live[rng.below(live.len() as u64) as usize];
         let op = rng.below(100);
-        let conn = if who == 0 {
+        let mut conn = if who == 0 {
             trunk.clone()
         } else {
             handles[who].as_ref().unwrap().connect().unwrap()
@@ -495,7 +495,10 @@ fn a_random_workload_survives_repeated_reopens() {
             models.push(models[who].clone());
             handles.push(Some(child));
         } else if op < 20 && who != 0 {
-            drop(conn);
+            // Close the branch's connection before its handle goes. (It was `drop(conn)`, which
+            // the final check below cannot compile against; that check is skipped for a released
+            // node, so the trunk connection standing in for it is never read.)
+            drop(std::mem::replace(&mut conn, trunk.clone()));
             handles[who] = None;
             models[who] = None;
         } else if op < 23 && who == 0 {
