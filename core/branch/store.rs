@@ -114,8 +114,11 @@
 //!   freed is skipped. (Abandoning long walks instead, and leaving their garbage to the horizon,
 //!   kept up to a third more versions at 10^5 branches: r11-space PREREG A4.)
 //!
-//! So a store call does at most `2 * gc_budget` reclamation steps, and every task completes. With no
-//! budget (the tests' eager mode) every reap frees its garbage at once, as before.
+//! So a store call visits at most `2 * gc_budget` index entries and releases at most `gc_budget`
+//! pending images, and every task completes — except the reap of the trunk's LAST child, which
+//! releases everything at once (nothing can be read any more) and forgets the per-page epochs
+//! (`written`, `chunk_born`), whose absence is their conservative value. With no budget (the tests'
+//! eager mode) every reap frees its garbage at once, as before.
 //!
 //! A branch whose handle has been dropped but that still has a live child or an open connection
 //! is kept (its versions are still read through); it is freed the moment the last of those goes,
@@ -1193,6 +1196,12 @@ impl BranchStore {
                         }
                     }
                 };
+                if trunk.lineage.children.is_empty() {
+                    // No child left: every version is gone, and so is any reason to remember when
+                    // a page or a chunk last changed (an absent epoch is the conservative 0).
+                    trunk.written.clear();
+                    trunk.chunk_born.clear();
+                }
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
                 return (freed, freed_chunks);
             }
