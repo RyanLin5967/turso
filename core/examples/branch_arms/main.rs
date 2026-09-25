@@ -12,6 +12,8 @@
 //!   churn_spread churn, plus the trunk rewrites the `spread` walk's next row in every cycle (amendment 3)
 //!   pages      every branch writes w pages in one transaction; x axis = N, one block per w
 //!   spread_trunk the `spread` arm's trunk writes with NO branches (amendment 2); x = trunk writes
+//!   grow       the base curve's growth (fork + open + one-row write per branch) with EVERY fork timed,
+//!              to see one-off stalls that checkpoint sampling cannot (amendment 7)
 //!
 //! `--no-autocheckpoint` disables the trunk connection's WAL auto-actions (auto-checkpoint and WAL
 //! restart), amendment 2. Every state line prints the WAL file's size.
@@ -57,6 +59,7 @@ enum Arm {
     ChurnSpread,
     Pages,
     SpreadTrunk,
+    Grow,
 }
 
 /// Which live branch a churn cycle reaps.
@@ -113,6 +116,7 @@ fn parse_args() -> Args {
                     "churn_spread" => Arm::ChurnSpread,
                     "pages" => Arm::Pages,
                     "spread_trunk" => Arm::SpreadTrunk,
+                    "grow" => Arm::Grow,
                     other => die(&format!("unknown arm {other}")),
                 })
             }
@@ -547,6 +551,7 @@ fn main() {
         Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread => arm_churn(&mut bench, &args),
         Arm::Pages => arm_pages(&mut bench, &args),
         Arm::SpreadTrunk => arm_spread_trunk(&mut bench, &args),
+        Arm::Grow => arm_grow(&mut bench, &args),
     }
     let end = db.branch_stats();
     if end.live_branches != 0 || end.arena_slots_in_use != 0 {
@@ -1195,4 +1200,64 @@ fn arm_spread_trunk(b: &mut Bench, args: &Args) {
         b.print_state(n, "");
     }
     b.print_slopes(&args.checkpoints, &["trunk_write"]);
+}
+
+/// Amendment 7: the base curve's growth — each branch forked from the trunk, opened, and given one
+/// row — with EVERY fork timed, not K samples at a checkpoint. A stall that one fork in ~2^k pays
+/// (the store's branch table doubling under its mutex) is invisible to p50 and to K samples taken
+/// between doublings; here each window (previous checkpoint, this one] reports its forks' p50, p99
+/// and max, and every fork at or above `STALL_US` is listed with the branch count it forked at.
+fn arm_grow(b: &mut Bench, args: &Args) {
+    const STALL_US: f64 = 100.0;
+    println!("{HEADER}");
+    let mut live: Vec<Live> = Vec::new();
+    let mut stalls: Vec<(usize, f64)> = Vec::new();
+    for &n in &args.checkpoints {
+        let mut fork = Op::default();
+        let (mut max_us, mut max_at) = (0.0f64, 0usize);
+        while live.len() < n {
+            let at = live.len();
+            let row = row_for(at);
+            let branch = b.timed(&mut fork, || b.trunk.fork_branch().unwrap());
+            let us = fork.samples.last().expect("just timed").as_secs_f64() * 1e6;
+            if us > max_us {
+                (max_us, max_at) = (us, at);
+            }
+            if us >= STALL_US {
+                stalls.push((at, us));
+            }
+            let conn = branch.connect().unwrap();
+            update(&conn, row);
+            drop(conn);
+            live.push(Live {
+                branch,
+                rows: vec![row],
+                trunk_writes_at_fork: 0,
+            });
+        }
+        let s = b.db.branch_stats();
+        if s.live_branches != n || s.arena_slots_in_use != n {
+            not_a_result(&format!("expected {n} branches and {n} arena pages: {s:?}"));
+        }
+        let probe = &live[b.rng.below(live.len())];
+        let conn = probe.branch.connect().unwrap();
+        if read_v(&conn, probe.rows[0]) != branch_value(probe.rows[0]) {
+            not_a_result("a grown branch did not read its own write");
+        }
+        drop(conn);
+        b.print_op(n, "grow_fork", &fork);
+        b.print_state(
+            n,
+            &format!(
+                "window_forks={} window_max_us={max_us:.1} window_max_at_n={max_at}",
+                fork.samples.len()
+            ),
+        );
+    }
+    b.print_slopes(&args.checkpoints, &["grow_fork"]);
+    println!("# stalls >= {STALL_US} us: {} forks", stalls.len());
+    for (at, us) in &stalls {
+        println!("# stall\tn={at}\tus={us:.1}");
+    }
+    drop(live);
 }

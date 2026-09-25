@@ -512,3 +512,35 @@ changes only how the one level is looked up. Counters equal the before file's ex
 control). Amendment 4's OFF runs attribute F1+F2 like-for-like against the curve lane's OFF before files.
 
 **Erratum (appended 2026-09-25T03:09:41Z):** amendment 6 was committed at 2026-09-25T03:09:34Z (`2f2a2934d`); its header's "03:15Z" was typed, not read from the clock.
+
+### Amendment 7 — written 2026-09-25T05:12Z: every fork timed during growth (the branch table's rehash), before any run of it
+
+**Why.** Every arm times K samples at a checkpoint, so a stall that one fork in ~2^k pays is invisible to p50 and to
+the samples. One such stall is in the source (R, `core/branch/store.rs` at `0f4232957`): `StoreInner.branches` is a
+`std::collections::HashMap<BranchId, BranchState>` that grows by doubling. hashbrown's capacity at 2^k buckets is
+7/8·2^k [RECALLED: `bucket_mask_to_capacity`]. The insert that finds it full reallocates and moves every entry, which is
+O(N) work under the store's one mutex that every branch operation takes. `BranchState` is ~250 B inline (I, from its
+fields), so at N = 917,504 the move copies ~230 MB into a fresh ~512 MB table. None of the four fixes touches this
+table.
+
+**Arm.** `branch_arms --arm grow` (this commit). It does the base curve's growth: a fork from the trunk, an open, and a
+one-row write per branch. EVERY fork is timed. Each window (previous checkpoint, this one] prints its forks' p50, p90, p99
+and max, the branch count at the max, and a state line. Every fork ≥ 100 µs is listed as `# stall n=<branches before
+the fork> us=<µs>`. A random grown branch is read back and checked.
+
+**Runs** (timed, lockrun, timeout 3600): `grow_fin` = `--arm grow --checkpoints 100,1000,10000,100000,1000000` on the
+final store with this harness. `grow_base` = the same on the unfixed store (751f85d56's `core/branch/` under this
+harness, a plumbing commit like `105efa150`). Both binaries are built UNLOCKED at background QoS, which is the lead's
+rule for untimed steps while D195 holds the fleet lock.
+
+**Predictions.**
+- `grow_fork` p50 |slope| < 0.10 over the windows. This is control's `fork`: 0.33–0.54 µs, `turso_curve/raw/control.txt`.
+- Each hashbrown threshold 7/8·2^k from 14,336 to 917,504 appears in the stall list at n = threshold exactly. Those are
+  14336, 28672, 57344, 114688, 229376, 458752 and 917504. The stall time at the thresholds grows about linearly: the
+  log-log slope over the 7 thresholds is in [0.6, 1.3]. The window max for windows ≥ 10^5 sits at a threshold, and the
+  10^6 window's max is in [5, 500] ms.
+- `grow_base` shows the same thresholds. Its stall at 917,504 is within 2× of `grow_fin`'s, since F4 adds `trunk_at`,
+  `inherited` and `view` to `BranchState`, about 40 B more to move.
+- This is a max-latency term ∝ N, and its standard fix is incremental resizing [RECALLED: Litwin's linear hashing,
+  1980; Redis's incremental rehash; `griddle` for hashbrown]. It is reported as a residual. It is not built here, because
+  the brief's fixes are F1–F4.
