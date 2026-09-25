@@ -57,6 +57,8 @@ pub(crate) mod page_map;
 pub(crate) mod store;
 pub mod walpin;
 
+use std::cell::Cell;
+
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};
 use crate::storage::wal::WalAutoActions;
@@ -142,6 +144,67 @@ pub fn check_branchable(mvcc_enabled: bool) -> Result<()> {
         return Err(Unbranchable::MvccJournalMode.into());
     }
     Ok(())
+}
+
+thread_local! {
+    static SESSION_PROBE: Cell<Option<fn(&'static str)>> = const { Cell::new(None) };
+}
+
+/// Install (or remove) a probe that the connect path calls at each of its step boundaries, on this
+/// thread only. Observation only: the open-session harness reads its allocator between labels to
+/// split a connection's bytes by component. Unset, each call site costs one thread-local read.
+#[doc(hidden)]
+pub fn set_session_probe(probe: Option<fn(&'static str)>) {
+    SESSION_PROBE.with(|p| p.set(probe));
+}
+
+pub(crate) fn session_probe(label: &'static str) {
+    SESSION_PROBE.with(|p| {
+        if let Some(f) = p.get() {
+            f(label)
+        }
+    });
+}
+
+/// What one open connection holds, as integers, for the open-session harness.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionFootprint {
+    /// Pages in the connection's private page cache.
+    pub cached_pages: usize,
+    /// The connection's pager holds a WAL read lock (a read transaction is open).
+    pub holds_read_lock: bool,
+    /// On a branch: the connection's schema is the very `Arc` the branch store holds, not a copy.
+    pub schema_shared_with_store: bool,
+    /// Entries in the connection's own symbol table, by kind.
+    pub sym_functions: usize,
+    pub sym_collations: usize,
+    pub sym_vtabs: usize,
+    pub sym_vtab_modules: usize,
+    pub sym_index_methods: usize,
+}
+
+/// `size_of` of the per-connection structures, for attributing the connect path's bytes.
+#[doc(hidden)]
+pub fn session_type_sizes() -> Vec<(&'static str, usize)> {
+    vec![
+        ("Connection", std::mem::size_of::<Connection>()),
+        ("Pager", std::mem::size_of::<Pager>()),
+        (
+            "WalFile",
+            std::mem::size_of::<crate::storage::wal::WalFile>(),
+        ),
+        (
+            "PageCache",
+            std::mem::size_of::<crate::storage::page_cache::PageCache>(),
+        ),
+        ("SymbolTable", std::mem::size_of::<crate::SymbolTable>()),
+        ("Schema", std::mem::size_of::<crate::schema::Schema>()),
+        (
+            "Page",
+            std::mem::size_of::<crate::storage::pager::Page>(),
+        ),
+    ]
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -353,6 +416,30 @@ impl Connection {
     pub fn branch_id(&self) -> Option<BranchId> {
         self.pager.load().branch_id()
     }
+
+    /// What this connection holds, as integers. Observation only.
+    #[doc(hidden)]
+    pub fn session_footprint(&self) -> SessionFootprint {
+        let pager = self.pager.load();
+        let schema = self.schema.read().clone();
+        let schema_shared_with_store = pager.branch_id().is_some_and(|id| {
+            self.db
+                .branches
+                .schema(id)
+                .is_ok_and(|stored| Arc::ptr_eq(&stored, &schema))
+        });
+        let syms = self.syms.read();
+        SessionFootprint {
+            cached_pages: pager.page_cache_len(),
+            holds_read_lock: pager.holds_read_lock(),
+            schema_shared_with_store,
+            sym_functions: syms.functions.len(),
+            sym_collations: syms.collations.len(),
+            sym_vtabs: syms.vtabs.len(),
+            sym_vtab_modules: syms.vtab_modules.len(),
+            sym_index_methods: syms.index_methods.len(),
+        }
+    }
 }
 
 impl Database {
@@ -408,16 +495,20 @@ impl Database {
     /// Open a connection on branch `id`: an ordinary connection whose pager is bound to the branch
     /// and whose schema is the branch's own.
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
+        session_probe("begin");
         let schema = self.branches.open(id)?;
         // Built before anything fallible below, so an error there still closes the branch.
         let binding = BranchBinding {
             store: self.branches.clone(),
             id,
         };
+        session_probe("store_open");
         let pager = self._init(None, None)?;
+        session_probe("init_pager");
         // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may
         // survive into the branch's view.
         pager.clear_page_cache(false);
+        session_probe("clear_trunk_page1");
         pager.set_schema_cookie(None);
         pager.bind_branch(binding)?;
         let pager = Arc::new(pager);
@@ -426,6 +517,7 @@ impl Database {
             .block(|| pager.with_header(|header| header.default_page_cache_size))
             .unwrap_or_default()
             .get();
+        session_probe("bind_read_page1");
         self._connect_with_pager_and_default_cache_size(
             false,
             pager,
