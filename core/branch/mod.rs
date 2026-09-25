@@ -223,6 +223,57 @@ pub struct Reaped {
     pub deferred: bool,
 }
 
+/// What the last open of the branch store read and rebuilt (r11-restart lane). An observing
+/// instrument only: nothing reads it back. Each phase time is paired with the integer that phase
+/// is proportional to, so the phase table closes against `total_ns`.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchOpenStats {
+    /// Bytes of `<db>-branch-snap` read (0 when absent).
+    pub snap_bytes: u64,
+    /// Bytes of `<db>-branch-log` read.
+    pub log_bytes: u64,
+    /// Log records decoded and replayed.
+    pub records: u64,
+    /// Branches decoded from the snapshot.
+    pub snap_branches: u64,
+    /// Branch states in memory after replay and collection.
+    pub branches: u64,
+    /// `current` entries materialised, over every branch.
+    pub current_entries: u64,
+    /// Retained versions materialised in branch lineages.
+    pub retained_entries: u64,
+    /// Retained versions materialised in the trunk's lineage.
+    pub trunk_retained: u64,
+    /// Live children of the trunk.
+    pub trunk_children: u64,
+    /// Page-map inserts made by `derive_page_maps` after a snapshot load (sota-durable lane; the
+    /// page maps are derived at open, and this is that derivation's work). Timed inside `load_ns`.
+    pub derived_map_inserts: u64,
+    /// Slots named by the recovered state (the reachability sweep's input).
+    pub referenced_slots: u64,
+    /// The arena file's high-water mark in slots (the sweep's range).
+    pub arena_high_water: u64,
+    /// Slots the sweep put on the free list.
+    pub arena_free: u64,
+    /// `Journal::recover`: read and decode both files (snap_bytes + log_bytes).
+    pub recover_ns: u64,
+    /// `load_snapshot` (snap_branches).
+    pub load_ns: u64,
+    /// Replay (records).
+    pub replay_ns: u64,
+    /// `collect_released` (branches scanned).
+    pub collect_ns: u64,
+    /// `referenced_slots` (referenced_slots).
+    pub referenced_ns: u64,
+    /// `Arena::open_file` (arena_high_water).
+    pub arena_ns: u64,
+    /// The expiry pass at open.
+    pub expire_ns: u64,
+    /// The whole `BranchStore::open`.
+    pub total_ns: u64,
+}
+
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
@@ -441,6 +492,18 @@ impl Database {
     /// Refused on a read-only handle of a database with branches, whose branch store is not open.
     pub fn branch_stats(&self) -> Result<BranchStats> {
         self.branches.stats()
+    }
+
+    /// What the branch store's open read and rebuilt (r11-restart lane instrument).
+    #[doc(hidden)]
+    pub fn branch_open_stats(&self) -> BranchOpenStats {
+        self.branches.open_stats()
+    }
+
+    /// `(resolve calls, arena slot reads)` since open (r11-restart lane instrument).
+    #[doc(hidden)]
+    pub fn branch_read_counters(&self) -> (u64, u64) {
+        self.branches.read_counters()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.
