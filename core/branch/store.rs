@@ -282,6 +282,30 @@ enum Stamp {
     Flush,
 }
 
+/// Observation only (r11-churn instrument; nothing reads them): what expiry passes that found
+/// something due did, and what compactions cost. Process-wide; updated under the store mutex.
+pub(crate) mod churn_counters {
+    use std::sync::atomic::AtomicU64;
+    pub(crate) static EXPIRE_PASSES_WITH_DUE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_REAPED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_FREED_PAGES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_FSYNCS: AtomicU64 = AtomicU64::new(0);
+    /// Passes whose records rode on a fork's own flush (r11-churn amendment 2's fix).
+    pub(crate) static EXPIRE_PIGGYBACKED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_NS_MAX: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_FSYNCS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+}
+
+/// An expiry pass planned but not yet durable (see `BranchStore::expire_plan`).
+struct ExpirePlan {
+    due: Vec<BranchId>,
+    records: Vec<Record>,
+    now: u64,
+}
+
 /// The finest grain at which expiry passes queue a clock stamp.
 const STAMP_EVERY_MS: u64 = 1000;
 
@@ -696,11 +720,35 @@ impl BranchStore {
     /// child keeps exactly the versions that child can read. The Release records are made durable
     /// together, before anything is freed.
     fn expire(&self, inner: &mut StoreInner, stamp: Stamp) -> Result<(Expired, u64)> {
+        let plan = self.expire_plan(inner, stamp)?;
+        let now = plan.now;
+        if plan.due.is_empty() {
+            return Ok((Expired::default(), now));
+        }
+        let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
+        self.log_all(inner, plan.records.clone())?;
+        let fsyncs = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0;
+        let expired = self.expire_apply(inner, plan, fsyncs);
+        self.maybe_compact(inner);
+        Ok((expired, now))
+    }
+
+    /// The first half of an expiry pass: what is due, and the records that release it (deepest
+    /// first, then a clock stamp), WITHOUT flushing them. A caller that flushes anyway puts them in
+    /// its own flush ahead of its own records (group commit, r11-churn amendment 2), and applies the
+    /// plan only after that flush, so rule 2 holds: nothing is freed before its Release is durable.
+    /// With nothing due, the stamp is handled here exactly as the pass always did.
+    fn expire_plan(&self, inner: &mut StoreInner, stamp: Stamp) -> Result<ExpirePlan> {
         let now = inner.lease.now_ms();
+        let empty = ExpirePlan {
+            due: Vec::new(),
+            records: Vec::new(),
+            now,
+        };
         // A fail-stopped store cannot make a Release durable, so it reaps nothing (and frees
         // nothing); reads stay available and the next open recovers from disk.
         if inner.poisoned() {
-            return Ok((Expired::default(), now));
+            return Ok(empty);
         }
         let mut due: Vec<BranchId> = inner
             .leases
@@ -729,7 +777,7 @@ impl BranchStore {
                     }
                 }
             }
-            return Ok((Expired::default(), now));
+            return Ok(empty);
         }
         due.sort_by_key(|&id| (std::cmp::Reverse(inner.depth(id)), id));
         let mut records: Vec<Record> = due
@@ -738,23 +786,41 @@ impl BranchStore {
             .collect();
         records.push(Record::Clock { now_ms: now });
         inner.lease.queued(now);
-        self.log_all(inner, records)?;
+        Ok(ExpirePlan { due, records, now })
+    }
+
+    /// The second half of an expiry pass, once its records are durable: release what was due and
+    /// free what that frees. `fsyncs` is what the flush that carried the records cost the pass (0
+    /// when it rode on another operation's flush); observation only.
+    fn expire_apply(&self, inner: &mut StoreInner, plan: ExpirePlan, fsyncs: u64) -> Expired {
+        let due = plan.due;
         let mut freed = Vec::new();
         for &id in &due {
             inner.apply_release(id, &mut freed);
         }
         let freed_pages = freed.len();
+        {
+            use churn_counters::*;
+            EXPIRE_PASSES_WITH_DUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            EXPIRE_REAPED.fetch_add(due.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            EXPIRE_FREED_PAGES.fetch_add(freed_pages as u64, std::sync::atomic::Ordering::Relaxed);
+            EXPIRE_FSYNCS.fetch_add(fsyncs, std::sync::atomic::Ordering::Relaxed);
+        }
         inner.release_slots(freed);
         self.sync_trunk_children(inner);
         self.sync_lease_flag(inner);
-        self.maybe_compact(inner);
-        Ok((
-            Expired {
-                reaped: due,
-                freed_pages,
-            },
-            now,
-        ))
+        Expired {
+            reaped: due,
+            freed_pages,
+        }
+    }
+
+    /// Leases outstanding, and how many of them have run out (observation only, r11-churn).
+    pub(crate) fn lease_counts(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        let now = inner.lease.now_ms();
+        let due = inner.leases.range(..=(now, BranchId(u64::MAX))).count();
+        (inner.leases.len(), due)
     }
 
     /// Move the lease clock forward, for tests. It never moves back.
@@ -797,8 +863,22 @@ impl BranchStore {
     /// log intact; a failure after it fail-stops the journal (see `Journal::compact`).
     fn maybe_compact(&self, inner: &mut StoreInner) {
         if inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
+            let t = Instant::now();
+            let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
+            }
+            use churn_counters::*;
+            let ns = t.elapsed().as_nanos() as u64;
+            COMPACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            COMPACT_NS_TOTAL.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+            COMPACT_NS_MAX.fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+            COMPACT_FSYNCS.fetch_add(
+                super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if let Some(j) = inner.journal.as_ref() {
+                COMPACT_BYTES_LAST.store(j.snapshot_len(), std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -828,13 +908,23 @@ impl BranchStore {
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
         let mut inner = self.inner.lock();
         inner.ensure_backing(page_size)?;
-        let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
+        // The expiry pass rides on the fork's own flush (group commit, r11-churn amendment 2): the
+        // same records in the same order as the pass's own flush followed by the fork's, made
+        // durable by one flush, then freed, then the fork applied.
+        let plan = self.expire_plan(&mut inner, Stamp::Queue)?;
+        let now = plan.now;
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now);
+        let (fork_records, lease) = inner.fork_records(id, BranchId::TRUNK, now);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
+        let mut records = plan.records.clone();
+        records.extend(fork_records);
         self.log_all(&mut inner, records)?;
+        if !plan.due.is_empty() {
+            self.expire_apply(&mut inner, plan, 0);
+            churn_counters::EXPIRE_PIGGYBACKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         inner.apply_fork(BranchId::TRUNK, id, Some(schema), Handle::Attached)?;
         inner.apply_fork_lease(id, lease);
         self.sync_trunk_children(&inner);
@@ -849,22 +939,43 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         // Reap what has expired first, so a parent whose lease ran out is refused rather than
         // revived by a child that would pin it (Neon refuses to "create children from expiring
-        // branches").
-        let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
-        let st = inner.branches.get(&parent).ok_or_else(|| gone(parent))?;
-        if st.writer {
-            return Err(LimboError::Busy);
-        }
-        if st.handle.is_released() {
+        // branches"). The pass rides on the fork's own flush (group commit, r11-churn amendment 2);
+        // when the fork is refused, the pass is completed alone, as before.
+        let plan = self.expire_plan(&mut inner, Stamp::Queue)?;
+        let now = plan.now;
+        let forkable = !plan.due.contains(&parent)
+            && matches!(inner.branches.get(&parent),
+                        Some(st) if !st.writer && !st.handle.is_released());
+        if !forkable {
+            // Refused: complete the pass alone, then refuse exactly as the pass-then-check order
+            // always did (gone, Busy, or reaped, in that order).
+            if !plan.due.is_empty() {
+                let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
+                self.log_all(&mut inner, plan.records.clone())?;
+                let fsyncs =
+                    super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0;
+                self.expire_apply(&mut inner, plan, fsyncs);
+                self.maybe_compact(&mut inner);
+            }
+            let st = inner.branches.get(&parent).ok_or_else(|| gone(parent))?;
+            if st.writer {
+                return Err(LimboError::Busy);
+            }
             return Err(reaped(parent));
         }
-        let schema = st.schema.clone();
+        let schema = inner.branches.get(&parent).expect("checked above").schema.clone();
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, parent, now);
+        let (fork_records, lease) = inner.fork_records(id, parent, now);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
+        let mut records = plan.records.clone();
+        records.extend(fork_records);
         self.log_all(&mut inner, records)?;
+        if !plan.due.is_empty() {
+            self.expire_apply(&mut inner, plan, 0);
+            churn_counters::EXPIRE_PIGGYBACKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         inner.apply_fork(parent, id, schema, Handle::Attached)?;
         inner.apply_fork_lease(id, lease);
         self.sync_lease_flag(&inner);
@@ -978,6 +1089,76 @@ impl BranchStore {
             freed_pages,
             deferred: inner.branches.contains_key(&id),
         })
+    }
+
+    /// Release several branches with ONE durable flush: group commit for reaps (r11-churn, PREREG
+    /// amendment 2). Every Release record is buffered and one flush makes them all durable before
+    /// anything is freed — rule 2, per batch instead of per branch, as `expire` already does for
+    /// leases and as ZFS frees a transaction group's destroys at its one sync. The releases are then
+    /// applied in the given order, so a chain released root first defers each interior until its
+    /// tip frees it, exactly as one `release_handle` per branch would. If the flush fails, every
+    /// branch of the batch is kept (`ReleasePending`), as `release_handle` keeps one.
+    pub(crate) fn release_many(&self, ids: &[BranchId]) -> Result<Vec<Reaped>> {
+        let mut inner = self.inner.lock();
+        let mut out = vec![
+            Reaped {
+                freed_pages: 0,
+                deferred: false,
+            };
+            ids.len()
+        ];
+        let mut todo = Vec::with_capacity(ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        for (i, &id) in ids.iter().enumerate() {
+            let Some(st) = inner.branches.get(&id) else {
+                continue;
+            };
+            match st.handle {
+                Handle::Released => out[i].deferred = true,
+                Handle::ReleasePending => {
+                    return Err(fail_stopped(inner.journal.as_ref(), id, "no release"))
+                }
+                Handle::Attached | Handle::Detached => {
+                    if seen.insert(id) {
+                        todo.push(i);
+                    } else {
+                        out[i].deferred = true;
+                    }
+                }
+            }
+        }
+        if todo.is_empty() {
+            return Ok(out);
+        }
+        let records = todo
+            .iter()
+            .map(|&i| Record::Release { branch: ids[i].0 })
+            .collect();
+        if let Err(e) = self.log_all(&mut inner, records) {
+            tracing::warn!("{} branches released in memory only: {e}", todo.len());
+            for &i in &todo {
+                if let Some(st) = inner.branches.get_mut(&ids[i]) {
+                    st.handle = Handle::ReleasePending;
+                }
+            }
+            return Err(LimboError::InternalError(format!(
+                "{} branches were not released durably ({e}); they are kept, and come back at the \
+                 next open",
+                todo.len()
+            )));
+        }
+        let mut freed = Vec::new();
+        for &i in &todo {
+            let before = freed.len();
+            inner.apply_release(ids[i], &mut freed);
+            out[i].freed_pages = freed.len() - before;
+            out[i].deferred = inner.branches.contains_key(&ids[i]);
+        }
+        inner.release_slots(freed);
+        self.sync_trunk_children(&inner);
+        self.sync_lease_flag(&inner);
+        self.maybe_compact(&mut inner);
+        Ok(out)
     }
 
     /// Detach a live branch from its handle without releasing it.
