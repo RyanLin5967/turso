@@ -91,8 +91,14 @@ impl PageMap {
             "arena slot u32::MAX is the page map's empty marker"
         );
         if self.root.is_none() {
-            self.root = Some(Arc::new(Node::empty(0)));
+            // The first root is as tall as its first page needs. Starting from a leaf and lifting it
+            // would leave that leaf, empty, at kid 0: never read by a lookup, but a node no entry
+            // needs (r11-diff-list's fix, turso 68cb8dd59, ported).
             self.height = 0;
+            while !self.covers(page) {
+                self.height += 1;
+            }
+            self.root = Some(Arc::new(Node::empty(self.height)));
         }
         while !self.covers(page) {
             let mut kids: [Option<Arc<Node>>; WIDTH] = std::array::from_fn(|_| None);
@@ -116,6 +122,23 @@ impl PageMap {
                 }
             };
         }
+    }
+}
+
+#[cfg(test)]
+impl PageMap {
+    /// (nodes reachable from the root, pages mapped).
+    fn census(&self) -> (u64, u64) {
+        fn walk(node: &Node) -> (u64, u64) {
+            match node {
+                Node::Inner(kids) => kids.iter().flatten().fold((1, 0), |(n, e), kid| {
+                    let (kn, ke) = walk(kid);
+                    (n + kn, e + ke)
+                }),
+                Node::Leaf(slots) => (1, slots.iter().filter(|m| m.0 != EMPTY).count() as u64),
+            }
+        }
+        self.root.as_deref().map_or((0, 0), walk)
     }
 }
 
@@ -156,6 +179,14 @@ mod tests {
             versions.push((map, model));
         }
         for (i, (map, model)) in versions.iter().enumerate() {
+            // Every node holds at least one mapping, so no version keeps a node no entry needs.
+            let (nodes, entries) = map.census();
+            assert_eq!(entries, model.len() as u64, "version {i}: census disagrees with the model");
+            assert!(
+                nodes <= (u64::from(map.height) + 1) * entries,
+                "version {i}: {nodes} nodes for {entries} pages at height {}",
+                map.height
+            );
             for (&page, &slot) in model {
                 assert_eq!(map.get(page), Some(slot), "version {i} page {page}");
             }
@@ -173,5 +204,8 @@ mod tests {
         assert_eq!(map.get(3), Some((7, 70)));
         assert_eq!(map.get(4), None);
         assert_eq!(map.get(1 << 20), None, "a page beyond the root's reach");
+        let mut tall = PageMap::default();
+        tall.insert(1000, (9, 90));
+        assert_eq!(tall.census(), (2, 1), "a first page >= 32 left a node no entry needs");
     }
 }
