@@ -924,3 +924,33 @@ Each must fail a `branch::` test, or no F5 run proceeds.
 **Runs, QUEUED-FOR-FANS, after F6's chain.** The worktree is switched to this branch. `tests_F5`, `mutate_F5`,
 `build_F5`, `F5_smoke`, `F5_main`, `F5_hold`, `F5_prof`, `F5_prof4`, with amendment 7's arguments unchanged. Before files:
 `F6_*`.
+
+### Amendment 8b — written 2026-09-25T13:38:39Z: F6's first test run hung; the cause is in Turso's CompletionGroup; the fix, before any timed F6 run
+
+**What happened.** `tests_F6` (`turso_conc/raw/tests_F6.txt`, banked `0c5f2bd`, rc 101) passed 40 of 41 tests. It hung in
+`mechanism_tests::indexes_and_overflow_pages_branch_like_table_leaves` at the branch UPDATE on line 696. I stopped it by
+pid after 10 minutes, and the chain refused to continue. A `/usr/bin/sample` of the hung thread shows the VDBE
+re-polling a pending IO completion that never finishes (`Program::normal_step` → `IOCompletions::finished`). No timed
+F6 run had started.
+
+**Cause, read from source.**
+- F6's `read_page_no_cache` returns a `CompletionGroup` of one (the read, plus the cache fill).
+- `CompletionGroup::build`, when every child has already finished (a synchronous `pread`), calls the group's callback
+  directly. It never runs the group Completion's own `callback`, so the group's parent slot is never claimed.
+- Btree balance collects sibling page loads, the completions `read_page` returns, into its own `CompletionGroup`
+  (`btree.rs`, `pending_sibling_load_completions`). Linking the finished inner group succeeds because the slot is
+  open, and the outer group then waits for a notification that was skipped.
+- This is a latent Turso bug: any group that finishes during `build` hangs an outer group it is nested in. F6 exposed it
+  by returning a group where callers had only ever seen plain read completions.
+
+**Fix (this commit).** `CompletionGroup::build` finishes a group that completes during `build` through
+`Completion::callback`, on both the success and the error path. That runs the group's callback once, records the result
+and claims the parent slot. Test: `io::completions::tests::a_group_finished_during_build_counts_as_finished_in_an_outer_group`
+nests a finished group (and a failed one) in an outer group, and asserts that the outer one is finished (and failed).
+
+**Added runs, before any timed F6 run.**
+- `tests_F6` now runs `branch::` and `io::completions` together.
+- `tests_F6_core`: the whole `turso_core` lib suite. This change touches core IO, not only the branch module.
+- `mutate_F6` gains F6M4, which reverts the fix and is tested with the `io::completions` filter; the new test must fail.
+
+Nothing timed or asserted in amendments 7, 8 or 8a changes. The same fix goes onto F5's branch before F5 builds.
