@@ -716,6 +716,10 @@ impl BranchStore {
     pub(crate) fn stats(&self) -> BranchStats {
         let inner = self.inner.lock();
         let mut work = inner.work;
+        [
+            work.branch_table_seg_alloc_bytes,
+            work.branch_table_seg_freed_bytes,
+        ] = inner.branches.segment_bytes();
         if let Some(arena) = inner.arena.as_ref() {
             [
                 work.arena_free_moved,

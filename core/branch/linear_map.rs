@@ -43,6 +43,8 @@ pub(crate) struct LinearMap<K, V> {
     split: usize,
     len: usize,
     hasher: RandomState,
+    /// Observation only: bytes of bucket segments allocated and freed over the map's life.
+    seg_bytes: [u64; 2],
 }
 
 impl<K, V> Default for LinearMap<K, V> {
@@ -53,6 +55,7 @@ impl<K, V> Default for LinearMap<K, V> {
             split: 0,
             len: 0,
             hasher: RandomState::new(),
+            seg_bytes: [0; 2],
         }
     }
 }
@@ -92,6 +95,11 @@ fn locate(b: usize) -> (usize, usize) {
 }
 
 impl<K: Hash + Eq, V> LinearMap<K, V> {
+    /// Bytes of bucket segments allocated and freed so far (observation only).
+    pub(crate) fn segment_bytes(&self) -> [u64; 2] {
+        self.seg_bytes
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -171,6 +179,7 @@ impl<K: Hash + Eq, V> LinearMap<K, V> {
     pub(crate) fn insert(&mut self, k: K, v: V, moved: &mut u64) -> Option<V> {
         if self.segments.is_empty() {
             self.segments.push(zeroed_segment(1));
+            self.seg_bytes[0] += std::mem::size_of::<Chain<K, V>>() as u64;
         }
         let hash = self.hash(&k);
         let b = self.address(hash);
@@ -236,6 +245,7 @@ impl<K: Hash + Eq, V> LinearMap<K, V> {
         if s == self.segments.len() {
             let size = if s == 0 { 1 } else { 1usize << (s - 1) };
             self.segments.push(zeroed_segment(size));
+            self.seg_bytes[0] += (size * std::mem::size_of::<Chain<K, V>>()) as u64;
         }
         let bit = 1u64 << self.level;
         let mut chain = self.bucket_mut(self.split).take();
@@ -283,7 +293,9 @@ impl<K: Hash + Eq, V> LinearMap<K, V> {
         let (s, o) = locate(last);
         if o == 0 && s > 0 {
             // Bucket `last` opened segment `s`; with it gone, the segment is empty.
-            free_empty_segment(self.segments.pop().expect("segment s exists"));
+            let seg = self.segments.pop().expect("segment s exists");
+            self.seg_bytes[1] += (seg.len() * std::mem::size_of::<Chain<K, V>>()) as u64;
+            free_empty_segment(seg);
         }
         relinked
     }

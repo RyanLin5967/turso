@@ -250,6 +250,10 @@ pub struct BranchWork {
     pub map_slot_increfs: u64,
     /// Branch first-writes that reused the page's slot in place because no other map could reach it.
     pub writes_in_place: u64,
+    /// Bytes of bucket segments the `branches` table allocated (observation only).
+    pub branch_table_seg_alloc_bytes: u64,
+    /// Bytes of bucket segments the `branches` table freed (observation only).
+    pub branch_table_seg_freed_bytes: u64,
 }
 
 impl Branch {

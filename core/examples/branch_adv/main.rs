@@ -74,7 +74,7 @@ fn parse_args() -> Args {
     a
 }
 
-const NF: usize = 22;
+const NF: usize = 24;
 
 const FIELDS: [&str; NF] = [
     "resolve_calls",
@@ -99,6 +99,8 @@ const FIELDS: [&str; NF] = [
     "retired",
     "map_slot_increfs",
     "writes_in_place",
+    "branch_table_seg_alloc_bytes",
+    "branch_table_seg_freed_bytes",
 ];
 
 fn fields(w: &BranchWork) -> [u64; NF] {
@@ -125,6 +127,8 @@ fn fields(w: &BranchWork) -> [u64; NF] {
         w.retired,
         w.map_slot_increfs,
         w.writes_in_place,
+        w.branch_table_seg_alloc_bytes,
+        w.branch_table_seg_freed_bytes,
     ]
 }
 
