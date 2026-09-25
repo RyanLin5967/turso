@@ -337,7 +337,7 @@ impl Bench {
                     .sum::<f64>()
                     / n as f64;
                 let mut line = format!(
-                    "{x}\t{pair}\t{name}\t{n}\t{:.2}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}\t{}\t{:.2}\t{}\t{}\t{:.2}\t{:.2}",
+                    "{x}\t{pair}\t{name}\t{n}\t{:.2}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}\t{}\t{:.2}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}",
                     mean(k.iter().copied(), n),
                     k.iter().min().unwrap(),
                     k.iter().max().unwrap(),
@@ -353,6 +353,7 @@ impl Bench {
                     totals.iter().max().unwrap(),
                     per_k,
                     mean(w.iter().map(|w| w.trie_reported), n),
+                    mean(w.iter().map(|w| w.trie_pruned), n),
                 );
                 if !c.us.is_empty() {
                     let mut us = c.us.clone();
@@ -390,7 +391,7 @@ impl Bench {
     }
 }
 
-const DIFF_HEADER: &str = "x\tpair\tarm\tsamples\tk_mean\tk_min\tk_max\tresolved\tarena\ttrie_nodes\ttrie_leaf\ttrunk_mean\ttrunk_min\ttrunk_max\twork_mean\twork_min\twork_max\twork_per_k\ttrie_reported[\tp50_us\tp90_us\tmax_us]";
+const DIFF_HEADER: &str = "x\tpair\tarm\tsamples\tk_mean\tk_min\tk_max\tresolved\tarena\ttrie_nodes\ttrie_leaf\ttrunk_mean\ttrunk_min\ttrunk_max\twork_mean\twork_min\twork_max\twork_per_k\ttrie_reported\ttrie_pruned[\tp50_us\tp90_us\tmax_us]";
 const LIST_HEADER: &str = "x\tquery\tarm\tsamples\tout_mean\tout_min\tout_max\tvisited_mean\tvisited_min\tvisited_max\tvisited_per_out\ttable_len\ttable_capacity[\tp50_us\tp90_us\tmax_us]";
 
 fn main() {

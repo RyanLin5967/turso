@@ -90,6 +90,8 @@ pub struct TrieWork {
     pub leaf_entries: u64,
     /// Pages the walk or diff reported.
     pub reported: u64,
+    /// Subtrees a diff skipped because both sides held the same node.
+    pub pruned: u64,
 }
 
 impl<V: TrieValue> PageMap<V> {
@@ -258,7 +260,10 @@ fn diff_nodes<V: TrieValue>(
 ) {
     let (a, b) = match (a, b) {
         (None, None) => return,
-        (Some(a), Some(b)) if Arc::ptr_eq(a, b) => return,
+        (Some(a), Some(b)) if Arc::ptr_eq(a, b) => {
+            work.pruned += 1;
+            return;
+        }
         (Some(only), None) | (None, Some(only)) => {
             walk(only, level, base, work, &mut |p, _| f(p));
             return;

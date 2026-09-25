@@ -80,6 +80,8 @@ pub struct DiffWork {
     pub trie_leaf_entries: u64,
     /// Pages the page-map walks and diffs reported, before de-duplication.
     pub trie_reported: u64,
+    /// Shared subtrees the page-map diffs skipped by pointer equality.
+    pub trie_pruned: u64,
     /// Trunk index entries visited: retained versions by death (`Died`), or last-write entries
     /// (`Written`).
     pub trunk_entries: u64,
@@ -103,6 +105,7 @@ impl DiffWork {
         self.trie_nodes += t.nodes;
         self.trie_leaf_entries += t.leaf_entries;
         self.trie_reported += t.reported;
+        self.trie_pruned += t.pruned;
     }
 }
 
@@ -522,7 +525,7 @@ mod tests {
         nonempty: u64,
         empty_distinct: u64,
         different_trunk_at: u64,
-        fix_cheaper: u64,
+        fix_pruned: u64,
         scans: u64,
         max_depth: usize,
         max_height: u32,
@@ -548,7 +551,7 @@ mod tests {
         let mut nodes: Vec<Node> = Vec::new();
         let mut generation = 0u64;
         let mut cov = Coverage::default();
-        for step in 0..1500 {
+        for step in 0..2000 {
             let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
             match rng.below(12) {
                 0..=1 if live.len() < 50 => {
@@ -561,7 +564,8 @@ mod tests {
                     });
                 }
                 2..=3 if !live.is_empty() && live.len() < 50 => {
-                    let parent = if rng.below(2) == 0 {
+                    // Three times in four the newest live branch, so that chains grow deep.
+                    let parent = if rng.below(4) != 0 {
                         *live.last().unwrap()
                     } else {
                         live[rng.below(live.len() as u64) as usize]
@@ -625,17 +629,18 @@ mod tests {
             cov.nonempty > 100
                 && cov.empty_distinct > 10
                 && cov.different_trunk_at > 100
-                && cov.fix_cheaper > 100
+                && cov.fix_pruned > 100
                 && cov.scans > 20
                 && cov.max_depth >= 8
                 && cov.max_height >= 2,
             "seed {seed:#x}: the shapes the arms differ on did not all occur: nonempty {}, empty \
-             between distinct views {}, pairs with different trunk_at {}, Fix cheaper than Died {}, \
+             between distinct views {}, pairs with different trunk_at {}, Fix diffs that skipped a \
+             shared subtree and still found a difference {}, \
              scans {}, depth {}, map height {}",
             cov.nonempty,
             cov.empty_distinct,
             cov.different_trunk_at,
-            cov.fix_cheaper,
+            cov.fix_pruned,
             cov.scans,
             cov.max_depth,
             cov.max_height
@@ -661,7 +666,6 @@ mod tests {
             arms.push(DiffArm::Scan { pages: 40_000 });
             cov.scans += 1;
         }
-        let mut died_total = 0;
         for arm in arms {
             let d = store.diff(x, y, arm).unwrap();
             assert_eq!(
@@ -671,7 +675,6 @@ mod tests {
             );
             let w = d.work;
             match arm {
-                DiffArm::Died => died_total = w.total(),
                 DiffArm::Fix => {
                     let h = u64::from(w.max_height);
                     assert!(
@@ -683,12 +686,12 @@ mod tests {
                         x.0,
                         y.0
                     );
-                    if w.total() < died_total {
-                        cov.fix_cheaper += 1;
+                    if w.trie_pruned > 0 && w.output > 0 {
+                        cov.fix_pruned += 1;
                     }
                     cov.max_height = cov.max_height.max(w.max_height);
                 }
-                DiffArm::Written => {}
+                DiffArm::Died | DiffArm::Written => {}
                 // A view diffed against itself returns before resolving anything.
                 DiffArm::Scan { pages } => assert_eq!(
                     w.pages_resolved,
