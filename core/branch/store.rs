@@ -282,6 +282,21 @@ enum Stamp {
     Flush,
 }
 
+/// Observation only (r11-churn instrument; nothing reads them): what expiry passes that found
+/// something due did, and what compactions cost. Process-wide; updated under the store mutex.
+pub(crate) mod churn_counters {
+    use std::sync::atomic::AtomicU64;
+    pub(crate) static EXPIRE_PASSES_WITH_DUE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_REAPED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_FREED_PAGES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_FSYNCS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_NS_MAX: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_FSYNCS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+}
+
 /// The finest grain at which expiry passes queue a clock stamp.
 const STAMP_EVERY_MS: u64 = 1000;
 
@@ -738,12 +753,21 @@ impl BranchStore {
             .collect();
         records.push(Record::Clock { now_ms: now });
         inner.lease.queued(now);
+        let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
         self.log_all(inner, records)?;
         let mut freed = Vec::new();
         for &id in &due {
             inner.apply_release(id, &mut freed);
         }
         let freed_pages = freed.len();
+        {
+            use churn_counters::*;
+            let fsyncs = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0;
+            EXPIRE_PASSES_WITH_DUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            EXPIRE_REAPED.fetch_add(due.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            EXPIRE_FREED_PAGES.fetch_add(freed_pages as u64, std::sync::atomic::Ordering::Relaxed);
+            EXPIRE_FSYNCS.fetch_add(fsyncs, std::sync::atomic::Ordering::Relaxed);
+        }
         inner.release_slots(freed);
         self.sync_trunk_children(inner);
         self.sync_lease_flag(inner);
@@ -755,6 +779,14 @@ impl BranchStore {
             },
             now,
         ))
+    }
+
+    /// Leases outstanding, and how many of them have run out (observation only, r11-churn).
+    pub(crate) fn lease_counts(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        let now = inner.lease.now_ms();
+        let due = inner.leases.range(..=(now, BranchId(u64::MAX))).count();
+        (inner.leases.len(), due)
     }
 
     /// Move the lease clock forward, for tests. It never moves back.
@@ -797,8 +829,22 @@ impl BranchStore {
     /// log intact; a failure after it fail-stops the journal (see `Journal::compact`).
     fn maybe_compact(&self, inner: &mut StoreInner) {
         if inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
+            let t = Instant::now();
+            let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
+            }
+            use churn_counters::*;
+            let ns = t.elapsed().as_nanos() as u64;
+            COMPACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            COMPACT_NS_TOTAL.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+            COMPACT_NS_MAX.fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+            COMPACT_FSYNCS.fetch_add(
+                super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if let Some(j) = inner.journal.as_ref() {
+                COMPACT_BYTES_LAST.store(j.snapshot_len(), std::sync::atomic::Ordering::Relaxed);
             }
         }
     }

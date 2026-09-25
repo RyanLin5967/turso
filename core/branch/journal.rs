@@ -798,6 +798,11 @@ impl Journal {
         Ok(())
     }
 
+    /// The last snapshot's size in bytes (observation only, r11-churn).
+    pub(crate) fn snapshot_len(&self) -> u64 {
+        self.snapshot_len
+    }
+
     pub(crate) fn wants_compaction(&self) -> bool {
         self.len > COMPACT_MIN_LOG_BYTES.max(2 * self.snapshot_len)
     }
@@ -1085,10 +1090,19 @@ pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
     }
 }
 
+/// Observation only (r11-churn instrument; nothing reads it): every `fsync_file` call, process-wide
+/// and on the calling thread. Every branch-file fsync goes through `fsync_file`.
+pub(crate) static FSYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    pub(crate) static THREAD_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// `fsync(2)`, as Turso's own `FileSyncType::Fsync` — deliberately NOT `F_FULLFSYNC`, which std's
 /// `sync_all` uses on Apple platforms: branch state gets the durability class the trunk gets under
 /// default settings, no stronger and no weaker.
 pub(crate) fn fsync_file(file: &File) -> Result<()> {
+    FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_FSYNCS.with(|n| n.set(n.get() + 1));
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;

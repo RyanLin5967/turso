@@ -202,6 +202,43 @@ pub struct Branch {
     released: bool,
 }
 
+/// Observation-only counters (r11-churn instrument): branch-file fsyncs process-wide and on the
+/// calling thread, expiry passes that found something due, and compactions. Process-wide.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChurnCounters {
+    pub fsyncs: u64,
+    pub thread_fsyncs: u64,
+    pub expire_passes_with_due: u64,
+    pub expire_reaped: u64,
+    pub expire_freed_pages: u64,
+    pub expire_fsyncs: u64,
+    pub compactions: u64,
+    pub compact_ns_total: u64,
+    pub compact_ns_max: u64,
+    pub compact_fsyncs: u64,
+    pub compact_bytes_last: u64,
+}
+
+#[doc(hidden)]
+pub fn churn_counters() -> ChurnCounters {
+    use std::sync::atomic::Ordering::Relaxed;
+    use store::churn_counters::*;
+    ChurnCounters {
+        fsyncs: journal::FSYNCS.load(Relaxed),
+        thread_fsyncs: journal::THREAD_FSYNCS.with(|n| n.get()),
+        expire_passes_with_due: EXPIRE_PASSES_WITH_DUE.load(Relaxed),
+        expire_reaped: EXPIRE_REAPED.load(Relaxed),
+        expire_freed_pages: EXPIRE_FREED_PAGES.load(Relaxed),
+        expire_fsyncs: EXPIRE_FSYNCS.load(Relaxed),
+        compactions: COMPACTIONS.load(Relaxed),
+        compact_ns_total: COMPACT_NS_TOTAL.load(Relaxed),
+        compact_ns_max: COMPACT_NS_MAX.load(Relaxed),
+        compact_fsyncs: COMPACT_FSYNCS.load(Relaxed),
+        compact_bytes_last: COMPACT_BYTES_LAST.load(Relaxed),
+    }
+}
+
 /// What a lease-expiry pass reaped.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Expired {
@@ -445,6 +482,12 @@ impl Database {
     /// fork and at every open, so calling this is never required for reclamation to happen.
     pub fn expire_branches(&self) -> Result<Expired> {
         self.branches.expire_now()
+    }
+
+    /// Leases outstanding and leases run out but not yet reaped (observation only, r11-churn).
+    #[doc(hidden)]
+    pub fn branch_lease_counts(&self) -> (usize, usize) {
+        self.branches.lease_counts()
     }
 
     /// Move the lease clock forward, for tests and benchmarks. It never moves back.
