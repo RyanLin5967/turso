@@ -23,15 +23,33 @@
 //! A slot is therefore free exactly when no live map can reach it, and a write may overwrite a slot
 //! in place exactly when [`PageMap::exclusive`] holds and its count is 1: no other map can reach it.
 //!
-//! `std::sync::Arc` rather than `crate::sync::Arc`: the nodes are plain data that is only ever
-//! touched under the branch store's mutex, so there is no interleaving for a model checker to
-//! explore, and `Arc::get_mut` — which succeeds only while no other version shares a node — is
-//! what tells a copy from an in-place update.
+//! `std::sync::Arc` rather than `crate::sync::Arc`: `Arc::get_mut` — which succeeds only while no
+//! other version shares a node — is what tells a copy from an in-place update.
+//!
+//! # Under threads (FRS, r11-bushy-conc)
+//!
+//! The store is striped, so two maps that share nodes can be changed at once by threads holding
+//! different locks. Three things keep the counts exact:
+//!
+//! * `refs` is one atomic count per slot ([`Refs`]).
+//! * Every drop of a node reference goes through [`release_node`], which takes the node only if it
+//!   was the LAST reference (`Arc::into_inner`, which exactly one of several racing droppers wins —
+//!   `Arc::try_unwrap` could let both fail and the node die uncounted: r11-fix-interactions K1(c)).
+//!   That includes the reference an insert drops after copying a shared node: if every other holder
+//!   let go meanwhile, the copy's source is released like any other node.
+//! * What a map's owner reads to decide "in place" cannot change under it. A node on its path
+//!   gains a holder only if the owner's map is cloned (a fork, which the store refuses during the
+//!   owner's write transaction) or if a node holding it is copied — and a node holding it is on the
+//!   owner's path only if the owner holds it too, so the path was not exclusive. A slot's count
+//!   rises only when a leaf naming it is copied, which the same argument rules out when the owner's
+//!   leaf is the only one. Counts can FALL under the owner (another map lets go), which only turns a
+//!   copy into what could have been an in-place write.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::arena::Slot;
+use super::radix::Radix;
 
 const BITS: u32 = 5;
 const WIDTH: usize = 1 << BITS;
@@ -118,6 +136,67 @@ pub(crate) fn map_work() -> MapWork {
 fn count(counter: &AtomicU64, n: u64) {
     if observing() {
         counter.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// How many leaf NODES name each arena slot (see the module doc), one atomic count per slot, in
+/// chunks installed once, so any thread can update any slot's count without a lock.
+pub(crate) struct Refs(Radix<AtomicU32>);
+
+impl Refs {
+    pub(crate) fn new() -> Self {
+        Self(Radix::new())
+    }
+
+    pub(crate) fn get(&self, slot: Slot) -> u32 {
+        self.0.get(slot).map_or(0, |c| c.load(Ordering::Acquire))
+    }
+
+    fn inc(&self, slot: Slot) {
+        self.0.get_or_insert(slot).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Name `slot` once less; true if nothing names it any more.
+    fn dec(&self, slot: Slot) -> bool {
+        let old = self
+            .0
+            .get(slot)
+            .expect("a counted slot has its count installed")
+            .fetch_sub(1, Ordering::Release);
+        crate::turso_assert!(old > 0, "a slot's count went below zero");
+        if old == 1 {
+            fence(Ordering::Acquire);
+            return true;
+        }
+        false
+    }
+}
+
+/// Drop one reference to a node. Only the last reference takes the node (`Arc::into_inner`): then
+/// each leaf among what it alone held names its slots once less, and `free` gets every slot no leaf
+/// names any more. Nodes another reference still holds only lose this one.
+fn release_node(arc: Arc<Node>, refs: &Refs, free: &mut impl FnMut(Slot)) {
+    let Some(mut node) = Arc::into_inner(arc) else {
+        count(&ARCS_DROPPED_SHARED, 1);
+        return;
+    };
+    count(&NODES_RELEASED, 1);
+    match &mut node {
+        Node::Inner(kids) => {
+            for kid in kids.iter_mut() {
+                if let Some(kid) = kid.take() {
+                    release_node(kid, refs, free);
+                }
+            }
+        }
+        Node::Leaf(slots) => {
+            for &slot in slots.iter().filter(|&&s| s != EMPTY) {
+                count(&REFS_RELEASED, 1);
+                if refs.dec(slot) {
+                    free(slot);
+                }
+            }
+        }
     }
 }
 
@@ -242,29 +321,39 @@ impl PageMap {
     }
 
     /// Make `arc` this map's own node, copying it if another version shares it. A copied leaf
-    /// names each of its slots once more.
-    fn unshare<'a>(arc: &'a mut Arc<Node>, refs: &mut [u32]) -> &'a mut Node {
+    /// names each of its slots once more; the reference to the source is dropped through
+    /// [`release_node`], which releases it if every other holder let go meanwhile.
+    fn unshare<'a>(
+        arc: &'a mut Arc<Node>,
+        refs: &Refs,
+        free: &mut impl FnMut(Slot),
+    ) -> &'a mut Node {
         if Arc::get_mut(arc).is_none() {
             count(&SHARED_PROBES, 1);
             let copy = (**arc).clone();
             count(&NODES_COPIED, 1);
             if let Node::Leaf(slots) = &copy {
                 for &slot in slots.iter().filter(|&&s| s != EMPTY) {
-                    refs[slot as usize] += 1;
+                    refs.inc(slot);
                     count(&REFS_TOUCHED, 1);
                 }
             }
-            // The node this replaces is still another version's: this drops a shared reference.
-            *arc = Arc::new(copy);
-            count(&ARCS_DROPPED_SHARED, 1);
+            let source = std::mem::replace(arc, Arc::new(copy));
+            release_node(source, refs, free);
         }
         Arc::get_mut(arc).expect("just made this map's own")
     }
 
     /// Map `page` to `slot` in this map only, keeping `refs` exact (see the module doc). Every other
-    /// version of this map — every clone taken before this call — keeps the mapping it had. Returns
-    /// the slot the entry named before if no leaf names it any more, for the caller to free.
-    pub(crate) fn insert_counted(&mut self, page: u32, slot: Slot, refs: &mut [u32]) -> Option<Slot> {
+    /// version of this map — every clone taken before this call — keeps the mapping it had. `free`
+    /// gets the slot the entry named before if no leaf names it any more.
+    pub(crate) fn insert_counted(
+        &mut self,
+        page: u32,
+        slot: Slot,
+        refs: &Refs,
+        free: &mut impl FnMut(Slot),
+    ) {
         crate::turso_assert!(slot != EMPTY, "arena slot u32::MAX is the page map's empty marker");
         if self.root.is_none() {
             self.root = Some(Arc::new(Node::empty(0)));
@@ -279,7 +368,7 @@ impl PageMap {
             count(&NODES_BUILT, 1);
         }
         let mut level = self.height;
-        let mut node = Self::unshare(self.root.as_mut().expect("created above"), refs);
+        let mut node = Self::unshare(self.root.as_mut().expect("created above"), refs, free);
         loop {
             node = match node {
                 Node::Inner(kids) => {
@@ -288,18 +377,19 @@ impl PageMap {
                         Arc::new(Node::empty(level - 1))
                     });
                     level -= 1;
-                    Self::unshare(kid, refs)
+                    Self::unshare(kid, refs, free)
                 }
                 Node::Leaf(slots) => {
                     let old = std::mem::replace(&mut slots[Self::index(page, 0)], slot);
-                    refs[slot as usize] += 1;
+                    refs.inc(slot);
                     count(&REFS_TOUCHED, 1);
-                    if old == EMPTY {
-                        return None;
+                    if old != EMPTY {
+                        count(&REFS_TOUCHED, 1);
+                        if refs.dec(old) {
+                            free(old);
+                        }
                     }
-                    refs[old as usize] -= 1;
-                    count(&REFS_TOUCHED, 1);
-                    return (refs[old as usize] == 0).then_some(old);
+                    return;
                 }
             };
         }
@@ -308,32 +398,7 @@ impl PageMap {
     /// Give up this map. The nodes it alone holds are dropped; each leaf among them names its
     /// slots once less, and `free` gets every slot no leaf names any more. Nodes another map shares
     /// only lose this map's reference. The cost is the nodes this map alone holds, times 32.
-    pub(crate) fn release(mut self, refs: &mut [u32], free: &mut impl FnMut(Slot)) {
-        fn release_node(arc: Arc<Node>, refs: &mut [u32], free: &mut impl FnMut(Slot)) {
-            let Ok(mut node) = Arc::try_unwrap(arc) else {
-                count(&ARCS_DROPPED_SHARED, 1);
-                return;
-            };
-            count(&NODES_RELEASED, 1);
-            match &mut node {
-                Node::Inner(kids) => {
-                    for kid in kids.iter_mut() {
-                        if let Some(kid) = kid.take() {
-                            release_node(kid, refs, free);
-                        }
-                    }
-                }
-                Node::Leaf(slots) => {
-                    for &slot in slots.iter().filter(|&&s| s != EMPTY) {
-                        refs[slot as usize] -= 1;
-                        count(&REFS_RELEASED, 1);
-                        if refs[slot as usize] == 0 {
-                            free(slot);
-                        }
-                    }
-                }
-            }
-        }
+    pub(crate) fn release(mut self, refs: &Refs, free: &mut impl FnMut(Slot)) {
         if let Some(root) = self.root.take() {
             release_node(root, refs, free);
         }
@@ -389,7 +454,7 @@ mod tests {
     #[test]
     fn every_version_keeps_its_own_mappings_and_a_slot_dies_with_its_last_reader() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        let mut refs = vec![0u32; 5_000];
+        let refs = Refs::new();
         let mut next_slot: Slot = 0;
         let mut freed: HashSet<Slot> = HashSet::new();
         let mut versions: Vec<Option<(PageMap, HashMap<u32, Slot>)>> = vec![Some(Default::default())];
@@ -398,7 +463,7 @@ mod tests {
             if rng.next() % 3 == 0 && live.len() > 1 {
                 let i = live[(rng.next() % live.len() as u64) as usize];
                 let (map, _) = versions[i].take().unwrap();
-                map.release(&mut refs, &mut |slot| {
+                map.release(&refs, &mut |slot| {
                     assert!(freed.insert(slot), "step {step}: slot {slot} freed twice");
                 });
             } else {
@@ -412,9 +477,9 @@ mod tests {
                     };
                     let slot = next_slot;
                     next_slot += 1;
-                    if let Some(dead) = map.insert_counted(page, slot, &mut refs) {
+                    map.insert_counted(page, slot, &refs, &mut |dead| {
                         assert!(freed.insert(dead), "step {step}: slot {dead} freed twice");
-                    }
+                    });
                     model.insert(page, slot);
                 }
                 versions.push(Some((map, model)));
@@ -440,48 +505,50 @@ mod tests {
             }
         }
         for (map, _) in versions.into_iter().flatten() {
-            map.release(&mut refs, &mut |slot| assert!(freed.insert(slot)));
+            map.release(&refs, &mut |slot| assert!(freed.insert(slot)));
         }
         assert_eq!(freed.len(), next_slot as usize, "a slot outlived every map");
-        assert!(refs.iter().all(|&r| r == 0), "a count is left over");
+        assert!((0..next_slot).all(|s| refs.get(s) == 0), "a count is left over");
     }
 
     /// `exclusive` holds for a map's own path and fails for any path a clone shares, and an
     /// insert through a shared path makes it exclusive again for the writer only.
     #[test]
     fn a_path_is_exclusive_until_a_clone_shares_it() {
-        let mut refs = vec![0u32; 16];
+        let refs = Refs::new();
         let mut a = PageMap::default();
+        let mut none = |s: Slot| panic!("slot {s} freed");
         assert!(!a.exclusive(3), "an unmapped page is not exclusively mapped");
-        assert!(a.insert_counted(3, 0, &mut refs).is_none());
-        assert!(a.insert_counted(700, 1, &mut refs).is_none());
+        a.insert_counted(3, 0, &refs, &mut none);
+        a.insert_counted(700, 1, &refs, &mut none);
         assert!(a.exclusive(3) && a.exclusive(700));
         let mut b = a.clone();
         assert!(!a.exclusive(3) && !b.exclusive(3), "a clone shares the whole map");
-        assert_eq!(b.insert_counted(3, 2, &mut refs), None, "a still names slot 0");
+        // a still names slot 0, so the insert frees nothing.
+        b.insert_counted(3, 2, &refs, &mut none);
         assert!(b.exclusive(3), "b's copied path is b's own");
         assert!(!b.exclusive(700), "b still shares page 700's leaf with a");
-        assert_eq!(refs[0], 1, "only a's leaf names slot 0");
+        assert_eq!(refs.get(0), 1, "only a's leaf names slot 0");
         assert_eq!(a.get(3), Some(0));
         assert_eq!(b.get(3), Some(2));
         let mut freed = Vec::new();
-        a.release(&mut refs, &mut |s| freed.push(s));
+        a.release(&refs, &mut |s| freed.push(s));
         assert_eq!(freed, vec![0], "slot 1 is still b's");
         assert!(b.exclusive(700), "a's release left b the only holder");
-        b.release(&mut refs, &mut |s| freed.push(s));
+        b.release(&refs, &mut |s| freed.push(s));
         freed.sort();
         assert_eq!(freed, vec![0, 1, 2]);
     }
 
     #[test]
     fn an_empty_map_and_an_unaddressable_page_read_as_absent() {
-        let mut refs = vec![0u32; 8];
+        let refs = Refs::new();
         let mut map = PageMap::default();
         assert_eq!(map.get(0), None);
-        map.insert_counted(3, 7, &mut refs);
+        map.insert_counted(3, 7, &refs, &mut |_| {});
         assert_eq!(map.get(3), Some(7));
         assert_eq!(map.get(4), None);
         assert_eq!(map.get(1 << 20), None, "a page beyond the root's reach");
-        map.release(&mut refs, &mut |_| {});
+        map.release(&refs, &mut |_| {});
     }
 }

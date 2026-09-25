@@ -54,6 +54,7 @@
 
 pub(crate) mod arena;
 pub(crate) mod page_map;
+pub(crate) mod radix;
 pub(crate) mod store;
 
 pub use page_map::{set_observe, MapWork};
@@ -214,12 +215,32 @@ pub struct BranchWork {
     pub branch_first_writes: u64,
     /// Of those, the writes that went in place (no other map could reach the slot).
     pub in_place_writes: u64,
-    /// The store lock's own accounting, per site.
+    /// The store locks' own accounting, per site.
     pub lock: LockCounts,
 }
 
+impl BranchWork {
+    /// Add `o`'s counts to these (the striped store sums its locks' parts).
+    pub(crate) fn add(&mut self, o: &BranchWork) {
+        self.resolve_calls += o.resolve_calls;
+        self.resolve_levels += o.resolve_levels;
+        self.resolve_retained_examined += o.resolve_retained_examined;
+        self.gc_examined += o.gc_examined;
+        self.gc_range_entries += o.gc_range_entries;
+        self.states_freed += o.states_freed;
+        self.branch_first_writes += o.branch_first_writes;
+        self.in_place_writes += o.in_place_writes;
+        for i in 0..LOCK_SITES.len() {
+            self.lock.acquisitions[i] += o.lock.acquisitions[i];
+            self.lock.contended[i] += o.lock.contended[i];
+        }
+        self.lock.wait_ns += o.lock.wait_ns;
+        self.lock.hold_ns += o.lock.hold_ns;
+    }
+}
+
 /// The sites at which the branch store takes its lock, in the order of [`LockCounts`]' arrays.
-pub const LOCK_SITES: [&str; 15] = [
+pub const LOCK_SITES: [&str; 19] = [
     "fork",
     "fork_trunk",
     "open",
@@ -235,16 +256,20 @@ pub const LOCK_SITES: [&str; 15] = [
     "commit",
     "resolve",
     "observe",
+    "fork_insert",
+    "resolve_trunk",
+    "child_gone",
+    "depot",
 ];
 
-/// Acquisitions of the branch store's lock since the database opened, counted under the lock
-/// itself. Observation only.
+/// Acquisitions of the branch store's locks since the database opened, each counted under the lock
+/// it counts. Observation only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LockCounts {
-    /// Acquisitions per site ([`LOCK_SITES`]).
-    pub acquisitions: [u64; 15],
-    /// Of those, the ones that found the lock held and waited, per site.
-    pub contended: [u64; 15],
+    /// Acquisitions per site ([`LOCK_SITES`]), summed over every lock of the striped store.
+    pub acquisitions: [u64; 19],
+    /// Of those, the ones that found their lock held and waited, per site.
+    pub contended: [u64; 19],
     /// Nanoseconds the contended acquisitions waited, all sites.
     pub wait_ns: u64,
     /// Nanoseconds the lock was held, all sites; counted only while lock timing is on

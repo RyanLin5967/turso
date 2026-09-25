@@ -172,7 +172,7 @@ impl Interval {
     }
 }
 
-fn sites(counts: &[u64; 15], base: &[u64; 15]) -> String {
+fn sites(counts: &[u64], base: &[u64]) -> String {
     LOCK_SITES
         .iter()
         .enumerate()
@@ -227,7 +227,7 @@ fn checkpoint(
     let resolves = w.resolve_calls - w0.resolve_calls;
     let per = |v: u64| if resolves == 0 { 0.0 } else { v as f64 / resolves as f64 };
     let (lock, lock0) = (w.lock, w0.lock);
-    let total = |a: &[u64; 15], b: &[u64; 15]| -> u64 { (0..15).map(|i| a[i] - b[i]).sum() };
+    let total = |a: &[u64], b: &[u64]| -> u64 { a.iter().zip(b).map(|(a, b)| a - b).sum() };
     let m = s.map_work;
     println!(
         "# ckpt x={x} level={} handles={} states={} zombies={zombies} arena_in_use={} \
