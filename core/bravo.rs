@@ -295,9 +295,10 @@ mod tests {
         }
         for i in 0..2000u64 {
             let mut g = lock.write();
-            g.0 = i;
+            let pair: &mut (u64, u64) = &mut g;
+            pair.0 = i;
             std::hint::spin_loop();
-            g.1 = i;
+            pair.1 = i;
         }
         stop.store(true, Ordering::Relaxed);
         let fast: u64 = hs.into_iter().map(|h| h.join().unwrap()).sum();

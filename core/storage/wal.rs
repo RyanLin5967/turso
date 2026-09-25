@@ -7485,11 +7485,9 @@ pub mod test {
             .read_locks
             .iter()
             .enumerate()
-            .filter_map(|(slot, lock)| {
-                let state = lock.0.load(Ordering::Acquire);
-                let has_readers = (state & super::TursoRwLock::READER_COUNT_MASK) != 0;
-                has_readers.then_some(slot)
-            })
+            // `held_value` is Some exactly when a reader holds the slot, whether readers are counted in the word
+            // or (r11-coherence FW) in per-thread indicators.
+            .filter_map(|(slot, lock)| lock.held_value().is_some().then_some(slot))
             .collect()
     }
 
