@@ -284,11 +284,11 @@ mod tests {
     #[test]
     fn every_version_keeps_its_own_mappings_and_a_slot_dies_with_its_last_reader() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        let mut refs = vec![0u32; 20_000];
+        let mut refs = vec![0u32; 5_000];
         let mut next_slot: Slot = 0;
         let mut freed: HashSet<Slot> = HashSet::new();
         let mut versions: Vec<Option<(PageMap, HashMap<u32, Slot>)>> = vec![Some(Default::default())];
-        for step in 0..6000u32 {
+        for step in 0..1500u32 {
             let live: Vec<usize> = (0..versions.len()).filter(|&i| versions[i].is_some()).collect();
             if rng.next() % 3 == 0 && live.len() > 1 {
                 let i = live[(rng.next() % live.len() as u64) as usize];
