@@ -194,7 +194,7 @@ impl CompletionGroup {
             if let Some(err) = c.get_error() {
                 let _ = group_inner.result.set(Some(err));
                 group_inner.outstanding.store(0, Ordering::SeqCst);
-                (group_inner.complete)(Err(err));
+                group.callback(Err(err));
                 return group;
             }
             group_inner.outstanding.fetch_sub(1, Ordering::SeqCst);
@@ -203,7 +203,12 @@ impl CompletionGroup {
         if group_inner.outstanding.load(Ordering::SeqCst) == 0 {
             // Set result to Some(None) on success so succeeded() returns true
             let _ = group_inner.result.set(None);
-            (group_inner.complete)(Ok(0));
+            // Finish the group the way any completion finishes — through its own `callback`, which
+            // runs the group's callback once, records the result and claims the parent slot. Calling
+            // only the group's callback here left the slot open, so a group that finished during
+            // `build` could still be linked into an outer group, which then waited for a
+            // notification that had already been skipped: the outer group never finished.
+            group.callback(Ok(0));
         }
         group
     }
@@ -638,6 +643,39 @@ mod tests {
                 "iteration {i}: child is finished but the group never will be"
             );
         }
+    }
+
+    /// A group whose children had all finished before `build` is itself finished, and must count as
+    /// finished when it is added to an outer group — as a finished leaf completion does. The outer
+    /// group used to wait forever: the inner group's parent slot was never claimed, so linking
+    /// succeeded, and the notification it waited for had been skipped.
+    #[test]
+    fn a_group_finished_during_build_counts_as_finished_in_an_outer_group() {
+        let child = Completion::new_write(|_| {});
+        child.complete(0);
+        let mut inner = CompletionGroup::new(|_| {});
+        inner.add(&child);
+        let inner = inner.build();
+        assert!(inner.finished() && inner.succeeded());
+        let mut outer = CompletionGroup::new(|_| {});
+        outer.add(&inner);
+        let outer = outer.build();
+        assert!(
+            outer.finished(),
+            "an outer group of one finished group never finishes"
+        );
+
+        // And the error path: a group that failed during build fails its outer group.
+        let failed = Completion::new_write(|_| {});
+        failed.error(CompletionError::Aborted);
+        let mut inner = CompletionGroup::new(|_| {});
+        inner.add(&failed);
+        let inner = inner.build();
+        assert!(inner.finished() && inner.get_error().is_some());
+        let mut outer = CompletionGroup::new(|_| {});
+        outer.add(&inner);
+        let outer = outer.build();
+        assert!(outer.finished() && outer.get_error().is_some());
     }
 
     #[test]
