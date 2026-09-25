@@ -495,7 +495,7 @@ fn reaper_loop(
         }
         for e in batch {
             let t = Instant::now();
-            let r = e.branch.reap();
+            let r = e.branch.reap().unwrap();
             let ns = t.elapsed().as_nanos() as u64;
             // The chain structure fixes every reap's outcome (PREREG): a link with a successor in
             // its chain is deferred and frees nothing; the chain's last link frees the chain.
