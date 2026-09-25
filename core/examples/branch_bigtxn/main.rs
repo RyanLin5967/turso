@@ -628,8 +628,9 @@ impl ProbeStats {
         if before <= PH_COMMIT && PH_COMMIT <= after {
             self.max_commit_ns = self.max_commit_ns.max(ns);
         }
+        let last = self.hist.len() - 1;
         let b = ((ns.max(1) as f64).log2() * 8.0) as usize;
-        self.hist[b.min(self.hist.len() - 1)] += 1;
+        self.hist[b.min(last)] += 1;
     }
 
     /// The lower edge (ns) of the bucket holding the p-th percentile.
