@@ -91,6 +91,27 @@
 //! The same query serves whole pages (a branch's own versions) and chunks (the trunk's). A pending
 //! image is garbage once the oldest live child of the trunk is no older than its write.
 //!
+//! # Bounded reclamation at the trunk — the horizon sweep
+//!
+//! At chunk granularity almost every version's `[born, died)` holds some live child, so garbage
+//! appears mostly when an OLD child goes, and it is everything that child alone could see: measured,
+//! up to two million chunk versions in one reap at 10^6 live branches (r11-space, raw
+//! `s2a_w32768_n1e6`). The trunk therefore reclaims incrementally, as MVCC engines do below their
+//! oldest snapshot (EBR; PostgreSQL's `OldestXmin`; Hekaton's GC watermark):
+//!
+//! * every version and pending image whose `died` is no later than the oldest live child's fork is
+//!   garbage (no live child can have forked inside it), and `by_died` lists them first; the SWEEP
+//!   frees at most `gc_budget` of each per store call;
+//! * the oldest child's reap therefore walks nothing — its garbage all has `died` at or before the
+//!   new oldest fork;
+//! * a middle or newest child's walk stops once it has visited more than `gc_budget` entries. What
+//!   it would have freed is garbage no read can reach (a read's predecessor search finds the version
+//!   that contains its fork, and a garbage version contains none), and it lies below the horizon
+//!   once the children around it go, where the sweep frees it.
+//!
+//! So a store call does at most about `2 * gc_budget` reclamation steps. With no budget (the tests'
+//! eager mode) every reap frees its garbage at once, as before.
+//!
 //! A branch whose handle has been dropped but that still has a live child or an open connection
 //! is kept (its versions are still read through); it is freed the moment the last of those goes,
 //! and freeing it may in turn free its parent.
@@ -133,6 +154,8 @@ use crate::{LimboError, Result};
 
 /// The trunk's chunk size when `TURSO_BRANCH_CHUNK_BYTES` does not set one.
 const DEFAULT_CHUNK_BYTES: usize = 64;
+/// The trunk's reclamation steps per store call when `TURSO_BRANCH_GC_BUDGET` does not set one.
+const DEFAULT_GC_BUDGET: usize = 64;
 
 pub(crate) struct BranchStore {
     inner: Mutex<StoreInner>,
@@ -216,6 +239,8 @@ struct TrunkState {
     chunks: Option<Arena>,
     /// Bytes per chunk: the configured size, or the page size if that is smaller.
     chunk_size: usize,
+    /// Reclamation steps per store call (see "Bounded reclamation"); `None` reclaims eagerly.
+    gc_budget: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -290,28 +315,49 @@ impl<U: Unit> Lineage<U> {
     }
 
     /// Detach the child forked at `f` and release every retained version that only it could see.
-    fn child_gone(&mut self, f: u64, arena: &mut Arena, work: &mut BranchWork) -> usize {
+    ///
+    /// With a `budget` (the trunk's bounded reclamation), the oldest child's garbage is left to the
+    /// horizon sweep, and a walk that would visit more than `budget` index entries is abandoned,
+    /// leaving its garbage to the sweep too. Without one, every version is released now.
+    fn child_gone(
+        &mut self,
+        f: u64,
+        arena: &mut Arena,
+        work: &mut BranchWork,
+        budget: Option<usize>,
+    ) -> usize {
         let removed = self.children.remove(&f);
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
-        let dead = self.garbage(f, lo, hi, work);
-        for &(born, page, unit, died) in &dead {
-            let versions = self.retained.get_mut(&page).expect("indexed version is listed");
-            let v = versions
-                .remove(&(unit, born))
-                .expect("indexed version is listed");
-            work.gc_examined += 1;
-            if versions.is_empty() {
-                self.retained.remove(&page);
-            }
-            let indexed = self.by_born.remove(&(born, page, unit, died))
-                && self.by_died.remove(&(died, page, unit, born));
-            crate::turso_assert!(indexed, "a released version was missing from an index");
-            self.versions -= 1;
-            arena.release(v.slot);
+        if budget.is_some() && lo.is_none() {
+            return 0;
+        }
+        let Some(dead) = self.garbage(f, lo, hi, budget, work) else {
+            return 0;
+        };
+        for &v in &dead {
+            self.release(v, arena, work);
         }
         dead.len()
+    }
+
+    /// Release one indexed version, `(born, page, unit, died)`: out of the fat node and both
+    /// indexes, and its slot back to `arena`.
+    fn release(&mut self, (born, page, unit, died): (u64, u32, U, u64), arena: &mut Arena, work: &mut BranchWork) {
+        let versions = self.retained.get_mut(&page).expect("indexed version is listed");
+        let v = versions
+            .remove(&(unit, born))
+            .expect("indexed version is listed");
+        work.gc_examined += 1;
+        if versions.is_empty() {
+            self.retained.remove(&page);
+        }
+        let indexed = self.by_born.remove(&(born, page, unit, died))
+            && self.by_died.remove(&(died, page, unit, born));
+        crate::turso_assert!(indexed, "a released version was missing from an index");
+        self.versions -= 1;
+        arena.release(v.slot);
     }
 
     /// The versions that held `f` and no other live child, as `(born, page, unit, died)`, once `f`
@@ -331,14 +377,16 @@ impl<U: Unit> Lineage<U> {
     ///   `hi`, or back past `lo`). The ranges are walked in lockstep and the first to end is
     ///   filtered, so the walk costs twice the SMALLER range, never the larger.
     ///
-    /// `gc_range_entries` counts every entry either range yields.
+    /// `gc_range_entries` counts every entry either range yields. With a `budget`, the walk gives up
+    /// (`None`) once it has visited more than `budget` entries.
     fn garbage(
         &self,
         f: u64,
         lo: Option<u64>,
         hi: Option<u64>,
+        budget: Option<usize>,
         work: &mut BranchWork,
-    ) -> Vec<(u64, u32, U, u64)> {
+    ) -> Option<Vec<(u64, u32, U, u64)>> {
         // `born` in (lo, f] and `died` in (f, hi], as bounds on the two indexes' first field.
         let after = |e: u64| (e, NO_PAGE, U::LAST, u64::MAX);
         let born_from = lo.map_or(Bound::Unbounded, |lo| Bound::Excluded(after(lo)));
@@ -377,6 +425,9 @@ impl<U: Unit> Lineage<U> {
                     Some(v) => {
                         work.gc_range_entries += 1;
                         seen[side].push(v);
+                        if budget.is_some_and(|b| seen[0].len() + seen[1].len() > b) {
+                            return None;
+                        }
                     }
                     None => break 'walk side,
                 }
@@ -384,7 +435,7 @@ impl<U: Unit> Lineage<U> {
         };
         let mut dead = std::mem::take(&mut seen[finished]);
         dead.retain(|&(born, _, _, died)| only_f(born, died));
-        dead
+        Some(dead)
     }
 
     fn release_all(self, arena: &mut Arena) -> Vec<Slot> {
@@ -409,6 +460,7 @@ impl TrunkState {
             chunk_born: HashMap::new(),
             chunks: None,
             chunk_size: 0,
+            gc_budget: None,
         }
     }
 
@@ -462,23 +514,50 @@ impl TrunkState {
         }
     }
 
-    /// Release every pending image no live child is older than. Returns how many.
-    fn release_stale_pending(&mut self, arena: &mut Arena) -> usize {
+    /// The horizon sweep: release, in `died` order, up to `budget` chunk versions and up to `budget`
+    /// pending images that no live child is older than (with no live child, all of them). Returns
+    /// the pages and the chunks released.
+    fn sweep(&mut self, arena: &mut Arena, work: &mut BranchWork, budget: usize) -> (usize, usize) {
         let oldest = self.lineage.children.keys().next().copied();
-        let mut freed = 0;
-        while let Some(&(died, page)) = self.pending_by_died.first() {
-            if oldest.is_some_and(|f| f < died) {
+        // Nothing a live child can see died at or before the oldest live fork.
+        let below = |died: u64| oldest.is_none_or(|f| died <= f);
+        let TrunkState {
+            lineage,
+            pending,
+            pending_by_died,
+            chunks,
+            ..
+        } = self;
+        let mut freed_chunks = 0;
+        if let Some(chunks) = chunks.as_mut() {
+            while freed_chunks < budget {
+                let Some(&(died, page, unit, born)) = lineage.by_died.first() else {
+                    break;
+                };
+                if !below(died) {
+                    break;
+                }
+                work.gc_range_entries += 1;
+                lineage.release((born, page, unit, died), chunks, work);
+                freed_chunks += 1;
+            }
+        }
+        let mut freed_pages = 0;
+        while freed_pages < budget {
+            let Some(&(died, page)) = pending_by_died.first() else {
+                break;
+            };
+            if !below(died) {
                 break;
             }
-            self.pending_by_died.pop_first();
-            let p = self
-                .pending
+            pending_by_died.pop_first();
+            let p = pending
                 .remove(&page)
                 .expect("an indexed pending image is listed");
             arena.release(p.slot);
-            freed += 1;
+            freed_pages += 1;
         }
-        freed
+        (freed_pages, freed_chunks)
     }
 }
 
@@ -504,20 +583,45 @@ fn configured_chunk_size() -> usize {
     }
 }
 
+/// The trunk's reclamation steps per store call: `TURSO_BRANCH_GC_BUDGET` (a positive number, or
+/// `eager` for none), else the default.
+fn configured_gc_budget() -> Option<usize> {
+    match std::env::var("TURSO_BRANCH_GC_BUDGET") {
+        Err(_) => Some(DEFAULT_GC_BUDGET),
+        Ok(v) if v == "eager" => None,
+        Ok(v) => {
+            let n: usize = v
+                .parse()
+                .unwrap_or_else(|_| panic!("TURSO_BRANCH_GC_BUDGET={v} is not a number or `eager`"));
+            assert!(n > 0, "TURSO_BRANCH_GC_BUDGET must be positive");
+            Some(n)
+        }
+    }
+}
+
 impl BranchStore {
     pub(crate) fn new() -> Self {
-        Self::with_chunk_size(configured_chunk_size())
+        Self::with_config(configured_chunk_size(), configured_gc_budget())
     }
 
     /// A store whose trunk keeps `chunk_size`-byte chunks (a power of two of at least 16 bytes;
-    /// pages smaller than it are kept whole).
+    /// pages smaller than it are kept whole) and reclaims eagerly.
+    #[cfg(test)]
     pub(crate) fn with_chunk_size(chunk_size: usize) -> Self {
+        Self::with_config(chunk_size, None)
+    }
+
+    /// As [`Self::with_chunk_size`], reclaiming at most about `2 * gc_budget` steps per store call
+    /// (`None`: eagerly).
+    pub(crate) fn with_config(chunk_size: usize, gc_budget: Option<usize>) -> Self {
         assert!(
             chunk_size.is_power_of_two() && chunk_size >= 16,
             "chunk size {chunk_size} must be a power of two of at least 16"
         );
+        assert!(gc_budget != Some(0), "a reclamation budget must be positive");
         let mut trunk = TrunkState::new();
         trunk.chunk_size = chunk_size;
+        trunk.gc_budget = gc_budget;
         Self {
             inner: Mutex::new(StoreInner {
                 arena: None,
@@ -769,6 +873,9 @@ impl BranchStore {
             trunk.pending_by_died.insert((epoch, page));
         }
         trunk.written.insert(page, epoch);
+        if let Some(budget) = trunk.gc_budget {
+            trunk.sweep(arena, work, budget);
+        }
     }
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
@@ -877,6 +984,19 @@ impl BranchStore {
             .map_or_else(Vec::new, |a| a.slots_in_use())
     }
 
+    /// The trunk's retained chunk versions as `(page, chunk, died)`, for membership assertions.
+    #[cfg(test)]
+    fn trunk_version_keys(&self) -> std::collections::BTreeSet<(u32, u16, u64)> {
+        self.inner
+            .lock()
+            .trunk
+            .lineage
+            .by_died
+            .iter()
+            .map(|&(died, page, unit, _)| (page, unit, died))
+            .collect()
+    }
+
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
         self.inner
             .lock()
@@ -917,15 +1037,23 @@ impl BranchStore {
                     .chunks
                     .as_mut()
                     .expect("the page arena exists, so the chunk arena does");
-                let freed_chunks = trunk.lineage.child_gone(st.fork_epoch, chunks, work);
-                freed += trunk.release_stale_pending(arena);
+                let budget = trunk.gc_budget;
+                let mut freed_chunks = trunk.lineage.child_gone(st.fork_epoch, chunks, work, budget);
+                // With no child left nothing can be read, so everything goes now.
+                let sweep = match budget {
+                    Some(b) if !trunk.lineage.children.is_empty() => b,
+                    _ => usize::MAX,
+                };
+                let (pages, chunks) = trunk.sweep(arena, work, sweep);
+                freed += pages;
+                freed_chunks += chunks;
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
                 return (freed, freed_chunks);
             }
             let parent = branches
                 .get_mut(&st.parent)
                 .expect("a live branch's parent is kept while the branch lives");
-            freed += parent.lineage.child_gone(st.fork_epoch, arena, work);
+            freed += parent.lineage.child_gone(st.fork_epoch, arena, work, None);
             id = st.parent;
         }
     }
@@ -1274,6 +1402,163 @@ mod tests {
             (s.arena_slots_in_use, s.chunk_slots_in_use, s.trunk_versions),
             (0, 0, 0),
             "seed {seed:#x}: versions leaked"
+        );
+    }
+
+    /// Bounded reclamation (module doc, "Bounded reclamation at the trunk") against the same model
+    /// as the test above, with a budget of 2 steps. After every step:
+    ///
+    /// * every live child reads every page byte for byte (a version left for the sweep must never be
+    ///   laid over a read, and a version a child needs must never be gone);
+    /// * the store holds every chunk version a live child can see, and only versions that were once
+    ///   retained;
+    /// * a reap does at most `2 * BUDGET + 1` index steps (a walk abandoned after `BUDGET + 1`, a
+    ///   sweep of `BUDGET`), and a trunk write at most `BUDGET` — except the reap of the last child,
+    ///   which frees everything, since nothing can be read any more.
+    ///
+    /// The run must have deferred garbage and abandoned or capped work at least once, or it says
+    /// nothing about the bounded path; and at the end the store must be empty.
+    #[test]
+    fn bounded_reclamation_never_frees_a_visible_version_and_catches_up() {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            run_bounded(seed);
+        }
+    }
+
+    fn run_bounded(seed: u64) {
+        const BUDGET: usize = 2;
+        let store = BranchStore::with_config(CHUNK, Some(BUDGET));
+        let mut rng = Rng(seed);
+        let mut current: HashMap<u32, [u64; CPP]> = (0..PAGES).map(|p| (p, [0; CPP])).collect();
+        let mut live: Vec<(BranchId, u64, HashMap<u32, [u64; CPP]>)> = Vec::new();
+        // The eager rule, as in `run_chunks`; `ever` is every chunk version it ever retained.
+        let mut written: HashMap<u32, u64> = HashMap::new();
+        let mut pending: HashMap<u32, ([u64; CPP], u64)> = HashMap::new();
+        let mut chunk_born: HashMap<(u32, usize), u64> = HashMap::new();
+        let mut history: Vec<(u32, usize, u64, u64)> = Vec::new();
+        let mut ever: HashSet<(u32, u16, u64)> = HashSet::new();
+        let mut epoch = 0u64;
+        let mut generation = 0u64;
+        let (mut deferred, mut capped) = (0, 0);
+        for step in 0..2000 {
+            match rng.below(10) {
+                0..=2 if live.len() < 40 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    live.push((id, epoch, current.clone()));
+                    epoch += 1;
+                }
+                0..=5 => {
+                    for _ in 0..=rng.below(3) {
+                        let page = rng.below(PAGES as u64) as u32;
+                        if store.trunk_has_children() {
+                            let born = written.get(&page).copied().unwrap_or(0);
+                            if born < epoch {
+                                if let Some((pre, died)) = pending.remove(&page) {
+                                    let now = current[&page];
+                                    for c in (0..CPP).filter(|&c| pre[c] != now[c]) {
+                                        let b = chunk_born.get(&(page, c)).copied().unwrap_or(0);
+                                        if live.iter().any(|&(_, f, _)| b <= f && f < died) {
+                                            history.push((page, c, b, died));
+                                            ever.insert((page, c as u16, died));
+                                        }
+                                        chunk_born.insert((page, c), died);
+                                    }
+                                }
+                                if !live.is_empty() {
+                                    pending.insert(page, (current[&page], epoch));
+                                }
+                                written.insert(page, epoch);
+                            }
+                            let before = store.stats().work.gc_range_entries;
+                            store.first_write_trunk(page, &chunked(&current[&page]));
+                            let steps = store.stats().work.gc_range_entries - before;
+                            assert!(
+                                steps <= BUDGET as u64,
+                                "seed {seed:#x} step {step}: a trunk write took {steps} reclamation steps"
+                            );
+                            capped += usize::from(steps == BUDGET as u64);
+                        }
+                        let mut gens = current[&page];
+                        for g in gens.iter_mut() {
+                            if rng.below(2) == 0 {
+                                generation += 1;
+                                *g = generation;
+                            }
+                        }
+                        current.insert(page, gens);
+                    }
+                }
+                _ if !live.is_empty() => {
+                    let at = match rng.below(3) {
+                        0 => 0,
+                        1 => live.len() - 1,
+                        _ => rng.below(live.len() as u64) as usize,
+                    };
+                    let (id, _, _) = live.remove(at);
+                    let oldest = live.first().map(|c| c.1);
+                    pending.retain(|_, &mut (_, died)| oldest.is_some_and(|o| o < died));
+                    let before = store.stats().work.gc_range_entries;
+                    let reaped = store.release_handle(id);
+                    let steps = store.stats().work.gc_range_entries - before;
+                    assert!(!reaped.deferred, "seed {seed:#x} step {step}");
+                    if !live.is_empty() {
+                        assert!(
+                            steps <= 2 * BUDGET as u64 + 1,
+                            "seed {seed:#x} step {step}: a reap took {steps} reclamation steps"
+                        );
+                        capped += usize::from(steps > BUDGET as u64);
+                    }
+                }
+                _ => {}
+            }
+            let alive: HashSet<(u32, u16, u64)> = history
+                .iter()
+                .filter(|&&(_, _, born, died)| live.iter().any(|&(_, f, _)| born <= f && f < died))
+                .map(|&(page, c, _, died)| (page, c as u16, died))
+                .collect();
+            let held = store.trunk_version_keys();
+            for v in &alive {
+                assert!(
+                    held.contains(v),
+                    "seed {seed:#x} step {step}: chunk version {v:?} freed while a live child can see it"
+                );
+            }
+            for v in &held {
+                assert!(
+                    ever.contains(v),
+                    "seed {seed:#x} step {step}: the store holds {v:?}, which was never retained"
+                );
+            }
+            deferred += usize::from(held.len() > alive.len());
+            let mut buf = vec![0u8; PAGE];
+            for (id, f, view) in &live {
+                for page in 0..PAGES {
+                    let in_arena = store.resolve_into(*id, page, &mut buf).unwrap();
+                    let got = if in_arena {
+                        buf.clone()
+                    } else {
+                        chunked(&current[&page])
+                    };
+                    assert_eq!(
+                        got,
+                        chunked(&view[&page]),
+                        "seed {seed:#x} step {step}: child forked at {f} read the wrong page {page}"
+                    );
+                }
+            }
+        }
+        assert!(
+            deferred > 0 && capped > 0,
+            "seed {seed:#x}: steps with garbage deferred {deferred}, calls capped {capped}"
+        );
+        for (id, _, _) in live {
+            store.release_handle(id);
+        }
+        let s = store.stats();
+        assert_eq!(
+            (s.arena_slots_in_use, s.chunk_slots_in_use, s.trunk_versions, s.trunk_pending_pages),
+            (0, 0, 0, 0),
+            "seed {seed:#x}: the sweep did not catch up once the last child went"
         );
     }
 
