@@ -405,3 +405,29 @@ refitted.
 **What the report owes.** For each run, op and x: p50 before and after, the slope before and after, and the counters.
 Every term that still grows with N is listed, with the mechanism read from source. That covers time, space (arena, RSS,
 WAL bytes) and every counter. A term predicted above and not found is reported as not found.
+
+### Amendment 5 — written 2026-09-25T00:50Z: `--synchronous`, and a2 under NORMAL on the fixed store; before any fixed run
+
+No fixed run has started. The amendment-4 runner was stopped at 00:49:50Z, while it was still waiting for the lock
+for its build. Its aborted build log is kept at `turso_sota/raw/aborted/`.
+
+**Why.** The turso_curve lane attributed a2's `trunk_write` step and the WAL's linear growth to `synchronous=OFF`.
+Under OFF, Turso's checkpoint does not publish its backfill, so every later commit checkpoints again and the log never
+restarts. That is intended upstream (`test_checkpoint_sync_mode_off_leaves_backfill_unpublished`). The lane measured
+it at `turso_curve/raw/e4_spread_trunk_normal.txt` and `e5_spread_normal.txt`: under NORMAL there is no step and the
+WAL stays bounded. Under OFF that artifact hides the fixed store's own trunk-write term. At 10^6 each retaining trunk
+write now inserts into three B-trees of ~10^6 entries: the per-page map, `by_born` and `by_died`.
+
+**Harness.** This commit carries `--synchronous off|normal|full`, ported verbatim from turso_curve's `48a2b97a3`. The
+default stays OFF, so every amendment-4 run behaves as registered. The fixed binary is built from THIS commit
+instead of `22a345c01`. `core/branch/` is byte-identical between the two. The harness differs only by this flag.
+
+**Run.** `e5_fix`: `--arm spread --synchronous normal --checkpoints 100,1000,10000,100000,1000000 --samples 200`.
+Its before is `turso_curve/raw/e5_spread_normal.txt`.
+
+**Predictions.**
+- Counters as a2_fix: `read_inh` and `read_hot` 1.00 ± 0.05 at N ≥ 10^3, `first_write` 1.00 ± 0.05 at N ≥ 10^3, reap 0.
+- Space: WAL ≤ 5 MB at every x (e5: 4.1 MB at 10^6).
+- `trunk_write` p50 |slope| < 0.10, within ±20% of e5's at every x.
+- Every other op within ±15% of e5's p50, except `read_hot` and `read_inh`, which lose their scans. At 10^6, e5 scanned
+  944–955 versions per read on ~7.5 µs.

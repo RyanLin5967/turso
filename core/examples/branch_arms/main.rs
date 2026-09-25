@@ -16,6 +16,9 @@
 //! `--no-autocheckpoint` disables the trunk connection's WAL auto-actions (auto-checkpoint and WAL
 //! restart), amendment 2. Every state line prints the WAL file's size.
 //!
+//! `--synchronous off|normal|full` sets the trunk's sync mode (default off, as amendments 1-2).
+//! Ported verbatim from the turso_curve lane's amendment 3 (`48a2b97a3`); this lane's amendment 5.
+//!
 //! `--victim oldest|random` (churn arms only; default random) picks each cycle's reap victim: a
 //! uniformly random live branch, or the oldest one, which is the order uniform-TTL lease expiry
 //! reaps in (amendment 3).
@@ -73,6 +76,7 @@ struct Args {
     windows: usize,
     w_list: Vec<usize>,
     no_autocheckpoint: bool,
+    synchronous: String,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -93,6 +97,7 @@ fn parse_args() -> Args {
         windows: 10,
         w_list: vec![1],
         no_autocheckpoint: false,
+        synchronous: "OFF".to_string(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -118,6 +123,15 @@ fn parse_args() -> Args {
             "--windows" => args.windows = val().parse().unwrap_or_else(|_| die("bad --windows")),
             "--w" => args.w_list = parse_list(&val(), "--w"),
             "--no-autocheckpoint" => args.no_autocheckpoint = true,
+            "--synchronous" => {
+                args.synchronous = match val().as_str() {
+                    "off" => "OFF",
+                    "normal" => "NORMAL",
+                    "full" => "FULL",
+                    other => die(&format!("unknown --synchronous {other}")),
+                }
+                .to_string()
+            }
             "--victim" => {
                 args.victim = match val().as_str() {
                     "random" => Victim::Random,
@@ -465,7 +479,10 @@ fn main() {
     }
     // Amendment 1: trunk commits do not fsync. The fsync is not the mechanism under test, and the
     // `hot`/`spread`/`churn_hot` arms commit on the trunk once per fork, up to 10^6 times.
-    trunk.execute("PRAGMA synchronous = OFF").unwrap();
+    // Amendment 5: `--synchronous` overrides the mode; the default stays OFF.
+    trunk
+        .execute(format!("PRAGMA synchronous = {}", args.synchronous))
+        .unwrap();
     trunk
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
