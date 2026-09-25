@@ -179,6 +179,54 @@ pub struct BranchStats {
     pub work: BranchWork,
 }
 
+/// The size of every structure the branch store keeps resident, for curves against the number of
+/// branches ever created at a fixed live count. Observation only: [`Database::branch_resident`] takes
+/// it by a full scan under the store lock, so callers take it between timed operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchResident {
+    /// Branch states kept, including reaped ones kept for a live child (`BranchStats::live_branches`).
+    pub states: usize,
+    /// States whose handle has gone: kept only because a child or a connection still needs them.
+    pub zombies: usize,
+    /// States with an open connection.
+    pub open: usize,
+    /// `HashMap::capacity` of the branch table: items plus growth left. At a fixed item count it
+    /// falls by one per tombstone and returns to the table's full capacity at a rehash.
+    pub table_capacity: usize,
+    /// The next branch id; ids are never reused.
+    pub next_id: u64,
+    /// The trunk's fork epoch, advanced once per trunk fork.
+    pub trunk_epoch: u64,
+    /// Live children of the trunk.
+    pub trunk_children: usize,
+    /// Trunk pre-images retained for children (entries of each of the trunk's three indexes).
+    pub trunk_retained_versions: usize,
+    /// Pages with at least one retained trunk version.
+    pub trunk_retained_pages: usize,
+    /// Entries of the trunk's last-write-epoch map, which is never pruned.
+    pub trunk_written_pages: usize,
+    /// Child entries summed over every branch state's lineage.
+    pub branch_children: usize,
+    /// Retained versions summed over every branch state's lineage.
+    pub branch_retained_versions: usize,
+    /// Current pages summed over every branch state.
+    pub branch_current_pages: usize,
+    /// Branch states that carry a `view` page map (they have forked a child).
+    pub views: usize,
+    /// Distinct persistent page-map nodes reachable from every state's maps.
+    pub page_map_nodes: usize,
+    /// True if some lineage's three version indexes disagree in size (a bookkeeping defect).
+    pub index_mismatch: bool,
+    /// Arena slots ever handed out (the arena never shrinks below this).
+    pub arena_high_water: usize,
+    pub arena_in_use: usize,
+    pub arena_free_list_len: usize,
+    pub arena_free_list_capacity: usize,
+    pub arena_free_bits_words: usize,
+    /// Arena chunks allocated (each `SLOTS_PER_CHUNK` pages; never freed).
+    pub arena_chunks: usize,
+}
+
 /// Cumulative counts of the store's per-call work since the database opened. Observation only:
 /// nothing in the mechanism reads them. Each is updated once per call under the lock the call
 /// already holds, from a loop index the call computes anyway, so counting adds no per-element step.
@@ -357,6 +405,18 @@ impl Connection {
 impl Database {
     pub fn branch_stats(&self) -> BranchStats {
         self.branches.stats()
+    }
+
+    /// Every resident structure of the branch store, by a full scan. Observation only.
+    #[doc(hidden)]
+    pub fn branch_resident(&self) -> BranchResident {
+        self.branches.resident()
+    }
+
+    /// `(states, capacity)` of the branch table, in O(1). Observation only.
+    #[doc(hidden)]
+    pub fn branch_table_shape(&self) -> (usize, usize) {
+        self.branches.table_shape()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.

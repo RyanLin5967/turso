@@ -84,7 +84,7 @@ use std::ops::Bound;
 
 use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
-use super::{BranchId, BranchStats, BranchWork, Reaped};
+use super::{BranchId, BranchResident, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
 use crate::sync::atomic::{AtomicUsize, Ordering};
@@ -630,6 +630,60 @@ impl BranchStore {
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
             work: inner.work,
         }
+    }
+
+    /// `(states, capacity)` of the branch table: `HashMap::capacity` is items plus growth left, so
+    /// at a fixed item count it falls by one per tombstone and jumps back at a rehash. O(1).
+    pub(crate) fn table_shape(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        (inner.branches.len(), inner.branches.capacity())
+    }
+
+    /// Every resident structure's size, by a full scan under the lock. Observation only.
+    pub(crate) fn resident(&self) -> BranchResident {
+        let inner = self.inner.lock();
+        let mut r = BranchResident {
+            states: inner.branches.len(),
+            table_capacity: inner.branches.capacity(),
+            next_id: inner.next_id,
+            trunk_epoch: inner.trunk.lineage.epoch,
+            trunk_children: inner.trunk.lineage.children.len(),
+            trunk_retained_versions: inner.trunk.lineage.by_born.len(),
+            trunk_retained_pages: inner.trunk.lineage.retained.len(),
+            trunk_written_pages: inner.trunk.written.len(),
+            ..Default::default()
+        };
+        let mut index_mismatch = inner.trunk.lineage.by_died.len() != r.trunk_retained_versions
+            || inner.trunk.lineage.retained.values().map(|v| v.len()).sum::<usize>()
+                != r.trunk_retained_versions;
+        let mut nodes = std::collections::HashSet::new();
+        for st in inner.branches.values() {
+            r.zombies += usize::from(!st.handle);
+            r.open += usize::from(st.open);
+            r.branch_children += st.lineage.children.len();
+            r.branch_retained_versions += st.lineage.by_born.len();
+            index_mismatch |= st.lineage.by_died.len() != st.lineage.by_born.len()
+                || st.lineage.retained.values().map(|v| v.len()).sum::<usize>()
+                    != st.lineage.by_born.len();
+            r.branch_current_pages += st.current.len();
+            st.inherited.count_nodes(&mut nodes);
+            if let Some(view) = &st.view {
+                r.views += 1;
+                view.count_nodes(&mut nodes);
+            }
+        }
+        r.page_map_nodes = nodes.len();
+        r.index_mismatch = index_mismatch;
+        if let Some(arena) = &inner.arena {
+            let (high_water, free_capacity, free_bits_words, chunks) = arena.shape();
+            r.arena_high_water = high_water;
+            r.arena_in_use = arena.in_use();
+            r.arena_free_list_len = arena.free_count();
+            r.arena_free_list_capacity = free_capacity;
+            r.arena_free_bits_words = free_bits_words;
+            r.arena_chunks = chunks;
+        }
+        r
     }
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {

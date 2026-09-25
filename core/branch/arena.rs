@@ -93,6 +93,17 @@ impl Arena {
         self.free.len()
     }
 
+    /// `(high_water, free list capacity, free-bit words, chunks)`, for resident-size curves.
+    /// Observation only.
+    pub(crate) fn shape(&self) -> (usize, usize, usize, usize) {
+        (
+            self.high_water as usize,
+            self.free.capacity(),
+            self.free_bits.len(),
+            self.chunks.len(),
+        )
+    }
+
     pub(crate) fn page(&self, slot: Slot) -> &[u8] {
         let (chunk, offset) = self.locate(slot);
         &self.chunks[chunk][offset..offset + self.page_size]
