@@ -1445,7 +1445,7 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 /// driver tracks is which phase/completion it's waiting on.
 pub struct BuildSharedWal {
     reader: Option<Arc<StreamingWalReader>>,
-    wal_file_shared: Arc<RwLock<WalFileShared>>,
+    wal_file_shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
     file_size: u64,
     phase: BuildSharedWalPhase,
 }
@@ -1471,7 +1471,7 @@ impl BuildSharedWal {
     pub fn begin(file: &Arc<dyn File>) -> Result<Self> {
         let size = file.size()?;
 
-        let header = Arc::new(SpinLock::new(WalHeader::default()));
+        let header = Arc::new(crate::seqlock::SeqLock::new(WalHeader::default()));
         let read_locks = std::array::from_fn(|_| TursoRwLock::new());
         for (i, l) in read_locks.iter().enumerate() {
             l.write();
@@ -1479,7 +1479,7 @@ impl BuildSharedWal {
             l.unlock();
         }
 
-        let wal_file_shared = Arc::new(RwLock::new(WalFileShared {
+        let wal_file_shared = Arc::new(crate::bravo::BravoRwLock::new(WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
                 wal_header: header.clone(),
@@ -1539,7 +1539,7 @@ impl BuildSharedWal {
     /// Drive the recovery state machine. Yields the in-flight read completion
     /// when it must wait; returns `Done(wal_file_shared)` once the full WAL
     /// has been scanned (or recovery short-circuited).
-    pub fn poll(&mut self) -> Result<IOResult<Arc<RwLock<WalFileShared>>>> {
+    pub fn poll(&mut self) -> Result<IOResult<Arc<crate::bravo::BravoRwLock<WalFileShared>>>> {
         loop {
             match self.phase.clone() {
                 BuildSharedWalPhase::NeedHeaderRead => {
@@ -1607,15 +1607,15 @@ impl BuildSharedWal {
 pub fn build_shared_wal(
     file: &Arc<dyn File>,
     io: &Arc<dyn crate::IO>,
-) -> Result<Arc<RwLock<WalFileShared>>> {
+) -> Result<Arc<crate::bravo::BravoRwLock<WalFileShared>>> {
     let mut driver = BuildSharedWal::begin(file)?;
     io.block(|| driver.poll())
 }
 
 pub(super) struct StreamingWalReader {
     file: Arc<dyn File>,
-    wal_shared: Arc<RwLock<WalFileShared>>,
-    header: Arc<SpinLock<WalHeader>>,
+    wal_shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
+    header: Arc<crate::seqlock::SeqLock<WalHeader>>,
     file_size: u64,
     state: RwLock<StreamingState>,
     off_atomic: AtomicU64,
@@ -1639,8 +1639,8 @@ struct StreamingState {
 impl StreamingWalReader {
     fn new(
         file: Arc<dyn File>,
-        wal_shared: Arc<RwLock<WalFileShared>>,
-        header: Arc<SpinLock<WalHeader>>,
+        wal_shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
+        header: Arc<crate::seqlock::SeqLock<WalHeader>>,
         file_size: u64,
     ) -> Self {
         Self {

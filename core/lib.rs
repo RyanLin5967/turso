@@ -48,6 +48,8 @@ pub(crate) mod btree_dump;
 pub(crate) mod sync;
 #[doc(hidden)]
 pub mod coherence;
+pub(crate) mod bravo;
+pub(crate) mod seqlock;
 pub(crate) mod thread;
 
 mod assert;

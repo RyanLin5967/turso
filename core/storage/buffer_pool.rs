@@ -14,8 +14,9 @@ use std::sync::OnceLock;
 #[derive(Debug)]
 /// A buffer allocated from an arena from `[BufferPool]`
 pub struct ArenaBuffer {
-    /// The `Arena` the buffer came from
-    arena: Arc<Arena>,
+    /// The `Arena` the buffer came from. ManuallyDrop: with magazines (r11-coherence FP) the strong count it
+    /// stands for is a credit returned to the freeing thread's magazine, not decremented.
+    arena: std::mem::ManuallyDrop<Arc<Arena>>,
     /// Pointer to the start of the buffer
     ptr: NonNull<u8>,
     /// Identifier for the `[Arena]` the buffer came from
@@ -35,7 +36,7 @@ crate::assert::assert_send_sync!(ArenaBuffer);
 impl ArenaBuffer {
     fn new(arena: Arc<Arena>, ptr: NonNull<u8>, len: usize, arena_id: u32, slot_idx: u32) -> Self {
         ArenaBuffer {
-            arena,
+            arena: std::mem::ManuallyDrop::new(arena),
             ptr,
             arena_id,
             slot_idx,
@@ -69,7 +70,158 @@ impl ArenaBuffer {
 
 impl Drop for ArenaBuffer {
     fn drop(&mut self) {
+        if self.arena.magazines {
+            magazine::free(&self.arena, self.slot_idx, self.logical_len());
+            // The buffer's strong count became a credit of this thread's magazine.
+            return;
+        }
         self.arena.free(self.slot_idx, self.logical_len());
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.arena) };
+    }
+}
+
+/// r11-coherence FP: per-thread magazines of free slots (Bonwick & Adams, USENIX 2001) and a sloppy count of the
+/// arena's Arc (Boyd-Wickizer et al., OSDI 2010): a thread takes slots from the shared bitmap and strong counts from
+/// the Arc in batches of [`BATCH`], and hands them out and takes them back without touching either.
+///
+/// A magazine holds one keep-alive strong count plus its credits, so an arena outlives every magazine holding its
+/// slots. A magazine whose arena nobody else holds any more (no pool, no buffer) is pruned when its thread next opens
+/// a magazine, and every magazine returns its slots and counts when its thread exits.
+mod magazine {
+    use super::Arena;
+    use crate::sync::atomic::Ordering;
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    pub(super) const BATCH: usize = 8;
+
+    struct Mag {
+        arena: *const Arena,
+        slots: Vec<u32>,
+        credits: usize,
+    }
+
+    impl Mag {
+        fn return_slots(&mut self, n: usize) {
+            let n = n.min(self.slots.len());
+            if n == 0 {
+                return;
+            }
+            // Safety: this magazine holds a strong count (see the module doc); not borrowed from `self`.
+            let a = unsafe { &*self.arena };
+            for s in self.slots.drain(self.slots.len() - n..) {
+                a.free_slots.free_one(s);
+            }
+            crate::coherence::bump(crate::coherence::Class::BufPool, 1);
+            a.allocated_slots.fetch_sub(n, Ordering::AcqRel);
+        }
+
+        fn return_credits(&mut self, n: usize) {
+            crate::coherence::bump(crate::coherence::Class::BufPool, n as u64);
+            for _ in 0..n {
+                unsafe { Arc::decrement_strong_count(self.arena) };
+            }
+            self.credits -= n;
+        }
+    }
+
+    impl Drop for Mag {
+        fn drop(&mut self) {
+            let all = self.slots.len();
+            self.return_slots(all);
+            let credits = self.credits;
+            self.return_credits(credits);
+            // The keep-alive count, last: it may free the arena.
+            crate::coherence::bump(crate::coherence::Class::BufPool, 1);
+            unsafe { Arc::decrement_strong_count(self.arena) };
+        }
+    }
+
+    thread_local! {
+        static MAGS: RefCell<Vec<Mag>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn with_mag<R>(arena: &Arc<Arena>, f: impl FnOnce(&mut Mag) -> R) -> Option<R> {
+        MAGS.try_with(|m| {
+            let mut m = m.borrow_mut();
+            let p = Arc::as_ptr(arena);
+            let i = match m.iter().position(|x| x.arena == p) {
+                Some(i) => i,
+                None => {
+                    // Drop magazines whose arena only they keep alive.
+                    m.retain(|x| Arc::strong_count(&std::mem::ManuallyDrop::new(unsafe {
+                        Arc::from_raw(x.arena)
+                    })) > x.credits + 1);
+                    crate::coherence::bump(crate::coherence::Class::BufPool, 1);
+                    unsafe { Arc::increment_strong_count(p) };
+                    m.push(Mag {
+                        arena: p,
+                        slots: Vec::with_capacity(2 * BATCH + 1),
+                        credits: 0,
+                    });
+                    m.len() - 1
+                }
+            };
+            f(&mut m[i])
+        })
+        .ok()
+    }
+
+    /// A slot and a strong count for a new buffer, from this thread's magazine. None: the arena is exhausted (or
+    /// the thread is exiting), and the caller takes the direct path.
+    pub(super) fn alloc(arena: &Arc<Arena>) -> Option<u32> {
+        with_mag(arena, |mag| {
+            if mag.slots.is_empty() {
+                // Safety: the magazine holds a strong count; not borrowed from `mag`.
+                let a = unsafe { &*mag.arena };
+                let mut got = 0;
+                while got < BATCH {
+                    match a.free_slots.alloc_one() {
+                        Some(s) => {
+                            mag.slots.push(s);
+                            got += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if got == 0 {
+                    return None;
+                }
+                crate::coherence::bump(crate::coherence::Class::BufPool, 1);
+                a.allocated_slots.fetch_add(got, Ordering::AcqRel);
+            }
+            if mag.credits == 0 {
+                crate::coherence::bump(crate::coherence::Class::BufPool, BATCH as u64);
+                for _ in 0..BATCH {
+                    unsafe { Arc::increment_strong_count(mag.arena) };
+                }
+                mag.credits = BATCH;
+            }
+            mag.credits -= 1;
+            mag.slots.pop()
+        })
+        .flatten()
+    }
+
+    /// Take back a buffer's slot and its strong count.
+    pub(super) fn free(arena: &Arc<Arena>, slot: u32, len: usize) {
+        crate::turso_assert!(len <= arena.slot_size, "pooled buffers must not exceed one slot");
+        let done = with_mag(arena, |mag| {
+            mag.slots.push(slot);
+            mag.credits += 1;
+            if mag.slots.len() > 2 * BATCH {
+                mag.return_slots(BATCH);
+            }
+            if mag.credits > 2 * BATCH {
+                mag.return_credits(BATCH);
+            }
+        });
+        if done.is_none() {
+            // The thread is exiting: the direct path.
+            arena.free_slots.free_one(slot);
+            arena.allocated_slots.fetch_sub(1, Ordering::AcqRel);
+            unsafe { Arc::decrement_strong_count(Arc::as_ptr(arena)) };
+        }
     }
 }
 
@@ -367,6 +519,8 @@ struct Arena {
     arena_size: usize,
     /// Slot size the total arena is divided into.
     slot_size: usize,
+    /// r11-coherence FP: buffers come from per-thread magazines (see [`magazine`]).
+    magazines: bool,
 }
 
 // SAFETY: Arena's base pointer comes from mmap and is never aliased. All mutable
@@ -424,6 +578,7 @@ impl Arena {
             allocated_slots: AtomicUsize::new(0),
             slot_size,
             arena_size: rounded_bytes,
+            magazines: crate::coherence::fix(crate::coherence::FIX_POOL),
         })
     }
 
@@ -432,6 +587,16 @@ impl Arena {
         if size > arena.slot_size {
             // The buffer pool only supports single-slot allocations. Larger requests fall back to
             // temporary heap buffers via the caller.
+            return None;
+        }
+        if arena.magazines {
+            if let Some(slot) = magazine::alloc(arena) {
+                let offset = slot as usize * arena.slot_size;
+                let ptr = unsafe { NonNull::new_unchecked(arena.base.as_ptr().add(offset)) };
+                // The strong count this Arc stands for is the magazine credit `alloc` consumed.
+                let arc = unsafe { Arc::from_raw(Arc::as_ptr(arena)) };
+                return Some(Buffer::new_pooled(ArenaBuffer::new(arc, ptr, size, arena.id, slot)));
+            }
             return None;
         }
         let first_idx = arena.free_slots.alloc_one()?;

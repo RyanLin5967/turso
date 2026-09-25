@@ -190,6 +190,23 @@ pub(crate) struct BranchStore {
     /// Whether [`take`] times how long each acquisition holds its lock. Off by default: it is the
     /// one part of the lock accounting that adds work inside a critical section.
     lock_timing: AtomicBool,
+    /// r11-coherence FS: the counters below replace `next_id`, `live` and `trunk_children`, each on a line of its
+    /// own, so the read-mostly fields above (`lock_timing`, read by every lock, `trunk_pages.generation`, read by
+    /// every trunk resolve, `trunk_format`) sit on lines nobody writes; ids come from per-thread blocks.
+    fs: bool,
+    uid: u64,
+    fs_next_id: CachePadded<AtomicU64>,
+    fs_live: CachePadded<AtomicUsize>,
+    fs_trunk_children: CachePadded<AtomicUsize>,
+}
+
+/// FS: ids a thread takes per trip to the store's counter.
+const ID_BLOCK: u64 = 64;
+static STORE_UIDS: AtomicU64 = AtomicU64::new(1);
+
+std::thread_local! {
+    /// FS: this thread's id blocks, one per store, keyed by the store's `uid` (never reused, unlike its address).
+    static ID_BLOCKS: std::cell::RefCell<Vec<(u64, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// One stripe of the branch map.
@@ -680,7 +697,59 @@ impl BranchStore {
             live: AtomicUsize::new(0),
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
+            fs: crate::coherence::fix(crate::coherence::FIX_STORE),
+            uid: STORE_UIDS.fetch_add(1, Ordering::Relaxed),
+            fs_next_id: CachePadded::new(AtomicU64::new(1)),
+            fs_live: CachePadded::new(AtomicUsize::new(0)),
+            fs_trunk_children: CachePadded::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// The live-branch counter (FS: on its own line).
+    #[inline(always)]
+    fn live_ctr(&self) -> &AtomicUsize {
+        if self.fs {
+            &self.fs_live
+        } else {
+            &self.live
+        }
+    }
+
+    /// The trunk-children counter (FS: on its own line).
+    #[inline(always)]
+    fn trunk_children_ctr(&self) -> &AtomicUsize {
+        if self.fs {
+            &self.fs_trunk_children
+        } else {
+            &self.trunk_children
+        }
+    }
+
+    /// A fresh branch id. FS: from this thread's block of [`ID_BLOCK`], refilled from the store's counter.
+    fn next_branch_id(&self) -> BranchId {
+        if !self.fs {
+            crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
+            return BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        }
+        ID_BLOCKS.with(|b| {
+            let mut b = b.borrow_mut();
+            let i = match b.iter().position(|e| e.0 == self.uid) {
+                Some(i) => i,
+                None => {
+                    b.push((self.uid, 0, 0));
+                    b.len() - 1
+                }
+            };
+            if b[i].1 == b[i].2 {
+                crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
+                let start = self.fs_next_id.fetch_add(ID_BLOCK, Ordering::Relaxed);
+                b[i].1 = start;
+                b[i].2 = start + ID_BLOCK;
+            }
+            let id = b[i].1;
+            b[i].1 += 1;
+            BranchId(id)
+        })
     }
 
     fn timed(&self) -> bool {
@@ -705,6 +774,9 @@ impl BranchStore {
         ));
         out.push(("store.written".into(), a(&self.written as *const _ as *const u8)));
         out.push(("store.self".into(), a(self as *const _ as *const u8)));
+        out.push(("store.fs_next_id".into(), a(&*self.fs_next_id as *const _ as *const u8)));
+        out.push(("store.fs_live".into(), a(&*self.fs_live as *const _ as *const u8)));
+        out.push(("store.fs_trunk_children".into(), a(&*self.fs_trunk_children as *const _ as *const u8)));
     }
 
     fn shard(&self, id: BranchId) -> Held<'_, Shard> {
@@ -752,13 +824,13 @@ impl BranchStore {
     }
 
     pub(crate) fn trunk_has_children(&self) -> bool {
-        self.trunk_children.load(Ordering::Acquire) > 0
+        self.trunk_children_ctr().load(Ordering::Acquire) > 0
     }
 
     /// Whether any branch state exists at all, including one kept alive only by a live child.
     /// Paths that rewrite the trunk without passing through `add_dirty` refuse while this holds.
     pub(crate) fn has_branches(&self) -> bool {
-        self.live.load(Ordering::Acquire) > 0
+        self.live_ctr().load(Ordering::Acquire) > 0
     }
 
     /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
@@ -784,21 +856,20 @@ impl BranchStore {
         }
         let (id, f) = {
             let mut trunk = self.trunk();
-            crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-            let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
+            let id = self.next_branch_id();
             let f = trunk.lineage.epoch;
             trunk.lineage.epoch += 1;
             trunk.lineage.children.insert(f, id);
             (id, f)
         };
         crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-        self.live.fetch_add(1, Ordering::AcqRel);
+        self.live_ctr().fetch_add(1, Ordering::AcqRel);
         self.shard(id).branches.insert(
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
         );
         crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-        self.trunk_children.fetch_add(1, Ordering::AcqRel);
+        self.trunk_children_ctr().fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
 
@@ -813,8 +884,7 @@ impl BranchStore {
             if st.writer {
                 return Err(LimboError::Busy);
             }
-            crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-            let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
+            let id = self.next_branch_id();
             let f = st.lineage.epoch;
             st.lineage.epoch += 1;
             st.lineage.children.insert(f, id);
@@ -833,7 +903,7 @@ impl BranchStore {
             (id, BranchState::new(parent, f, schema, st.trunk_at, view))
         };
         crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-        self.live.fetch_add(1, Ordering::AcqRel);
+        self.live_ctr().fetch_add(1, Ordering::AcqRel);
         self.shard(id).branches.insert(id, child);
         Ok(id)
     }
@@ -1193,7 +1263,7 @@ impl BranchStore {
             }
             let st = shard.branches.remove(&at).expect("just looked it up");
             crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-            self.live.fetch_sub(1, Ordering::AcqRel);
+            self.live_ctr().fetch_sub(1, Ordering::AcqRel);
             let domain = &mut shard.domain;
             for owned in st.current.values() {
                 domain.release(owned.slot);
@@ -1210,7 +1280,7 @@ impl BranchStore {
                 } = &mut *trunk;
                 freed += lineage.child_gone(st.fork_epoch, domain, work);
                 crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-                if self.trunk_children.fetch_sub(1, Ordering::AcqRel) == 1 {
+                if self.trunk_children_ctr().fetch_sub(1, Ordering::AcqRel) == 1 {
                     // From here the trunk writes without telling the store, so no cached version
                     // can be trusted once a branch exists again. No branch can read in between: a
                     // fork needs this lock.

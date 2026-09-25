@@ -554,10 +554,7 @@ crate::assert::assert_send_sync!(Connection);
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        crate::coherence::bump(
-            crate::coherence::Class::Builtin,
-            self.syms.read().entries() as u64,
-        );
+        crate::coherence::bump(crate::coherence::Class::Builtin, self.syms.read().drop_rmws());
         if !self.is_closed() {
             // A handle dropped mid-transaction rolls that transaction back
             // below, so parked index-method cursors must receive the same
@@ -5286,11 +5283,72 @@ pub type StepResult = vdbe::StepResult;
 
 #[derive(Default)]
 pub struct SymbolTable {
-    pub functions: HashMap<String, Arc<function::ExternalFunc>>,
-    pub collations: HashMap<u32, Arc<function::ExternalCollation>>,
-    pub vtabs: HashMap<String, Arc<VirtualTable>>,
-    pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
-    pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
+    pub functions: CowMap<String, Arc<function::ExternalFunc>>,
+    pub collations: CowMap<u32, Arc<function::ExternalCollation>>,
+    pub vtabs: CowMap<String, Arc<VirtualTable>>,
+    pub vtab_modules: CowMap<String, Arc<crate::ext::VTabImpl>>,
+    pub index_methods: CowMap<String, Arc<dyn IndexMethod>>,
+}
+
+/// A map shared copy-on-write (r11-coherence FB): a connection's symbol maps start as the database's builtin maps
+/// themselves, one Arc each, and are copied only by the connection that changes one (CREATE VIRTUAL TABLE, a
+/// collation, an extension). Reads go through `Deref` unchanged; any `&mut` access copies a shared map first.
+/// Prior art: SQLite keeps its builtin functions in one global hash every connection consults.
+pub struct CowMap<K, V>(Arc<HashMap<K, V>>);
+
+impl<K, V> Default for CowMap<K, V> {
+    fn default() -> Self {
+        Self(Arc::new(HashMap::default()))
+    }
+}
+
+impl<K, V> Clone for CowMap<K, V> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<K, V> std::ops::Deref for CowMap<K, V> {
+    type Target = HashMap<K, V>;
+    fn deref(&self) -> &HashMap<K, V> {
+        &self.0
+    }
+}
+
+impl<K: Clone + std::hash::Hash + Eq, V: Clone> std::ops::DerefMut for CowMap<K, V> {
+    fn deref_mut(&mut self) -> &mut HashMap<K, V> {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a CowMap<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::collections::hash_map::Iter<'a, K, V>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for CowMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<K, V> CowMap<K, V> {
+    /// Whether this map is still shared with another table.
+    fn is_shared(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
+
+    /// The shared-line writes dropping this map will make: its own Arc when shared, else one per entry's Arc.
+    fn drop_rmws(&self) -> u64 {
+        if self.is_shared() {
+            1
+        } else {
+            self.0.len() as u64
+        }
+    }
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -5327,11 +5385,11 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
 impl SymbolTable {
     pub fn new() -> Self {
         Self {
-            functions: HashMap::default(),
-            collations: HashMap::default(),
-            vtabs: HashMap::default(),
-            vtab_modules: HashMap::default(),
-            index_methods: HashMap::default(),
+            functions: CowMap::default(),
+            collations: CowMap::default(),
+            vtabs: CowMap::default(),
+            vtab_modules: CowMap::default(),
+            index_methods: CowMap::default(),
         }
     }
     pub fn resolve_function(
@@ -5367,21 +5425,37 @@ impl SymbolTable {
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
-        for (name, func) in &other.functions {
-            self.functions.insert(name.clone(), func.clone());
+        // r11-coherence FB: an empty map takes `other`'s whole map, one Arc, instead of a copy of each entry.
+        fn merge<K: Clone + std::hash::Hash + Eq, V: Clone>(
+            mine: &mut CowMap<K, V>,
+            theirs: &CowMap<K, V>,
+            share: bool,
+        ) {
+            if share && mine.is_empty() {
+                crate::coherence::bump(crate::coherence::Class::Builtin, 1);
+                *mine = theirs.clone();
+                return;
+            }
+            crate::coherence::bump(crate::coherence::Class::Builtin, theirs.len() as u64);
+            for (k, v) in theirs {
+                mine.insert(k.clone(), v.clone());
+            }
         }
-        for (id, collation) in &other.collations {
-            self.collations.insert(*id, collation.clone());
-        }
-        for (name, vtab) in &other.vtabs {
-            self.vtabs.insert(name.clone(), vtab.clone());
-        }
-        for (name, module) in &other.vtab_modules {
-            self.vtab_modules.insert(name.clone(), module.clone());
-        }
-        for (name, module) in &other.index_methods {
-            self.index_methods.insert(name.clone(), module.clone());
-        }
+        let share = crate::coherence::fix(crate::coherence::FIX_BUILTIN);
+        merge(&mut self.functions, &other.functions, share);
+        merge(&mut self.collations, &other.collations, share);
+        merge(&mut self.vtabs, &other.vtabs, share);
+        merge(&mut self.vtab_modules, &other.vtab_modules, share);
+        merge(&mut self.index_methods, &other.index_methods, share);
+    }
+
+    /// Coherence instrument: the shared-line writes dropping this table makes (see `CowMap::drop_rmws`).
+    pub(crate) fn drop_rmws(&self) -> u64 {
+        self.functions.drop_rmws()
+            + self.collations.drop_rmws()
+            + self.vtabs.drop_rmws()
+            + self.vtab_modules.drop_rmws()
+            + self.index_methods.drop_rmws()
     }
 }
 

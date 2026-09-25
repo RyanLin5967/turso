@@ -534,7 +534,7 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     /// When set, MVCC will use this implementation for logical-log durability
     /// (commit, sync, checkpoint thresholds, etc.) instead of the built-in storage.
     pub(crate) durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-    pub(crate) shared_wal: Arc<RwLock<WalFileShared>>,
+    pub(crate) shared_wal: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     init_lock: Arc<Mutex<()>>,
@@ -2480,7 +2480,6 @@ impl Database {
         crate::coherence::bump(crate::coherence::Class::Builtin, 2);
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
-        crate::coherence::bump(crate::coherence::Class::Builtin, builtin_syms.entries() as u64);
         conn.syms.write().extend(&builtin_syms);
         refresh_analyze_stats(&conn);
         Ok(conn)

@@ -257,8 +257,7 @@ impl WalConnectionState {
     }
 }
 
-#[repr(transparent)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 /// A 64-bit read-write lock with embedded 32-bit value storage.
 /// Using a single Atomic allows the reader count and lock state are updated
 /// atomically together while sitting in a single cpu cache line.
@@ -276,10 +275,32 @@ impl WalConnectionState {
 /// - Release semantics on unlock ensure all writes made while holding the
 ///   lock are visible to the next acquirer
 /// - The embedded value can be atomically read without holding any lock
-pub struct TursoRwLock(AtomicU64);
+///
+/// r11-coherence FW (`coherence::FIX_WAL` at construction): readers count themselves in per-thread indicators
+/// ([`crate::bravo::ReaderIndicators`], as Linux's percpu_rw_semaphore) instead of in the word, and the word moves
+/// to a line of its own. A writer announces itself with PENDING, then requires the indicators to sum to zero;
+/// PENDING is never held, so an `unlock` that finds WRITER set is the writer's. Without the fix this is the
+/// original single-word lock.
+pub struct TursoRwLock {
+    word: AtomicU64,
+    dist: Option<Box<DistLock>>,
+}
+
+#[repr(align(128))]
+#[derive(Debug)]
+struct DistLock {
+    word: AtomicU64,
+    readers: crate::bravo::ReaderIndicators,
+}
 
 pub const READMARK_NOT_USED: u32 = 0xffffffff;
 const NO_LOCK_HELD: usize = usize::MAX;
+
+impl Default for TursoRwLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TursoRwLock {
     /// Bit 0: Writer flag
@@ -300,9 +321,30 @@ impl TursoRwLock {
     /// Mask for 32 value bits [63:32]
     const VALUE_MASK: u64 = 0xffff_ffffu64 << Self::VALUE_SHIFT;
 
+    /// Distributed mode only: a writer is checking the reader indicators. Readers back off. Bit 31 is the top
+    /// reader-count bit, which distributed mode never uses (its readers are not in the word).
+    const PENDING: u64 = 1 << 31;
+
     #[inline]
-    pub const fn new() -> Self {
-        Self(AtomicU64::new(0))
+    pub fn new() -> Self {
+        Self {
+            word: AtomicU64::new(0),
+            dist: crate::coherence::fix(crate::coherence::FIX_WAL).then(|| {
+                Box::new(DistLock {
+                    word: AtomicU64::new(0),
+                    readers: crate::bravo::ReaderIndicators::new(),
+                })
+            }),
+        }
+    }
+
+    /// The word holding the writer bit and the value.
+    #[inline(always)]
+    fn w(&self) -> &AtomicU64 {
+        match &self.dist {
+            Some(d) => &d.word,
+            None => &self.word,
+        }
     }
 
     const fn has_writer(val: u64) -> bool {
@@ -322,14 +364,37 @@ impl TursoRwLock {
         }
     }
 
+    /// Distributed mode: announce a writer, or fail if one is there. The CAS is SeqCst, so the indicator sum
+    /// that follows is ordered after it (Dekker with a reader's arrive-then-load).
+    fn dist_pending(d: &DistLock) -> bool {
+        let cur = d.word.load(Ordering::Acquire);
+        if cur & (Self::WRITER | Self::PENDING) != 0 {
+            return false;
+        }
+        let ok = d
+            .word
+            .compare_exchange(cur, cur | Self::PENDING, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok();
+        Self::count_cas(ok);
+        ok
+    }
+
     #[inline]
     /// Try to acquire a shared read lock.
     pub fn read(&self) -> bool {
+        if let Some(d) = &self.dist {
+            d.readers.arrive();
+            if d.word.load(Ordering::SeqCst) & (Self::WRITER | Self::PENDING) != 0 {
+                d.readers.depart();
+                return false;
+            }
+            return true;
+        }
         let mut count = 0;
         // Bounded loop to avoid infinite loops
         // Retry on Reader contention (should hopefully be spurious)
         while count < 1_000_000 {
-            let cur = self.0.load(Ordering::Acquire);
+            let cur = self.word.load(Ordering::Acquire);
             // If a writer is present we cannot proceed.
             if Self::has_writer(cur) {
                 return false;
@@ -340,7 +405,7 @@ impl TursoRwLock {
             // for success, Acquire establishes happens-before relationship with the previous Release from unlock
             // for failure we only care about reading it for the next iteration so we can use Relaxed.
             let res = self
-                .0
+                .word
                 .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed);
             crate::coherence::bump(crate::coherence::Class::WalMark, 1);
             if res.is_err() {
@@ -358,14 +423,29 @@ impl TursoRwLock {
     /// Try to take an exclusive lock. Succeeds if no readers and no writer.
     #[inline]
     pub fn write(&self) -> bool {
-        let cur = self.0.load(Ordering::Acquire);
+        if let Some(d) = &self.dist {
+            if !Self::dist_pending(d) {
+                return false;
+            }
+            if d.readers.sum() != 0 {
+                crate::coherence::bump(crate::coherence::Class::WalMark, 1);
+                d.word.fetch_and(!Self::PENDING, Ordering::Release);
+                return false;
+            }
+            // PENDING -> WRITER.
+            crate::coherence::bump(crate::coherence::Class::WalMark, 1);
+            d.word
+                .fetch_xor(Self::PENDING | Self::WRITER, Ordering::AcqRel);
+            return true;
+        }
+        let cur = self.word.load(Ordering::Acquire);
         // exclusive lock, so require no readers and no writer
         if Self::has_writer(cur) || Self::has_readers(cur) {
             return false;
         }
         let desired = cur | Self::WRITER;
         let ok = self
-            .0 // Safety: Failure here can be Relaxed as we will read again on next iteration.
+            .word // Safety: Failure here can be Relaxed as we will read again on next iteration.
             .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
             .is_ok();
         Self::count_cas(ok);
@@ -377,7 +457,23 @@ impl TursoRwLock {
     /// return true if lock was upgraded succesfully - and false otherwise
     #[inline]
     pub fn upgrade(&self) -> bool {
-        let cur = self.0.load(Ordering::Acquire);
+        if let Some(d) = &self.dist {
+            if !Self::dist_pending(d) {
+                return false;
+            }
+            // The caller holds one read; it must be the only one.
+            if d.readers.sum() != 1 {
+                crate::coherence::bump(crate::coherence::Class::WalMark, 1);
+                d.word.fetch_and(!Self::PENDING, Ordering::Release);
+                return false;
+            }
+            crate::coherence::bump(crate::coherence::Class::WalMark, 1);
+            d.word
+                .fetch_xor(Self::PENDING | Self::WRITER, Ordering::AcqRel);
+            d.readers.depart();
+            return true;
+        }
+        let cur = self.word.load(Ordering::Acquire);
         // Check for single reader: exactly one reader, any value
         if (cur & !Self::VALUE_MASK) != Self::READER_INC {
             return false;
@@ -385,7 +481,7 @@ impl TursoRwLock {
         // Preserve value bits, replace reader with writer
         let desired = (cur & Self::VALUE_MASK) | Self::WRITER;
         let ok = self
-            .0
+            .word
             .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
             .is_ok();
         Self::count_cas(ok);
@@ -396,14 +492,21 @@ impl TursoRwLock {
     /// MUST be called for a lock acquired by the writer
     #[inline]
     pub fn downgrade(&self) {
-        let cur = self.0.load(Ordering::Acquire);
+        if let Some(d) = &self.dist {
+            turso_debug_assert!(Self::has_writer(d.word.load(Ordering::Acquire)));
+            d.readers.arrive();
+            crate::coherence::bump(crate::coherence::Class::WalMark, 1);
+            d.word.fetch_and(!Self::WRITER, Ordering::Release);
+            return;
+        }
+        let cur = self.word.load(Ordering::Acquire);
         turso_debug_assert!(Self::has_writer(cur));
         // Preserve value bits, replace writer with one reader
         let desired = (cur & Self::VALUE_MASK) | Self::READER_INC;
         #[cfg(debug_assertions)]
         {
             let prev = self
-                .0
+                .word
                 .compare_exchange(cur, desired, Ordering::AcqRel, Ordering::Relaxed);
             turso_debug_assert!(
                 prev.is_ok(),
@@ -413,7 +516,7 @@ impl TursoRwLock {
         crate::coherence::bump(crate::coherence::Class::WalMark, 1);
         #[cfg(not(debug_assertions))]
         {
-            self.0.store(desired, Ordering::Release);
+            self.word.store(desired, Ordering::Release);
         }
     }
 
@@ -422,12 +525,21 @@ impl TursoRwLock {
     /// For write lock: clear writer bit
     /// For read lock: decrement reader count
     pub fn unlock(&self) {
-        let cur = self.0.load(Ordering::Acquire);
+        if let Some(d) = &self.dist {
+            if d.word.load(Ordering::Acquire) & Self::WRITER != 0 {
+                crate::coherence::bump(crate::coherence::Class::WalMark, 1);
+                d.word.fetch_and(!Self::WRITER, Ordering::Release);
+            } else {
+                d.readers.depart();
+            }
+            return;
+        }
+        let cur = self.word.load(Ordering::Acquire);
         if (cur & Self::WRITER) != 0 {
             // Clear writer bit, preserve everything else (including value)
             // Release ordering ensures all our writes are visible to next acquirer
             crate::coherence::bump(crate::coherence::Class::WalMark, 1);
-            let cur = self.0.fetch_and(!Self::WRITER, Ordering::Release);
+            let cur = self.word.fetch_and(!Self::WRITER, Ordering::Release);
             turso_assert!(!Self::has_readers(cur), "write lock was held with readers");
         } else {
             turso_assert!(
@@ -435,14 +547,14 @@ impl TursoRwLock {
                 "unlock called with no readers or writers"
             );
             crate::coherence::bump(crate::coherence::Class::WalMark, 1);
-            self.0.fetch_sub(Self::READER_INC, Ordering::Release);
+            self.word.fetch_sub(Self::READER_INC, Ordering::Release);
         }
     }
 
     #[inline]
     /// Read the embedded 32-bit value atomically regardless of slot occupancy.
     pub fn get_value(&self) -> u32 {
-        (self.0.load(Ordering::Acquire) >> Self::VALUE_SHIFT) as u32
+        (self.w().load(Ordering::Acquire) >> Self::VALUE_SHIFT) as u32
     }
 
     #[inline]
@@ -450,7 +562,11 @@ impl TursoRwLock {
     /// (otherwise the value is stale from a past holder). Lock-free single-load; used to
     /// find the minimum frame any active reader is pinned at without mutating the slot.
     pub fn held_value(&self) -> Option<u32> {
-        let cur = self.0.load(Ordering::Acquire);
+        if let Some(d) = &self.dist {
+            let cur = d.word.load(Ordering::Acquire);
+            return (d.readers.sum() > 0).then_some((cur >> Self::VALUE_SHIFT) as u32);
+        }
+        let cur = self.word.load(Ordering::Acquire);
         if Self::has_readers(cur) {
             Some((cur >> Self::VALUE_SHIFT) as u32)
         } else {
@@ -462,11 +578,12 @@ impl TursoRwLock {
     /// Set the embedded value while holding the write lock.
     pub fn set_value_exclusive(&self, v: u32) {
         // Must be called only while WRITER bit is set
-        let cur = self.0.load(Ordering::Acquire);
+        let w = self.w();
+        let cur = w.load(Ordering::Acquire);
         turso_assert!(Self::has_writer(cur), "must hold exclusive lock");
         let desired = (cur & !Self::VALUE_MASK) | ((v as u64) << Self::VALUE_SHIFT);
         crate::coherence::bump(crate::coherence::Class::WalMark, 1);
-        self.0.store(desired, Ordering::Release);
+        w.store(desired, Ordering::Release);
     }
 }
 
@@ -605,7 +722,10 @@ trait WalCoordination: Debug + Send + Sync {
     fn wal_file(&self) -> Result<Arc<dyn File>>;
 
     /// Clone the shared WAL state backing this coordination backend.
-    fn shared_wal_state(&self) -> Arc<RwLock<WalFileShared>>;
+    fn shared_wal_state(&self) -> Arc<crate::bravo::BravoRwLock<WalFileShared>>;
+
+    /// The shared WAL state, not cloned (r11-coherence FW): valid while this coordination lives.
+    fn shared_wal_ptr(&self) -> std::ptr::NonNull<crate::bravo::BravoRwLock<WalFileShared>>;
 
     /// Report whether the WAL header has already been written and synced.
     fn wal_is_initialized(&self) -> bool;
@@ -867,26 +987,24 @@ pub trait Wal: Debug + Send + Sync {
 
 #[derive(Debug)]
 struct InProcessWalCoordination {
-    shared: Arc<RwLock<WalFileShared>>,
+    shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
 }
 
 impl InProcessWalCoordination {
     /// Build the in-process coordination backend over the existing shared WAL state.
-    fn new(shared: Arc<RwLock<WalFileShared>>) -> Self {
+    fn new(shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>) -> Self {
         Self { shared }
     }
 
     /// `self.rd()`, counted by the coherence instrument.
     #[inline(always)]
-    fn rd(&self) -> crate::sync::RwLockReadGuard<'_, WalFileShared> {
-        crate::coherence::bump(crate::coherence::Class::WalRwRead, 2);
+    fn rd(&self) -> crate::bravo::BravoReadGuard<'_, WalFileShared> {
         self.shared.read()
     }
 
     /// `self.wr()`, counted by the coherence instrument.
     #[inline(always)]
-    fn wr(&self) -> crate::sync::RwLockWriteGuard<'_, WalFileShared> {
-        crate::coherence::bump(crate::coherence::Class::WalRwWrite, 2);
+    fn wr(&self) -> crate::bravo::BravoWriteGuard<'_, WalFileShared> {
         self.shared.write()
     }
 
@@ -954,7 +1072,7 @@ impl InProcessWalCoordination {
 impl WalCoordination for InProcessWalCoordination {
     fn load_snapshot(&self) -> WalSnapshot {
         let shared = self.rd();
-        let checkpoint_seq = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail)).checkpoint_seq;
+        let checkpoint_seq = shared.metadata.wal_header.read().checkpoint_seq;
         WalSnapshot {
             max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
             nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -1236,7 +1354,7 @@ impl WalCoordination for InProcessWalCoordination {
         }
         let mut shared = self.wr();
         shared.restart_wal_header(io);
-        let checkpoint_seq = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail)).checkpoint_seq;
+        let checkpoint_seq = shared.metadata.wal_header.read().checkpoint_seq;
         Ok(WalSnapshot {
             max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
             nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -1281,7 +1399,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn wal_header(&self) -> WalHeader {
-        *self.rd().metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail))
+        self.rd().metadata.wal_header.read()
     }
 
     fn wal_file(&self) -> Result<Arc<dyn File>> {
@@ -1305,7 +1423,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn prepare_wal_header(&self, io: &dyn IO, page_size: PageSize) -> Option<WalHeader> {
-        let mut shared: crate::sync::RwLockWriteGuard<'_, WalFileShared> = self.wr();
+        let mut shared: crate::bravo::BravoWriteGuard<'_, WalFileShared> = self.wr();
         if shared.metadata.initialized.load(Ordering::Acquire) {
             return None;
         }
@@ -1422,9 +1540,13 @@ impl WalCoordination for InProcessWalCoordination {
         Arc::as_ptr(&self.shared) as usize
     }
 
-    fn shared_wal_state(&self) -> Arc<RwLock<WalFileShared>> {
+    fn shared_wal_state(&self) -> Arc<crate::bravo::BravoRwLock<WalFileShared>> {
         crate::coherence::bump(crate::coherence::Class::WalArc, 1);
         self.shared.clone()
+    }
+
+    fn shared_wal_ptr(&self) -> std::ptr::NonNull<crate::bravo::BravoRwLock<WalFileShared>> {
+        std::ptr::NonNull::from(&*self.shared)
     }
 }
 
@@ -1442,7 +1564,7 @@ impl WalCoordination for InProcessWalCoordination {
 #[cfg(host_shared_wal)]
 #[derive(Debug)]
 struct ShmWalCoordination {
-    shared: Arc<RwLock<WalFileShared>>,
+    shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
     fallback: InProcessWalCoordination,
     authority: Arc<MappedSharedWalCoordination>,
     /// This connection's currently held reader slot, if any.
@@ -1498,7 +1620,7 @@ impl ShmWalCoordination {
     }
 
     fn new(
-        shared: Arc<RwLock<WalFileShared>>,
+        shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
     ) -> Self {
         let fallback = InProcessWalCoordination::new(shared.clone());
@@ -2351,8 +2473,12 @@ impl WalCoordination for ShmWalCoordination {
         self.fallback.wal_file()
     }
 
-    fn shared_wal_state(&self) -> Arc<RwLock<WalFileShared>> {
+    fn shared_wal_state(&self) -> Arc<crate::bravo::BravoRwLock<WalFileShared>> {
         self.shared.clone()
+    }
+
+    fn shared_wal_ptr(&self) -> std::ptr::NonNull<crate::bravo::BravoRwLock<WalFileShared>> {
+        std::ptr::NonNull::from(&*self.shared)
     }
 
     fn wal_is_initialized(&self) -> bool {
@@ -2714,6 +2840,14 @@ impl fmt::Debug for OngoingCheckpoint {
 pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
+    /// Manages locks needed for VACUUM. This is very much similar to `checkpoint_guard`
+    /// This lock is to be held by all readers before they can begin. And VACUUM holds it
+    /// exclusively. See `install_vacuum_lock_guard` for its lifecycle.
+    /// Declared before `coordination` so that it drops first: a `VacuumLockGuard::ReadRaw` points into the
+    /// state the coordination keeps alive (r11-coherence FW).
+    vacuum_lock_guard: RwLock<Option<VacuumLockGuard>>,
+    /// r11-coherence FW: read transactions take the vacuum lock without cloning the shared state's Arc.
+    no_arc_per_read: bool,
     coordination: Arc<dyn WalCoordination>,
 
     syncing: Arc<AtomicBool>,
@@ -2735,10 +2869,6 @@ pub struct WalFile {
 
     /// Manages locks needed for checkpointing
     checkpoint_guard: RwLock<Option<CheckpointLocks>>,
-    /// Manages locks needed for VACUUM. This is very much similar to `checkpoint_guard`
-    /// This lock is to be held by all readers before they can begin. And VACUUM holds it
-    /// exclusively. See `install_vacuum_lock_guard` for its lifecycle.
-    vacuum_lock_guard: RwLock<Option<VacuumLockGuard>>,
 
     io_ctx: RwLock<IOContext>,
 
@@ -2824,7 +2954,7 @@ impl fmt::Debug for WalFile {
 /// Authoritative WAL metadata currently shared by all connections in a process.
 pub struct WalSharedMetadata {
     pub enabled: AtomicBool,
-    pub wal_header: Arc<SpinLock<WalHeader>>,
+    pub wal_header: Arc<crate::seqlock::SeqLock<WalHeader>>,
     pub min_frame: AtomicU64,
     pub max_frame: AtomicU64,
     pub nbackfills: AtomicU64,
@@ -2885,12 +3015,12 @@ pub struct WalSharedRuntime {
 /// immediate no-op WAL (readonly, file absent) or an in-progress recovery scan
 /// to be pumped via [`OpenSharedWal::poll`] until it returns `Done`.
 pub enum OpenSharedWal {
-    Noop(Arc<RwLock<WalFileShared>>),
+    Noop(Arc<crate::bravo::BravoRwLock<WalFileShared>>),
     Build(sqlite3_ondisk::BuildSharedWal),
 }
 
 impl OpenSharedWal {
-    pub fn poll(&mut self) -> Result<IOResult<Arc<RwLock<WalFileShared>>>> {
+    pub fn poll(&mut self) -> Result<IOResult<Arc<crate::bravo::BravoRwLock<WalFileShared>>>> {
         match self {
             OpenSharedWal::Noop(wal) => Ok(IOResult::Done(wal.clone())),
             OpenSharedWal::Build(driver) => driver.poll(),
@@ -2975,14 +3105,22 @@ impl fmt::Debug for WalFileShared {
 
 #[derive(Debug)]
 enum VacuumLockGuard {
-    Read { ptr: Arc<RwLock<WalFileShared>> },
-    Write { ptr: Arc<RwLock<WalFileShared>> },
+    Read { ptr: Arc<crate::bravo::BravoRwLock<WalFileShared>> },
+    Write { ptr: Arc<crate::bravo::BravoRwLock<WalFileShared>> },
+    /// r11-coherence FW: a read hold that keeps no Arc. Sound because the guard lives only in its WalFile's
+    /// `vacuum_lock_guard`, which is declared (so dropped) before the `coordination` that owns the Arc.
+    ReadRaw {
+        ptr: std::ptr::NonNull<crate::bravo::BravoRwLock<WalFileShared>>,
+    },
 }
 
+// ReadRaw's pointer is to a Sync value kept alive by the owning WalFile (see the variant).
+unsafe impl Send for VacuumLockGuard {}
+unsafe impl Sync for VacuumLockGuard {}
+
 impl VacuumLockGuard {
-    fn try_read(ptr: Arc<RwLock<WalFileShared>>) -> Option<Self> {
+    fn try_read(ptr: Arc<crate::bravo::BravoRwLock<WalFileShared>>) -> Option<Self> {
         let acquired = {
-            crate::coherence::bump(crate::coherence::Class::WalRwRead, 2);
             let shared = ptr.read();
             shared.runtime.vacuum_lock.read()
         };
@@ -2993,9 +3131,13 @@ impl VacuumLockGuard {
         }
     }
 
-    fn try_write(ptr: Arc<RwLock<WalFileShared>>) -> Option<Self> {
+    fn try_read_raw(ptr: std::ptr::NonNull<crate::bravo::BravoRwLock<WalFileShared>>) -> Option<Self> {
+        let acquired = unsafe { ptr.as_ref() }.read().runtime.vacuum_lock.read();
+        acquired.then_some(Self::ReadRaw { ptr })
+    }
+
+    fn try_write(ptr: Arc<crate::bravo::BravoRwLock<WalFileShared>>) -> Option<Self> {
         let acquired = {
-            crate::coherence::bump(crate::coherence::Class::WalRwRead, 2);
             let shared = ptr.read();
             shared.runtime.vacuum_lock.write()
         };
@@ -3007,7 +3149,7 @@ impl VacuumLockGuard {
     }
 
     const fn is_read(&self) -> bool {
-        matches!(self, Self::Read { .. })
+        matches!(self, Self::Read { .. } | Self::ReadRaw { .. })
     }
 
     const fn is_write(&self) -> bool {
@@ -3019,10 +3161,12 @@ impl Drop for VacuumLockGuard {
     fn drop(&mut self) {
         match self {
             Self::Read { ptr } | Self::Write { ptr } => {
-                crate::coherence::bump(crate::coherence::Class::WalRwRead, 2);
                 // The guard's Arc is released right after this.
                 crate::coherence::bump(crate::coherence::Class::WalArc, 1);
                 ptr.read().runtime.vacuum_lock.unlock();
+            }
+            Self::ReadRaw { ptr } => {
+                unsafe { ptr.as_ref() }.read().runtime.vacuum_lock.unlock();
             }
         }
     }
@@ -3277,9 +3421,12 @@ impl WalFile {
         // Before we can start the txn, we must first take read lock on the vacuum. If we cannot,
         // then vacuum is already in progress. Once we acquire a read lock, this would prevent
         // vacuum to run till the lock is released.
-        let Some(vacuum_lock_guard) =
+        let vacuum_lock_guard = if self.no_arc_per_read {
+            VacuumLockGuard::try_read_raw(self.coordination.shared_wal_ptr())
+        } else {
             VacuumLockGuard::try_read(self.coordination.shared_wal_state())
-        else {
+        };
+        let Some(vacuum_lock_guard) = vacuum_lock_guard else {
             tracing::debug!("begin_read_tx: VACUUM holds the vacuum lock, returning Busy");
             return TryBeginReadResult::Busy;
         };
@@ -4688,7 +4835,7 @@ impl WalFile {
     #[cfg(host_shared_wal)]
     pub(crate) fn new_with_shared_coordination(
         io: Arc<dyn IO>,
-        shared: Arc<RwLock<WalFileShared>>,
+        shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
         _last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
@@ -4706,7 +4853,7 @@ impl WalFile {
 
     pub fn new(
         io: Arc<dyn IO>,
-        shared: Arc<RwLock<WalFileShared>>,
+        shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
         (last_checksum, max_frame): ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
@@ -4745,6 +4892,7 @@ impl WalFile {
             syncing: Arc::new(AtomicBool::new(false)),
             write_lock_held: AtomicBool::new(false),
             vacuum_lock_guard: RwLock::new(None),
+            no_arc_per_read: crate::coherence::fix(crate::coherence::FIX_WAL),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
@@ -5654,7 +5802,7 @@ impl WalFileShared {
         flags: crate::OpenFlags,
         authority: &Arc<MappedSharedWalCoordination>,
         db_file: &Arc<dyn DatabaseStorage>,
-    ) -> Result<Arc<RwLock<WalFileShared>>> {
+    ) -> Result<Arc<crate::bravo::BravoRwLock<WalFileShared>>> {
         let snapshot = authority.snapshot();
         let file = match io.open_file(path, flags, false) {
             Ok(file) => file,
@@ -5745,7 +5893,7 @@ impl WalFileShared {
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
-                wal_header: Arc::new(SpinLock::new(wal_header)),
+                wal_header: Arc::new(crate::seqlock::SeqLock::new(wal_header)),
                 min_frame: AtomicU64::new(0),
                 max_frame: AtomicU64::new(snapshot.max_frame),
                 nbackfills: AtomicU64::new(snapshot.nbackfills),
@@ -5769,14 +5917,14 @@ impl WalFileShared {
                 )),
             },
         };
-        Ok(Arc::new(RwLock::new(shared)))
+        Ok(Arc::new(crate::bravo::BravoRwLock::new(shared)))
     }
 
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,
         flags: crate::OpenFlags,
-    ) -> Result<Arc<RwLock<WalFileShared>>> {
+    ) -> Result<Arc<crate::bravo::BravoRwLock<WalFileShared>>> {
         let mut driver = Self::open_shared_if_exists_begin(io, path, flags)?;
         io.block(|| driver.poll())
     }
@@ -5810,7 +5958,7 @@ impl WalFileShared {
         Ok(self.metadata.initialized.load(Ordering::Acquire))
     }
 
-    pub fn new_noop() -> Arc<RwLock<WalFileShared>> {
+    pub fn new_noop() -> Arc<crate::bravo::BravoRwLock<WalFileShared>> {
         let wal_header = WalHeader::new();
         let read_locks = array::from_fn(|_| TursoRwLock::new());
         for (i, lock) in read_locks.iter().enumerate() {
@@ -5821,7 +5969,7 @@ impl WalFileShared {
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(false),
-                wal_header: Arc::new(SpinLock::new(wal_header)),
+                wal_header: Arc::new(crate::seqlock::SeqLock::new(wal_header)),
                 min_frame: AtomicU64::new(0),
                 max_frame: AtomicU64::new(0),
                 nbackfills: AtomicU64::new(0),
@@ -5845,11 +5993,11 @@ impl WalFileShared {
                 )),
             },
         };
-        Arc::new(RwLock::new(shared))
+        Arc::new(crate::bravo::BravoRwLock::new(shared))
     }
 
     #[cfg(test)]
-    pub(super) fn new_shared(file: Arc<dyn File>) -> Result<Arc<RwLock<WalFileShared>>> {
+    pub(super) fn new_shared(file: Arc<dyn File>) -> Result<Arc<crate::bravo::BravoRwLock<WalFileShared>>> {
         let wal_header = WalHeader::new();
         let read_locks = array::from_fn(|_| TursoRwLock::new());
         // slot zero is always zero as it signifies that reads can be done from the db file
@@ -5863,7 +6011,7 @@ impl WalFileShared {
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
-                wal_header: Arc::new(SpinLock::new(wal_header)),
+                wal_header: Arc::new(crate::seqlock::SeqLock::new(wal_header)),
                 min_frame: AtomicU64::new(0),
                 max_frame: AtomicU64::new(0),
                 nbackfills: AtomicU64::new(0),
@@ -5887,11 +6035,11 @@ impl WalFileShared {
                 )),
             },
         };
-        Ok(Arc::new(RwLock::new(shared)))
+        Ok(Arc::new(crate::bravo::BravoRwLock::new(shared)))
     }
 
     pub fn page_size(&self) -> u32 {
-        self.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail)).page_size
+        self.metadata.wal_header.read().page_size
     }
 
     /// Called after a successful RESTART/TRUNCATE mode checkpoint
@@ -6329,7 +6477,7 @@ pub mod test {
         );
     }
 
-    fn make_test_wal() -> (Arc<RwLock<WalFileShared>>, WalFile) {
+    fn make_test_wal() -> (Arc<crate::bravo::BravoRwLock<WalFileShared>>, WalFile) {
         let io = shared_wal_test_io();
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         let shared = WalFileShared::new_noop();
@@ -6339,7 +6487,7 @@ pub mod test {
         (shared, wal)
     }
 
-    fn make_test_wal_from_shared(shared: Arc<RwLock<WalFileShared>>) -> WalFile {
+    fn make_test_wal_from_shared(shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>) -> WalFile {
         let io = shared_wal_test_io();
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         let snapshot = shared.read().last_checksum_and_max_frame();
@@ -7143,7 +7291,7 @@ pub mod test {
         }
     }
 
-    fn set_shared_snapshot(shared: &Arc<RwLock<WalFileShared>>, snapshot: WalSnapshot) {
+    fn set_shared_snapshot(shared: &Arc<crate::bravo::BravoRwLock<WalFileShared>>, snapshot: WalSnapshot) {
         let mut guard = shared.write();
         guard
             .metadata
@@ -7161,13 +7309,13 @@ pub mod test {
             .store(snapshot.transaction_count, Ordering::Release);
     }
 
-    fn make_test_coordination(shared: &Arc<RwLock<WalFileShared>>) -> InProcessWalCoordination {
+    fn make_test_coordination(shared: &Arc<crate::bravo::BravoRwLock<WalFileShared>>) -> InProcessWalCoordination {
         InProcessWalCoordination::new(shared.clone())
     }
 
     #[cfg(host_shared_wal)]
     fn make_test_shm_coordination(
-        shared: &Arc<RwLock<WalFileShared>>,
+        shared: &Arc<crate::bravo::BravoRwLock<WalFileShared>>,
         path: &std::path::Path,
     ) -> (Arc<MappedSharedWalCoordination>, ShmWalCoordination) {
         let io = shared_wal_test_io();
@@ -7345,7 +7493,7 @@ pub mod test {
             .collect()
     }
 
-    fn wal_header_snapshot(shared: &Arc<RwLock<WalFileShared>>) -> (u32, u32, u32, u32) {
+    fn wal_header_snapshot(shared: &Arc<crate::bravo::BravoRwLock<WalFileShared>>) -> (u32, u32, u32, u32) {
         // (checkpoint_seq, salt1, salt2, page_size)
         let shared_guard = shared.read();
         let hdr = shared_guard.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
