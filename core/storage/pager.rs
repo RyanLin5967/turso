@@ -3168,10 +3168,11 @@ impl Pager {
         if let Some(branch) = self.branch.get() {
             // A branch's writes go to its own page space, never to the WAL, so it takes the
             // branch's write lock and leaves the WAL's alone: branches write concurrently with the
-            // trunk and with each other. Slots a transaction ended without commit or rollback
-            // still holds are returned first.
-            branch.discard();
+            // trunk and with each other. Once this pager holds the branch's write lock no earlier
+            // transaction of it is live, so any slots one ended without commit or rollback still
+            // holds are returned.
             branch.store.begin_write(branch.id)?;
+            branch.discard();
             return Ok(IOResult::Done(()));
         }
         let Some(wal) = self.wal.as_ref() else {
