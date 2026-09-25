@@ -2267,33 +2267,39 @@ impl Database {
                         self.open_flags |= OpenFlags::ReadOnly;
                     }
 
-                    let header: HeaderRefMut = return_if_io!(HeaderRefMut::from_pager(pager));
-                    let header_mut = header.borrow_mut();
+                    // Validation only READS the header. A mutable header ref marks page 1 dirty,
+                    // and `Pager::add_dirty` is where the branch copy decision is taken: with a live
+                    // child of the trunk, every open used to retain page 1 — read from the database
+                    // FILE, since the WAL is not open yet — as a branch pre-image, for a write that
+                    // never happens (r11-restart lane, PREREG A1 and A5). So the mutable ref is taken
+                    // only below, when the header really is rewritten.
+                    let header: HeaderRef = return_if_io!(HeaderRef::from_pager(pager));
+                    let header_ref = header.borrow();
 
-                    if !header_mut.text_encoding.is_utf8() {
+                    if !header_ref.text_encoding.is_utf8() {
                         return Err(LimboError::UnsupportedEncoding(
-                            header_mut.text_encoding.to_string(),
+                            header_ref.text_encoding.to_string(),
                         ));
                     }
 
                     let (read_version, write_version) =
-                        { (header_mut.read_version, header_mut.write_version) };
+                        { (header_ref.read_version, header_ref.write_version) };
 
-                    if encryption_key.is_none() && header_mut.magic != SQLITE_HEADER {
+                    if encryption_key.is_none() && header_ref.magic != SQLITE_HEADER {
                         tracing::error!(
                             "invalid value of database header magic bytes: {:?}",
-                            header_mut.magic
+                            header_ref.magic
                         );
                         return Err(LimboError::NotADB);
                     }
                     // when we open fresh db with encryption params - header will be SQLite at this point
                     if encryption_key.is_some()
-                        && (header_mut.magic != SQLITE_HEADER
-                            && !header_mut.magic.starts_with(TURSO_HEADER_PREFIX))
+                        && (header_ref.magic != SQLITE_HEADER
+                            && !header_ref.magic.starts_with(TURSO_HEADER_PREFIX))
                     {
                         tracing::error!(
                             "invalid value of database header magic bytes: {:?}",
-                            header_mut.magic
+                            header_ref.magic
                         );
                         return Err(LimboError::NotADB);
                     }
@@ -2316,25 +2322,25 @@ impl Database {
                     );
 
                     // Validate fixed header fields per SQLite spec
-                    if header_mut.max_embed_frac != 64 {
+                    if header_ref.max_embed_frac != 64 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid max_embed_frac: expected 64, got {}",
-                            header_mut.max_embed_frac
+                            header_ref.max_embed_frac
                         )));
                     }
-                    if header_mut.min_embed_frac != 32 {
+                    if header_ref.min_embed_frac != 32 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid min_embed_frac: expected 32, got {}",
-                            header_mut.min_embed_frac
+                            header_ref.min_embed_frac
                         )));
                     }
-                    if header_mut.leaf_frac != 32 {
+                    if header_ref.leaf_frac != 32 {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid leaf_frac: expected 32, got {}",
-                            header_mut.leaf_frac
+                            header_ref.leaf_frac
                         )));
                     }
-                    let schema_format = header_mut.schema_format.get();
+                    let schema_format = header_ref.schema_format.get();
                     // If the database is completely empty, if it has no schema, then the schema format number can be zero.
                     if !(0..=4).contains(&schema_format) {
                         return Err(LimboError::Corrupt(format!(
@@ -2342,7 +2348,7 @@ impl Database {
                         )));
                     }
                     if !matches!(
-                        header_mut.text_encoding,
+                        header_ref.text_encoding,
                         TextEncoding::Unset
                             | TextEncoding::Utf8
                             | TextEncoding::Utf16Le
@@ -2350,16 +2356,16 @@ impl Database {
                     ) {
                         return Err(LimboError::Corrupt(format!(
                             "Invalid text_encoding: {}",
-                            header_mut.text_encoding
+                            header_ref.text_encoding
                         )));
                     }
                     if !matches!(
-                        header_mut.text_encoding,
+                        header_ref.text_encoding,
                         TextEncoding::Unset | TextEncoding::Utf8
                     ) {
                         return Err(LimboError::Corrupt(format!(
                             "Only utf8 text_encoding is supported by tursodb: got={}",
-                            header_mut.text_encoding
+                            header_ref.text_encoding
                         )));
                     }
 
@@ -2396,9 +2402,7 @@ impl Database {
                                 );
                                 false
                             } else {
-                                // Convert Legacy to WAL mode
-                                header_mut.read_version = RawVersion::from(Version::Wal);
-                                header_mut.write_version = RawVersion::from(Version::Wal);
+                                // Convert Legacy to WAL mode (written below, through a mutable ref)
                                 true
                             }
                         }
@@ -2416,7 +2420,16 @@ impl Database {
                         )));
                     }
 
-                    let page = header.page().clone();
+                    let page = if header_modified {
+                        let header_mut: HeaderRefMut =
+                            return_if_io!(HeaderRefMut::from_pager(pager));
+                        let h = header_mut.borrow_mut();
+                        h.read_version = RawVersion::from(Version::Wal);
+                        h.write_version = RawVersion::from(Version::Wal);
+                        header_mut.page().clone()
+                    } else {
+                        header.page().clone()
+                    };
                     // `header` (a cheap Arc<Page> wrapper, no lock) is dropped
                     // here; the page ref carries the (possibly modified) header
                     // buffer forward.
