@@ -1372,6 +1372,13 @@ mod tests {
         cache.delete(keys[5]).unwrap();
         assert_eq!(cache.parked_len, 38);
         cache.verify_cache_integrity();
+        // A spill path that cleans pages instead of marking them spilled (the ephemeral one)
+        // returns each with `unpark_clean`; a page still dirty stays parked.
+        cache.peek(&keys[6], false).unwrap().clear_dirty();
+        cache.unpark_clean(keys[6]);
+        cache.unpark_clean(keys[7]);
+        assert_eq!(cache.parked_len, 37);
+        cache.verify_cache_integrity();
         // The transaction ends: its pages are clean and back on the queue, and inserts drain the
         // cache under capacity again.
         for key in &keys[1..] {
