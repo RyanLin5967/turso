@@ -1806,6 +1806,15 @@ impl BranchStore {
         resident + others
     }
 
+    /// Catalog statements that wrote a row, since open (r11-restart lane instrument).
+    pub(crate) fn catalog_rows_written(&self) -> u64 {
+        self.inner
+            .lock()
+            .cat
+            .as_ref()
+            .map_or(0, |c| c.catalog.counters.rows_written)
+    }
+
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
     /// read)` since open (r11-restart lane instrument; zeros for a snapshot store).
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {

@@ -497,6 +497,12 @@ impl Database {
         self.branches.catalog_counters()
     }
 
+    /// Catalog statements that wrote a row since open; 0 for a store that is not a catalog store.
+    #[doc(hidden)]
+    pub fn branch_catalog_rows_written(&self) -> u64 {
+        self.branches.catalog_rows_written()
+    }
+
     /// `(resolve calls, arena slot reads)` since open (r11-restart lane instrument).
     #[doc(hidden)]
     pub fn branch_read_counters(&self) -> (u64, u64) {

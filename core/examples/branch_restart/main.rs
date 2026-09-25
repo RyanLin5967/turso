@@ -563,6 +563,85 @@ fn ckpt(args: &Args) {
     drop(db);
 }
 
+/// (c2): the store's checkpoint after `--writes` branch commits spread over random live branches
+/// (each: attach, connect, rewrite the branch's own row in place, close, detach). A checkpoint is
+/// taken first, so the timed one covers only these commits: in snapshot mode a compaction (all live
+/// state), in catalog mode the catalog checkpoint (the dirty branches' rows).
+fn ckpt2(args: &Args) {
+    let files = Files::new(&args.db);
+    let db = open_db(&args.db, true, args.catalog);
+    let trunk = db.connect().unwrap();
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n {
+        not_a_result(&format!("ckpt2: {st:?}, expected {} branches", args.n));
+    }
+    db.branch_compact_now().unwrap();
+    let settled = files.line();
+    let mut rng = Rng(args.seed);
+    let mut distinct = std::collections::HashSet::new();
+    let t = Instant::now();
+    for g in 0..args.writes {
+        let id = 1 + rng.below(args.n) as u64;
+        distinct.insert(id);
+        let branch = db
+            .branch(BranchId(id))
+            .unwrap_or_else(|e| not_a_result(&format!("attach {id}: {e}")));
+        let conn = branch.connect().unwrap();
+        conn.execute(format!(
+            "UPDATE t SET v = '{}' WHERE id = {}",
+            trunk_write_value(g as u64),
+            row_for(id)
+        ))
+        .unwrap();
+        drop(conn);
+        let _ = branch.into_id();
+    }
+    let t_commits = t.elapsed();
+    let (log0, cat0, catw0, snap0) = (
+        size_of(&files.log),
+        size_of(&files.cat),
+        size_of(&files.cat_wal),
+        size_of(&files.snap),
+    );
+    let w0 = db.branch_catalog_rows_written();
+    let t = Instant::now();
+    db.branch_compact_now().unwrap();
+    let t_ck = t.elapsed();
+    let rows_written = db.branch_catalog_rows_written() - w0;
+    let (log1, cat1, catw1, snap1) = (
+        size_of(&files.log),
+        size_of(&files.cat),
+        size_of(&files.cat_wal),
+        size_of(&files.snap),
+    );
+    // A sample of the rewritten branches reads its new row.
+    let mut rng = Rng(args.seed);
+    for g in 0..args.writes.min(20) {
+        let id = 1 + rng.below(args.n) as u64;
+        let _ = g;
+        let branch = db.branch(BranchId(id)).unwrap();
+        let conn = branch.connect().unwrap();
+        let v = read_v(&conn, row_for(id));
+        if !v.starts_with('t') {
+            not_a_result(&format!("ckpt2: branch {id} lost its rewrite: {v:.12}"));
+        }
+        drop(conn);
+        let _ = branch.into_id();
+    }
+    println!(
+        "CKPT2\tn={}\twrites={}\tdistinct={}\tcommits_total_us={:.1}\tlog_before_ckpt={log0}\tckpt_us={:.1}\tcat_rows_written={rows_written}\t\
+         snap_before={snap0}\tsnap_after={snap1}\tcat_before={cat0}\tcat_after={cat1}\tcat_wal_before={catw0}\t\
+         cat_wal_after={catw1}\tlog_after={log1}\tsettled: {settled}",
+        args.n,
+        args.writes,
+        distinct.len(),
+        t_commits.as_secs_f64() * 1e6,
+        t_ck.as_secs_f64() * 1e6
+    );
+    drop(trunk);
+    drop(db);
+}
+
 fn main() {
     let args = parse_args();
     if cfg!(debug_assertions) {
@@ -573,6 +652,7 @@ fn main() {
         "open" => open(&args),
         "compact" => compact(&args),
         "ckpt" => ckpt(&args),
+        "ckpt2" => ckpt2(&args),
         other => die(&format!("unknown command {other}")),
     }
 }
