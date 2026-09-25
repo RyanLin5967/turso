@@ -11,6 +11,10 @@
 //! pre-image for the children forked since that page's last write: retained trunk versions for the
 //! open to rebuild. Its `open` must then run without --probes (the trunk rows have moved).
 //!
+//! `grow --child-every K` (sota-durable lane, PREREG D3.11): every K-th fork is a child of the branch forked just
+//! before it (attached by id, forked, detached again) instead of a fork of the trunk, so the store holds parents
+//! with live children, whose page maps an open after a snapshot load must derive.
+//!
 //! `grow` is the kill -9 VICTIM: it opens the database `Durable { sync: false }` (the files are the
 //! same bytes as with sync; only fsyncs differ), grows it to N live branches — each forked from the
 //! trunk, each updating one row (one leaf page), each detached so it outlives the process — prints
@@ -60,6 +64,7 @@ struct Args {
     seed: u64,
     label: String,
     trunk_every: usize,
+    child_every: usize,
 }
 
 fn parse_args() -> Args {
@@ -74,6 +79,7 @@ fn parse_args() -> Args {
         seed: 0x9E37_79B9_7F4A_7C15,
         label: String::new(),
         trunk_every: 0,
+        child_every: 0,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -84,6 +90,7 @@ fn parse_args() -> Args {
             "--writes" => args.writes = val().parse().unwrap_or_else(|_| die("bad --writes")),
             "--seed" => args.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
             "--label" => args.label = val(),
+            "--child-every" => args.child_every = val().parse().unwrap_or_else(|_| die("bad --child-every")),
             "--trunk-every" => args.trunk_every = val().parse().unwrap_or_else(|_| die("bad --trunk-every")),
             other => die(&format!("unknown argument {other}")),
         }
@@ -270,11 +277,24 @@ fn grow(args: &Args) {
     }
     let start = live;
     let mut trunk_writes = 0u64;
+    let mut children = 0u64;
     let mut snap_changes = 0u64;
     let mut last_snap = size_of(&files.snap);
     while live < args.n {
         let expect = live as u64 + 1;
-        let branch = trunk.fork_branch().unwrap();
+        let branch = if args.child_every > 0 && expect > 1 && expect % args.child_every as u64 == 0 {
+            // A child of the branch forked just before: attach it by id, fork, detach it again
+            // (dropping the handle would release it).
+            let parent = db
+                .branch(BranchId(expect - 1))
+                .unwrap_or_else(|e| not_a_result(&format!("attach {}: {e}", expect - 1)));
+            let child = parent.fork().unwrap();
+            let _ = parent.into_id();
+            children += 1;
+            child
+        } else {
+            trunk.fork_branch().unwrap()
+        };
         if branch.id() != BranchId(expect) {
             not_a_result(&format!("fork returned {:?}, expected id {expect}", branch.id()));
         }
@@ -310,7 +330,10 @@ fn grow(args: &Args) {
     {
         not_a_result(&format!("after growth: {st:?}, expected {} branches and pages", args.n));
     }
-    println!("# trunk writes this growth: {trunk_writes} (--trunk-every {})", args.trunk_every);
+    println!(
+        "# trunk writes this growth: {trunk_writes} (--trunk-every {}); forks of a branch: {children} (--child-every {})",
+        args.trunk_every, args.child_every
+    );
     println!(
         "# grown {start} -> {} branches; snapshot size changes observed: {snap_changes}; {}; rss_bytes={}",
         args.n,
@@ -373,12 +396,14 @@ fn open(args: &Args) {
     let t_connect = t.elapsed();
     let rss1 = rss_bytes();
     let s = db.branch_open_stats();
+    let reads = db.branch_read_counters();
     let st = db.branch_stats().unwrap();
     if st.live_branches != args.n || st.arena_slots_in_use < args.n {
         not_a_result(&format!("after open: {st:?}, expected {} branches", args.n));
     }
     println!(
         "OPEN\tn={}\tlabel={}\tdb_open_us={:.1}\ttrunk_connect_us={:.1}\t{}\t{}\tlive={}\tarena_in_use={}\t\
+         resolve_calls_since_open={}\tarena_reads_since_open={}\t\
          rss_before={rss0}\trss_after_open={rss1}\tfiles_before: {files_before}",
         args.n,
         args.label,
@@ -387,7 +412,9 @@ fn open(args: &Args) {
         stats_line(&s).replace(' ', "\t"),
         phases_line(&s).replace(' ', "\t"),
         st.live_branches,
-        st.arena_slots_in_use
+        st.arena_slots_in_use,
+        reads.0,
+        reads.1
     );
     if args.probes > 0 {
         let mut rng = Rng(args.seed);
