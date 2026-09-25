@@ -734,7 +734,11 @@ mod tests {
     }
 
     /// The trunk's retained-version index against a brute-force model, through the store's own
-    /// entry points (`fork_trunk`, `first_write_trunk`, `release_handle`, `resolve_into`).
+    /// entry points (`fork_trunk`, `first_write_trunk`, `release_handle`, `resolve_into`), and the
+    /// garbage query's cost against its contract: a reap with no older live sibling, or no younger
+    /// one, visits exactly the versions it frees, and one with both visits 2·|B| index entries if
+    /// |B| <= |D| and 2·|D| + 1 otherwise, where B and D are the versions born in `(lo, f]` and
+    /// dying in `(f, hi]`.
     ///
     /// The trunk rewrites a handful of pages, several per epoch, so versions share `born` and `died`
     /// across pages; children are reaped oldest-first, newest-first and at random, so the garbage
@@ -792,14 +796,36 @@ mod tests {
                         1 => live.len() - 1,
                         _ => rng.below(live.len() as u64) as usize,
                     };
-                    let (id, _, _) = live.remove(at);
-                    let before = store.stats().arena_slots_in_use;
+                    let lo = at.checked_sub(1).map(|i| live[i].1);
+                    let hi = live.get(at + 1).map(|c| c.1);
+                    let (id, f, _) = live.remove(at);
+                    let b = history
+                        .iter()
+                        .filter(|&&(_, born, _)| lo.is_none_or(|lo| born > lo) && born <= f)
+                        .count() as u64;
+                    let d = history
+                        .iter()
+                        .filter(|&&(_, _, died)| f < died && hi.is_none_or(|hi| died <= hi))
+                        .count() as u64;
+                    let before = store.stats();
                     let reaped = store.release_handle(id);
+                    let after = store.stats();
                     assert!(!reaped.deferred, "seed {seed:#x} step {step}");
                     assert_eq!(
-                        before - store.stats().arena_slots_in_use,
+                        before.arena_slots_in_use - after.arena_slots_in_use,
                         reaped.freed_pages,
                         "seed {seed:#x} step {step}: the reap's report disagrees with the arena"
+                    );
+                    let visited = after.work.gc_range_entries - before.work.gc_range_entries;
+                    let contract = match (lo, hi) {
+                        (None, _) | (_, None) => reaped.freed_pages as u64,
+                        _ if b <= d => 2 * b,
+                        _ => 2 * d + 1,
+                    };
+                    assert_eq!(
+                        visited, contract,
+                        "seed {seed:#x} step {step}: reaping the child forked at {f} (lo {lo:?}, \
+                         hi {hi:?}, |B| {b}, |D| {d}) visited {visited} index entries"
                     );
                     if reaped.freed_pages > 0 {
                         match at {
