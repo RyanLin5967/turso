@@ -86,6 +86,11 @@ impl HeaderRef {
         let content = self.0.get_contents();
         bytemuck::from_bytes::<DatabaseHeader>(&content.as_slice()[0..DatabaseHeader::SIZE])
     }
+
+    /// The underlying page.
+    pub fn page(&self) -> &PageRef {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone)]
