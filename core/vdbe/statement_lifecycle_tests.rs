@@ -177,7 +177,7 @@ fn fail_rolls_back_base_rows_when_index_method_preparation_fails() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    std::sync::Arc::make_mut(&mut db.builtin_syms.write()).index_methods.insert(
+    db.builtin_syms.write().index_methods.insert(
         "failing_prepare".to_string(),
         Arc::new(FailingPrepareIndexMethod),
     );

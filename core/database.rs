@@ -541,7 +541,7 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
-    pub(crate) builtin_syms: parking_lot::RwLock<std::sync::Arc<SymbolTable>>,
+    pub(crate) builtin_syms: parking_lot::RwLock<SymbolTable>,
     /// SQL dialect this database runs under, interpreting `sqlite_schema`
     /// SQL rows. Passed explicitly by every open path, fixed at open time,
     /// and shared by all connections because the parsed [`Schema`] is
@@ -688,7 +688,7 @@ impl Database {
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
             db_file,
-            builtin_syms: parking_lot::RwLock::new(std::sync::Arc::new(syms)),
+            builtin_syms: parking_lot::RwLock::new(syms),
             dialect,
             io: io.clone(),
             open_flags: flags,
@@ -2414,7 +2414,7 @@ impl Database {
             last_insert_rowid: AtomicI64::new(0),
             changes: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
-            syms: parking_lot::RwLock::new(std::sync::Arc::new(SymbolTable::new())),
+            syms: parking_lot::RwLock::new(SymbolTable::new()),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
@@ -2480,9 +2480,9 @@ impl Database {
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
         crate::branch::session_probe("connection");
-        // The connection shares the built-in table (FS1); it copies it only if it registers a
-        // symbol of its own.
-        *conn.syms.write() = self.builtin_syms.read().clone();
+        let builtin_syms = self.builtin_syms.read();
+        // add built-in extensions symbols to the connection to prevent having to load each time
+        conn.syms.write().extend(&builtin_syms);
         crate::branch::session_probe("syms");
         // A shared branch schema already carries the analyze stats it was forked or committed with;
         // loading them again would deep-copy the whole Schema into this connection

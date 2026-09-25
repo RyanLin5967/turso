@@ -1443,9 +1443,7 @@ pub fn op_vcreate(
     let table =
         crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
     {
-        std::sync::Arc::make_mut(&mut conn.syms.write())
-            .vtabs
-            .insert(table_name, table);
+        conn.syms.write().vtabs.insert(table_name, table);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1650,10 +1648,7 @@ pub fn op_vdestroy(
     load_insn!(VDestroy { db: _, table_name }, insn);
     let conn = program.connection.clone();
     {
-        let Some(vtab) = std::sync::Arc::make_mut(&mut conn.syms.write())
-            .vtabs
-            .remove(table_name)
-        else {
+        let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
             mark_unlikely();
             return Err(crate::LimboError::InternalError(
                 "Could not find Virtual Table to Destroy".to_string(),

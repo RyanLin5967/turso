@@ -388,11 +388,7 @@ pub struct Connection {
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
-    /// Shared with the database's built-in table until this connection registers something of its
-    /// own, then copied on that first write (`Arc::make_mut`): SQLite keeps its built-in functions
-    /// in one global table, and copying Turso's into every connection cost each open branch
-    /// session 5,246 bytes in 67 allocations (r11-sessions FS1).
-    pub(crate) syms: parking_lot::RwLock<std::sync::Arc<SymbolTable>>,
+    pub(crate) syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
     /// page size used for an uninitialized database or the next vacuum command.
@@ -4535,7 +4531,7 @@ impl Connection {
     ) {
         let collation = CollationSeq::custom(&name);
         let normalized_name = crate::util::normalize_ident(&name);
-        std::sync::Arc::make_mut(&mut self.syms.write()).collations.insert(
+        self.syms.write().collations.insert(
             collation.id(),
             Arc::new(function::ExternalCollation::new(
                 normalized_name,
@@ -5276,7 +5272,7 @@ pub type Row = vdbe::Row;
 
 pub type StepResult = vdbe::StepResult;
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct SymbolTable {
     pub functions: HashMap<String, Arc<function::ExternalFunc>>,
     pub collations: HashMap<u32, Arc<function::ExternalCollation>>,
