@@ -523,6 +523,11 @@ impl Bench {
         self.db.branch_stats().work.resolve_calls
     }
 
+    /// Store-lock acquisitions (F6's counters; this harness copy is built only on the F6 store).
+    fn lock_takes(&self) -> u64 {
+        self.db.branch_stats().work.lock_acquisitions
+    }
+
     fn wal_bytes(&self) -> u64 {
         std::fs::metadata(&self.wal_path).map_or(0, |m| m.len())
     }
@@ -805,6 +810,7 @@ fn main() {
         let lo = sessions.len();
         let fds_before = open_fds();
         let mem_before = mem();
+        let locks_before = b.lock_takes();
         let t = Instant::now();
         while sessions.len() < n {
             if STOP.load(Ordering::Acquire) {
@@ -823,6 +829,7 @@ fn main() {
             sessions.push(s);
         }
         let grow_s = t.elapsed().as_secs_f64();
+        let locks_growth = b.lock_takes() - locks_before;
         let x = sessions.len();
         let added = x - lo;
         let mem_after = mem();
@@ -883,6 +890,10 @@ fn main() {
             swap_used_mib(),
             memory_level(),
             b.wal_bytes(),
+        );
+        println!(
+            "# growth_cost x={x} store_lock_takes_per_session={:.3}",
+            locks_growth as f64 / added.max(1) as f64
         );
         println!(
             "# footprint session0: functions={} collations={} vtabs={} vtab_modules={} index_methods={}",
@@ -956,6 +967,9 @@ fn main() {
 fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
     let k = b.args.active;
     let mut ops: [(Acc, Acc, Vec<Duration>); 5] = Default::default();
+    // Per op: store-lock acquisitions and allocations (K12: what a multiplexed statement pays).
+    let mut op_locks: [Acc; 5] = Default::default();
+    let mut op_allocs: [Acc; 5] = Default::default();
     let names = [
         "trunk_commit",
         "sess_read_cold",
@@ -968,19 +982,21 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
     let intx = b.args.mode == Mode::Intx;
     for c in 0..k {
         // 1. the trunk commits
-        let (r0, m0) = (b.resolves(), mem());
+        let (r0, m0, l0) = (b.resolves(), mem(), b.lock_takes());
         let t = Instant::now();
         b.trunk_commit();
         ops[0].2.push(t.elapsed());
         ops[0].0.add((b.resolves() - r0) as i64);
         ops[0].1.add(mem().bytes - m0.bytes);
+        op_locks[0].add((b.lock_takes() - l0) as i64);
+        op_allocs[0].add(mem().allocs - m0.allocs);
 
         // 2 and 3. a held session reads its row, twice
         let si = b.rng.below(sessions.len());
         sessions[si].touched = true;
         for op in [1, 2] {
             let s = &sessions[si];
-            let (r0, m0) = (b.resolves(), mem());
+            let (r0, m0, l0) = (b.resolves(), mem(), b.lock_takes());
             let t = Instant::now();
             let got = match &s.conn {
                 Some(conn) => read_v(conn, s.row),
@@ -989,6 +1005,8 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
             ops[op].2.push(t.elapsed());
             ops[op].0.add((b.resolves() - r0) as i64);
             ops[op].1.add(mem().bytes - m0.bytes);
+            op_locks[op].add((b.lock_takes() - l0) as i64);
+            op_allocs[op].add(mem().allocs - m0.allocs);
             if got != s.expect(&b.model) {
                 not_a_result(&format!("held session {si} read {got} at active cycle {c}"));
             }
@@ -997,7 +1015,7 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
         // 4. a fresh session, used once and reaped
         let row = row_for(1_000_000_000 + c);
         let at_fork = b.model.writes;
-        let (r0, m0) = (b.resolves(), mem());
+        let (r0, m0, l0) = (b.resolves(), mem(), b.lock_takes());
         let t = Instant::now();
         let br = b.trunk.fork_branch().unwrap();
         let conn = br.connect().unwrap();
@@ -1007,17 +1025,21 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
         ops[3].2.push(t.elapsed());
         ops[3].0.add((b.resolves() - r0) as i64);
         ops[3].1.add(mem().bytes - m0.bytes);
+        op_locks[3].add((b.lock_takes() - l0) as i64);
+        op_allocs[3].add(mem().allocs - m0.allocs);
         if got != b.model.value_at(row, at_fork) || reaped.deferred {
             not_a_result(&format!("fresh session at cycle {c}: read {got}, {reaped:?}"));
         }
 
         // 5. a passive checkpoint
-        let (r0, m0) = (b.resolves(), mem());
+        let (r0, m0, l0) = (b.resolves(), mem(), b.lock_takes());
         let t = Instant::now();
         let (bu, lg, ck) = b.checkpoint_passive();
         ops[4].2.push(t.elapsed());
         ops[4].0.add((b.resolves() - r0) as i64);
         ops[4].1.add(mem().bytes - m0.bytes);
+        op_locks[4].add((b.lock_takes() - l0) as i64);
+        op_allocs[4].add(mem().allocs - m0.allocs);
         busy.add(bu);
         log.add(lg);
         ckpt.add(ck);
@@ -1036,6 +1058,15 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
             res.min,
             res.max,
             bytes.mean()
+        );
+        println!(
+            "active_cost\t{x}\t{name}\t{k}\tlock_takes {:.2} [{},{}]\tallocs {:.2} [{},{}]",
+            op_locks[i].mean(),
+            op_locks[i].min,
+            op_locks[i].max,
+            op_allocs[i].mean(),
+            op_allocs[i].min,
+            op_allocs[i].max
         );
     }
     println!(
