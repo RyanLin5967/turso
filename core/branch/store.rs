@@ -54,7 +54,7 @@
 //!   the garbage is exactly the versions with `died` in `(f, hi]`;
 //! * with no younger one (the newest child), exactly those with `born` in `(lo, f]`;
 //! * with both, each range also holds survivors, and the two are walked in lockstep until the
-//!   shorter one ends (see [`Lineage::garbage`]).
+//!   shorter one ends (see [`BranchStore::reclaim_both`]).
 //!
 //! A branch whose handle has been dropped but that still has a live child or an open connection
 //! is kept (its versions are still read through); it is freed the moment the last of those goes,
@@ -293,30 +293,18 @@ impl Lineage {
         (f < v.died).then_some(v.slot)
     }
 
-    /// Detach the child forked at `f`. With both of its neighbours live, release here every
-    /// retained version that only it could see (the lockstep walk of [`Lineage::garbage`]); with a
-    /// neighbour missing, those versions are exactly one index range, returned for
-    /// [`BranchStore::reclaim_range`] to release in bounded holds.
-    fn child_gone(
-        &mut self,
-        f: u64,
-        arena: &mut Arena,
-        work: &mut BranchWork,
-    ) -> (usize, Option<GarbageRange>) {
+    /// Detach the child forked at `f` and return the index range(s) holding every retained version
+    /// only it could see (see [`BranchStore::reclaim_range`]).
+    fn child_gone(&mut self, f: u64) -> GarbageRange {
         let removed = self.children.remove(&f);
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
         match (lo, hi) {
-            (None, _) => return (0, Some(GarbageRange::Died { after: f, to: hi })),
-            (Some(lo), None) => return (0, Some(GarbageRange::Born { after: lo, to: f })),
-            (Some(_), Some(_)) => {}
+            (None, _) => GarbageRange::Died { after: f, to: hi },
+            (Some(lo), None) => GarbageRange::Born { after: lo, to: f },
+            (Some(lo), Some(hi)) => GarbageRange::Both { lo, f, hi },
         }
-        let dead = self.garbage(f, lo, hi, work);
-        for &(born, page, died) in &dead {
-            self.release_version(born, page, died, arena, work);
-        }
-        (dead.len(), None)
     }
 
     /// Remove one retained version from the per-page map and both indexes, and free its slot.
@@ -367,92 +355,51 @@ impl Lineage {
                     .copied()
                     .collect()
             }
+            GarbageRange::Both { .. } => unreachable!("a two-sided query is walked in lockstep"),
         }
     }
 
-    /// The versions that held `f` and no other live child, as `(born, page, died)`, once `f` has
-    /// left `children`; `lo` and `hi` are its former neighbours there.
-    ///
-    /// Every retained version holds at least one live child's fork epoch: it is retained only if
-    /// one forked inside it, and this function hands it back the moment the last one goes. So a
-    /// version with `born > lo` and `died <= hi` held `f` and nothing else, and one holding `f`
-    /// that reaches back to `lo` or on to `hi` is still needed. That makes the garbage
-    /// `{born > lo, died <= hi}`, and each index answers one side of it:
-    ///
-    /// * `lo` absent: `died` in `(f, hi]`. Every such version was born at or before `f` (it holds
-    ///   a live child, and there is none below `f`), so every entry the range yields is garbage.
-    ///   This is the oldest child — the victim of uniform-TTL expiry — and the cost is what it frees.
-    /// * `hi` absent: `born` in `(lo, f]`, every entry garbage by the same argument.
-    /// * both: garbage lies in both ranges, and each also yields survivors (versions reaching past
-    ///   `hi`, or back past `lo`). The ranges are walked in lockstep and the first to end is
-    ///   filtered, so the walk costs twice the SMALLER range, never the larger.
-    ///
-    /// `gc_range_entries` counts every entry either range yields.
-    fn garbage(
+    /// The two-sided query's next entry on `side` (0: `born` in `(lo, f]`; 1: `died` in
+    /// `(f, hi]`) strictly after the index key `resume`, as `(born, page, died)`.
+    fn lockstep_next(
         &self,
-        f: u64,
-        lo: Option<u64>,
-        hi: Option<u64>,
-        work: &mut BranchWork,
-    ) -> Vec<(u64, u32, u64)> {
-        // `born` in (lo, f] and `died` in (f, hi], as bounds on the two indexes' first field.
+        side: usize,
+        (lo, f, hi): (u64, u64, u64),
+        resume: Option<(u64, u32, u64)>,
+    ) -> Option<(u64, u32, u64)> {
         let after = |e: u64| (e, NO_PAGE, u64::MAX);
-        let born_from = lo.map_or(Bound::Unbounded, |lo| Bound::Excluded(after(lo)));
-        let born_to = Bound::Included(after(f));
-        let died_from = Bound::Excluded(after(f));
-        let died_to = hi.map_or(Bound::Unbounded, |hi| Bound::Included(after(hi)));
-        let only_f = |born: u64, died: u64| {
-            lo.is_none_or(|lo| born > lo)
-                && born <= f
-                && f < died
-                && hi.is_none_or(|hi| died <= hi)
-        };
-        let mut by_born = self.by_born.range((born_from, born_to));
-        let mut by_died = self
-            .by_died
-            .range((died_from, died_to))
-            .map(|&(died, page, born)| (born, page, died));
-        let mut seen: [Vec<(u64, u32, u64)>; 2] = Default::default();
-        // Which ranges to walk: the one side's own range when a neighbour is missing, else both.
-        let walk = match (lo, hi) {
-            (None, _) => [false, true],
-            (Some(_), None) => [true, false],
-            (Some(_), Some(_)) => [true, true],
-        };
-        let finished = 'walk: loop {
-            for side in 0..2 {
-                if !walk[side] {
-                    continue;
-                }
-                let next = if side == 0 {
-                    by_born.next().copied()
-                } else {
-                    by_died.next()
-                };
-                match next {
-                    Some(v) => {
-                        work.gc_range_entries += 1;
-                        seen[side].push(v);
-                    }
-                    None => break 'walk side,
-                }
-            }
-        };
-        let mut dead = std::mem::take(&mut seen[finished]);
-        dead.retain(|&(born, _, died)| only_f(born, died));
-        dead
+        if side == 0 {
+            let from = Bound::Excluded(resume.unwrap_or(after(lo)));
+            self.by_born
+                .range((from, Bound::Included(after(f))))
+                .next()
+                .copied()
+        } else {
+            let from = Bound::Excluded(resume.unwrap_or(after(f)));
+            self.by_died
+                .range((from, Bound::Included(after(hi))))
+                .next()
+                .map(|&(died, page, born)| (born, page, died))
+        }
     }
 
+    /// `(born, page, died)` is still retained.
+    fn holds(&self, born: u64, page: u32, died: u64) -> bool {
+        self.by_born.contains(&(born, page, died))
+    }
 }
 
 /// The versions a reaped child alone could see when it had no live neighbour on one side: one
-/// range of one index (see [`Lineage::garbage`]).
+/// range of one index, or two walked in lockstep (see [`BranchStore::reclaim_both`]).
 #[derive(Clone, Copy)]
 enum GarbageRange {
     /// `died` in `(after, to]`, `to` absent meaning unbounded: the child had no older live sibling.
     Died { after: u64, to: Option<u64> },
     /// `born` in `(after, to]`: it had no younger one.
     Born { after: u64, to: u64 },
+    /// It had both neighbours, `lo` and `hi`: `born` in `(lo, f]` and `died` in `(f, hi]`, each also
+    /// holding survivors, walked in lockstep.
+    Both { lo: u64, f: u64, hi: u64 },
 }
 
 /// What a reap unlinked under one hold and left to be freed in holds of at most [`HOLD_BATCH`]
@@ -691,8 +638,7 @@ impl BranchStore {
                 st.open = false;
                 st.writer = false;
             }
-            let freed = self.collect(&mut inner, id, &mut reclaim);
-            inner.hold.pages += freed as u64;
+            self.collect(&mut inner, id, &mut reclaim);
         }
         self.reclaim(reclaim);
     }
@@ -700,7 +646,7 @@ impl BranchStore {
     /// The `Branch` handle has gone.
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
         let mut reclaim = Reclaim::default();
-        let (freed, deferred) = {
+        let deferred = {
             let mut inner = self.lock();
             let Some(st) = inner.branches.get_mut(&id) else {
                 return Reaped {
@@ -709,12 +655,11 @@ impl BranchStore {
                 };
             };
             st.handle = false;
-            let freed = self.collect(&mut inner, id, &mut reclaim);
-            inner.hold.pages += freed as u64;
-            (freed, inner.branches.contains_key(&id))
+            self.collect(&mut inner, id, &mut reclaim);
+            inner.branches.contains_key(&id)
         };
         Reaped {
-            freed_pages: freed + self.reclaim(reclaim),
+            freed_pages: self.reclaim(reclaim),
             deferred,
         }
     }
@@ -973,26 +918,20 @@ impl BranchStore {
     }
 
     /// Unlink `id` if nothing can reach it any more, then its parent if that removed the parent's
-    /// last reason to exist. Returns the arena pages released here; what an unlinked branch owned,
-    /// and a one-sided garbage range, go to `reclaim` for [`BranchStore::reclaim`].
-    fn collect(&self, inner: &mut StoreInner, mut id: BranchId, reclaim: &mut Reclaim) -> usize {
-        let mut freed = 0;
+    /// last reason to exist. Frees nothing: what an unlinked branch owned, and the garbage its
+    /// parent kept only for it, go to `reclaim` for [`BranchStore::reclaim`].
+    fn collect(&self, inner: &mut StoreInner, mut id: BranchId, reclaim: &mut Reclaim) {
         loop {
             let Some(st) = inner.branches.get(&id) else {
-                return freed;
+                return;
             };
             if st.handle || st.open || !st.lineage.children.is_empty() {
-                return freed;
+                return;
             }
             let st = inner.branches.remove(&id).expect("just looked it up");
             let StoreInner {
-                arena,
-                trunk,
-                branches,
-                work,
-                ..
+                trunk, branches, ..
             } = &mut *inner;
-            let arena = arena.as_mut().expect("a branch existed, so the arena does");
             let (parent, fork_epoch) = (st.parent, st.fork_epoch);
             reclaim.states.push(st);
             let lineage = if parent.is_trunk() {
@@ -1003,14 +942,10 @@ impl BranchStore {
                     .expect("a live branch's parent is kept while the branch lives")
                     .lineage
             };
-            let (now, range) = lineage.child_gone(fork_epoch, arena, work);
-            freed += now;
-            if let Some(range) = range {
-                reclaim.ranges.push((parent, range));
-            }
+            reclaim.ranges.push((parent, lineage.child_gone(fork_epoch)));
             if parent.is_trunk() {
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
-                return freed;
+                return;
             }
             id = parent;
         }
@@ -1043,9 +978,12 @@ impl BranchStore {
     /// which no later fork can change (a fork's epoch is past every `died`). So an interleaved reap
     /// of a sibling that frees some of the same versions, or a new fork, cannot make this free a
     /// version twice or free one a child can see. With no interleaving every entry of the range is
-    /// garbage (see [`Lineage::garbage`]) and the entries visited equal the versions freed. If
+    /// garbage (see [`BranchStore::reclaim_both`]) and the entries visited equal the versions freed. If
     /// `node` is gone its whole lineage was freed with it and there is nothing left to do.
     fn reclaim_range(&self, node: BranchId, range: GarbageRange) -> usize {
+        if let GarbageRange::Both { lo, f, hi } = range {
+            return self.reclaim_both(node, (lo, f, hi));
+        }
         let mut freed = 0;
         let mut resume = None;
         loop {
@@ -1087,8 +1025,91 @@ impl BranchStore {
             resume = Some(match range {
                 GarbageRange::Died { .. } => (died, page, born),
                 GarbageRange::Born { .. } => (born, page, died),
+                GarbageRange::Both { .. } => unreachable!("walked by reclaim_both"),
             });
         }
+    }
+
+    /// The two-sided query, for a child reaped between two live siblings `lo` and `hi`.
+    ///
+    /// Every retained version holds at least one live child's fork epoch: it is retained only if
+    /// one forked inside it, and it is handed back the moment the last one goes. So a version with
+    /// `born > lo` and `died <= hi` held `f` and nothing else, and one holding `f` that reaches
+    /// back to `lo` or on to `hi` is still needed. The garbage `{born > lo, died <= hi}` lies in
+    /// both `born` in `(lo, f]` and `died` in `(f, hi]`, and each range also yields survivors, so
+    /// the two are walked in lockstep and the first to end holds all the garbage: the walk costs
+    /// twice the SMALLER range, never the larger (`gc_range_entries` counts every entry either
+    /// range yields). The walk takes at most [`HOLD_BATCH`] steps per hold, resuming each side
+    /// after the last key it visited; the finished side's entries are then freed, at most
+    /// [`HOLD_BATCH`] per hold, each only if it is still retained and no live child lies in its
+    /// `[born, died)` — with no interleaving that is exactly `born > lo && died <= hi`.
+    fn reclaim_both(&self, node: BranchId, bounds: (u64, u64, u64)) -> usize {
+        let mut seen: [Vec<(u64, u32, u64)>; 2] = Default::default();
+        let mut resume: [Option<(u64, u32, u64)>; 2] = [None, None];
+        let finished = 'walk: loop {
+            let mut inner = self.lock();
+            let StoreInner {
+                trunk,
+                branches,
+                work,
+                hold,
+                ..
+            } = &mut *inner;
+            let lineage = if node.is_trunk() {
+                &trunk.lineage
+            } else {
+                match branches.get(&node) {
+                    Some(st) => &st.lineage,
+                    None => return 0,
+                }
+            };
+            for _ in 0..HOLD_BATCH {
+                for side in 0..2 {
+                    match lineage.lockstep_next(side, bounds, resume[side]) {
+                        Some(v @ (born, page, died)) => {
+                            work.gc_range_entries += 1;
+                            hold.pages += 1;
+                            seen[side].push(v);
+                            resume[side] = Some(if side == 0 {
+                                (born, page, died)
+                            } else {
+                                (died, page, born)
+                            });
+                        }
+                        None => break 'walk side,
+                    }
+                }
+            }
+        };
+        let mut freed = 0;
+        for batch in seen[finished].chunks(HOLD_BATCH) {
+            let mut inner = self.lock();
+            let StoreInner {
+                arena,
+                trunk,
+                branches,
+                work,
+                hold,
+                ..
+            } = &mut *inner;
+            let lineage = if node.is_trunk() {
+                &mut trunk.lineage
+            } else {
+                match branches.get_mut(&node) {
+                    Some(st) => &mut st.lineage,
+                    None => return freed,
+                }
+            };
+            let arena = arena.as_mut().expect("retained versions exist, so the arena does");
+            for &(born, page, died) in batch {
+                if lineage.holds(born, page, died) && !lineage.has_child_in(born, died) {
+                    lineage.release_version(born, page, died, arena, work);
+                    freed += 1;
+                }
+            }
+            hold.pages += batch.len() as u64;
+        }
+        freed
     }
 }
 
@@ -1577,5 +1598,46 @@ mod tests {
             assert_eq!(store.stats().live_branches, 0);
             assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
         }
+    }
+
+    /// Three commits of D pages on a branch with a fork after each of the first two, then a reap of
+    /// the middle child: the two-sided walk finds the second commit's D versions as garbage, and
+    /// no hold of the store mutex visits more than 2·HOLD_BATCH index entries on the way.
+    #[test]
+    fn a_two_sided_reap_of_a_large_garbage_set_holds_the_mutex_briefly() {
+        const D: u32 = 5000;
+        let store = BranchStore::new();
+        let p = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        let write = |gen: u64| {
+            store.begin_write(p).unwrap();
+            commit_all(&store, p, D, gen);
+            store.end_write(p);
+        };
+        write(1);
+        let c1 = store.fork_branch(p).unwrap();
+        write(2);
+        let c2 = store.fork_branch(p).unwrap();
+        write(3);
+        let c3 = store.fork_branch(p).unwrap();
+        let _ = store.take_hold_max();
+        let before = store.stats();
+        let reaped = store.release_handle(c2);
+        let after = store.stats();
+        let max = store.take_hold_max();
+        assert_eq!(reaped.freed_pages, D as usize, "the middle child's garbage");
+        assert_eq!(
+            after.work.gc_range_entries - before.work.gc_range_entries,
+            2 * u64::from(D),
+            "the lockstep walk visits twice the smaller range"
+        );
+        assert!(max.pages <= 2 * HOLD_BATCH as u64, "one hold visited {} entries", max.pages);
+        for page in 0..D {
+            assert_eq!(read_gen(&store, c1, page), Some(1), "c1 page {page}");
+            assert_eq!(read_gen(&store, c3, page), Some(3), "c3 page {page}");
+        }
+        for id in [c1, c3, p] {
+            store.release_handle(id);
+        }
+        assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
     }
 }
