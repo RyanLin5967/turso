@@ -8,9 +8,10 @@
 //! pages, and at most 7 for any `u32`. Nothing here depends on how many versions exist or on how
 //! they descend from one another.
 //!
-//! The map only NAMES slots; it owns none. The store's retained-version bookkeeping decides how long
-//! a slot lives, and it keeps every slot any live branch can see (see `store`), which is every slot a
-//! live branch's map can hold.
+//! The maps OWN the branch slots they name, by count: each slot counts the leaf nodes that name it
+//! (see [`PageMap::set`] and [`PageMap::release`]), and it is freed when the last one goes. So a
+//! branch slot lives exactly as long as some map can reach it. Trunk-retained slots never appear in
+//! a map; the trunk's interval reclamation keeps those (see `store`).
 //!
 //! `std::sync::Arc` rather than `crate::sync::Arc`: the nodes are plain data that is only ever
 //! touched under the branch store's mutex, so there is no interleaving for a model checker to
@@ -80,7 +81,7 @@ fn unique<'a>(node: &'a mut Arc<Node>, refs: &mut impl SlotRefs, w: &mut MapWork
 const BITS: u32 = 5;
 const WIDTH: usize = 1 << BITS;
 const MASK: u32 = WIDTH as u32 - 1;
-/// No arena slot has this index ([`PageMap::insert`] refuses it); it marks an empty leaf entry.
+/// No arena slot has this index ([`PageMap::set`] refuses it); it marks an empty leaf entry.
 const EMPTY: Slot = Slot::MAX;
 
 #[derive(Clone)]

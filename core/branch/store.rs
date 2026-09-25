@@ -340,17 +340,6 @@ impl Lineage {
         }
         freed
     }
-
-    fn release_all(mut self, arena: &mut Arena) -> Vec<Slot> {
-        let mut slots = Vec::new();
-        for versions in self.retained.drain_values() {
-            slots.extend(versions.into_values().map(|v| v.slot));
-        }
-        for &slot in &slots {
-            arena.release(slot);
-        }
-        slots
-    }
 }
 
 /// `map.insert`, adding to `moved` the entries a bucket split relinked (observation only; see
@@ -465,11 +454,9 @@ impl BranchStore {
             ..
         } = &mut *inner;
         let st = branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
-        if !st.handle && !st.open {
-            // Dead: no handle and no connection, so nothing in the engine can name it, and its map
-            // is released. Only a store-level caller could get here.
-            return Err(gone(parent));
-        }
+        // A dead branch (no handle, no connection) has released its map; nothing in the engine can
+        // name it, and a store-level caller gets `gone` rather than a fork of nothing.
+        let view = st.view.clone().ok_or_else(|| gone(parent))?;
         if st.writer {
             return Err(LimboError::Busy);
         }
@@ -477,10 +464,6 @@ impl BranchStore {
         st.lineage.epoch += 1;
         st.lineage.children.insert(f, Child::new(id));
         let schema = st.schema.clone();
-        let view = st
-            .view
-            .clone()
-            .expect("a branch with a handle or a connection keeps its map");
         let trunk_at = st.trunk_at;
         let after = counted_insert(
             branches,
@@ -499,6 +482,10 @@ impl BranchStore {
     pub(crate) fn open(&self, id: BranchId) -> Result<Arc<Schema>> {
         let mut inner = self.inner.lock();
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        if st.view.is_none() {
+            // Dead (see `fork_branch`): only a store-level caller can name it.
+            return Err(gone(id));
+        }
         if st.open {
             return Err(LimboError::InvalidArgument(format!(
                 "branch {} already has an open connection; a branch serves one connection at a \
@@ -548,7 +535,7 @@ impl BranchStore {
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
         let mut inner = self.inner.lock();
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
-        if !st.handle && !st.open {
+        if st.view.is_none() {
             return Err(gone(id));
         }
         if st.writer {
@@ -594,16 +581,16 @@ impl BranchStore {
         } = &mut *inner;
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        if st.view.is_none() {
+            return Err(gone(id));
+        }
         crate::turso_assert!(st.writer, "branch page written outside a write transaction");
         let epoch = st.lineage.epoch;
         if st.current.get(&page).is_some_and(|o| o.born == epoch) {
             // Already decided since the branch's last fork: no child has seen this slot.
             return Ok(());
         }
-        let view = st
-            .view
-            .as_mut()
-            .expect("a branch with a write transaction keeps its map");
+        let view = st.view.as_mut().expect("checked above");
         let mut w = MapWork::default();
         // The slot this branch sees now, with the path to it made this map's own. If no other map
         // names it — no child forked since it was written, no sibling or ancestor still reads it —
@@ -671,6 +658,9 @@ impl BranchStore {
             arena, branches, ..
         } = &mut *inner;
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        if st.view.is_none() {
+            return Err(gone(id));
+        }
         if pages.is_empty() {
             return Ok(());
         }
@@ -905,8 +895,11 @@ impl StoreInner {
     ) -> Result<Option<Slot>> {
         *levels += 1;
         let st = self.branches.get(&id).ok_or_else(|| gone(id))?;
-        // A branch sees its own versions and its ancestors' as of its fork, all through its map.
-        if let Some(slot) = st.view.as_ref().and_then(|view| view.get(page)) {
+        // A branch sees its own versions and its ancestors' as of its fork, all through its map. A
+        // dead branch has released it and reads nothing (it would otherwise fall through to the
+        // trunk and read the wrong page).
+        let view = st.view.as_ref().ok_or_else(|| gone(id))?;
+        if let Some(slot) = view.get(page) {
             return Ok(Some(slot));
         }
         *levels += 1;
@@ -1336,11 +1329,18 @@ fn a_dead_parent_frees_what_it_wrote_after_its_last_fork() {
         }
         // The shapes the page maps exist for must have occurred, or a green run says nothing —
         // including a dead branch spliced out from above its one live child.
-        let splices = store.stats().work.splices;
+        let (splices, in_place) = {
+            let w = store.stats().work;
+            (w.splices, w.writes_in_place)
+        };
         assert!(
-            max_depth >= 10 && deferred > 0 && wrote_after_fork > 0 && splices > 0,
+            max_depth >= 10
+                && deferred > 0
+                && wrote_after_fork > 0
+                && splices > 0
+                && in_place > 0,
             "seed {seed:#x}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
-             after its first fork {wrote_after_fork}, splices {splices}"
+             after its first fork {wrote_after_fork}, splices {splices}, writes in place {in_place}"
         );
         for n in nodes.iter().filter(|n| n.handle) {
             store.release_handle(n.id);

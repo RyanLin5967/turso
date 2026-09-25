@@ -3782,9 +3782,9 @@ impl Pager {
     /// the moment before its first byte changes, and the only place a [`WriteTicket`] is minted,
     /// so no page write can skip it.
     ///
-    /// * On a branch: a page the branch does not own yet is copied into a fresh slot of its own
-    ///   page space; a page it owns that a live child can still see keeps its old slot for that
-    ///   child and gets a fresh one.
+    /// * On a branch: the page is written in place if no other branch's page map names its slot
+    ///   (no child forked since it was written, no ancestor or sibling still reads it); otherwise it
+    ///   is copied into a fresh slot and every map that named the old one keeps it.
     /// * On the trunk: a page a live branch can still see has its pre-image copied into the arena
     ///   before the write, so neither this commit nor a later checkpoint reaches the branch.
     ///

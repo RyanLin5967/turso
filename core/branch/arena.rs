@@ -1,9 +1,10 @@
 //! The branch arena: page-sized slots handed out and taken back.
 //!
-//! A slot is a branch's own copy of one page — either the page's current version on a branch that
-//! wrote it, or a superseded version kept alive because a child forked while it was current. The
-//! arena does not know which; [`super::store`] owns that bookkeeping and the arena only answers
-//! "give me a page" and "take this page back".
+//! A slot is one copy of one page: a branch's version, alive while some branch's page map names it,
+//! or a trunk pre-image kept for the trunk's children. The arena does not know which. For branch
+//! slots it keeps the count of page-map leaves that name each one (see [`super::page_map`]) and frees
+//! the slot when that count reaches zero; trunk slots keep a count of zero and are released directly
+//! by [`super::store`]'s reclamation.
 //!
 //! ⚠ **The arena is volatile.** Slots live in memory and there is no persisted map from branch to
 //! slot, so branches do not survive a restart. That is a scope line, not an oversight: the question
