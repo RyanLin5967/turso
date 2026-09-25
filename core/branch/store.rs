@@ -198,6 +198,15 @@ pub(crate) struct BranchStore {
     fs_next_id: CachePadded<AtomicU64>,
     fs_live: CachePadded<AtomicUsize>,
     fs_trunk_children: CachePadded<AtomicUsize>,
+    /// r11-coherence FK: the trunk's live children by fork epoch, a lock-free skiplist, and the epoch counter a
+    /// fork takes its epoch from, replacing `trunk.lineage.{children, epoch}`. `k_retained` counts the trunk's
+    /// retained versions (changed only under the trunk lock): a reap that finds it 0 needs no garbage pass and no
+    /// lock. A trunk writer raises it before it scans the children and a reaper reads it after its removal, both
+    /// SeqCst, so a version retained for a child being reaped is always collected by that reap.
+    fk: bool,
+    k_epoch: CachePadded<AtomicU64>,
+    k_children: crate::skiplist::SkipMap<u64, BranchId>,
+    k_retained: CachePadded<AtomicUsize>,
 }
 
 /// FS: ids a thread takes per trip to the store's counter.
@@ -565,6 +574,18 @@ impl Lineage {
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
+        self.release_garbage(f, lo, hi, arena, work)
+    }
+
+    /// Free the versions that held `f` and no other live child, given `f`'s former neighbours.
+    fn release_garbage(
+        &mut self,
+        f: u64,
+        lo: Option<u64>,
+        hi: Option<u64>,
+        arena: &mut Domain,
+        work: &mut BranchWork,
+    ) -> usize {
         let dead = self.garbage(f, lo, hi, work);
         for &(born, page, died) in &dead {
             let versions = self.retained.get_mut(&page).expect("indexed version is listed");
@@ -702,6 +723,10 @@ impl BranchStore {
             fs_next_id: CachePadded::new(AtomicU64::new(1)),
             fs_live: CachePadded::new(AtomicUsize::new(0)),
             fs_trunk_children: CachePadded::new(AtomicUsize::new(0)),
+            fk: crate::coherence::fix(crate::coherence::FIX_TRUNKIDX),
+            k_epoch: CachePadded::new(AtomicU64::new(0)),
+            k_children: crate::skiplist::SkipMap::new(),
+            k_retained: CachePadded::new(AtomicUsize::new(0)),
         }
     }
 
@@ -823,6 +848,11 @@ impl BranchStore {
         self.trunk_pages.fill(key, bytes);
     }
 
+    /// FK: whether every trunk write takes its copy decision (and stamps `written`) even with no child alive.
+    pub(crate) fn stamps_every_trunk_write(&self) -> bool {
+        self.fk
+    }
+
     pub(crate) fn trunk_has_children(&self) -> bool {
         self.trunk_children_ctr().load(Ordering::Acquire) > 0
     }
@@ -854,7 +884,14 @@ impl BranchStore {
                 format.0, format.1
             )));
         }
-        let (id, f) = {
+        let (id, f) = if self.fk {
+            // The caller excludes trunk writers (the WAL write lock, or FG's gate), so no copy decision reads the
+            // epoch or the children while they change; concurrent forks and reaps are the skiplist's to order.
+            let id = self.next_branch_id();
+            let f = self.k_epoch.fetch_add(1, Ordering::AcqRel);
+            self.k_children.insert(f, id);
+            (id, f)
+        } else {
             let mut trunk = self.trunk();
             let id = self.next_branch_id();
             let f = trunk.lineage.epoch;
@@ -1052,12 +1089,27 @@ impl BranchStore {
         let TrunkInner {
             lineage, domain, ..
         } = &mut *trunk;
-        let epoch = lineage.epoch;
+        let epoch = if self.fk {
+            self.k_epoch.load(Ordering::Acquire)
+        } else {
+            lineage.epoch
+        };
         let born = self.written(page);
         if born >= epoch {
             return;
         }
-        if lineage.has_child_in(born, epoch) {
+        let has_child = if self.fk {
+            // Announce the version before looking for its readers (see `k_retained`); undone if none.
+            self.k_retained.fetch_add(1, Ordering::SeqCst);
+            let found = born < epoch && self.k_children.range(born..epoch).next().is_some();
+            if !found {
+                self.k_retained.fetch_sub(1, Ordering::SeqCst);
+            }
+            found
+        } else {
+            lineage.has_child_in(born, epoch)
+        };
+        if has_child {
             let slot = domain.alloc(self.page_size());
             domain.page_mut(slot).copy_from_slice(pre_image);
             lineage.retain(
@@ -1271,6 +1323,37 @@ impl BranchStore {
             }
             freed += st.lineage.release_all(domain).len();
             drop(shard);
+            if st.parent.is_trunk() && self.fk {
+                let removed = self.k_children.remove(&st.fork_epoch);
+                crate::turso_assert!(removed.is_some(), "detached a child the trunk does not list");
+                drop(removed);
+                if self.k_retained.load(Ordering::SeqCst) > 0 {
+                    // Garbage passes run one at a time under the trunk lock, each with the neighbours the
+                    // skiplist lists at that moment, so two reaps of adjacent children cannot both keep a version
+                    // only they held (the second pass sees the first child gone).
+                    let mut trunk = self.trunk();
+                    let TrunkInner {
+                        lineage,
+                        domain,
+                        work,
+                    } = &mut *trunk;
+                    let f = st.fork_epoch;
+                    let lo = self.k_children.range(..f).next_back().map(|e| *e.key());
+                    let hi = self.k_children.range(f..).next().map(|e| *e.key());
+                    let n = lineage.release_garbage(f, lo, hi, domain, work);
+                    self.k_retained.fetch_sub(n, Ordering::SeqCst);
+                    freed += n;
+                }
+                crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
+                if self.trunk_children_ctr().fetch_sub(1, Ordering::AcqRel) == 1 {
+                    // Kept, but not relied on: with FK every trunk write stamps `written` whether or not the trunk
+                    // has children (`stamps_every_trunk_write`), so a cache key names its version exactly and the
+                    // generation guards nothing. It must not: forks no longer take the trunk lock, so one can run
+                    // between the decrement above and this bump.
+                    self.trunk_pages.generation.fetch_add(1, Ordering::AcqRel);
+                }
+                return (freed, true);
+            }
             if st.parent.is_trunk() {
                 let mut trunk = self.trunk();
                 let TrunkInner {

@@ -3864,7 +3864,7 @@ impl Pager {
             );
         }
         if let Some(store) = self.branch_store.get() {
-            if store.trunk_has_children() {
+            if store.trunk_has_children() || store.stamps_every_trunk_write() {
                 store.first_write_trunk(page_no, page.get_contents().as_slice());
             }
         }
