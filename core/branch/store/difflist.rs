@@ -56,7 +56,7 @@
 //! listing is the catalog as of the clone. Its other filters return small ranges and use `Index`.
 //! Branch ids are the maps' keys, so they must fit in a `u32`; a fork past that is refused.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
 use super::{gone, BranchState, BranchStore, Owned, StoreInner, NO_PAGE};
@@ -176,8 +176,10 @@ pub(crate) struct Catalog {
     by_owner_lease: BTreeSet<(u64, u64, u64)>,
     /// The same ids as persistent maps (id → parent id), all of them and per parent, for
     /// [`ListArm::Snapshot`]. An insert or removal copies a path only while a listing holds a clone.
+    /// Per parent in a B-tree, not a hash table: a table's growth moves every entry at once, under
+    /// the store's mutex (turso_sota §4's rehash stall), and bushy trees have up to N/2 parents.
     live_map: PageMap<u64>,
-    by_parent: HashMap<BranchId, PageMap<u64>>,
+    by_parent: BTreeMap<BranchId, PageMap<u64>>,
 }
 
 /// The largest branch id a snapshot map can key.
