@@ -54,6 +54,7 @@
 
 pub(crate) mod arena;
 pub(crate) mod journal;
+pub(crate) mod page_map;
 pub(crate) mod store;
 
 use crate::error::LimboError;
@@ -244,7 +245,9 @@ pub struct BranchStats {
 pub struct BranchWork {
     /// Page resolutions against the branch tree (one per branch-pager page read).
     pub resolve_calls: u64,
-    /// Nodes visited by those resolutions: the branch, each ancestor, and the trunk when reached.
+    /// Nodes consulted by those resolutions: the branch (its own pages and its inherited page map),
+    /// then the trunk when neither holds the page — at most 2. (Before the persistent page map this
+    /// counted the branch, each ancestor walked, and the trunk.)
     pub resolve_levels: u64,
     /// Retained versions compared against the fork epoch while resolving (`Lineage::retained_at`):
     /// at most one per lineage consulted, the page's born-predecessor. The O(log V) descent that

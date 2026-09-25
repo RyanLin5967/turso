@@ -16,6 +16,24 @@
 //! 3. the same question one level up, down to the trunk, whose current version lives in the WAL
 //!    and the database file and is read by the ordinary pager path.
 //!
+//! # Resolution without the walk — the page map (round 10's F4, ported from turso `a31198dd8`)
+//!
+//! Steps 2 and 3 are answered for every level between a branch and the trunk at once, and frozen,
+//! at the moment the branch forks: nothing a branch sees through its ancestors can change after its
+//! fork (an ancestor's later commit retains the version the branch saw, in the same slot, and a
+//! released interior's retirement keeps every version a live child forked inside). So each branch
+//! carries `inherited`, a persistent [`PageMap`] of every arena page it sees through its ancestors,
+//! which is its parent's `view` at the fork: the parent's own `inherited` plus the parent's current
+//! pages, kept up to date by the parent's commits once it has forked a child. A fork clones the
+//! parent's `view` in O(1) and a commit path-copies O(log P) trie nodes, so a lookup costs the same
+//! at depth 1000 as at depth 1. A page no branch in the chain wrote is the trunk's, as of
+//! `trunk_at`, the fork epoch at which the branch's ancestry leaves the trunk.
+//!
+//! The maps are derived state, like the retained indexes: replay applies `Fork` and `Commit`
+//! records through the same code that builds them live, and after `load_snapshot` (which replays no
+//! fork) `derive_page_maps` rebuilds every `inherited` from the recovered lineages, parents before
+//! children. The log and snapshot formats do not change.
+//!
 //! # Where the copies come from — the write ticket
 //!
 //! Every copy decision is taken at the first [`crate::storage::pager::Pager::add_dirty`] of a
@@ -99,7 +117,9 @@
 //!
 //! * One `Mutex` guards every branch, held across the durable store's fsyncs. Correct, and a named
 //!   wall under concurrent writers; the benchmark this lane ships is single-threaded and says so.
-//! * Resolution walks the ancestor chain: cost grows with DEPTH, not with the number of branches.
+//! * The persistent page maps are an index over slots the lineages own; they own nothing. A
+//!   branch's `inherited` names only slots its ancestors keep for it, so dropping a map never frees
+//!   a page and keeping one never pins a page.
 //! * Recovery is eager: every branch map is materialised at open, O(live branch state).
 //!
 //! # Per-page version order (the fat node; round 10's F1, ported from turso `0de3aa904`)
@@ -122,6 +142,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::arena::{Arena, Slot};
+use super::page_map::PageMap;
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::{BranchDurability, BranchFailpoint, BranchId, BranchStats, BranchWork, Expired, Reaped};
 use crate::schema::Schema;
@@ -364,9 +385,41 @@ struct BranchState {
     writer: bool,
     /// The lease deadline on the lease clock; `None` = the branch never expires.
     lease: Option<u64>,
+    /// The fork epoch at which this branch's ancestry leaves the trunk: its own fork epoch if its
+    /// parent is the trunk, else its parent's `trunk_at`.
+    trunk_at: u64,
+    /// Every arena page this branch sees through its ancestors: its parent's `view` at the fork.
+    inherited: PageMap,
+    /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
+    /// branch's first fork and kept current by its commits from then on; `None` until it forks, and
+    /// again once it is retired (a released branch takes no child).
+    view: Option<PageMap>,
 }
 
 impl BranchState {
+    /// The map a child forked now inherits, built from `inherited` and `current` the first time.
+    fn view_now(&mut self) -> &PageMap {
+        let (inherited, current) = (&self.inherited, &self.current);
+        self.view.get_or_insert_with(|| {
+            let mut view = inherited.clone();
+            for (&page, owned) in current {
+                view.insert(page, (owned.slot, owned.crc));
+            }
+            view
+        })
+    }
+
+    /// The version of `page` this branch held at its own epoch `f` — what a child forked at `f`
+    /// reads from it — if it held one of its own then.
+    fn version_at(&self, page: u32, f: u64) -> Option<(Slot, u32)> {
+        if let Some(owned) = self.current.get(&page) {
+            if owned.born <= f {
+                return Some((owned.slot, owned.crc));
+            }
+        }
+        self.lineage.retained_at(page, f, &mut 0)
+    }
+
     /// F4. A released branch never reads its own `current` again, never writes, and takes no new
     /// child. So each current version becomes a retained one that died at the branch's epoch — a
     /// live child forked at `f` reads it exactly as before, because `born <= f < epoch` — and every
@@ -375,6 +428,8 @@ impl BranchState {
     /// (ferrodb's `retire_arenas_by_rule`); `Lineage::child_gone` then frees the rest incrementally.
     /// Only for a branch with no open connection: an open one still reads `current` at `u64::MAX`.
     fn retire_current(&mut self, freed: &mut Vec<Slot>) {
+        // Its children keep their own `inherited`; a released branch forks no new one.
+        self.view = None;
         let epoch = self.lineage.epoch;
         for (page, owned) in self.current.drain() {
             if self.lineage.has_child_in(owned.born, epoch) {
@@ -1752,18 +1807,20 @@ impl StoreInner {
                 child.0
             )));
         }
-        let lineage = if parent.is_trunk() {
-            &mut self.trunk.lineage
+        let (f, inherited, trunk_at) = if parent.is_trunk() {
+            let lineage = &mut self.trunk.lineage;
+            let f = lineage.epoch;
+            lineage.epoch += 1;
+            lineage.children.insert(f, child);
+            (f, PageMap::default(), f)
         } else {
-            &mut self
-                .branches
-                .get_mut(&parent)
-                .ok_or_else(|| gone(parent))?
-                .lineage
+            let st = self.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
+            let f = st.lineage.epoch;
+            st.lineage.epoch += 1;
+            st.lineage.children.insert(f, child);
+            let inherited = st.view_now().clone();
+            (f, inherited, st.trunk_at)
         };
-        let f = lineage.epoch;
-        lineage.epoch += 1;
-        lineage.children.insert(f, child);
         self.next_id = self.next_id.max(child.0 + 1);
         self.branches.insert(
             child,
@@ -1778,6 +1835,9 @@ impl StoreInner {
                 open: false,
                 writer: false,
                 lease: None,
+                trunk_at,
+                inherited,
+                view: None,
             },
         );
         Ok(())
@@ -1799,6 +1859,9 @@ impl StoreInner {
                 born: epoch,
                 crc,
             };
+            if let Some(view) = st.view.as_mut() {
+                view.insert(page, (slot, crc));
+            }
             if let Some(old) = st.current.insert(page, new) {
                 if st.lineage.has_child_in(old.born, epoch) {
                     st.lineage.retain(
@@ -1882,7 +1945,8 @@ impl StoreInner {
         }
     }
 
-    /// `levels` counts the nodes visited and `examined` the retained versions compared.
+    /// `levels` counts the nodes consulted — the branch (its own pages and its `inherited` map),
+    /// then the trunk if neither holds the page — and `examined` the retained versions compared.
     fn resolve(
         &self,
         id: BranchId,
@@ -1890,39 +1954,80 @@ impl StoreInner {
         levels: &mut u64,
         examined: &mut u64,
     ) -> Result<Option<(Slot, u32)>> {
-        let mut node = id;
-        // A branch sees all of its own versions; its ancestors only as of the fork.
-        let mut at = u64::MAX;
-        loop {
-            *levels += 1;
-            if node.is_trunk() {
-                if let Some(found) = self.trunk.lineage.retained_at(page, at, examined) {
-                    return Ok(Some(found));
-                }
-                let born = self.trunk.written.get(&page).copied().unwrap_or(0);
-                if born > at {
-                    // The trunk overwrote this page after the fork and nothing was retained: the
-                    // ordinary read path would return the NEW version. Refuse rather than serve it.
-                    return Err(LimboError::Corrupt(format!(
-                        "branch {} would read trunk page {page} written after its fork; the \
-                         pre-image was not retained",
-                        id.0
-                    )));
-                }
-                return Ok(None);
-            }
-            let st = self.branches.get(&node).ok_or_else(|| gone(node))?;
-            if let Some(owned) = st.current.get(&page) {
-                if owned.born <= at {
-                    return Ok(Some((owned.slot, owned.crc)));
-                }
-            }
-            if let Some(found) = st.lineage.retained_at(page, at, examined) {
-                return Ok(Some(found));
-            }
-            at = st.fork_epoch;
-            node = st.parent;
+        *levels += 1;
+        let st = self.branches.get(&id).ok_or_else(|| gone(id))?;
+        // A branch sees all of its own versions; its ancestors' as of its fork, which `inherited`
+        // froze then.
+        if let Some(owned) = st.current.get(&page) {
+            return Ok(Some((owned.slot, owned.crc)));
         }
+        if let Some(found) = st.inherited.get(page) {
+            return Ok(Some(found));
+        }
+        *levels += 1;
+        let at = st.trunk_at;
+        if let Some(found) = self.trunk.lineage.retained_at(page, at, examined) {
+            return Ok(Some(found));
+        }
+        let born = self.trunk.written.get(&page).copied().unwrap_or(0);
+        if born > at {
+            // The trunk overwrote this page after the fork and nothing was retained: the ordinary
+            // read path would return the NEW version. Refuse rather than serve it.
+            return Err(LimboError::Corrupt(format!(
+                "branch {} would read trunk page {page} written after its fork; the pre-image was \
+                 not retained",
+                id.0
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Rebuild every branch's `inherited` map and `trunk_at` from the recovered lineages, parents
+    /// before children: `load_snapshot` restores state without replaying the forks that built them.
+    /// A child forked from branch `p` at `f` inherits `p`'s own `inherited` overlaid with every page
+    /// `p` held at `f` — its current version if born by then, else the retained version holding `f`.
+    fn derive_page_maps(&mut self) -> Result<()> {
+        let mut todo: Vec<(BranchId, PageMap, u64)> = self
+            .trunk
+            .lineage
+            .children
+            .iter()
+            .map(|(&f, &id)| (id, PageMap::default(), f))
+            .collect();
+        let mut reached = 0;
+        while let Some((id, inherited, trunk_at)) = todo.pop() {
+            reached += 1;
+            let st = self
+                .branches
+                .get_mut(&id)
+                .expect("a lineage lists only branches that exist");
+            st.inherited = inherited;
+            st.trunk_at = trunk_at;
+            st.view = None;
+            let st = &self.branches[&id];
+            let mut pages: BTreeSet<u32> = st.current.keys().copied().collect();
+            pages.extend(st.lineage.retained.keys().copied());
+            for (&f, &child) in &st.lineage.children {
+                let mut map = st.inherited.clone();
+                for &page in &pages {
+                    if let Some(found) = st.version_at(page, f) {
+                        map.insert(page, found);
+                    }
+                }
+                todo.push((child, map, st.trunk_at));
+            }
+        }
+        // A branch no lineage lists would keep an empty map and read its ancestors' pages from the
+        // trunk: refuse the open rather than serve it.
+        if reached != self.branches.len() {
+            return Err(LimboError::Corrupt(format!(
+                "branch snapshot: {} of {} branches are listed by no lineage; their page maps \
+                 cannot be derived",
+                self.branches.len() - reached,
+                self.branches.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Re-execute one logged operation during recovery.
@@ -2099,6 +2204,10 @@ impl StoreInner {
                     open: false,
                     writer: false,
                     lease,
+                    // Placeholders: `derive_page_maps` sets both once every lineage is linked.
+                    trunk_at: 0,
+                    inherited: PageMap::default(),
+                    view: None,
                 },
             );
         }
@@ -2122,6 +2231,7 @@ impl StoreInner {
                 )));
             }
         }
+        self.derive_page_maps()?;
         Ok(())
     }
 }
