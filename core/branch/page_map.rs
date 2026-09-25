@@ -130,8 +130,14 @@ impl<V: TrieValue> PageMap<V> {
     pub(crate) fn insert(&mut self, page: u32, value: V) {
         crate::turso_assert!(value != V::EMPTY, "a page map value equal to its empty marker");
         if self.root.is_none() {
-            self.root = Some(Arc::new(Node::empty(0)));
+            // The first root is as tall as its first page needs. Starting from a leaf and lifting it
+            // would leave that leaf, empty, at kid 0: never read by a lookup, but visited by every
+            // walk and diff, which count on every node holding at least one entry.
             self.height = 0;
+            while !self.covers(page) {
+                self.height += 1;
+            }
+            self.root = Some(Arc::new(Node::empty(self.height)));
         }
         while !self.covers(page) {
             let mut kids: [Option<Arc<Node<V>>>; WIDTH] = std::array::from_fn(|_| None);
@@ -397,7 +403,14 @@ mod tests {
             want.dedup();
             assert_eq!(got, want, "versions {i} and {j}");
             let mut all = Vec::new();
-            a.for_each(&mut TrieWork::default(), &mut |p, v| all.push((p, v)));
+            let mut walked = TrieWork::default();
+            a.for_each(&mut walked, &mut |p, v| all.push((p, v)));
+            // Every node holds at least one entry, so a walk costs at most one path per entry.
+            assert!(
+                walked.nodes <= (u64::from(a.height()) + 1) * walked.reported,
+                "version {i}: a walk visited {walked:?} at height {}",
+                a.height()
+            );
             all.sort_unstable();
             let mut want_all: Vec<(u32, u64)> = ma.iter().map(|(&p, &v)| (p, v)).collect();
             want_all.sort_unstable();
