@@ -97,10 +97,12 @@ use std::time::{Duration, Instant};
 
 use super::arena::{Arena, Slot};
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
-use super::{BranchDurability, BranchFailpoint, BranchId, BranchStats, Expired, Reaped};
+use super::{
+    BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchStats, Expired, Reaped,
+};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
-use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
 
@@ -125,6 +127,11 @@ pub(crate) struct BranchStore {
     /// A read-only open of a database WITH branch files: the branch store was not opened, and every
     /// branch operation is refused by name (review 4 C2; see `open_with_flags`).
     trunk_only: bool,
+    /// What the open read and rebuilt (r11-restart lane instrument; observing only).
+    open_stats: BranchOpenStats,
+    /// `resolve_into` calls and the arena slot reads they made (r11-restart lane instrument).
+    resolve_calls: AtomicU64,
+    arena_reads: AtomicU64,
 }
 
 struct StoreInner {
@@ -501,6 +508,9 @@ impl BranchStore {
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
             trunk_only: true,
+            open_stats: BranchOpenStats::default(),
+            resolve_calls: AtomicU64::new(0),
+            arena_reads: AtomicU64::new(0),
         }
     }
 
@@ -529,6 +539,9 @@ impl BranchStore {
         db_path: &str,
     ) -> Result<Self> {
         let memory = crate::is_memory_like(db_path);
+        let opened = Instant::now();
+        let mut stats = BranchOpenStats::default();
+        let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let inner = match durability {
             BranchDurability::Volatile => {
                 if !memory && BranchFiles::for_db(db_path).exist() {
@@ -549,48 +562,90 @@ impl BranchStore {
                 let files = BranchFiles::for_db(db_path);
                 let mut inner = StoreInner::fresh(Some(files.clone()), sync, default_lease);
                 if files.exist() {
-                    if let Some(recovered) = Journal::recover(&files, sync)? {
+                    let t = Instant::now();
+                    let recovered = Journal::recover(&files, sync)?;
+                    stats.recover_ns = ns(t);
+                    if let Some(recovered) = recovered {
+                        stats.snap_bytes = recovered.snap_bytes;
+                        stats.log_bytes = recovered.log_bytes;
+                        stats.records = recovered.records.len() as u64;
+                        let t = Instant::now();
                         if let Some(snapshot) = recovered.snapshot {
+                            stats.snap_branches = snapshot.branches.len() as u64;
                             inner.load_snapshot(snapshot)?;
                         }
+                        stats.load_ns = ns(t);
                         // Frees during replay are not acted on: the free set is derived below
                         // from what the recovered state references.
                         let mut ignored = Vec::new();
+                        let t = Instant::now();
                         for record in &recovered.records {
                             inner.replay(record, &mut ignored)?;
                         }
+                        stats.replay_ns = ns(t);
                         // A snapshot can hold a released branch that was kept only by an open
                         // connection; after a restart nothing is open.
+                        let t = Instant::now();
                         inner.collect_released(&mut ignored);
+                        stats.collect_ns = ns(t);
+                        let t = Instant::now();
                         let referenced = inner.referenced_slots();
-                        inner.arena = Some(Arena::open_file(
+                        stats.referenced_ns = ns(t);
+                        stats.referenced_slots = referenced.len() as u64;
+                        let t = Instant::now();
+                        let arena = Arena::open_file(
                             &files.arena,
                             recovered.page_size,
                             false,
                             &referenced,
-                        )?);
+                        )?;
+                        stats.arena_ns = ns(t);
+                        stats.arena_high_water = arena.in_use() as u64 + arena.free_count() as u64;
+                        stats.arena_free = arena.free_count() as u64;
+                        inner.arena = Some(arena);
                         inner.journal = Some(recovered.journal);
                     }
                 }
                 inner
             }
         };
-        let store = Self {
+        let mut store = Self {
             trunk_children: AtomicUsize::new(inner.trunk.lineage.children.len()),
             inner: Mutex::new(inner),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
             trunk_only: false,
+            open_stats: BranchOpenStats::default(),
+            resolve_calls: AtomicU64::new(0),
+            arena_reads: AtomicU64::new(0),
         };
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
         // what makes a crashed agent's branch temporary. The clock resumed where it was last
         // stamped, so nothing expires here that had time left then.
         {
+            let t = Instant::now();
             let mut inner = store.inner.lock();
             store.expire(&mut inner, Stamp::No)?;
             store.sync_lease_flag(&inner);
+            stats.expire_ns = ns(t);
         }
+        stats.total_ns = ns(opened);
+        // The instrument's own counting scan, after `total_ns` so the open time does not carry it.
+        {
+            let inner = store.inner.lock();
+            stats.branches = inner.branches.len() as u64;
+            stats.current_entries = inner.branches.values().map(|b| b.current.len() as u64).sum();
+            stats.retained_entries = inner
+                .branches
+                .values()
+                .map(|b| b.lineage.retained.values().map(|v| v.len() as u64).sum::<u64>())
+                .sum();
+            stats.trunk_retained =
+                inner.trunk.lineage.retained.values().map(|v| v.len() as u64).sum();
+            stats.trunk_children = inner.trunk.lineage.children.len() as u64;
+        }
+        store.open_stats = stats;
         Ok(store)
     }
 
@@ -1328,9 +1383,11 @@ impl BranchStore {
     /// ordinary WAL / database-file path.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
         let inner = self.inner.lock();
+        self.resolve_calls.fetch_add(1, Ordering::Relaxed);
         let Some((slot, crc)) = inner.resolve(id, page)? else {
             return Ok(false);
         };
+        self.arena_reads.fetch_add(1, Ordering::Relaxed);
         let arena = inner
             .arena
             .as_ref()
@@ -1345,6 +1402,17 @@ impl BranchStore {
             )));
         }
         Ok(true)
+    }
+
+    pub(crate) fn open_stats(&self) -> BranchOpenStats {
+        self.open_stats
+    }
+
+    pub(crate) fn read_counters(&self) -> (u64, u64) {
+        (
+            self.resolve_calls.load(Ordering::Relaxed),
+            self.arena_reads.load(Ordering::Relaxed),
+        )
     }
 
     pub(crate) fn stats(&self) -> Result<BranchStats> {

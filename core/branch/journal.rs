@@ -412,6 +412,9 @@ pub(crate) struct Recovered {
     pub(crate) snapshot: Option<SnapshotState>,
     pub(crate) records: Vec<Record>,
     pub(crate) journal: Journal,
+    /// Bytes read from the snapshot and the log (r11-restart lane instrument).
+    pub(crate) snap_bytes: u64,
+    pub(crate) log_bytes: u64,
 }
 
 pub(crate) struct Journal {
@@ -669,6 +672,8 @@ impl Journal {
             snapshot: snapshot_state,
             records,
             journal,
+            snap_bytes: snapshot_len,
+            log_bytes: bytes.len() as u64,
         }))
     }
 
