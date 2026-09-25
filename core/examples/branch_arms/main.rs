@@ -9,11 +9,16 @@
 //!   chain      one fork chain, trunk -> b1 -> ... -> bd; x axis = depth d
 //!   churn      steady N: every cycle forks + writes one branch and reaps a random live one
 //!   churn_hot  churn, plus the trunk rewrites the hot row in every cycle
+//!   churn_spread churn, plus the trunk rewrites the `spread` walk's next row in every cycle (amendment 3)
 //!   pages      every branch writes w pages in one transaction; x axis = N, one block per w
 //!   spread_trunk the `spread` arm's trunk writes with NO branches (amendment 2); x = trunk writes
 //!
 //! `--no-autocheckpoint` disables the trunk connection's WAL auto-actions (auto-checkpoint and WAL
 //! restart), amendment 2. Every state line prints the WAL file's size.
+//!
+//! `--victim oldest|random` (churn arms only; default random) picks each cycle's reap victim: a
+//! uniformly random live branch, or the oldest one, which is the order uniform-TTL lease expiry
+//! reaps in (amendment 3).
 //!
 //! Every read a sample makes is checked against a model the harness keeps itself (never against
 //! the engine), and the engine's own counts are checked against the workload before a number is
@@ -21,7 +26,7 @@
 //! the engine's work counters for that op (resolutions, nodes walked, retained versions compared),
 //! so a slope can be read against an integer that load cannot move.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,12 +51,21 @@ enum Arm {
     Chain,
     Churn,
     ChurnHot,
+    ChurnSpread,
     Pages,
     SpreadTrunk,
 }
 
+/// Which live branch a churn cycle reaps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Victim {
+    Random,
+    Oldest,
+}
+
 struct Args {
     arm: Arm,
+    victim: Victim,
     checkpoints: Vec<usize>,
     samples: usize,
     seed: u64,
@@ -71,6 +85,7 @@ fn parse_args() -> Args {
     let mut arm = None;
     let mut args = Args {
         arm: Arm::Hot,
+        victim: Victim::Random,
         checkpoints: vec![100, 1000],
         samples: 200,
         seed: 0x9E37_79B9_7F4A_7C15,
@@ -90,6 +105,7 @@ fn parse_args() -> Args {
                     "chain" => Arm::Chain,
                     "churn" => Arm::Churn,
                     "churn_hot" => Arm::ChurnHot,
+                    "churn_spread" => Arm::ChurnSpread,
                     "pages" => Arm::Pages,
                     "spread_trunk" => Arm::SpreadTrunk,
                     other => die(&format!("unknown arm {other}")),
@@ -102,10 +118,22 @@ fn parse_args() -> Args {
             "--windows" => args.windows = val().parse().unwrap_or_else(|_| die("bad --windows")),
             "--w" => args.w_list = parse_list(&val(), "--w"),
             "--no-autocheckpoint" => args.no_autocheckpoint = true,
+            "--victim" => {
+                args.victim = match val().as_str() {
+                    "random" => Victim::Random,
+                    "oldest" => Victim::Oldest,
+                    other => die(&format!("unknown victim policy {other}")),
+                }
+            }
             other => die(&format!("unknown argument {other}")),
         }
     }
     args.arm = arm.unwrap_or_else(|| die("--arm is required"));
+    if args.victim != Victim::Random
+        && !matches!(args.arm, Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread)
+    {
+        die("--victim applies to the churn arms only");
+    }
     if args.checkpoints.is_empty() || args.checkpoints.windows(2).any(|w| w[0] >= w[1]) {
         die("--checkpoints must be strictly increasing");
     }
@@ -460,10 +488,11 @@ fn main() {
 
     println!("# branch_arms — Turso fork, per-branch CoW arena, PREREG amendment 1");
     println!(
-        "# arm={:?} checkpoints={:?} samples={} seed={:#x} cycles={} windows={} w={:?} \
+        "# arm={:?} victim={:?} checkpoints={:?} samples={} seed={:#x} cycles={} windows={} w={:?} \
          trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} page_size={page_size} \
          trunk_pages={trunk_pages} trunk_synchronous={synchronous} no_autocheckpoint={}",
         args.arm,
+        args.victim,
         args.checkpoints,
         args.samples,
         args.seed,
@@ -498,7 +527,7 @@ fn main() {
     match args.arm {
         Arm::Hot | Arm::Spread => arm_trunk_writes(&mut bench, &args),
         Arm::Chain => arm_chain(&mut bench, &args),
-        Arm::Churn | Arm::ChurnHot => arm_churn(&mut bench, &args),
+        Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread => arm_churn(&mut bench, &args),
         Arm::Pages => arm_pages(&mut bench, &args),
         Arm::SpreadTrunk => arm_spread_trunk(&mut bench, &args),
     }
@@ -526,11 +555,11 @@ fn grow_from_trunk(b: &mut Bench, row: i64) -> Live {
     live
 }
 
-/// The trunk write that follows every fork in `hot`, `spread` and `churn_hot`.
+/// The trunk write that follows every fork in `hot`, `spread`, `churn_hot` and `churn_spread`.
 fn trunk_row(arm: Arm, g: u64) -> i64 {
     match arm {
         Arm::Hot | Arm::ChurnHot => HOT_ROW,
-        Arm::Spread => spread_row(g),
+        Arm::Spread | Arm::ChurnSpread => spread_row(g),
         _ => unreachable!(),
     }
 }
@@ -788,31 +817,40 @@ fn arm_chain(b: &mut Bench, args: &Args) {
     );
 }
 
-/// Arms (c) `churn` and `churn_hot`: steady N. Each cycle forks and writes one branch (plus one
-/// trunk write in `churn_hot`) and reaps a uniformly random live branch.
+/// Arms (c) `churn`, `churn_hot` and `churn_spread`: steady N. Each cycle forks and writes one
+/// branch (plus one trunk write in `churn_hot` and `churn_spread`) and reaps one older live branch:
+/// a uniformly random one, or with `--victim oldest` the oldest (amendment 3).
 fn arm_churn(b: &mut Bench, args: &Args) {
     println!("{HEADER}");
     let hot = args.arm == Arm::ChurnHot;
-    let mut live: Vec<Live> = Vec::new();
+    let spread = args.arm == Arm::ChurnSpread;
+    let trunk_writes = hot || spread;
+    // Fork order front to back: the front is the oldest live branch.
+    let mut live: VecDeque<Live> = VecDeque::new();
     let mut grown = 0usize;
     let per_window = args.cycles / args.windows;
     let own_plus_retained = |n: usize| if hot { 2 * n } else { n };
+    // churn_spread: versions retained minus versions freed, from the harness's own count of trunk
+    // writes (each retains exactly one leaf: a live child forked since the leaf's last write, the
+    // one forked this cycle) and the engine's report of what each reap freed beyond its own page.
+    let mut retained_expected: usize = 0;
     for &n in &args.checkpoints {
         while live.len() < n {
-            live.push(grow_from_trunk(b, row_for(grown)));
+            live.push_back(grow_from_trunk(b, row_for(grown)));
             grown += 1;
-            if hot {
-                b.trunk_write(HOT_ROW);
+            if trunk_writes {
+                b.trunk_write(trunk_row(args.arm, b.model.writes));
+                retained_expected += 1;
             }
         }
         let s = b.db.branch_stats();
-        if s.live_branches != n || s.arena_slots_in_use != own_plus_retained(n) {
+        let expected_in_use = if spread { n + retained_expected } else { own_plus_retained(n) };
+        if s.live_branches != n || s.arena_slots_in_use != expected_in_use {
             not_a_result(&format!(
-                "expected {n} branches and {} arena pages before churn: {s:?}",
-                own_plus_retained(n)
+                "expected {n} branches and {expected_in_use} arena pages before churn: {s:?}"
             ));
         }
-        let mut all: [Op; 7] = Default::default();
+        let mut all: [Op; 8] = Default::default();
         let names = [
             "fork",
             "open",
@@ -821,11 +859,13 @@ fn arm_churn(b: &mut Bench, args: &Args) {
             "reap",
             "read_own",
             "read_hot",
+            "read_inh",
         ];
         let mut off_prediction_reaps = 0usize;
+        let mut versions_freed = 0usize;
         let rss0 = rss_bytes();
         for wdx in 0..args.windows {
-            let mut win: [Op; 7] = Default::default();
+            let mut win: [Op; 8] = Default::default();
             for c in 0..per_window {
                 let row = row_for(grown);
                 grown += 1;
@@ -834,22 +874,39 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 let conn = b.timed(&mut win[1], || branch.connect().unwrap());
                 b.timed(&mut win[2], || update(&conn, row));
                 drop(conn);
-                if hot {
-                    let g = b.model.record(HOT_ROW);
-                    let sql =
-                        format!("UPDATE t SET v = '{}' WHERE id = {HOT_ROW}", trunk_gen_value(g));
+                if trunk_writes {
+                    let trow = trunk_row(args.arm, b.model.writes);
+                    let g = b.model.record(trow);
+                    let sql = format!("UPDATE t SET v = '{}' WHERE id = {trow}", trunk_gen_value(g));
                     b.timed(&mut win[3], || b.trunk.execute(sql).unwrap());
+                    retained_expected += 1;
                 }
-                let victim = live.swap_remove(b.rng.below(live.len()));
-                live.push(Live {
+                // `swap_remove_back` is `Vec::swap_remove`: the random policy draws and removes
+                // exactly as amendment 1's harness did.
+                let victim = match args.victim {
+                    Victim::Random => live.swap_remove_back(b.rng.below(live.len())).unwrap(),
+                    Victim::Oldest => live.pop_front().unwrap(),
+                };
+                live.push_back(Live {
                     branch,
                     rows: vec![row],
                     trunk_writes_at_fork: at_fork,
                 });
                 let reaped = b.timed(&mut win[4], || victim.branch.reap().unwrap());
+                if reaped.deferred || reaped.freed_pages < 1 {
+                    not_a_result(&format!("a churn reap freed {reaped:?}"));
+                }
+                versions_freed += reaped.freed_pages - 1;
+                retained_expected = retained_expected
+                    .checked_sub(reaped.freed_pages - 1)
+                    .unwrap_or_else(|| {
+                        not_a_result(&format!(
+                            "a churn reap freed {reaped:?}, more versions than were retained"
+                        ))
+                    });
                 // Predicted from the source: the victim's own page, plus in churn_hot the one
-                // version of the hot page that only it could see.
-                if reaped.deferred || reaped.freed_pages != if hot { 2 } else { 1 } {
+                // version of the hot page that only it could see. churn_spread has no fixed count.
+                if !spread && reaped.freed_pages != if hot { 2 } else { 1 } {
                     off_prediction_reaps += 1;
                 }
                 if c % 10 == 0 {
@@ -869,11 +926,28 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                             not_a_result("a churn read of the hot row returned the wrong version");
                         }
                     }
+                    if spread {
+                        // A row the branch did not write, on a leaf the trunk's walk rewrites.
+                        let other = (own - 1 + TRUNK_ROWS / 2) % TRUNK_ROWS + 1;
+                        let conn = target.branch.connect().unwrap();
+                        let got = b.timed(&mut win[7], || read_v(&conn, other));
+                        drop(conn);
+                        if got != target.expect(&b.model, other) {
+                            not_a_result("a churn read of a trunk-written row returned the wrong version");
+                        }
+                    }
                 }
             }
             let s = b.db.branch_stats();
             if s.live_branches != n {
                 not_a_result(&format!("churn left {} live branches, expected {n}", s.live_branches));
+            }
+            if spread && s.arena_slots_in_use != n + retained_expected {
+                not_a_result(&format!(
+                    "churn_spread window {wdx}: expected {n} own + {retained_expected} retained arena \
+                     pages, engine has {}",
+                    s.arena_slots_in_use
+                ));
             }
             let mut line = format!("# window x={n} w={wdx}");
             for (i, op) in win.iter_mut().enumerate() {
@@ -911,27 +985,42 @@ fn arm_churn(b: &mut Bench, args: &Args) {
             }
         }
         let s = b.db.branch_stats();
+        let predicted = if spread { n + retained_expected } else { own_plus_retained(n) };
         b.print_state(
             n,
             &format!(
-                "cycles={} predicted_arena_in_use={} predicted_high_water_max={} \
-                 off_prediction_reaps={off_prediction_reaps} rss_before_churn={rss0}",
+                "cycles={} victim={:?} predicted_arena_in_use={predicted} \
+                 predicted_high_water_max={} off_prediction_reaps={} versions_freed={versions_freed} \
+                 rss_before_churn={rss0}",
                 args.cycles,
-                own_plus_retained(n),
-                own_plus_retained(n) + if hot { 2 } else { 1 },
+                args.victim,
+                if spread {
+                    "n/a".to_string()
+                } else {
+                    (own_plus_retained(n) + if hot { 2 } else { 1 }).to_string()
+                },
+                if spread { "n/a".to_string() } else { off_prediction_reaps.to_string() },
             ),
         );
-        if s.arena_slots_in_use != own_plus_retained(n) {
+        if s.arena_slots_in_use != predicted {
             println!(
-                "# ARENA-PREDICTION-MISS x={n}: in use {} != predicted {}",
-                s.arena_slots_in_use,
-                own_plus_retained(n)
+                "# ARENA-PREDICTION-MISS x={n}: in use {} != predicted {predicted}",
+                s.arena_slots_in_use
             );
         }
     }
     b.print_slopes(
         &args.checkpoints,
-        &["fork", "open", "first_write", "trunk_write", "reap", "read_own", "read_hot"],
+        &[
+            "fork",
+            "open",
+            "first_write",
+            "trunk_write",
+            "reap",
+            "read_own",
+            "read_hot",
+            "read_inh",
+        ],
     );
     drop(live);
 }
