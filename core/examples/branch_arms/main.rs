@@ -490,6 +490,8 @@ impl Live {
 #[derive(Default)]
 struct Op {
     samples: Vec<Duration>,
+    /// Samples taken, kept or not (`--counters-only` keeps none).
+    n: usize,
     work: WorkSum,
 }
 
@@ -535,7 +537,11 @@ impl Bench {
         let before = self.work();
         let t = Instant::now();
         let out = f();
-        op.samples.push(t.elapsed());
+        let elapsed = t.elapsed();
+        op.n += 1;
+        if !counters_only() {
+            op.samples.push(elapsed);
+        }
         op.work.add(before, self.work());
         out
     }
@@ -550,8 +556,8 @@ impl Bench {
     fn print_op(&mut self, x: usize, name: &'static str, op: &Op) {
         let mut us: Vec<f64> = op.samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
         us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = us.len() as f64;
-        let p50 = percentile(&us, 50.0);
+        let n = op.n as f64;
+        let p50 = if counters_only() { 0.0 } else { percentile(&us, 50.0) };
         let per = |v: u64| v as f64 / n;
         let times = if counters_only() {
             "-\t-\t-\t-".to_string()
@@ -565,7 +571,7 @@ impl Bench {
         };
         println!(
             "{x}\t{name}\t{}\t{times}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
-            us.len(),
+            op.n,
             per(op.work.resolve_calls),
             per(op.work.resolve_levels),
             per(op.work.resolve_retained_examined),
@@ -756,7 +762,11 @@ fn main() {
         Arm::SpreadTrunk => arm_spread_trunk(&mut bench, &args),
     }
     let end = db.branch_stats();
-    if end.live_branches != 0 || end.arena_slots_in_use != 0 {
+    if end.live_branches != 0
+        || end.arena_slots_in_use != 0
+        || end.chunk_slots_in_use != 0
+        || end.trunk_pending_pages != 0
+    {
         not_a_result(&format!("teardown leaked: {end:?}"));
     }
     println!(
@@ -1090,6 +1100,8 @@ fn arm_churn(b: &mut Bench, args: &Args) {
         let mut off_prediction_reaps = 0usize;
         let mut versions_freed = 0usize;
         let mut chunks_freed = 0usize;
+        // The largest single reap in the window: a reclamation stall is one reap that frees a lot.
+        let (mut max_reap_pages, mut max_reap_chunks) = (0usize, 0usize);
         let rss0 = rss_bytes();
         for wdx in 0..args.windows {
             let mut win: [Op; 8] = Default::default();
@@ -1125,6 +1137,8 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 }
                 versions_freed += reaped.freed_pages - 1;
                 chunks_freed += reaped.freed_chunks;
+                max_reap_pages = max_reap_pages.max(reaped.freed_pages);
+                max_reap_chunks = max_reap_chunks.max(reaped.freed_chunks);
                 if !args.store_agnostic {
                     retained_expected = retained_expected
                         .checked_sub(reaped.freed_pages - 1)
@@ -1181,7 +1195,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
             }
             let mut line = format!("# window x={n} w={wdx}");
             for (i, op) in win.iter_mut().enumerate() {
-                if op.samples.is_empty() {
+                if op.n == 0 {
                     continue;
                 }
                 let mut us: Vec<f64> = op.samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
@@ -1196,6 +1210,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                     );
                 }
                 all[i].samples.append(&mut op.samples);
+                all[i].n += op.n;
                 let w = op.work;
                 all[i].work.resolve_calls += w.resolve_calls;
                 all[i].work.resolve_levels += w.resolve_levels;
@@ -1206,7 +1221,8 @@ fn arm_churn(b: &mut Bench, args: &Args) {
             }
             line += &format!(
                 " arena_in_use={} arena_high_water={} rss_bytes={} heap_live_bytes={} {} \
-                 versions_freed={versions_freed} chunks_freed={chunks_freed}",
+                 versions_freed={versions_freed} chunks_freed={chunks_freed} \
+                 max_reap_pages={max_reap_pages} max_reap_chunks={max_reap_chunks}",
                 s.arena_slots_in_use,
                 s.arena_slots_in_use + s.arena_slots_free,
                 rss_bytes(),
@@ -1214,13 +1230,14 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 subpage(&s)
             );
             println!("{line}");
+            (max_reap_pages, max_reap_chunks) = (0, 0);
             if args.verify_scan > 0 {
                 let rows_checked = verify_scan(b, &live, &mut vrng, args.verify_scan);
                 println!("# verify x={n} w={wdx} branches={} rows_checked={rows_checked}", args.verify_scan);
             }
         }
         for (i, op) in all.iter().enumerate() {
-            if !op.samples.is_empty() {
+            if op.n > 0 {
                 b.print_op(n, names[i], op);
             }
         }
