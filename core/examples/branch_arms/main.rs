@@ -1500,6 +1500,18 @@ fn cpu_ns() -> (u64, u64) {
     (ns(ru.ru_utime), ns(ru.ru_stime))
 }
 
+/// The process's page faults (reclaims, then faults needing I/O) and context switches (voluntary,
+/// then involuntary) so far: `reapconc` reads them around its timed windows, so a window whose
+/// structures the OS took away (faults) or whose threads the box preempted (involuntary switches)
+/// can be told from one that measured the store (r11-k6-measure PREREG amendment 4).
+fn rusage_counts() -> [u64; 4] {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        not_a_result("getrusage failed");
+    }
+    [ru.ru_minflt, ru.ru_majflt, ru.ru_nvcsw, ru.ru_nivcsw].map(|v| v as u64)
+}
+
 /// Arm (f) `conc` (amendment 7): T threads, each churning its own share of N live branches with
 /// fork -> first write -> reads -> reap (see [`conc_thread`]). One cell per (N, T); the T list runs
 /// forward and then reversed at each N (draws 0 and 1), so drift across a block shows as the
@@ -1767,6 +1779,11 @@ struct RcCell {
     writes: u64,
     busy_fork: u64,
     busy_write: u64,
+    /// Page reclaims, faults needing I/O, voluntary and involuntary context switches, over the
+    /// timed windows (see [`rusage_counts`]).
+    ru: [u64; 4],
+    /// Resident bytes at the cell's first timed window.
+    rss_start: u64,
     work: RcWork,
     split: SplitWalkCounts,
     /// Latencies: reap, then (inline) fork and trunk write.
@@ -1960,12 +1977,20 @@ fn rc_cell_phase(
             }
             freed_round.store(0, std::sync::atomic::Ordering::Relaxed);
             let before = b.db.branch_stats();
+            if cell.rounds == 0 {
+                cell.rss_start = rss_bytes();
+            }
             let cpu0 = cpu_ns();
+            let ru0 = rusage_counts();
             start.wait();
             let w0 = Instant::now();
             end.wait();
             let wall = w0.elapsed();
+            let ru1 = rusage_counts();
             let cpu1 = cpu_ns();
+            for (acc, (a, b)) in cell.ru.iter_mut().zip(ru0.iter().zip(ru1.iter())) {
+                *acc += b - a;
+            }
             let after = b.db.branch_stats();
             if args.unsafe_split {
                 b.db.set_branch_unsafe_split_walk(false);
@@ -2047,7 +2072,9 @@ fn rc_cell_inline(
     let seq0 = *seq;
     let victim = args.victim;
     let before = b.db.branch_stats();
+    let rss_start = rss_bytes();
     let cpu0 = cpu_ns();
+    let ru0 = rusage_counts();
     let (wall, outs) = std::thread::scope(|s| {
         let handles: Vec<_> = shares
             .into_iter()
@@ -2105,9 +2132,14 @@ fn rc_cell_inline(
         let outs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         (w0.elapsed(), outs)
     });
+    let ru1 = rusage_counts();
     let cpu1 = cpu_ns();
     let after = b.db.branch_stats();
     let mut cell = RcCell::default();
+    cell.rss_start = rss_start;
+    for (acc, (a, b)) in cell.ru.iter_mut().zip(ru0.iter().zip(ru1.iter())) {
+        *acc = b - a;
+    }
     for (share, mut lat, busy, freed, writes) in outs {
         live.extend(share);
         for (all, l) in cell.lat.iter_mut().zip(lat.iter_mut()) {
@@ -2255,7 +2287,7 @@ fn arm_reapconc(b: &mut Bench, args: &Args) {
                  gc_free_ns={} gc_examined={} gc_range={} lock_acq={} lock_contended={} \
                  lock_wait_ns={} split_walks={} split_range={} split_walk_ns={} split_candidates={} \
                  split_frees={} split_misses={} forks={} trunk_writes={} busy_fork={} busy_write={} \
-                 rss_bytes={}",
+                 minflt={} majflt={} nvcsw={} nivcsw={} rss_start={} rss_bytes={}",
                 args.refill,
                 args.victim,
                 args.write_every,
@@ -2295,6 +2327,11 @@ fn arm_reapconc(b: &mut Bench, args: &Args) {
                 cell.writes,
                 cell.busy_fork,
                 cell.busy_write,
+                cell.ru[0],
+                cell.ru[1],
+                cell.ru[2],
+                cell.ru[3],
+                cell.rss_start,
                 rss_bytes()
             );
             let r = cell.reaps as f64;
