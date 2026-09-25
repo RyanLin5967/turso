@@ -64,6 +64,9 @@ struct Args {
     trunk_children: usize,
     probe: ProbeKind,
     dir: Option<PathBuf>,
+    /// The branch arm's UPDATE runs as its own (autocommit) transaction: no statement journal, and
+    /// one phase `update+commit` instead of two.
+    autocommit: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -96,6 +99,7 @@ fn parse_args() -> Args {
         trunk_children: 0,
         probe: ProbeKind::ForkReap,
         dir: None,
+        autocommit: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -129,6 +133,7 @@ fn parse_args() -> Args {
                 }
             }
             "--dir" => args.dir = Some(PathBuf::from(val())),
+            "--autocommit" => args.autocommit = true,
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -354,19 +359,34 @@ fn check_sample(conn: &Arc<Connection>, id: i64, mark: Option<char>) {
 }
 
 /// The branch arm's unit: one big transaction on a fresh branch, then its first fork and its reap.
-fn big_branch_txn(ctx: &Ctx, trunk: &Arc<Connection>, d: usize, n: usize, rep: usize) -> (Duration, Duration) {
+fn big_branch_txn(
+    ctx: &Ctx,
+    trunk: &Arc<Connection>,
+    d: usize,
+    n: usize,
+    rep: usize,
+    autocommit: bool,
+) -> (Duration, Duration) {
     let db = &ctx.db;
     let before = snap(db);
     let b = trunk.fork_branch().unwrap();
     let bc = b.connect().unwrap();
-    bc.execute("BEGIN").unwrap();
     let sql = format!("UPDATE t SET v = 'B' || substr(v, 2) WHERE id <= {d}");
-    let (_, t_update) = ctx.phase("update", d, n, rep, || bc.page_cache_len(), || {
-        bc.execute(&sql).unwrap()
-    });
-    let (_, t_commit) = ctx.phase("commit", d, n, rep, || bc.page_cache_len(), || {
-        bc.execute("COMMIT").unwrap()
-    });
+    let (t_update, t_commit) = if autocommit {
+        let (_, t) = ctx.phase("update+commit", d, n, rep, || bc.page_cache_len(), || {
+            bc.execute(&sql).unwrap()
+        });
+        (t, Duration::ZERO)
+    } else {
+        bc.execute("BEGIN").unwrap();
+        let (_, t_update) = ctx.phase("update", d, n, rep, || bc.page_cache_len(), || {
+            bc.execute(&sql).unwrap()
+        });
+        let (_, t_commit) = ctx.phase("commit", d, n, rep, || bc.page_cache_len(), || {
+            bc.execute("COMMIT").unwrap()
+        });
+        (t_update, t_commit)
+    };
     let after = snap(db);
     if after.arena_in_use - before.arena_in_use != d {
         not_a_result(&format!(
@@ -490,7 +510,7 @@ fn arm_branch(ctx: &Ctx, trunk: &Arc<Connection>, args: &Args) {
     println!("{HEADER}");
     for (i, &d) in args.d_list.iter().enumerate() {
         for rep in 0..reps_for(args, i) {
-            let (tu, tc) = big_branch_txn(ctx, trunk, d, 0, rep);
+            let (tu, tc) = big_branch_txn(ctx, trunk, d, 0, rep, args.autocommit);
             if ctx.timing {
                 println!(
                     "# D={d} rep={rep} ns_per_page update={:.1} commit={:.1} rss_bytes={}",
@@ -722,7 +742,7 @@ fn main() {
     println!("# branch_bigtxn — Turso fork, lane r11-bigtxn PREREG");
     println!(
         "# arm={:?} d={:?} n={:?} rows={} reps={} reps_last={} timing={} trunk_children={} probe={:?} \
-         value_len={VALUE_LEN} page_count={page_count} build_s={:.1}",
+         autocommit={} value_len={VALUE_LEN} page_count={page_count} build_s={:.1}",
         args.arm,
         args.d_list,
         args.n_list,
@@ -732,6 +752,7 @@ fn main() {
         args.timing,
         args.trunk_children,
         args.probe,
+        args.autocommit,
         build.elapsed().as_secs_f64()
     );
     println!(
