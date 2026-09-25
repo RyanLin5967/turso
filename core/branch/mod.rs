@@ -238,6 +238,20 @@ pub struct BranchWork {
     pub trunk_fork_wal_locks: u64,
     /// Nanoseconds trunk forks held the WAL write lock, summed; 0 while lock timing is off.
     pub trunk_fork_wal_hold_ns: u64,
+    /// Trunk forks registered without the WAL write lock, against the commit gate.
+    pub trunk_forks_fast: u64,
+    /// Trunk forks registered under the WAL write lock: the trunk's first live child, or a fork
+    /// that lost to trunk commits on every lock-free attempt.
+    pub trunk_forks_locked: u64,
+    /// Lock-free attempts, by the trunk forks that registered, abandoned because a trunk commit took
+    /// its copy decisions in between (or was taking them).
+    pub trunk_fork_gate_retries: u64,
+    /// Trunk commits that took their copy decisions in the store (`begin_trunk_commit`).
+    pub trunk_commits_decided: u64,
+    /// Pages those commits wrote with a pre-image the pager had captured.
+    pub trunk_pre_images_captured: u64,
+    /// Captured pre-images kept as retained versions, because a live child could see them.
+    pub trunk_pre_images_retained: u64,
 }
 
 impl BranchWork {
@@ -263,6 +277,12 @@ impl BranchWork {
             trunk_fork_read_txs,
             trunk_fork_wal_locks,
             trunk_fork_wal_hold_ns,
+            trunk_forks_fast,
+            trunk_forks_locked,
+            trunk_fork_gate_retries,
+            trunk_commits_decided,
+            trunk_pre_images_captured,
+            trunk_pre_images_retained,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -283,6 +303,12 @@ impl BranchWork {
         self.trunk_fork_read_txs += trunk_fork_read_txs;
         self.trunk_fork_wal_locks += trunk_fork_wal_locks;
         self.trunk_fork_wal_hold_ns += trunk_fork_wal_hold_ns;
+        self.trunk_forks_fast += trunk_forks_fast;
+        self.trunk_forks_locked += trunk_forks_locked;
+        self.trunk_fork_gate_retries += trunk_fork_gate_retries;
+        self.trunk_commits_decided += trunk_commits_decided;
+        self.trunk_pre_images_captured += trunk_pre_images_captured;
+        self.trunk_pre_images_retained += trunk_pre_images_retained;
     }
 }
 
@@ -386,16 +412,53 @@ impl Connection {
         Ok(Branch::new(self.db.clone(), id))
     }
 
-    /// Fork the trunk under its WAL write lock. The lock is the point: a trunk write transaction
-    /// in flight across the fork took its copy decisions for the previous epoch, so the pages it
-    /// commits afterwards would be visible to the new branch. Holding the writer lock means there
-    /// is no such transaction, and the read snapshot it forces is the latest commit.
+    /// Fork the trunk. A trunk commit takes its copy decisions at its serialization point, against
+    /// the epoch there (see the store's "Trunk commits and forks"), so a fork needs no WAL write
+    /// lock: it takes a read snapshot between two commits' decisions and registers under the trunk's
+    /// lock if no commit took its decisions since, which a trunk write transaction in flight does
+    /// only at its commit. It never waits out a write transaction and never serialises with another
+    /// fork on the WAL.
+    ///
+    /// The trunk's first live child is forked under the WAL write lock instead, as every fork was
+    /// before: a writer that saw no child captured no pre-images, so no child may appear before its
+    /// commit. So is a fork that lost to trunk commits on every lock-free attempt, so a stream of
+    /// commits cannot starve it.
     fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
+        const LOCK_FREE_ATTEMPTS: usize = 8;
+        let store = &self.db.branches;
+        // Observation only (see `BranchWork::trunk_fork_*`): read txs begun, WAL write-lock
+        // acquisitions and lock-free attempts lost, handed to the store at the registration.
+        let mut attempts = store::ForkAttempts::default();
+        for _ in 0..LOCK_FREE_ATTEMPTS {
+            let seen = store.trunk_commit_seq();
+            if seen % 2 == 1 {
+                // A trunk commit is between its copy decisions and its publication.
+                attempts.gate_retries += 1;
+                pager.io.yield_now();
+                continue;
+            }
+            pager.begin_read_tx()?;
+            attempts.read_txs += 1;
+            let forked = self.fork_trunk_registered(pager, Some(seen), attempts);
+            pager.end_read_tx();
+            match forked? {
+                store::TrunkFork::Forked(id) => return Ok(id),
+                store::TrunkFork::Retry => attempts.gate_retries += 1,
+                store::TrunkFork::NeedsWriterLock => break,
+            }
+        }
+        self.fork_trunk_locked(pager, attempts)
+    }
+
+    /// Fork the trunk under its WAL write lock: no trunk write transaction is in flight, and the
+    /// read snapshot the lock forces is the latest commit.
+    fn fork_trunk_locked(
+        self: &Arc<Connection>,
+        pager: &Arc<Pager>,
+        mut attempts: store::ForkAttempts,
+    ) -> Result<BranchId> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
-        // Observation only (see `BranchWork::trunk_fork_*`): read txs begun and WAL write-lock
-        // acquisitions, handed to the store at the registration; the hold only with lock timing on.
-        let mut attempts = store::ForkAttempts::default();
         loop {
             pager.begin_read_tx()?;
             attempts.read_txs += 1;
@@ -416,7 +479,7 @@ impl Connection {
                 }
             }
             let held = self.db.branches.timed().then(std::time::Instant::now);
-            let forked = self.fork_trunk_locked(pager, attempts);
+            let forked = self.fork_trunk_registered(pager, None, attempts);
             pager.end_write_tx();
             if let Some(held) = held {
                 self.db
@@ -424,15 +487,24 @@ impl Connection {
                     .add_fork_wal_hold(held.elapsed().as_nanos() as u64);
             }
             pager.end_read_tx();
-            return forked;
+            return match forked? {
+                store::TrunkFork::Forked(id) => Ok(id),
+                _ => Err(LimboError::InternalError(
+                    "a trunk fork under the WAL write lock was not registered".to_string(),
+                )),
+            };
         }
     }
 
-    fn fork_trunk_locked(
+    /// Register a trunk fork against the caller's read snapshot: `seen` is the commit gate's count
+    /// read before the snapshot began, or `None` under the WAL write lock (see
+    /// [`BranchStore::fork_trunk`]).
+    fn fork_trunk_registered(
         self: &Arc<Connection>,
         pager: &Arc<Pager>,
+        seen: Option<u64>,
         attempts: store::ForkAttempts,
-    ) -> Result<BranchId> {
+    ) -> Result<store::TrunkFork> {
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
@@ -452,7 +524,7 @@ impl Connection {
         })?;
         self.db
             .branches
-            .fork_trunk(schema, page_size, reserved_space, attempts)
+            .fork_trunk(schema, page_size, reserved_space, seen, attempts)
     }
 
     /// The branch this connection is open on, if any.
