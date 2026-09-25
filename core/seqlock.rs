@@ -124,11 +124,18 @@ mod tests {
         let l = Arc::new(SeqLock::new((0u64, 0u64, 0u64, 0u64)));
         assert!(l.optimistic, "the test must run the optimistic path");
         let stop = Arc::new(AtomicBool::new(false));
+        // Writes start once every reader has read: under load a reader thread could otherwise start after the
+        // last write and read nothing (tests_fix8_none).
+        let started = Arc::new(AtomicU64::new(0));
         let hs: Vec<_> = (0..4)
             .map(|_| {
-                let (l, stop) = (l.clone(), stop.clone());
+                let (l, stop, started) = (l.clone(), stop.clone(), started.clone());
                 std::thread::spawn(move || {
                     let mut n = 0u64;
+                    let v = l.read();
+                    assert!(v.0 == v.1 && v.1 == v.2 && v.2 == v.3, "torn read {v:?}");
+                    n += 1;
+                    started.fetch_add(1, Ordering::Relaxed);
                     while !stop.load(Ordering::Relaxed) {
                         let v = l.read();
                         assert!(v.0 == v.1 && v.1 == v.2 && v.2 == v.3, "torn read {v:?}");
@@ -138,6 +145,9 @@ mod tests {
                 })
             })
             .collect();
+        while started.load(Ordering::Relaxed) < 4 {
+            std::hint::spin_loop();
+        }
         for i in 1..20_000u64 {
             let mut g = l.lock();
             *g = (i, i, i, i);
