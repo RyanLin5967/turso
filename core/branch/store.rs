@@ -93,7 +93,11 @@
 //!   different branches; the benchmark this lane ships is single-threaded and says so.
 //! * The persistent page maps are an index over slots the lineages own; they own nothing. A
 //!   branch's `inherited` names only slots its ancestors keep for it (see "Resolution without the
-//!   walk"), so dropping a map never frees a page and keeping one never pins a page.
+//!   walk"), so dropping a map never frees a page and keeping one never pins a page. One exception,
+//!   harmless by construction: after a splice, a child's `inherited` can still name a zombie slot
+//!   that the splice freed because the child had overwritten that page. Every reader consults the
+//!   branch's `current` before its `inherited` (`resolve`, `fork_branch`'s view), so such an entry
+//!   is never read; code that walks `inherited` alone must skip pages present in `current`.
 //!
 //! # Per-page version order (the fat node)
 //!
@@ -146,8 +150,9 @@ struct StoreInner {
 
 #[derive(Default)]
 struct Lineage {
-    /// The epoch this node's next write is born in: one past its latest fork epoch (or past its own
-    /// fork epoch before it has forked).
+    /// The epoch this node's next write is born in: one past its latest fork epoch, or before it
+    /// has forked, one past the fork epoch it was created with (a splice later lowers `fork_epoch`
+    /// to its zombie parent's and leaves this alone).
     epoch: u64,
     /// Live children by fork epoch. Fork epochs are unique within a parent.
     children: BTreeMap<u64, BranchId>,
@@ -680,8 +685,9 @@ impl BranchStore {
         }
     }
 
-    /// `(states, capacity)` of the branch table: `HashMap::capacity` is items plus growth left, so
-    /// at a fixed item count it falls by one per tombstone and jumps back at a rehash. O(1).
+    /// `(states, capacity)` of the branch table: capacity is the slots allocated, which changes only
+    /// when a chunk is appended (F8, [`super::table`]; before F8 it was `HashMap::capacity`, which
+    /// fell by one per tombstone and jumped back at a rehash). O(1).
     pub(crate) fn table_shape(&self) -> (usize, usize) {
         let inner = self.inner.lock();
         (inner.branches.len(), inner.branches.capacity())
@@ -955,7 +961,11 @@ impl StoreInner {
             for (page, co) in c_current.drain() {
                 z.current.insert(page, co);
             }
-            z.current_by_born.append(c_by_born);
+            // One insert per child entry: `BTreeSet::append` rebuilds from both sides, O(larger),
+            // which would make every commit-direction splice cost the zombie's whole map.
+            for entry in std::mem::take(c_by_born) {
+                z.current_by_born.insert(entry);
+            }
             std::mem::swap(c_current, &mut z.current);
             std::mem::swap(c_by_born, &mut z.current_by_born);
         }
@@ -1523,5 +1533,77 @@ mod tests {
         }
         assert_eq!(store.stats().live_branches, 0, "seed {seed:#x}: branches leaked");
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
+    }
+
+    /// A zombie kept only by an open connection is spliced the moment the connection closes, while
+    /// its only child is in the middle of a write transaction; the child's in-flight decisions
+    /// survive the merge (its commit lands where they point), a page the zombie wrote and the child
+    /// had overwritten is freed, and a page the child reads through the zombie is kept for the
+    /// child's own later children.
+    #[test]
+    fn a_zombie_closed_while_its_child_is_mid_write_is_spliced_without_disturbing_the_write() {
+        let store = BranchStore::new();
+        let z = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        let mut generation = 100u64;
+        // z writes pages 0, 1 and 2.
+        store.begin_write(z).unwrap();
+        let mut committed = Vec::new();
+        for page in 0..3u32 {
+            store.first_write_branch(z, page, &image(0)).unwrap();
+            generation += 1;
+            committed.push(page_with(page, generation));
+        }
+        store.commit_pages(z, &committed).unwrap();
+        store.end_write(z);
+        let z_gen: Vec<u64> = (0..3).map(|p| 101 + p).collect();
+        let c = store.fork_branch(z).unwrap();
+        // c overwrites page 1 and commits; then opens a transaction on page 2 and leaves it open.
+        store.begin_write(c).unwrap();
+        store.first_write_branch(c, 1, &image(z_gen[1])).unwrap();
+        store.commit_pages(c, &[page_with(1, 201)]).unwrap();
+        store.end_write(c);
+        store.open(z).unwrap();
+        let reaped = store.release_handle(z);
+        assert!(reaped.deferred && reaped.freed_pages == 0, "an open zombie was freed: {reaped:?}");
+        assert_eq!(store.stats().live_branches, 2);
+        store.begin_write(c).unwrap();
+        store.first_write_branch(c, 2, &image(z_gen[2])).unwrap();
+        let before = store.stats();
+        store.close(z);
+        let after = store.stats();
+        check_invariants(&store, "after the splice");
+        assert_eq!(after.live_branches, 1, "the closed zombie was not spliced");
+        assert_eq!(after.work.splices, before.work.splices + 1);
+        assert_eq!(
+            before.arena_slots_in_use - after.arena_slots_in_use,
+            2,
+            "z's versions of pages 1 and 2 are freed: c overwrote 1 and holds its own copy of 2 \
+             (the in-flight write's pre-image), and c has no child to read either"
+        );
+        store.commit_pages(c, &[page_with(2, 202)]).unwrap();
+        store.end_write(c);
+        let read = |id: BranchId, page: u32| -> Option<u64> {
+            let mut buf = vec![0u8; PAGE];
+            store
+                .resolve_into(id, page, &mut buf)
+                .unwrap()
+                .then(|| u64::from_le_bytes(buf[..8].try_into().unwrap()))
+        };
+        assert_eq!(read(c, 0), Some(z_gen[0]), "c lost the page it read through z");
+        assert_eq!(read(c, 1), Some(201));
+        assert_eq!(read(c, 2), Some(202), "the in-flight write did not land");
+        // A child of c forked now, then c rewrites page 0: the child keeps z's version.
+        let d = store.fork_branch(c).unwrap();
+        store.begin_write(c).unwrap();
+        store.first_write_branch(c, 0, &image(z_gen[0])).unwrap();
+        store.commit_pages(c, &[page_with(0, 300)]).unwrap();
+        store.end_write(c);
+        check_invariants(&store, "after c rewrote an absorbed page");
+        assert_eq!(read(d, 0), Some(z_gen[0]), "d lost z's version of page 0");
+        assert_eq!(read(c, 0), Some(300));
+        store.release_handle(c);
+        store.release_handle(d);
+        assert_eq!(store.stats().live_branches, 0);
+        assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
     }
 }

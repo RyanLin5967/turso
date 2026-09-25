@@ -148,8 +148,11 @@ pub fn check_branchable(mvcc_enabled: bool) -> Result<()> {
 ///
 /// The handle owns the branch. Dropping it — or calling [`Branch::reap`], which is the same thing
 /// with a report — releases the branch's pages at once, unless something still reads through them:
-/// an open connection on the branch, or a live child forked from it. Then the branch is kept until
-/// the last of those goes, and freed at that moment.
+/// an open connection on the branch, or a live child forked from it. With an open connection, or
+/// two or more kept children, the branch is kept until the last of those goes, and freed at that
+/// moment. With exactly one kept child and no connection it is spliced out at once: the child takes
+/// its place and keeps the pages it reads through it, and the rest are freed (see `store`,
+/// "Splicing a zombie out").
 pub struct Branch {
     db: Arc<Database>,
     id: BranchId,
@@ -160,10 +163,11 @@ pub struct Branch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaped {
     /// Arena pages returned to the free list by this call: the branch's own, plus any version an
-    /// ancestor was retaining only for it.
+    /// ancestor was retaining only for it. A splice counts the pages it freed as unreadable.
     pub freed_pages: usize,
-    /// True when the branch could not be freed yet (an open connection or a live child still reads
-    /// through it); its pages are freed when the last of those goes away.
+    /// True when some of the branch's pages outlive this call: the branch is kept (an open
+    /// connection, or two or more kept children, still read through it), or it was spliced into its
+    /// only child, which now holds the pages it reads. They are freed when their last reader goes.
     pub deferred: bool,
 }
 
@@ -191,12 +195,13 @@ pub struct BranchResident {
     pub zombies: usize,
     /// States with an open connection.
     pub open: usize,
-    /// `HashMap::capacity` of the branch table: items plus growth left. At a fixed item count it
-    /// falls by one per tombstone and returns to the table's full capacity at a rehash.
+    /// Slots allocated in the branch table (a slot map since F8: it grows by whole chunks and has no
+    /// tombstones; before F8 this was `HashMap::capacity`, items plus growth left).
     pub table_capacity: usize,
-    /// The next branch id; ids are never reused.
+    /// One more than the number of branches ever created. Since F8 it is a count, not an id: ids
+    /// are slot and generation (see `table`).
     pub next_id: u64,
-    /// The trunk's fork epoch, advanced once per trunk fork.
+    /// One past the store-wide fork clock's value at the trunk's latest fork.
     pub trunk_epoch: u64,
     /// Live children of the trunk.
     pub trunk_children: usize,

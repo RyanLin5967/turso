@@ -16,15 +16,22 @@
 //!   --trunk spread   the trunk also rewrites the next row of a walk over the whole table each cycle
 //!
 //! Every new branch writes its own row. At each checkpoint (a value of N_ever) the harness prints
-//! every resident structure of the store (`Database::branch_resident`), and REFUSES to print a
-//! number unless the engine's kept states, zombies and arena pages equal the harness's own model of
-//! the reclamation rule, and no arena slot is unowned. Unless `--untimed`, it also prints per-op
-//! latency over the last `--window` cycles before the checkpoint, and every sample at or above
-//! `--stall-us`. With `--untimed` no clock is read: the run prints integers only.
+//! every resident structure of the store (`Database::branch_resident`), then exits `NOT A RESULT`
+//! (rc 1, after that line) unless the engine's kept states and zombies equal the harness's own
+//! model of the reclamation rule, no arena slot is unowned, and (under `--expect keep` only) the
+//! arena pages equal the rule's count; under `--expect splice` the arena is not modelled. A read
+//! that disagrees with the model exits the same way at once. Unless `--untimed`, it also prints
+//! per-op latency over the last `--window` cycles before the checkpoint, and every sample at or
+//! above `--stall-us`. With `--untimed` no clock is read: the run prints integers only.
 //!
-//! Every cycle, outside any timed region, it reads the branch table's `(len, capacity)`; capacity is
-//! items plus growth left, so at a fixed item count it falls by one per hashbrown tombstone and jumps
-//! back at a rehash. Rehashes are counted (in place vs resize) and tombstones printed.
+//! Every value a branch writes is keyed by the harness's own count of branches created, never by
+//! the engine's id: since F8 an id is `generation << 32 | slot`, which passes 12 digits after a
+//! slot's ~233rd reuse, and a longer value is no longer an in-place rewrite (review finding H1).
+//!
+//! Every cycle, outside any timed region, it reads the branch table's `(len, capacity)`. Before F8,
+//! capacity was items plus growth left, so at a fixed item count it fell by one per hashbrown
+//! tombstone and jumped back at a rehash; rehashes are counted (in place vs resize) and tombstones
+//! printed. Since F8 capacity is slots allocated, so tombstones read 0 and a jump is a chunk append.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -296,7 +303,11 @@ impl TrunkModel {
 /// parent saw it at the fork (the nearest ancestor's row), and the trunk as of its root's fork.
 struct Live {
     branch: Branch,
+    /// The engine's id, for the kept-state model.
     id: u64,
+    /// This branch's number among all branches ever created (1-based), for its row values: before
+    /// F8 it equalled the engine's id.
+    tag: u64,
     own_row: i64,
     generation: u64,
     parent_row: Option<(i64, String)>,
@@ -305,7 +316,7 @@ struct Live {
 
 impl Live {
     fn own(&self) -> String {
-        branch_value(self.id, self.generation)
+        branch_value(self.tag, self.generation)
     }
 }
 
@@ -590,10 +601,11 @@ fn main() {
             }
         };
         let id = branch.id().0;
+        let tag = created as u64 + 1;
         kept.fork(id, parent_id);
         let own_row = row_for(created);
         let conn = timer.time(1, n_ever, || branch.connect().unwrap());
-        let value = branch_value(id, 0);
+        let value = branch_value(tag, 0);
         timer.time(2, n_ever, || update_to(&conn, own_row, &value));
         drop(conn);
         if args.shape == Shape::Moran {
@@ -617,6 +629,7 @@ fn main() {
         Live {
             branch,
             id,
+            tag,
             own_row,
             generation: 0,
             parent_row,
