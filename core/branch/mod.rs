@@ -56,6 +56,8 @@ pub(crate) mod arena;
 pub(crate) mod page_map;
 pub(crate) mod store;
 
+pub use page_map::MapWork;
+
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};
 use crate::storage::wal::WalAutoActions;
@@ -178,6 +180,8 @@ pub struct BranchStats {
     /// Persistent page-map trie nodes alive in this PROCESS (every database's maps; a node shared by
     /// many maps counts once). Observation only.
     pub page_map_nodes: usize,
+    /// Cumulative page-map work in this PROCESS. Observation only.
+    pub map_work: MapWork,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -206,6 +210,10 @@ pub struct BranchWork {
     /// its ancestors, so a reap removes at most one. (Before them a reap could free a whole chain
     /// of reaped ancestors kept for it: the cascade.)
     pub states_freed: u64,
+    /// Copy decisions for a branch's first write to a page in a transaction.
+    pub branch_first_writes: u64,
+    /// Of those, the writes that went in place (no other map could reach the slot).
+    pub in_place_writes: u64,
 }
 
 impl Branch {

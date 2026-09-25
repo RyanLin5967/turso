@@ -468,6 +468,7 @@ impl BranchStore {
             arena,
             refs,
             branches,
+            work,
             ..
         } = &mut *inner;
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
@@ -476,10 +477,14 @@ impl BranchStore {
         if st.dirty.contains_key(&page) {
             return Ok(());
         }
+        work.branch_first_writes += 1;
         let slot = match st.map.get(page) {
             // No other map can reach it: nobody else reads this version, so it is rewritten in
             // place.
-            Some(slot) if refs[slot as usize] == 1 && st.map.exclusive(page) => slot,
+            Some(slot) if refs[slot as usize] == 1 && st.map.exclusive(page) => {
+                work.in_place_writes += 1;
+                slot
+            }
             // Another map can reach it (or it is the trunk's): a fresh slot for this branch only.
             _ => {
                 let slot = arena.alloc();
@@ -586,6 +591,7 @@ impl BranchStore {
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
             page_map_nodes: page_map::live_nodes(),
+            map_work: page_map::map_work(),
             work: inner.work,
         }
     }

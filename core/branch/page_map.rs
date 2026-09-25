@@ -28,7 +28,7 @@
 //! explore, and `Arc::get_mut` — which succeeds only while no other version shares a node — is
 //! what tells a copy from an in-place update.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::arena::Slot;
@@ -48,6 +48,44 @@ static LIVE_NODES: AtomicUsize = AtomicUsize::new(0);
 /// The number of trie nodes alive in this process (see [`LIVE_NODES`]).
 pub(crate) fn live_nodes() -> usize {
     LIVE_NODES.load(Ordering::Relaxed)
+}
+
+/// Work the maps have done in this process, counted where it happens. Observation only, like
+/// [`LIVE_NODES`]: nothing in the mechanism reads them.
+static NODES_COPIED: AtomicU64 = AtomicU64::new(0);
+static NODES_BUILT: AtomicU64 = AtomicU64::new(0);
+static REFS_TOUCHED: AtomicU64 = AtomicU64::new(0);
+static NODES_RELEASED: AtomicU64 = AtomicU64::new(0);
+static REFS_RELEASED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative page-map work in this process (see [`map_work`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MapWork {
+    /// Shared nodes an insert copied to make the path its own.
+    pub nodes_copied: u64,
+    /// Nodes an insert built: an empty root, a new level above the root, a missing child.
+    pub nodes_built: u64,
+    /// Per-slot count updates by inserts: one per slot a copied leaf names, one for the new entry,
+    /// one for the entry it replaced.
+    pub refs_touched: u64,
+    /// Nodes a release freed (those the released map alone held).
+    pub nodes_released: u64,
+    /// Per-slot count decrements by releases.
+    pub refs_released: u64,
+}
+
+pub(crate) fn map_work() -> MapWork {
+    MapWork {
+        nodes_copied: NODES_COPIED.load(Ordering::Relaxed),
+        nodes_built: NODES_BUILT.load(Ordering::Relaxed),
+        refs_touched: REFS_TOUCHED.load(Ordering::Relaxed),
+        nodes_released: NODES_RELEASED.load(Ordering::Relaxed),
+        refs_released: REFS_RELEASED.load(Ordering::Relaxed),
+    }
+}
+
+fn count(counter: &AtomicU64, n: u64) {
+    counter.fetch_add(n, Ordering::Relaxed);
 }
 
 enum Node {
@@ -155,9 +193,11 @@ impl PageMap {
     fn unshare<'a>(arc: &'a mut Arc<Node>, refs: &mut [u32]) -> &'a mut Node {
         if Arc::get_mut(arc).is_none() {
             let copy = (**arc).clone();
+            count(&NODES_COPIED, 1);
             if let Node::Leaf(slots) = &copy {
                 for &slot in slots.iter().filter(|&&s| s != EMPTY) {
                     refs[slot as usize] += 1;
+                    count(&REFS_TOUCHED, 1);
                 }
             }
             *arc = Arc::new(copy);
@@ -173,30 +213,36 @@ impl PageMap {
         if self.root.is_none() {
             self.root = Some(Arc::new(Node::empty(0)));
             self.height = 0;
+            count(&NODES_BUILT, 1);
         }
         while !self.covers(page) {
             let mut kids: [Option<Arc<Node>>; WIDTH] = std::array::from_fn(|_| None);
             kids[0] = self.root.take();
             self.root = Some(Arc::new(Node::counted(Node::Inner(kids))));
             self.height += 1;
+            count(&NODES_BUILT, 1);
         }
         let mut level = self.height;
         let mut node = Self::unshare(self.root.as_mut().expect("created above"), refs);
         loop {
             node = match node {
                 Node::Inner(kids) => {
-                    let kid = kids[Self::index(page, level)]
-                        .get_or_insert_with(|| Arc::new(Node::empty(level - 1)));
+                    let kid = kids[Self::index(page, level)].get_or_insert_with(|| {
+                        count(&NODES_BUILT, 1);
+                        Arc::new(Node::empty(level - 1))
+                    });
                     level -= 1;
                     Self::unshare(kid, refs)
                 }
                 Node::Leaf(slots) => {
                     let old = std::mem::replace(&mut slots[Self::index(page, 0)], slot);
                     refs[slot as usize] += 1;
+                    count(&REFS_TOUCHED, 1);
                     if old == EMPTY {
                         return None;
                     }
                     refs[old as usize] -= 1;
+                    count(&REFS_TOUCHED, 1);
                     return (refs[old as usize] == 0).then_some(old);
                 }
             };
@@ -211,6 +257,7 @@ impl PageMap {
             let Ok(mut node) = Arc::try_unwrap(arc) else {
                 return;
             };
+            count(&NODES_RELEASED, 1);
             match &mut node {
                 Node::Inner(kids) => {
                     for kid in kids.iter_mut() {
@@ -222,6 +269,7 @@ impl PageMap {
                 Node::Leaf(slots) => {
                     for &slot in slots.iter().filter(|&&s| s != EMPTY) {
                         refs[slot as usize] -= 1;
+                        count(&REFS_RELEASED, 1);
                         if refs[slot as usize] == 0 {
                             free(slot);
                         }

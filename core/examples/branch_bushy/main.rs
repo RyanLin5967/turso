@@ -32,7 +32,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use turso_core::branch::{Branch, BranchWork};
+use turso_core::branch::{Branch, BranchWork, MapWork};
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO};
 
 const TRUNK_ROWS: i64 = 20_000;
@@ -270,6 +270,8 @@ struct Bench {
     /// Reaps that freed more than one state.
     cascades: u64,
     reads_checked: u64,
+    /// Page-map work before the shape ran (the fixture does none).
+    map0: MapWork,
 }
 
 impl Bench {
@@ -480,6 +482,7 @@ impl Bench {
         }
         let needed = if args.needed { self.db.branch_needed_slots().to_string() } else { "skipped".to_string() };
         let w = s.work;
+        let m0 = self.map0;
         let resolves = w.resolve_calls - w0.resolve_calls;
         let per = |v: u64| if resolves == 0 { 0.0 } else { v as f64 / resolves as f64 };
         let max_depth = self.nodes.iter().skip(1).map(|n| n.depth).max().unwrap_or(0);
@@ -488,7 +491,8 @@ impl Bench {
              arena_high_water={} needed={needed} page_map_nodes={} resolves={resolves} \
              levels_per_resolve={:.4} examined_per_resolve={:.4} reaps={} states_freed={} \
              max_cascade={} cascades={} gc_range={} gc_examined={} nodes={} max_depth={max_depth} \
-             reads_checked={} rss_bytes={}{extra}",
+             reads_checked={} rss_bytes={} first_writes={} in_place={} nodes_copied={} nodes_built={} \
+             refs_touched={} nodes_released={} refs_released={}{extra}",
             level.map_or("-".to_string(), |l| l.to_string()),
             self.handles,
             self.states,
@@ -506,6 +510,13 @@ impl Bench {
             self.nodes.len() - 1,
             self.reads_checked,
             rss_bytes(),
+            w.branch_first_writes - w0.branch_first_writes,
+            w.in_place_writes - w0.in_place_writes,
+            s.map_work.nodes_copied - m0.nodes_copied,
+            s.map_work.nodes_built - m0.nodes_built,
+            s.map_work.refs_touched - m0.refs_touched,
+            s.map_work.nodes_released - m0.nodes_released,
+            s.map_work.refs_released - m0.refs_released,
         );
     }
 
@@ -821,6 +832,7 @@ fn main() {
         max_cascade: 0,
         cascades: 0,
         reads_checked: 0,
+        map0: db.branch_stats().map_work,
     };
     match args.shape {
         Shape::Bb => shape_bb(&mut b, &args),
