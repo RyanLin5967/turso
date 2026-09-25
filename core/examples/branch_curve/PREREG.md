@@ -326,3 +326,82 @@ retention occupies an arena slot at the trunk write; this lane may not edit test
 remove: a1 `trunk_write` p50 is flat, 10.54–12.58 µs over 10^2..10^6 (`turso_curve/raw/a1_hot.txt`), against 10.71 µs
 for the same kind of commit with no branch at all (e1, x=10^2): there is no growing term. F3 belongs to the durable
 build (`ec168128b`), where the barrier pays an arena fsync and a log fsync per retaining trunk commit.
+
+### Amendment 4 — written 2026-09-25T00:20Z: every arm re-run with F1 + F2 in the store, predictions before any fixed run
+
+**Erratum to amendments 3 and 3a:** their headers say 00:21Z; they were committed at 00:19Z (`933e5df80`), before
+any run they govern (`c2f_base` started after). The label was typed, not read from the clock.
+
+**The store under test** (`0de3aa904` F1, `2d2653599` F2, `a3d79b98d` F2's cost-contract test):
+- **F1** — each node's retained versions of a page sit in a `BTreeMap` keyed by `born` (the fat node with a search tree,
+  DSST 1989). `retained_at` is a predecessor search; `child_gone` removes by key. `resolve_retained_examined` now counts at
+  most one version per lineage consulted, and `gc_examined` one per version released.
+- **F2** — the versions are also indexed by `died` (ZFS deadlists). `child_gone` queries `died ∈ (f, hi]` when the victim
+  has no older live sibling, `born ∈ (lo, f]` when it has no younger one, and both in lockstep otherwise.
+  `gc_range_entries` counts every entry either walk yields. A one-sided reap visits exactly what it frees; a two-sided
+  one visits 2|B| if |B| ≤ |D|, else 2|D|+1. `store::tests` pins both, and five mutants fail it (`turso_sota/raw/mutate_F2.txt`).
+- **F3** — not built (amendment 3a).
+
+**Build and runs.** One release build of `branch_arms` and `branch_curve` from the commit that carries this amendment. It
+is copied out of the tree like amendment 3's binary. Runs go through `turso_sota/run_fixed.sh` (lockrun `turso-sota`,
+timeout 3600 each), raw to `turso_sota/raw/<run>_fix.txt`, each committed before it is read. The "before" of each run is
+the banked `turso_curve/raw/` file named in the table; for the amendment-3 arms it is `turso_sota/raw/<run>_base.txt`.
+
+| run | arguments (after `branch_arms` unless named) | before |
+|---|---|---|
+| control_fix | `branch_curve --checkpoints 100,1000,10000,100000,1000000 --samples 200` | control |
+| a1_fix | `--arm hot --checkpoints 100,…,1000000 --samples 200` | a1_hot |
+| a2_fix | `--arm spread --checkpoints 100,…,1000000 --samples 200` | a2_spread |
+| a2r2_fix | `--arm spread --checkpoints 100,…,1000000 --samples 1000` | a2_spread_r2 |
+| b_fix | `--arm chain --checkpoints 1,3,10,32,100,316,1000 --samples 200` | b_chain_r2 |
+| c1_fix | `--arm churn --checkpoints 100,…,1000000 --cycles 2000000 --windows 10` | c1_churn_r2 |
+| c2_fix | `--arm churn_hot --checkpoints 100,…,1000000 --cycles 100000 --windows 10` | c2_churn_hot |
+| c2f_fix, c3_fix, c3f_fix | amendment 3's arguments | `<run>_base` |
+| d_w_fix | `--arm pages --w 1,2,4,8,16,32,64 --checkpoints 10000 --samples 1000` | d_w_r2 |
+| d_N_fix | `--arm pages --w 8 --checkpoints 100,1000,10000,100000 --samples 200` | d_N |
+| e1_fix | `--arm spread_trunk --checkpoints 100,1000,10000 --samples 200` | e1_spread_trunk |
+| e2_fix | `--arm spread --no-autocheckpoint --checkpoints 100,1000,10000 --samples 200` | e2_spread_nockpt |
+| e3_fix | `--arm spread --checkpoints 1000,30000 --samples 200`, `/usr/bin/sample <pid> 5` taken after x=1000 prints | e3_profile |
+
+**Counter predictions.** Where a value is given, it is `turso_sota/model_out/` "fixed" column. The model was committed
+at `d37719e`, before this. A counter outside its interval is a break of F1/F2 or of the model, and it is reported, not
+refitted.
+- a1: `read_hot` `ret_examined_per_op` 1.00 ± 0.02 at every N. reap `gc_examined_per_op` 1.00, `gc_range_per_op` 2.00
+  ± 0.02 (the samples are reaped oldest-sample first, so each has both neighbours, and |B| = |D| = 1). `first_write` ≤ 0.02.
+- a2: `read_inh` and `read_hot` 1.00 ± 0.05 at N ≥ 10^3 (0.51 and 1.00 at 10^2). `first_write` 1.00 ± 0.05 at N ≥ 10^3.
+  reap 0.00 / 0.00.
+- a2r2: reap `gc_range_per_op` 3.00 ± 15% and `gc_examined_per_op` 0.46 ± 15% at every N. Reads 1.00 ± 0.05 at N ≥ 10^3.
+- c2: reap `gc_examined_per_op` 1.00, `gc_range_per_op` 2.00 ± 0.02. `read_hot` 1.00 ± 0.02. `first_write` 0.00 ± 0.01.
+- c2f: reap 1.00 / 1.00 ± 0.01. `read_hot` 1.00 ± 0.02.
+- c3: reap `gc_range_per_op` ± 20% of (1.34, 7.03, 6.53, 3.03, 2.23). `gc_examined_per_op` = versions freed per reap ± 15%,
+  with the same freed as c3_base. `read_inh` and `first_write` 1.00 ± 0.05 at N ≥ 10^3.
+- c3f: reap `gc_range_per_op` = `gc_examined_per_op` = versions freed per reap = 1.00 ± 3% at every N. `read_inh` 1.00
+  ± 0.05 at N ≥ 10^3.
+- b, c1, d_w, d_N, control, e1: no retained version exists in the chain (each level writes before it forks), in c1 and d
+  (the trunk never writes), or in e1 (no branch). F1 and F2 are therefore not exercised. Every counter equals its
+  "before" file's exactly. e2: reads 1.00 ± 0.05 at N ≥ 10^3.
+- Space: arena counts equal the "before" files' at every checkpoint, and the harness asserts them. RSS rises only by
+  the indexes: per retained version, a `BTreeMap` entry replaces a `Vec` slot, and two `BTreeSet` entries replace a
+  `retained_by_born` pair. Prediction: RSS at 10^6 within +3% of the "before" RSS in a1, a2, c2, c2f, c3, c3f.
+
+**Time predictions.** These are inferred (I), and they are the hypotheses the residual-wall report tests.
+- **Removed walls.** At 10^6, p50 is at least 20× lower than before for a1 `read_hot` (before 156.67 µs) and a1 `reap`
+  (251.92 µs), c2 `reap` (129.75) and `read_hot` (160.83), and c2f's reap and `read_hot` (base). For each of these, the
+  p50 slope over 10^2..10^6 is < 0.40, and the local slope 10^5→10^6 is < 0.40.
+- **Residual term, predicted to show: log N descents at a cache-exceeding footprint.** A reap now does about 8 B-tree
+  descents: `children` (remove plus two neighbour probes), the two index ranges, the per-page map, and the two index
+  removals. In the retaining arms each tree holds ~N entries, and each descent level past the caches is a miss. So
+  a1/c2/c2f `reap` p50 slope in [0.10, 0.40] and p50 at 10^6 in [1, 6] µs. c1's reap already reads +0.202 (c1_churn_r2)
+  with only `children` and the branch `HashMap` at N. `read_hot` does one descent more than before plus the arena
+  slot read: |slope| < 0.15.
+- **c3f's step removed.** reap p50 at N ≥ 10^3 is at least 2× lower than c3f_base's. c3f's reap and c3's reap
+  are within 2× of each other at every N.
+- **Unchanged by construction (engine, not branching).** `trunk_write` in a2, c3, c3f and e1 keeps e1's auto-checkpoint
+  step: ≈ 375–400 µs from x = 10^3, within ±15% of the before file at each N. WAL bytes grow with trunk commits as before.
+- **Everything else** is within ±15% of its before file's p50 at every x, or within the before file's own window-to-window
+  spread where that is larger. This covers `fork`, `open`, the `first_write`s that retain nothing, `read_own`, `read_open`,
+  `read_inh` in a1, all of b, c1 and d, and control.
+
+**What the report owes.** For each run, op and x: p50 before and after, the slope before and after, and the counters.
+Every term that still grows with N is listed, with the mechanism read from source. That covers time, space (arena, RSS,
+WAL bytes) and every counter. A term predicted above and not found is reported as not found.
