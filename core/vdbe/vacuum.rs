@@ -376,7 +376,8 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
 /// the source.
 pub(crate) fn mirror_symbols(source: &Connection, target: &Connection) {
     let source_syms = source.syms.read();
-    let mut target_syms = target.syms.write();
+    let mut target_guard = target.syms.write();
+    let target_syms = Arc::make_mut(&mut target_guard);
     target_syms.functions.extend(
         source_syms
             .functions

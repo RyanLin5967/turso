@@ -245,7 +245,8 @@ impl Database {
     /// to register these once-per-connection, and the connection can just extend its symbol table
     pub fn register_global_builtin_extensions(&self) -> Result<(), String> {
         {
-            let mut syms = self.builtin_syms.write();
+            let mut guard = self.builtin_syms.write();
+            let syms = std::sync::Arc::make_mut(&mut guard);
             syms.index_methods.insert(
                 TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME.to_string(),
                 Arc::new(VectorSparseInvertedIndexMethod),
@@ -258,7 +259,8 @@ impl Database {
             syms.index_methods
                 .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
         }
-        let syms = self.builtin_syms.data_ptr();
+        // Called once at open, before any connection shares the table, so this is not a copy.
+        let syms: *mut SymbolTable = std::sync::Arc::make_mut(&mut self.builtin_syms.write());
         // Pass the mutex pointer and the appropriate handler
         let schema_mutex_ptr =
             &*self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
@@ -338,7 +340,7 @@ impl Connection {
         let schema_mutex_ptr =
             &*self.db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = ExtensionCtx {
-            syms: self.syms.data_ptr(),
+            syms: std::sync::Arc::make_mut(&mut self.syms.write()) as *mut SymbolTable,
             schema: schema_mutex_ptr as *mut c_void,
             prepare_context_generation: &self.prepare_context_generation as *const _,
         };
