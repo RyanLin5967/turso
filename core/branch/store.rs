@@ -79,12 +79,38 @@
 //! an older generation is never served. The cache is filled by the pager after it reads a page for
 //! a branch ([`BranchStore::fill_trunk_page`]), under the key [`BranchStore::resolve_into`] gave.
 //!
+//! # Concurrency — a striped store
+//!
+//! The store was one `Mutex` over every branch. Under threads it was not the first wall — the
+//! kernel's read path was, removed by the shared trunk-page cache above — but it was the next one:
+//! every operation of every branch took it, held for 1.6–4.6 µs per agent cycle (PREREG amendments
+//! 7, 8, 8a and 9). It is now striped, the standard answer for a map whose operations each touch one
+//! key (lock striping: the segments of Java's `ConcurrentHashMap`, and every sharded lock table
+//! since):
+//!
+//! * **Shards.** Branch `id` lives in shard `id % SHARDS`, together with the arena domain its own
+//!   pages are allocated from, behind the shard's lock. An operation on one branch — open, close,
+//!   begin and end a write, a copy decision, a commit, a resolution — takes that one lock.
+//! * **The trunk** keeps its lineage (fork epochs of its children, retained versions and their
+//!   indexes) and the arena of its retained versions behind its own lock. Trunk forks, trunk
+//!   copy decisions and the reaps of trunk children take it.
+//! * **Reads of the trunk without its lock.** A resolution that falls through to the trunk needs
+//!   the trunk's lock only if the trunk has rewritten the page since the branch's ancestry left it.
+//!   The trunk epoch of each page's last write is kept in a [`Radix`], which any thread reads
+//!   with three acquire loads and no write (the read side of read-copy-update, with nothing to
+//!   reclaim), so a branch reading a page the trunk has not rewritten takes no trunk lock.
+//! * **Two branches, two locks, never at once.** A fork locks the parent's shard, then the child's;
+//!   a reap locks the child's, then the parent's (or the trunk). Neither holds two, so there is no
+//!   lock order to violate; the windows between them are harmless (see [`BranchStore::fork_trunk`]
+//!   and [`BranchStore::collect`]).
+//! * A slot's number carries its domain, so a slot of another shard — a page an ancestor in that
+//!   shard wrote — is read under that shard's lock, and a release into the wrong domain is refused.
+//!
+//! Every acquisition of every lock goes through `take`, which counts it (see [`BranchWork`]), so
+//! what still serialises can be read from integers rather than inferred from a latency curve.
+//!
 //! # What this does not do
 //!
-//! * One `Mutex` guards every branch. Correct, and a known wall under concurrent writers on
-//!   different branches; the benchmark this lane ships is single-threaded and says so. Every
-//!   acquisition goes through [`BranchStore::lock`], which counts it (see [`BranchWork`]), so the
-//!   wall can be read from integers rather than inferred from a latency curve.
 //! * The persistent page maps are an index over slots the lineages own; they own nothing. A
 //!   branch's `inherited` names only slots its ancestors keep for it (see "Resolution without the
 //!   walk"), so dropping a map never frees a page and keeping one never pins a page.
@@ -104,6 +130,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Bound, Deref, DerefMut};
 use std::time::Instant;
 
+use crossbeam_utils::CachePadded;
+
 use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
@@ -114,8 +142,43 @@ use crate::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use crate::{LimboError, Result};
 use arc_swap::ArcSwapOption;
 
+/// Shards of the branch map: branch `id` lives, with every page it owns, in shard `id % SHARDS`.
+const SHARDS: usize = 64;
+/// The arena domain of the trunk's retained versions. Shard `i` allocates from domain `i`.
+const TRUNK_DOMAIN: usize = SHARDS;
+/// A slot carries its domain in its top bits and the domain arena's own slot number below them.
+/// 65 domains need 7 bits, which leaves 2^25 slots per domain, and no global slot reaches
+/// `u32::MAX` (the page map's empty marker).
+const LOCAL_BITS: u32 = 25;
+
+fn domain_of(slot: Slot) -> usize {
+    (slot >> LOCAL_BITS) as usize
+}
+
+fn shard_of(id: BranchId) -> usize {
+    (id.0 % SHARDS as u64) as usize
+}
+
 pub(crate) struct BranchStore {
-    inner: Mutex<StoreInner>,
+    /// The branch map, striped: each shard holds its branches' states and the arena their pages
+    /// live in, behind its own lock.
+    shards: Box<[CachePadded<Mutex<Shard>>]>,
+    /// The trunk's lineage and the arena of its retained versions, behind their own lock.
+    trunk: CachePadded<Mutex<TrunkInner>>,
+    /// The trunk epoch of its last write to each page, readable without a lock (see [`Radix`]).
+    /// Written only under `trunk`'s lock. Absent reads as 0: "before the first fork that was live at
+    /// the time", the conservative answer (see `first_write_trunk`).
+    written: Radix<AtomicU64>,
+    next_id: AtomicU64,
+    /// The trunk's page size and reserved bytes per page, recorded at the first fork. Every arena
+    /// domain uses the page size; neither can change while a branch exists (both need VACUUM, which
+    /// is refused), so a branch connection takes its page format from here instead of reading the
+    /// trunk's file header.
+    trunk_format: OnceLock<(usize, u8)>,
+    /// The trunk's pages as branches have read them (see "Trunk pages without the file").
+    trunk_pages: TrunkPages,
+    /// Branch states that exist, including ones kept alive only by a live child.
+    live: AtomicUsize,
     /// Live children of the trunk. Read without the lock on every trunk first-write so that a
     /// database with no branches pays one atomic load per written page and nothing else.
     ///
@@ -124,15 +187,164 @@ pub(crate) struct BranchStore {
     /// same lock. A 1-to-0 transition (a reap) racing the read only makes the writer take the lock
     /// and find nothing to do.
     trunk_children: AtomicUsize,
-    /// Whether [`BranchStore::lock`] times how long each acquisition holds the lock. Off by default:
-    /// it is the one part of the lock accounting that adds work inside the critical section.
+    /// Whether [`take`] times how long each acquisition holds its lock. Off by default: it is the
+    /// one part of the lock accounting that adds work inside a critical section.
     lock_timing: AtomicBool,
-    /// The trunk's pages as branches have read them (see "Trunk pages without the file").
-    trunk_pages: TrunkPages,
-    /// The trunk's page size and reserved bytes per page, recorded at the first fork. Neither can
-    /// change while a branch exists (both need VACUUM, which is refused), so a branch connection
-    /// takes its page format from here instead of reading the trunk's file header.
-    trunk_format: OnceLock<(usize, u8)>,
+}
+
+/// One stripe of the branch map.
+struct Shard {
+    branches: HashMap<BranchId, BranchState>,
+    domain: Domain,
+    /// Observation only; see [`BranchWork`]. This shard's lock is counted into its `lock_*` fields.
+    work: BranchWork,
+}
+
+struct TrunkInner {
+    lineage: Lineage,
+    domain: Domain,
+    /// Observation only. The trunk's lock is counted into its `lock_*` fields.
+    work: BranchWork,
+}
+
+/// A lock-protected structure that counts its own lock.
+trait Counted {
+    fn work(&mut self) -> &mut BranchWork;
+}
+
+impl Counted for Shard {
+    fn work(&mut self) -> &mut BranchWork {
+        &mut self.work
+    }
+}
+
+impl Counted for TrunkInner {
+    fn work(&mut self) -> &mut BranchWork {
+        &mut self.work
+    }
+}
+
+/// A lock of the store, held. Observation only: dropping it adds the time it was held to its
+/// structure's `lock_hold_ns` when lock timing was on at the acquisition, and does nothing else.
+struct Held<'a, T: Counted> {
+    guard: MutexGuard<'a, T>,
+    since: Option<Instant>,
+}
+
+impl<T: Counted> Deref for Held<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T: Counted> DerefMut for Held<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T: Counted> Drop for Held<'_, T> {
+    fn drop(&mut self) {
+        if let Some(since) = self.since {
+            self.guard.work().lock_hold_ns += since.elapsed().as_nanos() as u64;
+        }
+    }
+}
+
+/// Take `lock`, counting the acquisition into the structure it guards: every one, the ones that
+/// found the lock held, and how long those waited. The counts are written under the lock itself,
+/// so counting adds no shared write the lock does not already make, and the clock is read only on
+/// the contended path, by the thread that is waiting anyway — except with `timed`, which reads it
+/// once more at the acquisition and once at the release.
+fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
+    let (mut guard, waited) = match lock.try_lock() {
+        Some(guard) => (guard, None),
+        None => {
+            let start = Instant::now();
+            let guard = lock.lock();
+            (guard, Some(start.elapsed()))
+        }
+    };
+    let work = guard.work();
+    work.lock_acquisitions += 1;
+    if let Some(waited) = waited {
+        work.lock_contended += 1;
+        work.lock_wait_ns += waited.as_nanos() as u64;
+    }
+    let since = timed.then(Instant::now);
+    Held { guard, since }
+}
+
+/// One arena domain: a shard's pages, or the trunk's retained versions. Slots it hands out carry
+/// its number (see [`LOCAL_BITS`]); it refuses a slot of another domain, so a page released into
+/// the wrong arena is caught at the release.
+struct Domain {
+    id: usize,
+    arena: Option<Arena>,
+}
+
+impl Domain {
+    fn new(id: usize) -> Self {
+        Self { id, arena: None }
+    }
+
+    fn local(&self, slot: Slot) -> Slot {
+        crate::turso_assert!(domain_of(slot) == self.id, "an arena slot of another domain");
+        slot & ((1 << LOCAL_BITS) - 1)
+    }
+
+    fn arena(&self) -> &Arena {
+        self.arena.as_ref().expect("a slot of this domain exists, so its arena does")
+    }
+
+    fn alloc(&mut self, page_size: usize) -> Slot {
+        let local = self.arena.get_or_insert_with(|| Arena::new(page_size)).alloc();
+        crate::turso_assert!(local < 1 << LOCAL_BITS, "an arena domain is out of slots");
+        ((self.id as u32) << LOCAL_BITS) | local
+    }
+
+    fn release(&mut self, slot: Slot) {
+        let local = self.local(slot);
+        self.arena
+            .as_mut()
+            .expect("a slot of this domain exists, so its arena does")
+            .release(local);
+    }
+
+    fn page(&self, slot: Slot) -> &[u8] {
+        self.arena().page(self.local(slot))
+    }
+
+    fn page_mut(&mut self, slot: Slot) -> &mut [u8] {
+        let local = self.local(slot);
+        self.arena
+            .as_mut()
+            .expect("a slot of this domain exists, so its arena does")
+            .page_mut(local)
+    }
+
+    fn in_use(&self) -> usize {
+        self.arena.as_ref().map_or(0, |a| a.in_use())
+    }
+
+    fn free_count(&self) -> usize {
+        self.arena.as_ref().map_or(0, |a| a.free_count())
+    }
+
+    fn slots_in_use(&self) -> impl Iterator<Item = Slot> + '_ {
+        let id = (self.id as u32) << LOCAL_BITS;
+        self.arena
+            .iter()
+            .flat_map(|a| a.slots_in_use())
+            .map(move |local| id | local)
+    }
+
+    fn is_free(&self, slot: Slot) -> bool {
+        self.arena
+            .as_ref()
+            .is_some_and(|a| a.is_free(self.local(slot)))
+    }
 }
 
 /// Where the page a branch asked for comes from.
@@ -243,43 +455,6 @@ impl TrunkPages {
     }
 }
 
-/// The store's lock, held. Observation only: dropping it adds the time it was held to
-/// `lock_hold_ns` when lock timing was on at the acquisition, and does nothing else.
-struct Held<'a> {
-    guard: MutexGuard<'a, StoreInner>,
-    since: Option<Instant>,
-}
-
-impl Deref for Held<'_> {
-    type Target = StoreInner;
-    fn deref(&self) -> &StoreInner {
-        &self.guard
-    }
-}
-
-impl DerefMut for Held<'_> {
-    fn deref_mut(&mut self) -> &mut StoreInner {
-        &mut self.guard
-    }
-}
-
-impl Drop for Held<'_> {
-    fn drop(&mut self) {
-        if let Some(since) = self.since {
-            self.guard.work.lock_hold_ns += since.elapsed().as_nanos() as u64;
-        }
-    }
-}
-
-struct StoreInner {
-    arena: Option<Arena>,
-    next_id: u64,
-    trunk: TrunkState,
-    branches: HashMap<BranchId, BranchState>,
-    /// Observation only; see [`BranchWork`].
-    work: BranchWork,
-}
-
 #[derive(Default)]
 struct Lineage {
     /// Advanced by each fork of this node; the pre-increment value is the child's fork epoch.
@@ -304,14 +479,6 @@ struct Retained {
     born: u64,
     died: u64,
     slot: Slot,
-}
-
-struct TrunkState {
-    lineage: Lineage,
-    /// The trunk epoch of its last write to each page. Absent means "before the first fork that
-    /// was live at the time", i.e. epoch 0, which is the conservative answer: it can only cause a
-    /// retention that was not strictly needed, never skip one that was.
-    written: HashMap<u32, u64>,
 }
 
 struct BranchState {
@@ -376,7 +543,7 @@ impl Lineage {
     }
 
     /// Detach the child forked at `f` and release every retained version that only it could see.
-    fn child_gone(&mut self, f: u64, arena: &mut Arena, work: &mut BranchWork) -> usize {
+    fn child_gone(&mut self, f: u64, arena: &mut Domain, work: &mut BranchWork) -> usize {
         let removed = self.children.remove(&f);
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
@@ -470,7 +637,7 @@ impl Lineage {
         dead
     }
 
-    fn release_all(self, arena: &mut Arena) -> Vec<Slot> {
+    fn release_all(self, arena: &mut Domain) -> Vec<Slot> {
         let mut slots = Vec::new();
         for (_, versions) in self.retained {
             slots.extend(versions.into_values().map(|v| v.slot));
@@ -489,24 +656,63 @@ fn gone(id: BranchId) -> LimboError {
 impl BranchStore {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Mutex::new(StoreInner {
-                arena: None,
-                next_id: 1,
-                trunk: TrunkState {
-                    lineage: Lineage::default(),
-                    written: HashMap::new(),
-                },
-                branches: HashMap::new(),
+            shards: (0..SHARDS)
+                .map(|i| {
+                    CachePadded::new(Mutex::new(Shard {
+                        branches: HashMap::new(),
+                        domain: Domain::new(i),
+                        work: BranchWork::default(),
+                    }))
+                })
+                .collect(),
+            trunk: CachePadded::new(Mutex::new(TrunkInner {
+                lineage: Lineage::default(),
+                domain: Domain::new(TRUNK_DOMAIN),
                 work: BranchWork::default(),
-            }),
-            trunk_children: AtomicUsize::new(0),
-            lock_timing: AtomicBool::new(false),
+            })),
+            written: Radix::new(),
+            next_id: AtomicU64::new(1),
+            trunk_format: OnceLock::new(),
             trunk_pages: TrunkPages {
                 generation: AtomicU64::new(0),
                 pages: Radix::new(),
             },
-            trunk_format: OnceLock::new(),
+            live: AtomicUsize::new(0),
+            trunk_children: AtomicUsize::new(0),
+            lock_timing: AtomicBool::new(false),
         }
+    }
+
+    fn timed(&self) -> bool {
+        self.lock_timing.load(Ordering::Relaxed)
+    }
+
+    /// The shard of branch `id`, locked.
+    fn shard(&self, id: BranchId) -> Held<'_, Shard> {
+        take(&self.shards[shard_of(id)], self.timed())
+    }
+
+    fn trunk(&self) -> Held<'_, TrunkInner> {
+        take(&self.trunk, self.timed())
+    }
+
+    /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
+    pub(crate) fn set_lock_timing(&self, on: bool) {
+        self.lock_timing.store(on, Ordering::Relaxed);
+    }
+
+    fn page_size(&self) -> usize {
+        self.trunk_format
+            .get()
+            .expect("a branch exists, so the first fork fixed the page size")
+            .0
+    }
+
+    /// The trunk epoch of its last write to `page`, without a lock.
+    fn written(&self, page: u32) -> u64 {
+        self.written
+            .get(page)
+            .map_or(0, |epoch| epoch.load(Ordering::Acquire))
     }
 
     /// The trunk's page size and reserved bytes per page, once a branch has been forked.
@@ -526,35 +732,6 @@ impl BranchStore {
         self.trunk_pages.fill(key, bytes);
     }
 
-    /// Take the store's lock, counting the acquisition into `work`: every one, the ones that found
-    /// the lock held, and how long those waited. The counts are written under the lock itself, so
-    /// counting adds no shared write the lock does not already make, and the clock is read only on
-    /// the contended path, by the thread that is waiting anyway — except with lock timing on, which
-    /// reads it once more at the acquisition and once at the release.
-    fn lock(&self) -> Held<'_> {
-        let (mut guard, waited) = match self.inner.try_lock() {
-            Some(guard) => (guard, None),
-            None => {
-                let start = Instant::now();
-                let guard = self.inner.lock();
-                (guard, Some(start.elapsed()))
-            }
-        };
-        let work = &mut guard.work;
-        work.lock_acquisitions += 1;
-        if let Some(waited) = waited {
-            work.lock_contended += 1;
-            work.lock_wait_ns += waited.as_nanos() as u64;
-        }
-        let since = self.lock_timing.load(Ordering::Relaxed).then(Instant::now);
-        Held { guard, since }
-    }
-
-    /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
-    pub(crate) fn set_lock_timing(&self, on: bool) {
-        self.lock_timing.store(on, Ordering::Relaxed);
-    }
-
     pub(crate) fn trunk_has_children(&self) -> bool {
         self.trunk_children.load(Ordering::Acquire) > 0
     }
@@ -562,12 +739,16 @@ impl BranchStore {
     /// Whether any branch state exists at all, including one kept alive only by a live child.
     /// Paths that rewrite the trunk without passing through `add_dirty` refuse while this holds.
     pub(crate) fn has_branches(&self) -> bool {
-        !self.lock().branches.is_empty()
+        self.live.load(Ordering::Acquire) > 0
     }
 
     /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
+    ///
+    /// The child is listed among the trunk's children before its state exists in its shard. Nothing
+    /// can reach it in between: its id has not been returned, and a sibling's reap only reads its
+    /// fork epoch, which is final.
     pub(crate) fn fork_trunk(
         &self,
         schema: Arc<Schema>,
@@ -582,23 +763,16 @@ impl BranchStore {
                 format.0, format.1
             )));
         }
-        let mut inner = self.lock();
-        match &inner.arena {
-            None => inner.arena = Some(Arena::new(page_size)),
-            Some(arena) if arena.page_size() != page_size => {
-                return Err(LimboError::InternalError(format!(
-                    "branch arena holds {}-byte pages but the database now uses {page_size}",
-                    arena.page_size()
-                )));
-            }
-            Some(_) => {}
-        }
-        let id = BranchId(inner.next_id);
-        inner.next_id += 1;
-        let f = inner.trunk.lineage.epoch;
-        inner.trunk.lineage.epoch += 1;
-        inner.trunk.lineage.children.insert(f, id);
-        inner.branches.insert(
+        let (id, f) = {
+            let mut trunk = self.trunk();
+            let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
+            let f = trunk.lineage.epoch;
+            trunk.lineage.epoch += 1;
+            trunk.lineage.children.insert(f, id);
+            (id, f)
+        };
+        self.live.fetch_add(1, Ordering::AcqRel);
+        self.shard(id).branches.insert(
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
         );
@@ -607,34 +781,36 @@ impl BranchStore {
     }
 
     /// Fork a child of a branch. Refused while the parent has a write transaction in progress, for
-    /// the same reason a trunk fork takes the WAL write lock.
+    /// the same reason a trunk fork takes the WAL write lock. The parent's shard and the child's are
+    /// locked one after the other, never together (see [`BranchStore::fork_trunk`] for why the
+    /// window between them is harmless).
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
-        let mut inner = self.lock();
-        let id = BranchId(inner.next_id);
-        let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
-        if st.writer {
-            return Err(LimboError::Busy);
-        }
-        let f = st.lineage.epoch;
-        st.lineage.epoch += 1;
-        st.lineage.children.insert(f, id);
-        let schema = st.schema.clone();
-        let (current, inherited) = (&st.current, &st.inherited);
-        let view = st
-            .view
-            .get_or_insert_with(|| {
-                let mut view = inherited.clone();
-                for (&page, owned) in current {
-                    view.insert(page, owned.slot);
-                }
-                view
-            })
-            .clone();
-        let trunk_at = st.trunk_at;
-        inner.next_id += 1;
-        inner
-            .branches
-            .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
+        let (id, child) = {
+            let mut shard = self.shard(parent);
+            let st = shard.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
+            if st.writer {
+                return Err(LimboError::Busy);
+            }
+            let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
+            let f = st.lineage.epoch;
+            st.lineage.epoch += 1;
+            st.lineage.children.insert(f, id);
+            let schema = st.schema.clone();
+            let (current, inherited) = (&st.current, &st.inherited);
+            let view = st
+                .view
+                .get_or_insert_with(|| {
+                    let mut view = inherited.clone();
+                    for (&page, owned) in current {
+                        view.insert(page, owned.slot);
+                    }
+                    view
+                })
+                .clone();
+            (id, BranchState::new(parent, f, schema, st.trunk_at, view))
+        };
+        self.live.fetch_add(1, Ordering::AcqRel);
+        self.shard(id).branches.insert(id, child);
         Ok(id)
     }
 
@@ -642,8 +818,8 @@ impl BranchStore {
     /// branch: two would each hold a private page cache of the same page space, and nothing would
     /// tell one that the other had committed — a silently stale read, so it is refused.
     pub(crate) fn open(&self, id: BranchId) -> Result<Arc<Schema>> {
-        let mut inner = self.lock();
-        let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        let mut shard = self.shard(id);
+        let st = shard.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.open {
             return Err(LimboError::InvalidArgument(format!(
                 "branch {} already has an open connection; a branch serves one connection at a \
@@ -658,34 +834,34 @@ impl BranchStore {
 
     /// The connection on `id` has gone. Releases its write lock if a transaction was abandoned.
     pub(crate) fn close(&self, id: BranchId) {
-        let mut inner = self.lock();
-        if let Some(st) = inner.branches.get_mut(&id) {
+        let mut shard = self.shard(id);
+        if let Some(st) = shard.branches.get_mut(&id) {
             st.open = false;
             st.writer = false;
         }
-        self.collect(&mut inner, id);
+        self.collect(shard, id);
     }
 
     /// The `Branch` handle has gone.
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
-        let mut inner = self.lock();
-        let Some(st) = inner.branches.get_mut(&id) else {
+        let mut shard = self.shard(id);
+        let Some(st) = shard.branches.get_mut(&id) else {
             return Reaped {
                 freed_pages: 0,
                 deferred: false,
             };
         };
         st.handle = false;
-        let freed_pages = self.collect(&mut inner, id);
+        let (freed_pages, removed) = self.collect(shard, id);
         Reaped {
             freed_pages,
-            deferred: inner.branches.contains_key(&id),
+            deferred: !removed,
         }
     }
 
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
-        let mut inner = self.lock();
-        let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        let mut shard = self.shard(id);
+        let st = shard.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.writer {
             return Err(LimboError::Busy);
         }
@@ -694,22 +870,21 @@ impl BranchStore {
     }
 
     pub(crate) fn end_write(&self, id: BranchId) {
-        if let Some(st) = self.lock().branches.get_mut(&id) {
+        if let Some(st) = self.shard(id).branches.get_mut(&id) {
             st.writer = false;
         }
     }
 
     pub(crate) fn holds_writer(&self, id: BranchId) -> bool {
-        self
-            .lock()
+        self.shard(id)
             .branches
             .get(&id)
             .is_some_and(|st| st.writer)
     }
 
     pub(crate) fn schema(&self, id: BranchId) -> Result<Arc<Schema>> {
-        let inner = self.lock();
-        Ok(inner.branches.get(&id).ok_or_else(|| gone(id))?.schema.clone())
+        let shard = self.shard(id);
+        Ok(shard.branches.get(&id).ok_or_else(|| gone(id))?.schema.clone())
     }
 
     /// The copy decision for a branch's first write to `page` in a transaction. `pre_image` is the
@@ -720,18 +895,18 @@ impl BranchStore {
         page: u32,
         pre_image: &[u8],
     ) -> Result<()> {
-        let mut inner = self.lock();
-        let StoreInner {
-            arena, branches, ..
-        } = &mut *inner;
-        let arena = arena.as_mut().expect("a branch exists, so the arena does");
+        let page_size = self.page_size();
+        let mut shard = self.shard(id);
+        let Shard {
+            branches, domain, ..
+        } = &mut *shard;
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         crate::turso_assert!(st.writer, "branch page written outside a write transaction");
         let epoch = st.lineage.epoch;
         match st.current.get(&page).copied() {
             None => {
-                let slot = arena.alloc();
-                arena.page_mut(slot).copy_from_slice(pre_image);
+                let slot = domain.alloc(page_size);
+                domain.page_mut(slot).copy_from_slice(pre_image);
                 st.current.insert(page, Owned { slot, born: epoch });
                 if let Some(view) = st.view.as_mut() {
                     view.insert(page, slot);
@@ -740,8 +915,8 @@ impl BranchStore {
             Some(owned) if owned.born == epoch => {}
             Some(owned) => {
                 if st.lineage.has_child_in(owned.born, epoch) {
-                    let slot = arena.alloc();
-                    arena.page_mut(slot).copy_from_slice(pre_image);
+                    let slot = domain.alloc(page_size);
+                    domain.page_mut(slot).copy_from_slice(pre_image);
                     st.lineage.retain(
                         page,
                         Retained {
@@ -772,19 +947,24 @@ impl BranchStore {
 
     /// The copy decision for the trunk's first write to `page` in a transaction: if a live child
     /// can still see the version about to be overwritten, keep a copy of it for that child.
+    ///
+    /// `written` is updated after the retained version is in place and before this write can reach
+    /// the WAL, so a reader whose WAL snapshot holds the new version also sees the new epoch, and
+    /// looks the page up under the trunk's lock (see [`BranchStore::resolve_into`]).
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
-        let mut inner = self.lock();
-        let StoreInner { arena, trunk, .. } = &mut *inner;
-        let epoch = trunk.lineage.epoch;
-        let born = trunk.written.get(&page).copied().unwrap_or(0);
+        let mut trunk = self.trunk();
+        let TrunkInner {
+            lineage, domain, ..
+        } = &mut *trunk;
+        let epoch = lineage.epoch;
+        let born = self.written(page);
         if born >= epoch {
             return;
         }
-        if trunk.lineage.has_child_in(born, epoch) {
-            let arena = arena.as_mut().expect("the trunk has a child, so the arena exists");
-            let slot = arena.alloc();
-            arena.page_mut(slot).copy_from_slice(pre_image);
-            trunk.lineage.retain(
+        if lineage.has_child_in(born, epoch) {
+            let slot = domain.alloc(self.page_size());
+            domain.page_mut(slot).copy_from_slice(pre_image);
+            lineage.retain(
                 page,
                 Retained {
                     born,
@@ -793,20 +973,19 @@ impl BranchStore {
                 },
             );
         }
-        trunk.written.insert(page, epoch);
+        self.written.get_or_insert(page).store(epoch, Ordering::Release);
     }
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
-        let mut inner = self.lock();
-        let StoreInner {
-            arena, branches, ..
-        } = &mut *inner;
+        let mut shard = self.shard(id);
+        let Shard {
+            branches, domain, ..
+        } = &mut *shard;
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if pages.is_empty() {
             return Ok(());
         }
-        let arena = arena.as_mut().expect("a branch exists, so the arena does");
         for page in pages {
             let no = page.get().id as u32;
             let owned = st.current.get(&no).copied().ok_or_else(|| {
@@ -819,7 +998,7 @@ impl BranchStore {
                 owned.born == st.lineage.epoch,
                 "a committed branch page was decided in an earlier epoch"
             );
-            arena
+            domain
                 .page_mut(owned.slot)
                 .copy_from_slice(page.get_contents().as_slice());
         }
@@ -827,62 +1006,120 @@ impl BranchStore {
     }
 
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
-        let mut inner = self.lock();
-        inner.branches.get_mut(&id).ok_or_else(|| gone(id))?.schema = schema;
+        self.shard(id)
+            .branches
+            .get_mut(&id)
+            .ok_or_else(|| gone(id))?
+            .schema = schema;
         Ok(())
     }
 
-    /// Fill `out` with `page` as branch `id` sees it, if that version lives in the arena. `false`
-    /// means the branch sees the trunk's current version, which the caller reads through the
-    /// ordinary WAL / database-file path.
+    /// Fill `out` with `page` as branch `id` sees it, if that version lives in the arena or the
+    /// shared trunk-page cache holds it. [`Resolved::Trunk`] means the branch sees the trunk's
+    /// current version, which the caller reads through the ordinary WAL / database-file path, and
+    /// the key to cache that read under.
     ///
-    /// The trunk's version comes from the shared cache when it holds it; otherwise the answer is
-    /// [`Resolved::Trunk`] with the key to cache the caller's read under.
+    /// The branch's own shard answers for its own pages and for everything its ancestors wrote
+    /// (`inherited`). A slot of another shard is copied under that shard's lock, taken after this
+    /// one is released: nothing frees a slot a live branch can see, and the caller's connection
+    /// keeps this branch live. A page no branch in the chain wrote is the trunk's. The trunk's lock
+    /// is taken only when `written` says the trunk has rewritten the page since this branch's
+    /// ancestry left it; otherwise the trunk's current version is the answer — from the cache when
+    /// it holds it — and no trunk lock is taken. The cache is consulted, and its hit or miss
+    /// counted, under this branch's shard lock.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<Resolved> {
-        let mut inner = self.lock();
-        let (mut levels, mut examined) = (0, 0);
-        let resolved = inner.resolve(id, page, &mut levels, &mut examined);
-        inner.work.resolve_calls += 1;
-        inner.work.resolve_levels += levels;
-        inner.work.resolve_retained_examined += examined;
-        let Some(slot) = resolved? else {
-            // `resolve` answered "the trunk's current version", so the trunk's last write to this
-            // page came at or before the branch's `trunk_at`, in a closed epoch.
-            let key = TrunkPageKey {
-                page,
-                epoch: inner.trunk.written.get(&page).copied().unwrap_or(0),
-                generation: self.trunk_pages.generation.load(Ordering::Acquire),
-            };
-            if self.trunk_pages.copy_into(key, out) {
-                inner.work.trunk_page_hits += 1;
-                return Ok(Resolved::Filled);
+        let (at, elsewhere) = {
+            let mut shard = self.shard(id);
+            shard.work.resolve_calls += 1;
+            shard.work.resolve_levels += 1;
+            let st = shard.branches.get(&id).ok_or_else(|| gone(id))?;
+            let found = st
+                .current
+                .get(&page)
+                .map(|owned| owned.slot)
+                .or_else(|| st.inherited.get(page));
+            let at = st.trunk_at;
+            match found {
+                Some(slot) if domain_of(slot) == shard_of(id) => {
+                    out.copy_from_slice(shard.domain.page(slot));
+                    return Ok(Resolved::Filled);
+                }
+                Some(slot) => (at, Some(slot)),
+                None => {
+                    shard.work.resolve_levels += 1;
+                    // Every retained version of `page` died at or before the trunk's last write to
+                    // it, so none can cover `at` unless that write came after `at`. Otherwise the
+                    // branch sees the trunk's current version, last written in a closed epoch.
+                    let epoch = self.written(page);
+                    if epoch <= at {
+                        let key = TrunkPageKey {
+                            page,
+                            epoch,
+                            generation: self.trunk_pages.generation.load(Ordering::Acquire),
+                        };
+                        if self.trunk_pages.copy_into(key, out) {
+                            shard.work.trunk_page_hits += 1;
+                            return Ok(Resolved::Filled);
+                        }
+                        shard.work.trunk_page_misses += 1;
+                        return Ok(Resolved::Trunk(key));
+                    }
+                    (at, None)
+                }
             }
-            inner.work.trunk_page_misses += 1;
-            return Ok(Resolved::Trunk(key));
         };
-        out.copy_from_slice(
-            inner
-                .arena
-                .as_ref()
-                .expect("a slot resolved, so the arena exists")
-                .page(slot),
-        );
-        Ok(Resolved::Filled)
+        if let Some(slot) = elsewhere {
+            let d = domain_of(slot);
+            crate::turso_assert!(d < SHARDS, "a branch's page map named a trunk slot");
+            out.copy_from_slice(take(&self.shards[d], self.timed()).domain.page(slot));
+            return Ok(Resolved::Filled);
+        }
+        let mut trunk = self.trunk();
+        let mut examined = 0;
+        let found = trunk.lineage.retained_at(page, at, &mut examined);
+        trunk.work.resolve_retained_examined += examined;
+        if let Some(slot) = found {
+            out.copy_from_slice(trunk.domain.page(slot));
+            return Ok(Resolved::Filled);
+        }
+        // The trunk overwrote this page after the fork and nothing was retained: the ordinary
+        // read path would return the NEW version. Refuse rather than serve it.
+        Err(LimboError::Corrupt(format!(
+            "branch {} would read trunk page {page} written after its fork; the pre-image was \
+             not retained",
+            id.0
+        )))
     }
 
+    /// Every counter summed over the trunk and the shards; `trunk_lock_*` is the trunk's lock
+    /// alone. Takes every lock once, one at a time, so under concurrent use the sums are not one
+    /// instant's: each is exact for the calls that finished before this one began.
     pub(crate) fn stats(&self) -> BranchStats {
-        let inner = self.lock();
-        BranchStats {
-            live_branches: inner.branches.len(),
-            arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
-            arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
-            work: inner.work,
+        fn add(stats: &mut BranchStats, work: &BranchWork, domain: &Domain) {
+            stats.arena_slots_in_use += domain.in_use();
+            stats.arena_slots_free += domain.free_count();
+            stats.work.add(work);
         }
+        let mut stats = BranchStats::default();
+        {
+            let trunk = self.trunk();
+            add(&mut stats, &trunk.work, &trunk.domain);
+            stats.work.trunk_lock_acquisitions = trunk.work.lock_acquisitions;
+            stats.work.trunk_lock_contended = trunk.work.lock_contended;
+            stats.work.trunk_lock_wait_ns = trunk.work.lock_wait_ns;
+            stats.work.trunk_lock_hold_ns = trunk.work.lock_hold_ns;
+        }
+        for lock in self.shards.iter() {
+            let shard = take(lock, self.timed());
+            stats.live_branches += shard.branches.len();
+            add(&mut stats, &shard.work, &shard.domain);
+        }
+        stats
     }
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
-        let inner = self.lock();
-        let Some(st) = inner.branches.get(&id) else {
+        let shard = self.shard(id);
+        let Some(st) = shard.branches.get(&id) else {
             return Vec::new();
         };
         let mut slots: Vec<u32> = st.current.values().map(|o| o.slot).collect();
@@ -893,101 +1130,78 @@ impl BranchStore {
     }
 
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
-        self
-            .lock()
-            .arena
-            .as_ref()
-            .map_or_else(Vec::new, |a| a.slots_in_use())
+        let mut slots: Vec<u32> = self.trunk().domain.slots_in_use().collect();
+        for lock in self.shards.iter() {
+            slots.extend(take(lock, self.timed()).domain.slots_in_use());
+        }
+        slots
     }
 
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
-        self
-            .lock()
-            .arena
-            .as_ref()
-            .is_some_and(|a| a.is_free(slot))
+        match domain_of(slot) {
+            TRUNK_DOMAIN => self.trunk().domain.is_free(slot),
+            d if d < SHARDS => take(&self.shards[d], self.timed()).domain.is_free(slot),
+            _ => false,
+        }
     }
 
-    /// Free `id` if nothing can reach it any more, then its parent if that freed the parent's last
-    /// reason to exist. Returns the number of arena pages released.
-    fn collect(&self, inner: &mut StoreInner, mut id: BranchId) -> usize {
+    /// Free `id` — whose shard the caller holds — if nothing can reach it any more, then its parent
+    /// if that freed the parent's last reason to exist. Returns the number of arena pages released
+    /// and whether `id` itself was freed.
+    ///
+    /// A freed branch leaves its shard (with every page it owned) before its parent forgets it, so
+    /// for a moment the parent still lists its fork epoch. A sibling reaped in that moment keeps
+    /// what that epoch could see — the conservative side — and the parent's `child_gone` for this
+    /// branch then frees it, because each `child_gone` computes its garbage from the children the
+    /// parent lists at that instant, under the parent's lock. Locks are taken child first, one at a
+    /// time, never two at once.
+    fn collect(&self, mut shard: Held<'_, Shard>, id: BranchId) -> (usize, bool) {
         let mut freed = 0;
+        let mut at = id;
         loop {
-            let Some(st) = inner.branches.get(&id) else {
-                return freed;
+            let Some(st) = shard.branches.get(&at) else {
+                return (freed, at != id);
             };
             if st.handle || st.open || !st.lineage.children.is_empty() {
-                return freed;
+                return (freed, at != id);
             }
-            let st = inner.branches.remove(&id).expect("just looked it up");
-            let StoreInner {
-                arena,
-                trunk,
-                branches,
-                work,
-                ..
-            } = &mut *inner;
-            let arena = arena.as_mut().expect("a branch existed, so the arena does");
+            let st = shard.branches.remove(&at).expect("just looked it up");
+            self.live.fetch_sub(1, Ordering::AcqRel);
+            let domain = &mut shard.domain;
             for owned in st.current.values() {
-                arena.release(owned.slot);
+                domain.release(owned.slot);
                 freed += 1;
             }
-            freed += st.lineage.release_all(arena).len();
+            freed += st.lineage.release_all(domain).len();
+            drop(shard);
             if st.parent.is_trunk() {
-                freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
+                let mut trunk = self.trunk();
+                let TrunkInner {
+                    lineage,
+                    domain,
+                    work,
+                } = &mut *trunk;
+                freed += lineage.child_gone(st.fork_epoch, domain, work);
                 if self.trunk_children.fetch_sub(1, Ordering::AcqRel) == 1 {
                     // From here the trunk writes without telling the store, so no cached version
-                    // can be trusted once a branch exists again. No branch can read in between:
-                    // a fork needs this lock.
+                    // can be trusted once a branch exists again. No branch can read in between: a
+                    // fork needs this lock.
                     self.trunk_pages.generation.fetch_add(1, Ordering::AcqRel);
                 }
-                return freed;
+                return (freed, true);
             }
+            shard = self.shard(st.parent);
+            let Shard {
+                branches,
+                domain,
+                work,
+            } = &mut *shard;
             let parent = branches
                 .get_mut(&st.parent)
                 .expect("a live branch's parent is kept while the branch lives");
-            freed += parent.lineage.child_gone(st.fork_epoch, arena, work);
-            id = st.parent;
+            freed += parent.lineage.child_gone(st.fork_epoch, domain, work);
+            at = st.parent;
         }
-    }
-}
-
-impl StoreInner {
-    /// `levels` counts the nodes consulted — the branch (its own pages and its `inherited` map),
-    /// then the trunk if neither holds the page — and `examined` the retained versions compared.
-    fn resolve(
-        &self,
-        id: BranchId,
-        page: u32,
-        levels: &mut u64,
-        examined: &mut u64,
-    ) -> Result<Option<Slot>> {
-        *levels += 1;
-        let st = self.branches.get(&id).ok_or_else(|| gone(id))?;
-        // A branch sees all of its own versions; its ancestors' as of its fork, which `inherited`
-        // froze then.
-        if let Some(owned) = st.current.get(&page) {
-            return Ok(Some(owned.slot));
-        }
-        if let Some(slot) = st.inherited.get(page) {
-            return Ok(Some(slot));
-        }
-        *levels += 1;
-        let at = st.trunk_at;
-        if let Some(slot) = self.trunk.lineage.retained_at(page, at, examined) {
-            return Ok(Some(slot));
-        }
-        let born = self.trunk.written.get(&page).copied().unwrap_or(0);
-        if born > at {
-            // The trunk overwrote this page after the fork and nothing was retained: the ordinary
-            // read path would return the NEW version. Refuse rather than serve it.
-            return Err(LimboError::Corrupt(format!(
-                "branch {} would read trunk page {page} written after its fork; the pre-image was \
-                 not retained",
-                id.0
-            )));
-        }
-        Ok(None)
     }
 }
 
@@ -1187,8 +1401,9 @@ mod tests {
     }
 
     /// The lock accounting, forced to fire and shown not to fire spuriously. One thread alone makes
-    /// only uncontended acquisitions, one per call, and with timing off no hold time. A holder that
-    /// keeps the lock for 500 ms while a second thread asks for it makes that acquisition contended,
+    /// only uncontended acquisitions, one per lock per call, and with timing off no hold time. A
+    /// holder that keeps the trunk's lock for 500 ms while a second thread asks for it makes that
+    /// acquisition contended, counted against the trunk,
     /// with a non-zero wait, and with timing on its own hold is counted before the waiter can read
     /// the counters. The bounds are loose on purpose: the waiter would have to be descheduled for the
     /// whole 500 ms to miss the hold, and nothing here is timed tighter than "more than zero".
@@ -1200,7 +1415,10 @@ mod tests {
             store.stats();
         }
         let quiet = store.stats().work;
-        assert_eq!(quiet.lock_acquisitions - base.lock_acquisitions, 11);
+        // `stats` takes the trunk's lock and every shard's, once each.
+        let per_call = SHARDS as u64 + 1;
+        assert_eq!(quiet.lock_acquisitions - base.lock_acquisitions, 11 * per_call);
+        assert_eq!(quiet.trunk_lock_acquisitions - base.trunk_lock_acquisitions, 11);
         assert_eq!(
             (quiet.lock_contended, quiet.lock_wait_ns, quiet.lock_hold_ns),
             (0, 0, 0),
@@ -1213,7 +1431,7 @@ mod tests {
         let holder = {
             let store = store.clone();
             std::thread::spawn(move || {
-                let held = store.lock();
+                let held = store.trunk();
                 tx.send(()).unwrap();
                 std::thread::sleep(hold);
                 drop(held);
@@ -1223,11 +1441,12 @@ mod tests {
         let forced = store.stats().work;
         holder.join().unwrap();
         assert_eq!(forced.lock_contended, 1, "the waiting acquisition was not counted");
+        assert_eq!(forced.trunk_lock_contended, 1, "it was not counted against the trunk's lock");
         assert!(forced.lock_wait_ns > 0, "a contended acquisition waited 0 ns");
         assert!(
-            forced.lock_hold_ns >= hold.as_nanos() as u64,
+            forced.trunk_lock_hold_ns >= hold.as_nanos() as u64,
             "the holder's {hold:?} was counted as {} ns",
-            forced.lock_hold_ns
+            forced.trunk_lock_hold_ns
         );
     }
 
@@ -1373,6 +1592,164 @@ mod tests {
         }
         assert_eq!(store.stats().live_branches, 0, "seed {seed:#x}: branches leaked");
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
+    }
+
+    /// The striped store under threads, against a model. Four workers each grow their own trees —
+    /// trunk forks, forks of their own branches, writes, reaps — and after every step resolve every
+    /// page of every branch they hold, while a fifth thread rewrites trunk pages. The test imposes
+    /// the discipline the pager does: trunk forks and trunk copy decisions hold the WAL write lock
+    /// (`wal`), a trunk commit publishes under the snapshot lock's write side (`committed`), and a
+    /// reader resolves a page and reads the trunk's committed page under one read-side snapshot.
+    /// Every branch must read, for every page, what it saw at its fork or wrote itself, and at the
+    /// end every branch and every slot must be gone.
+    ///
+    /// The shapes the stripes exist for must occur, or a green run says nothing: pages a branch
+    /// sees through an ancestor in another shard, trunk rewrites a branch reads through the trunk's
+    /// lock, and reaps deferred by a live child.
+    #[test]
+    fn striped_store_under_threads_reads_every_fork_as_it_was() {
+        use std::sync::atomic::{AtomicBool as StdBool, AtomicU64 as StdU64};
+        use std::sync::{Mutex as StdMutex, RwLock};
+        const WORKERS: u64 = 4;
+        const STEPS: usize = 600;
+        let store = Arc::new(BranchStore::new());
+        let wal = Arc::new(StdMutex::new(()));
+        let committed = Arc::new(RwLock::new(
+            (0..PAGES).map(|p| (p, 0u64)).collect::<HashMap<u32, u64>>(),
+        ));
+        let generation = Arc::new(StdU64::new(1));
+        let done = Arc::new(StdBool::new(false));
+        let writer = {
+            let (store, wal, committed, generation, done) = (
+                store.clone(),
+                wal.clone(),
+                committed.clone(),
+                generation.clone(),
+                done.clone(),
+            );
+            std::thread::spawn(move || {
+                let mut rng = Rng(0x5851_F42D_4C95_7F2D);
+                let mut writes = 0u64;
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    let _w = wal.lock().unwrap();
+                    let page = rng.below(u64::from(PAGES)) as u32;
+                    if store.trunk_has_children() {
+                        let before = committed.read().unwrap()[&page];
+                        store.first_write_trunk(page, &image(before));
+                    }
+                    let g = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    committed.write().unwrap().insert(page, g);
+                    writes += 1;
+                    drop(_w);
+                    std::thread::yield_now();
+                }
+                writes
+            })
+        };
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|w| {
+                let (store, wal, committed, generation) =
+                    (store.clone(), wal.clone(), committed.clone(), generation.clone());
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ ((w + 1) * 0xD1B5_4A32_D192_ED03));
+                    let mut nodes: Vec<Node> = Vec::new();
+                    let (mut cross_shard, mut deferred) = (0u64, 0u64);
+                    let mut buf = vec![0u8; PAGE];
+                    for step in 0..STEPS {
+                        let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
+                        match rng.below(10) {
+                            0..=1 if live.len() < 16 => {
+                                let _w = wal.lock().unwrap();
+                                let sees = committed.read().unwrap().clone();
+                                let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+                                nodes.push(Node { id, sees, handle: true, depth: 1, forked: false });
+                            }
+                            2..=3 if !live.is_empty() && live.len() < 16 => {
+                                let p = live[rng.below(live.len() as u64) as usize];
+                                let id = store.fork_branch(nodes[p].id).unwrap();
+                                if shard_of(id) != shard_of(nodes[p].id) {
+                                    cross_shard += 1;
+                                }
+                                let (sees, depth) = (nodes[p].sees.clone(), nodes[p].depth + 1);
+                                nodes[p].forked = true;
+                                nodes.push(Node { id, sees, handle: true, depth, forked: false });
+                            }
+                            4..=6 if !live.is_empty() => {
+                                let v = live[rng.below(live.len() as u64) as usize];
+                                let id = nodes[v].id;
+                                store.begin_write(id).unwrap();
+                                let mut committed_pages: Vec<PageRef> = Vec::new();
+                                for _ in 0..=rng.below(2) {
+                                    let page = rng.below(u64::from(PAGES)) as u32;
+                                    if committed_pages.iter().any(|p| p.get().id == page as usize) {
+                                        continue;
+                                    }
+                                    store
+                                        .first_write_branch(id, page, &image(nodes[v].sees[&page]))
+                                        .unwrap();
+                                    let g = generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    committed_pages.push(page_with(page, g));
+                                    nodes[v].sees.insert(page, g);
+                                }
+                                store.commit_pages(id, &committed_pages).unwrap();
+                                store.end_write(id);
+                            }
+                            7..=8 if !live.is_empty() => {
+                                let v = live[rng.below(live.len() as u64) as usize];
+                                nodes[v].handle = false;
+                                if store.release_handle(nodes[v].id).deferred {
+                                    deferred += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                        for n in nodes.iter().filter(|n| n.handle) {
+                            for page in 0..PAGES {
+                                let snapshot = committed.read().unwrap();
+                                let got = match store.resolve_into(n.id, page, &mut buf).unwrap() {
+                                    Resolved::Filled => {
+                                        u64::from_le_bytes(buf[..8].try_into().unwrap())
+                                    }
+                                    // As the pager: read the committed page under this snapshot,
+                                    // then cache it under the key.
+                                    Resolved::Trunk(key) => {
+                                        store.fill_trunk_page(key, &image(snapshot[&page]));
+                                        snapshot[&page]
+                                    }
+                                };
+                                assert_eq!(
+                                    got, n.sees[&page],
+                                    "worker {w} step {step}: branch {} at depth {} read the wrong \
+                                     page {page}",
+                                    n.id.0, n.depth
+                                );
+                            }
+                        }
+                    }
+                    for n in nodes.iter().filter(|n| n.handle) {
+                        store.release_handle(n.id);
+                    }
+                    (cross_shard, deferred)
+                })
+            })
+            .collect();
+        let (mut cross_shard, mut deferred) = (0, 0);
+        for w in workers {
+            let (c, d) = w.join().unwrap();
+            cross_shard += c;
+            deferred += d;
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let writes = writer.join().unwrap();
+        let stats = store.stats();
+        assert!(
+            cross_shard > 0 && deferred > 0 && writes > 0 && stats.work.resolve_retained_examined > 0,
+            "cross-shard forks {cross_shard}, deferred reaps {deferred}, trunk writes {writes}, \
+             trunk-locked resolutions that examined a version {}",
+            stats.work.resolve_retained_examined
+        );
+        assert_eq!(stats.live_branches, 0, "branches leaked");
+        assert_eq!(stats.arena_slots_in_use, 0, "slots leaked");
     }
 
     /// The shared trunk-page cache against a model. Children fork and are reaped, often down to

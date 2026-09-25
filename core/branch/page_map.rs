@@ -12,10 +12,11 @@
 //! a slot lives, and it keeps every slot any live branch can see (see `store`), which is every slot a
 //! live branch's map can hold.
 //!
-//! `std::sync::Arc` rather than `crate::sync::Arc`: the nodes are plain data that is only ever
-//! touched under the branch store's mutex, so there is no interleaving for a model checker to
-//! explore, and `Arc::make_mut` — which copies a node only while another version shares it — is
-//! what makes an insert into an unshared map free of copies.
+//! `std::sync::Arc` rather than `crate::sync::Arc`: the nodes are plain data. A map is read and
+//! written under its branch's shard lock, and a parent's map shares nodes with its children's,
+//! which live under other shards' locks — but a shared node is never written: `Arc::make_mut`
+//! copies a node while another version shares it (deciding so with an atomic check of the count),
+//! and that is also what makes an insert into an unshared map free of copies.
 
 use std::sync::Arc;
 

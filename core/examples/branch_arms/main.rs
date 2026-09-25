@@ -1518,7 +1518,8 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                  lock_acq={acq} lock_contended={contended} lock_wait_ns={wait_ns} lock_hold_ns={hold_ns} \
                  acq_per_cycle={:.3} contended_frac={:.4} wait_frac={:.4} hold_util={:.4} \
                  busy_fork={} busy_open={} busy_other={} rss_bytes={} resolves={} \
-                 trunk_page_hits={} trunk_page_misses={}",
+                 trunk_page_hits={} trunk_page_misses={} trunk_lock_acq={} trunk_lock_contended={} \
+                 trunk_lock_wait_ns={} trunk_lock_hold_ns={}",
                 t * c,
                 wall.as_nanos(),
                 cycles / wall.as_secs_f64(),
@@ -1537,6 +1538,10 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 d(before.resolve_calls, after.resolve_calls),
                 d(before.trunk_page_hits, after.trunk_page_hits),
                 d(before.trunk_page_misses, after.trunk_page_misses),
+                d(before.trunk_lock_acquisitions, after.trunk_lock_acquisitions),
+                d(before.trunk_lock_contended, after.trunk_lock_contended),
+                d(before.trunk_lock_wait_ns, after.trunk_lock_wait_ns),
+                d(before.trunk_lock_hold_ns, after.trunk_lock_hold_ns),
             );
         }
     }

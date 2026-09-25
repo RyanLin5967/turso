@@ -182,7 +182,9 @@ pub struct BranchStats {
 /// Cumulative counts of the store's per-call work since the database opened. Observation only:
 /// nothing in the mechanism reads them. Each is updated once per call under the lock the call
 /// already holds, from a loop index the call computes anyway, so counting adds no per-element step.
-/// The `lock_*` counters describe that lock itself; only `lock_hold_ns` adds work under it.
+/// The `lock_*` counters describe the store's locks themselves, summed over all of them (the trunk's
+/// and every shard's); `trunk_lock_*` is the trunk's alone. Only the `*_hold_ns` pair adds work under
+/// a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchWork {
     /// Page resolutions against the branch tree (one per branch-pager page read).
@@ -193,15 +195,18 @@ pub struct BranchWork {
     pub resolve_levels: u64,
     /// Retained versions compared against the fork epoch while resolving (`Lineage::retained_at`):
     /// at most one per lineage consulted, the page's born-predecessor. The O(log V) descent that
-    /// finds it is not counted; time is the only instrument for it.
+    /// finds it is not counted; time is the only instrument for it. Since the striped store, the
+    /// trunk's retained versions are consulted only for a page the trunk rewrote after the reader's
+    /// fork, so a version the unlocked check proves irrelevant is no longer compared or counted.
     pub resolve_retained_examined: u64,
     /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
     /// index this counted a position scan's comparisons.)
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
-    /// Acquisitions of the store's lock. Every store entry point takes it (a `stats` call counts
-    /// its own), so this is an integer the workload fixes and load cannot move.
+    /// Acquisitions of the store's locks. Every store entry point takes at least one (a `stats`
+    /// call counts its own: one per lock), so this is an integer the workload fixes and load
+    /// cannot move.
     pub lock_acquisitions: u64,
     /// Acquisitions that found the lock held by another thread and waited for it.
     pub lock_contended: u64,
@@ -217,6 +222,50 @@ pub struct BranchWork {
     /// Resolutions of a trunk page it did not hold, which the pager then read through the WAL or
     /// the database file.
     pub trunk_page_misses: u64,
+    /// The trunk's lock alone: trunk forks, trunk copy decisions, reaps of trunk children, and
+    /// resolutions of pages the trunk rewrote after the reader's fork.
+    pub trunk_lock_acquisitions: u64,
+    pub trunk_lock_contended: u64,
+    pub trunk_lock_wait_ns: u64,
+    pub trunk_lock_hold_ns: u64,
+}
+
+impl BranchWork {
+    /// Add every counter of `other` into this one.
+    pub(crate) fn add(&mut self, other: &BranchWork) {
+        let BranchWork {
+            resolve_calls,
+            resolve_levels,
+            resolve_retained_examined,
+            gc_examined,
+            gc_range_entries,
+            lock_acquisitions,
+            lock_contended,
+            lock_wait_ns,
+            lock_hold_ns,
+            trunk_page_hits,
+            trunk_page_misses,
+            trunk_lock_acquisitions,
+            trunk_lock_contended,
+            trunk_lock_wait_ns,
+            trunk_lock_hold_ns,
+        } = *other;
+        self.resolve_calls += resolve_calls;
+        self.resolve_levels += resolve_levels;
+        self.resolve_retained_examined += resolve_retained_examined;
+        self.gc_examined += gc_examined;
+        self.gc_range_entries += gc_range_entries;
+        self.lock_acquisitions += lock_acquisitions;
+        self.lock_contended += lock_contended;
+        self.lock_wait_ns += lock_wait_ns;
+        self.lock_hold_ns += lock_hold_ns;
+        self.trunk_page_hits += trunk_page_hits;
+        self.trunk_page_misses += trunk_page_misses;
+        self.trunk_lock_acquisitions += trunk_lock_acquisitions;
+        self.trunk_lock_contended += trunk_lock_contended;
+        self.trunk_lock_wait_ns += trunk_lock_wait_ns;
+        self.trunk_lock_hold_ns += trunk_lock_hold_ns;
+    }
 }
 
 impl Branch {

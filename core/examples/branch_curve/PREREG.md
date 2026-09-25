@@ -811,3 +811,116 @@ files before writing it here.
   - `/usr/bin/sample <pid> 3` taken 1 s after `# cell N=1000000 T=4 draw=0 start`;
   - `conc_prof4` on the amendment-7 binary (sha256 `52995fc3…`, built from `323dbfd79`), `F6_prof4` on F6's.
   - Only the profiles are read. No prediction: the user-mode growth has no mechanism named yet.
+
+### Amendment 9 — written 2026-09-25T06:18:25Z: F5, the striped store, pre-registered SOURCE-ONLY and UNBUILT; its runs follow F6's
+
+**Status.** Quiet mode (Ryan, 05:27Z) forbids local compute. On the lead's instruction this commit is source-only:
+- F5 is on branch `inv-conc-F5-noindex`, a child of `4ae0841ee` (F6 plus amendment 8a);
+- it has never been compiled, and no test of it has run;
+- the F6 chain runs first, on branch `inv-conc-noindex`.
+
+A compile fix is an amendment only if it changes what is timed or asserted.
+
+**Why F5.**
+- Amendment 7 measured the store lock's hold at T=1: 1.6–1.8 µs per cycle at 10^3 and 3.7–4.6 at 10^6. At T=16 it was
+  held 11–18% of the time, while throughput was capped by the kernel's read path.
+- F6 removes that read path (amendment 8). F6 also copies each cache hit under the same lock (amendment 8a).
+- Throughput should then rise until the store lock saturates, near 1/hold ≈ 150–270k cycles/s at 10^6 (I). Amendment
+  8 predicts the store lock as F6's wall at 10^6.
+
+**Design** (`core/branch/store.rs` on this branch).
+- **Shards.** 64 shards, `CachePadded<Mutex<Shard>>`. Branch `id` lives in shard `id % 64`, with its state and an arena
+  domain from which its own pages are allocated. A slot's top 7 bits name its domain, and a release into the wrong
+  domain is refused.
+- **Trunk.** The trunk's lineage and retained versions sit behind their own lock.
+- **Lock-free reads.** `written` (the trunk epoch of each page's last write) and F6's trunk-page cache are lock-free
+  radixes: three levels, installed once, never unlinked. A branch reading a page the trunk has not rewritten since its
+  fork takes only its own shard's lock; the cache hit and its counter are taken under that lock.
+- **Two locks, never at once.** A fork takes the parent's (or the trunk's) lock, then the child's shard lock. A reap
+  takes the child's shard lock, then the parent's lock. The windows between are argued in the code
+  (`fork_trunk`, `collect`).
+- **Generation bump.** F6's bump on the trunk's last child is made under the trunk lock.
+- **Counters.** `lock_*` is summed over all locks; `trunk_lock_*` is the trunk's lock alone; `stats` takes each lock
+  once.
+
+**Prior art, no novelty claimed.**
+- Lock striping: the segments of Java's `ConcurrentHashMap` (JSR 166) [RECALLED].
+- The read side of RCU for a structure that is only ever installed, never unlinked (McKenney) [RECALLED].
+- A per-stripe allocator domain, like per-CPU slab magazines (Bonwick 1994/2001) and per-thread arenas
+  (jemalloc, tcmalloc) [RECALLED].
+
+**Lock acquisitions per `conc` cycle, READ FROM THE CODE on this branch.**
+- The trunk lock is taken exactly twice per cycle: `fork_trunk` (the epoch, the children insert) and the reap's
+  `collect` (`child_gone` on the trunk). No other op in this arm takes it. The trunk never writes here, so no copy
+  decision runs, and resolutions of trunk pages stay on the lock-free path.
+- Every other store call takes exactly its branch's shard lock:
+  - `open` and `close`;
+  - `begin_write`, `end_write` and `holds_writer`;
+  - `first_write_branch` and `commit_pages`;
+  - every resolution: own pages, and trunk pages through the cache.
+
+  Trunk children have no `inherited` pages, so no cross-shard copy occurs in this arm.
+- So F5's `lock_acquisitions` per cycle = F6's + 2 (fork and reap each take one lock more), and `trunk_lock` = 2.
+
+**Which ops scale, and which residuals will not.**
+- **Scale by construction:** everything that touches one branch. In this arm that is every resolution, open, close,
+  write and commit. Threads share shards (64 stripes, ~20 acquisitions per cycle per thread) but never a branch.
+- **Serialised by construction in F5:**
+  - (i) Every trunk fork. It holds the trunk's WAL write lock in Turso (`Connection::fork_trunk`, where a concurrent
+    forker gets Busy and the harness retries after `yield_now`), and it takes the trunk lock.
+  - (ii) Every reap of a trunk child. It takes the trunk lock for `child_gone`: a removal and two neighbour probes on a
+    `BTreeMap` of N fork epochs, plus two index range queries.
+- **Residuals read from Turso code that neither F5 nor F6 touches.** These are candidates for amendment 8a's
+  unattributed user-CPU growth at T=2–8, unverified until `conc_prof4`/`F6_prof4`:
+  - the WAL read path of every branch statement and connect (`WalFile::begin_read_tx`/`end_read_tx`). It takes a
+    parking_lot read of `RwLock<WalFileShared>`, clones and read-locks it again for `VacuumLockGuard`, and acquires
+    `read_locks[0]` shared. These are atomic read-modify-writes on a handful of cache lines every thread shares;
+  - shared reference counts: the trunk's `Arc<Schema>` is cloned by every branch open and released by every connection
+    drop, all trunk children sharing one; `Arc<Database>` likewise;
+  - the buffer pool's atomic slot bitmap (`buffer_pool.get_page` on every read);
+  - `Database::schema`'s mutex in every trunk fork (`clone_schema`).
+
+**Predictions** (I; judged against `F6_main`/`F6_hold`, amendment 7's arguments unchanged):
+- **P9.1 (integers).** `trunk_lock_acquisitions` per cycle = 2.000 ± 0.001 at every N, T and draw; the `stats` calls
+  add ≤ 2/(T·C). `lock_acquisitions` per cycle = `F6_main`'s in the same cell + 2.00 ± 0.02.
+- **P9.2.** The shard contended fraction, (lock_contended − trunk_lock_contended) / (lock_acquisitions −
+  trunk_lock_acquisitions), is 0 at T=1 and ≤ 0.02 in every cell.
+- **P9.3.** W (all locks) ≤ 0.05 at T=16 at every N. The trunk lock's U_trunk = trunk_lock_hold_ns / wall ≤ 0.3 at
+  every N (`F5_hold`). Its hold is a fork's insert plus a reap's `child_gone` on an N-entry map: 0.3–1.5 µs per cycle at
+  10^6.
+- **P9.4.** X(1) within ±10% of `F6_main`'s at every N.
+- **P9.5.**
+  - If `F6_main` shows the store lock as the wall at 10^6 (E < 0.5, W ≥ 0.25, U ≥ 0.6): `F5_main`'s X(16) there is ≥ 1.5×
+    `F6_main`'s.
+  - If it does not: `F5_main`'s X(16) is within ±20% of `F6_main`'s at every N, a wall removed that did not bind.
+- **P9.6 (the residual).** E(16) < 0.7 at N=10^6 in both draws: F5+F6 does not reach "scales" at T=16. In `F5_prof`, frames
+  under `BranchStore` are < 10% of worker samples, and the largest waits lie outside the branch store, among the four
+  residuals above.
+- **P9.7.** `busy_fork` per cycle at T=16 ≥ `F6_main`'s. Fork's p99 at T=16 ≥ 5× its p99 at T=1 at every N (forks
+  serialise on the WAL write lock while every other op gets cheaper).
+- **Correctness.** No NOT A RESULT; after every cell, arena = live = N; every reap frees exactly 1 page.
+
+**Tests in this commit (unrun).**
+- `store::tests::striped_store_under_threads_reads_every_fork_as_it_was`:
+  - four workers grow trees (trunk forks, forks of their own branches, writes, reaps) and resolve every page after every
+    step;
+  - a fifth thread rewrites trunk pages, under the WAL-lock and snapshot discipline the pager imposes;
+  - a miss is filled into the cache under the reader's snapshot;
+  - it asserts that cross-shard forks, deferred reaps, trunk writes and trunk-locked resolutions all occurred.
+- `lock_accounting_counts_a_forced_wait_and_nothing_else`: 65 acquisitions per `stats`, and the contended hold counted
+  against the trunk's class.
+- Every model, cache and mechanism test of F1–F6.
+
+**Mutants** (`turso_conc/mutate_F5.sh`; anchors checked unique against this commit's `store.rs`):
+- F5M1: the trunk never consulted;
+- F5M2: a trunk child never detached;
+- F5M3: a child filed in its parent's shard;
+- F5M4: a foreign slot read from the reader's own shard;
+- F5M5: the trunk's write epoch never published;
+- F6M1 and F6M2 again, on the cache code as it moved.
+
+Each must fail a `branch::` test, or no F5 run proceeds.
+
+**Runs, QUEUED-FOR-FANS, after F6's chain.** The worktree is switched to this branch. `tests_F5`, `mutate_F5`,
+`build_F5`, `F5_smoke`, `F5_main`, `F5_hold`, `F5_prof`, `F5_prof4`, with amendment 7's arguments unchanged. Before files:
+`F6_*`.
