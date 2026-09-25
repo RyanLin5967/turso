@@ -174,6 +174,10 @@ pub(crate) struct BranchStore {
     /// same lock. A 1-to-0 transition (a reap) racing the read only makes the writer take the lock
     /// and find nothing to do.
     trunk_children: AtomicUsize,
+    /// Test-only: runs while a first fork builds its view outside the mutex, so a test can make
+    /// another thread act inside that window deterministically.
+    #[cfg(test)]
+    fork_build_pause: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 struct StoreInner {
@@ -508,6 +512,8 @@ impl BranchStore {
                 hold_max: HoldMax::default(),
             }),
             trunk_children: AtomicUsize::new(0),
+            #[cfg(test)]
+            fork_build_pause: Mutex::new(None),
         }
     }
 
@@ -601,6 +607,10 @@ impl BranchStore {
                     id: parent,
                     armed: true,
                 };
+                #[cfg(test)]
+                if let Some(pause) = self.fork_build_pause.lock().as_ref() {
+                    pause();
+                }
                 for (&page, owned) in current.iter() {
                     view.insert(page, owned.slot);
                 }
@@ -669,23 +679,28 @@ impl BranchStore {
 
     /// The `Branch` handle has gone.
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
-        let mut reclaim = Reclaim::default();
-        let deferred = {
-            let mut inner = self.lock();
-            let Some(st) = inner.branches.get_mut(&id) else {
-                return Reaped {
-                    freed_pages: 0,
-                    deferred: false,
-                };
+        let Some((reclaim, deferred)) = self.unlink_handle(id) else {
+            return Reaped {
+                freed_pages: 0,
+                deferred: false,
             };
-            st.handle = false;
-            self.collect(&mut inner, id, &mut reclaim);
-            inner.branches.contains_key(&id)
         };
         Reaped {
             freed_pages: self.reclaim(reclaim),
             deferred,
         }
+    }
+
+    /// The first half of `release_handle`, in one hold: drop the handle and unlink whatever that
+    /// made unreachable. Returns what is left to free, and whether the branch itself was kept.
+    fn unlink_handle(&self, id: BranchId) -> Option<(Reclaim, bool)> {
+        let mut reclaim = Reclaim::default();
+        let mut inner = self.lock();
+        let st = inner.branches.get_mut(&id)?;
+        st.handle = false;
+        self.collect(&mut inner, id, &mut reclaim);
+        let deferred = inner.branches.contains_key(&id);
+        Some((reclaim, deferred))
     }
 
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
@@ -1662,6 +1677,72 @@ mod tests {
         for id in [c1, c3, p] {
             store.release_handle(id);
         }
+        assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
+    }
+
+    /// A reap's deferred garbage range can gain a version a NEW child needs before the reap frees
+    /// it: the newest child f is unlinked, a child g is forked, and the trunk rewrites a page whose
+    /// current version was born inside f's range, retaining it for g. The reclamation must keep that
+    /// version (no live child may lose a version it can see), and free the rest.
+    #[test]
+    fn a_deferred_reclamation_keeps_a_version_a_later_child_needs() {
+        let store = BranchStore::new();
+        let lo = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        // epoch 1: the trunk rewrites page 0 (generation 0 -> 1), retaining [0, 1) for lo.
+        store.first_write_trunk(0, &image(0));
+        let f = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        let (reclaim, deferred) = store.unlink_handle(f).expect("f is live");
+        assert!(!deferred);
+        // Between the unlink and the reclamation: fork g, and rewrite page 0 (generation 1 -> 2),
+        // which retains [1, 3) — born inside f's range (lo, f] = (0, 1] — for g.
+        let g = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        store.first_write_trunk(0, &image(1));
+        let before = store.stats().arena_slots_in_use;
+        store.reclaim(reclaim);
+        assert_eq!(store.stats().arena_slots_in_use, before, "the reclamation freed a live version");
+        assert_eq!(read_gen(&store, g, 0), Some(1), "g reads page 0 as of its fork");
+        assert_eq!(read_gen(&store, lo, 0), Some(0), "lo reads page 0 as of its fork");
+        for id in [lo, g] {
+            store.release_handle(id);
+        }
+        assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
+    }
+
+    /// A writer that commits while a first fork is building its view outside the mutex: the writer
+    /// must wait for the view to be installed (the `forking` flag), so that the commit sees the new
+    /// child and retains the versions the child's view names. The test pauses the build and lets a
+    /// writer thread try to commit inside the pause.
+    #[test]
+    fn a_commit_cannot_land_inside_a_first_fork_view_build() {
+        const N: u32 = 300;
+        let store = Arc::new(BranchStore::new());
+        let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        store.begin_write(id).unwrap();
+        commit_all(&store, id, N, 1);
+        store.end_write(id);
+        let writer: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        {
+            let (s, w) = (store.clone(), writer.clone());
+            *store.fork_build_pause.lock() = Some(Box::new(move || {
+                let s = s.clone();
+                *w.lock() = Some(std::thread::spawn(move || {
+                    s.begin_write(id).unwrap();
+                    commit_all(&s, id, N, 2);
+                    s.end_write(id);
+                }));
+                // Long enough for an unobstructed writer to finish inside the build window.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }));
+        }
+        let child = store.fork_branch(id).unwrap();
+        *store.fork_build_pause.lock() = None;
+        writer.lock().take().unwrap().join().unwrap();
+        for p in 0..N {
+            assert_eq!(read_gen(&store, child, p), Some(1), "the child's page {p}");
+            assert_eq!(read_gen(&store, id, p), Some(2), "the parent's page {p}");
+        }
+        store.release_handle(child);
+        store.release_handle(id);
         assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
     }
 }
