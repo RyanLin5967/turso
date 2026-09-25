@@ -161,6 +161,9 @@ pub struct Reaped {
     /// Arena pages returned to the free list by this call: the branch's own, plus any version an
     /// ancestor was retaining only for it.
     pub freed_pages: usize,
+    /// Trunk chunk versions released by this call. A store that keeps the trunk's versions as
+    /// whole pages counts them in `freed_pages` and reports 0 here.
+    pub freed_chunks: usize,
     /// True when the branch could not be freed yet (an open connection or a live child still reads
     /// through it); its pages are freed when the last of those goes away.
     pub deferred: bool,
@@ -175,6 +178,17 @@ pub struct BranchStats {
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
+    /// Superseded versions the trunk keeps for its live children: whole pages in a page-granular
+    /// store, chunks in a sub-page one.
+    pub trunk_versions: usize,
+    /// The bytes of page data those versions hold.
+    pub trunk_version_bytes: usize,
+    /// Sub-page store: trunk pages whose latest write's whole pre-image is kept (0 otherwise).
+    pub trunk_pending_pages: usize,
+    /// Sub-page store: chunk slots in use (0 otherwise).
+    pub chunk_slots_in_use: usize,
+    /// Sub-page store: bytes per chunk (0 otherwise).
+    pub chunk_size: usize,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -199,6 +213,13 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
+    /// Sub-page store: chunks a trunk write was found to have changed, counted at its page's next
+    /// trunk write (0 otherwise).
+    pub trunk_chunks_changed: u64,
+    /// Sub-page store: those of them kept as chunk versions, because a live child can see them.
+    pub trunk_chunks_retained: u64,
+    /// Sub-page store: chunks laid over a pending image by resolutions.
+    pub resolve_chunks_overlaid: u64,
 }
 
 impl Branch {

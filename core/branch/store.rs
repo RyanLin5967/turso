@@ -125,6 +125,8 @@ struct Lineage {
     by_born: BTreeSet<(u64, u32, u64)>,
     /// The same versions as `(died, page, born)`, for the reclamation range query by death.
     by_died: BTreeSet<(u64, u32, u64)>,
+    /// How many versions `retained` holds. Observation only.
+    versions: usize,
 }
 
 /// No page has this number (SQLite's largest is `u32::MAX - 1`; [`Lineage::retain`] refuses it), so
@@ -196,6 +198,7 @@ impl Lineage {
         versions.insert(v.born, v);
         self.by_born.insert((v.born, page, v.died));
         self.by_died.insert((v.died, page, v.born));
+        self.versions += 1;
     }
 
     /// The retained version of `page` visible to a child forked at `f`: the born-predecessor of
@@ -224,6 +227,7 @@ impl Lineage {
             let indexed = self.by_born.remove(&(born, page, died))
                 && self.by_died.remove(&(died, page, born));
             crate::turso_assert!(indexed, "a released version was missing from an index");
+            self.versions -= 1;
             arena.release(v.slot);
         }
         dead.len()
@@ -439,6 +443,7 @@ impl BranchStore {
         let Some(st) = inner.branches.get_mut(&id) else {
             return Reaped {
                 freed_pages: 0,
+                freed_chunks: 0,
                 deferred: false,
             };
         };
@@ -446,6 +451,7 @@ impl BranchStore {
         let freed_pages = self.collect(&mut inner, id);
         Reaped {
             freed_pages,
+            freed_chunks: 0,
             deferred: inner.branches.contains_key(&id),
         }
     }
@@ -624,10 +630,16 @@ impl BranchStore {
 
     pub(crate) fn stats(&self) -> BranchStats {
         let inner = self.inner.lock();
+        let versions = inner.trunk.lineage.versions;
         BranchStats {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
+            trunk_versions: versions,
+            trunk_version_bytes: versions * inner.arena.as_ref().map_or(0, |a| a.page_size()),
+            trunk_pending_pages: 0,
+            chunk_slots_in_use: 0,
+            chunk_size: 0,
             work: inner.work,
         }
     }
