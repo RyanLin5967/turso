@@ -259,3 +259,70 @@ Decision rule (a step = trunk_write p50 at x=10^4 ≥ 5× its value at x=10^2):
 - e1 flat and e2 flat → needs branches AND the auto-checkpoint: a branching × checkpoint interaction; e3 names frames.
 - e1 flat and e2 steps → branching, not the checkpoint; e3 names frames.
 Whatever e3 shows is labelled a candidate unless e1/e2 isolate it.
+
+### Amendment 3 — 2026-09-25T00:21Z: FIFO victims and a `churn_spread` arm, run on the UNFIXED store first
+
+Recorded by lane `turso_sota` (artie-research `frontier/round10/turso_sota/`), which builds the published fixes for
+three walls this curve found and re-measures. Amendments 1-2 are unchanged; this adds runs.
+
+**Why.** Uniform-TTL lease expiry reaps the OLDEST branch. No banked arm does: a1/a2 reap their samples in fork
+order on top of the live set, and c1/c2 reap a uniformly random one. The FIFO cost is predicted from source and a model
+only (`assumption_audit.md` item 3, `cand_turso-fifo-child-gone.md` §1c, `cand_turso-hot-page-chain.md` §2).
+
+**Harness** (`795e2e42b`, no engine change): `--victim oldest|random` for the churn arms (default random; live branches
+move to a `VecDeque`, and `swap_remove_back` is `Vec::swap_remove`, so random-victim runs draw and remove as before);
+arm `churn_spread` = `churn` plus one `spread_row` trunk write per fork and per cycle, a `read_inh` of the row 10,000
+away from the branch's own every 10th cycle (checked against the harness's model), and arena conservation
+(`N + retained − freed`) asserted at every window. **Binary:** built from `795e2e42b` (store = `751f85d56`'s;
+`turso_sota/raw/build_H.txt`), copied out of the worktree as sha256 `350a1df1…79d6` so the tree can take the fixes
+while these run; each raw header records the path and `built_from`.
+
+**Runs** (`turso_sota/run.sh`, lockrun `turso-sota`, timeout 3600, raw to `turso_sota/raw/`, committed before read):
+
+| run | arguments |
+|---|---|
+| c2f_base | `--arm churn_hot --victim oldest --checkpoints 100,1000,10000,100000,1000000 --cycles 1000000 --windows 10` |
+| c3_base | `--arm churn_spread --checkpoints 100,1000,10000,100000,1000000 --cycles 100000 --windows 10` |
+| c3f_base | `--arm churn_spread --victim oldest --checkpoints 100,1000,10000,100000,1000000 --cycles 100000 --windows 10` |
+
+c2f runs 10^6 cycles so that each checkpoint's FIFO turns its whole population over: with fewer cycles than N the
+victims are only the previous checkpoint's survivors and the position scan reads about min(cycles, N)/2, not N/2.
+
+**Counter predictions** come from `turso_sota/model.py` (a transcription of this store's trunk lineage and of this
+harness, RNG included), committed with its outputs (`turso_sota/model_out/`) at artie-research `d37719e`, before
+these runs. Its calibration (`model_out/calib.txt`) reproduces printed engine counters exactly where the page mapping
+is not involved — c2 reap `gc_examined` 50.47 / 502.07 / 4999.44 / 50135.47, a1 reap 150.50 … 100050.50, a2_r2 reap
+`gc_range` 248.64 and `gc_examined` 87.40 at 10^5, a2 `read_inh` 0.51 / 2.12 / 10.38 / 94.06 — and `read_hot` within
+2%. Its leaves hold 37 rows (541 leaves); the engine's own leaf count is not read, so spread-arm counters carry that.
+- **c2f_base.** reap `gc_examined_per_op` = (N+1)/2 ± 2% (model 50.50 … 500000.50), `gc_range_per_op` 1.00;
+  `read_hot` `ret_examined` = model ± 3% (50.47 … 498672.97); every reap frees 2 pages, arena = 2N at every window.
+  **Wall:** reap and `read_hot` p50 slope in [0.4, 1.0], local 10^5→10^6 in [0.7, 1.05] (c2, random victim, measured
+  +0.621 / +0.966 and +0.322 / +0.866: same counters, so the same slopes within the inconclusive band).
+- **c3_base** (random). reap `gc_range_per_op` = model ± 20% (5.30, 6.57, 5.28, 2.03, 1.21), `gc_examined_per_op`
+  ± 30% (1.00, 5.50, 22.69, 4.84, 1.93), versions freed per reap ± 15% (0.996, 0.947, 0.517, 0.061, 0.025);
+  `read_inh` `ret_examined` ± 15% (0.95, 9.04, 58.70, 241.34, 1225.36); `first_write` ± 15% (0.95, 11.90, 95.73,
+  371.52, 2212.05). No wall: reap, `read_inh`, `first_write` p50 |slope| < 0.25 (a2's 955-version `read_inh` scan
+  cost ~1.5 µs at 10^6). `trunk_write`: the engine's auto-checkpoint step of e1 (≈ 375–400 µs from 10^3 on).
+- **c3f_base** (oldest). reap `gc_range_per_op` 101 ± 3% at 10^2 and the leaf count, 541 ± 3%, at 10^3…10^6: the
+  born range (−∞, f] holds one version per leaf rewritten since the victim forked; versions freed per reap 1.00 ± 3%;
+  `gc_examined_per_op` ± 30% (1.00, 1.00, 9.32, 92.96, 92.96); `read_inh` ± 15% (0.18, 1.65, 10.02, 93.35, 935.17).
+  **Step, not slope:** reap p50 at every N ≥ 10^3 at least 2× c3_base's reap p50 at the same N, and |slope| over
+  10^3…10^6 < 0.25, because the term is bounded by the trunk's leaf count, not by N.
+
+A counter outside its interval is a break of the model, reported as such, and the model is not refitted to it.
+
+### Amendment 3a — 2026-09-25T00:21Z: F3 (retain by reference to the WAL frame) is NOT built in this arena
+
+Recorded before any fixed run, so the fixed runs are read against F1+F2 only. The published fix (Retro's
+write-ahead-snapshot invariant, ATC 2014; Thresher/SNAP) moves a pre-image's capture off the commit path because
+there it is synchronous I/O. Here it is not: `copy_on_write_decision` hands `first_write_trunk` the page already
+resident in the trunk's page cache, and the arena is memory, so the capture is one slot allocation and one 4 KiB
+memcpy under the store mutex, with no fsync (the durable build's two per retaining trunk commit do not exist in
+this tree). Deferring it to the checkpoint would replace that memcpy with a later read of the WAL frame or database
+page, and add a copy-out phase to `Pager::checkpoint_inner` and before `try_restart_log_before_write`, plus a branch
+read validated against a concurrent backfill. It would also break `reaping_the_last_child_frees_what_the_trunk_
+retained_for_it` and `a_retained_version_lives_exactly_as_long_as_a_child_that_can_see_it`, which assert that a
+retention occupies an arena slot at the trunk write; this lane may not edit test assertions. Measured cost it would
+remove: a1 `trunk_write` p50 is flat, 10.54–12.58 µs over 10^2..10^6 (`turso_curve/raw/a1_hot.txt`), against 10.71 µs
+for the same kind of commit with no branch at all (e1, x=10^2): there is no growing term. F3 belongs to the durable
+build (`ec168128b`), where the barrier pays an arena fsync and a log fsync per retaining trunk commit.
