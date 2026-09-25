@@ -1,0 +1,950 @@
+//! Open branch sessions: N branch connections held open at once. Specification:
+//! artie-research frontier/round11/r11-sessions/PREREG.md (this is its implementation).
+//!
+//!   cargo run -p turso_core --release --example branch_sessions -- --mode <mode> [options]
+//!
+//! Modes (each session's first action after `connect`, and the state it is then left in):
+//!
+//!   open   nothing: connected, never used
+//!   read   one point SELECT of the session's row, autocommit
+//!   write  one UPDATE of the session's row, autocommit
+//!   intx   BEGIN, then the point SELECT; the transaction is left open (idle in transaction)
+//!
+//! `--analyze` runs ANALYZE on the trunk before the first fork; `--tables K` adds K-1 small tables with
+//! one index each (schema size). `--active K` runs K cycles of the active ops at every checkpoint, with
+//! every held session still open. `--timing` adds Instant percentiles; without it the run prints only
+//! integer counters and may run outside the fleet lock.
+//!
+//! The space instrument is a counting global allocator: live bytes and live allocations, exact integers.
+//! A probe inside the engine's connect path (`turso_core::branch::set_session_probe`) marks each step
+//! boundary, so a connection's bytes are split by the step that allocated them. Two known blind spots:
+//! the buffer pool's first 768 page buffers come from an mmap'd arena the allocator cannot see, and a
+//! page buffer freed into turso's thread-local buffer cache is not a deallocation (so a buffer can be
+//! allocated in one step and handed to a page in a later one). Totals over an interval are exact once
+//! the arena is exhausted.
+//!
+//! Every read is checked against a model the harness keeps itself (never against the engine); a
+//! mismatch prints `NOT A RESULT` and exits 1.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use turso_core::branch::{set_session_probe, Branch, SessionFootprint};
+use turso_core::{
+    Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO,
+};
+
+// ---------------------------------------------------------------------------------------------
+// The instrument: a counting allocator.
+
+struct Counting;
+
+static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
+static LIVE_ALLOCS: AtomicI64 = AtomicI64::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
+            LIVE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
+            LIVE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        LIVE_BYTES.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+        LIVE_ALLOCS.fetch_sub(1, Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+#[derive(Clone, Copy, Default, Debug)]
+struct Mem {
+    bytes: i64,
+    allocs: i64,
+}
+
+fn mem() -> Mem {
+    Mem {
+        bytes: LIVE_BYTES.load(Ordering::Relaxed),
+        allocs: LIVE_ALLOCS.load(Ordering::Relaxed),
+    }
+}
+
+/// The engine's connect-path labels, in the order the engine calls them. The probe writes into a
+/// fixed array so that recording a sample allocates nothing.
+const LABELS: [&str; 8] = [
+    "begin",
+    "store_open",
+    "init_pager",
+    "clear_trunk_page1",
+    "bind_read_page1",
+    "connection",
+    "syms",
+    "analyze_stats",
+];
+const NL: usize = LABELS.len();
+static PROBE_BYTES: [AtomicI64; NL] = [const { AtomicI64::new(0) }; NL];
+static PROBE_ALLOCS: [AtomicI64; NL] = [const { AtomicI64::new(0) }; NL];
+static PROBE_SEEN: AtomicUsize = AtomicUsize::new(0);
+static PROBE_UNKNOWN: AtomicUsize = AtomicUsize::new(0);
+
+fn probe(label: &'static str) {
+    let m = mem();
+    match LABELS.iter().position(|l| *l == label) {
+        Some(i) => {
+            PROBE_BYTES[i].store(m.bytes, Ordering::Relaxed);
+            PROBE_ALLOCS[i].store(m.allocs, Ordering::Relaxed);
+            PROBE_SEEN.fetch_or(1 << i, Ordering::Relaxed);
+        }
+        None => {
+            PROBE_UNKNOWN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Arguments.
+
+const TRUNK_ROWS: i64 = 20_000;
+const VALUE_LEN: usize = 100;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    Open,
+    Read,
+    Write,
+    Intx,
+}
+
+struct Args {
+    mode: Mode,
+    checkpoints: Vec<usize>,
+    analyze: bool,
+    tables: usize,
+    active: usize,
+    timing: bool,
+    seed: u64,
+    swap_limit_mib: u64,
+    level_floor: u32,
+}
+
+fn die(msg: &str) -> ! {
+    eprintln!("branch_sessions: {msg}");
+    std::process::exit(2)
+}
+
+fn not_a_result(msg: &str) -> ! {
+    println!("NOT A RESULT: {msg}");
+    std::process::exit(1)
+}
+
+fn parse_args() -> Args {
+    let mut mode = None;
+    let mut args = Args {
+        mode: Mode::Open,
+        checkpoints: vec![1_000, 10_000, 100_000, 1_000_000],
+        analyze: false,
+        tables: 1,
+        active: 0,
+        timing: false,
+        seed: 0x9E37_79B9_7F4A_7C15,
+        swap_limit_mib: 6 * 1024,
+        level_floor: 12,
+    };
+    let mut it = std::env::args().skip(1);
+    while let Some(flag) = it.next() {
+        let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
+        match flag.as_str() {
+            "--mode" => {
+                mode = Some(match val().as_str() {
+                    "open" => Mode::Open,
+                    "read" => Mode::Read,
+                    "write" => Mode::Write,
+                    "intx" => Mode::Intx,
+                    other => die(&format!("unknown mode {other}")),
+                })
+            }
+            "--checkpoints" => {
+                args.checkpoints = val()
+                    .split(',')
+                    .map(|x| x.parse().unwrap_or_else(|_| die("bad --checkpoints")))
+                    .collect()
+            }
+            "--analyze" => args.analyze = true,
+            "--tables" => args.tables = val().parse().unwrap_or_else(|_| die("bad --tables")),
+            "--active" => args.active = val().parse().unwrap_or_else(|_| die("bad --active")),
+            "--timing" => args.timing = true,
+            "--seed" => args.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
+            "--swap-limit-mib" => {
+                args.swap_limit_mib = val().parse().unwrap_or_else(|_| die("bad --swap-limit-mib"))
+            }
+            "--level-floor" => {
+                args.level_floor = val().parse().unwrap_or_else(|_| die("bad --level-floor"))
+            }
+            other => die(&format!("unknown argument {other}")),
+        }
+    }
+    args.mode = mode.unwrap_or_else(|| die("--mode is required"));
+    if args.checkpoints.is_empty() || args.checkpoints.windows(2).any(|w| w[0] >= w[1]) {
+        die("--checkpoints must be strictly increasing");
+    }
+    if args.tables == 0 {
+        die("--tables must be at least 1");
+    }
+    if args.tables > 1 && !args.analyze {
+        die("--tables applies with --analyze");
+    }
+    args
+}
+
+// ---------------------------------------------------------------------------------------------
+// The box: swap, memory level, fds, RSS.
+
+fn swap_used_mib() -> u64 {
+    let mut xsu: libc::xsw_usage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::xsw_usage>();
+    let name = c"vm.swapusage";
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut xsu as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        not_a_result("sysctl vm.swapusage failed: the memory guard cannot read swap");
+    }
+    xsu.xsu_used / (1024 * 1024)
+}
+
+fn memory_level() -> u32 {
+    let mut level: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let name = c"kern.memorystatus_level";
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut level as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        not_a_result("sysctl kern.memorystatus_level failed: the memory guard cannot read the level");
+    }
+    level as u32
+}
+
+fn open_fds() -> usize {
+    std::fs::read_dir("/dev/fd").map_or(0, |d| d.count())
+}
+
+fn rss_bytes() -> u64 {
+    memory_stats::memory_stats().map_or(0, |m| m.physical_mem as u64)
+}
+
+fn clock_tick_ns() -> f64 {
+    let mut min = u128::MAX;
+    for _ in 0..10_000 {
+        let a = Instant::now();
+        let mut b = Instant::now();
+        while b == a {
+            b = Instant::now();
+        }
+        min = min.min((b - a).as_nanos());
+    }
+    min as f64
+}
+
+// ---------------------------------------------------------------------------------------------
+// Workload and model.
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+fn trunk_value(id: i64) -> String {
+    format!("{:0>width$}", id, width = VALUE_LEN)
+}
+
+fn branch_value(id: i64) -> String {
+    format!("b{:0>width$}", id, width = VALUE_LEN - 1)
+}
+
+fn trunk_gen_value(generation: u64) -> String {
+    format!("t{:0>width$}", generation, width = VALUE_LEN - 1)
+}
+
+fn row_for(n: usize) -> i64 {
+    ((n as u64).wrapping_mul(2_654_435_761) % TRUNK_ROWS as u64) as i64 + 1
+}
+
+fn spread_row(g: u64) -> i64 {
+    ((g * 37) % TRUNK_ROWS as u64) as i64 + 1
+}
+
+fn read_v(conn: &Arc<Connection>, id: i64) -> String {
+    let mut stmt = conn
+        .prepare(format!("SELECT v FROM t WHERE id = {id}"))
+        .unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    match rows.as_slice() {
+        [row] => match &row[0] {
+            Value::Text(t) => t.as_str().to_string(),
+            other => not_a_result(&format!("row {id}: expected text, got {other:?}")),
+        },
+        _ => not_a_result(&format!("row {id}: {} rows", rows.len())),
+    }
+}
+
+/// The trunk's write history, kept by the harness.
+#[derive(Default)]
+struct TrunkModel {
+    writes: u64,
+    history: HashMap<i64, Vec<(u64, u64)>>,
+}
+
+impl TrunkModel {
+    fn record(&mut self, row: i64) -> u64 {
+        let g = self.writes;
+        self.writes += 1;
+        self.history.entry(row).or_default().push((g, g));
+        g
+    }
+    fn value_at(&self, row: i64, writes_at_fork: u64) -> String {
+        let Some(h) = self.history.get(&row) else {
+            return trunk_value(row);
+        };
+        let n = h.partition_point(|&(seq, _)| seq < writes_at_fork);
+        if n == 0 {
+            trunk_value(row)
+        } else {
+            trunk_gen_value(h[n - 1].1)
+        }
+    }
+}
+
+struct Session {
+    branch: Branch,
+    conn: Arc<Connection>,
+    row: i64,
+    wrote: bool,
+    trunk_writes_at_fork: u64,
+}
+
+impl Session {
+    fn expect(&self, model: &TrunkModel) -> String {
+        if self.wrote {
+            branch_value(self.row)
+        } else {
+            model.value_at(self.row, self.trunk_writes_at_fork)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-interval accounting.
+
+/// Sum, min and max of one integer per session.
+#[derive(Clone, Copy)]
+struct Acc {
+    n: u64,
+    sum: i64,
+    min: i64,
+    max: i64,
+}
+
+impl Default for Acc {
+    fn default() -> Self {
+        Acc {
+            n: 0,
+            sum: 0,
+            min: i64::MAX,
+            max: i64::MIN,
+        }
+    }
+}
+
+impl Acc {
+    fn add(&mut self, v: i64) {
+        self.n += 1;
+        self.sum += v;
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+    }
+    fn mean(&self) -> f64 {
+        if self.n == 0 {
+            0.0
+        } else {
+            self.sum as f64 / self.n as f64
+        }
+    }
+}
+
+/// The phases a session's growth is split into: fork, each connect-path step, the tail of connect
+/// after the last probe, and the mode's first action.
+const PHASES: [&str; 11] = [
+    "fork",
+    "connect.store_open",
+    "connect.init_pager",
+    "connect.clear_trunk_page1",
+    "connect.bind_read_page1",
+    "connect.connection",
+    "connect.syms",
+    "connect.analyze_stats",
+    "connect.return",
+    "connect.total",
+    "action",
+];
+
+#[derive(Default)]
+struct Interval {
+    bytes: [Acc; PHASES.len()],
+    allocs: [Acc; PHASES.len()],
+    times: [Vec<Duration>; 3],
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let rank = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
+    sorted[rank]
+}
+
+fn pct(ds: &[Duration]) -> (f64, f64, f64, f64) {
+    let mut us: Vec<f64> = ds.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+    us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (
+        percentile(&us, 50.0),
+        percentile(&us, 90.0),
+        percentile(&us, 99.0),
+        us[us.len() - 1],
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+
+struct Bench {
+    args: Args,
+    db: Arc<Database>,
+    wal_path: PathBuf,
+    trunk: Arc<Connection>,
+    model: TrunkModel,
+    rng: Rng,
+}
+
+impl Bench {
+    fn resolves(&self) -> u64 {
+        self.db.branch_stats().work.resolve_calls
+    }
+
+    fn wal_bytes(&self) -> u64 {
+        std::fs::metadata(&self.wal_path).map_or(0, |m| m.len())
+    }
+
+    fn trunk_commit(&mut self) {
+        let row = spread_row(self.model.writes);
+        let g = self.model.record(row);
+        self.trunk
+            .execute(format!(
+                "UPDATE t SET v = '{}' WHERE id = {row}",
+                trunk_gen_value(g)
+            ))
+            .unwrap();
+    }
+
+    fn checkpoint_passive(&self) -> (i64, i64, i64) {
+        let rows = self
+            .trunk
+            .prepare("PRAGMA wal_checkpoint(PASSIVE)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let r = &rows[0];
+        (
+            r[0].as_int().unwrap(),
+            r[1].as_int().unwrap(),
+            r[2].as_int().unwrap(),
+        )
+    }
+
+    /// Open one session: fork, connect (probed), and the mode's first action.
+    fn open_session(&mut self, i: usize, iv: &mut Interval) -> Session {
+        let row = row_for(i);
+        let at_fork = self.model.writes;
+        let m0 = mem();
+        let t0 = Instant::now();
+        let branch = self.trunk.fork_branch().unwrap();
+        let t1 = Instant::now();
+        let m1 = mem();
+        PROBE_SEEN.store(0, Ordering::Relaxed);
+        set_session_probe(Some(probe));
+        let t2 = Instant::now();
+        let conn = branch.connect().unwrap();
+        let t3 = Instant::now();
+        set_session_probe(None);
+        let m2 = mem();
+        let seen = PROBE_SEEN.load(Ordering::Relaxed);
+        if seen != (1 << NL) - 1 {
+            not_a_result(&format!("the connect path did not hit every probe: mask {seen:#b}"));
+        }
+        let mut wrote = false;
+        let t4 = Instant::now();
+        match self.args.mode {
+            Mode::Open => {}
+            Mode::Read => {
+                let got = read_v(&conn, row);
+                if got != self.model.value_at(row, at_fork) {
+                    not_a_result(&format!("session {i} read {got}"));
+                }
+            }
+            Mode::Write => {
+                conn.execute(format!(
+                    "UPDATE t SET v = '{}' WHERE id = {row}",
+                    branch_value(row)
+                ))
+                .unwrap();
+                wrote = true;
+            }
+            Mode::Intx => {
+                conn.execute("BEGIN").unwrap();
+                let got = read_v(&conn, row);
+                if got != self.model.value_at(row, at_fork) {
+                    not_a_result(&format!("session {i} read {got}"));
+                }
+            }
+        }
+        let t5 = Instant::now();
+        let m3 = mem();
+
+        let pb = |k: usize| PROBE_BYTES[k].load(Ordering::Relaxed);
+        let pa = |k: usize| PROBE_ALLOCS[k].load(Ordering::Relaxed);
+        iv.bytes[0].add(m1.bytes - m0.bytes);
+        iv.allocs[0].add(m1.allocs - m0.allocs);
+        // The probe's own "begin" is the first thing connect_branch does; anything between m1 and it
+        // (Branch::connect's call) is charged to store_open.
+        let mut prev = (m1.bytes, m1.allocs);
+        for k in 1..NL {
+            iv.bytes[k].add(pb(k) - prev.0);
+            iv.allocs[k].add(pa(k) - prev.1);
+            prev = (pb(k), pa(k));
+        }
+        iv.bytes[NL].add(m2.bytes - prev.0);
+        iv.allocs[NL].add(m2.allocs - prev.1);
+        iv.bytes[NL + 1].add(m2.bytes - m1.bytes);
+        iv.allocs[NL + 1].add(m2.allocs - m1.allocs);
+        iv.bytes[NL + 2].add(m3.bytes - m2.bytes);
+        iv.allocs[NL + 2].add(m3.allocs - m2.allocs);
+        if self.args.timing {
+            iv.times[0].push(t1 - t0);
+            iv.times[1].push(t3 - t2);
+            iv.times[2].push(t5 - t4);
+        }
+        Session {
+            branch,
+            conn,
+            row,
+            wrote,
+            trunk_writes_at_fork: at_fork,
+        }
+    }
+}
+
+fn footprints(sessions: &[Session]) -> (u64, u64, u64, u64, u64, SessionFootprint) {
+    let (mut pages, mut pmin, mut pmax, mut locks, mut shared) = (0u64, u64::MAX, 0u64, 0u64, 0u64);
+    for s in sessions {
+        let f = s.conn.session_footprint();
+        pages += f.cached_pages as u64;
+        pmin = pmin.min(f.cached_pages as u64);
+        pmax = pmax.max(f.cached_pages as u64);
+        locks += f.holds_read_lock as u64;
+        shared += f.schema_shared_with_store as u64;
+    }
+    let first = sessions
+        .first()
+        .map(|s| s.conn.session_footprint())
+        .unwrap_or_default();
+    (pages, pmin, pmax, locks, shared, first)
+}
+
+fn main() {
+    let args = parse_args();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("branch_sessions.db");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let trunk = db.connect().unwrap();
+    trunk.execute("PRAGMA synchronous = NORMAL").unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    trunk.execute("BEGIN").unwrap();
+    for id in 1..=TRUNK_ROWS {
+        trunk
+            .execute(format!("INSERT INTO t VALUES ({id}, '{}')", trunk_value(id)))
+            .unwrap();
+    }
+    for k in 1..args.tables {
+        trunk
+            .execute(format!(
+                "CREATE TABLE x{k}(id INTEGER PRIMARY KEY, a TEXT, b INTEGER)"
+            ))
+            .unwrap();
+        trunk
+            .execute(format!("CREATE INDEX x{k}_a ON x{k}(a)"))
+            .unwrap();
+        for j in 0..4 {
+            trunk
+                .execute(format!("INSERT INTO x{k} VALUES ({j}, 'a{}', {j})", j % 2))
+                .unwrap();
+        }
+    }
+    trunk.execute("COMMIT").unwrap();
+    if args.analyze {
+        trunk.execute("ANALYZE").unwrap();
+    }
+    trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let int = |sql: &str| {
+        trunk.prepare(sql).unwrap().run_collect_rows().unwrap()[0][0]
+            .as_int()
+            .unwrap()
+    };
+    let page_size = int("PRAGMA page_size");
+    let trunk_pages = int("PRAGMA page_count");
+    let synchronous = int("PRAGMA synchronous");
+
+    println!("# branch_sessions — Turso fork, r11-sessions PREREG (frontier/round11/r11-sessions)");
+    println!(
+        "# mode={:?} checkpoints={:?} analyze={} tables={} active={} timing={} seed={:#x} \
+         swap_limit_mib={} level_floor={} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
+         page_size={page_size} trunk_pages={trunk_pages} trunk_synchronous={synchronous}",
+        args.mode,
+        args.checkpoints,
+        args.analyze,
+        args.tables,
+        args.active,
+        args.timing,
+        args.seed,
+        args.swap_limit_mib,
+        args.level_floor
+    );
+    println!(
+        "# build: {} ; clock tick {:.0} ns",
+        if cfg!(debug_assertions) {
+            "DEBUG (not a timing result)"
+        } else {
+            "release"
+        },
+        clock_tick_ns()
+    );
+    for (name, size) in turso_core::branch::session_type_sizes() {
+        println!("# size_of {name} = {size}");
+    }
+    let wal_path = PathBuf::from(format!("{}-wal", path.to_str().unwrap()));
+    let mut b = Bench {
+        db: db.clone(),
+        wal_path,
+        trunk,
+        model: TrunkModel::default(),
+        rng: Rng(args.seed),
+        args,
+    };
+    let base = mem();
+    let fds0 = open_fds();
+    println!(
+        "# base live_bytes={} live_allocs={} fds={fds0} rss_bytes={} swap_used_mib={} memory_level={}",
+        base.bytes,
+        base.allocs,
+        rss_bytes(),
+        swap_used_mib(),
+        memory_level()
+    );
+    println!(
+        "#\tx\tphase\tsessions\tbytes_mean\tbytes_min\tbytes_max\tallocs_mean\tallocs_min\tallocs_max"
+    );
+
+    let mut sessions: Vec<Session> = Vec::new();
+    let mut limit: Option<String> = None;
+    let checkpoints = b.args.checkpoints.clone();
+    let mut reached = Vec::new();
+    for &n in &checkpoints {
+        let mut iv = Interval::default();
+        let lo = sessions.len();
+        let fds_before = open_fds();
+        let mem_before = mem();
+        let t = Instant::now();
+        while sessions.len() < n {
+            if sessions.len() % 1000 == 0 {
+                let (swap, level) = (swap_used_mib(), memory_level());
+                if swap > b.args.swap_limit_mib || level < b.args.level_floor {
+                    limit = Some(format!(
+                        "N={} swap_used_mib={swap} memory_level={level} live_bytes={} rss_bytes={}",
+                        sessions.len(),
+                        mem().bytes,
+                        rss_bytes()
+                    ));
+                    break;
+                }
+            }
+            let i = sessions.len();
+            let s = b.open_session(i, &mut iv);
+            sessions.push(s);
+        }
+        let grow_s = t.elapsed().as_secs_f64();
+        let x = sessions.len();
+        let added = x - lo;
+        let mem_after = mem();
+        let fds_after = open_fds();
+        let st = b.db.branch_stats();
+        let expect_arena = if b.args.mode == Mode::Write { x } else { 0 };
+        if st.live_branches != x {
+            not_a_result(&format!("expected {x} live branches, engine has {}", st.live_branches));
+        }
+        let (pages, pmin, pmax, locks, shared, first) = footprints(&sessions);
+        for (k, name) in PHASES.iter().enumerate() {
+            let (bb, aa) = (&iv.bytes[k], &iv.allocs[k]);
+            if bb.n == 0 {
+                continue;
+            }
+            println!(
+                "phase\t{x}\t{name}\t{}\t{:.2}\t{}\t{}\t{:.3}\t{}\t{}",
+                bb.n,
+                bb.mean(),
+                bb.min,
+                bb.max,
+                aa.mean(),
+                aa.min,
+                aa.max
+            );
+        }
+        if b.args.timing && added > 0 {
+            for (k, name) in ["fork", "connect", "action"].iter().enumerate() {
+                let (p50, p90, p99, max) = pct(&iv.times[k]);
+                println!("time\t{x}\t{name}\t{added}\t{p50:.2}\t{p90:.2}\t{p99:.2}\t{max:.2}");
+            }
+        }
+        println!(
+            "# x={x} added={added} interval_bytes_per_session={:.2} interval_allocs_per_session={:.3} \
+             live_bytes={} live_allocs={} bytes_per_session_total={:.2} fds={} fds_delta_interval={} \
+             cached_pages_total={pages} cached_pages_min={pmin} cached_pages_max={pmax} \
+             sessions_holding_read_lock={locks} sessions_schema_shared={shared} \
+             arena_in_use={} arena_expected_own={expect_arena} rss_bytes={} swap_used_mib={} \
+             memory_level={} wal_bytes={} grow_s={grow_s:.1}",
+            if added > 0 {
+                (mem_after.bytes - mem_before.bytes) as f64 / added as f64
+            } else {
+                0.0
+            },
+            if added > 0 {
+                (mem_after.allocs - mem_before.allocs) as f64 / added as f64
+            } else {
+                0.0
+            },
+            mem_after.bytes,
+            mem_after.allocs,
+            (mem_after.bytes - base.bytes) as f64 / x.max(1) as f64,
+            fds_after,
+            fds_after as i64 - fds_before as i64,
+            st.arena_slots_in_use,
+            rss_bytes(),
+            swap_used_mib(),
+            memory_level(),
+            b.wal_bytes(),
+        );
+        println!(
+            "# footprint session0: functions={} collations={} vtabs={} vtab_modules={} index_methods={}",
+            first.sym_functions,
+            first.sym_collations,
+            first.sym_vtabs,
+            first.sym_vtab_modules,
+            first.sym_index_methods
+        );
+        reached.push(x);
+        if b.args.active > 0 && !sessions.is_empty() {
+            active_arm(&mut b, &mut sessions, x);
+        }
+        if limit.is_some() {
+            break;
+        }
+    }
+    match &limit {
+        Some(l) => println!("# LIMIT reached at {l}"),
+        None => println!("# LIMIT not reached: every checkpoint grown"),
+    }
+
+    // Teardown, decomposed: close every intx transaction, then drop the connections, then the
+    // branch handles, reading the allocator between steps.
+    let n = sessions.len();
+    if b.args.mode == Mode::Intx {
+        for s in &sessions {
+            s.conn.execute("COMMIT").unwrap();
+        }
+    }
+    let m0 = mem();
+    let fds_a = open_fds();
+    let mut branches = Vec::with_capacity(n);
+    for s in sessions {
+        branches.push(s.branch);
+        drop(s.conn);
+    }
+    let m1 = mem();
+    let fds_b = open_fds();
+    for br in branches {
+        br.reap().unwrap();
+    }
+    let m2 = mem();
+    println!(
+        "# teardown sessions={n} conn_bytes_freed_per_session={:.2} conn_allocs_freed_per_session={:.3} \
+         branch_bytes_freed_per_session={:.2} branch_allocs_freed_per_session={:.3} fds_freed={}",
+        (m0.bytes - m1.bytes) as f64 / n.max(1) as f64,
+        (m0.allocs - m1.allocs) as f64 / n.max(1) as f64,
+        (m1.bytes - m2.bytes) as f64 / n.max(1) as f64,
+        (m1.allocs - m2.allocs) as f64 / n.max(1) as f64,
+        fds_a as i64 - fds_b as i64
+    );
+    let end = db.branch_stats();
+    if end.live_branches != 0 || end.arena_slots_in_use != 0 {
+        not_a_result(&format!("teardown leaked: {end:?}"));
+    }
+    if PROBE_UNKNOWN.load(Ordering::Relaxed) != 0 {
+        not_a_result("the engine called a probe label the harness does not know");
+    }
+    println!("# teardown: every branch freed, arena empty; reached {reached:?}");
+}
+
+/// The active ops, K cycles, with every held session still open.
+fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
+    let k = b.args.active;
+    let mut ops: [(Acc, Acc, Vec<Duration>); 5] = Default::default();
+    let names = [
+        "trunk_commit",
+        "sess_read_cold",
+        "sess_read_warm",
+        "new_session",
+        "ckpt",
+    ];
+    let (mut busy, mut log, mut ckpt) = (Acc::default(), Acc::default(), Acc::default());
+    let wal0 = b.wal_bytes();
+    let intx = b.args.mode == Mode::Intx;
+    for c in 0..k {
+        // 1. the trunk commits
+        let (r0, m0) = (b.resolves(), mem());
+        let t = Instant::now();
+        b.trunk_commit();
+        ops[0].2.push(t.elapsed());
+        ops[0].0.add((b.resolves() - r0) as i64);
+        ops[0].1.add(mem().bytes - m0.bytes);
+
+        // 2 and 3. a held session reads its row, twice
+        let si = b.rng.below(sessions.len());
+        for op in [1, 2] {
+            let s = &sessions[si];
+            let (r0, m0) = (b.resolves(), mem());
+            let t = Instant::now();
+            let got = read_v(&s.conn, s.row);
+            ops[op].2.push(t.elapsed());
+            ops[op].0.add((b.resolves() - r0) as i64);
+            ops[op].1.add(mem().bytes - m0.bytes);
+            if got != s.expect(&b.model) {
+                not_a_result(&format!("held session {si} read {got} at active cycle {c}"));
+            }
+        }
+
+        // 4. a fresh session, used once and reaped
+        let row = row_for(1_000_000_000 + c);
+        let at_fork = b.model.writes;
+        let (r0, m0) = (b.resolves(), mem());
+        let t = Instant::now();
+        let br = b.trunk.fork_branch().unwrap();
+        let conn = br.connect().unwrap();
+        let got = read_v(&conn, row);
+        drop(conn);
+        let reaped = br.reap().unwrap();
+        ops[3].2.push(t.elapsed());
+        ops[3].0.add((b.resolves() - r0) as i64);
+        ops[3].1.add(mem().bytes - m0.bytes);
+        if got != b.model.value_at(row, at_fork) || reaped.deferred {
+            not_a_result(&format!("fresh session at cycle {c}: read {got}, {reaped:?}"));
+        }
+
+        // 5. a passive checkpoint
+        let (r0, m0) = (b.resolves(), mem());
+        let t = Instant::now();
+        let (bu, lg, ck) = b.checkpoint_passive();
+        ops[4].2.push(t.elapsed());
+        ops[4].0.add((b.resolves() - r0) as i64);
+        ops[4].1.add(mem().bytes - m0.bytes);
+        busy.add(bu);
+        log.add(lg);
+        ckpt.add(ck);
+    }
+    for (i, name) in names.iter().enumerate() {
+        let (res, bytes, times) = &ops[i];
+        let timing = if b.args.timing {
+            let (p50, p90, p99, max) = pct(times);
+            format!("\t{p50:.2}\t{p90:.2}\t{p99:.2}\t{max:.2}")
+        } else {
+            String::new()
+        };
+        println!(
+            "active\t{x}\t{name}\t{k}\t{:.2}\t{}\t{}\t{:.2}{timing}",
+            res.mean(),
+            res.min,
+            res.max,
+            bytes.mean()
+        );
+    }
+    println!(
+        "# active x={x} intx={intx} ckpt_busy_mean={:.3} ckpt_log_min={} ckpt_log_max={} \
+         ckpt_checkpointed_min={} ckpt_checkpointed_max={} wal_bytes_before={wal0} wal_bytes_after={} \
+         trunk_writes={}",
+        busy.mean(),
+        log.min,
+        log.max,
+        ckpt.min,
+        ckpt.max,
+        b.wal_bytes(),
+        b.model.writes
+    );
+}

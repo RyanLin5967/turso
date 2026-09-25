@@ -2476,10 +2476,13 @@ impl Database {
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+        crate::branch::session_probe("connection");
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
+        crate::branch::session_probe("syms");
         refresh_analyze_stats(&conn);
+        crate::branch::session_probe("analyze_stats");
         Ok(conn)
     }
 
