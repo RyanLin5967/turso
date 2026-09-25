@@ -80,8 +80,9 @@ impl PageMap {
     }
 
     /// Map `page` to `slot`, replacing any previous mapping. Every other version of this map —
-    /// every clone taken before this call — keeps the mapping it had.
-    pub(crate) fn insert(&mut self, page: u32, slot: Slot) {
+    /// every clone taken before this call — keeps the mapping it had. Returns the number of nodes
+    /// it cloned because another version shared them (observation only).
+    pub(crate) fn insert(&mut self, page: u32, slot: Slot) -> u64 {
         crate::turso_assert!(slot != EMPTY, "arena slot u32::MAX is the page map's empty marker");
         if self.root.is_none() {
             self.root = Some(Arc::new(Node::empty(0)));
@@ -94,18 +95,22 @@ impl PageMap {
             self.height += 1;
         }
         let mut level = self.height;
-        let mut node = Arc::make_mut(self.root.as_mut().expect("created above"));
+        let mut copied = 0;
+        let root = self.root.as_mut().expect("created above");
+        copied += u64::from(Arc::get_mut(root).is_none());
+        let mut node = Arc::make_mut(root);
         loop {
             node = match node {
                 Node::Inner(kids) => {
                     let kid = kids[Self::index(page, level)]
                         .get_or_insert_with(|| Arc::new(Node::empty(level - 1)));
                     level -= 1;
+                    copied += u64::from(Arc::get_mut(kid).is_none());
                     Arc::make_mut(kid)
                 }
                 Node::Leaf(slots) => {
                     slots[Self::index(page, 0)] = slot;
-                    return;
+                    return copied;
                 }
             };
         }

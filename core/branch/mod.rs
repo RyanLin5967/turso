@@ -53,6 +53,8 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+#[doc(hidden)]
+pub mod bench;
 pub(crate) mod page_map;
 pub(crate) mod store;
 
@@ -199,6 +201,27 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
+    /// Entries the `branches` table relocated by growing: a `capacity()` change across an insert,
+    /// counted as the `len()` before it.
+    pub branch_table_moved: u64,
+    /// The same for the per-page tables (`trunk.written`, each lineage's `retained`, each branch's
+    /// `current`).
+    pub page_table_moved: u64,
+    /// Elements the arena's free list relocated by growing.
+    pub arena_free_moved: u64,
+    /// Words the arena's free-bit vector relocated by growing.
+    pub arena_bits_moved: u64,
+    /// Chunk pointers the arena's chunk vector relocated by growing.
+    pub arena_chunks_moved: u64,
+    /// Page-map nodes cloned by path copying (a write into a node another map still shares).
+    pub map_nodes_copied: u64,
+    /// Inserts made building a branch's `view` at its first fork.
+    pub view_inserts: u64,
+    /// Heap roots compared against the next live sibling by a reap (the per-first-holder heaps;
+    /// always 0 on the store that answers the garbage query with the two range walks).
+    pub gc_heap_examined: u64,
+    /// Right-spine nodes walked by heap melds (0 on the range-walk store, as above).
+    pub gc_meld_steps: u64,
 }
 
 impl Branch {

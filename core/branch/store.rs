@@ -80,6 +80,7 @@
 //! refuses a version that would break the disjointness the search relies on.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::Hash;
 use std::ops::Bound;
 
 use super::arena::{Arena, Slot};
@@ -183,8 +184,11 @@ impl Lineage {
         from < to && self.children.range(from..to).next().is_some()
     }
 
-    fn retain(&mut self, page: u32, v: Retained) {
-        let versions = self.retained.entry(page).or_default();
+    fn retain(&mut self, page: u32, v: Retained, moved: &mut u64) {
+        if !self.retained.contains_key(&page) {
+            counted_insert(&mut self.retained, page, BTreeMap::new(), moved);
+        }
+        let versions = self.retained.get_mut(&page).expect("inserted above");
         crate::turso_assert!(
             versions
                 .last_key_value()
@@ -314,6 +318,16 @@ impl Lineage {
     }
 }
 
+/// `map.insert`, adding to `moved` the entries the map relocated if the insert made it grow
+/// (observation only; see [`BranchWork::branch_table_moved`]).
+fn counted_insert<K: Hash + Eq, V>(map: &mut HashMap<K, V>, k: K, v: V, moved: &mut u64) {
+    let (cap, len) = (map.capacity(), map.len());
+    map.insert(k, v);
+    if map.capacity() != cap {
+        *moved += len as u64;
+    }
+}
+
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
@@ -333,6 +347,11 @@ impl BranchStore {
             }),
             trunk_children: AtomicUsize::new(0),
         }
+    }
+
+    /// Bytes of one `branches` entry, for the adversarial driver's space estimate.
+    pub(crate) fn branch_entry_bytes() -> usize {
+        std::mem::size_of::<(BranchId, BranchState)>()
     }
 
     pub(crate) fn trunk_has_children(&self) -> bool {
@@ -365,9 +384,12 @@ impl BranchStore {
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
         inner.trunk.lineage.children.insert(f, id);
-        inner.branches.insert(
+        let StoreInner { branches, work, .. } = &mut *inner;
+        counted_insert(
+            branches,
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
+            &mut work.branch_table_moved,
         );
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
@@ -378,7 +400,8 @@ impl BranchStore {
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         let mut inner = self.inner.lock();
         let id = BranchId(inner.next_id);
-        let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
+        let StoreInner { branches, work, .. } = &mut *inner;
+        let st = branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
             return Err(LimboError::Busy);
         }
@@ -392,16 +415,20 @@ impl BranchStore {
             .get_or_insert_with(|| {
                 let mut view = inherited.clone();
                 for (&page, owned) in current {
-                    view.insert(page, owned.slot);
+                    work.map_nodes_copied += view.insert(page, owned.slot);
+                    work.view_inserts += 1;
                 }
                 view
             })
             .clone();
         let trunk_at = st.trunk_at;
+        counted_insert(
+            branches,
+            id,
+            BranchState::new(parent, f, schema, trunk_at, view),
+            &mut work.branch_table_moved,
+        );
         inner.next_id += 1;
-        inner
-            .branches
-            .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
         Ok(id)
     }
 
@@ -489,7 +516,10 @@ impl BranchStore {
     ) -> Result<()> {
         let mut inner = self.inner.lock();
         let StoreInner {
-            arena, branches, ..
+            arena,
+            branches,
+            work,
+            ..
         } = &mut *inner;
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
@@ -499,9 +529,14 @@ impl BranchStore {
             None => {
                 let slot = arena.alloc();
                 arena.page_mut(slot).copy_from_slice(pre_image);
-                st.current.insert(page, Owned { slot, born: epoch });
+                counted_insert(
+                    &mut st.current,
+                    page,
+                    Owned { slot, born: epoch },
+                    &mut work.page_table_moved,
+                );
                 if let Some(view) = st.view.as_mut() {
-                    view.insert(page, slot);
+                    work.map_nodes_copied += view.insert(page, slot);
                 }
             }
             Some(owned) if owned.born == epoch => {}
@@ -516,10 +551,11 @@ impl BranchStore {
                             died: epoch,
                             slot: owned.slot,
                         },
+                        &mut work.page_table_moved,
                     );
                     st.current.insert(page, Owned { slot, born: epoch });
                     if let Some(view) = st.view.as_mut() {
-                        view.insert(page, slot);
+                        work.map_nodes_copied += view.insert(page, slot);
                     }
                 } else {
                     // No live child can see the current version: it is rewritten in its own slot,
@@ -541,7 +577,9 @@ impl BranchStore {
     /// can still see the version about to be overwritten, keep a copy of it for that child.
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
         let mut inner = self.inner.lock();
-        let StoreInner { arena, trunk, .. } = &mut *inner;
+        let StoreInner {
+            arena, trunk, work, ..
+        } = &mut *inner;
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
         if born >= epoch {
@@ -558,9 +596,10 @@ impl BranchStore {
                     died: epoch,
                     slot,
                 },
+                &mut work.page_table_moved,
             );
         }
-        trunk.written.insert(page, epoch);
+        counted_insert(&mut trunk.written, page, epoch, &mut work.page_table_moved);
     }
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
@@ -624,11 +663,19 @@ impl BranchStore {
 
     pub(crate) fn stats(&self) -> BranchStats {
         let inner = self.inner.lock();
+        let mut work = inner.work;
+        if let Some(arena) = inner.arena.as_ref() {
+            [
+                work.arena_free_moved,
+                work.arena_bits_moved,
+                work.arena_chunks_moved,
+            ] = arena.moved();
+        }
         BranchStats {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
-            work: inner.work,
+            work,
         }
     }
 

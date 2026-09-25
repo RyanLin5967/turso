@@ -30,6 +30,9 @@ pub(crate) struct Arena {
     /// cannot answer "is this slot free" without a scan, and releasing an already-free slot must be
     /// caught AT the release — found later, it is two owners of one page and nothing says which.
     free_bits: Vec<u64>,
+    /// Observation only: elements relocated when `free`, `free_bits` and `chunks` grew (a
+    /// `capacity()` change, counted as the `len()` before it).
+    moved: [u64; 3],
 }
 
 impl Arena {
@@ -40,7 +43,13 @@ impl Arena {
             high_water: 0,
             free: Vec::new(),
             free_bits: Vec::new(),
+            moved: [0; 3],
         }
+    }
+
+    /// Elements relocated by growth of the free list, the free-bit vector and the chunk vector.
+    pub(crate) fn moved(&self) -> [u64; 3] {
+        self.moved
     }
 
     pub(crate) fn page_size(&self) -> usize {
@@ -55,13 +64,21 @@ impl Arena {
         let slot = self.high_water;
         let chunk = slot as usize / SLOTS_PER_CHUNK;
         if chunk == self.chunks.len() {
+            let (cap, len) = (self.chunks.capacity(), self.chunks.len());
             self.chunks
                 .push(vec![0u8; SLOTS_PER_CHUNK * self.page_size].into_boxed_slice());
+            if self.chunks.capacity() != cap {
+                self.moved[2] += len as u64;
+            }
         }
         self.high_water += 1;
         let words = (self.high_water as usize).div_ceil(64);
         if self.free_bits.len() < words {
+            let (cap, len) = (self.free_bits.capacity(), self.free_bits.len());
             self.free_bits.resize(words, 0);
+            if self.free_bits.capacity() != cap {
+                self.moved[1] += len as u64;
+            }
         }
         slot
     }
@@ -70,7 +87,11 @@ impl Arena {
         turso_assert!(slot < self.high_water, "released a slot the arena never handed out");
         turso_assert!(!self.is_free(slot), "released an arena slot that was already free");
         self.set_free_bit(slot, true);
+        let (cap, len) = (self.free.capacity(), self.free.len());
         self.free.push(slot);
+        if self.free.capacity() != cap {
+            self.moved[0] += len as u64;
+        }
     }
 
     pub(crate) fn is_free(&self, slot: Slot) -> bool {
