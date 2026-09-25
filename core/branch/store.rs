@@ -893,7 +893,7 @@ impl BranchStore {
         let mut page = false;
         for &p in st.current.keys() {
             count(Validation::PageStamp, &mut probes);
-            if written(p) > at + m2 {
+            if written(p) + u64::from(mutant(9)) > at + m2 {
                 page = true;
                 break;
             }
@@ -904,7 +904,7 @@ impl BranchStore {
             count(Validation::KeyStamp, &mut probes);
             let row = merge.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
             let table = merge.table_stamps.get(&root).copied().unwrap_or(0);
-            if row.max(table) > at + m3 {
+            if row.max(table) + u64::from(mutant(10)) > at + m3 {
                 key = true;
                 break;
             }

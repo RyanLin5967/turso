@@ -339,6 +339,14 @@ impl Run {
         if o.key_conflict && !o.page_conflict {
             not_a_result(&format!("agent {}: a row conflict without a page conflict: {o:?}", p.j));
         }
+        // Upper bounds (A6): a page conflict needs a trunk write since the fork; the log and the page
+        // stamps decide identically.
+        if o.page_conflict && !o.scalar_conflict {
+            not_a_result(&format!("agent {}: a page conflict without a trunk write since the fork: {o:?}", p.j));
+        }
+        if o.log_conflict.is_some_and(|log| log != o.page_conflict) {
+            not_a_result(&format!("agent {}: the log and the page stamps disagree: {o:?}", p.j));
+        }
         if o.rows_written != p.ids.len() {
             not_a_result(&format!("agent {}: {} rows written, planned {}", p.j, o.rows_written, p.ids.len()));
         }
