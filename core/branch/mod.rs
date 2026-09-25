@@ -53,7 +53,6 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
-pub(crate) mod page_map;
 pub(crate) mod store;
 
 use crate::error::LimboError;
@@ -186,16 +185,11 @@ pub struct BranchStats {
 pub struct BranchWork {
     /// Page resolutions against the branch tree (one per branch-pager page read).
     pub resolve_calls: u64,
-    /// Nodes consulted by those resolutions: the branch (its own pages and its inherited page map),
-    /// then the trunk when neither holds the page — at most 2. (Before the persistent page map this
-    /// counted the branch, each ancestor walked, and the trunk.)
+    /// Nodes visited by those resolutions: the branch, each ancestor, and the trunk when reached.
     pub resolve_levels: u64,
-    /// Retained versions compared against the fork epoch while resolving (`Lineage::retained_at`):
-    /// at most one per lineage consulted, the page's born-predecessor. The O(log V) descent that
-    /// finds it is not counted; time is the only instrument for it.
+    /// Retained versions compared while resolving (the scan in `Lineage::retained_at`).
     pub resolve_retained_examined: u64,
-    /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
-    /// index this counted a position scan's comparisons.)
+    /// Retained versions compared while freeing garbage versions (the scan in `child_gone`).
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
