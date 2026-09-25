@@ -1367,6 +1367,35 @@ fn a_dead_parent_frees_what_it_wrote_after_its_last_fork() {
                     );
                 }
             }
+            // Branch space held is branch space reachable: every arena slot is either a trunk
+            // version kept for a trunk child, or named by the page map of a live branch. A slot
+            // that is neither is held for nobody (PREREG amendment 4).
+            let (held, reachable) = {
+                let inner = store.inner.lock();
+                let mut reach: HashSet<Slot> = HashSet::new();
+                for n in nodes.iter().filter(|n| n.handle) {
+                    let st = inner.branches.get(&n.id).expect("a live branch has state");
+                    if let Some(view) = st.view.as_ref() {
+                        reach.extend(view.slots());
+                    }
+                }
+                let trunk_versions: usize = inner
+                    .trunk
+                    .lineage
+                    .retained
+                    .values()
+                    .map(|versions| versions.len())
+                    .sum();
+                (
+                    inner.arena.as_ref().map_or(0, |a| a.in_use()),
+                    reach.len() + trunk_versions,
+                )
+            };
+            assert_eq!(
+                held, reachable,
+                "seed {seed:#x} step {step}: the arena holds {held} slots, but only {reachable} \
+                 are reachable from a live branch or kept for a trunk child"
+            );
         }
         // The shapes the page maps exist for must have occurred, or a green run says nothing —
         // including a dead branch spliced out from above its one live child.

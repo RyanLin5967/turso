@@ -79,6 +79,21 @@ impl PageMap {
         }
     }
 
+    /// Every slot the map names, for accounting checks (a node shared with another map is
+    /// visited once per map that holds it).
+    #[cfg(test)]
+    pub(crate) fn slots(&self) -> Vec<Slot> {
+        let mut out = Vec::new();
+        let mut stack: Vec<&Node> = self.root.as_deref().into_iter().collect();
+        while let Some(node) = stack.pop() {
+            match node {
+                Node::Inner(kids) => stack.extend(kids.iter().flatten().map(|k| &**k)),
+                Node::Leaf(slots) => out.extend(slots.iter().copied().filter(|&s| s != EMPTY)),
+            }
+        }
+        out
+    }
+
     /// Map `page` to `slot`, replacing any previous mapping. Every other version of this map —
     /// every clone taken before this call — keeps the mapping it had. Returns the number of nodes
     /// it cloned because another version shared them (observation only).

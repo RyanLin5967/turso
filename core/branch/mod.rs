@@ -241,6 +241,10 @@ pub struct BranchWork {
     /// Current versions of dead branches retired into their retained sets (0 on a store that keeps
     /// a dead branch's current pages until it is freed).
     pub retired: u64,
+    /// Slot references taken by page maps (0 on a store whose maps count nothing).
+    pub map_slot_increfs: u64,
+    /// Branch first-writes that reused the page's slot in place (0 where not counted).
+    pub writes_in_place: u64,
 }
 
 impl Branch {

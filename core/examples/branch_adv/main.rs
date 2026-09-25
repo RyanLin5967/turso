@@ -70,7 +70,7 @@ fn parse_args() -> Args {
     a
 }
 
-const NF: usize = 20;
+const NF: usize = 22;
 
 const FIELDS: [&str; NF] = [
     "resolve_calls",
@@ -93,6 +93,8 @@ const FIELDS: [&str; NF] = [
     "arena_chunks_freed",
     "splices",
     "retired",
+    "map_slot_increfs",
+    "writes_in_place",
 ];
 
 fn fields(w: &BranchWork) -> [u64; NF] {
@@ -117,6 +119,8 @@ fn fields(w: &BranchWork) -> [u64; NF] {
         w.arena_chunks_freed,
         w.splices,
         w.retired,
+        w.map_slot_increfs,
+        w.writes_in_place,
     ]
 }
 
@@ -534,15 +538,17 @@ fn arm_pathcopy(a: &Args) {
 }
 
 /// W8: a chain of depth d whose intermediate handles are all released, then its leaf reaped.
-/// With `writes`, each link writes one page of its own before forking the next.
-fn arm_chain(a: &Args, writes: bool) {
+/// With `writes`, each link writes one page of its own before forking the next; with `same`
+/// (W8b, amendment 4), each link overwrites the SAME page 0, so the leaf sees one version of it.
+fn arm_chain(a: &Args, writes: bool, same: bool) {
     for &d in &a.list {
         let s = StoreBench::new(a.page_size);
         let m = Meter { s: &s, time: a.time };
         let mut prev = fork_trunk(&s);
         for j in 0..d {
             if writes {
-                s.branch_write(prev, &[j as u32])
+                let page = if same { 0 } else { j as u32 };
+                s.branch_write(prev, &[page])
                     .unwrap_or_else(|e| die(&format!("write: {e}")));
             }
             let next = fork_branch(&s, prev);
@@ -554,7 +560,19 @@ fn arm_chain(a: &Args, writes: bool) {
         let st = s.stats();
         let before = st.live_branches;
         check(before >= 1 && before <= d + 1, "between 1 and d+1 branch states are kept");
-        if writes {
+        if writes && same {
+            let mut buf = vec![0u8; a.page_size];
+            let in_arena = s
+                .resolve_into(prev, 0, &mut buf)
+                .unwrap_or_else(|e| die(&format!("resolve: {e}")));
+            if !in_arena {
+                die("the leaf does not see its parent's version of page 0");
+            }
+            println!(
+                "space d={d} same_page held_slots={} visible_to_leaf=1",
+                st.arena_slots_in_use
+            );
+        } else if writes {
             check(st.arena_slots_in_use == d, "the chain's d pages are all still held");
             let mut buf = vec![0u8; a.page_size];
             for j in (0..d).step_by((d / 1000).max(1)) {
@@ -650,8 +668,9 @@ fn main() {
         "bigwrite" => arm_bigwrite(&a),
         "view" => arm_view(&a),
         "pathcopy" => arm_pathcopy(&a),
-        "chain" => arm_chain(&a, false),
-        "chainw" => arm_chain(&a, true),
+        "chain" => arm_chain(&a, false, false),
+        "chainw" => arm_chain(&a, true, false),
+        "chainow" => arm_chain(&a, true, true),
         "deadfork" => arm_deadfork(&a, false),
         "deadfork_pre" => arm_deadfork(&a, true),
         other => die(&format!("unknown arm {other}")),
