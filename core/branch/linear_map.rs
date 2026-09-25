@@ -304,6 +304,25 @@ impl<K: Hash + Eq, V> LinearMap<K, V> {
         self.iter().map(|(_, v)| v)
     }
 
+    /// Every entry, leaving the map empty.
+    pub(crate) fn drain(&mut self) -> Vec<(K, V)> {
+        let mut out = Vec::with_capacity(self.len);
+        for seg in &mut self.segments {
+            for head in seg.iter_mut() {
+                let mut chain = head.take();
+                while let Some(mut n) = chain {
+                    chain = n.next.take();
+                    out.push((n.key, n.value));
+                }
+            }
+        }
+        self.segments.clear();
+        self.level = 0;
+        self.split = 0;
+        self.len = 0;
+        out
+    }
+
     /// Every value, leaving the map empty.
     pub(crate) fn drain_values(&mut self) -> Vec<V> {
         let mut out = Vec::with_capacity(self.len);

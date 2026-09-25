@@ -793,6 +793,10 @@ impl BranchStore {
             if st.handle || st.open {
                 return freed;
             }
+            if !st.lineage.children.is_empty() && !st.current.is_empty() {
+                freed += self.retire(inner, id);
+            }
+            let st = inner.branches.get(&id).expect("looked up above");
             if st.lineage.children.len() == 1 {
                 return freed + self.splice(inner, id);
             }
@@ -835,6 +839,47 @@ impl BranchStore {
 }
 
 impl BranchStore {
+    /// `id` has no handle and no connection, so it will never be written or forked again, and
+    /// each of its current versions is now exactly a version `[born, epoch)` whose readers are its
+    /// children forked inside that range. File each such version as retained — the reaps of those
+    /// children then free it the moment its last reader goes — and free at once each one that no
+    /// live child can read: a page written after the branch's last fork is invisible to every
+    /// child. Without this, those pages were held until the branch itself was freed, however long
+    /// its children lived. Runs once per branch, O(its current pages · log V). Returns the pages
+    /// freed.
+    fn retire(&self, inner: &mut StoreInner, id: BranchId) -> usize {
+        let StoreInner {
+            arena,
+            branches,
+            work,
+            ..
+        } = &mut *inner;
+        let arena = arena.as_mut().expect("a branch exists, so the arena does");
+        let st = branches.get_mut(&id).expect("the caller looked it up");
+        let epoch = st.lineage.epoch;
+        let mut freed = 0;
+        for (page, owned) in st.current.drain() {
+            work.retired += 1;
+            if st.lineage.has_child_in(owned.born, epoch) {
+                st.lineage.retain(
+                    page,
+                    Retained {
+                        born: owned.born,
+                        died: epoch,
+                        slot: owned.slot,
+                    },
+                    work,
+                );
+            } else {
+                arena.release(owned.slot);
+                freed += 1;
+            }
+        }
+        // Nothing will fork from it again, so nothing will read its view.
+        st.view = None;
+        freed
+    }
+
     /// Remove `id` — no handle, no connection, exactly one live child — from the tree, and give its
     /// child its place: the child becomes its parent's child at `id`'s fork epoch, and takes over
     /// every slot of `id`'s that it sees. That is all of `id`'s retained versions (each holds a live
@@ -1145,7 +1190,57 @@ mod tests {
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
     }
 
-    /// A committed branch page holding `image(generation)`, as the pager hands it to
+    /// One committed write transaction on `id` of `pages`, each holding `image(generation)`.
+fn commit(store: &BranchStore, id: BranchId, pages: &[u32], before: u64, generation: u64) {
+    store.begin_write(id).unwrap();
+    for &page in pages {
+        store.first_write_branch(id, page, &image(before)).unwrap();
+    }
+    let committed: Vec<PageRef> = pages.iter().map(|&p| page_with(p, generation)).collect();
+    store.commit_pages(id, &committed).unwrap();
+    store.end_write(id);
+}
+
+/// A parent that forks two children, then writes, then dies frees at once the pages it wrote
+/// after its last fork — neither child can see them — and keeps the pages it wrote before,
+/// which both children read, until neither child can.
+#[test]
+fn a_dead_parent_frees_what_it_wrote_after_its_last_fork() {
+    let store = BranchStore::new();
+    let parent = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+    commit(&store, parent, &[0, 1, 2], 0, 1);
+    let c1 = store.fork_branch(parent).unwrap();
+    let c2 = store.fork_branch(parent).unwrap();
+    commit(&store, parent, &[3, 4, 5], 0, 2);
+    assert_eq!(store.stats().arena_slots_in_use, 6);
+
+    let reaped = store.release_handle(parent);
+    assert!(reaped.deferred, "its children still read through it");
+    assert_eq!(reaped.freed_pages, 3, "the three pages written after the last fork");
+    assert_eq!(store.stats().arena_slots_in_use, 3);
+    let mut buf = vec![0u8; PAGE];
+    for child in [c1, c2] {
+        for page in 0..3 {
+            assert!(store.resolve_into(child, page, &mut buf).unwrap());
+            assert_eq!(buf, image(1), "child {} page {page}", child.0);
+        }
+        for page in 3..6 {
+            assert!(!store.resolve_into(child, page, &mut buf).unwrap(), "page {page}");
+        }
+    }
+
+    store.release_handle(c1);
+    assert_eq!(store.stats().arena_slots_in_use, 3, "c2 still reads the pre-fork pages");
+    for page in 0..3 {
+        assert!(store.resolve_into(c2, page, &mut buf).unwrap());
+        assert_eq!(buf, image(1));
+    }
+    store.release_handle(c2);
+    assert_eq!(store.stats().arena_slots_in_use, 0);
+    assert_eq!(store.stats().live_branches, 0);
+}
+
+/// A committed branch page holding `image(generation)`, as the pager hands it to
     /// `commit_pages`.
     fn page_with(page: u32, generation: u64) -> PageRef {
         let p = Arc::new(crate::storage::pager::Page::new(i64::from(page)));

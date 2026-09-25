@@ -238,6 +238,9 @@ pub struct BranchWork {
     /// Handle-less, closed branches with one live child spliced out of the tree (0 on a store that
     /// keeps them).
     pub splices: u64,
+    /// Current versions of dead branches retired into their retained sets (0 on a store that keeps
+    /// a dead branch's current pages until it is freed).
+    pub retired: u64,
 }
 
 impl Branch {
