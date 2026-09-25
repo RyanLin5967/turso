@@ -28,9 +28,24 @@
 //! printed; a mismatch prints `NOT A RESULT` and exits 1. Beside each latency the harness prints
 //! the engine's work counters for that op (resolutions, nodes walked, retained versions compared),
 //! so a slope can be read against an integer that load cannot move.
+//!
+//! Lane r11-space (round 11, `frontier/round11/r11-space/PREREG.md`) generalises `churn_spread`
+//! with harness-only flags whose defaults reproduce c3 exactly:
+//!
+//!   --trunk-rows R --stride s   the table has R rows and the trunk's g-th write rewrites row
+//!                               (g*s mod R)+1 (c3: 20000 and 37)
+//!   --page-size P               PRAGMA page_size before the table exists (churn arms)
+//!   --trunk-values random       each trunk write stores a pseudo-random value, so a rewrite
+//!                               changes the whole value (default `counter`, c3's)
+//!   --counters-only             print no latency: counters, arena, RSS and heap bytes only
+//!
+//! Every state and window line also prints `heap_live_bytes`: the requested bytes of every live
+//! heap allocation of the process, from a counting global allocator (an integer, exact).
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,6 +55,64 @@ use turso_core::{
 };
 
 const TRUNK_ROWS: i64 = 20_000;
+/// The table's row count and the `spread` walk's stride, set once from `--trunk-rows` and
+/// `--stride` before the table is built (defaults: TRUNK_ROWS and 37, i.e. c3).
+static ROWS: AtomicI64 = AtomicI64::new(TRUNK_ROWS);
+static STRIDE: AtomicU64 = AtomicU64::new(37);
+/// `--trunk-values random`.
+static RANDOM_VALUES: AtomicBool = AtomicBool::new(false);
+/// `--counters-only`.
+static COUNTERS_ONLY: AtomicBool = AtomicBool::new(false);
+
+fn rows() -> i64 {
+    ROWS.load(Ordering::Relaxed)
+}
+
+fn counters_only() -> bool {
+    COUNTERS_ONLY.load(Ordering::Relaxed)
+}
+
+/// Requested bytes of every live heap allocation.
+static HEAP_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+struct CountingAlloc;
+
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            HEAP_LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc_zeroed(layout);
+        if !p.is_null() {
+            HEAP_LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+        HEAP_LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            HEAP_LIVE.fetch_add(new_size, Ordering::Relaxed);
+            HEAP_LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static GLOBAL: CountingAlloc = CountingAlloc;
+
+fn heap_live_bytes() -> usize {
+    HEAP_LIVE.load(Ordering::Relaxed)
+}
+
 const VALUE_LEN: usize = 100;
 /// The row the trunk rewrites in `hot` and `churn_hot`.
 const HOT_ROW: i64 = 1;
@@ -77,6 +150,11 @@ struct Args {
     w_list: Vec<usize>,
     no_autocheckpoint: bool,
     synchronous: String,
+    trunk_rows: i64,
+    stride: u64,
+    page_size: Option<i64>,
+    random_values: bool,
+    counters_only: bool,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -98,6 +176,11 @@ fn parse_args() -> Args {
         w_list: vec![1],
         no_autocheckpoint: false,
         synchronous: "OFF".to_string(),
+        trunk_rows: TRUNK_ROWS,
+        stride: 37,
+        page_size: None,
+        random_values: false,
+        counters_only: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -139,10 +222,38 @@ fn parse_args() -> Args {
                     other => die(&format!("unknown victim policy {other}")),
                 }
             }
+            "--trunk-rows" => {
+                args.trunk_rows = val().parse().unwrap_or_else(|_| die("bad --trunk-rows"))
+            }
+            "--stride" => args.stride = val().parse().unwrap_or_else(|_| die("bad --stride")),
+            "--page-size" => {
+                args.page_size = Some(val().parse().unwrap_or_else(|_| die("bad --page-size")))
+            }
+            "--trunk-values" => {
+                args.random_values = match val().as_str() {
+                    "counter" => false,
+                    "random" => true,
+                    other => die(&format!("unknown --trunk-values {other}")),
+                }
+            }
+            "--counters-only" => args.counters_only = true,
             other => die(&format!("unknown argument {other}")),
         }
     }
     args.arm = arm.unwrap_or_else(|| die("--arm is required"));
+    let churn = matches!(args.arm, Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread);
+    // The other arms' row arithmetic (chain halves, the pages arm's stride) assumes c3's table.
+    if (args.trunk_rows != TRUNK_ROWS || args.stride != 37 || args.random_values)
+        && args.arm != Arm::ChurnSpread
+    {
+        die("--trunk-rows, --stride and --trunk-values apply to churn_spread only");
+    }
+    if (args.page_size.is_some() || args.counters_only) && !churn {
+        die("--page-size and --counters-only apply to the churn arms only");
+    }
+    if args.trunk_rows < 2 || args.stride == 0 || gcd(args.stride, args.trunk_rows as u64) != 1 {
+        die("--trunk-rows must be >= 2 and --stride coprime with it, so the walk visits every row");
+    }
     if args.victim != Victim::Random
         && !matches!(args.arm, Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread)
     {
@@ -159,6 +270,14 @@ fn parse_args() -> Args {
         die("--w entries must be in 1..=64");
     }
     args
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
 }
 
 fn die(msg: &str) -> ! {
@@ -193,29 +312,51 @@ fn branch_value(id: i64) -> String {
 }
 
 /// The trunk's `generation`-th rewrite of a row: same length, so it rewrites the row in place.
+/// With `--trunk-values random` the 99 characters after the `t` are hex digits of a splitmix64
+/// stream seeded by the generation, so two generations differ in (almost) every byte.
 fn trunk_gen_value(generation: u64) -> String {
-    format!("t{:0>width$}", generation, width = VALUE_LEN - 1)
+    if !RANDOM_VALUES.load(Ordering::Relaxed) {
+        return format!("t{:0>width$}", generation, width = VALUE_LEN - 1);
+    }
+    let mut s = String::with_capacity(VALUE_LEN);
+    s.push('t');
+    let mut x = generation;
+    while s.len() < VALUE_LEN {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        for i in 0..16 {
+            if s.len() == VALUE_LEN {
+                break;
+            }
+            s.push(char::from_digit(((z >> (4 * i)) & 0xF) as u32, 16).unwrap());
+        }
+    }
+    s
 }
 
 fn row_for(n: usize) -> i64 {
-    ((n as u64).wrapping_mul(2_654_435_761) % TRUNK_ROWS as u64) as i64 + 1
+    ((n as u64).wrapping_mul(2_654_435_761) % rows() as u64) as i64 + 1
 }
 
-/// `spread`: the row the trunk rewrites at its g-th write. 37 is coprime with 20,000, so the walk
-/// visits every row, one leaf further on each time (a leaf holds ~37 rows).
+/// `spread`: the row the trunk rewrites at its g-th write. The stride (37) is coprime with the row
+/// count (20,000), so the walk visits every row, one leaf further on each time (a leaf holds ~37
+/// rows). `--trunk-rows` and `--stride` change both.
 fn spread_row(g: u64) -> i64 {
-    ((g * 37) % TRUNK_ROWS as u64) as i64 + 1
+    (g.wrapping_mul(STRIDE.load(Ordering::Relaxed)) % rows() as u64) as i64 + 1
 }
 
 /// `chain`: level `l` writes a row in the first half of the table; `read_inh` reads the second
 /// half, which no level writes, so its whole descent resolves through every level to the trunk.
 fn chain_row(level: usize) -> i64 {
-    ((level as u64).wrapping_mul(2_654_435_761) % (TRUNK_ROWS / 2) as u64) as i64 + 1
+    ((level as u64).wrapping_mul(2_654_435_761) % (rows() / 2) as u64) as i64 + 1
 }
 
 fn page_rows(n: usize, w: usize) -> Vec<i64> {
     (0..w as i64)
-        .map(|j| (row_for(n) - 1 + j * PAGE_STRIDE) % TRUNK_ROWS + 1)
+        .map(|j| (row_for(n) - 1 + j * PAGE_STRIDE) % rows() + 1)
         .collect()
 }
 
@@ -377,12 +518,19 @@ impl Bench {
         let n = us.len() as f64;
         let p50 = percentile(&us, 50.0);
         let per = |v: u64| v as f64 / n;
+        let times = if counters_only() {
+            "-\t-\t-\t-".to_string()
+        } else {
+            format!(
+                "{p50:.2}\t{:.2}\t{:.2}\t{:.2}",
+                percentile(&us, 90.0),
+                percentile(&us, 99.0),
+                us[us.len() - 1]
+            )
+        };
         println!(
-            "{x}\t{name}\t{}\t{p50:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+            "{x}\t{name}\t{}\t{times}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
             us.len(),
-            percentile(&us, 90.0),
-            percentile(&us, 99.0),
-            us[us.len() - 1],
             per(op.work.resolve_calls),
             per(op.work.resolve_levels),
             per(op.work.resolve_retained_examined),
@@ -403,19 +551,20 @@ impl Bench {
         let s = self.db.branch_stats();
         println!(
             "# x={x} live={} arena_in_use={} arena_free={} arena_high_water={} rss_bytes={} \
-             trunk_writes={} wal_bytes={} {extra}",
+             heap_live_bytes={} trunk_writes={} wal_bytes={} {extra}",
             s.live_branches,
             s.arena_slots_in_use,
             s.arena_slots_free,
             s.arena_slots_in_use + s.arena_slots_free,
             rss_bytes(),
+            heap_live_bytes(),
             self.model.writes,
             std::fs::metadata(&self.wal_path).map_or(0, |m| m.len())
         );
     }
 
     fn print_slopes(&self, xs: &[usize], ops: &[&'static str]) {
-        if xs.len() < 2 {
+        if xs.len() < 2 || counters_only() {
             return;
         }
         println!("# log-log slopes over x={xs:?}: p50, then each work counter that is non-zero");
@@ -460,6 +609,10 @@ const HEADER: &str = "x\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\tresolves_p
 
 fn main() {
     let args = parse_args();
+    ROWS.store(args.trunk_rows, Ordering::Relaxed);
+    STRIDE.store(args.stride, Ordering::Relaxed);
+    RANDOM_VALUES.store(args.random_values, Ordering::Relaxed);
+    COUNTERS_ONLY.store(args.counters_only, Ordering::Relaxed);
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("branch_arms.db");
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
@@ -483,11 +636,15 @@ fn main() {
     trunk
         .execute(format!("PRAGMA synchronous = {}", args.synchronous))
         .unwrap();
+    if let Some(p) = args.page_size {
+        // Before the first table: the page size is fixed when page 1 is first written.
+        trunk.execute(format!("PRAGMA page_size = {p}")).unwrap();
+    }
     trunk
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
     trunk.execute("BEGIN").unwrap();
-    for id in 1..=TRUNK_ROWS {
+    for id in 1..=rows() {
         trunk
             .execute(format!("INSERT INTO t VALUES ({id}, '{}')", trunk_value(id)))
             .unwrap();
@@ -502,12 +659,16 @@ fn main() {
     let page_size = int("PRAGMA page_size");
     let trunk_pages = int("PRAGMA page_count");
     let synchronous = int("PRAGMA synchronous");
+    if args.page_size.is_some_and(|p| p != page_size) {
+        not_a_result(&format!("asked for page_size {:?}, the database has {page_size}", args.page_size));
+    }
 
     println!("# branch_arms — Turso fork, per-branch CoW arena, PREREG amendment 1");
     println!(
         "# arm={:?} victim={:?} checkpoints={:?} samples={} seed={:#x} cycles={} windows={} w={:?} \
-         trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} page_size={page_size} \
-         trunk_pages={trunk_pages} trunk_synchronous={synchronous} no_autocheckpoint={}",
+         trunk_rows={} stride={} trunk_values={} value_len={VALUE_LEN} page_size={page_size} \
+         trunk_pages={trunk_pages} trunk_synchronous={synchronous} no_autocheckpoint={} \
+         counters_only={}",
         args.arm,
         args.victim,
         args.checkpoints,
@@ -516,21 +677,30 @@ fn main() {
         args.cycles,
         args.windows,
         args.w_list,
-        args.no_autocheckpoint
+        rows(),
+        args.stride,
+        if args.random_values { "random" } else { "counter" },
+        args.no_autocheckpoint,
+        args.counters_only
     );
+    if counters_only() {
+        println!("# counters only: no latency is printed; every time column reads -");
+    } else {
+        println!(
+            "# clock tick {:.0} ns (Instant); times are microseconds per operation; work columns \
+             are engine counters per sample of that op",
+            clock_tick_ns()
+        );
+    }
     println!(
-        "# clock tick {:.0} ns (Instant); times are microseconds per operation; work columns are \
-         engine counters per sample of that op",
-        clock_tick_ns()
-    );
-    println!(
-        "# build: {} ; rss_base_bytes={}",
+        "# build: {} ; rss_base_bytes={} heap_live_bytes={}",
         if cfg!(debug_assertions) {
             "DEBUG (not a timing result)"
         } else {
             "release"
         },
-        rss_bytes()
+        rss_bytes(),
+        heap_live_bytes()
     );
 
     let mut bench = Bench {
@@ -642,7 +812,7 @@ fn arm_trunk_writes(b: &mut Bench, args: &Args) {
         for _ in 0..k {
             let target = &live[b.rng.below(live.len())];
             let own = target.rows[0];
-            let other = (own - 1 + TRUNK_ROWS / 2) % TRUNK_ROWS + 1;
+            let other = (own - 1 + rows() / 2) % rows() + 1;
             let conn = b.timed(&mut read_open, || target.branch.connect().unwrap());
             let got_own = b.timed(&mut read_own, || read_v(&conn, own));
             let got_inh = b.timed(&mut read_inh, || read_v(&conn, other));
@@ -761,7 +931,7 @@ fn arm_chain(b: &mut Bench, args: &Args) {
         let (mut read_open, mut read_own, mut read_inh, mut read_anc) =
             (Op::default(), Op::default(), Op::default(), Op::default());
         for _ in 0..k {
-            let inh = TRUNK_ROWS / 2 + 1 + b.rng.below((TRUNK_ROWS / 2) as usize) as i64;
+            let inh = rows() / 2 + 1 + b.rng.below((rows() / 2) as usize) as i64;
             let conn = b.timed(&mut read_open, || tip.branch.connect().unwrap());
             let got_own = b.timed(&mut read_own, || read_v(&conn, tip_row));
             drop(conn);
@@ -945,7 +1115,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                     }
                     if spread {
                         // A row the branch did not write, on a leaf the trunk's walk rewrites.
-                        let other = (own - 1 + TRUNK_ROWS / 2) % TRUNK_ROWS + 1;
+                        let other = (own - 1 + rows() / 2) % rows() + 1;
                         let conn = target.branch.connect().unwrap();
                         let got = b.timed(&mut win[7], || read_v(&conn, other));
                         drop(conn);
@@ -973,13 +1143,15 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 }
                 let mut us: Vec<f64> = op.samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
                 us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                line += &format!(
-                    " {}_p50={:.2} {}_p99={:.2}",
-                    names[i],
-                    percentile(&us, 50.0),
-                    names[i],
-                    percentile(&us, 99.0)
-                );
+                if !counters_only() {
+                    line += &format!(
+                        " {}_p50={:.2} {}_p99={:.2}",
+                        names[i],
+                        percentile(&us, 50.0),
+                        names[i],
+                        percentile(&us, 99.0)
+                    );
+                }
                 all[i].samples.append(&mut op.samples);
                 let w = op.work;
                 all[i].work.resolve_calls += w.resolve_calls;
@@ -989,10 +1161,12 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 all[i].work.gc_range_entries += w.gc_range_entries;
             }
             line += &format!(
-                " arena_in_use={} arena_high_water={} rss_bytes={}",
+                " arena_in_use={} arena_high_water={} rss_bytes={} heap_live_bytes={} \
+                 versions_freed={versions_freed}",
                 s.arena_slots_in_use,
                 s.arena_slots_in_use + s.arena_slots_free,
-                rss_bytes()
+                rss_bytes(),
+                heap_live_bytes()
             );
             println!("{line}");
         }
