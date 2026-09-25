@@ -179,7 +179,11 @@ impl Stmt {
             self.stmt
                 .bind_at(NonZero::new(i + 1).expect("i + 1 > 0"), p.clone())?;
         }
-        let rows = self.stmt.run_collect_rows()?;
+        let rows = self.stmt.run_collect_rows();
+        // Reset at once, finished or not: a statement left un-reset must hold no read mark on the
+        // catalog's WAL (a held mark keeps the WAL from ever restarting; PREREG A7).
+        self.stmt.reset()?;
+        let rows = rows?;
         counters.queries += 1;
         counters.rows_read += rows.len() as u64;
         Ok(rows)
@@ -191,7 +195,9 @@ impl Stmt {
             self.stmt
                 .bind_at(NonZero::new(i + 1).expect("i + 1 > 0"), p.clone())?;
         }
-        self.stmt.run_ignore_rows()?;
+        let done = self.stmt.run_ignore_rows();
+        self.stmt.reset()?;
+        done?;
         counters.queries += 1;
         counters.rows_written += 1;
         Ok(())
@@ -362,6 +368,21 @@ impl Catalog {
     pub(crate) fn commit(&mut self) -> Result<()> {
         self.conn.execute("COMMIT")?;
         Ok(())
+    }
+
+    /// Checkpoint the catalog's WAL into its file and truncate it (r11-restart lane, fix v2, PREREG
+    /// A7). Turso's WAL restarts only when a writer finds it fully backfilled with no read mark in
+    /// use, which this catalog's pattern never meets, so without this the WAL keeps every frame ever
+    /// written and an open recovers all of them. Returns the pragma's row (busy, log, checkpointed).
+    pub(crate) fn truncate_wal(&mut self) -> Result<Vec<i64>> {
+        let rows = self
+            .conn
+            .prepare("PRAGMA wal_checkpoint(TRUNCATE)")?
+            .run_collect_rows()?;
+        Ok(rows
+            .first()
+            .map(|r| r.iter().map(|v| v.as_int().unwrap_or(-1)).collect())
+            .unwrap_or_default())
     }
 
     /// `EXPLAIN QUERY PLAN` of every query the store runs on the catalog, for the test that

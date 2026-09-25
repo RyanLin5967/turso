@@ -2498,6 +2498,15 @@ impl StoreInner {
             ));
         }
         journal.restart_at(generation)?;
+        // Fix v2 (PREREG A7): bound the catalog's own WAL. The checkpoint above is already durable, so
+        // a failure here costs only WAL length, never state: it is logged, not returned.
+        match cat.catalog.truncate_wal() {
+            Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
+                tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("branch catalog WAL truncation failed: {e}"),
+        }
         cat.dirty.clear();
         cat.removed.clear();
         cat.trunk_dirty.clear();
