@@ -745,3 +745,69 @@ root count, from the `Call graph` section: 16 × 2,108 at 10^6, 21,344 samples a
 
 The share of `pread` samples inside `connect_branch` is unchanged: 64.1% and 64.5%. No prediction or run of amendment 8
 depends on these two figures.
+
+### Amendment 8a — written 2026-09-25T06:13:06Z: a fresh-context review of amendment 8, its corrections, and three runs added before any F6 build or run
+
+A read-only reviewer that had not seen the work attacked amendment 8. The lane verified each point below from the raw
+files before writing it here.
+
+**Corrections to amendment 8's summary of amendment 7.**
+- System CPU per cycle at T=16 and N ≥ 10^5 is **307–389 µs, 67–74%** of all CPU. The earlier "370–390 µs, 73%" left
+  out N=10^5 draw 1.
+- **When the wall is in the kernel, and when it is not.** Per-cycle thread-time growth over T=1, from `conc_main`'s
+  `cellsum` lines:
+  - At T=2 and T=4, where the first WALL verdicts are, 71–78% of the growth is **user** CPU. At T=8 it is 57–63%.
+  - The kernel dominates only at T=16 with N ≥ 10^5: sys is 72–78% of the growth.
+  - At N=10^3, T=16 stays user-dominated in `conc_main` (61–64%).
+  - The only profile was taken at T=16, so the user-mode growth at T=2–8 is **unattributed**.
+- **Regimes differ between runs.** The N=10^3, T=16 cell ran with sys at 118–136 µs/cycle in `conc_main`, 297–301 in
+  `conc_hold`, and 390–401 in `conc_prof`. The 10^3 profile therefore describes `conc_prof`'s regime, not
+  `conc_main`'s.
+- **Where the store lock is ruled out.** W(16) ≈ 0.10 holds only at N=10^6 in `conc_main`; it is 0.20–0.22 at N=10^3.
+  By amendment 7's rule, "outside the store lock" is established at T=4 at every N and in 2 of the 6 T=16 cells. The T=8
+  cells and 4 of the T=16 cells are "attribution open".
+- **Profile shares.** `pread` is 60.4–61.0% of worker samples at 10^6 and 70.5–71.5% at 10^3. The range spans the two
+  ways of counting: `sample`'s own top-of-stack total, and the sum over call-graph leaves (224 more at 10^6). Of those
+  samples, 64–65% are inside `connect_branch`. This supersedes the erratum's single figures.
+- **Not every sys cycle is `pread`.** `swtch_pri` (parking_lot yielding: a trap, counted as sys) is 8.7% of worker
+  samples at 10^6.
+- **A missed expectation.** P7.5's parenthetical "Sn(16) ≈ 12–14" missed in all 12 T=16 cells (11.4–15.7). It was not
+  one of the 40 registered checks.
+
+**Corrections to amendment 8's design and predictions.**
+- **e_pread cannot tell per-file from per-process or system-wide serialisation.** All its syscall modes use one file in
+  one process. The class "per file" is withdrawn until `e_pread2` below. Its low-T comparisons (S(2), and whether
+  same-page is worse at T ≤ 2) rest on one run of 28–43 ms per point, with T=1 varying up to 35% between passes, and are
+  not read. Only the collapse at T ≥ 8 is.
+- **F6 adds hold time.** On a hit, the 4 KiB copy runs under the store's one lock. F6's hold per cycle at T=1 is
+  predicted at amendment 7's value plus 1–3 µs (I). The "cap near 1/hold" in amendment 8 is lowered accordingly. No
+  registered bound changes.
+- **F6 keeps at most one version per trunk page ever read, stale generations included**, until replaced. Memory stays
+  at or below the trunk's size.
+- **The attribution criterion for F6 is the profile, not total sys CPU.** A store lock under contention yields through
+  `swtch_pri`, which is sys time. So amendment 8's falsifier "sys ≥ 100 µs/cycle at T=16" is replaced for the
+  attribution by: **`pread` ≥ 10% of worker samples in `F6_prof`** withdraws the pread attribution. The registered
+  sys predictions stand and are reported as registered. The pair "W(16) ≥ 0.25 and sys ≤ 30 µs" may break on
+  `swtch_pri` alone; if it does, the report says which half.
+
+**Added before any F6 run.**
+- **Test.** `mechanism_tests::branches_read_their_fork_while_the_trunk_writes_concurrently`, with real threads:
+  - one thread rewrites rows and forks 300 branches in a recorded order;
+  - four readers check every branch's rows and full table, on two connections, while the trunk keeps writing;
+  - the trunk also passes through moments with no live child.
+
+  It must pass in `tests_F6`, and it is expected to kill F6M1 and F6M2 as well.
+- **Run `e_pread2`** (`pread_mb.c` gains two modes; `e_pread2.sh`): `same_shared` as a baseline, `same_ownfile`, and
+  `same_procs`, at T in {1,2,4,8,16}, forward and reversed, M = 100,000.
+  - `same_ownfile`: each thread reads page 0 of its own copy of the file.
+  - `same_procs`: T processes, one thread each, read page 0 of the one file.
+  - Read only for S(16) ≥ 8 (scales) against S(16) ≤ 2 (collapses):
+    - `same_ownfile` scales and `same_procs` collapses: **per file**, system-wide.
+    - both collapse: **system-wide beyond one file**.
+    - `same_procs` scales and `same_ownfile` collapses: **per process**.
+  - No prediction.
+- **Runs `conc_prof4` and `F6_prof4`**, to attribute the T=2–4 wall:
+  - arguments `--arm conc --threads 4 --checkpoints 1000000 --cycles 100000`;
+  - `/usr/bin/sample <pid> 3` taken 1 s after `# cell N=1000000 T=4 draw=0 start`;
+  - `conc_prof4` on the amendment-7 binary (sha256 `52995fc3…`, built from `323dbfd79`), `F6_prof4` on F6's.
+  - Only the profiles are read. No prediction: the user-mode growth has no mechanism named yet.
