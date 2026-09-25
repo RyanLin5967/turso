@@ -12,10 +12,11 @@
 //! a slot lives, and it keeps every slot any live branch can see (see `store`), which is every slot a
 //! live branch's map can hold.
 //!
-//! `std::sync::Arc` rather than `crate::sync::Arc`: the nodes are plain data that is only ever
-//! touched under the branch store's mutex, so there is no interleaving for a model checker to
-//! explore, and `Arc::make_mut` — which copies a node only while another version shares it — is
-//! what makes an insert into an unshared map free of copies.
+//! `std::sync::Arc` rather than `crate::sync::Arc`: the nodes are plain data, touched under the
+//! branch store's mutex or, for a branch's first fork (which builds its view from a snapshot) and a
+//! reap (which drops an unlinked branch's maps), by one thread outside it; the reference counts
+//! are atomic and `Arc::make_mut` — which copies a node only while another version shares it —
+//! checks uniqueness atomically, and is what makes an insert into an unshared map free of copies.
 
 use std::sync::Arc;
 

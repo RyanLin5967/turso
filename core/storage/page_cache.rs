@@ -315,6 +315,17 @@ impl PageCache {
         self.parked_len = 0;
     }
 
+    /// Return `key`'s entry to the queue if a sweep parked it and its page is clean again (a spill
+    /// path that cleans pages instead of marking them spilled: the ephemeral one).
+    pub fn unpark_clean(&mut self, key: PageCacheKey) {
+        if let Some(&entry_ptr) = self.map.get(&key) {
+            let entry = unsafe { &*entry_ptr };
+            if entry.parked && !entry.page.is_dirty() {
+                self.unpark(entry_ptr);
+            }
+        }
+    }
+
     /// A page no sweep may evict until its transaction ends or it is spilled.
     #[inline]
     fn parkable(page: &PageRef) -> bool {

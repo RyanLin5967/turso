@@ -4365,12 +4365,18 @@ impl Pager {
 
     /// Finish a spill operation for ephemeral tables
     fn finish_ephemeral_spill(&self, pages: &[PinGuard]) {
+        let mut cache = self.page_cache.write();
         for page in pages {
             let tag = page.get().wal_tag.load(Ordering::Acquire);
             // wal tag is set to TAG_UNSET when adding to dirty_pages, meaning that this
             // page was dirtied after the spill started, so we don't clear the dirty flag in that case
             if tag != TAG_UNSET {
                 page.clear_dirty();
+            }
+            // A spilled page is clean now: if a sweep parked it while it was dirty, it must go
+            // back to the queue or no sweep would ever evict it again.
+            if !page.is_dirty() {
+                cache.unpark_clean(PageCacheKey::new(page.get().id));
             }
         }
     }
@@ -4891,6 +4897,8 @@ impl Pager {
                 }
             }
             dirty_pages.clear();
+            // The committed pages are clean: return any the sweep parked to its queue.
+            cache.unpark_all();
         }
         Ok(WalFrameInfo {
             page_no: header.page_number,

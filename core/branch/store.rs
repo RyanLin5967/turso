@@ -389,6 +389,24 @@ impl Lineage {
     }
 }
 
+/// Clears a branch's `forking` flag if its first fork's view build unwinds, so that a writer or a
+/// second fork waiting on the flag is not left waiting for ever.
+struct ForkingGuard<'a> {
+    store: &'a BranchStore,
+    id: BranchId,
+    armed: bool,
+}
+
+impl Drop for ForkingGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(st) = self.store.inner.lock().branches.get_mut(&self.id) {
+                st.forking = false;
+            }
+        }
+    }
+}
+
 /// The versions a reaped child alone could see when it had no live neighbour on one side: one
 /// range of one index, or two walked in lockstep (see [`BranchStore::reclaim_both`]).
 #[derive(Clone, Copy)]
@@ -578,6 +596,11 @@ impl BranchStore {
                 st.forking = true;
                 let (mut view, current) = (st.inherited.clone(), st.current.clone());
                 drop(inner);
+                let mut unwinding = ForkingGuard {
+                    store: self,
+                    id: parent,
+                    armed: true,
+                };
                 for (&page, owned) in current.iter() {
                     view.insert(page, owned.slot);
                 }
@@ -593,6 +616,7 @@ impl BranchStore {
                     .expect("a branch being forked is kept by the handle or connection forking it");
                 st.view = Some(view);
                 st.forking = false;
+                unwinding.armed = false;
                 continue;
             };
             let f = st.lineage.epoch;
