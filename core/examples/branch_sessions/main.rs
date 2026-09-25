@@ -117,6 +117,8 @@ static PROBE_BYTES: [AtomicI64; NL] = [const { AtomicI64::new(0) }; NL];
 static PROBE_ALLOCS: [AtomicI64; NL] = [const { AtomicI64::new(0) }; NL];
 static PROBE_SEEN: AtomicUsize = AtomicUsize::new(0);
 static PROBE_UNKNOWN: AtomicUsize = AtomicUsize::new(0);
+/// `PRAGMA wal_checkpoint` values that were not integers (recorded as -1).
+static CKPT_NONINT: AtomicUsize = AtomicUsize::new(0);
 
 fn probe(label: &'static str) {
     let m = mem();
@@ -155,7 +157,11 @@ struct Args {
     timing: bool,
     seed: u64,
     swap_limit_mib: u64,
+    swap_growth_mib: u64,
     level_floor: u32,
+    /// Session multiplexing: a session keeps only its Branch handle; each statement connects, runs,
+    /// and drops its connection.
+    mux: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -178,8 +184,10 @@ fn parse_args() -> Args {
         active: 0,
         timing: false,
         seed: 0x9E37_79B9_7F4A_7C15,
-        swap_limit_mib: 6 * 1024,
-        level_floor: 12,
+        swap_limit_mib: 7936,
+        swap_growth_mib: 512,
+        level_floor: 20,
+        mux: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -208,6 +216,11 @@ fn parse_args() -> Args {
             "--swap-limit-mib" => {
                 args.swap_limit_mib = val().parse().unwrap_or_else(|_| die("bad --swap-limit-mib"))
             }
+            "--swap-growth-mib" => {
+                args.swap_growth_mib =
+                    val().parse().unwrap_or_else(|_| die("bad --swap-growth-mib"))
+            }
+            "--mux" => args.mux = true,
             "--level-floor" => {
                 args.level_floor = val().parse().unwrap_or_else(|_| die("bad --level-floor"))
             }
@@ -266,6 +279,30 @@ fn memory_level() -> u32 {
         not_a_result("sysctl kern.memorystatus_level failed: the memory guard cannot read the level");
     }
     level as u32
+}
+
+/// The fleet memory rule (LANE-BRIEF, 15:47Z): a guard that polls at least once a second and stops the
+/// run when swap has grown more than the allowance since the run started, exceeds the absolute limit, or
+/// kern.memorystatus_level reads below the floor. A thread polls every 200 ms; the growth loop reads the
+/// flag before every session. The thread allocates nothing in its loop, so it cannot move the counters.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STOP_SWAP: AtomicI64 = AtomicI64::new(-1);
+static STOP_LEVEL: AtomicI64 = AtomicI64::new(-1);
+static MIN_LEVEL: AtomicI64 = AtomicI64::new(i64::MAX);
+static MAX_SWAP: AtomicI64 = AtomicI64::new(0);
+
+fn start_watchdog(swap0: u64, growth: u64, limit: u64, floor: u32) {
+    std::thread::spawn(move || loop {
+        let (swap, level) = (swap_used_mib(), memory_level());
+        MIN_LEVEL.fetch_min(level as i64, Ordering::Relaxed);
+        MAX_SWAP.fetch_max(swap as i64, Ordering::Relaxed);
+        if swap > swap0 + growth || swap > limit || level < floor {
+            STOP_SWAP.store(swap as i64, Ordering::Relaxed);
+            STOP_LEVEL.store(level as i64, Ordering::Relaxed);
+            STOP.store(true, Ordering::Release);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    });
 }
 
 fn open_fds() -> usize {
@@ -368,7 +405,8 @@ impl TrunkModel {
 
 struct Session {
     branch: Branch,
-    conn: Arc<Connection>,
+    /// `None` under --mux: the session holds no connection between statements.
+    conn: Option<Arc<Connection>>,
     row: i64,
     wrote: bool,
     trunk_writes_at_fork: u64,
@@ -427,7 +465,7 @@ impl Acc {
 
 /// The phases a session's growth is split into: fork, each connect-path step (one per label after
 /// "begin"), the tail of connect after the last probe, and the mode's first action.
-const PHASES: [&str; NL + 3] = [
+const PHASES: [&str; NL + 4] = [
     "fork",
     "connect.store_open",
     "connect.init.header",
@@ -443,6 +481,7 @@ const PHASES: [&str; NL + 3] = [
     "connect.return",
     "connect.total",
     "action",
+    "mux.drop",
 ];
 
 #[derive(Default)]
@@ -507,11 +546,13 @@ impl Bench {
             .run_collect_rows()
             .unwrap();
         let r = &rows[0];
-        (
-            r[0].as_int().unwrap(),
-            r[1].as_int().unwrap(),
-            r[2].as_int().unwrap(),
-        )
+        let int = |v: &Value| {
+            v.as_int().unwrap_or_else(|| {
+                CKPT_NONINT.fetch_add(1, Ordering::Relaxed);
+                -1
+            })
+        };
+        (int(&r[0]), int(&r[1]), int(&r[2]))
     }
 
     /// Open one session: fork, connect (probed), and the mode's first action.
@@ -566,6 +607,15 @@ impl Bench {
         }
         let t5 = Instant::now();
         let m3 = mem();
+        let conn = if self.args.mux {
+            drop(conn);
+            let m4 = mem();
+            iv.bytes[NL + 3].add(m4.bytes - m3.bytes);
+            iv.allocs[NL + 3].add(m4.allocs - m3.allocs);
+            None
+        } else {
+            Some(conn)
+        };
 
         let pb = |k: usize| PROBE_BYTES[k].load(Ordering::Relaxed);
         let pa = |k: usize| PROBE_ALLOCS[k].load(Ordering::Relaxed);
@@ -610,7 +660,10 @@ fn footprints(sessions: &[Session]) -> (u64, u64, u64, u64, u64, u64, SessionFoo
     let (mut pages, mut pmin, mut pmax, mut locks, mut shared) = (0u64, u64::MAX, 0u64, 0u64, 0u64);
     let mut touched = 0u64;
     for s in sessions {
-        let f = s.conn.session_footprint();
+        let Some(conn) = &s.conn else {
+            continue;
+        };
+        let f = conn.session_footprint();
         pages += f.cached_pages as u64;
         if s.touched {
             touched += 1;
@@ -623,7 +676,8 @@ fn footprints(sessions: &[Session]) -> (u64, u64, u64, u64, u64, u64, SessionFoo
     }
     let first = sessions
         .first()
-        .map(|s| s.conn.session_footprint())
+        .and_then(|s| s.conn.as_ref())
+        .map(|c| c.session_footprint())
         .unwrap_or_default();
     (pages, pmin, pmax, locks, shared, touched, first)
 }
@@ -685,7 +739,8 @@ fn main() {
     println!("# branch_sessions — Turso fork, r11-sessions PREREG (frontier/round11/r11-sessions)");
     println!(
         "# mode={:?} checkpoints={:?} analyze={} tables={} active={} timing={} seed={:#x} \
-         swap_limit_mib={} level_floor={} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
+         swap_limit_mib={} swap_growth_mib={} level_floor={} mux={} \
+         trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
          page_size={page_size} trunk_pages={trunk_pages} trunk_synchronous={synchronous}",
         args.mode,
         args.checkpoints,
@@ -695,7 +750,9 @@ fn main() {
         args.timing,
         args.seed,
         args.swap_limit_mib,
-        args.level_floor
+        args.swap_growth_mib,
+        args.level_floor,
+        args.mux
     );
     println!(
         "# build: {} ; clock tick {:.0} ns",
@@ -718,6 +775,13 @@ fn main() {
         rng: Rng(args.seed),
         args,
     };
+    let swap0 = swap_used_mib();
+    start_watchdog(
+        swap0,
+        b.args.swap_growth_mib,
+        b.args.swap_limit_mib,
+        b.args.level_floor,
+    );
     let base = mem();
     let fds0 = open_fds();
     println!(
@@ -743,17 +807,16 @@ fn main() {
         let mem_before = mem();
         let t = Instant::now();
         while sessions.len() < n {
-            if sessions.len() % 1000 == 0 {
-                let (swap, level) = (swap_used_mib(), memory_level());
-                if swap > b.args.swap_limit_mib || level < b.args.level_floor {
-                    limit = Some(format!(
-                        "N={} swap_used_mib={swap} memory_level={level} live_bytes={} rss_bytes={}",
-                        sessions.len(),
-                        mem().bytes,
-                        rss_bytes()
-                    ));
-                    break;
-                }
+            if STOP.load(Ordering::Acquire) {
+                limit = Some(format!(
+                    "N={} swap_used_mib={} memory_level={} live_bytes={} rss_bytes={}",
+                    sessions.len(),
+                    STOP_SWAP.load(Ordering::Relaxed),
+                    STOP_LEVEL.load(Ordering::Relaxed),
+                    mem().bytes,
+                    rss_bytes()
+                ));
+                break;
             }
             let i = sessions.len();
             let s = b.open_session(i, &mut iv);
@@ -841,13 +904,20 @@ fn main() {
         Some(l) => println!("# LIMIT reached at {l}"),
         None => println!("# LIMIT not reached: every checkpoint grown"),
     }
+    println!(
+        "# guard: swap_at_start_mib={swap0} max_swap_mib={} min_memory_level={}",
+        MAX_SWAP.load(Ordering::Relaxed),
+        MIN_LEVEL.load(Ordering::Relaxed)
+    );
 
     // Teardown, decomposed: close every intx transaction, then drop the connections, then the
     // branch handles, reading the allocator between steps.
     let n = sessions.len();
     if b.args.mode == Mode::Intx {
         for s in &sessions {
-            s.conn.execute("COMMIT").unwrap();
+            if let Some(conn) = &s.conn {
+                conn.execute("COMMIT").unwrap();
+            }
         }
     }
     let m0 = mem();
@@ -912,7 +982,10 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
             let s = &sessions[si];
             let (r0, m0) = (b.resolves(), mem());
             let t = Instant::now();
-            let got = read_v(&s.conn, s.row);
+            let got = match &s.conn {
+                Some(conn) => read_v(conn, s.row),
+                None => read_v(&s.branch.connect().unwrap(), s.row),
+            };
             ops[op].2.push(t.elapsed());
             ops[op].0.add((b.resolves() - r0) as i64);
             ops[op].1.add(mem().bytes - m0.bytes);
@@ -967,13 +1040,14 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
     }
     println!(
         "# active x={x} intx={intx} ckpt_busy_mean={:.3} ckpt_log_min={} ckpt_log_max={} \
-         ckpt_checkpointed_min={} ckpt_checkpointed_max={} wal_bytes_before={wal0} wal_bytes_after={} \
-         trunk_writes={}",
+         ckpt_checkpointed_min={} ckpt_checkpointed_max={} ckpt_nonint={} wal_bytes_before={wal0} \
+         wal_bytes_after={} trunk_writes={}",
         busy.mean(),
         log.min,
         log.max,
         ckpt.min,
         ckpt.max,
+        CKPT_NONINT.load(Ordering::Relaxed),
         b.wal_bytes(),
         b.model.writes
     );
