@@ -38,6 +38,13 @@
 //!   --trunk-values random       each trunk write stores a pseudo-random value, so a rewrite
 //!                               changes the whole value (default `counter`, c3's)
 //!   --counters-only             print no latency: counters, arena, RSS and heap bytes only
+//!   --store-agnostic            churn arms: do not check the arena against the page-granular
+//!                               store's predictions (a store that keeps sub-page versions has
+//!                               other counts); every read is still checked against the model
+//!   --verify-scan K             churn arms: after every window, K random live branches each scan
+//!                               128 consecutive rows, and after every checkpoint the OLDEST live
+//!                               branch scans the whole table; every row is checked against the
+//!                               model (drawn from a separate Rng, so the victim sequence is unchanged)
 //!
 //! Every state and window line also prints `heap_live_bytes`: the requested bytes of every live
 //! heap allocation of the process, from a counting global allocator (an integer, exact).
@@ -113,6 +120,22 @@ fn heap_live_bytes() -> usize {
     HEAP_LIVE.load(Ordering::Relaxed)
 }
 
+/// The store's trunk-version accounting (zero chunk fields in a page-granular store).
+fn subpage(s: &turso_core::branch::BranchStats) -> String {
+    format!(
+        "trunk_versions={} trunk_version_bytes={} trunk_pending_pages={} chunk_slots_in_use={} \
+         chunk_size={} chunks_changed={} chunks_retained={} chunks_overlaid={}",
+        s.trunk_versions,
+        s.trunk_version_bytes,
+        s.trunk_pending_pages,
+        s.chunk_slots_in_use,
+        s.chunk_size,
+        s.work.trunk_chunks_changed,
+        s.work.trunk_chunks_retained,
+        s.work.resolve_chunks_overlaid
+    )
+}
+
 const VALUE_LEN: usize = 100;
 /// The row the trunk rewrites in `hot` and `churn_hot`.
 const HOT_ROW: i64 = 1;
@@ -155,6 +178,8 @@ struct Args {
     page_size: Option<i64>,
     random_values: bool,
     counters_only: bool,
+    store_agnostic: bool,
+    verify_scan: usize,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -181,6 +206,8 @@ fn parse_args() -> Args {
         page_size: None,
         random_values: false,
         counters_only: false,
+        store_agnostic: false,
+        verify_scan: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -237,6 +264,10 @@ fn parse_args() -> Args {
                 }
             }
             "--counters-only" => args.counters_only = true,
+            "--store-agnostic" => args.store_agnostic = true,
+            "--verify-scan" => {
+                args.verify_scan = val().parse().unwrap_or_else(|_| die("bad --verify-scan"))
+            }
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -248,8 +279,10 @@ fn parse_args() -> Args {
     {
         die("--trunk-rows, --stride and --trunk-values apply to churn_spread only");
     }
-    if (args.page_size.is_some() || args.counters_only) && !churn {
-        die("--page-size and --counters-only apply to the churn arms only");
+    if (args.page_size.is_some() || args.counters_only || args.store_agnostic || args.verify_scan > 0)
+        && !churn
+    {
+        die("--page-size, --counters-only, --store-agnostic and --verify-scan apply to the churn arms only");
     }
     if args.trunk_rows < 2 || args.stride == 0 || gcd(args.stride, args.trunk_rows as u64) != 1 {
         die("--trunk-rows must be >= 2 and --stride coprime with it, so the walk visits every row");
@@ -467,6 +500,7 @@ struct WorkSum {
     resolve_retained_examined: u64,
     gc_examined: u64,
     gc_range_entries: u64,
+    chunks_overlaid: u64,
 }
 
 impl WorkSum {
@@ -476,6 +510,7 @@ impl WorkSum {
         self.resolve_retained_examined += b.resolve_retained_examined - a.resolve_retained_examined;
         self.gc_examined += b.gc_examined - a.gc_examined;
         self.gc_range_entries += b.gc_range_entries - a.gc_range_entries;
+        self.chunks_overlaid += b.resolve_chunks_overlaid - a.resolve_chunks_overlaid;
     }
 }
 
@@ -529,13 +564,14 @@ impl Bench {
             )
         };
         println!(
-            "{x}\t{name}\t{}\t{times}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+            "{x}\t{name}\t{}\t{times}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
             us.len(),
             per(op.work.resolve_calls),
             per(op.work.resolve_levels),
             per(op.work.resolve_retained_examined),
             per(op.work.gc_examined),
             per(op.work.gc_range_entries),
+            per(op.work.chunks_overlaid),
         );
         self.summary.push((
             x,
@@ -551,13 +587,14 @@ impl Bench {
         let s = self.db.branch_stats();
         println!(
             "# x={x} live={} arena_in_use={} arena_free={} arena_high_water={} rss_bytes={} \
-             heap_live_bytes={} trunk_writes={} wal_bytes={} {extra}",
+             heap_live_bytes={} {} trunk_writes={} wal_bytes={} {extra}",
             s.live_branches,
             s.arena_slots_in_use,
             s.arena_slots_free,
             s.arena_slots_in_use + s.arena_slots_free,
             rss_bytes(),
             heap_live_bytes(),
+            subpage(&s),
             self.model.writes,
             std::fs::metadata(&self.wal_path).map_or(0, |m| m.len())
         );
@@ -605,7 +642,7 @@ impl Bench {
     }
 }
 
-const HEADER: &str = "x\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\tresolves_per_op\tlevels_per_op\tret_examined_per_op\tgc_examined_per_op\tgc_range_per_op";
+const HEADER: &str = "x\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\tresolves_per_op\tlevels_per_op\tret_examined_per_op\tgc_examined_per_op\tgc_range_per_op\toverlaid_per_op";
 
 fn main() {
     let args = parse_args();
@@ -1017,6 +1054,8 @@ fn arm_churn(b: &mut Bench, args: &Args) {
     let mut grown = 0usize;
     let per_window = args.cycles / args.windows;
     let own_plus_retained = |n: usize| if hot { 2 * n } else { n };
+    // --verify-scan draws from its own stream, so the victims are the same with and without it.
+    let mut vrng = Rng(args.seed ^ 0x5DEE_CE66_D1CE_F00D);
     // churn_spread: versions retained minus versions freed, from the harness's own count of trunk
     // writes (each retains exactly one leaf: a live child forked since the leaf's last write, the
     // one forked this cycle) and the engine's report of what each reap freed beyond its own page.
@@ -1032,7 +1071,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
         }
         let s = b.db.branch_stats();
         let expected_in_use = if spread { n + retained_expected } else { own_plus_retained(n) };
-        if s.live_branches != n || s.arena_slots_in_use != expected_in_use {
+        if s.live_branches != n || (!args.store_agnostic && s.arena_slots_in_use != expected_in_use) {
             not_a_result(&format!(
                 "expected {n} branches and {expected_in_use} arena pages before churn: {s:?}"
             ));
@@ -1050,6 +1089,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
         ];
         let mut off_prediction_reaps = 0usize;
         let mut versions_freed = 0usize;
+        let mut chunks_freed = 0usize;
         let rss0 = rss_bytes();
         for wdx in 0..args.windows {
             let mut win: [Op; 8] = Default::default();
@@ -1084,13 +1124,16 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                     not_a_result(&format!("a churn reap freed {reaped:?}"));
                 }
                 versions_freed += reaped.freed_pages - 1;
-                retained_expected = retained_expected
-                    .checked_sub(reaped.freed_pages - 1)
-                    .unwrap_or_else(|| {
-                        not_a_result(&format!(
-                            "a churn reap freed {reaped:?}, more versions than were retained"
-                        ))
-                    });
+                chunks_freed += reaped.freed_chunks;
+                if !args.store_agnostic {
+                    retained_expected = retained_expected
+                        .checked_sub(reaped.freed_pages - 1)
+                        .unwrap_or_else(|| {
+                            not_a_result(&format!(
+                                "a churn reap freed {reaped:?}, more versions than were retained"
+                            ))
+                        });
+                }
                 // Predicted from the source: the victim's own page, plus in churn_hot the one
                 // version of the hot page that only it could see. churn_spread has no fixed count.
                 if !spread && reaped.freed_pages != if hot { 2 } else { 1 } {
@@ -1129,7 +1172,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
             if s.live_branches != n {
                 not_a_result(&format!("churn left {} live branches, expected {n}", s.live_branches));
             }
-            if spread && s.arena_slots_in_use != n + retained_expected {
+            if spread && !args.store_agnostic && s.arena_slots_in_use != n + retained_expected {
                 not_a_result(&format!(
                     "churn_spread window {wdx}: expected {n} own + {retained_expected} retained arena \
                      pages, engine has {}",
@@ -1159,28 +1202,47 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 all[i].work.resolve_retained_examined += w.resolve_retained_examined;
                 all[i].work.gc_examined += w.gc_examined;
                 all[i].work.gc_range_entries += w.gc_range_entries;
+                all[i].work.chunks_overlaid += w.chunks_overlaid;
             }
             line += &format!(
-                " arena_in_use={} arena_high_water={} rss_bytes={} heap_live_bytes={} \
-                 versions_freed={versions_freed}",
+                " arena_in_use={} arena_high_water={} rss_bytes={} heap_live_bytes={} {} \
+                 versions_freed={versions_freed} chunks_freed={chunks_freed}",
                 s.arena_slots_in_use,
                 s.arena_slots_in_use + s.arena_slots_free,
                 rss_bytes(),
-                heap_live_bytes()
+                heap_live_bytes(),
+                subpage(&s)
             );
             println!("{line}");
+            if args.verify_scan > 0 {
+                let rows_checked = verify_scan(b, &live, &mut vrng, args.verify_scan);
+                println!("# verify x={n} w={wdx} branches={} rows_checked={rows_checked}", args.verify_scan);
+            }
         }
         for (i, op) in all.iter().enumerate() {
             if !op.samples.is_empty() {
                 b.print_op(n, names[i], op);
             }
         }
+        if args.verify_scan > 0 {
+            let (fork_writes, rows_checked) = verify_oldest(b, &live);
+            println!(
+                "# verify x={n} oldest_full_scan rows_checked={rows_checked} \
+                 oldest_trunk_writes_at_fork={fork_writes} trunk_writes={}",
+                b.model.writes
+            );
+        }
         let s = b.db.branch_stats();
         let predicted = if spread { n + retained_expected } else { own_plus_retained(n) };
+        let predicted_txt = if args.store_agnostic {
+            "n/a (store-agnostic)".to_string()
+        } else {
+            predicted.to_string()
+        };
         b.print_state(
             n,
             &format!(
-                "cycles={} victim={:?} predicted_arena_in_use={predicted} \
+                "cycles={} victim={:?} predicted_arena_in_use={predicted_txt} \
                  predicted_high_water_max={} off_prediction_reaps={} versions_freed={versions_freed} \
                  rss_before_churn={rss0}",
                 args.cycles,
@@ -1193,7 +1255,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 if spread { "n/a".to_string() } else { off_prediction_reaps.to_string() },
             ),
         );
-        if s.arena_slots_in_use != predicted {
+        if !args.store_agnostic && s.arena_slots_in_use != predicted {
             println!(
                 "# ARENA-PREDICTION-MISS x={n}: in use {} != predicted {predicted}",
                 s.arena_slots_in_use
@@ -1214,6 +1276,56 @@ fn arm_churn(b: &mut Bench, args: &Args) {
         ],
     );
     drop(live);
+}
+
+/// `--verify-scan`: `k` random live branches each read 128 consecutive rows, every row checked
+/// against the model. Returns the rows checked.
+fn verify_scan(b: &Bench, live: &VecDeque<Live>, vrng: &mut Rng, k: usize) -> usize {
+    let mut checked = 0;
+    for _ in 0..k {
+        let target = &live[vrng.below(live.len())];
+        let lo = 1 + vrng.below(rows() as usize) as i64;
+        let hi = (lo + 127).min(rows());
+        checked += scan_and_check(b, target, lo, hi);
+    }
+    checked
+}
+
+/// `--verify-scan`: the oldest live branch (the one that reads the most retained versions) reads
+/// the whole table. Returns its fork point and the rows checked.
+fn verify_oldest(b: &Bench, live: &VecDeque<Live>) -> (u64, usize) {
+    let oldest = live
+        .iter()
+        .min_by_key(|l| l.trunk_writes_at_fork)
+        .expect("a churn arm has live branches");
+    (oldest.trunk_writes_at_fork, scan_and_check(b, oldest, 1, rows()))
+}
+
+fn scan_and_check(b: &Bench, target: &Live, lo: i64, hi: i64) -> usize {
+    let conn = target.branch.connect().unwrap();
+    let mut stmt = conn
+        .prepare(format!("SELECT id, v FROM t WHERE id BETWEEN {lo} AND {hi} ORDER BY id"))
+        .unwrap();
+    let got = stmt.run_collect_rows().unwrap();
+    drop(stmt);
+    drop(conn);
+    if got.len() as i64 != hi - lo + 1 {
+        not_a_result(&format!("a verify scan of rows {lo}..={hi} returned {} rows", got.len()));
+    }
+    for (i, row) in got.iter().enumerate() {
+        let id = lo + i as i64;
+        let ok = row[0].as_int() == Some(id)
+            && matches!(&row[1], Value::Text(t) if t.as_str() == target.expect(&b.model, id));
+        if !ok {
+            not_a_result(&format!(
+                "a verify scan read row {id} as {row:?}; the branch forked after trunk write {} \
+                 must read {:?}",
+                target.trunk_writes_at_fork,
+                target.expect(&b.model, id)
+            ));
+        }
+    }
+    got.len()
 }
 
 /// Arm (d) `pages`: every branch writes w rows on w distinct leaves in one transaction. One block
