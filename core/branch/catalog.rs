@@ -70,6 +70,31 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS free(slot INTEGER PRIMARY KEY)",
 ];
 
+/// The catalog's per-operation lookups, as prepared below (for the plan test).
+#[cfg(test)]
+const LOOKUPS: &[&str] = &[
+    "SELECT parent, fork_epoch, epoch, released, lease, n_children FROM branch WHERE id = ?1",
+    "SELECT k, slot, born, crc FROM cur WHERE k >= ?1 AND k < ?2",
+    "SELECT page, born, died, slot, crc FROM ret WHERE owner = ?1",
+    "SELECT born, died, slot, crc FROM ret WHERE owner = ?1 AND page = ?2",
+    "SELECT page FROM ret WHERE owner = ?1 AND born > ?2 AND born <= ?3",
+    "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch >= ?2 AND fork_epoch < ?3 ORDER BY fork_epoch ASC LIMIT ?4",
+    "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch < ?2 ORDER BY fork_epoch DESC LIMIT ?3",
+    "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch > ?2 ORDER BY fork_epoch ASC LIMIT ?3",
+    "SELECT id FROM branch WHERE lease > -1 AND lease <= ?1",
+    "SELECT lease FROM branch WHERE lease > -1 ORDER BY lease ASC LIMIT 1",
+    "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
+    "SELECT id FROM branch WHERE released = 1",
+    "SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2",
+    "SELECT 1 FROM free WHERE slot = ?1",
+    "DELETE FROM cur WHERE k >= ?1 AND k < ?2",
+    "DELETE FROM ret WHERE owner = ?1",
+    "DELETE FROM ret WHERE owner = ?1 AND page = ?2",
+    "DELETE FROM free WHERE slot <= ?1",
+    "DELETE FROM free WHERE slot = ?1",
+    "DELETE FROM branch WHERE id = ?1",
+];
+
 const META_GENERATION: i64 = 1;
 const META_PAGE_SIZE: i64 = 2;
 const META_NEXT_ID: i64 = 3;
@@ -272,9 +297,13 @@ impl Catalog {
                 "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch > ?2 \
                  ORDER BY fork_epoch ASC LIMIT ?3",
             )?,
-            lease_due: p("SELECT id FROM branch WHERE lease IS NOT NULL AND lease <= ?1")?,
-            lease_min: p("SELECT min(lease) FROM branch WHERE lease IS NOT NULL")?,
-            lease_min_after: p("SELECT min(lease) FROM branch WHERE lease > ?1")?,
+            // Range seeks on `branch_lease`: NULL sorts first in the index, so `lease > -1` skips
+            // every unleased row instead of walking them (deadlines are never negative).
+            lease_due: p("SELECT id FROM branch WHERE lease > -1 AND lease <= ?1")?,
+            lease_min: p("SELECT lease FROM branch WHERE lease > -1 ORDER BY lease ASC LIMIT 1")?,
+            lease_min_after: p(
+                "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
+            )?,
             trunk_counts: p("SELECT page, count(*) FROM ret WHERE owner = 0 GROUP BY page")?,
             released: p("SELECT id FROM branch WHERE released = 1")?,
             unreleased: p("SELECT id FROM branch WHERE released = 0")?,
@@ -331,6 +360,25 @@ impl Catalog {
     pub(crate) fn commit(&mut self) -> Result<()> {
         self.conn.execute("COMMIT")?;
         Ok(())
+    }
+
+    /// `EXPLAIN QUERY PLAN` of every query the store runs on the catalog, for the test that
+    /// proves none of them walks a table or sorts (r11-restart lane): `(sql, plan lines)`.
+    #[cfg(test)]
+    pub(crate) fn plans(&self) -> Result<Vec<(&'static str, Vec<String>)>> {
+        let mut out = Vec::new();
+        for sql in LOOKUPS {
+            let rows = self
+                .conn
+                .prepare(format!("EXPLAIN QUERY PLAN {sql}"))?
+                .run_collect_rows()?;
+            let lines = rows
+                .iter()
+                .map(|r| r.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" "))
+                .collect();
+            out.push((*sql, lines));
+        }
+        Ok(out)
     }
 
     pub(crate) fn rollback(&mut self) {

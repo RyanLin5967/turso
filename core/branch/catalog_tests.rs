@@ -232,3 +232,27 @@ fn the_two_durable_modes_refuse_each_others_files() {
     }
     assert!(open_at(&snap_path, catalog()).is_err(), "a catalog store opened a snapshot store's files");
 }
+
+/// The claim rests on every per-operation catalog query being an index seek: a query that walks a
+/// table, or sorts its matches, is Θ(N) and would put back what the catalog removes. Read from the
+/// planner itself, not assumed: no plan line may be a bare SCAN of a catalog table or a temp
+/// B-tree sort.
+#[test]
+fn every_catalog_lookup_is_a_seek() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cat = super::catalog::Catalog::open(&dir.path().join("cat"), false).unwrap();
+    let mut bad = Vec::new();
+    for (sql, lines) in cat.plans().unwrap() {
+        eprintln!("{sql}\n    {}", lines.join("\n    "));
+        assert!(!lines.is_empty(), "no plan for {sql}");
+        for line in &lines {
+            let walks = ["branch", "cur", "ret", "free"]
+                .iter()
+                .any(|t| line.contains(&format!("SCAN {t}")));
+            if walks || line.contains("TEMP B-TREE") {
+                bad.push(format!("{sql}: {line}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "catalog lookups that walk or sort:\n{}", bad.join("\n"));
+}
