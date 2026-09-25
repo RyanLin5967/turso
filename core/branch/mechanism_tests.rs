@@ -1009,3 +1009,51 @@ fn sorted_stats(stats: &crate::stats::AnalyzeStats) -> Vec<(String, String)> {
     v.sort();
     v
 }
+
+/// FS5. A trunk page served from the shared trunk-page cache is held by reference, not copied;
+/// the first write to it on a branch copies it first, so neither the cache, nor another branch,
+/// nor the trunk sees the write.
+#[test]
+fn a_shared_trunk_page_is_copied_before_a_branch_writes_it() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let before: BTreeMap<i64, String> = (1..=300).map(|id| (id, original(id))).collect();
+    let b1 = trunk.fork_branch().unwrap();
+    let c1 = b1.connect().unwrap();
+    assert_eq!(table(&c1), before);
+    let b2 = trunk.fork_branch().unwrap();
+    let c2 = b2.connect().unwrap();
+    assert_eq!(table(&c2), before);
+    let pages = rows(&trunk, "PRAGMA page_count")[0][0].as_int().unwrap() as usize;
+    let shared = c2.pager.load().shared_cached_pages(pages);
+    assert!(shared >= 2, "the second branch holds {shared} shared pages; the cache was copied");
+    // Every leaf rewritten on the second branch, in one transaction and then row by row.
+    c2.execute("BEGIN").unwrap();
+    for id in (1..=300).step_by(3) {
+        set(&c2, id, &format!("b2-{id}"));
+    }
+    c2.execute("COMMIT").unwrap();
+    for id in (2..=300).step_by(3) {
+        set(&c2, id, &format!("b2-{id}"));
+    }
+    assert!(
+        c2.pager.load().shared_cached_pages(pages) < shared,
+        "writing did not replace the shared pages it wrote"
+    );
+    let mut want = before.clone();
+    for id in 1..=300 {
+        if id % 3 != 0 {
+            want.insert(id, format!("b2-{id}"));
+        }
+    }
+    assert_eq!(table(&c2), want);
+    assert_eq!(table(&c1), before, "the first branch sees the second one's writes");
+    let b3 = trunk.fork_branch().unwrap();
+    let c3 = b3.connect().unwrap();
+    assert_eq!(table(&c3), before, "a branch write reached the shared cache");
+    assert_eq!(table(&trunk), before);
+    drop(c2);
+    let c2 = b2.connect().unwrap();
+    assert_eq!(table(&c2), want, "the branch lost its writes");
+}

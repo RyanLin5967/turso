@@ -140,6 +140,9 @@ pub(crate) enum Resolved {
     /// The page is in the caller's buffer: a branch version from the arena, or the trunk's version
     /// from the shared cache.
     Filled,
+    /// The trunk's version, from the shared cache, not copied: the caller holds these bytes as its
+    /// page's buffer and must copy them before its first write (FS5).
+    Shared(Arc<crate::alloc::DynBoxedSlice<u8>>),
     /// The branch sees the trunk's current version and the cache does not hold it: the caller reads
     /// it through the WAL or the database file, and may hand it to
     /// [`BranchStore::fill_trunk_page`] under this key.
@@ -196,11 +199,13 @@ impl<T: Default> Radix<T> {
     }
 }
 
-/// One cached trunk page. `std::sync::Arc`, as `arc_swap` requires.
+/// One cached trunk page. `std::sync::Arc`, as `arc_swap` requires. The bytes sit in their own
+/// shared allocation so that a branch pager can hold them as its page's buffer without a copy
+/// (r11-sessions FS5); they are never written after the fill.
 struct CachedPage {
     generation: u64,
     epoch: u64,
-    bytes: Box<[u8]>,
+    bytes: Arc<crate::alloc::DynBoxedSlice<u8>>,
 }
 
 struct TrunkPages {
@@ -210,18 +215,26 @@ struct TrunkPages {
 }
 
 impl TrunkPages {
-    /// Copy the version `key` names into `out`, if it is cached.
-    fn copy_into(&self, key: TrunkPageKey, out: &mut [u8]) -> bool {
-        let Some(slot) = self.pages.get(key.page) else {
-            return false;
-        };
+    /// The bytes of the version `key` names, if it is cached.
+    fn get(&self, key: TrunkPageKey) -> Option<Arc<crate::alloc::DynBoxedSlice<u8>>> {
+        let slot = self.pages.get(key.page)?;
         let cached = slot.load();
         match cached.as_deref() {
             Some(p) if p.generation == key.generation && p.epoch == key.epoch => {
-                out.copy_from_slice(&p.bytes);
+                Some(p.bytes.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Copy the version `key` names into `out`, if it is cached.
+    fn copy_into(&self, key: TrunkPageKey, out: &mut [u8]) -> bool {
+        match self.get(key) {
+            Some(bytes) => {
+                out.copy_from_slice(&bytes);
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -234,7 +247,7 @@ impl TrunkPages {
         let new = std::sync::Arc::new(CachedPage {
             generation: key.generation,
             epoch: key.epoch,
-            bytes: bytes.into(),
+            bytes: Arc::new(bytes.to_vec().into_boxed_slice()),
         });
         self.pages.get_or_insert(key.page).rcu(|old| match old {
             Some(p) if p.generation == key.generation && p.epoch >= key.epoch => Some(p.clone()),
@@ -839,6 +852,22 @@ impl BranchStore {
     /// The trunk's version comes from the shared cache when it holds it; otherwise the answer is
     /// [`Resolved::Trunk`] with the key to cache the caller's read under.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<Resolved> {
+        self.resolve_impl(id, page, out, false)
+    }
+
+    /// As [`Self::resolve_into`], except that a trunk version the shared cache holds is handed
+    /// back as [`Resolved::Shared`] — the cached bytes themselves, for the caller to hold as its
+    /// page's (immutable) buffer — instead of being copied into `out` (FS5).
+    pub(crate) fn resolve_shared(
+        &self,
+        id: BranchId,
+        page: u32,
+        out: &mut [u8],
+    ) -> Result<Resolved> {
+        self.resolve_impl(id, page, out, true)
+    }
+
+    fn resolve_impl(&self, id: BranchId, page: u32, out: &mut [u8], share: bool) -> Result<Resolved> {
         let mut inner = self.lock();
         let (mut levels, mut examined) = (0, 0);
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
@@ -853,7 +882,12 @@ impl BranchStore {
                 epoch: inner.trunk.written.get(&page).copied().unwrap_or(0),
                 generation: self.trunk_pages.generation.load(Ordering::Acquire),
             };
-            if self.trunk_pages.copy_into(key, out) {
+            if share {
+                if let Some(bytes) = self.trunk_pages.get(key) {
+                    inner.work.trunk_page_hits += 1;
+                    return Ok(Resolved::Shared(bytes));
+                }
+            } else if self.trunk_pages.copy_into(key, out) {
                 inner.work.trunk_page_hits += 1;
                 return Ok(Resolved::Filled);
             }
@@ -1423,8 +1457,15 @@ mod tests {
             }
             for (id, view) in &live {
                 for page in 0..PAGES {
-                    let got = match store.resolve_into(*id, page, &mut buf).unwrap() {
+                    // Odd steps take the pager's by-reference path (FS5), even steps the copying one.
+                    let resolved = if step % 2 == 1 {
+                        store.resolve_shared(*id, page, &mut buf)
+                    } else {
+                        store.resolve_into(*id, page, &mut buf)
+                    };
+                    let got = match resolved.unwrap() {
                         Resolved::Filled => u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                        Resolved::Shared(bytes) => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
                         Resolved::Trunk(key) => {
                             store.fill_trunk_page(key, &image(current[&page]));
                             current[&page]

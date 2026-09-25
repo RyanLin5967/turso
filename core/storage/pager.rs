@@ -1832,6 +1832,22 @@ impl Pager {
         self.branch.get().map(|b| b.id)
     }
 
+    /// Of pages 1..=`upto` in this pager's cache, how many hold the shared trunk-page cache's bytes
+    /// rather than a copy (FS5). Observation only.
+    pub(crate) fn shared_cached_pages(&self, upto: usize) -> usize {
+        let mut cache = self.page_cache.write();
+        (1..=upto)
+            .filter(|&n| {
+                cache.peek(&PageCacheKey::new(n), false).is_some_and(|p| {
+                    p.get()
+                        .buffer
+                        .as_ref()
+                        .is_some_and(|b| matches!(**b, Buffer::Shared(_)))
+                })
+            })
+            .count()
+    }
+
     /// Pages in this pager's private page cache. Observation only (branch session footprint).
     pub(crate) fn page_cache_len(&self) -> usize {
         self.page_cache.read().len()
@@ -3683,13 +3699,17 @@ impl Pager {
                 "a branch pager does not read the WAL at an explicit watermark".to_string(),
             ));
         }
-        let buf = Arc::new(self.buffer_pool.get_page());
-        if let Resolved::Trunk(key) =
-            branch
-                .store
-                .resolve_into(branch.id, page_idx as u32, buf.as_mut_slice())?
+        let mut buf = Arc::new(self.buffer_pool.get_page());
+        match branch
+            .store
+            .resolve_shared(branch.id, page_idx as u32, buf.as_mut_slice())?
         {
-            return Ok(BranchRead::Trunk(key));
+            Resolved::Trunk(key) => return Ok(BranchRead::Trunk(key)),
+            // The trunk's cached version, held by reference: every open session that reads this
+            // version shares one copy of its bytes (FS5). `copy_on_write_decision` gives the page
+            // a private copy before its first write.
+            Resolved::Shared(bytes) => buf = Arc::new(Buffer::new_shared(bytes)),
+            Resolved::Filled => {}
         }
         let page = Arc::new(Page::new(page_idx));
         page.set_locked();
@@ -3856,6 +3876,20 @@ impl Pager {
         }
         let page_no = page.get().id as u32;
         if let Some(branch) = self.branch.get() {
+            // A page whose bytes are the shared trunk-page cache's (FS5) gets its own copy first:
+            // nothing may write the cache's bytes.
+            let shared = page
+                .get()
+                .buffer
+                .as_ref()
+                .is_some_and(|b| matches!(**b, Buffer::Shared(_)));
+            if shared {
+                let private = self.buffer_pool.get_page();
+                private
+                    .as_mut_slice()
+                    .copy_from_slice(page.get_contents().as_slice());
+                page.get().buffer = Some(Arc::new(private));
+            }
             return branch.store.first_write_branch(
                 branch.id,
                 page_no,
