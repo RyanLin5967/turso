@@ -63,6 +63,10 @@ use crate::sync::Arc;
 use crate::util::IOExt as _;
 use crate::{Connection, Database, Result, TransactionState};
 use store::BranchStore;
+pub use store::{
+    content_hash, Digest, Plant, RecvWork, SendMode, SendReport, ShipDump, TrunkImage,
+    CURRENT_ENTRY_BYTES, RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
+};
 
 /// The identity of a branch. Distinct from any page or transaction id on purpose: a branch
 /// outlives the transactions that write into it, which is the whole point of the mechanism.
@@ -359,6 +363,71 @@ impl Database {
         self.branches.stats()
     }
 
+    /// Track what a receiver of this database's branch store needs (see `store::ship`). Must run
+    /// before the first fork.
+    #[doc(hidden)]
+    pub fn branch_enable_shipping(&self) -> Result<()> {
+        self.branches.enable_shipping()
+    }
+
+    /// The branch store's shipping position: a receiver that applied a stream ending here is at it.
+    #[doc(hidden)]
+    pub fn branch_ship_seq(&self) -> u64 {
+        self.branches.ship_seq()
+    }
+
+    /// Bytes a log of every branch-store operation would have shipped since shipping began.
+    #[doc(hidden)]
+    pub fn branch_log_bytes(&self) -> u64 {
+        self.branches.log_bytes()
+    }
+
+    /// Every receiver is at or past `upto`: drop the tombstones it no longer needs.
+    #[doc(hidden)]
+    pub fn branch_forget_tombstones(&self, upto: u64) -> usize {
+        self.branches.forget_tombstones(upto)
+    }
+
+    #[doc(hidden)]
+    pub fn branch_tombstones(&self) -> usize {
+        self.branches.tombstone_count()
+    }
+
+    /// Send the branch store (see `store::ship`). `trunk` must be the trunk's checkpointed image.
+    #[doc(hidden)]
+    pub fn branch_send(
+        &self,
+        mode: SendMode,
+        base: Option<u64>,
+        trunk: &TrunkImage,
+        delta: bool,
+        plant: Plant,
+        out: Option<&mut dyn std::io::Write>,
+    ) -> Result<SendReport> {
+        self.branches.send(mode, base, trunk, delta, plant, out)
+    }
+
+    #[doc(hidden)]
+    pub fn branch_digest(&self, trunk: &TrunkImage) -> Digest {
+        self.branches.digest(trunk)
+    }
+
+    #[doc(hidden)]
+    pub fn branch_dump(&self, trunk: &TrunkImage) -> ShipDump {
+        self.branches.dump(trunk)
+    }
+
+    /// Write branch `id`'s database image to `out`; returns (pages, pages differing from `trunk`).
+    #[doc(hidden)]
+    pub fn branch_export(
+        &self,
+        id: BranchId,
+        trunk: &TrunkImage,
+        out: &mut dyn std::io::Write,
+    ) -> Result<(u32, u32)> {
+        self.branches.export(id, trunk, out)
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
@@ -399,6 +468,55 @@ impl Database {
             default_cache_size,
             Some(schema),
         )
+    }
+}
+
+/// A replica of a branch store: the states, slots and trunk image that full and incremental
+/// streams from [`Database::branch_send`] build, with no database of its own.
+#[doc(hidden)]
+pub struct Replica {
+    store: BranchStore,
+    trunk: TrunkImage,
+    at: Option<u64>,
+    /// Fire-check: skip deriving `inherited`, so the digest must catch it.
+    pub skip_inherit: bool,
+}
+
+impl Replica {
+    pub fn new(page_size: usize) -> Self {
+        Self {
+            store: BranchStore::new(),
+            trunk: TrunkImage::empty(page_size),
+            at: None,
+            skip_inherit: false,
+        }
+    }
+
+    /// Apply one stream. A full stream needs a fresh replica; an incremental one must start at
+    /// this replica's position.
+    pub fn receive(&mut self, r: &mut dyn std::io::Read) -> Result<RecvWork> {
+        self.store
+            .receive(r, &mut self.trunk, &mut self.at, self.skip_inherit)
+    }
+
+    pub fn at(&self) -> Option<u64> {
+        self.at
+    }
+
+    pub fn digest(&self) -> Digest {
+        self.store.digest(&self.trunk)
+    }
+
+    pub fn stats(&self) -> BranchStats {
+        self.store.stats()
+    }
+
+    pub fn trunk(&self) -> &TrunkImage {
+        &self.trunk
+    }
+
+    pub fn export(&self, id: BranchId, out: &mut dyn std::io::Write) -> Result<(u32, u32)> {
+        self.store.export(id, &self.trunk, out)
     }
 }
 

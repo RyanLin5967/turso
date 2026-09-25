@@ -48,6 +48,8 @@ pub(crate) struct PageMap {
     root: Option<Arc<Node>>,
     /// Inner levels above the leaves: pages below `WIDTH^(height + 1)` are addressable.
     height: u32,
+    /// Pages mapped. Per version, like the mappings: a clone keeps the count it had.
+    len: usize,
 }
 
 impl PageMap {
@@ -104,10 +106,44 @@ impl PageMap {
                     Arc::make_mut(kid)
                 }
                 Node::Leaf(slots) => {
-                    slots[Self::index(page, 0)] = slot;
+                    let entry = &mut slots[Self::index(page, 0)];
+                    if *entry == EMPTY {
+                        self.len += 1;
+                    }
+                    *entry = slot;
                     return;
                 }
             };
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Every `(page, slot)` mapping, in page order.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(u32, Slot)) {
+        fn walk(node: &Node, level: u32, base: u64, f: &mut impl FnMut(u32, Slot)) {
+            match node {
+                Node::Inner(kids) => {
+                    for (i, kid) in kids.iter().enumerate() {
+                        if let Some(kid) = kid {
+                            let base = base | ((i as u64) << (BITS * level));
+                            walk(kid, level - 1, base, f);
+                        }
+                    }
+                }
+                Node::Leaf(slots) => {
+                    for (i, &slot) in slots.iter().enumerate() {
+                        if slot != EMPTY {
+                            f((base | i as u64) as u32, slot);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(root) = self.root.as_deref() {
+            walk(root, self.height, 0, &mut f);
         }
     }
 }
@@ -152,6 +188,12 @@ mod tests {
             for (&page, &slot) in model {
                 assert_eq!(map.get(page), Some(slot), "version {i} page {page}");
             }
+            assert_eq!(map.len(), model.len(), "version {i}: len");
+            let mut listed = Vec::new();
+            map.for_each(|page, slot| listed.push((page, slot)));
+            let mut expected: Vec<(u32, Slot)> = model.iter().map(|(&p, &s)| (p, s)).collect();
+            expected.sort_unstable();
+            assert_eq!(listed, expected, "version {i}: for_each must list every mapping in page order");
             for page in [0, 1, 31, 32, 1023, 1024, 4999, u32::MAX - 1] {
                 assert_eq!(map.get(page), model.get(&page).copied(), "version {i} page {page}");
             }

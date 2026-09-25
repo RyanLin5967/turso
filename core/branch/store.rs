@@ -87,9 +87,16 @@ use super::page_map::PageMap;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
-use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
+
+mod ship;
+pub use ship::{
+    content_hash, Digest, Plant, RecvWork, SendMode, SendReport, ShipDump, TrunkImage,
+    CURRENT_ENTRY_BYTES, RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
+};
+pub(crate) use ship::Track;
 
 pub(crate) struct BranchStore {
     inner: Mutex<StoreInner>,
@@ -101,6 +108,9 @@ pub(crate) struct BranchStore {
     /// same lock. A 1-to-0 transition (a reap) racing the read only makes the writer take the lock
     /// and find nothing to do.
     trunk_children: AtomicUsize,
+    /// Shipping is tracked (see `ship`): every trunk write must reach `first_write_trunk`, even with
+    /// no live child, so that the store knows which trunk pages changed since a receiver's point.
+    tracking: AtomicBool,
 }
 
 struct StoreInner {
@@ -110,6 +120,8 @@ struct StoreInner {
     branches: HashMap<BranchId, BranchState>,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
+    /// Shipping state, once [`BranchStore::enable_shipping`] ran.
+    track: Option<Track>,
 }
 
 #[derive(Default)]
@@ -136,6 +148,8 @@ struct Retained {
     born: u64,
     died: u64,
     slot: Slot,
+    /// The shipping sequence number at which it was retained (0 when shipping is not tracked).
+    seq: u64,
 }
 
 struct TrunkState {
@@ -169,6 +183,10 @@ struct BranchState {
     /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
     /// branch's first fork and kept current by its writes from then on; `None` until it forks.
     view: Option<PageMap>,
+    /// Shipping sequence numbers: when the state was forked, and when a field a receiver needs last
+    /// changed (0 when shipping is not tracked).
+    born_seq: u64,
+    dirty_seq: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -208,12 +226,19 @@ impl Lineage {
     }
 
     /// Detach the child forked at `f` and release every retained version that only it could see.
-    fn child_gone(&mut self, f: u64, arena: &mut Arena, work: &mut BranchWork) -> usize {
+    /// Returns the released versions with their pages.
+    fn child_gone(
+        &mut self,
+        f: u64,
+        arena: &mut Arena,
+        work: &mut BranchWork,
+    ) -> Vec<(u32, Retained)> {
         let removed = self.children.remove(&f);
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
         let dead = self.garbage(f, lo, hi, work);
+        let mut released = Vec::with_capacity(dead.len());
         for &(born, page, died) in &dead {
             let versions = self.retained.get_mut(&page).expect("indexed version is listed");
             let v = versions.remove(&born).expect("indexed version is listed");
@@ -225,8 +250,9 @@ impl Lineage {
                 && self.by_died.remove(&(died, page, born));
             crate::turso_assert!(indexed, "a released version was missing from an index");
             arena.release(v.slot);
+            released.push((page, v));
         }
-        dead.len()
+        released
     }
 
     /// The versions that held `f` and no other live child, as `(born, page, died)`, once `f` has
@@ -330,9 +356,23 @@ impl BranchStore {
                 },
                 branches: HashMap::new(),
                 work: BranchWork::default(),
+                track: None,
             }),
             trunk_children: AtomicUsize::new(0),
+            tracking: AtomicBool::new(false),
         }
+    }
+
+    /// Whether every trunk write must reach [`BranchStore::first_write_trunk`].
+    pub(crate) fn tracks_trunk(&self) -> bool {
+        self.tracking.load(Ordering::Acquire)
+    }
+
+    /// Paths that rewrite trunk pages without `add_dirty` refuse while this holds: with a branch
+    /// alive they would change what it reads, and while shipping is tracked they would change a page
+    /// no stream would ever carry.
+    pub(crate) fn guards_trunk(&self) -> bool {
+        self.tracks_trunk() || self.has_branches()
     }
 
     pub(crate) fn trunk_has_children(&self) -> bool {
@@ -350,7 +390,9 @@ impl BranchStore {
     /// the previous epoch, and the new child would see them.
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
         let mut inner = self.inner.lock();
+        let seq = inner.tick();
         match &inner.arena {
+            None if inner.track.is_some() => inner.arena = Some(Arena::with_stamps(page_size)),
             None => inner.arena = Some(Arena::new(page_size)),
             Some(arena) if arena.page_size() != page_size => {
                 return Err(LimboError::InternalError(format!(
@@ -367,8 +409,9 @@ impl BranchStore {
         inner.trunk.lineage.children.insert(f, id);
         inner.branches.insert(
             id,
-            BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
+            BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default(), seq),
         );
+        inner.born(id, seq);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
@@ -377,6 +420,7 @@ impl BranchStore {
     /// the same reason a trunk fork takes the WAL write lock.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         let mut inner = self.inner.lock();
+        let seq = inner.tick();
         let id = BranchId(inner.next_id);
         let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
@@ -401,7 +445,9 @@ impl BranchStore {
         inner.next_id += 1;
         inner
             .branches
-            .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
+            .insert(id, BranchState::new(parent, f, schema, trunk_at, view, seq));
+        inner.touch(parent, seq);
+        inner.born(id, seq);
         Ok(id)
     }
 
@@ -426,6 +472,7 @@ impl BranchStore {
     /// The connection on `id` has gone. Releases its write lock if a transaction was abandoned.
     pub(crate) fn close(&self, id: BranchId) {
         let mut inner = self.inner.lock();
+        inner.tick();
         if let Some(st) = inner.branches.get_mut(&id) {
             st.open = false;
             st.writer = false;
@@ -436,6 +483,7 @@ impl BranchStore {
     /// The `Branch` handle has gone.
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
         let mut inner = self.inner.lock();
+        let seq = inner.tick();
         let Some(st) = inner.branches.get_mut(&id) else {
             return Reaped {
                 freed_pages: 0,
@@ -444,9 +492,16 @@ impl BranchStore {
         };
         st.handle = false;
         let freed_pages = self.collect(&mut inner, id);
+        let deferred = inner.branches.contains_key(&id);
+        if deferred {
+            inner.touch(id, seq);
+        }
+        if let Some(t) = inner.track.as_mut() {
+            t.log_bytes += 9;
+        }
         Reaped {
             freed_pages,
-            deferred: inner.branches.contains_key(&id),
+            deferred,
         }
     }
 
@@ -488,6 +543,7 @@ impl BranchStore {
         pre_image: &[u8],
     ) -> Result<()> {
         let mut inner = self.inner.lock();
+        let seq = inner.tick();
         let StoreInner {
             arena, branches, ..
         } = &mut *inner;
@@ -498,6 +554,7 @@ impl BranchStore {
         match st.current.get(&page).copied() {
             None => {
                 let slot = arena.alloc();
+                arena.stamp(slot, seq, seq, page);
                 arena.page_mut(slot).copy_from_slice(pre_image);
                 st.current.insert(page, Owned { slot, born: epoch });
                 if let Some(view) = st.view.as_mut() {
@@ -508,6 +565,7 @@ impl BranchStore {
             Some(owned) => {
                 if st.lineage.has_child_in(owned.born, epoch) {
                     let slot = arena.alloc();
+                    arena.stamp(slot, seq, seq, page);
                     arena.page_mut(slot).copy_from_slice(pre_image);
                     st.lineage.retain(
                         page,
@@ -515,6 +573,7 @@ impl BranchStore {
                             born: owned.born,
                             died: epoch,
                             slot: owned.slot,
+                            seq,
                         },
                     );
                     st.current.insert(page, Owned { slot, born: epoch });
@@ -534,6 +593,7 @@ impl BranchStore {
                 }
             }
         }
+        inner.touch(id, seq);
         Ok(())
     }
 
@@ -541,7 +601,16 @@ impl BranchStore {
     /// can still see the version about to be overwritten, keep a copy of it for that child.
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
         let mut inner = self.inner.lock();
-        let StoreInner { arena, trunk, .. } = &mut *inner;
+        let seq = inner.tick();
+        let StoreInner {
+            arena,
+            trunk,
+            track,
+            ..
+        } = &mut *inner;
+        // The page's previous content was born at its previous write; that is the content birth of
+        // a pre-image retained below, though its slot is handed out now.
+        let content_born = track.as_mut().map_or(0, |t| t.trunk_written(page, seq, pre_image.len()));
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
         if born >= epoch {
@@ -550,6 +619,7 @@ impl BranchStore {
         if trunk.lineage.has_child_in(born, epoch) {
             let arena = arena.as_mut().expect("the trunk has a child, so the arena exists");
             let slot = arena.alloc();
+            arena.stamp(slot, seq, content_born, page);
             arena.page_mut(slot).copy_from_slice(pre_image);
             trunk.lineage.retain(
                 page,
@@ -557,8 +627,12 @@ impl BranchStore {
                     born,
                     died: epoch,
                     slot,
+                    seq,
                 },
             );
+            if let Some(t) = track.as_mut() {
+                t.trunk_retained.insert((seq, page, born));
+            }
         }
         trunk.written.insert(page, epoch);
     }
@@ -566,8 +640,12 @@ impl BranchStore {
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
         let mut inner = self.inner.lock();
+        let seq = inner.tick();
         let StoreInner {
-            arena, branches, ..
+            arena,
+            branches,
+            track,
+            ..
         } = &mut *inner;
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if pages.is_empty() {
@@ -589,13 +667,19 @@ impl BranchStore {
             arena
                 .page_mut(owned.slot)
                 .copy_from_slice(page.get_contents().as_slice());
+            arena.stamp_content(owned.slot, seq);
+            if let Some(t) = track.as_mut() {
+                t.log_bytes += 8 + arena.page_size() as u64;
+            }
         }
         Ok(())
     }
 
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
         let mut inner = self.inner.lock();
+        let seq = inner.tick();
         inner.branches.get_mut(&id).ok_or_else(|| gone(id))?.schema = schema;
+        inner.touch(id, seq);
         Ok(())
     }
 
@@ -677,8 +761,12 @@ impl BranchStore {
                 trunk,
                 branches,
                 work,
+                track,
                 ..
             } = &mut *inner;
+            if let Some(t) = track.as_mut() {
+                t.state_gone(id, st.born_seq, st.dirty_seq);
+            }
             let arena = arena.as_mut().expect("a branch existed, so the arena does");
             for owned in st.current.values() {
                 arena.release(owned.slot);
@@ -686,20 +774,52 @@ impl BranchStore {
             }
             freed += st.lineage.release_all(arena).len();
             if st.parent.is_trunk() {
-                freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
+                let released = trunk.lineage.child_gone(st.fork_epoch, arena, work);
+                freed += released.len();
+                if let Some(t) = track.as_mut() {
+                    for (page, v) in &released {
+                        t.trunk_retained.remove(&(v.seq, *page, v.born));
+                    }
+                }
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
                 return freed;
             }
             let parent = branches
                 .get_mut(&st.parent)
                 .expect("a live branch's parent is kept while the branch lives");
-            freed += parent.lineage.child_gone(st.fork_epoch, arena, work);
+            freed += parent.lineage.child_gone(st.fork_epoch, arena, work).len();
             id = st.parent;
         }
     }
 }
 
 impl StoreInner {
+    /// Advance the shipping sequence for one store operation and return it (0 when untracked).
+    fn tick(&mut self) -> u64 {
+        self.track.as_mut().map_or(0, |t| {
+            t.seq += 1;
+            t.seq
+        })
+    }
+
+    /// A field of state `id` that a receiver needs changed at `seq`.
+    fn touch(&mut self, id: BranchId, seq: u64) {
+        let (Some(t), Some(st)) = (self.track.as_mut(), self.branches.get_mut(&id)) else {
+            return;
+        };
+        t.dirty.remove(&(st.dirty_seq, id));
+        st.dirty_seq = seq;
+        t.dirty.insert((seq, id));
+    }
+
+    /// State `id` was forked at `seq`.
+    fn born(&mut self, id: BranchId, seq: u64) {
+        if let Some(t) = self.track.as_mut() {
+            t.dirty.insert((seq, id));
+            t.log_bytes += 33;
+        }
+    }
+
     /// `levels` counts the nodes consulted — the branch (its own pages and its `inherited` map),
     /// then the trunk if neither holds the page — and `examined` the retained versions compared.
     fn resolve(
@@ -745,6 +865,7 @@ impl BranchState {
         schema: Arc<Schema>,
         trunk_at: u64,
         inherited: PageMap,
+        seq: u64,
     ) -> Self {
         Self {
             parent,
@@ -758,6 +879,8 @@ impl BranchState {
             trunk_at,
             inherited,
             view: None,
+            born_seq: seq,
+            dirty_seq: seq,
         }
     }
 }

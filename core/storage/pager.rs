@@ -1824,17 +1824,18 @@ impl Pager {
     }
 
     /// Paths that rewrite pages WITHOUT going through `add_dirty` take no copy decision, so they
-    /// would change what a branch reads. They refuse while any branch exists, and on a branch.
+    /// would change what a branch reads. They refuse while any branch exists, while the branch
+    /// store is tracked for shipping (a replica would never hear of the change), and on a branch.
     fn refuse_if_branching(&self, what: &str) -> Result<()> {
         let on_branch = self.branch.get().is_some();
-        let branches_exist = self.branch_store.get().is_some_and(|s| s.has_branches());
+        let branches_exist = self.branch_store.get().is_some_and(|s| s.guards_trunk());
         if on_branch || branches_exist {
             return Err(LimboError::InvalidArgument(format!(
                 "{what} rewrites pages without a copy-on-write decision, so it is refused {}",
                 if on_branch {
                     "on a branch connection"
                 } else {
-                    "while branches of this database exist"
+                    "while branches of this database exist or its branch store is shipped"
                 }
             )));
         }
@@ -3802,7 +3803,7 @@ impl Pager {
             );
         }
         if let Some(store) = self.branch_store.get() {
-            if store.trunk_has_children() {
+            if store.trunk_has_children() || store.tracks_trunk() {
                 store.first_write_trunk(page_no, page.get_contents().as_slice());
             }
         }
