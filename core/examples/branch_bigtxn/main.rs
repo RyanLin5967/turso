@@ -64,8 +64,8 @@ struct Args {
     trunk_children: usize,
     probe: ProbeKind,
     dir: Option<PathBuf>,
-    /// The branch arm's UPDATE runs as its own (autocommit) transaction: no statement journal, and
-    /// one phase `update+commit` instead of two.
+    /// The branch and trunk arms' UPDATE runs as its own (autocommit) transaction: no statement
+    /// journal, and one phase `update+commit` instead of two.
     autocommit: bool,
 }
 
@@ -538,14 +538,22 @@ fn arm_trunk(ctx: &Ctx, trunk: &Arc<Connection>, args: &Args) {
                 .map(|_| trunk.fork_branch().unwrap())
                 .collect();
             let before = snap(&ctx.db);
-            trunk.execute("BEGIN").unwrap();
             let sql = format!("UPDATE t SET v = '{mark}' || substr(v, 2) WHERE id <= {d}");
-            let (_, tu) = ctx.phase("update", d, 0, rep, || trunk.page_cache_len(), || {
-                trunk.execute(&sql).unwrap()
-            });
-            let (_, tc) = ctx.phase("commit", d, 0, rep, || trunk.page_cache_len(), || {
-                trunk.execute("COMMIT").unwrap()
-            });
+            let (tu, tc) = if args.autocommit {
+                let (_, t) = ctx.phase("update+commit", d, 0, rep, || trunk.page_cache_len(), || {
+                    trunk.execute(&sql).unwrap()
+                });
+                (t, Duration::ZERO)
+            } else {
+                trunk.execute("BEGIN").unwrap();
+                let (_, tu) = ctx.phase("update", d, 0, rep, || trunk.page_cache_len(), || {
+                    trunk.execute(&sql).unwrap()
+                });
+                let (_, tc) = ctx.phase("commit", d, 0, rep, || trunk.page_cache_len(), || {
+                    trunk.execute("COMMIT").unwrap()
+                });
+                (tu, tc)
+            };
             let after = snap(&ctx.db);
             let retained = after.arena_in_use - before.arena_in_use;
             let want = if args.trunk_children > 0 { d } else { 0 };
