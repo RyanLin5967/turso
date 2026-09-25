@@ -56,7 +56,7 @@ pub(crate) mod arena;
 pub(crate) mod page_map;
 pub(crate) mod store;
 
-pub use page_map::MapWork;
+pub use page_map::{MapWork, OBSERVE};
 
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};

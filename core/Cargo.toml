@@ -29,6 +29,9 @@ default = [
 ]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
+# Branch-store observers that are process-global atomics (page-map live nodes, page-map work counts).
+# On for counter runs, off for timed runs: an observer inside a timed loop is part of what it times.
+branch-observe = []
 # Harness-side observability: turns on aristo's instrument surface so the
 # logical-log conformance DTs can read private LogicalLog state (header
 # version, pending running CRC) and construct LogRecords. Off by default;

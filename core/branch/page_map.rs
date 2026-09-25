@@ -45,10 +45,15 @@ const EMPTY: Slot = Slot::MAX;
 /// that many maps share counts once. Nothing in the mechanism reads it.
 static LIVE_NODES: AtomicUsize = AtomicUsize::new(0);
 
-/// The number of trie nodes alive in this process (see [`LIVE_NODES`]).
+/// The number of trie nodes alive in this process (see [`LIVE_NODES`]); 0 without the
+/// `branch-observe` feature, which is what maintains it.
 pub(crate) fn live_nodes() -> usize {
     LIVE_NODES.load(Ordering::Relaxed)
 }
+
+/// Whether the process-global observers above and below are compiled in (the `branch-observe`
+/// feature). Without it they cost nothing and read 0.
+pub const OBSERVE: bool = cfg!(feature = "branch-observe");
 
 /// Work the maps have done in this process, counted where it happens. Observation only, like
 /// [`LIVE_NODES`]: nothing in the mechanism reads them.
@@ -85,7 +90,9 @@ pub(crate) fn map_work() -> MapWork {
 }
 
 fn count(counter: &AtomicU64, n: u64) {
-    counter.fetch_add(n, Ordering::Relaxed);
+    if OBSERVE {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 enum Node {
@@ -104,7 +111,9 @@ impl Node {
 
     /// Every node is built through here, so that [`LIVE_NODES`] sees it.
     fn counted(node: Node) -> Self {
-        LIVE_NODES.fetch_add(1, Ordering::Relaxed);
+        if OBSERVE {
+            LIVE_NODES.fetch_add(1, Ordering::Relaxed);
+        }
         node
     }
 }
@@ -121,7 +130,9 @@ impl Clone for Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        LIVE_NODES.fetch_sub(1, Ordering::Relaxed);
+        if OBSERVE {
+            LIVE_NODES.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
