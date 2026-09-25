@@ -954,3 +954,28 @@ nests a finished group (and a failed one) in an outer group, and asserts that th
 - `mutate_F6` gains F6M4, which reverts the fix and is tested with the `io::completions` filter; the new test must fail.
 
 Nothing timed or asserted in amendments 7, 8 or 8a changes. The same fix goes onto F5's branch before F5 builds.
+
+### Amendment 8c — written 2026-09-25T15:05:20Z: the mutation gate miscounted; the verdict now comes from the tests (doc only; nothing timed or asserted changes)
+
+`mutate_F6` (`turso_conc/raw/mutate_F6.txt`, banked `86da8e2`) reported "applied 4, killed 3". The gate counted a kill as
+cargo exit code 101, and that misread two of the four mutants:
+- **F6M2 (epoch not compared) was KILLED, not a survivor.** Two registered tests printed FAILED on it:
+  `store::tests::the_trunk_page_cache_serves_each_branch_the_version_it_forked_from` and
+  `mechanism_tests::a_random_workload_matches_a_model_of_independent_copies`. Another test then hung on the corrupted
+  data, so the run hit its timeout (rc 124).
+- **F6M4 was UNTESTED, not killed.** Its compile failed on a stale incremental-cache session ("failed to create
+  dependency graph … dep-graph.part.bin: No such file or directory", the same fault as `raw/aborted/tests_F6_incremental_dep_graph_error_1408Z.txt`);
+  rc 101 came from the compiler, and no test ran.
+- F6M1 and F6M3 were killed by FAILED tests (listed in the file).
+
+**Gate from now on** (`mutate_F6.sh`, `mutate_F5.sh`, `run_F6.sh`, `run_F5.sh`). Each mutant's verdict comes from its
+test output:
+- **KILLED:** at least one `test … FAILED` line;
+- **INVALID:** a compile error;
+- **SURVIVED:** rc 0;
+- **INCONCLUSIVE:** anything else.
+
+A chain proceeds only if every registered mutant is KILLED. Mutant builds run with `CARGO_INCREMENTAL=0`, so the
+stale-cache fault cannot recur there; the per-mutant timeout is 900 s. No mutant is added, dropped or changed. All four
+F6 mutants re-run as `mutate_F6b` (`raw/mutate_F6.txt` stays as banked). The source is unchanged from `00f2a88c6`, where
+`tests_F6` (`68129c4`) and the whole-lib `tests_F6_core` (`58d41dc`) passed; this commit changes only this file.
