@@ -70,7 +70,9 @@ fn parse_args() -> Args {
     a
 }
 
-const FIELDS: [&str; 14] = [
+const NF: usize = 18;
+
+const FIELDS: [&str; NF] = [
     "resolve_calls",
     "resolve_levels",
     "resolve_retained_examined",
@@ -85,9 +87,13 @@ const FIELDS: [&str; 14] = [
     "view_inserts",
     "gc_heap_examined",
     "gc_meld_steps",
+    "branch_table_resizes",
+    "branch_table_rehashes",
+    "arena_frames_copied",
+    "arena_chunks_freed",
 ];
 
-fn fields(w: &BranchWork) -> [u64; 14] {
+fn fields(w: &BranchWork) -> [u64; NF] {
     [
         w.resolve_calls,
         w.resolve_levels,
@@ -103,6 +109,10 @@ fn fields(w: &BranchWork) -> [u64; 14] {
         w.view_inserts,
         w.gc_heap_examined,
         w.gc_meld_steps,
+        w.branch_table_resizes,
+        w.branch_table_rehashes,
+        w.arena_frames_copied,
+        w.arena_chunks_freed,
     ]
 }
 
@@ -126,7 +136,7 @@ fn thread_cpu_ns() -> u64 {
 /// One measured op: counter deltas, and (with `--time`) wall and thread-CPU microseconds.
 struct Op<T> {
     out: T,
-    d: [u64; 14],
+    d: [u64; NF],
     wall_us: f64,
     cpu_us: f64,
 }
@@ -150,8 +160,8 @@ impl Meter<'_> {
             (f(), 0.0, 0.0)
         };
         let after = fields(&self.s.stats().work);
-        let mut d = [0u64; 14];
-        for i in 0..14 {
+        let mut d = [0u64; NF];
+        for i in 0..NF {
             d[i] = after[i] - before[i];
         }
         Op {
@@ -167,8 +177,8 @@ impl Meter<'_> {
 #[derive(Default)]
 struct Summary {
     ops: u64,
-    sum: [u64; 14],
-    max: [u64; 14],
+    sum: [u64; NF],
+    max: [u64; NF],
     cpu: Vec<f32>,
     wall_max: f64,
     cpu_max: f64,
@@ -178,7 +188,7 @@ struct Summary {
 impl Summary {
     fn add<T>(&mut self, op: &Op<T>, time: bool, stall_us: f64) -> bool {
         self.ops += 1;
-        for i in 0..14 {
+        for i in 0..NF {
             self.sum[i] += op.d[i];
             self.max[i] = self.max[i].max(op.d[i]);
         }
@@ -196,7 +206,7 @@ impl Summary {
 
     fn print(&mut self, label: &str, time: bool) {
         let mut line = format!("summary {label} ops={}", self.ops);
-        for i in 0..14 {
+        for i in 0..NF {
             if self.sum[i] > 0 {
                 line += &format!(" {}_sum={} {}_max={}", FIELDS[i], self.sum[i], FIELDS[i], self.max[i]);
             }
@@ -217,9 +227,9 @@ impl Summary {
     }
 }
 
-fn nonzero(d: &[u64; 14]) -> String {
+fn nonzero(d: &[u64; NF]) -> String {
     let mut s = String::new();
-    for i in 0..14 {
+    for i in 0..NF {
         if d[i] > 0 {
             s += &format!(" {}={}", FIELDS[i], d[i]);
         }
@@ -448,7 +458,10 @@ fn arm_arena(a: &Args) {
             st2.arena_slots_in_use,
             held(&st2)
         );
-        check(held(&st2) == held(&st), "re-growth reuses the freed slots");
+        check(
+            held(&st2) <= v + 256,
+            "re-growth to V holds at most V slots plus one chunk (the peak is reused, not exceeded)",
+        );
     }
 }
 

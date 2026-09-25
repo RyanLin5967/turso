@@ -111,6 +111,8 @@ struct StoreInner {
     branches: HashMap<BranchId, BranchState>,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
+    /// Observation only: the largest `capacity()` the `branches` table has had.
+    branch_table_peak: usize,
 }
 
 #[derive(Default)]
@@ -318,13 +320,39 @@ impl Lineage {
     }
 }
 
-/// `map.insert`, adding to `moved` the entries the map relocated if the insert made it grow
-/// (observation only; see [`BranchWork::branch_table_moved`]).
-fn counted_insert<K: Hash + Eq, V>(map: &mut HashMap<K, V>, k: K, v: V, moved: &mut u64) {
+/// `map.insert`, adding to `moved` the entries the insert relocated (observation only; see
+/// [`BranchWork::branch_table_moved`]), and returning the table's `capacity()` after it if it did.
+///
+/// `capacity()` is hashbrown's `items + growth_left`: an insert into an empty bucket leaves it
+/// unchanged, one that reuses a tombstone raises it by exactly one, and a rehash — a doubling, or
+/// an in-place rebuild that clears the tombstones — raises it by more. So a rise of more than one
+/// is a relocation of every entry. Blind spot: an in-place rebuild that clears exactly one
+/// tombstone reads as a reuse.
+fn counted_insert<K: Hash + Eq, V>(
+    map: &mut HashMap<K, V>,
+    k: K,
+    v: V,
+    moved: &mut u64,
+) -> Option<usize> {
     let (cap, len) = (map.capacity(), map.len());
     map.insert(k, v);
-    if map.capacity() != cap {
+    let after = map.capacity();
+    (after > cap + 1).then(|| {
         *moved += len as u64;
+        after
+    })
+}
+
+/// Attribute a `branches` relocation: a capacity above every earlier one is a doubling, anything
+/// else an in-place rebuild.
+fn note_branch_table(work: &mut BranchWork, peak: &mut usize, after: Option<usize>) {
+    if let Some(after) = after {
+        if after > *peak {
+            *peak = after;
+            work.branch_table_resizes += 1;
+        } else {
+            work.branch_table_rehashes += 1;
+        }
     }
 }
 
@@ -344,6 +372,7 @@ impl BranchStore {
                 },
                 branches: HashMap::new(),
                 work: BranchWork::default(),
+                branch_table_peak: 0,
             }),
             trunk_children: AtomicUsize::new(0),
         }
@@ -384,13 +413,19 @@ impl BranchStore {
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
         inner.trunk.lineage.children.insert(f, id);
-        let StoreInner { branches, work, .. } = &mut *inner;
-        counted_insert(
+        let StoreInner {
+            branches,
+            work,
+            branch_table_peak,
+            ..
+        } = &mut *inner;
+        let after = counted_insert(
             branches,
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
             &mut work.branch_table_moved,
         );
+        note_branch_table(work, branch_table_peak, after);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
@@ -400,7 +435,12 @@ impl BranchStore {
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         let mut inner = self.inner.lock();
         let id = BranchId(inner.next_id);
-        let StoreInner { branches, work, .. } = &mut *inner;
+        let StoreInner {
+            branches,
+            work,
+            branch_table_peak,
+            ..
+        } = &mut *inner;
         let st = branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
             return Err(LimboError::Busy);
@@ -422,12 +462,13 @@ impl BranchStore {
             })
             .clone();
         let trunk_at = st.trunk_at;
-        counted_insert(
+        let after = counted_insert(
             branches,
             id,
             BranchState::new(parent, f, schema, trunk_at, view),
             &mut work.branch_table_moved,
         );
+        note_branch_table(work, branch_table_peak, after);
         inner.next_id += 1;
         Ok(id)
     }

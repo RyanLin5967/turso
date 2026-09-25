@@ -201,9 +201,14 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
-    /// Entries the `branches` table relocated by growing: a `capacity()` change across an insert,
+    /// Entries the `branches` table relocated: an insert across which `capacity()` rose by more
+    /// than one (a doubling or an in-place rehash; a tombstone reuse raises it by exactly one),
     /// counted as the `len()` before it.
     pub branch_table_moved: u64,
+    /// Of those relocations, the doublings (a capacity above every earlier one).
+    pub branch_table_resizes: u64,
+    /// Of those relocations, the in-place rehashes that cleared tombstones.
+    pub branch_table_rehashes: u64,
     /// The same for the per-page tables (`trunk.written`, each lineage's `retained`, each branch's
     /// `current`).
     pub page_table_moved: u64,
@@ -222,6 +227,10 @@ pub struct BranchWork {
     pub gc_heap_examined: u64,
     /// Right-spine nodes walked by heap melds (0 on the range-walk store, as above).
     pub gc_meld_steps: u64,
+    /// Pages the arena copied to evacuate a sparse chunk (0 on an arena that never moves a page).
+    pub arena_frames_copied: u64,
+    /// Arena chunks returned to the allocator (0 on an arena that never returns one).
+    pub arena_chunks_freed: u64,
 }
 
 impl Branch {
