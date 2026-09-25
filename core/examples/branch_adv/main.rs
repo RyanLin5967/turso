@@ -70,7 +70,7 @@ fn parse_args() -> Args {
     a
 }
 
-const NF: usize = 19;
+const NF: usize = 20;
 
 const FIELDS: [&str; NF] = [
     "resolve_calls",
@@ -92,6 +92,7 @@ const FIELDS: [&str; NF] = [
     "arena_frames_copied",
     "arena_chunks_freed",
     "splices",
+    "retired",
 ];
 
 fn fields(w: &BranchWork) -> [u64; NF] {
@@ -115,6 +116,7 @@ fn fields(w: &BranchWork) -> [u64; NF] {
         w.arena_frames_copied,
         w.arena_chunks_freed,
         w.splices,
+        w.retired,
     ]
 }
 
