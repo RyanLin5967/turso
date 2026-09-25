@@ -9,7 +9,7 @@
 //! window around the slot is full, and when tombstones use up the table's growth allowance an insert
 //! REHASHES THE WHOLE TABLE in place. Under steady churn at a fixed number of branches that recurs
 //! forever at a constant rate: lane r11-ever measured 41 in-place rehashes per 10^7 forks at 10^4
-//! live branches, each a 0.43–0.69 ms fork stall under the store's one mutex. A slot map has no
+//! live branches, each a 0.41–0.73 ms fork stall under the store's one mutex (raw t_e1_10k). A slot map has no
 //! probe sequence, so it has no tombstones and never rehashes.
 //!
 //! Slots live in fixed-size chunks that never move, so growing the table allocates one chunk and

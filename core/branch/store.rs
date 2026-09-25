@@ -1046,7 +1046,10 @@ impl BranchState {
         Self {
             parent,
             fork_epoch,
-            // The child's first write is born after its fork epoch (see "The model").
+            // The child's first write is born after its fork epoch (see "The model"). Any start up to
+            // the child's first own fork epoch gives the same decisions, since every comparison is
+            // against this node's own children (r11-ever's mutant M6, starting at 0, survived every
+            // test for that reason); f + 1 keeps each node's epochs after its creation.
             lineage: Lineage {
                 epoch: fork_epoch + 1,
                 ..Lineage::default()
