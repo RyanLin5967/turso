@@ -19,6 +19,11 @@
 //! will never fork from it again (bb: its live children reached its fanout; cat and beam: the level
 //! after it). `--continue` makes a node rewrite its own row after each child it forks.
 //!
+//! `--refcounted` (PREREG amendment 1) tells the harness the store frees a branch state as soon as
+//! its handle and connection are gone (reference-counted page maps, no kept ancestors), so the
+//! harness's own count of states follows that rule instead of "a state lives while it has a handle
+//! or a child state".
+//!
 //! Without `--timing` the run prints integer counters only, never a time: such a run may go
 //! without the fleet lock (LANE-BRIEF). Every read is checked against a model the harness keeps
 //! (never against the engine), and the engine's branch-state count against the harness's own
@@ -75,6 +80,7 @@ struct Args {
     timing: bool,
     samples: usize,
     needed: bool,
+    refcounted: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -105,6 +111,7 @@ fn parse_args() -> Args {
         timing: false,
         samples: 200,
         needed: true,
+        refcounted: false,
     };
     let mut shape = None;
     let mut it = std::env::args().skip(1);
@@ -149,6 +156,7 @@ fn parse_args() -> Args {
             "--timing" => args.timing = true,
             "--samples" => args.samples = num(val(), "--samples") as usize,
             "--no-needed" => args.needed = false,
+            "--refcounted" => args.refcounted = true,
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -253,6 +261,7 @@ struct Bench {
     rng: Rng,
     rows: Rows,
     cont: bool,
+    refcounted: bool,
     generation: u64,
     handles: u64,
     states: u64,
@@ -410,8 +419,18 @@ impl Bench {
     }
 
     /// The harness's own rule for which states exist: a state lives while it has a handle or a
-    /// child state. Returns how many states `id`'s handle drop frees.
+    /// child state (under `--refcounted`: while it has a handle). Returns how many states `id`'s
+    /// handle drop frees.
     fn free_states(&mut self, mut id: u32) -> u64 {
+        if self.refcounted {
+            let n = &mut self.nodes[id as usize];
+            if n.branch.is_some() || !n.state {
+                return 0;
+            }
+            n.state = false;
+            self.states -= 1;
+            return 1;
+        }
         let mut freed = 0;
         loop {
             let n = &mut self.nodes[id as usize];
@@ -752,7 +771,7 @@ fn main() {
     println!(
         "# shape={:?} rows={:?} interior={:?} continue={} fr={} fi={} depth={} gamma_milli={} \
          fanout={} beam={} expand={} checkpoints={:?} seed={:#x} timing={} samples={} \
-         trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} trunk_pages={page_count} build={}",
+         refcounted={} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} trunk_pages={page_count} build={}",
         args.shape,
         args.rows,
         args.interior,
@@ -768,6 +787,7 @@ fn main() {
         args.seed,
         args.timing,
         args.samples,
+        args.refcounted,
         if cfg!(debug_assertions) { "DEBUG" } else { "release" },
     );
     if args.timing {
@@ -793,6 +813,7 @@ fn main() {
         rng: Rng(args.seed),
         rows: args.rows,
         cont: args.cont,
+        refcounted: args.refcounted,
         generation: 0,
         handles: 0,
         states: 0,
