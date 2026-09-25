@@ -104,6 +104,10 @@ struct Args {
     refill: Refill,
     /// `reapconc`, phase refill only: the UNSAFE split walk (a throughput ceiling, nothing else).
     unsafe_split: bool,
+    /// `reapconc`, with the split walk only: K6's race put back (UNSAFE; a leak demonstration).
+    unsafe_k6_race: bool,
+    /// `reapconc`: reaps take the trunk's lock by spinning instead of parking (a control).
+    trunk_spin: bool,
     /// `reapconc`: warm-up windows of N single-threaded churn cycles before each N's cells.
     warmup: usize,
     cell_reaps: usize,
@@ -135,6 +139,8 @@ fn parse_args() -> Args {
         write_every: 8,
         refill: Refill::Phase,
         unsafe_split: false,
+        unsafe_k6_race: false,
+        trunk_spin: false,
         warmup: 12,
         cell_reaps: 100_000,
         round_reaps: 10_000,
@@ -200,6 +206,14 @@ fn parse_args() -> Args {
                 args.unsafe_split = true;
                 reapconc_flags = true;
             }
+            "--unsafe-k6-race" => {
+                args.unsafe_k6_race = true;
+                reapconc_flags = true;
+            }
+            "--trunk-spin" => {
+                args.trunk_spin = true;
+                reapconc_flags = true;
+            }
             "--warmup" => {
                 args.warmup = val().parse().unwrap_or_else(|_| die("bad --warmup"));
                 reapconc_flags = true;
@@ -263,13 +277,16 @@ fn parse_args() -> Args {
         if args.refill == Refill::Phase && args.checkpoints.iter().any(|&n| n < args.round_reaps) {
             die("--refill phase needs every N >= --round-reaps: a round must not empty a share");
         }
+        if args.unsafe_k6_race && !args.unsafe_split {
+            die("--unsafe-k6-race puts K6's race into the split walk: it needs --unsafe-split-walk");
+        }
         if args.unsafe_split && args.refill != Refill::Phase {
             die("--unsafe-split-walk is valid with --refill phase only: an inline trunk write would \
                  retain a version the walk's snapshot lacks");
         }
     } else if reapconc_flags {
-        die("--write-every, --refill, --unsafe-split-walk, --warmup, --cell-reaps, --round-reaps and \
-             --read-checks apply to --arm reapconc only");
+        die("--write-every, --refill, --unsafe-split-walk, --unsafe-k6-race, --trunk-spin, --warmup, \
+             --cell-reaps, --round-reaps and --read-checks apply to --arm reapconc only");
     }
     args
 }
@@ -2157,6 +2174,8 @@ fn rc_print_lat(n: usize, t: usize, draw: u64, op: &str, lat: &[Duration]) {
 /// (no leaked version), and read checks against the harness's trunk model.
 fn arm_reapconc(b: &mut Bench, args: &Args) {
     b.db.set_branch_lock_timing(args.lock_timing);
+    b.db.set_branch_trunk_spin(args.trunk_spin);
+    b.db.set_branch_unsafe_k6_race(args.unsafe_k6_race);
     let tmax = *args.threads.iter().max().unwrap();
     let trunks: Vec<Arc<Connection>> = if args.refill == Refill::Inline {
         (0..tmax)
@@ -2171,13 +2190,15 @@ fn arm_reapconc(b: &mut Bench, args: &Args) {
         Vec::new()
     };
     println!(
-        "# reapconc: refill={:?} victim={:?} write_every={} unsafe_split_walk={} threads={:?} \
-         (forward, then reversed) warmup_windows={} cell_reaps={} round_reaps={} read_checks={} \
-         lock_timing={} synchronous={}",
+        "# reapconc: refill={:?} victim={:?} write_every={} unsafe_split_walk={} unsafe_k6_race={} \
+         trunk_spin={} threads={:?} (forward, then reversed) warmup_windows={} cell_reaps={} \
+         round_reaps={} read_checks={} lock_timing={} synchronous={}",
         args.refill,
         args.victim,
         args.write_every,
         args.unsafe_split,
+        args.unsafe_k6_race,
+        args.trunk_spin,
         args.threads,
         args.warmup,
         args.cell_reaps,
@@ -2190,6 +2211,12 @@ fn arm_reapconc(b: &mut Bench, args: &Args) {
         println!(
             "# UNSAFE: the reap's F2 walk runs outside the trunk lock, over an index snapshot taken \
              at each reap phase's start; read ONLY for its throughput ceiling"
+        );
+    }
+    if args.unsafe_k6_race {
+        println!(
+            "# UNSAFE: K6's race is on: each reap probes its neighbours and detaches in two critical \
+             sections; read ONLY for the leak the audit counts"
         );
     }
     println!("{RC_HEADER}");

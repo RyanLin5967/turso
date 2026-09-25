@@ -525,6 +525,20 @@ impl Database {
         self.branches.set_unsafe_split_walk(on);
     }
 
+    /// A measurement control: while on, reaps of trunk children take the trunk's lock by spinning
+    /// instead of parking. Off by default.
+    #[doc(hidden)]
+    pub fn set_branch_trunk_spin(&self, on: bool) {
+        self.branches.set_trunk_spin(on);
+    }
+
+    /// ⚠ UNSAFE, a measurement control: with the split walk on, reaps probe their neighbours and
+    /// detach in two critical sections (K6's race), which leaks versions. Off by default.
+    #[doc(hidden)]
+    pub fn set_branch_unsafe_k6_race(&self, on: bool) {
+        self.branches.set_unsafe_k6_race(on);
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {

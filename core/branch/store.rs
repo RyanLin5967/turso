@@ -195,10 +195,19 @@ pub(crate) struct BranchStore {
     split: CachePadded<SplitWalk>,
 }
 
-/// The UNSAFE split walk's switch and the index snapshot its walks read.
+/// The UNSAFE split walk's switch and the index snapshot its walks read, and two more measurement
+/// controls on the same line (r11-k6-measure PREREG amendment 3): reaps that spin for the trunk's
+/// lock instead of parking, and the split walk with K6's race put back.
 struct SplitWalk {
     on: AtomicBool,
     snapshot: ArcSwapOption<SplitSnapshot>,
+    /// A reap of a trunk child takes the trunk's lock by spinning on `try_lock` with backoff, never
+    /// parking (see [`take_spinning`]). Everything else takes it as before.
+    spin: AtomicBool,
+    /// ⚠ UNSAFE, with the split walk only: the neighbour probe and the detach become two critical
+    /// sections, as they are under a concurrent children index (K6). Adjacent concurrent reaps can
+    /// then each see the other as a neighbour and leak what only the two of them held.
+    k6_race: AtomicBool,
 }
 
 /// The trunk's two reclamation indexes as they were when the split walk was turned on.
@@ -298,6 +307,42 @@ fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
         None => {
             let start = Instant::now();
             let guard = lock.lock();
+            (guard, Some(start.elapsed()))
+        }
+    };
+    let work = guard.work();
+    work.lock_acquisitions += 1;
+    let waited = waited.map(|w| w.as_nanos() as u64);
+    if let Some(waited) = waited {
+        work.lock_contended += 1;
+        work.lock_wait_ns += waited;
+    }
+    let since = timed.then(Instant::now);
+    Held {
+        guard,
+        since,
+        waited,
+    }
+}
+
+/// [`take`], but a held lock is waited for by spinning on `try_lock` with exponential backoff (up
+/// to 64 spin hints between attempts) instead of parking: a measurement control that removes the
+/// park and unpark from every handoff, so what is left is the hold itself. Counted as `take` counts.
+fn take_spinning<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
+    let (mut guard, waited) = match lock.try_lock() {
+        Some(guard) => (guard, None),
+        None => {
+            let start = Instant::now();
+            let mut backoff = 1u32;
+            let guard = loop {
+                for _ in 0..backoff {
+                    std::hint::spin_loop();
+                }
+                if let Some(guard) = lock.try_lock() {
+                    break guard;
+                }
+                backoff = (backoff * 2).min(64);
+            };
             (guard, Some(start.elapsed()))
         }
     };
@@ -800,6 +845,8 @@ impl BranchStore {
             split: CachePadded::new(SplitWalk {
                 on: AtomicBool::new(false),
                 snapshot: ArcSwapOption::empty(),
+                spin: AtomicBool::new(false),
+                k6_race: AtomicBool::new(false),
             }),
         }
     }
@@ -844,6 +891,20 @@ impl BranchStore {
             self.split.on.store(false, Ordering::Release);
             self.split.snapshot.store(None);
         }
+    }
+
+    /// A measurement control: reaps of trunk children spin for the trunk's lock (see
+    /// [`take_spinning`]) while on.
+    pub(crate) fn set_trunk_spin(&self, on: bool) {
+        self.split.spin.store(on, Ordering::Release);
+    }
+
+    /// ⚠ UNSAFE, a measurement control: while on, the split walk probes a reaped child's neighbours
+    /// and detaches it in two critical sections instead of one (K6). It leaks; it never frees early,
+    /// because neighbours probed earlier are at least as close as the ones there at the detach, which
+    /// only narrows the garbage query. Takes effect only while the split walk is on.
+    pub(crate) fn set_unsafe_k6_race(&self, on: bool) {
+        self.split.k6_race.store(on, Ordering::Release);
     }
 
     /// Every retained version of the trunk checked against its live children (see [`TrunkAudit`]).
@@ -1350,7 +1411,11 @@ impl BranchStore {
                     freed += self.reap_split(st.fork_epoch);
                     return (freed, true);
                 }
-                let mut trunk = self.trunk();
+                let mut trunk = if self.split.spin.load(Ordering::Relaxed) {
+                    take_spinning(&self.trunk, self.timed())
+                } else {
+                    self.trunk()
+                };
                 let (since, waited) = (trunk.since, trunk.waited);
                 let TrunkInner {
                     lineage,
@@ -1399,6 +1464,17 @@ impl BranchStore {
     /// passes only versions that held this child and no other then, so no live child can need them,
     /// and each is freed by exactly one reap. A candidate already gone is counted, not freed.
     fn reap_split(&self, f: u64) -> usize {
+        // K6's race (UNSAFE): the neighbours are probed in a critical section of their own, before
+        // the one that detaches the child, as a concurrent children index would allow.
+        let probed = self.split.k6_race.load(Ordering::Acquire).then(|| {
+            let mut trunk = self.trunk();
+            let (since, waited) = (trunk.since, trunk.waited);
+            let TrunkInner { lineage, work, .. } = &mut *trunk;
+            let lo = lineage.children.range(..f).next_back().map(|(&e, _)| e);
+            let hi = lineage.children.range(f + 1..).next().map(|(&e, _)| e);
+            count_reap(work, since, waited);
+            (lo, hi)
+        });
         let (lo, hi) = {
             let mut trunk = self.trunk();
             let (since, waited) = (trunk.since, trunk.waited);
@@ -1409,7 +1485,7 @@ impl BranchStore {
             }
             self.trunk_child_gone();
             count_reap(work, since, waited);
-            (lo, hi)
+            probed.unwrap_or((lo, hi))
         };
         let snapshot = self.split.snapshot.load();
         let snapshot = snapshot
@@ -2183,21 +2259,35 @@ mod tests {
         store.first_write_trunk(0, &image(0));
     }
 
+    /// How [`reap_concurrently`] reaps.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum ReapMode {
+        Serialized,
+        /// The ordinary reap, taking the trunk's lock by spinning.
+        Spin,
+        Split,
+        /// The split walk with K6's race: it may leak, and must never free early.
+        K6Race,
+    }
+
     /// Reaps of trunk children from four threads at once, many of them adjacent, in the ordinary
-    /// serialized reap and in the UNSAFE split walk: afterwards the arena must hold exactly the
-    /// versions whose `[born, died)` still holds a surviving child's fork epoch (the brute-force
-    /// model), the audit must find no leak, every survivor must read every page as of its fork, and
-    /// the split walk must have walked once per reap, freed through its locked step, and missed
-    /// nothing.
+    /// serialized reap (parking and spinning) and in the UNSAFE split walk: afterwards the arena must
+    /// hold exactly the versions whose `[born, died)` still holds a surviving child's fork epoch (the
+    /// brute-force model), the audit must find no leak, every survivor must read every page as of its
+    /// fork, and the split walk must have walked once per reap, freed through its locked step, and
+    /// missed nothing. With K6's race put back, every survivor must still read every page right, and
+    /// every version beyond the model's must be one the audit calls leaked.
     #[test]
     fn concurrent_trunk_reaps_free_exactly_the_model_serialized_and_split() {
         for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
-            reap_concurrently(false, seed);
-            reap_concurrently(true, seed);
+            for mode in [ReapMode::Serialized, ReapMode::Spin, ReapMode::Split, ReapMode::K6Race] {
+                reap_concurrently(mode, seed);
+            }
         }
     }
 
-    fn reap_concurrently(split: bool, seed: u64) {
+    fn reap_concurrently(mode: ReapMode, seed: u64) {
+        let split = matches!(mode, ReapMode::Split | ReapMode::K6Race);
         const CHILDREN: u64 = 2_000;
         const THREADS: u64 = 4;
         const REAPS: usize = 300;
@@ -2224,6 +2314,8 @@ mod tests {
         if split {
             store.set_unsafe_split_walk(true);
         }
+        store.set_unsafe_k6_race(mode == ReapMode::K6Race);
+        store.set_trunk_spin(mode == ReapMode::Spin);
         let mut shares: Vec<Vec<(BranchId, u64, HashMap<u32, u64>)>> =
             (0..THREADS).map(|_| Vec::new()).collect();
         for (i, child) in live.into_iter().enumerate() {
@@ -2266,12 +2358,17 @@ mod tests {
             .iter()
             .filter(|&&(_, born, died)| survivors.iter().any(|&(_, f, _)| born <= f && f < died))
             .count();
-        let label = format!("seed {seed:#x} split {split}");
-        assert_eq!(store.stats().arena_slots_in_use, alive, "{label}: not the model's versions");
-        assert_eq!(freed, history.len() - alive, "{label}: the reaps' reports disagree");
-        assert!(freed > 0, "{label}: no reap freed a version");
+        let label = format!("seed {seed:#x} mode {mode:?}");
         let audit = store.audit_trunk();
-        assert_eq!((audit.leaked, audit.versions), (0, alive), "{label}: {audit:?}");
+        let leaked = if mode == ReapMode::K6Race { audit.leaked } else { 0 };
+        assert_eq!(
+            store.stats().arena_slots_in_use,
+            alive + leaked,
+            "{label}: not the model's versions (plus, under K6's race, the audit's leaked ones)"
+        );
+        assert_eq!(freed + leaked, history.len() - alive, "{label}: the reaps' reports disagree");
+        assert!(freed > 0, "{label}: no reap freed a version");
+        assert_eq!((audit.leaked, audit.versions), (leaked, alive + leaked), "{label}: {audit:?}");
         if split {
             assert_eq!(counts.walks, THREADS * REAPS as u64, "{label}: {counts:?}");
             assert!(counts.frees > 0 && counts.misses == 0, "{label}: {counts:?}");
