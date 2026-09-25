@@ -56,3 +56,28 @@ reported as "not exercised", never as the absence of the stall.
 
 ---
 ## Amendments (append-only)
+
+### Amendment D2 — written 2026-09-25T14:06Z: time the branch's own first write too, for the compaction stall; before any D2 run
+
+D1's four runs (artie-research `e5cac8e`, `4751b03`, `6007c4d`, `eeba8b7`) read "compactions: 0" in the durable arms,
+yet the branch snapshot appeared (0 → 1,106,635 bytes between x = 10^4 and 3·10^4). `maybe_compact` also runs at the
+end of `commit_pages` (`store.rs:1322` at `ec168128b`), i.e. inside a branch's own first write, which D1 did not time.
+So D1's compaction checks read the instrument's blind spot, not the engine; they stand as broken.
+
+**Change** (this commit): the growth loop also times each branch's own first write (`grow_write`: the UPDATE on the
+branch's connection, the connect excluded) with the same snapshot-change detection. Nothing else changes.
+
+**Runs** (lockrun, timeout 3600, raw committed before read): `--checkpoints 100,1000,10000,100000,300000 --samples 200`
+with `--durability durable --synchronous full` (`dur2_sync_full`) and `--durability durable-nosync --synchronous full`
+(`dur2_nosync_full`).
+
+**Predictions (I).**
+- At least 3 compactions per arm by x = 3·10^5, each listed with its op and n.
+- A compaction writes the whole live state, so its latency grows with n: log-log slope of compaction µs against n
+  ≥ 0.5 over the compactions listed, per arm.
+- The snapshot at the last checkpoint holds 20–120 bytes per live branch (D1: 1,106,635 bytes at a compaction
+  somewhere in 10^4..3·10^4, i.e. 37–111 bytes per branch there).
+- The largest compaction stall at n ≥ 10^5 is in [2, 500] ms in the sync arm, and the op that pays it holds the store
+  mutex throughout (R: `commit_pages`, `fork_trunk` and `durability_barrier` call `maybe_compact` under `inner`).
+- Everything D1 checked (37 log bytes and 4096 arena bytes per `trunk_retain`, 0 per `trunk_plain`, the ratios) holds
+  again at every x.

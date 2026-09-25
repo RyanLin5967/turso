@@ -8,8 +8,9 @@
 //!
 //! Workload: the `hot` arm of `branch_arms` — N live branches, each forked from the trunk and given one
 //! page of its own, with one trunk UPDATE of row 1 after every fork, so each trunk write keeps one
-//! pre-image. During growth every fork and every trunk write is timed (`grow_fork`, `grow_trunk`), and
-//! any op during which the branch snapshot file changed is listed as a compaction.
+//! pre-image. During growth every fork, every branch's own first write and every trunk write is timed
+//! (`grow_fork`, `grow_write`, `grow_trunk`; `grow_write` from amendment D2, because compaction also runs at a
+//! branch commit), and any op during which the branch snapshot file changed is listed as a compaction.
 //!
 //! At each checkpoint N, K samples, each: fork a sample branch (untimed), then time
 //!
@@ -347,7 +348,7 @@ fn main() {
     let mut grown = 0usize;
     let mut compaction_log: Vec<(&'static str, usize, f64)> = Vec::new();
     for &n in &args.checkpoints {
-        let (mut gfork, mut gtrunk) = (Op::default(), Op::default());
+        let (mut gfork, mut gwrite, mut gtrunk) = (Op::default(), Op::default(), Op::default());
         while live.len() < n {
             let at = live.len();
             let writes_at_fork = b.writes;
@@ -356,8 +357,8 @@ fn main() {
             let row = row_for(grown);
             grown += 1;
             let conn = branch.connect().unwrap();
-            conn.execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", branch_value(row)))
-                .unwrap();
+            let sql = format!("UPDATE t SET v = '{}' WHERE id = {row}", branch_value(row));
+            b.timed(&mut gwrite, at, || conn.execute(sql).unwrap());
             drop(conn);
             live.push(Live {
                 branch,
@@ -398,10 +399,17 @@ fn main() {
             not_a_result(&format!("sampling did not return to {n} branches and {} pages: {s:?}", 2 * n));
         }
         print_op(n, "grow_fork", &gfork);
+        print_op(n, "grow_write", &gwrite);
         print_op(n, "grow_trunk", &gtrunk);
         print_op(n, "trunk_retain", &retain);
         print_op(n, "trunk_plain", &plain);
-        for (name, op) in [("grow_fork", &gfork), ("grow_trunk", &gtrunk), ("trunk_retain", &retain), ("trunk_plain", &plain)] {
+        for (name, op) in [
+            ("grow_fork", &gfork),
+            ("grow_write", &gwrite),
+            ("grow_trunk", &gtrunk),
+            ("trunk_retain", &retain),
+            ("trunk_plain", &plain),
+        ] {
             for &(at, us) in &op.compactions {
                 compaction_log.push((name, at, us));
             }
