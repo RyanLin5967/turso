@@ -159,7 +159,7 @@ pub struct Branch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaped {
     /// Arena pages returned to the free list by this call: the branch's own, plus any version an
-    /// ancestor was retaining only for it.
+    /// ancestor was retaining only for it, plus any trunk pending image no live child needs now.
     pub freed_pages: usize,
     /// Trunk chunk versions released by this call. A store that keeps the trunk's versions as
     /// whole pages counts them in `freed_pages` and reports 0 here.
@@ -204,8 +204,9 @@ pub struct BranchWork {
     /// then the trunk when neither holds the page — at most 2. (Before the persistent page map this
     /// counted the branch, each ancestor walked, and the trunk.)
     pub resolve_levels: u64,
-    /// Retained versions compared against the fork epoch while resolving (`Lineage::retained_at`):
-    /// at most one per lineage consulted, the page's born-predecessor. The O(log V) descent that
+    /// Retained versions compared against the fork epoch while resolving (`TrunkState::overlay`):
+    /// at most one per chunk of the page, each chunk's born-predecessor (the trunk keeps chunk
+    /// versions; see `store`, "The trunk keeps sub-page versions"). The O(log V) descent that
     /// finds it is not counted; time is the only instrument for it.
     pub resolve_retained_examined: u64,
     /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
