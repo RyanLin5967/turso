@@ -71,13 +71,41 @@
 //! version in the key as in a buffer tag with its LSN.
 //!
 //! A cached version is immutable. A branch reads the trunk's current version of a page only when
-//! the trunk's last write to it came in an epoch at or before the branch's `trunk_at`; that epoch
-//! was closed by a fork, which holds the WAL write lock, so no trunk write can change the version
-//! the key names. The one gap is a trunk with no live child: it writes without telling the store
-//! (see `first_write_trunk`'s caller), so `written` can name an epoch whose page has since changed.
+//! the trunk's last COMMIT of it came in an epoch at or before the branch's `trunk_at`: `written`
+//! holds the epoch of each page's last commit, stamped at the commit's serialization point (see
+//! "Trunk commits and forks" below), so a commit after the fork at `trunk_at` stamps its pages with
+//! a later epoch before it publishes them, and no trunk write can change the version the key names —
+//! the buffer tag with its LSN, where the LSN is the commit's epoch. The one gap is a trunk with no
+//! live child: it writes without telling the store (see [`BranchStore::begin_trunk_commit`]), so
+//! `written` can name an epoch whose page has since changed.
 //! The trunk's last child going therefore bumps the cache's generation, and a version cached under
 //! an older generation is never served. The cache is filled by the pager after it reads a page for
 //! a branch ([`BranchStore::fill_trunk_page`]), under the key [`BranchStore::resolve_into`] gave.
+//!
+//! # Trunk commits and forks — decisions at the commit, forks without the writer's lock
+//!
+//! A trunk fork used to take the trunk's WAL write lock, because a trunk write transaction took its
+//! copy decisions at each page's first write, for the epoch of that moment: had a fork come in
+//! between, the commit would have reached the new child. So every fork waited out every trunk
+//! transaction from BEGIN to COMMIT, and every fork serialised with every other (sweep-lock L4).
+//! Now the decisions are taken where an optimistic transaction takes its own — at the commit's
+//! serialization point, against the epoch there (Silo, SOSP 2013):
+//!
+//! * **The writer** only CAPTURES, at a page's first write in the transaction, the page as it was
+//!   (the pager's write set), and only while the trunk has a live child. After the frames are
+//!   written and synced and before they are published, [`BranchStore::begin_trunk_commit`] takes
+//!   every decision in one section under the trunk's lock — retain `[born, epoch)` if a live child
+//!   forked in it, stamp `written` with `epoch` — and opens the COMMIT GATE (`trunk_commits` odd);
+//!   dropping the [`TrunkCommitGate`] after the publication closes it. A rolled-back transaction
+//!   leaves nothing in the store.
+//! * **A fork** reads `trunk_commits` (waiting out an open gate), begins a WAL read transaction, and
+//!   registers under the trunk's lock only if `trunk_commits` has not moved since: no commit has
+//!   taken its decisions since the fork's snapshot, so every commit decided before the registration
+//!   is in the snapshot (and published), and every commit decided after it sees the child and
+//!   retains for it. The registration is the fork's linearisation point; it takes no WAL write lock.
+//! * **The first child** is forked the old way, under the WAL write lock: a writer that saw no live
+//!   child captured nothing, and must not see one appear before it commits. `trunk_children` goes
+//!   from 0 to 1 only there, and a writer holds that lock from BEGIN to COMMIT.
 //!
 //! # Concurrency — a striped store
 //!
@@ -165,9 +193,9 @@ pub(crate) struct BranchStore {
     shards: Box<[CachePadded<Mutex<Shard>>]>,
     /// The trunk's lineage and the arena of its retained versions, behind their own lock.
     trunk: CachePadded<Mutex<TrunkInner>>,
-    /// The trunk epoch of its last write to each page, readable without a lock (see [`Radix`]).
-    /// Written only under `trunk`'s lock. Absent reads as 0: "before the first fork that was live at
-    /// the time", the conservative answer (see `first_write_trunk`).
+    /// The trunk epoch of its last commit of each page, readable without a lock (see [`Radix`]).
+    /// Written only under `trunk`'s lock, by [`BranchStore::begin_trunk_commit`]. Absent reads as 0:
+    /// "before the first fork that was live at the time", the conservative answer.
     written: Radix<AtomicU64>,
     next_id: AtomicU64,
     /// The trunk's page size and reserved bytes per page, recorded at the first fork. Every arena
@@ -183,16 +211,25 @@ pub(crate) struct BranchStore {
     /// database with no branches pays one atomic load per written page and nothing else.
     ///
     /// The unlocked read is sound because the only transition that matters — 0 to 1 — happens in
-    /// a trunk fork, which holds the trunk's WAL write lock; a trunk writer reading this holds the
-    /// same lock. A 1-to-0 transition (a reap) racing the read only makes the writer take the lock
-    /// and find nothing to do.
+    /// a trunk fork that holds the trunk's WAL write lock (a fork without it refuses to be the first
+    /// child); a trunk writer reading this holds the same lock. A 1-to-0 transition (a reap) racing
+    /// the read only makes the writer capture a pre-image nobody needs. Changed only under the
+    /// trunk's lock.
     trunk_children: AtomicUsize,
+    /// The commit gate: trunk commits that have taken their copy decisions, counted twice — odd
+    /// while a commit is between its decisions and its publication (see "Trunk commits and forks").
+    /// Advanced only by the trunk's one writer; the opening advance is under the trunk's lock.
+    trunk_commits: AtomicU64,
     /// Whether [`take`] times how long each acquisition holds its lock. Off by default: it is the
     /// one part of the lock accounting that adds work inside a critical section.
     lock_timing: AtomicBool,
     /// Nanoseconds trunk forks held the trunk's WAL write lock, summed; written only while lock
     /// timing is on (see [`BranchWork::trunk_fork_wal_hold_ns`]). Observation only.
     fork_wal_hold_ns: AtomicU64,
+    /// Test-only: run by a trunk fork right after its trunk-lock hold, where a trunk writer could
+    /// read `trunk_children` (K10-7).
+    #[cfg(test)]
+    after_fork_hold: std::sync::Mutex<Option<Box<dyn Fn(&BranchStore) + Send>>>,
 }
 
 /// What a trunk fork did before it registered, for [`BranchWork`]'s `trunk_fork_*` counters.
@@ -203,6 +240,30 @@ pub(crate) struct ForkAttempts {
     pub(crate) read_txs: u64,
     /// WAL write-lock acquisitions.
     pub(crate) wal_locks: u64,
+    /// Lock-free attempts abandoned because a trunk commit took its decisions in between.
+    pub(crate) gate_retries: u64,
+}
+
+/// What a trunk fork's registration did.
+pub(crate) enum TrunkFork {
+    Forked(BranchId),
+    /// A trunk commit took its copy decisions after the fork's snapshot, or was taking them: begin
+    /// a new snapshot and try again.
+    Retry,
+    /// The trunk has no live child, so this fork would be the first: fork under the WAL write lock.
+    NeedsWriterLock,
+}
+
+/// A trunk commit between its copy decisions and its publication. Dropping it closes the commit
+/// gate: drop it once the commit is published (or has failed), never before.
+pub(crate) struct TrunkCommitGate<'a> {
+    store: &'a BranchStore,
+}
+
+impl Drop for TrunkCommitGate<'_> {
+    fn drop(&mut self) {
+        self.store.trunk_commits.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// One stripe of the branch map.
@@ -692,8 +753,11 @@ impl BranchStore {
             },
             live: AtomicUsize::new(0),
             trunk_children: AtomicUsize::new(0),
+            trunk_commits: AtomicU64::new(0),
             lock_timing: AtomicBool::new(false),
             fork_wal_hold_ns: AtomicU64::new(0),
+            #[cfg(test)]
+            after_fork_hold: std::sync::Mutex::new(None),
         }
     }
 
@@ -763,9 +827,18 @@ impl BranchStore {
         self.live.load(Ordering::Acquire) > 0
     }
 
-    /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
-    /// transaction in flight across the fork would commit pages whose copy decision was taken for
-    /// the previous epoch, and the new child would see them.
+    /// The commit gate's count, for a lock-free trunk fork to hand back to [`Self::fork_trunk`]. Odd
+    /// while a trunk commit is between its copy decisions and its publication.
+    pub(crate) fn trunk_commit_seq(&self) -> u64 {
+        self.trunk_commits.load(Ordering::Acquire)
+    }
+
+    /// Fork a child of the trunk, the caller holding a WAL read snapshot taken after it read
+    /// `seen` from [`Self::trunk_commit_seq`] (an even count). Registered only if no trunk commit
+    /// has taken its copy decisions since `seen` — so every commit decided before this registration
+    /// is in the caller's snapshot, and every one decided after it retains what the child sees —
+    /// and only if the trunk already has a live child (see "Trunk commits and forks"). `seen: None`
+    /// means the caller holds the trunk's WAL write lock instead, and the fork always registers.
     ///
     /// The child is listed among the trunk's children before its state exists in its shard. Nothing
     /// can reach it in between: its id has not been returned, and a sibling's reap only reads its
@@ -775,8 +848,9 @@ impl BranchStore {
         schema: Arc<Schema>,
         page_size: usize,
         reserved_space: u8,
+        seen: Option<u64>,
         attempts: ForkAttempts,
-    ) -> Result<BranchId> {
+    ) -> Result<TrunkFork> {
         let format = *self.trunk_format.get_or_init(|| (page_size, reserved_space));
         if format != (page_size, reserved_space) {
             return Err(LimboError::InternalError(format!(
@@ -787,22 +861,43 @@ impl BranchStore {
         }
         let (id, f) = {
             let mut trunk = self.trunk();
+            if let Some(seen) = seen {
+                if self.trunk_children.load(Ordering::Acquire) == 0 {
+                    return Ok(TrunkFork::NeedsWriterLock);
+                }
+                // An odd count was read inside a commit's gate: the snapshot may or may not hold
+                // that commit, so it cannot be told which side of it the child is on.
+                if seen % 2 == 1 || self.trunk_commits.load(Ordering::Acquire) != seen {
+                    return Ok(TrunkFork::Retry);
+                }
+            }
             let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
             let f = trunk.lineage.epoch;
             trunk.lineage.epoch += 1;
             trunk.lineage.children.insert(f, id);
-            trunk.work.trunk_forks += 1;
-            trunk.work.trunk_fork_read_txs += attempts.read_txs;
-            trunk.work.trunk_fork_wal_locks += attempts.wal_locks;
+            self.trunk_children.fetch_add(1, Ordering::AcqRel);
+            let work = &mut trunk.work;
+            work.trunk_forks += 1;
+            if seen.is_some() {
+                work.trunk_forks_fast += 1;
+            } else {
+                work.trunk_forks_locked += 1;
+            }
+            work.trunk_fork_read_txs += attempts.read_txs;
+            work.trunk_fork_wal_locks += attempts.wal_locks;
+            work.trunk_fork_gate_retries += attempts.gate_retries;
             (id, f)
         };
+        #[cfg(test)]
+        if let Some(hook) = self.after_fork_hold.lock().unwrap().as_ref() {
+            hook(self);
+        }
         self.live.fetch_add(1, Ordering::AcqRel);
         self.shard(id).branches.insert(
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
         );
-        self.trunk_children.fetch_add(1, Ordering::AcqRel);
-        Ok(id)
+        Ok(TrunkFork::Forked(id))
     }
 
     /// Fork a child of a branch. Refused while the parent has a write transaction in progress, for
@@ -970,35 +1065,76 @@ impl BranchStore {
         Ok(())
     }
 
-    /// The copy decision for the trunk's first write to `page` in a transaction: if a live child
-    /// can still see the version about to be overwritten, keep a copy of it for that child.
+    /// The copy decisions of one trunk commit, taken at its serialization point: after its frames
+    /// are written and before they are published. `pages` is every page the commit writes, each with
+    /// the pre-image the pager captured at the page's first write in the transaction, or `None` if
+    /// the trunk had no live child then. For each page last committed before this epoch: if a live
+    /// child forked since then can see the version being overwritten, keep a copy of it for that
+    /// child, and stamp `written` with this epoch.
     ///
-    /// `written` is updated after the retained version is in place and before this write can reach
-    /// the WAL, so a reader whose WAL snapshot holds the new version also sees the new epoch, and
-    /// looks the page up under the trunk's lock (see [`BranchStore::resolve_into`]).
-    pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
+    /// The decisions are taken against the epoch NOW, so a fork registered at any moment of the
+    /// transaction is seen. `written` is stamped before the commit is published, so a reader whose
+    /// WAL snapshot holds the new version also sees the new epoch and looks the page up under the
+    /// trunk's lock (see [`BranchStore::resolve_into`]). The returned gate keeps lock-free forks from
+    /// registering until it is dropped; the caller drops it once the commit is published.
+    ///
+    /// A page without a pre-image was first written while the trunk had no live child; the trunk's
+    /// WAL write lock, which the writer holds, keeps a first child from being forked before the
+    /// commit, so no live child can see what it overwrites — asserted, as the writer tells the store
+    /// nothing else about that page (the cache's generation covers it; see "Trunk pages without the
+    /// file").
+    pub(crate) fn begin_trunk_commit<'a, 'p>(
+        &'a self,
+        pages: impl IntoIterator<Item = (u32, Option<&'p [u8]>)>,
+    ) -> TrunkCommitGate<'a> {
         let mut trunk = self.trunk();
+        let opened = self.trunk_commits.fetch_add(1, Ordering::AcqRel);
+        crate::turso_assert!(opened % 2 == 0, "two trunk commits inside the commit gate at once");
+        let gate = TrunkCommitGate { store: self };
         let TrunkInner {
-            lineage, domain, ..
+            lineage,
+            domain,
+            work,
         } = &mut *trunk;
         let epoch = lineage.epoch;
-        let born = self.written(page);
-        if born >= epoch {
-            return;
+        work.trunk_commits_decided += 1;
+        for (page, pre_image) in pages {
+            let born = self.written(page);
+            let Some(pre_image) = pre_image else {
+                crate::turso_assert!(
+                    !lineage.has_child_in(born, epoch),
+                    "a trunk commit overwrites a page a live child can see, and no pre-image was \
+                     captured for it"
+                );
+                continue;
+            };
+            work.trunk_pre_images_captured += 1;
+            if born >= epoch {
+                continue;
+            }
+            if lineage.has_child_in(born, epoch) {
+                let slot = domain.alloc(self.page_size());
+                domain.page_mut(slot).copy_from_slice(pre_image);
+                lineage.retain(
+                    page,
+                    Retained {
+                        born,
+                        died: epoch,
+                        slot,
+                    },
+                );
+                work.trunk_pre_images_retained += 1;
+            }
+            self.written.get_or_insert(page).store(epoch, Ordering::Release);
         }
-        if lineage.has_child_in(born, epoch) {
-            let slot = domain.alloc(self.page_size());
-            domain.page_mut(slot).copy_from_slice(pre_image);
-            lineage.retain(
-                page,
-                Retained {
-                    born,
-                    died: epoch,
-                    slot,
-                },
-            );
-        }
-        self.written.get_or_insert(page).store(epoch, Ordering::Release);
+        gate
+    }
+
+    /// The copy decision for one page, as a one-page trunk commit: for the store's model tests,
+    /// which drive the store without a pager.
+    #[cfg(test)]
+    pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
+        drop(self.begin_trunk_commit([(page, Some(pre_image))]));
     }
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
@@ -1277,6 +1413,17 @@ mod tests {
         generation.to_le_bytes().repeat(PAGE / 8)
     }
 
+    /// A trunk fork as the pager makes it under the trunk's WAL write lock: it always registers.
+    fn fork_locked(store: &BranchStore) -> BranchId {
+        match store
+            .fork_trunk(Arc::new(Schema::default()), PAGE, 0, None, ForkAttempts::default())
+            .unwrap()
+        {
+            TrunkFork::Forked(id) => id,
+            _ => unreachable!("a fork under the WAL write lock always registers"),
+        }
+    }
+
     /// The trunk's retained-version index against a brute-force model, through the store's own
     /// entry points (`fork_trunk`, `first_write_trunk`, `release_handle`, `resolve_into`), and the
     /// garbage query's cost against its contract: a reap with no older live sibling, or no younger
@@ -1312,7 +1459,7 @@ mod tests {
         for step in 0..1500 {
             match rng.below(10) {
                 0..=2 if live.len() < 40 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0, ForkAttempts::default()).unwrap();
+                    let id = fork_locked(&store);
                     live.push((id, epoch, current.clone()));
                     epoch += 1;
                 }
@@ -1518,7 +1665,7 @@ mod tests {
             let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
             match rng.below(12) {
                 0 if live.len() < 60 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0, ForkAttempts::default()).unwrap();
+                    let id = fork_locked(&store);
                     nodes.push(Node {
                         id,
                         sees: trunk.clone(),
@@ -1687,7 +1834,7 @@ mod tests {
                             0..=1 if live.len() < 16 => {
                                 let _w = wal.lock().unwrap();
                                 let sees = committed.read().unwrap().clone();
-                                let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0, ForkAttempts::default()).unwrap();
+                                let id = fork_locked(&store);
                                 nodes.push(Node { id, sees, handle: true, depth: 1, forked: false });
                             }
                             2..=3 if !live.is_empty() && live.len() < 16 => {
@@ -1802,7 +1949,7 @@ mod tests {
         for step in 0..3000 {
             match rng.below(10) {
                 0..=2 if live.len() < 3 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0, ForkAttempts::default()).unwrap();
+                    let id = fork_locked(&store);
                     live.push((id, current.clone()));
                 }
                 3..=5 => {
@@ -1852,5 +1999,294 @@ mod tests {
             store.release_handle(id);
         }
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
+    }
+
+    /// A fork without the WAL write lock (r11-forklock PREREG §0, K10-4): it registers only between
+    /// two commits' gates, against the count it read before its snapshot, and never as the trunk's
+    /// first child. Each refusal is forced to fire, and each admission shown after it.
+    #[test]
+    fn a_lock_free_fork_registers_only_between_commit_gates_and_never_as_the_first_child() {
+        let store = BranchStore::new();
+        let fast = |seen: u64| {
+            store
+                .fork_trunk(Arc::new(Schema::default()), PAGE, 0, Some(seen), ForkAttempts::default())
+                .unwrap()
+        };
+        assert!(
+            matches!(fast(store.trunk_commit_seq()), TrunkFork::NeedsWriterLock),
+            "a lock-free fork registered as the trunk's first child"
+        );
+        let first = fork_locked(&store);
+        let seen = store.trunk_commit_seq();
+        assert_eq!(seen % 2, 0, "the gate is open with no commit in flight");
+        let TrunkFork::Forked(a) = fast(seen) else {
+            panic!("a lock-free fork between commits was refused");
+        };
+
+        let gate = store.begin_trunk_commit([(1, Some(&image(0)[..]))]);
+        let inside = store.trunk_commit_seq();
+        assert_eq!(inside, seen + 1, "a commit's decisions did not open the gate");
+        assert!(
+            matches!(fast(seen), TrunkFork::Retry),
+            "a fork registered against a snapshot taken before a commit's decisions"
+        );
+        assert!(
+            matches!(fast(inside), TrunkFork::Retry),
+            "a fork registered inside a commit's gate"
+        );
+        drop(gate);
+        let after = store.trunk_commit_seq();
+        assert_eq!(after, seen + 2, "the gate did not close");
+        assert!(
+            matches!(fast(seen), TrunkFork::Retry),
+            "a fork registered against a snapshot taken before a published commit"
+        );
+        let TrunkFork::Forked(b) = fast(after) else {
+            panic!("a lock-free fork after the commit was refused");
+        };
+        let work = store.stats().work;
+        assert_eq!(
+            (work.trunk_forks, work.trunk_forks_fast, work.trunk_forks_locked),
+            (3, 2, 1)
+        );
+        for id in [first, a, b] {
+            store.release_handle(id);
+        }
+    }
+
+    /// The copy decisions of a trunk transaction are taken at its commit, against the epoch there
+    /// (K10-1 and K10-2 at the store's level). A child forked after the writer captured a page and
+    /// before its commit reads the pre-image, both when the page's last commit was in an earlier
+    /// epoch and when it was in the epoch just before this one; a child forked after the commit
+    /// reads the trunk's new version.
+    #[test]
+    fn a_trunk_commit_decides_against_the_epoch_at_its_commit_not_at_its_first_write() {
+        let store = BranchStore::new();
+        let first = fork_locked(&store);
+        let mut buf = vec![0u8; PAGE];
+        let mut read = |id: BranchId| match store.resolve_into(id, 3, &mut buf).unwrap() {
+            Resolved::Filled => Some(u64::from_le_bytes(buf[..8].try_into().unwrap())),
+            Resolved::Trunk(_) => None,
+        };
+        let fast = || {
+            let seen = store.trunk_commit_seq();
+            match store
+                .fork_trunk(Arc::new(Schema::default()), PAGE, 0, Some(seen), ForkAttempts::default())
+                .unwrap()
+            {
+                TrunkFork::Forked(id) => id,
+                _ => panic!("a lock-free fork between commits was refused"),
+            }
+        };
+        // C0: page 3 goes from generation 0 to 1 in epoch 1; `first` keeps generation 0.
+        drop(store.begin_trunk_commit([(3, Some(&image(0)[..]))]));
+        // C1: the writer captures generation 1, then a child forks, then C1 commits generation 2.
+        let captured = image(1);
+        let x = fast();
+        drop(store.begin_trunk_commit([(3, Some(&captured[..]))]));
+        // C2: the page's last commit is two epochs back; again a child forks mid-transaction.
+        let captured2 = image(2);
+        let y = fast();
+        let z = fast();
+        drop(store.begin_trunk_commit([(3, Some(&captured2[..]))]));
+        let after = fast();
+        assert_eq!(read(first), Some(0), "the child forked before C0 lost its version");
+        assert_eq!(read(x), Some(1), "a child forked inside C1 did not get C1's pre-image");
+        assert_eq!(read(y), Some(2), "a child forked inside C2 did not get C2's pre-image");
+        assert_eq!(read(z), Some(2), "a child forked inside C2 did not get C2's pre-image");
+        assert_eq!(read(after), None, "a child forked after C2 does not read the trunk's page");
+        let work = store.stats().work;
+        assert_eq!(work.trunk_commits_decided, 3);
+        assert_eq!(work.trunk_pre_images_retained, 3, "one retained version per commit");
+        for id in [first, x, y, z, after] {
+            store.release_handle(id);
+        }
+        assert_eq!(store.stats().arena_slots_in_use, 0, "versions leaked");
+    }
+
+    /// Lock-free forks racing trunk commits under threads (K10). A writer runs transactions of one to
+    /// three pages under a stand-in for the WAL write lock (`wal`): it captures each page's pre-image
+    /// at its first write while the trunk has a live child, yields (so forks land inside the
+    /// transaction), takes the commit's decisions, publishes under the stand-in for the WAL snapshot
+    /// (`committed`), yields inside the gate, and closes it. Four fork threads fork without `wal`
+    /// (under it only when the store answers `NeedsWriterLock`), each taking its snapshot after
+    /// reading the gate's count as the pager does, and check every page of every child they hold —
+    /// resolving and reading under one snapshot, filling the trunk-page cache on a miss — against
+    /// the snapshot the child was forked from, then reap some. The shapes the protocol exists for
+    /// must occur: forks inside an open transaction, retained pre-images, and lock-free forks.
+    #[test]
+    fn lock_free_forks_racing_trunk_commits_read_every_fork_as_it_was() {
+        use std::sync::atomic::{AtomicBool as StdBool, AtomicU64 as StdU64};
+        use std::sync::{Mutex as StdMutex, RwLock};
+        const FORKERS: u64 = 4;
+        const FORKS: usize = 300;
+        let store = Arc::new(BranchStore::new());
+        let wal = Arc::new(StdMutex::new(()));
+        let committed = Arc::new(RwLock::new(
+            (0..PAGES).map(|p| (p, 0u64)).collect::<HashMap<u32, u64>>(),
+        ));
+        let done = Arc::new(StdBool::new(false));
+        let mid_txn_forks = Arc::new(StdU64::new(0));
+        let writer = {
+            let (store, wal, committed, done, mid) = (
+                store.clone(),
+                wal.clone(),
+                committed.clone(),
+                done.clone(),
+                mid_txn_forks.clone(),
+            );
+            std::thread::spawn(move || {
+                let mut rng = Rng(0x5851_F42D_4C95_7F2D);
+                let mut generation = 1u64;
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    let _w = wal.lock().unwrap();
+                    let forks_before = store.stats().work.trunk_forks;
+                    let mut captured: HashMap<u32, Vec<u8>> = HashMap::new();
+                    let mut pages = Vec::new();
+                    for _ in 0..=rng.below(3) {
+                        let page = rng.below(u64::from(PAGES)) as u32;
+                        if !pages.contains(&page) {
+                            pages.push(page);
+                            if store.trunk_has_children() {
+                                captured.insert(page, image(committed.read().unwrap()[&page]));
+                            }
+                        }
+                        std::thread::yield_now();
+                    }
+                    let gate = store.begin_trunk_commit(
+                        pages
+                            .iter()
+                            .map(|&p| (p, captured.get(&p).map(|b| &b[..]))),
+                    );
+                    if store.stats().work.trunk_forks > forks_before {
+                        mid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    {
+                        let mut c = committed.write().unwrap();
+                        for &p in &pages {
+                            c.insert(p, generation);
+                            generation += 1;
+                        }
+                    }
+                    std::thread::yield_now();
+                    drop(gate);
+                    drop(_w);
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let forkers: Vec<_> = (0..FORKERS)
+            .map(|w| {
+                let (store, wal, committed) = (store.clone(), wal.clone(), committed.clone());
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ ((w + 1) * 0xD1B5_4A32_D192_ED03));
+                    let mut held: Vec<(BranchId, HashMap<u32, u64>)> = Vec::new();
+                    let mut buf = vec![0u8; PAGE];
+                    let check = |id: BranchId, sees: &HashMap<u32, u64>, buf: &mut Vec<u8>| {
+                        for page in 0..PAGES {
+                            let snap = committed.read().unwrap();
+                            let got = match store.resolve_into(id, page, buf).unwrap() {
+                                Resolved::Filled => u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                                Resolved::Trunk(key) => {
+                                    store.fill_trunk_page(key, &image(snap[&page]));
+                                    snap[&page]
+                                }
+                            };
+                            drop(snap);
+                            assert_eq!(got, sees[&page], "child {} page {page}", id.0);
+                        }
+                    };
+                    for _ in 0..FORKS {
+                        let (id, sees) = loop {
+                            let seen = store.trunk_commit_seq();
+                            if seen % 2 == 1 {
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            let sees = committed.read().unwrap().clone();
+                            match store
+                                .fork_trunk(
+                                    Arc::new(Schema::default()),
+                                    PAGE,
+                                    0,
+                                    Some(seen),
+                                    ForkAttempts::default(),
+                                )
+                                .unwrap()
+                            {
+                                TrunkFork::Forked(id) => break (id, sees),
+                                TrunkFork::Retry => std::thread::yield_now(),
+                                TrunkFork::NeedsWriterLock => {
+                                    let _w = wal.lock().unwrap();
+                                    let sees = committed.read().unwrap().clone();
+                                    break (fork_locked(&store), sees);
+                                }
+                            }
+                        };
+                        check(id, &sees, &mut buf);
+                        held.push((id, sees));
+                        let i = rng.below(held.len() as u64) as usize;
+                        check(held[i].0, &held[i].1, &mut buf);
+                        if held.len() > 6 || rng.below(4) == 0 {
+                            let (id, _) = held.swap_remove(rng.below(held.len() as u64) as usize);
+                            store.release_handle(id);
+                        }
+                    }
+                    for (id, sees) in &held {
+                        check(*id, sees, &mut buf);
+                    }
+                    for (id, _) in held {
+                        store.release_handle(id);
+                    }
+                })
+            })
+            .collect();
+        for f in forkers {
+            f.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+        writer.join().unwrap();
+        let work = store.stats().work;
+        assert_eq!(work.trunk_forks, FORKERS * FORKS as u64);
+        assert!(work.trunk_forks_fast > 0, "no fork took the lock-free path: {work:?}");
+        assert!(work.trunk_pre_images_retained > 0, "no commit retained a pre-image: {work:?}");
+        assert!(
+            mid_txn_forks.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "no fork landed inside an open trunk transaction"
+        );
+        assert_eq!(store.stats().live_branches, 0, "branches leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "versions leaked");
+    }
+
+    /// K10-7 (F6 condition (i), lead item 17:05Z): outside the trunk's lock a listed trunk child is
+    /// always counted in `trunk_children`, which a trunk writer reads without that lock to decide
+    /// whether to capture pre-images. A hook run right after each fork's trunk-lock hold asserts it,
+    /// for the first child (forked under the WAL write lock) and for a lock-free one.
+    #[test]
+    fn a_listed_trunk_child_is_counted_the_moment_the_trunk_lock_is_released() {
+        let store = BranchStore::new();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let ran = ran.clone();
+            *store.after_fork_hold.lock().unwrap() = Some(Box::new(move |s: &BranchStore| {
+                assert!(
+                    s.trunk_has_children(),
+                    "a trunk child is listed and not counted once the trunk's lock is released"
+                );
+                ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        let first = fork_locked(&store);
+        let seen = store.trunk_commit_seq();
+        let TrunkFork::Forked(second) = store
+            .fork_trunk(Arc::new(Schema::default()), PAGE, 0, Some(seen), ForkAttempts::default())
+            .unwrap()
+        else {
+            panic!("a lock-free fork between commits was refused");
+        };
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 2, "the hook did not run");
+        *store.after_fork_hold.lock().unwrap() = None;
+        store.release_handle(first);
+        store.release_handle(second);
     }
 }

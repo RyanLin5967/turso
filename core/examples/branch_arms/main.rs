@@ -2005,6 +2005,8 @@ fn arm_forks(b: &mut Bench, args: &Args) {
                  writer_per_s={wper_s:.1} writer_busy={wbusy} sampled_verified={verified} \
                  user_ns={} sys_ns={} rss_bytes={} arena_in_use={} \
                  trunk_forks={} trunk_fork_read_txs={} trunk_fork_wal_locks={} trunk_fork_wal_hold_ns={} \
+                 trunk_forks_fast={} trunk_forks_locked={} trunk_fork_gate_retries={} \
+                 trunk_commits_decided={} trunk_pre_images_captured={} trunk_pre_images_retained={} \
                  trunk_lock_acq={} trunk_lock_contended={} trunk_lock_wait_ns={} trunk_lock_hold_ns={} \
                  lock_acq={} lock_contended={} lock_wait_ns={} lock_hold_ns={}",
                 wall.as_nanos(),
@@ -2021,6 +2023,12 @@ fn arm_forks(b: &mut Bench, args: &Args) {
                 d(|x| x.trunk_fork_read_txs),
                 d(|x| x.trunk_fork_wal_locks),
                 d(|x| x.trunk_fork_wal_hold_ns),
+                d(|x| x.trunk_forks_fast),
+                d(|x| x.trunk_forks_locked),
+                d(|x| x.trunk_fork_gate_retries),
+                d(|x| x.trunk_commits_decided),
+                d(|x| x.trunk_pre_images_captured),
+                d(|x| x.trunk_pre_images_retained),
                 d(|x| x.trunk_lock_acquisitions),
                 d(|x| x.trunk_lock_contended),
                 d(|x| x.trunk_lock_wait_ns),

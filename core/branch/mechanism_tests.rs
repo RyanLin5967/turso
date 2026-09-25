@@ -913,3 +913,263 @@ fn branches_read_their_fork_while_the_trunk_writes_concurrently() {
     );
     assert_eq!(db.branch_stats().live_branches, 0, "branches leaked");
 }
+
+/// K10-1 (r11-forklock PREREG §0): a fork while a trunk write transaction is open is not refused,
+/// and never sees that transaction. Child A exists before the transaction (the trunk's first child
+/// is forked under the WAL write lock); B is forked inside it and read inside it, which fills the
+/// shared trunk-page cache with the pages the transaction is rewriting; C is forked inside it after
+/// that. After the commit, A, B and C read every rewritten row as it was, on two connections, and a
+/// fork D after the commit reads the new rows — never the versions B cached.
+#[test]
+fn a_fork_during_an_open_trunk_transaction_is_admitted_and_never_sees_it() {
+    let (_dir, db) = open_db();
+    let writer = db.connect().unwrap();
+    seed(&writer, 200);
+    let forker = db.connect().unwrap();
+    // Three rows on three different leaves (about 37 rows fit a leaf).
+    let ids = [7, 100, 190];
+    let a = forker.fork_branch().unwrap();
+    let locked = db.branch_stats().work;
+    assert_eq!(locked.trunk_forks_locked, 1, "the first child was not forked under the lock");
+
+    writer.execute("BEGIN").unwrap();
+    for id in ids {
+        set(&writer, id, &format!("in-flight-{id}"));
+    }
+    let b = forker
+        .fork_branch()
+        .expect("a fork while a trunk write is open must not be refused");
+    let bc = b.connect().unwrap();
+    for id in ids {
+        assert_eq!(value(&bc, id), Some(original(id)), "B, inside the transaction");
+    }
+    drop(bc);
+    let c = forker
+        .fork_branch()
+        .expect("a fork while a trunk write is open must not be refused");
+    writer.execute("COMMIT").unwrap();
+
+    for (name, branch) in [("A", &a), ("B", &b), ("C", &c)] {
+        for _ in 0..2 {
+            let conn = branch.connect().unwrap();
+            for id in ids {
+                assert_eq!(
+                    value(&conn, id),
+                    Some(original(id)),
+                    "{name} sees a trunk transaction that committed after its fork"
+                );
+            }
+        }
+    }
+    let d = forker.fork_branch().unwrap();
+    let dc = d.connect().unwrap();
+    for id in ids {
+        assert_eq!(
+            value(&dc, id),
+            Some(format!("in-flight-{id}")),
+            "a fork after the commit was served a version cached before it"
+        );
+    }
+    let work = db.branch_stats().work;
+    assert_eq!(work.trunk_forks, 4);
+    assert_eq!(work.trunk_forks_locked, 1, "a fork after the first took the WAL write lock");
+    assert_eq!(work.trunk_fork_wal_locks, 1, "a fork after the first took the WAL write lock");
+    assert!(work.trunk_pre_images_retained >= 3, "the commit retained nothing: {work:?}");
+}
+
+/// K10-2: the commit's decision for a page last committed in the epoch just before its own. C0
+/// rewrites row 7 with a child alive; then, with no fork in between, C1 opens and rewrites it
+/// again, X is forked inside C1, and C1 commits. X must read C0's row — not the original, which only
+/// the first child keeps, and not C1's.
+#[test]
+fn a_fork_inside_a_transaction_reads_the_commit_just_before_it() {
+    let (_dir, db) = open_db();
+    let writer = db.connect().unwrap();
+    seed(&writer, 200);
+    let forker = db.connect().unwrap();
+    let first = forker.fork_branch().unwrap();
+    set(&writer, 7, "c0");
+    writer.execute("BEGIN").unwrap();
+    set(&writer, 7, "c1");
+    let x = forker.fork_branch().unwrap();
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(value(&x.connect().unwrap(), 7).as_deref(), Some("c0"));
+    assert_eq!(value(&first.connect().unwrap(), 7), Some(original(7)));
+    let after = forker.fork_branch().unwrap();
+    assert_eq!(value(&after.connect().unwrap(), 7).as_deref(), Some("c1"));
+}
+
+/// K10-3: a commit that retains nothing still stamps its pages with its epoch, so a version the
+/// shared trunk-page cache holds for an older epoch never reaches a later fork. X (forked before the
+/// row's last commit) keeps the trunk's child count above zero, so no generation bump hides the
+/// defect; Y, forked after that commit, reads the row (caching its page) and is reaped; the trunk
+/// rewrites the row with no live child able to see the old version; Z, forked after, must read the
+/// new row.
+#[test]
+fn a_commit_that_retains_nothing_still_restamps_so_a_cached_page_never_reaches_a_later_fork() {
+    let (_dir, db) = open_db();
+    let writer = db.connect().unwrap();
+    seed(&writer, 200);
+    let forker = db.connect().unwrap();
+    let x = forker.fork_branch().unwrap();
+    set(&writer, 7, "v1");
+    let y = forker.fork_branch().unwrap();
+    assert_eq!(value(&y.connect().unwrap(), 7).as_deref(), Some("v1"));
+    drop(y);
+    let before = db.branch_stats().work;
+    set(&writer, 7, "v2");
+    let after = db.branch_stats().work;
+    assert_eq!(
+        after.trunk_pre_images_retained, before.trunk_pre_images_retained,
+        "the fixture is wrong: the second rewrite retained a version"
+    );
+    let z = forker.fork_branch().unwrap();
+    assert_eq!(value(&z.connect().unwrap(), 7).as_deref(), Some("v2"));
+    assert_eq!(value(&x.connect().unwrap(), 7), Some(original(7)));
+}
+
+/// K10-5: lock-free forks racing a trunk writer under threads. The writer commits transactions that
+/// set 8 rows on 8 different leaves to its transaction number k, back to back. Four threads fork
+/// continuously, each reading the writer's clock around its fork — `done` (commits returned) before
+/// the call and `started` (transactions begun) after it returns — and read each branch at once, while
+/// the writer keeps committing, and again at the end: every read must show one k in all 8 rows, with
+/// done <= k <= started, the same k every time.
+#[test]
+fn lock_free_forks_racing_a_trunk_writer_read_one_committed_state_each() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    const FORKERS: usize = 4;
+    const FORKS: usize = 60;
+    let ids: Vec<i64> = (0..8).map(|i| 7 + 50 * i).collect();
+    let (_dir, db) = open_db();
+    let writer = db.connect().unwrap();
+    seed(&writer, 400);
+    let first = writer.fork_branch().unwrap();
+    let started = AtomicU64::new(0);
+    let done = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let k_of = |id: i64, v: &str| -> u64 {
+        if v == original(id) {
+            0
+        } else {
+            v.strip_prefix("k")
+                .and_then(|k| k.parse().ok())
+                .unwrap_or_else(|| panic!("row {id} holds {v}"))
+        }
+    };
+    let read_k = |branch: &Branch| -> u64 {
+        let conn = branch.connect().unwrap();
+        let ks: Vec<u64> = ids
+            .iter()
+            .map(|&id| k_of(id, &value(&conn, id).unwrap()))
+            .collect();
+        assert!(ks.iter().all(|&k| k == ks[0]), "a torn trunk state: {ks:?}");
+        ks[0]
+    };
+    let checked = std::thread::scope(|s| {
+        let w = s.spawn(|| {
+            let mut commits = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                let k = started.fetch_add(1, Ordering::AcqRel) + 1;
+                exec_retrying_busy(&writer, "BEGIN IMMEDIATE");
+                for &id in &ids {
+                    set(&writer, id, &format!("k{k}"));
+                }
+                writer.execute("COMMIT").unwrap();
+                done.fetch_add(1, Ordering::AcqRel);
+                commits += 1;
+            }
+            commits
+        });
+        let forkers: Vec<_> = (0..FORKERS)
+            .map(|_| {
+                s.spawn(|| {
+                    let conn = db.connect().unwrap();
+                    let mut held = Vec::new();
+                    for _ in 0..FORKS {
+                        let lo = done.load(Ordering::Acquire);
+                        let branch = loop {
+                            match conn.fork_branch() {
+                                Ok(b) => break b,
+                                Err(LimboError::Busy | LimboError::BusySnapshot) => {
+                                    std::thread::yield_now()
+                                }
+                                Err(e) => panic!("fork failed: {e}"),
+                            }
+                        };
+                        let hi = started.load(Ordering::Acquire);
+                        let k = read_k(&branch);
+                        assert!(lo <= k && k <= hi, "branch reads k={k}, outside [{lo}, {hi}]");
+                        held.push((branch, k));
+                    }
+                    held
+                })
+            })
+            .collect();
+        let held: Vec<(Branch, u64)> = forkers
+            .into_iter()
+            .flat_map(|f| f.join().unwrap())
+            .collect();
+        stop.store(true, Ordering::Release);
+        let commits = w.join().unwrap();
+        assert!(commits > 0, "the writer never committed");
+        for (branch, k) in &held {
+            assert_eq!(read_k(branch), *k, "branch {} changed after its fork", branch.id().0);
+        }
+        held.len()
+    });
+    assert_eq!(checked, FORKERS * FORKS);
+    let work = db.branch_stats().work;
+    assert!(work.trunk_forks_fast > 0, "no fork took the lock-free path: {work:?}");
+    assert!(
+        work.trunk_pre_images_retained > 0,
+        "no commit retained a version for a fork: {work:?}"
+    );
+    drop(first);
+}
+
+/// K10-6, the interleaving of r11-fi-refute-code's model (snzi_f6.py; lead item 17:05Z): the last
+/// child goes after caching a page (the generation moves on), the trunk opens a write transaction
+/// that rewrites the page with no child alive (nothing captured), and a fork races it. A fork inside
+/// the transaction is the trunk's first child, so it must answer Busy (it needs the WAL write lock)
+/// or, if admitted, read the page as it was; a fork after the commit must read the new row, never
+/// the page cached under the old generation. Run with the racing fork inside the transaction and
+/// with it after the commit.
+#[test]
+fn a_fork_racing_the_first_trunk_write_after_the_last_child_goes_never_reads_a_stale_page() {
+    for fork_inside in [true, false] {
+        let (_dir, db) = open_db();
+        let writer = db.connect().unwrap();
+        seed(&writer, 200);
+        let forker = db.connect().unwrap();
+        let a = forker.fork_branch().unwrap();
+        assert_eq!(value(&a.connect().unwrap(), 7), Some(original(7)));
+        drop(a);
+        assert_eq!(db.branch_stats().live_branches, 0);
+        writer.execute("BEGIN").unwrap();
+        set(&writer, 7, "after-the-last-child");
+        let inside = if fork_inside {
+            match forker.fork_branch() {
+                Ok(b) => Some(b),
+                Err(LimboError::Busy) => None,
+                Err(e) => panic!("a fork inside the write failed: {e}"),
+            }
+        } else {
+            None
+        };
+        writer.execute("COMMIT").unwrap();
+        if let Some(b) = &inside {
+            assert_eq!(
+                value(&b.connect().unwrap(), 7),
+                Some(original(7)),
+                "a fork inside the trunk's write saw it"
+            );
+        }
+        let c = forker.fork_branch().unwrap();
+        assert_eq!(
+            value(&c.connect().unwrap(), 7).as_deref(),
+            Some("after-the-last-child"),
+            "a fork after the write was served the page cached under the old generation \
+             (fork_inside={fork_inside})"
+        );
+    }
+}
