@@ -226,6 +226,10 @@ pub(crate) struct BranchStore {
     /// Nanoseconds trunk forks held the trunk's WAL write lock, summed; written only while lock
     /// timing is on (see [`BranchWork::trunk_fork_wal_hold_ns`]). Observation only.
     fork_wal_hold_ns: AtomicU64,
+    /// Test-only: run by a trunk fork right after its trunk-lock hold, where a trunk writer could
+    /// read `trunk_children` (K10-7).
+    #[cfg(test)]
+    after_fork_hold: std::sync::Mutex<Option<Box<dyn Fn(&BranchStore) + Send>>>,
 }
 
 /// What a trunk fork did before it registered, for [`BranchWork`]'s `trunk_fork_*` counters.
@@ -752,6 +756,8 @@ impl BranchStore {
             trunk_commits: AtomicU64::new(0),
             lock_timing: AtomicBool::new(false),
             fork_wal_hold_ns: AtomicU64::new(0),
+            #[cfg(test)]
+            after_fork_hold: std::sync::Mutex::new(None),
         }
     }
 
@@ -882,6 +888,10 @@ impl BranchStore {
             work.trunk_fork_gate_retries += attempts.gate_retries;
             (id, f)
         };
+        #[cfg(test)]
+        if let Some(hook) = self.after_fork_hold.lock().unwrap().as_ref() {
+            hook(self);
+        }
         self.live.fetch_add(1, Ordering::AcqRel);
         self.shard(id).branches.insert(
             id,
@@ -2246,5 +2256,37 @@ mod tests {
         );
         assert_eq!(store.stats().live_branches, 0, "branches leaked");
         assert_eq!(store.stats().arena_slots_in_use, 0, "versions leaked");
+    }
+
+    /// K10-7 (F6 condition (i), lead item 17:05Z): outside the trunk's lock a listed trunk child is
+    /// always counted in `trunk_children`, which a trunk writer reads without that lock to decide
+    /// whether to capture pre-images. A hook run right after each fork's trunk-lock hold asserts it,
+    /// for the first child (forked under the WAL write lock) and for a lock-free one.
+    #[test]
+    fn a_listed_trunk_child_is_counted_the_moment_the_trunk_lock_is_released() {
+        let store = BranchStore::new();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let ran = ran.clone();
+            *store.after_fork_hold.lock().unwrap() = Some(Box::new(move |s: &BranchStore| {
+                assert!(
+                    s.trunk_has_children(),
+                    "a trunk child is listed and not counted once the trunk's lock is released"
+                );
+                ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        let first = fork_locked(&store);
+        let seen = store.trunk_commit_seq();
+        let TrunkFork::Forked(second) = store
+            .fork_trunk(Arc::new(Schema::default()), PAGE, 0, Some(seen), ForkAttempts::default())
+            .unwrap()
+        else {
+            panic!("a lock-free fork between commits was refused");
+        };
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 2, "the hook did not run");
+        *store.after_fork_hold.lock().unwrap() = None;
+        store.release_handle(first);
+        store.release_handle(second);
     }
 }

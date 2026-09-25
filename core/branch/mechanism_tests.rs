@@ -1126,3 +1126,50 @@ fn lock_free_forks_racing_a_trunk_writer_read_one_committed_state_each() {
     );
     drop(first);
 }
+
+/// K10-6, the interleaving of r11-fi-refute-code's model (snzi_f6.py; lead item 17:05Z): the last
+/// child goes after caching a page (the generation moves on), the trunk opens a write transaction
+/// that rewrites the page with no child alive (nothing captured), and a fork races it. A fork inside
+/// the transaction is the trunk's first child, so it must answer Busy (it needs the WAL write lock)
+/// or, if admitted, read the page as it was; a fork after the commit must read the new row, never
+/// the page cached under the old generation. Run with the racing fork inside the transaction and
+/// with it after the commit.
+#[test]
+fn a_fork_racing_the_first_trunk_write_after_the_last_child_goes_never_reads_a_stale_page() {
+    for fork_inside in [true, false] {
+        let (_dir, db) = open_db();
+        let writer = db.connect().unwrap();
+        seed(&writer, 200);
+        let forker = db.connect().unwrap();
+        let a = forker.fork_branch().unwrap();
+        assert_eq!(value(&a.connect().unwrap(), 7), Some(original(7)));
+        drop(a);
+        assert_eq!(db.branch_stats().live_branches, 0);
+        writer.execute("BEGIN").unwrap();
+        set(&writer, 7, "after-the-last-child");
+        let inside = if fork_inside {
+            match forker.fork_branch() {
+                Ok(b) => Some(b),
+                Err(LimboError::Busy) => None,
+                Err(e) => panic!("a fork inside the write failed: {e}"),
+            }
+        } else {
+            None
+        };
+        writer.execute("COMMIT").unwrap();
+        if let Some(b) = &inside {
+            assert_eq!(
+                value(&b.connect().unwrap(), 7),
+                Some(original(7)),
+                "a fork inside the trunk's write saw it"
+            );
+        }
+        let c = forker.fork_branch().unwrap();
+        assert_eq!(
+            value(&c.connect().unwrap(), 7).as_deref(),
+            Some("after-the-last-child"),
+            "a fork after the write was served the page cached under the old generation \
+             (fork_inside={fork_inside})"
+        );
+    }
+}
