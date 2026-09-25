@@ -94,17 +94,24 @@ fn mem() -> Mem {
 }
 
 /// The engine's connect-path labels, in the order the engine calls them. The probe writes into a
-/// fixed array so that recording a sample allocates nothing.
-const LABELS: [&str; 8] = [
+/// fixed array so that recording a sample allocates nothing. A build may skip labels (a store that
+/// builds branch pagers differently has other steps); `REQUIRED` are the ones every build has, and a
+/// session's bytes between two seen labels are charged to the later one.
+const LABELS: [&str; 12] = [
     "begin",
     "store_open",
+    "init.header",
+    "init.wal",
+    "init.pager_new",
     "init_pager",
+    "init_branch",
     "clear_trunk_page1",
     "bind_read_page1",
     "connection",
     "syms",
     "analyze_stats",
 ];
+const REQUIRED: [&str; 5] = ["begin", "store_open", "connection", "syms", "analyze_stats"];
 const NL: usize = LABELS.len();
 static PROBE_BYTES: [AtomicI64; NL] = [const { AtomicI64::new(0) }; NL];
 static PROBE_ALLOCS: [AtomicI64; NL] = [const { AtomicI64::new(0) }; NL];
@@ -365,6 +372,8 @@ struct Session {
     row: i64,
     wrote: bool,
     trunk_writes_at_fork: u64,
+    /// The active arm has used this session, so its footprint is no longer its idle one.
+    touched: bool,
 }
 
 impl Session {
@@ -416,12 +425,16 @@ impl Acc {
     }
 }
 
-/// The phases a session's growth is split into: fork, each connect-path step, the tail of connect
-/// after the last probe, and the mode's first action.
-const PHASES: [&str; 11] = [
+/// The phases a session's growth is split into: fork, each connect-path step (one per label after
+/// "begin"), the tail of connect after the last probe, and the mode's first action.
+const PHASES: [&str; NL + 3] = [
     "fork",
     "connect.store_open",
+    "connect.init.header",
+    "connect.init.wal",
+    "connect.init.pager_new",
     "connect.init_pager",
+    "connect.init_branch",
     "connect.clear_trunk_page1",
     "connect.bind_read_page1",
     "connect.connection",
@@ -518,8 +531,12 @@ impl Bench {
         set_session_probe(None);
         let m2 = mem();
         let seen = PROBE_SEEN.load(Ordering::Relaxed);
-        if seen != (1 << NL) - 1 {
-            not_a_result(&format!("the connect path did not hit every probe: mask {seen:#b}"));
+        let required = REQUIRED
+            .iter()
+            .map(|r| 1usize << LABELS.iter().position(|l| l == r).unwrap())
+            .fold(0, |a, b| a | b);
+        if seen & required != required {
+            not_a_result(&format!("the connect path missed a required probe: mask {seen:#b}"));
         }
         let mut wrote = false;
         let t4 = Instant::now();
@@ -558,6 +575,9 @@ impl Bench {
         // (Branch::connect's call) is charged to store_open.
         let mut prev = (m1.bytes, m1.allocs);
         for k in 1..NL {
+            if seen & (1 << k) == 0 {
+                continue;
+            }
             iv.bytes[k].add(pb(k) - prev.0);
             iv.allocs[k].add(pa(k) - prev.1);
             prev = (pb(k), pa(k));
@@ -579,17 +599,25 @@ impl Bench {
             row,
             wrote,
             trunk_writes_at_fork: at_fork,
+            touched: false,
         }
     }
 }
 
-fn footprints(sessions: &[Session]) -> (u64, u64, u64, u64, u64, SessionFootprint) {
+/// Totals over every held session; the min/max of cached pages are over the sessions the active arm
+/// has not used (their idle footprint), and `touched` counts the others.
+fn footprints(sessions: &[Session]) -> (u64, u64, u64, u64, u64, u64, SessionFootprint) {
     let (mut pages, mut pmin, mut pmax, mut locks, mut shared) = (0u64, u64::MAX, 0u64, 0u64, 0u64);
+    let mut touched = 0u64;
     for s in sessions {
         let f = s.conn.session_footprint();
         pages += f.cached_pages as u64;
-        pmin = pmin.min(f.cached_pages as u64);
-        pmax = pmax.max(f.cached_pages as u64);
+        if s.touched {
+            touched += 1;
+        } else {
+            pmin = pmin.min(f.cached_pages as u64);
+            pmax = pmax.max(f.cached_pages as u64);
+        }
         locks += f.holds_read_lock as u64;
         shared += f.schema_shared_with_store as u64;
     }
@@ -597,7 +625,7 @@ fn footprints(sessions: &[Session]) -> (u64, u64, u64, u64, u64, SessionFootprin
         .first()
         .map(|s| s.conn.session_footprint())
         .unwrap_or_default();
-    (pages, pmin, pmax, locks, shared, first)
+    (pages, pmin, pmax, locks, shared, touched, first)
 }
 
 fn main() {
@@ -741,7 +769,7 @@ fn main() {
         if st.live_branches != x {
             not_a_result(&format!("expected {x} live branches, engine has {}", st.live_branches));
         }
-        let (pages, pmin, pmax, locks, shared, first) = footprints(&sessions);
+        let (pages, pmin, pmax, locks, shared, touched, first) = footprints(&sessions);
         for (k, name) in PHASES.iter().enumerate() {
             let (bb, aa) = (&iv.bytes[k], &iv.allocs[k]);
             if bb.n == 0 {
@@ -768,6 +796,7 @@ fn main() {
             "# x={x} added={added} interval_bytes_per_session={:.2} interval_allocs_per_session={:.3} \
              live_bytes={} live_allocs={} bytes_per_session_total={:.2} fds={} fds_delta_interval={} \
              cached_pages_total={pages} cached_pages_min={pmin} cached_pages_max={pmax} \
+             sessions_touched_by_active={touched} \
              sessions_holding_read_lock={locks} sessions_schema_shared={shared} \
              arena_in_use={} arena_expected_own={expect_arena} rss_bytes={} swap_used_mib={} \
              memory_level={} wal_bytes={} grow_s={grow_s:.1}",
@@ -878,6 +907,7 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
 
         // 2 and 3. a held session reads its row, twice
         let si = b.rng.below(sessions.len());
+        sessions[si].touched = true;
         for op in [1, 2] {
             let s = &sessions[si];
             let (r0, m0) = (b.resolves(), mem());

@@ -3046,11 +3046,13 @@ impl Database {
         let wal_enabled = shared_wal.metadata.enabled.load(Ordering::SeqCst);
         let last_checksum_and_max_frame = shared_wal.last_checksum_and_max_frame();
         drop(shared_wal);
+        crate::branch::session_probe("init.header");
         let pager_wal: Option<Arc<dyn Wal>> = if wal_enabled {
             Some(self.build_wal(last_checksum_and_max_frame, buffer_pool.clone())?)
         } else {
             None
         };
+        crate::branch::session_probe("init.wal");
 
         let pager = Pager::new(
             self.db_file.clone(),
@@ -3061,6 +3063,7 @@ impl Database {
             self.init_lock.clone(),
             self.init_page_1.clone(),
         )?;
+        crate::branch::session_probe("init.pager_new");
         pager.set_branch_store(self.branches.clone());
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
