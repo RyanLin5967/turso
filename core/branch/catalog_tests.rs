@@ -183,9 +183,13 @@ fn a_crash_after_a_checkpoint_replays_only_the_tail() {
     {
         let db = open_at(&path, catalog()).unwrap();
         seed(&db.connect().unwrap());
-        let mut all = grow(&db, 30);
+        // (id, row): `grow` numbers rows from its own first branch, so each call's rows restart at 1.
+        let rows = |v: Vec<BranchId>| -> Vec<(BranchId, i64)> {
+            v.into_iter().enumerate().map(|(i, id)| (id, 1 + (i % 400) as i64)).collect()
+        };
+        let mut all = rows(grow(&db, 30));
         db.branch_compact_now().unwrap();
-        tail = grow(&db, 5);
+        tail = rows(grow(&db, 5));
         all.extend(&tail);
         ids = all;
         let trunk = db.connect().unwrap();
@@ -197,10 +201,9 @@ fn a_crash_after_a_checkpoint_replays_only_the_tail() {
     assert!(s.records > 0 && s.records <= 20, "the tail was not what was replayed: {s:?}");
     assert!(s.branch_loads <= tail.len() as u64 + 1, "recovery loaded more than the tail: {s:?}");
     assert_eq!(db.branch_stats().unwrap().live_branches, 35);
-    for (i, &id) in ids.iter().enumerate() {
+    for &(id, row) in &ids {
         let b = db.branch(id).unwrap();
         let c = b.connect().unwrap();
-        let row = 1 + (i % 400) as i64;
         assert_eq!(value(&c, row), format!("b{}", id.0));
         // Every branch forked before the trunk's write sees row 3 as it was.
         if row != 3 {

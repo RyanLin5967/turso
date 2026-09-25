@@ -934,6 +934,14 @@ impl BranchStore {
             }
         }
         stats.touched_slots = touched.len() as u64;
+        if super::arena::trace_slots() {
+            let mut t: Vec<(Slot, bool)> = touched.iter().map(|(&s, &u)| (s, u)).collect();
+            t.sort_unstable();
+            eprintln!(
+                "R11SLOT recover meta_hw={} file_hw={file_hw} meta_in_use={} touched={t:?} free_mem={free_mem:?} taken={taken:?} in_use={in_use} records={}",
+                meta.arena_hw, meta.in_use, recovered.records.len()
+            );
+        }
         stats.arena_free = free_mem.len() as u64;
         stats.arena_high_water = high_water as u64;
         cat.taken = taken;
@@ -1873,12 +1881,15 @@ impl BranchStore {
         };
         // Catalog stores: a slot the catalog lists free and this process has not taken is free
         // too, though the arena's bitmap does not say so.
+        // Only rows this process has not fetched: a fetched row stays in the table until the next
+        // checkpoint, whether its slot is on the in-memory free list (the bitmap says so) or in use.
+        let cursor = cat.free_cursor;
         let listed: HashSet<Slot> = cat
             .catalog
             .free_all()
             .unwrap_or_default()
             .into_iter()
-            .filter(|s| !cat.taken.contains(s))
+            .filter(|s| !cat.taken.contains(s) && cursor.is_none_or(|c| *s > c))
             .collect();
         arena
             .slots_in_use()
@@ -1894,7 +1905,9 @@ impl BranchStore {
             return true;
         }
         cat.as_mut().is_some_and(|cat| {
-            !cat.taken.contains(&slot) && cat.catalog.free_has(slot).unwrap_or(false)
+            !cat.taken.contains(&slot)
+                && cat.free_cursor.is_none_or(|c| slot > c)
+                && cat.catalog.free_has(slot).unwrap_or(false)
         })
     }
 
@@ -2429,6 +2442,26 @@ impl StoreInner {
             in_use: (arena.in_use() - reserved.len()) as u64,
             states: self.n_states,
         };
+        if super::arena::trace_slots() {
+            let named: Vec<(u64, Vec<Slot>)> = rows
+                .iter()
+                .map(|b| {
+                    let mut v: Vec<Slot> = b.current.iter().map(|c| c.1).collect();
+                    v.extend(b.retained.iter().map(|r| r.3));
+                    (b.id, v)
+                })
+                .collect();
+            eprintln!(
+                "R11SLOT checkpoint gen={generation} rows={named:?} removed={:?} trunk_pages={:?} cursor={:?} taken={:?} free_mem={:?} reserved={reserved:?} hw={} in_use={}",
+                cat.removed,
+                trunk_pages,
+                cat.free_cursor,
+                cat.taken,
+                arena.free_list(),
+                arena.high_water(),
+                arena.in_use()
+            );
+        }
         let catalog = &mut cat.catalog;
         catalog.begin()?;
         let written = (|| -> Result<()> {

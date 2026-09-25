@@ -17,6 +17,12 @@ use std::fs::File;
 use std::path::Path;
 
 use super::journal::{fsync_file, open_rw, read_at, write_at};
+
+/// r11-restart lane instrument: `R11_TRACE_SLOTS` prints every slot transition (observing only).
+pub(crate) fn trace_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("R11_TRACE_SLOTS").is_some())
+}
 use crate::{turso_assert, LimboError, Result};
 
 /// Index of a page-sized slot in the arena.
@@ -145,6 +151,9 @@ impl Arena {
     /// Put a slot that is free but not on the in-memory list (a catalog free row) on it. Not a
     /// release: the count in use does not change.
     pub(crate) fn add_free(&mut self, slot: Slot) {
+        if trace_slots() {
+            eprintln!("R11SLOT add_free {slot}");
+        }
         turso_assert!(slot < self.high_water, "a free slot past the high-water mark");
         turso_assert!(!self.is_free(slot), "a slot added to the free list twice");
         self.set_free_bit(slot, true);
@@ -158,6 +167,9 @@ impl Arena {
 
     /// Empty the in-memory free list (a catalog checkpoint has written it to the catalog).
     pub(crate) fn drain_free(&mut self) {
+        if trace_slots() {
+            eprintln!("R11SLOT drain_free {:?}", self.free);
+        }
         for slot in std::mem::take(&mut self.free) {
             self.set_free_bit(slot, false);
         }
@@ -175,7 +187,13 @@ impl Arena {
         self.in_use += 1;
         if let Some(slot) = self.free.pop() {
             self.set_free_bit(slot, false);
+            if trace_slots() {
+                eprintln!("R11SLOT alloc {slot} (free list)");
+            }
             return slot;
+        }
+        if trace_slots() {
+            eprintln!("R11SLOT alloc {} (high water)", self.high_water);
         }
         let slot = self.high_water;
         if let Backing::Memory { chunks } = &mut self.backing {
@@ -196,6 +214,9 @@ impl Arena {
     pub(crate) fn release(&mut self, slot: Slot) {
         turso_assert!(slot < self.high_water, "released a slot the arena never handed out");
         turso_assert!(!self.is_free(slot), "released an arena slot that was already free");
+        if trace_slots() {
+            eprintln!("R11SLOT release {slot}");
+        }
         self.set_free_bit(slot, true);
         self.free.push(slot);
         self.in_use -= 1;
