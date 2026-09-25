@@ -293,6 +293,20 @@ impl Lineage {
     }
 }
 
+/// r11-bushy-refute fire-check switch (NOT the mechanism; this worktree only, never merged): BUSHY_MUT=m2
+/// (in place on refs==1 alone, the lane's M2), m3 (on exclusive alone, M3), noinplace (never in place), leak
+/// (collect keeps every slot of a freed map, M5). Unset or anything else: the store as committed at 4db5e1970.
+fn refute_mutant() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("BUSHY_MUT").as_deref() {
+        Ok("m2") => 2,
+        Ok("m3") => 3,
+        Ok("noinplace") => 4,
+        Ok("leak") => 5,
+        _ => 0,
+    })
+}
+
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
@@ -481,7 +495,14 @@ impl BranchStore {
         let slot = match st.map.get(page) {
             // No other map can reach it: nobody else reads this version, so it is rewritten in
             // place.
-            Some(slot) if refs[slot as usize] == 1 && st.map.exclusive(page) => {
+            Some(slot)
+                if match refute_mutant() {
+                    2 => refs[slot as usize] == 1,
+                    3 => st.map.exclusive(page),
+                    4 => false,
+                    _ => refs[slot as usize] == 1 && st.map.exclusive(page),
+                } =>
+            {
                 work.in_place_writes += 1;
                 slot
             }
@@ -685,10 +706,12 @@ impl BranchStore {
         work.states_freed += 1;
         let arena = arena.as_mut().expect("a branch existed, so the arena does");
         let mut freed = 0;
-        st.map.release(refs, &mut |slot| {
-            arena.release(slot);
-            freed += 1;
-        });
+        if refute_mutant() != 5 {
+            st.map.release(refs, &mut |slot| {
+                arena.release(slot);
+                freed += 1;
+            });
+        }
         let count = trunk
             .lineage
             .children
