@@ -642,6 +642,53 @@ fn ckpt2(args: &Args) {
     drop(db);
 }
 
+/// (b2) victim: open, checkpoint once (so the log holds only what follows), then `--writes` branch
+/// commits over random live branches (each: attach, connect, rewrite the branch's own row, close,
+/// detach), print READY and block until killed. The log tail it leaves names old branches, which a
+/// recovery must bring back: the steady-state crash, where the growth chain's tails only name
+/// branches forked in the same tail (PREREG A11).
+fn churn(args: &Args) {
+    let files = Files::new(&args.db);
+    let db = open_db(&args.db, false, args.catalog);
+    let _trunk = db.connect().unwrap();
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n {
+        not_a_result(&format!("churn: {st:?}, expected {} branches", args.n));
+    }
+    db.branch_compact_now().unwrap();
+    let mut rng = Rng(args.seed);
+    let mut distinct = std::collections::HashSet::new();
+    for g in 0..args.writes {
+        let id = 1 + rng.below(args.n) as u64;
+        distinct.insert(id);
+        let branch = db
+            .branch(BranchId(id))
+            .unwrap_or_else(|e| not_a_result(&format!("attach {id}: {e}")));
+        let conn = branch.connect().unwrap();
+        conn.execute(format!(
+            "UPDATE t SET v = '{}' WHERE id = {}",
+            trunk_write_value(g as u64),
+            row_for(id)
+        ))
+        .unwrap();
+        drop(conn);
+        let _ = branch.into_id();
+    }
+    println!(
+        "# churn victim pid={} n={} writes={} distinct={} {}",
+        std::process::id(),
+        args.n,
+        args.writes,
+        distinct.len(),
+        files.line()
+    );
+    println!("READY n={} pid={}", args.n, std::process::id());
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 fn main() {
     let args = parse_args();
     if cfg!(debug_assertions) {
@@ -653,6 +700,7 @@ fn main() {
         "compact" => compact(&args),
         "ckpt" => ckpt(&args),
         "ckpt2" => ckpt2(&args),
+        "churn" => churn(&args),
         other => die(&format!("unknown command {other}")),
     }
 }

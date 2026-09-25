@@ -259,3 +259,28 @@ fn every_catalog_lookup_is_a_seek() {
     }
     assert!(bad.is_empty(), "catalog lookups that walk or sort:\n{}", bad.join("\n"));
 }
+
+/// Fix v4 (PREREG A11): releasing K children of one parent after a checkpoint reads O(K) catalog
+/// rows. Before, each release's neighbour lookup skipped every sibling released since the
+/// checkpoint one row at a time — about K^2/2 rows for releases in ascending order.
+#[test]
+fn releasing_many_siblings_reads_linear_catalog_rows() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    seed(&db.connect().unwrap());
+    let k = 3000;
+    let ids = grow(&db, k);
+    db.branch_compact_now().unwrap();
+    let (_, _, _, rows0) = db.branch_catalog_counters();
+    for &id in &ids {
+        db.branch(id).unwrap().reap().unwrap();
+    }
+    let (_, _, _, rows1) = db.branch_catalog_counters();
+    let read = rows1 - rows0;
+    assert!(
+        read < 20 * k as u64,
+        "releasing {k} siblings read {read} catalog rows: not linear"
+    );
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0);
+}

@@ -439,13 +439,17 @@ impl BranchState {
 /// Live children of every node, by (parent, fork epoch); fork epochs are unique within a parent.
 ///
 /// An eager store holds every child here. A catalog store holds here only the children forked
-/// since its last checkpoint, plus `gone`: children removed since, whose rows the catalog still
-/// holds. Everything else is read from the catalog's `branch_children` index on demand, so no
-/// query reads more catalog rows than one plus the `gone` entries in its range.
+/// since its last checkpoint; the rest are read from the catalog's `branch_children` index on
+/// demand. Every child removed since the last checkpoint is kept in `removed` with its nearest live
+/// siblings at the moment it went (fix v4, PREREG A11): a catalog query that lands on a removed
+/// row follows those links instead of reading the next row, so K removals cost O(K) lookups, not
+/// the O(K^2) of skipping every removed row one by one. The links stay true because a fork epoch
+/// is never reused and new children only ever take higher epochs.
 #[derive(Default)]
 struct ChildIndex {
     map: BTreeMap<(u64, u64), BranchId>,
-    gone: BTreeSet<(u64, u64)>,
+    /// (parent, fork epoch) -> (nearest live sibling below, above) when it was removed.
+    removed: HashMap<(u64, u64), (Option<u64>, Option<u64>)>,
 }
 
 impl ChildIndex {
@@ -453,13 +457,70 @@ impl ChildIndex {
         self.map.insert((parent.0, f), child);
     }
 
-    /// Remove the child `parent` forked at `f`. `catalog`: the catalog may still hold its row, so
-    /// a child not forked since the last checkpoint is recorded as gone (and cannot be checked).
-    fn remove(&mut self, parent: BranchId, f: u64, catalog: bool) -> bool {
-        if self.map.remove(&(parent.0, f)).is_some() {
-            return true;
+    /// Remove the child `parent` forked at `f`, and return its nearest live siblings below and
+    /// above. `catalog`: a catalog store, whose catalog may still hold the child's row. False in
+    /// the first element when an eager store does not list the child.
+    fn remove(
+        &mut self,
+        mut cat: Option<&mut Catalog>,
+        parent: BranchId,
+        f: u64,
+        catalog: bool,
+    ) -> Result<(bool, Option<u64>, Option<u64>)> {
+        let listed = self.map.remove(&(parent.0, f)).is_some();
+        if !catalog {
+            // An eager store holds every child in `map`: no links are needed, or kept.
+            if !listed {
+                return Ok((false, None, None));
+            }
+            return Ok((true, self.below(None, parent, f)?, self.above(None, parent, f)?));
         }
-        catalog && self.gone.insert((parent.0, f))
+        // Mark it removed before looking for its neighbours, so neither lookup returns it.
+        let fresh = self.removed.insert((parent.0, f), (None, None)).is_none();
+        let lo = self.below(cat.as_deref_mut(), parent, f)?;
+        let hi = self.above(cat, parent, f)?;
+        self.removed.insert((parent.0, f), (lo, hi));
+        Ok((listed || fresh, lo, hi))
+    }
+
+    /// Follow the removal links from `e` downward (or upward) to a live child.
+    fn resolve(&self, p: u64, mut e: Option<u64>, down: bool) -> Option<u64> {
+        while let Some(x) = e {
+            match self.removed.get(&(p, x)) {
+                None => return Some(x),
+                Some(&(lo, hi)) => e = if down { lo } else { hi },
+            }
+        }
+        None
+    }
+
+    /// The nearest live child of `p` below `f`.
+    fn below(&self, cat: Option<&mut Catalog>, parent: BranchId, f: u64) -> Result<Option<u64>> {
+        let p = parent.0;
+        let mem = self.map.range((p, 0)..(p, f)).next_back().map(|(&(_, e), _)| e);
+        let Some(cat) = cat else {
+            return Ok(mem);
+        };
+        let row = cat.children_below(p, f, 1)?.into_iter().next();
+        Ok(mem.max(self.resolve(p, row, true)))
+    }
+
+    /// The nearest live child of `p` above `f`.
+    fn above(&self, cat: Option<&mut Catalog>, parent: BranchId, f: u64) -> Result<Option<u64>> {
+        let p = parent.0;
+        let mem = self
+            .map
+            .range((p, f.saturating_add(1))..=(p, u64::MAX))
+            .next()
+            .map(|(&(_, e), _)| e);
+        let Some(cat) = cat else {
+            return Ok(mem);
+        };
+        let row = cat.children_above(p, f, 1)?.into_iter().next();
+        Ok(match (mem, self.resolve(p, row, false)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        })
     }
 
     /// True if a live child of `parent` forked in `[from, to)`: one that can see a version current
@@ -475,46 +536,8 @@ impl ChildIndex {
         let Some(cat) = cat else {
             return Ok(false);
         };
-        let skip = self.gone.range((p, from)..(p, to)).count();
-        Ok(cat
-            .children_in(p, from, to, skip + 1)?
-            .into_iter()
-            .any(|e| !self.gone.contains(&(p, e))))
-    }
-
-    /// The nearest live children of `parent` below and above `f` (`f` itself already removed).
-    fn neighbours(
-        &self,
-        cat: Option<&mut Catalog>,
-        parent: BranchId,
-        f: u64,
-    ) -> Result<(Option<u64>, Option<u64>)> {
-        let p = parent.0;
-        let mut lo = self.map.range((p, 0)..(p, f)).next_back().map(|(&(_, e), _)| e);
-        let mut hi = self
-            .map
-            .range((p, f.saturating_add(1))..=(p, u64::MAX))
-            .next()
-            .map(|(&(_, e), _)| e);
-        if let Some(cat) = cat {
-            let skip = self.gone.range((p, 0)..(p, f)).count();
-            if let Some(e) = cat
-                .children_below(p, f, skip + 1)?
-                .into_iter()
-                .find(|&e| !self.gone.contains(&(p, e)))
-            {
-                lo = lo.max(Some(e));
-            }
-            let skip = self.gone.range((p, f.saturating_add(1))..=(p, u64::MAX)).count();
-            if let Some(e) = cat
-                .children_above(p, f, skip + 1)?
-                .into_iter()
-                .find(|&e| !self.gone.contains(&(p, e)))
-            {
-                hi = Some(hi.map_or(e, |h| h.min(e)));
-            }
-        }
-        Ok((lo, hi))
+        let row = cat.children_in(p, from, to, 1)?.into_iter().next();
+        Ok(self.resolve(p, row, false).is_some_and(|e| e < to))
     }
 }
 
@@ -2532,7 +2555,7 @@ impl StoreInner {
         cat.removed.clear();
         cat.trunk_dirty.clear();
         self.children.map.clear();
-        self.children.gone.clear();
+        self.children.removed.clear();
         // Every free slot is in the catalog now: the in-memory list is dropped and refetched.
         arena.drain_free();
         cat.free_cursor = None;
@@ -2713,10 +2736,10 @@ impl StoreInner {
             freed.extend(st.pending.values().copied());
             st.lineage.release_all(freed);
             let (parent, f) = (st.parent, st.fork_epoch);
-            let listed = self.children.remove(parent, f, self.cat.is_some());
-            crate::turso_assert!(listed, "detached a child the parent does not list");
+            let catalog_mode = self.cat.is_some();
             let catalog = self.cat.as_mut().map(|c| &mut c.catalog);
-            let (lo, hi) = self.children.neighbours(catalog, parent, f)?;
+            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode)?;
+            crate::turso_assert!(listed, "detached a child the parent does not list");
             if parent.is_trunk() {
                 // Catalog stores: every trunk page holding a version the garbage range can reach
                 // is made resident first, so the in-memory range query sees all of them.
