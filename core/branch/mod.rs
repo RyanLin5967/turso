@@ -146,9 +146,9 @@ pub fn check_branchable(mvcc_enabled: bool) -> Result<()> {
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
 ///
 /// The handle owns the branch. Dropping it — or calling [`Branch::reap`], which is the same thing
-/// with a report — releases the branch's pages at once, unless something still reads through them:
-/// an open connection on the branch, or a live child forked from it. Then the branch is kept until
-/// the last of those goes, and freed at that moment.
+/// with a report — frees the branch at once, unless a connection is still open on it; then it is
+/// freed when that connection goes. Freeing a branch releases every page no other live branch can
+/// read; the pages a live child still reads stay, held by the child's own page map.
 pub struct Branch {
     db: Arc<Database>,
     id: BranchId,
@@ -158,20 +158,20 @@ pub struct Branch {
 /// What reaping a branch released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaped {
-    /// Arena pages returned to the free list by this call: the branch's own, plus any version an
-    /// ancestor was retaining only for it.
+    /// Arena pages returned to the free list by this call: every page no live branch can reach any
+    /// more, plus any trunk version only this branch read.
     pub freed_pages: usize,
-    /// True when the branch could not be freed yet (an open connection or a live child still reads
-    /// through it); its pages are freed when the last of those goes away.
+    /// True when the branch could not be freed yet because a connection is open on it; it is freed
+    /// when that connection goes.
     pub deferred: bool,
 }
 
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
-    /// Branch states that exist, including reaped branches kept alive by a live child.
+    /// Branch states that exist: each has a handle or an open connection.
     pub live_branches: usize,
-    /// Arena pages owned by some branch (or retained for one).
+    /// Arena pages some branch's page map names, or the trunk retains for a branch.
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
@@ -189,21 +189,22 @@ pub struct BranchStats {
 pub struct BranchWork {
     /// Page resolutions against the branch tree (one per branch-pager page read).
     pub resolve_calls: u64,
-    /// Nodes consulted by those resolutions: the branch (its own pages and its inherited page map),
-    /// then the trunk when neither holds the page — at most 2. (Before the persistent page map this
-    /// counted the branch, each ancestor walked, and the trunk.)
+    /// Nodes consulted by those resolutions: the branch's page map, then the trunk when the map does
+    /// not hold the page — at most 2. (Before the persistent page map this counted the branch, each
+    /// ancestor walked, and the trunk.)
     pub resolve_levels: u64,
     /// Retained versions compared against the fork epoch while resolving (`Lineage::retained_at`):
     /// at most one per lineage consulted, the page's born-predecessor. The O(log V) descent that
     /// finds it is not counted; time is the only instrument for it.
     pub resolve_retained_examined: u64,
-    /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
-    /// index this counted a position scan's comparisons.)
+    /// Retained trunk versions released by `child_gone`: one per removal by key. (Before the
+    /// born-ordered index this counted a position scan's comparisons.)
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
-    /// Branch states removed: each reaped branch, plus every ancestor its removal freed in the same
-    /// call (the cascade).
+    /// Branch states removed. With reference-counted page maps a state is freed alone, never with
+    /// its ancestors, so a reap removes at most one. (Before them a reap could free a whole chain
+    /// of reaped ancestors kept for it: the cascade.)
     pub states_freed: u64,
 }
 
@@ -241,7 +242,8 @@ impl Branch {
         Ok(self.db.branches.release_handle(self.id))
     }
 
-    /// The arena slots this branch currently owns or retains, for membership assertions.
+    /// Every arena slot this branch's page map names — its own writes and every ancestor page it
+    /// reads — for membership assertions.
     #[doc(hidden)]
     pub fn owned_slots(&self) -> Vec<u32> {
         self.db.branches.owned_slots(self.id)
@@ -378,13 +380,15 @@ impl Database {
     }
 
     /// Arena slots some live branch can still read (see `BranchStore::needed_slots`); the rest of
-    /// `arena_slots_in_use` is unreachable. Observation only, O(mapped pages).
+    /// `arena_slots_in_use` is unreachable (0 with reference-counted page maps, up to the trunk's
+    /// interval retention). Observation only, O(mapped pages).
     #[doc(hidden)]
     pub fn branch_needed_slots(&self) -> usize {
         self.branches.needed_slots()
     }
 
-    /// Branch states with no handle and no open connection, kept for a live child. O(branches).
+    /// Branch states with no handle and no open connection. O(branches). Always 0: such a state is
+    /// freed the moment it arises.
     #[doc(hidden)]
     pub fn branch_zombies(&self) -> usize {
         self.branches.zombies()

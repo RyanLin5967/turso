@@ -155,6 +155,9 @@ fn a_retained_version_lives_exactly_as_long_as_a_child_that_can_see_it() {
     assert_eq!(in_use(&db), before);
 }
 
+/// With reference-counted page maps the parent's STATE goes at once; the pages its child reads stay,
+/// held by the child's own map. (Before them, the whole parent was kept and the reap reported
+/// `deferred`.)
 #[test]
 fn a_reaped_parent_is_kept_while_its_child_reads_through_it() {
     let (_dir, db) = open_db();
@@ -169,7 +172,8 @@ fn a_reaped_parent_is_kept_while_its_child_reads_through_it() {
     assert!(!parent_slots.is_empty());
 
     let reaped = b.reap().unwrap();
-    assert!(reaped.deferred, "a parent with a live child was freed");
+    assert!(!reaped.deferred, "no connection is open on the parent");
+    assert_eq!(db.branch_stats().live_branches, 1, "only the child is left");
     assert_eq!(reaped.freed_pages, 0);
     for slot in &parent_slots {
         assert!(!db.branch_slot_is_free(*slot), "the child's view was freed under it");
