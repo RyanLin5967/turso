@@ -13,6 +13,8 @@
 //!         level's node; each other child is pruned with probability `--gamma`. x = levels.
 //!   beam  beam search: each of the `--beam` nodes forks `--expand` children, each writes and reads;
 //!         `--beam` of the pool, drawn uniformly, form the next beam, the rest are pruned. x = levels.
+//!   hub   one root-level branch alternates a fork and a rewrite of its row; its children never
+//!         write (r11-sweep-n row T1: each child pins the hub's page-map path). x = children.
 //!
 //! `--rows hot` makes every node write the same row (one page, the most shadowing); `--rows spread`
 //! makes node n write `row_for(n)`. `--interior release` drops a node's handle once the workload
@@ -32,7 +34,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use turso_core::branch::{Branch, BranchWork};
+use turso_core::branch::{Branch, BranchWork, OBSERVE};
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO};
 
 const TRUNK_ROWS: i64 = 20_000;
@@ -49,6 +51,7 @@ enum Shape {
     Bb,
     Cat,
     Beam,
+    Hub,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,6 +127,7 @@ fn parse_args() -> Args {
                     "bb" => Shape::Bb,
                     "cat" => Shape::Cat,
                     "beam" => Shape::Beam,
+                    "hub" => Shape::Hub,
                     other => die(&format!("unknown shape {other}")),
                 })
             }
@@ -288,10 +292,12 @@ impl Bench {
     fn expect(&self, reader: u32, row: i64) -> String {
         let n = &self.nodes[reader as usize];
         if n.row == row {
-            let &(_, g) = n.writes.last().expect("a node writes its row when it is created");
-            return node_value(reader, g);
+            // A node reads its own latest write; a `hub` child never writes and reads on up.
+            if let Some(&(_, g)) = n.writes.last() {
+                return node_value(reader, g);
+            }
         }
-        if self.rows == Rows::Hot {
+        if self.rows == Rows::Hot && row != HOT_ROW {
             // Under `--rows hot` no node writes any other row.
             return trunk_value(row);
         }
@@ -303,7 +309,9 @@ impl Bench {
             let an = &self.nodes[a as usize];
             if an.row == row {
                 let seen = an.writes.partition_point(|&(e, _)| e <= f);
-                return node_value(a, an.writes[seen - 1].1);
+                if seen > 0 {
+                    return node_value(a, an.writes[seen - 1].1);
+                }
             }
             (a, f) = (an.parent, an.fork_epoch);
         }
@@ -691,6 +699,40 @@ fn shape_cat(b: &mut Bench, args: &Args) {
 }
 
 /// Beam search: each beam node forks `--expand` children; `--beam` of the pool survive.
+/// The hub (r11-sweep-n SWEEP.md row T1): one root-level branch writes its row, then repeats {fork a
+/// child; rewrite its row}. The children never write; each reads the hub's row once, checked. So every
+/// child pins the version of the hub's page, and of its page-map path, that it forked from. x = children.
+fn shape_hub(b: &mut Bench, args: &Args) {
+    let w0 = b.work();
+    let mut timing_rng = Rng(args.seed ^ 0xA5A5_A5A5_A5A5_A5A5);
+    let (hub, branch) = b.fork(TRUNK);
+    b.step_child(hub, &branch);
+    b.keep(hub, branch);
+    let hub_row = b.nodes[hub as usize].row;
+    let mut children = 0u64;
+    for &x in &args.checkpoints {
+        while children < x {
+            let (id, branch) = b.fork(hub);
+            let conn = branch.connect().unwrap();
+            let got = read_v(&conn, hub_row);
+            if got != b.expect(id, hub_row) {
+                not_a_result(&format!("hub child {id} read the hub's row as {got}"));
+            }
+            b.reads_checked += 1;
+            drop(conn);
+            b.keep(id, branch);
+            let conn = b.nodes[hub as usize].branch.as_ref().expect("the hub").connect().unwrap();
+            b.write(hub, &conn);
+            drop(conn);
+            children += 1;
+        }
+        b.checkpoint(args, x, None, w0, &format!(" children={children}"));
+        if args.timing {
+            b.sample(args, x, &[hub], &mut timing_rng);
+        }
+    }
+}
+
 fn shape_beam(b: &mut Bench, args: &Args) {
     let w0 = b.work();
     let mut timing_rng = Rng(args.seed ^ 0xA5A5_A5A5_A5A5_A5A5);
@@ -771,7 +813,8 @@ fn main() {
     println!(
         "# shape={:?} rows={:?} interior={:?} continue={} fr={} fi={} depth={} gamma_milli={} \
          fanout={} beam={} expand={} checkpoints={:?} seed={:#x} timing={} samples={} \
-         refcounted={} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} trunk_pages={page_count} build={}",
+         refcounted={} observe={OBSERVE} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
+         trunk_pages={page_count} build={}",
         args.shape,
         args.rows,
         args.interior,
@@ -826,6 +869,7 @@ fn main() {
         Shape::Bb => shape_bb(&mut b, &args),
         Shape::Cat => shape_cat(&mut b, &args),
         Shape::Beam => shape_beam(&mut b, &args),
+        Shape::Hub => shape_hub(&mut b, &args),
     }
     b.teardown(args.timing);
 }
