@@ -979,3 +979,16 @@ A chain proceeds only if every registered mutant is KILLED. Mutant builds run wi
 stale-cache fault cannot recur there; the per-mutant timeout is 900 s. No mutant is added, dropped or changed. All four
 F6 mutants re-run as `mutate_F6b` (`raw/mutate_F6.txt` stays as banked). The source is unchanged from `00f2a88c6`, where
 `tests_F6` (`68129c4`) and the whole-lib `tests_F6_core` (`58d41dc`) passed; this commit changes only this file.
+
+### Amendment 9a — written 2026-09-25T16:32:35Z: F5's compile fix (one line; nothing timed or asserted changes)
+
+As committed (`b1e2f3e1a` … `bdac92c73`), F5 does not compile. The lane `r11-coherence` found this and fixed it in turso
+`a7adf8704`. rustc reports "lifetime may not live long enough" in `BranchStore::collect`:
+- the parameter `shard: Held<'_, Shard>` gets its own anonymous lifetime;
+- the cascade reassigns it with `self.shard(st.parent)`, which borrows `self`.
+
+The fix names the one lifetime both need: `fn collect<'a>(&'a self, mut shard: Held<'a, Shard>, id: BranchId)`. This
+lane takes that exact line as its own commit; `git diff bdac92c73 a7adf8704` is that single line. It changes no
+behaviour. Verification is this lane's own compile: `tests_F5` (the lib tests, F5 included) must build and pass before
+any F5 run, as amendment 9 already requires. F5 has never been compiled by this lane; any further compile fix gets its
+own note here.
