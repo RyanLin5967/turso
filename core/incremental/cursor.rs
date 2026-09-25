@@ -403,6 +403,9 @@ mod tests {
                 enable_without_rowid: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
+                // Compile fix (r11-restart lane): the fork added these two fields.
+                branch_durability: Default::default(),
+                branch_lease: None,
             },
             None,
             Arc::new(SqliteDialect),

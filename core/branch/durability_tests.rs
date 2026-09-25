@@ -491,17 +491,19 @@ fn a_random_workload_survives_repeated_reopens() {
         let live: Vec<usize> = (0..models.len()).filter(|&i| models[i].is_some()).collect();
         let who = live[rng.below(live.len() as u64) as usize];
         let op = rng.below(100);
-        let conn = if who == 0 {
+        // An Option so the drop below ends the connection and the checks after it still compile
+        // (compile fix, r11-restart lane: the base's `drop(conn)` then `&table(&conn)` did not).
+        let mut conn = Some(if who == 0 {
             trunk.clone()
         } else {
             handles[who].as_ref().unwrap().connect().unwrap()
-        };
+        });
         if op < 12 && live.len() < 10 {
-            let child = conn.fork_branch().unwrap();
+            let child = conn.as_ref().unwrap().fork_branch().unwrap();
             models.push(models[who].clone());
             handles.push(Some(child));
         } else if op < 20 && who != 0 {
-            drop(conn);
+            conn = None;
             handles[who] = None;
             models[who] = None;
         } else if op < 23 && who == 0 {
@@ -509,6 +511,7 @@ fn a_random_workload_survives_repeated_reopens() {
         } else if op < 25 {
             db.branch_compact_now().unwrap();
         } else {
+            let conn = conn.as_ref().unwrap();
             let model = models[who].as_mut().unwrap();
             let before = model.clone();
             conn.execute("BEGIN").unwrap();
@@ -518,7 +521,7 @@ fn a_random_workload_survives_repeated_reopens() {
                     0 if !keys.is_empty() => {
                         let id = keys[rng.below(keys.len() as u64) as usize];
                         let v = format!("{who}-{step}-{}", "u".repeat(rng.below(200) as usize));
-                        set(&conn, id, &v);
+                        set(conn, id, &v);
                         model.insert(id, v);
                     }
                     1 if !keys.is_empty() => {
@@ -555,7 +558,7 @@ fn a_random_workload_survives_repeated_reopens() {
         }
         if who != 0 && models[who].is_some() {
             assert_eq!(
-                &table(&conn),
+                &table(conn.as_ref().unwrap()),
                 models[who].as_ref().unwrap(),
                 "step {step}: node {who} diverged"
             );
@@ -1446,7 +1449,7 @@ fn a_second_store_over_live_branch_files_refuses_at_open() {
     drop(db);
     let second = store::BranchStore::open(durability, None, path.to_str().unwrap())
         .expect("the first store is gone, so its lock is too");
-    assert!(second.ids().contains(&b_id), "the refused open damaged the first store's state");
+    assert!(second.ids().unwrap().contains(&b_id), "the refused open damaged the first store's state");
 }
 
 /// N1, the arena half of the lazy door. A store that opened before any branch file existed takes
