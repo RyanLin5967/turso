@@ -292,6 +292,12 @@ pub(crate) mod churn_counters {
     pub(crate) static EXPIRE_FSYNCS: AtomicU64 = AtomicU64::new(0);
     /// Passes whose records rode on a fork's own flush (r11-churn amendment 2's fix).
     pub(crate) static EXPIRE_PIGGYBACKED: AtomicU64 = AtomicU64::new(0);
+    /// Group commit (amendment 4). This store has none: they stay 0, so the one harness reads
+    /// both stores.
+    pub(crate) static GC_FLIGHTS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static GC_LOCKED_FLUSHES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static GC_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static GC_ALREADY_DURABLE: AtomicU64 = AtomicU64::new(0);
     pub(crate) static COMPACTIONS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static COMPACT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
     pub(crate) static COMPACT_NS_MAX: AtomicU64 = AtomicU64::new(0);

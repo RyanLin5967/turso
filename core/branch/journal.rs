@@ -1106,6 +1106,17 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
+        // Measurement switch (r11-churn amendment 4, observation of the durability class, not a
+        // mechanism): `TURSO_BRANCH_FULLFSYNC=1` makes every branch-file sync `F_FULLFSYNC` on
+        // Apple platforms, which flushes the drive's cache as plain fsync(2) there does not.
+        #[cfg(target_vendor = "apple")]
+        if full_fsync() {
+            // SAFETY: as below.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+                return Err(io_error(std::io::Error::last_os_error(), "F_FULLFSYNC branch file"));
+            }
+            return Ok(());
+        }
         // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));
@@ -1117,6 +1128,18 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
         file.sync_all()
             .map_err(|e| io_error(e, "fsync branch file"))
     }
+}
+
+/// Whether `TURSO_BRANCH_FULLFSYNC=1` asked for `F_FULLFSYNC` (read once per process).
+#[cfg(target_vendor = "apple")]
+pub(crate) fn full_fsync() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| std::env::var("TURSO_BRANCH_FULLFSYNC").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn full_fsync() -> bool {
+    false
 }
 
 /// Make a file's creation or rename durable: on POSIX that is an fsync of its directory.
