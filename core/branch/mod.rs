@@ -187,9 +187,12 @@ pub struct BranchWork {
     pub resolve_calls: u64,
     /// Nodes visited by those resolutions: the branch, each ancestor, and the trunk when reached.
     pub resolve_levels: u64,
-    /// Retained versions compared while resolving (the scan in `Lineage::retained_at`).
+    /// Retained versions compared against the fork epoch while resolving (`Lineage::retained_at`):
+    /// at most one per lineage consulted, the page's born-predecessor. The O(log V) descent that
+    /// finds it is not counted; time is the only instrument for it.
     pub resolve_retained_examined: u64,
-    /// Retained versions compared while freeing garbage versions (the scan in `child_gone`).
+    /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
+    /// index this counted a position scan's comparisons.)
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,

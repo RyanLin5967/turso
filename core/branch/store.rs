@@ -45,6 +45,17 @@
 //! * One `Mutex` guards every branch. Correct, and a known wall under concurrent writers on
 //!   different branches; the benchmark this lane ships is single-threaded and says so.
 //! * Resolution walks the ancestor chain: cost grows with DEPTH, not with the number of branches.
+//!
+//! # Per-page version order (the fat node)
+//!
+//! Within one node, one page's retained versions have non-empty, pairwise disjoint `[born, died)`
+//! ranges: the trunk retains `[written, epoch)` and then sets `written = epoch`, and a branch
+//! retains `[owned.born, epoch)` and re-bears its current version at `epoch`. So `born` is unique
+//! per (node, page), and the version a child forked at `f` sees is the one with the greatest
+//! `born <= f`, provided `f < died`. The versions are kept in a map ordered by `born`, which makes
+//! that lookup a predecessor search and a release a removal by key — Driscoll, Sarnak, Sleator and
+//! Tarjan's fat node (JCSS 1989) with a search tree over its version stamps. [`Lineage::retain`]
+//! refuses a version that would break the disjointness the search relies on.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
@@ -84,8 +95,9 @@ struct Lineage {
     epoch: u64,
     /// Live children by fork epoch. Fork epochs are unique within a parent.
     children: BTreeMap<u64, BranchId>,
-    /// Superseded versions kept because a live child forked while they were current.
-    retained: HashMap<u32, Vec<Retained>>,
+    /// Superseded versions kept because a live child forked while they were current, per page and
+    /// ordered by `born` (see "Per-page version order" above).
+    retained: HashMap<u32, BTreeMap<u64, Retained>>,
     /// The same versions keyed by `born`, for the reclamation range query: born -> [(page, died)].
     retained_by_born: BTreeMap<u64, Vec<(u32, u64)>>,
 }
@@ -135,20 +147,28 @@ impl Lineage {
     }
 
     fn retain(&mut self, page: u32, v: Retained) {
-        self.retained.entry(page).or_default().push(v);
+        let versions = self.retained.entry(page).or_default();
+        crate::turso_assert!(
+            versions
+                .last_key_value()
+                .is_none_or(|(_, last)| last.died <= v.born),
+            "a retained version overlaps an older one of the same page; the born-ordered lookup \
+             would return the wrong one"
+        );
+        versions.insert(v.born, v);
         self.retained_by_born
             .entry(v.born)
             .or_default()
             .push((page, v.died));
     }
 
-    /// The retained version of `page` visible to a child forked at `f`. `examined` counts the
-    /// versions compared.
+    /// The retained version of `page` visible to a child forked at `f`: the born-predecessor of
+    /// `f`, if it was still current at `f`. `examined` counts the versions compared against `f` —
+    /// at most one; the O(log V) descent that finds it is not counted.
     fn retained_at(&self, page: u32, f: u64, examined: &mut u64) -> Option<Slot> {
-        let versions = self.retained.get(&page)?;
-        let at = versions.iter().position(|v| v.born <= f && f < v.died);
-        *examined += at.map_or(versions.len(), |i| i + 1) as u64;
-        at.map(|i| versions[i].slot)
+        let (_, v) = self.retained.get(&page)?.range(..=f).next_back()?;
+        *examined += 1;
+        (f < v.died).then_some(v.slot)
     }
 
     /// Detach the child forked at `f` and release every retained version that only it could see.
@@ -174,12 +194,8 @@ impl Lineage {
         }
         for &(born, page) in &dead {
             let versions = self.retained.get_mut(&page).expect("indexed version is listed");
-            let at = versions
-                .iter()
-                .position(|v| v.born == born)
-                .expect("indexed version is listed");
-            work.gc_examined += at as u64 + 1;
-            let v = versions.swap_remove(at);
+            let v = versions.remove(&born).expect("indexed version is listed");
+            work.gc_examined += 1;
             if versions.is_empty() {
                 self.retained.remove(&page);
             }
@@ -199,7 +215,7 @@ impl Lineage {
     fn release_all(self, arena: &mut Arena) -> Vec<Slot> {
         let mut slots = Vec::new();
         for (_, versions) in self.retained {
-            slots.extend(versions.into_iter().map(|v| v.slot));
+            slots.extend(versions.into_values().map(|v| v.slot));
         }
         for &slot in &slots {
             arena.release(slot);
@@ -508,7 +524,7 @@ impl BranchStore {
         };
         let mut slots: Vec<u32> = st.current.values().map(|o| o.slot).collect();
         for versions in st.lineage.retained.values() {
-            slots.extend(versions.iter().map(|v| v.slot));
+            slots.extend(versions.values().map(|v| v.slot));
         }
         slots
     }
