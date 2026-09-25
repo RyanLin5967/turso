@@ -2207,3 +2207,229 @@ mod tests {
         assert!(recovered.leases.contains(&(0, id)), "the deadline index lost it");
     }
 }
+
+/// Shared by the sota-durable tests (round 11 PREREG D3): stores of either durability, and crash
+/// images of a durable one.
+#[cfg(test)]
+mod sota_helpers {
+    use super::*;
+
+    pub(super) const PAGE: usize = 512;
+
+    pub(super) struct Rng(pub(super) u64);
+    impl Rng {
+        pub(super) fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    pub(super) fn image(generation: u64) -> Vec<u8> {
+        generation.to_le_bytes().repeat(PAGE / 8)
+    }
+
+    /// A store of the given durability over `dir` (unused when volatile).
+    pub(super) fn open_store(durable: bool, dir: &std::path::Path, name: &str) -> BranchStore {
+        let durability = if durable {
+            BranchDurability::Durable { sync: false }
+        } else {
+            BranchDurability::Volatile
+        };
+        let path = if durable {
+            dir.join(name).to_str().unwrap().to_string()
+        } else {
+            ":memory:".to_string()
+        };
+        BranchStore::open(durability, None, &path).unwrap()
+    }
+
+    /// Copy every branch file of the store at `dir/name` to `dir/<image>` while it is open, and
+    /// open the copy: what a kill -9 at this point would recover.
+    pub(super) fn crash_image(dir: &std::path::Path, name: &str, image: &str) -> BranchStore {
+        let from = BranchFiles::for_db(dir.join(name).to_str().unwrap());
+        let to = BranchFiles::for_db(dir.join(image).to_str().unwrap());
+        for (src, dst) in [(&from.log, &to.log), (&from.arena, &to.arena), (&from.snap, &to.snap)] {
+            let _ = std::fs::remove_file(dst);
+            if src.exists() {
+                std::fs::copy(src, dst).unwrap();
+            }
+        }
+        BranchStore::open(BranchDurability::Durable { sync: false }, None, to_str(&dir.join(image)))
+            .unwrap()
+    }
+
+    fn to_str(p: &std::path::Path) -> &str {
+        p.to_str().unwrap()
+    }
+}
+
+/// Round 10's F4 tree test (turso `a31198dd8`), ported to the durable store and run volatile and
+/// durable: branch TREES — forks from the trunk and from branches, deep chains, trunk writes and
+/// branch commits before and after forking, deferred reaps — against a model in which each branch is
+/// a plain copy of its parent's pages at its fork. The durable run compacts at random steps and opens
+/// a CRASH IMAGE (every branch file copied while the store is open) at random points: after
+/// recovery — replay alone, or a snapshot whose page maps `derive_page_maps` rebuilt — every live
+/// branch must read every page as before, from the same slot set, with consistent indexes.
+#[cfg(test)]
+mod sota_tree_tests {
+    use super::sota_helpers::{crash_image, image, open_store, Rng, PAGE};
+    use super::*;
+
+    const PAGES: u32 = 6;
+
+    /// A committed branch page holding `image(generation)`, as the pager hands it to
+    /// `commit_pages`.
+    fn page_with(page: u32, generation: u64) -> PageRef {
+        let p = Arc::new(crate::storage::pager::Page::new(i64::from(page)));
+        let buffer = Arc::new(crate::Buffer::new_temporary(PAGE));
+        buffer.as_mut_slice().copy_from_slice(&image(generation));
+        p.get().buffer = Some(buffer);
+        p
+    }
+
+    struct Node {
+        id: BranchId,
+        sees: HashMap<u32, u64>,
+        handle: bool,
+        depth: usize,
+        forked: bool,
+    }
+
+    #[test]
+    fn every_branch_of_a_random_tree_reads_its_parent_as_of_its_fork() {
+        for durable in [false, true] {
+            for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+                run_tree(seed, durable);
+            }
+        }
+    }
+
+    fn run_tree(seed: u64, durable: bool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = open_store(durable, dir.path(), "db");
+        let mut rng = Rng(seed);
+        let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut generation = 0u64;
+        let (mut deferred, mut max_depth, mut wrote_after_fork, mut images) = (0, 0, 0, 0);
+        for step in 0..2500 {
+            let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
+            match rng.below(12) {
+                0 if live.len() < 60 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    nodes.push(Node {
+                        id,
+                        sees: trunk.clone(),
+                        handle: true,
+                        depth: 1,
+                        forked: false,
+                    });
+                }
+                1..=3 if !live.is_empty() && live.len() < 60 => {
+                    // Half the time the newest live branch, so that chains grow deep.
+                    let parent = if rng.below(2) == 0 {
+                        *live.last().unwrap()
+                    } else {
+                        live[rng.below(live.len() as u64) as usize]
+                    };
+                    let id = store.fork_branch(nodes[parent].id).unwrap();
+                    let (sees, depth) = (nodes[parent].sees.clone(), nodes[parent].depth + 1);
+                    nodes[parent].forked = true;
+                    max_depth = max_depth.max(depth);
+                    nodes.push(Node {
+                        id,
+                        sees,
+                        handle: true,
+                        depth,
+                        forked: false,
+                    });
+                }
+                4..=5 => {
+                    let page = rng.below(u64::from(PAGES)) as u32;
+                    if store.trunk_has_children() {
+                        store.first_write_trunk(page, &image(trunk[&page])).unwrap();
+                    }
+                    store.durability_barrier().unwrap();
+                    generation += 1;
+                    trunk.insert(page, generation);
+                }
+                6..=9 if !live.is_empty() => {
+                    let v = live[rng.below(live.len() as u64) as usize];
+                    if nodes[v].forked {
+                        wrote_after_fork += 1;
+                    }
+                    let id = nodes[v].id;
+                    store.begin_write(id).unwrap();
+                    let mut committed = Vec::new();
+                    for _ in 0..=rng.below(2) {
+                        let page = rng.below(u64::from(PAGES)) as u32;
+                        if committed.iter().any(|p: &PageRef| p.get().id == page as usize) {
+                            continue;
+                        }
+                        store.first_write_branch(id, page).unwrap();
+                        generation += 1;
+                        committed.push(page_with(page, generation));
+                        nodes[v].sees.insert(page, generation);
+                    }
+                    store.commit_pages(id, &committed).unwrap();
+                    store.end_write(id);
+                }
+                _ if !live.is_empty() => {
+                    let v = live[rng.below(live.len() as u64) as usize];
+                    nodes[v].handle = false;
+                    if store.release_handle(nodes[v].id).unwrap().deferred {
+                        deferred += 1;
+                    }
+                }
+                _ => {}
+            }
+            let check = |s: &BranchStore, what: &str| {
+                let mut buf = vec![0u8; PAGE];
+                for n in nodes.iter().filter(|n| n.handle) {
+                    for page in 0..PAGES {
+                        let got = if s.resolve_into(n.id, page, &mut buf).unwrap() {
+                            u64::from_le_bytes(buf[..8].try_into().unwrap())
+                        } else {
+                            trunk[&page]
+                        };
+                        assert_eq!(
+                            got,
+                            n.sees[&page],
+                            "seed {seed:#x} step {step} {what}: branch {} at depth {} read the \
+                             wrong page {page}",
+                            n.id.0,
+                            n.depth
+                        );
+                    }
+                }
+            };
+            check(&store, "live");
+            if durable && rng.below(20) == 0 {
+                if rng.below(2) == 0 {
+                    store.compact_now().unwrap();
+                }
+                let recovered = crash_image(dir.path(), "db", "image");
+                images += 1;
+                assert_eq!(
+                    recovered.slots_in_use(),
+                    store.slots_in_use(),
+                    "seed {seed:#x} step {step}: recovery changed the live slot set"
+                );
+                check(&recovered, "after recovery");
+            }
+        }
+        // The shapes the page maps exist for must have occurred, or a green run says nothing.
+        assert!(
+            max_depth >= 10 && deferred > 0 && wrote_after_fork > 0 && (!durable || images > 20),
+            "seed {seed:#x}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
+             after its first fork {wrote_after_fork}, crash images {images}"
+        );
+        for n in nodes.iter().filter(|n| n.handle) {
+            store.release_handle(n.id).unwrap();
+        }
+        assert_eq!(store.stats().unwrap().live_branches, 0, "seed {seed:#x}: branches leaked");
+        assert_eq!(store.stats().unwrap().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
+    }
+}
