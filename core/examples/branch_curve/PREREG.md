@@ -735,3 +735,13 @@ before read):
 **What follows.** If the store lock is then the wall, amendment 9 pre-registers F5 on top of F6, before its build. F5
 is the store striped into 64 shards, each owning its branches and an arena domain, with the trunk behind its own lock
 and read without it through a lock-free epoch radix. Its draft is `turso_conc/fix_draft/`.
+
+**Erratum to amendment 8 (appended 2026-09-25T05:48:49Z; doc only, before any F6 build or run).** Two profile shares in "What
+amendment 7's runs showed" were computed against the wrong denominator: the total of `sample`'s "top of stack (when >= 5)"
+list, which leaves out part of the samples. Against the authoritative denominator (16 worker threads × each thread's
+root count, from the `Call graph` section: 16 × 2,108 at 10^6, 21,344 samples at 10^3):
+- `pread` is at the top of **61.0%** of worker samples at N=10^6 and **71.5%** at 10^3, not "64–70%";
+- parking_lot's slow path under `BranchStore` takes **12.8%** at 10^6 and **5.8%** at 10^3, not "~17%".
+
+The share of `pread` samples inside `connect_branch` is unchanged: 64.1% and 64.5%. No prediction or run of amendment 8
+depends on these two figures.
