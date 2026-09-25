@@ -15,6 +15,9 @@
 //! `--no-autocheckpoint` disables the trunk connection's WAL auto-actions (auto-checkpoint and WAL
 //! restart), amendment 2. Every state line prints the WAL file's size.
 //!
+//! `--synchronous off|normal|full` sets the trunk's sync mode (default off, as amendments 1-2);
+//! `--victim random|newest` picks churn's reap victim (default random), amendment 3.
+//!
 //! Every read a sample makes is checked against a model the harness keeps itself (never against
 //! the engine), and the engine's own counts are checked against the workload before a number is
 //! printed; a mismatch prints `NOT A RESULT` and exits 1. Beside each latency the harness prints
@@ -59,6 +62,8 @@ struct Args {
     windows: usize,
     w_list: Vec<usize>,
     no_autocheckpoint: bool,
+    synchronous: String,
+    newest_victim: bool,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -78,6 +83,8 @@ fn parse_args() -> Args {
         windows: 10,
         w_list: vec![1],
         no_autocheckpoint: false,
+        synchronous: "OFF".to_string(),
+        newest_victim: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -102,6 +109,22 @@ fn parse_args() -> Args {
             "--windows" => args.windows = val().parse().unwrap_or_else(|_| die("bad --windows")),
             "--w" => args.w_list = parse_list(&val(), "--w"),
             "--no-autocheckpoint" => args.no_autocheckpoint = true,
+            "--synchronous" => {
+                args.synchronous = match val().as_str() {
+                    "off" => "OFF",
+                    "normal" => "NORMAL",
+                    "full" => "FULL",
+                    other => die(&format!("unknown --synchronous {other}")),
+                }
+                .to_string()
+            }
+            "--victim" => {
+                args.newest_victim = match val().as_str() {
+                    "random" => false,
+                    "newest" => true,
+                    other => die(&format!("unknown --victim {other}")),
+                }
+            }
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -437,7 +460,10 @@ fn main() {
     }
     // Amendment 1: trunk commits do not fsync. The fsync is not the mechanism under test, and the
     // `hot`/`spread`/`churn_hot` arms commit on the trunk once per fork, up to 10^6 times.
-    trunk.execute("PRAGMA synchronous = OFF").unwrap();
+    // Amendment 3: `--synchronous` overrides the mode; the default stays OFF.
+    trunk
+        .execute(format!("PRAGMA synchronous = {}", args.synchronous))
+        .unwrap();
     trunk
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -462,7 +488,8 @@ fn main() {
     println!(
         "# arm={:?} checkpoints={:?} samples={} seed={:#x} cycles={} windows={} w={:?} \
          trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} page_size={page_size} \
-         trunk_pages={trunk_pages} trunk_synchronous={synchronous} no_autocheckpoint={}",
+         trunk_pages={trunk_pages} trunk_synchronous={synchronous} no_autocheckpoint={} \
+         newest_victim={}",
         args.arm,
         args.checkpoints,
         args.samples,
@@ -470,7 +497,8 @@ fn main() {
         args.cycles,
         args.windows,
         args.w_list,
-        args.no_autocheckpoint
+        args.no_autocheckpoint,
+        args.newest_victim
     );
     println!(
         "# clock tick {:.0} ns (Instant); times are microseconds per operation; work columns are \
@@ -840,7 +868,13 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                         format!("UPDATE t SET v = '{}' WHERE id = {HOT_ROW}", trunk_gen_value(g));
                     b.timed(&mut win[3], || b.trunk.execute(sql).unwrap());
                 }
-                let victim = live.swap_remove(b.rng.below(live.len()));
+                // Amendment 3: `newest` reaps the branch forked one cycle ago (hot in cache) instead
+                // of a uniformly random one.
+                let victim = if args.newest_victim {
+                    live.pop().unwrap()
+                } else {
+                    live.swap_remove(b.rng.below(live.len()))
+                };
                 live.push(Live {
                     branch,
                     rows: vec![row],
