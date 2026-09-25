@@ -202,8 +202,9 @@ impl Trunk {
         }
     }
 
-    /// Check one merge's verdicts against the model, before applying it.
-    fn check(&self, seed: u64, o: &MergeOutcome, m: &Model, policy: MergePolicy) {
+    /// Check one merge's verdicts against the model, before applying it. `batched`: an earlier
+    /// member of the same batch may have written the trunk without a commit yet.
+    fn check(&self, seed: u64, o: &MergeOutcome, m: &Model, policy: MergePolicy, batched: bool) {
         assert_eq!(
             o.key_conflict,
             self.key_conflict(m),
@@ -217,7 +218,11 @@ impl Trunk {
             !o.page_conflict || o.scalar_conflict,
             "seed {seed:#x}: a page conflict without a commit since the fork: {o:?}"
         );
-        assert_eq!(o.scalar_conflict, o.commits_since_fork > 0, "{o:?}");
+        if batched {
+            assert!(o.scalar_conflict || o.commits_since_fork == 0, "{o:?}");
+        } else {
+            assert_eq!(o.scalar_conflict, o.commits_since_fork > 0, "{o:?}");
+        }
         if policy.validation == Validation::Log {
             assert_eq!(
                 o.log_conflict,
@@ -311,7 +316,7 @@ fn run(seed: u64, with_index: bool) -> Tally {
                 let Live { branch, m } = live.swap_remove(rng.below(live.len() as u64) as usize);
                 let policy = POLICIES[rng.below(POLICIES.len() as u64) as usize];
                 let o = merger.merge(branch, policy).unwrap();
-                t.check(seed, &o, &m, policy);
+                t.check(seed, &o, &m, policy, false);
                 match o.refused {
                     None => {
                         t.apply(&m, policy.install);
@@ -335,7 +340,7 @@ fn run(seed: u64, with_index: bool) -> Tally {
                     members.into_iter().map(|l| (l.branch, l.m)).unzip();
                 let outcomes = merger.merge_batch(branches, policy).unwrap();
                 for (o, m) in outcomes.iter().zip(&models) {
-                    t.check(seed, o, m, policy);
+                    t.check(seed, o, m, policy, true);
                     if o.refused.is_none() {
                         t.apply(m, policy.install);
                         tally.batch_committed += 1;
@@ -488,6 +493,15 @@ fn out_of_scope_merges_are_refused_not_merged() {
     b.db.branches.branch_bulk_written(b.id);
     let o = merger.merge(b, key).unwrap();
     assert_eq!(o.refused, Some(Refusal::Scope), "{o:?}");
+    // A trunk DDL since the fork.
+    let b = trunk.fork_branch().unwrap();
+    b.connect()
+        .unwrap()
+        .execute("UPDATE t SET v = 'd' WHERE id = 1")
+        .unwrap();
+    trunk.execute("CREATE TABLE w(x)").unwrap();
+    let o = merger.merge(b, key).unwrap();
+    assert_eq!(o.refused, Some(Refusal::Scope), "{o:?}");
     // Nothing above reached the trunk.
     assert_eq!(texts(&trunk, "SELECT v FROM t"), ["a"]);
     // The physical install without read tracking, and a batch under a validator that cannot see
@@ -513,4 +527,66 @@ fn out_of_scope_merges_are_refused_not_merged() {
         )
         .is_err());
     assert_eq!(db.branch_stats().live_branches, 0);
+}
+
+/// The physical install's structural guard, where it is conservative: a trunk delete next to the
+/// branch's row rebalances the leaves around it and writes their parent, which the branch read.
+/// `balance_non_root` dirties every sibling it touches, so the branch's own leaf is either written
+/// (a page conflict) or untouched, and the guard refuses the untouched cases too. Every committed
+/// merge must be correct, and the guard must decide some merges alone here. (With the guard off,
+/// `R11_MERGE_MUTANT=5`, exactly these merges commit, and correctly: frontier/round11/r11-merge.)
+#[test]
+fn the_structural_guard_also_refuses_a_restructure_that_left_the_branch_leaf_alone() {
+    let mut guard_alone = 0;
+    for offset in (4..=80).step_by(4) {
+        for below in [false, true] {
+            let (_dir, db) = open_db();
+            db.set_branch_read_tracking(true);
+            let trunk = db.connect().unwrap();
+            trunk
+                .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            trunk.execute("BEGIN").unwrap();
+            for id in 1..=1000 {
+                trunk
+                    .execute(format!("INSERT INTO t VALUES ({id}, '{}')", val("t", id, 100)))
+                    .unwrap();
+            }
+            trunk.execute("COMMIT").unwrap();
+            let b = trunk.fork_branch().unwrap();
+            b.connect()
+                .unwrap()
+                .execute(format!("UPDATE t SET v = '{}' WHERE id = 500", val("b", 500, 100)))
+                .unwrap();
+            let (lo, hi) = if below {
+                (500 - offset - 60, 500 - offset)
+            } else {
+                (500 + offset, 500 + offset + 60)
+            };
+            trunk
+                .execute(format!("DELETE FROM t WHERE id BETWEEN {lo} AND {hi}"))
+                .unwrap();
+            let mut merger = Merger::new(trunk.clone()).unwrap();
+            let o = merger
+                .merge(
+                    b,
+                    MergePolicy {
+                        validation: Validation::PageStamp,
+                        install: Install::Physical,
+                    },
+                )
+                .unwrap();
+            if o.refused.is_none() {
+                assert_eq!(
+                    texts(&trunk, "SELECT v FROM t WHERE id = 500"),
+                    [val("b", 500, 100)],
+                    "offset {offset} below {below}: a committed merge lost the update: {o:?}"
+                );
+            } else if o.refused == Some(Refusal::Structural) && !o.page_conflict {
+                guard_alone += 1;
+            }
+            assert_eq!(integrity(&trunk), ["ok"], "offset {offset} below {below}: {o:?}");
+        }
+    }
+    assert!(guard_alone > 0, "the sweep never restructured above an untouched branch leaf");
 }

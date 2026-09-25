@@ -12,12 +12,14 @@
 //!
 //! Scope: a merge takes a direct child of the trunk with no open connection, no live child, no DDL
 //! and no write that names no row (clear, destroy, incremental blob I/O), whose index writes are all
-//! to indexes of rowid tables. Anything else is refused as [`Refusal::Scope`], not merged.
+//! to indexes of rowid tables, and whose schema is still the trunk's (no trunk DDL since the fork).
+//! Anything else is refused as [`Refusal::Scope`], not merged.
 //!
 //! # Validation: what "the trunk changed the same thing" is checked against
 //!
-//! * [`Validation::Scalar`] — any trunk commit since the fork. ferrodb's D174 gate and git's
-//!   fast-forward-only rule: one comparison, and every merge conflicts with every other.
+//! * [`Validation::Scalar`] — any trunk commit since the fork (or, inside a batch, any page an
+//!   earlier member wrote). ferrodb's D174 gate and git's fast-forward-only rule: one comparison,
+//!   and every merge conflicts with every other.
 //! * [`Validation::Log`] — Kung & Robinson's backward validation (TODS 1981), which is also how
 //!   Iceberg and Delta validate a commit against every snapshot since its base: the committed trunk
 //!   write sets since the fork, page by page, against B's written pages.
@@ -35,11 +37,18 @@
 //!
 //! * [`Install::Physical`] — the page-level three-way merge: B's pages are copied over the trunk's.
 //!   Sound only where the trunk did not write the page since the fork (so ours = base), which a
-//!   page-granular validator establishes, and only if the trunk did not restructure the tree above
-//!   B's pages: a split or a free on the trunk moves or orphans a leaf B wrote WITHOUT writing that
-//!   leaf, but it always writes an interior page B read to reach it. So the physical install needs
-//!   B's page reads (see [`crate::Database::set_branch_read_tracking`]) and refuses as
-//!   [`Refusal::Structural`] when the trunk wrote an interior page B read.
+//!   page-granular validator establishes, and only if the page is still where B's tree put it. A
+//!   balance dirties every sibling it touches (`balance_non_root`), so a trunk delete or split that
+//!   moves B's rows writes B's page and is a page conflict. What a page stamp cannot see is a page
+//!   freed without a balance: `Pager::free_page` does not write the page it frees, so after a
+//!   `clear_btree` or `btree_destroy` on the trunk, B's page could sit on the freelist unwritten and
+//!   copying it back would orphan B's rows. Every such operation writes the b-tree's root, an
+//!   interior page B read to reach its leaf. So the physical install needs B's page reads (see
+//!   [`crate::Database::set_branch_read_tracking`]) and refuses as [`Refusal::Structural`] when the
+//!   trunk wrote an interior page B read. That is conservative: a split or a merge of other leaves
+//!   under the same parent also writes it. Through SQL on the trunk, without DDL (which a merge
+//!   refuses as out of scope), no free-without-write path was found in this fork, so in the
+//!   measured workloads every structural refusal is a false conflict (frontier/round11/r11-merge).
 //! * [`Install::Replay`] — the logical install: each row B wrote is copied from B into the trunk
 //!   through the trunk's own SQL path (UPDATE, INSERT if the trunk lacks it, DELETE if B does), so
 //!   splits, page allocation and indexes are the trunk's. Works under every validator.
@@ -298,7 +307,11 @@ impl Merger {
             let prep = self
                 .store
                 .merge_prepare(branch.id, policy.validation, physical)?;
-            let scope = prep.scope.or_else(|| row_scope(&prep));
+            let trunk_schema = self.trunk.schema.read().schema_version;
+            let scope = prep.scope.or_else(|| row_scope(&prep)).or_else(|| {
+                (prep.schema.schema_version != trunk_schema)
+                    .then_some("the trunk changed its schema since the fork")
+            });
             let refused = if scope.is_some() {
                 Some(Refusal::Scope)
             } else {
@@ -340,7 +353,9 @@ impl Merger {
         for (page, image) in &prep.pages {
             pager.install_page_image(*page, image, db_size)?;
         }
-        self.store.trunk_rows_written(&prep.rows);
+        if !super::store::mutant(6) {
+            self.store.trunk_rows_written(&prep.rows);
+        }
         self.store
             .merge_counted(|w| w.merge_pages_installed += prep.pages.len() as u64);
         Ok(())

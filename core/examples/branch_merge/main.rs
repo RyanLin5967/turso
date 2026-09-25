@@ -458,10 +458,16 @@ fn main() {
         .unwrap();
     let setup = Instant::now();
     trunk.execute("BEGIN").unwrap();
-    for i in 1..=args.rows as i64 {
-        trunk
-            .execute(format!("INSERT INTO t VALUES ({}, '{}')", i << 20, trunk_value(i)))
-            .unwrap();
+    {
+        let mut insert = trunk.prepare("INSERT INTO t VALUES (?1, ?2)").unwrap();
+        for i in 1..=args.rows as i64 {
+            insert.bind_at(1.try_into().unwrap(), Value::from_i64(i << 20)).unwrap();
+            insert
+                .bind_at(2.try_into().unwrap(), Value::from_text(trunk_value(i)))
+                .unwrap();
+            insert.run_ignore_rows().unwrap();
+            insert.reset().unwrap();
+        }
     }
     trunk.execute("COMMIT").unwrap();
     trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();

@@ -141,7 +141,8 @@ impl MergeState {
     /// epoch: a record of epoch `e` refuses a branch only if `e > trunk_at`, and every live or
     /// future child has `trunk_at >= oldest`. `None` (no child) drops everything.
     pub(super) fn prune(&mut self, oldest: Option<u64>) {
-        let keep = |e: u64| oldest.is_some_and(|o| e > o);
+        let slack = u64::from(mutant(8));
+        let keep = |e: u64| oldest.is_some_and(|o| e > o + slack);
         while self.log.front().is_some_and(|&(e, _)| !keep(e)) {
             self.log.pop_front();
         }
@@ -171,6 +172,25 @@ struct Lineage {
     by_born: BTreeSet<(u64, u32, u64)>,
     /// The same versions as `(died, page, born)`, for the reclamation range query by death.
     by_died: BTreeSet<(u64, u32, u64)>,
+}
+
+/// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge validation mechanism n, so
+/// the model test can be shown to fail for each (frontier/round11/r11-merge). Always false otherwise.
+#[cfg(test)]
+pub(crate) fn mutant(n: u32) -> bool {
+    static CHOSEN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        std::env::var("R11_MERGE_MUTANT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }) == n
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn mutant(_n: u32) -> bool {
+    false
 }
 
 /// No page has this number (SQLite's largest is `u32::MAX - 1`; [`Lineage::retain`] refuses it), so
@@ -853,21 +873,27 @@ impl BranchStore {
         };
         let at = st.trunk_at;
         let written = |page: u32| trunk.written.get(&page).copied().unwrap_or(0);
+        let (m2, m3, m4) = (
+            u64::from(mutant(2)),
+            u64::from(mutant(3)),
+            u64::from(mutant(4)),
+        );
         let mut probes = 0u64;
         let count = |v: Validation, probes: &mut u64| {
             if v == active {
                 *probes += 1;
             }
         };
-        // V0: any trunk commit since the fork.
+        // V0: any trunk commit since the fork, or any page the transaction in progress wrote (an
+        // earlier member of the same batch).
         let commits_since_fork = merge.trunk_commits - st.commits_at_fork;
         count(Validation::Scalar, &mut probes);
-        let scalar = commits_since_fork > 0;
+        let scalar = commits_since_fork > u64::from(mutant(1)) || !merge.tx_pages.is_empty();
         // V2: any page this branch wrote that the trunk wrote after the fork.
         let mut page = false;
         for &p in st.current.keys() {
             count(Validation::PageStamp, &mut probes);
-            if written(p) > at {
+            if written(p) > at + m2 {
                 page = true;
                 break;
             }
@@ -878,7 +904,7 @@ impl BranchStore {
             count(Validation::KeyStamp, &mut probes);
             let row = merge.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
             let table = merge.table_stamps.get(&root).copied().unwrap_or(0);
-            if row.max(table) > at {
+            if row.max(table) > at + m3 {
                 key = true;
                 break;
             }
@@ -887,7 +913,7 @@ impl BranchStore {
         // first, checked page by page against this branch's write set.
         let log = (active == Validation::Log).then(|| {
             for (e, pages) in merge.log.iter().rev() {
-                if *e <= at {
+                if *e <= at + m4 {
                     break;
                 }
                 work.merge_log_entries_scanned += 1;
@@ -904,6 +930,9 @@ impl BranchStore {
         // The physical install's guard: an interior page this branch read that the trunk wrote
         // since the fork (its type read from the version the branch saw).
         let structural = physical.then(|| {
+            if mutant(5) {
+                return false;
+            }
             let mut unused = 0;
             for &q in &st.reads {
                 work.merge_structural_probes += 1;
