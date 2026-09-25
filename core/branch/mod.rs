@@ -228,6 +228,21 @@ pub struct BranchWork {
     pub trunk_lock_contended: u64,
     pub trunk_lock_wait_ns: u64,
     pub trunk_lock_hold_ns: u64,
+    /// The trunk's lock taken by reaps of trunk children (`collect`), and of those, the ones that
+    /// waited and how long. A subset of `trunk_lock_*`, so a reap's share of the trunk's lock can be
+    /// read apart from forks, copy decisions and resolutions.
+    pub reap_trunk_acquisitions: u64,
+    pub reap_trunk_contended: u64,
+    pub reap_trunk_wait_ns: u64,
+    /// Nanoseconds those acquisitions held the lock, with lock timing on; 0 while it is off.
+    pub reap_trunk_hold_ns: u64,
+    /// `child_gone`, with lock timing on, split into its three steps: removing the child and
+    /// probing its neighbours, the garbage walk ([`store`]'s `Lineage::garbage`), and releasing
+    /// what the walk found. Summed over every lineage (the trunk's under its lock, a branch's under
+    /// its shard's); 0 while timing is off.
+    pub gc_probe_ns: u64,
+    pub gc_walk_ns: u64,
+    pub gc_free_ns: u64,
 }
 
 impl BranchWork {
@@ -249,6 +264,13 @@ impl BranchWork {
             trunk_lock_contended,
             trunk_lock_wait_ns,
             trunk_lock_hold_ns,
+            reap_trunk_acquisitions,
+            reap_trunk_contended,
+            reap_trunk_wait_ns,
+            reap_trunk_hold_ns,
+            gc_probe_ns,
+            gc_walk_ns,
+            gc_free_ns,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -265,7 +287,55 @@ impl BranchWork {
         self.trunk_lock_contended += trunk_lock_contended;
         self.trunk_lock_wait_ns += trunk_lock_wait_ns;
         self.trunk_lock_hold_ns += trunk_lock_hold_ns;
+        self.reap_trunk_acquisitions += reap_trunk_acquisitions;
+        self.reap_trunk_contended += reap_trunk_contended;
+        self.reap_trunk_wait_ns += reap_trunk_wait_ns;
+        self.reap_trunk_hold_ns += reap_trunk_hold_ns;
+        self.gc_probe_ns += gc_probe_ns;
+        self.gc_walk_ns += gc_walk_ns;
+        self.gc_free_ns += gc_free_ns;
     }
+}
+
+/// The trunk's retained versions checked against its live children, for [`Database::branch_audit_trunk`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrunkAudit {
+    /// Live children of the trunk (fork epochs it lists).
+    pub children: usize,
+    /// Retained versions, counted in the per-page map.
+    pub versions: usize,
+    /// Entries of the two reclamation indexes; each must equal `versions`.
+    pub by_born: usize,
+    pub by_died: usize,
+    /// Versions whose `[born, died)` holds no live child's fork epoch: garbage nothing will free.
+    /// F2's invariant makes this 0 whenever no reap is in flight.
+    pub leaked: usize,
+}
+
+/// A thread's own counts of the UNSAFE split walk (see [`Database::set_branch_unsafe_split_walk`]),
+/// read and reset by [`take_split_walk_counts`]. The walk runs outside every lock, so its counts
+/// cannot go into [`BranchWork`]; they stay with the thread that walked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SplitWalkCounts {
+    /// Walks run (one per reap of a trunk child while the split walk was on).
+    pub walks: u64,
+    /// Index entries the walks visited.
+    pub range_entries: u64,
+    /// Nanoseconds spent walking.
+    pub walk_ns: u64,
+    /// Versions the walks handed to the locked free step.
+    pub candidates: u64,
+    /// Locked free steps taken: one per walk that found a candidate (each takes the trunk's lock a
+    /// second time).
+    pub frees: u64,
+    /// Candidates the free step no longer found. The split walk's argument says 0.
+    pub misses: u64,
+}
+
+/// This thread's split-walk counts since its last call, reset to zero.
+#[doc(hidden)]
+pub fn take_split_walk_counts() -> SplitWalkCounts {
+    store::take_split_walk_counts()
 }
 
 impl Branch {
@@ -436,6 +506,23 @@ impl Database {
     #[doc(hidden)]
     pub fn set_branch_lock_timing(&self, on: bool) {
         self.branches.set_lock_timing(on);
+    }
+
+    /// Every retained version of the trunk against its live children (see [`TrunkAudit`]). Takes the
+    /// trunk's lock for a walk over every version, O(V log N): call it only while nothing runs.
+    #[doc(hidden)]
+    pub fn branch_audit_trunk(&self) -> TrunkAudit {
+        self.branches.audit_trunk()
+    }
+
+    /// ⚠ UNSAFE, a measurement control only: while on, a reap of a trunk child walks for garbage
+    /// OUTSIDE the trunk's lock, over a snapshot of the reclamation indexes taken when it was turned
+    /// on, and frees what it found under the lock afterwards. That is exact only while no trunk
+    /// version is retained, so the store refuses a retain while it is on. Turning it on clones both
+    /// indexes under the trunk's lock; turning it off drops the snapshot.
+    #[doc(hidden)]
+    pub fn set_branch_unsafe_split_walk(&self, on: bool) {
+        self.branches.set_unsafe_split_walk(on);
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.

@@ -13,6 +13,8 @@
 //!   pages      every branch writes w pages in one transaction; x axis = N, one block per w
 //!   spread_trunk the `spread` arm's trunk writes with NO branches (amendment 2); x = trunk writes
 //!   conc       T threads churn their own shares of N live branches (amendment 7); one cell per (N, T)
+//!   reapconc   T threads reap trunk children concurrently while the trunk writes, and N is held by
+//!              re-forks (frontier/round11/r11-k6-measure/PREREG.md); one cell per (N, T)
 //!
 //! `--no-autocheckpoint` disables the trunk connection's WAL auto-actions (auto-checkpoint and WAL
 //! restart), amendment 2. Every state line prints the WAL file's size.
@@ -40,7 +42,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use turso_core::branch::{Branch, BranchWork};
+use turso_core::branch::{take_split_walk_counts, Branch, BranchWork, SplitWalkCounts};
 use turso_core::{
     Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, SqliteDialect, Value,
     IO,
@@ -65,6 +67,16 @@ enum Arm {
     Pages,
     SpreadTrunk,
     Conc,
+    ReapConc,
+}
+
+/// How `reapconc` holds N after its reaps (r11-k6-measure PREREG §0).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Refill {
+    /// The T threads reap alone, in timed phases; between phases the main thread re-forks.
+    Phase,
+    /// Each thread re-forks its own replacement, and writes the trunk, in its own cycle.
+    Inline,
 }
 
 /// Which live branch a churn cycle reaps.
@@ -87,6 +99,16 @@ struct Args {
     synchronous: String,
     threads: Vec<usize>,
     lock_timing: bool,
+    /// `reapconc`: a spread trunk write after every k-th fork; 0 = no trunk write (V = 0).
+    write_every: usize,
+    refill: Refill,
+    /// `reapconc`, phase refill only: the UNSAFE split walk (a throughput ceiling, nothing else).
+    unsafe_split: bool,
+    /// `reapconc`: warm-up windows of N single-threaded churn cycles before each N's cells.
+    warmup: usize,
+    cell_reaps: usize,
+    round_reaps: usize,
+    read_checks: usize,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -110,7 +132,15 @@ fn parse_args() -> Args {
         synchronous: "OFF".to_string(),
         threads: Vec::new(),
         lock_timing: false,
+        write_every: 8,
+        refill: Refill::Phase,
+        unsafe_split: false,
+        warmup: 12,
+        cell_reaps: 100_000,
+        round_reaps: 10_000,
+        read_checks: 200,
     };
+    let mut reapconc_flags = false;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -126,6 +156,7 @@ fn parse_args() -> Args {
                     "pages" => Arm::Pages,
                     "spread_trunk" => Arm::SpreadTrunk,
                     "conc" => Arm::Conc,
+                    "reapconc" => Arm::ReapConc,
                     other => die(&format!("unknown arm {other}")),
                 })
             }
@@ -153,6 +184,38 @@ fn parse_args() -> Args {
                     other => die(&format!("unknown --lock-timing {other}")),
                 }
             }
+            "--write-every" => {
+                args.write_every = val().parse().unwrap_or_else(|_| die("bad --write-every"));
+                reapconc_flags = true;
+            }
+            "--refill" => {
+                args.refill = match val().as_str() {
+                    "phase" => Refill::Phase,
+                    "inline" => Refill::Inline,
+                    other => die(&format!("unknown --refill {other}")),
+                };
+                reapconc_flags = true;
+            }
+            "--unsafe-split-walk" => {
+                args.unsafe_split = true;
+                reapconc_flags = true;
+            }
+            "--warmup" => {
+                args.warmup = val().parse().unwrap_or_else(|_| die("bad --warmup"));
+                reapconc_flags = true;
+            }
+            "--cell-reaps" => {
+                args.cell_reaps = val().parse().unwrap_or_else(|_| die("bad --cell-reaps"));
+                reapconc_flags = true;
+            }
+            "--round-reaps" => {
+                args.round_reaps = val().parse().unwrap_or_else(|_| die("bad --round-reaps"));
+                reapconc_flags = true;
+            }
+            "--read-checks" => {
+                args.read_checks = val().parse().unwrap_or_else(|_| die("bad --read-checks"));
+                reapconc_flags = true;
+            }
             "--victim" => {
                 args.victim = match val().as_str() {
                     "random" => Victim::Random,
@@ -165,9 +228,12 @@ fn parse_args() -> Args {
     }
     args.arm = arm.unwrap_or_else(|| die("--arm is required"));
     if args.victim != Victim::Random
-        && !matches!(args.arm, Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread)
+        && !matches!(
+            args.arm,
+            Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread | Arm::ReapConc
+        )
     {
-        die("--victim applies to the churn arms only");
+        die("--victim applies to the churn arms and reapconc only");
     }
     if args.checkpoints.is_empty() || args.checkpoints.windows(2).any(|w| w[0] >= w[1]) {
         die("--checkpoints must be strictly increasing");
@@ -179,15 +245,31 @@ fn parse_args() -> Args {
     if args.w_list.is_empty() || args.w_list.iter().any(|&w| w == 0 || w > 64) {
         die("--w entries must be in 1..=64");
     }
-    if args.arm == Arm::Conc {
+    if matches!(args.arm, Arm::Conc | Arm::ReapConc) {
         if args.threads.is_empty() || args.threads.contains(&0) {
-            die("--arm conc needs --threads, every entry positive");
+            die("--arm conc and reapconc need --threads, every entry positive");
         }
         if args.checkpoints.iter().any(|&n| n < *args.threads.iter().max().unwrap()) {
-            die("--arm conc needs every checkpoint N >= the largest T, so each thread owns a branch");
+            die("--arm conc and reapconc need every checkpoint N >= the largest T, so each thread owns a branch");
         }
     } else if !args.threads.is_empty() || args.lock_timing {
-        die("--threads and --lock-timing apply to --arm conc only");
+        die("--threads and --lock-timing apply to --arm conc and reapconc only");
+    }
+    if args.arm == Arm::ReapConc {
+        let tmax = *args.threads.iter().max().unwrap();
+        if args.round_reaps < tmax || args.cell_reaps < args.round_reaps {
+            die("--round-reaps must be >= the largest T and <= --cell-reaps");
+        }
+        if args.refill == Refill::Phase && args.checkpoints.iter().any(|&n| n < args.round_reaps) {
+            die("--refill phase needs every N >= --round-reaps: a round must not empty a share");
+        }
+        if args.unsafe_split && args.refill != Refill::Phase {
+            die("--unsafe-split-walk is valid with --refill phase only: an inline trunk write would \
+                 retain a version the walk's snapshot lacks");
+        }
+    } else if reapconc_flags {
+        die("--write-every, --refill, --unsafe-split-walk, --warmup, --cell-reaps, --round-reaps and \
+             --read-checks apply to --arm reapconc only");
     }
     args
 }
@@ -579,6 +661,7 @@ fn main() {
         Arm::Pages => arm_pages(&mut bench, &args),
         Arm::SpreadTrunk => arm_spread_trunk(&mut bench, &args),
         Arm::Conc => arm_conc(&mut bench, &args),
+        Arm::ReapConc => arm_reapconc(&mut bench, &args),
     }
     let end = db.branch_stats();
     if end.live_branches != 0 || end.arena_slots_in_use != 0 {
@@ -1543,6 +1626,701 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 d(before.trunk_lock_wait_ns, after.trunk_lock_wait_ns),
                 d(before.trunk_lock_hold_ns, after.trunk_lock_hold_ns),
             );
+        }
+    }
+    drop(live);
+    drop(trunks);
+}
+
+/// A live trunk child of `reapconc`. It never writes, and connects only for a read check.
+struct Child {
+    branch: Branch,
+    /// Fork order over the whole run; the `oldest` victim policy keeps shares in this order.
+    seq: u64,
+    /// Trunk writes committed before its fork, or `None` for a child an `inline` thread forked,
+    /// whose place among concurrent trunk writes the harness does not know (never read-checked).
+    writes_at_fork: Option<u64>,
+}
+
+fn rc_pick(share: &mut VecDeque<Child>, victim: Victim, rng: &mut Rng) -> Child {
+    match victim {
+        Victim::Random => {
+            let at = rng.below(share.len());
+            share.swap_remove_back(at).unwrap()
+        }
+        Victim::Oldest => share.pop_front().unwrap(),
+    }
+}
+
+/// Reap `child`, which nothing else reads through; returns the versions the reap freed.
+fn rc_reap(child: Child) -> usize {
+    let reaped = child
+        .branch
+        .reap()
+        .unwrap_or_else(|e| not_a_result(&format!("reapconc reap failed: {e}")));
+    if reaped.deferred {
+        not_a_result(&format!("a reapconc reap was deferred: {reaped:?}"));
+    }
+    reaped.freed_pages
+}
+
+/// Fork one trunk child on the main trunk connection; after every k-th fork of the run, write the
+/// `spread` walk's next row on the trunk.
+fn rc_fork(b: &mut Bench, k: usize, forks: &mut u64, seq: &mut u64) -> Child {
+    let branch = b
+        .trunk
+        .fork_branch()
+        .unwrap_or_else(|e| not_a_result(&format!("reapconc fork failed: {e}")));
+    let child = Child {
+        branch,
+        seq: *seq,
+        writes_at_fork: Some(b.model.writes),
+    };
+    *seq += 1;
+    *forks += 1;
+    if k > 0 && *forks % k as u64 == 0 {
+        b.trunk_write(spread_row(b.model.writes));
+    }
+    child
+}
+
+/// The engine's counters that `reapconc` reads, summed over the timed windows only.
+#[derive(Default, Clone, Copy)]
+struct RcWork {
+    trunk_acq: u64,
+    trunk_contended: u64,
+    trunk_wait_ns: u64,
+    trunk_hold_ns: u64,
+    reap_acq: u64,
+    reap_contended: u64,
+    reap_wait_ns: u64,
+    reap_hold_ns: u64,
+    probe_ns: u64,
+    walk_ns: u64,
+    free_ns: u64,
+    gc_examined: u64,
+    gc_range: u64,
+    lock_acq: u64,
+    lock_contended: u64,
+    lock_wait_ns: u64,
+}
+
+impl RcWork {
+    fn add(&mut self, a: &BranchWork, b: &BranchWork) {
+        self.trunk_acq += b.trunk_lock_acquisitions - a.trunk_lock_acquisitions;
+        self.trunk_contended += b.trunk_lock_contended - a.trunk_lock_contended;
+        self.trunk_wait_ns += b.trunk_lock_wait_ns - a.trunk_lock_wait_ns;
+        self.trunk_hold_ns += b.trunk_lock_hold_ns - a.trunk_lock_hold_ns;
+        self.reap_acq += b.reap_trunk_acquisitions - a.reap_trunk_acquisitions;
+        self.reap_contended += b.reap_trunk_contended - a.reap_trunk_contended;
+        self.reap_wait_ns += b.reap_trunk_wait_ns - a.reap_trunk_wait_ns;
+        self.reap_hold_ns += b.reap_trunk_hold_ns - a.reap_trunk_hold_ns;
+        self.probe_ns += b.gc_probe_ns - a.gc_probe_ns;
+        self.walk_ns += b.gc_walk_ns - a.gc_walk_ns;
+        self.free_ns += b.gc_free_ns - a.gc_free_ns;
+        self.gc_examined += b.gc_examined - a.gc_examined;
+        self.gc_range += b.gc_range_entries - a.gc_range_entries;
+        self.lock_acq += b.lock_acquisitions - a.lock_acquisitions;
+        self.lock_contended += b.lock_contended - a.lock_contended;
+        self.lock_wait_ns += b.lock_wait_ns - a.lock_wait_ns;
+    }
+}
+
+fn add_split(into: &mut SplitWalkCounts, c: SplitWalkCounts) {
+    into.walks += c.walks;
+    into.range_entries += c.range_entries;
+    into.walk_ns += c.walk_ns;
+    into.candidates += c.candidates;
+    into.frees += c.frees;
+    into.misses += c.misses;
+}
+
+/// One `reapconc` cell's totals over its timed windows.
+#[derive(Default)]
+struct RcCell {
+    reaps: u64,
+    rounds: u64,
+    wall_ns: u128,
+    /// Phase refill: per round, the latest reaper's end minus the earliest one's start.
+    span_ns: u128,
+    user_ns: u64,
+    sys_ns: u64,
+    freed: u64,
+    forks: u64,
+    writes: u64,
+    busy_fork: u64,
+    busy_write: u64,
+    work: RcWork,
+    split: SplitWalkCounts,
+    /// Latencies: reap, then (inline) fork and trunk write.
+    lat: [Vec<Duration>; 3],
+}
+
+const RC_HEADER: &str = "N\tT\tdraw\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us";
+
+/// Audit the trunk's retained versions against its live children and the arena; returns V.
+fn rc_audit(b: &Bench, n: usize, tag: &str) -> usize {
+    let a = b.db.branch_audit_trunk();
+    let s = b.db.branch_stats();
+    println!(
+        "# audit {tag} children={} versions={} by_born={} by_died={} leaked={} arena_in_use={} \
+         live={} rss_bytes={}",
+        a.children,
+        a.versions,
+        a.by_born,
+        a.by_died,
+        a.leaked,
+        s.arena_slots_in_use,
+        s.live_branches,
+        rss_bytes()
+    );
+    if a.children != n
+        || s.live_branches != n
+        || a.by_born != a.versions
+        || a.by_died != a.versions
+        || s.arena_slots_in_use != a.versions
+    {
+        not_a_result(&format!(
+            "audit {tag}: {a:?} against {n} live children and {} arena pages",
+            s.arena_slots_in_use
+        ));
+    }
+    if a.leaked > 0 {
+        println!("# AUDIT-LEAKED {} at {tag}", a.leaked);
+    }
+    a.versions
+}
+
+/// Read two random rows through each of `want` random children whose fork the harness can place
+/// among the trunk's writes, each on its own connection, against the harness's trunk model.
+/// Returns (children checked, children eligible).
+fn rc_read_checks(b: &mut Bench, live: &VecDeque<Child>, want: usize) -> (usize, usize) {
+    let known: Vec<usize> = (0..live.len())
+        .filter(|&i| live[i].writes_at_fork.is_some())
+        .collect();
+    if known.is_empty() {
+        return (0, 0);
+    }
+    for _ in 0..want {
+        let child = &live[known[b.rng.below(known.len())]];
+        let at = child.writes_at_fork.unwrap();
+        let conn = child
+            .branch
+            .connect()
+            .unwrap_or_else(|e| not_a_result(&format!("reapconc read check: connect failed: {e}")));
+        for _ in 0..2 {
+            let row = b.rng.below(TRUNK_ROWS as usize) as i64 + 1;
+            let rows = select_v(&conn, row).unwrap_or_else(|e| {
+                not_a_result(&format!("reapconc read check of row {row}: {e}"))
+            });
+            check_v(&rows, row, &b.model.value_at(row, at));
+        }
+    }
+    (want, known.len())
+}
+
+/// Grow to `n` live trunk children, then run `args.warmup` windows of `n` single-threaded churn
+/// cycles (reap one, fork one, the trunk writing after every k-th fork), printing V per window.
+fn rc_grow_and_warm(
+    b: &mut Bench,
+    args: &Args,
+    live: &mut VecDeque<Child>,
+    n: usize,
+    forks: &mut u64,
+    seq: &mut u64,
+) {
+    let k = args.write_every;
+    let t0 = Instant::now();
+    while live.len() < n {
+        let child = rc_fork(b, k, forks, seq);
+        live.push_back(child);
+    }
+    let s = b.db.branch_stats();
+    println!(
+        "# grow x={n} forks={forks} trunk_writes={} grow_us={:.0} V={} rss_bytes={}",
+        b.model.writes,
+        t0.elapsed().as_secs_f64() * 1e6,
+        s.arena_slots_in_use,
+        rss_bytes()
+    );
+    let mut vs = Vec::new();
+    for w in 0..args.warmup {
+        let t0 = Instant::now();
+        let mut freed = 0usize;
+        for _ in 0..n {
+            let victim = rc_pick(live, args.victim, &mut b.rng);
+            freed += rc_reap(victim);
+            let child = rc_fork(b, k, forks, seq);
+            live.push_back(child);
+        }
+        let s = b.db.branch_stats();
+        vs.push(s.arena_slots_in_use);
+        println!(
+            "# warmup x={n} window={w} cycles={n} V={} freed={freed} us={:.0} trunk_writes={} \
+             rss_bytes={}",
+            s.arena_slots_in_use,
+            t0.elapsed().as_secs_f64() * 1e6,
+            b.model.writes,
+            rss_bytes()
+        );
+    }
+    if vs.len() >= 2 {
+        let (prev, last) = (vs[vs.len() - 2], vs[vs.len() - 1]);
+        let ratio = if prev == 0 { f64::from(u8::from(last == 0)) } else { last as f64 / prev as f64 };
+        println!(
+            "# steady x={n} V_prev={prev} V_last={last} ratio={ratio:.4} {}",
+            if (ratio - 1.0).abs() <= 0.03 { "STEADY" } else { "NOT-STEADY" }
+        );
+    }
+    rc_audit(b, n, &format!("warmup x={n}"));
+}
+
+/// A `phase` cell: rounds of (the T threads reap K = round_reaps / T random children of their own
+/// share, concurrently, timed; then the main thread alone re-forks K·T children and deals them back).
+/// The reap phase is the only thing running while it is timed, so the trunk's lock is taken by
+/// reaps alone; the engine's counters are read just outside it.
+fn rc_cell_phase(
+    b: &mut Bench,
+    args: &Args,
+    live: &mut VecDeque<Child>,
+    n: usize,
+    t: usize,
+    draw: u64,
+    forks: &mut u64,
+    seq: &mut u64,
+) -> RcCell {
+    let k_each = args.round_reaps / t;
+    let rounds = args.cell_reaps / (k_each * t);
+    let mut dealt: Vec<VecDeque<Child>> = (0..t).map(|_| VecDeque::with_capacity(n / t + 1)).collect();
+    for (i, child) in live.drain(..).enumerate() {
+        dealt[i % t].push_back(child);
+    }
+    let shares: Vec<std::sync::Mutex<VecDeque<Child>>> =
+        dealt.into_iter().map(std::sync::Mutex::new).collect();
+    let (start, end) = (Barrier::new(t + 1), Barrier::new(t + 1));
+    let freed_round = std::sync::atomic::AtomicUsize::new(0);
+    let victim = args.victim;
+    let mut cell = RcCell::default();
+    let outs = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..t)
+            .map(|i| {
+                let (shares, start, end, freed_round) = (&shares, &start, &end, &freed_round);
+                let seed = args.seed
+                    ^ (i as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03)
+                    ^ ((n as u64) << 24)
+                    ^ (draw << 56)
+                    ^ ((t as u64) << 48);
+                s.spawn(move || {
+                    let mut rng = Rng(seed | 1);
+                    let mut lat = Vec::with_capacity(k_each * rounds);
+                    let mut spans = Vec::with_capacity(rounds);
+                    let mut split = SplitWalkCounts::default();
+                    for _ in 0..rounds {
+                        start.wait();
+                        let t0 = Instant::now();
+                        let mut share = shares[i].lock().unwrap();
+                        let mut freed = 0;
+                        for _ in 0..k_each {
+                            let child = rc_pick(&mut share, victim, &mut rng);
+                            let a = Instant::now();
+                            freed += rc_reap(child);
+                            lat.push(a.elapsed());
+                        }
+                        drop(share);
+                        let t1 = Instant::now();
+                        freed_round.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+                        spans.push((t0, t1));
+                        add_split(&mut split, take_split_walk_counts());
+                        end.wait();
+                    }
+                    (lat, spans, split)
+                })
+            })
+            .collect();
+        for _ in 0..rounds {
+            if args.unsafe_split {
+                b.db.set_branch_unsafe_split_walk(true);
+            }
+            freed_round.store(0, std::sync::atomic::Ordering::Relaxed);
+            let before = b.db.branch_stats();
+            let cpu0 = cpu_ns();
+            start.wait();
+            let w0 = Instant::now();
+            end.wait();
+            let wall = w0.elapsed();
+            let cpu1 = cpu_ns();
+            let after = b.db.branch_stats();
+            if args.unsafe_split {
+                b.db.set_branch_unsafe_split_walk(false);
+            }
+            let freed = freed_round.load(std::sync::atomic::Ordering::Relaxed);
+            // PREREG P2: nothing is retained inside a phase, so the arena shrinks by exactly what the
+            // reaps reported, and the engine released exactly that many versions.
+            if before.arena_slots_in_use.checked_sub(after.arena_slots_in_use) != Some(freed)
+                || (after.work.gc_examined - before.work.gc_examined) as usize != freed
+            {
+                not_a_result(&format!(
+                    "reap phase N={n} T={t} draw={draw}: the reaps reported {freed} freed; the arena \
+                     went {} -> {} and gc_examined +{}",
+                    before.arena_slots_in_use,
+                    after.arena_slots_in_use,
+                    after.work.gc_examined - before.work.gc_examined
+                ));
+            }
+            cell.work.add(&before.work, &after.work);
+            cell.reaps += (k_each * t) as u64;
+            cell.rounds += 1;
+            cell.wall_ns += wall.as_nanos();
+            cell.freed += freed as u64;
+            cell.user_ns += cpu1.0 - cpu0.0;
+            cell.sys_ns += cpu1.1 - cpu0.1;
+            let writes0 = b.model.writes;
+            for j in 0..k_each * t {
+                let child = rc_fork(b, args.write_every, forks, seq);
+                shares[j % t].lock().unwrap().push_back(child);
+            }
+            cell.forks += (k_each * t) as u64;
+            cell.writes += b.model.writes - writes0;
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let mut spans: Vec<Vec<(Instant, Instant)>> = Vec::new();
+    for (mut lat, s, split) in outs {
+        cell.lat[0].append(&mut lat);
+        spans.push(s);
+        add_split(&mut cell.split, split);
+    }
+    for r in 0..rounds {
+        let first = spans.iter().map(|s| s[r].0).min().unwrap();
+        let last = spans.iter().map(|s| s[r].1).max().unwrap();
+        cell.span_ns += (last - first).as_nanos();
+    }
+    for share in shares {
+        live.extend(share.into_inner().unwrap());
+    }
+    live.make_contiguous().sort_unstable_by_key(|c| c.seq);
+    cell
+}
+
+/// An `inline` cell: each of the T threads runs cell_reaps / T cycles of (reap a random child of its
+/// own share; re-fork a replacement through its own trunk connection; after every k-th own cycle
+/// write the spread walk's next row through it). `Busy` answers are retried and counted.
+#[allow(clippy::too_many_arguments)]
+fn rc_cell_inline(
+    b: &mut Bench,
+    args: &Args,
+    trunks: &[Arc<Connection>],
+    live: &mut VecDeque<Child>,
+    n: usize,
+    t: usize,
+    draw: u64,
+    seq: &mut u64,
+) -> RcCell {
+    let c_each = args.cell_reaps / t;
+    let k = args.write_every;
+    let mut shares: Vec<VecDeque<Child>> = (0..t).map(|_| VecDeque::with_capacity(n / t + 1)).collect();
+    for (i, child) in live.drain(..).enumerate() {
+        shares[i % t].push_back(child);
+    }
+    let g = std::sync::atomic::AtomicU64::new(b.model.writes);
+    let barrier = Barrier::new(t + 1);
+    let seq0 = *seq;
+    let victim = args.victim;
+    let before = b.db.branch_stats();
+    let cpu0 = cpu_ns();
+    let (wall, outs) = std::thread::scope(|s| {
+        let handles: Vec<_> = shares
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut share)| {
+                let trunk = trunks[i].clone();
+                let (g, barrier) = (&g, &barrier);
+                let seed = args.seed
+                    ^ (i as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03)
+                    ^ ((n as u64) << 24)
+                    ^ (draw << 56)
+                    ^ ((t as u64) << 48);
+                s.spawn(move || {
+                    let mut rng = Rng(seed | 1);
+                    let mut lat: [Vec<Duration>; 3] = [
+                        Vec::with_capacity(c_each),
+                        Vec::with_capacity(c_each),
+                        Vec::with_capacity(if k > 0 { c_each / k + 1 } else { 0 }),
+                    ];
+                    let mut busy = [0u64; 2];
+                    let (mut freed, mut writes) = (0usize, 0u64);
+                    barrier.wait();
+                    for c in 0..c_each {
+                        let child = rc_pick(&mut share, victim, &mut rng);
+                        let a = Instant::now();
+                        freed += rc_reap(child);
+                        lat[0].push(a.elapsed());
+                        let a = Instant::now();
+                        let branch = busy_retry(&mut busy[0], "fork", || trunk.fork_branch());
+                        lat[1].push(a.elapsed());
+                        share.push_back(Child {
+                            branch,
+                            seq: seq0 + (c * t + i) as u64,
+                            writes_at_fork: None,
+                        });
+                        if k > 0 && (c + 1) % k == 0 {
+                            let gen = g.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let sql = format!(
+                                "UPDATE t SET v = '{}' WHERE id = {}",
+                                trunk_gen_value(gen),
+                                spread_row(gen)
+                            );
+                            let a = Instant::now();
+                            busy_retry(&mut busy[1], "trunk_write", || trunk.execute(sql.as_str()));
+                            lat[2].push(a.elapsed());
+                            writes += 1;
+                        }
+                    }
+                    (share, lat, busy, freed, writes)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let w0 = Instant::now();
+        let outs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        (w0.elapsed(), outs)
+    });
+    let cpu1 = cpu_ns();
+    let after = b.db.branch_stats();
+    let mut cell = RcCell::default();
+    for (share, mut lat, busy, freed, writes) in outs {
+        live.extend(share);
+        for (all, l) in cell.lat.iter_mut().zip(lat.iter_mut()) {
+            all.append(l);
+        }
+        cell.busy_fork += busy[0];
+        cell.busy_write += busy[1];
+        cell.freed += freed as u64;
+        cell.writes += writes;
+    }
+    live.make_contiguous().sort_unstable_by_key(|c| c.seq);
+    *seq = seq0 + (c_each * t) as u64;
+    // Every write the threads made has committed, each to a distinct row (`spread_row` repeats only
+    // every 20,000 writes), so the model catches up in generation order.
+    let g_end = g.load(std::sync::atomic::Ordering::Relaxed);
+    if g_end - b.model.writes != cell.writes {
+        not_a_result("inline trunk writes and the shared generation counter disagree");
+    }
+    while b.model.writes < g_end {
+        let row = spread_row(b.model.writes);
+        b.model.record(row);
+    }
+    cell.work.add(&before.work, &after.work);
+    cell.reaps = (c_each * t) as u64;
+    cell.rounds = 1;
+    cell.forks = cell.reaps;
+    cell.wall_ns = wall.as_nanos();
+    cell.span_ns = wall.as_nanos();
+    cell.user_ns = cpu1.0 - cpu0.0;
+    cell.sys_ns = cpu1.1 - cpu0.1;
+    // Versions retained inside the cell: what the arena gained plus what the reaps freed. Each
+    // trunk write retains at most one (its leaf).
+    let retained = (after.arena_slots_in_use + cell.freed as usize) as i64
+        - before.arena_slots_in_use as i64;
+    if retained < 0 || retained as u64 > cell.writes {
+        not_a_result(&format!(
+            "inline cell N={n} T={t}: {retained} versions retained by {} trunk writes",
+            cell.writes
+        ));
+    }
+    cell
+}
+
+fn rc_print_lat(n: usize, t: usize, draw: u64, op: &str, lat: &[Duration]) {
+    if lat.is_empty() {
+        return;
+    }
+    let mut us: Vec<f64> = lat.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+    us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "{n}\t{t}\t{draw}\t{op}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
+        us.len(),
+        percentile(&us, 50.0),
+        percentile(&us, 90.0),
+        percentile(&us, 99.0),
+        us[us.len() - 1]
+    );
+}
+
+/// Arm `reapconc` (frontier/round11/r11-k6-measure/PREREG.md §0): does the serialized reap of trunk
+/// children bind at T > 1? Children never write; the trunk writes the `spread` walk after every k-th
+/// fork, so the trunk retains versions (V > 0) unless k = 0. At each N: grow, warm up to steady
+/// state, then one cell per (T, draw), T forward and then reversed. After each cell: the trunk audit
+/// (no leaked version), and read checks against the harness's trunk model.
+fn arm_reapconc(b: &mut Bench, args: &Args) {
+    b.db.set_branch_lock_timing(args.lock_timing);
+    let tmax = *args.threads.iter().max().unwrap();
+    let trunks: Vec<Arc<Connection>> = if args.refill == Refill::Inline {
+        (0..tmax)
+            .map(|_| {
+                let conn = b.db.connect().unwrap();
+                conn.execute(format!("PRAGMA synchronous = {}", args.synchronous))
+                    .unwrap();
+                conn
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    println!(
+        "# reapconc: refill={:?} victim={:?} write_every={} unsafe_split_walk={} threads={:?} \
+         (forward, then reversed) warmup_windows={} cell_reaps={} round_reaps={} read_checks={} \
+         lock_timing={} synchronous={}",
+        args.refill,
+        args.victim,
+        args.write_every,
+        args.unsafe_split,
+        args.threads,
+        args.warmup,
+        args.cell_reaps,
+        args.round_reaps,
+        args.read_checks,
+        args.lock_timing,
+        args.synchronous
+    );
+    if args.unsafe_split {
+        println!(
+            "# UNSAFE: the reap's F2 walk runs outside the trunk lock, over an index snapshot taken \
+             at each reap phase's start; read ONLY for its throughput ceiling"
+        );
+    }
+    println!("{RC_HEADER}");
+    let mut live: VecDeque<Child> = VecDeque::new();
+    let (mut forks, mut seq) = (0u64, 0u64);
+    for &n in &args.checkpoints {
+        rc_grow_and_warm(b, args, &mut live, n, &mut forks, &mut seq);
+        let order: Vec<(usize, u64)> = args
+            .threads
+            .iter()
+            .map(|&t| (t, 0u64))
+            .chain(args.threads.iter().rev().map(|&t| (t, 1u64)))
+            .collect();
+        for (t, draw) in order {
+            let null = null_ops_per_s(t);
+            let v0 = b.db.branch_stats().arena_slots_in_use;
+            println!("# rcell N={n} T={t} draw={draw} start");
+            let cell = match args.refill {
+                Refill::Phase => {
+                    rc_cell_phase(b, args, &mut live, n, t, draw, &mut forks, &mut seq)
+                }
+                Refill::Inline => {
+                    let cell = rc_cell_inline(b, args, &trunks, &mut live, n, t, draw, &mut seq);
+                    forks += cell.forks;
+                    cell
+                }
+            };
+            let v1 = b.db.branch_stats().arena_slots_in_use;
+            let (w, sp) = (&cell.work, &cell.split);
+            println!(
+                "# rcell N={n} T={t} draw={draw} refill={:?} victim={:?} k={} split={} reaps={} \
+                 rounds={} wall_ns={} span_ns={} reaps_per_s={:.1} reaps_per_s_span={:.1} \
+                 null_ops_per_s={null:.0} user_ns={} sys_ns={} V_start={v0} V_end={v1} freed={} \
+                 trunk_acq={} trunk_contended={} trunk_wait_ns={} trunk_hold_ns={} reap_acq={} \
+                 reap_contended={} reap_wait_ns={} reap_hold_ns={} gc_probe_ns={} gc_walk_ns={} \
+                 gc_free_ns={} gc_examined={} gc_range={} lock_acq={} lock_contended={} \
+                 lock_wait_ns={} split_walks={} split_range={} split_walk_ns={} split_candidates={} \
+                 split_frees={} split_misses={} forks={} trunk_writes={} busy_fork={} busy_write={} \
+                 rss_bytes={}",
+                args.refill,
+                args.victim,
+                args.write_every,
+                u8::from(args.unsafe_split),
+                cell.reaps,
+                cell.rounds,
+                cell.wall_ns,
+                cell.span_ns,
+                cell.reaps as f64 / (cell.wall_ns as f64 / 1e9),
+                cell.reaps as f64 / (cell.span_ns as f64 / 1e9),
+                cell.user_ns,
+                cell.sys_ns,
+                cell.freed,
+                w.trunk_acq,
+                w.trunk_contended,
+                w.trunk_wait_ns,
+                w.trunk_hold_ns,
+                w.reap_acq,
+                w.reap_contended,
+                w.reap_wait_ns,
+                w.reap_hold_ns,
+                w.probe_ns,
+                w.walk_ns,
+                w.free_ns,
+                w.gc_examined,
+                w.gc_range,
+                w.lock_acq,
+                w.lock_contended,
+                w.lock_wait_ns,
+                sp.walks,
+                sp.range_entries,
+                sp.walk_ns,
+                sp.candidates,
+                sp.frees,
+                sp.misses,
+                cell.forks,
+                cell.writes,
+                cell.busy_fork,
+                cell.busy_write,
+                rss_bytes()
+            );
+            let r = cell.reaps as f64;
+            let wall = cell.wall_ns as f64;
+            println!(
+                "# derived N={n} T={t} draw={draw} U_reap={:.4} U_trunk={:.4} hold_per_reap_ns={:.1} \
+                 probe_per_reap_ns={:.1} walk_per_reap_ns={:.1} free_per_reap_ns={:.1} \
+                 rest_per_reap_ns={:.1} wait_per_reap_ns={:.1} contended_frac={:.4} \
+                 freed_per_reap={:.4} range_per_reap={:.4} split_walk_per_reap_ns={:.1}",
+                w.reap_hold_ns as f64 / wall,
+                w.trunk_hold_ns as f64 / wall,
+                w.reap_hold_ns as f64 / r,
+                w.probe_ns as f64 / r,
+                w.walk_ns as f64 / r,
+                w.free_ns as f64 / r,
+                (w.reap_hold_ns as f64 - (w.probe_ns + w.walk_ns + w.free_ns) as f64) / r,
+                w.reap_wait_ns as f64 / r,
+                w.reap_contended as f64 / r,
+                cell.freed as f64 / r,
+                (w.gc_range + sp.range_entries) as f64 / r,
+                sp.walk_ns as f64 / r,
+            );
+            // PREREG P1: the lock acquisitions the source predicts, per timed window.
+            let (reaps, rounds) = (cell.reaps, cell.rounds);
+            let (want_reap, want_trunk, want_all) = match args.refill {
+                Refill::Phase => (
+                    reaps + sp.frees,
+                    reaps + sp.frees + rounds,
+                    2 * reaps + sp.frees + 65 * rounds,
+                ),
+                // A trunk fork takes the trunk's lock once, a spread write's copy decision once.
+                Refill::Inline => (reaps, reaps + cell.forks + cell.writes + 1, 0),
+            };
+            let all_ok = args.refill == Refill::Inline || w.lock_acq == want_all;
+            println!(
+                "# P1 N={n} T={t} draw={draw} reap_acq={} want={want_reap} trunk_acq={} want={want_trunk} \
+                 lock_acq={} want={} {}",
+                w.reap_acq,
+                w.trunk_acq,
+                w.lock_acq,
+                if args.refill == Refill::Phase { want_all.to_string() } else { "n/a".to_string() },
+                if w.reap_acq == want_reap && w.trunk_acq == want_trunk && all_ok {
+                    "HOLDS"
+                } else {
+                    "BROKEN"
+                }
+            );
+            rc_print_lat(n, t, draw, "reap", &cell.lat[0]);
+            rc_print_lat(n, t, draw, "fork", &cell.lat[1]);
+            rc_print_lat(n, t, draw, "trunk_write", &cell.lat[2]);
+            rc_audit(b, n, &format!("cell N={n} T={t} draw={draw}"));
+            let (checked, eligible) = rc_read_checks(b, &live, args.read_checks);
+            println!("# reads N={n} T={t} draw={draw} checked={checked} eligible={eligible}");
         }
     }
     drop(live);

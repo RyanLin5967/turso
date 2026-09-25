@@ -134,7 +134,7 @@ use crossbeam_utils::CachePadded;
 
 use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
-use super::{BranchId, BranchStats, BranchWork, Reaped};
+use super::{BranchId, BranchStats, BranchWork, Reaped, SplitWalkCounts, TrunkAudit};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
 use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -190,6 +190,39 @@ pub(crate) struct BranchStore {
     /// Whether [`take`] times how long each acquisition holds its lock. Off by default: it is the
     /// one part of the lock accounting that adds work inside a critical section.
     lock_timing: AtomicBool,
+    /// ⚠ The UNSAFE split walk, a measurement control (see [`BranchStore::set_unsafe_split_walk`]).
+    /// On its own line: every reap of a trunk child reads `on`, and nothing writes it while reaps run.
+    split: CachePadded<SplitWalk>,
+}
+
+/// The UNSAFE split walk's switch and the index snapshot its walks read.
+struct SplitWalk {
+    on: AtomicBool,
+    snapshot: ArcSwapOption<SplitSnapshot>,
+}
+
+/// The trunk's two reclamation indexes as they were when the split walk was turned on.
+struct SplitSnapshot {
+    by_born: BTreeSet<(u64, u32, u64)>,
+    by_died: BTreeSet<(u64, u32, u64)>,
+}
+
+thread_local! {
+    /// This thread's split-walk counts (see [`SplitWalkCounts`]).
+    static SPLIT_COUNTS: std::cell::Cell<SplitWalkCounts> = const {
+        std::cell::Cell::new(SplitWalkCounts {
+            walks: 0,
+            range_entries: 0,
+            walk_ns: 0,
+            candidates: 0,
+            frees: 0,
+            misses: 0,
+        })
+    };
+}
+
+pub(crate) fn take_split_walk_counts() -> SplitWalkCounts {
+    SPLIT_COUNTS.with(|c| c.replace(SplitWalkCounts::default()))
 }
 
 /// One stripe of the branch map.
@@ -229,6 +262,8 @@ impl Counted for TrunkInner {
 struct Held<'a, T: Counted> {
     guard: MutexGuard<'a, T>,
     since: Option<Instant>,
+    /// Nanoseconds this acquisition waited, if it found the lock held.
+    waited: Option<u64>,
 }
 
 impl<T: Counted> Deref for Held<'_, T> {
@@ -268,12 +303,30 @@ fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
     };
     let work = guard.work();
     work.lock_acquisitions += 1;
+    let waited = waited.map(|w| w.as_nanos() as u64);
     if let Some(waited) = waited {
         work.lock_contended += 1;
-        work.lock_wait_ns += waited.as_nanos() as u64;
+        work.lock_wait_ns += waited;
     }
     let since = timed.then(Instant::now);
-    Held { guard, since }
+    Held {
+        guard,
+        since,
+        waited,
+    }
+}
+
+/// Count one acquisition of the trunk's lock by a reap into `work`: `since` and `waited` are the
+/// acquisition's own (see [`Held`]), and the hold runs to this call.
+fn count_reap(work: &mut BranchWork, since: Option<Instant>, waited: Option<u64>) {
+    work.reap_trunk_acquisitions += 1;
+    if let Some(waited) = waited {
+        work.reap_trunk_contended += 1;
+        work.reap_trunk_wait_ns += waited;
+    }
+    if let Some(since) = since {
+        work.reap_trunk_hold_ns += since.elapsed().as_nanos() as u64;
+    }
 }
 
 /// One arena domain: a shard's pages, or the trunk's retained versions. Slots it hands out carry
@@ -543,13 +596,64 @@ impl Lineage {
     }
 
     /// Detach the child forked at `f` and release every retained version that only it could see.
-    fn child_gone(&mut self, f: u64, arena: &mut Domain, work: &mut BranchWork) -> usize {
+    /// `since` is when the caller took the lock this lineage lives under, if lock timing is on; the
+    /// three steps are then timed into `work` (see [`BranchWork::gc_walk_ns`]).
+    fn child_gone(
+        &mut self,
+        f: u64,
+        arena: &mut Domain,
+        work: &mut BranchWork,
+        since: Option<Instant>,
+    ) -> usize {
+        let (lo, hi) = self.detach(f);
+        let walk_from = since.map(|since| {
+            let now = Instant::now();
+            work.gc_probe_ns += (now - since).as_nanos() as u64;
+            now
+        });
+        let dead = self.garbage(f, lo, hi, work);
+        let free_from = walk_from.map(|from| {
+            let now = Instant::now();
+            work.gc_walk_ns += (now - from).as_nanos() as u64;
+            now
+        });
+        let (freed, _) = self.release(&dead, arena, work, false);
+        if let Some(from) = free_from {
+            work.gc_free_ns += from.elapsed().as_nanos() as u64;
+        }
+        freed
+    }
+
+    /// Remove the child forked at `f` from `children`, and return its former neighbours there.
+    fn detach(&mut self, f: u64) -> (Option<u64>, Option<u64>) {
         let removed = self.children.remove(&f);
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
-        let dead = self.garbage(f, lo, hi, work);
-        for &(born, page, died) in &dead {
+        (lo, hi)
+    }
+
+    /// Release `dead`, retained versions as `(born, page, died)`, and return how many were released
+    /// and how many were no longer listed. Only the split walk passes `skip_missing` (its snapshot
+    /// can name a version another reap has since released); otherwise a missing one is a broken index.
+    fn release(
+        &mut self,
+        dead: &[(u64, u32, u64)],
+        arena: &mut Domain,
+        work: &mut BranchWork,
+        skip_missing: bool,
+    ) -> (usize, usize) {
+        let (mut freed, mut missing) = (0, 0);
+        for &(born, page, died) in dead {
+            if skip_missing
+                && !self
+                    .retained
+                    .get(&page)
+                    .is_some_and(|versions| versions.contains_key(&born))
+            {
+                missing += 1;
+                continue;
+            }
             let versions = self.retained.get_mut(&page).expect("indexed version is listed");
             let v = versions.remove(&born).expect("indexed version is listed");
             work.gc_examined += 1;
@@ -560,8 +664,9 @@ impl Lineage {
                 && self.by_died.remove(&(died, page, born));
             crate::turso_assert!(indexed, "a released version was missing from an index");
             arena.release(v.slot);
+            freed += 1;
         }
-        dead.len()
+        (freed, missing)
     }
 
     /// The versions that held `f` and no other live child, as `(born, page, died)`, once `f` has
@@ -589,52 +694,7 @@ impl Lineage {
         hi: Option<u64>,
         work: &mut BranchWork,
     ) -> Vec<(u64, u32, u64)> {
-        // `born` in (lo, f] and `died` in (f, hi], as bounds on the two indexes' first field.
-        let after = |e: u64| (e, NO_PAGE, u64::MAX);
-        let born_from = lo.map_or(Bound::Unbounded, |lo| Bound::Excluded(after(lo)));
-        let born_to = Bound::Included(after(f));
-        let died_from = Bound::Excluded(after(f));
-        let died_to = hi.map_or(Bound::Unbounded, |hi| Bound::Included(after(hi)));
-        let only_f = |born: u64, died: u64| {
-            lo.is_none_or(|lo| born > lo)
-                && born <= f
-                && f < died
-                && hi.is_none_or(|hi| died <= hi)
-        };
-        let mut by_born = self.by_born.range((born_from, born_to));
-        let mut by_died = self
-            .by_died
-            .range((died_from, died_to))
-            .map(|&(died, page, born)| (born, page, died));
-        let mut seen: [Vec<(u64, u32, u64)>; 2] = Default::default();
-        // Which ranges to walk: the one side's own range when a neighbour is missing, else both.
-        let walk = match (lo, hi) {
-            (None, _) => [false, true],
-            (Some(_), None) => [true, false],
-            (Some(_), Some(_)) => [true, true],
-        };
-        let finished = 'walk: loop {
-            for side in 0..2 {
-                if !walk[side] {
-                    continue;
-                }
-                let next = if side == 0 {
-                    by_born.next().copied()
-                } else {
-                    by_died.next()
-                };
-                match next {
-                    Some(v) => {
-                        work.gc_range_entries += 1;
-                        seen[side].push(v);
-                    }
-                    None => break 'walk side,
-                }
-            }
-        };
-        let mut dead = std::mem::take(&mut seen[finished]);
-        dead.retain(|&(born, _, died)| only_f(born, died));
-        dead
+        garbage_in(&self.by_born, &self.by_died, f, lo, hi, &mut work.gc_range_entries)
     }
 
     fn release_all(self, arena: &mut Domain) -> Vec<Slot> {
@@ -647,6 +707,63 @@ impl Lineage {
         }
         slots
     }
+}
+
+/// [`Lineage::garbage`] over the two indexes given, counting every entry either range yields into
+/// `entries`. The UNSAFE split walk calls it on a snapshot, outside the trunk's lock.
+fn garbage_in(
+    by_born: &BTreeSet<(u64, u32, u64)>,
+    by_died: &BTreeSet<(u64, u32, u64)>,
+    f: u64,
+    lo: Option<u64>,
+    hi: Option<u64>,
+    entries: &mut u64,
+) -> Vec<(u64, u32, u64)> {
+    // `born` in (lo, f] and `died` in (f, hi], as bounds on the two indexes' first field.
+    let after = |e: u64| (e, NO_PAGE, u64::MAX);
+    let born_from = lo.map_or(Bound::Unbounded, |lo| Bound::Excluded(after(lo)));
+    let born_to = Bound::Included(after(f));
+    let died_from = Bound::Excluded(after(f));
+    let died_to = hi.map_or(Bound::Unbounded, |hi| Bound::Included(after(hi)));
+    let only_f = |born: u64, died: u64| {
+        lo.is_none_or(|lo| born > lo)
+            && born <= f
+            && f < died
+            && hi.is_none_or(|hi| died <= hi)
+    };
+    let mut by_born = by_born.range((born_from, born_to));
+    let mut by_died = by_died
+        .range((died_from, died_to))
+        .map(|&(died, page, born)| (born, page, died));
+    let mut seen: [Vec<(u64, u32, u64)>; 2] = Default::default();
+    // Which ranges to walk: the one side's own range when a neighbour is missing, else both.
+    let walk = match (lo, hi) {
+        (None, _) => [false, true],
+        (Some(_), None) => [true, false],
+        (Some(_), Some(_)) => [true, true],
+    };
+    let finished = 'walk: loop {
+        for side in 0..2 {
+            if !walk[side] {
+                continue;
+            }
+            let next = if side == 0 {
+                by_born.next().copied()
+            } else {
+                by_died.next()
+            };
+            match next {
+                Some(v) => {
+                    *entries += 1;
+                    seen[side].push(v);
+                }
+                None => break 'walk side,
+            }
+        }
+    };
+    let mut dead = std::mem::take(&mut seen[finished]);
+    dead.retain(|&(born, _, died)| only_f(born, died));
+    dead
 }
 
 fn gone(id: BranchId) -> LimboError {
@@ -680,6 +797,10 @@ impl BranchStore {
             live: AtomicUsize::new(0),
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
+            split: CachePadded::new(SplitWalk {
+                on: AtomicBool::new(false),
+                snapshot: ArcSwapOption::empty(),
+            }),
         }
     }
 
@@ -699,6 +820,51 @@ impl BranchStore {
     /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
     pub(crate) fn set_lock_timing(&self, on: bool) {
         self.lock_timing.store(on, Ordering::Relaxed);
+    }
+
+    /// ⚠ UNSAFE, a measurement control: turn the split walk on or off (see
+    /// [`crate::Database::set_branch_unsafe_split_walk`]). On, a reap of a trunk child detaches it
+    /// and probes its neighbours under the trunk's lock, walks for garbage WITHOUT the lock over the
+    /// snapshot taken here, and frees what it found under the lock again. The walk is exact only if
+    /// every version a garbage query can return is in the snapshot, i.e. nothing is retained after
+    /// it is taken; `first_write_trunk` refuses a retain while it is on. Turn it on and off only
+    /// while no reap is in flight.
+    pub(crate) fn set_unsafe_split_walk(&self, on: bool) {
+        let trunk = self.trunk();
+        if on {
+            let snapshot = SplitSnapshot {
+                by_born: trunk.lineage.by_born.clone(),
+                by_died: trunk.lineage.by_died.clone(),
+            };
+            self.split
+                .snapshot
+                .store(Some(std::sync::Arc::new(snapshot)));
+            self.split.on.store(true, Ordering::Release);
+        } else {
+            self.split.on.store(false, Ordering::Release);
+            self.split.snapshot.store(None);
+        }
+    }
+
+    /// Every retained version of the trunk checked against its live children (see [`TrunkAudit`]).
+    pub(crate) fn audit_trunk(&self) -> TrunkAudit {
+        let trunk = self.trunk();
+        let lineage = &trunk.lineage;
+        let mut audit = TrunkAudit {
+            children: lineage.children.len(),
+            by_born: lineage.by_born.len(),
+            by_died: lineage.by_died.len(),
+            ..TrunkAudit::default()
+        };
+        for versions in lineage.retained.values() {
+            for v in versions.values() {
+                audit.versions += 1;
+                if !lineage.has_child_in(v.born, v.died) {
+                    audit.leaked += 1;
+                }
+            }
+        }
+        audit
     }
 
     fn page_size(&self) -> usize {
@@ -962,6 +1128,11 @@ impl BranchStore {
             return;
         }
         if lineage.has_child_in(born, epoch) {
+            crate::turso_assert!(
+                !self.split.on.load(Ordering::Acquire),
+                "the UNSAFE split walk is on: a trunk version was retained that the reaps' index \
+                 snapshot does not hold"
+            );
             let slot = domain.alloc(self.page_size());
             domain.page_mut(slot).copy_from_slice(pre_image);
             lineage.retain(
@@ -1175,22 +1346,24 @@ impl BranchStore {
             freed += st.lineage.release_all(domain).len();
             drop(shard);
             if st.parent.is_trunk() {
+                if self.split.on.load(Ordering::Acquire) {
+                    freed += self.reap_split(st.fork_epoch);
+                    return (freed, true);
+                }
                 let mut trunk = self.trunk();
+                let (since, waited) = (trunk.since, trunk.waited);
                 let TrunkInner {
                     lineage,
                     domain,
                     work,
                 } = &mut *trunk;
-                freed += lineage.child_gone(st.fork_epoch, domain, work);
-                if self.trunk_children.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    // From here the trunk writes without telling the store, so no cached version
-                    // can be trusted once a branch exists again. No branch can read in between: a
-                    // fork needs this lock.
-                    self.trunk_pages.generation.fetch_add(1, Ordering::AcqRel);
-                }
+                freed += lineage.child_gone(st.fork_epoch, domain, work, since);
+                self.trunk_child_gone();
+                count_reap(work, since, waited);
                 return (freed, true);
             }
             shard = self.shard(st.parent);
+            let since = shard.since;
             let Shard {
                 branches,
                 domain,
@@ -1199,9 +1372,82 @@ impl BranchStore {
             let parent = branches
                 .get_mut(&st.parent)
                 .expect("a live branch's parent is kept while the branch lives");
-            freed += parent.lineage.child_gone(st.fork_epoch, domain, work);
+            freed += parent.lineage.child_gone(st.fork_epoch, domain, work, since);
             at = st.parent;
         }
+    }
+}
+
+impl BranchStore {
+    /// The trunk has one child fewer. Called under the trunk's lock, after the child is detached.
+    fn trunk_child_gone(&self) {
+        if self.trunk_children.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // From here the trunk writes without telling the store, so no cached version can be
+            // trusted once a branch exists again. No branch can read in between: a fork needs this
+            // lock.
+            self.trunk_pages.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// ⚠ UNSAFE (see [`Self::set_unsafe_split_walk`]): the trunk's side of a reap with the garbage
+    /// walk outside the trunk's lock. Returns the versions freed.
+    ///
+    /// Detaching the child and probing its neighbours stay one critical section, so of two reaps the
+    /// second sees the first's child gone: the pair a concurrent children index would break (K6).
+    /// The walk then reads the snapshot, which holds every version live at the detach because
+    /// nothing has been retained since it was taken; `only_f` against the neighbours at the detach
+    /// passes only versions that held this child and no other then, so no live child can need them,
+    /// and each is freed by exactly one reap. A candidate already gone is counted, not freed.
+    fn reap_split(&self, f: u64) -> usize {
+        let (lo, hi) = {
+            let mut trunk = self.trunk();
+            let (since, waited) = (trunk.since, trunk.waited);
+            let TrunkInner { lineage, work, .. } = &mut *trunk;
+            let (lo, hi) = lineage.detach(f);
+            if let Some(since) = since {
+                work.gc_probe_ns += since.elapsed().as_nanos() as u64;
+            }
+            self.trunk_child_gone();
+            count_reap(work, since, waited);
+            (lo, hi)
+        };
+        let snapshot = self.split.snapshot.load();
+        let snapshot = snapshot
+            .as_ref()
+            .expect("the split walk is on only while its snapshot is installed");
+        let mut counts = SPLIT_COUNTS.with(|c| c.get());
+        let start = Instant::now();
+        let dead = garbage_in(
+            &snapshot.by_born,
+            &snapshot.by_died,
+            f,
+            lo,
+            hi,
+            &mut counts.range_entries,
+        );
+        counts.walk_ns += start.elapsed().as_nanos() as u64;
+        counts.walks += 1;
+        counts.candidates += dead.len() as u64;
+        let mut freed = 0;
+        if !dead.is_empty() {
+            counts.frees += 1;
+            let mut trunk = self.trunk();
+            let (since, waited) = (trunk.since, trunk.waited);
+            let TrunkInner {
+                lineage,
+                domain,
+                work,
+            } = &mut *trunk;
+            let (released, missing) = lineage.release(&dead, domain, work, true);
+            if let Some(since) = since {
+                work.gc_free_ns += since.elapsed().as_nanos() as u64;
+            }
+            count_reap(work, since, waited);
+            freed = released;
+            counts.misses += missing as u64;
+        }
+        SPLIT_COUNTS.with(|c| c.set(counts));
+        freed
     }
 }
 
@@ -1826,5 +2072,225 @@ mod tests {
             store.release_handle(id);
         }
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
+    }
+
+    /// K6 (r11-fix-interactions): F2 is exact only while a reap's detach and its neighbour probe are
+    /// one critical section. Replayed here on two adjacent children holding one version: each probes
+    /// the other as its neighbour before either is detached, so neither walk returns the version,
+    /// and the audit must report exactly it as leaked. The same shape reaped through the store must
+    /// leave nothing leaked at any point.
+    #[test]
+    fn the_audit_reports_k6s_leak_replayed_and_nothing_after_ordinary_reaps() {
+        let store = BranchStore::new();
+        let a = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        let b = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        // Epoch 2: page 0 has never been written, so it retains [0, 2), which a (0) and b (1) hold.
+        store.first_write_trunk(0, &image(0));
+        let audit = store.audit_trunk();
+        assert_eq!(
+            (audit.children, audit.versions, audit.by_born, audit.by_died, audit.leaked),
+            (2, 1, 1, 1, 0)
+        );
+        store.release_handle(a);
+        let audit = store.audit_trunk();
+        assert_eq!((audit.children, audit.versions, audit.leaked), (1, 1, 0), "b still holds it");
+        store.release_handle(b);
+        let audit = store.audit_trunk();
+        assert_eq!((audit.children, audit.versions, audit.leaked), (0, 0, 0));
+        assert_eq!(store.stats().arena_slots_in_use, 0);
+
+        let store = BranchStore::new();
+        let _a = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        let _b = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        store.first_write_trunk(0, &image(0));
+        let mut trunk = store.trunk();
+        let TrunkInner {
+            lineage,
+            domain,
+            work,
+        } = &mut *trunk;
+        // Both probe before either detaches: a sees (none, 1), b sees (0, none).
+        lineage.children.remove(&0);
+        lineage.children.remove(&1);
+        let dead_a = lineage.garbage(0, None, Some(1), work);
+        let dead_b = lineage.garbage(1, Some(0), None, work);
+        assert!(dead_a.is_empty() && dead_b.is_empty(), "the replay did not lose the version");
+        lineage.release(&dead_a, domain, work, false);
+        lineage.release(&dead_b, domain, work, false);
+        drop(trunk);
+        let audit = store.audit_trunk();
+        assert_eq!((audit.children, audit.versions, audit.leaked), (0, 1, 1), "{audit:?}");
+    }
+
+    /// The reap's lock accounting: every reap of a trunk child takes the trunk's lock exactly once,
+    /// and is counted as a reap acquisition; with timing off nothing is timed, and with it on the
+    /// three steps of `child_gone` fit inside the hold they were timed within.
+    #[test]
+    fn a_trunk_reap_counts_one_trunk_acquisition_and_times_its_steps_only_when_timed() {
+        let store = BranchStore::new();
+        let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut ids = Vec::new();
+        for i in 0..200u64 {
+            ids.push(store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap());
+            let page = (i % u64::from(PAGES)) as u32;
+            store.first_write_trunk(page, &image(current[&page]));
+            current.insert(page, i + 1);
+        }
+        let reap = |ids: &[BranchId]| {
+            let before = store.stats().work;
+            let mut freed = 0;
+            for &id in ids {
+                freed += store.release_handle(id).freed_pages;
+            }
+            let after = store.stats().work;
+            (before, after, freed)
+        };
+        let (before, after, freed_off) = reap(&ids[..100]);
+        assert_eq!(after.reap_trunk_acquisitions - before.reap_trunk_acquisitions, 100);
+        assert_eq!(after.trunk_lock_acquisitions - before.trunk_lock_acquisitions, 101);
+        assert_eq!(
+            (
+                after.reap_trunk_hold_ns,
+                after.gc_probe_ns,
+                after.gc_walk_ns,
+                after.gc_free_ns
+            ),
+            (0, 0, 0, 0),
+            "timing off: nothing timed"
+        );
+        store.set_lock_timing(true);
+        let (before, after, freed_on) = reap(&ids[100..]);
+        assert_eq!(after.reap_trunk_acquisitions - before.reap_trunk_acquisitions, 100);
+        assert_eq!(after.trunk_lock_acquisitions - before.trunk_lock_acquisitions, 101);
+        let steps = after.gc_probe_ns + after.gc_walk_ns + after.gc_free_ns;
+        assert!(
+            steps > 0 && steps <= after.reap_trunk_hold_ns,
+            "steps {steps} ns against a hold of {} ns",
+            after.reap_trunk_hold_ns
+        );
+        assert!(freed_off + freed_on > 0, "no reap freed a version: the walk was never exercised");
+        assert_eq!(store.stats().arena_slots_in_use, 0);
+    }
+
+    /// ⚠ The UNSAFE split walk refuses the one thing that would make it wrong: a retain while its
+    /// snapshot is installed.
+    #[test]
+    #[should_panic(expected = "UNSAFE split walk is on")]
+    fn the_split_walk_refuses_a_retain() {
+        let store = BranchStore::new();
+        let _a = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        store.set_unsafe_split_walk(true);
+        store.first_write_trunk(0, &image(0));
+    }
+
+    /// Reaps of trunk children from four threads at once, many of them adjacent, in the ordinary
+    /// serialized reap and in the UNSAFE split walk: afterwards the arena must hold exactly the
+    /// versions whose `[born, died)` still holds a surviving child's fork epoch (the brute-force
+    /// model), the audit must find no leak, every survivor must read every page as of its fork, and
+    /// the split walk must have walked once per reap, freed through its locked step, and missed
+    /// nothing.
+    #[test]
+    fn concurrent_trunk_reaps_free_exactly_the_model_serialized_and_split() {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            reap_concurrently(false, seed);
+            reap_concurrently(true, seed);
+        }
+    }
+
+    fn reap_concurrently(split: bool, seed: u64) {
+        const CHILDREN: u64 = 2_000;
+        const THREADS: u64 = 4;
+        const REAPS: usize = 300;
+        let store = Arc::new(BranchStore::new());
+        let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut written: HashMap<u32, u64> = HashMap::new();
+        let mut history: Vec<(u32, u64, u64)> = Vec::new();
+        // (id, fork epoch, the trunk's pages at the fork)
+        let mut live: Vec<(BranchId, u64, HashMap<u32, u64>)> = Vec::new();
+        for i in 0..CHILDREN {
+            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+            live.push((id, i, current.clone()));
+            let epoch = i + 1;
+            let page = (i % u64::from(PAGES)) as u32;
+            let born = written.get(&page).copied().unwrap_or(0);
+            if live.iter().any(|&(_, f, _)| born <= f && f < epoch) {
+                history.push((page, born, epoch));
+            }
+            written.insert(page, epoch);
+            store.first_write_trunk(page, &image(current[&page]));
+            current.insert(page, i + 1);
+        }
+        assert_eq!(store.stats().arena_slots_in_use, history.len());
+        if split {
+            store.set_unsafe_split_walk(true);
+        }
+        let mut shares: Vec<Vec<(BranchId, u64, HashMap<u32, u64>)>> =
+            (0..THREADS).map(|_| Vec::new()).collect();
+        for (i, child) in live.into_iter().enumerate() {
+            shares[i % THREADS as usize].push(child);
+        }
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS as usize));
+        let handles: Vec<_> = shares
+            .into_iter()
+            .enumerate()
+            .map(|(t, mut share)| {
+                let (store, barrier) = (store.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let mut rng = Rng(seed ^ ((t as u64 + 1) * 0xD1B5_4A32_D192_ED03));
+                    let mut freed = 0;
+                    barrier.wait();
+                    for _ in 0..REAPS {
+                        let at = rng.below(share.len() as u64) as usize;
+                        let reaped = store.release_handle(share.swap_remove(at).0);
+                        assert!(!reaped.deferred);
+                        freed += reaped.freed_pages;
+                    }
+                    (share, freed, super::take_split_walk_counts())
+                })
+            })
+            .collect();
+        let (mut survivors, mut freed, mut counts) = (Vec::new(), 0, SplitWalkCounts::default());
+        for h in handles {
+            let (share, f, c) = h.join().unwrap();
+            survivors.extend(share);
+            freed += f;
+            counts.walks += c.walks;
+            counts.candidates += c.candidates;
+            counts.frees += c.frees;
+            counts.misses += c.misses;
+        }
+        if split {
+            store.set_unsafe_split_walk(false);
+        }
+        let alive = history
+            .iter()
+            .filter(|&&(_, born, died)| survivors.iter().any(|&(_, f, _)| born <= f && f < died))
+            .count();
+        let label = format!("seed {seed:#x} split {split}");
+        assert_eq!(store.stats().arena_slots_in_use, alive, "{label}: not the model's versions");
+        assert_eq!(freed, history.len() - alive, "{label}: the reaps' reports disagree");
+        assert!(freed > 0, "{label}: no reap freed a version");
+        let audit = store.audit_trunk();
+        assert_eq!((audit.leaked, audit.versions), (0, alive), "{label}: {audit:?}");
+        if split {
+            assert_eq!(counts.walks, THREADS * REAPS as u64, "{label}: {counts:?}");
+            assert!(counts.frees > 0 && counts.misses == 0, "{label}: {counts:?}");
+        } else {
+            assert_eq!(counts, SplitWalkCounts::default(), "{label}: split counts without the split");
+        }
+        let mut buf = vec![0u8; PAGE];
+        for (id, f, view) in &survivors {
+            for page in 0..PAGES {
+                let got = match store.resolve_into(*id, page, &mut buf).unwrap() {
+                    Resolved::Filled => u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                    Resolved::Trunk(_) => current[&page],
+                };
+                assert_eq!(got, view[&page], "{label}: child {f} read the wrong page {page}");
+            }
+        }
+        for (id, _, _) in survivors {
+            store.release_handle(id);
+        }
+        assert_eq!(store.stats().arena_slots_in_use, 0, "{label}: versions leaked at teardown");
     }
 }
