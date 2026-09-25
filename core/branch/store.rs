@@ -2,12 +2,14 @@
 //!
 //! # The model
 //!
-//! Every node in the branch tree — the trunk and each branch — carries an `epoch` that its own
-//! forks advance: a child forked from a node records the node's epoch at that moment as its
-//! `fork_epoch`, and the node's epoch then increments. A version of a page that a node wrote in
-//! epoch `born` is visible to that node's children forked at any epoch `>= born`, until the node
-//! overwrites it in epoch `died`; after that it is visible only to children forked in
-//! `[born, died)`. A branch therefore sees, for each page:
+//! Every fork, of the trunk or of any branch, takes the next value `f` of one store-wide clock: the
+//! child records `f` as its `fork_epoch`, and the parent's `epoch` (the epoch its next write is born
+//! in) becomes `f + 1`, as does the child's. Per node, fork epochs therefore strictly increase, which
+//! is all the rules below use; one clock for every node is what lets a splice (see "Reclamation")
+//! move versions between a node and its child without rewriting a single epoch. A version of a page
+//! that a node wrote in epoch `born` is visible to that node's children forked at any epoch
+//! `>= born`, until the node overwrites it in epoch `died`; after that it is visible only to
+//! children forked in `[born, died)`. A branch therefore sees, for each page:
 //!
 //! 1. its own current version, if it has written the page; else
 //! 2. its parent's version at the branch's `fork_epoch` — the parent's current version if it was
@@ -56,9 +58,34 @@
 //! * with both, each range also holds survivors, and the two are walked in lockstep until the
 //!   shorter one ends (see [`Lineage::garbage`]).
 //!
-//! A branch whose handle has been dropped but that still has a live child or an open connection
-//! is kept (its versions are still read through); it is freed the moment the last of those goes,
-//! and freeing it may in turn free its parent.
+//! A branch whose handle has been dropped but that still has an open connection, or two or more
+//! kept children, is kept (its versions are still read through); it is freed the moment the last of
+//! those goes, and freeing it may in turn free its parent.
+//!
+//! # Splicing a zombie out — the chain collapse
+//!
+//! A branch whose handle has gone, with no open connection and exactly ONE kept child `c`, is
+//! spliced out instead of kept: `c` takes its place under its parent, at the same fork epoch, and
+//! inherits the versions it was reading through it. Without this, every branch an agent forked from
+//! and then dropped stayed resident for as long as any descendant lived, so a workload that forks
+//! from its newest branch and expires its oldest kept every branch it ever created (lane r11-ever).
+//! It is the chain collapse of QEMU's `block-stream` / `block-commit` and of ZFS's `zfs promote`
+//! (whose `zfs destroy -d` is the deferral this replaces):
+//!
+//! 1. the zombie's versions born after `c`'s fork are invisible to `c` and are freed (a range of
+//!    `current_by_born`);
+//! 2. each of its retained versions holds `c`'s fork epoch (`c` is its only child), so it is what `c`
+//!    reads of that page and becomes the zombie's current version of it;
+//! 3. what remains is exactly what `c` reads through `inherited`. It is merged into `c`'s own
+//!    versions by iterating the SMALLER of the two `current` maps and probing the larger (union by
+//!    size; `block-stream` moves the base into the top, `block-commit` the top into the base), and
+//!    the merged map is moved into `c` by swap. A zombie version of a page `c` has written is kept as
+//!    a retained version of `c`, `[born, c's first own version)`, if a child of `c` forked inside
+//!    that range, and freed otherwise. The clock is shared, so every zombie version is born before
+//!    every epoch of `c` and no key changes.
+//!
+//! After every store call, every zombie has at least two kept children, so the kept states number at
+//! most twice the live ones.
 //!
 //! # What this does not do
 //!
@@ -106,6 +133,8 @@ pub(crate) struct BranchStore {
 struct StoreInner {
     arena: Option<Arena>,
     next_id: u64,
+    /// The store-wide fork clock: the next fork's epoch (see "The model").
+    clock: u64,
     trunk: TrunkState,
     branches: HashMap<BranchId, BranchState>,
     /// Observation only; see [`BranchWork`].
@@ -114,7 +143,8 @@ struct StoreInner {
 
 #[derive(Default)]
 struct Lineage {
-    /// Advanced by each fork of this node; the pre-increment value is the child's fork epoch.
+    /// The epoch this node's next write is born in: one past its latest fork epoch (or past its own
+    /// fork epoch before it has forked).
     epoch: u64,
     /// Live children by fork epoch. Fork epochs are unique within a parent.
     children: BTreeMap<u64, BranchId>,
@@ -150,8 +180,11 @@ struct BranchState {
     parent: BranchId,
     fork_epoch: u64,
     lineage: Lineage,
-    /// The branch's current version of every page it has written.
+    /// The branch's current version of every page it has written, or read through a spliced-out
+    /// ancestor (see "Splicing a zombie out").
     current: HashMap<u32, Owned>,
+    /// `current` as `(born, page)`, so the versions born after a given epoch are a range.
+    current_by_born: BTreeSet<(u64, u32)>,
     /// The branch's committed schema. Shared with the parent at fork (an `Arc` clone), replaced by
     /// a committed DDL on the branch.
     schema: Arc<Schema>,
@@ -185,12 +218,20 @@ impl Lineage {
 
     fn retain(&mut self, page: u32, v: Retained) {
         let versions = self.retained.entry(page).or_default();
+        // A splice can retain a version OLDER than the ones already kept, so both neighbours are
+        // checked: the predecessor must die by `v.born`, the successor be born at `v.died` or later.
         crate::turso_assert!(
-            versions
-                .last_key_value()
-                .is_none_or(|(_, last)| last.died <= v.born),
-            "a retained version overlaps an older one of the same page; the born-ordered lookup \
-             would return the wrong one"
+            v.born < v.died
+                && versions
+                    .range(..=v.born)
+                    .next_back()
+                    .is_none_or(|(_, prev)| prev.died <= v.born && prev.born != v.born)
+                && versions
+                    .range(v.born..)
+                    .next()
+                    .is_none_or(|(_, next)| v.died <= next.born),
+            "a retained version overlaps another of the same page; the born-ordered lookup would \
+             return the wrong one"
         );
         crate::turso_assert!(page != NO_PAGE, "page number u32::MAX is the index sentinel");
         versions.insert(v.born, v);
@@ -324,6 +365,7 @@ impl BranchStore {
             inner: Mutex::new(StoreInner {
                 arena: None,
                 next_id: 1,
+                clock: 0,
                 trunk: TrunkState {
                     lineage: Lineage::default(),
                     written: HashMap::new(),
@@ -362,8 +404,9 @@ impl BranchStore {
         }
         let id = BranchId(inner.next_id);
         inner.next_id += 1;
-        let f = inner.trunk.lineage.epoch;
-        inner.trunk.lineage.epoch += 1;
+        let f = inner.clock;
+        inner.clock += 1;
+        inner.trunk.lineage.epoch = f + 1;
         inner.trunk.lineage.children.insert(f, id);
         inner.branches.insert(
             id,
@@ -378,12 +421,12 @@ impl BranchStore {
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         let mut inner = self.inner.lock();
         let id = BranchId(inner.next_id);
+        let f = inner.clock;
         let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
             return Err(LimboError::Busy);
         }
-        let f = st.lineage.epoch;
-        st.lineage.epoch += 1;
+        st.lineage.epoch = f + 1;
         st.lineage.children.insert(f, id);
         let schema = st.schema.clone();
         let (current, inherited) = (&st.current, &st.inherited);
@@ -399,6 +442,7 @@ impl BranchStore {
             .clone();
         let trunk_at = st.trunk_at;
         inner.next_id += 1;
+        inner.clock += 1;
         inner
             .branches
             .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
@@ -443,10 +487,11 @@ impl BranchStore {
             };
         };
         st.handle = false;
-        let freed_pages = self.collect(&mut inner, id);
+        let (freed_pages, spliced) = self.collect(&mut inner, id);
         Reaped {
             freed_pages,
-            deferred: inner.branches.contains_key(&id),
+            // A spliced branch's versions live on in its child, freed when that child goes.
+            deferred: spliced || inner.branches.contains_key(&id),
         }
     }
 
@@ -499,7 +544,7 @@ impl BranchStore {
             None => {
                 let slot = arena.alloc();
                 arena.page_mut(slot).copy_from_slice(pre_image);
-                st.current.insert(page, Owned { slot, born: epoch });
+                st.set_current(page, Owned { slot, born: epoch });
                 if let Some(view) = st.view.as_mut() {
                     view.insert(page, slot);
                 }
@@ -517,14 +562,14 @@ impl BranchStore {
                             slot: owned.slot,
                         },
                     );
-                    st.current.insert(page, Owned { slot, born: epoch });
+                    st.set_current(page, Owned { slot, born: epoch });
                     if let Some(view) = st.view.as_mut() {
                         view.insert(page, slot);
                     }
                 } else {
                     // No live child can see the current version: it is rewritten in its own slot,
                     // which is already the one `view` names.
-                    st.current.insert(
+                    st.set_current(
                         page,
                         Owned {
                             slot: owned.slot,
@@ -666,6 +711,7 @@ impl BranchStore {
                 || st.lineage.retained.values().map(|v| v.len()).sum::<usize>()
                     != st.lineage.by_born.len();
             r.branch_current_pages += st.current.len();
+            index_mismatch |= st.current_by_born.len() != st.current.len();
             st.inherited.count_nodes(&mut nodes);
             if let Some(view) = &st.view {
                 r.views += 1;
@@ -715,15 +761,26 @@ impl BranchStore {
     }
 
     /// Free `id` if nothing can reach it any more, then its parent if that freed the parent's last
-    /// reason to exist. Returns the number of arena pages released.
-    fn collect(&self, inner: &mut StoreInner, mut id: BranchId) -> usize {
+    /// reason to exist; a state left with no handle, no connection and exactly one kept child is
+    /// spliced out instead (see "Splicing a zombie out"). Returns the number of arena pages released,
+    /// and whether `id` itself was spliced.
+    fn collect(&self, inner: &mut StoreInner, mut id: BranchId) -> (usize, bool) {
         let mut freed = 0;
+        let first = id;
         loop {
             let Some(st) = inner.branches.get(&id) else {
-                return freed;
+                return (freed, false);
             };
-            if st.handle || st.open || !st.lineage.children.is_empty() {
-                return freed;
+            if st.handle || st.open {
+                return (freed, false);
+            }
+            match st.lineage.children.len() {
+                0 => {}
+                1 => {
+                    freed += inner.splice(id);
+                    return (freed, id == first);
+                }
+                _ => return (freed, false),
             }
             let st = inner.branches.remove(&id).expect("just looked it up");
             let StoreInner {
@@ -742,7 +799,7 @@ impl BranchStore {
             if st.parent.is_trunk() {
                 freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
-                return freed;
+                return (freed, false);
             }
             let parent = branches
                 .get_mut(&st.parent)
@@ -754,6 +811,149 @@ impl BranchStore {
 }
 
 impl StoreInner {
+    /// Splice the zombie `zid` (no handle, no connection, exactly one kept child) out of the tree:
+    /// its child takes its place and inherits the versions it reads through it (see "Splicing a
+    /// zombie out"). Returns the arena pages freed.
+    fn splice(&mut self, zid: BranchId) -> usize {
+        let StoreInner {
+            arena,
+            trunk,
+            branches,
+            work,
+            ..
+        } = self;
+        let arena = arena.as_mut().expect("a branch exists, so the arena does");
+        let mut z = branches.remove(&zid).expect("the zombie is kept");
+        crate::turso_assert!(
+            !z.handle && !z.open && z.lineage.children.len() == 1,
+            "spliced a branch that is not a zombie with one child"
+        );
+        let (&f, &cid) = z.lineage.children.iter().next().expect("one child");
+        let mut freed = 0;
+        let mut visited = 0u64;
+        // 1. Versions born after the child's fork: the child cannot see them.
+        let later: Vec<(u64, u32)> = z
+            .current_by_born
+            .range((f + 1, 0)..)
+            .copied()
+            .collect();
+        for (born, page) in later {
+            let owned = z.current.remove(&page).expect("indexed current version");
+            z.current_by_born.remove(&(born, page));
+            arena.release(owned.slot);
+            freed += 1;
+            visited += 1;
+        }
+        // 2. Every retained version holds `f` (the child is the only one left), at most one per
+        //    page: it is what the child reads of that page.
+        let retained = std::mem::take(&mut z.lineage.retained);
+        z.lineage.by_born.clear();
+        z.lineage.by_died.clear();
+        for (page, versions) in retained {
+            crate::turso_assert!(versions.len() == 1, "two retained versions hold one fork epoch");
+            let v = versions.into_values().next().expect("one version");
+            crate::turso_assert!(
+                v.born <= f && f < v.died && !z.current.contains_key(&page),
+                "a zombie's retained version does not hold its only child's fork epoch"
+            );
+            z.set_current(
+                page,
+                Owned {
+                    slot: v.slot,
+                    born: v.born,
+                },
+            );
+            visited += 1;
+        }
+        // 3. Merge what the child reads through the zombie into the child's own versions: iterate
+        //    the smaller map, probe the larger, keep the merged map in the child.
+        let c = branches.get_mut(&cid).expect("the zombie's child is kept");
+        crate::turso_assert!(c.fork_epoch == f && c.parent == zid, "child link mismatch");
+        let BranchState {
+            current: c_current,
+            current_by_born: c_by_born,
+            lineage: c_lineage,
+            ..
+        } = c;
+        // Keep a zombie version of a page the child has written for the child's children that
+        // forked before the child's first own version of it, else free it.
+        let mut shadowed = |page: u32, zo: Owned, c_first: u64, lineage: &mut Lineage| -> usize {
+            if lineage.has_child_in(zo.born, c_first) {
+                lineage.retain(
+                    page,
+                    Retained {
+                        born: zo.born,
+                        died: c_first,
+                        slot: zo.slot,
+                    },
+                );
+                0
+            } else {
+                arena.release(zo.slot);
+                1
+            }
+        };
+        let first_own = |lineage: &Lineage, page: u32, co: Owned| -> u64 {
+            lineage
+                .retained
+                .get(&page)
+                .and_then(|v| v.first_key_value().map(|(&b, _)| b))
+                .map_or(co.born, |b| b.min(co.born))
+        };
+        let commit = z.current.len() > c_current.len();
+        if !commit {
+            // Stream: the zombie's versions into the child.
+            for (page, zo) in std::mem::take(&mut z.current) {
+                visited += 1;
+                match c_current.get(&page).copied() {
+                    None => {
+                        c_current.insert(page, zo);
+                        c_by_born.insert((zo.born, page));
+                    }
+                    Some(co) => {
+                        let c_first = first_own(c_lineage, page, co);
+                        freed += shadowed(page, zo, c_first, c_lineage);
+                    }
+                }
+            }
+            z.current_by_born.clear();
+        } else {
+            // Commit: the child's versions into the zombie's map, which then becomes the child's.
+            for (&page, &co) in c_current.iter() {
+                visited += 1;
+                if let Some(zo) = z.current.remove(&page) {
+                    z.current_by_born.remove(&(zo.born, page));
+                    let c_first = first_own(c_lineage, page, co);
+                    freed += shadowed(page, zo, c_first, c_lineage);
+                }
+            }
+            for (page, co) in c_current.drain() {
+                z.current.insert(page, co);
+            }
+            z.current_by_born.append(c_by_born);
+            std::mem::swap(c_current, &mut z.current);
+            std::mem::swap(c_by_born, &mut z.current_by_born);
+        }
+        // 4. The child takes the zombie's place.
+        c.parent = z.parent;
+        c.fork_epoch = z.fork_epoch;
+        let siblings = if z.parent.is_trunk() {
+            &mut trunk.lineage.children
+        } else {
+            &mut branches
+                .get_mut(&z.parent)
+                .expect("a kept branch's parent is kept")
+                .lineage
+                .children
+        };
+        let was = siblings.insert(z.fork_epoch, cid);
+        crate::turso_assert!(was == Some(zid), "the zombie's parent did not list it");
+        work.splices += 1;
+        work.splice_commits += u64::from(commit);
+        work.splice_entries += visited;
+        freed
+    }
+
     /// `levels` counts the nodes consulted — the branch (its own pages and its `inherited` map),
     /// then the trunk if neither holds the page — and `examined` the retained versions compared.
     fn resolve(
@@ -793,6 +993,14 @@ impl StoreInner {
 }
 
 impl BranchState {
+    /// Set `page`'s current version, keeping `current_by_born` in step.
+    fn set_current(&mut self, page: u32, owned: Owned) {
+        if let Some(old) = self.current.insert(page, owned) {
+            self.current_by_born.remove(&(old.born, page));
+        }
+        self.current_by_born.insert((owned.born, page));
+    }
+
     fn new(
         parent: BranchId,
         fork_epoch: u64,
@@ -803,8 +1011,13 @@ impl BranchState {
         Self {
             parent,
             fork_epoch,
-            lineage: Lineage::default(),
+            // The child's first write is born after its fork epoch (see "The model").
+            lineage: Lineage {
+                epoch: fork_epoch + 1,
+                ..Lineage::default()
+            },
             current: HashMap::new(),
+            current_by_born: BTreeSet::new(),
             schema,
             handle: true,
             open: false,
@@ -836,6 +1049,56 @@ mod tests {
 
     fn image(generation: u64) -> Vec<u8> {
         generation.to_le_bytes().repeat(PAGE / 8)
+    }
+
+    /// The splice invariant and the bookkeeping behind it, read under the lock after a step: no
+    /// kept zombie has fewer than two kept children, every index agrees with the map it indexes,
+    /// every arena slot in use is owned by exactly one current or retained version, and every
+    /// child link is mirrored by its parent.
+    fn check_invariants(store: &BranchStore, what: &str) {
+        let inner = store.inner.lock();
+        let mut owned: Vec<Slot> = Vec::new();
+        let lineage_slots = |l: &Lineage, owned: &mut Vec<Slot>| {
+            assert_eq!(l.by_born.len(), l.by_died.len(), "{what}: born/died index sizes");
+            let n: usize = l.retained.values().map(|v| v.len()).sum();
+            assert_eq!(n, l.by_born.len(), "{what}: retained vs index");
+            for v in l.retained.values() {
+                owned.extend(v.values().map(|r| r.slot));
+            }
+        };
+        lineage_slots(&inner.trunk.lineage, &mut owned);
+        for (&id, st) in &inner.branches {
+            if !st.handle && !st.open {
+                assert!(
+                    st.lineage.children.len() >= 2,
+                    "{what}: zombie {} kept with {} children",
+                    id.0,
+                    st.lineage.children.len()
+                );
+            }
+            assert_eq!(st.current.len(), st.current_by_born.len(), "{what}: current index");
+            for (&page, o) in &st.current {
+                assert!(st.current_by_born.contains(&(o.born, page)), "{what}: index entry");
+                owned.push(o.slot);
+            }
+            lineage_slots(&st.lineage, &mut owned);
+            for (&f, &child) in &st.lineage.children {
+                let c = inner.branches.get(&child).expect("a listed child is kept");
+                assert!(c.parent == id && c.fork_epoch == f, "{what}: child link");
+            }
+            let listed = if st.parent.is_trunk() {
+                inner.trunk.lineage.children.get(&st.fork_epoch)
+            } else {
+                inner.branches[&st.parent].lineage.children.get(&st.fork_epoch)
+            };
+            assert_eq!(listed, Some(&id), "{what}: parent does not list branch {}", id.0);
+        }
+        let n = owned.len();
+        owned.sort_unstable();
+        owned.dedup();
+        assert_eq!(owned.len(), n, "{what}: an arena slot has two owners");
+        let in_use = inner.arena.as_ref().map_or(0, |a| a.in_use());
+        assert_eq!(in_use, n, "{what}: arena slots in use that no version owns");
     }
 
     /// The trunk's retained-version index against a brute-force model, through the store's own
@@ -1094,6 +1357,7 @@ mod tests {
                 }
                 _ => {}
             }
+            check_invariants(&store, &format!("seed {seed:#x} step {step}"));
             let mut buf = vec![0u8; PAGE];
             for n in nodes.iter().filter(|n| n.handle) {
                 for page in 0..PAGES {
@@ -1118,8 +1382,119 @@ mod tests {
             "seed {seed:#x}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
              after its first fork {wrote_after_fork}"
         );
+        let work = store.stats().work;
+        assert!(
+            work.splices > 0 && work.splice_commits > 0 && work.splice_commits < work.splices,
+            "seed {seed:#x}: splices {} of which commits {}: both merge directions must run",
+            work.splices,
+            work.splice_commits
+        );
         for n in nodes.iter().filter(|n| n.handle) {
             store.release_handle(n.id);
+        }
+        assert_eq!(store.stats().live_branches, 0, "seed {seed:#x}: branches leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
+    }
+
+    /// The two agent shapes that made the store keep every branch it ever created (lane r11-ever),
+    /// against a model in which each branch is a plain copy of its parent's pages at its fork:
+    /// `newest` forks every branch from the newest live one and reaps the oldest (without the
+    /// splice, nothing is ever freed); `random` forks from a random live branch, which then keeps
+    /// writing, and reaps a random one. Every live branch must read what the model says for every
+    /// page after every step, the invariants must hold, the kept states must stay within twice the
+    /// live ones, and teardown must free everything.
+    #[test]
+    fn churned_branch_trees_keep_at_most_twice_their_live_branches() {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            for newest in [true, false] {
+                run_churn(seed, newest);
+            }
+        }
+    }
+
+    fn run_churn(seed: u64, newest: bool) {
+        const LIVE: usize = 24;
+        let store = BranchStore::new();
+        let mut rng = Rng(seed);
+        let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        // (id, what it sees), oldest first.
+        let mut live: Vec<(BranchId, HashMap<u32, u64>)> = Vec::new();
+        let mut generation = 0u64;
+        let write = |store: &BranchStore,
+                     id: BranchId,
+                     sees: &mut HashMap<u32, u64>,
+                     rng: &mut Rng,
+                     generation: &mut u64| {
+            store.begin_write(id).unwrap();
+            let mut committed = Vec::new();
+            for _ in 0..=rng.below(2) {
+                let page = rng.below(u64::from(PAGES)) as u32;
+                if committed.iter().any(|p: &PageRef| p.get().id == page as usize) {
+                    continue;
+                }
+                store.first_write_branch(id, page, &image(sees[&page])).unwrap();
+                *generation += 1;
+                committed.push(page_with(page, *generation));
+                sees.insert(page, *generation);
+            }
+            store.commit_pages(id, &committed).unwrap();
+            store.end_write(id);
+        };
+        for step in 0..3000 {
+            let parent = match live.len() {
+                0 => None,
+                n if newest => Some(n - 1),
+                n => Some(rng.below(n as u64) as usize),
+            };
+            let (id, mut sees) = match parent {
+                None => (
+                    store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap(),
+                    trunk.clone(),
+                ),
+                Some(i) => (store.fork_branch(live[i].0).unwrap(), live[i].1.clone()),
+            };
+            write(&store, id, &mut sees, &mut rng, &mut generation);
+            if let Some(i) = parent.filter(|_| !newest || rng.below(2) == 0) {
+                // The parent keeps working after the fork.
+                let (pid, mut psees) = (live[i].0, std::mem::take(&mut live[i].1));
+                write(&store, pid, &mut psees, &mut rng, &mut generation);
+                live[i].1 = psees;
+            }
+            if rng.below(4) == 0 {
+                let page = rng.below(u64::from(PAGES)) as u32;
+                store.first_write_trunk(page, &image(trunk[&page]));
+                generation += 1;
+                trunk.insert(page, generation);
+            }
+            live.push((id, sees));
+            if live.len() > LIVE {
+                let at = if newest { 0 } else { rng.below(live.len() as u64 - 1) as usize };
+                let (victim, _) = live.remove(at);
+                store.release_handle(victim);
+            }
+            let what = format!("seed {seed:#x} newest {newest} step {step}");
+            check_invariants(&store, &what);
+            let states = store.stats().live_branches;
+            assert!(states < 2 * LIVE, "{what}: {states} states kept for {} live", live.len());
+            if newest {
+                assert_eq!(states, live.len(), "{what}: a chain kept a zombie");
+            }
+            let mut buf = vec![0u8; PAGE];
+            for (id, sees) in &live {
+                for page in 0..PAGES {
+                    let got = if store.resolve_into(*id, page, &mut buf).unwrap() {
+                        u64::from_le_bytes(buf[..8].try_into().unwrap())
+                    } else {
+                        trunk[&page]
+                    };
+                    assert_eq!(got, sees[&page], "{what}: branch {} read page {page}", id.0);
+                }
+            }
+        }
+        let work = store.stats().work;
+        assert!(work.splices > 1000, "seed {seed:#x} newest {newest}: {} splices", work.splices);
+        for (id, _) in live {
+            store.release_handle(id);
         }
         assert_eq!(store.stats().live_branches, 0, "seed {seed:#x}: branches leaked");
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");

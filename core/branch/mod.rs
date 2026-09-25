@@ -247,6 +247,13 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
+    /// Zombies spliced out of the tree (see `store`, "Splicing a zombie out").
+    pub splices: u64,
+    /// Splices that moved the child's `current` map into the zombie's (the child's was smaller).
+    pub splice_commits: u64,
+    /// Entries those splices visited: versions freed as invisible, retained versions converted, and
+    /// every entry of the smaller `current` map.
+    pub splice_entries: u64,
 }
 
 impl Branch {
