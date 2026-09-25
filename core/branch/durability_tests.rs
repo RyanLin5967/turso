@@ -1432,7 +1432,10 @@ fn a_second_store_over_live_branch_files_refuses_at_open() {
     drop(db);
     let second = store::BranchStore::open(durability, None, path.to_str().unwrap())
         .expect("the first store is gone, so its lock is too");
-    assert!(second.ids().contains(&b_id), "the refused open damaged the first store's state");
+    assert!(
+        second.ids().expect("a read-write store lists its branches").contains(&b_id),
+        "the refused open damaged the first store's state"
+    );
 }
 
 /// N1, the arena half of the lazy door. A store that opened before any branch file existed takes
