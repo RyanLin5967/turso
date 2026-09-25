@@ -1500,6 +1500,10 @@ impl BuildSharedWal {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                fork_gate: crate::bravo::BravoRwLock::with_bias(
+                    (),
+                    crate::coherence::fix(crate::coherence::FIX_GATE),
+                ),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),

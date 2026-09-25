@@ -3452,6 +3452,26 @@ impl Pager {
         wal.holds_read_lock()
     }
 
+    /// r11-coherence FG: see `Wal::fork_gate_on`.
+    pub(crate) fn fork_gate_on(&self) -> bool {
+        self.branch.get().is_none() && self.wal.as_ref().is_some_and(|wal| wal.fork_gate_on())
+    }
+
+    /// FG: see `Wal::fork_gate_enter`.
+    pub(crate) fn fork_gate_enter(&self) -> Result<()> {
+        match self.wal.as_ref() {
+            Some(wal) => wal.fork_gate_enter(),
+            None => Ok(()),
+        }
+    }
+
+    /// FG: see `Wal::fork_gate_exit`.
+    pub(crate) fn fork_gate_exit(&self) {
+        if let Some(wal) = self.wal.as_ref() {
+            wal.fork_gate_exit();
+        }
+    }
+
     pub fn holds_write_lock(&self) -> bool {
         if let Some(branch) = self.branch.get() {
             return branch.store.holds_writer(branch.id);

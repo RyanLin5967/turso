@@ -760,6 +760,20 @@ trait WalCoordination: Debug + Send + Sync {
 /// Write-ahead log (WAL).
 #[aristo::intent("The WAL subsystem maintains LSN monotonicity, frame commitment ordering, recovery idempotency, checkpoint safety, and group commit atomicity.", id = "wal_protocol_correctness", verify = "neural")]
 pub trait Wal: Debug + Send + Sync {
+    /// r11-coherence FG: whether trunk forks use the fork gate instead of the WAL write lock.
+    fn fork_gate_on(&self) -> bool {
+        false
+    }
+
+    /// FG: enter the fork gate as a reader, inside a read transaction. `Busy` while a trunk write transaction holds
+    /// it; `BusySnapshot` if a commit landed since this read transaction began (the fork must retry from a fresh one).
+    fn fork_gate_enter(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// FG: leave the fork gate.
+    fn fork_gate_exit(&self) {}
+
     /// Begin a read transaction.
     /// Returns whether the database state has changed since the last read transaction.
     fn begin_read_tx(&self) -> Result<bool>;
@@ -2848,6 +2862,11 @@ pub struct WalFile {
     vacuum_lock_guard: RwLock<Option<VacuumLockGuard>>,
     /// r11-coherence FW: read transactions take the vacuum lock without cloning the shared state's Arc.
     no_arc_per_read: bool,
+    /// r11-coherence FG: this connection's fork-gate state: whether the gate is used at all, the read hold of a fork
+    /// in progress, and whether a trunk write transaction of this connection holds it exclusively.
+    fork_gate: bool,
+    fork_gate_read: crate::sync::Mutex<Option<crate::bravo::RawRead>>,
+    fork_gate_write_held: AtomicBool,
     coordination: Arc<dyn WalCoordination>,
 
     syncing: Arc<AtomicBool>,
@@ -3003,6 +3022,8 @@ pub struct WalSharedRuntime {
 
     /// Serialises checkpointer threads, only one checkpoint can be in flight at any time. Blocking and exclusive only
     pub checkpoint_lock: TursoRwLock,
+    /// r11-coherence FG: trunk forks hold this shared, trunk write transactions exclusively (see `Wal::fork_gate_*`).
+    pub fork_gate: crate::bravo::BravoRwLock<()>,
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
@@ -3499,7 +3520,62 @@ impl WalFile {
     }
 }
 
+impl WalFile {
+    fn fork_gate_write_enter(&self) {
+        if !self.fork_gate {
+            return;
+        }
+        // Waits for forks in flight; they hold the gate only across one store fork.
+        unsafe { self.coordination.shared_wal_ptr().as_ref() }
+            .read()
+            .runtime
+            .fork_gate
+            .write_raw();
+        self.fork_gate_write_held.store(true, Ordering::Release);
+    }
+
+    fn fork_gate_write_exit(&self) {
+        if self.fork_gate_write_held.swap(false, Ordering::AcqRel) {
+            let shared = unsafe { self.coordination.shared_wal_ptr().as_ref() }.read();
+            unsafe { shared.runtime.fork_gate.unlock_write_raw() };
+        }
+    }
+}
+
 impl Wal for WalFile {
+    fn fork_gate_on(&self) -> bool {
+        self.fork_gate
+    }
+
+    fn fork_gate_enter(&self) -> Result<()> {
+        turso_assert!(
+            self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
+            "a fork enters the fork gate inside a read transaction"
+        );
+        let shared = unsafe { self.coordination.shared_wal_ptr().as_ref() }.read();
+        let Some(token) = shared.runtime.fork_gate.try_read_raw() else {
+            return Err(LimboError::Busy);
+        };
+        drop(shared);
+        // With the gate held no trunk write transaction is in flight, so no commit can land until it is left: the
+        // read snapshot is the latest commit exactly when it still equals the shared one.
+        if self.db_changed_against(self.load_coordination_snapshot(), self.connection_state()) {
+            let shared = unsafe { self.coordination.shared_wal_ptr().as_ref() }.read();
+            unsafe { shared.runtime.fork_gate.unlock_read_raw(token) };
+            return Err(LimboError::BusySnapshot);
+        }
+        let prev = self.fork_gate_read.lock().replace(token);
+        turso_assert!(prev.is_none(), "fork gate entered twice by one connection");
+        Ok(())
+    }
+
+    fn fork_gate_exit(&self) {
+        if let Some(token) = self.fork_gate_read.lock().take() {
+            let shared = unsafe { self.coordination.shared_wal_ptr().as_ref() }.read();
+            unsafe { shared.runtime.fork_gate.unlock_read_raw(token) };
+        }
+    }
+
     fn begin_read_tx(&self) -> Result<bool> {
         // Implement progressive backoff because transient lock contention
         // should resolve quickly, but under heavy contention busy-spinning wastes
@@ -3614,6 +3690,7 @@ impl Wal for WalFile {
                 "begin_write_tx called while write lock already held according to connection state"
             );
         }
+        self.fork_gate_write_enter();
 
         if !allowed_auto_actions.contains(WalAutoActions::Restart) {
             return Ok(());
@@ -3626,6 +3703,7 @@ impl Wal for WalFile {
         }
 
         // don't forget to release the write-lock if
+        self.fork_gate_write_exit();
         self.coordination.end_write_tx();
         turso_assert!(
             self.write_lock_held
@@ -3646,6 +3724,7 @@ impl Wal for WalFile {
                 .is_ok(),
             "end_write_tx called while write lock not held according to connection state"
         );
+        self.fork_gate_write_exit();
         self.coordination.end_write_tx();
     }
 
@@ -4899,6 +4978,9 @@ impl WalFile {
             write_lock_held: AtomicBool::new(false),
             vacuum_lock_guard: RwLock::new(None),
             no_arc_per_read: crate::coherence::fix(crate::coherence::FIX_WAL),
+            fork_gate: crate::coherence::fix(crate::coherence::FIX_GATE),
+            fork_gate_read: crate::sync::Mutex::new(None),
+            fork_gate_write_held: AtomicBool::new(false),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
@@ -5917,6 +5999,10 @@ impl WalFileShared {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                fork_gate: crate::bravo::BravoRwLock::with_bias(
+                    (),
+                    crate::coherence::fix(crate::coherence::FIX_GATE),
+                ),
                 epoch: AtomicU32::new(snapshot.checkpoint_epoch),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
@@ -5993,6 +6079,10 @@ impl WalFileShared {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                fork_gate: crate::bravo::BravoRwLock::with_bias(
+                    (),
+                    crate::coherence::fix(crate::coherence::FIX_GATE),
+                ),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
@@ -6035,6 +6125,10 @@ impl WalFileShared {
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
                 checkpoint_lock: TursoRwLock::new(),
+                fork_gate: crate::bravo::BravoRwLock::with_bias(
+                    (),
+                    crate::coherence::fix(crate::coherence::FIX_GATE),
+                ),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),

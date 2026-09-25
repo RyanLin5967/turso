@@ -91,7 +91,11 @@ pub struct BravoWriteGuard<'a, T: ?Sized>(parking_lot::RwLockWriteGuard<'a, T>);
 
 impl<T> BravoRwLock<T> {
     pub fn new(value: T) -> Self {
-        let enabled = crate::coherence::fix(crate::coherence::FIX_WAL);
+        Self::with_bias(value, crate::coherence::fix(crate::coherence::FIX_WAL))
+    }
+
+    /// A lock whose reader bias is on (`enabled`) or never used.
+    pub fn with_bias(value: T, enabled: bool) -> Self {
         Self {
             rbias: AtomicBool::new(enabled),
             enabled,
@@ -184,6 +188,52 @@ impl<T: ?Sized> BravoRwLock<T> {
     /// Shared access without the fast path, for code that needs parking_lot's guard.
     pub fn is_biased(&self) -> bool {
         self.rbias.load(Ordering::Relaxed)
+    }
+}
+
+/// A read hold taken without a guard ([`BravoRwLock::try_read_raw`]), released by [`BravoRwLock::unlock_read_raw`].
+#[derive(Debug)]
+pub enum RawRead {
+    Fast(&'static AtomicPtr<()>),
+    Slow,
+}
+
+impl<T: ?Sized> BravoRwLock<T> {
+    /// `try_read`, holding the lock past the call: the token says how to release it.
+    pub fn try_read_raw(&self) -> Option<RawRead> {
+        let g = self.try_read()?;
+        let token = match &g {
+            BravoReadGuard::Fast { slot, .. } => RawRead::Fast(*slot),
+            BravoReadGuard::Slow(_) => RawRead::Slow,
+        };
+        // The hold outlives the call: the slot stays claimed, or the parking_lot read stays held, until
+        // `unlock_read_raw`.
+        std::mem::forget(g);
+        Some(token)
+    }
+
+    /// Release a hold `try_read_raw` took.
+    ///
+    /// # Safety
+    /// `token` came from this lock's `try_read_raw` and was not released before.
+    pub unsafe fn unlock_read_raw(&self, token: RawRead) {
+        match token {
+            RawRead::Fast(slot) => slot.store(std::ptr::null_mut(), Ordering::Release),
+            RawRead::Slow => self.inner.force_unlock_read(),
+        }
+    }
+
+    /// `write`, holding the lock past the call.
+    pub fn write_raw(&self) {
+        std::mem::forget(self.write());
+    }
+
+    /// Release a hold `write_raw` took.
+    ///
+    /// # Safety
+    /// The caller holds this lock through `write_raw`.
+    pub unsafe fn unlock_write_raw(&self) {
+        self.inner.force_unlock_write();
     }
 }
 

@@ -967,10 +967,20 @@ impl Connection {
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
-        crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
-        let schema = self.schema.read().clone();
+        // FA: translate under the connection's own schema read lock (a per-connection lock) instead of cloning the
+        // shared Arc<Schema>, whose strong count every branch connection writes.
+        let schema_guard;
+        let schema_clone;
+        let schema: &Arc<Schema> = if crate::coherence::fix(crate::coherence::FIX_ARC) {
+            schema_guard = self.schema.read();
+            &schema_guard
+        } else {
+            crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
+            schema_clone = self.schema.read().clone();
+            &schema_clone
+        };
         match translate::translate(
-            &schema,
+            schema,
             stmt,
             pager.clone(),
             self.clone(),

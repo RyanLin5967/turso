@@ -121,6 +121,11 @@ pub const FIX_BUILTIN: u32 = 2;
 pub const FIX_POOL: u32 = 4;
 /// FS: the branch store's global counters on lines of their own.
 pub const FIX_STORE: u32 = 8;
+/// FA: Arc<Schema> borrowed rather than cloned where a statement or a connect only reads it (amendment 6).
+pub const FIX_ARC: u32 = 16;
+/// FG: trunk forks enter a reader-biased gate instead of the WAL write lock; trunk writers hold it exclusively
+/// (amendment 6). Not part of `all`, which stays amendment 2's four.
+pub const FIX_GATE: u32 = 32;
 
 static FIXES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
@@ -140,6 +145,8 @@ pub fn parse_fixes(s: &str) -> Option<u32> {
             "B" => FIX_BUILTIN,
             "P" => FIX_POOL,
             "S" => FIX_STORE,
+            "A" => FIX_ARC,
+            "G" => FIX_GATE,
             _ => return None,
         };
     }

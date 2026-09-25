@@ -375,6 +375,30 @@ impl Connection {
     fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
+        if pager.fork_gate_on() {
+            // r11-coherence FG: a reader of the fork gate. Trunk write transactions hold it exclusively for as long
+            // as they hold the WAL write lock, so the guarantee below is the one the write lock gave, and forks no
+            // longer exclude each other.
+            loop {
+                pager.begin_read_tx()?;
+                match pager.fork_gate_enter() {
+                    Ok(()) => {}
+                    Err(LimboError::BusySnapshot) if attempt < SNAPSHOT_RETRIES => {
+                        pager.end_read_tx();
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(err) => {
+                        pager.end_read_tx();
+                        return Err(err);
+                    }
+                }
+                let forked = self.fork_trunk_locked(pager);
+                pager.fork_gate_exit();
+                pager.end_read_tx();
+                return forked;
+            }
+        }
         loop {
             pager.begin_read_tx()?;
             let begun = pager
@@ -407,11 +431,28 @@ impl Connection {
         // connection's own snapshot or the shared one is that schema whenever the cookie agrees;
         // if neither does, a DDL commit is between publishing its pages and its schema, and the
         // caller retries rather than fork a branch whose schema disagrees with its pages.
-        crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
-        let schema = [self.schema.read().clone(), self.db.clone_schema()]
-            .into_iter()
-            .find(|schema| schema.schema_version == cookie)
-            .ok_or(LimboError::SchemaUpdated)?;
+        // FA: clone only the schema that matches, and take the database's schema Mutex only if the connection's
+        // own does not.
+        let schema = if crate::coherence::fix(crate::coherence::FIX_ARC) {
+            let own = self.schema.read();
+            if own.schema_version == cookie {
+                crate::coherence::bump(crate::coherence::Class::SchemaArc, 1);
+                own.clone()
+            } else {
+                drop(own);
+                let shared = self.db.clone_schema();
+                if shared.schema_version != cookie {
+                    return Err(LimboError::SchemaUpdated);
+                }
+                shared
+            }
+        } else {
+            crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
+            [self.schema.read().clone(), self.db.clone_schema()]
+                .into_iter()
+                .find(|schema| schema.schema_version == cookie)
+                .ok_or(LimboError::SchemaUpdated)?
+        };
         let page_size = pager.get_page_size_unchecked().get() as usize;
         let reserved_space = pager.get_reserved_space().ok_or_else(|| {
             LimboError::InternalError(

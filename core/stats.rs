@@ -114,6 +114,12 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
     }
 
     // Need a snapshot of the current schema to validate tables/indexes.
+    // FA: look for the stats table without cloning the shared Arc<Schema>.
+    if crate::coherence::fix(crate::coherence::FIX_ARC)
+        && conn.schema.read().get_btree_table(STATS_TABLE).is_none()
+    {
+        return;
+    }
     crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
     let schema_snapshot = { conn.schema.read().clone() };
     if schema_snapshot.get_btree_table(STATS_TABLE).is_none() {
