@@ -96,7 +96,7 @@ impl PageMap {
         }
         while !self.covers(page) {
             let mut kids: [Option<Arc<Node>>; WIDTH] = std::array::from_fn(|_| None);
-            kids[0] = self.root.take();
+            kids[if super::store::mutant("M12") { 1 } else { 0 }] = self.root.take();
             self.root = Some(Arc::new(Node::Inner(kids)));
             self.height += 1;
         }

@@ -402,8 +402,10 @@ impl BranchState {
         let (inherited, current) = (&self.inherited, &self.current);
         self.view.get_or_insert_with(|| {
             let mut view = inherited.clone();
-            for (&page, owned) in current {
-                view.insert(page, (owned.slot, owned.crc));
+            if !mutant("M8") {
+                for (&page, owned) in current {
+                    view.insert(page, (owned.slot, owned.crc));
+                }
             }
             view
         })
@@ -413,7 +415,7 @@ impl BranchState {
     /// reads from it — if it held one of its own then.
     fn version_at(&self, page: u32, f: u64) -> Option<(Slot, u32)> {
         if let Some(owned) = self.current.get(&page) {
-            if owned.born <= f {
+            if owned.born <= f || mutant("D3") {
                 return Some((owned.slot, owned.crc));
             }
         }
@@ -483,7 +485,7 @@ impl Lineage {
     fn retained_at(&self, page: u32, f: u64, examined: &mut u64) -> Option<(Slot, u32)> {
         let (_, v) = self.retained.get(&page)?.range(..=f).next_back()?;
         *examined += 1;
-        (f < v.died).then_some((v.slot, v.crc))
+        (f < v.died || mutant("M3")).then_some((v.slot, v.crc))
     }
 
     /// Detach the child forked at `f`; every retained version only it could see goes to `freed`.
@@ -538,10 +540,10 @@ impl Lineage {
         let died_from = Bound::Excluded(after(f));
         let died_to = hi.map_or(Bound::Unbounded, |hi| Bound::Included(after(hi)));
         let only_f = |born: u64, died: u64| {
-            lo.is_none_or(|lo| born > lo)
+            (mutant("M4") || lo.is_none_or(|lo| born > lo))
                 && born <= f
                 && f < died
-                && hi.is_none_or(|hi| died <= hi)
+                && (mutant("M1") || hi.is_none_or(|hi| died <= hi))
         };
         let mut by_born = self.by_born.range((born_from, born_to));
         let mut by_died = self
@@ -551,7 +553,7 @@ impl Lineage {
         let mut seen: [Vec<(u64, u32, u64)>; 2] = Default::default();
         // Which ranges to walk: the one side's own range when a neighbour is missing, else both.
         let walk = match (lo, hi) {
-            (None, _) => [false, true],
+            (None, _) => if mutant("M6") { [true, false] } else { [false, true] },
             (Some(_), None) => [true, false],
             (Some(_), Some(_)) => [true, true],
         };
@@ -574,7 +576,7 @@ impl Lineage {
                 }
             }
         };
-        let mut dead = std::mem::take(&mut seen[finished]);
+        let mut dead = std::mem::take(&mut seen[if mutant("M2") { 1 - finished } else { finished }]);
         dead.retain(|&(born, _, died)| only_f(born, died));
         dead
     }
@@ -1819,7 +1821,7 @@ impl StoreInner {
             st.lineage.epoch += 1;
             st.lineage.children.insert(f, child);
             let inherited = st.view_now().clone();
-            (f, inherited, st.trunk_at)
+            (f, inherited, if mutant("M11") { f } else { st.trunk_at })
         };
         self.next_id = self.next_id.max(child.0 + 1);
         self.branches.insert(
@@ -1859,8 +1861,10 @@ impl StoreInner {
                 born: epoch,
                 crc,
             };
-            if let Some(view) = st.view.as_mut() {
-                view.insert(page, (slot, crc));
+            if !mutant("M9") {
+                if let Some(view) = st.view.as_mut() {
+                    view.insert(page, (slot, crc));
+                }
             }
             if let Some(old) = st.current.insert(page, new) {
                 if st.lineage.has_child_in(old.born, epoch) {
@@ -1961,8 +1965,10 @@ impl StoreInner {
         if let Some(owned) = st.current.get(&page) {
             return Ok(Some((owned.slot, owned.crc)));
         }
-        if let Some(found) = st.inherited.get(page) {
-            return Ok(Some(found));
+        if !mutant("M7") {
+            if let Some(found) = st.inherited.get(page) {
+                return Ok(Some(found));
+            }
         }
         *levels += 1;
         let at = st.trunk_at;
@@ -2008,13 +2014,13 @@ impl StoreInner {
             let mut pages: BTreeSet<u32> = st.current.keys().copied().collect();
             pages.extend(st.lineage.retained.keys().copied());
             for (&f, &child) in &st.lineage.children {
-                let mut map = st.inherited.clone();
+                let mut map = if mutant("D5") { PageMap::default() } else { st.inherited.clone() };
                 for &page in &pages {
                     if let Some(found) = st.version_at(page, f) {
                         map.insert(page, found);
                     }
                 }
-                todo.push((child, map, st.trunk_at));
+                todo.push((child, map, if mutant("D4") { f } else { st.trunk_at }));
             }
         }
         // A branch no lineage lists would keep an empty map and read its ancestors' pages from the
@@ -2231,7 +2237,15 @@ impl StoreInner {
                 )));
             }
         }
-        self.derive_page_maps()?;
+        if !mutant("D1") {
+            self.derive_page_maps()?;
+        }
+        if mutant("D2") {
+            self.trunk.lineage.by_died.clear();
+            for st in self.branches.values_mut() {
+                st.lineage.by_died.clear();
+            }
+        }
         Ok(())
     }
 }
@@ -2405,6 +2419,13 @@ mod tests {
         assert_eq!(recovered.branches[&id].lease, Some(0), "a 0 deadline read back as no lease");
         assert!(recovered.leases.contains(&(0, id)), "the deadline index lost it");
     }
+}
+
+/// MUTANT SCHEMATA (round 11 PREREG D3.3; this commit is never merged): the mutant named by the environment
+/// variable `SOTA_MUTANT` is switched on for the whole process; unset, every site takes its original path.
+pub(crate) fn mutant(name: &str) -> bool {
+    static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ON.get_or_init(|| std::env::var("SOTA_MUTANT").ok()).as_deref() == Some(name)
 }
 
 /// Shared by the sota-durable tests (round 11 PREREG D3): stores of either durability, and crash
