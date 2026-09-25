@@ -111,6 +111,7 @@ use std::ops::Bound;
 
 use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
+use super::table::BranchTable;
 use super::{BranchId, BranchResident, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
@@ -136,7 +137,9 @@ struct StoreInner {
     /// The store-wide fork clock: the next fork's epoch (see "The model").
     clock: u64,
     trunk: TrunkState,
-    branches: HashMap<BranchId, BranchState>,
+    /// Branch states by id: a slot map, so churn leaves no tombstones and never rehashes (F8,
+    /// see [`super::table`]).
+    branches: BranchTable<BranchState>,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
 }
@@ -370,7 +373,7 @@ impl BranchStore {
                     lineage: Lineage::default(),
                     written: HashMap::new(),
                 },
-                branches: HashMap::new(),
+                branches: BranchTable::new(),
                 work: BranchWork::default(),
             }),
             trunk_children: AtomicUsize::new(0),
@@ -402,7 +405,7 @@ impl BranchStore {
             }
             Some(_) => {}
         }
-        let id = BranchId(inner.next_id);
+        let id = inner.branches.vacant_id();
         inner.next_id += 1;
         let f = inner.clock;
         inner.clock += 1;
@@ -420,7 +423,7 @@ impl BranchStore {
     /// the same reason a trunk fork takes the WAL write lock.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         let mut inner = self.inner.lock();
-        let id = BranchId(inner.next_id);
+        let id = inner.branches.vacant_id();
         let f = inner.clock;
         let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
@@ -719,6 +722,28 @@ impl BranchStore {
             }
         }
         r.page_map_nodes = nodes.len();
+        // Slots some reader (a branch with a handle or an open connection) can read: its own
+        // current versions, what its `inherited` map names for pages it has not written, and the
+        // trunk's retained version at its `trunk_at` for pages neither holds.
+        let mut visible = std::collections::HashSet::new();
+        let mut unused = 0u64;
+        for st in inner.branches.values().filter(|st| st.handle || st.open) {
+            visible.extend(st.current.values().map(|o| o.slot));
+            st.inherited.for_each(|page, slot| {
+                if !st.current.contains_key(&page) {
+                    visible.insert(slot);
+                }
+            });
+            for &page in inner.trunk.lineage.retained.keys() {
+                if st.current.contains_key(&page) || st.inherited.get(page).is_some() {
+                    continue;
+                }
+                if let Some(slot) = inner.trunk.lineage.retained_at(page, st.trunk_at, &mut unused) {
+                    visible.insert(slot);
+                }
+            }
+        }
+        r.visible_slots = visible.len();
         r.index_mismatch = index_mismatch;
         if let Some(arena) = &inner.arena {
             let (high_water, free_capacity, free_bits_words, chunks) = arena.shape();
@@ -1067,7 +1092,7 @@ mod tests {
             }
         };
         lineage_slots(&inner.trunk.lineage, &mut owned);
-        for (&id, st) in &inner.branches {
+        for (id, st) in inner.branches.iter() {
             if !st.handle && !st.open {
                 assert!(
                     st.lineage.children.len() >= 2,

@@ -55,6 +55,7 @@
 pub(crate) mod arena;
 pub(crate) mod page_map;
 pub(crate) mod store;
+pub(crate) mod table;
 
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};
@@ -217,6 +218,11 @@ pub struct BranchResident {
     pub page_map_nodes: usize,
     /// True if some lineage's three version indexes disagree in size (a bookkeeping defect).
     pub index_mismatch: bool,
+    /// Distinct arena slots some reader (a branch with a handle or an open connection) can read:
+    /// the page-granular minimum the arena could hold. `arena_in_use - visible_slots` is what the
+    /// store keeps that no reader can reach (for children not yet forked, nothing: a zombie forks
+    /// nothing and a live branch's own versions count as visible).
+    pub visible_slots: usize,
     /// Arena slots ever handed out (the arena never shrinks below this).
     pub arena_high_water: usize,
     pub arena_in_use: usize,

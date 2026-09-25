@@ -97,6 +97,31 @@ impl PageMap {
         }
     }
 
+    /// Call `f` with every `(page, slot)` this map holds. Observation only.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(u32, Slot)) {
+        fn walk(node: &Node, prefix: u64, f: &mut dyn FnMut(u32, Slot)) {
+            match node {
+                Node::Inner(kids) => {
+                    for (i, kid) in kids.iter().enumerate() {
+                        if let Some(kid) = kid {
+                            walk(kid, (prefix << BITS) | i as u64, f);
+                        }
+                    }
+                }
+                Node::Leaf(slots) => {
+                    for (i, &slot) in slots.iter().enumerate() {
+                        if slot != EMPTY {
+                            f(((prefix << BITS) | i as u64) as u32, slot);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(root) = &self.root {
+            walk(root, 0, &mut f);
+        }
+    }
+
     /// Map `page` to `slot`, replacing any previous mapping. Every other version of this map —
     /// every clone taken before this call — keeps the mapping it had.
     pub(crate) fn insert(&mut self, page: u32, slot: Slot) {

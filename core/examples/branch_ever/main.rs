@@ -763,7 +763,7 @@ fn main() {
              branch_children={} branch_retained_versions={} branch_current_pages={} views={} \
              page_map_nodes={} index_mismatch={} arena_high_water={} arena_in_use={} \
              arena_free_list_len={} arena_free_list_capacity={} arena_free_bits_words={} \
-             arena_chunks={} arena_unowned={} model_states={model_states} \
+             arena_chunks={} arena_unowned={} visible_slots={} model_states={model_states} \
              model_zombies={model_zombies} model_children={model_children} model_roots={roots} \
              predicted_arena_pages={} freed_states_total={freed_states_total} \
              reads_checked={reads_checked} rss_bytes={} harness_model_bytes={} \
@@ -798,6 +798,7 @@ fn main() {
             r.arena_free_bits_words,
             r.arena_chunks,
             unowned as isize,
+            r.visible_slots,
             predicted_pages.map_or("n/a".to_string(), |p| p.to_string()),
             rss_bytes(),
             kept.bytes(),
@@ -885,7 +886,7 @@ fn main() {
             println!("# slope\tp50\t{name}\t{}", fmt(slope(&pts)));
         }
     }
-    let counters: [(&str, fn(&BranchResident) -> usize); 14] = [
+    let counters: [(&str, fn(&BranchResident) -> usize); 15] = [
         ("states", |r| r.states),
         ("zombies", |r| r.zombies),
         ("table_capacity", |r| r.table_capacity),
@@ -898,6 +899,7 @@ fn main() {
         ("page_map_nodes", |r| r.page_map_nodes),
         ("arena_high_water", |r| r.arena_high_water),
         ("arena_in_use", |r| r.arena_in_use),
+        ("visible_slots", |r| r.visible_slots),
         ("arena_free_list_capacity", |r| r.arena_free_list_capacity),
         ("arena_chunks", |r| r.arena_chunks),
     ];
