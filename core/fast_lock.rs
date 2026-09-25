@@ -53,6 +53,25 @@ impl<T> SpinLock<T> {
         SpinLockGuard { lock: self }
     }
 
+    /// [`Self::lock`], counted by the coherence instrument: every swap and the release store into `class`, and the
+    /// swaps that found the lock held also into `fail`.
+    #[inline]
+    pub fn lock_class(
+        &self,
+        class: crate::coherence::Class,
+        fail: Option<crate::coherence::Class>,
+    ) -> SpinLockGuard<'_, T> {
+        while self.locked.swap(true, Ordering::Acquire) {
+            crate::coherence::bump(class, 1);
+            if let Some(fail) = fail {
+                crate::coherence::bump(fail, 1);
+            }
+            spin_loop();
+        }
+        crate::coherence::bump(class, 2);
+        SpinLockGuard { lock: self }
+    }
+
     pub fn into_inner(self) -> UnsafeCell<T> {
         self.value
     }

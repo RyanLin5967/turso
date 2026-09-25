@@ -46,6 +46,8 @@ pub mod vector;
 #[cfg(feature = "cli_only")]
 pub(crate) mod btree_dump;
 pub(crate) mod sync;
+#[doc(hidden)]
+pub mod coherence;
 pub(crate) mod thread;
 
 mod assert;

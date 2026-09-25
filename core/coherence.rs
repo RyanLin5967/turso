@@ -1,0 +1,205 @@
+//! Coherence instrument (r11-coherence PREREG §0 (a)): thread-local counts of the atomic writes that land on
+//! memory other threads also write, one counter per class. Observation only.
+//!
+//! Without the `coherence` feature every [`bump`] is an empty inline function and [`snapshot`] returns zeros, so
+//! a timed build carries no instrument. With it, each class is one `Cell<u64>` in a const-initialised
+//! `thread_local` (no allocation, no registration, no shared write): a thread reads its own totals with
+//! [`snapshot`], and the harness sums the threads it ran.
+//!
+//! Units: RMWs and plain stores to a shared line, as issued. A parking_lot read acquisition and its release are 2;
+//! a failed CAS attempt counts, and also counts in its class's `*_FAIL` twin, so retries are visible apart.
+//! A site that is not instrumented is not counted; that is the instrument's blind spot.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Class {
+    /// RwLock<WalFileShared>, read side: acquire + release.
+    WalRwRead,
+    /// RwLock<WalFileShared>, write side: acquire + release.
+    WalRwWrite,
+    /// Arc<RwLock<WalFileShared>> strong-count increments and decrements on the connection paths.
+    WalArc,
+    /// The WAL header SpinLock: every swap attempt, and the release store.
+    WalHdr,
+    /// WAL header SpinLock swaps that found the lock held.
+    WalHdrFail,
+    /// TursoRwLock (read marks, vacuum lock, write lock, checkpoint lock): every CAS attempt and every
+    /// fetch_sub / fetch_and / release store.
+    WalMark,
+    /// TursoRwLock CAS attempts that failed.
+    WalMarkFail,
+    /// The WAL frame_cache SpinLock: swap attempts and release stores.
+    WalFc,
+    /// Buffer pool alloc/free: bitmap CAS attempts, hint stores, allocated_slots, Arc<Arena> clone/drop.
+    BufPool,
+    /// Builtin symbols copied into a connection: the builtin_syms RwLock pair, one Arc clone per symbol, and the
+    /// symbol Arc drops when the connection's table goes.
+    Builtin,
+    /// Arc<Schema> clones and drops at the sweep's sites.
+    SchemaArc,
+    /// Arc clones and drops of handles that live as long as the Database, per connection.
+    DbArc,
+    /// Database::n_connections and the Database::schema Mutex.
+    DbHot,
+    /// The branch store's global atomics: next_id, live, trunk_children.
+    StoreGlobal,
+    /// Heap allocations (counted by a harness allocator through [`bump`]).
+    Malloc,
+    /// Heap frees.
+    Free,
+}
+
+pub const CLASSES: usize = 16;
+
+pub const NAMES: [&str; CLASSES] = [
+    "wal_rw_read",
+    "wal_rw_write",
+    "wal_arc",
+    "wal_hdr",
+    "wal_hdr_fail",
+    "wal_mark",
+    "wal_mark_fail",
+    "wal_fc",
+    "bufpool",
+    "builtin",
+    "schema_arc",
+    "db_arc",
+    "db_hot",
+    "store_global",
+    "malloc",
+    "free",
+];
+
+#[cfg(feature = "coherence")]
+mod imp {
+    use super::CLASSES;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static COUNTS: [Cell<u64>; CLASSES] = const { [const { Cell::new(0) }; CLASSES] };
+    }
+}
+
+/// Add `n` to this thread's count of `class`.
+#[inline(always)]
+pub fn bump(class: Class, n: u64) {
+    #[cfg(feature = "coherence")]
+    imp::COUNTS.with(|c| {
+        let cell = &c[class as usize];
+        cell.set(cell.get() + n);
+    });
+    #[cfg(not(feature = "coherence"))]
+    let _ = (class, n);
+}
+
+/// This thread's totals so far, in [`NAMES`] order. All zeros without the `coherence` feature.
+pub fn snapshot() -> [u64; CLASSES] {
+    #[cfg(feature = "coherence")]
+    {
+        imp::COUNTS.with(|c| std::array::from_fn(|i| c[i].get()))
+    }
+    #[cfg(not(feature = "coherence"))]
+    {
+        [0; CLASSES]
+    }
+}
+
+/// Whether this build carries the instrument.
+pub const ENABLED: bool = cfg!(feature = "coherence");
+
+// --- The published fixes, selected at run time (r11-coherence amendment 2) -----------------------------------------
+// Every fix is compiled into every build, instrumented or not, and chosen once per process from TURSO_R11_FIX (or
+// `set_fixes` before first use), so one binary measures each arm under the same code generation. A structure that
+// depends on a fix reads the choice once, at its construction.
+
+/// FW: BRAVO on RwLock<WalFileShared>, per-thread reader indicators on the WAL read marks, a seqlock for the WAL
+/// header, no Arc clone per read transaction.
+pub const FIX_WAL: u32 = 1;
+/// FB: builtin symbols shared by every connection (copy-on-write maps) instead of copied into each.
+pub const FIX_BUILTIN: u32 = 2;
+/// FP: per-thread buffer magazines and sloppy reference counts in the buffer pool.
+pub const FIX_POOL: u32 = 4;
+/// FS: the branch store's global counters on lines of their own.
+pub const FIX_STORE: u32 = 8;
+
+static FIXES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Parse a fix list: `none`, `all`, or letters from `W`, `B`, `P`, `S` separated by commas.
+pub fn parse_fixes(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() || s == "none" {
+        return Some(0);
+    }
+    if s == "all" {
+        return Some(FIX_WAL | FIX_BUILTIN | FIX_POOL | FIX_STORE);
+    }
+    let mut m = 0;
+    for part in s.split(',') {
+        m |= match part.trim() {
+            "W" => FIX_WAL,
+            "B" => FIX_BUILTIN,
+            "P" => FIX_POOL,
+            "S" => FIX_STORE,
+            _ => return None,
+        };
+    }
+    Some(m)
+}
+
+/// Choose the fixes for this process. Only before anything has read them; returns false if too late.
+pub fn set_fixes(mask: u32) -> bool {
+    FIXES.set(mask).is_ok() || fixes() == mask
+}
+
+/// The fixes this process runs with.
+pub fn fixes() -> u32 {
+    *FIXES.get_or_init(|| match std::env::var("TURSO_R11_FIX") {
+        Ok(s) => parse_fixes(&s).unwrap_or_else(|| panic!("TURSO_R11_FIX={s}: expected none, all or W,B,P,S")),
+        Err(_) => 0,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FIXES: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: run this thread's constructions with `mask`, whatever the process chose.
+#[cfg(test)]
+pub fn force_fixes_for_test(mask: u32) {
+    TEST_FIXES.with(|c| c.set(Some(mask)));
+}
+
+/// Whether fix `bit` is on (for structures, read once at construction).
+#[inline]
+pub fn fix(bit: u32) -> bool {
+    #[cfg(test)]
+    if let Some(m) = TEST_FIXES.with(|c| c.get()) {
+        return m & bit != 0;
+    }
+    fixes() & bit != 0
+}
+
+#[cfg(all(test, feature = "coherence"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_are_per_thread_and_exact() {
+        let before = snapshot();
+        bump(Class::WalMark, 3);
+        bump(Class::WalMark, 1);
+        bump(Class::Builtin, 2);
+        let after = snapshot();
+        assert_eq!(after[Class::WalMark as usize] - before[Class::WalMark as usize], 4);
+        assert_eq!(after[Class::Builtin as usize] - before[Class::Builtin as usize], 2);
+        let other = std::thread::spawn(|| {
+            bump(Class::WalMark, 5);
+            snapshot()[Class::WalMark as usize]
+        })
+        .join()
+        .unwrap();
+        assert_eq!(other, 5, "another thread's count starts at zero");
+        assert_eq!(snapshot()[Class::WalMark as usize], after[Class::WalMark as usize]);
+    }
+}

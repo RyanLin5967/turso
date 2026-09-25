@@ -41,10 +41,58 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use turso_core::branch::{Branch, BranchWork};
+use turso_core::coherence;
 use turso_core::{
     Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, SqliteDialect, Value,
     IO,
 };
+
+/// r11-coherence (PREREG §0 (a)): with the `coherence` feature, every heap allocation and free is counted into the
+/// calling thread's coherence counters. Without it the system allocator is used unchanged.
+#[cfg(feature = "coherence")]
+mod counting_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use turso_core::coherence::{bump, Class};
+
+    pub struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            bump(Class::Malloc, 1);
+            System.alloc(l)
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            bump(Class::Malloc, 1);
+            System.alloc_zeroed(l)
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            bump(Class::Free, 1);
+            System.dealloc(p, l)
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            bump(Class::Malloc, 1);
+            bump(Class::Free, 1);
+            System.realloc(p, l, n)
+        }
+    }
+
+    #[global_allocator]
+    static A: Counting = Counting;
+}
+
+/// The census markers (r11-coherence census.py): lldb arms 128-byte write watchpoints on `lines` when this is called
+/// and reads them out at [`coh_census_stop`]. They do nothing else.
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn coh_census_start(lines: *const usize, n: usize) {
+    std::hint::black_box((lines, n));
+}
+
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn coh_census_stop() {
+    std::hint::black_box(());
+}
 
 const TRUNK_ROWS: i64 = 20_000;
 const VALUE_LEN: usize = 100;
@@ -87,6 +135,11 @@ struct Args {
     synchronous: String,
     threads: Vec<usize>,
     lock_timing: bool,
+    /// r11-coherence census: K cycles at T=1 between the census markers, at checkpoint `census_at`, watching the
+    /// 128-byte lines of the named addresses (`--census-lines`, names from the address table).
+    census: usize,
+    census_at: usize,
+    census_lines: Vec<String>,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -110,6 +163,9 @@ fn parse_args() -> Args {
         synchronous: "OFF".to_string(),
         threads: Vec::new(),
         lock_timing: false,
+        census: 0,
+        census_at: 0,
+        census_lines: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -146,6 +202,13 @@ fn parse_args() -> Args {
                 .to_string()
             }
             "--threads" => args.threads = parse_list(&val(), "--threads"),
+            "--census" => args.census = val().parse().unwrap_or_else(|_| die("bad --census")),
+            "--census-at" => {
+                args.census_at = val().parse().unwrap_or_else(|_| die("bad --census-at"))
+            }
+            "--census-lines" => {
+                args.census_lines = val().split(',').map(str::to_string).collect()
+            }
             "--lock-timing" => {
                 args.lock_timing = match val().as_str() {
                     "on" => true,
@@ -185,6 +248,17 @@ fn parse_args() -> Args {
         }
         if args.checkpoints.iter().any(|&n| n < *args.threads.iter().max().unwrap()) {
             die("--arm conc needs every checkpoint N >= the largest T, so each thread owns a branch");
+        }
+        if args.census > 0 {
+            if !coherence::ENABLED {
+                die("--census needs a build with the `coherence` feature");
+            }
+            if !args.checkpoints.contains(&args.census_at) {
+                die("--census-at must be one of --checkpoints");
+            }
+            if args.census_lines.is_empty() || args.census_lines.len() > 4 {
+                die("--census-lines names 1 to 4 addresses (the box's watchpoint registers)");
+            }
         }
     } else if !args.threads.is_empty() || args.lock_timing {
         die("--threads and --lock-timing apply to --arm conc only");
@@ -1249,6 +1323,8 @@ struct ConcOut {
     ops: [Vec<Duration>; 7],
     busy: [u64; 7],
     elapsed: Duration,
+    /// This thread's coherence counts over its cycles (all zero without the `coherence` feature).
+    coh: [u64; coherence::CLASSES],
 }
 
 /// Run `f` until it does not answer `Busy`/`BusySnapshot`, counting those answers. Anything else
@@ -1302,6 +1378,7 @@ fn conc_thread(
     }
     let mut busy = [0u64; 7];
     barrier.wait();
+    let coh0 = coherence::snapshot();
     let start = Instant::now();
     for c in 0..cycles {
         let row = row_for(base + c);
@@ -1352,11 +1429,14 @@ fn conc_thread(
             op.push(d);
         }
     }
+    let elapsed = start.elapsed();
+    let coh1 = coherence::snapshot();
     ConcOut {
         share,
         ops,
         busy,
-        elapsed: start.elapsed(),
+        elapsed,
+        coh: std::array::from_fn(|i| coh1[i] - coh0[i]),
     }
 }
 
@@ -1406,6 +1486,50 @@ fn cpu_ns() -> (u64, u64) {
 /// difference between one T's two draws. Before each cell, the null workload measures what the box
 /// gives T threads that share nothing. Per cell: throughput, per-op latency, Busy retries, process
 /// CPU time, and the store's lock counters (acquisitions, contended acquisitions, wait, hold).
+/// The coherence counts of `cycles` cycles, per cycle, as one `# coh` line (PREREG §0 (a)). `shared_rmw` sums the
+/// classes that are writes to shared lines: not the `*_fail` twins (already inside their class) nor malloc/free.
+fn print_coh(label: &str, coh: &[u64; coherence::CLASSES], cycles: f64) {
+    if !coherence::ENABLED {
+        return;
+    }
+    let mut line = format!("# coh {label} cycles={cycles}");
+    let mut shared = 0u64;
+    for (i, name) in coherence::NAMES.iter().enumerate() {
+        line.push_str(&format!(" {name}={:.3}", coh[i] as f64 / cycles));
+        if !name.ends_with("_fail") && *name != "malloc" && *name != "free" {
+            shared += coh[i];
+        }
+    }
+    line.push_str(&format!(" shared_rmw={:.3}", shared as f64 / cycles));
+    println!("{line}");
+}
+
+/// Every hot address the lane counts (PREREG §0 (b)), by name: the engine's table plus the trunk connection's schema.
+fn coh_addrs(b: &Bench, trunk: &Arc<Connection>) -> Vec<(String, usize)> {
+    let mut v = b.db.coherence_addrs();
+    v.push(("conn.trunk.schema.arcinner".to_string(), trunk.coherence_schema_addr()));
+    v
+}
+
+fn print_addrs(addrs: &[(String, usize)]) {
+    let mut sorted: Vec<_> = addrs.to_vec();
+    sorted.sort_by_key(|(_, a)| *a);
+    for (name, a) in &sorted {
+        println!("# addr {name} {a:#x} line={:#x} off={}", a & !127, a & 127);
+    }
+    let mut lines: Vec<(usize, Vec<String>)> = Vec::new();
+    for (name, a) in &sorted {
+        let l = a & !127;
+        match lines.last_mut() {
+            Some((ll, names)) if *ll == l => names.push(name.clone()),
+            _ => lines.push((l, vec![name.clone()])),
+        }
+    }
+    for (l, names) in lines {
+        println!("# line {l:#x}: {}", names.join(" "));
+    }
+}
+
 fn arm_conc(b: &mut Bench, args: &Args) {
     let tmax = *args.threads.iter().max().unwrap();
     b.db.set_branch_lock_timing(args.lock_timing);
@@ -1431,6 +1555,43 @@ fn arm_conc(b: &mut Bench, args: &Args) {
             not_a_result(&format!("expected {n} branches and {n} arena pages before the block: {s:?}"));
         }
         b.print_state(n, &format!("grow_total_us={grow_us:.0}"));
+        if coherence::ENABLED {
+            print_addrs(&coh_addrs(b, &trunks[0]));
+        }
+        if args.census > 0 && n == args.census_at {
+            // Warm the caches as a steady cell would be, then run the census block on this thread alone.
+            let addrs = coh_addrs(b, &trunks[0]);
+            let lines: Vec<usize> = args
+                .census_lines
+                .iter()
+                .map(|name| {
+                    addrs
+                        .iter()
+                        .find(|(nm, _)| nm == name)
+                        .unwrap_or_else(|| die(&format!("no address named {name}")))
+                        .1
+                        & !127
+                })
+                .collect();
+            let one = Barrier::new(1);
+            let warm = conc_thread(trunks[0].clone(), std::mem::take(&mut live), &one, args.seed ^ 0xC3, grown, 200);
+            grown += 200;
+            coh_census_start(lines.as_ptr(), lines.len());
+            let out = conc_thread(trunks[0].clone(), warm.share, &one, args.seed ^ 0xC5, grown, args.census);
+            coh_census_stop();
+            grown += args.census;
+            println!(
+                "# census N={n} cycles={} lines={:?} ({})",
+                args.census,
+                lines.iter().map(|l| format!("{l:#x}")).collect::<Vec<_>>(),
+                args.census_lines.join(",")
+            );
+            print_coh(&format!("census N={n}"), &out.coh, args.census as f64);
+            live = out.share;
+            if live.len() != n {
+                not_a_result("the census block changed the live count");
+            }
+        }
         let order = args
             .threads
             .iter()
@@ -1473,8 +1634,12 @@ fn arm_conc(b: &mut Bench, args: &Args) {
             grown += t * c;
             let mut ops: [Vec<Duration>; 7] = Default::default();
             let mut busy = [0u64; 7];
+            let mut coh = [0u64; coherence::CLASSES];
             let (mut th_min, mut th_max) = (Duration::MAX, Duration::ZERO);
             for out in outs {
+                for (sum, x) in coh.iter_mut().zip(out.coh) {
+                    *sum += x;
+                }
                 live.extend(out.share);
                 for (i, mut samples) in out.ops.into_iter().enumerate() {
                     ops[i].append(&mut samples);
@@ -1506,6 +1671,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 );
             }
             let cycles = (t * c) as f64;
+            print_coh(&format!("N={n} T={t} draw={draw}"), &coh, cycles);
             let wall_ns = wall.as_nanos() as f64;
             let d = |from: u64, to: u64| to - from;
             let acq = d(before.lock_acquisitions, after.lock_acquisitions);

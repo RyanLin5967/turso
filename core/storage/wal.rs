@@ -313,6 +313,15 @@ impl TursoRwLock {
         val & Self::READER_COUNT_MASK != 0
     }
 
+    /// Coherence instrument: one CAS on this lock's word, and whether it failed.
+    #[inline(always)]
+    fn count_cas(ok: bool) {
+        crate::coherence::bump(crate::coherence::Class::WalMark, 1);
+        if !ok {
+            crate::coherence::bump(crate::coherence::Class::WalMarkFail, 1);
+        }
+    }
+
     #[inline]
     /// Try to acquire a shared read lock.
     pub fn read(&self) -> bool {
@@ -333,7 +342,9 @@ impl TursoRwLock {
             let res = self
                 .0
                 .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed);
+            crate::coherence::bump(crate::coherence::Class::WalMark, 1);
             if res.is_err() {
+                crate::coherence::bump(crate::coherence::Class::WalMarkFail, 1);
                 count += 1;
                 crate::thread::spin_loop();
                 continue;
@@ -353,9 +364,12 @@ impl TursoRwLock {
             return false;
         }
         let desired = cur | Self::WRITER;
-        self.0 // Safety: Failure here can be Relaxed as we will read again on next iteration.
+        let ok = self
+            .0 // Safety: Failure here can be Relaxed as we will read again on next iteration.
             .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+            .is_ok();
+        Self::count_cas(ok);
+        ok
     }
 
     /// upgrade read lock to the write lock
@@ -370,9 +384,12 @@ impl TursoRwLock {
         }
         // Preserve value bits, replace reader with writer
         let desired = (cur & Self::VALUE_MASK) | Self::WRITER;
-        self.0
+        let ok = self
+            .0
             .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+            .is_ok();
+        Self::count_cas(ok);
+        ok
     }
 
     /// downgrade write lock to the read lock
@@ -393,6 +410,7 @@ impl TursoRwLock {
                 "downgrade CAS failed — lock was mutated concurrently"
             );
         }
+        crate::coherence::bump(crate::coherence::Class::WalMark, 1);
         #[cfg(not(debug_assertions))]
         {
             self.0.store(desired, Ordering::Release);
@@ -408,6 +426,7 @@ impl TursoRwLock {
         if (cur & Self::WRITER) != 0 {
             // Clear writer bit, preserve everything else (including value)
             // Release ordering ensures all our writes are visible to next acquirer
+            crate::coherence::bump(crate::coherence::Class::WalMark, 1);
             let cur = self.0.fetch_and(!Self::WRITER, Ordering::Release);
             turso_assert!(!Self::has_readers(cur), "write lock was held with readers");
         } else {
@@ -415,6 +434,7 @@ impl TursoRwLock {
                 Self::has_readers(cur),
                 "unlock called with no readers or writers"
             );
+            crate::coherence::bump(crate::coherence::Class::WalMark, 1);
             self.0.fetch_sub(Self::READER_INC, Ordering::Release);
         }
     }
@@ -445,6 +465,7 @@ impl TursoRwLock {
         let cur = self.0.load(Ordering::Acquire);
         turso_assert!(Self::has_writer(cur), "must hold exclusive lock");
         let desired = (cur & !Self::VALUE_MASK) | ((v as u64) << Self::VALUE_SHIFT);
+        crate::coherence::bump(crate::coherence::Class::WalMark, 1);
         self.0.store(desired, Ordering::Release);
     }
 }
@@ -855,26 +876,40 @@ impl InProcessWalCoordination {
         Self { shared }
     }
 
+    /// `self.rd()`, counted by the coherence instrument.
+    #[inline(always)]
+    fn rd(&self) -> crate::sync::RwLockReadGuard<'_, WalFileShared> {
+        crate::coherence::bump(crate::coherence::Class::WalRwRead, 2);
+        self.shared.read()
+    }
+
+    /// `self.wr()`, counted by the coherence instrument.
+    #[inline(always)]
+    fn wr(&self) -> crate::sync::RwLockWriteGuard<'_, WalFileShared> {
+        crate::coherence::bump(crate::coherence::Class::WalRwWrite, 2);
+        self.shared.write()
+    }
+
     fn try_read_mark_shared(&self, slot: usize) -> bool {
-        self.shared.read().runtime.read_locks[slot].read()
+        self.rd().runtime.read_locks[slot].read()
     }
 
     fn try_read_mark_exclusive(&self, slot: usize) -> bool {
-        self.shared.read().runtime.read_locks[slot].write()
+        self.rd().runtime.read_locks[slot].write()
     }
 
     fn unlock_read_mark(&self, slot: usize) {
-        self.shared.read().runtime.read_locks[slot].unlock();
+        self.rd().runtime.read_locks[slot].unlock();
     }
 
     fn read_mark_value(&self, slot: usize) -> u32 {
-        self.shared.read().runtime.read_locks[slot].get_value()
+        self.rd().runtime.read_locks[slot].get_value()
     }
 
     /// Lowest read-mark frame across slots currently held by a reader (1..5; slot 0 is the
     /// db-file read mark), or `None` if no reader holds a slot. Read-only / lock-free.
     fn min_pinned_read_frame_inner(&self) -> Option<u64> {
-        let shared = self.shared.read();
+        let shared = self.rd();
         let mut min: Option<u64> = None;
         for slot in 1..5 {
             if let Some(v) = shared.runtime.read_locks[slot].held_value() {
@@ -888,38 +923,38 @@ impl InProcessWalCoordination {
     }
 
     fn set_read_mark_value_exclusive(&self, slot: usize, value: u32) {
-        self.shared.read().runtime.read_locks[slot].set_value_exclusive(value);
+        self.rd().runtime.read_locks[slot].set_value_exclusive(value);
     }
 
     fn try_upgrade_read_mark(&self, slot: usize) -> bool {
-        self.shared.read().runtime.read_locks[slot].upgrade()
+        self.rd().runtime.read_locks[slot].upgrade()
     }
 
     fn downgrade_read_mark(&self, slot: usize) {
-        self.shared.read().runtime.read_locks[slot].downgrade();
+        self.rd().runtime.read_locks[slot].downgrade();
     }
 
     fn try_write_lock(&self) -> bool {
-        self.shared.read().runtime.write_lock.write()
+        self.rd().runtime.write_lock.write()
     }
 
     fn unlock_write_lock(&self) {
-        self.shared.read().runtime.write_lock.unlock();
+        self.rd().runtime.write_lock.unlock();
     }
 
     fn try_checkpoint_lock(&self) -> bool {
-        self.shared.read().runtime.checkpoint_lock.write()
+        self.rd().runtime.checkpoint_lock.write()
     }
 
     fn unlock_checkpoint_lock(&self) {
-        self.shared.read().runtime.checkpoint_lock.unlock();
+        self.rd().runtime.checkpoint_lock.unlock();
     }
 }
 
 impl WalCoordination for InProcessWalCoordination {
     fn load_snapshot(&self) -> WalSnapshot {
-        let shared = self.shared.read();
-        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        let shared = self.rd();
+        let checkpoint_seq = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail)).checkpoint_seq;
         WalSnapshot {
             max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
             nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -930,7 +965,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn publish_commit(&self, commit: WalCommitState) {
-        let mut shared = self.shared.write();
+        let mut shared = self.wr();
         shared
             .metadata
             .max_frame
@@ -943,8 +978,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn publish_backfill(&self, max_frame: u64) {
-        self.shared
-            .write()
+        self.wr()
             .metadata
             .nbackfills
             .store(max_frame, Ordering::Release);
@@ -967,8 +1001,8 @@ impl WalCoordination for InProcessWalCoordination {
         max_frame: u64,
         frame_watermark: Option<u64>,
     ) -> Option<u64> {
-        let shared = self.shared.read();
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let shared = self.rd();
+        let frame_cache = shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
         let range = frame_watermark
             .map(|x| 0..=x)
             .unwrap_or(min_frame..=max_frame);
@@ -982,8 +1016,8 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
-        let shared = self.shared.read();
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let shared = self.rd();
+        let frame_cache = shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
         let mut list = Vec::with_capacity(frame_cache.len());
         for (&page_id, frames) in frame_cache.iter() {
             if let Some(&frame_id) = frames
@@ -998,7 +1032,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn checkpoint_epoch(&self) -> u32 {
-        self.shared.read().runtime.epoch.load(Ordering::Acquire)
+        self.rd().runtime.epoch.load(Ordering::Acquire)
     }
 
     fn bump_checkpoint_epoch(&self) -> u32 {
@@ -1200,9 +1234,9 @@ impl WalCoordination for InProcessWalCoordination {
             }
             self.set_read_mark_value_exclusive(idx, READMARK_NOT_USED);
         }
-        let mut shared = self.shared.write();
+        let mut shared = self.wr();
         shared.restart_wal_header(io);
-        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        let checkpoint_seq = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail)).checkpoint_seq;
         Ok(WalSnapshot {
             max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
             nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -1234,7 +1268,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn prepare_truncate(&self) -> Result<Arc<dyn File>> {
-        let shared = self.shared.read();
+        let shared = self.rd();
         turso_assert!(
             shared.metadata.enabled.load(Ordering::Relaxed),
             "WAL must be enabled"
@@ -1247,11 +1281,11 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn wal_header(&self) -> WalHeader {
-        *self.shared.read().metadata.wal_header.lock()
+        *self.rd().metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail))
     }
 
     fn wal_file(&self) -> Result<Arc<dyn File>> {
-        let shared = self.shared.read();
+        let shared = self.rd();
         turso_assert!(
             shared.metadata.enabled.load(Ordering::Relaxed),
             "WAL must be enabled"
@@ -1271,13 +1305,13 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn prepare_wal_header(&self, io: &dyn IO, page_size: PageSize) -> Option<WalHeader> {
-        let mut shared: crate::sync::RwLockWriteGuard<'_, WalFileShared> = self.shared.write();
+        let mut shared: crate::sync::RwLockWriteGuard<'_, WalFileShared> = self.wr();
         if shared.metadata.initialized.load(Ordering::Acquire) {
             return None;
         }
 
         let (header, checksum) = {
-            let mut hdr = shared.metadata.wal_header.lock();
+            let mut hdr = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             hdr.magic = if cfg!(target_endian = "big") {
                 WAL_MAGIC_BE
             } else {
@@ -1311,8 +1345,8 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn cache_frame(&self, page_id: u64, frame_id: u64) {
-        let shared = self.shared.read();
-        let mut frame_cache = shared.runtime.frame_cache.lock();
+        let shared = self.rd();
+        let mut frame_cache = shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
         // Frame-slot reuse / append-position rewind guard. Within a WAL
         // generation frames are appended with strictly increasing numbers, so
         // a `frame_id` that does not exceed the current high-water means the
@@ -1351,8 +1385,8 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn rollback_cache(&self, max_frame: u64) {
-        let shared = self.shared.read();
-        let mut frame_cache = shared.runtime.frame_cache.lock();
+        let shared = self.rd();
+        let mut frame_cache = shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
         frame_cache.retain(|_page_id, frames| {
             while frames.last().is_some_and(|&frame| frame > max_frame) {
                 frames.pop();
@@ -1389,6 +1423,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn shared_wal_state(&self) -> Arc<RwLock<WalFileShared>> {
+        crate::coherence::bump(crate::coherence::Class::WalArc, 1);
         self.shared.clone()
     }
 }
@@ -1445,7 +1480,7 @@ impl ShmWalCoordination {
         shared: &WalFileShared,
         authority_snapshot: SharedWalCoordinationHeader,
     ) -> SharedWalCoordinationHeader {
-        let header = shared.metadata.wal_header.lock();
+        let header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
         SharedWalCoordinationHeader {
             max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
             nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -1521,7 +1556,7 @@ impl ShmWalCoordination {
             .epoch
             .store(snapshot.checkpoint_epoch, Ordering::Release);
         if install_header {
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.checkpoint_seq = snapshot.checkpoint_seq;
             header.page_size = snapshot.page_size;
             header.salt_1 = snapshot.salt_1;
@@ -1545,7 +1580,7 @@ impl ShmWalCoordination {
         let mut shared = self.shared.write();
         Self::install_local_snapshot(&mut shared, snapshot, true);
         shared.metadata.initialized.store(false, Ordering::Release);
-        shared.runtime.frame_cache.lock().clear();
+        shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).clear();
         shared
             .runtime
             .frame_cache_high_water
@@ -1556,7 +1591,7 @@ impl ShmWalCoordination {
     fn sync_authority_frames_from_local(&self) {
         let entries = {
             let shared = self.shared.read();
-            let frame_cache = shared.runtime.frame_cache.lock();
+            let frame_cache = shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
             let mut entries = Vec::new();
             for (&page_id, frames) in frame_cache.iter() {
                 for &frame_id in frames {
@@ -1740,7 +1775,7 @@ impl ShmWalCoordination {
         authority_snapshot: SharedWalCoordinationHeader,
         shared: &WalFileShared,
     ) -> bool {
-        let header = shared.metadata.wal_header.lock();
+        let header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
         header.checkpoint_seq == authority_snapshot.checkpoint_seq
             && header.page_size == authority_snapshot.page_size
             && header.salt_1 == authority_snapshot.salt_1
@@ -1840,7 +1875,7 @@ impl ShmWalCoordination {
             let mut shared = self.shared.write();
             Self::install_local_snapshot(&mut shared, restarted, true);
             shared.metadata.initialized.store(false, Ordering::Release);
-            shared.runtime.frame_cache.lock().clear();
+            shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).clear();
             shared
                 .runtime
                 .frame_cache_high_water
@@ -1926,7 +1961,7 @@ impl WalCoordination for ShmWalCoordination {
                 .metadata
                 .transaction_count
                 .store(commit.transaction_count, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.checksum_1 = commit.last_checksum.0;
             header.checksum_2 = commit.last_checksum.1;
         }
@@ -2947,6 +2982,7 @@ enum VacuumLockGuard {
 impl VacuumLockGuard {
     fn try_read(ptr: Arc<RwLock<WalFileShared>>) -> Option<Self> {
         let acquired = {
+            crate::coherence::bump(crate::coherence::Class::WalRwRead, 2);
             let shared = ptr.read();
             shared.runtime.vacuum_lock.read()
         };
@@ -2959,6 +2995,7 @@ impl VacuumLockGuard {
 
     fn try_write(ptr: Arc<RwLock<WalFileShared>>) -> Option<Self> {
         let acquired = {
+            crate::coherence::bump(crate::coherence::Class::WalRwRead, 2);
             let shared = ptr.read();
             shared.runtime.vacuum_lock.write()
         };
@@ -2982,6 +3019,9 @@ impl Drop for VacuumLockGuard {
     fn drop(&mut self) {
         match self {
             Self::Read { ptr } | Self::Write { ptr } => {
+                crate::coherence::bump(crate::coherence::Class::WalRwRead, 2);
+                // The guard's Arc is released right after this.
+                crate::coherence::bump(crate::coherence::Class::WalArc, 1);
                 ptr.read().runtime.vacuum_lock.unlock();
             }
         }
@@ -5851,7 +5891,7 @@ impl WalFileShared {
     }
 
     pub fn page_size(&self) -> u32 {
-        self.metadata.wal_header.lock().page_size
+        self.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail)).page_size
     }
 
     /// Called after a successful RESTART/TRUNCATE mode checkpoint
@@ -5871,7 +5911,7 @@ impl WalFileShared {
     /// writing frames into the start of the log file.
     fn restart_wal_header(&mut self, io: &dyn IO) {
         {
-            let mut hdr = self.metadata.wal_header.lock();
+            let mut hdr = self.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             hdr.checkpoint_seq = hdr.checkpoint_seq.wrapping_add(1);
             // keep hdr.magic, hdr.file_format, hdr.page_size as-is
             hdr.salt_1 = hdr.salt_1.wrapping_add(1);
@@ -5885,7 +5925,7 @@ impl WalFileShared {
             self.metadata.initialized.store(false, Ordering::Release);
         }
 
-        self.runtime.frame_cache.lock().clear();
+        self.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).clear();
         self.runtime
             .frame_cache_high_water
             .store(0, Ordering::Release);
@@ -7114,7 +7154,7 @@ pub mod test {
             .nbackfills
             .store(snapshot.nbackfills, Ordering::Release);
         guard.metadata.last_checksum = snapshot.last_checksum;
-        guard.metadata.wal_header.lock().checkpoint_seq = snapshot.checkpoint_seq;
+        guard.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail)).checkpoint_seq = snapshot.checkpoint_seq;
         guard
             .metadata
             .transaction_count
@@ -7308,7 +7348,7 @@ pub mod test {
     fn wal_header_snapshot(shared: &Arc<RwLock<WalFileShared>>) -> (u32, u32, u32, u32) {
         // (checkpoint_seq, salt1, salt2, page_size)
         let shared_guard = shared.read();
-        let hdr = shared_guard.metadata.wal_header.lock();
+        let hdr = shared_guard.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
         (hdr.checkpoint_seq, hdr.salt_1, hdr.salt_2, hdr.page_size)
     }
 
@@ -7409,7 +7449,7 @@ pub mod test {
         {
             let guard = shared.write();
             guard.runtime.epoch.store(5, Ordering::Release);
-            guard.runtime.frame_cache.lock().extend([
+            guard.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).extend([
                 (1, vec![1, 4, 8]),
                 (2, vec![2, 6]),
                 (3, vec![3]),
@@ -7450,7 +7490,7 @@ pub mod test {
         set_shared_snapshot(&shared, snapshot);
         {
             let guard = shared.write();
-            let mut header = guard.metadata.wal_header.lock();
+            let mut header = guard.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.checksum_1 = 144;
             header.checksum_2 = 233;
@@ -7485,7 +7525,7 @@ pub mod test {
         for lock in &guard.runtime.read_locks[2..] {
             assert_eq!(lock.get_value(), READMARK_NOT_USED);
         }
-        assert!(guard.runtime.frame_cache.lock().is_empty());
+        assert!(guard.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).is_empty());
         assert!(!guard.metadata.initialized.load(Ordering::Acquire));
     }
 
@@ -7508,7 +7548,7 @@ pub mod test {
         assert_eq!(coordination.find_frame(7, 0, 5, None), Some(2));
         assert_eq!(coordination.iter_latest_frames(0, 5), vec![(7, 2), (9, 4)]);
         assert_eq!(
-            shared.read().runtime.frame_cache.lock().get(&7),
+            shared.read().runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).get(&7),
             Some(&vec![2])
         );
     }
@@ -7668,7 +7708,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, snapshot);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -7753,7 +7793,7 @@ pub mod test {
         set_shared_snapshot(&shared, snapshot);
         {
             let shared = shared.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -7810,7 +7850,7 @@ pub mod test {
         set_shared_snapshot(&shared, snapshot_a);
         {
             let shared = shared.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -7904,7 +7944,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, snapshot);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -7959,7 +7999,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, snapshot);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -7985,7 +8025,7 @@ pub mod test {
                 .store(42, Ordering::Release);
             shared.runtime.epoch.store(99, Ordering::Release);
             shared.metadata.initialized.store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.checkpoint_seq = 88;
             header.page_size = 2048;
             header.salt_1 = 91;
@@ -8042,7 +8082,7 @@ pub mod test {
         );
         assert_eq!(shared.runtime.epoch.load(Ordering::Acquire), 5);
         assert!(!shared.metadata.initialized.load(Ordering::Acquire));
-        assert!(shared.runtime.frame_cache.lock().is_empty());
+        assert!(shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).is_empty());
     }
 
     #[cfg(host_shared_wal)]
@@ -8068,7 +8108,7 @@ pub mod test {
             set_shared_snapshot(&shared, snapshot);
             {
                 let shared = shared.write();
-                let mut header = shared.metadata.wal_header.lock();
+                let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
                 header.page_size = 4096;
                 header.salt_1 = 17;
                 header.salt_2 = 23;
@@ -8165,7 +8205,7 @@ pub mod test {
             .metadata
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
-        assert!(shared.runtime.frame_cache.lock().is_empty());
+        assert!(shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).is_empty());
     }
 
     #[cfg(host_shared_wal)]
@@ -8191,7 +8231,7 @@ pub mod test {
             &open_test_db_file_for_wal(&io, &wal_path),
         )
         .unwrap();
-        assert!(shared.read().runtime.frame_cache.lock().is_empty());
+        assert!(shared.read().runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).is_empty());
 
         let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
         buffer_pool.finalize_with_page_size(4096).unwrap();
@@ -8211,7 +8251,7 @@ pub mod test {
             "page lookup must refuse the overflowed path instead of rescanning the WAL synchronously"
         );
         assert!(
-            shared.read().runtime.frame_cache.lock().is_empty(),
+            shared.read().runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).is_empty(),
             "refusing the overflow refresh must leave the local fallback cache untouched"
         );
 
@@ -8268,7 +8308,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert_eq!(
-            shared.runtime.frame_cache.lock().get(&7).cloned(),
+            shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).get(&7).cloned(),
             Some(vec![1])
         );
     }
@@ -8359,7 +8399,7 @@ pub mod test {
             .loaded_from_disk_scan
             .load(Ordering::Acquire));
         assert_eq!(
-            shared.runtime.frame_cache.lock().get(&7).cloned(),
+            shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).get(&7).cloned(),
             Some(vec![1])
         );
     }
@@ -8480,7 +8520,7 @@ pub mod test {
             "preserving a newer zero-frame generation must require the first append to rewrite the WAL header"
         );
         assert!(
-            shared.read().runtime.frame_cache.lock().is_empty(),
+            shared.read().runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).is_empty(),
             "older WAL frames from a prior generation must not survive zero-frame authority recovery"
         );
     }
@@ -8865,7 +8905,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, authoritative);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -8895,13 +8935,13 @@ pub mod test {
                 .metadata
                 .loaded_from_disk_scan
                 .store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
             header.checksum_1 = stale.last_checksum.0;
             header.checksum_2 = stale.last_checksum.1;
-            shared.runtime.frame_cache.lock().insert(7, vec![2]);
+            shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).insert(7, vec![2]);
         }
 
         let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
@@ -8942,7 +8982,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, authoritative);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -8964,13 +9004,13 @@ pub mod test {
                 .metadata
                 .loaded_from_disk_scan
                 .store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
             header.checksum_1 = authoritative.last_checksum.0;
             header.checksum_2 = authoritative.last_checksum.1;
-            let mut frame_cache = shared.runtime.frame_cache.lock();
+            let mut frame_cache = shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
             frame_cache.insert(7, vec![2]);
             frame_cache.insert(9, vec![5]);
         }
@@ -9020,7 +9060,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, authoritative);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -9044,14 +9084,14 @@ pub mod test {
                 .metadata
                 .loaded_from_disk_scan
                 .store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
             header.checksum_1 = authoritative.last_checksum.0;
             header.checksum_2 = authoritative.last_checksum.1;
-            shared.runtime.frame_cache.lock().insert(7, vec![2]);
-            shared.runtime.frame_cache.lock().insert(9, vec![5]);
+            shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).insert(7, vec![2]);
+            shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None).insert(9, vec![5]);
         }
 
         let (authority, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
@@ -9151,7 +9191,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, authoritative);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -9172,7 +9212,7 @@ pub mod test {
                 .metadata
                 .loaded_from_disk_scan
                 .store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.page_size = 4096;
             header.checkpoint_seq = authoritative.checkpoint_seq;
             header.salt_1 = 17;
@@ -9236,7 +9276,7 @@ pub mod test {
                 .transaction_count
                 .store(3, Ordering::Release);
             shared.metadata.initialized.store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.checkpoint_seq = 2;
             header.page_size = 4096;
             header.salt_1 = 7;
@@ -9257,7 +9297,7 @@ pub mod test {
                 !shared.metadata.initialized.load(Ordering::Acquire),
                 "stale local initialized state must be cleared"
             );
-            let header = shared.metadata.wal_header.lock();
+            let header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             assert_eq!(header.checkpoint_seq, authoritative.checkpoint_seq);
             assert_eq!(header.page_size, authoritative.page_size);
             assert_eq!(header.salt_1, authoritative.salt_1);
@@ -9349,7 +9389,7 @@ pub mod test {
                 .transaction_count
                 .store(authoritative.transaction_count, Ordering::Release);
             shared.metadata.last_checksum = (31, 37);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.checkpoint_seq = authoritative.checkpoint_seq;
             header.page_size = authoritative.page_size;
             header.salt_1 = authoritative.salt_1;
@@ -9383,7 +9423,7 @@ pub mod test {
                 .metadata
                 .transaction_count
                 .store(3, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             header.checkpoint_seq = 2;
             header.page_size = 4096;
             header.salt_1 = 17;

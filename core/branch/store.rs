@@ -688,6 +688,25 @@ impl BranchStore {
     }
 
     /// The shard of branch `id`, locked.
+    /// Coherence instrument (r11-coherence PREREG §0 (b)): the addresses of the store's shared words.
+    pub(crate) fn coherence_addrs(&self, out: &mut Vec<(String, usize)>) {
+        let a = |x: *const u8| x as usize;
+        out.push(("store.shards[0]".into(), a(&*self.shards[0] as *const _ as *const u8)));
+        out.push(("store.shards[1]".into(), a(&*self.shards[1] as *const _ as *const u8)));
+        out.push(("store.trunk".into(), a(&*self.trunk as *const _ as *const u8)));
+        out.push(("store.next_id".into(), a(&self.next_id as *const _ as *const u8)));
+        out.push(("store.live".into(), a(&self.live as *const _ as *const u8)));
+        out.push(("store.trunk_children".into(), a(&self.trunk_children as *const _ as *const u8)));
+        out.push(("store.lock_timing".into(), a(&self.lock_timing as *const _ as *const u8)));
+        out.push(("store.trunk_format".into(), a(&self.trunk_format as *const _ as *const u8)));
+        out.push((
+            "store.trunk_pages.generation".into(),
+            a(&self.trunk_pages.generation as *const _ as *const u8),
+        ));
+        out.push(("store.written".into(), a(&self.written as *const _ as *const u8)));
+        out.push(("store.self".into(), a(self as *const _ as *const u8)));
+    }
+
     fn shard(&self, id: BranchId) -> Held<'_, Shard> {
         take(&self.shards[shard_of(id)], self.timed())
     }
@@ -765,17 +784,20 @@ impl BranchStore {
         }
         let (id, f) = {
             let mut trunk = self.trunk();
+            crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
             let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
             let f = trunk.lineage.epoch;
             trunk.lineage.epoch += 1;
             trunk.lineage.children.insert(f, id);
             (id, f)
         };
+        crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
         self.live.fetch_add(1, Ordering::AcqRel);
         self.shard(id).branches.insert(
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
         );
+        crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
@@ -791,6 +813,7 @@ impl BranchStore {
             if st.writer {
                 return Err(LimboError::Busy);
             }
+            crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
             let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
             let f = st.lineage.epoch;
             st.lineage.epoch += 1;
@@ -809,6 +832,7 @@ impl BranchStore {
                 .clone();
             (id, BranchState::new(parent, f, schema, st.trunk_at, view))
         };
+        crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
         self.live.fetch_add(1, Ordering::AcqRel);
         self.shard(id).branches.insert(id, child);
         Ok(id)
@@ -829,6 +853,8 @@ impl BranchStore {
             )));
         }
         st.open = true;
+        // The clone and its drop at the connection's close.
+        crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
         Ok(st.schema.clone())
     }
 
@@ -1166,6 +1192,7 @@ impl BranchStore {
                 return (freed, at != id);
             }
             let st = shard.branches.remove(&at).expect("just looked it up");
+            crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
             self.live.fetch_sub(1, Ordering::AcqRel);
             let domain = &mut shard.domain;
             for owned in st.current.values() {
@@ -1182,6 +1209,7 @@ impl BranchStore {
                     work,
                 } = &mut *trunk;
                 freed += lineage.child_gone(st.fork_epoch, domain, work);
+                crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
                 if self.trunk_children.fetch_sub(1, Ordering::AcqRel) == 1 {
                     // From here the trunk writes without telling the store, so no cached version
                     // can be trusted once a branch exists again. No branch can read in between: a

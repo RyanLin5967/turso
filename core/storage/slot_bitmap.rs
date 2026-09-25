@@ -93,6 +93,7 @@ impl AtomicSlotBitmap {
                 let bit = word.trailing_zeros();
                 let new_word = word & !(1u64 << bit);
 
+                crate::coherence::bump(crate::coherence::Class::BufPool, 1);
                 match self.words[word_idx].compare_exchange_weak(
                     word,
                     new_word,
@@ -106,6 +107,7 @@ impl AtomicSlotBitmap {
                         } else {
                             word_idx
                         };
+                        crate::coherence::bump(crate::coherence::Class::BufPool, 1);
                         self.next_word_hint.store(new_hint, Ordering::Release);
                         return Some(word_and_bit_to_slot(word_idx, bit));
                     }
@@ -119,16 +121,26 @@ impl AtomicSlotBitmap {
         None
     }
 
+    /// Coherence instrument (r11-coherence PREREG §0 (b)): the addresses of word 0 and of the hint.
+    pub(crate) fn coherence_addrs(&self) -> (usize, usize) {
+        (
+            self.words.as_ptr() as usize,
+            &self.next_word_hint as *const _ as usize,
+        )
+    }
+
     /// Frees a previously allocated slot. Wait-free (single atomic op).
     pub fn free_one(&self, slot: u32) {
         turso_assert!(slot < self.n_slots, "free_one out of bounds");
         let (word_idx, bit) = slot_to_word_and_bit(slot);
         let mask = 1u64 << bit;
+        crate::coherence::bump(crate::coherence::Class::BufPool, 1);
         let old = self.words[word_idx].fetch_or(mask, Ordering::Release);
         debug_assert!((old & mask) == 0, "double-free detected for slot {slot}");
         // If this word is before the current hint, pull the hint back.
         let hint = self.next_word_hint.load(Ordering::Acquire);
         if word_idx < hint {
+            crate::coherence::bump(crate::coherence::Class::BufPool, 1);
             self.next_word_hint.store(word_idx, Ordering::Release);
         }
     }

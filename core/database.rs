@@ -2474,10 +2474,13 @@ impl Database {
             prepare_context_generation: AtomicU64::new(0),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
+        crate::coherence::bump(crate::coherence::Class::DbHot, 1);
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+        crate::coherence::bump(crate::coherence::Class::Builtin, 2);
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
+        crate::coherence::bump(crate::coherence::Class::Builtin, builtin_syms.entries() as u64);
         conn.syms.write().extend(&builtin_syms);
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2832,7 +2835,7 @@ impl Database {
             .load(Ordering::Acquire);
         let reopened_max_frame = shared_wal.metadata.max_frame.load(Ordering::Acquire);
         let reopened_nbackfills = shared_wal.metadata.nbackfills.load(Ordering::Acquire);
-        let reopened_checkpoint_seq = shared_wal.metadata.wal_header.lock().checkpoint_seq;
+        let reopened_checkpoint_seq = shared_wal.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail)).checkpoint_seq;
         drop(shared_wal);
 
         #[cfg(host_shared_wal)]
@@ -2894,7 +2897,7 @@ impl Database {
     pub fn local_wal_find_frame_for_testing(&self, page_id: u64) -> Result<Option<u64>> {
         let shared = self.shared_wal.read();
         let max_frame = shared.metadata.max_frame.load(Ordering::Acquire);
-        let frame_cache = shared.runtime.frame_cache.lock();
+        let frame_cache = shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
         Ok(frame_cache.get(&page_id).and_then(|frames| {
             frames
                 .iter()
@@ -3183,7 +3186,62 @@ impl Database {
         Ok(name)
     }
 
+    /// Coherence instrument (r11-coherence PREREG §0 (b)): the address of every hot shared word the lane counts,
+    /// by name. An `*.arcinner` entry is the Arc's strong count. Observation only.
+    #[doc(hidden)]
+    pub fn coherence_addrs(self: &Arc<Database>) -> Vec<(String, usize)> {
+        fn inner<T: ?Sized>(a: &Arc<T>) -> usize {
+            Arc::as_ptr(a) as *const u8 as usize - 2 * std::mem::size_of::<usize>()
+        }
+        fn at<T: ?Sized>(x: &T) -> usize {
+            x as *const T as *const u8 as usize
+        }
+        let mut out: Vec<(String, usize)> = vec![
+            ("db.arcinner".into(), inner(self)),
+            ("db.n_connections".into(), at(&self.n_connections)),
+            ("db.builtin_syms".into(), at(&self.builtin_syms)),
+            ("db.schema_mutex.arcinner".into(), inner(&self.schema)),
+            ("db.schema.arcinner".into(), inner(&*self.schema.lock())),
+            ("db.io.arcinner".into(), inner(&self.io)),
+            ("db.db_file.arcinner".into(), inner(&self.db_file)),
+            ("db.buffer_pool.arcinner".into(), inner(&self.buffer_pool)),
+            ("db.init_lock.arcinner".into(), inner(&self.init_lock)),
+            ("db.init_page_1.arcinner".into(), inner(&self.init_page_1)),
+            ("db.branches.arcinner".into(), inner(&self.branches)),
+            ("wal.arcinner".into(), inner(&self.shared_wal)),
+            // lock_api's RwLock keeps its raw lock first; this is that word.
+            ("wal.rwlock_word".into(), Arc::as_ptr(&self.shared_wal) as *const u8 as usize),
+        ];
+        {
+            let g = self.shared_wal.read();
+            out.push(("wal.enabled".into(), at(&g.metadata.enabled)));
+            out.push(("wal.max_frame".into(), at(&g.metadata.max_frame)));
+            out.push(("wal.nbackfills".into(), at(&g.metadata.nbackfills)));
+            out.push(("wal.transaction_count".into(), at(&g.metadata.transaction_count)));
+            out.push(("wal.last_checksum".into(), at(&g.metadata.last_checksum)));
+            for i in 0..5 {
+                out.push((format!("wal.read_locks[{i}]"), at(&g.runtime.read_locks[i])));
+            }
+            out.push(("wal.vacuum_lock".into(), at(&g.runtime.vacuum_lock)));
+            out.push(("wal.write_lock".into(), at(&g.runtime.write_lock)));
+            out.push(("wal.checkpoint_lock".into(), at(&g.runtime.checkpoint_lock)));
+            out.push(("wal.epoch".into(), at(&g.runtime.epoch)));
+            out.push(("wal.header.arcinner".into(), inner(&g.metadata.wal_header)));
+            out.push(("wal.frame_cache.arcinner".into(), inner(&g.runtime.frame_cache)));
+            out.push((
+                "wal.overflow_cov.arcinner".into(),
+                inner(&g.runtime.overflow_fallback_coverage),
+            ));
+        }
+        self.buffer_pool.coherence_addrs(&mut out);
+        self.branches.coherence_addrs(&mut out);
+        out
+    }
+
     pub(crate) fn clone_schema(&self) -> Arc<Schema> {
+        // The Mutex's lock and unlock, and the Arc's clone and its eventual drop.
+        crate::coherence::bump(crate::coherence::Class::DbHot, 2);
+        crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
         let schema = self.schema.lock();
         schema.clone()
     }

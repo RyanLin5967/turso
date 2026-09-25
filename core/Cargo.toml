@@ -55,6 +55,8 @@ cli_only = []
 test_helper = []
 bench = []
 nanosecond-bench = ["bench"]
+# r11-coherence instrument: thread-local counts of shared-line writes (core/coherence.rs).
+coherence = []
 fts = ["dep:tantivy"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]

@@ -554,6 +554,10 @@ crate::assert::assert_send_sync!(Connection);
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        crate::coherence::bump(
+            crate::coherence::Class::Builtin,
+            self.syms.read().entries() as u64,
+        );
         if !self.is_closed() {
             // A handle dropped mid-transaction rolls that transaction back
             // below, so parked index-method cursors must receive the same
@@ -605,6 +609,7 @@ impl Drop for Connection {
             });
 
             // if connection wasn't properly closed, decrement the connection counter
+            crate::coherence::bump(crate::coherence::Class::DbHot, 1);
             self.db
                 .n_connections
                 .fetch_sub(1, crate::sync::atomic::Ordering::SeqCst);
@@ -613,6 +618,12 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    /// Coherence instrument (r11-coherence PREREG §0 (b)): the strong count of this connection's Arc<Schema>.
+    #[doc(hidden)]
+    pub fn coherence_schema_addr(&self) -> usize {
+        Arc::as_ptr(&*self.schema.read()) as *const u8 as usize - 2 * std::mem::size_of::<usize>()
+    }
+
     fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
         let was_reparsing = self.schema_reparse_in_progress.swap(true, Ordering::SeqCst);
         turso_assert!(
@@ -959,6 +970,7 @@ impl Connection {
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
+        crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
         let schema = self.schema.read().clone();
         match translate::translate(
             &schema,
@@ -5343,6 +5355,15 @@ impl SymbolTable {
         self.collations
             .contains_key(&collation.id())
             .then_some(collation)
+    }
+
+    /// Entries across every map: the Arcs [`Self::extend`] clones out of `other`.
+    pub fn entries(&self) -> usize {
+        self.functions.len()
+            + self.collations.len()
+            + self.vtabs.len()
+            + self.vtab_modules.len()
+            + self.index_methods.len()
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {

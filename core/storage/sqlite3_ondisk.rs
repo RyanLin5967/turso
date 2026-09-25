@@ -1882,7 +1882,7 @@ impl StreamingWalReader {
             return;
         }
         let wfs = self.wal_shared.read();
-        let mut frame_cache = wfs.runtime.frame_cache.lock();
+        let mut frame_cache = wfs.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
         for (page, mut frames) in state.pending_frames.drain() {
             // Only include frames up to last valid commit
             frames.retain(|&f| f <= state.last_valid_frame);
@@ -1914,12 +1914,12 @@ impl StreamingWalReader {
 
         let max_frame = st.last_valid_frame;
         if max_frame > 0 {
-            let mut frame_cache = wfs.runtime.frame_cache.lock();
+            let mut frame_cache = wfs.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
             for frames in frame_cache.values_mut() {
                 frames.retain(|&f| f <= max_frame);
             }
             frame_cache.retain(|_, frames| !frames.is_empty());
-            let header = wfs.metadata.wal_header.lock();
+            let header = wfs.metadata.wal_header.lock_class(crate::coherence::Class::WalHdr, Some(crate::coherence::Class::WalHdrFail));
             wfs.runtime.overflow_fallback_coverage.lock().record(
                 header.checkpoint_seq,
                 header.salt_1,
@@ -2507,7 +2507,7 @@ mod tests {
         // checksum should only include committed frame.
         assert_ne!(guard.metadata.last_checksum, after_frame3_checksum);
 
-        let frame_cache = guard.runtime.frame_cache.lock();
+        let frame_cache = guard.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
         assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));
         assert!(frame_cache.get(&2).is_none());
     }

@@ -407,6 +407,7 @@ impl Connection {
         // connection's own snapshot or the shared one is that schema whenever the cookie agrees;
         // if neither does, a DDL commit is between publishing its pages and its schema, and the
         // caller retries rather than fork a branch whose schema disagrees with its pages.
+        crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
         let schema = [self.schema.read().clone(), self.db.clone_schema()]
             .into_iter()
             .find(|schema| schema.schema_version == cookie)

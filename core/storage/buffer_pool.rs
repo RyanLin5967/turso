@@ -161,6 +161,29 @@ impl BufferPool {
 
     /// Request a `Buffer` the size of the `db_page_size` the `BufferPool` was initialized with.
     #[inline]
+    /// Coherence instrument (r11-coherence PREREG §0 (b)): the addresses of each arena's hot words.
+    pub(crate) fn coherence_addrs(&self, out: &mut Vec<(String, usize)>) {
+        let inner = self.inner();
+        for (name, arena) in [
+            ("bufpool.page_arena", &inner.page_arena),
+            ("bufpool.wal_frame_arena", &inner.wal_frame_arena),
+        ] {
+            if let Some(a) = arena {
+                out.push((
+                    format!("{name}.arcinner"),
+                    Arc::as_ptr(a) as usize - 2 * std::mem::size_of::<usize>(),
+                ));
+                out.push((
+                    format!("{name}.allocated_slots"),
+                    &a.allocated_slots as *const _ as usize,
+                ));
+                let (w0, hint) = a.free_slots.coherence_addrs();
+                out.push((format!("{name}.bitmap_word0"), w0));
+                out.push((format!("{name}.next_word_hint"), hint));
+            }
+        }
+    }
+
     pub fn get_page(&self) -> Buffer {
         let inner = self.inner_mut();
         inner.get_db_page_buffer()
@@ -412,6 +435,8 @@ impl Arena {
             return None;
         }
         let first_idx = arena.free_slots.alloc_one()?;
+        // allocated_slots, and the Arc<Arena> the buffer carries.
+        crate::coherence::bump(crate::coherence::Class::BufPool, 2);
         arena.allocated_slots.fetch_add(1, Ordering::AcqRel);
         let offset = first_idx as usize * arena.slot_size;
         let ptr = unsafe { NonNull::new_unchecked(arena.base.as_ptr().add(offset)) };
@@ -435,6 +460,8 @@ impl Arena {
             "must not already be marked free"
         );
         self.free_slots.free_one(slot_idx);
+        // allocated_slots, and the buffer's Arc<Arena>, released right after this.
+        crate::coherence::bump(crate::coherence::Class::BufPool, 2);
         self.allocated_slots.fetch_sub(1, Ordering::AcqRel);
     }
 }
