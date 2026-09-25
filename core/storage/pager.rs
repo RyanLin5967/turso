@@ -3288,6 +3288,10 @@ impl Pager {
                         connection.get_sync_mode(),
                         connection.get_data_sync_retry(),
                     ));
+                    // The branch store's merge record: this transaction's write set is committed.
+                    if let Some(store) = self.branch_store.get() {
+                        store.trunk_tx_end(true);
+                    }
 
                     let schema_did_change = match connection.get_tx_state() {
                         TransactionState::Write { schema_did_change } => schema_did_change,
@@ -3391,6 +3395,11 @@ impl Pager {
             _ => (false, false),
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
+        if is_write && self.branch.get().is_none() {
+            if let Some(store) = self.branch_store.get() {
+                store.trunk_tx_end(false);
+            }
+        }
         if is_write {
             self.clear_savepoints()
                 .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
@@ -3806,6 +3815,72 @@ impl Pager {
                 store.first_write_trunk(page_no, page.get_contents().as_slice());
             }
         }
+        Ok(())
+    }
+
+    /// A table cursor wrote or deleted `rowid` in the b-tree rooted at `root`. On a branch it joins
+    /// the branch's row write set; on the trunk, while it has a child, it stamps the row with the
+    /// current epoch. Both are what `branch::merge` validates with.
+    pub(crate) fn note_row_write(&self, root: i64, rowid: i64) {
+        if let Some(branch) = self.branch.get() {
+            branch.store.branch_row_written(branch.id, root, rowid);
+        } else if let Some(store) = self.branch_store.get() {
+            if store.trunk_has_children() {
+                store.trunk_row_written(root, rowid);
+            }
+        }
+    }
+
+    /// An index cursor wrote the b-tree rooted at `root` (an index, or a WITHOUT ROWID table).
+    pub(crate) fn note_index_write(&self, root: i64) {
+        if let Some(branch) = self.branch.get() {
+            branch.store.branch_index_written(branch.id, root);
+        }
+    }
+
+    /// A cursor wrote the table rooted at `root` without naming the rows (clear, destroy,
+    /// incremental blob I/O).
+    pub(crate) fn note_bulk_write(&self, root: i64) {
+        if let Some(branch) = self.branch.get() {
+            branch.store.branch_bulk_written(branch.id);
+        } else if let Some(store) = self.branch_store.get() {
+            if store.trunk_has_children() {
+                store.trunk_bulk_written(root);
+            }
+        }
+    }
+
+    /// The trunk's database size in pages, as the write transaction in progress sees it.
+    pub(crate) fn trunk_db_size(&self) -> Result<u32> {
+        self.io.block(|| self.with_header(|h| h.database_size.get()))
+    }
+
+    /// Overwrite trunk page `page_no` with `image` in the write transaction in progress: the merge's
+    /// physical install. A page past `db_size` (the size before the install began) is one the
+    /// merged branch allocated; it is created in the cache. Every page passes through
+    /// [`Pager::add_dirty`], so the trunk's own copy-on-write keeps its pre-image for any live
+    /// branch that can still see it.
+    pub(crate) fn install_page_image(&self, page_no: u32, image: &[u8], db_size: u32) -> Result<()> {
+        if self.branch.get().is_some() {
+            return Err(LimboError::InternalError(
+                "a merge installs pages into the trunk, never into a branch".to_string(),
+            ));
+        }
+        let page = if page_no > db_size {
+            let page = allocate_new_page(i64::from(page_no), &self.buffer_pool);
+            self.page_cache
+                .write()
+                .force_insert_page(PageCacheKey::new(page_no as usize), page.clone())?;
+            page
+        } else {
+            let (page, c) = self.io.block(|| self.read_page(i64::from(page_no)))?;
+            if let Some(c) = c {
+                self.io.wait_for_completion(c)?;
+            }
+            page
+        };
+        let ticket = self.add_dirty(&page)?;
+        page.get_contents().as_mut(&ticket).copy_from_slice(image);
         Ok(())
     }
 

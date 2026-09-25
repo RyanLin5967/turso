@@ -79,7 +79,7 @@
 //! Tarjan's fat node (JCSS 1989) with a search tree over its version stamps. [`Lineage::retain`]
 //! refuses a version that would break the disjointness the search relies on.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 
 use super::arena::{Arena, Slot};
@@ -110,6 +110,52 @@ struct StoreInner {
     branches: HashMap<BranchId, BranchState>,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
+    /// What a merge validates against (see [`super::merge`]).
+    merge: MergeState,
+}
+
+/// The trunk-side record a merge validates against. Every field is written only while the trunk has
+/// a live child: a branch forked later has `trunk_at` at or above the epoch of anything written
+/// before it, so nothing written while the trunk had no child can refuse it.
+#[derive(Default)]
+pub(super) struct MergeState {
+    /// Trunk write transactions committed with at least one page while the trunk had a child (V0).
+    pub(super) trunk_commits: u64,
+    /// Pages first-written by the trunk write transaction in progress, for the log.
+    tx_pages: Vec<u32>,
+    /// V1: committed trunk write sets as (epoch, pages sorted), oldest first, pruned below the
+    /// oldest live child's fork epoch.
+    pub(super) log: VecDeque<(u64, Vec<u32>)>,
+    /// V3: (table root, rowid) -> the epoch of the trunk's last write of that row.
+    pub(super) row_stamps: HashMap<(i64, i64), u64>,
+    /// `row_stamps` in stamping order (epochs ascend), for pruning.
+    stamp_order: VecDeque<(u64, i64, i64)>,
+    /// Tables the trunk wrote without naming the rows: root -> epoch.
+    pub(super) table_stamps: HashMap<i64, u64>,
+    /// Record each branch's page reads; the physical install's structural guard needs them.
+    pub(super) track_reads: bool,
+}
+
+impl MergeState {
+    /// Drop every stamp and log entry at or below `oldest`, the oldest live trunk child's fork
+    /// epoch: a record of epoch `e` refuses a branch only if `e > trunk_at`, and every live or
+    /// future child has `trunk_at >= oldest`. `None` (no child) drops everything.
+    pub(super) fn prune(&mut self, oldest: Option<u64>) {
+        let keep = |e: u64| oldest.is_some_and(|o| e > o);
+        while self.log.front().is_some_and(|&(e, _)| !keep(e)) {
+            self.log.pop_front();
+        }
+        while let Some(&(e, root, rowid)) = self.stamp_order.front() {
+            if keep(e) {
+                break;
+            }
+            self.stamp_order.pop_front();
+            if self.row_stamps.get(&(root, rowid)) == Some(&e) {
+                self.row_stamps.remove(&(root, rowid));
+            }
+        }
+        self.table_stamps.retain(|_, e| keep(*e));
+    }
 }
 
 #[derive(Default)]
@@ -169,6 +215,19 @@ struct BranchState {
     /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
     /// branch's first fork and kept current by its writes from then on; `None` until it forks.
     view: Option<PageMap>,
+    /// Trunk commits counted when this branch forked (V0). Meaningful for trunk children only.
+    commits_at_fork: u64,
+    /// Rows this branch's table cursors wrote, as (table root, rowid): its row write set. Kept
+    /// through a rollback, so it can only over-state what the branch changed.
+    rows: HashSet<(i64, i64)>,
+    /// Roots of b-trees this branch wrote through index cursors (indexes, WITHOUT ROWID tables).
+    index_roots: HashSet<i64>,
+    /// This branch wrote a table without naming the rows (clear, destroy, incremental blob I/O).
+    bulk: bool,
+    /// This branch committed a DDL.
+    ddl: bool,
+    /// Pages this branch read, while the store tracks reads.
+    reads: HashSet<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -330,6 +389,7 @@ impl BranchStore {
                 },
                 branches: HashMap::new(),
                 work: BranchWork::default(),
+                merge: MergeState::default(),
             }),
             trunk_children: AtomicUsize::new(0),
         }
@@ -365,10 +425,9 @@ impl BranchStore {
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
         inner.trunk.lineage.children.insert(f, id);
-        inner.branches.insert(
-            id,
-            BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
-        );
+        let mut st = BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default());
+        st.commits_at_fork = inner.merge.trunk_commits;
+        inner.branches.insert(id, st);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
@@ -541,7 +600,15 @@ impl BranchStore {
     /// can still see the version about to be overwritten, keep a copy of it for that child.
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
         let mut inner = self.inner.lock();
-        let StoreInner { arena, trunk, .. } = &mut *inner;
+        let StoreInner {
+            arena,
+            trunk,
+            merge,
+            ..
+        } = &mut *inner;
+        // Every page the transaction writes belongs to its write set, including one already
+        // written earlier in this epoch (which the early return below skips).
+        merge.tx_pages.push(page);
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
         if born >= epoch {
@@ -595,7 +662,9 @@ impl BranchStore {
 
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
         let mut inner = self.inner.lock();
-        inner.branches.get_mut(&id).ok_or_else(|| gone(id))?.schema = schema;
+        let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        st.schema = schema;
+        st.ddl = true;
         Ok(())
     }
 
@@ -604,6 +673,11 @@ impl BranchStore {
     /// ordinary WAL / database-file path.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
         let mut inner = self.inner.lock();
+        if inner.merge.track_reads {
+            if let Some(st) = inner.branches.get_mut(&id) {
+                st.reads.insert(page);
+            }
+        }
         let (mut levels, mut examined) = (0, 0);
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
         inner.work.resolve_calls += 1;
@@ -629,6 +703,9 @@ impl BranchStore {
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
             work: inner.work,
+            merge_log_entries: inner.merge.log.len(),
+            merge_log_pages: inner.merge.log.iter().map(|(_, p)| p.len()).sum(),
+            row_stamps: inner.merge.row_stamps.len(),
         }
     }
 
@@ -658,6 +735,227 @@ impl BranchStore {
             .arena
             .as_ref()
             .is_some_and(|a| a.is_free(slot))
+    }
+
+    /// A table cursor on branch `id` wrote or deleted `rowid` in the b-tree rooted at `root`.
+    pub(crate) fn branch_row_written(&self, id: BranchId, root: i64, rowid: i64) {
+        if let Some(st) = self.inner.lock().branches.get_mut(&id) {
+            st.rows.insert((root, rowid));
+        }
+    }
+
+    /// An index cursor on branch `id` wrote the b-tree rooted at `root`.
+    pub(crate) fn branch_index_written(&self, id: BranchId, root: i64) {
+        if let Some(st) = self.inner.lock().branches.get_mut(&id) {
+            st.index_roots.insert(root);
+        }
+    }
+
+    /// Branch `id` wrote a table without naming the rows.
+    pub(crate) fn branch_bulk_written(&self, id: BranchId) {
+        if let Some(st) = self.inner.lock().branches.get_mut(&id) {
+            st.bulk = true;
+        }
+    }
+
+    /// The trunk wrote or deleted `rowid` in the b-tree rooted at `root`, while it has a child.
+    pub(crate) fn trunk_row_written(&self, root: i64, rowid: i64) {
+        let mut inner = self.inner.lock();
+        let epoch = inner.trunk.lineage.epoch;
+        let merge = &mut inner.merge;
+        if merge.row_stamps.insert((root, rowid), epoch) != Some(epoch) {
+            merge.stamp_order.push_back((epoch, root, rowid));
+        }
+    }
+
+    /// Stamp `rows` as written by the trunk now: a physical merge install writes them without a
+    /// cursor, so without this a later row-granular validation would miss them.
+    pub(crate) fn trunk_rows_written(&self, rows: &[(i64, i64)]) {
+        let mut inner = self.inner.lock();
+        let epoch = inner.trunk.lineage.epoch;
+        let merge = &mut inner.merge;
+        for &(root, rowid) in rows {
+            if merge.row_stamps.insert((root, rowid), epoch) != Some(epoch) {
+                merge.stamp_order.push_back((epoch, root, rowid));
+            }
+        }
+    }
+
+    /// The trunk wrote the table rooted at `root` without naming the rows, while it has a child.
+    pub(crate) fn trunk_bulk_written(&self, root: i64) {
+        let mut inner = self.inner.lock();
+        let epoch = inner.trunk.lineage.epoch;
+        inner.merge.table_stamps.insert(root, epoch);
+    }
+
+    /// The trunk write transaction in progress committed (`true`) or rolled back. A committed one
+    /// that wrote a page while the trunk had a child is one trunk commit and one log entry. The
+    /// page and row stamps it set stay either way: a rolled-back write's stamp can only refuse a
+    /// merge that did not conflict, never admit one that did.
+    pub(crate) fn trunk_tx_end(&self, committed: bool) {
+        let mut inner = self.inner.lock();
+        let oldest = inner.trunk.lineage.children.keys().next().copied();
+        let epoch = inner.trunk.lineage.epoch;
+        let StoreInner { merge, work, .. } = &mut *inner;
+        let mut pages = std::mem::take(&mut merge.tx_pages);
+        if committed && !pages.is_empty() {
+            pages.sort_unstable();
+            pages.dedup();
+            merge.trunk_commits += 1;
+            work.trunk_commits += 1;
+            merge.log.push_back((epoch, pages));
+        }
+        merge.prune(oldest);
+    }
+
+    pub(crate) fn set_track_reads(&self, on: bool) {
+        self.inner.lock().merge.track_reads = on;
+    }
+
+    pub(crate) fn tracks_reads(&self) -> bool {
+        self.inner.lock().merge.track_reads
+    }
+
+    /// Everything a merge of `id` needs from the store, under one hold of the lock: the scope
+    /// check, every validator's verdict (the active one's probes counted), and what to install.
+    pub(super) fn merge_prepare(
+        &self,
+        id: BranchId,
+        active: super::merge::Validation,
+        physical: bool,
+    ) -> Result<super::merge::Prepared> {
+        use super::merge::{Prepared, Validation};
+        let mut inner = self.inner.lock();
+        let oldest = inner.trunk.lineage.children.keys().next().copied();
+        inner.merge.prune(oldest);
+        inner.work.merge_attempts += 1;
+        let StoreInner {
+            arena,
+            trunk,
+            branches,
+            work,
+            merge,
+            ..
+        } = &mut *inner;
+        let st = branches.get(&id).ok_or_else(|| gone(id))?;
+        let scope = if !st.parent.is_trunk() {
+            Some("the branch is not a child of the trunk")
+        } else if st.open || st.writer {
+            Some("the branch has an open connection")
+        } else if !st.lineage.children.is_empty() {
+            Some("the branch has a live child")
+        } else if st.ddl {
+            Some("the branch committed a DDL")
+        } else if st.bulk {
+            Some("the branch wrote a table without naming the rows")
+        } else {
+            None
+        };
+        let at = st.trunk_at;
+        let written = |page: u32| trunk.written.get(&page).copied().unwrap_or(0);
+        let mut probes = 0u64;
+        let count = |v: Validation, probes: &mut u64| {
+            if v == active {
+                *probes += 1;
+            }
+        };
+        // V0: any trunk commit since the fork.
+        let commits_since_fork = merge.trunk_commits - st.commits_at_fork;
+        count(Validation::Scalar, &mut probes);
+        let scalar = commits_since_fork > 0;
+        // V2: any page this branch wrote that the trunk wrote after the fork.
+        let mut page = false;
+        for &p in st.current.keys() {
+            count(Validation::PageStamp, &mut probes);
+            if written(p) > at {
+                page = true;
+                break;
+            }
+        }
+        // V3: any row this branch wrote that the trunk wrote after the fork.
+        let mut key = false;
+        for &(root, rowid) in &st.rows {
+            count(Validation::KeyStamp, &mut probes);
+            let row = merge.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
+            let table = merge.table_stamps.get(&root).copied().unwrap_or(0);
+            if row.max(table) > at {
+                key = true;
+                break;
+            }
+        }
+        // V1, computed only when active: every committed trunk write set since the fork, newest
+        // first, checked page by page against this branch's write set.
+        let log = (active == Validation::Log).then(|| {
+            for (e, pages) in merge.log.iter().rev() {
+                if *e <= at {
+                    break;
+                }
+                work.merge_log_entries_scanned += 1;
+                for p in pages {
+                    probes += 1;
+                    if st.current.contains_key(p) {
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+        work.merge_probes += probes;
+        // The physical install's guard: an interior page this branch read that the trunk wrote
+        // since the fork (its type read from the version the branch saw).
+        let structural = physical.then(|| {
+            let mut unused = 0;
+            for &q in &st.reads {
+                work.merge_structural_probes += 1;
+                if written(q) <= at {
+                    continue;
+                }
+                let Some(slot) = trunk.lineage.retained_at(q, at, &mut unused) else {
+                    // Written after the fork while this branch lived, so a version was retained;
+                    // not finding one means the bookkeeping is broken, and guessing is unsound.
+                    return true;
+                };
+                let base = arena.as_ref().expect("a branch exists").page(slot);
+                let kind = base[if q == 1 { 100 } else { 0 }];
+                if kind == 0x02 || kind == 0x05 {
+                    return true;
+                }
+            }
+            false
+        });
+        let arena = arena.as_ref().expect("a branch exists, so the arena does");
+        let pages = if physical {
+            let mut pages: Vec<(u32, Vec<u8>)> = st
+                .current
+                .iter()
+                .map(|(&p, owned)| (p, arena.page(owned.slot).to_vec()))
+                .collect();
+            pages.sort_unstable_by_key(|(p, _)| *p);
+            pages
+        } else {
+            Vec::new()
+        };
+        let mut rows: Vec<(i64, i64)> = st.rows.iter().copied().collect();
+        rows.sort_unstable();
+        Ok(Prepared {
+            scope,
+            commits_since_fork,
+            scalar,
+            log,
+            page,
+            key,
+            structural,
+            pages_written: st.current.len(),
+            pages,
+            rows,
+            index_roots: st.index_roots.iter().copied().collect(),
+            schema: st.schema.clone(),
+        })
+    }
+
+    /// Count a merge's outcome.
+    pub(super) fn merge_counted(&self, f: impl FnOnce(&mut BranchWork)) {
+        f(&mut self.inner.lock().work);
     }
 
     /// Free `id` if nothing can reach it any more, then its parent if that freed the parent's last
@@ -758,6 +1056,12 @@ impl BranchState {
             trunk_at,
             inherited,
             view: None,
+            commits_at_fork: 0,
+            rows: HashSet::new(),
+            index_roots: HashSet::new(),
+            bulk: false,
+            ddl: false,
+            reads: HashSet::new(),
         }
     }
 }

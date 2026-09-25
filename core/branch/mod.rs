@@ -53,6 +53,7 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+pub mod merge;
 pub(crate) mod page_map;
 pub(crate) mod store;
 
@@ -177,6 +178,12 @@ pub struct BranchStats {
     pub arena_slots_free: usize,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
+    /// Committed trunk write sets the merge log (V1) holds.
+    pub merge_log_entries: usize,
+    /// Pages across those write sets.
+    pub merge_log_pages: usize,
+    /// Row stamps (V3) held.
+    pub row_stamps: usize,
 }
 
 /// Cumulative counts of the store's per-call work since the database opened. Observation only:
@@ -199,6 +206,30 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
+    /// Merges attempted ([`merge::Merger`]), including those refused as out of scope.
+    pub merge_attempts: u64,
+    /// Merges committed.
+    pub merge_commits: u64,
+    /// Merges refused, by the active validator's class.
+    pub merge_refused_scalar: u64,
+    pub merge_refused_log: u64,
+    pub merge_refused_page: u64,
+    pub merge_refused_key: u64,
+    pub merge_refused_structural: u64,
+    pub merge_refused_scope: u64,
+    /// Probes the ACTIVE validator made: 1 for the scalar gate, one per page or row checked for the
+    /// stamps, one per logged page for the log. Each stops at its first conflict.
+    pub merge_probes: u64,
+    /// Log entries (committed trunk write sets) the log validator visited.
+    pub merge_log_entries_scanned: u64,
+    /// Pages the physical install's structural guard checked.
+    pub merge_structural_probes: u64,
+    /// Pages the physical install copied into the trunk.
+    pub merge_pages_installed: u64,
+    /// Rows the replay install wrote into the trunk (updated, inserted or deleted).
+    pub merge_rows_installed: u64,
+    /// Trunk write transactions committed with a page while the trunk had a child.
+    pub trunk_commits: u64,
 }
 
 impl Branch {
@@ -359,6 +390,12 @@ impl Database {
         self.branches.stats()
     }
 
+    /// Record every branch's page reads, which the physical merge install's structural guard
+    /// needs ([`merge::Install::Physical`]). Off by default.
+    pub fn set_branch_read_tracking(&self, on: bool) {
+        self.branches.set_track_reads(on);
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
@@ -407,6 +444,9 @@ mod isolation_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod mechanism_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod merge_tests;
 
 #[cfg(test)]
 mod tests {
