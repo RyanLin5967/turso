@@ -581,6 +581,44 @@ fn arm_chain(a: &Args, writes: bool) {
     }
 }
 
+/// W9: k parents each fork two children and then (or, with `pre`, first) write 10 pages, then
+/// die. Pages written after a parent's last fork are invisible to both children.
+fn arm_deadfork(a: &Args, pre: bool) {
+    let w = 10u32;
+    let pages: Vec<u32> = (1..=w).collect();
+    for &k in &a.list {
+        let s = StoreBench::new(a.page_size);
+        let m = Meter { s: &s, time: a.time };
+        let mut kids = Vec::with_capacity(2 * k);
+        let mut reaps = Summary::default();
+        for _ in 0..k {
+            let p = fork_trunk(&s);
+            if pre {
+                s.branch_write(p, &pages).unwrap_or_else(|e| die(&format!("write: {e}")));
+            }
+            kids.push(fork_branch(&s, p));
+            kids.push(fork_branch(&s, p));
+            if !pre {
+                s.branch_write(p, &pages).unwrap_or_else(|e| die(&format!("write: {e}")));
+            }
+            let op = m.op(|| s.reap(p));
+            if !op.out.deferred {
+                die("releasing a parent with two live children was not deferred");
+            }
+            reaps.add(&op, a.time, a.stall_us);
+        }
+        let st = s.stats();
+        println!(
+            "space K={k} W={w} pre={pre} in_use={} live_branches={} written={}",
+            st.arena_slots_in_use,
+            st.live_branches,
+            k * w as usize
+        );
+        reaps.print(&format!("K={k} parent_reap"), a.time);
+        drop(kids);
+    }
+}
+
 fn main() {
     let a = parse_args();
     let head = std::process::Command::new("git")
@@ -612,6 +650,8 @@ fn main() {
         "pathcopy" => arm_pathcopy(&a),
         "chain" => arm_chain(&a, false),
         "chainw" => arm_chain(&a, true),
+        "deadfork" => arm_deadfork(&a, false),
+        "deadfork_pre" => arm_deadfork(&a, true),
         other => die(&format!("unknown arm {other}")),
     }
     println!("# done");
