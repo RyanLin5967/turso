@@ -258,6 +258,9 @@ struct Run {
     perm: Vec<u32>,
     queue: VecDeque<Agent>,
     next_j: usize,
+    /// The validator for the unmeasured warm-up merges: the log validator's decisions equal the page
+    /// stamps' merge by merge (the model test asserts it), and the page stamps cost O(1) per page.
+    warm_validation: Option<Validation>,
 }
 
 impl Run {
@@ -309,7 +312,7 @@ impl Run {
         let (branches, plans): (Vec<Branch>, Vec<Plan>) =
             agents.into_iter().map(|a| (a.branch, a.plan)).unzip();
         let policy = MergePolicy {
-            validation: self.args.validation,
+            validation: self.warm_validation.unwrap_or(self.args.validation),
             install: self.args.install,
         };
         let t = Instant::now();
@@ -513,6 +516,7 @@ fn main() {
         perm,
         queue: VecDeque::new(),
         next_j: 0,
+        warm_validation: None,
     };
 
     // The straggler: forked first, merged last, pinning the oldest fork epoch throughout.
@@ -524,11 +528,30 @@ fn main() {
         let a = run.spawn();
         run.queue.push_back(a);
     }
+    // Warm-up 2: L-1 merge cycles, unmeasured, so that every measured merge has exactly L-1 merge
+    // attempts between its fork and its merge (L-g..L-1 in batches). The fill's agents were forked
+    // before any merge, so without this the first L-1 measured merges would see 0..L-2.
+    run.warm_validation = (run.args.validation == Validation::Log).then_some(Validation::PageStamp);
+    let mut warm_window = Window::default();
+    let g = run.args.g;
+    let mut warm_merges = 0;
+    while warm_merges + g <= run.args.inflight - 1 {
+        for _ in 0..g {
+            let a = run.spawn();
+            run.queue.push_back(a);
+        }
+        let batch: Vec<Agent> = (0..g).map(|_| run.queue.pop_front().unwrap()).collect();
+        run.merge(batch, &mut warm_window);
+        warm_merges += g;
+    }
+    run.warm_validation = None;
     let warm_s = warm.elapsed().as_secs_f64();
     let s = run.db.branch_stats();
     println!(
-        "# warm-up: {} in flight, live_branches={} arena_in_use={} rss_bytes={}{}",
+        "# warm-up: {} in flight, {} warm-up merges ({} committed), live_branches={} arena_in_use={} rss_bytes={}{}",
         run.queue.len(),
+        warm_window.attempts,
+        warm_window.committed,
         s.live_branches,
         s.arena_slots_in_use,
         rss_bytes(),
@@ -540,7 +563,6 @@ fn main() {
     );
 
     let per_window = run.args.merges / run.args.windows;
-    let g = run.args.g;
     let mut merged = 0usize;
     for index in 0..run.args.windows {
         let mut w = Window::default();
