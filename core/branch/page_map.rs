@@ -17,6 +17,7 @@
 //! explore, and `Arc::make_mut` — which copies a node only while another version shares it — is
 //! what makes an insert into an unshared map free of copies.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::arena::Slot;
@@ -27,7 +28,16 @@ const MASK: u32 = WIDTH as u32 - 1;
 /// No arena slot has this index ([`PageMap::insert`] refuses it); it marks an empty leaf entry.
 const EMPTY: Slot = Slot::MAX;
 
-#[derive(Clone)]
+/// Trie nodes alive in this process, across every map of every database. Observation only
+/// ([`live_nodes`]): counted where a node is built or copied and where it is dropped, so a node
+/// that many maps share counts once. Nothing in the mechanism reads it.
+static LIVE_NODES: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of trie nodes alive in this process (see [`LIVE_NODES`]).
+pub(crate) fn live_nodes() -> usize {
+    LIVE_NODES.load(Ordering::Relaxed)
+}
+
 enum Node {
     Inner([Option<Arc<Node>>; WIDTH]),
     Leaf([Slot; WIDTH]),
@@ -36,10 +46,32 @@ enum Node {
 impl Node {
     fn empty(level: u32) -> Self {
         if level == 0 {
-            Node::Leaf([EMPTY; WIDTH])
+            Self::counted(Node::Leaf([EMPTY; WIDTH]))
         } else {
-            Node::Inner(std::array::from_fn(|_| None))
+            Self::counted(Node::Inner(std::array::from_fn(|_| None)))
         }
+    }
+
+    /// Every node is built through here, so that [`LIVE_NODES`] sees it.
+    fn counted(node: Node) -> Self {
+        LIVE_NODES.fetch_add(1, Ordering::Relaxed);
+        node
+    }
+}
+
+/// `Arc::make_mut` copies a shared node through this.
+impl Clone for Node {
+    fn clone(&self) -> Self {
+        Self::counted(match self {
+            Node::Inner(kids) => Node::Inner(kids.clone()),
+            Node::Leaf(slots) => Node::Leaf(*slots),
+        })
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        LIVE_NODES.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -90,7 +122,7 @@ impl PageMap {
         while !self.covers(page) {
             let mut kids: [Option<Arc<Node>>; WIDTH] = std::array::from_fn(|_| None);
             kids[0] = self.root.take();
-            self.root = Some(Arc::new(Node::Inner(kids)));
+            self.root = Some(Arc::new(Node::counted(Node::Inner(kids))));
             self.height += 1;
         }
         let mut level = self.height;
@@ -108,6 +140,31 @@ impl PageMap {
                     return;
                 }
             };
+        }
+    }
+
+    /// Call `f(page, slot)` for every mapping. Observation only (the needed-slot instrument).
+    pub(crate) fn for_each(&self, mut f: impl FnMut(u32, Slot)) {
+        fn walk(node: &Node, level: u32, base: u32, f: &mut impl FnMut(u32, Slot)) {
+            match node {
+                Node::Inner(kids) => {
+                    for (i, kid) in kids.iter().enumerate() {
+                        if let Some(kid) = kid {
+                            walk(kid, level - 1, base | ((i as u32) << (BITS * level)), f);
+                        }
+                    }
+                }
+                Node::Leaf(slots) => {
+                    for (i, &slot) in slots.iter().enumerate() {
+                        if slot != EMPTY {
+                            f(base | i as u32, slot);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(root) = self.root.as_deref() {
+            walk(root, self.height, 0, &mut f);
         }
     }
 }
@@ -155,6 +212,11 @@ mod tests {
             for page in [0, 1, 31, 32, 1023, 1024, 4999, u32::MAX - 1] {
                 assert_eq!(map.get(page), model.get(&page).copied(), "version {i} page {page}");
             }
+            let mut listed = HashMap::new();
+            map.for_each(|page, slot| {
+                assert!(listed.insert(page, slot).is_none(), "version {i} lists page {page} twice");
+            });
+            assert_eq!(&listed, model, "version {i}: for_each disagrees with the model");
         }
     }
 

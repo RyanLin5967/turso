@@ -79,11 +79,11 @@
 //! Tarjan's fat node (JCSS 1989) with a search tree over its version stamps. [`Lineage::retain`]
 //! refuses a version that would break the disjointness the search relies on.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
 
 use super::arena::{Arena, Slot};
-use super::page_map::PageMap;
+use super::page_map::{self, PageMap};
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
@@ -628,8 +628,53 @@ impl BranchStore {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
+            page_map_nodes: page_map::live_nodes(),
             work: inner.work,
         }
+    }
+
+    /// Branch states kept only because something still reads through them: no handle, no open
+    /// connection, and a live child. Observation only; O(branches).
+    pub(crate) fn zombies(&self) -> usize {
+        self.inner
+            .lock()
+            .branches
+            .values()
+            .filter(|st| !st.handle && !st.open)
+            .count()
+    }
+
+    /// The arena slots some live branch (a handle or an open connection) can still read, from the
+    /// structures `resolve` reads: its current pages, its inherited pages it has not overwritten,
+    /// and the trunk's retained versions at its `trunk_at` for pages neither holds. Every other
+    /// slot in use is one no read can reach again: forks of a live branch inherit the same set, and
+    /// a zombie can neither be read nor forked. Observation only; O(sum of mapped pages).
+    pub(crate) fn needed_slots(&self) -> usize {
+        let inner = self.inner.lock();
+        let mut needed = HashSet::new();
+        let mut examined = 0;
+        for st in inner.branches.values().filter(|st| st.handle || st.open) {
+            needed.extend(st.current.values().map(|o| o.slot));
+            st.inherited.for_each(|page, slot| {
+                if !st.current.contains_key(&page) {
+                    needed.insert(slot);
+                }
+            });
+            for &page in inner.trunk.lineage.retained.keys() {
+                if st.current.contains_key(&page) || st.inherited.get(page).is_some() {
+                    continue;
+                }
+                if let Some(slot) =
+                    inner
+                        .trunk
+                        .lineage
+                        .retained_at(page, st.trunk_at, &mut examined)
+                {
+                    needed.insert(slot);
+                }
+            }
+        }
+        needed.len()
     }
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
@@ -679,6 +724,7 @@ impl BranchStore {
                 work,
                 ..
             } = &mut *inner;
+            work.states_freed += 1;
             let arena = arena.as_mut().expect("a branch existed, so the arena does");
             for owned in st.current.values() {
                 arena.release(owned.slot);

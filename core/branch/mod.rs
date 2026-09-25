@@ -175,6 +175,9 @@ pub struct BranchStats {
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
+    /// Persistent page-map trie nodes alive in this PROCESS (every database's maps; a node shared by
+    /// many maps counts once). Observation only.
+    pub page_map_nodes: usize,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -199,6 +202,9 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
+    /// Branch states removed: each reaped branch, plus every ancestor its removal freed in the same
+    /// call (the cascade).
+    pub states_freed: u64,
 }
 
 impl Branch {
@@ -369,6 +375,19 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_slots_in_use(&self) -> Vec<u32> {
         self.branches.slots_in_use()
+    }
+
+    /// Arena slots some live branch can still read (see `BranchStore::needed_slots`); the rest of
+    /// `arena_slots_in_use` is unreachable. Observation only, O(mapped pages).
+    #[doc(hidden)]
+    pub fn branch_needed_slots(&self) -> usize {
+        self.branches.needed_slots()
+    }
+
+    /// Branch states with no handle and no open connection, kept for a live child. O(branches).
+    #[doc(hidden)]
+    pub fn branch_zombies(&self) -> usize {
+        self.branches.zombies()
     }
 
     /// Open a connection on branch `id`: an ordinary connection whose pager is bound to the branch
