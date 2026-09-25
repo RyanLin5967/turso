@@ -95,6 +95,7 @@ const LOOKUPS: &[&str] = &[
     "DELETE FROM free WHERE slot <= ?1",
     "DELETE FROM free WHERE slot = ?1",
     "DELETE FROM branch WHERE id = ?1",
+    "UPDATE branch SET epoch = ?2, released = ?3, lease = ?4, n_children = ?5 WHERE id = ?1",
 ];
 
 const META_GENERATION: i64 = 1;
@@ -212,6 +213,7 @@ pub(crate) struct Catalog {
     meta_put: Stmt,
     branch_get: Stmt,
     branch_put: Stmt,
+    branch_update: Stmt,
     branch_del: Stmt,
     cur_range: Stmt,
     cur_del_range: Stmt,
@@ -277,6 +279,9 @@ impl Catalog {
             branch_put: p(
                 "INSERT OR REPLACE INTO branch(id, parent, fork_epoch, epoch, released, lease, n_children) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?,
+            branch_update: p(
+                "UPDATE branch SET epoch = ?2, released = ?3, lease = ?4, n_children = ?5 WHERE id = ?1",
             )?,
             branch_del: p("DELETE FROM branch WHERE id = ?1")?,
             cur_range: p("SELECT k, slot, born, crc FROM cur WHERE k >= ?1 AND k < ?2")?,
@@ -471,6 +476,61 @@ impl Catalog {
             ));
         }
         Ok(Some(b))
+    }
+
+    /// Rewrite the mutable columns of a branch row the catalog already holds (parent and fork
+    /// epoch never change, so the children index is not touched).
+    pub(crate) fn update_row(&mut self, b: &CatBranch) -> Result<()> {
+        self.branch_update.exec(
+            &[
+                int(b.id),
+                int(b.epoch),
+                Value::from_i64(b.released as i64),
+                b.lease.map_or(Value::Null, int),
+                int(b.n_children),
+            ],
+            &mut self.counters,
+        )
+    }
+
+    /// Replace a branch's `cur` rows.
+    pub(crate) fn put_cur(&mut self, b: &CatBranch) -> Result<()> {
+        let lo = cur_key(b.id, 0)?;
+        self.cur_del_range.exec(
+            &[Value::from_i64(lo), Value::from_i64(lo + (1i64 << 32))],
+            &mut self.counters,
+        )?;
+        for &(page, slot, born, crc) in &b.current {
+            self.cur_put.exec(
+                &[
+                    Value::from_i64(cur_key(b.id, page)?),
+                    int(slot as u64),
+                    int(born),
+                    int(crc as u64),
+                ],
+                &mut self.counters,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Replace a branch's retained versions.
+    pub(crate) fn put_ret(&mut self, b: &CatBranch) -> Result<()> {
+        self.ret_del_owner.exec(&[int(b.id)], &mut self.counters)?;
+        for &(page, born, died, slot, crc) in &b.retained {
+            self.ret_put.exec(
+                &[
+                    int(b.id),
+                    int(page as u64),
+                    int(born),
+                    int(died),
+                    int(slot as u64),
+                    int(crc as u64),
+                ],
+                &mut self.counters,
+            )?;
+        }
+        Ok(())
     }
 
     /// Write one branch whole, replacing whatever the catalog held for it.

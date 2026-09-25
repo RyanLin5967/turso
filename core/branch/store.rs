@@ -164,8 +164,10 @@ struct StoreInner {
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
 struct CatState {
     catalog: Catalog,
-    /// Branches whose catalog rows are stale: rewritten whole at the next checkpoint.
-    dirty: HashSet<BranchId>,
+    /// Branches whose catalog rows are stale, and which of their rows (`DIRTY_*`): at the next
+    /// checkpoint only those are rewritten (fix v3, PREREG A9: a commit rewrites the branch's `cur`
+    /// rows and never its `branch` row, so its secondary indexes are not touched).
+    dirty: HashMap<BranchId, u8>,
     /// Branches removed since the last checkpoint: deleted from the catalog at the next one, and
     /// never loaded from it again.
     removed: HashSet<BranchId>,
@@ -190,7 +192,7 @@ impl CatState {
     fn new(catalog: Catalog) -> Self {
         Self {
             catalog,
-            dirty: HashSet::new(),
+            dirty: HashMap::new(),
             removed: HashSet::new(),
             trunk_loaded: HashSet::new(),
             trunk_dirty: HashSet::new(),
@@ -203,6 +205,13 @@ impl CatState {
         }
     }
 }
+
+/// What of a branch's catalog state a checkpoint must rewrite.
+const DIRTY_ROW: u8 = 1;
+const DIRTY_CUR: u8 = 2;
+const DIRTY_RET: u8 = 4;
+/// Forked since the last checkpoint: no catalog row yet, so everything is written.
+const DIRTY_NEW: u8 = 8;
 
 /// The lease clock: milliseconds of time the database has been OPEN, summed across every open.
 ///
@@ -2051,7 +2060,7 @@ impl StoreInner {
         let deadline = st.lease.unwrap_or(0).max(deadline);
         st.lease = Some(deadline);
         self.leases.insert((deadline, id));
-        self.mark_dirty(id);
+        self.mark_dirty(id, DIRTY_ROW);
     }
 
     fn poisoned(&self) -> bool {
@@ -2168,11 +2177,11 @@ impl StoreInner {
         Ok(())
     }
 
-    /// `id`'s catalog row is stale: rewrite it at the next checkpoint.
-    fn mark_dirty(&mut self, id: BranchId) {
+    /// Part of `id`'s catalog state (`DIRTY_*`) is stale: rewrite it at the next checkpoint.
+    fn mark_dirty(&mut self, id: BranchId, what: u8) {
         if let Some(cat) = self.cat.as_mut() {
             if !id.is_trunk() {
-                cat.dirty.insert(id);
+                *cat.dirty.entry(id).or_insert(0) |= what;
             }
         }
     }
@@ -2394,11 +2403,11 @@ impl StoreInner {
             arena.sync()?;
         }
         let generation = journal.generation() + 1;
-        let rows: Vec<CatBranch> = cat
+        let rows: Vec<(CatBranch, u8)> = cat
             .dirty
             .iter()
-            .filter_map(|id| self.branches.get(id).map(|st| (id, st)))
-            .map(|(&id, st)| CatBranch {
+            .filter_map(|(id, &what)| self.branches.get(id).map(|st| (id, st, what)))
+            .map(|(&id, st, what)| (CatBranch {
                 id: id.0,
                 parent: st.parent.0,
                 fork_epoch: st.fork_epoch,
@@ -2412,7 +2421,7 @@ impl StoreInner {
                     .map(|(&page, o)| (page, o.slot, o.born, o.crc))
                     .collect(),
                 retained: st.lineage.retained_list(),
-            })
+            }, what))
             .collect();
         let trunk_pages: Vec<(u32, Vec<(u64, u64, Slot, u32)>)> = cat
             .trunk_dirty
@@ -2445,7 +2454,7 @@ impl StoreInner {
         if super::arena::trace_slots() {
             let named: Vec<(u64, Vec<Slot>)> = rows
                 .iter()
-                .map(|b| {
+                .map(|(b, _)| {
                     let mut v: Vec<Slot> = b.current.iter().map(|c| c.1).collect();
                     v.extend(b.retained.iter().map(|r| r.3));
                     (b.id, v)
@@ -2465,8 +2474,20 @@ impl StoreInner {
         let catalog = &mut cat.catalog;
         catalog.begin()?;
         let written = (|| -> Result<()> {
-            for b in &rows {
-                catalog.put_branch(b)?;
+            for (b, what) in &rows {
+                if what & DIRTY_NEW != 0 {
+                    catalog.put_branch(b)?;
+                    continue;
+                }
+                if what & DIRTY_ROW != 0 {
+                    catalog.update_row(b)?;
+                }
+                if what & DIRTY_CUR != 0 {
+                    catalog.put_cur(b)?;
+                }
+                if what & DIRTY_RET != 0 {
+                    catalog.put_ret(b)?;
+                }
             }
             for &id in &cat.removed {
                 catalog.delete_branch(id.0)?;
@@ -2579,8 +2600,8 @@ impl StoreInner {
             },
         );
         self.n_states += 1;
-        self.mark_dirty(parent);
-        self.mark_dirty(child);
+        self.mark_dirty(parent, DIRTY_ROW);
+        self.mark_dirty(child, DIRTY_NEW);
         Ok(())
     }
 
@@ -2604,6 +2625,7 @@ impl StoreInner {
         let mut catalog = cat.as_mut().map(|c| &mut c.catalog);
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         let epoch = st.lineage.epoch;
+        let mut what = DIRTY_CUR;
         for &(page, slot, crc) in pages {
             let new = Owned {
                 slot,
@@ -2612,6 +2634,7 @@ impl StoreInner {
             };
             if let Some(old) = st.current.insert(page, new) {
                 if children.any_in(catalog.as_deref_mut(), id, old.born, epoch)? {
+                    what |= DIRTY_RET;
                     st.lineage.retain(
                         page,
                         Retained {
@@ -2626,7 +2649,7 @@ impl StoreInner {
                 }
             }
         }
-        self.mark_dirty(id);
+        self.mark_dirty(id, what);
         Ok(())
     }
 
@@ -2647,7 +2670,7 @@ impl StoreInner {
                 self.leases.remove(&(deadline, id));
             }
         }
-        self.mark_dirty(id);
+        self.mark_dirty(id, DIRTY_ROW);
         self.collect(id, freed)
     }
 
@@ -2677,7 +2700,7 @@ impl StoreInner {
                 } = self;
                 let st = branches.get_mut(&id).expect("just looked it up");
                 st.retire_current(id, children, cat.as_mut().map(|c| &mut c.catalog), freed)?;
-                self.mark_dirty(id);
+                self.mark_dirty(id, DIRTY_CUR | DIRTY_RET);
                 return Ok(());
             }
             let st = self.branches.remove(&id).expect("just looked it up");
@@ -2718,7 +2741,7 @@ impl StoreInner {
                 .get_mut(&parent)
                 .expect("a live branch's parent is kept while the branch lives");
             parent_st.lineage.child_gone(f, lo, hi, freed);
-            self.mark_dirty(parent);
+            self.mark_dirty(parent, DIRTY_ROW | DIRTY_RET);
             id = parent;
         }
     }
