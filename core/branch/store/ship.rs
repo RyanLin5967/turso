@@ -21,16 +21,20 @@
 //!    retained before `base` can never be pinned by a child forked after it (the child's fork epoch
 //!    is past the version's `died`), so applying deaths to the `base` state before anything new
 //!    arrives frees exactly what the sender freed.
-//! 2. `REF`: a retained TRUNK pre-image whose content the receiver already holds as its own trunk
+//! 2. `STATE`: every state changed since `base`, from a change index (Btrfs generations; Dolt's
+//!    prolly-tree diff), in id order so a parent precedes its children; then `TRUNK_META`. A
+//!    changed state's new `current` map can drop a slot the receiver holds: the sender retained
+//!    that version for a child and freed it when the child died, both inside the window, so no
+//!    tombstone names it. The receiver releases every slot a state stopped naming here, before
+//!    any page record can claim that slot number again.
+//! 3. `REF`: a retained TRUNK pre-image whose content the receiver already holds as its own trunk
 //!    page. The trunk's pre-image is COPIED into a slot handed out when the trunk overwrites the
 //!    page (`first_write_trunk`), so choosing pages by when the slot was handed out would ship old
 //!    content again; choosing by when the content was born — ZFS's block birth txg — ships a
 //!    reference, whose content hash the receiver checks.
-//! 3. `TRUNK_PAGE`: trunk pages written since `base`.
-//! 4. `SLOT`: every live slot whose content was born after `base`, from the arena's birth index.
-//! 5. `STATE`: every state changed since `base`, from a change index (Btrfs generations; Dolt's
-//!    prolly-tree diff), in id order so a parent precedes its children.
-//! 6. `TRUNK_META`, then `END`.
+//! 4. `TRUNK_PAGE`: trunk pages written since `base`.
+//! 5. `SLOT`: every live slot whose content was born after `base`, from the arena's birth index.
+//! 6. `END`.
 //!
 //! The other modes exist to be COUNTED against this one: a per-dataset stream that re-describes every
 //! state and lists every live id for deletion (`zfs send -R -I` / `recv -F`), one that picks pages by
@@ -229,6 +233,8 @@ pub struct RecvWork {
     pub entries: u64,
     pub retained_inserted: u64,
     pub trie_inserts: u64,
+    /// Slots a changed state's old `current` named and its new record does not.
+    pub slots_released: u64,
 }
 
 /// A canonical digest of a store's whole observable state (see [`BranchStore::digest`]).
@@ -605,6 +611,115 @@ impl BranchStore {
             }
         }
 
+        // The states step 2 ships: every one, or those changed since the base.
+        let ids: Vec<BranchId> = match mode {
+            SendMode::IncrFix | SendMode::IncrAlloc => {
+                let mut ids: Vec<BranchId> = t
+                    .dirty
+                    .range((Bound::Excluded((base_seq, BranchId(u64::MAX))), Bound::Unbounded))
+                    .map(|&(_, id)| id)
+                    .collect();
+                rep.index_visited += ids.len() as u64;
+                ids.sort_unstable();
+                ids
+            }
+            _ => {
+                let mut ids: Vec<BranchId> = inner.branches.keys().copied().collect();
+                ids.sort_unstable();
+                ids
+            }
+        };
+        // 2. States, in id order, and the trunk's metadata — before any page, so that a receiver
+        // releases every slot a changed state stopped naming (a current version that was retained
+        // and then freed inside the window) before a later record claims that slot again.
+        for &id in &ids {
+            let st = &inner.branches[&id];
+            rep.states_visited += 1;
+            let new = !mode.incremental() || st.born_seq > base_seq;
+            let incremental_versions = matches!(mode, SendMode::IncrFix | SendMode::IncrAlloc) && !new;
+            let mut current: Vec<(u32, Owned)> = st.current.iter().map(|(&p, &o)| (p, o)).collect();
+            current.sort_unstable_by_key(|&(p, _)| p);
+            let all = retained_sorted(&st.lineage);
+            rep.entries_visited += (current.len() + all.len()) as u64;
+            let retained: Vec<(u32, Retained)> = all
+                .into_iter()
+                .filter(|(_, v)| !incremental_versions || v.seq > base_seq)
+                .collect();
+            let mut rec = Rec::new(T_STATE)
+                .u64(id.0)
+                .u64(st.parent.0)
+                .u64(st.fork_epoch)
+                .u64(st.lineage.epoch)
+                .u8(u8::from(st.handle) | (u8::from(new) << 1))
+                .u32(st.schema.schema_version)
+                .u32(current.len() as u32)
+                .u32(retained.len() as u32);
+            for &(page, o) in &current {
+                rec = rec.u32(page).u32(o.slot).u64(o.born);
+            }
+            for &(page, v) in &retained {
+                rec = rec.u32(page).u64(v.born).u64(v.died).u32(v.slot);
+            }
+            rep.state_records += 1;
+            rep.current_entries += current.len() as u64;
+            rep.retained_entries += retained.len() as u64;
+            rep.meta_bytes += rec.0.len() as u64;
+            sink.put(&rec.0)?;
+            if mode == SendMode::FullMaps {
+                // A per-dataset stream describes each clone's whole map: `inherited` ∪ `current`.
+                let own_new = st
+                    .current
+                    .keys()
+                    .filter(|&&p| st.inherited.get(p).is_none())
+                    .count();
+                let entries = (st.inherited.len() + own_new) as u64;
+                rep.entries_visited += entries;
+                rep.maps_bytes += 13 + 8 * entries;
+                rep.meta_bytes += 13 + 8 * entries;
+                sink.bytes += 13 + 8 * entries;
+            }
+        }
+
+        let written: Vec<(u32, u64)> = if matches!(mode, SendMode::IncrFix | SendMode::IncrAlloc) {
+            let mut w: Vec<(u32, u64)> = t
+                .trunk_by_seq
+                .range((Bound::Excluded((base_seq, u32::MAX)), Bound::Unbounded))
+                .filter_map(|&(_, page)| inner.trunk.written.get(&page).map(|&e| (page, e)))
+                .collect();
+            w.sort_unstable();
+            w
+        } else {
+            let mut w: Vec<(u32, u64)> = inner.trunk.written.iter().map(|(&p, &e)| (p, e)).collect();
+            w.sort_unstable();
+            w
+        };
+        let trunk_retained: Vec<(u32, Retained)> = if matches!(mode, SendMode::IncrFix | SendMode::IncrAlloc) {
+            let mut v: Vec<(u32, Retained)> = t
+                .trunk_retained
+                .range((Bound::Excluded((base_seq, u32::MAX, u64::MAX)), Bound::Unbounded))
+                .map(|&(_, page, born)| (page, inner.trunk.lineage.retained[&page][&born]))
+                .collect();
+            v.sort_unstable_by_key(|&(page, v)| (page, v.born));
+            v
+        } else {
+            retained_sorted(&inner.trunk.lineage)
+        };
+        rep.entries_visited += (written.len() + trunk_retained.len()) as u64;
+        let mut rec = Rec::new(T_TRUNK_META)
+            .u64(inner.trunk.lineage.epoch)
+            .u32(written.len() as u32)
+            .u32(trunk_retained.len() as u32);
+        for &(page, e) in &written {
+            rec = rec.u32(page).u64(e);
+        }
+        for &(page, v) in &trunk_retained {
+            rec = rec.u32(page).u64(v.born).u64(v.died).u32(v.slot);
+        }
+        rep.written_entries += written.len() as u64;
+        rep.trunk_retained_entries += trunk_retained.len() as u64;
+        rep.meta_bytes += rec.0.len() as u64;
+        sink.put(&rec.0)?;
+
         let arena = inner.arena.as_ref();
         let mut ship_page = |sink: &mut Sink,
                              rep: &mut SendReport,
@@ -655,7 +770,7 @@ impl BranchStore {
             sink.put(&rec.0)
         };
 
-        // 2. References to trunk pre-images the receiver holds (IncrAlloc ships them as data).
+        // 3. References to trunk pre-images the receiver holds (IncrAlloc ships them as data).
         let mut ref_slots: Vec<(Slot, u32)> = Vec::new();
         if matches!(mode, SendMode::IncrFix | SendMode::IncrRoot | SendMode::IncrAlloc) {
             for &(_, page, born) in t
@@ -696,7 +811,7 @@ impl BranchStore {
             }
         }
 
-        // 3. Trunk pages.
+        // 4. Trunk pages.
         let trunk_pages: Vec<u32> = if mode.incremental() {
             let mut pages: Vec<u32> = t
                 .trunk_by_seq
@@ -716,24 +831,6 @@ impl BranchStore {
             rep.trunk_page_records += 1;
         }
 
-        // The states step 5 ships: every one, or those changed since the base.
-        let ids: Vec<BranchId> = match mode {
-            SendMode::IncrFix | SendMode::IncrAlloc => {
-                let mut ids: Vec<BranchId> = t
-                    .dirty
-                    .range((Bound::Excluded((base_seq, BranchId(u64::MAX))), Bound::Unbounded))
-                    .map(|&(_, id)| id)
-                    .collect();
-                rep.index_visited += ids.len() as u64;
-                ids.sort_unstable();
-                ids
-            }
-            _ => {
-                let mut ids: Vec<BranchId> = inner.branches.keys().copied().collect();
-                ids.sort_unstable();
-                ids
-            }
-        };
         // Counted only (`payload_delta_fork`): each shipped slot's FORK BASE, the version its owner
         // saw before writing it: a branch page's is what the branch reads through its ancestry
         // (`inherited`, else the trunk as of `trunk_at`); a retained trunk version's is the next
@@ -767,7 +864,7 @@ impl BranchStore {
             }
         }
 
-        // 4. Slots.
+        // 5. Slots.
         if let Some(arena) = arena {
             let slots: Vec<Slot> = if mode.incremental() {
                 let s = arena.content_newer_than(base_seq);
@@ -799,96 +896,6 @@ impl BranchStore {
                 rep.slot_records += 1;
             }
         }
-
-        // 5. States, in id order (`ids` above).
-        for id in ids {
-            let st = &inner.branches[&id];
-            rep.states_visited += 1;
-            let new = !mode.incremental() || st.born_seq > base_seq;
-            let incremental_versions = matches!(mode, SendMode::IncrFix | SendMode::IncrAlloc) && !new;
-            let mut current: Vec<(u32, Owned)> = st.current.iter().map(|(&p, &o)| (p, o)).collect();
-            current.sort_unstable_by_key(|&(p, _)| p);
-            let all = retained_sorted(&st.lineage);
-            rep.entries_visited += (current.len() + all.len()) as u64;
-            let retained: Vec<(u32, Retained)> = all
-                .into_iter()
-                .filter(|(_, v)| !incremental_versions || v.seq > base_seq)
-                .collect();
-            let mut rec = Rec::new(T_STATE)
-                .u64(id.0)
-                .u64(st.parent.0)
-                .u64(st.fork_epoch)
-                .u64(st.lineage.epoch)
-                .u8(u8::from(st.handle) | (u8::from(new) << 1))
-                .u32(st.schema.schema_version)
-                .u32(current.len() as u32)
-                .u32(retained.len() as u32);
-            for &(page, o) in &current {
-                rec = rec.u32(page).u32(o.slot).u64(o.born);
-            }
-            for &(page, v) in &retained {
-                rec = rec.u32(page).u64(v.born).u64(v.died).u32(v.slot);
-            }
-            rep.state_records += 1;
-            rep.current_entries += current.len() as u64;
-            rep.retained_entries += retained.len() as u64;
-            rep.meta_bytes += rec.0.len() as u64;
-            sink.put(&rec.0)?;
-            if mode == SendMode::FullMaps {
-                // A per-dataset stream describes each clone's whole map: `inherited` ∪ `current`.
-                let own_new = st
-                    .current
-                    .keys()
-                    .filter(|&&p| st.inherited.get(p).is_none())
-                    .count();
-                let entries = (st.inherited.len() + own_new) as u64;
-                rep.entries_visited += entries;
-                rep.maps_bytes += 13 + 8 * entries;
-                rep.meta_bytes += 13 + 8 * entries;
-                sink.bytes += 13 + 8 * entries;
-            }
-        }
-
-        // 6. The trunk's own metadata.
-        let written: Vec<(u32, u64)> = if matches!(mode, SendMode::IncrFix | SendMode::IncrAlloc) {
-            let mut w: Vec<(u32, u64)> = t
-                .trunk_by_seq
-                .range((Bound::Excluded((base_seq, u32::MAX)), Bound::Unbounded))
-                .filter_map(|&(_, page)| inner.trunk.written.get(&page).map(|&e| (page, e)))
-                .collect();
-            w.sort_unstable();
-            w
-        } else {
-            let mut w: Vec<(u32, u64)> = inner.trunk.written.iter().map(|(&p, &e)| (p, e)).collect();
-            w.sort_unstable();
-            w
-        };
-        let trunk_retained: Vec<(u32, Retained)> = if matches!(mode, SendMode::IncrFix | SendMode::IncrAlloc) {
-            let mut v: Vec<(u32, Retained)> = t
-                .trunk_retained
-                .range((Bound::Excluded((base_seq, u32::MAX, u64::MAX)), Bound::Unbounded))
-                .map(|&(_, page, born)| (page, inner.trunk.lineage.retained[&page][&born]))
-                .collect();
-            v.sort_unstable_by_key(|&(page, v)| (page, v.born));
-            v
-        } else {
-            retained_sorted(&inner.trunk.lineage)
-        };
-        rep.entries_visited += (written.len() + trunk_retained.len()) as u64;
-        let mut rec = Rec::new(T_TRUNK_META)
-            .u64(inner.trunk.lineage.epoch)
-            .u32(written.len() as u32)
-            .u32(trunk_retained.len() as u32);
-        for &(page, e) in &written {
-            rec = rec.u32(page).u64(e);
-        }
-        for &(page, v) in &trunk_retained {
-            rec = rec.u32(page).u64(v.born).u64(v.died).u32(v.slot);
-        }
-        rep.written_entries += written.len() as u64;
-        rep.trunk_retained_entries += trunk_retained.len() as u64;
-        rep.meta_bytes += rec.0.len() as u64;
-        sink.put(&rec.0)?;
 
         let end = Rec::new(T_END).u64(t.seq);
         rep.meta_bytes += end.0.len() as u64;
@@ -1062,11 +1069,28 @@ impl BranchStore {
                     } else {
                         work.states_updated += 1;
                     }
-                    let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
+                    let StoreInner {
+                        arena, branches, ..
+                    } = &mut *inner;
+                    let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
                     st.lineage.epoch = epoch;
                     st.handle = handle;
                     if st.schema.schema_version != schema_version {
                         st.schema = schema;
+                    }
+                    // A slot the old `current` named and nothing in this record names any more was
+                    // retained and freed on the sender inside the window (see the module doc).
+                    let named: HashSet<Slot> = current
+                        .values()
+                        .map(|o| o.slot)
+                        .chain(retained.iter().map(|(_, v)| v.slot))
+                        .collect();
+                    let arena = arena.as_mut().expect("created above");
+                    for o in st.current.values() {
+                        if !named.contains(&o.slot) {
+                            arena.release(o.slot);
+                            work.slots_released += 1;
+                        }
                     }
                     st.current = current;
                     st.view = None;

@@ -435,7 +435,7 @@ fn pipe(
     };
     let sent = sent.unwrap_or_else(|e| not_a_result(&format!("{point}: send failed: {e}")));
     println!(
-        "recv\t{point}\trecords={}\tslots_written={}\tslots_claimed={}\trefs={}\ttrunk_pages={}\tdeaths={}\tgc_freed={}\tstates_new={}\tstates_updated={}\tentries={}\tretained_inserted={}\ttrie_inserts={}\twall_s={secs:.3}(unlocked)",
+        "recv\t{point}\trecords={}\tslots_written={}\tslots_claimed={}\trefs={}\ttrunk_pages={}\tdeaths={}\tgc_freed={}\tstates_new={}\tstates_updated={}\tentries={}\tretained_inserted={}\ttrie_inserts={}\tslots_released={}\twall_s={secs:.3}(unlocked)",
         work.records,
         work.slots_written,
         work.slots_claimed,
@@ -448,6 +448,7 @@ fn pipe(
         work.entries,
         work.retained_inserted,
         work.trie_inserts,
+        work.slots_released,
     );
     sent
 }
