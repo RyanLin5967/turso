@@ -510,3 +510,5 @@ changes only how the one level is looked up. Counters equal the before file's ex
 
 **What the report reads.** The residual list comes from `final` (NORMAL for the trunk-writing arms, OFF for b, c1, d and
 control). Amendment 4's OFF runs attribute F1+F2 like-for-like against the curve lane's OFF before files.
+
+**Erratum (appended 2026-09-25T03:09:41Z):** amendment 6 was committed at 2026-09-25T03:09:34Z (`2f2a2934d`); its header's "03:15Z" was typed, not read from the clock.
