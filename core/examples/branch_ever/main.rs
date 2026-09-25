@@ -776,7 +776,9 @@ fn main() {
              branch_children={} branch_retained_versions={} branch_current_pages={} views={} \
              page_map_nodes={} index_mismatch={} arena_high_water={} arena_in_use={} \
              arena_free_list_len={} arena_free_list_capacity={} arena_free_bits_words={} \
-             arena_chunks={} arena_unowned={} visible_slots={} model_states={model_states} \
+             arena_chunks={} arena_unowned={} visible_slots={} waste_zombie_current_after_last_fork={} \
+             waste_zombie_current_shadowed={} waste_zombie_retained={} waste_live_retained={} \
+             waste_trunk_retained={} waste_live_current={} model_states={model_states} \
              model_zombies={model_zombies} model_children={model_children} model_roots={roots} \
              predicted_arena_pages={} freed_states_total={freed_states_total} \
              reads_checked={reads_checked} rss_bytes={} harness_model_bytes={} \
@@ -812,6 +814,12 @@ fn main() {
             r.arena_chunks,
             unowned as isize,
             r.visible_slots,
+            r.waste_zombie_current_after_last_fork,
+            r.waste_zombie_current_shadowed,
+            r.waste_zombie_retained,
+            r.waste_live_retained,
+            r.waste_trunk_retained,
+            r.waste_live_current,
             predicted_pages.map_or("n/a".to_string(), |p| p.to_string()),
             rss_bytes(),
             kept.bytes(),
@@ -828,6 +836,19 @@ fn main() {
             not_a_result(&format!(
                 "open {} index_mismatch {} unowned arena slots {}",
                 r.open, r.index_mismatch, unowned as isize
+            ));
+        }
+        let waste_parts = r.waste_zombie_current_after_last_fork
+            + r.waste_zombie_current_shadowed
+            + r.waste_zombie_retained
+            + r.waste_live_retained
+            + r.waste_trunk_retained
+            + r.waste_live_current;
+        if waste_parts != r.arena_in_use - r.visible_slots || r.waste_live_current != 0 {
+            not_a_result(&format!(
+                "waste parts sum to {waste_parts}, arena - visible is {}; live current waste {}",
+                r.arena_in_use - r.visible_slots,
+                r.waste_live_current
             ));
         }
         if r.states != model_states || r.zombies != model_zombies {

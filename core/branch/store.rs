@@ -750,6 +750,39 @@ impl BranchStore {
             }
         }
         r.visible_slots = visible.len();
+        // Where the unreadable slots sit (observation only): a zombie's current versions born after
+        // its newest kept child's fork (no child can ever read them), its other current versions,
+        // retained versions of zombies and of live branches, and the trunk's retained versions.
+        for st in inner.branches.values() {
+            let zombie = !st.handle && !st.open;
+            let newest = st.lineage.children.keys().next_back().copied();
+            for o in st.current.values() {
+                if visible.contains(&o.slot) {
+                    continue;
+                }
+                if !zombie {
+                    r.waste_live_current += 1;
+                } else if newest.is_none_or(|f| o.born > f) {
+                    r.waste_zombie_current_after_last_fork += 1;
+                } else {
+                    r.waste_zombie_current_shadowed += 1;
+                }
+            }
+            for versions in st.lineage.retained.values() {
+                for v in versions.values() {
+                    if !visible.contains(&v.slot) {
+                        if zombie {
+                            r.waste_zombie_retained += 1;
+                        } else {
+                            r.waste_live_retained += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for versions in inner.trunk.lineage.retained.values() {
+            r.waste_trunk_retained += versions.values().filter(|v| !visible.contains(&v.slot)).count();
+        }
         r.index_mismatch = index_mismatch;
         if let Some(arena) = &inner.arena {
             let (high_water, free_capacity, free_bits_words, chunks) = arena.shape();

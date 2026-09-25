@@ -228,6 +228,17 @@ pub struct BranchResident {
     /// store keeps that no reader can reach (for children not yet forked, nothing: a zombie forks
     /// nothing and a live branch's own versions count as visible).
     pub visible_slots: usize,
+    /// Arena slots no reader can read, by owner: a zombie's current versions born after its newest
+    /// kept child's fork, its other current versions (every descendant has overwritten the page),
+    /// retained versions of zombies and of live branches (the child they are kept for overwrote the
+    /// page), the trunk's retained versions, and a live branch's current versions (always 0: a
+    /// branch reads its own). They sum to `arena_in_use - visible_slots`.
+    pub waste_zombie_current_after_last_fork: usize,
+    pub waste_zombie_current_shadowed: usize,
+    pub waste_zombie_retained: usize,
+    pub waste_live_retained: usize,
+    pub waste_trunk_retained: usize,
+    pub waste_live_current: usize,
     /// Arena slots ever handed out (the arena never shrinks below this).
     pub arena_high_water: usize,
     pub arena_in_use: usize,
