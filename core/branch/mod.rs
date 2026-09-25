@@ -199,7 +199,35 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
+    /// Acquisitions of the store mutex by the mechanism (the observation calls are not counted).
+    pub lock_holds: u64,
+    /// Arena page bytes memcpy'd while the store mutex was held.
+    pub locked_copy_bytes: u64,
 }
+
+/// The largest single hold of the store mutex, per measure, since the previous
+/// [`Database::branch_take_hold_max`]. Observation only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HoldMax {
+    /// Arena pages allocated, copied, mapped or released inside one hold.
+    pub pages: u64,
+    /// Arena page bytes memcpy'd inside one hold.
+    pub copy_bytes: u64,
+    /// Entries moved by std `HashMap` growth inside one hold.
+    pub realloc_moved: u64,
+    /// Nanoseconds of one hold, from acquisition to release; 0 unless [`set_hold_timing`] is on.
+    pub ns: u64,
+}
+
+/// Time every hold of the branch store's mutex into [`HoldMax::ns`]. Observation only; costs two
+/// clock reads per hold while on.
+#[doc(hidden)]
+pub fn set_hold_timing(on: bool) {
+    store::set_hold_timing(on);
+}
+
+#[doc(hidden)]
+pub use crate::storage::page_cache::{cache_work, CacheWork};
 
 impl Branch {
     fn new(db: Arc<Database>, id: BranchId) -> Self {
@@ -352,11 +380,23 @@ impl Connection {
     pub fn branch_id(&self) -> Option<BranchId> {
         self.pager.load().branch_id()
     }
+
+    /// Pages currently held in this connection's page cache. Observation only.
+    #[doc(hidden)]
+    pub fn page_cache_len(&self) -> usize {
+        self.pager.load().page_cache_len()
+    }
 }
 
 impl Database {
     pub fn branch_stats(&self) -> BranchStats {
         self.branches.stats()
+    }
+
+    /// The per-hold maxima of the branch store's mutex since the previous call; resets them.
+    #[doc(hidden)]
+    pub fn branch_take_hold_max(&self) -> HoldMax {
+        self.branches.take_hold_max()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.

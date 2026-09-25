@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use rustc_hash::FxHashMap as HashMap;
 use tracing::trace;
@@ -25,6 +26,65 @@ pub const MINIMUM_PAGE_CACHE_SIZE_IN_PAGES: usize = 200;
 
 /// The spill threshold as a fraction of capacity.
 const DEFAULT_SPILL_THRESHOLD_PERCENT: usize = 90;
+
+/// Process-wide counts of the page caches' replacement work, for attributing a large
+/// transaction's cost (branch lane r11-bigtxn). Observation only: nothing reads them but
+/// [`cache_work`], and each is added once per call from a count the call keeps anyway.
+struct CacheCounters {
+    evict_calls: AtomicU64,
+    evict_examined: AtomicU64,
+    evict_full: AtomicU64,
+    over_capacity_admits: AtomicU64,
+    evictable_scan_entries: AtomicU64,
+    spill_scan_entries: AtomicU64,
+    subjournal_pages: AtomicU64,
+}
+
+static CACHE_COUNTERS: CacheCounters = CacheCounters {
+    evict_calls: AtomicU64::new(0),
+    evict_examined: AtomicU64::new(0),
+    evict_full: AtomicU64::new(0),
+    over_capacity_admits: AtomicU64::new(0),
+    evictable_scan_entries: AtomicU64::new(0),
+    spill_scan_entries: AtomicU64::new(0),
+    subjournal_pages: AtomicU64::new(0),
+};
+
+/// A snapshot of [`cache_work`]'s counters, summed over every page cache in the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CacheWork {
+    /// Calls to the SIEVE eviction (`evict_one`).
+    pub evict_calls: u64,
+    /// Entries the SIEVE hand stepped over or evicted.
+    pub evict_examined: u64,
+    /// Eviction calls that found nothing evictable (`CacheError::Full`).
+    pub evict_full: u64,
+    /// Pages admitted over capacity because nothing could be evicted.
+    pub over_capacity_admits: u64,
+    /// Entries visited by the spill check's evictable-page count.
+    pub evictable_scan_entries: u64,
+    /// Entries visited while collecting pages to spill.
+    pub spill_scan_entries: u64,
+    /// Pages written to a statement journal (subjournal).
+    pub subjournal_pages: u64,
+}
+
+pub fn cache_work() -> CacheWork {
+    let c = &CACHE_COUNTERS;
+    CacheWork {
+        evict_calls: c.evict_calls.load(Relaxed),
+        evict_examined: c.evict_examined.load(Relaxed),
+        evict_full: c.evict_full.load(Relaxed),
+        over_capacity_admits: c.over_capacity_admits.load(Relaxed),
+        evictable_scan_entries: c.evictable_scan_entries.load(Relaxed),
+        spill_scan_entries: c.spill_scan_entries.load(Relaxed),
+        subjournal_pages: c.subjournal_pages.load(Relaxed),
+    }
+}
+
+pub(crate) fn count_subjournal_page() {
+    CACHE_COUNTERS.subjournal_pages.fetch_add(1, Relaxed);
+}
 
 #[derive(Debug, Copy, Eq, Hash, PartialEq, Clone)]
 #[repr(transparent)]
@@ -482,6 +542,9 @@ impl PageCache {
     #[inline]
     /// Count pages that can be evicted without spilling.
     fn count_evictable_pages(&self) -> usize {
+        CACHE_COUNTERS
+            .evictable_scan_entries
+            .fetch_add(self.map.len() as u64, Relaxed);
         self.map
             .values()
             .filter(|&&entry_ptr| {
@@ -572,7 +635,9 @@ impl PageCache {
         const EST_SPILL: usize = 128;
         let mut spillable: Vec<PinGuard> = Vec::with_capacity(EST_SPILL);
 
+        let mut scanned = 0u64;
         for (_, &entry_ptr) in self.map.iter() {
+            scanned += 1;
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             if Self::spillable(page) {
@@ -582,6 +647,9 @@ impl PageCache {
                 break;
             }
         }
+        CACHE_COUNTERS
+            .spill_scan_entries
+            .fetch_add(scanned, Relaxed);
         spillable.sort_by_key(|pg| pg.get().id);
         spillable
     }
@@ -614,6 +682,9 @@ impl PageCache {
     /// Returns `CacheError::Full` if not enough pages can be evicted
     fn make_room_for(&mut self, n: usize, bypass_capacity: bool) -> Result<(), CacheError> {
         if bypass_capacity {
+            if self.len() + n > self.capacity {
+                CACHE_COUNTERS.over_capacity_admits.fetch_add(1, Relaxed);
+            }
             return Ok(());
         }
         if n > self.capacity {
@@ -646,6 +717,7 @@ impl PageCache {
 
         let mut examined = 0usize;
         let max_examinations = self.len().saturating_mul(REF_MAX as usize + 1);
+        CACHE_COUNTERS.evict_calls.fetch_add(1, Relaxed);
 
         while examined < max_examinations {
             // Clock hand should never be null here since we checked len() > 0
@@ -689,6 +761,9 @@ impl PageCache {
                 // Update evictable count after successful eviction
                 self.evictable_count = self.evictable_count.saturating_sub(1);
 
+                CACHE_COUNTERS
+                    .evict_examined
+                    .fetch_add(examined as u64 + 1, Relaxed);
                 return Ok(());
             } else if evictable {
                 // Decrement ref bit and continue
@@ -702,6 +777,10 @@ impl PageCache {
             }
         }
 
+        CACHE_COUNTERS
+            .evict_examined
+            .fetch_add(examined as u64, Relaxed);
+        CACHE_COUNTERS.evict_full.fetch_add(1, Relaxed);
         Err(CacheError::Full)
     }
 

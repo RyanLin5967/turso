@@ -2107,6 +2107,7 @@ impl Pager {
 
         let c = subjournal.write_page(write_offset, page_size, buffer, c)?;
         turso_assert!(c.succeeded(), "memory IO should complete immediately");
+        super::page_cache::count_subjournal_page();
         Ok(())
     }
 
@@ -3743,6 +3744,11 @@ impl Pager {
             }
         });
         Ok(page)
+    }
+
+    /// Pages currently held in this pager's page cache. Observation only.
+    pub(crate) fn page_cache_len(&self) -> usize {
+        self.page_cache.read().len()
     }
 
     /// Changes the size of the page cache.
