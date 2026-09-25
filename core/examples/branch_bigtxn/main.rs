@@ -592,18 +592,75 @@ fn arm_trunk(ctx: &Ctx, trunk: &Arc<Connection>, args: &Args) {
     }
 }
 
-/// One probe sample: start offset from the run's base instant, and latency.
-type Probe = (Duration, Duration);
+/// Phases of one probe rep, as the main thread announces them: the probe reads the counter before
+/// and after each op, so an op overlaps phase k exactly when `before <= k <= after`.
+const PH_UPDATE: u64 = 1;
+const PH_COMMIT: u64 = 2;
+
+/// What the probe thread keeps: bounded, so that the harness's memory does not grow with the run
+/// (a first version kept every sample, ~5e8 per rep).
+struct ProbeStats {
+    samples: u64,
+    max_ns: u64,
+    max_update_ns: u64,
+    max_commit_ns: u64,
+    /// Latency histogram: bucket = floor(8 * log2(ns)), so each octave has eight buckets.
+    hist: Vec<u64>,
+}
+
+impl ProbeStats {
+    fn new() -> Self {
+        Self {
+            samples: 0,
+            max_ns: 0,
+            max_update_ns: 0,
+            max_commit_ns: 0,
+            hist: vec![0; 8 * 64],
+        }
+    }
+
+    fn record(&mut self, ns: u64, before: u64, after: u64) {
+        self.samples += 1;
+        self.max_ns = self.max_ns.max(ns);
+        if before <= PH_UPDATE && PH_UPDATE <= after {
+            self.max_update_ns = self.max_update_ns.max(ns);
+        }
+        if before <= PH_COMMIT && PH_COMMIT <= after {
+            self.max_commit_ns = self.max_commit_ns.max(ns);
+        }
+        let b = ((ns.max(1) as f64).log2() * 8.0) as usize;
+        self.hist[b.min(self.hist.len() - 1)] += 1;
+    }
+
+    /// The lower edge (ns) of the bucket holding the p-th percentile.
+    fn pct(&self, p: f64) -> f64 {
+        let want = ((p / 100.0) * self.samples as f64).ceil().max(1.0) as u64;
+        let mut seen = 0;
+        for (b, &c) in self.hist.iter().enumerate() {
+            seen += c;
+            if seen >= want {
+                return 2f64.powf(b as f64 / 8.0);
+            }
+        }
+        f64::NAN
+    }
+}
 
 fn arm_probe(ctx: &Ctx, trunk: &Arc<Connection>, args: &Args) {
     let d = args.d_list[0];
     let mut others: Vec<Branch> = Vec::new();
     let probe_branch = trunk.fork_branch().unwrap();
     let probe_conn = match args.probe {
-        ProbeKind::Write1 => Some(probe_branch.connect().unwrap()),
+        ProbeKind::Write1 => {
+            let pc = probe_branch.connect().unwrap();
+            // The probe's page is the branch's own before any rep, so a rep's writes rewrite it and
+            // leave the arena's count where it was.
+            pc.execute("UPDATE t SET v = 'P' || substr(v, 2) WHERE id = 1")
+                .unwrap();
+            Some(pc)
+        }
         ProbeKind::ForkReap => None,
     };
-    let base = Instant::now();
     println!("{HEADER}");
     for &n in &args.n_list {
         let grow_start = Instant::now();
@@ -628,19 +685,25 @@ fn arm_probe(ctx: &Ctx, trunk: &Arc<Connection>, args: &Args) {
         );
         for rep in 0..args.reps {
             let stop = Arc::new(AtomicBool::new(false));
+            let phase = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let before = snap(&ctx.db);
             let handle = {
-                let stop = stop.clone();
+                let (stop, phase) = (stop.clone(), phase.clone());
                 let kind = args.probe;
-                let pb = probe_branch.fork().unwrap();
+                let pb = match kind {
+                    ProbeKind::ForkReap => Some(probe_branch.fork().unwrap()),
+                    ProbeKind::Write1 => None,
+                };
                 let pc = probe_conn.clone();
                 std::thread::spawn(move || {
-                    let mut samples: Vec<Probe> = Vec::with_capacity(1 << 20);
+                    let mut st = ProbeStats::new();
                     let mut g = 0u64;
                     while !stop.load(Ordering::Relaxed) {
+                        let ph0 = phase.load(Ordering::Acquire);
                         let t0 = Instant::now();
                         match kind {
                             ProbeKind::ForkReap => {
-                                let c = pb.fork().unwrap();
+                                let c = pb.as_ref().unwrap().fork().unwrap();
                                 drop(c);
                             }
                             ProbeKind::Write1 => {
@@ -653,24 +716,28 @@ fn arm_probe(ctx: &Ctx, trunk: &Arc<Connection>, args: &Args) {
                                     .unwrap();
                             }
                         }
+                        let ns = t0.elapsed().as_nanos() as u64;
+                        let ph1 = phase.load(Ordering::Acquire);
                         g += 1;
-                        samples.push((t0 - base, t0.elapsed()));
+                        st.record(ns, ph0, ph1);
                     }
                     drop(pb);
-                    samples
+                    st
                 })
             };
             let c0 = Instant::now();
-            let before = snap(&ctx.db);
             let b = trunk.fork_branch().unwrap();
             let bc = b.connect().unwrap();
             bc.execute("BEGIN").unwrap();
             let sql = format!("UPDATE t SET v = 'B' || substr(v, 2) WHERE id <= {d}");
-            let u0 = Instant::now() - base;
-            ctx.phase("update", d, n, rep, || bc.page_cache_len(), || bc.execute(&sql).unwrap());
-            let k0 = Instant::now() - base;
-            ctx.phase("commit", d, n, rep, || bc.page_cache_len(), || bc.execute("COMMIT").unwrap());
-            let k1 = Instant::now() - base;
+            phase.store(PH_UPDATE, Ordering::Release);
+            let (_, t_update) =
+                ctx.phase("update", d, n, rep, || bc.page_cache_len(), || bc.execute(&sql).unwrap());
+            phase.store(PH_COMMIT, Ordering::Release);
+            let (_, t_commit) = ctx.phase("commit", d, n, rep, || bc.page_cache_len(), || {
+                bc.execute("COMMIT").unwrap()
+            });
+            phase.store(PH_COMMIT + 1, Ordering::Release);
             let marked = count_marked(&bc, d, 'B');
             if marked != d as i64 {
                 not_a_result(&format!("branch reads {marked} rewritten rows of {d}"));
@@ -681,39 +748,32 @@ fn arm_probe(ctx: &Ctx, trunk: &Arc<Connection>, args: &Args) {
                 not_a_result(&format!("reap freed {}", reaped.freed_pages));
             }
             stop.store(true, Ordering::Relaxed);
-            let samples = handle.join().unwrap();
+            let st = handle.join().unwrap();
             let after = snap(&ctx.db);
             if after.arena_in_use != before.arena_in_use {
-                not_a_result("probe rep leaked arena pages");
+                not_a_result(&format!(
+                    "probe rep leaked arena pages: {} -> {}",
+                    before.arena_in_use, after.arena_in_use
+                ));
             }
-            let overlaps = |lo: Duration, hi: Duration| {
-                samples
-                    .iter()
-                    .filter(|(s, l)| *s < hi && *s + *l > lo)
-                    .map(|(_, l)| *l)
-                    .max()
-                    .unwrap_or_default()
-            };
-            let mut lat: Vec<f64> = samples.iter().map(|(_, l)| l.as_secs_f64() * 1e6).collect();
-            lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let pct = |p: f64| lat[((p / 100.0) * (lat.len() - 1) as f64).round() as usize];
-            if ctx.timing && !lat.is_empty() {
+            if ctx.timing && st.samples > 0 {
                 println!(
                     "# probe N={n} rep={rep} kind={:?} samples={} p50_us={:.2} p99_us={:.2} max_us={:.1} \
-                     max_during_update_us={:.1} max_during_commit_us={:.1} update_ms={:.1} commit_ms={:.1} wall_s={:.1}",
+                     max_during_update_us={:.1} max_during_commit_us={:.1} update_ms={:.1} commit_ms={:.1} \
+                     wall_s={:.1} (percentiles: lower edge of a 1/8-octave bucket)",
                     args.probe,
-                    lat.len(),
-                    pct(50.0),
-                    pct(99.0),
-                    lat[lat.len() - 1],
-                    overlaps(u0, k0).as_secs_f64() * 1e6,
-                    overlaps(k0, k1).as_secs_f64() * 1e6,
-                    (k0 - u0).as_secs_f64() * 1e3,
-                    (k1 - k0).as_secs_f64() * 1e3,
+                    st.samples,
+                    st.pct(50.0) / 1e3,
+                    st.pct(99.0) / 1e3,
+                    st.max_ns as f64 / 1e3,
+                    st.max_update_ns as f64 / 1e3,
+                    st.max_commit_ns as f64 / 1e3,
+                    t_update.as_secs_f64() * 1e3,
+                    t_commit.as_secs_f64() * 1e3,
                     c0.elapsed().as_secs_f64()
                 );
             } else {
-                println!("# probe N={n} rep={rep} kind={:?} samples={}", args.probe, lat.len());
+                println!("# probe N={n} rep={rep} kind={:?} samples={}", args.probe, st.samples);
             }
         }
     }
