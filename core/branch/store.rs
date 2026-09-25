@@ -63,7 +63,9 @@
 //! # What this does not do
 //!
 //! * One `Mutex` guards every branch. Correct, and a known wall under concurrent writers on
-//!   different branches; the benchmark this lane ships is single-threaded and says so.
+//!   different branches; the benchmark this lane ships is single-threaded and says so. Every
+//!   acquisition goes through [`BranchStore::lock`], which counts it (see [`BranchWork`]), so the
+//!   wall can be read from integers rather than inferred from a latency curve.
 //! * The persistent page maps are an index over slots the lineages own; they own nothing. A
 //!   branch's `inherited` names only slots its ancestors keep for it (see "Resolution without the
 //!   walk"), so dropping a map never frees a page and keeping one never pins a page.
@@ -80,15 +82,16 @@
 //! refuses a version that would break the disjointness the search relies on.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::Bound;
+use std::ops::{Bound, Deref, DerefMut};
+use std::time::Instant;
 
 use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
-use crate::sync::atomic::{AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::sync::{Arc, Mutex, MutexGuard};
 use crate::{LimboError, Result};
 
 pub(crate) struct BranchStore {
@@ -101,6 +104,37 @@ pub(crate) struct BranchStore {
     /// same lock. A 1-to-0 transition (a reap) racing the read only makes the writer take the lock
     /// and find nothing to do.
     trunk_children: AtomicUsize,
+    /// Whether [`BranchStore::lock`] times how long each acquisition holds the lock. Off by default:
+    /// it is the one part of the lock accounting that adds work inside the critical section.
+    lock_timing: AtomicBool,
+}
+
+/// The store's lock, held. Observation only: dropping it adds the time it was held to
+/// `lock_hold_ns` when lock timing was on at the acquisition, and does nothing else.
+struct Held<'a> {
+    guard: MutexGuard<'a, StoreInner>,
+    since: Option<Instant>,
+}
+
+impl Deref for Held<'_> {
+    type Target = StoreInner;
+    fn deref(&self) -> &StoreInner {
+        &self.guard
+    }
+}
+
+impl DerefMut for Held<'_> {
+    fn deref_mut(&mut self) -> &mut StoreInner {
+        &mut self.guard
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if let Some(since) = self.since {
+            self.guard.work.lock_hold_ns += since.elapsed().as_nanos() as u64;
+        }
+    }
 }
 
 struct StoreInner {
@@ -332,7 +366,37 @@ impl BranchStore {
                 work: BranchWork::default(),
             }),
             trunk_children: AtomicUsize::new(0),
+            lock_timing: AtomicBool::new(false),
         }
+    }
+
+    /// Take the store's lock, counting the acquisition into `work`: every one, the ones that found
+    /// the lock held, and how long those waited. The counts are written under the lock itself, so
+    /// counting adds no shared write the lock does not already make, and the clock is read only on
+    /// the contended path, by the thread that is waiting anyway — except with lock timing on, which
+    /// reads it once more at the acquisition and once at the release.
+    fn lock(&self) -> Held<'_> {
+        let (mut guard, waited) = match self.inner.try_lock() {
+            Some(guard) => (guard, None),
+            None => {
+                let start = Instant::now();
+                let guard = self.inner.lock();
+                (guard, Some(start.elapsed()))
+            }
+        };
+        let work = &mut guard.work;
+        work.lock_acquisitions += 1;
+        if let Some(waited) = waited {
+            work.lock_contended += 1;
+            work.lock_wait_ns += waited.as_nanos() as u64;
+        }
+        let since = self.lock_timing.load(Ordering::Relaxed).then(Instant::now);
+        Held { guard, since }
+    }
+
+    /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
+    pub(crate) fn set_lock_timing(&self, on: bool) {
+        self.lock_timing.store(on, Ordering::Relaxed);
     }
 
     pub(crate) fn trunk_has_children(&self) -> bool {
@@ -342,14 +406,14 @@ impl BranchStore {
     /// Whether any branch state exists at all, including one kept alive only by a live child.
     /// Paths that rewrite the trunk without passing through `add_dirty` refuse while this holds.
     pub(crate) fn has_branches(&self) -> bool {
-        !self.inner.lock().branches.is_empty()
+        !self.lock().branches.is_empty()
     }
 
     /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         match &inner.arena {
             None => inner.arena = Some(Arena::new(page_size)),
             Some(arena) if arena.page_size() != page_size => {
@@ -376,7 +440,7 @@ impl BranchStore {
     /// Fork a child of a branch. Refused while the parent has a write transaction in progress, for
     /// the same reason a trunk fork takes the WAL write lock.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let id = BranchId(inner.next_id);
         let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
@@ -409,7 +473,7 @@ impl BranchStore {
     /// branch: two would each hold a private page cache of the same page space, and nothing would
     /// tell one that the other had committed — a silently stale read, so it is refused.
     pub(crate) fn open(&self, id: BranchId) -> Result<Arc<Schema>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.open {
             return Err(LimboError::InvalidArgument(format!(
@@ -425,7 +489,7 @@ impl BranchStore {
 
     /// The connection on `id` has gone. Releases its write lock if a transaction was abandoned.
     pub(crate) fn close(&self, id: BranchId) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         if let Some(st) = inner.branches.get_mut(&id) {
             st.open = false;
             st.writer = false;
@@ -435,7 +499,7 @@ impl BranchStore {
 
     /// The `Branch` handle has gone.
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let Some(st) = inner.branches.get_mut(&id) else {
             return Reaped {
                 freed_pages: 0,
@@ -451,7 +515,7 @@ impl BranchStore {
     }
 
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.writer {
             return Err(LimboError::Busy);
@@ -461,13 +525,13 @@ impl BranchStore {
     }
 
     pub(crate) fn end_write(&self, id: BranchId) {
-        if let Some(st) = self.inner.lock().branches.get_mut(&id) {
+        if let Some(st) = self.lock().branches.get_mut(&id) {
             st.writer = false;
         }
     }
 
     pub(crate) fn holds_writer(&self, id: BranchId) -> bool {
-        self.inner
+        self
             .lock()
             .branches
             .get(&id)
@@ -475,7 +539,7 @@ impl BranchStore {
     }
 
     pub(crate) fn schema(&self, id: BranchId) -> Result<Arc<Schema>> {
-        let inner = self.inner.lock();
+        let inner = self.lock();
         Ok(inner.branches.get(&id).ok_or_else(|| gone(id))?.schema.clone())
     }
 
@@ -487,7 +551,7 @@ impl BranchStore {
         page: u32,
         pre_image: &[u8],
     ) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let StoreInner {
             arena, branches, ..
         } = &mut *inner;
@@ -540,7 +604,7 @@ impl BranchStore {
     /// The copy decision for the trunk's first write to `page` in a transaction: if a live child
     /// can still see the version about to be overwritten, keep a copy of it for that child.
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let StoreInner { arena, trunk, .. } = &mut *inner;
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
@@ -565,7 +629,7 @@ impl BranchStore {
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let StoreInner {
             arena, branches, ..
         } = &mut *inner;
@@ -594,7 +658,7 @@ impl BranchStore {
     }
 
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         inner.branches.get_mut(&id).ok_or_else(|| gone(id))?.schema = schema;
         Ok(())
     }
@@ -603,7 +667,7 @@ impl BranchStore {
     /// means the branch sees the trunk's current version, which the caller reads through the
     /// ordinary WAL / database-file path.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let (mut levels, mut examined) = (0, 0);
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
         inner.work.resolve_calls += 1;
@@ -623,7 +687,7 @@ impl BranchStore {
     }
 
     pub(crate) fn stats(&self) -> BranchStats {
-        let inner = self.inner.lock();
+        let inner = self.lock();
         BranchStats {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
@@ -633,7 +697,7 @@ impl BranchStore {
     }
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
-        let inner = self.inner.lock();
+        let inner = self.lock();
         let Some(st) = inner.branches.get(&id) else {
             return Vec::new();
         };
@@ -645,7 +709,7 @@ impl BranchStore {
     }
 
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
-        self.inner
+        self
             .lock()
             .arena
             .as_ref()
@@ -653,7 +717,7 @@ impl BranchStore {
     }
 
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
-        self.inner
+        self
             .lock()
             .arena
             .as_ref()
@@ -928,6 +992,51 @@ mod tests {
             store.release_handle(id);
         }
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
+    }
+
+    /// The lock accounting, forced to fire and shown not to fire spuriously. One thread alone makes
+    /// only uncontended acquisitions, one per call, and with timing off no hold time. A holder that
+    /// keeps the lock for 500 ms while a second thread asks for it makes that acquisition contended,
+    /// with a non-zero wait, and with timing on its own hold is counted before the waiter can read
+    /// the counters. The bounds are loose on purpose: the waiter would have to be descheduled for the
+    /// whole 500 ms to miss the hold, and nothing here is timed tighter than "more than zero".
+    #[test]
+    fn lock_accounting_counts_a_forced_wait_and_nothing_else() {
+        let store = Arc::new(BranchStore::new());
+        let base = store.stats().work;
+        for _ in 0..10 {
+            store.stats();
+        }
+        let quiet = store.stats().work;
+        assert_eq!(quiet.lock_acquisitions - base.lock_acquisitions, 11);
+        assert_eq!(
+            (quiet.lock_contended, quiet.lock_wait_ns, quiet.lock_hold_ns),
+            (0, 0, 0),
+            "one thread, timing off: nothing contended, nothing timed"
+        );
+
+        store.set_lock_timing(true);
+        let hold = std::time::Duration::from_millis(500);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let held = store.lock();
+                tx.send(()).unwrap();
+                std::thread::sleep(hold);
+                drop(held);
+            })
+        };
+        rx.recv().unwrap();
+        let forced = store.stats().work;
+        holder.join().unwrap();
+        assert_eq!(forced.lock_contended, 1, "the waiting acquisition was not counted");
+        assert!(forced.lock_wait_ns > 0, "a contended acquisition waited 0 ns");
+        assert!(
+            forced.lock_hold_ns >= hold.as_nanos() as u64,
+            "the holder's {hold:?} was counted as {} ns",
+            forced.lock_hold_ns
+        );
     }
 
     /// A committed branch page holding `image(generation)`, as the pager hands it to

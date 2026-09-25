@@ -512,3 +512,114 @@ changes only how the one level is looked up. Counters equal the before file's ex
 control). Amendment 4's OFF runs attribute F1+F2 like-for-like against the curve lane's OFF before files.
 
 **Erratum (appended 2026-09-25T03:09:41Z):** amendment 6 was committed at 2026-09-25T03:09:34Z (`2f2a2934d`); its header's "03:15Z" was typed, not read from the clock.
+
+### Amendment 7 — written 2026-09-25T04:46:28Z: the concurrency axis, T threads at live N up to 10^6; before its first build or run
+
+Lane `turso_conc` (agent `inv-turso-conc`), worktree `turso-inv-conc-noindex`, base `0f4232957` (F1+F2+F4, the `final`
+store of amendment 6). Nothing below changes amendments 1-6 or any of their runs.
+
+**Why.** Every run so far is single-threaded, so the store's one `Mutex` has never been contended (`turso_curve/REPORT.md`
+§6). The store's own module doc calls that Mutex "a known wall under concurrent writers on different branches". BranchBench
+(arXiv 2604.17180) reports Dolt's throughput plateauing at T=4 [from the lead's brief; not read by this lane].
+
+**Engine change: lock accounting, observation only (this commit).** Every acquisition of the store's lock goes through
+`BranchStore::lock`: `try_lock`, and only when that fails, a timed blocking `lock`. Four counters in `BranchWork`, written
+under the lock itself: `lock_acquisitions`, `lock_contended` (acquisitions whose `try_lock` failed), `lock_wait_ns` (their
+wait, clock read by the waiting thread only) and `lock_hold_ns`. The last counts only while lock timing is on
+(`Database::set_branch_lock_timing`, default off). It is the one counter that adds work inside the critical section: two
+clock reads per acquisition. Nothing in the mechanism reads the counters. `core/sync.rs` re-exports parking_lot's
+`MutexGuard` (the shuttle adapter already defines one). Fire-check, run before any conc run:
+`store::tests::lock_accounting_counts_a_forced_wait_and_nothing_else`. One thread makes 11 calls and must count exactly 11
+acquisitions, 0 contended, 0 wait, 0 hold. A thread holding the lock 500 ms while another asks must produce exactly 1
+contended acquisition, wait > 0, and hold ≥ 500 ms with timing on.
+
+**Harness: `branch_arms --arm conc`.** One trunk table as in every arm (20,000 rows, checkpointed; the trunk never writes
+here, so nothing is retained). N branches are grown single-threaded, each forked from the trunk and writing one row. Then,
+at each N, one cell per T in the `--threads` list, first forward (draw 0) and then reversed (draw 1). Each cell:
+1. The null workload: T threads, each running the same 10^8-step xorshift loop, sharing nothing. `null_ops_per_s` is the
+   box's parallelism at that moment.
+2. The N live branches are dealt round-robin into T shares. Each thread gets its own trunk connection.
+3. After a barrier, each thread runs C = `--cycles` cycles:
+   - `fork` a branch from its trunk connection;
+   - `open` a connection on it;
+   - `first_write`: one autocommit UPDATE of row `row_for(g)` on it; drop the connection;
+   - `read_open` a connection on a random branch of the share;
+   - `read_own`: SELECT that branch's own row;
+   - `read_inh`: SELECT a far row, the trunk's, on the same connection; drop the connection;
+   - `reap` a random branch of the share. The new branch joins the share after the victim is drawn, so N is fixed.
+4. Every read is checked against the value the harness knows. Every reap must free exactly 1 page, not deferred. After the
+   cell, the engine must report exactly N live branches and N arena pages. Otherwise the run prints `NOT A RESULT` and exits 1.
+5. `Busy`/`BusySnapshot` from any op is retried after a `yield_now` and counted per op. A trunk fork holds the trunk's WAL
+   write lock (`mod.rs` `fork_trunk`), so two threads forking at once is the one expected source of Busy. Any other
+   error is not a result.
+
+Printed per cell:
+- per op: p50/p90/p99/max over T·C samples, plus its Busy retries;
+- `cellsum`: cycles, wall (barrier release to the last join), `cycles_per_s`, `null_ops_per_s`, the slowest and fastest
+  thread's elapsed, process user and sys CPU (getrusage), the four lock counters over the cell, and RSS.
+
+The two connection drops (`Store::close`) sit inside the wall time but outside every timed op.
+
+**Definitions (pre-registered).**
+- X(N,T,d) = T·C / wall. S(T) = X(T)/X(1) and Sn(T) = null(T)/null(1), each within one N and one draw.
+- E(T) = S(T)/Sn(T): parallel efficiency against what the box gives T threads that share nothing.
+- **Scales** at T: E(T) ≥ 0.7 in both draws. **Wall** at T: E(T) < 0.5 in both draws. Anything else is inconclusive and
+  reported so. When X for the two draws of one (N,T) differs by more than 15%, the cell has drifted and no verdict is taken.
+- W = lock_wait_ns / (T · wall): the fraction of thread-time spent waiting for the store's lock.
+- U = lock_hold_ns / wall: the fraction of wall time the lock is held (`conc_hold` only).
+- The store lock **is the wall** at (N,T) when all three hold: E < 0.5, W ≥ 0.25 (`conc_main`), and U ≥ 0.6 (`conc_hold`).
+- When E < 0.5 but W < 0.10, the wall is outside the store lock. It is attributed only through `conc_prof`'s profile, and
+  it stays a candidate until a counter confirms it.
+
+**Runs** (`turso_conc/run_conc.sh`: lockrun `turso-conc`, `taskpolicy -b` for the build, `timeout` on every step, each raw
+file committed before it is read):
+1. `tests_conc`: `cargo test -p turso_core --lib branch::`. Every branch test must pass, the fire-check included, or
+   nothing below runs. Then `mutate_conc`: two mutants of the accounting, each applied to `store.rs`, tested the same way,
+   and restored from git. M1: `try_lock` replaced by a blocking `lock`, so nothing is ever counted contended. M2: the hold
+   time is never added. Each must fail the fire-check, or nothing below runs.
+2. `build_conc`: a release build of `branch_arms` from the commit that carries this amendment, copied out of the tree.
+3. `conc_smoke`: `--arm conc --threads 1,2 --checkpoints 16 --cycles 200`. Assertions only; NOT A RESULT.
+4. `conc_main`: `--arm conc --threads 1,2,4,8,16 --checkpoints 1000,100000,1000000 --cycles 20000 --lock-timing off`.
+   Throughput, latency, W. All E and S verdicts are read from this run.
+5. `conc_hold`: the same arguments with `--lock-timing on`. Gives U. Its X against `conc_main`'s is the cost of the
+   instrument.
+6. `conc_prof`: `--arm conc --threads 16 --checkpoints 1000,1000000 --cycles 60000`. `/usr/bin/sample <pid> 3` is taken
+   1 s after each `# cell N=… T=16 draw=0 start` line. Only the two profiles are read from this run.
+
+**Predictions** (read from source; each is inferred, I, unverified):
+- **P7.1 (integer, load-immune).** Lock acquisitions per cycle:
+  - identical within ±0.5% across T and draws at each N, and across N;
+  - in [19, 40]. That is 9 resolutions (open 1, first_write 3, read_open 1, read_own 3, read_inh 1, as the banked
+    `resolves_per_op` of `c1_fix`/`a1_fix` read with the root cached for read_inh), fork 1, store.open 2, begin_write,
+    first_write_branch, commit_pages and end_write 4, close 2, release_handle 1, plus an unknown number of
+    `holds_writer` calls from the VDBE.
+  - An `open` Busy retry adds 2 (open, then close); the report subtracts those.
+- **P7.2.** `lock_contended` = 0 exactly at T=1, where one thread holds every acquisition. `busy_fork` = 0 exactly at T=1.
+  Both > 0 in every T=16 cell. A zero there means the detector did not fire; that is not a clean result.
+- **P7.3 (hold, `conc_hold`, T=1).** Hold per cycle:
+  - at N=10^6, in [1, 10] µs;
+  - at N=10^6, at least 1.3× its value at N=10^3. The branch-state lookups and the reap's tree walks miss the caches at
+    10^6, and every one of them runs under the lock.
+- **P7.4.** X(1) in [15k, 35k] cycles/s at every N. The op p50s summed over one cycle, from `control_fix`/`c1_fix`, come to
+  ~35 µs, plus the drops.
+- **P7.5 (the wall).**
+  - At N=10^6: E(16) < 0.5 in both draws, with W(16) ≥ 0.25 and U(16) ≥ 0.5.
+  - The Amdahl bound from P7.3's hold is s = hold/cycle ≈ 0.12, so S(16) ≤ 1/(s + (1-s)/16) ≈ 5.7. Sn(16) on 6 Super + 12
+    Performance cores is ≈ 12-14, if the box is otherwise idle.
+  - At N=10^3 (s ≈ 0.045, S(16) ≤ ≈ 9.5): no verdict is predicted.
+  - E(16) at 10^6 < E(16) at 10^3 in both draws.
+  - E(2) ≥ 0.8 at every N.
+- **P7.6.** Correctness: no NOT A RESULT; after every cell, arena = live = N; every reap frees exactly 1 page.
+- **P7.7 (the instrument's cost).** `conc_hold`'s X is within ±10% of `conc_main`'s at T=1 at every N, and ≥ 0.8× at T=16.
+  If that breaks, U is reported as perturbed: an upper bound on the unperturbed hold.
+
+**Falsifiers.**
+- E(16) ≥ 0.7 at N=10^6 in both draws: no wall at T ≤ 16 on this box for this workload. W and U are then reported as
+  headroom.
+- E(16) < 0.5 with W < 0.10: the wall is not the store lock. The profile names a candidate; the fix waits for a counter.
+- Acquisitions per cycle differing across T by more than 0.5% after open retries are subtracted: the counter or the
+  harness is broken, and no lock attribution is made.
+
+**What follows.** If a wall is found, amendment 8 names the standard fix and its prior art, and pre-registers its
+predictions, before its build. It re-runs `conc_main`, `conc_hold` and `conc_prof` unchanged on the fixed store. The
+report lists what still does not scale, with its mechanism read from source and the counter that proves it.

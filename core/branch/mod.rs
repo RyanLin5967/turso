@@ -182,6 +182,7 @@ pub struct BranchStats {
 /// Cumulative counts of the store's per-call work since the database opened. Observation only:
 /// nothing in the mechanism reads them. Each is updated once per call under the lock the call
 /// already holds, from a loop index the call computes anyway, so counting adds no per-element step.
+/// The `lock_*` counters describe that lock itself; only `lock_hold_ns` adds work under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchWork {
     /// Page resolutions against the branch tree (one per branch-pager page read).
@@ -199,6 +200,18 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
+    /// Acquisitions of the store's lock. Every store entry point takes it (a `stats` call counts
+    /// its own), so this is an integer the workload fixes and load cannot move.
+    pub lock_acquisitions: u64,
+    /// Acquisitions that found the lock held by another thread and waited for it.
+    pub lock_contended: u64,
+    /// Nanoseconds those acquisitions waited, summed. The clock is read only on the contended path,
+    /// by the waiting thread.
+    pub lock_wait_ns: u64,
+    /// Nanoseconds the lock was held, summed over acquisitions made while lock timing was on
+    /// ([`Database::set_branch_lock_timing`]); 0 while it is off. The one counter that adds work
+    /// inside the critical section: two clock reads per acquisition.
+    pub lock_hold_ns: u64,
 }
 
 impl Branch {
@@ -357,6 +370,13 @@ impl Connection {
 impl Database {
     pub fn branch_stats(&self) -> BranchStats {
         self.branches.stats()
+    }
+
+    /// Time how long each acquisition holds the branch store's lock, into
+    /// [`BranchWork::lock_hold_ns`]. Observation only; off by default.
+    #[doc(hidden)]
+    pub fn set_branch_lock_timing(&self, on: bool) {
+        self.branches.set_lock_timing(on);
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.

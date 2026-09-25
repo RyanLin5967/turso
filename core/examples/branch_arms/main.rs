@@ -12,6 +12,7 @@
 //!   churn_spread churn, plus the trunk rewrites the `spread` walk's next row in every cycle (amendment 3)
 //!   pages      every branch writes w pages in one transaction; x axis = N, one block per w
 //!   spread_trunk the `spread` arm's trunk writes with NO branches (amendment 2); x = trunk writes
+//!   conc       T threads churn their own shares of N live branches (amendment 7); one cell per (N, T)
 //!
 //! `--no-autocheckpoint` disables the trunk connection's WAL auto-actions (auto-checkpoint and WAL
 //! restart), amendment 2. Every state line prints the WAL file's size.
@@ -23,6 +24,11 @@
 //! uniformly random live branch, or the oldest one, which is the order uniform-TTL lease expiry
 //! reaps in (amendment 3).
 //!
+//! `--threads 1,2,4,...` (conc only) is the T list; each N runs it forward and then reversed.
+//! `--cycles` is then the cycles EACH thread runs per cell. `--lock-timing on|off` (conc only,
+//! default off) turns on the store's lock-hold timing, the one lock counter that adds work under the
+//! lock (amendment 7).
+//!
 //! Every read a sample makes is checked against a model the harness keeps itself (never against
 //! the engine), and the engine's own counts are checked against the workload before a number is
 //! printed; a mismatch prints `NOT A RESULT` and exits 1. Beside each latency the harness prints
@@ -31,12 +37,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use turso_core::branch::{Branch, BranchWork};
 use turso_core::{
-    Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO,
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, SqliteDialect, Value,
+    IO,
 };
 
 const TRUNK_ROWS: i64 = 20_000;
@@ -57,6 +64,7 @@ enum Arm {
     ChurnSpread,
     Pages,
     SpreadTrunk,
+    Conc,
 }
 
 /// Which live branch a churn cycle reaps.
@@ -77,6 +85,8 @@ struct Args {
     w_list: Vec<usize>,
     no_autocheckpoint: bool,
     synchronous: String,
+    threads: Vec<usize>,
+    lock_timing: bool,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -98,6 +108,8 @@ fn parse_args() -> Args {
         w_list: vec![1],
         no_autocheckpoint: false,
         synchronous: "OFF".to_string(),
+        threads: Vec::new(),
+        lock_timing: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -113,6 +125,7 @@ fn parse_args() -> Args {
                     "churn_spread" => Arm::ChurnSpread,
                     "pages" => Arm::Pages,
                     "spread_trunk" => Arm::SpreadTrunk,
+                    "conc" => Arm::Conc,
                     other => die(&format!("unknown arm {other}")),
                 })
             }
@@ -131,6 +144,14 @@ fn parse_args() -> Args {
                     other => die(&format!("unknown --synchronous {other}")),
                 }
                 .to_string()
+            }
+            "--threads" => args.threads = parse_list(&val(), "--threads"),
+            "--lock-timing" => {
+                args.lock_timing = match val().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => die(&format!("unknown --lock-timing {other}")),
+                }
             }
             "--victim" => {
                 args.victim = match val().as_str() {
@@ -157,6 +178,16 @@ fn parse_args() -> Args {
     }
     if args.w_list.is_empty() || args.w_list.iter().any(|&w| w == 0 || w > 64) {
         die("--w entries must be in 1..=64");
+    }
+    if args.arm == Arm::Conc {
+        if args.threads.is_empty() || args.threads.contains(&0) {
+            die("--arm conc needs --threads, every entry positive");
+        }
+        if args.checkpoints.iter().any(|&n| n < *args.threads.iter().max().unwrap()) {
+            die("--arm conc needs every checkpoint N >= the largest T, so each thread owns a branch");
+        }
+    } else if !args.threads.is_empty() || args.lock_timing {
+        die("--threads and --lock-timing apply to --arm conc only");
     }
     args
 }
@@ -547,6 +578,7 @@ fn main() {
         Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread => arm_churn(&mut bench, &args),
         Arm::Pages => arm_pages(&mut bench, &args),
         Arm::SpreadTrunk => arm_spread_trunk(&mut bench, &args),
+        Arm::Conc => arm_conc(&mut bench, &args),
     }
     let end = db.branch_stats();
     if end.live_branches != 0 || end.arena_slots_in_use != 0 {
@@ -1195,4 +1227,315 @@ fn arm_spread_trunk(b: &mut Bench, args: &Args) {
         b.print_state(n, "");
     }
     b.print_slopes(&args.checkpoints, &["trunk_write"]);
+}
+
+/// The ops of one `conc` cycle, in the order a cycle runs them.
+const CONC_OPS: [&str; 7] = [
+    "fork",
+    "open",
+    "first_write",
+    "read_open",
+    "read_own",
+    "read_inh",
+    "reap",
+];
+
+const CONC_HEADER: &str = "N\tT\tdraw\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\tbusy_retries";
+
+/// What one `conc` thread hands back: its share of the live branches, one latency per cycle per op,
+/// and the `Busy` answers it retried, per op.
+struct ConcOut {
+    share: Vec<Live>,
+    ops: [Vec<Duration>; 7],
+    busy: [u64; 7],
+    elapsed: Duration,
+}
+
+/// Run `f` until it does not answer `Busy`/`BusySnapshot`, counting those answers. Anything else
+/// is not a result.
+fn busy_retry<T>(busy: &mut u64, what: &str, mut f: impl FnMut() -> turso_core::Result<T>) -> T {
+    loop {
+        match f() {
+            Ok(v) => return v,
+            Err(LimboError::Busy | LimboError::BusySnapshot) => {
+                *busy += 1;
+                std::thread::yield_now();
+            }
+            Err(e) => not_a_result(&format!("conc {what} failed: {e}")),
+        }
+    }
+}
+
+fn select_v(conn: &Arc<Connection>, id: i64) -> turso_core::Result<Vec<Vec<Value>>> {
+    conn.prepare(format!("SELECT v FROM t WHERE id = {id}"))?
+        .run_collect_rows()
+}
+
+fn check_v(rows: &[Vec<Value>], id: i64, expect: &str) {
+    match rows {
+        [row] => match &row[0] {
+            Value::Text(t) if t.as_str() == expect => {}
+            other => not_a_result(&format!("conc read of row {id}: got {other:?}, expected {expect}")),
+        },
+        _ => not_a_result(&format!("conc read of row {id}: {} rows", rows.len())),
+    }
+}
+
+/// One `conc` thread: `cycles` cycles against its own trunk connection and its own share. Each
+/// cycle forks a branch, writes row `row_for(base + c)` on it, opens a random branch of the share
+/// and reads its own row and a far row (the trunk's), then reaps a random branch of the share
+/// (never the one forked this cycle, which joins the share after the draw), so the share's size is
+/// fixed. Every read is checked against what the harness knows the branch holds; the trunk never
+/// writes in this arm, so a far row is always the trunk's original value.
+fn conc_thread(
+    trunk: Arc<Connection>,
+    mut share: Vec<Live>,
+    barrier: &Barrier,
+    seed: u64,
+    base: usize,
+    cycles: usize,
+) -> ConcOut {
+    let mut rng = Rng(seed | 1);
+    let mut ops: [Vec<Duration>; 7] = Default::default();
+    for op in ops.iter_mut() {
+        op.reserve_exact(cycles);
+    }
+    let mut busy = [0u64; 7];
+    barrier.wait();
+    let start = Instant::now();
+    for c in 0..cycles {
+        let row = row_for(base + c);
+        let t0 = Instant::now();
+        let branch = busy_retry(&mut busy[0], "fork", || trunk.fork_branch());
+        let t1 = Instant::now();
+        let conn = busy_retry(&mut busy[1], "open", || branch.connect());
+        let t2 = Instant::now();
+        busy_retry(&mut busy[2], "first_write", || {
+            conn.execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", branch_value(row)))
+        });
+        let t3 = Instant::now();
+        drop(conn);
+        let target = &share[rng.below(share.len())];
+        let own = target.rows[0];
+        let far = (own - 1 + TRUNK_ROWS / 2) % TRUNK_ROWS + 1;
+        let t4 = Instant::now();
+        let conn = busy_retry(&mut busy[3], "read_open", || target.branch.connect());
+        let t5 = Instant::now();
+        let got_own = busy_retry(&mut busy[4], "read_own", || select_v(&conn, own));
+        let t6 = Instant::now();
+        let got_far = busy_retry(&mut busy[5], "read_inh", || select_v(&conn, far));
+        let t7 = Instant::now();
+        drop(conn);
+        check_v(&got_own, own, &branch_value(own));
+        check_v(&got_far, far, &trunk_value(far));
+        let victim = share.swap_remove(rng.below(share.len()));
+        share.push(Live {
+            branch,
+            rows: vec![row],
+            trunk_writes_at_fork: 0,
+        });
+        let t8 = Instant::now();
+        let reaped = victim.branch.reap().unwrap_or_else(|e| not_a_result(&format!("conc reap failed: {e}")));
+        let t9 = Instant::now();
+        if reaped.deferred || reaped.freed_pages != 1 {
+            not_a_result(&format!("a conc reap freed {reaped:?}, expected exactly 1 page"));
+        }
+        for (op, d) in ops.iter_mut().zip([
+            t1 - t0,
+            t2 - t1,
+            t3 - t2,
+            t5 - t4,
+            t6 - t5,
+            t7 - t6,
+            t9 - t8,
+        ]) {
+            op.push(d);
+        }
+    }
+    ConcOut {
+        share,
+        ops,
+        busy,
+        elapsed: start.elapsed(),
+    }
+}
+
+/// The box's parallelism at this moment, with nothing shared: `t` threads each run the same fixed
+/// xorshift loop. Operations per second over the slowest thread's finish.
+fn null_ops_per_s(t: usize) -> f64 {
+    const ITER: u64 = 100_000_000;
+    let barrier = Barrier::new(t + 1);
+    let wall = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..t)
+            .map(|i| {
+                let barrier = &barrier;
+                s.spawn(move || {
+                    let mut r = Rng(0x2545_F491_4F6C_DD1D ^ (i as u64 + 1));
+                    barrier.wait();
+                    let mut acc = 0u64;
+                    for _ in 0..ITER {
+                        acc = acc.wrapping_add(r.next());
+                    }
+                    std::hint::black_box(acc)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let start = Instant::now();
+        for h in handles {
+            h.join().unwrap();
+        }
+        start.elapsed()
+    });
+    (t as u64 * ITER) as f64 / wall.as_secs_f64()
+}
+
+/// User and system CPU time of the whole process so far, in nanoseconds.
+fn cpu_ns() -> (u64, u64) {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        not_a_result("getrusage failed");
+    }
+    let ns = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000_000 + tv.tv_usec as u64 * 1_000;
+    (ns(ru.ru_utime), ns(ru.ru_stime))
+}
+
+/// Arm (f) `conc` (amendment 7): T threads, each churning its own share of N live branches with
+/// fork -> first write -> reads -> reap (see [`conc_thread`]). One cell per (N, T); the T list runs
+/// forward and then reversed at each N (draws 0 and 1), so drift across a block shows as the
+/// difference between one T's two draws. Before each cell, the null workload measures what the box
+/// gives T threads that share nothing. Per cell: throughput, per-op latency, Busy retries, process
+/// CPU time, and the store's lock counters (acquisitions, contended acquisitions, wait, hold).
+fn arm_conc(b: &mut Bench, args: &Args) {
+    let tmax = *args.threads.iter().max().unwrap();
+    b.db.set_branch_lock_timing(args.lock_timing);
+    // One trunk connection per thread: a connection serves one thread at a time.
+    let trunks: Vec<Arc<Connection>> = (0..tmax).map(|_| b.db.connect().unwrap()).collect();
+    println!(
+        "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={}",
+        args.threads, args.cycles, args.lock_timing
+    );
+    println!("{CONC_HEADER}");
+    let mut live: Vec<Live> = Vec::new();
+    let mut grown = 0usize;
+    let c = args.cycles;
+    for &n in &args.checkpoints {
+        let t = Instant::now();
+        while live.len() < n {
+            live.push(grow_from_trunk(b, row_for(grown)));
+            grown += 1;
+        }
+        let grow_us = t.elapsed().as_secs_f64() * 1e6;
+        let s = b.db.branch_stats();
+        if s.live_branches != n || s.arena_slots_in_use != n {
+            not_a_result(&format!("expected {n} branches and {n} arena pages before the block: {s:?}"));
+        }
+        b.print_state(n, &format!("grow_total_us={grow_us:.0}"));
+        let order = args
+            .threads
+            .iter()
+            .map(|&t| (t, 0u64))
+            .chain(args.threads.iter().rev().map(|&t| (t, 1u64)));
+        for (t, draw) in order {
+            let null = null_ops_per_s(t);
+            // Deal the live branches round-robin, so every share holds branches of every age.
+            let mut shares: Vec<Vec<Live>> = (0..t).map(|_| Vec::with_capacity(n / t + 1)).collect();
+            for (i, l) in live.drain(..).enumerate() {
+                shares[i % t].push(l);
+            }
+            let barrier = Barrier::new(t + 1);
+            println!("# cell N={n} T={t} draw={draw} start");
+            let before = b.db.branch_stats().work;
+            let cpu0 = cpu_ns();
+            let (wall, outs) = std::thread::scope(|s| {
+                let handles: Vec<_> = shares
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, share)| {
+                        let trunk = trunks[i].clone();
+                        let barrier = &barrier;
+                        let seed = args.seed
+                            ^ (i as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03)
+                            ^ ((n as u64) << 24)
+                            ^ (draw << 56)
+                            ^ ((t as u64) << 48);
+                        let base = grown + i * c;
+                        s.spawn(move || conc_thread(trunk, share, barrier, seed, base, c))
+                    })
+                    .collect();
+                barrier.wait();
+                let start = Instant::now();
+                let outs: Vec<ConcOut> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                (start.elapsed(), outs)
+            });
+            let cpu1 = cpu_ns();
+            let after = b.db.branch_stats().work;
+            grown += t * c;
+            let mut ops: [Vec<Duration>; 7] = Default::default();
+            let mut busy = [0u64; 7];
+            let (mut th_min, mut th_max) = (Duration::MAX, Duration::ZERO);
+            for out in outs {
+                live.extend(out.share);
+                for (i, mut samples) in out.ops.into_iter().enumerate() {
+                    ops[i].append(&mut samples);
+                    busy[i] += out.busy[i];
+                }
+                th_min = th_min.min(out.elapsed);
+                th_max = th_max.max(out.elapsed);
+            }
+            let s = b.db.branch_stats();
+            if s.live_branches != n || s.arena_slots_in_use != n || live.len() != n {
+                not_a_result(&format!(
+                    "cell N={n} T={t} draw={draw} did not return to {n} branches and {n} arena pages \
+                     (harness holds {}): {s:?}",
+                    live.len()
+                ));
+            }
+            for (i, samples) in ops.iter().enumerate() {
+                let mut us: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+                us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!(
+                    "{n}\t{t}\t{draw}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}",
+                    CONC_OPS[i],
+                    us.len(),
+                    percentile(&us, 50.0),
+                    percentile(&us, 90.0),
+                    percentile(&us, 99.0),
+                    us[us.len() - 1],
+                    busy[i]
+                );
+            }
+            let cycles = (t * c) as f64;
+            let wall_ns = wall.as_nanos() as f64;
+            let d = |from: u64, to: u64| to - from;
+            let acq = d(before.lock_acquisitions, after.lock_acquisitions);
+            let contended = d(before.lock_contended, after.lock_contended);
+            let wait_ns = d(before.lock_wait_ns, after.lock_wait_ns);
+            let hold_ns = d(before.lock_hold_ns, after.lock_hold_ns);
+            println!(
+                "# cellsum N={n} T={t} draw={draw} cycles={} wall_ns={} cycles_per_s={:.1} \
+                 null_ops_per_s={null:.0} thread_ms_min={:.3} thread_ms_max={:.3} user_ns={} sys_ns={} \
+                 lock_acq={acq} lock_contended={contended} lock_wait_ns={wait_ns} lock_hold_ns={hold_ns} \
+                 acq_per_cycle={:.3} contended_frac={:.4} wait_frac={:.4} hold_util={:.4} \
+                 busy_fork={} busy_open={} busy_other={} rss_bytes={}",
+                t * c,
+                wall.as_nanos(),
+                cycles / wall.as_secs_f64(),
+                th_min.as_secs_f64() * 1e3,
+                th_max.as_secs_f64() * 1e3,
+                cpu1.0 - cpu0.0,
+                cpu1.1 - cpu0.1,
+                acq as f64 / cycles,
+                contended as f64 / acq as f64,
+                wait_ns as f64 / (t as f64 * wall_ns),
+                hold_ns as f64 / wall_ns,
+                busy[0],
+                busy[1],
+                busy[2..].iter().sum::<u64>(),
+                rss_bytes()
+            );
+        }
+    }
+    drop(live);
+    drop(trunks);
 }
