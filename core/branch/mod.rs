@@ -366,6 +366,23 @@ impl Database {
         self.shared_wal.read().walpin_stats()
     }
 
+    /// Turn FW3 on or off for this database's branches (tests; the harness uses the process
+    /// switch). Call before any branch connection is opened.
+    #[doc(hidden)]
+    pub fn walpin_set_fw3(&self, on: bool) {
+        self.branches.set_fw3(on);
+    }
+
+    /// FW2: open the second WAL file (`<wal>2`). Call once, right after open, before any write.
+    #[doc(hidden)]
+    pub fn walpin_open_wal2(&self) -> Result<()> {
+        let file = self
+            .io
+            .open_file(&format!("{}2", self.walpin_wal_path()), crate::OpenFlags::Create, false)?;
+        self.shared_wal.read().walpin_set_wal2_file(file);
+        Ok(())
+    }
+
     /// The trunk WAL's max_frame alone: one atomic load under the shared WAL lock.
     #[doc(hidden)]
     pub fn walpin_max_frame(&self) -> u64 {
@@ -424,6 +441,9 @@ mod isolation_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod mechanism_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod walpin_tests;
 
 #[cfg(test)]
 mod tests {

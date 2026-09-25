@@ -101,6 +101,9 @@ pub(crate) struct BranchStore {
     /// same lock. A 1-to-0 transition (a reap) racing the read only makes the writer take the lock
     /// and find nothing to do.
     trunk_children: AtomicUsize,
+    /// r11-walpin FW3 for this database's branches: taken from the process switch when the store
+    /// is created (`walpin::set_fixes` before open), or set per database by a test.
+    fw3: std::sync::atomic::AtomicBool,
 }
 
 struct StoreInner {
@@ -332,7 +335,16 @@ impl BranchStore {
                 work: BranchWork::default(),
             }),
             trunk_children: AtomicUsize::new(0),
+            fw3: std::sync::atomic::AtomicBool::new(super::walpin::fw3()),
         }
+    }
+
+    pub(crate) fn fw3(&self) -> bool {
+        self.fw3.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_fw3(&self, on: bool) {
+        self.fw3.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn trunk_has_children(&self) -> bool {
@@ -620,6 +632,14 @@ impl BranchStore {
                 .page(slot),
         );
         Ok(true)
+    }
+
+    /// r11-walpin FW3: whether branch `id` still reads `page` from the trunk (the store holds no
+    /// version of it for this branch). Not counted in the work counters.
+    pub(crate) fn sees_trunk(&self, id: BranchId, page: u32) -> Result<bool> {
+        let inner = self.inner.lock();
+        let (mut levels, mut examined) = (0, 0);
+        Ok(inner.resolve(id, page, &mut levels, &mut examined)?.is_none())
     }
 
     pub(crate) fn stats(&self) -> BranchStats {

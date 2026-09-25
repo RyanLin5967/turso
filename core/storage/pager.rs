@@ -3118,6 +3118,13 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
+        if self.branch.get().is_some_and(|b| b.store.fw3()) {
+            // r11-walpin FW3: a branch's view is frozen at its fork, and the store keeps the
+            // pre-image of every trunk page the trunk rewrites after it, so the branch needs no
+            // snapshot of the trunk's WAL: no read mark, nothing that caps a checkpoint or blocks
+            // a restart, and no cache invalidation (see `read_branch_page_fw3`).
+            return Ok(());
+        }
         let changed = wal.begin_read_tx()?;
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
@@ -3489,6 +3496,14 @@ impl Pager {
         turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
         if let Some(branch) = self.branch.get() {
+            if branch.store.fw3() {
+                return self.read_branch_page_fw3(
+                    branch,
+                    page_idx,
+                    frame_watermark,
+                    allow_empty_read,
+                );
+            }
             if let Some(read) = self.read_branch_page(branch, page_idx, frame_watermark)? {
                 return Ok(read);
             }
@@ -3646,6 +3661,71 @@ impl Pager {
         // backend would.
         c.complete(len as i32);
         Ok(Some((page, c)))
+    }
+
+    /// r11-walpin FW3: read `page_idx` for a branch that holds no trunk WAL snapshot.
+    ///
+    /// An arena version is read as `read_branch_page` reads it. A trunk page is read at the trunk's
+    /// latest committed version, optimistically, and kept only if two checks made AFTER the bytes
+    /// are in both pass:
+    /// * the store still sends this branch to the trunk for this page. The trunk records a write
+    ///   (and retains the pre-image) at `add_dirty`, before any frame of it exists, so this means
+    ///   no frame written after the branch's fork existed before the check: the latest frame the
+    ///   read found, or the database page, is the version the branch saw at its fork. A database
+    ///   read found no frame of the page above the published `nbackfills`, which is published only
+    ///   after the database file is synced, and no checkpoint can be writing the page (it would
+    ///   need a newer frame of it, i.e. one written after the fork).
+    /// * the WAL generation (`checkpoint_seq`) is the one the frame was looked up in: within a
+    ///   generation frames up to the snapshot's `max_frame` are committed and never rewritten, and
+    ///   a restart bumps the generation before any slot is reused.
+    /// Otherwise it retries from a fresh snapshot (counted in `walpin::FW3_RETRIES`).
+    fn read_branch_page_fw3(
+        &self,
+        branch: &BranchBinding,
+        page_idx: i64,
+        frame_watermark: Option<u64>,
+        allow_empty_read: bool,
+    ) -> Result<(PageRef, Completion)> {
+        use crate::branch::walpin;
+        let wal = self.wal.as_ref().ok_or_else(|| {
+            LimboError::InternalError("a branch pager reads the trunk through its WAL".into())
+        })?;
+        for _ in 0..1_000 {
+            let (nbackfills, max_frame, generation) = wal.fw3_snapshot().ok_or_else(|| {
+                LimboError::InternalError("FW3 needs the in-process WAL".into())
+            })?;
+            if let Some(read) = self.read_branch_page(branch, page_idx, frame_watermark)? {
+                return Ok(read);
+            }
+            let frame = wal.fw3_find_frame(page_idx as u64, nbackfills + 1, max_frame);
+            #[cfg(test)]
+            fw3_test_hook::fire(page_idx);
+            let page = Arc::new(Page::new(page_idx));
+            let c = match frame {
+                Some(frame_id) => wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone())?,
+                None => {
+                    page.set_locked();
+                    let io_ctx = self.io_ctx.read();
+                    self.begin_read_disk_page(
+                        page_idx as usize,
+                        page.clone(),
+                        allow_empty_read,
+                        &io_ctx,
+                    )?
+                }
+            };
+            self.io.wait_for_completion(c.clone())?;
+            walpin::FW3_TRUNK_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let still_trunk = branch.store.sees_trunk(branch.id, page_idx as u32)?;
+            let same_generation = wal.fw3_snapshot().map(|s| s.2) == Some(generation);
+            #[cfg(test)]
+            let (still_trunk, same_generation) = fw3_test_hook::mutate(still_trunk, same_generation);
+            if still_trunk && same_generation {
+                return Ok((page, c));
+            }
+            walpin::FW3_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(LimboError::Busy)
     }
 
     fn begin_read_disk_page(
@@ -7219,5 +7299,37 @@ mod checkpoint_phase_tests {
             ),
             "resuming after the post-sync gap must install a valid durable backfill proof"
         );
+    }
+}
+
+/// r11-walpin FW3 test hook: a closure run once, between a branch's trunk-frame lookup and its read,
+/// at the first trunk-page read of a branch on this thread after `set`; and the validation
+/// mutants, which a test switches on to show each check is load-bearing. Thread-local, so tests
+/// running in parallel do not see each other's.
+#[cfg(test)]
+pub(crate) mod fw3_test_hook {
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce(i64)>>> = RefCell::new(None);
+        static MUTANT: Cell<u8> = const { Cell::new(0) };
+    }
+    pub(crate) fn set(f: Box<dyn FnOnce(i64)>) {
+        HOOK.with(|h| *h.borrow_mut() = Some(f));
+    }
+    pub(crate) fn fire(page_idx: i64) {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f(page_idx);
+        }
+    }
+    /// 0: none; 1: the store check always passes; 2: the generation check always passes.
+    pub(crate) fn set_mutant(m: u8) {
+        MUTANT.with(|c| c.set(m));
+    }
+    pub(crate) fn mutate(still_trunk: bool, same_generation: bool) -> (bool, bool) {
+        match MUTANT.with(|c| c.get()) {
+            1 => (true, same_generation),
+            2 => (still_trunk, true),
+            _ => (still_trunk, same_generation),
+        }
     }
 }

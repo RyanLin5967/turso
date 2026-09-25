@@ -2693,6 +2693,11 @@ impl Database {
         )
     }
 
+    /// The WAL's path, for r11-walpin's FW2 (which opens `<wal>2` beside it).
+    pub(crate) fn walpin_wal_path(&self) -> &str {
+        &self.wal_path
+    }
+
     #[cfg(host_shared_wal)]
     pub(crate) fn shared_wal_coordination(
         &self,
