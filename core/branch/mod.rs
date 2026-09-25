@@ -55,6 +55,7 @@
 pub(crate) mod arena;
 pub(crate) mod page_map;
 pub(crate) mod store;
+pub mod walpin;
 
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};
@@ -357,6 +358,22 @@ impl Connection {
 impl Database {
     pub fn branch_stats(&self) -> BranchStats {
         self.branches.stats()
+    }
+
+    /// The trunk WAL's state, for the r11-walpin instrument (observation only).
+    #[doc(hidden)]
+    pub fn walpin_stats(&self) -> walpin::WalPinStats {
+        self.shared_wal.read().walpin_stats()
+    }
+
+    /// The trunk WAL's max_frame alone: one atomic load under the shared WAL lock.
+    #[doc(hidden)]
+    pub fn walpin_max_frame(&self) -> u64 {
+        self.shared_wal
+            .read()
+            .metadata
+            .max_frame
+            .load(crate::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.

@@ -1,6 +1,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::branch::walpin;
 use crate::io::FileSyncType;
+use std::sync::atomic::Ordering::Relaxed;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
 use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert};
@@ -436,6 +438,11 @@ impl TursoRwLock {
         } else {
             None
         }
+    }
+
+    /// Readers holding this slot now (observation only).
+    pub fn reader_count(&self) -> u32 {
+        ((self.0.load(Ordering::Acquire) & Self::READER_COUNT_MASK) >> Self::READER_SHIFT) as u32
     }
 
     #[inline]
@@ -972,11 +979,16 @@ impl WalCoordination for InProcessWalCoordination {
         let range = frame_watermark
             .map(|x| 0..=x)
             .unwrap_or(min_frame..=max_frame);
+        walpin::FIND_CALLS.fetch_add(1, Relaxed);
         let result = frame_cache.get(&page_id).and_then(|frames| {
-            frames
-                .iter()
-                .rfind(|&&frame| range.contains(&frame))
-                .copied()
+            // `rposition` is `rfind` returning the index, so the elements it examined are known
+            // without counting inside the loop: len - index on a hit, len on a miss.
+            let hit = frames.iter().rposition(|&frame| range.contains(&frame));
+            walpin::FIND_SCANNED.fetch_add(
+                hit.map_or(frames.len(), |i| frames.len() - i) as u64,
+                Relaxed,
+            );
+            hit.map(|i| frames[i])
         });
         result
     }
@@ -985,14 +997,18 @@ impl WalCoordination for InProcessWalCoordination {
         let shared = self.shared.read();
         let frame_cache = shared.runtime.frame_cache.lock();
         let mut list = Vec::with_capacity(frame_cache.len());
+        let mut scanned = 0usize;
         for (&page_id, frames) in frame_cache.iter() {
-            if let Some(&frame_id) = frames
+            let hit = frames
                 .iter()
-                .rfind(|&&frame| (min_frame..=max_frame).contains(&frame))
-            {
-                list.push((page_id, frame_id));
+                .rposition(|&frame| (min_frame..=max_frame).contains(&frame));
+            scanned += hit.map_or(frames.len(), |i| frames.len() - i);
+            if let Some(i) = hit {
+                list.push((page_id, frames[i]));
             }
         }
+        walpin::CKPT_CALLS.fetch_add(1, Relaxed);
+        walpin::CKPT_FRAMES_SCANNED.fetch_add(scanned as u64, Relaxed);
         list.sort_unstable_by_key(|&(page_id, _)| page_id);
         list
     }
@@ -5600,6 +5616,33 @@ fn classify_authority_snapshot_against_wal(
 }
 
 impl WalFileShared {
+    /// The WAL's state for the r11-walpin instrument, read under this lock and the frame_cache lock.
+    pub(crate) fn walpin_stats(&self) -> walpin::WalPinStats {
+        let frame_cache = self.runtime.frame_cache.lock();
+        let (mut fc_frames, mut fc_bytes) = (0u64, 0u64);
+        for frames in frame_cache.values() {
+            fc_frames += frames.len() as u64;
+            fc_bytes += frames.capacity() as u64 * 8;
+        }
+        fc_bytes += frame_cache.capacity() as u64 * 33;
+        let fc_pages = frame_cache.len() as u64;
+        drop(frame_cache);
+        let mut stats = walpin::WalPinStats {
+            max_frame: self.metadata.max_frame.load(Ordering::Acquire),
+            nbackfills: self.metadata.nbackfills.load(Ordering::Acquire),
+            checkpoint_seq: self.metadata.wal_header.lock().checkpoint_seq,
+            fc_pages,
+            fc_frames,
+            fc_bytes,
+            ..Default::default()
+        };
+        for (i, lock) in self.runtime.read_locks.iter().enumerate() {
+            stats.mark_values[i] = lock.get_value();
+            stats.mark_readers[i] = lock.reader_count();
+        }
+        stats
+    }
+
     pub fn last_checksum_and_max_frame(&self) -> ((u32, u32), u64) {
         (
             self.metadata.last_checksum,
@@ -5870,6 +5913,7 @@ impl WalFileShared {
     /// client to write to the database (which may be this one) does so by
     /// writing frames into the start of the log file.
     fn restart_wal_header(&mut self, io: &dyn IO) {
+        walpin::RESTARTS.fetch_add(1, Relaxed);
         {
             let mut hdr = self.metadata.wal_header.lock();
             hdr.checkpoint_seq = hdr.checkpoint_seq.wrapping_add(1);
