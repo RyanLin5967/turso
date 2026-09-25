@@ -1155,7 +1155,7 @@ impl BranchStore {
     /// branch then frees it, because each `child_gone` computes its garbage from the children the
     /// parent lists at that instant, under the parent's lock. Locks are taken child first, one at a
     /// time, never two at once.
-    fn collect(&self, mut shard: Held<'_, Shard>, id: BranchId) -> (usize, bool) {
+    fn collect<'a>(&'a self, mut shard: Held<'a, Shard>, id: BranchId) -> (usize, bool) {
         let mut freed = 0;
         let mut at = id;
         loop {
