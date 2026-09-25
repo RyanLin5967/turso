@@ -28,12 +28,20 @@
 //! without the fleet lock (LANE-BRIEF). Every read is checked against a model the harness keeps
 //! (never against the engine), and the engine's branch-state count against the harness's own
 //! count of states that must exist; a mismatch prints `NOT A RESULT` and exits 1.
+//!
+//! `--threads T` (lane r11-bushy-conc, `frontier/round11/r11-bushy-conc/PREREG.md`) runs the bb and
+//! cat shapes on T threads; see `threaded.rs`. `--timing` turns the store's page-map observers off
+//! (`set_observe`), so that no observer writes a shared line inside a timed loop.
+
+mod threaded;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use turso_core::branch::{Branch, BranchWork, MapWork};
-use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO};
+use turso_core::{
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, SqliteDialect, Value, IO,
+};
 
 const TRUNK_ROWS: i64 = 20_000;
 const VALUE_LEN: usize = 100;
@@ -81,6 +89,10 @@ struct Args {
     samples: usize,
     needed: bool,
     refcounted: bool,
+    /// `--threads T`: the threaded mode (`threaded.rs`).
+    threads: Option<usize>,
+    /// `--hold-timing`: time every hold of the store's lock (with `--timing` only).
+    hold_timing: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -112,6 +124,8 @@ fn parse_args() -> Args {
         samples: 200,
         needed: true,
         refcounted: false,
+        threads: None,
+        hold_timing: false,
     };
     let mut shape = None;
     let mut it = std::env::args().skip(1);
@@ -157,6 +171,8 @@ fn parse_args() -> Args {
             "--samples" => args.samples = num(val(), "--samples") as usize,
             "--no-needed" => args.needed = false,
             "--refcounted" => args.refcounted = true,
+            "--threads" => args.threads = Some(num(val(), "--threads") as usize),
+            "--hold-timing" => args.hold_timing = true,
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -172,6 +188,17 @@ fn parse_args() -> Args {
     }
     if args.shape == Shape::Beam && args.beam > args.expand {
         die("--beam must not exceed --expand (the first level's pool is --expand children)");
+    }
+    if args.hold_timing && !args.timing {
+        die("--hold-timing needs --timing");
+    }
+    if let Some(t) = args.threads {
+        if t == 0 {
+            die("--threads must be positive");
+        }
+        if args.shape == Shape::Beam || args.cont || !args.refcounted {
+            die("--threads runs bb and cat, without --continue, on --refcounted (PREREG §2d)");
+        }
     }
     args
 }
@@ -236,6 +263,78 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[rank]
 }
 
+/// What `reader` reads for `row`, from the harness's own write log.
+fn expect_in(nodes: &[Node], rows: Rows, reader: u32, row: i64) -> String {
+    let n = &nodes[reader as usize];
+    if n.row == row {
+        let &(_, g) = n.writes.last().expect("a node writes its row when it is created");
+        return node_value(reader, g);
+    }
+    if rows == Rows::Hot {
+        // Under `--rows hot` no node writes any other row.
+        return trunk_value(row);
+    }
+    let (mut a, mut f) = (n.parent, n.fork_epoch);
+    loop {
+        if a == TRUNK {
+            return trunk_value(row);
+        }
+        let an = &nodes[a as usize];
+        if an.row == row {
+            let seen = an.writes.partition_point(|&(e, _)| e <= f);
+            return node_value(a, an.writes[seen - 1].1);
+        }
+        (a, f) = (an.parent, an.fork_epoch);
+    }
+}
+
+/// The node's evaluate reads: its own row, then its parent's row (spread) or a trunk row (hot),
+/// and one node in DEEP_READ_EVERY also the row of its root-level ancestor.
+fn read_rows_in(nodes: &[Node], rows: Rows, id: u32) -> Vec<i64> {
+    let n = &nodes[id as usize];
+    let mut out = vec![n.row];
+    out.push(match rows {
+        Rows::Hot => trunk_row(id),
+        Rows::Spread if n.parent != TRUNK => nodes[n.parent as usize].row,
+        Rows::Spread => trunk_row(id),
+    });
+    if id % DEEP_READ_EVERY == 0 && rows == Rows::Spread {
+        let mut a = id;
+        while nodes[a as usize].parent != TRUNK {
+            a = nodes[a as usize].parent;
+        }
+        out.push(nodes[a as usize].row);
+    }
+    out
+}
+
+/// Per-op latency series (`--threads` with `--timing`), in the order of `threaded::OPS`.
+const OP_FORK: usize = 0;
+const OP_OPEN: usize = 1;
+const OP_WRITE: usize = 2;
+const OP_READ_OWN: usize = 3;
+const OP_CLOSE: usize = 5;
+const OP_REAP: usize = 6;
+type OpTimes = [Vec<u32>; 7];
+
+fn ns(d: Duration) -> u32 {
+    d.as_nanos().min(u32::MAX as u128) as u32
+}
+
+/// Fork a child of the trunk, retrying while another thread's trunk fork holds the WAL write lock.
+fn fork_trunk_retrying(trunk: &Arc<Connection>, busy: &mut u64) -> Branch {
+    loop {
+        match trunk.fork_branch() {
+            Ok(branch) => return branch,
+            Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => {
+                *busy += 1;
+                std::thread::yield_now();
+            }
+            Err(e) => panic!("trunk fork failed: {e}"),
+        }
+    }
+}
+
 struct Node {
     parent: u32,
     /// The parent's epoch (forks made so far) when this node was forked.
@@ -272,9 +371,60 @@ struct Bench {
     reads_checked: u64,
     /// Page-map work before the shape ran (the fixture does none).
     map0: MapWork,
+    /// Trunk forks refused Busy and retried (only another thread's trunk fork can cause one).
+    fork_busy: u64,
+    /// Check every reap against `branch_stats()` (sequential mode). The threaded mode does not
+    /// call the store inside a step; it checks the totals at each checkpoint instead.
+    per_reap_check: bool,
+    /// Per-op latencies (`--threads` with `--timing`).
+    times: Option<OpTimes>,
 }
 
 impl Bench {
+    fn new(db: Arc<Database>, trunk: Arc<Connection>, args: &Args, seed: u64) -> Self {
+        Self {
+            map0: db.branch_stats().map_work,
+            db,
+            trunk,
+            nodes: vec![Node {
+                parent: TRUNK,
+                fork_epoch: 0,
+                depth: 0,
+                row: 0,
+                epoch: 0,
+                kept_children: 0,
+                child_states: 0,
+                writes: Vec::new(),
+                branch: None,
+                state: false,
+            }],
+            rng: Rng(seed),
+            rows: args.rows,
+            cont: args.cont,
+            refcounted: args.refcounted,
+            generation: 0,
+            handles: 0,
+            states: 0,
+            reaps: 0,
+            max_cascade: 0,
+            cascades: 0,
+            reads_checked: 0,
+            fork_busy: 0,
+            per_reap_check: true,
+            times: None,
+        }
+    }
+
+    fn clock(&self) -> Option<Instant> {
+        self.times.as_ref().map(|_| Instant::now())
+    }
+
+    fn lap(&mut self, op: usize, since: Option<Instant>) {
+        if let (Some(times), Some(since)) = (self.times.as_mut(), since) {
+            times[op].push(ns(since.elapsed()));
+        }
+    }
+
     fn work(&self) -> BranchWork {
         self.db.branch_stats().work
     }
@@ -288,36 +438,18 @@ impl Bench {
 
     /// What `reader` reads for `row`, from the harness's own write log.
     fn expect(&self, reader: u32, row: i64) -> String {
-        let n = &self.nodes[reader as usize];
-        if n.row == row {
-            let &(_, g) = n.writes.last().expect("a node writes its row when it is created");
-            return node_value(reader, g);
-        }
-        if self.rows == Rows::Hot {
-            // Under `--rows hot` no node writes any other row.
-            return trunk_value(row);
-        }
-        let (mut a, mut f) = (n.parent, n.fork_epoch);
-        loop {
-            if a == TRUNK {
-                return trunk_value(row);
-            }
-            let an = &self.nodes[a as usize];
-            if an.row == row {
-                let seen = an.writes.partition_point(|&(e, _)| e <= f);
-                return node_value(a, an.writes[seen - 1].1);
-            }
-            (a, f) = (an.parent, an.fork_epoch);
-        }
+        expect_in(&self.nodes, self.rows, reader, row)
     }
 
     /// Fork a child of `parent` (a node with a live handle, or the trunk) and record it.
     fn fork(&mut self, parent: u32) -> (u32, Branch) {
+        let a = self.clock();
         let branch = if parent == TRUNK {
-            self.trunk.fork_branch().unwrap()
+            fork_trunk_retrying(&self.trunk, &mut self.fork_busy)
         } else {
             self.nodes[parent as usize].branch.as_ref().expect("forked from a live handle").fork().unwrap()
         };
+        self.lap(OP_FORK, a);
         let id = self.nodes.len() as u32;
         let p = &mut self.nodes[parent as usize];
         let (fork_epoch, depth) = (p.epoch, p.depth + 1);
@@ -352,29 +484,18 @@ impl Bench {
         update_to(conn, row, &node_value(id, g));
     }
 
-    /// The node's evaluate reads: its own row, then its parent's row (spread) or a trunk row (hot),
-    /// and one node in DEEP_READ_EVERY also the row of its root-level ancestor.
+    /// The node's evaluate reads (see `read_rows_in`).
     fn read_rows(&self, id: u32) -> Vec<i64> {
-        let n = &self.nodes[id as usize];
-        let mut rows = vec![n.row];
-        rows.push(match self.rows {
-            Rows::Hot => trunk_row(id),
-            Rows::Spread if n.parent != TRUNK => self.nodes[n.parent as usize].row,
-            Rows::Spread => trunk_row(id),
-        });
-        if id % DEEP_READ_EVERY == 0 && self.rows == Rows::Spread {
-            let mut a = id;
-            while self.nodes[a as usize].parent != TRUNK {
-                a = self.nodes[a as usize].parent;
-            }
-            rows.push(self.nodes[a as usize].row);
-        }
-        rows
+        read_rows_in(&self.nodes, self.rows, id)
     }
 
     fn evaluate(&mut self, id: u32, conn: &Arc<Connection>) {
-        for row in self.read_rows(id) {
+        for (k, row) in self.read_rows(id).into_iter().enumerate() {
+            let a = self.clock();
             let got = read_v(conn, row);
+            if k < 2 {
+                self.lap(OP_READ_OWN + k, a);
+            }
             if got != self.expect(id, row) {
                 not_a_result(&format!("node {id} read row {row} as {got}, expected {}", self.expect(id, row)));
             }
@@ -384,10 +505,16 @@ impl Bench {
 
     /// One node's step after its fork: connect, write, evaluate, disconnect.
     fn step_child(&mut self, id: u32, branch: &Branch) {
+        let a = self.clock();
         let conn = branch.connect().unwrap();
+        self.lap(OP_OPEN, a);
+        let a = self.clock();
         self.write(id, &conn);
+        self.lap(OP_WRITE, a);
         self.evaluate(id, &conn);
+        let a = self.clock();
         drop(conn);
+        self.lap(OP_CLOSE, a);
     }
 
     /// `--continue`: the parent rewrites its own row after forking a child.
@@ -400,13 +527,19 @@ impl Bench {
         drop(conn);
     }
 
-    /// Drop `id`'s handle and check the engine freed exactly the states the harness says must go.
+    /// Drop `id`'s handle and check the engine freed exactly the states the harness says must go
+    /// (without `per_reap_check`, only the `deferred` flag here; the totals at the checkpoint).
     fn release(&mut self, id: u32, branch: Branch) {
-        let before = self.work().states_freed;
+        let before = self.per_reap_check.then(|| self.work().states_freed);
+        let a = self.clock();
         let reaped = branch.reap().unwrap();
-        let freed = self.work().states_freed - before;
+        self.lap(OP_REAP, a);
         self.handles -= 1;
         let expected = self.free_states(id);
+        let freed = match before {
+            Some(before) => self.work().states_freed - before,
+            None => expected,
+        };
         if freed != expected || reaped.deferred != (expected == 0) {
             not_a_result(&format!(
                 "reaping node {id} freed {freed} states (deferred {}), the harness expects {expected}",
@@ -608,55 +741,76 @@ impl Bench {
     }
 }
 
-/// BranchBench's step loop. The trunk is node 0 with fanout `--fr`; every other node has `--fi`.
-fn shape_bb(b: &mut Bench, args: &Args) {
-    let w0 = b.work();
-    let mut timing_rng = Rng(args.seed ^ 0xA5A5_A5A5_A5A5_A5A5);
-    // The nodes a step may pick, and each node's index in it (u32::MAX: not eligible).
-    let mut eligible: Vec<u32> = vec![TRUNK];
-    let mut pos: Vec<u32> = vec![0];
-    let cap = |id: u32| if id == TRUNK { args.fr } else { args.fi };
-    let remove = |eligible: &mut Vec<u32>, pos: &mut Vec<u32>, id: u32| {
-        let i = pos[id as usize] as usize;
-        let last = *eligible.last().unwrap();
-        eligible.swap_remove(i);
-        if last != id {
-            pos[last as usize] = i as u32;
+/// BranchBench's walk state: the nodes a step may pick, and each node's index in it (u32::MAX: not
+/// eligible).
+struct BbWalk {
+    eligible: Vec<u32>,
+    pos: Vec<u32>,
+}
+
+impl BbWalk {
+    fn new() -> Self {
+        Self {
+            eligible: vec![TRUNK],
+            pos: vec![0],
         }
-        pos[id as usize] = u32::MAX;
-    };
-    for &x in &args.checkpoints {
+    }
+
+    /// BranchBench's step loop until the tree has `x` nodes. The trunk is node 0 with fanout `--fr`;
+    /// every other node has `--fi`.
+    fn advance(&mut self, b: &mut Bench, args: &Args, x: u64) {
+        let cap = |id: u32| if id == TRUNK { args.fr } else { args.fi };
         while ((b.nodes.len() - 1) as u64) < x {
-            if eligible.is_empty() {
+            if self.eligible.is_empty() {
                 not_a_result(&format!("the tree saturated at {} nodes", b.nodes.len() - 1));
             }
-            let p = eligible[b.rng.below(eligible.len() as u64) as usize];
+            let p = self.eligible[b.rng.below(self.eligible.len() as u64) as usize];
             let (id, branch) = b.fork(p);
-            pos.push(u32::MAX);
+            self.pos.push(u32::MAX);
             b.step_child(id, &branch);
             if b.draw_prune(args.gamma_milli) {
                 b.prune(id, branch);
             } else {
                 b.keep(id, branch);
                 if b.nodes[id as usize].depth < args.depth {
-                    pos[id as usize] = eligible.len() as u32;
-                    eligible.push(id);
+                    self.pos[id as usize] = self.eligible.len() as u32;
+                    self.eligible.push(id);
                 }
             }
             b.continue_write(p);
             if b.nodes[p as usize].kept_children == cap(p) {
-                remove(&mut eligible, &mut pos, p);
+                self.remove(p);
                 if args.interior == Interior::Release && p != TRUNK {
                     b.release_interior(p);
                 }
             }
         }
-        b.checkpoint(args, x, None, w0, &format!(" eligible={}", eligible.len()));
+    }
+
+    fn remove(&mut self, id: u32) {
+        let i = self.pos[id as usize] as usize;
+        let last = *self.eligible.last().unwrap();
+        self.eligible.swap_remove(i);
+        if last != id {
+            self.pos[last as usize] = i as u32;
+        }
+        self.pos[id as usize] = u32::MAX;
+    }
+}
+
+/// BranchBench's step loop, checkpoint by checkpoint.
+fn shape_bb(b: &mut Bench, args: &Args) {
+    let w0 = b.work();
+    let mut timing_rng = Rng(args.seed ^ 0xA5A5_A5A5_A5A5_A5A5);
+    let mut walk = BbWalk::new();
+    for &x in &args.checkpoints {
+        walk.advance(b, args, x);
+        b.checkpoint(args, x, None, w0, &format!(" eligible={}", walk.eligible.len()));
         if args.timing {
-            let parents = eligible.clone();
+            let parents = walk.eligible.clone();
             b.sample(args, x, &parents, &mut timing_rng);
             // The sampled children were pruned; they are never eligible.
-            pos.resize(b.nodes.len(), u32::MAX);
+            walk.pos.resize(b.nodes.len(), u32::MAX);
         }
     }
 }
@@ -806,34 +960,20 @@ fn main() {
     } else {
         println!("# counters only: this run prints no time");
     }
-    let mut b = Bench {
-        db: db.clone(),
-        trunk,
-        nodes: vec![Node {
-            parent: TRUNK,
-            fork_epoch: 0,
-            depth: 0,
-            row: 0,
-            epoch: 0,
-            kept_children: 0,
-            child_states: 0,
-            writes: Vec::new(),
-            branch: None,
-            state: false,
-        }],
-        rng: Rng(args.seed),
-        rows: args.rows,
-        cont: args.cont,
-        refcounted: args.refcounted,
-        generation: 0,
-        handles: 0,
-        states: 0,
-        reaps: 0,
-        max_cascade: 0,
-        cascades: 0,
-        reads_checked: 0,
-        map0: db.branch_stats().map_work,
-    };
+    // K16 (r11-bushy amendment 6): no page-map observer writes a shared line inside a timed loop.
+    turso_core::branch::set_observe(!args.timing);
+    db.set_branch_lock_timing(args.hold_timing);
+    println!(
+        "# observe={} hold_timing={} threads={}",
+        !args.timing,
+        args.hold_timing,
+        args.threads.map_or("-".to_string(), |t| t.to_string())
+    );
+    if let Some(t) = args.threads {
+        threaded::run(&args, db, trunk, t);
+        return;
+    }
+    let mut b = Bench::new(db.clone(), trunk, &args, args.seed);
     match args.shape {
         Shape::Bb => shape_bb(&mut b, &args),
         Shape::Cat => shape_cat(&mut b, &args),

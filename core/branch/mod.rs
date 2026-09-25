@@ -56,7 +56,7 @@ pub(crate) mod arena;
 pub(crate) mod page_map;
 pub(crate) mod store;
 
-pub use page_map::MapWork;
+pub use page_map::{set_observe, MapWork};
 
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};
@@ -214,6 +214,42 @@ pub struct BranchWork {
     pub branch_first_writes: u64,
     /// Of those, the writes that went in place (no other map could reach the slot).
     pub in_place_writes: u64,
+    /// The store lock's own accounting, per site.
+    pub lock: LockCounts,
+}
+
+/// The sites at which the branch store takes its lock, in the order of [`LockCounts`]' arrays.
+pub const LOCK_SITES: [&str; 15] = [
+    "fork",
+    "fork_trunk",
+    "open",
+    "close",
+    "release",
+    "begin_write",
+    "end_write",
+    "holds_writer",
+    "schema",
+    "set_schema",
+    "first_write_branch",
+    "first_write_trunk",
+    "commit",
+    "resolve",
+    "observe",
+];
+
+/// Acquisitions of the branch store's lock since the database opened, counted under the lock
+/// itself. Observation only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LockCounts {
+    /// Acquisitions per site ([`LOCK_SITES`]).
+    pub acquisitions: [u64; 15],
+    /// Of those, the ones that found the lock held and waited, per site.
+    pub contended: [u64; 15],
+    /// Nanoseconds the contended acquisitions waited, all sites.
+    pub wait_ns: u64,
+    /// Nanoseconds the lock was held, all sites; counted only while lock timing is on
+    /// ([`Database::set_branch_lock_timing`]), since timing a hold adds work inside it.
+    pub hold_ns: u64,
 }
 
 impl Branch {
@@ -373,6 +409,12 @@ impl Connection {
 impl Database {
     pub fn branch_stats(&self) -> BranchStats {
         self.branches.stats()
+    }
+
+    /// Time how long each acquisition holds the branch store's lock ([`LockCounts::hold_ns`]).
+    /// Off by default. Observation only.
+    pub fn set_branch_lock_timing(&self, on: bool) {
+        self.branches.set_lock_timing(on);
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.

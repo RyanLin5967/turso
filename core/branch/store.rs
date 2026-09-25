@@ -76,19 +76,74 @@
 //! version that would break the disjointness the search relies on.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ops::Bound;
+use std::ops::{Bound, Deref, DerefMut};
+use std::time::Instant;
 
 use super::arena::{Arena, Slot};
 use super::page_map::{self, PageMap};
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
-use crate::sync::atomic::{AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::sync::{Arc, Mutex, MutexGuard};
 use crate::{LimboError, Result};
+
+/// Where the store's lock is taken, for the per-site counts in [`super::LockCounts`] (the order of
+/// [`super::LOCK_SITES`]).
+#[derive(Clone, Copy)]
+enum Site {
+    Fork,
+    ForkTrunk,
+    Open,
+    Close,
+    Release,
+    BeginWrite,
+    EndWrite,
+    HoldsWriter,
+    Schema,
+    SetSchema,
+    FirstWriteBranch,
+    FirstWriteTrunk,
+    Commit,
+    Resolve,
+    /// Accounting and membership queries: stats, zombies, needed and owned slots, `has_branches`.
+    Observe,
+}
+
+/// The store's lock, held. Observation only: dropping it adds the time it was held to
+/// `lock.hold_ns` when lock timing was on at the acquisition, and does nothing else.
+struct Held<'a> {
+    guard: MutexGuard<'a, StoreInner>,
+    since: Option<Instant>,
+}
+
+impl Deref for Held<'_> {
+    type Target = StoreInner;
+    fn deref(&self) -> &StoreInner {
+        &self.guard
+    }
+}
+
+impl DerefMut for Held<'_> {
+    fn deref_mut(&mut self) -> &mut StoreInner {
+        &mut self.guard
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if let Some(since) = self.since {
+            self.guard.work.lock.hold_ns += since.elapsed().as_nanos() as u64;
+        }
+    }
+}
 
 pub(crate) struct BranchStore {
     inner: Mutex<StoreInner>,
+    /// Whether [`BranchStore::take`] times how long each acquisition holds the lock. Off by
+    /// default: it is the one part of the lock accounting that adds work inside the critical
+    /// section.
+    lock_timing: AtomicBool,
     /// Counted `trunk_at` epochs, i.e. whether any branch reads the trunk as of a past epoch. Read
     /// without the lock on every trunk first-write so that a database with no branches pays one
     /// atomic load per written page and nothing else.
@@ -311,8 +366,42 @@ impl BranchStore {
                 branches: HashMap::new(),
                 work: BranchWork::default(),
             }),
+            lock_timing: AtomicBool::new(false),
             trunk_children: AtomicUsize::new(0),
         }
+    }
+
+    /// Take the store's lock at `site`, counting the acquisition: every one, the ones that found
+    /// the lock held, and how long those waited (F5's `take`, turso a7adf8704). The counts are
+    /// written under the lock itself, so counting adds no shared write the lock does not already
+    /// make, and the clock is read only on the contended path, by the thread that is waiting
+    /// anyway — except with lock timing on, which reads it once more at the acquisition and once
+    /// at the release.
+    fn take(&self, site: Site) -> Held<'_> {
+        let (mut guard, waited) = match self.inner.try_lock() {
+            Some(guard) => (guard, None),
+            None => {
+                let start = Instant::now();
+                let guard = self.inner.lock();
+                (guard, Some(start.elapsed()))
+            }
+        };
+        let lock = &mut guard.work.lock;
+        lock.acquisitions[site as usize] += 1;
+        if let Some(waited) = waited {
+            lock.contended[site as usize] += 1;
+            lock.wait_ns += waited.as_nanos() as u64;
+        }
+        let since = self
+            .lock_timing
+            .load(Ordering::Relaxed)
+            .then(Instant::now);
+        Held { guard, since }
+    }
+
+    /// Turn the lock's hold timing on or off (see [`BranchStore::take`]).
+    pub(crate) fn set_lock_timing(&self, on: bool) {
+        self.lock_timing.store(on, Ordering::Relaxed);
     }
 
     pub(crate) fn trunk_has_children(&self) -> bool {
@@ -322,14 +411,14 @@ impl BranchStore {
     /// Whether any branch state exists at all. Paths that rewrite the trunk without passing through
     /// `add_dirty` refuse while this holds.
     pub(crate) fn has_branches(&self) -> bool {
-        !self.inner.lock().branches.is_empty()
+        !self.take(Site::Observe).branches.is_empty()
     }
 
     /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::ForkTrunk);
         match &inner.arena {
             None => inner.arena = Some(Arena::new(page_size)),
             Some(arena) if arena.page_size() != page_size => {
@@ -355,7 +444,7 @@ impl BranchStore {
     /// Fork a child of a branch: a clone of its page map, O(1). Refused while the parent has a
     /// write transaction in progress, for the same reason a trunk fork takes the WAL write lock.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::Fork);
         let id = BranchId(inner.next_id);
         let StoreInner {
             branches,
@@ -382,7 +471,7 @@ impl BranchStore {
     /// branch: two would each hold a private page cache of the same page space, and nothing would
     /// tell one that the other had committed — a silently stale read, so it is refused.
     pub(crate) fn open(&self, id: BranchId) -> Result<Arc<Schema>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::Open);
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.open {
             return Err(LimboError::InvalidArgument(format!(
@@ -398,7 +487,7 @@ impl BranchStore {
 
     /// The connection on `id` has gone. Releases its write lock if a transaction was abandoned.
     pub(crate) fn close(&self, id: BranchId) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::Close);
         if let Some(st) = inner.branches.get_mut(&id) {
             st.open = false;
             st.writer = false;
@@ -409,7 +498,7 @@ impl BranchStore {
 
     /// The `Branch` handle has gone.
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::Release);
         let Some(st) = inner.branches.get_mut(&id) else {
             return Reaped {
                 freed_pages: 0,
@@ -425,7 +514,7 @@ impl BranchStore {
     }
 
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::BeginWrite);
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.writer {
             return Err(LimboError::Busy);
@@ -436,22 +525,21 @@ impl BranchStore {
     }
 
     pub(crate) fn end_write(&self, id: BranchId) {
-        if let Some(st) = self.inner.lock().branches.get_mut(&id) {
+        if let Some(st) = self.take(Site::EndWrite).branches.get_mut(&id) {
             st.writer = false;
             st.dirty.clear();
         }
     }
 
     pub(crate) fn holds_writer(&self, id: BranchId) -> bool {
-        self.inner
-            .lock()
+        self.take(Site::HoldsWriter)
             .branches
             .get(&id)
             .is_some_and(|st| st.writer)
     }
 
     pub(crate) fn schema(&self, id: BranchId) -> Result<Arc<Schema>> {
-        let inner = self.inner.lock();
+        let inner = self.take(Site::Schema);
         Ok(inner.branches.get(&id).ok_or_else(|| gone(id))?.schema.clone())
     }
 
@@ -463,7 +551,7 @@ impl BranchStore {
         page: u32,
         pre_image: &[u8],
     ) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::FirstWriteBranch);
         let StoreInner {
             arena,
             refs,
@@ -505,7 +593,7 @@ impl BranchStore {
     /// The copy decision for the trunk's first write to `page` in a transaction: if a live branch
     /// can still see the version about to be overwritten, keep a copy of it for that branch.
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::FirstWriteTrunk);
         let StoreInner { arena, trunk, .. } = &mut *inner;
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
@@ -530,7 +618,7 @@ impl BranchStore {
 
     /// Commit a branch's dirty pages into the slots their copy decisions chose.
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::Commit);
         let StoreInner {
             arena, branches, ..
         } = &mut *inner;
@@ -556,7 +644,7 @@ impl BranchStore {
     }
 
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::SetSchema);
         inner.branches.get_mut(&id).ok_or_else(|| gone(id))?.schema = schema;
         Ok(())
     }
@@ -565,7 +653,7 @@ impl BranchStore {
     /// means the branch sees the trunk's current version, which the caller reads through the
     /// ordinary WAL / database-file path.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.take(Site::Resolve);
         let (mut levels, mut examined) = (0, 0);
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
         inner.work.resolve_calls += 1;
@@ -585,7 +673,7 @@ impl BranchStore {
     }
 
     pub(crate) fn stats(&self) -> BranchStats {
-        let inner = self.inner.lock();
+        let inner = self.take(Site::Observe);
         BranchStats {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
@@ -599,8 +687,7 @@ impl BranchStore {
     /// Branch states with no handle and no open connection. Observation only; O(branches). Such a
     /// state is freed the moment it arises, so this is 0 whenever the lock is free.
     pub(crate) fn zombies(&self) -> usize {
-        self.inner
-            .lock()
+        self.take(Site::Observe)
             .branches
             .values()
             .filter(|st| !st.handle && !st.open)
@@ -612,7 +699,7 @@ impl BranchStore {
     /// does not hold. Every other slot in use is one no read can reach again. Observation only;
     /// O(sum of mapped pages).
     pub(crate) fn needed_slots(&self) -> usize {
-        let inner = self.inner.lock();
+        let inner = self.take(Site::Observe);
         let mut needed = HashSet::new();
         let mut examined = 0;
         for st in inner.branches.values().filter(|st| st.handle || st.open) {
@@ -638,7 +725,7 @@ impl BranchStore {
 
     /// Every arena slot this branch's map names: its own writes and every ancestor page it reads.
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
-        let inner = self.inner.lock();
+        let inner = self.take(Site::Observe);
         let Some(st) = inner.branches.get(&id) else {
             return Vec::new();
         };
@@ -648,16 +735,14 @@ impl BranchStore {
     }
 
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
-        self.inner
-            .lock()
+        self.take(Site::Observe)
             .arena
             .as_ref()
             .map_or_else(Vec::new, |a| a.slots_in_use())
     }
 
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
-        self.inner
-            .lock()
+        self.take(Site::Observe)
             .arena
             .as_ref()
             .is_some_and(|a| a.is_free(slot))

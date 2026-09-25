@@ -28,7 +28,7 @@
 //! explore, and `Arc::get_mut` — which succeeds only while no other version shares a node — is
 //! what tells a copy from an in-place update.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::arena::Slot;
@@ -39,6 +39,22 @@ const MASK: u32 = WIDTH as u32 - 1;
 /// No arena slot has this index ([`PageMap::insert_counted`] refuses it); it marks an empty leaf
 /// entry.
 const EMPTY: Slot = Slot::MAX;
+
+/// Whether the process-global observers below count. On by default; a timed run turns them off
+/// before its first branch ([`set_observe`]), so that no observer writes a shared line inside a
+/// timed loop — each event then costs one relaxed load of this flag, which nothing writes after
+/// start. Turning it off or on while maps are alive leaves [`LIVE_NODES`] meaningless.
+static OBSERVE_ON: AtomicBool = AtomicBool::new(true);
+
+/// Turn the page-map observers ([`live_nodes`], [`map_work`]) on or off for this process. Call it
+/// before the first branch is forked.
+pub fn set_observe(on: bool) {
+    OBSERVE_ON.store(on, Ordering::Relaxed);
+}
+
+fn observing() -> bool {
+    OBSERVE_ON.load(Ordering::Relaxed)
+}
 
 /// Trie nodes alive in this process, across every map of every database. Observation only
 /// ([`live_nodes`]): counted where a node is built or copied and where it is dropped, so a node
@@ -57,6 +73,9 @@ static NODES_BUILT: AtomicU64 = AtomicU64::new(0);
 static REFS_TOUCHED: AtomicU64 = AtomicU64::new(0);
 static NODES_RELEASED: AtomicU64 = AtomicU64::new(0);
 static REFS_RELEASED: AtomicU64 = AtomicU64::new(0);
+static ARCS_CLONED: AtomicU64 = AtomicU64::new(0);
+static ARCS_DROPPED_SHARED: AtomicU64 = AtomicU64::new(0);
+static SHARED_PROBES: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative page-map work in this process (see [`map_work`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,6 +91,15 @@ pub struct MapWork {
     pub nodes_released: u64,
     /// Per-slot count decrements by releases.
     pub refs_released: u64,
+    /// Node `Arc` clones: a map clone at a fork (its root), and every child an inner-node copy
+    /// shares. Each is an atomic increment on a node other maps also reference.
+    pub arcs_cloned: u64,
+    /// Node `Arc` drops that did not free the node (another map still held it): an atomic
+    /// decrement on a shared node, by an insert that copied it away or by a release.
+    pub arcs_dropped_shared: u64,
+    /// Uniqueness probes (`Arc::get_mut`) that found a node shared, before an insert copies it.
+    /// Each writes the shared node's line twice (the weak count's lock and its restore).
+    pub shared_probes: u64,
 }
 
 pub(crate) fn map_work() -> MapWork {
@@ -81,11 +109,16 @@ pub(crate) fn map_work() -> MapWork {
         refs_touched: REFS_TOUCHED.load(Ordering::Relaxed),
         nodes_released: NODES_RELEASED.load(Ordering::Relaxed),
         refs_released: REFS_RELEASED.load(Ordering::Relaxed),
+        arcs_cloned: ARCS_CLONED.load(Ordering::Relaxed),
+        arcs_dropped_shared: ARCS_DROPPED_SHARED.load(Ordering::Relaxed),
+        shared_probes: SHARED_PROBES.load(Ordering::Relaxed),
     }
 }
 
 fn count(counter: &AtomicU64, n: u64) {
-    counter.fetch_add(n, Ordering::Relaxed);
+    if observing() {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 enum Node {
@@ -104,7 +137,9 @@ impl Node {
 
     /// Every node is built through here, so that [`LIVE_NODES`] sees it.
     fn counted(node: Node) -> Self {
-        LIVE_NODES.fetch_add(1, Ordering::Relaxed);
+        if observing() {
+            LIVE_NODES.fetch_add(1, Ordering::Relaxed);
+        }
         node
     }
 }
@@ -113,7 +148,10 @@ impl Node {
 impl Clone for Node {
     fn clone(&self) -> Self {
         Self::counted(match self {
-            Node::Inner(kids) => Node::Inner(kids.clone()),
+            Node::Inner(kids) => {
+                count(&ARCS_CLONED, kids.iter().flatten().count() as u64);
+                Node::Inner(kids.clone())
+            }
             Node::Leaf(slots) => Node::Leaf(*slots),
         })
     }
@@ -121,15 +159,30 @@ impl Clone for Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        LIVE_NODES.fetch_sub(1, Ordering::Relaxed);
+        if observing() {
+            LIVE_NODES.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct PageMap {
     root: Option<Arc<Node>>,
     /// Inner levels above the leaves: pages below `WIDTH^(height + 1)` are addressable.
     height: u32,
+}
+
+/// A fork's O(1) clone: one increment of the root's count.
+impl Clone for PageMap {
+    fn clone(&self) -> Self {
+        if self.root.is_some() {
+            count(&ARCS_CLONED, 1);
+        }
+        Self {
+            root: self.root.clone(),
+            height: self.height,
+        }
+    }
 }
 
 impl PageMap {
@@ -192,6 +245,7 @@ impl PageMap {
     /// names each of its slots once more.
     fn unshare<'a>(arc: &'a mut Arc<Node>, refs: &mut [u32]) -> &'a mut Node {
         if Arc::get_mut(arc).is_none() {
+            count(&SHARED_PROBES, 1);
             let copy = (**arc).clone();
             count(&NODES_COPIED, 1);
             if let Node::Leaf(slots) = &copy {
@@ -200,7 +254,9 @@ impl PageMap {
                     count(&REFS_TOUCHED, 1);
                 }
             }
+            // The node this replaces is still another version's: this drops a shared reference.
             *arc = Arc::new(copy);
+            count(&ARCS_DROPPED_SHARED, 1);
         }
         Arc::get_mut(arc).expect("just made this map's own")
     }
@@ -255,6 +311,7 @@ impl PageMap {
     pub(crate) fn release(mut self, refs: &mut [u32], free: &mut impl FnMut(Slot)) {
         fn release_node(arc: Arc<Node>, refs: &mut [u32], free: &mut impl FnMut(Slot)) {
             let Ok(mut node) = Arc::try_unwrap(arc) else {
+                count(&ARCS_DROPPED_SHARED, 1);
                 return;
             };
             count(&NODES_RELEASED, 1);
