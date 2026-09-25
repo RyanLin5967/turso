@@ -623,3 +623,115 @@ file committed before it is read):
 **What follows.** If a wall is found, amendment 8 names the standard fix and its prior art, and pre-registers its
 predictions, before its build. It re-runs `conc_main`, `conc_hold` and `conc_prof` unchanged on the fixed store. The
 report lists what still does not scale, with its mechanism read from source and the counter that proves it.
+
+### Amendment 8 — written 2026-09-25T05:40:30Z: amendment 7's wall is the kernel's read path, not the store lock; its attribution run and its fix (F6), before either runs
+
+**What amendment 7's runs showed** (all banked in `turso_conc/raw/`, each committed before it was read; verdicts by
+`turso_conc/analyze_conc.py`, committed at `8c144a9` before any data):
+- The tests and the fire-check passed (`tests_conc`, 38/38). Both accounting mutants were killed by the assertion aimed at
+  each (`mutate_conc`).
+- `conc_main` (`9c83fbf`) and `conc_hold` (`d36c6fe`): 5 of 40 registered checks broken, all of them in P7.5.
+  - Throughput stops scaling at T=4 for N ≥ 10^5, where the verdict is WALL. At T=16, X is below X(1): 0.76–0.94×, and
+    E(16) is 0.05–0.08.
+  - The store lock is not the wall: W(16) ≈ 0.10 and U(16) ≈ 0.18, against the registered 0.25 and 0.5. E(2) is
+    0.50–0.64, against a registered floor of 0.8.
+  - What held: acquisitions per cycle 19.95 ± 0.005 at every N and T (P7.1); both detectors silent at T=1 and firing at
+    T=16 (P7.2); hold per cycle 3.7–4.6 µs at 10^6 against 1.6–1.8 at 10^3 (P7.3); X(1) 27.4k–29.4k (P7.4); the
+    instrument's cost within bounds (P7.7).
+- System CPU per cycle rises from 4.6–5.8 µs at T=1 to 370–390 µs at T=16 (N ≥ 10^5), 73% of all CPU (getrusage, from
+  the `cellsum` lines).
+- `conc_prof` (`9a9390c`), `/usr/bin/sample` at T=16, excluding the main thread's `join`:
+  - `pread` is at the top of 64–70% of worker samples;
+  - 64% of those are inside `connect_branch`, the rest in statements' page reads;
+  - parking_lot's slow path under `BranchStore` (`swtch_pri`, `__psynch_cvwait`) takes ~17%.
+- **Mechanism, read from source.** Every branch connection starts with an empty page cache. It pays:
+  - `_init`'s two reads of the trunk's file: the 512-byte header (`read_db_header_buf`) and page 1 (`ReadPage1`);
+  - the page-1 read `connect_branch` makes through the branch;
+  - one read per trunk page its statements touch.
+
+  The WAL is empty in this arm, so each read is a `pread` of the one database file every thread shares. The count per
+  cycle is ~12, INFERRED from the banked `resolves_per_op` and the code; no counter measured it in amendment 7.
+- **Two walls in series:** the kernel's `pread` path, then the store lock.
+
+**A. Attribution run `e_pread`: which kernel structure serialises the reads** (`turso_conc/pread_mb.c`, `e_pread.sh`).
+- The file: 545 pages of 4 KiB in `$TMPDIR`, the volume the harness's TempDir uses, warmed before every run.
+- T threads each `pread` ONE 4 KiB page M = 100,000 times. Six modes:
+  - `same_shared`: every thread the same page, through one shared descriptor;
+  - `diff_shared`: page 1+16i for thread i, through the shared descriptor;
+  - `same_own`: the same page, each thread through its own descriptor;
+  - `diff_own`: its own page, its own descriptor;
+  - `same_mmap` / `diff_mmap`: a `memcpy` from one read-only `MAP_SHARED` mapping instead of a syscall.
+- T in {1,2,4,8,16}, the list forward and then reversed. S(T) = reads/s(T) / reads/s(1).
+- Predictions:
+  - `same_shared`: S(16) ≤ 2. Every connect reads page 1, and the profile puts most of the wall there.
+  - `same_mmap` and `diff_mmap`: S(16) ≥ 8.
+  - None for the other three modes, which classify the serialiser:
+    - per page if `same_*` collapse and `diff_*` scale;
+    - per file if all four syscall modes collapse;
+    - per descriptor if `*_shared` collapse and `*_own` scale.
+- The fix below does not depend on the class, because it removes the syscall. The class goes into the report as the
+  mechanism.
+
+**B. F6: a shared, versioned trunk-page cache for branch reads (this commit).**
+- **Store.**
+  - `BranchStore` keeps the trunk's pages as branches have read them, keyed by (page, trunk epoch of its last write,
+    cache generation), in a lock-free three-level radix of `ArcSwapOption`.
+  - `resolve_into` answers "the trunk's current version" only when the trunk's last write to the page came at or before
+    the branch's `trunk_at`. That epoch was closed by a fork, which holds the WAL write lock, so the version under the
+    key is immutable. The cache serves it when it holds it; otherwise it returns the key, and the pager, once its read
+    of the WAL or file has loaded the page, calls `fill_trunk_page`. The callback is a `CompletionGroup` of one.
+  - The one gap: a trunk with no live child writes without a copy decision, so `written` does not move. The trunk's last
+    child going therefore bumps the generation, and older entries are never served.
+- **Connect.** `connect_branch` builds its pager with `Database::_init_branch`. The page format (page size and reserved
+  byte) comes from the store, recorded at the first fork, instead of the header read. The pager is bound before page 1
+  is read, so page 1 comes through the branch, and nothing of the trunk's is ever in the pager, so `clear_page_cache`
+  is gone.
+- **Prior art.** The shared buffer pool of every server DBMS (PostgreSQL `shared_buffers`, the InnoDB buffer pool,
+  SQLite's shared-cache mode), with the version in the key as in a buffer tag with its LSN (the (page, LSN) keys of
+  Neon's page cache [RECALLED]). No novelty is claimed.
+- **Counters.** `trunk_page_hits` and `trunk_page_misses` in `BranchWork`. The harness prints them and the resolutions in
+  `cellsum`; the change is additive and times nothing new.
+- **Tests.**
+  - `store::tests::the_trunk_page_cache_serves_each_branch_the_version_it_forked_from`: a model with trunk writes with
+    and without children, the last child going, and every read checked. It asserts hits > 0, childless writes > 0, and
+    that the last child went.
+  - `mechanism_tests::a_trunk_write_with_no_branch_alive_is_never_served_from_the_trunk_page_cache`, through SQL: a
+    second branch hits and misses nothing, and a row the trunk rewrote with no branch alive reads new.
+- **Mutants** (`mutate_F6.sh`; each must fail a `branch::` test, or no F6 run proceeds):
+  - F6M1: the generation never bumped;
+  - F6M2: the epoch not compared on a hit;
+  - F6M3: the pager never fills.
+
+**Runs** (`turso_conc/run_F6.sh`, lockrun `turso-conc`, `taskpolicy -b` on cargo, `timeout` everywhere, raw committed
+before read):
+- `e_pread`;
+- then `tests_F6`, `mutate_F6`, `build_F6`;
+- then `F6_smoke`, `F6_main`, `F6_hold`, `F6_prof`, with amendment 7's arguments unchanged. Their before files are
+  `conc_*`.
+
+**Predictions for F6** (I = inferred):
+- **Counters (integers).**
+  - `trunk_page_misses` ≤ 700 in the first cell of each run (the ~545-page working set fills once), and ≤ 0.01 per cycle
+    in every later cell.
+  - Acquisitions per cycle equal across T within 0.5% at each N, and within ±1.0 of amendment 7's 19.95. The cache adds
+    no acquisition, and a connect still resolves page 1 once.
+- **System CPU per cycle.** ≤ 1.5 µs at T=1 and ≤ 30 µs at T=16 at every N. Amendment 7: 4.6–5.8 and 118–389.
+- **Throughput.**
+  - X(1) ≥ 1.15× `conc_main`'s at every N (~12 syscalls of ~0.5 µs each removed from a ~35 µs cycle, I).
+  - X(16) ≥ 2× `conc_main`'s at N=10^6 and ≥ 3× at N=10^3.
+- **The next wall.** At N=10^6 the store lock becomes the wall: E(16) < 0.5 in both draws, with W(16) ≥ 0.25 (`F6_main`)
+  and U(16) ≥ 0.6 (`F6_hold`). The hold per cycle, 3.7–4.6 µs at 10^6, caps X near 1/hold ≈ 220–270k cycles/s. At
+  N=10^3 no verdict is predicted.
+- **Profile.** In `F6_prof`, `pread` is < 5% of worker samples at both N, and parking_lot's slow path under
+  `BranchStore` is the largest remaining wait.
+- **Correctness.** No NOT A RESULT; after every cell, arena = live = N; every reap frees exactly 1 page.
+
+**Falsifiers.**
+- System CPU per cycle at T=16 ≥ 100 µs with misses ≈ 0: the kernel time was not the reads', and the attribution to
+  `pread` is withdrawn.
+- X(16) not above `conc_main`'s: the reads were not what bound throughput.
+- Misses per cycle not ≈ 0: the cache is not doing what it claims, and no F6 number is read as its effect.
+
+**What follows.** If the store lock is then the wall, amendment 9 pre-registers F5 on top of F6, before its build. F5
+is the store striped into 64 shards, each owning its branches and an arena domain, with the trunk behind its own lock
+and read without it through a lock-free epoch radix. Its draft is `turso_conc/fix_draft/`.

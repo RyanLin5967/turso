@@ -797,3 +797,45 @@ fn exec_retrying_busy(conn: &Arc<Connection>, sql: &str) {
     }
     panic!("{sql}: still Busy after 10,000 attempts");
 }
+
+/// The branch store's shared trunk-page cache, through SQL. A second branch reading the pages a
+/// first one read is served from the cache — no page read from the file. Then the trunk's last
+/// child goes and the trunk rewrites a row with no branch alive, a write the branch store never
+/// sees; a branch forked after that must read the NEW row, not the version cached before.
+#[test]
+fn a_trunk_write_with_no_branch_alive_is_never_served_from_the_trunk_page_cache() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let a = trunk.fork_branch().unwrap();
+    let conn = a.connect().unwrap();
+    assert_eq!(value(&conn, 7).as_deref(), Some(original(7).as_str()));
+    drop(conn);
+
+    let before = db.branch_stats().work;
+    let b = trunk.fork_branch().unwrap();
+    let conn = b.connect().unwrap();
+    assert_eq!(value(&conn, 7).as_deref(), Some(original(7).as_str()));
+    drop(conn);
+    let after = db.branch_stats().work;
+    assert!(
+        after.trunk_page_hits > before.trunk_page_hits,
+        "a second branch reading the first one's trunk pages was never served from the cache"
+    );
+    assert_eq!(
+        after.trunk_page_misses, before.trunk_page_misses,
+        "a trunk page the first branch had read was read from the file again"
+    );
+
+    drop(a);
+    drop(b);
+    assert_eq!(db.branch_stats().live_branches, 0);
+    set(&trunk, 7, "rewritten-while-no-branch-was-alive");
+    let c = trunk.fork_branch().unwrap();
+    let conn = c.connect().unwrap();
+    assert_eq!(
+        value(&conn, 7).as_deref(),
+        Some("rewritten-while-no-branch-was-alive"),
+        "a branch was served a trunk page cached before the trunk rewrote it with no branch alive"
+    );
+}

@@ -1517,7 +1517,8 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                  null_ops_per_s={null:.0} thread_ms_min={:.3} thread_ms_max={:.3} user_ns={} sys_ns={} \
                  lock_acq={acq} lock_contended={contended} lock_wait_ns={wait_ns} lock_hold_ns={hold_ns} \
                  acq_per_cycle={:.3} contended_frac={:.4} wait_frac={:.4} hold_util={:.4} \
-                 busy_fork={} busy_open={} busy_other={} rss_bytes={}",
+                 busy_fork={} busy_open={} busy_other={} rss_bytes={} resolves={} \
+                 trunk_page_hits={} trunk_page_misses={}",
                 t * c,
                 wall.as_nanos(),
                 cycles / wall.as_secs_f64(),
@@ -1532,7 +1533,10 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 busy[0],
                 busy[1],
                 busy[2..].iter().sum::<u64>(),
-                rss_bytes()
+                rss_bytes(),
+                d(before.resolve_calls, after.resolve_calls),
+                d(before.trunk_page_hits, after.trunk_page_hits),
+                d(before.trunk_page_misses, after.trunk_page_misses),
             );
         }
     }

@@ -212,6 +212,11 @@ pub struct BranchWork {
     /// ([`Database::set_branch_lock_timing`]); 0 while it is off. The one counter that adds work
     /// inside the critical section: two clock reads per acquisition.
     pub lock_hold_ns: u64,
+    /// Resolutions of a trunk page that the shared trunk-page cache answered.
+    pub trunk_page_hits: u64,
+    /// Resolutions of a trunk page it did not hold, which the pager then read through the WAL or
+    /// the database file.
+    pub trunk_page_misses: u64,
 }
 
 impl Branch {
@@ -358,7 +363,12 @@ impl Connection {
             .find(|schema| schema.schema_version == cookie)
             .ok_or(LimboError::SchemaUpdated)?;
         let page_size = pager.get_page_size_unchecked().get() as usize;
-        self.db.branches.fork_trunk(schema, page_size)
+        let reserved_space = pager.get_reserved_space().ok_or_else(|| {
+            LimboError::InternalError(
+                "an initialized database's pager has no reserved-space byte".to_string(),
+            )
+        })?;
+        self.db.branches.fork_trunk(schema, page_size, reserved_space)
     }
 
     /// The branch this connection is open on, if any.
@@ -393,6 +403,9 @@ impl Database {
 
     /// Open a connection on branch `id`: an ordinary connection whose pager is bound to the branch
     /// and whose schema is the branch's own.
+    ///
+    /// The pager is built by `_init_branch`, bound before it reads anything, so page 1 — like every
+    /// page after it — is read as the BRANCH sees it, and nothing of the trunk's can be left in it.
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
         let schema = self.branches.open(id)?;
         // Built before anything fallible below, so an error there still closes the branch.
@@ -400,12 +413,8 @@ impl Database {
             store: self.branches.clone(),
             id,
         };
-        let pager = self._init(None, None)?;
-        // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may
-        // survive into the branch's view.
-        pager.clear_page_cache(false);
+        let pager = self._init_branch(binding)?;
         pager.set_schema_cookie(None);
-        pager.bind_branch(binding)?;
         let pager = Arc::new(pager);
         let default_cache_size = pager
             .io

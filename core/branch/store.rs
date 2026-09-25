@@ -60,6 +60,25 @@
 //! is kept (its versions are still read through); it is freed the moment the last of those goes,
 //! and freeing it may in turn free its parent.
 //!
+//! # Trunk pages without the file — a shared, versioned page cache
+//!
+//! A page no branch in a chain wrote is the trunk's, and the pager reads it through the WAL or the
+//! database file. Every branch connection starts with an empty page cache, so under many short
+//! connections every one of those reads is a read system call on the one file every thread shares,
+//! and on this box the kernel serialises them (PREREG amendments 7 and 8). The store therefore keeps
+//! the trunk's pages as branches have read them, shared by every branch, keyed by page and by the
+//! trunk epoch of the page's last write — the shared buffer pool of every server database, with the
+//! version in the key as in a buffer tag with its LSN.
+//!
+//! A cached version is immutable. A branch reads the trunk's current version of a page only when
+//! the trunk's last write to it came in an epoch at or before the branch's `trunk_at`; that epoch
+//! was closed by a fork, which holds the WAL write lock, so no trunk write can change the version
+//! the key names. The one gap is a trunk with no live child: it writes without telling the store
+//! (see `first_write_trunk`'s caller), so `written` can name an epoch whose page has since changed.
+//! The trunk's last child going therefore bumps the cache's generation, and a version cached under
+//! an older generation is never served. The cache is filled by the pager after it reads a page for
+//! a branch ([`BranchStore::fill_trunk_page`]), under the key [`BranchStore::resolve_into`] gave.
+//!
 //! # What this does not do
 //!
 //! * One `Mutex` guards every branch. Correct, and a known wall under concurrent writers on
@@ -90,9 +109,10 @@ use super::page_map::PageMap;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
-use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex, MutexGuard};
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use crate::{LimboError, Result};
+use arc_swap::ArcSwapOption;
 
 pub(crate) struct BranchStore {
     inner: Mutex<StoreInner>,
@@ -107,6 +127,120 @@ pub(crate) struct BranchStore {
     /// Whether [`BranchStore::lock`] times how long each acquisition holds the lock. Off by default:
     /// it is the one part of the lock accounting that adds work inside the critical section.
     lock_timing: AtomicBool,
+    /// The trunk's pages as branches have read them (see "Trunk pages without the file").
+    trunk_pages: TrunkPages,
+    /// The trunk's page size and reserved bytes per page, recorded at the first fork. Neither can
+    /// change while a branch exists (both need VACUUM, which is refused), so a branch connection
+    /// takes its page format from here instead of reading the trunk's file header.
+    trunk_format: OnceLock<(usize, u8)>,
+}
+
+/// Where the page a branch asked for comes from.
+pub(crate) enum Resolved {
+    /// The page is in the caller's buffer: a branch version from the arena, or the trunk's version
+    /// from the shared cache.
+    Filled,
+    /// The branch sees the trunk's current version and the cache does not hold it: the caller reads
+    /// it through the WAL or the database file, and may hand it to
+    /// [`BranchStore::fill_trunk_page`] under this key.
+    Trunk(TrunkPageKey),
+}
+
+/// A version of a trunk page: the page, the trunk epoch of its last write, and the cache
+/// generation it was resolved in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TrunkPageKey {
+    page: u32,
+    epoch: u64,
+    generation: u64,
+}
+
+/// A map from page number to `T` that any thread can read without a lock: three levels of 2^10,
+/// 2^10 and 2^12 entries over the 32-bit page number, each installed once and never freed or moved
+/// until the store drops. A lookup is three acquire loads and no write, so readers share the lines
+/// they read instead of taking them from one another.
+struct Radix<T> {
+    top: OnceLock<Box<[OnceLock<Box<[OnceLock<Box<[T]>>]>>]>>,
+}
+
+impl<T: Default> Radix<T> {
+    const TOP: usize = 1 << 10;
+    const MID: usize = 1 << 10;
+    const LEAF: usize = 1 << 12;
+
+    fn new() -> Self {
+        Self {
+            top: OnceLock::new(),
+        }
+    }
+
+    fn split(page: u32) -> (usize, usize, usize) {
+        let page = page as usize;
+        (page >> 22, (page >> 12) & (Self::MID - 1), page & (Self::LEAF - 1))
+    }
+
+    fn get(&self, page: u32) -> Option<&T> {
+        let (t, m, l) = Self::split(page);
+        let leaf = self.top.get()?[t].get()?[m].get()?;
+        Some(&leaf[l])
+    }
+
+    fn get_or_insert(&self, page: u32) -> &T {
+        let (t, m, l) = Self::split(page);
+        let top = self
+            .top
+            .get_or_init(|| (0..Self::TOP).map(|_| OnceLock::new()).collect());
+        let mid = top[t].get_or_init(|| (0..Self::MID).map(|_| OnceLock::new()).collect());
+        let leaf = mid[m].get_or_init(|| (0..Self::LEAF).map(|_| T::default()).collect());
+        &leaf[l]
+    }
+}
+
+/// One cached trunk page. `std::sync::Arc`, as `arc_swap` requires.
+struct CachedPage {
+    generation: u64,
+    epoch: u64,
+    bytes: Box<[u8]>,
+}
+
+struct TrunkPages {
+    /// Bumped whenever the trunk's last child goes (see "Trunk pages without the file").
+    generation: AtomicU64,
+    pages: Radix<ArcSwapOption<CachedPage>>,
+}
+
+impl TrunkPages {
+    /// Copy the version `key` names into `out`, if it is cached.
+    fn copy_into(&self, key: TrunkPageKey, out: &mut [u8]) -> bool {
+        let Some(slot) = self.pages.get(key.page) else {
+            return false;
+        };
+        let cached = slot.load();
+        match cached.as_deref() {
+            Some(p) if p.generation == key.generation && p.epoch == key.epoch => {
+                out.copy_from_slice(&p.bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Cache `bytes` as the version `key` names, unless the generation has moved on since `key` was
+    /// resolved or a version at least as new is already cached.
+    fn fill(&self, key: TrunkPageKey, bytes: &[u8]) {
+        if key.generation != self.generation.load(Ordering::Acquire) {
+            return;
+        }
+        let new = std::sync::Arc::new(CachedPage {
+            generation: key.generation,
+            epoch: key.epoch,
+            bytes: bytes.into(),
+        });
+        self.pages.get_or_insert(key.page).rcu(|old| match old {
+            Some(p) if p.generation == key.generation && p.epoch >= key.epoch => Some(p.clone()),
+            _ => Some(new.clone()),
+        });
+    }
 }
 
 /// The store's lock, held. Observation only: dropping it adds the time it was held to
@@ -367,7 +501,29 @@ impl BranchStore {
             }),
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
+            trunk_pages: TrunkPages {
+                generation: AtomicU64::new(0),
+                pages: Radix::new(),
+            },
+            trunk_format: OnceLock::new(),
         }
+    }
+
+    /// The trunk's page size and reserved bytes per page, once a branch has been forked.
+    pub(crate) fn trunk_page_format(&self) -> Option<(usize, u8)> {
+        self.trunk_format.get().copied()
+    }
+
+    /// Cache a trunk page the pager has read for a branch, under the key [`Self::resolve_into`]
+    /// gave for it. `bytes` must be the whole page as the WAL or the database file held it under
+    /// the reading connection's snapshot.
+    pub(crate) fn fill_trunk_page(&self, key: TrunkPageKey, bytes: &[u8]) {
+        let page_size = self.trunk_format.get().map(|f| f.0);
+        crate::turso_assert!(
+            page_size == Some(bytes.len()),
+            "a trunk page to cache is not one page long"
+        );
+        self.trunk_pages.fill(key, bytes);
     }
 
     /// Take the store's lock, counting the acquisition into `work`: every one, the ones that found
@@ -412,7 +568,20 @@ impl BranchStore {
     /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
-    pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
+    pub(crate) fn fork_trunk(
+        &self,
+        schema: Arc<Schema>,
+        page_size: usize,
+        reserved_space: u8,
+    ) -> Result<BranchId> {
+        let format = *self.trunk_format.get_or_init(|| (page_size, reserved_space));
+        if format != (page_size, reserved_space) {
+            return Err(LimboError::InternalError(format!(
+                "branches were forked from {}-byte pages with {} reserved bytes, but the database \
+                 now has {page_size} and {reserved_space}",
+                format.0, format.1
+            )));
+        }
         let mut inner = self.lock();
         match &inner.arena {
             None => inner.arena = Some(Arena::new(page_size)),
@@ -666,7 +835,10 @@ impl BranchStore {
     /// Fill `out` with `page` as branch `id` sees it, if that version lives in the arena. `false`
     /// means the branch sees the trunk's current version, which the caller reads through the
     /// ordinary WAL / database-file path.
-    pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
+    ///
+    /// The trunk's version comes from the shared cache when it holds it; otherwise the answer is
+    /// [`Resolved::Trunk`] with the key to cache the caller's read under.
+    pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<Resolved> {
         let mut inner = self.lock();
         let (mut levels, mut examined) = (0, 0);
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
@@ -674,7 +846,19 @@ impl BranchStore {
         inner.work.resolve_levels += levels;
         inner.work.resolve_retained_examined += examined;
         let Some(slot) = resolved? else {
-            return Ok(false);
+            // `resolve` answered "the trunk's current version", so the trunk's last write to this
+            // page came at or before the branch's `trunk_at`, in a closed epoch.
+            let key = TrunkPageKey {
+                page,
+                epoch: inner.trunk.written.get(&page).copied().unwrap_or(0),
+                generation: self.trunk_pages.generation.load(Ordering::Acquire),
+            };
+            if self.trunk_pages.copy_into(key, out) {
+                inner.work.trunk_page_hits += 1;
+                return Ok(Resolved::Filled);
+            }
+            inner.work.trunk_page_misses += 1;
+            return Ok(Resolved::Trunk(key));
         };
         out.copy_from_slice(
             inner
@@ -683,7 +867,7 @@ impl BranchStore {
                 .expect("a slot resolved, so the arena exists")
                 .page(slot),
         );
-        Ok(true)
+        Ok(Resolved::Filled)
     }
 
     pub(crate) fn stats(&self) -> BranchStats {
@@ -751,7 +935,12 @@ impl BranchStore {
             freed += st.lineage.release_all(arena).len();
             if st.parent.is_trunk() {
                 freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
-                self.trunk_children.fetch_sub(1, Ordering::AcqRel);
+                if self.trunk_children.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    // From here the trunk writes without telling the store, so no cached version
+                    // can be trusted once a branch exists again. No branch can read in between:
+                    // a fork needs this lock.
+                    self.trunk_pages.generation.fetch_add(1, Ordering::AcqRel);
+                }
                 return freed;
             }
             let parent = branches
@@ -883,7 +1072,7 @@ mod tests {
         for step in 0..1500 {
             match rng.below(10) {
                 0..=2 if live.len() < 40 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
                     live.push((id, epoch, current.clone()));
                     epoch += 1;
                 }
@@ -968,7 +1157,10 @@ mod tests {
             let mut buf = vec![0u8; PAGE];
             for (id, f, view) in &live {
                 for page in 0..PAGES {
-                    let in_arena = store.resolve_into(*id, page, &mut buf).unwrap();
+                    let in_arena = matches!(
+                        store.resolve_into(*id, page, &mut buf).unwrap(),
+                        Resolved::Filled
+                    );
                     let got = if in_arena {
                         u64::from_le_bytes(buf[..8].try_into().unwrap())
                     } else {
@@ -1081,7 +1273,7 @@ mod tests {
             let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
             match rng.below(12) {
                 0 if live.len() < 60 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
                     nodes.push(Node {
                         id,
                         sees: trunk.clone(),
@@ -1152,7 +1344,10 @@ mod tests {
             let mut buf = vec![0u8; PAGE];
             for n in nodes.iter().filter(|n| n.handle) {
                 for page in 0..PAGES {
-                    let got = if store.resolve_into(n.id, page, &mut buf).unwrap() {
+                    let got = if matches!(
+                        store.resolve_into(n.id, page, &mut buf).unwrap(),
+                        Resolved::Filled
+                    ) {
                         u64::from_le_bytes(buf[..8].try_into().unwrap())
                     } else {
                         trunk[&page]
@@ -1178,5 +1373,81 @@ mod tests {
         }
         assert_eq!(store.stats().live_branches, 0, "seed {seed:#x}: branches leaked");
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
+    }
+
+    /// The shared trunk-page cache against a model. Children fork and are reaped, often down to
+    /// none, so the trunk also writes pages while it has no child — as the pager then does, with no
+    /// copy decision and so nothing the store can see. The trunk rewrites pages with and without
+    /// children, and after every step every live child reads every page through `resolve_into`. A
+    /// miss is answered from the model's trunk and cached under the key the store gave, as the
+    /// pager does after its read. Every read must return the page as of the child's fork, and the
+    /// cache must have served reads: a cache that never hits has not been tested.
+    #[test]
+    fn the_trunk_page_cache_serves_each_branch_the_version_it_forked_from() {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            run_cache(seed);
+        }
+    }
+
+    fn run_cache(seed: u64) {
+        let store = BranchStore::new();
+        let mut rng = Rng(seed);
+        let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut live: Vec<(BranchId, HashMap<u32, u64>)> = Vec::new();
+        let (mut generation, mut childless_writes, mut emptied) = (0u64, 0u64, 0u64);
+        let mut buf = vec![0u8; PAGE];
+        for step in 0..3000 {
+            match rng.below(10) {
+                0..=2 if live.len() < 3 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+                    live.push((id, current.clone()));
+                }
+                3..=5 => {
+                    let page = rng.below(u64::from(PAGES)) as u32;
+                    if store.trunk_has_children() {
+                        store.first_write_trunk(page, &image(current[&page]));
+                    } else {
+                        childless_writes += 1;
+                    }
+                    generation += 1;
+                    current.insert(page, generation);
+                }
+                _ if !live.is_empty() => {
+                    let (id, _) = live.swap_remove(rng.below(live.len() as u64) as usize);
+                    store.release_handle(id);
+                    if live.is_empty() {
+                        emptied += 1;
+                    }
+                }
+                _ => {}
+            }
+            for (id, view) in &live {
+                for page in 0..PAGES {
+                    let got = match store.resolve_into(*id, page, &mut buf).unwrap() {
+                        Resolved::Filled => u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                        Resolved::Trunk(key) => {
+                            store.fill_trunk_page(key, &image(current[&page]));
+                            current[&page]
+                        }
+                    };
+                    assert_eq!(
+                        got, view[&page],
+                        "seed {seed:#x} step {step}: branch {} read the wrong page {page}",
+                        id.0
+                    );
+                }
+            }
+        }
+        let work = store.stats().work;
+        assert!(
+            work.trunk_page_hits > 0 && childless_writes > 0 && emptied > 0,
+            "seed {seed:#x}: cache hits {}, trunk writes with no child {childless_writes}, times the \
+             last child went {emptied}",
+            work.trunk_page_hits
+        );
+        for (id, _) in live {
+            store.release_handle(id);
+        }
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
     }
 }

@@ -1646,6 +1646,52 @@ impl Database {
             .block(|| self._init_nonblock(&mut st, encryption_key, page_codec.as_ref()))
     }
 
+    /// A pager for a connection on a branch: [`Database::_init`] without its two reads of the
+    /// trunk's file. `_init` reads the 512-byte header (for the page size and reserved space) and
+    /// page 1 (for the auto-vacuum mode) before a pager could be bound to a branch, so every branch
+    /// connection paid both as read system calls on the one file all threads share — and on a box
+    /// with many threads the kernel serialises those (PREREG amendment 8). Here the page format is
+    /// the one the branch store recorded from the trunk at the first fork (neither part can change
+    /// while a branch exists: both need VACUUM, which is refused), and the pager is bound to the
+    /// branch before page 1 is read, so page 1 comes through the branch — from its own pages or
+    /// from the shared trunk-page cache — and is the branch's page 1, not the trunk's.
+    pub(crate) fn _init_branch(&self, binding: crate::branch::BranchBinding) -> Result<Pager> {
+        let (page_size, reserved) = binding.store.trunk_page_format().ok_or_else(|| {
+            LimboError::InternalError(
+                "a branch exists, so the first fork recorded the page format".to_string(),
+            )
+        })?;
+        let page_size = u32::try_from(page_size)
+            .ok()
+            .and_then(PageSize::new)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("recorded page size {page_size} is invalid"))
+            })?;
+        let mut hdr_st = DbHeaderReadState::default();
+        let pager = self
+            .io
+            .block(|| self.init_pager(None, Some((reserved, page_size)), &mut hdr_st, None))?;
+        pager.enable_encryption(self.opts.enable_encryption);
+        pager.bind_branch(binding)?;
+        // As `_init`: a read transaction around the read of page 1, with one retry on a transient
+        // Busy from the shared WAL bootstrap path.
+        let mut attempts = 0u32;
+        loop {
+            match pager.begin_read_tx() {
+                Ok(()) => break,
+                Err(LimboError::Busy) if attempts == 0 => {
+                    attempts += 1;
+                    pager.io.yield_now();
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let mut st = InitState::ReadPage1 {
+            pager: Box::new(pager),
+        };
+        self.io.block(|| self._init_nonblock(&mut st, None, None))
+    }
+
     /// Necessary Pager initialization, so that we are prepared to read from
     /// Page 1. For encrypted databases, the encryption key must be provided to
     /// properly decrypt page 1. Non-blocking: drives `init_pager` (DB-header
@@ -1667,7 +1713,7 @@ impl Database {
                     *st = InitState::InitPager(DbHeaderReadState::default());
                 }
                 InitState::InitPager(hdr_st) => {
-                    let pager = return_if_io!(self.init_pager(None, hdr_st, page_codec));
+                    let pager = return_if_io!(self.init_pager(None, None, hdr_st, page_codec));
                     pager.enable_encryption(self.opts.enable_encryption);
 
                     // Set up encryption context BEFORE reading the header page.
@@ -2910,9 +2956,12 @@ impl Database {
         )))
     }
 
+    /// `format`, when given, is the database's reserved-space byte and page size, known already
+    /// (see [`Database::_init_branch`]); the header is then not read.
     fn init_pager(
         &self,
         requested_page_size: Option<usize>,
+        format: Option<(u8, PageSize)>,
         hdr_st: &mut DbHeaderReadState,
         page_codec: Option<&Arc<dyn PageCodec>>,
     ) -> Result<IOResult<Pager>> {
@@ -2921,7 +2970,10 @@ impl Database {
         // For an existing (initialized) database, read the 512-byte header
         // once (non-blocking) and recover both the reserved-space byte and the
         // on-disk page size from it.
-        let (header_reserved_bytes, header_page_size) = if self.initialized() {
+        let (header_reserved_bytes, header_page_size) = if let Some((reserved, page_size)) = format
+        {
+            (Some(reserved), Some(page_size))
+        } else if self.initialized() {
             let buf = return_if_io!(self.read_db_header_buf(hdr_st));
             if let Some(codec) = page_codec {
                 let header_info = codec.bootstrap_page_info(buf.as_slice())?;
