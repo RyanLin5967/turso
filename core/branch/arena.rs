@@ -11,10 +11,49 @@
 //! engine's pager, and ferrodb's own D79 showed that making the branch map durable is a separate
 //! wall with its own curve. Mixing the two would hide which one a slope belongs to.
 
+use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use std::ptr::NonNull;
+
 use crate::turso_assert;
 
 /// Index of a page-sized slot in the arena.
 pub(crate) type Slot = u32;
+
+/// The address of one slot's bytes, for filling a slot without the store mutex.
+///
+/// Sound only for the write transaction that allocated the slot and has not published it: until
+/// the store maps it, no other party can name the slot, so nothing else reads or writes those
+/// bytes; and the arena never moves or frees a chunk while it lives (chunks are only appended),
+/// which the holder guarantees by keeping the store alive.
+#[derive(Clone, Copy)]
+pub(crate) struct SlotPtr {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: see the type's contract; the pointer is plain memory with no thread affinity.
+unsafe impl Send for SlotPtr {}
+unsafe impl Sync for SlotPtr {}
+
+impl SlotPtr {
+    /// Copy `src` into the slot.
+    ///
+    /// # Safety
+    /// The caller owns the slot under the type's contract.
+    pub(crate) unsafe fn write(&self, src: &[u8]) {
+        turso_assert!(src.len() == self.len, "slot write of the wrong length");
+        std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr(), self.len);
+    }
+
+    /// Copy the slot into `dst`.
+    ///
+    /// # Safety
+    /// The caller owns the slot under the type's contract.
+    pub(crate) unsafe fn read(&self, dst: &mut [u8]) {
+        turso_assert!(dst.len() == self.len, "slot read of the wrong length");
+        std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), dst.as_mut_ptr(), self.len);
+    }
+}
 
 /// Slots per allocation. Chunks are zero-filled through the allocator, so the OS backs a chunk with
 /// memory only as its slots are touched; the chunk size bounds the granularity, not the footprint.
@@ -22,7 +61,11 @@ const SLOTS_PER_CHUNK: usize = 256;
 
 pub(crate) struct Arena {
     page_size: usize,
-    chunks: Vec<Box<[u8]>>,
+    /// Zero-filled allocations of `SLOTS_PER_CHUNK * page_size` bytes, never moved or freed before
+    /// the arena drops. Raw, so that a slice is only ever formed over one slot's bytes: a
+    /// transaction may then fill a slot it owns (see [`SlotPtr`]) while the store mutex's holder
+    /// works on other slots of the same chunk.
+    chunks: Vec<NonNull<u8>>,
     /// Slots below this have been handed out at least once.
     high_water: u32,
     free: Vec<Slot>,
@@ -30,6 +73,20 @@ pub(crate) struct Arena {
     /// cannot answer "is this slot free" without a scan, and releasing an already-free slot must be
     /// caught AT the release — found later, it is two owners of one page and nothing says which.
     free_bits: Vec<u64>,
+}
+
+// SAFETY: the chunks are plain memory owned by the arena; access to them is governed by the
+// store mutex, and by `SlotPtr`'s contract for a slot a transaction owns.
+unsafe impl Send for Arena {}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        let layout = self.chunk_layout();
+        for chunk in self.chunks.drain(..) {
+            // SAFETY: allocated in `alloc` with this layout, and freed only here.
+            unsafe { dealloc(chunk.as_ptr(), layout) };
+        }
+    }
 }
 
 impl Arena {
@@ -55,8 +112,11 @@ impl Arena {
         let slot = self.high_water;
         let chunk = slot as usize / SLOTS_PER_CHUNK;
         if chunk == self.chunks.len() {
+            let layout = self.chunk_layout();
+            // SAFETY: the layout has a nonzero size.
+            let ptr = unsafe { alloc_zeroed(layout) };
             self.chunks
-                .push(vec![0u8; SLOTS_PER_CHUNK * self.page_size].into_boxed_slice());
+                .push(NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout)));
         }
         self.high_water += 1;
         let words = (self.high_water as usize).div_ceil(64);
@@ -94,14 +154,34 @@ impl Arena {
     }
 
     pub(crate) fn page(&self, slot: Slot) -> &[u8] {
-        let (chunk, offset) = self.locate(slot);
-        &self.chunks[chunk][offset..offset + self.page_size]
+        let ptr = self.slot_addr(slot);
+        // SAFETY: one slot's bytes inside a live chunk; `&self` rules out a `page_mut` alias, and a
+        // slot a transaction owns is not one anybody resolves to.
+        unsafe { std::slice::from_raw_parts(ptr.as_ptr(), self.page_size) }
     }
 
     pub(crate) fn page_mut(&mut self, slot: Slot) -> &mut [u8] {
+        let ptr = self.slot_addr(slot);
+        // SAFETY: as `page`, exclusively.
+        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), self.page_size) }
+    }
+
+    /// The slot's address, for its owning transaction to fill without the store mutex.
+    pub(crate) fn slot_ptr(&self, slot: Slot) -> SlotPtr {
+        SlotPtr {
+            ptr: self.slot_addr(slot),
+            len: self.page_size,
+        }
+    }
+
+    fn slot_addr(&self, slot: Slot) -> NonNull<u8> {
         let (chunk, offset) = self.locate(slot);
-        let page_size = self.page_size;
-        &mut self.chunks[chunk][offset..offset + page_size]
+        // SAFETY: `locate` bounds the offset by the chunk's size.
+        unsafe { self.chunks[chunk].add(offset) }
+    }
+
+    fn chunk_layout(&self) -> Layout {
+        Layout::from_size_align(SLOTS_PER_CHUNK * self.page_size, 64).expect("a chunk's layout")
     }
 
     fn locate(&self, slot: Slot) -> (usize, usize) {

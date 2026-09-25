@@ -203,6 +203,8 @@ pub struct BranchWork {
     pub lock_holds: u64,
     /// Arena page bytes memcpy'd while the store mutex was held.
     pub locked_copy_bytes: u64,
+    /// Page-map entries a branch's first fork inserted into its view, outside the store mutex.
+    pub view_build_pages: u64,
 }
 
 /// The largest single hold of the store mutex, per measure, since the previous
@@ -285,10 +287,53 @@ impl Drop for Branch {
 pub(crate) struct BranchBinding {
     pub(crate) store: Arc<BranchStore>,
     pub(crate) id: BranchId,
+    /// The write transaction's own slots (see [`store::ShadowTxn`]); empty between transactions.
+    pub(crate) txn: crate::sync::Mutex<store::ShadowTxn>,
+}
+
+impl BranchBinding {
+    pub(crate) fn new(store: Arc<BranchStore>, id: BranchId) -> Self {
+        Self {
+            store,
+            id,
+            txn: crate::sync::Mutex::new(store::ShadowTxn::default()),
+        }
+    }
+
+    /// The first write of `page` in this transaction: give it a slot of the transaction's own.
+    pub(crate) fn first_write(&self, page: u32) -> Result<()> {
+        self.store.shadow_slot(self.id, page, &mut self.txn.lock())
+    }
+
+    /// Copy a dirty page's image into its slot: at a spill, and at commit.
+    pub(crate) fn fill(&self, page: u32, image: &[u8]) -> Result<()> {
+        self.txn.lock().fill(page, image)
+    }
+
+    /// The page as this transaction spilled it, if it did.
+    pub(crate) fn read_spilled(&self, page: u32, out: &mut [u8]) -> Result<bool> {
+        self.txn.lock().read(page, out)
+    }
+
+    pub(crate) fn is_filled(&self, page: u32) -> bool {
+        self.txn.lock().is_filled(page)
+    }
+
+    /// Commit: map the pages of `dirty` to their filled slots.
+    pub(crate) fn publish(&self, dirty: &[u32]) -> Result<()> {
+        self.store.publish(self.id, &mut self.txn.lock(), dirty)
+    }
+
+    /// Roll back: return the transaction's slots. The committed ones were never written.
+    pub(crate) fn discard(&self) {
+        self.store.discard(&mut self.txn.lock());
+    }
 }
 
 impl Drop for BranchBinding {
     fn drop(&mut self) {
+        // A transaction abandoned with its connection returns its slots before the branch closes.
+        self.discard();
         self.store.close(self.id);
     }
 }
@@ -416,10 +461,7 @@ impl Database {
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
         let schema = self.branches.open(id)?;
         // Built before anything fallible below, so an error there still closes the branch.
-        let binding = BranchBinding {
-            store: self.branches.clone(),
-            id,
-        };
+        let binding = BranchBinding::new(self.branches.clone(), id);
         let pager = self._init(None, None)?;
         // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may
         // survive into the branch's view.

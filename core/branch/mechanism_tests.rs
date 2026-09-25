@@ -797,3 +797,74 @@ fn exec_retrying_busy(conn: &Arc<Connection>, sql: &str) {
     }
     panic!("{sql}: still Busy after 10,000 attempts");
 }
+
+/// A branch transaction far larger than its page cache spills into its own slots (a STEAL policy):
+/// the cache stays bounded, a spilled page rewritten later in the transaction commits its last
+/// image, a rollback returns exactly the slots the transaction took, a savepoint rollback restores
+/// pages spilled after the savepoint, and a child forked before a large commit keeps what it saw.
+#[test]
+fn a_spilling_branch_transaction_commits_rolls_back_and_forks_intact() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20_000);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    let pages = rows(&bc, "PRAGMA page_count")[0][0].as_int().unwrap();
+    bc.execute("PRAGMA cache_size = 10").unwrap();
+    let expect = |id: i64, every7: &str, rest: &str| {
+        if id % 7 == 0 {
+            format!("{every7}-{id}")
+        } else {
+            format!("{rest}-{id}")
+        }
+    };
+
+    bc.execute("BEGIN").unwrap();
+    bc.execute("UPDATE t SET v = 'a-' || id").unwrap();
+    let cached = bc.page_cache_len() as i64;
+    assert!(
+        cached < pages / 2,
+        "the cache holds {cached} of {pages} pages after dirtying them all: nothing spilled"
+    );
+    bc.execute("UPDATE t SET v = 'b-' || id WHERE id % 7 = 0").unwrap();
+    bc.execute("COMMIT").unwrap();
+    let t = table(&bc);
+    assert_eq!(t.len(), 20_000);
+    for (id, v) in &t {
+        assert_eq!(v, &expect(*id, "b", "a"), "row {id} after the spilling commit");
+    }
+    assert_eq!(value(&trunk, 7), Some(original(7)));
+
+    let child = b.fork().unwrap();
+    let committed = in_use(&db);
+    bc.execute("BEGIN").unwrap();
+    bc.execute("UPDATE t SET v = 'c-' || id").unwrap();
+    bc.execute("ROLLBACK").unwrap();
+    assert_eq!(in_use(&db), committed, "a rolled-back transaction kept or lost slots");
+
+    bc.execute("BEGIN").unwrap();
+    bc.execute("UPDATE t SET v = 'd-' || id").unwrap();
+    bc.execute("SAVEPOINT sp").unwrap();
+    bc.execute("UPDATE t SET v = 'e-' || id").unwrap();
+    bc.execute("ROLLBACK TO sp").unwrap();
+    bc.execute("RELEASE sp").unwrap();
+    bc.execute("COMMIT").unwrap();
+    drop(bc);
+
+    let bc = b.connect().unwrap();
+    for (id, v) in table(&bc) {
+        assert_eq!(v, format!("d-{id}"), "row {id} after the savepoint rollback");
+    }
+    assert_eq!(rows(&bc, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
+    let cc = child.connect().unwrap();
+    for (id, v) in table(&cc) {
+        assert_eq!(v, expect(id, "b", "a"), "the child's row {id}");
+    }
+    assert_eq!(rows(&cc, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
+    drop(cc);
+    drop(child);
+    drop(bc);
+    drop(b);
+    assert!(in_use(&db).is_empty(), "slots leaked");
+    assert_eq!(db.branch_stats().live_branches, 0);
+}

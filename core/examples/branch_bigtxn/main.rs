@@ -12,6 +12,10 @@
 //!           children forked before it, so the trunk retains D pre-images.
 //!   probe   grow N other live branches (one written page each) and, at each N, run the branch
 //!           arm's transaction at D while one other thread loops a small branch op and timestamps it.
+//!   addcol  BranchBench Software Dev's shape on a branch: `ALTER TABLE t ADD COLUMN w TEXT`, then a
+//!           backfill `UPDATE t SET w = substr(v, 1, 700) WHERE id <= 3D` over 1,300-byte rows
+//!           (three per leaf), so the D leaves it rewrites no longer fit and split: new pages are
+//!           allocated inside the transaction. Phases: alter, update, commit, fork_first, reap.
 //!
 //! Every phase prints the engine's counter deltas (store-mutex holds, bytes copied under the mutex,
 //! the largest single hold, page-cache replacement work). Times are printed only with `--timing`,
@@ -30,6 +34,9 @@ use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, Sqli
 /// One row per 4 KiB leaf: two 3,000-byte cells cannot share a leaf, and one stays below the
 /// 4,061-byte local-payload limit, so no overflow page.
 const VALUE_LEN: usize = 3000;
+/// `addcol`: three 1,300-byte rows fill a leaf; with a 700-byte column added, two do.
+const ADDCOL_VALUE_LEN: usize = 1300;
+const ADDCOL_ROWS_PER_LEAF: usize = 3;
 const BUILD_BATCH: i64 = 10_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,6 +44,7 @@ enum Arm {
     Branch,
     Trunk,
     Probe,
+    Addcol,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,6 +106,7 @@ fn parse_args() -> Args {
                     "branch" => Arm::Branch,
                     "trunk" => Arm::Trunk,
                     "probe" => Arm::Probe,
+                    "addcol" => Arm::Addcol,
                     other => die(&format!("unknown arm {other}")),
                 })
             }
@@ -126,11 +135,19 @@ fn parse_args() -> Args {
     args.arm = arm.unwrap_or_else(|| die("--arm is required"));
     args.reps_last = reps_last.unwrap_or(args.reps);
     let max_d = *args.d_list.iter().max().unwrap_or(&0);
+    let rows_per_d = if args.arm == Arm::Addcol {
+        ADDCOL_ROWS_PER_LEAF
+    } else {
+        1
+    };
     if args.rows == 0 {
-        args.rows = max_d;
+        args.rows = max_d * rows_per_d;
     }
-    if args.d_list.is_empty() || args.d_list.contains(&0) || max_d > args.rows {
-        die("--d entries must be positive and at most --rows");
+    if max_d * rows_per_d > args.rows {
+        die("--rows must cover every --d");
+    }
+    if args.d_list.is_empty() || args.d_list.contains(&0) {
+        die("--d entries must be positive");
     }
     if args.reps == 0 || args.reps_last == 0 {
         die("--reps must be positive");
@@ -143,6 +160,10 @@ fn parse_args() -> Args {
 
 fn trunk_value(id: i64) -> String {
     format!("{:0>width$}", id, width = VALUE_LEN)
+}
+
+fn addcol_value(id: i64) -> String {
+    format!("{:0>width$}", id, width = ADDCOL_VALUE_LEN)
 }
 
 fn int(conn: &Arc<Connection>, sql: &str) -> i64 {
@@ -189,7 +210,7 @@ fn snap(db: &Arc<Database>) -> Snap {
 
 const HEADER: &str = "phase\tD\tN\trep\tus\tlock_holds\tlocked_copy_bytes\tmax_hold_pages\tmax_hold_copy_bytes\t\
 max_hold_realloc_moved\tmax_hold_ns\tresolve_calls\tevict_calls\tevict_examined\tevict_full\t\
-over_capacity_admits\tevictable_scan\tspill_scan\tsubjournal_pages\tarena_in_use\tcache_len";
+over_capacity_admits\tevictable_scan\tspill_scan\tsubjournal_pages\tarena_in_use\tcache_len\tview_build_pages";
 
 struct Ctx {
     db: Arc<Database>,
@@ -226,7 +247,7 @@ impl Ctx {
             "-".to_string()
         };
         println!(
-            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             b.w.lock_holds - a.w.lock_holds,
             b.w.locked_copy_bytes - a.w.locked_copy_bytes,
             m.pages,
@@ -242,6 +263,7 @@ impl Ctx {
             b.c.subjournal_pages - a.c.subjournal_pages,
             b.arena_in_use,
             cache_len(),
+            b.w.view_build_pages - a.w.view_build_pages,
         );
         (out, el)
     }
@@ -266,7 +288,7 @@ fn open_db(dir: &Path) -> (Arc<Database>, Arc<Connection>) {
     (db, trunk)
 }
 
-fn build_table(trunk: &Arc<Connection>, rows: usize) {
+fn build_table(trunk: &Arc<Connection>, rows: usize, value: fn(i64) -> String) {
     trunk.execute("PRAGMA synchronous = NORMAL").unwrap();
     trunk
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
@@ -280,7 +302,7 @@ fn build_table(trunk: &Arc<Connection>, rows: usize) {
             ins.reset().unwrap();
             ins.bind_at(NonZero::new(1).unwrap(), Value::from_i64(id))
                 .unwrap();
-            ins.bind_at(NonZero::new(2).unwrap(), Value::build_text(trunk_value(id)))
+            ins.bind_at(NonZero::new(2).unwrap(), Value::build_text(value(id)))
                 .unwrap();
             ins.run_ignore_rows().unwrap();
             id += 1;
@@ -379,6 +401,81 @@ fn big_branch_txn(ctx: &Ctx, trunk: &Arc<Connection>, d: usize, n: usize, rep: u
         ));
     }
     (t_update, t_commit)
+}
+
+/// The addcol arm's unit: add a column on a fresh branch and backfill it over the first 3D rows.
+fn addcol_txn(ctx: &Ctx, trunk: &Arc<Connection>, d: usize, rep: usize) -> Duration {
+    let db = &ctx.db;
+    let rows = d * ADDCOL_ROWS_PER_LEAF;
+    let before = snap(db);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    bc.execute("BEGIN").unwrap();
+    let t = Instant::now();
+    ctx.phase("alter", d, 0, rep, || bc.page_cache_len(), || {
+        bc.execute("ALTER TABLE t ADD COLUMN w TEXT").unwrap()
+    });
+    let sql = format!("UPDATE t SET w = substr(v, 1, 700) WHERE id <= {rows}");
+    ctx.phase("update", d, 0, rep, || bc.page_cache_len(), || bc.execute(&sql).unwrap());
+    ctx.phase("commit", d, 0, rep, || bc.page_cache_len(), || bc.execute("COMMIT").unwrap());
+    let el = t.elapsed();
+    let written = snap(db).arena_in_use - before.arena_in_use;
+    let filled = int(&bc, "SELECT count(*) FROM t WHERE w IS NOT NULL");
+    if filled != rows as i64 {
+        not_a_result(&format!("the branch backfilled {filled} rows of {rows}"));
+    }
+    let tail_ok = int(
+        &bc,
+        &format!("SELECT count(*) FROM t WHERE id <= {rows} AND w = substr(v, 1, 700)"),
+    );
+    if tail_ok != rows as i64 {
+        not_a_result(&format!("{tail_ok} backfilled rows of {rows} hold the right value"));
+    }
+    let integrity = bc
+        .prepare("PRAGMA integrity_check")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    if integrity.len() != 1 || integrity[0][0] != Value::build_text("ok") {
+        not_a_result(&format!("branch integrity_check: {integrity:?}"));
+    }
+    if trunk.prepare("SELECT w FROM t").is_ok() {
+        not_a_result("the trunk sees the branch's new column");
+    }
+    let (child, _) = ctx.phase("fork_first", d, 0, rep, || bc.page_cache_len(), || b.fork().unwrap());
+    ctx.phase("reap_child", d, 0, rep, || 0, || child.reap().unwrap());
+    drop(bc);
+    let (reaped, _) = ctx.phase("reap", d, 0, rep, || 0, || b.reap().unwrap());
+    if reaped.freed_pages != written || reaped.deferred {
+        not_a_result(&format!(
+            "addcol D={d}: wrote {written} arena pages, the reap freed {} (deferred {})",
+            reaped.freed_pages, reaped.deferred
+        ));
+    }
+    let end = snap(db);
+    if end.arena_in_use != before.arena_in_use || end.live != before.live {
+        not_a_result("the addcol rep leaked");
+    }
+    println!("# addcol D={d} rep={rep} arena_pages_written={written}");
+    el
+}
+
+fn arm_addcol(ctx: &Ctx, trunk: &Arc<Connection>, args: &Args) {
+    println!("{HEADER}");
+    for (i, &d) in args.d_list.iter().enumerate() {
+        for rep in 0..reps_for(args, i) {
+            let el = addcol_txn(ctx, trunk, d, rep);
+            if ctx.timing {
+                println!(
+                    "# addcol D={d} rep={rep} ns_per_leaf alter+update+commit={:.1} rss_bytes={}",
+                    el.as_nanos() as f64 / d as f64,
+                    rss_bytes()
+                );
+            } else {
+                println!("# addcol D={d} rep={rep} rss_bytes={}", rss_bytes());
+            }
+        }
+    }
 }
 
 fn reps_for(args: &Args, i: usize) -> usize {
@@ -615,7 +712,12 @@ fn main() {
     };
     let (db, trunk) = open_db(&dir);
     let build = Instant::now();
-    build_table(&trunk, args.rows);
+    let value = if args.arm == Arm::Addcol {
+        addcol_value
+    } else {
+        trunk_value
+    };
+    build_table(&trunk, args.rows, value);
     let page_count = int(&trunk, "PRAGMA page_count");
     println!("# branch_bigtxn — Turso fork, lane r11-bigtxn PREREG");
     println!(
@@ -654,6 +756,7 @@ fn main() {
         Arm::Branch => arm_branch(&ctx, &trunk, &args),
         Arm::Trunk => arm_trunk(&ctx, &trunk, &args),
         Arm::Probe => arm_probe(&ctx, &trunk, &args),
+        Arm::Addcol => arm_addcol(&ctx, &trunk, &args),
     }
     let end = db.branch_stats();
     if end.live_branches != 0 || end.arena_slots_in_use != 0 {
