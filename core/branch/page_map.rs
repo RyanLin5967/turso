@@ -19,7 +19,63 @@
 
 use std::sync::Arc;
 
-use super::arena::Slot;
+use super::arena::{Arena, Slot};
+
+/// Where a counted map reports the references its leaves take and drop (see [`PageMap::set`]).
+pub(crate) trait SlotRefs {
+    fn incref(&mut self, slot: Slot);
+    /// Returns whether that was the slot's last reference (it is freed).
+    fn decref(&mut self, slot: Slot) -> bool;
+}
+
+impl SlotRefs for Arena {
+    fn incref(&mut self, slot: Slot) {
+        Arena::incref(self, slot)
+    }
+    fn decref(&mut self, slot: Slot) -> bool {
+        Arena::decref(self, slot)
+    }
+}
+
+/// An uncounted map (the unit tests below).
+#[cfg(test)]
+struct NoRefs;
+
+#[cfg(test)]
+impl SlotRefs for NoRefs {
+    fn incref(&mut self, _: Slot) {}
+    fn decref(&mut self, _: Slot) -> bool {
+        false
+    }
+}
+
+/// Observation only: what a counted map operation did.
+#[derive(Default)]
+pub(crate) struct MapWork {
+    /// Nodes cloned because another map shared them.
+    pub(crate) nodes_copied: u64,
+    /// References taken: one per slot of each cloned leaf, one per new entry.
+    pub(crate) slot_increfs: u64,
+    /// Slots whose last reference this operation dropped (freed).
+    pub(crate) freed: u64,
+}
+
+/// `Arc::make_mut` that counts: a leaf cloned because another map shares it is one more node naming
+/// each of its slots.
+fn unique<'a>(node: &'a mut Arc<Node>, refs: &mut impl SlotRefs, w: &mut MapWork) -> &'a mut Node {
+    let shared = Arc::get_mut(node).is_none();
+    let node = Arc::make_mut(node);
+    if shared {
+        w.nodes_copied += 1;
+        if let Node::Leaf(slots) = node {
+            for &slot in slots.iter().filter(|&&s| s != EMPTY) {
+                refs.incref(slot);
+                w.slot_increfs += 1;
+            }
+        }
+    }
+    node
+}
 
 const BITS: u32 = 5;
 const WIDTH: usize = 1 << BITS;
@@ -94,10 +150,24 @@ impl PageMap {
         out
     }
 
-    /// Map `page` to `slot`, replacing any previous mapping. Every other version of this map —
-    /// every clone taken before this call — keeps the mapping it had. Returns the number of nodes
-    /// it cloned because another version shared them (observation only).
+    /// Uncounted [`PageMap::set`], for the unit tests. Returns the nodes it cloned.
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, page: u32, slot: Slot) -> u64 {
+        let mut w = MapWork::default();
+        self.set(page, slot, &mut NoRefs, &mut w);
+        w.nodes_copied
+    }
+
+    /// Map `page` to `slot`, replacing any previous mapping. Every other version of this map —
+    /// every clone taken before this call — keeps the mapping it had.
+    ///
+    /// Reference counts (Rodeh, "B-trees, Shadowing, and Clones", ACM TOS 2008, as btrfs counts
+    /// shadowed tree blocks): each slot is counted once per LEAF NODE that names it, not per map,
+    /// so a clone of a whole map costs nothing. Copying a shared leaf takes a reference to each of
+    /// its slots; replacing an entry moves one; [`PageMap::release`] drops the references of the
+    /// nodes only this map held. Setting an entry to the slot it already holds changes no count and
+    /// only makes the path to it this map's own.
+    pub(crate) fn set(&mut self, page: u32, slot: Slot, refs: &mut impl SlotRefs, w: &mut MapWork) {
         crate::turso_assert!(slot != EMPTY, "arena slot u32::MAX is the page map's empty marker");
         if self.root.is_none() {
             self.root = Some(Arc::new(Node::empty(0)));
@@ -110,24 +180,46 @@ impl PageMap {
             self.height += 1;
         }
         let mut level = self.height;
-        let mut copied = 0;
-        let root = self.root.as_mut().expect("created above");
-        copied += u64::from(Arc::get_mut(root).is_none());
-        let mut node = Arc::make_mut(root);
+        let mut node = unique(self.root.as_mut().expect("created above"), refs, w);
         loop {
             node = match node {
                 Node::Inner(kids) => {
                     let kid = kids[Self::index(page, level)]
                         .get_or_insert_with(|| Arc::new(Node::empty(level - 1)));
                     level -= 1;
-                    copied += u64::from(Arc::get_mut(kid).is_none());
-                    Arc::make_mut(kid)
+                    unique(kid, refs, w)
                 }
                 Node::Leaf(slots) => {
-                    slots[Self::index(page, 0)] = slot;
-                    return copied;
+                    let old = std::mem::replace(&mut slots[Self::index(page, 0)], slot);
+                    if old != slot {
+                        refs.incref(slot);
+                        w.slot_increfs += 1;
+                        if old != EMPTY && refs.decref(old) {
+                            w.freed += 1;
+                        }
+                    }
+                    return;
                 }
             };
+        }
+    }
+
+    /// Drop this map, and the references of every node it alone held; a node another map still
+    /// holds is left to that map. Visits only this map's own nodes, iteratively.
+    pub(crate) fn release(&mut self, refs: &mut impl SlotRefs, w: &mut MapWork) {
+        let mut stack: Vec<Arc<Node>> = self.root.take().into_iter().collect();
+        while let Some(node) = stack.pop() {
+            match Arc::try_unwrap(node) {
+                Ok(Node::Inner(kids)) => stack.extend(kids.into_iter().flatten()),
+                Ok(Node::Leaf(slots)) => {
+                    for slot in slots.into_iter().filter(|&s| s != EMPTY) {
+                        if refs.decref(slot) {
+                            w.freed += 1;
+                        }
+                    }
+                }
+                Err(_shared) => {}
+            }
         }
     }
 }

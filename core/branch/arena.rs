@@ -44,6 +44,11 @@ const CHUNK_BLOCK: usize = 256;
 /// A handle entry with this bit set is live and names a frame; clear, it is free and its low
 /// 32 bits are the next free handle plus one (0 = none).
 const LIVE: u64 = 1 << 63;
+/// Bits 32..=62 of a live entry count the page-map leaf nodes that name the slot (see
+/// [`super::page_map`]). Only branch slots are counted; a trunk-retained slot keeps 0 and is
+/// released directly by the trunk's reclamation.
+const REF: u64 = 1 << 32;
+const REF_MASK: u64 = ((1 << 31) - 1) << 32;
 /// No chunk.
 const NIL: u32 = u32::MAX;
 
@@ -292,9 +297,40 @@ impl Arena {
         h
     }
 
+    /// Count one more page-map leaf that names `slot`.
+    pub(crate) fn incref(&mut self, slot: Slot) {
+        turso_assert!(!self.is_free(slot), "counted a reference to a free arena slot");
+        let entry = self.entry_mut(slot);
+        turso_assert!(*entry & REF_MASK != REF_MASK, "arena slot reference count overflow");
+        *entry += REF;
+    }
+
+    /// Count one leaf fewer; the slot is released when none is left. Returns whether it was.
+    pub(crate) fn decref(&mut self, slot: Slot) -> bool {
+        turso_assert!(!self.is_free(slot), "dropped a reference to a free arena slot");
+        let entry = self.entry(slot);
+        turso_assert!(entry & REF_MASK != 0, "dropped a reference the slot does not have");
+        *self.entry_mut(slot) = entry - REF;
+        if (entry - REF) & REF_MASK == 0 {
+            self.release(slot);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Page-map leaves that name `slot`.
+    pub(crate) fn refs(&self, slot: Slot) -> u32 {
+        ((self.entry(slot) & REF_MASK) >> 32) as u32
+    }
+
     pub(crate) fn release(&mut self, slot: Slot) {
         turso_assert!(slot < self.handle_high_water, "released a slot the arena never handed out");
         turso_assert!(!self.is_free(slot), "released an arena slot that was already free");
+        turso_assert!(
+            self.entry(slot) & REF_MASK == 0,
+            "released an arena slot a page map still names"
+        );
         let frame = self.entry(slot) as u32;
         *self.entry_mut(slot) = u64::from(self.free_handle);
         self.free_handle = slot + 1;
@@ -357,7 +393,8 @@ impl Arena {
             let src = self.chunk(c).data[from_off..from_off + page_size].to_vec();
             self.chunk_mut(frame / CHUNK as u32).data[to_off..to_off + page_size]
                 .copy_from_slice(&src);
-            *self.entry_mut(h) = LIVE | u64::from(frame);
+            let refs = self.entry(h) & REF_MASK;
+            *self.entry_mut(h) = LIVE | refs | u64::from(frame);
             self.copied += 1;
             self.free_frame(c * CHUNK as u32 + i);
         }

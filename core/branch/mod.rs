@@ -164,15 +164,18 @@ pub struct Reaped {
     /// Arena pages returned to the free list by this call: the branch's own, plus any version an
     /// ancestor was retaining only for it.
     pub freed_pages: usize,
-    /// True when the branch could not be freed yet (an open connection or a live child still reads
-    /// through it); its pages are freed when the last of those goes away.
+    /// True when something still reads through the branch (an open connection or a live child), so
+    /// its pages outlive this call: they are freed when the last map naming them goes. The branch's
+    /// own state may be gone already — a dead branch with one live child is spliced out of the
+    /// tree — so this says nothing about `live_branches`.
     pub deferred: bool,
 }
 
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
-    /// Branch states that exist, including reaped branches kept alive by a live child.
+    /// Branch states that exist: branches with a handle or an open connection, plus reaped ones kept
+    /// as the fork point of two or more live children (one with a single live child is spliced out).
     pub live_branches: usize,
     /// Arena pages owned by some branch (or retained for one).
     pub arena_slots_in_use: usize,
@@ -205,13 +208,14 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
-    /// Entries the `branches` table relocated: an insert across which `capacity()` rose by more
-    /// than one (a doubling or an in-place rehash; a tombstone reuse raises it by exactly one),
-    /// counted as the `len()` before it.
+    /// Entries the `branches` table relocated: the entries a linear-hashing bucket split or merge
+    /// relinked. (On a std `HashMap`, an insert across which `capacity()` rose by more than one,
+    /// counted as the `len()` before it.)
     pub branch_table_moved: u64,
-    /// Of those relocations, the doublings (a capacity above every earlier one).
+    /// Of those relocations, the doublings (a capacity above every earlier one). Always 0 on the
+    /// linear-hashing table, which never rehashes as a whole.
     pub branch_table_resizes: u64,
-    /// Of those relocations, the in-place rehashes that cleared tombstones.
+    /// Of those relocations, the in-place rehashes that cleared tombstones (always 0, as above).
     pub branch_table_rehashes: u64,
     /// The same for the per-page tables (`trunk.written`, each lineage's `retained`, each branch's
     /// `current`).
@@ -238,12 +242,13 @@ pub struct BranchWork {
     /// Handle-less, closed branches with one live child spliced out of the tree (0 on a store that
     /// keeps them).
     pub splices: u64,
-    /// Current versions of dead branches retired into their retained sets (0 on a store that keeps
-    /// a dead branch's current pages until it is freed).
+    /// Current pages of dead branches dropped with their page map (the ones no other map named were
+    /// freed; the rest live on in the maps that name them).
     pub retired: u64,
-    /// Slot references taken by page maps (0 on a store whose maps count nothing).
+    /// Slot references taken by page maps: one per slot of each shared leaf a write copied, one per
+    /// new entry (0 on a store whose maps count nothing).
     pub map_slot_increfs: u64,
-    /// Branch first-writes that reused the page's slot in place (0 where not counted).
+    /// Branch first-writes that reused the page's slot in place because no other map could reach it.
     pub writes_in_place: u64,
 }
 

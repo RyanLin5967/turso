@@ -19,13 +19,12 @@
 //!
 //! Steps 2 and 3 are answered for every level between a branch and the trunk at once, and frozen,
 //! at the moment the branch forks: nothing a branch sees through its ancestors can change after its
-//! fork (an ancestor's later write retains the version the branch saw, in the same slot). So each
-//! branch carries `inherited`, a persistent [`PageMap`] of every arena page it sees through its
-//! ancestors, which is its parent's `view` at the fork: the parent's own `inherited` plus the
-//! parent's current pages, kept up to date by the parent's writes once it has forked a child. A
-//! fork clones the parent's `view` in O(1) and a write path-copies O(log P) trie nodes, so a
-//! lookup costs the same at depth 1000 as at depth 1. A page no branch in the chain wrote is the
-//! trunk's, as of `trunk_at`, the fork epoch at which the branch's ancestry leaves the trunk.
+//! fork (an ancestor's later write goes to a new slot and the version the branch saw keeps its
+//! own). So each branch carries `view`, a persistent [`PageMap`] of every arena page it sees: its
+//! parent's `view` at the fork, then updated by the branch's own writes. A fork clones the parent's
+//! `view` in O(1) and a write path-copies O(log P) trie nodes, so a lookup costs the same at depth
+//! 1000 as at depth 1. A page no branch in the chain wrote is the trunk's, as of `trunk_at`, the
+//! fork epoch at which the branch's ancestry leaves the trunk.
 //!
 //! # Where the copies come from — the write ticket
 //!
@@ -34,9 +33,9 @@
 //! place a [`crate::storage::pager::WriteTicket`] can be minted. So every page write is preceded by
 //! the copy decision by construction:
 //!
-//! * a **branch** writing a page it does not yet own copies the page into a fresh slot of its own
-//!   page space; writing a page it owns while a live child can still see the current version moves
-//!   that version to the retained set and copies into a fresh slot;
+//! * a **branch** writes in place only into a slot no other map names (see "Reclamation");
+//!   otherwise it copies the page into a fresh slot and its map points there, while every map that
+//!   named the old slot — a child's, a sibling's, an ancestor's — keeps it;
 //! * the **trunk** writing a page that a live child can still see copies the pre-image into a slot
 //!   and retains it, before the write reaches the WAL — so neither the commit nor a later
 //!   checkpoint that moves the new version into the database file can reach the child.
@@ -60,23 +59,33 @@
 //! ZFS-deadlist indexes by `born` and by `died`, cost twice the smaller range whatever it freed:
 //! a reap could walk every version and free none.)
 //!
-//! A branch whose handle has been dropped but that still has a live child or an open connection
-//! is kept (its versions are still read through); it is freed the moment the last of those goes,
-//! and freeing it may in turn free its parent.
+//! That is the TRUNK's reclamation. A branch's versions are reclaimed by reference counts instead
+//! (Rodeh, "B-trees, Shadowing, and Clones", ACM TOS 2008): every branch page lives in a slot that
+//! counts the page-map leaf nodes naming it, a branch resolves and forks through one map (its
+//! `view`), and a branch write copies the path to its leaf and takes a new slot only if another map
+//! can still reach the old one — otherwise it writes in place. So a branch slot lives exactly as
+//! long as some live branch's map can reach it: a version a descendant has overwritten, or one only
+//! a dead ancestor named, is freed when the last map naming it goes, which interval retention
+//! cannot see (the interval predicate ignores descendants' writes).
+//!
+//! A branch whose handle has been dropped and that has no open connection releases its map at once
+//! (its children hold their own). If it still has two or more live children its state is kept as
+//! their fork point; with one it is spliced out, the child taking its place in its parent; with
+//! none it is freed, and freeing it may in turn free or splice its parent.
 //!
 //! # What this does not do
 //!
 //! * One `Mutex` guards every branch. Correct, and a known wall under concurrent writers on
 //!   different branches; the benchmark this lane ships is single-threaded and says so.
-//! * The persistent page maps are an index over slots the lineages own; they own nothing. A
-//!   branch's `inherited` names only slots its ancestors keep for it (see "Resolution without the
-//!   walk"), so dropping a map never frees a page and keeping one never pins a page.
+//! * Branch space held is branch space reachable, exactly — but the TRUNK's retained versions are
+//!   kept by the interval predicate, so a trunk version a trunk child has itself overwritten is
+//!   kept for that child although it cannot read it (at most one per page the child wrote).
 //!
 //! # Per-page version order (the fat node)
 //!
 //! Within one node, one page's retained versions have non-empty, pairwise disjoint `[born, died)`
-//! ranges: the trunk retains `[written, epoch)` and then sets `written = epoch`, and a branch
-//! retains `[owned.born, epoch)` and re-bears its current version at `epoch`. So `born` is unique
+//! ranges: the trunk retains `[written, epoch)` and then sets `written = epoch` (branches no longer
+//! retain; see "Reclamation"). So `born` is unique
 //! per (node, page), and the version a child forked at `f` sees is the one with the greatest
 //! `born <= f`, provided `f < died`. The versions are kept in a map ordered by `born`, which makes
 //! that lookup a predecessor search and a release a removal by key — Driscoll, Sarnak, Sleator and
@@ -87,7 +96,7 @@ use std::collections::BTreeMap;
 
 use super::arena::{Arena, Slot};
 use super::linear_map::LinearMap;
-use super::page_map::PageMap;
+use super::page_map::{MapWork, PageMap};
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
@@ -228,15 +237,10 @@ struct BranchState {
     /// The fork epoch at which this branch's ancestry leaves the trunk: its own fork epoch if its
     /// parent is the trunk, else its parent's `trunk_at`.
     trunk_at: u64,
-    /// Every arena page this branch sees through its ancestors: its parent's `view` at the fork.
-    inherited: PageMap,
-    /// Slots this branch took over from ancestors spliced out above it (see [`BranchStore::splice`]):
-    /// pages only this branch still sees, through `inherited`. Freed with the branch.
-    adopted: Vec<Slot>,
-    /// `inherited` plus this branch's current pages, for its children to inherit. Kept from the
-    /// branch's creation (a clone of `inherited`, one reference count) and by each of its writes,
-    /// so a fork clones it in O(1) whatever the branch wrote before its first fork. (Built lazily
-    /// at the first fork instead, that fork cost one insert per page the branch had written.)
+    /// Every arena page this branch sees: its parent's `view` at the fork (a clone, one reference
+    /// count), updated by each of the branch's writes, so a fork clones it in O(1) whatever the
+    /// branch wrote before. Its leaves hold the counted references that keep branch slots alive
+    /// (see "Reclamation"). `None` once the branch is dead: it released the map.
     view: Option<PageMap>,
 }
 
@@ -461,6 +465,11 @@ impl BranchStore {
             ..
         } = &mut *inner;
         let st = branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
+        if !st.handle && !st.open {
+            // Dead: no handle and no connection, so nothing in the engine can name it, and its map
+            // is released. Only a store-level caller could get here.
+            return Err(gone(parent));
+        }
         if st.writer {
             return Err(LimboError::Busy);
         }
@@ -468,18 +477,10 @@ impl BranchStore {
         st.lineage.epoch += 1;
         st.lineage.children.insert(f, Child::new(id));
         let schema = st.schema.clone();
-        let (current, inherited) = (&st.current, &st.inherited);
         let view = st
             .view
-            .get_or_insert_with(|| {
-                let mut view = inherited.clone();
-                for (&page, owned) in current.iter() {
-                    work.map_nodes_copied += view.insert(page, owned.slot);
-                    work.view_inserts += 1;
-                }
-                view
-            })
-            .clone();
+            .clone()
+            .expect("a branch with a handle or a connection keeps its map");
         let trunk_at = st.trunk_at;
         let after = counted_insert(
             branches,
@@ -547,6 +548,9 @@ impl BranchStore {
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
         let mut inner = self.inner.lock();
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        if !st.handle && !st.open {
+            return Err(gone(id));
+        }
         if st.writer {
             return Err(LimboError::Busy);
         }
@@ -592,56 +596,42 @@ impl BranchStore {
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         crate::turso_assert!(st.writer, "branch page written outside a write transaction");
         let epoch = st.lineage.epoch;
-        match st.current.get(&page).copied() {
+        if st.current.get(&page).is_some_and(|o| o.born == epoch) {
+            // Already decided since the branch's last fork: no child has seen this slot.
+            return Ok(());
+        }
+        let view = st
+            .view
+            .as_mut()
+            .expect("a branch with a write transaction keeps its map");
+        let mut w = MapWork::default();
+        // The slot this branch sees now, with the path to it made this map's own. If no other map
+        // names it — no child forked since it was written, no sibling or ancestor still reads it —
+        // the write goes in place; else it takes a new slot and the others keep the old one.
+        let reuse = view.get(page).filter(|&seen| {
+            view.set(page, seen, arena, &mut w);
+            arena.refs(seen) == 1
+        });
+        let slot = match reuse {
+            Some(slot) => {
+                work.writes_in_place += 1;
+                slot
+            }
             None => {
                 let slot = arena.alloc();
                 arena.page_mut(slot).copy_from_slice(pre_image);
-                counted_insert(
-                    &mut st.current,
-                    page,
-                    Owned { slot, born: epoch },
-                    &mut work.page_table_moved,
-                );
-                if let Some(view) = st.view.as_mut() {
-                    work.map_nodes_copied += view.insert(page, slot);
-                }
+                view.set(page, slot, arena, &mut w);
+                slot
             }
-            Some(owned) if owned.born == epoch => {}
-            Some(owned) => {
-                if st.lineage.has_child_in(owned.born, epoch) {
-                    let slot = arena.alloc();
-                    arena.page_mut(slot).copy_from_slice(pre_image);
-                    st.lineage.retain(
-                        page,
-                        Retained {
-                            born: owned.born,
-                            died: epoch,
-                            slot: owned.slot,
-                        },
-                        work,
-                    );
-                    st.current.insert(
-                        page,
-                        Owned { slot, born: epoch },
-                        &mut work.page_table_moved,
-                    );
-                    if let Some(view) = st.view.as_mut() {
-                        work.map_nodes_copied += view.insert(page, slot);
-                    }
-                } else {
-                    // No live child can see the current version: it is rewritten in its own slot,
-                    // which is already the one `view` names.
-                    st.current.insert(
-                        page,
-                        Owned {
-                            slot: owned.slot,
-                            born: epoch,
-                        },
-                        &mut work.page_table_moved,
-                    );
-                }
-            }
-        }
+        };
+        work.map_nodes_copied += w.nodes_copied;
+        work.map_slot_increfs += w.slot_increfs;
+        counted_insert(
+            &mut st.current,
+            page,
+            Owned { slot, born: epoch },
+            &mut work.page_table_moved,
+        );
         Ok(())
     }
 
@@ -759,7 +749,6 @@ impl BranchStore {
             return Vec::new();
         };
         let mut slots: Vec<u32> = st.current.values().map(|o| o.slot).collect();
-        slots.extend(st.adopted.iter().copied());
         for versions in st.lineage.retained.values() {
             slots.extend(versions.values().map(|v| v.slot));
         }
@@ -793,12 +782,13 @@ impl BranchStore {
             if st.handle || st.open {
                 return freed;
             }
-            if !st.lineage.children.is_empty() && !st.current.is_empty() {
+            if st.view.is_some() {
                 freed += self.retire(inner, id);
             }
             let st = inner.branches.get(&id).expect("looked up above");
             if st.lineage.children.len() == 1 {
-                return freed + self.splice(inner, id);
+                self.splice(inner, id);
+                return freed;
             }
             if !st.lineage.children.is_empty() {
                 return freed;
@@ -815,15 +805,10 @@ impl BranchStore {
                 ..
             } = &mut *inner;
             let arena = arena.as_mut().expect("a branch existed, so the arena does");
-            for owned in st.current.values() {
-                arena.release(owned.slot);
-                freed += 1;
-            }
-            for &slot in &st.adopted {
-                arena.release(slot);
-                freed += 1;
-            }
-            freed += st.lineage.release_all(arena).len();
+            crate::turso_assert!(
+                st.lineage.retained.is_empty(),
+                "a branch lineage retained a version; branch versions live by reference count"
+            );
             if st.parent.is_trunk() {
                 freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
@@ -839,14 +824,9 @@ impl BranchStore {
 }
 
 impl BranchStore {
-    /// `id` has no handle and no connection, so it will never be written or forked again, and
-    /// each of its current versions is now exactly a version `[born, epoch)` whose readers are its
-    /// children forked inside that range. File each such version as retained — the reaps of those
-    /// children then free it the moment its last reader goes — and free at once each one that no
-    /// live child can read: a page written after the branch's last fork is invisible to every
-    /// child. Without this, those pages were held until the branch itself was freed, however long
-    /// its children lived. Runs once per branch, O(its current pages · log V). Returns the pages
-    /// freed.
+    /// `id` has no handle and no connection, so it will never be written, read or forked again:
+    /// release its map. A slot only this map named is freed; one a child's map (or anyone's) still
+    /// names lives on there. Returns the pages freed.
     fn retire(&self, inner: &mut StoreInner, id: BranchId) -> usize {
         let StoreInner {
             arena,
@@ -856,80 +836,44 @@ impl BranchStore {
         } = &mut *inner;
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).expect("the caller looked it up");
-        let epoch = st.lineage.epoch;
-        let mut freed = 0;
-        for (page, owned) in st.current.drain() {
-            work.retired += 1;
-            if st.lineage.has_child_in(owned.born, epoch) {
-                st.lineage.retain(
-                    page,
-                    Retained {
-                        born: owned.born,
-                        died: epoch,
-                        slot: owned.slot,
-                    },
-                    work,
-                );
-            } else {
-                arena.release(owned.slot);
-                freed += 1;
-            }
+        let mut w = MapWork::default();
+        if let Some(mut view) = st.view.take() {
+            view.release(arena, &mut w);
         }
-        // Nothing will fork from it again, so nothing will read its view.
-        st.view = None;
-        freed
+        work.retired += st.current.len() as u64;
+        st.current = LinearMap::default();
+        w.freed as usize
     }
 
-    /// Remove `id` — no handle, no connection, exactly one live child — from the tree, and give its
-    /// child its place: the child becomes its parent's child at `id`'s fork epoch, and takes over
-    /// every slot of `id`'s that it sees. That is all of `id`'s retained versions (each holds a live
-    /// child's fork epoch, and there is one child) and its current pages written before the child's
-    /// fork; its later writes nobody can see, and they are freed. Nothing the child resolves
-    /// changes: its `inherited` map already names those slots, and it saw the parent as of `id`'s
-    /// fork, which is the epoch it now holds there. The cost is `id`'s own pages plus the smaller
-    /// of the two adopted lists, so a chain of dead ancestors costs O(1) states instead of one each
-    /// (ZFS `promote` hands a clone's origin snapshots to the clone the same way). Returns the
-    /// pages freed.
-    fn splice(&self, inner: &mut StoreInner, id: BranchId) -> usize {
+    /// Remove `id` — dead, map released, exactly one live child — from the tree and give the child
+    /// its place: the child becomes its parent's child at `id`'s fork epoch, which is what it saw
+    /// of that parent. Nothing moves: every slot the child reads is named, and counted, by its own
+    /// map. So a chain of dead ancestors costs one state, not one each.
+    fn splice(&self, inner: &mut StoreInner, id: BranchId) {
         let st = inner
             .branches
             .remove(&id, &mut inner.work.branch_table_moved)
             .expect("the caller looked it up");
+        crate::turso_assert!(
+            st.view.is_none() && st.lineage.retained.is_empty(),
+            "a spliced branch still names or retains a slot"
+        );
         let StoreInner {
-            arena,
             trunk,
             branches,
             work,
             ..
         } = &mut *inner;
-        let arena = arena.as_mut().expect("a branch existed, so the arena does");
-        let (&fc, child) = st
+        let child_id = st
             .lineage
             .children
-            .iter()
+            .values()
             .next()
-            .expect("the caller saw exactly one child");
-        let child_id = child.id;
-        let mut freed = 0;
-        let mut keep: Vec<Slot> = st.adopted;
-        for owned in st.current.values() {
-            if owned.born <= fc {
-                keep.push(owned.slot);
-            } else {
-                arena.release(owned.slot);
-                freed += 1;
-            }
-        }
-        for versions in st.lineage.retained.values() {
-            keep.extend(versions.values().map(|v| v.slot));
-        }
+            .expect("the caller saw exactly one child")
+            .id;
         let c = branches
             .get_mut(&child_id)
             .expect("a live branch's child is live");
-        if c.adopted.len() < keep.len() {
-            std::mem::swap(&mut c.adopted, &mut keep);
-        }
-        c.adopted.extend(keep);
         c.parent = st.parent;
         c.fork_epoch = st.fork_epoch;
         work.splices += 1;
@@ -946,13 +890,12 @@ impl BranchStore {
             .get_mut(&st.fork_epoch)
             .expect("the parent lists the spliced branch")
             .id = child_id;
-        freed
     }
 }
 
 impl StoreInner {
-    /// `levels` counts the nodes consulted — the branch (its own pages and its `inherited` map),
-    /// then the trunk if neither holds the page — and `examined` the retained versions compared.
+    /// `levels` counts the nodes consulted — the branch (its map), then the trunk if the map does
+    /// not hold the page — and `examined` the retained versions compared.
     fn resolve(
         &self,
         id: BranchId,
@@ -962,12 +905,8 @@ impl StoreInner {
     ) -> Result<Option<Slot>> {
         *levels += 1;
         let st = self.branches.get(&id).ok_or_else(|| gone(id))?;
-        // A branch sees all of its own versions; its ancestors' as of its fork, which `inherited`
-        // froze then.
-        if let Some(owned) = st.current.get(&page) {
-            return Ok(Some(owned.slot));
-        }
-        if let Some(slot) = st.inherited.get(page) {
+        // A branch sees its own versions and its ancestors' as of its fork, all through its map.
+        if let Some(slot) = st.view.as_ref().and_then(|view| view.get(page)) {
             return Ok(Some(slot));
         }
         *levels += 1;
@@ -995,7 +934,7 @@ impl BranchState {
         fork_epoch: u64,
         schema: Arc<Schema>,
         trunk_at: u64,
-        inherited: PageMap,
+        view: PageMap,
     ) -> Self {
         Self {
             parent,
@@ -1007,9 +946,7 @@ impl BranchState {
             open: false,
             writer: false,
             trunk_at,
-            adopted: Vec::new(),
-            view: Some(inherited.clone()),
-            inherited,
+            view: Some(view),
         }
     }
 }
