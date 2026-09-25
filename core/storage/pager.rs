@@ -1832,6 +1832,11 @@ impl Pager {
         self.branch.get().map(|b| b.id)
     }
 
+    /// Pages in this pager's private page cache. Observation only (branch session footprint).
+    pub(crate) fn page_cache_len(&self) -> usize {
+        self.page_cache.read().len()
+    }
+
     /// Paths that rewrite pages WITHOUT going through `add_dirty` take no copy decision, so they
     /// would change what a branch reads. They refuse while any branch exists, and on a branch.
     fn refuse_if_branching(&self, what: &str) -> Result<()> {
