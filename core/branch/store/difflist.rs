@@ -153,6 +153,11 @@ pub struct ListWork {
     /// Of those, the ones visited while holding the store's mutex: all of them, except for a
     /// snapshot listing, which visits none under it.
     pub under_lock: u64,
+    /// A snapshot listing's walk: the trie nodes it visited and the leaf slots it read (32 per
+    /// leaf, empty or not). `entries_visited` counts only the entries it found; this is its work.
+    /// Zero for the other arms.
+    pub trie_nodes: u64,
+    pub trie_leaf_slots: u64,
     pub output: u64,
     /// The branch table's entries and capacity at the call: a scan's time follows the capacity.
     pub table_len: u64,
@@ -265,6 +270,8 @@ impl BranchStore {
         let mut t = TrieWork::default();
         snapshot.for_each(&mut t, &mut |id, _| ids.push(BranchId(u64::from(id))));
         work.entries_visited = t.reported;
+        work.trie_nodes = t.nodes;
+        work.trie_leaf_slots = t.leaf_entries;
         work.output = ids.len() as u64;
         Ok(Listing { ids, work })
     }
@@ -902,8 +909,12 @@ mod tests {
                     );
                     let w = got.work;
                     let exact = match (arm, filter) {
+                        // A leaf holds 32 slots and a u32 path at most 7 nodes, so the walk's work is
+                        // at most 39 per entry it returns.
                         (ListArm::Snapshot, ListFilter::All | ListFilter::Parent(_)) => {
-                            w.entries_visited == w.output && w.under_lock == 0
+                            w.entries_visited == w.output
+                                && w.under_lock == 0
+                                && w.trie_nodes + w.trie_leaf_slots <= 39 * w.output
                         }
                         (ListArm::Scan, _) => w.entries_visited == w.table_len,
                         (_, ListFilter::Parent(_)) => w.entries_visited >= w.output,

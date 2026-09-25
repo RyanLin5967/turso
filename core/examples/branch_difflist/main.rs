@@ -399,7 +399,7 @@ impl Bench {
 }
 
 const DIFF_HEADER: &str = "x\tpair\tarm\tsamples\tk_mean\tk_min\tk_max\tresolved\tarena\ttrie_nodes\ttrie_leaf\ttrunk_mean\ttrunk_min\ttrunk_max\twork_mean\twork_min\twork_max\twork_per_k\ttrie_reported\ttrie_pruned[\tp50_us\tp90_us\tmax_us]";
-const LIST_HEADER: &str = "x\tquery\tarm\tsamples\tout_mean\tout_min\tout_max\tvisited_mean\tvisited_min\tvisited_max\tvisited_per_out\ttable_len\ttable_capacity\tunder_lock_mean[\tp50_us\tp90_us\tmax_us]";
+const LIST_HEADER: &str = "x\tquery\tarm\tsamples\tout_mean\tout_min\tout_max\tvisited_mean\tvisited_min\tvisited_max\tvisited_per_out\ttable_len\ttable_capacity\tunder_lock_mean\tsnap_nodes_mean\tsnap_leaf_mean[\tp50_us\tp90_us\tmax_us]";
 const STALL_HEADER: &str = "x\tlister\top\tops\tp50_us\tp99_us\tp999_us\tmax_us\tlists\tlist_p50_us\tlist_max_us";
 
 fn main() {
@@ -854,7 +854,7 @@ fn list_queries(b: &mut Bench, recs: &[Rec], x: usize) {
                 .sum::<f64>()
                 / k as f64;
             let mut line = format!(
-                "{x}\t{q}\t{arm}\t{k}\t{:.2}\t{}\t{}\t{:.2}\t{}\t{}\t{:.2}\t{}\t{}\t{:.2}",
+                "{x}\t{q}\t{arm}\t{k}\t{:.2}\t{}\t{}\t{:.2}\t{}\t{}\t{:.2}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}",
                 mean(out.iter().copied(), k),
                 out.iter().min().unwrap(),
                 out.iter().max().unwrap(),
@@ -865,6 +865,8 @@ fn list_queries(b: &mut Bench, recs: &[Rec], x: usize) {
                 w[0].table_len,
                 w[0].table_capacity,
                 mean(w.iter().map(|w| w.under_lock), k),
+                mean(w.iter().map(|w| w.trie_nodes), k),
+                mean(w.iter().map(|w| w.trie_leaf_slots), k),
             );
             if !c.us.is_empty() {
                 let mut us = c.us.clone();
