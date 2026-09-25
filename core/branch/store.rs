@@ -2832,4 +2832,221 @@ mod sota_tree_tests {
         assert_eq!(store.stats().unwrap().live_branches, 0, "seed {seed:#x}: branches leaked");
         assert_eq!(store.stats().unwrap().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
     }
+
+    /// The failpoints this test kills the store at, each armed just before the operation that
+    /// consumes it.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum Kill {
+        ForkFlush,
+        TrunkBarrier,
+        CommitAfterSlots,
+        CommitFlush,
+        ReleaseFlush,
+        CompactAfterRename,
+    }
+    const KILLS: [Kill; 6] = [
+        Kill::ForkFlush,
+        Kill::TrunkBarrier,
+        Kill::CommitAfterSlots,
+        Kill::CommitFlush,
+        Kill::ReleaseFlush,
+        Kill::CompactAfterRename,
+    ];
+
+    /// kill -9 AT THE FAILPOINTS (round 11 PREREG D3): the same random tree, durable, but now and
+    /// then the next operation is made to fail at one of the store's failpoints — a fork or commit
+    /// whose record never becomes durable, a commit that wrote its slots and died before its
+    /// record, a trunk commit that died at its barrier, a release whose record failed, a compaction
+    /// that died after renaming its snapshot. The process "dies" there: every branch file is copied
+    /// as it stands and the copy is opened, and the workload CONTINUES on the recovered store, so
+    /// forks, commits, reaps and compactions run against state that recovery rebuilt (the page maps
+    /// `derive_page_maps` made, the indexes `Lineage::retain` refilled). The model is the state the
+    /// failed operation did not reach. After every recovery every live branch reads every page as
+    /// the model says and the indexes agree; at the end every branch is released and the arena is
+    /// empty, so no recovery leaked a slot or freed one twice.
+    #[test]
+    fn every_branch_reads_as_the_model_says_after_a_kill_at_any_failpoint() {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            run_killed(seed);
+        }
+    }
+
+    fn run_killed(seed: u64) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut name = "db".to_string();
+        let mut store = open_store(true, dir.path(), &name);
+        let mut rng = Rng(seed);
+        let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut generation = 0u64;
+        let mut kills: HashMap<Kill, u32> = HashMap::new();
+        let (mut max_depth, mut lives) = (0, 0);
+        for step in 0..2000 {
+            let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
+            // One operation in ten is killed at a failpoint that operation consumes.
+            let kill = rng.below(10) == 0;
+            let arm = |store: &BranchStore, fp: BranchFailpoint| {
+                if kill {
+                    store.set_failpoint(Some(fp));
+                }
+            };
+            let mut killed: Option<Kill> = None;
+            match rng.below(13) {
+                0..=3 if live.len() < 50 => {
+                    let from_trunk = live.is_empty() || rng.below(4) == 0;
+                    arm(&store, BranchFailpoint::LogFlushFails);
+                    let (forked, sees, depth) = if from_trunk {
+                        (store.fork_trunk(Arc::new(Schema::default()), PAGE), trunk.clone(), 1)
+                    } else {
+                        let parent = if rng.below(2) == 0 {
+                            *live.last().unwrap()
+                        } else {
+                            live[rng.below(live.len() as u64) as usize]
+                        };
+                        let r = store.fork_branch(nodes[parent].id);
+                        if r.is_ok() {
+                            nodes[parent].forked = true;
+                        }
+                        (r, nodes[parent].sees.clone(), nodes[parent].depth + 1)
+                    };
+                    match forked {
+                        Ok(id) => {
+                            max_depth = max_depth.max(depth);
+                            nodes.push(Node { id, sees, handle: true, depth, forked: false });
+                        }
+                        Err(e) => {
+                            assert!(kill, "seed {seed:#x} step {step}: fork failed unarmed: {e}");
+                            killed = Some(Kill::ForkFlush);
+                        }
+                    }
+                }
+                4..=5 => {
+                    let page = rng.below(u64::from(PAGES)) as u32;
+                    if store.trunk_has_children() {
+                        store.first_write_trunk(page, &image(trunk[&page])).unwrap();
+                    }
+                    arm(&store, BranchFailpoint::BarrierBeforeRecords);
+                    match store.durability_barrier() {
+                        Ok(()) => {
+                            generation += 1;
+                            trunk.insert(page, generation);
+                        }
+                        // The trunk commit dies at its barrier: it never happened.
+                        Err(e) => {
+                            assert!(kill, "seed {seed:#x} step {step}: barrier failed unarmed: {e}");
+                            killed = Some(Kill::TrunkBarrier);
+                        }
+                    }
+                }
+                6..=9 if !live.is_empty() => {
+                    let v = live[rng.below(live.len() as u64) as usize];
+                    let id = nodes[v].id;
+                    store.begin_write(id).unwrap();
+                    let mut committed = Vec::new();
+                    let mut sees = nodes[v].sees.clone();
+                    for _ in 0..=rng.below(2) {
+                        let page = rng.below(u64::from(PAGES)) as u32;
+                        if committed.iter().any(|p: &PageRef| p.get().id == page as usize) {
+                            continue;
+                        }
+                        store.first_write_branch(id, page).unwrap();
+                        generation += 1;
+                        committed.push(page_with(page, generation));
+                        sees.insert(page, generation);
+                    }
+                    let fp = if rng.below(2) == 0 {
+                        BranchFailpoint::CommitAfterSlotsBeforeRecord
+                    } else {
+                        BranchFailpoint::LogFlushFails
+                    };
+                    arm(&store, fp);
+                    match store.commit_pages(id, &committed) {
+                        Ok(()) => {
+                            store.end_write(id);
+                            nodes[v].sees = sees;
+                        }
+                        // The commit is not durable: the branch is as it was.
+                        Err(e) => {
+                            assert!(kill, "seed {seed:#x} step {step}: commit failed unarmed: {e}");
+                            killed = Some(if fp == BranchFailpoint::LogFlushFails {
+                                Kill::CommitFlush
+                            } else {
+                                Kill::CommitAfterSlots
+                            });
+                        }
+                    }
+                }
+                10..=11 if !live.is_empty() => {
+                    let v = live[rng.below(live.len() as u64) as usize];
+                    arm(&store, BranchFailpoint::LogFlushFails);
+                    match store.release_handle(nodes[v].id) {
+                        Ok(_) => nodes[v].handle = false,
+                        // The release is not durable: the branch comes back, detached.
+                        Err(e) => {
+                            assert!(kill, "seed {seed:#x} step {step}: release failed unarmed: {e}");
+                            killed = Some(Kill::ReleaseFlush);
+                        }
+                    }
+                }
+                12 if !nodes.is_empty() => {
+                    arm(&store, BranchFailpoint::CompactAfterRenameBeforeLogReset);
+                    if let Err(e) = store.compact_now() {
+                        assert!(kill, "seed {seed:#x} step {step}: compaction failed unarmed: {e}");
+                        killed = Some(Kill::CompactAfterRename);
+                    }
+                }
+                _ => {}
+            }
+            // An armed failpoint the operation did not consume (a barrier with nothing to flush)
+            // is disarmed: the operation completed.
+            store.set_failpoint(None);
+            let check = |s: &BranchStore, what: &str| {
+                let mut buf = vec![0u8; PAGE];
+                for n in nodes.iter().filter(|n| n.handle) {
+                    for page in 0..PAGES {
+                        let got = if s.resolve_into(n.id, page, &mut buf).unwrap() {
+                            u64::from_le_bytes(buf[..8].try_into().unwrap())
+                        } else {
+                            trunk[&page]
+                        };
+                        assert_eq!(
+                            got, n.sees[&page],
+                            "seed {seed:#x} step {step} {what}: branch {} at depth {} read the \
+                             wrong page {page}",
+                            n.id.0, n.depth
+                        );
+                    }
+                }
+            };
+            if let Some(k) = killed {
+                *kills.entry(k).or_default() += 1;
+                let next = format!("life{lives}");
+                lives += 1;
+                let recovered = crash_image(dir.path(), &name, &next);
+                recovered.check_indexes();
+                check(&recovered, &format!("after a kill at {k:?}"));
+                // The dead process's store goes; the workload continues on what recovery built.
+                store = recovered;
+                name = next;
+            } else {
+                check(&store, "live");
+            }
+        }
+        for k in KILLS {
+            assert!(
+                kills.get(&k).copied().unwrap_or(0) > 0,
+                "seed {seed:#x}: no kill at {k:?} (kills {kills:?})"
+            );
+        }
+        assert!(max_depth >= 10, "seed {seed:#x}: max depth {max_depth}");
+        for n in nodes.iter().filter(|n| n.handle) {
+            store.release_handle(n.id).unwrap();
+        }
+        assert_eq!(store.stats().unwrap().live_branches, 0, "seed {seed:#x}: branches leaked");
+        assert_eq!(
+            store.stats().unwrap().arena_slots_in_use,
+            0,
+            "seed {seed:#x}: slots leaked across {lives} recoveries"
+        );
+    }
 }
