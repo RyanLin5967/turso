@@ -728,7 +728,7 @@ impl BranchStore {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
-            arena_handles: inner.arena.as_ref().map_or(0, |a| a.handle_high_water()),
+            arena_handles: inner.arena.as_ref().map_or(0, |a| a.handles_held()),
             work,
         }
     }

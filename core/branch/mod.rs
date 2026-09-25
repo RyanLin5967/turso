@@ -181,8 +181,8 @@ pub struct BranchStats {
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
-    /// Handles the arena's handle table has had to hold at once (one 8-byte word each): the one
-    /// arena structure that stays at its peak.
+    /// Handle entries the arena's table holds, 8 bytes each: 512 per handle block that still has a
+    /// live handle (the table shrinks with the live set; see `arena`).
     pub arena_handles: usize,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,

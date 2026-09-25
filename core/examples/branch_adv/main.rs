@@ -26,6 +26,8 @@ struct Args {
     page_size: usize,
     time: bool,
     stall_us: f64,
+    /// arena: keep every `stride`-th slot of the burst (default 256, one per frame chunk).
+    stride: usize,
 }
 
 fn die(msg: &str) -> ! {
@@ -43,6 +45,7 @@ fn parse_args() -> Args {
         page_size: 64,
         time: false,
         stall_us: 100.0,
+        stride: 256,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -61,6 +64,7 @@ fn parse_args() -> Args {
             "--page-size" => a.page_size = val().parse().unwrap_or_else(|_| die("bad --page-size")),
             "--stall-us" => a.stall_us = val().parse().unwrap_or_else(|_| die("bad --stall-us")),
             "--time" => a.time = true,
+            "--stride" => a.stride = val().parse().unwrap_or_else(|_| die("bad --stride")),
             _ => die(&format!("unknown flag {flag}")),
         }
     }
@@ -426,7 +430,7 @@ fn arm_arena(a: &Args) {
         let mut reap = Summary::default();
         let mut kept = Vec::new();
         for (i, id) in ids.into_iter().enumerate() {
-            if i % 256 == 0 {
+            if i % a.stride == 0 {
                 kept.push(id);
                 continue;
             }
@@ -441,7 +445,7 @@ fn arm_arena(a: &Args) {
         }
         let st = s.stats();
         let live = st.arena_slots_in_use;
-        check(live == v.div_ceil(256), "live slots = ceil(V/256)");
+        check(live == v.div_ceil(a.stride), "live slots = ceil(V/stride)");
         println!(
             "space V={v} live_slots={live} free_slots={} held_slots={} held_over_live={:.2} \
              held_bytes={} live_bytes={} handles={} handle_bytes={}",
@@ -648,7 +652,7 @@ fn main() {
         .unwrap_or_default();
     println!(
         "# branch_adv arm={} n={} list={:?} cycles={} seed={:#x} page_size={} time={} stall_us={} \
-         cwd_head={head} branch_entry_bytes={}",
+         stride={} cwd_head={head} branch_entry_bytes={}",
         a.arm,
         a.n,
         a.list,
@@ -657,6 +661,7 @@ fn main() {
         a.page_size,
         a.time,
         a.stall_us,
+        a.stride,
         StoreBench::branch_entry_bytes()
     );
     match a.arm.as_str() {

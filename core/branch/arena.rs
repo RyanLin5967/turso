@@ -27,10 +27,18 @@
 //!   others and freed. It holds at most half a chunk (the sparsest is at most the average, which
 //!   is under half), so one release copies at most 128 pages and frees at least 128 frames, which
 //!   keeps free frames at most live frames plus one chunk: held <= 2·live + 256.
-//! * Nothing here relocates a growing vector: free frames are threaded through each chunk, free
-//!   handles through the handle table, and both directories are two-level with a top level
-//!   reserved at creation. The handle table keeps one word per slot the arena has ever had live at
-//!   once — 8 bytes against a page — and that is the only thing that stays at the peak.
+//! * A handle cannot move — page maps name it, from however many leaves — so the handle table
+//!   cannot be compacted the way frames are. It is a slab too: blocks of 512 handles (4 KiB), each
+//!   with its own free list, allocated lowest-block-first (address-ordered first fit) and freed when
+//!   their last handle is. So the table holds at most one 4 KiB block per live slot — a constant
+//!   factor, not the peak — and after a burst it shrinks to the blocks that still hold a survivor.
+//!   (Only relocating handles would do better: back-references from each slot to the leaves that
+//!   name it, as btrfs keeps from extents to tree blocks.)
+//! * Nothing here relocates a growing vector: free frames are threaded through each chunk and free
+//!   handles through each handle block, and both directories are two-level with a top level
+//!   reserved at creation.
+
+use std::collections::BTreeSet;
 
 use crate::turso_assert;
 
@@ -39,9 +47,12 @@ pub(crate) type Slot = u32;
 
 /// Frames per chunk.
 const CHUNK: usize = 256;
-/// Handles per handle block, and chunks per chunk block.
+/// Top-level size of the chunk directory, reserved at creation; and chunks per second-level box.
 const BLOCK: usize = 1 << 16;
 const CHUNK_BLOCK: usize = 256;
+/// Handles per handle block (4 KiB of entries), and handle blocks per second-level directory box.
+const HBLOCK: usize = 512;
+const HDIR: usize = 4096;
 /// A handle entry with this bit set is live and names a frame; clear, it is free and its low
 /// 32 bits are the next free handle plus one (0 = none).
 const LIVE: u64 = 1 << 63;
@@ -70,12 +81,25 @@ enum ChunkSlot {
     Spare(u32),
 }
 
+/// 512 handle entries (see [`LIVE`]), with the free ones threaded as index plus one (0 = none).
+struct HandleBlock {
+    entries: [u64; HBLOCK],
+    free_head: u32,
+    live: u32,
+}
+
 pub(crate) struct Arena {
     page_size: usize,
-    /// `handles[h >> 16][h & 0xFFFF]`: see [`LIVE`].
-    handles: Vec<Box<[u64]>>,
-    handle_high_water: u32,
-    free_handle: u32,
+    /// Handle block `b` (handles `[512·b, 512·(b+1))`) at `hdir[b / 4096][b % 4096]`, `None`
+    /// while no handle in it is live.
+    hdir: Vec<Box<[Option<Box<HandleBlock>>]>>,
+    /// Handle blocks ever created; every handle below `512 ·` this has been handed out or could be.
+    hblock_high: u32,
+    /// Held handle blocks with a free handle: allocation takes the lowest.
+    hfree: BTreeSet<u32>,
+    /// Block ids below `hblock_high` whose block is not held.
+    hspare: BTreeSet<u32>,
+    held_hblocks: usize,
     /// `chunks[c >> 8][c & 0xFF]`.
     chunks: Vec<Box<[ChunkSlot]>>,
     chunk_high_water: u32,
@@ -97,9 +121,11 @@ impl Arena {
     pub(crate) fn new(page_size: usize) -> Self {
         Self {
             page_size,
-            handles: Vec::with_capacity(BLOCK),
-            handle_high_water: 0,
-            free_handle: 0,
+            hdir: Vec::with_capacity((1usize << 32) / (HBLOCK * HDIR)),
+            hblock_high: 0,
+            hfree: BTreeSet::new(),
+            hspare: BTreeSet::new(),
+            held_hblocks: 0,
             chunks: Vec::with_capacity(BLOCK),
             chunk_high_water: 0,
             spare_id: 0,
@@ -145,12 +171,90 @@ impl Arena {
         }
     }
 
+    fn hblock(&self, b: u32) -> Option<&HandleBlock> {
+        self.hdir
+            .get(b as usize / HDIR)?
+            .get(b as usize % HDIR)?
+            .as_deref()
+    }
+
+    fn hblock_mut(&mut self, b: u32) -> &mut HandleBlock {
+        self.hdir[b as usize / HDIR][b as usize % HDIR]
+            .as_deref_mut()
+            .expect("a held handle block")
+    }
+
     fn entry(&self, h: Slot) -> u64 {
-        self.handles[h as usize / BLOCK][h as usize % BLOCK]
+        self.hblock(h / HBLOCK as u32).expect("a held handle block").entries[h as usize % HBLOCK]
     }
 
     fn entry_mut(&mut self, h: Slot) -> &mut u64 {
-        &mut self.handles[h as usize / BLOCK][h as usize % BLOCK]
+        &mut self.hblock_mut(h / HBLOCK as u32).entries[h as usize % HBLOCK]
+    }
+
+    fn handle_high_water(&self) -> u32 {
+        self.hblock_high.saturating_mul(HBLOCK as u32)
+    }
+
+    /// A free handle from the lowest held block that has one, else from a new block.
+    fn alloc_handle(&mut self) -> Slot {
+        let b = match self.hfree.first().copied() {
+            Some(b) => b,
+            None => {
+                let b = self.hspare.pop_first().unwrap_or_else(|| {
+                    let b = self.hblock_high;
+                    turso_assert!(
+                        (b as usize + 1) * HBLOCK <= u32::MAX as usize,
+                        "the arena ran out of handles"
+                    );
+                    self.hblock_high += 1;
+                    if b as usize / HDIR == self.hdir.len() {
+                        self.hdir
+                            .push(std::iter::repeat_with(|| None).take(HDIR).collect());
+                    }
+                    b
+                });
+                let mut entries = [0u64; HBLOCK];
+                for (i, e) in entries.iter_mut().enumerate().take(HBLOCK - 1) {
+                    *e = i as u64 + 2;
+                }
+                self.hdir[b as usize / HDIR][b as usize % HDIR] = Some(Box::new(HandleBlock {
+                    entries,
+                    free_head: 1,
+                    live: 0,
+                }));
+                self.held_hblocks += 1;
+                self.hfree.insert(b);
+                b
+            }
+        };
+        let blk = self.hblock_mut(b);
+        let i = blk.free_head - 1;
+        blk.free_head = blk.entries[i as usize] as u32;
+        blk.live += 1;
+        if blk.free_head == 0 {
+            self.hfree.remove(&b);
+        }
+        b * HBLOCK as u32 + i
+    }
+
+    /// Return handle `h` to its block, and the block to the allocator if that was its last.
+    fn free_handle(&mut self, h: Slot) {
+        let b = h / HBLOCK as u32;
+        let blk = self.hblock_mut(b);
+        let was_full = blk.free_head == 0;
+        let i = h % HBLOCK as u32;
+        blk.entries[i as usize] = u64::from(blk.free_head);
+        blk.free_head = i + 1;
+        blk.live -= 1;
+        if blk.live == 0 {
+            self.hdir[b as usize / HDIR][b as usize % HDIR] = None;
+            self.held_hblocks -= 1;
+            self.hfree.remove(&b);
+            self.hspare.insert(b);
+        } else if was_full {
+            self.hfree.insert(b);
+        }
     }
 
     fn unlink(&mut self, c: u32) {
@@ -277,20 +381,7 @@ impl Arena {
     }
 
     pub(crate) fn alloc(&mut self) -> Slot {
-        let h = if self.free_handle != 0 {
-            let h = self.free_handle - 1;
-            self.free_handle = self.entry(h) as u32;
-            h
-        } else {
-            let h = self.handle_high_water;
-            turso_assert!(h != u32::MAX, "the arena ran out of handles");
-            if h as usize / BLOCK == self.handles.len() {
-                turso_assert!(self.handles.len() < BLOCK, "the handle directory is full");
-                self.handles.push(vec![0u64; BLOCK].into_boxed_slice());
-            }
-            self.handle_high_water += 1;
-            h
-        };
+        let h = self.alloc_handle();
         let c = self.fullest(NIL).unwrap_or_else(|| self.new_chunk());
         let frame = self.take_frame(c, h);
         *self.entry_mut(h) = LIVE | u64::from(frame);
@@ -326,15 +417,14 @@ impl Arena {
     }
 
     pub(crate) fn release(&mut self, slot: Slot) {
-        turso_assert!(slot < self.handle_high_water, "released a slot the arena never handed out");
+        turso_assert!(slot < self.handle_high_water(), "released a slot the arena never handed out");
         turso_assert!(!self.is_free(slot), "released an arena slot that was already free");
         turso_assert!(
             self.entry(slot) & REF_MASK == 0,
             "released an arena slot a page map still names"
         );
         let frame = self.entry(slot) as u32;
-        *self.entry_mut(slot) = u64::from(self.free_handle);
-        self.free_handle = slot + 1;
+        self.free_handle(slot);
         self.live -= 1;
         self.free_frame(frame);
         let free = self.held_chunks * CHUNK - self.live;
@@ -402,7 +492,10 @@ impl Arena {
     }
 
     pub(crate) fn is_free(&self, slot: Slot) -> bool {
-        slot < self.handle_high_water && self.entry(slot) & LIVE == 0
+        slot < self.handle_high_water()
+            && self
+                .hblock(slot / HBLOCK as u32)
+                .is_none_or(|blk| blk.entries[slot as usize % HBLOCK] & LIVE == 0)
     }
 
     pub(crate) fn in_use(&self) -> usize {
@@ -411,7 +504,7 @@ impl Arena {
 
     /// Every slot currently handed out, for membership checks.
     pub(crate) fn slots_in_use(&self) -> Vec<Slot> {
-        (0..self.handle_high_water)
+        (0..self.handle_high_water())
             .filter(|&s| !self.is_free(s))
             .collect()
     }
@@ -421,9 +514,9 @@ impl Arena {
         self.held_chunks * CHUNK - self.live
     }
 
-    /// Handles the table has ever needed at once: its size in words.
-    pub(crate) fn handle_high_water(&self) -> usize {
-        self.handle_high_water as usize
+    /// Handle entries the table holds: 512 per block that still has a live handle.
+    pub(crate) fn handles_held(&self) -> usize {
+        self.held_hblocks * HBLOCK
     }
 
     pub(crate) fn page(&self, slot: Slot) -> &[u8] {
@@ -438,7 +531,7 @@ impl Arena {
     }
 
     fn locate(&self, slot: Slot) -> (u32, usize) {
-        turso_assert!(slot < self.handle_high_water, "arena slot out of range");
+        turso_assert!(slot < self.handle_high_water(), "arena slot out of range");
         turso_assert!(!self.is_free(slot), "access to a free arena slot");
         let frame = self.entry(slot) as u32;
         (
@@ -525,6 +618,32 @@ mod tests {
         assert!(arena.compaction().0 > 0, "the scatter must have forced an evacuation");
         for &s in slots.iter().step_by(CHUNK) {
             assert!(arena.page(s).iter().all(|&x| x == (s % 251) as u8), "slot {s} lost its bytes");
+        }
+    }
+
+    /// The handle table shrinks to the blocks that still hold a live handle: after a burst of 40
+    /// handle blocks, keeping every 1,024th slot keeps every other block (20), and keeping only
+    /// the first block's worth keeps one — where a table kept at its peak would hold all 40.
+    #[test]
+    fn handle_blocks_are_freed_when_their_last_handle_is() {
+        for (stride, blocks) in [(1024usize, 20usize), (HBLOCK * 40, 1)] {
+            let mut arena = Arena::new(64);
+            let slots: Vec<Slot> = (0..HBLOCK * 40).map(|_| arena.alloc()).collect();
+            assert_eq!(arena.handles_held(), HBLOCK * 40);
+            for (i, &s) in slots.iter().enumerate() {
+                arena.page_mut(s).fill((s % 251) as u8);
+                if i % stride != 0 {
+                    arena.release(s);
+                }
+            }
+            assert_eq!(arena.handles_held(), HBLOCK * blocks, "stride {stride}");
+            for &s in slots.iter().step_by(stride) {
+                assert!(arena.page(s).iter().all(|&x| x == (s % 251) as u8), "slot {s}");
+                assert!(!arena.is_free(s));
+            }
+            for (i, &s) in slots.iter().enumerate() {
+                assert_eq!(arena.is_free(s), i % stride != 0, "slot {s}");
+            }
         }
     }
 
