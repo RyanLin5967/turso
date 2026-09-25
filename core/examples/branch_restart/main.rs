@@ -283,11 +283,16 @@ fn grow(args: &Args) {
         }
     }
     let st = db.branch_stats().unwrap();
-    if st.live_branches != args.n || st.arena_slots_in_use != args.n {
-        not_a_result(&format!("after growth: {st:?}, expected {} branches and pages", args.n));
+    let tr = db.branch_trunk_retained();
+    if st.live_branches != args.n || st.arena_slots_in_use as u64 != args.n as u64 + tr {
+        not_a_result(&format!(
+            "after growth: {st:?} with {tr} trunk pre-images, expected {} branches and {} pages",
+            args.n,
+            args.n as u64 + tr
+        ));
     }
     println!(
-        "# grown {start} -> {} branches; snapshot size changes observed: {snap_changes}; {}; rss_bytes={}",
+        "# grown {start} -> {} branches; snapshot size changes observed: {snap_changes}; trunk_retained={tr}; {}; rss_bytes={}",
         args.n,
         files.line(),
         rss_bytes()
@@ -349,11 +354,16 @@ fn open(args: &Args) {
     let rss1 = rss_bytes();
     let s = db.branch_open_stats();
     let st = db.branch_stats().unwrap();
-    if st.live_branches != args.n || st.arena_slots_in_use < args.n {
-        not_a_result(&format!("after open: {st:?}, expected {} branches", args.n));
+    let tr = db.branch_trunk_retained();
+    if st.live_branches != args.n || st.arena_slots_in_use as u64 != args.n as u64 + tr {
+        not_a_result(&format!(
+            "after open: {st:?} with {tr} trunk pre-images, expected {} branches and {} pages",
+            args.n,
+            args.n as u64 + tr
+        ));
     }
     println!(
-        "OPEN\tn={}\tlabel={}\tdb_open_us={:.1}\ttrunk_connect_us={:.1}\t{}\t{}\tlive={}\tarena_in_use={}\t\
+        "OPEN\tn={}\tlabel={}\tdb_open_us={:.1}\ttrunk_connect_us={:.1}\t{}\t{}\tlive={}\tarena_in_use={}\ttrunk_retained_now={tr}\t\
          rss_before={rss0}\trss_after_open={rss1}\tfiles_before: {files_before}",
         args.n,
         args.label,

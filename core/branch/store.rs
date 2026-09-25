@@ -1192,6 +1192,13 @@ impl BranchStore {
                 )));
             }
             let arena = arena.as_mut().expect("the trunk has a child, so the arena exists");
+            // r11-restart lane instrument: who asked for this pre-image (observing only).
+            if std::env::var_os("R11_TRACE_TRUNK_RETAIN").is_some() {
+                eprintln!(
+                    "R11_TRACE_TRUNK_RETAIN page={page} born={born} epoch={epoch}\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
             let slot = arena.alloc();
             arena.write_slot(slot, pre_image)?;
             let crc = crc32c::crc32c(pre_image);
@@ -1406,6 +1413,11 @@ impl BranchStore {
 
     pub(crate) fn open_stats(&self) -> BranchOpenStats {
         self.open_stats
+    }
+
+    pub(crate) fn trunk_retained_count(&self) -> u64 {
+        let inner = self.inner.lock();
+        inner.trunk.lineage.retained.values().map(|v| v.len() as u64).sum()
     }
 
     pub(crate) fn read_counters(&self) -> (u64, u64) {

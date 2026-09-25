@@ -476,6 +476,12 @@ impl Database {
         self.branches.read_counters()
     }
 
+    /// Trunk pre-images the store holds now (r11-restart lane instrument).
+    #[doc(hidden)]
+    pub fn branch_trunk_retained(&self) -> u64 {
+        self.branches.trunk_retained_count()
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
