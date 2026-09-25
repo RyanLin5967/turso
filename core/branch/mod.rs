@@ -228,6 +228,16 @@ pub struct BranchWork {
     pub trunk_lock_contended: u64,
     pub trunk_lock_wait_ns: u64,
     pub trunk_lock_hold_ns: u64,
+    /// Children of the trunk registered by a fork.
+    pub trunk_forks: u64,
+    /// WAL read transactions begun by the trunk forks that registered: one each, plus one per internal
+    /// `BusySnapshot` retry. A fork that answered `Busy` never registers and is not counted here.
+    pub trunk_fork_read_txs: u64,
+    /// WAL write-lock acquisitions by the trunk forks that registered: one each, plus one per internal
+    /// `BusySnapshot` retry (which acquired the lock and released it).
+    pub trunk_fork_wal_locks: u64,
+    /// Nanoseconds trunk forks held the WAL write lock, summed; 0 while lock timing is off.
+    pub trunk_fork_wal_hold_ns: u64,
 }
 
 impl BranchWork {
@@ -249,6 +259,10 @@ impl BranchWork {
             trunk_lock_contended,
             trunk_lock_wait_ns,
             trunk_lock_hold_ns,
+            trunk_forks,
+            trunk_fork_read_txs,
+            trunk_fork_wal_locks,
+            trunk_fork_wal_hold_ns,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -265,6 +279,10 @@ impl BranchWork {
         self.trunk_lock_contended += trunk_lock_contended;
         self.trunk_lock_wait_ns += trunk_lock_wait_ns;
         self.trunk_lock_hold_ns += trunk_lock_hold_ns;
+        self.trunk_forks += trunk_forks;
+        self.trunk_fork_read_txs += trunk_fork_read_txs;
+        self.trunk_fork_wal_locks += trunk_fork_wal_locks;
+        self.trunk_fork_wal_hold_ns += trunk_fork_wal_hold_ns;
     }
 }
 
@@ -375,14 +393,19 @@ impl Connection {
     fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
+        // Observation only (see `BranchWork::trunk_fork_*`): read txs begun and WAL write-lock
+        // acquisitions, handed to the store at the registration; the hold only with lock timing on.
+        let mut attempts = store::ForkAttempts::default();
         loop {
             pager.begin_read_tx()?;
+            attempts.read_txs += 1;
             let begun = pager
                 .io
                 .block(|| pager.begin_write_tx(WalAutoActions::empty()));
             match begun {
-                Ok(()) => {}
+                Ok(()) => attempts.wal_locks += 1,
                 Err(LimboError::BusySnapshot) if attempt < SNAPSHOT_RETRIES => {
+                    attempts.wal_locks += 1;
                     pager.end_read_tx();
                     attempt += 1;
                     continue;
@@ -392,14 +415,24 @@ impl Connection {
                     return Err(err);
                 }
             }
-            let forked = self.fork_trunk_locked(pager);
+            let held = self.db.branches.timed().then(std::time::Instant::now);
+            let forked = self.fork_trunk_locked(pager, attempts);
             pager.end_write_tx();
+            if let Some(held) = held {
+                self.db
+                    .branches
+                    .add_fork_wal_hold(held.elapsed().as_nanos() as u64);
+            }
             pager.end_read_tx();
             return forked;
         }
     }
 
-    fn fork_trunk_locked(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
+    fn fork_trunk_locked(
+        self: &Arc<Connection>,
+        pager: &Arc<Pager>,
+        attempts: store::ForkAttempts,
+    ) -> Result<BranchId> {
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
@@ -417,7 +450,9 @@ impl Connection {
                 "an initialized database's pager has no reserved-space byte".to_string(),
             )
         })?;
-        self.db.branches.fork_trunk(schema, page_size, reserved_space)
+        self.db
+            .branches
+            .fork_trunk(schema, page_size, reserved_space, attempts)
     }
 
     /// The branch this connection is open on, if any.

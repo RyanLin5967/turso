@@ -190,6 +190,19 @@ pub(crate) struct BranchStore {
     /// Whether [`take`] times how long each acquisition holds its lock. Off by default: it is the
     /// one part of the lock accounting that adds work inside a critical section.
     lock_timing: AtomicBool,
+    /// Nanoseconds trunk forks held the trunk's WAL write lock, summed; written only while lock
+    /// timing is on (see [`BranchWork::trunk_fork_wal_hold_ns`]). Observation only.
+    fork_wal_hold_ns: AtomicU64,
+}
+
+/// What a trunk fork did before it registered, for [`BranchWork`]'s `trunk_fork_*` counters.
+/// Observation only.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ForkAttempts {
+    /// WAL read transactions begun.
+    pub(crate) read_txs: u64,
+    /// WAL write-lock acquisitions.
+    pub(crate) wal_locks: u64,
 }
 
 /// One stripe of the branch map.
@@ -680,11 +693,19 @@ impl BranchStore {
             live: AtomicUsize::new(0),
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
+            fork_wal_hold_ns: AtomicU64::new(0),
         }
     }
 
-    fn timed(&self) -> bool {
+    /// Whether lock timing is on (see [`BranchWork::lock_hold_ns`]).
+    pub(crate) fn timed(&self) -> bool {
         self.lock_timing.load(Ordering::Relaxed)
+    }
+
+    /// Add one trunk fork's WAL write-lock hold to [`BranchWork::trunk_fork_wal_hold_ns`]. Called
+    /// only while lock timing is on.
+    pub(crate) fn add_fork_wal_hold(&self, ns: u64) {
+        self.fork_wal_hold_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
     /// The shard of branch `id`, locked.
@@ -754,6 +775,7 @@ impl BranchStore {
         schema: Arc<Schema>,
         page_size: usize,
         reserved_space: u8,
+        attempts: ForkAttempts,
     ) -> Result<BranchId> {
         let format = *self.trunk_format.get_or_init(|| (page_size, reserved_space));
         if format != (page_size, reserved_space) {
@@ -769,6 +791,9 @@ impl BranchStore {
             let f = trunk.lineage.epoch;
             trunk.lineage.epoch += 1;
             trunk.lineage.children.insert(f, id);
+            trunk.work.trunk_forks += 1;
+            trunk.work.trunk_fork_read_txs += attempts.read_txs;
+            trunk.work.trunk_fork_wal_locks += attempts.wal_locks;
             (id, f)
         };
         self.live.fetch_add(1, Ordering::AcqRel);
@@ -1109,6 +1134,7 @@ impl BranchStore {
             stats.work.trunk_lock_wait_ns = trunk.work.lock_wait_ns;
             stats.work.trunk_lock_hold_ns = trunk.work.lock_hold_ns;
         }
+        stats.work.trunk_fork_wal_hold_ns = self.fork_wal_hold_ns.load(Ordering::Relaxed);
         for lock in self.shards.iter() {
             let shard = take(lock, self.timed());
             stats.live_branches += shard.branches.len();
@@ -1286,7 +1312,7 @@ mod tests {
         for step in 0..1500 {
             match rng.below(10) {
                 0..=2 if live.len() < 40 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0, ForkAttempts::default()).unwrap();
                     live.push((id, epoch, current.clone()));
                     epoch += 1;
                 }
@@ -1492,7 +1518,7 @@ mod tests {
             let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
             match rng.below(12) {
                 0 if live.len() < 60 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0, ForkAttempts::default()).unwrap();
                     nodes.push(Node {
                         id,
                         sees: trunk.clone(),
@@ -1661,7 +1687,7 @@ mod tests {
                             0..=1 if live.len() < 16 => {
                                 let _w = wal.lock().unwrap();
                                 let sees = committed.read().unwrap().clone();
-                                let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+                                let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0, ForkAttempts::default()).unwrap();
                                 nodes.push(Node { id, sees, handle: true, depth: 1, forked: false });
                             }
                             2..=3 if !live.is_empty() && live.len() < 16 => {
@@ -1776,7 +1802,7 @@ mod tests {
         for step in 0..3000 {
             match rng.below(10) {
                 0..=2 if live.len() < 3 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0, ForkAttempts::default()).unwrap();
                     live.push((id, current.clone()));
                 }
                 3..=5 => {

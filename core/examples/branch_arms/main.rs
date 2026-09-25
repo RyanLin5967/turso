@@ -13,6 +13,7 @@
 //!   pages      every branch writes w pages in one transaction; x axis = N, one block per w
 //!   spread_trunk the `spread` arm's trunk writes with NO branches (amendment 2); x = trunk writes
 //!   conc       T threads churn their own shares of N live branches (amendment 7); one cell per (N, T)
+//!   forks      T threads fork from the trunk and reap, against an optional trunk writer (r11-forklock)
 //!
 //! `--no-autocheckpoint` disables the trunk connection's WAL auto-actions (auto-checkpoint and WAL
 //! restart), amendment 2. Every state line prints the WAL file's size.
@@ -24,7 +25,12 @@
 //! uniformly random live branch, or the oldest one, which is the order uniform-TTL lease expiry
 //! reaps in (amendment 3).
 //!
-//! `--threads 1,2,4,...` (conc only) is the T list; each N runs it forward and then reversed.
+//! `--writer 0|1|64` (forks only, default 0): the trunk writer running beside the fork threads — none,
+//! autocommit single-row UPDATEs back to back, or `BEGIN IMMEDIATE` + 64 single-row UPDATEs on 64
+//! distinct leaves + `COMMIT` back to back (r11-forklock PREREG §0). `--cell-deadline-s` (forks only,
+//! default 120) stops a cell's fork threads early; the cell then reports the forks it completed.
+//!
+//! `--threads 1,2,4,...` (conc and forks) is the T list; each N runs it forward and then reversed.
 //! `--cycles` is then the cycles EACH thread runs per cell. `--lock-timing on|off` (conc only,
 //! default off) turns on the store's lock-hold timing, the one lock counter that adds work under the
 //! lock (amendment 7).
@@ -65,6 +71,7 @@ enum Arm {
     Pages,
     SpreadTrunk,
     Conc,
+    Forks,
 }
 
 /// Which live branch a churn cycle reaps.
@@ -87,6 +94,8 @@ struct Args {
     synchronous: String,
     threads: Vec<usize>,
     lock_timing: bool,
+    writer: usize,
+    cell_deadline_s: u64,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -110,6 +119,8 @@ fn parse_args() -> Args {
         synchronous: "OFF".to_string(),
         threads: Vec::new(),
         lock_timing: false,
+        writer: 0,
+        cell_deadline_s: 120,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -126,6 +137,7 @@ fn parse_args() -> Args {
                     "pages" => Arm::Pages,
                     "spread_trunk" => Arm::SpreadTrunk,
                     "conc" => Arm::Conc,
+                    "forks" => Arm::Forks,
                     other => die(&format!("unknown arm {other}")),
                 })
             }
@@ -146,6 +158,19 @@ fn parse_args() -> Args {
                 .to_string()
             }
             "--threads" => args.threads = parse_list(&val(), "--threads"),
+            "--writer" => {
+                args.writer = match val().as_str() {
+                    "0" => 0,
+                    "1" => 1,
+                    "64" => 64,
+                    other => die(&format!("unknown --writer {other} (0, 1 or 64)")),
+                }
+            }
+            "--cell-deadline-s" => {
+                args.cell_deadline_s = val()
+                    .parse()
+                    .unwrap_or_else(|_| die("bad --cell-deadline-s"))
+            }
             "--lock-timing" => {
                 args.lock_timing = match val().as_str() {
                     "on" => true,
@@ -179,15 +204,18 @@ fn parse_args() -> Args {
     if args.w_list.is_empty() || args.w_list.iter().any(|&w| w == 0 || w > 64) {
         die("--w entries must be in 1..=64");
     }
-    if args.arm == Arm::Conc {
+    if matches!(args.arm, Arm::Conc | Arm::Forks) {
         if args.threads.is_empty() || args.threads.contains(&0) {
-            die("--arm conc needs --threads, every entry positive");
+            die("--arm conc and forks need --threads, every entry positive");
         }
         if args.checkpoints.iter().any(|&n| n < *args.threads.iter().max().unwrap()) {
-            die("--arm conc needs every checkpoint N >= the largest T, so each thread owns a branch");
+            die("--arm conc and forks need every checkpoint N >= the largest T, so each thread owns a branch");
         }
     } else if !args.threads.is_empty() || args.lock_timing {
-        die("--threads and --lock-timing apply to --arm conc only");
+        die("--threads and --lock-timing apply to --arm conc and forks only");
+    }
+    if args.arm != Arm::Forks && args.writer != 0 {
+        die("--writer applies to --arm forks only");
     }
     args
 }
@@ -579,6 +607,7 @@ fn main() {
         Arm::Pages => arm_pages(&mut bench, &args),
         Arm::SpreadTrunk => arm_spread_trunk(&mut bench, &args),
         Arm::Conc => arm_conc(&mut bench, &args),
+        Arm::Forks => arm_forks(&mut bench, &args),
     }
     let end = db.branch_stats();
     if end.live_branches != 0 || end.arena_slots_in_use != 0 {
@@ -1547,4 +1576,425 @@ fn arm_conc(b: &mut Bench, args: &Args) {
     }
     drop(live);
     drop(trunks);
+}
+
+/// The trunk writer's rows in `forks`: the hot row for `--writer 1`, 64 rows on 64 distinct leaves for
+/// `--writer 64`, none for `--writer 0` (the check then reads the hot row, which nobody writes).
+fn writer_rows(w: usize) -> Vec<i64> {
+    match w {
+        0 | 1 => vec![HOT_ROW],
+        _ => page_rows(0, w),
+    }
+}
+
+/// The writer transaction number a value of a writer row names: 0 for the row's original value.
+fn writer_k(row: i64, v: &str) -> Option<u64> {
+    if v == trunk_value(row) {
+        return Some(0);
+    }
+    v.strip_prefix('t')?.parse().ok()
+}
+
+/// What the `forks` arm's trunk writer publishes to the fork threads: transactions begun and
+/// transactions whose COMMIT returned, both counted from 1 across the whole run.
+#[derive(Default)]
+struct WriterClock {
+    started: std::sync::atomic::AtomicU64,
+    done: std::sync::atomic::AtomicU64,
+}
+
+struct WriterOut {
+    commits: u64,
+    busy: u64,
+    txn: Vec<Duration>,
+    elapsed: Duration,
+}
+
+/// The `forks` arm's trunk writer: back-to-back transactions until `stop`, each writing k (its number,
+/// from 1) into every writer row, so any committed state holds one k in all of them.
+fn forks_writer(
+    conn: Arc<Connection>,
+    w: usize,
+    clock: &WriterClock,
+    stop: &std::sync::atomic::AtomicBool,
+    barrier: &Barrier,
+) -> WriterOut {
+    use std::sync::atomic::Ordering;
+    let rows = writer_rows(w);
+    let mut out = WriterOut {
+        commits: 0,
+        busy: 0,
+        txn: Vec::new(),
+        elapsed: Duration::ZERO,
+    };
+    barrier.wait();
+    let start = Instant::now();
+    while !stop.load(Ordering::Acquire) {
+        let k = clock.started.fetch_add(1, Ordering::AcqRel) + 1;
+        let v = trunk_gen_value(k);
+        let t0 = Instant::now();
+        if w == 1 {
+            let sql = format!("UPDATE t SET v = '{v}' WHERE id = {HOT_ROW}");
+            busy_retry(&mut out.busy, "writer update", || conn.execute(&sql));
+        } else {
+            busy_retry(&mut out.busy, "writer begin", || conn.execute("BEGIN IMMEDIATE"));
+            for &row in &rows {
+                conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {row}"))
+                    .unwrap_or_else(|e| not_a_result(&format!("writer update failed: {e}")));
+            }
+            conn.execute("COMMIT")
+                .unwrap_or_else(|e| not_a_result(&format!("writer commit failed: {e}")));
+        }
+        out.txn.push(t0.elapsed());
+        clock.done.fetch_add(1, Ordering::AcqRel);
+        out.commits += 1;
+    }
+    out.elapsed = start.elapsed();
+    out
+}
+
+/// A branch a fork thread set aside to check after the cell: the writer's commits returned before
+/// its fork was called, and the writer's transactions begun when the fork returned.
+struct Sampled {
+    live: Live,
+    lo: u64,
+    hi: u64,
+}
+
+struct ForksOut {
+    share: Vec<Live>,
+    sampled: Vec<Sampled>,
+    fork: Vec<Duration>,
+    reap: Vec<Duration>,
+    busy: u64,
+    forks: usize,
+    elapsed: Duration,
+}
+
+/// One `forks` thread: up to `cycles` cycles against its own trunk connection, each a trunk fork
+/// (Busy answers retried and counted) and the reap of a random branch of its share, so the share's
+/// size is fixed. Every 64th fork is SAMPLED instead: kept out of the share, with the writer's clock
+/// read around the fork, and no victim reaped that cycle. Stops early at `deadline`.
+fn forks_thread(
+    trunk: Arc<Connection>,
+    mut share: Vec<Live>,
+    clock: &WriterClock,
+    barrier: &Barrier,
+    seed: u64,
+    cycles: usize,
+    deadline: Duration,
+) -> ForksOut {
+    use std::sync::atomic::Ordering;
+    let mut rng = Rng(seed | 1);
+    let mut out = ForksOut {
+        share: Vec::new(),
+        sampled: Vec::new(),
+        fork: Vec::with_capacity(cycles),
+        reap: Vec::with_capacity(cycles),
+        busy: 0,
+        forks: 0,
+        elapsed: Duration::ZERO,
+    };
+    barrier.wait();
+    let start = Instant::now();
+    for c in 0..cycles {
+        if start.elapsed() >= deadline {
+            break;
+        }
+        let lo = clock.done.load(Ordering::Acquire);
+        let t0 = Instant::now();
+        let branch = busy_retry(&mut out.busy, "fork", || trunk.fork_branch());
+        out.fork.push(t0.elapsed());
+        let hi = clock.started.load(Ordering::Acquire);
+        out.forks += 1;
+        let live = Live {
+            branch,
+            rows: Vec::new(),
+            trunk_writes_at_fork: 0,
+        };
+        if c % 64 == 63 {
+            out.sampled.push(Sampled { live, lo, hi });
+            continue;
+        }
+        let victim = share.swap_remove(rng.below(share.len()));
+        share.push(live);
+        let own = victim.rows.len();
+        let t1 = Instant::now();
+        let reaped = victim
+            .branch
+            .reap()
+            .unwrap_or_else(|e| not_a_result(&format!("forks reap failed: {e}")));
+        out.reap.push(t1.elapsed());
+        if reaped.deferred || reaped.freed_pages < own {
+            not_a_result(&format!("a forks reap freed {reaped:?}, expected at least {own} pages"));
+        }
+    }
+    out.elapsed = start.elapsed();
+    out.share = share;
+    out
+}
+
+/// Check one sampled branch: every writer row holds one k, on two connections, with lo <= k <= hi.
+fn check_sampled(s: &Sampled, rows: &[i64]) {
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let conn = s
+            .live
+            .branch
+            .connect()
+            .unwrap_or_else(|e| not_a_result(&format!("sampled branch connect failed: {e}")));
+        let ks: Vec<Option<u64>> = rows
+            .iter()
+            .map(|&row| {
+                let got = select_v(&conn, row)
+                    .unwrap_or_else(|e| not_a_result(&format!("sampled read failed: {e}")));
+                match got.as_slice() {
+                    [r] => match &r[0] {
+                        Value::Text(t) => writer_k(row, t.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            })
+            .collect();
+        drop(conn);
+        let k = ks[0];
+        if k.is_none() || ks.iter().any(|&x| x != k) {
+            not_a_result(&format!(
+                "sampled branch {} reads a torn or unknown writer state: {ks:?}",
+                s.live.branch.id().0
+            ));
+        }
+        seen.push(k.unwrap());
+    }
+    if seen[0] != seen[1] {
+        not_a_result(&format!(
+            "sampled branch {} changed between two connections: k {} then {}",
+            s.live.branch.id().0,
+            seen[0],
+            seen[1]
+        ));
+    }
+    let k = seen[0];
+    if k < s.lo || k > s.hi {
+        not_a_result(&format!(
+            "sampled branch {} reads writer txn {k}, outside [{}, {}] (commits returned before \
+             the fork, txns begun when it returned)",
+            s.live.branch.id().0,
+            s.lo,
+            s.hi
+        ));
+    }
+}
+
+const FORKS_HEADER: &str = "N\tT\tW\tdraw\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us";
+
+fn print_lat(n: usize, t: usize, w: usize, draw: u64, name: &str, samples: &mut [Duration]) {
+    if samples.is_empty() {
+        println!("{n}\t{t}\t{w}\t{draw}\t{name}\t0\t-\t-\t-\t-");
+        return;
+    }
+    let mut us: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+    us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "{n}\t{t}\t{w}\t{draw}\t{name}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+        us.len(),
+        percentile(&us, 50.0),
+        percentile(&us, 90.0),
+        percentile(&us, 99.0),
+        us[us.len() - 1]
+    );
+}
+
+/// Arm `forks` (r11-forklock PREREG §0): T threads fork from the trunk and reap, keeping N live trunk
+/// children, beside a trunk writer (`--writer`). One cell per (N, T); the T list runs forward and then
+/// reversed. Per cell: forks/s, fork and reap latency, Busy answers, the writer's commits, Busy answers
+/// and transaction latency, the store's trunk-fork and lock counters, and a check of every sampled
+/// branch against the writer's clock.
+fn arm_forks(b: &mut Bench, args: &Args) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tmax = *args.threads.iter().max().unwrap();
+    let w = args.writer;
+    let rows = writer_rows(w);
+    b.db.set_branch_lock_timing(args.lock_timing);
+    let trunks: Vec<Arc<Connection>> = (0..tmax).map(|_| b.db.connect().unwrap()).collect();
+    let writer = b.db.connect().unwrap();
+    writer
+        .execute(format!("PRAGMA synchronous = {}", args.synchronous))
+        .unwrap();
+    let clock = WriterClock::default();
+    println!(
+        "# forks: threads={:?} (forward, then reversed) cycles_per_thread={} writer={w} \
+         writer_rows={} lock_timing={} cell_deadline_s={}",
+        args.threads,
+        args.cycles,
+        rows.len(),
+        args.lock_timing,
+        args.cell_deadline_s
+    );
+    println!("{FORKS_HEADER}");
+    let mut live: Vec<Live> = Vec::new();
+    let mut grown = 0usize;
+    for &n in &args.checkpoints {
+        let t = Instant::now();
+        while live.len() < n {
+            live.push(grow_from_trunk(b, row_for(grown)));
+            grown += 1;
+        }
+        let grow_us = t.elapsed().as_secs_f64() * 1e6;
+        b.print_state(n, &format!("grow_total_us={grow_us:.0}"));
+        let order = args
+            .threads
+            .iter()
+            .map(|&t| (t, 0u64))
+            .chain(args.threads.iter().rev().map(|&t| (t, 1u64)));
+        for (t, draw) in order {
+            let null = null_ops_per_s(t);
+            let written_before = live.iter().filter(|l| !l.rows.is_empty()).count();
+            let mut shares: Vec<Vec<Live>> =
+                (0..t).map(|_| Vec::with_capacity(n / t + 1)).collect();
+            for (i, l) in live.drain(..).enumerate() {
+                shares[i % t].push(l);
+            }
+            // The fork threads, the writer if there is one, and this thread.
+            let barrier = Barrier::new(t + usize::from(w > 0) + 1);
+            let stop = AtomicBool::new(false);
+            println!("# cell N={n} T={t} W={w} draw={draw} start");
+            let before = b.db.branch_stats().work;
+            let done0 = clock.done.load(Ordering::Acquire);
+            let cpu0 = cpu_ns();
+            let deadline = Duration::from_secs(args.cell_deadline_s);
+            let (wall, outs, wout) = std::thread::scope(|s| {
+                let wh = (w > 0).then(|| {
+                    let conn = writer.clone();
+                    let (clock, stop, barrier) = (&clock, &stop, &barrier);
+                    s.spawn(move || forks_writer(conn, w, clock, stop, barrier))
+                });
+                let handles: Vec<_> = shares
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, share)| {
+                        let trunk = trunks[i].clone();
+                        let (clock, barrier) = (&clock, &barrier);
+                        let seed = args.seed
+                            ^ (i as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03)
+                            ^ ((n as u64) << 24)
+                            ^ (draw << 56)
+                            ^ ((t as u64) << 48);
+                        let cycles = args.cycles;
+                        s.spawn(move || {
+                            forks_thread(trunk, share, clock, barrier, seed, cycles, deadline)
+                        })
+                    })
+                    .collect();
+                barrier.wait();
+                let start = Instant::now();
+                let outs: Vec<ForksOut> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                let wall = start.elapsed();
+                stop.store(true, Ordering::Release);
+                let wout = wh.map(|h| h.join().unwrap());
+                (wall, outs, wout)
+            });
+            let cpu1 = cpu_ns();
+            let after = b.db.branch_stats().work;
+            let done1 = clock.done.load(Ordering::Acquire);
+            let (mut fork, mut reap, mut sampled) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut busy, mut forks) = (0u64, 0usize);
+            let (mut th_min, mut th_max) = (Duration::MAX, Duration::ZERO);
+            let mut shares = Vec::new();
+            for mut out in outs {
+                fork.append(&mut out.fork);
+                reap.append(&mut out.reap);
+                sampled.append(&mut out.sampled);
+                busy += out.busy;
+                forks += out.forks;
+                th_min = th_min.min(out.elapsed);
+                th_max = th_max.max(out.elapsed);
+                shares.push(out.share);
+            }
+            // The writer has stopped: check every sampled branch, then give each back to a share and
+            // reap one extra victim for it, so live returns to N.
+            for smp in &sampled {
+                check_sampled(smp, &rows);
+            }
+            let verified = sampled.len();
+            let mut rng = Rng(args.seed ^ (n as u64) ^ ((t as u64) << 40) ^ (draw << 60) | 1);
+            for (i, smp) in sampled.into_iter().enumerate() {
+                let share = &mut shares[i % t];
+                let victim = share.swap_remove(rng.below(share.len()));
+                share.push(smp.live);
+                let own = victim.rows.len();
+                let reaped = victim.branch.reap().unwrap_or_else(|e| {
+                    not_a_result(&format!("forks extra reap failed: {e}"))
+                });
+                if reaped.deferred || reaped.freed_pages < own {
+                    not_a_result(&format!("a forks extra reap freed {reaped:?}, expected >= {own}"));
+                }
+            }
+            for share in shares {
+                live.extend(share);
+            }
+            let st = b.db.branch_stats();
+            let written = live.iter().filter(|l| !l.rows.is_empty()).count();
+            if st.live_branches != n || live.len() != n {
+                not_a_result(&format!(
+                    "cell N={n} T={t} W={w} draw={draw} did not return to {n} branches (harness holds \
+                     {}): {st:?}",
+                    live.len()
+                ));
+            }
+            if st.arena_slots_in_use < written || (w == 0 && st.arena_slots_in_use != written) {
+                not_a_result(&format!(
+                    "cell N={n} T={t} W={w} draw={draw}: {} arena pages for {written} written branches \
+                     ({written_before} before the cell)",
+                    st.arena_slots_in_use
+                ));
+            }
+            print_lat(n, t, w, draw, "fork", &mut fork);
+            print_lat(n, t, w, draw, "reap", &mut reap);
+            let (wcommits, wbusy, wper_s) = match &wout {
+                Some(o) => (o.commits, o.busy, o.commits as f64 / o.elapsed.as_secs_f64()),
+                None => (0, 0, 0.0),
+            };
+            if let Some(mut o) = wout {
+                print_lat(n, t, w, draw, "writer_txn", &mut o.txn);
+            }
+            let d = |f: fn(&BranchWork) -> u64| f(&after) - f(&before);
+            println!(
+                "# forkcell N={n} T={t} W={w} draw={draw} forks={forks} wall_ns={} forks_per_s={:.1} \
+                 null_ops_per_s={null:.0} thread_ms_min={:.3} thread_ms_max={:.3} busy_fork={busy} \
+                 busy_per_fork={:.4} writer_commits={wcommits} writer_commits_clock={} \
+                 writer_per_s={wper_s:.1} writer_busy={wbusy} sampled_verified={verified} \
+                 user_ns={} sys_ns={} rss_bytes={} arena_in_use={} \
+                 trunk_forks={} trunk_fork_read_txs={} trunk_fork_wal_locks={} trunk_fork_wal_hold_ns={} \
+                 trunk_lock_acq={} trunk_lock_contended={} trunk_lock_wait_ns={} trunk_lock_hold_ns={} \
+                 lock_acq={} lock_contended={} lock_wait_ns={} lock_hold_ns={}",
+                wall.as_nanos(),
+                forks as f64 / wall.as_secs_f64(),
+                th_min.as_secs_f64() * 1e3,
+                th_max.as_secs_f64() * 1e3,
+                busy as f64 / forks.max(1) as f64,
+                done1 - done0,
+                cpu1.0 - cpu0.0,
+                cpu1.1 - cpu0.1,
+                rss_bytes(),
+                st.arena_slots_in_use,
+                d(|x| x.trunk_forks),
+                d(|x| x.trunk_fork_read_txs),
+                d(|x| x.trunk_fork_wal_locks),
+                d(|x| x.trunk_fork_wal_hold_ns),
+                d(|x| x.trunk_lock_acquisitions),
+                d(|x| x.trunk_lock_contended),
+                d(|x| x.trunk_lock_wait_ns),
+                d(|x| x.trunk_lock_hold_ns),
+                d(|x| x.lock_acquisitions),
+                d(|x| x.lock_contended),
+                d(|x| x.lock_wait_ns),
+                d(|x| x.lock_hold_ns),
+            );
+        }
+    }
+    drop(live);
+    drop(trunks);
+    drop(writer);
 }
