@@ -431,3 +431,82 @@ Its before is `turso_curve/raw/e5_spread_normal.txt`.
 - `trunk_write` p50 |slope| < 0.10, within ±20% of e5's at every x.
 - Every other op within ±15% of e5's p50, except `read_hot` and `read_inh`, which lose their scans. At 10^6, e5 scanned
   944–955 versions per read on ~7.5 µs.
+
+### Amendment 6 — written 2026-09-25T03:15Z: F4 (the depth wall), and the trunk-writing arms under synchronous=NORMAL; before any run it governs
+
+Two inputs from the lead (2026-09-25 ~02:50Z): the depth wall of `turso_curve/REPORT.md` §2.2/§3 (read_inh 7.00 → 73.42 µs and
+levels 6 → 3,003 = 3(d+1) over d = 1..1000, `turso_curve/raw/b_chain_r2.txt`) gets its standard fix, and the trunk_write
+step B1 is Turso's synchronous=OFF checkpoint cliff (REPORT §4 B1), so the trunk-writing arms are run under NORMAL as e5 was.
+**Seen before writing this:** a1_fix, c2_fix, c2f_fix (amendment 4, F1+F2, OFF) and c2f_base, c3_base, c3f_base (amendment 3).
+Predictions below that lean on them say so.
+
+**F4 = persistent page maps (path copying), turso `a31198dd8`.** Each branch carries `inherited`, a persistent 32-way radix
+trie from page number to arena slot. It holds every arena page the branch sees through its ancestors, and it is the parent's
+`view` at the fork: the parent's own `inherited` plus its current pages. The view is built at the parent's first fork, and the
+parent's writes keep it up to date after that. A fork clones the view in O(1), and a write path-copies O(log_32 P) nodes. A
+resolution looks at the branch's own current pages, then `inherited`, then the trunk at `trunk_at`, so it consults at most 2
+nodes at any depth. The maps name slots and own none. Prior art: Driscoll, Sarnak, Sleator and Tarjan 1989 (path copying), and
+copy-on-write B-trees, whose every snapshot has its own root, so a lookup costs the tree's height rather than the snapshot
+chain's [RECALLED: Btrfs, Rodeh TOS 2008; LMDB]. The two options the lead named, and why neither:
+- DSST node splitting gives O(1) amortised access for pointer structures of BOUNDED in-degree. A page map is an array of P
+  entries, and fully persistent arrays are not known to get O(1) that way [RECALLED: Dietz 1989, O(log log) per access].
+- A per-branch resolution cache (flatten-on-first-read, QEMU copy-on-read, Neon image layers) still walks d levels on the first
+  read of each (branch, page). Arm b's `read_inh` reads a random second-half leaf on a fresh connection, so most of its K=200
+  samples are first touches, and the wall would stay.
+Tests: `page_map::tests` (3,000 versions against a copied `HashMap`) and
+`store::tests::every_branch_of_a_random_tree_reads_its_parent_as_of_its_fork`. The latter drives the store's own entry points
+against a model in which each branch copies its parent at the fork. It covers chains of depth ≥ 10, writes after forking, and
+deferred reaps, and it asserts that each of these occurred. Results: `turso_sota/raw/tests_F4.txt`. Fire-check:
+`turso_sota/raw/mutate_F4.txt`, run before any F4 run.
+
+**Binaries.**
+- `final` = F1+F2+F4, built from the commit that carries this amendment and copied out of the tree.
+- `baseN` = the unfixed store (`751f85d56`'s `core/branch/`) under the `b8ca4be84` harness. Commit `105efa150`, built from
+  `git archive` into its own target dir (`turso_sota/build_baseN.sh`).
+
+**Runs** (`turso_sota/run_a6.sh`, lockrun, timeout 3600 each, raw committed before read).
+- Depth, on `final`, OFF: `b_fin` (`--arm chain --checkpoints 1,3,10,32,100,316,1000 --samples 200`, before `b_chain_r2`) and
+  `b_fin_r2` (same, `--samples 1000`, before `b_chain_r3`).
+- The rest of `final`, OFF, same arguments as their before files: `control_fin`, `c1_fin`, `d_w_fin`, `d_N_fin`.
+- NORMAL, every trunk-writing arm on both stores, `<arm>_nbase` and `<arm>_nfin`, with the amendment-4 arguments plus
+  `--synchronous normal`: a1, a2, c2, c2f, c3, c3f.
+
+**Predictions: b_fin and b_fin_r2.**
+- levels_per_op:
+  - `open`, `read_open`: 2.00 at every d. A 1-page resolution is the branch, then the trunk; page 1 is never written in the chain.
+  - `read_inh`: 6.00. `read_own`, `read_anc`: 5.00.
+  - `first_write`: in [5.0, 6.0] (the written leaf is the branch's or the trunk's).
+  - Before, these were 3(d+1), 2(d+1)+1, 3d+2 and 2,105.68 at d=1000.
+- p50 |slope| over d = 1..1000 < 0.10, and the local 316 → 1000 slope < 0.10, for `open`, `read_open`, `first_write`,
+  `read_own`, `read_inh`, `read_anc`. `read_inh` at d=1000 ≤ 1.3× its d=1 value.
+- `fork`: |slope| < 0.10 in b_fin_r2. B6's candidate, eviction by the walk, is gone with the walk. `reap`: |slope| < 0.10.
+- Cascade: one sample, freed = d, asserted. It frees d pages, so it is O(d) by what it must do.
+- Space: arena = d, asserted. RSS within the before file's ±5% at every d. The views add ≤ ~0.5 KB per level (I).
+
+**Predictions: the other `final` runs, OFF** (`control_fin`, `c1_fin`, `d_w_fin`, `d_N_fin`). Every branch is at depth 1, so F4
+changes only how the one level is looked up. Counters equal the before file's exactly. p50 is within ±15% at every x.
+
+**Predictions: NORMAL.**
+- Counters:
+  - `_nbase` counters equal the model's "base" columns (`model_out/`), as in amendment 3/4. The sync mode does not enter the
+    store.
+  - `_nfin` counters equal its "fixed" columns. For c3_nfin they equal amendment 4's c3 predictions.
+- `trunk_write` p50 |slope| < 0.10 in every NORMAL run, WAL ≤ 6 MB at every x, and `trunk_write` within ±25% of e5's
+  (9.0–11.4 µs). This is B1 absent.
+- `_nbase` walls, as in the OFF before files: a1/c2/c2f `reap` and `read_hot` slopes in [0.4, 1.0]. c3f_nbase reap is above
+  2× c3_nbase's at N ≥ 10^3.
+- `_nfin`:
+  - Those walls are removed. At 10^6, p50 ≤ 1/20 of `_nbase`'s for a1/c2/c2f `reap` and `read_hot`, and ≤ 1/2 of it for
+    c3f `reap`.
+  - **Residual predicted from the seen OFF runs:** reap with a RANDOM victim (c2, c3) keeps p50 slope in [0.10, 0.30]. In
+    c2_fix, 0.46 → 2.67 µs is +0.196, against c1's +0.202 with no retained versions at all (`turso_curve/raw/c1_churn_r2.txt`).
+    The same locality term with a larger constant.
+  - Reap with the OLDEST victim (c2f, c3f) or the newest (a1's samples) stays below 0.10 (c2f_fix +0.088, a1_fix +0.033).
+    **This breaks amendment 4's own prediction** of [0.10, 0.40] for a1/c2f. That prediction assumed every descent misses
+    the cache at 10^6, but oldest and newest victims touch the trees' edges.
+  - Every other op within ±15% of `_nbase`'s p50 at x ≤ 10^4, where no scan is long. At larger x it is below `_nbase`'s.
+- Space: arena counts equal `_nbase`'s exactly at every x in a1, a2, c2 and c2f. In c3/c3f, versions freed per reap equal
+  `_nbase`'s exactly, because the same RNG draws the same victims and the GC frees the same set.
+
+**What the report reads.** The residual list comes from `final` (NORMAL for the trunk-writing arms, OFF for b, c1, d and
+control). Amendment 4's OFF runs attribute F1+F2 like-for-like against the curve lane's OFF before files.
