@@ -43,7 +43,7 @@ use std::io::{Read, Write};
 use std::ops::Bound;
 
 use super::{
-    gone, Arena, BranchId, BranchState, BranchStore, BranchWork, Lineage, Owned, PageMap,
+    gone, Arena, BranchId, BranchState, BranchStore, Lineage, Owned, PageMap,
     Retained, Schema, Slot, StoreInner,
 };
 use crate::sync::atomic::Ordering;
@@ -1056,7 +1056,7 @@ impl BranchStore {
                     let schema = schema_for(schema_version);
                     let handle = flags & 1 != 0;
                     if flags & 2 != 0 {
-                        inner.insert_state(id, parent, fork_epoch, schema)?;
+                        inner.insert_state(id, parent, fork_epoch, schema.clone())?;
                         new_states.push(id);
                         work.states_new += 1;
                     } else {
