@@ -394,6 +394,7 @@ impl Database {
     }
 
     /// Send the branch store (see `store::ship`). `trunk` must be the trunk's checkpointed image.
+    /// `count` also computes the counted-only alternatives (delta and fork-delta sizes, dedup).
     #[doc(hidden)]
     pub fn branch_send(
         &self,
@@ -402,9 +403,10 @@ impl Database {
         trunk: &TrunkImage,
         delta: bool,
         plant: Plant,
+        count: bool,
         out: Option<&mut dyn std::io::Write>,
     ) -> Result<SendReport> {
-        self.branches.send(mode, base, trunk, delta, plant, out)
+        self.branches.send(mode, base, trunk, delta, plant, count, out)
     }
 
     #[doc(hidden)]

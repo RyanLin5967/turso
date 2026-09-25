@@ -519,6 +519,7 @@ impl BranchStore {
         trunk: &TrunkImage,
         use_delta: bool,
         plant: Plant,
+        count: bool,
         out: Option<&mut dyn Write>,
     ) -> Result<SendReport> {
         let inner = self.inner.lock();
@@ -731,14 +732,16 @@ impl BranchStore {
                              delta_base: Option<&[u8]>,
                              fork_base: Option<&[u8]>|
          -> Result<()> {
-            rep.payload_delta_fork += fork_base
-                .and_then(|b| delta_encode(b, content))
-                .map_or(content.len(), |d| d.len() + 2) as u64;
-            if seen.insert(content_hash(content)) {
-                rep.payload_dedup += content.len() as u64;
-            } else {
-                rep.dup_payloads += 1;
-                rep.payload_dedup += 13;
+            if count {
+                rep.payload_delta_fork += fork_base
+                    .and_then(|b| delta_encode(b, content))
+                    .map_or(content.len(), |d| d.len() + 2) as u64;
+                if seen.insert(content_hash(content)) {
+                    rep.payload_dedup += content.len() as u64;
+                } else {
+                    rep.dup_payloads += 1;
+                    rep.payload_dedup += 13;
+                }
             }
             let mut rec = Rec::new(tag).u32(id);
             if tag == T_SLOT {
@@ -753,7 +756,11 @@ impl BranchStore {
                 owned = flipped;
                 payload = &owned[..];
             }
-            let delta = delta_base.and_then(|b| delta_encode(b, payload));
+            let delta = if count || use_delta {
+                delta_base.and_then(|b| delta_encode(b, payload))
+            } else {
+                None
+            };
             rep.payload_raw += payload.len() as u64;
             rep.payload_delta += delta.as_ref().map_or(payload.len(), |d| d.len() + 2) as u64;
             rec = match (use_delta, delta) {
@@ -836,7 +843,7 @@ impl BranchStore {
         // (`inherited`, else the trunk as of `trunk_at`); a retained trunk version's is the next
         // version of that page. The receiver holds every such base.
         let mut fork_base: HashMap<Slot, (bool, u32)> = HashMap::new();
-        for id in &ids {
+        for id in ids.iter().filter(|_| count) {
             let st = &inner.branches[id];
             let base_of = |q: u32| -> (bool, u32) {
                 if let Some(s) = st.inherited.get(q) {
@@ -857,7 +864,7 @@ impl BranchStore {
                 }
             }
         }
-        for (&q, versions) in &inner.trunk.lineage.retained {
+        for (&q, versions) in inner.trunk.lineage.retained.iter().filter(|_| count) {
             for v in versions.values() {
                 let next = versions.get(&v.died).map_or((false, q), |n| (true, n.slot));
                 fork_base.insert(v.slot, next);
@@ -1519,7 +1526,7 @@ mod tests {
             };
             let delta = rng.below(2) == 0;
             let rep = store
-                .send(mode, at, &img, delta, Plant::None, Some(&mut buf))
+                .send(mode, at, &img, delta, Plant::None, true, Some(&mut buf))
                 .unwrap();
             refs += rep.ref_records;
             deads += rep.dead_records;
@@ -1537,7 +1544,7 @@ mod tests {
             let (mut ftrunk, mut fat) = (TrunkImage::empty(PAGE), None);
             let mut full = Vec::new();
             store
-                .send(SendMode::FullFix, None, &img, !delta, Plant::None, Some(&mut full))
+                .send(SendMode::FullFix, None, &img, !delta, Plant::None, true, Some(&mut full))
                 .unwrap();
             fresh.receive(&mut &full[..], &mut ftrunk, &mut fat, false).unwrap();
             assert_eq!(fresh.digest(&ftrunk), want, "seed {seed:#x} step {step}: full replica");
@@ -1588,7 +1595,7 @@ mod tests {
         let (mut rtrunk, mut at) = (TrunkImage::empty(PAGE), None);
         let mut buf = Vec::new();
         store
-            .send(SendMode::FullFix, None, &trunk_image(&trunk), false, Plant::None, Some(&mut buf))
+            .send(SendMode::FullFix, None, &trunk_image(&trunk), false, Plant::None, true, Some(&mut buf))
             .unwrap();
         replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false).unwrap();
         // After the base: a death, a trunk overwrite that retains a pre-image the replica holds (a
@@ -1604,7 +1611,7 @@ mod tests {
         let img = trunk_image(&trunk);
         let mut buf = Vec::new();
         let rep = store
-            .send(SendMode::IncrFix, at, &img, false, plant, Some(&mut buf))
+            .send(SendMode::IncrFix, at, &img, false, plant, true, Some(&mut buf))
             .unwrap();
         let dead_expected = if plant == Plant::DropTombstone { 0 } else { 1 };
         assert_eq!((rep.ref_records, rep.dead_records), (1, dead_expected), "{plant:?}: {rep:?}");
