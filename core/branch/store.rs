@@ -133,6 +133,9 @@ pub(crate) struct BranchStore {
     /// change while a branch exists (both need VACUUM, which is refused), so a branch connection
     /// takes its page format from here instead of reading the trunk's file header.
     trunk_format: OnceLock<(usize, u8)>,
+    /// r11-walpin FW3 for this database's branches: taken from the process switch when the store
+    /// is created (`walpin::set_fixes` before open), or set per database by a test.
+    fw3: std::sync::atomic::AtomicBool,
 }
 
 /// Where the page a branch asked for comes from.
@@ -519,6 +522,7 @@ impl BranchStore {
                 pages: Radix::new(),
             },
             trunk_format: OnceLock::new(),
+            fw3: std::sync::atomic::AtomicBool::new(super::walpin::fw3()),
         }
     }
 
@@ -537,6 +541,14 @@ impl BranchStore {
             "a trunk page to cache is not one page long"
         );
         self.trunk_pages.fill(key, bytes);
+    }
+
+    pub(crate) fn fw3(&self) -> bool {
+        self.fw3.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_fw3(&self, on: bool) {
+        self.fw3.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Take the store's lock, counting the acquisition into `work`: every one, the ones that found
@@ -902,6 +914,14 @@ impl BranchStore {
                 .page(slot),
         );
         Ok(Resolved::Filled)
+    }
+
+    /// r11-walpin FW3: whether branch `id` still reads `page` from the trunk (the store holds no
+    /// version of it for this branch). Not counted in the work counters.
+    pub(crate) fn sees_trunk(&self, id: BranchId, page: u32) -> Result<bool> {
+        let inner = self.lock();
+        let (mut levels, mut examined) = (0, 0);
+        Ok(inner.resolve(id, page, &mut levels, &mut examined)?.is_none())
     }
 
     pub(crate) fn stats(&self) -> BranchStats {

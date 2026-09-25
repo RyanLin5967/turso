@@ -1495,6 +1495,8 @@ impl BuildSharedWal {
             runtime: WalSharedRuntime {
                 frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
                 frame_cache_high_water: AtomicU64::new(0),
+                frame_log: Arc::new(SpinLock::new(crate::storage::wal::FrameLog::default())),
+                wal2: Arc::new(SpinLock::new(crate::storage::wal::Wal2State::default())),
                 file: Some(file.clone()),
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),

@@ -407,6 +407,9 @@ fn main() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
+    if fw2 {
+        db.walpin_open_wal2().unwrap();
+    }
     let trunk = db.connect().unwrap();
     trunk.execute("PRAGMA synchronous = NORMAL").unwrap();
     trunk

@@ -27,6 +27,20 @@ pub(crate) static FW3_RETRIES: AtomicU64 = AtomicU64::new(0);
 static FW1: AtomicBool = AtomicBool::new(false);
 static FW2: AtomicBool = AtomicBool::new(false);
 static FW3: AtomicBool = AtomicBool::new(false);
+static ENV_INIT: std::sync::Once = std::sync::Once::new();
+
+/// `TURSO_WALPIN_FIX=fw1,fw2,fw3` sets the switches at first use, so an existing test suite can be
+/// run under a fix; `set_fixes` afterwards overrides it.
+fn init_from_env() {
+    ENV_INIT.call_once(|| {
+        if let Ok(v) = std::env::var("TURSO_WALPIN_FIX") {
+            let has = |f: &str| v.split(',').any(|x| x.trim() == f);
+            FW1.store(has("fw1") || has("fw2"), Relaxed);
+            FW2.store(has("fw2"), Relaxed);
+            FW3.store(has("fw3"), Relaxed);
+        }
+    });
+}
 
 /// Cumulative counts since the process started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,6 +83,7 @@ pub fn counters() -> WalPinCounters {
 /// Select the fixes. Call before opening the database: FW1 and FW2 change what the WAL indexes as
 /// frames are appended, so switching them on a live WAL is refused by the harness, not handled here.
 pub fn set_fixes(fw1: bool, fw2: bool, fw3: bool) {
+    init_from_env();
     FW1.store(fw1 || fw2, Relaxed);
     FW2.store(fw2, Relaxed);
     FW3.store(fw3, Relaxed);
@@ -76,16 +91,19 @@ pub fn set_fixes(fw1: bool, fw2: bool, fw3: bool) {
 
 #[inline]
 pub(crate) fn fw1() -> bool {
+    init_from_env();
     FW1.load(Relaxed)
 }
 
 #[inline]
 pub(crate) fn fw2() -> bool {
+    init_from_env();
     FW2.load(Relaxed)
 }
 
 #[inline]
 pub(crate) fn fw3() -> bool {
+    init_from_env();
     FW3.load(Relaxed)
 }
 
