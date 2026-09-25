@@ -2400,6 +2400,9 @@ impl Database {
     ) -> Result<Arc<Connection>> {
         let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
+        // A branch connection is handed its branch's committed schema, which the branch store
+        // shares among every connection of the branch (and, until DDL, with its parent).
+        let shared_schema = schema.is_some();
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
@@ -2481,7 +2484,14 @@ impl Database {
         // symbol of its own.
         *conn.syms.write() = self.builtin_syms.read().clone();
         crate::branch::session_probe("syms");
-        refresh_analyze_stats(&conn);
+        // A shared branch schema already carries the analyze stats it was forked or committed with;
+        // loading them again would deep-copy the whole Schema into this connection
+        // (`with_schema_mut` → `Schema::try_make_mut`: 37,733 B per session with one analyzed
+        // table, r11-sessions FS3). Only a schema without stats loads them, and `connect_branch`
+        // then publishes that copy to the store, so the next connection shares it.
+        if !shared_schema || conn.schema.read().analyze_stats.needs_refresh() {
+            refresh_analyze_stats(&conn);
+        }
         crate::branch::session_probe("analyze_stats");
         Ok(conn)
     }

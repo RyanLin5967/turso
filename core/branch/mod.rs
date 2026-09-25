@@ -439,6 +439,23 @@ impl Connection {
         self.pager.load().branch_id()
     }
 
+    /// After this connection loaded analyze stats into its own copy of the branch schema, publish
+    /// that copy to the branch store, so the branch's later connections share it instead of
+    /// loading (and copying) again (FS3). Only outside a transaction: inside one, the stats may
+    /// come from uncommitted `sqlite_stat1` rows, and the branch commit publishes the schema.
+    pub(crate) fn publish_branch_schema_if_idle(&self) {
+        let Some(id) = self.pager.load().branch_id() else {
+            return;
+        };
+        if !self.get_auto_commit() || self.get_tx_state() != TransactionState::None {
+            return;
+        }
+        let schema = self.schema.read().clone();
+        if let Err(e) = self.db.branches.set_schema(id, schema) {
+            tracing::warn!("failed to publish a branch's analyze stats: {e}");
+        }
+    }
+
     /// What this connection holds, as integers. Observation only.
     #[doc(hidden)]
     pub fn session_footprint(&self) -> SessionFootprint {

@@ -3376,10 +3376,18 @@ impl Pager {
             pages
         };
         branch.store.commit_pages(branch.id, &dirty)?;
-        if schema_did_change {
-            branch
+        // Publish the connection's schema when DDL changed it, and also when the connection holds a
+        // private copy for any other reason (an ANALYZE on this branch refreshed its stats): branch
+        // connections share the store's schema instead of reloading stats at connect (FS3), so the
+        // store must carry the latest.
+        let schema = connection.schema.read().clone();
+        if schema_did_change
+            || !branch
                 .store
-                .set_schema(branch.id, connection.schema.read().clone())?;
+                .schema(branch.id)
+                .is_ok_and(|stored| Arc::ptr_eq(&stored, &schema))
+        {
+            branch.store.set_schema(branch.id, schema)?;
         }
         for page in &dirty {
             page.clear_dirty();

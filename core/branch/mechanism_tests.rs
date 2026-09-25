@@ -949,3 +949,63 @@ fn a_trunk_commit_does_not_invalidate_a_branch_cache_and_the_branch_still_reads_
     assert_eq!(table(&fresh), before);
     assert_eq!(value(&trunk, 7), Some("trunk-rewrite-7".to_string()));
 }
+
+/// FS3. With sqlite_stat1 present a branch connection shares the branch store's schema, stats
+/// included, instead of deep-copying it to load them; the stats it carries are the ones loading
+/// them through that connection would give; and a branch's own ANALYZE reaches its later
+/// connections.
+#[test]
+fn a_branch_connection_shares_its_store_schema_including_analyze_stats() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    trunk.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    trunk.execute("ANALYZE").unwrap();
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    let f = bc.session_footprint();
+    assert!(f.schema_shared_with_store, "the branch connection copied its schema");
+    let shared = bc.schema.read().clone();
+    assert!(
+        !shared.analyze_stats.needs_refresh(),
+        "the shared branch schema carries no analyze stats"
+    );
+    let loaded = crate::stats::gather_sqlite_stat1(&bc, &shared, None).unwrap();
+    assert_eq!(
+        format!("{:?}", sorted_stats(&shared.analyze_stats)),
+        format!("{:?}", sorted_stats(&loaded)),
+        "the shared stats differ from what this connection would load"
+    );
+    // The branch analyzes after changing its data; a later connection sees the new stats.
+    bc.execute("BEGIN").unwrap();
+    for id in 301..=900 {
+        bc.execute(format!("INSERT INTO t VALUES ({id}, 'b')")).unwrap();
+    }
+    bc.execute("COMMIT").unwrap();
+    bc.execute("ANALYZE").unwrap();
+    drop(bc);
+    let bc2 = b.connect().unwrap();
+    let later = bc2.schema.read().clone();
+    let reloaded = crate::stats::gather_sqlite_stat1(&bc2, &later, None).unwrap();
+    assert_eq!(
+        format!("{:?}", sorted_stats(&later.analyze_stats)),
+        format!("{:?}", sorted_stats(&reloaded)),
+        "a branch's own ANALYZE did not reach its next connection"
+    );
+    assert_ne!(
+        format!("{:?}", sorted_stats(&later.analyze_stats)),
+        format!("{:?}", sorted_stats(&shared.analyze_stats)),
+        "the branch's ANALYZE changed nothing, so this test cannot tell"
+    );
+    assert!(bc2.session_footprint().schema_shared_with_store);
+}
+
+fn sorted_stats(stats: &crate::stats::AnalyzeStats) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = stats
+        .tables
+        .iter()
+        .map(|(k, t)| (k.clone(), format!("{t:?}")))
+        .collect();
+    v.sort();
+    v
+}
