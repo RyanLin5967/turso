@@ -278,20 +278,27 @@ mod tests {
         let lock = Arc::new(BravoRwLock::new((0u64, 0u64)));
         assert!(lock.enabled, "the test must run the fast path");
         let stop = Arc::new(AtomicBool::new(false));
+        // Writes start only after some reader has taken the fast path: a writer that revokes the bias from the
+        // first instant can keep every reader on the slow path, and the test would then not run the fix.
+        let fast_seen = Arc::new(AtomicU64::new(0));
         let mut hs = Vec::new();
         for _ in 0..8 {
-            let (lock, stop) = (lock.clone(), stop.clone());
+            let (lock, stop, fast_seen) = (lock.clone(), stop.clone(), fast_seen.clone());
             hs.push(std::thread::spawn(move || {
                 let mut fast = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let g = lock.read();
                     if matches!(g, BravoReadGuard::Fast { .. }) {
                         fast += 1;
+                        fast_seen.fetch_add(1, Ordering::Relaxed);
                     }
                     assert_eq!(g.0, g.1, "a reader saw a half-written pair");
                 }
                 fast
             }));
+        }
+        while fast_seen.load(Ordering::Relaxed) < 1000 {
+            std::hint::spin_loop();
         }
         for i in 0..2000u64 {
             let mut g = lock.write();

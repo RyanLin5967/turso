@@ -3133,7 +3133,13 @@ impl VacuumLockGuard {
 
     fn try_read_raw(ptr: std::ptr::NonNull<crate::bravo::BravoRwLock<WalFileShared>>) -> Option<Self> {
         let acquired = unsafe { ptr.as_ref() }.read().runtime.vacuum_lock.read();
-        acquired.then_some(Self::ReadRaw { ptr })
+        // Not `then_some`: it builds the guard eagerly, and dropping the unused guard would unlock a lock this
+        // reader failed to take (it released VACUUM's exclusive hold; test_held_vacuum_checkpoint_locks_*).
+        if acquired {
+            Some(Self::ReadRaw { ptr })
+        } else {
+            None
+        }
     }
 
     fn try_write(ptr: Arc<crate::bravo::BravoRwLock<WalFileShared>>) -> Option<Self> {
