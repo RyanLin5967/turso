@@ -165,6 +165,25 @@ impl<V: TrieValue> PageMap<V> {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.root.is_none()
+    }
+
+    /// Remove `page`'s entry, if it has one. Every other version keeps its own, and an absent entry
+    /// copies nothing. A node left without an entry is dropped from its parent, and a root left
+    /// empty from the map, so every node a walk visits still holds an entry.
+    pub(crate) fn remove(&mut self, page: u32) {
+        if self.get(page).is_none() {
+            return;
+        }
+        let height = self.height;
+        let root = self.root.as_mut().expect("the entry is there");
+        if remove_in(root, height, page) {
+            self.root = None;
+            self.height = 0;
+        }
+    }
+
     /// Call `f` on every entry. Visits every node, so it costs what the map holds.
     pub(crate) fn for_each(&self, work: &mut TrieWork, f: &mut impl FnMut(u32, V)) {
         if let Some(root) = &self.root {
@@ -199,6 +218,24 @@ impl<V: TrieValue> PageMap<V> {
             hb -= 1;
         }
         diff_nodes(a, b, ha, 0, work, f);
+    }
+}
+
+/// Clear `page` under `node` (at `level`), which holds it; true when that leaves `node` empty.
+fn remove_in<V: TrieValue>(node: &mut Arc<Node<V>>, level: u32, page: u32) -> bool {
+    match Arc::make_mut(node) {
+        Node::Leaf(values) => {
+            values[(page & MASK) as usize] = V::EMPTY;
+            values.iter().all(|&v| v == V::EMPTY)
+        }
+        Node::Inner(kids) => {
+            let i = ((page >> (BITS * level)) & MASK) as usize;
+            let kid = kids[i].as_mut().expect("the entry is under this kid");
+            if remove_in(kid, level - 1, page) {
+                kids[i] = None;
+            }
+            kids.iter().all(Option::is_none)
+        }
     }
 }
 
@@ -420,6 +457,58 @@ mod tests {
             let mut want_all: Vec<(u32, u64)> = ma.iter().map(|(&p, &v)| (p, v)).collect();
             want_all.sort_unstable();
             assert_eq!(all, want_all, "version {i} walk");
+        }
+    }
+
+    /// Inserts and removes against a copied `HashMap`, over versions derived from one another: every
+    /// version keeps its own entries, and every node a walk visits holds an entry, so a map emptied by
+    /// removals has no root and a walk costs at most one path per entry.
+    #[test]
+    fn removals_keep_every_version_and_leave_no_empty_node() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let mut versions: Vec<(PageMap<u64>, HashMap<u32, u64>)> = vec![Default::default()];
+        for step in 0..3000u64 {
+            let from = (rng.next() % versions.len() as u64) as usize;
+            let (mut map, mut model) = versions[from].clone();
+            for _ in 0..(1 + rng.next() % 4) {
+                let page = match rng.next() % 3 {
+                    0 => (rng.next() % 64) as u32,
+                    1 => (rng.next() % 5000) as u32,
+                    _ => (rng.next() % 70_000) as u32,
+                };
+                if rng.next() % 2 == 0 {
+                    map.insert(page, step);
+                    model.insert(page, step);
+                } else {
+                    // Half the removals hit an entry the model holds (sorted: a HashMap's order is
+                    // random per process, and the test must replay).
+                    let mut held: Vec<u32> = model.keys().copied().collect();
+                    held.sort_unstable();
+                    let page = if !held.is_empty() && rng.next() % 2 == 0 {
+                        held[(rng.next() % held.len() as u64) as usize]
+                    } else {
+                        page
+                    };
+                    map.remove(page);
+                    model.remove(&page);
+                }
+            }
+            assert_eq!(map.is_empty(), model.is_empty(), "step {step}");
+            versions.push((map, model));
+        }
+        for (i, (map, model)) in versions.iter().enumerate() {
+            let mut all = Vec::new();
+            let mut walked = TrieWork::default();
+            map.for_each(&mut walked, &mut |p, v| all.push((p, v)));
+            all.sort_unstable();
+            let mut want: Vec<(u32, u64)> = model.iter().map(|(&p, &v)| (p, v)).collect();
+            want.sort_unstable();
+            assert_eq!(all, want, "version {i}");
+            assert!(
+                walked.nodes <= (u64::from(map.height()) + 1) * walked.reported,
+                "version {i}: {walked:?} at height {}",
+                map.height()
+            );
         }
     }
 

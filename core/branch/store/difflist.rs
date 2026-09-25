@@ -47,6 +47,14 @@
 //! indexes kept at fork, `set_meta` and handle release (the [`Catalog`]), and the per-parent
 //! `children` maps the store already had; [`ListArm::IndexSingle`] answers the owner-and-lease
 //! filter from the owner index alone, filtering the lease.
+//!
+//! Every arm above walks its output under the store's mutex, so a listing of all N branches stalls
+//! every other branch operation for Θ(N). [`ListArm::Snapshot`] answers `All` and `Parent` from
+//! persistent id maps (the page-map trie, keyed by branch id): it clones one in O(1) under the
+//! mutex and walks it after releasing it — a copy-on-write snapshot of an ordered index, as
+//! `google/btree`'s lazy `Clone` gives etcd and CockroachDB, and read-copy-update in general. The
+//! listing is the catalog as of the clone. Its other filters return small ranges and use `Index`.
+//! Branch ids are the maps' keys, so they must fit in a `u32`; a fork past that is refused.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
@@ -134,6 +142,7 @@ pub enum ListArm {
     Scan,
     Index,
     IndexSingle,
+    Snapshot,
 }
 
 /// What one LIST did. Observation only.
@@ -141,6 +150,9 @@ pub enum ListArm {
 pub struct ListWork {
     /// Table entries or index entries visited.
     pub entries_visited: u64,
+    /// Of those, the ones visited while holding the store's mutex: all of them, except for a
+    /// snapshot listing, which visits none under it.
+    pub under_lock: u64,
     pub output: u64,
     /// The branch table's entries and capacity at the call: a scan's time follows the capacity.
     pub table_len: u64,
@@ -162,6 +174,20 @@ pub(crate) struct Catalog {
     by_owner: BTreeSet<(u64, u64)>,
     by_lease: BTreeSet<(u64, u64)>,
     by_owner_lease: BTreeSet<(u64, u64, u64)>,
+    /// The same ids as persistent maps (id → parent id), all of them and per parent, for
+    /// [`ListArm::Snapshot`]. An insert or removal copies a path only while a listing holds a clone.
+    live_map: PageMap<u64>,
+    by_parent: HashMap<BranchId, PageMap<u64>>,
+}
+
+/// The largest branch id a snapshot map can key.
+pub(super) const MAX_LISTED_ID: u64 = u32::MAX as u64 - 1;
+
+fn map_key(id: BranchId) -> u32 {
+    u32::try_from(id.0)
+        .ok()
+        .filter(|&k| u64::from(k) <= MAX_LISTED_ID)
+        .expect("forks refuse ids past MAX_LISTED_ID")
 }
 
 /// `BranchState`'s defaults: no owner, no lease.
@@ -169,8 +195,26 @@ const NO_OWNER: u64 = 0;
 const NO_LEASE: u64 = u64::MAX;
 
 impl Catalog {
-    pub(super) fn add(&mut self, id: BranchId) {
+    pub(super) fn add(&mut self, id: BranchId, parent: BranchId) {
         self.insert(id, NO_OWNER, NO_LEASE);
+        self.live_map.insert(map_key(id), parent.0);
+        self.by_parent
+            .entry(parent)
+            .or_default()
+            .insert(map_key(id), parent.0);
+    }
+
+    pub(super) fn remove(&mut self, id: BranchId, parent: BranchId, owner: u64, lease: u64) {
+        self.remove_meta(id, owner, lease);
+        self.live_map.remove(map_key(id));
+        let siblings = self
+            .by_parent
+            .get_mut(&parent)
+            .expect("a listed branch is listed under its parent");
+        siblings.remove(map_key(id));
+        if siblings.is_empty() {
+            self.by_parent.remove(&parent);
+        }
     }
 
     fn insert(&mut self, id: BranchId, owner: u64, lease: u64) {
@@ -182,7 +226,7 @@ impl Catalog {
         crate::turso_assert!(fresh, "a branch was listed twice in the catalog");
     }
 
-    pub(super) fn remove(&mut self, id: BranchId, owner: u64, lease: u64) {
+    fn remove_meta(&mut self, id: BranchId, owner: u64, lease: u64) {
         let id = id.0;
         let listed = self.live.remove(&id)
             & self.by_owner.remove(&(owner, id))
@@ -198,7 +242,29 @@ impl BranchStore {
     }
 
     pub(crate) fn list(&self, filter: ListFilter, arm: ListArm) -> Result<Listing> {
-        self.inner.lock().list(filter, arm)
+        let inner = self.inner.lock();
+        let snapshot = match (arm, filter) {
+            (ListArm::Snapshot, ListFilter::All) => inner.catalog.live_map.clone(),
+            (ListArm::Snapshot, ListFilter::Parent(p)) => {
+                if !p.is_trunk() {
+                    inner.state(p)?;
+                }
+                inner.catalog.by_parent.get(&p).cloned().unwrap_or_default()
+            }
+            _ => return inner.list(filter, arm),
+        };
+        let mut work = ListWork {
+            table_len: inner.branches.len() as u64,
+            table_capacity: inner.branches.capacity() as u64,
+            ..Default::default()
+        };
+        drop(inner);
+        let mut ids = Vec::new();
+        let mut t = TrieWork::default();
+        snapshot.for_each(&mut t, &mut |id, _| ids.push(BranchId(u64::from(id))));
+        work.entries_visited = t.reported;
+        work.output = ids.len() as u64;
+        Ok(Listing { ids, work })
     }
 
     /// Set a branch's listing metadata. Refused for a branch without a handle: it is not listed.
@@ -210,7 +276,7 @@ impl BranchStore {
         }
         let old = (st.owner, st.lease);
         (st.owner, st.lease) = (owner, lease);
-        inner.catalog.remove(id, old.0, old.1);
+        inner.catalog.remove_meta(id, old.0, old.1);
         inner.catalog.insert(id, owner, lease);
         Ok(())
     }
@@ -449,7 +515,7 @@ impl StoreInner {
                 .by_lease
                 .range(..(t, 0))
                 .for_each(|&(_, id)| take(&mut ids, &mut work, id)),
-            (ListArm::Index, ListFilter::OwnerLease { owner, before }) => c
+            (ListArm::Index | ListArm::Snapshot, ListFilter::OwnerLease { owner, before }) => c
                 .by_owner_lease
                 .range((owner, 0, 0)..(owner, before, 0))
                 .for_each(|&(_, _, id)| take(&mut ids, &mut work, id)),
@@ -463,6 +529,7 @@ impl StoreInner {
             }
         }
         work.output = ids.len() as u64;
+        work.under_lock = work.entries_visited;
         Ok(Listing { ids, work })
     }
 }
@@ -824,7 +891,7 @@ mod tests {
                 if !want.is_empty() {
                     nonempty_filters += 1;
                 }
-                for arm in [ListArm::Scan, ListArm::Index, ListArm::IndexSingle] {
+                for arm in [ListArm::Scan, ListArm::Index, ListArm::IndexSingle, ListArm::Snapshot] {
                     let mut got = store.list(filter, arm).unwrap();
                     got.ids.sort_unstable();
                     assert_eq!(
@@ -833,6 +900,9 @@ mod tests {
                     );
                     let w = got.work;
                     let exact = match (arm, filter) {
+                        (ListArm::Snapshot, ListFilter::All | ListFilter::Parent(_)) => {
+                            w.entries_visited == w.output && w.under_lock == 0
+                        }
                         (ListArm::Scan, _) => w.entries_visited == w.table_len,
                         (_, ListFilter::Parent(_)) => w.entries_visited >= w.output,
                         (ListArm::IndexSingle, ListFilter::OwnerLease { .. }) => {

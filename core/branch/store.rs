@@ -378,6 +378,11 @@ impl BranchStore {
             }
             Some(_) => {}
         }
+        if inner.next_id > difflist::MAX_LISTED_ID {
+            return Err(LimboError::InternalError(
+                "branch ids are exhausted: the listing maps key them as u32".to_string(),
+            ));
+        }
         let id = BranchId(inner.next_id);
         inner.next_id += 1;
         let f = inner.trunk.lineage.epoch;
@@ -395,7 +400,7 @@ impl BranchStore {
                 trunk_snap,
             ),
         );
-        inner.catalog.add(id);
+        inner.catalog.add(id, BranchId::TRUNK);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
@@ -404,6 +409,11 @@ impl BranchStore {
     /// the same reason a trunk fork takes the WAL write lock.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         let mut inner = self.inner.lock();
+        if inner.next_id > difflist::MAX_LISTED_ID {
+            return Err(LimboError::InternalError(
+                "branch ids are exhausted: the listing maps key them as u32".to_string(),
+            ));
+        }
         let id = BranchId(inner.next_id);
         let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
@@ -430,7 +440,7 @@ impl BranchStore {
             id,
             BranchState::new(parent, f, schema, trunk_at, view, trunk_snap),
         );
-        inner.catalog.add(id);
+        inner.catalog.add(id, parent);
         Ok(id)
     }
 
@@ -472,9 +482,9 @@ impl BranchStore {
             };
         };
         let was_listed = std::mem::replace(&mut st.handle, false);
-        let (owner, lease) = (st.owner, st.lease);
+        let (parent, owner, lease) = (st.parent, st.owner, st.lease);
         if was_listed {
-            inner.catalog.remove(id, owner, lease);
+            inner.catalog.remove(id, parent, owner, lease);
         }
         let freed_pages = self.collect(&mut inner, id);
         Reaped {
