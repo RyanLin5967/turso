@@ -59,7 +59,9 @@ const SCHEMA: &[&str] = &[
      lease INTEGER, n_children INTEGER NOT NULL)",
     "CREATE INDEX IF NOT EXISTS branch_children ON branch(parent, fork_epoch)",
     "CREATE INDEX IF NOT EXISTS branch_lease ON branch(lease)",
-    "CREATE INDEX IF NOT EXISTS branch_released ON branch(released)",
+    // Released branches with no live child: only these can be collected at an open (a released
+    // interior with children is retired and stays), so an open never walks retired interiors.
+    "CREATE INDEX IF NOT EXISTS branch_released ON branch(released, n_children)",
     // k = branch << 32 | page: one B-tree lookup per (branch, page), one range per branch.
     "CREATE TABLE IF NOT EXISTS cur(k INTEGER PRIMARY KEY, slot INTEGER NOT NULL, \
      born INTEGER NOT NULL, crc INTEGER NOT NULL)",
@@ -84,7 +86,7 @@ const LOOKUPS: &[&str] = &[
     "SELECT id FROM branch WHERE lease > -1 AND lease <= ?1",
     "SELECT lease FROM branch WHERE lease > -1 ORDER BY lease ASC LIMIT 1",
     "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
-    "SELECT id FROM branch WHERE released = 1",
+    "SELECT id FROM branch WHERE released = 1 AND n_children = 0",
     "SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2",
     "SELECT 1 FROM free WHERE slot = ?1",
     "DELETE FROM cur WHERE k >= ?1 AND k < ?2",
@@ -305,7 +307,7 @@ impl Catalog {
                 "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
             )?,
             trunk_counts: p("SELECT page, count(*) FROM ret WHERE owner = 0 GROUP BY page")?,
-            released: p("SELECT id FROM branch WHERE released = 1")?,
+            released: p("SELECT id FROM branch WHERE released = 1 AND n_children = 0")?,
             unreleased: p("SELECT id FROM branch WHERE released = 0")?,
             free_after: p("SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2")?,
             free_first: p("SELECT slot FROM free ORDER BY slot ASC LIMIT ?1")?,
