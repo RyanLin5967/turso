@@ -108,10 +108,11 @@
 //!   `gc_budget` steps at a time (one index entry visited, or one candidate examined), resuming each
 //!   side of the lockstep walk after the last key it visited. Until its task frees it, garbage sits
 //!   where no read can reach it: a read's predecessor search finds the version that contains its
-//!   fork, and a garbage version contains none. A version inserted behind a task's resume key holds
-//!   a live child other than the reaped one, so it is never that task's garbage; a version another
-//!   task or the sweep has freed is skipped. (Abandoning long walks instead, and leaving their
-//!   garbage to the horizon, kept up to a third more versions at 10^5 branches: r11-space PREREG A4.)
+//!   fork, and a garbage version contains none. A candidate is freed only if, when examined, no live
+//!   child forked inside it — the query's bounds are those of the moment the task was queued, and a
+//!   version split off since can hold a child forked since; a version another task or the sweep has
+//!   freed is skipped. (Abandoning long walks instead, and leaving their garbage to the horizon,
+//!   kept up to a third more versions at 10^5 branches: r11-space PREREG A4.)
 //!
 //! So a store call does at most `2 * gc_budget` reclamation steps, and every task completes. With no
 //! budget (the tests' eager mode) every reap frees its garbage at once, as before.
@@ -323,7 +324,6 @@ impl GcTask {
             }
         }
         let side = self.finished.expect("the walk has ended");
-        let (lo, f, hi) = (self.lo, self.f, self.hi);
         while self.next_free < self.seen[side].len() {
             if *budget == 0 {
                 return false;
@@ -332,8 +332,11 @@ impl GcTask {
             let v = self.seen[side][self.next_free];
             self.next_free += 1;
             let (born, _, _, died) = v;
-            let only_f = born > lo && born <= f && f < died && hi.is_none_or(|hi| died <= hi);
-            if only_f && lineage.by_born.contains(&v) {
+            // Garbage NOW: no live child forked inside it. The query's `{born > lo, died <= hi}` held
+            // for the versions that existed when the task was queued, but a version split off since
+            // can hold a child forked since (when the reaped child was the newest, `hi` is open), so
+            // each candidate is checked against the children as they are.
+            if lineage.by_born.contains(&v) && !lineage.has_child_in(born, died) {
                 lineage.release(v, chunks, work);
                 *freed += 1;
             }
