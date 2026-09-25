@@ -63,6 +63,7 @@ use crate::sync::Arc;
 use crate::util::IOExt as _;
 use crate::{Connection, Database, Result, TransactionState};
 use store::BranchStore;
+pub use store::difflist::{Diff, DiffArm, DiffWork, ListArm, ListFilter, ListWork, Listing};
 
 /// The identity of a branch. Distinct from any page or transaction id on purpose: a branch
 /// outlives the transactions that write into it, which is the whole point of the mechanism.
@@ -235,6 +236,12 @@ impl Branch {
         Ok(self.db.branches.release_handle(self.id))
     }
 
+    /// Set this branch's listing metadata: an owner tag (0 = none) and a lease deadline
+    /// (`u64::MAX` = none). See [`Database::branch_list`].
+    pub fn set_meta(&self, owner: u64, lease: u64) -> Result<()> {
+        self.db.branches.set_meta(self.id, owner, lease)
+    }
+
     /// The arena slots this branch currently owns or retains, for membership assertions.
     #[doc(hidden)]
     pub fn owned_slots(&self) -> Vec<u32> {
@@ -357,6 +364,18 @@ impl Connection {
 impl Database {
     pub fn branch_stats(&self) -> BranchStats {
         self.branches.stats()
+    }
+
+    /// The pages whose version differs between two views, each a live branch or the trunk
+    /// ([`BranchId::TRUNK`], its current state). `arm` picks the search; every arm returns the same
+    /// pages (see `store::difflist`).
+    pub fn branch_diff(&self, x: BranchId, y: BranchId, arm: DiffArm) -> Result<Diff> {
+        self.branches.diff(x, y, arm)
+    }
+
+    /// The branches that hold a handle and match `filter`. Every arm returns the same ids.
+    pub fn branch_list(&self, filter: ListFilter, arm: ListArm) -> Result<Listing> {
+        self.branches.list(filter, arm)
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.

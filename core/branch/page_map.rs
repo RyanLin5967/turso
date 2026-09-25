@@ -16,6 +16,13 @@
 //! touched under the branch store's mutex, so there is no interleaving for a model checker to
 //! explore, and `Arc::make_mut` — which copies a node only while another version shares it — is
 //! what makes an insert into an unshared map free of copies.
+//!
+//! The value type is generic so that the trunk's persistent map of last-write epochs (`u64`) shares
+//! this code with the branches' slot maps (`Slot`). Two versions of one map that descend from a
+//! common clone share every node neither has written since, so [`PageMap::diff`] skips a shared
+//! subtree by pointer equality and costs what differs, not what exists — the structural-sharing
+//! diff of hash array mapped tries and of Merkle trees, and ZFS's birth-time pruning in another
+//! form.
 
 use std::sync::Arc;
 
@@ -24,33 +31,68 @@ use super::arena::Slot;
 const BITS: u32 = 5;
 const WIDTH: usize = 1 << BITS;
 const MASK: u32 = WIDTH as u32 - 1;
-/// No arena slot has this index ([`PageMap::insert`] refuses it); it marks an empty leaf entry.
-const EMPTY: Slot = Slot::MAX;
 
-#[derive(Clone)]
-enum Node {
-    Inner([Option<Arc<Node>>; WIDTH]),
-    Leaf([Slot; WIDTH]),
+/// A value a [`PageMap`] can hold. `EMPTY` marks an absent leaf entry, so no real value may equal it
+/// ([`PageMap::insert`] refuses it).
+pub(crate) trait TrieValue: Copy + Eq {
+    const EMPTY: Self;
 }
 
-impl Node {
+/// No arena slot has index `Slot::MAX`.
+impl TrieValue for Slot {
+    const EMPTY: Self = Slot::MAX;
+}
+
+/// No trunk epoch reaches `u64::MAX`: epochs advance by one per fork.
+impl TrieValue for u64 {
+    const EMPTY: Self = u64::MAX;
+}
+
+#[derive(Clone)]
+enum Node<V: TrieValue> {
+    Inner([Option<Arc<Node<V>>>; WIDTH]),
+    Leaf([V; WIDTH]),
+}
+
+impl<V: TrieValue> Node<V> {
     fn empty(level: u32) -> Self {
         if level == 0 {
-            Node::Leaf([EMPTY; WIDTH])
+            Node::Leaf([V::EMPTY; WIDTH])
         } else {
             Node::Inner(std::array::from_fn(|_| None))
         }
     }
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct PageMap {
-    root: Option<Arc<Node>>,
+#[derive(Clone)]
+pub(crate) struct PageMap<V: TrieValue = Slot> {
+    root: Option<Arc<Node<V>>>,
     /// Inner levels above the leaves: pages below `WIDTH^(height + 1)` are addressable.
     height: u32,
 }
 
-impl PageMap {
+impl<V: TrieValue> Default for PageMap<V> {
+    fn default() -> Self {
+        Self {
+            root: None,
+            height: 0,
+        }
+    }
+}
+
+/// What a walk or a diff of page maps touched. Observation only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrieWork {
+    /// Nodes visited by a full walk, plus node PAIRS compared by a diff that were not the same
+    /// node. A pair skipped by pointer equality is not counted here.
+    pub nodes: u64,
+    /// Leaf entries read: 32 per leaf a walk visits or a diff compares.
+    pub leaf_entries: u64,
+    /// Pages the walk or diff reported.
+    pub reported: u64,
+}
+
+impl<V: TrieValue> PageMap<V> {
     fn covers(&self, page: u32) -> bool {
         u64::from(page) < 1u64 << (BITS * (self.height + 1))
     }
@@ -59,7 +101,11 @@ impl PageMap {
         ((page >> (BITS * level)) & MASK) as usize
     }
 
-    pub(crate) fn get(&self, page: u32) -> Option<Slot> {
+    pub(crate) fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub(crate) fn get(&self, page: u32) -> Option<V> {
         let mut node = self.root.as_deref()?;
         if !self.covers(page) {
             return None;
@@ -71,9 +117,9 @@ impl PageMap {
                     node = kids[Self::index(page, level)].as_deref()?;
                     level -= 1;
                 }
-                Node::Leaf(slots) => {
-                    let slot = slots[Self::index(page, 0)];
-                    return (slot != EMPTY).then_some(slot);
+                Node::Leaf(values) => {
+                    let value = values[Self::index(page, 0)];
+                    return (value != V::EMPTY).then_some(value);
                 }
             }
         }
@@ -81,14 +127,14 @@ impl PageMap {
 
     /// Map `page` to `slot`, replacing any previous mapping. Every other version of this map —
     /// every clone taken before this call — keeps the mapping it had.
-    pub(crate) fn insert(&mut self, page: u32, slot: Slot) {
-        crate::turso_assert!(slot != EMPTY, "arena slot u32::MAX is the page map's empty marker");
+    pub(crate) fn insert(&mut self, page: u32, value: V) {
+        crate::turso_assert!(value != V::EMPTY, "a page map value equal to its empty marker");
         if self.root.is_none() {
             self.root = Some(Arc::new(Node::empty(0)));
             self.height = 0;
         }
         while !self.covers(page) {
-            let mut kids: [Option<Arc<Node>>; WIDTH] = std::array::from_fn(|_| None);
+            let mut kids: [Option<Arc<Node<V>>>; WIDTH] = std::array::from_fn(|_| None);
             kids[0] = self.root.take();
             self.root = Some(Arc::new(Node::Inner(kids)));
             self.height += 1;
@@ -103,12 +149,134 @@ impl PageMap {
                     level -= 1;
                     Arc::make_mut(kid)
                 }
-                Node::Leaf(slots) => {
-                    slots[Self::index(page, 0)] = slot;
+                Node::Leaf(values) => {
+                    values[Self::index(page, 0)] = value;
                     return;
                 }
             };
         }
+    }
+
+    /// Call `f` on every entry. Visits every node, so it costs what the map holds.
+    pub(crate) fn for_each(&self, work: &mut TrieWork, f: &mut impl FnMut(u32, V)) {
+        if let Some(root) = &self.root {
+            walk(root, self.height, 0, work, f);
+        }
+    }
+
+    /// Report every page whose entry differs between `self` and `other`, including a page present
+    /// in only one of them. A subtree the two maps share — the same node, by pointer — is skipped
+    /// unread, so two versions of one map that descend from a common clone cost the nodes on the
+    /// paths written since they diverged, not the size of either.
+    ///
+    /// When one map is taller, only kid 0 of each of its extra top levels overlaps the shorter
+    /// map's pages (a root grows by becoming kid 0 of a new root, `insert`); the other kids hold
+    /// pages the shorter map cannot, and are walked whole.
+    pub(crate) fn diff(&self, other: &Self, work: &mut TrieWork, f: &mut impl FnMut(u32)) {
+        let (mut a, mut b) = (self.root.as_ref(), other.root.as_ref());
+        // A map with no root has no entries at any height.
+        let (mut ha, mut hb) = (self.height, other.height);
+        if a.is_none() {
+            ha = hb;
+        }
+        if b.is_none() {
+            hb = ha;
+        }
+        while ha > hb {
+            a = descend_taller(a, ha, work, f);
+            ha -= 1;
+        }
+        while hb > ha {
+            b = descend_taller(b, hb, work, f);
+            hb -= 1;
+        }
+        diff_nodes(a, b, ha, 0, work, f);
+    }
+}
+
+fn walk<V: TrieValue>(
+    node: &Node<V>,
+    level: u32,
+    base: u32,
+    work: &mut TrieWork,
+    f: &mut impl FnMut(u32, V),
+) {
+    work.nodes += 1;
+    match node {
+        Node::Inner(kids) => {
+            for (i, kid) in kids.iter().enumerate() {
+                if let Some(kid) = kid {
+                    walk(kid, level - 1, base | ((i as u32) << (BITS * level)), work, f);
+                }
+            }
+        }
+        Node::Leaf(values) => {
+            work.leaf_entries += WIDTH as u64;
+            for (i, &value) in values.iter().enumerate() {
+                if value != V::EMPTY {
+                    work.reported += 1;
+                    f(base | i as u32, value);
+                }
+            }
+        }
+    }
+}
+
+/// One extra top level of the taller map in a diff: report every page under kids 1.. (the shorter
+/// map cannot hold them) and return kid 0, the part that overlaps.
+fn descend_taller<'a, V: TrieValue>(
+    node: Option<&'a Arc<Node<V>>>,
+    level: u32,
+    work: &mut TrieWork,
+    f: &mut impl FnMut(u32),
+) -> Option<&'a Arc<Node<V>>> {
+    let Node::Inner(kids) = &**node? else {
+        unreachable!("a node above the leaves is an inner node");
+    };
+    work.nodes += 1;
+    for (i, kid) in kids.iter().enumerate().skip(1) {
+        if let Some(kid) = kid {
+            walk(kid, level - 1, (i as u32) << (BITS * level), work, &mut |p, _| f(p));
+        }
+    }
+    kids[0].as_ref()
+}
+
+fn diff_nodes<V: TrieValue>(
+    a: Option<&Arc<Node<V>>>,
+    b: Option<&Arc<Node<V>>>,
+    level: u32,
+    base: u32,
+    work: &mut TrieWork,
+    f: &mut impl FnMut(u32),
+) {
+    let (a, b) = match (a, b) {
+        (None, None) => return,
+        (Some(a), Some(b)) if Arc::ptr_eq(a, b) => return,
+        (Some(only), None) | (None, Some(only)) => {
+            walk(only, level, base, work, &mut |p, _| f(p));
+            return;
+        }
+        (Some(a), Some(b)) => (a, b),
+    };
+    work.nodes += 1;
+    match (&**a, &**b) {
+        (Node::Inner(ka), Node::Inner(kb)) => {
+            for i in 0..WIDTH {
+                let base = base | ((i as u32) << (BITS * level));
+                diff_nodes(ka[i].as_ref(), kb[i].as_ref(), level - 1, base, work, f);
+            }
+        }
+        (Node::Leaf(va), Node::Leaf(vb)) => {
+            work.leaf_entries += WIDTH as u64;
+            for i in 0..WIDTH {
+                if va[i] != vb[i] {
+                    work.reported += 1;
+                    f(base | i as u32);
+                }
+            }
+        }
+        _ => unreachable!("two nodes at the same level are both inner or both leaves"),
     }
 }
 
@@ -133,7 +301,7 @@ mod tests {
     #[test]
     fn every_version_keeps_its_own_mappings_under_clones_and_inserts() {
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        let mut versions: Vec<(PageMap, HashMap<u32, Slot>)> = vec![Default::default()];
+        let mut versions: Vec<(PageMap<Slot>, HashMap<u32, Slot>)> = vec![Default::default()];
         for step in 0..3000u32 {
             let from = (rng.next() % versions.len() as u64) as usize;
             let (mut map, mut model) = versions[from].clone();
@@ -158,9 +326,88 @@ mod tests {
         }
     }
 
+    /// `for_each` and `diff` against the same copied-`HashMap` model, over versions of all heights
+    /// derived from one another by clones and inserts; and the diff's cost against its contract: a
+    /// version diffed against one it was cloned from costs at most `height + 1` node pairs and one
+    /// leaf of entries per page written since, however large the maps are.
+    #[test]
+    fn walk_and_diff_match_a_model_and_a_diff_costs_what_changed() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let mut versions: Vec<(PageMap<u64>, HashMap<u32, u64>)> = vec![Default::default()];
+        let mut pruned_cases = 0;
+        for step in 0..600u64 {
+            let from = (rng.next() % versions.len() as u64) as usize;
+            let (mut map, mut model) = versions[from].clone();
+            let inserts = rng.next() % 4;
+            let mut written = std::collections::HashSet::new();
+            for _ in 0..inserts {
+                let page = match rng.next() % 4 {
+                    0 => (rng.next() % 64) as u32,
+                    1 => (rng.next() % 5000) as u32,
+                    2 => (rng.next() % 70_000) as u32,
+                    _ => (rng.next() % u64::from(u32::MAX)) as u32,
+                };
+                map.insert(page, step);
+                model.insert(page, step);
+                written.insert(page);
+            }
+            // The cost contract, against the version this one was cloned from.
+            let mut work = TrieWork::default();
+            let mut got = Vec::new();
+            map.diff(&versions[from].0, &mut work, &mut |p| got.push(p));
+            got.sort_unstable();
+            let mut want: Vec<u32> = written
+                .iter()
+                .copied()
+                .filter(|p| versions[from].1.get(p) != Some(&step))
+                .collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "step {step}: diff against its source");
+            let h = u64::from(map.height().max(versions[from].0.height()));
+            if versions[from].0.height() == map.height() {
+                assert!(
+                    work.nodes <= (h + 1) * want.len() as u64
+                        && work.leaf_entries <= 32 * want.len() as u64,
+                    "step {step}: {work:?} for {} written pages at height {h}",
+                    want.len()
+                );
+                if !want.is_empty() && !versions[from].1.is_empty() {
+                    pruned_cases += 1;
+                }
+            }
+            versions.push((map, model));
+        }
+        assert!(pruned_cases > 100, "only {pruned_cases} diffs exercised the pruning contract");
+        for _ in 0..3000 {
+            let i = (rng.next() % versions.len() as u64) as usize;
+            let j = (rng.next() % versions.len() as u64) as usize;
+            let (a, ma) = &versions[i];
+            let (b, mb) = &versions[j];
+            let mut work = TrieWork::default();
+            let mut got = Vec::new();
+            a.diff(b, &mut work, &mut |p| got.push(p));
+            got.sort_unstable();
+            let mut want: Vec<u32> = ma
+                .keys()
+                .chain(mb.keys())
+                .copied()
+                .filter(|p| ma.get(p) != mb.get(p))
+                .collect();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(got, want, "versions {i} and {j}");
+            let mut all = Vec::new();
+            a.for_each(&mut TrieWork::default(), &mut |p, v| all.push((p, v)));
+            all.sort_unstable();
+            let mut want_all: Vec<(u32, u64)> = ma.iter().map(|(&p, &v)| (p, v)).collect();
+            want_all.sort_unstable();
+            assert_eq!(all, want_all, "version {i} walk");
+        }
+    }
+
     #[test]
     fn an_empty_map_and_an_unaddressable_page_read_as_absent() {
-        let mut map = PageMap::default();
+        let mut map = PageMap::<Slot>::default();
         assert_eq!(map.get(0), None);
         map.insert(3, 7);
         assert_eq!(map.get(3), Some(7));

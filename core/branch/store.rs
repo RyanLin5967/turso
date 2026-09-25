@@ -91,6 +91,8 @@ use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
 
+pub(crate) mod difflist;
+
 pub(crate) struct BranchStore {
     inner: Mutex<StoreInner>,
     /// Live children of the trunk. Read without the lock on every trunk first-write so that a
@@ -108,6 +110,8 @@ struct StoreInner {
     next_id: u64,
     trunk: TrunkState,
     branches: HashMap<BranchId, BranchState>,
+    /// Secondary indexes over the branches that hold a handle, for listing them (see `difflist`).
+    catalog: difflist::Catalog,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
 }
@@ -144,6 +148,11 @@ struct TrunkState {
     /// was live at the time", i.e. epoch 0, which is the conservative answer: it can only cause a
     /// retention that was not strictly needed, never skip one that was.
     written: HashMap<u32, u64>,
+    /// The same last-write epochs as a persistent page map, updated beside `written`. Each trunk
+    /// child keeps the version current at its fork (`BranchState::trunk_snap`), so the trunk pages
+    /// that differ between two fork points are a pointer-pruned diff of two versions of this map
+    /// (see `difflist`). A write copies the path to its page only while a snapshot shares it.
+    written_map: PageMap<u64>,
 }
 
 struct BranchState {
@@ -169,6 +178,13 @@ struct BranchState {
     /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
     /// branch's first fork and kept current by its writes from then on; `None` until it forks.
     view: Option<PageMap>,
+    /// The trunk's `written_map` as of `trunk_at`: taken at the fork of this branch's trunk-child
+    /// ancestor and passed down unchanged, like `trunk_at` itself.
+    trunk_snap: PageMap<u64>,
+    /// Listing metadata, set by `set_meta`: an owner tag (0 = none) and a lease deadline
+    /// (`u64::MAX` = none). Nothing in the page mechanism reads them.
+    owner: u64,
+    lease: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -327,8 +343,10 @@ impl BranchStore {
                 trunk: TrunkState {
                     lineage: Lineage::default(),
                     written: HashMap::new(),
+                    written_map: PageMap::default(),
                 },
                 branches: HashMap::new(),
+                catalog: difflist::Catalog::default(),
                 work: BranchWork::default(),
             }),
             trunk_children: AtomicUsize::new(0),
@@ -365,10 +383,19 @@ impl BranchStore {
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
         inner.trunk.lineage.children.insert(f, id);
+        let trunk_snap = inner.trunk.written_map.clone();
         inner.branches.insert(
             id,
-            BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
+            BranchState::new(
+                BranchId::TRUNK,
+                f,
+                schema,
+                f,
+                PageMap::default(),
+                trunk_snap,
+            ),
         );
+        inner.catalog.add(id);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
@@ -397,11 +424,13 @@ impl BranchStore {
                 view
             })
             .clone();
-        let trunk_at = st.trunk_at;
+        let (trunk_at, trunk_snap) = (st.trunk_at, st.trunk_snap.clone());
         inner.next_id += 1;
-        inner
-            .branches
-            .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
+        inner.branches.insert(
+            id,
+            BranchState::new(parent, f, schema, trunk_at, view, trunk_snap),
+        );
+        inner.catalog.add(id);
         Ok(id)
     }
 
@@ -442,7 +471,11 @@ impl BranchStore {
                 deferred: false,
             };
         };
-        st.handle = false;
+        let was_listed = std::mem::replace(&mut st.handle, false);
+        let (owner, lease) = (st.owner, st.lease);
+        if was_listed {
+            inner.catalog.remove(id, owner, lease);
+        }
         let freed_pages = self.collect(&mut inner, id);
         Reaped {
             freed_pages,
@@ -561,6 +594,7 @@ impl BranchStore {
             );
         }
         trunk.written.insert(page, epoch);
+        trunk.written_map.insert(page, epoch);
     }
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
@@ -745,6 +779,7 @@ impl BranchState {
         schema: Arc<Schema>,
         trunk_at: u64,
         inherited: PageMap,
+        trunk_snap: PageMap<u64>,
     ) -> Self {
         Self {
             parent,
@@ -758,6 +793,9 @@ impl BranchState {
             trunk_at,
             inherited,
             view: None,
+            trunk_snap,
+            owner: 0,
+            lease: u64::MAX,
         }
     }
 }
