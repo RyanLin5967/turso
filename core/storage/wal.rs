@@ -4697,7 +4697,10 @@ impl WalFile {
                 max_frame: 0,
                 current_page: 0,
                 pages_to_checkpoint: Vec::new(),
-                inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
+                // Grown on first use: only a connection that checkpoints issues these reads, and a
+                // branch connection never does, so reserving MAX_INFLIGHT_READS slots here put
+                // 12,288 bytes into every open branch session for nothing (r11-sessions, FS4).
+                inflight_reads: Vec::new(),
             }),
             checkpoint_threshold: 1000,
             buffer_pool,
