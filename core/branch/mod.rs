@@ -55,6 +55,7 @@
 pub(crate) mod arena;
 #[doc(hidden)]
 pub mod bench;
+pub(crate) mod linear_map;
 pub(crate) mod page_map;
 pub(crate) mod store;
 
@@ -177,6 +178,9 @@ pub struct BranchStats {
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
+    /// Handles the arena's handle table has had to hold at once (one 8-byte word each): the one
+    /// arena structure that stays at its peak.
+    pub arena_handles: usize,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -231,6 +235,9 @@ pub struct BranchWork {
     pub arena_frames_copied: u64,
     /// Arena chunks returned to the allocator (0 on an arena that never returns one).
     pub arena_chunks_freed: u64,
+    /// Handle-less, closed branches with one live child spliced out of the tree (0 on a store that
+    /// keeps them).
+    pub splices: u64,
 }
 
 impl Branch {

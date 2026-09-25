@@ -46,15 +46,19 @@
 //! A retained version is garbage once no live child of its node forked inside `[born, died)`.
 //! Removing the child forked at `f` can only make versions containing `f` garbage, and a version
 //! containing `f` becomes garbage exactly when it also lies strictly between `f`'s neighbouring
-//! live siblings `lo` and `hi`: `born > lo` and `died <= hi`. The versions are indexed both by
-//! `born` and by `died` — ZFS's deadlists, which key a dead block by the interval that killed it
-//! and split it by birth — so that each side of that query is a range, not a scan:
+//! live siblings `lo` and `hi`: `born > lo` and `died <= hi`.
 //!
-//! * with no older live sibling (the oldest child, which is whom uniform-TTL lease expiry reaps),
-//!   the garbage is exactly the versions with `died` in `(f, hi]`;
-//! * with no younger one (the newest child), exactly those with `born` in `(lo, f]`;
-//! * with both, each range also holds survivors, and the two are walked in lockstep until the
-//!   shorter one ends (see [`Lineage::garbage`]).
+//! The live children a version holds are a contiguous run of the node's live children (those
+//! forked in `[born, died)`), and the run only ever loses members. So each version is filed under
+//! its FIRST live holder, in a min-heap ordered by `died`: priority queues on the nodes of a
+//! union–find over the live list (Mendelson, Tarjan, Thorup and Zwick, SWAT 2004). When the child
+//! at `f` goes, the versions filed under it are exactly those with `born` in `(lo, f]`; of those,
+//! the garbage is the prefix of its heap with `died <= hi` (all of it, if there is no younger live
+//! sibling), and the rest now start at `hi`, so the heap is melded into `hi`'s. A reap therefore
+//! visits what it frees plus one heap root, and melds two heaps — leftist heaps (Crane 1972), so
+//! O(log V) worst case — and never walks a surviving version. (The two range walks this replaces,
+//! ZFS-deadlist indexes by `born` and by `died`, cost twice the smaller range whatever it freed:
+//! a reap could walk every version and free none.)
 //!
 //! A branch whose handle has been dropped but that still has a live child or an open connection
 //! is kept (its versions are still read through); it is freed the moment the last of those goes,
@@ -79,11 +83,10 @@
 //! Tarjan's fat node (JCSS 1989) with a search tree over its version stamps. [`Lineage::retain`]
 //! refuses a version that would break the disjointness the search relies on.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::hash::Hash;
-use std::ops::Bound;
+use std::collections::BTreeMap;
 
 use super::arena::{Arena, Slot};
+use super::linear_map::LinearMap;
 use super::page_map::PageMap;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
@@ -108,7 +111,7 @@ struct StoreInner {
     arena: Option<Arena>,
     next_id: u64,
     trunk: TrunkState,
-    branches: HashMap<BranchId, BranchState>,
+    branches: LinearMap<BranchId, BranchState>,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
     /// Observation only: the largest `capacity()` the `branches` table has had.
@@ -119,20 +122,78 @@ struct StoreInner {
 struct Lineage {
     /// Advanced by each fork of this node; the pre-increment value is the child's fork epoch.
     epoch: u64,
-    /// Live children by fork epoch. Fork epochs are unique within a parent.
-    children: BTreeMap<u64, BranchId>,
+    /// Live children by fork epoch, each with the retained versions it is the first live holder
+    /// of. Fork epochs are unique within a parent.
+    children: BTreeMap<u64, Child>,
     /// Superseded versions kept because a live child forked while they were current, per page and
     /// ordered by `born` (see "Per-page version order" above).
-    retained: HashMap<u32, BTreeMap<u64, Retained>>,
-    /// The same versions as `(born, page, died)`, for the reclamation range query by birth.
-    by_born: BTreeSet<(u64, u32, u64)>,
-    /// The same versions as `(died, page, born)`, for the reclamation range query by death.
-    by_died: BTreeSet<(u64, u32, u64)>,
+    retained: LinearMap<u32, BTreeMap<u64, Retained>>,
 }
 
-/// No page has this number (SQLite's largest is `u32::MAX - 1`; [`Lineage::retain`] refuses it), so
-/// `(e, NO_PAGE, u64::MAX)` sorts after every index entry whose first field is `e`.
-const NO_PAGE: u32 = u32::MAX;
+struct Child {
+    id: BranchId,
+    /// The retained versions whose first live holder this child is, by `died`.
+    first_of: Heap,
+}
+
+impl Child {
+    fn new(id: BranchId) -> Self {
+        Self { id, first_of: None }
+    }
+}
+
+/// A leftist min-heap of retained versions ordered by `died` (Crane 1972): every node's right
+/// spine is no longer than its left one, so a meld walks two right spines of O(log n) nodes each,
+/// worst case.
+struct HeapNode {
+    died: u64,
+    born: u64,
+    page: u32,
+    /// Length of the right spine below and including this node.
+    rank: u32,
+    left: Heap,
+    right: Heap,
+}
+
+type Heap = Option<Box<HeapNode>>;
+
+fn rank(h: &Heap) -> u32 {
+    h.as_ref().map_or(0, |n| n.rank)
+}
+
+/// Meld two heaps; `steps` gains the right-spine nodes visited (observation only).
+fn meld(a: Heap, b: Heap, steps: &mut u64) -> Heap {
+    match (a, b) {
+        (None, h) | (h, None) => h,
+        (Some(mut x), Some(mut y)) => {
+            *steps += 1;
+            if y.died < x.died {
+                std::mem::swap(&mut x, &mut y);
+            }
+            let right = x.right.take();
+            x.right = meld(right, Some(y), steps);
+            if rank(&x.left) < rank(&x.right) {
+                std::mem::swap(&mut x.left, &mut x.right);
+            }
+            x.rank = rank(&x.right) + 1;
+            Some(x)
+        }
+    }
+}
+
+impl Drop for HeapNode {
+    /// Iterative: a leftist heap's LEFT paths can be as long as the heap, and a recursive `Box`
+    /// drop down one would overflow the stack.
+    fn drop(&mut self) {
+        let mut stack: Vec<Box<HeapNode>> = Vec::new();
+        stack.extend(self.left.take());
+        stack.extend(self.right.take());
+        while let Some(mut n) = stack.pop() {
+            stack.extend(n.left.take());
+            stack.extend(n.right.take());
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Retained {
@@ -146,7 +207,7 @@ struct TrunkState {
     /// The trunk epoch of its last write to each page. Absent means "before the first fork that
     /// was live at the time", i.e. epoch 0, which is the conservative answer: it can only cause a
     /// retention that was not strictly needed, never skip one that was.
-    written: HashMap<u32, u64>,
+    written: LinearMap<u32, u64>,
 }
 
 struct BranchState {
@@ -154,7 +215,7 @@ struct BranchState {
     fork_epoch: u64,
     lineage: Lineage,
     /// The branch's current version of every page it has written.
-    current: HashMap<u32, Owned>,
+    current: LinearMap<u32, Owned>,
     /// The branch's committed schema. Shared with the parent at fork (an `Arc` clone), replaced by
     /// a committed DDL on the branch.
     schema: Arc<Schema>,
@@ -169,8 +230,13 @@ struct BranchState {
     trunk_at: u64,
     /// Every arena page this branch sees through its ancestors: its parent's `view` at the fork.
     inherited: PageMap,
-    /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
-    /// branch's first fork and kept current by its writes from then on; `None` until it forks.
+    /// Slots this branch took over from ancestors spliced out above it (see [`BranchStore::splice`]):
+    /// pages only this branch still sees, through `inherited`. Freed with the branch.
+    adopted: Vec<Slot>,
+    /// `inherited` plus this branch's current pages, for its children to inherit. Kept from the
+    /// branch's creation (a clone of `inherited`, one reference count) and by each of its writes,
+    /// so a fork clones it in O(1) whatever the branch wrote before its first fork. (Built lazily
+    /// at the first fork instead, that fork cost one insert per page the branch had written.)
     view: Option<PageMap>,
 }
 
@@ -186,9 +252,14 @@ impl Lineage {
         from < to && self.children.range(from..to).next().is_some()
     }
 
-    fn retain(&mut self, page: u32, v: Retained, moved: &mut u64) {
+    fn retain(&mut self, page: u32, v: Retained, work: &mut BranchWork) {
         if !self.retained.contains_key(&page) {
-            counted_insert(&mut self.retained, page, BTreeMap::new(), moved);
+            counted_insert(
+                &mut self.retained,
+                page,
+                BTreeMap::new(),
+                &mut work.page_table_moved,
+            );
         }
         let versions = self.retained.get_mut(&page).expect("inserted above");
         crate::turso_assert!(
@@ -198,10 +269,21 @@ impl Lineage {
             "a retained version overlaps an older one of the same page; the born-ordered lookup \
              would return the wrong one"
         );
-        crate::turso_assert!(page != NO_PAGE, "page number u32::MAX is the index sentinel");
         versions.insert(v.born, v);
-        self.by_born.insert((v.born, page, v.died));
-        self.by_died.insert((v.died, page, v.born));
+        let (_, first) = self
+            .children
+            .range_mut(v.born..v.died)
+            .next()
+            .expect("a version is retained only while a live child forked inside it");
+        let node = Some(Box::new(HeapNode {
+            died: v.died,
+            born: v.born,
+            page,
+            rank: 1,
+            left: None,
+            right: None,
+        }));
+        first.first_of = meld(first.first_of.take(), node, &mut work.gc_meld_steps);
     }
 
     /// The retained version of `page` visible to a child forked at `f`: the born-predecessor of
@@ -213,104 +295,51 @@ impl Lineage {
         (f < v.died).then_some(v.slot)
     }
 
-    /// Detach the child forked at `f` and release every retained version that only it could see.
+    /// Detach the child forked at `f` and release every retained version that only it could see:
+    /// the versions filed under `f` (it was their first live holder) whose `died` is at most the
+    /// next live sibling's fork epoch. The rest move to that sibling's heap.
     fn child_gone(&mut self, f: u64, arena: &mut Arena, work: &mut BranchWork) -> usize {
-        let removed = self.children.remove(&f);
-        crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
-        let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
+        let child = self.children.remove(&f);
+        crate::turso_assert!(child.is_some(), "detached a child the parent does not list");
+        let mut heap = child.expect("checked above").first_of;
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
-        let dead = self.garbage(f, lo, hi, work);
-        for &(born, page, died) in &dead {
-            let versions = self.retained.get_mut(&page).expect("indexed version is listed");
-            let v = versions.remove(&born).expect("indexed version is listed");
+        let mut freed = 0;
+        while let Some(root) = heap.as_ref() {
+            work.gc_heap_examined += 1;
+            if hi.is_some_and(|hi| root.died > hi) {
+                break;
+            }
+            let mut root = heap.take().expect("checked above");
+            heap = meld(root.left.take(), root.right.take(), &mut work.gc_meld_steps);
+            let versions = self
+                .retained
+                .get_mut(&root.page)
+                .expect("a filed version is listed");
+            let v = versions.remove(&root.born).expect("a filed version is listed");
+            crate::turso_assert!(v.died == root.died, "a filed version disagrees with its listing");
             work.gc_examined += 1;
             if versions.is_empty() {
-                self.retained.remove(&page);
+                self.retained.remove(&root.page, &mut work.page_table_moved);
             }
-            let indexed = self.by_born.remove(&(born, page, died))
-                && self.by_died.remove(&(died, page, born));
-            crate::turso_assert!(indexed, "a released version was missing from an index");
             arena.release(v.slot);
+            freed += 1;
         }
-        dead.len()
-    }
-
-    /// The versions that held `f` and no other live child, as `(born, page, died)`, once `f` has
-    /// left `children`; `lo` and `hi` are its former neighbours there.
-    ///
-    /// Every retained version holds at least one live child's fork epoch: it is retained only if
-    /// one forked inside it, and this function hands it back the moment the last one goes. So a
-    /// version with `born > lo` and `died <= hi` held `f` and nothing else, and one holding `f`
-    /// that reaches back to `lo` or on to `hi` is still needed. That makes the garbage
-    /// `{born > lo, died <= hi}`, and each index answers one side of it:
-    ///
-    /// * `lo` absent: `died` in `(f, hi]`. Every such version was born at or before `f` (it holds
-    ///   a live child, and there is none below `f`), so every entry the range yields is garbage.
-    ///   This is the oldest child — the victim of uniform-TTL expiry — and the cost is what it frees.
-    /// * `hi` absent: `born` in `(lo, f]`, every entry garbage by the same argument.
-    /// * both: garbage lies in both ranges, and each also yields survivors (versions reaching past
-    ///   `hi`, or back past `lo`). The ranges are walked in lockstep and the first to end is
-    ///   filtered, so the walk costs twice the SMALLER range, never the larger.
-    ///
-    /// `gc_range_entries` counts every entry either range yields.
-    fn garbage(
-        &self,
-        f: u64,
-        lo: Option<u64>,
-        hi: Option<u64>,
-        work: &mut BranchWork,
-    ) -> Vec<(u64, u32, u64)> {
-        // `born` in (lo, f] and `died` in (f, hi], as bounds on the two indexes' first field.
-        let after = |e: u64| (e, NO_PAGE, u64::MAX);
-        let born_from = lo.map_or(Bound::Unbounded, |lo| Bound::Excluded(after(lo)));
-        let born_to = Bound::Included(after(f));
-        let died_from = Bound::Excluded(after(f));
-        let died_to = hi.map_or(Bound::Unbounded, |hi| Bound::Included(after(hi)));
-        let only_f = |born: u64, died: u64| {
-            lo.is_none_or(|lo| born > lo)
-                && born <= f
-                && f < died
-                && hi.is_none_or(|hi| died <= hi)
-        };
-        let mut by_born = self.by_born.range((born_from, born_to));
-        let mut by_died = self
-            .by_died
-            .range((died_from, died_to))
-            .map(|&(died, page, born)| (born, page, died));
-        let mut seen: [Vec<(u64, u32, u64)>; 2] = Default::default();
-        // Which ranges to walk: the one side's own range when a neighbour is missing, else both.
-        let walk = match (lo, hi) {
-            (None, _) => [false, true],
-            (Some(_), None) => [true, false],
-            (Some(_), Some(_)) => [true, true],
-        };
-        let finished = 'walk: loop {
-            for side in 0..2 {
-                if !walk[side] {
-                    continue;
-                }
-                let next = if side == 0 {
-                    by_born.next().copied()
-                } else {
-                    by_died.next()
-                };
-                match next {
-                    Some(v) => {
-                        work.gc_range_entries += 1;
-                        seen[side].push(v);
-                    }
-                    None => break 'walk side,
-                }
+        match hi {
+            Some(hi) => {
+                let next = self.children.get_mut(&hi).expect("hi is a live child");
+                next.first_of = meld(next.first_of.take(), heap, &mut work.gc_meld_steps);
             }
-        };
-        let mut dead = std::mem::take(&mut seen[finished]);
-        dead.retain(|&(born, _, died)| only_f(born, died));
-        dead
+            None => crate::turso_assert!(
+                heap.is_none(),
+                "the youngest child left a version no live child holds"
+            ),
+        }
+        freed
     }
 
-    fn release_all(self, arena: &mut Arena) -> Vec<Slot> {
+    fn release_all(mut self, arena: &mut Arena) -> Vec<Slot> {
         let mut slots = Vec::new();
-        for (_, versions) in self.retained {
+        for versions in self.retained.drain_values() {
             slots.extend(versions.into_values().map(|v| v.slot));
         }
         for &slot in &slots {
@@ -320,27 +349,17 @@ impl Lineage {
     }
 }
 
-/// `map.insert`, adding to `moved` the entries the insert relocated (observation only; see
-/// [`BranchWork::branch_table_moved`]), and returning the table's `capacity()` after it if it did.
-///
-/// `capacity()` is hashbrown's `items + growth_left`: an insert into an empty bucket leaves it
-/// unchanged, one that reuses a tombstone raises it by exactly one, and a rehash — a doubling, or
-/// an in-place rebuild that clears the tombstones — raises it by more. So a rise of more than one
-/// is a relocation of every entry. Blind spot: an in-place rebuild that clears exactly one
-/// tombstone reads as a reuse.
-fn counted_insert<K: Hash + Eq, V>(
-    map: &mut HashMap<K, V>,
+/// `map.insert`, adding to `moved` the entries a bucket split relinked (observation only; see
+/// [`BranchWork::branch_table_moved`]). A linear-hashing map never rehashes the whole table, so
+/// there is no capacity to report (see [`note_branch_table`]).
+fn counted_insert<K: std::hash::Hash + Eq, V>(
+    map: &mut LinearMap<K, V>,
     k: K,
     v: V,
     moved: &mut u64,
 ) -> Option<usize> {
-    let (cap, len) = (map.capacity(), map.len());
-    map.insert(k, v);
-    let after = map.capacity();
-    (after > cap + 1).then(|| {
-        *moved += len as u64;
-        after
-    })
+    map.insert(k, v, moved);
+    None
 }
 
 /// Attribute a `branches` relocation: a capacity above every earlier one is a doubling, anything
@@ -368,9 +387,9 @@ impl BranchStore {
                 next_id: 1,
                 trunk: TrunkState {
                     lineage: Lineage::default(),
-                    written: HashMap::new(),
+                    written: LinearMap::default(),
                 },
-                branches: HashMap::new(),
+                branches: LinearMap::default(),
                 work: BranchWork::default(),
                 branch_table_peak: 0,
             }),
@@ -412,7 +431,7 @@ impl BranchStore {
         inner.next_id += 1;
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
-        inner.trunk.lineage.children.insert(f, id);
+        inner.trunk.lineage.children.insert(f, Child::new(id));
         let StoreInner {
             branches,
             work,
@@ -447,14 +466,14 @@ impl BranchStore {
         }
         let f = st.lineage.epoch;
         st.lineage.epoch += 1;
-        st.lineage.children.insert(f, id);
+        st.lineage.children.insert(f, Child::new(id));
         let schema = st.schema.clone();
         let (current, inherited) = (&st.current, &st.inherited);
         let view = st
             .view
             .get_or_insert_with(|| {
                 let mut view = inherited.clone();
-                for (&page, owned) in current {
+                for (&page, owned) in current.iter() {
                     work.map_nodes_copied += view.insert(page, owned.slot);
                     work.view_inserts += 1;
                 }
@@ -511,10 +530,17 @@ impl BranchStore {
             };
         };
         st.handle = false;
+        // Deferred means something still reads through the branch, so its pages outlive this call:
+        // kept with the branch, or, when it is spliced out, with the child that took them over.
+        let deferred = st.open || !st.lineage.children.is_empty();
         let freed_pages = self.collect(&mut inner, id);
+        crate::turso_assert!(
+            deferred || !inner.branches.contains_key(&id),
+            "a branch nothing reads through was kept"
+        );
         Reaped {
             freed_pages,
-            deferred: inner.branches.contains_key(&id),
+            deferred,
         }
     }
 
@@ -592,9 +618,13 @@ impl BranchStore {
                             died: epoch,
                             slot: owned.slot,
                         },
+                        work,
+                    );
+                    st.current.insert(
+                        page,
+                        Owned { slot, born: epoch },
                         &mut work.page_table_moved,
                     );
-                    st.current.insert(page, Owned { slot, born: epoch });
                     if let Some(view) = st.view.as_mut() {
                         work.map_nodes_copied += view.insert(page, slot);
                     }
@@ -607,6 +637,7 @@ impl BranchStore {
                             slot: owned.slot,
                             born: epoch,
                         },
+                        &mut work.page_table_moved,
                     );
                 }
             }
@@ -637,7 +668,7 @@ impl BranchStore {
                     died: epoch,
                     slot,
                 },
-                &mut work.page_table_moved,
+                work,
             );
         }
         counted_insert(&mut trunk.written, page, epoch, &mut work.page_table_moved);
@@ -711,11 +742,13 @@ impl BranchStore {
                 work.arena_bits_moved,
                 work.arena_chunks_moved,
             ] = arena.moved();
+            (work.arena_frames_copied, work.arena_chunks_freed) = arena.compaction();
         }
         BranchStats {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
+            arena_handles: inner.arena.as_ref().map_or(0, |a| a.handle_high_water()),
             work,
         }
     }
@@ -726,6 +759,7 @@ impl BranchStore {
             return Vec::new();
         };
         let mut slots: Vec<u32> = st.current.values().map(|o| o.slot).collect();
+        slots.extend(st.adopted.iter().copied());
         for versions in st.lineage.retained.values() {
             slots.extend(versions.values().map(|v| v.slot));
         }
@@ -756,10 +790,19 @@ impl BranchStore {
             let Some(st) = inner.branches.get(&id) else {
                 return freed;
             };
-            if st.handle || st.open || !st.lineage.children.is_empty() {
+            if st.handle || st.open {
                 return freed;
             }
-            let st = inner.branches.remove(&id).expect("just looked it up");
+            if st.lineage.children.len() == 1 {
+                return freed + self.splice(inner, id);
+            }
+            if !st.lineage.children.is_empty() {
+                return freed;
+            }
+            let st = inner
+                .branches
+                .remove(&id, &mut inner.work.branch_table_moved)
+                .expect("just looked it up");
             let StoreInner {
                 arena,
                 trunk,
@@ -770,6 +813,10 @@ impl BranchStore {
             let arena = arena.as_mut().expect("a branch existed, so the arena does");
             for owned in st.current.values() {
                 arena.release(owned.slot);
+                freed += 1;
+            }
+            for &slot in &st.adopted {
+                arena.release(slot);
                 freed += 1;
             }
             freed += st.lineage.release_all(arena).len();
@@ -784,6 +831,77 @@ impl BranchStore {
             freed += parent.lineage.child_gone(st.fork_epoch, arena, work);
             id = st.parent;
         }
+    }
+}
+
+impl BranchStore {
+    /// Remove `id` — no handle, no connection, exactly one live child — from the tree, and give its
+    /// child its place: the child becomes its parent's child at `id`'s fork epoch, and takes over
+    /// every slot of `id`'s that it sees. That is all of `id`'s retained versions (each holds a live
+    /// child's fork epoch, and there is one child) and its current pages written before the child's
+    /// fork; its later writes nobody can see, and they are freed. Nothing the child resolves
+    /// changes: its `inherited` map already names those slots, and it saw the parent as of `id`'s
+    /// fork, which is the epoch it now holds there. The cost is `id`'s own pages plus the smaller
+    /// of the two adopted lists, so a chain of dead ancestors costs O(1) states instead of one each
+    /// (ZFS `promote` hands a clone's origin snapshots to the clone the same way). Returns the
+    /// pages freed.
+    fn splice(&self, inner: &mut StoreInner, id: BranchId) -> usize {
+        let st = inner
+            .branches
+            .remove(&id, &mut inner.work.branch_table_moved)
+            .expect("the caller looked it up");
+        let StoreInner {
+            arena,
+            trunk,
+            branches,
+            work,
+            ..
+        } = &mut *inner;
+        let arena = arena.as_mut().expect("a branch existed, so the arena does");
+        let (&fc, child) = st
+            .lineage
+            .children
+            .iter()
+            .next()
+            .expect("the caller saw exactly one child");
+        let child_id = child.id;
+        let mut freed = 0;
+        let mut keep: Vec<Slot> = st.adopted;
+        for owned in st.current.values() {
+            if owned.born <= fc {
+                keep.push(owned.slot);
+            } else {
+                arena.release(owned.slot);
+                freed += 1;
+            }
+        }
+        for versions in st.lineage.retained.values() {
+            keep.extend(versions.values().map(|v| v.slot));
+        }
+        let c = branches
+            .get_mut(&child_id)
+            .expect("a live branch's child is live");
+        if c.adopted.len() < keep.len() {
+            std::mem::swap(&mut c.adopted, &mut keep);
+        }
+        c.adopted.extend(keep);
+        c.parent = st.parent;
+        c.fork_epoch = st.fork_epoch;
+        work.splices += 1;
+        let parent = if st.parent.is_trunk() {
+            &mut trunk.lineage
+        } else {
+            &mut branches
+                .get_mut(&st.parent)
+                .expect("a live branch's parent is kept while the branch lives")
+                .lineage
+        };
+        parent
+            .children
+            .get_mut(&st.fork_epoch)
+            .expect("the parent lists the spliced branch")
+            .id = child_id;
+        freed
     }
 }
 
@@ -838,14 +956,15 @@ impl BranchState {
             parent,
             fork_epoch,
             lineage: Lineage::default(),
-            current: HashMap::new(),
+            current: LinearMap::default(),
             schema,
             handle: true,
             open: false,
             writer: false,
             trunk_at,
+            adopted: Vec::new(),
+            view: Some(inherited.clone()),
             inherited,
-            view: None,
         }
     }
 }
@@ -853,7 +972,7 @@ impl BranchState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     const PAGE: usize = 64;
     const PAGES: u32 = 6;
@@ -874,10 +993,10 @@ mod tests {
 
     /// The trunk's retained-version index against a brute-force model, through the store's own
     /// entry points (`fork_trunk`, `first_write_trunk`, `release_handle`, `resolve_into`), and the
-    /// garbage query's cost against its contract: a reap with no older live sibling, or no younger
-    /// one, visits exactly the versions it frees, and one with both visits 2·|B| index entries if
-    /// |B| <= |D| and 2·|D| + 1 otherwise, where B and D are the versions born in `(lo, f]` and
-    /// dying in `(f, hi]`.
+    /// garbage query's cost against its contract: a reap examines exactly the versions it frees,
+    /// plus one heap root when some version filed under the reaped child survives it — a version
+    /// with `born` in `(lo, f]` and `died > hi` — and never any other version; and no reap's melds
+    /// walk more than 2·(log2(V + 1) + 1) right-spine nodes.
     ///
     /// The trunk rewrites a handful of pages, several per epoch, so versions share `born` and `died`
     /// across pages; children are reaped oldest-first, newest-first and at random, so the garbage
@@ -938,14 +1057,15 @@ mod tests {
                     let lo = at.checked_sub(1).map(|i| live[i].1);
                     let hi = live.get(at + 1).map(|c| c.1);
                     let (id, f, _) = live.remove(at);
-                    let b = history
+                    let filed = |&&(_, born, died): &&(u32, u64, u64)| {
+                        lo.is_none_or(|lo| born > lo) && born <= f && f < died
+                    };
+                    let survivors = history
                         .iter()
-                        .filter(|&&(_, born, _)| lo.is_none_or(|lo| born > lo) && born <= f)
+                        .filter(filed)
+                        .filter(|&&(_, _, died)| hi.is_some_and(|hi| died > hi))
                         .count() as u64;
-                    let d = history
-                        .iter()
-                        .filter(|&&(_, _, died)| f < died && hi.is_none_or(|hi| died <= hi))
-                        .count() as u64;
+                    let versions = history.len() as f64;
                     let before = store.stats();
                     let reaped = store.release_handle(id);
                     let after = store.stats();
@@ -955,16 +1075,23 @@ mod tests {
                         reaped.freed_pages,
                         "seed {seed:#x} step {step}: the reap's report disagrees with the arena"
                     );
-                    let visited = after.work.gc_range_entries - before.work.gc_range_entries;
-                    let contract = match (lo, hi) {
-                        (None, _) | (_, None) => reaped.freed_pages as u64,
-                        _ if b <= d => 2 * b,
-                        _ => 2 * d + 1,
-                    };
+                    let examined = after.work.gc_heap_examined - before.work.gc_heap_examined;
+                    let contract = reaped.freed_pages as u64 + u64::from(survivors > 0);
                     assert_eq!(
-                        visited, contract,
+                        examined, contract,
                         "seed {seed:#x} step {step}: reaping the child forked at {f} (lo {lo:?}, \
-                         hi {hi:?}, |B| {b}, |D| {d}) visited {visited} index entries"
+                         hi {hi:?}, {survivors} filed survivors) examined {examined} heap roots"
+                    );
+                    let steps = after.work.gc_meld_steps - before.work.gc_meld_steps;
+                    let bound = 2.0 * ((versions + 1.0).log2() + 1.0) * (1.0 + examined as f64);
+                    assert!(
+                        steps as f64 <= bound,
+                        "seed {seed:#x} step {step}: the reap's melds walked {steps} nodes over \
+                         {versions} versions"
+                    );
+                    assert_eq!(
+                        after.work.gc_range_entries, before.work.gc_range_entries,
+                        "the range walks are gone"
                     );
                     if reaped.freed_pages > 0 {
                         match at {
@@ -1146,11 +1273,13 @@ mod tests {
                 }
             }
         }
-        // The shapes the page maps exist for must have occurred, or a green run says nothing.
+        // The shapes the page maps exist for must have occurred, or a green run says nothing —
+        // including a dead branch spliced out from above its one live child.
+        let splices = store.stats().work.splices;
         assert!(
-            max_depth >= 10 && deferred > 0 && wrote_after_fork > 0,
+            max_depth >= 10 && deferred > 0 && wrote_after_fork > 0 && splices > 0,
             "seed {seed:#x}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
-             after its first fork {wrote_after_fork}"
+             after its first fork {wrote_after_fork}, splices {splices}"
         );
         for n in nodes.iter().filter(|n| n.handle) {
             store.release_handle(n.id);

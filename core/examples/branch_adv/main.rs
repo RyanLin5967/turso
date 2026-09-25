@@ -70,7 +70,7 @@ fn parse_args() -> Args {
     a
 }
 
-const NF: usize = 18;
+const NF: usize = 19;
 
 const FIELDS: [&str; NF] = [
     "resolve_calls",
@@ -91,6 +91,7 @@ const FIELDS: [&str; NF] = [
     "branch_table_rehashes",
     "arena_frames_copied",
     "arena_chunks_freed",
+    "splices",
 ];
 
 fn fields(w: &BranchWork) -> [u64; NF] {
@@ -113,6 +114,7 @@ fn fields(w: &BranchWork) -> [u64; NF] {
         w.branch_table_rehashes,
         w.arena_frames_copied,
         w.arena_chunks_freed,
+        w.splices,
     ]
 }
 
@@ -436,12 +438,14 @@ fn arm_arena(a: &Args) {
         check(live == v.div_ceil(256), "live slots = ceil(V/256)");
         println!(
             "space V={v} live_slots={live} free_slots={} held_slots={} held_over_live={:.2} \
-             held_bytes={} live_bytes={}",
+             held_bytes={} live_bytes={} handles={} handle_bytes={}",
             st.arena_slots_free,
             held(&st),
             held(&st) as f64 / live as f64,
             held(&st) * a.page_size,
-            live * a.page_size
+            live * a.page_size,
+            st.arena_handles,
+            st.arena_handles * 8
         );
         alloc.print(&format!("V={v} alloc"), a.time);
         reap.print(&format!("V={v} reap"), a.time);
@@ -528,31 +532,52 @@ fn arm_pathcopy(a: &Args) {
 }
 
 /// W8: a chain of depth d whose intermediate handles are all released, then its leaf reaped.
-fn arm_chain(a: &Args) {
+/// With `writes`, each link writes one page of its own before forking the next.
+fn arm_chain(a: &Args, writes: bool) {
     for &d in &a.list {
         let s = StoreBench::new(a.page_size);
         let m = Meter { s: &s, time: a.time };
         let mut prev = fork_trunk(&s);
-        for _ in 0..d {
+        for j in 0..d {
+            if writes {
+                s.branch_write(prev, &[j as u32])
+                    .unwrap_or_else(|e| die(&format!("write: {e}")));
+            }
             let next = fork_branch(&s, prev);
             if !s.reap(prev).deferred {
                 die("releasing a branch with a live child was not deferred");
             }
             prev = next;
         }
-        let before = s.stats().live_branches;
-        check(before == d + 1, "d+1 branch states are kept for one live handle");
+        let st = s.stats();
+        let before = st.live_branches;
+        check(before >= 1 && before <= d + 1, "between 1 and d+1 branch states are kept");
+        if writes {
+            check(st.arena_slots_in_use == d, "the chain's d pages are all still held");
+            let mut buf = vec![0u8; a.page_size];
+            for j in (0..d).step_by((d / 1000).max(1)) {
+                let in_arena = s
+                    .resolve_into(prev, j as u32, &mut buf)
+                    .unwrap_or_else(|e| die(&format!("resolve: {e}")));
+                if !in_arena {
+                    die("the leaf does not see an ancestor's page");
+                }
+            }
+            println!("# check ok: the leaf resolves its ancestors' pages to the arena");
+        }
         let op = m.op(|| s.reap(prev));
         let after = s.stats().live_branches;
         println!(
-            "event reap d={d} states_before={before} states_after={after} freed_pages={}{}{} \
-             entry_bytes={}",
+            "event reap d={d} states_before={before} states_after={after} chain_splices={} \
+             freed_pages={}{}{} entry_bytes={}",
+            st.work.splices,
             op.out.freed_pages,
             nonzero(&op.d),
             timing(&op, a.time),
             StoreBench::branch_entry_bytes()
         );
         check(after == 0, "the leaf's reap freed the whole chain");
+        check(s.stats().arena_slots_in_use == 0, "no page is left");
     }
 }
 
@@ -585,7 +610,8 @@ fn main() {
         "bigwrite" => arm_bigwrite(&a),
         "view" => arm_view(&a),
         "pathcopy" => arm_pathcopy(&a),
-        "chain" => arm_chain(&a),
+        "chain" => arm_chain(&a, false),
+        "chainw" => arm_chain(&a, true),
         other => die(&format!("unknown arm {other}")),
     }
     println!("# done");
