@@ -890,12 +890,12 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const PAGE: usize = 64;
-    const PAGES: u32 = 6;
+    pub(super) const PAGE: usize = 64;
+    pub(super) const PAGES: u32 = 6;
 
-    struct Rng(u64);
+    pub(super) struct Rng(pub(super) u64);
     impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
+        pub(super) fn below(&mut self, n: u64) -> u64 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
@@ -903,7 +903,7 @@ mod tests {
         }
     }
 
-    fn image(generation: u64) -> Vec<u8> {
+    pub(super) fn image(generation: u64) -> Vec<u8> {
         generation.to_le_bytes().repeat(PAGE / 8)
     }
 
@@ -1055,7 +1055,7 @@ mod tests {
 
     /// A committed branch page holding `image(generation)`, as the pager hands it to
     /// `commit_pages`.
-    fn page_with(page: u32, generation: u64) -> PageRef {
+    pub(super) fn page_with(page: u32, generation: u64) -> PageRef {
         let p = Arc::new(crate::storage::pager::Page::new(i64::from(page)));
         let buffer = Arc::new(crate::Buffer::new_temporary(PAGE));
         buffer.as_mut_slice().copy_from_slice(&image(generation));

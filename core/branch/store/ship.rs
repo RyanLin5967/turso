@@ -201,6 +201,10 @@ pub struct SendReport {
     pub payload_delta: u64,
     /// Payload bytes as this stream carries them (raw, or delta with its 2-byte length).
     pub payload_shipped: u64,
+    /// Payloads as run-diffs against each slot's FORK BASE (the version its owner saw before
+    /// writing it; a retained trunk version's next version), counted, not shipped; trunk pages
+    /// count raw.
+    pub payload_delta_fork: u64,
     pub payload_dedup: u64,
     pub dup_payloads: u64,
     /// Sender work: states, map/version entries, slots, and change-index entries visited.
@@ -609,8 +613,12 @@ impl BranchStore {
                              pgno: u32,
                              fresh: bool,
                              content: &[u8],
-                             delta_base: Option<&[u8]>|
+                             delta_base: Option<&[u8]>,
+                             fork_base: Option<&[u8]>|
          -> Result<()> {
+            rep.payload_delta_fork += fork_base
+                .and_then(|b| delta_encode(b, content))
+                .map_or(content.len(), |d| d.len() + 2) as u64;
             if seen.insert(content_hash(content)) {
                 rep.payload_dedup += content.len() as u64;
             } else {
@@ -666,7 +674,13 @@ impl BranchStore {
             for &(slot, page) in &ref_slots {
                 let content = arena.expect("a retained version has a slot").page(slot);
                 if mode == SendMode::IncrAlloc {
-                    ship_page(&mut sink, &mut rep, T_SLOT, slot, page, true, content, trunk.page(page))?;
+                    // A retained trunk version's fork base is the page's next version.
+                    let next = inner.trunk.lineage.retained[&page]
+                        .values()
+                        .find(|v| v.slot == slot)
+                        .and_then(|v| inner.trunk.lineage.retained[&page].get(&v.died))
+                        .map_or_else(|| trunk.page(page), |n| Some(arena.unwrap().page(n.slot)));
+                    ship_page(&mut sink, &mut rep, T_SLOT, slot, page, true, content, trunk.page(page), next)?;
                     rep.slot_records += 1;
                     continue;
                 }
@@ -698,38 +712,11 @@ impl BranchStore {
         };
         for pgno in trunk_pages {
             let page = trunk.page(pgno).expect("filtered to the image");
-            ship_page(&mut sink, &mut rep, T_TRUNK_PAGE, pgno, pgno, false, page, None)?;
+            ship_page(&mut sink, &mut rep, T_TRUNK_PAGE, pgno, pgno, false, page, None, None)?;
             rep.trunk_page_records += 1;
         }
 
-        // 4. Slots.
-        if let Some(arena) = arena {
-            let slots: Vec<Slot> = if mode.incremental() {
-                let s = arena.content_newer_than(base_seq);
-                rep.index_visited += s.len() as u64;
-                s
-            } else {
-                arena.slots_in_use()
-            };
-            for slot in slots {
-                rep.slots_visited += 1;
-                let (alloc_seq, _, page) = arena.stamps_of(slot).expect("tracked arena");
-                let fresh = !mode.incremental() || alloc_seq > base_seq;
-                ship_page(
-                    &mut sink,
-                    &mut rep,
-                    T_SLOT,
-                    slot,
-                    page,
-                    fresh,
-                    arena.page(slot),
-                    trunk.page(page),
-                )?;
-                rep.slot_records += 1;
-            }
-        }
-
-        // 5. States, in id order.
+        // The states step 5 ships: every one, or those changed since the base.
         let ids: Vec<BranchId> = match mode {
             SendMode::IncrFix | SendMode::IncrAlloc => {
                 let mut ids: Vec<BranchId> = t
@@ -747,6 +734,73 @@ impl BranchStore {
                 ids
             }
         };
+        // Counted only (`payload_delta_fork`): each shipped slot's FORK BASE, the version its owner
+        // saw before writing it: a branch page's is what the branch reads through its ancestry
+        // (`inherited`, else the trunk as of `trunk_at`); a retained trunk version's is the next
+        // version of that page. The receiver holds every such base.
+        let mut fork_base: HashMap<Slot, (bool, u32)> = HashMap::new();
+        for id in &ids {
+            let st = &inner.branches[id];
+            let base_of = |q: u32| -> (bool, u32) {
+                if let Some(s) = st.inherited.get(q) {
+                    return (true, s);
+                }
+                let mut examined = 0;
+                match inner.trunk.lineage.retained_at(q, st.trunk_at, &mut examined) {
+                    Some(s) => (true, s),
+                    None => (false, q),
+                }
+            };
+            for (&q, o) in &st.current {
+                fork_base.insert(o.slot, base_of(q));
+            }
+            for (&q, versions) in &st.lineage.retained {
+                for v in versions.values() {
+                    fork_base.insert(v.slot, base_of(q));
+                }
+            }
+        }
+        for (&q, versions) in &inner.trunk.lineage.retained {
+            for v in versions.values() {
+                let next = versions.get(&v.died).map_or((false, q), |n| (true, n.slot));
+                fork_base.insert(v.slot, next);
+            }
+        }
+
+        // 4. Slots.
+        if let Some(arena) = arena {
+            let slots: Vec<Slot> = if mode.incremental() {
+                let s = arena.content_newer_than(base_seq);
+                rep.index_visited += s.len() as u64;
+                s
+            } else {
+                arena.slots_in_use()
+            };
+            for slot in slots {
+                rep.slots_visited += 1;
+                let (alloc_seq, _, page) = arena.stamps_of(slot).expect("tracked arena");
+                let fresh = !mode.incremental() || alloc_seq > base_seq;
+                let fork = match fork_base.get(&slot) {
+                    Some(&(true, s)) => Some(arena.page(s)),
+                    Some(&(false, q)) => trunk.page(q),
+                    None => None,
+                };
+                ship_page(
+                    &mut sink,
+                    &mut rep,
+                    T_SLOT,
+                    slot,
+                    page,
+                    fresh,
+                    arena.page(slot),
+                    trunk.page(page),
+                    fork,
+                )?;
+                rep.slot_records += 1;
+            }
+        }
+
+        // 5. States, in id order (`ids` above).
         for id in ids {
             let st = &inner.branches[&id];
             rep.states_visited += 1;
@@ -1338,5 +1392,201 @@ impl StoreInner {
             }
         }
         inserts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{image, page_with, Rng, PAGE, PAGES};
+    use super::*;
+    use crate::storage::pager::PageRef;
+
+    fn trunk_image(trunk: &HashMap<u32, u64>) -> TrunkImage {
+        let mut bytes = Vec::new();
+        for page in 0..PAGES {
+            bytes.extend_from_slice(&image(trunk[&page]));
+        }
+        TrunkImage::new(PAGE, bytes)
+    }
+
+    /// Random branch trees — forks from the trunk and from branches, writes on both, reaps that
+    /// defer and cascade — with the source shipped to a replica by one full stream and then an
+    /// incremental stream every few steps, and a fresh replica seeded by a full stream beside it.
+    /// After every stream both replicas must equal the source by digest, and every live branch must
+    /// read every page identically on all three. The shapes the stream exists for must occur:
+    /// tombstones, trunk pre-image references, deferred reaps, derived page maps.
+    #[test]
+    fn replicas_equal_the_source_under_random_trees_and_incremental_streams() {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            run(seed);
+        }
+    }
+
+    fn run(seed: u64) {
+        let store = BranchStore::new();
+        store.enable_shipping().unwrap();
+        let mut rng = Rng(seed);
+        // Pages are numbered 1..=PAGES in the image; the store sees them as 0-based page numbers
+        // shifted by one so that trunk page `p` is image page `p + 1`.
+        let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut live: Vec<crate::branch::BranchId> = Vec::new();
+        let mut generation = 1000u64;
+        let replica = BranchStore::new();
+        let mut rtrunk = TrunkImage::empty(PAGE);
+        let mut at: Option<u64> = None;
+        let (mut refs, mut deads, mut deferred, mut trie, mut streams) = (0, 0, 0, 0, 0);
+        for step in 0..3000 {
+            match rng.below(12) {
+                0 if live.len() < 50 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    live.push(id);
+                }
+                1..=3 if !live.is_empty() && live.len() < 50 => {
+                    let parent = if rng.below(2) == 0 {
+                        *live.last().unwrap()
+                    } else {
+                        live[rng.below(live.len() as u64) as usize]
+                    };
+                    live.push(store.fork_branch(parent).unwrap());
+                }
+                4..=5 => {
+                    let page = rng.below(u64::from(PAGES)) as u32;
+                    store.first_write_trunk(page + 1, &image(trunk[&page]));
+                    generation += 1;
+                    trunk.insert(page, generation);
+                }
+                6..=9 if !live.is_empty() => {
+                    let id = live[rng.below(live.len() as u64) as usize];
+                    store.begin_write(id).unwrap();
+                    let mut committed: Vec<PageRef> = Vec::new();
+                    for _ in 0..=rng.below(2) {
+                        let page = rng.below(u64::from(PAGES)) as u32 + 1;
+                        if committed.iter().any(|p| p.get().id == page as usize) {
+                            continue;
+                        }
+                        let mut pre = vec![0u8; PAGE];
+                        if !store.resolve_into(id, page, &mut pre).unwrap() {
+                            pre = image(trunk[&(page - 1)]);
+                        }
+                        store.first_write_branch(id, page, &pre).unwrap();
+                        generation += 1;
+                        committed.push(page_with(page, generation));
+                    }
+                    store.commit_pages(id, &committed).unwrap();
+                    store.end_write(id);
+                }
+                _ if !live.is_empty() => {
+                    let id = live.swap_remove(rng.below(live.len() as u64) as usize);
+                    if store.release_handle(id).deferred {
+                        deferred += 1;
+                    }
+                }
+                _ => {}
+            }
+            if step % 37 != 0 {
+                continue;
+            }
+            let img = trunk_image(&trunk);
+            let mut buf = Vec::new();
+            let mode = if at.is_some() {
+                SendMode::IncrFix
+            } else {
+                SendMode::FullFix
+            };
+            let delta = rng.below(2) == 0;
+            let rep = store
+                .send(mode, at, &img, delta, Plant::None, Some(&mut buf))
+                .unwrap();
+            refs += rep.ref_records;
+            deads += rep.dead_records;
+            let work = replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false).unwrap();
+            trie += work.trie_inserts;
+            streams += 1;
+            store.forget_tombstones(at.unwrap());
+            let want = store.digest(&img);
+            assert_eq!(
+                replica.digest(&rtrunk),
+                want,
+                "seed {seed:#x} step {step}: the incrementally fed replica differs"
+            );
+            let fresh = BranchStore::new();
+            let (mut ftrunk, mut fat) = (TrunkImage::empty(PAGE), None);
+            let mut full = Vec::new();
+            store
+                .send(SendMode::FullFix, None, &img, !delta, Plant::None, Some(&mut full))
+                .unwrap();
+            fresh.receive(&mut &full[..], &mut ftrunk, &mut fat, false).unwrap();
+            assert_eq!(fresh.digest(&ftrunk), want, "seed {seed:#x} step {step}: full replica");
+            let (mut a, mut b, mut c) = (vec![0u8; PAGE], vec![0u8; PAGE], vec![0u8; PAGE]);
+            for &id in &live {
+                for page in 1..=PAGES {
+                    let sa = store.resolve_into(id, page, &mut a).unwrap();
+                    let sb = replica.resolve_into(id, page, &mut b).unwrap();
+                    let sc = fresh.resolve_into(id, page, &mut c).unwrap();
+                    assert_eq!((sa, sb, sc), (sa, sa, sa), "seed {seed:#x} step {step}");
+                    if sa {
+                        assert!(a == b && a == c, "seed {seed:#x} step {step}: branch {} page {page}", id.0);
+                    }
+                }
+            }
+        }
+        assert!(
+            streams > 50 && refs > 0 && deads > 0 && deferred > 0 && trie > 0,
+            "seed {seed:#x}: streams {streams}, refs {refs}, tombstones shipped {deads}, deferred \
+             reaps {deferred}, derived trie inserts {trie}"
+        );
+    }
+
+    /// The receiver's checks must fail on a planted defect — a flipped payload byte (digest), a
+    /// dropped tombstone (digest), a corrupted reference hash (refused at the reference) — and the
+    /// same stream unplanted must be accepted and equal: without that control a receiver that
+    /// refused everything would pass.
+    #[test]
+    fn a_planted_defect_is_caught_and_the_unplanted_stream_is_not() {
+        for plant in [Plant::FlipPayload, Plant::DropTombstone, Plant::BadRefHash] {
+            assert!(scenario(plant), "{plant:?} went unnoticed");
+            assert!(!scenario(Plant::None), "the unplanted stream was refused or differs");
+        }
+    }
+
+    /// Returns whether the replica refused the incremental stream or ended up different.
+    fn scenario(plant: Plant) -> bool {
+        let store = BranchStore::new();
+        store.enable_shipping().unwrap();
+        let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let a = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        let doomed = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        store.begin_write(a).unwrap();
+        store.first_write_branch(a, 1, &image(0)).unwrap();
+        store.commit_pages(a, &[page_with(1, 7)]).unwrap();
+        store.end_write(a);
+        let replica = BranchStore::new();
+        let (mut rtrunk, mut at) = (TrunkImage::empty(PAGE), None);
+        let mut buf = Vec::new();
+        store
+            .send(SendMode::FullFix, None, &trunk_image(&trunk), false, Plant::None, Some(&mut buf))
+            .unwrap();
+        replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false).unwrap();
+        // After the base: a death, a trunk overwrite that retains a pre-image the replica holds (a
+        // reference, pinned by `a`), and a fresh branch with a page of its own.
+        store.release_handle(doomed);
+        store.first_write_trunk(2, &image(trunk[&1]));
+        trunk.insert(1, 99);
+        let keep = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        store.begin_write(keep).unwrap();
+        store.first_write_branch(keep, 3, &image(0)).unwrap();
+        store.commit_pages(keep, &[page_with(3, 8)]).unwrap();
+        store.end_write(keep);
+        let img = trunk_image(&trunk);
+        let mut buf = Vec::new();
+        let rep = store
+            .send(SendMode::IncrFix, at, &img, false, plant, Some(&mut buf))
+            .unwrap();
+        let dead_expected = if plant == Plant::DropTombstone { 0 } else { 1 };
+        assert_eq!((rep.ref_records, rep.dead_records), (1, dead_expected), "{plant:?}: {rep:?}");
+        match replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false) {
+            Err(_) => true,
+            Ok(_) => replica.digest(&rtrunk) != store.digest(&img),
+        }
     }
 }

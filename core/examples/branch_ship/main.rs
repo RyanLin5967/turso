@@ -358,15 +358,16 @@ impl Read for PipeReader {
     }
 }
 
-const STREAM_HEADER: &str = "stream\tpoint\tlive\tmode\ttotal\ttotal_raw\ttotal_delta\ttotal_dedup\tpage_bytes\tref_bytes\tmeta_bytes\tslot_rec\ttrunk_rec\tref_rec\tstate_rec\tdead_rec\tcur_ent\tret_ent\ttret_ent\twritten_ent\tlive_list\tmaps\tdup\tstates_visited\tentries_visited\tslots_visited\tindex_visited";
+const STREAM_HEADER: &str = "stream\tpoint\tlive\tmode\ttotal\ttotal_raw\ttotal_delta\ttotal_delta_fork\ttotal_dedup\tpage_bytes\tref_bytes\tmeta_bytes\tslot_rec\ttrunk_rec\tref_rec\tstate_rec\tdead_rec\tcur_ent\tret_ent\ttret_ent\twritten_ent\tlive_list\tmaps\tdup\tstates_visited\tentries_visited\tslots_visited\tindex_visited";
 
 fn print_stream(point: &str, live: usize, mode: &str, r: &SendReport) {
     let non_payload = r.total_bytes - r.payload_shipped;
     println!(
-        "stream\t{point}\t{live}\t{mode}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "stream\t{point}\t{live}\t{mode}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         r.total_bytes,
         non_payload + r.payload_raw,
         non_payload + r.payload_delta,
+        non_payload + r.payload_delta_fork,
         non_payload + r.payload_dedup,
         r.page_bytes,
         r.ref_bytes,
