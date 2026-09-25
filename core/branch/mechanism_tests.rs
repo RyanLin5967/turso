@@ -868,3 +868,45 @@ fn a_spilling_branch_transaction_commits_rolls_back_and_forks_intact() {
     assert!(in_use(&db).is_empty(), "slots leaked");
     assert_eq!(db.branch_stats().live_branches, 0);
 }
+
+/// A branch transaction larger than one hold's batch: its commit, its first fork and its reap each
+/// hold the store mutex for a bounded number of pages, and nothing is copied under the mutex.
+#[test]
+fn a_large_branch_commit_fork_and_reap_hold_the_store_mutex_briefly() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20_000);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    bc.execute("BEGIN").unwrap();
+    bc.execute("UPDATE t SET v = 'big-' || id").unwrap();
+    let copied = db.branch_stats().work.locked_copy_bytes;
+    let _ = db.branch_take_hold_max();
+    bc.execute("COMMIT").unwrap();
+    let commit = db.branch_take_hold_max();
+    let owned = db.branch_stats().arena_slots_in_use as u64;
+    assert!(owned > 256, "the transaction owns only {owned} pages: too small to test the bound");
+    assert!(commit.pages <= 64, "one commit hold mapped {} pages", commit.pages);
+    assert_eq!(commit.copy_bytes, 0, "the commit copied pages under the store mutex");
+    assert_eq!(
+        db.branch_stats().work.locked_copy_bytes,
+        copied,
+        "the commit copied pages under the store mutex"
+    );
+
+    let built = db.branch_stats().work.view_build_pages;
+    let child = b.fork().unwrap();
+    let fork = db.branch_take_hold_max();
+    assert!(fork.pages <= 1, "the first fork held the mutex over {} pages", fork.pages);
+    assert_eq!(db.branch_stats().work.view_build_pages - built, owned);
+    assert_eq!(value(&child.connect().unwrap(), 7), Some("big-7".to_string()));
+
+    drop(child);
+    drop(bc);
+    let _ = db.branch_take_hold_max();
+    let reaped = b.reap().unwrap();
+    let reap = db.branch_take_hold_max();
+    assert_eq!(reaped.freed_pages as u64, owned);
+    assert!(reap.pages <= 64, "one reap hold freed {} pages", reap.pages);
+    assert_eq!(db.branch_stats().arena_slots_in_use, 0);
+}
