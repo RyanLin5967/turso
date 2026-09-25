@@ -153,6 +153,12 @@ impl Arena {
         self.free.len()
     }
 
+    /// The capacities of the arena's growable vectors (free list, free bits, chunk table), for the
+    /// store's realloc counter. Observation only.
+    pub(crate) fn capacities(&self) -> [usize; 3] {
+        [self.free.capacity(), self.free_bits.capacity(), self.chunks.capacity()]
+    }
+
     pub(crate) fn page(&self, slot: Slot) -> &[u8] {
         let ptr = self.slot_addr(slot);
         // SAFETY: one slot's bytes inside a live chunk; `&self` rules out a `page_mut` alias, and a

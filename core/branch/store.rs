@@ -113,6 +113,9 @@ struct HoldAcc {
 struct Hold<'a> {
     guard: MutexGuard<'a, StoreInner>,
     start: Option<std::time::Instant>,
+    /// The arena's vector capacities at acquisition: a growth inside the hold moved the old
+    /// contents, which the realloc counter charges to it.
+    arena_caps: [usize; 3],
 }
 
 impl Deref for Hold<'_> {
@@ -131,7 +134,13 @@ impl DerefMut for Hold<'_> {
 impl Drop for Hold<'_> {
     fn drop(&mut self) {
         let inner = &mut *self.guard;
-        let acc = std::mem::take(&mut inner.hold);
+        let mut acc = std::mem::take(&mut inner.hold);
+        let caps = inner.arena.as_ref().map_or([0; 3], |a| a.capacities());
+        for (old, new) in self.arena_caps.iter().zip(caps) {
+            if new != *old {
+                acc.realloc_moved += *old as u64;
+            }
+        }
         inner.work.lock_holds += 1;
         inner.work.locked_copy_bytes += acc.copy_bytes;
         let max = &mut inner.hold_max;
@@ -539,7 +548,12 @@ impl BranchStore {
         let start = HOLD_TIMING
             .load(std::sync::atomic::Ordering::Relaxed)
             .then(std::time::Instant::now);
-        Hold { guard, start }
+        let arena_caps = guard.arena.as_ref().map_or([0; 3], |a| a.capacities());
+        Hold {
+            guard,
+            start,
+            arena_caps,
+        }
     }
 
     /// The per-hold maxima since the previous call, which this call resets.
