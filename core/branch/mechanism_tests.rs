@@ -913,3 +913,39 @@ fn branches_read_their_fork_while_the_trunk_writes_concurrently() {
     );
     assert_eq!(db.branch_stats().live_branches, 0, "branches leaked");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Open sessions (r11-sessions FS2, FS3): what a held branch connection keeps.
+
+/// FS2. A branch connection keeps its private cache across trunk commits, a checkpoint that
+/// backfills them and a WAL restart, and still reads the trunk as of its fork. The resolve counter
+/// is the instrument: zero resolutions means every page came from the cache.
+#[test]
+fn a_trunk_commit_does_not_invalidate_a_branch_cache_and_the_branch_still_reads_its_fork() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    let before: BTreeMap<i64, String> = (1..=300).map(|id| (id, original(id))).collect();
+    assert_eq!(table(&bc), before);
+    for id in 1..=300 {
+        set(&trunk, id, &format!("trunk-rewrite-{id}"));
+    }
+    let r = rows(&trunk, "PRAGMA wal_checkpoint(TRUNCATE)");
+    assert_eq!(r[0][0].as_int(), Some(0), "the trunk checkpoint was busy");
+    let resolves = db.branch_stats().work.resolve_calls;
+    assert_eq!(table(&bc), before, "the held branch connection read past its fork");
+    assert_eq!(
+        db.branch_stats().work.resolve_calls - resolves,
+        0,
+        "the branch re-resolved pages it had cached: its cache was invalidated by trunk commits"
+    );
+    // A fresh connection resolves everything and reads the same fork.
+    let fresh = {
+        drop(bc);
+        b.connect().unwrap()
+    };
+    assert_eq!(table(&fresh), before);
+    assert_eq!(value(&trunk, 7), Some("trunk-rewrite-7".to_string()));
+}
