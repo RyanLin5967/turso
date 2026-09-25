@@ -138,8 +138,10 @@ fn with_fw3_an_open_branch_transaction_pins_nothing() {
 }
 
 /// The window, database-file case: the branch finds no frame of the leaf (the WAL is empty), and
-/// before it reads the database file the trunk rewrites that leaf and a TRUNCATE checkpoint copies
-/// the new version into the file. Returns what the branch read and the retries it took.
+/// before it reads the database file the trunk rewrites that leaf and a PASSIVE checkpoint copies
+/// the new version into the file. PASSIVE, not TRUNCATE: a restart would bump the WAL generation
+/// and the generation check would catch the window too, hiding whether the store check does
+/// (PREREG amendment 4). Returns what the branch read and the retries it took.
 fn trunk_write_in_the_window(mutant: u8) -> (Option<String>, u64) {
     let (_dir, db) = open_db(true);
     let trunk = db.connect().unwrap();
@@ -149,15 +151,31 @@ fn trunk_write_in_the_window(mutant: u8) -> (Option<String>, u64) {
     // Warm the root and the first leaf, so the next trunk-page read is the last row's leaf.
     assert_eq!(value(&conn, 1), original(1));
     let trunk2 = trunk.clone();
+    let db2 = db.clone();
+    let window = Arc::new(std::sync::Mutex::new(None));
+    let seen = window.clone();
     fw3_test_hook::set(Box::new(move |_page| {
+        let before = db2.walpin_stats();
         set(&trunk2, ROWS, "written-in-the-window");
-        trunk2.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        trunk2.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        let after = db2.walpin_stats();
+        *seen.lock().unwrap() = Some((before.checkpoint_seq, after.checkpoint_seq, after.nbackfills));
     }));
     fw3_test_hook::set_mutant(mutant);
     let before = walpin::counters().fw3_retries;
     let got = try_value(&conn, ROWS);
     let retries = walpin::counters().fw3_retries - before;
     fw3_test_hook::set_mutant(0);
+    let (seq_before, seq_after, nbackfills) = window
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the hook ran inside the branch's read");
+    assert_eq!(
+        seq_before, seq_after,
+        "the window's checkpoint must not restart the WAL, or the generation check sees it too"
+    );
+    assert!(nbackfills >= 1, "the post-fork frame reached the database file");
     // The trunk itself sees its own write.
     assert_eq!(value(&trunk, ROWS), "written-in-the-window");
     (got, retries)
@@ -343,5 +361,62 @@ fn concurrent_branch_readers_see_their_fork_with_fw3() {
     eprintln!(
         "with FW3: reads {} busy {} restarts {} fw3_retries {}",
         out.reads, out.busy, out.restarts, out.retries
+    );
+}
+
+/// The trunk's own rows survive checkpoints under whatever process switches are set
+/// (`TURSO_WALPIN_FIX`): FW1 picks each page's frame from its frame log rather than a per-page scan,
+/// and FW2 checkpoints and reuses whole files, so a wrong pick loses a committed row. A trunk
+/// reader pins the WAL while 3,000 one-row commits land (every page gets many frames), is released,
+/// 1,500 more land; then every row is read back through a fresh connection after a PASSIVE
+/// checkpoint, and again after a TRUNCATE checkpoint, when the database file alone holds them.
+/// Run once with no switch and once per switch.
+#[test]
+fn every_trunk_row_survives_checkpoints_under_the_process_switches() {
+    let (_dir, db) = open_db(false);
+    if walpin::fw2() {
+        db.walpin_open_wal2().unwrap();
+    }
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let mut model: Vec<String> = (0..=ROWS).map(original).collect();
+    let pin = db.connect().unwrap();
+    set(&trunk, 1, "before-pin");
+    model[1] = "before-pin".to_string();
+    pin.execute("BEGIN").unwrap();
+    assert_eq!(value(&pin, 1), "before-pin");
+    let write = |i: usize, model: &mut Vec<String>| {
+        // Every third write hits row 7 (one hot page with a long frame list); the rest walk the table.
+        let id = if i % 3 == 0 { 7 } else { (i as i64 * 37) % ROWS + 1 };
+        let v = format!("g{i}");
+        set(&trunk, id, &v);
+        model[id as usize] = v;
+    };
+    for i in 0..3_000 {
+        write(i, &mut model);
+    }
+    // The pinned reader still sees its snapshot.
+    assert_eq!(value(&pin, 1), "before-pin");
+    assert_eq!(value(&pin, 7), original(7));
+    pin.execute("COMMIT").unwrap();
+    for i in 3_000..4_500 {
+        write(i, &mut model);
+    }
+    let check = |when: &str| {
+        let fresh = db.connect().unwrap();
+        for id in 1..=ROWS {
+            assert_eq!(value(&fresh, id), model[id as usize], "{when}: row {id}");
+        }
+    };
+    trunk.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    check("after PASSIVE");
+    trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(db.walpin_stats().max_frame, 0, "TRUNCATE emptied the WAL");
+    check("after TRUNCATE, from the database file alone");
+    eprintln!(
+        "switches fw1={} fw2={}: counters {:?}",
+        walpin::fw1(),
+        walpin::fw2(),
+        walpin::counters()
     );
 }
