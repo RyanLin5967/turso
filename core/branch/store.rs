@@ -139,7 +139,9 @@ impl Drop for Hold<'_> {
         max.copy_bytes = max.copy_bytes.max(acc.copy_bytes);
         max.realloc_moved = max.realloc_moved.max(acc.realloc_moved);
         if let Some(start) = self.start {
-            max.ns = max.ns.max(start.elapsed().as_nanos() as u64);
+            let ns = start.elapsed().as_nanos() as u64;
+            max.ns = max.ns.max(ns);
+            inner.hold_hist[hold_bucket(ns)] += 1;
         }
     }
 }
@@ -191,6 +193,16 @@ struct StoreInner {
     /// [`BranchStore::take_hold_max`].
     hold: HoldAcc,
     hold_max: HoldMax,
+    /// Observation only, filled while hold timing is on: holds by duration, eight buckets per
+    /// octave of nanoseconds (see [`hold_bucket`]), since the last [`BranchStore::take_hold_hist`].
+    hold_hist: [u64; HOLD_HIST_BUCKETS],
+}
+
+const HOLD_HIST_BUCKETS: usize = 8 * 40;
+
+/// The histogram bucket of a hold of `ns` nanoseconds: floor(8 * log2(ns)).
+fn hold_bucket(ns: u64) -> usize {
+    (((ns.max(1) as f64).log2() * 8.0) as usize).min(HOLD_HIST_BUCKETS - 1)
 }
 
 #[derive(Default)]
@@ -510,6 +522,7 @@ impl BranchStore {
                 work: BranchWork::default(),
                 hold: HoldAcc::default(),
                 hold_max: HoldMax::default(),
+                hold_hist: [0; HOLD_HIST_BUCKETS],
             }),
             trunk_children: AtomicUsize::new(0),
             #[cfg(test)]
@@ -532,6 +545,15 @@ impl BranchStore {
     /// The per-hold maxima since the previous call, which this call resets.
     pub(crate) fn take_hold_max(&self) -> HoldMax {
         std::mem::take(&mut self.inner.lock().hold_max)
+    }
+
+    /// The hold-duration histogram since the previous call (bucket b holds durations in
+    /// [2^(b/8), 2^((b+1)/8)) ns), which this call resets. Empty unless hold timing is on.
+    pub(crate) fn take_hold_hist(&self) -> Vec<u64> {
+        let mut inner = self.inner.lock();
+        let hist = inner.hold_hist.to_vec();
+        inner.hold_hist = [0; HOLD_HIST_BUCKETS];
+        hist
     }
 
     pub(crate) fn trunk_has_children(&self) -> bool {

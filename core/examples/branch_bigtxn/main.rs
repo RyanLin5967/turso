@@ -215,7 +215,8 @@ fn snap(db: &Arc<Database>) -> Snap {
 
 const HEADER: &str = "phase\tD\tN\trep\tus\tlock_holds\tlocked_copy_bytes\tmax_hold_pages\tmax_hold_copy_bytes\t\
 max_hold_realloc_moved\tmax_hold_ns\tresolve_calls\tevict_calls\tevict_examined\tevict_full\t\
-over_capacity_admits\tevictable_scan\tspill_scan\tsubjournal_pages\tarena_in_use\tcache_len\tview_build_pages";
+over_capacity_admits\tevictable_scan\tspill_scan\tsubjournal_pages\tarena_in_use\tcache_len\tview_build_pages\t\
+holds_timed\thold_p50_ns\thold_p99_ns\thold_p999_ns";
 
 struct Ctx {
     db: Arc<Database>,
@@ -235,12 +236,30 @@ impl Ctx {
         f: impl FnOnce() -> T,
     ) -> (T, Duration) {
         let _ = self.db.branch_take_hold_max();
+        let _ = self.db.branch_take_hold_hist();
         let a = snap(&self.db);
         let t = Instant::now();
         let out = f();
         let el = t.elapsed();
         let b = snap(&self.db);
         let m: HoldMax = self.db.branch_take_hold_max();
+        let hist = self.db.branch_take_hold_hist();
+        let timed: u64 = hist.iter().sum();
+        // The lower edge (ns) of the bucket holding the q-quantile of this phase's hold durations.
+        let q = |q: f64| -> String {
+            if !self.timing || timed == 0 {
+                return "-".to_string();
+            }
+            let want = ((q * timed as f64).ceil() as u64).max(1);
+            let mut seen = 0;
+            for (b, &c) in hist.iter().enumerate() {
+                seen += c;
+                if seen >= want {
+                    return format!("{:.0}", 2f64.powf(b as f64 / 8.0));
+                }
+            }
+            "-".to_string()
+        };
         let us = if self.timing {
             format!("{:.1}", el.as_secs_f64() * 1e6)
         } else {
@@ -252,7 +271,7 @@ impl Ctx {
             "-".to_string()
         };
         println!(
-            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}",
             b.w.lock_holds - a.w.lock_holds,
             b.w.locked_copy_bytes - a.w.locked_copy_bytes,
             m.pages,
@@ -269,6 +288,9 @@ impl Ctx {
             b.arena_in_use,
             cache_len(),
             b.w.view_build_pages - a.w.view_build_pages,
+            q(0.5),
+            q(0.99),
+            q(0.999),
         );
         (out, el)
     }

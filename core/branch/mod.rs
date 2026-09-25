@@ -444,6 +444,13 @@ impl Database {
         self.branches.take_hold_max()
     }
 
+    /// Store-mutex holds by duration since the previous call, bucket b = [2^(b/8), 2^((b+1)/8)) ns;
+    /// resets it. Filled only while [`set_hold_timing`] is on.
+    #[doc(hidden)]
+    pub fn branch_take_hold_hist(&self) -> Vec<u64> {
+        self.branches.take_hold_hist()
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
