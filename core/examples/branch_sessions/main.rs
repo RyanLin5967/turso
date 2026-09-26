@@ -46,12 +46,27 @@ struct Counting;
 static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
 static LIVE_ALLOCS: AtomicI64 = AtomicI64::new(0);
 
+thread_local! {
+    /// This thread's own net bytes (allocated minus freed by this thread). Const-initialised and
+    /// drop-free, so touching it from the allocator allocates nothing.
+    static TL_BYTES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+fn tl_add(d: i64) {
+    let _ = TL_BYTES.try_with(|c| c.set(c.get() + d));
+}
+
+fn tl_bytes() -> i64 {
+    TL_BYTES.with(|c| c.get())
+}
+
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(layout) };
         if !p.is_null() {
             LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
             LIVE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            tl_add(layout.size() as i64);
         }
         p
     }
@@ -60,6 +75,7 @@ unsafe impl GlobalAlloc for Counting {
         if !p.is_null() {
             LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
             LIVE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            tl_add(layout.size() as i64);
         }
         p
     }
@@ -67,11 +83,13 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.dealloc(ptr, layout) };
         LIVE_BYTES.fetch_sub(layout.size() as i64, Ordering::Relaxed);
         LIVE_ALLOCS.fetch_sub(1, Ordering::Relaxed);
+        tl_add(-(layout.size() as i64));
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let p = unsafe { System.realloc(ptr, layout, new_size) };
         if !p.is_null() {
             LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+            tl_add(new_size as i64 - layout.size() as i64);
         }
         p
     }
@@ -162,6 +180,11 @@ struct Args {
     /// Session multiplexing: a session keeps only its Branch handle; each statement connects, runs,
     /// and drops its connection.
     mux: bool,
+    /// Pre-image arm (amendment 9): R of the W=4 leaves each session reads are rewritten by the
+    /// trunk after every session forked.
+    preimage: Option<usize>,
+    /// Concurrent trunk writer threads during the active arm (amendment 9).
+    trunk_writers: usize,
 }
 
 fn die(msg: &str) -> ! {
@@ -188,6 +211,8 @@ fn parse_args() -> Args {
         swap_growth_mib: 512,
         level_floor: 20,
         mux: false,
+        preimage: None,
+        trunk_writers: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -221,6 +246,12 @@ fn parse_args() -> Args {
                     val().parse().unwrap_or_else(|_| die("bad --swap-growth-mib"))
             }
             "--mux" => args.mux = true,
+            "--preimage" => {
+                args.preimage = Some(val().parse().unwrap_or_else(|_| die("bad --preimage")))
+            }
+            "--trunk-writers" => {
+                args.trunk_writers = val().parse().unwrap_or_else(|_| die("bad --trunk-writers"))
+            }
             "--level-floor" => {
                 args.level_floor = val().parse().unwrap_or_else(|_| die("bad --level-floor"))
             }
@@ -727,6 +758,14 @@ fn main() {
                 .unwrap();
         }
     }
+    if args.trunk_writers > 0 {
+        trunk
+            .execute("CREATE TABLE w(id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        for id in 1..=(args.trunk_writers as i64) * 1000 {
+            trunk.execute(format!("INSERT INTO w VALUES ({id}, 0)")).unwrap();
+        }
+    }
     trunk.execute("COMMIT").unwrap();
     if args.analyze {
         trunk.execute("ANALYZE").unwrap();
@@ -744,7 +783,7 @@ fn main() {
     println!("# branch_sessions — Turso fork, r11-sessions PREREG (frontier/round11/r11-sessions)");
     println!(
         "# mode={:?} checkpoints={:?} analyze={} tables={} active={} timing={} seed={:#x} \
-         swap_limit_mib={} swap_growth_mib={} level_floor={} mux={} \
+         swap_limit_mib={} swap_growth_mib={} level_floor={} mux={} preimage={:?} trunk_writers={} \
          trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
          page_size={page_size} trunk_pages={trunk_pages} trunk_synchronous={synchronous}",
         args.mode,
@@ -757,7 +796,9 @@ fn main() {
         args.swap_limit_mib,
         args.swap_growth_mib,
         args.level_floor,
-        args.mux
+        args.mux,
+        args.preimage,
+        args.trunk_writers
     );
     println!(
         "# build: {} ; clock tick {:.0} ns",
@@ -904,6 +945,9 @@ fn main() {
             first.sym_index_methods
         );
         reached.push(x);
+        if let Some(r) = b.args.preimage {
+            preimage_arm(&mut b, &mut sessions, x, r);
+        }
         if b.args.active > 0 && !sessions.is_empty() {
             active_arm(&mut b, &mut sessions, x);
         }
@@ -963,9 +1007,124 @@ fn main() {
     println!("# teardown: every branch freed, arena empty; reached {reached:?}");
 }
 
+/// The pre-image arm (amendment 9): after every held session forked, the trunk rewrites one row on
+/// each of `r` of the 4 leaves every session then reads. A session's read of a rewritten leaf resolves
+/// to the pre-image the trunk retained for it. Per session: the allocator bytes of the read and the
+/// store's counters for it.
+fn preimage_arm(b: &mut Bench, sessions: &mut [Session], x: usize, r: usize) {
+    const ROWS: [i64; 4] = [1, 602, 1203, 1804];
+    if r > ROWS.len() {
+        die("--preimage R needs R <= 4");
+    }
+    for &row in &ROWS[..r] {
+        let g = b.model.record(row);
+        b.trunk
+            .execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_gen_value(g)))
+            .unwrap();
+    }
+    let fs9 = std::env::var("TURSO_R11S_FS9").unwrap_or_default();
+    let (mut bytes, mut res, mut hits, mut misses, mut arena) =
+        (Acc::default(), Acc::default(), Acc::default(), Acc::default(), Acc::default());
+    let (mut copies, mut shared, mut fills) = (Acc::default(), Acc::default(), Acc::default());
+    let mut first = None;
+    for (i, s) in sessions.iter_mut().enumerate() {
+        s.touched = true;
+        let conn = s.conn.as_ref().expect("the pre-image arm holds connections");
+        let (m0, w0) = (mem(), b.db.branch_stats().work);
+        for &row in &ROWS {
+            let got = read_v(conn, row);
+            let want = b.model.value_at(row, s.trunk_writes_at_fork);
+            if got != want {
+                not_a_result(&format!("pre-image arm: session {i} read {got} for row {row}, want {want}"));
+            }
+        }
+        let (m1, w1) = (mem(), b.db.branch_stats().work);
+        let d = |f: fn(&turso_core::branch::BranchWork) -> u64| (f(&w1) - f(&w0)) as i64;
+        let row = (
+            m1.bytes - m0.bytes,
+            d(|w| w.resolve_calls),
+            d(|w| w.trunk_page_hits),
+            d(|w| w.trunk_page_misses),
+            d(|w| w.retained_copies),
+            d(|w| w.retained_shared_hits),
+            d(|w| w.retained_clone_fills),
+        );
+        if i == 0 {
+            first = Some(row);
+            continue;
+        }
+        bytes.add(row.0);
+        res.add(row.1);
+        hits.add(row.2);
+        misses.add(row.3);
+        arena.add(row.1 - row.2 - row.3);
+        copies.add(row.4);
+        shared.add(row.5);
+        fills.add(row.6);
+    }
+    println!("# preimage x={x} r={r} w=4 fs9={fs9:?} first_session={first:?} (bytes, resolves, hits, misses, retained_copies, retained_shared_hits, retained_clone_fills)");
+    for (name, a) in [
+        ("read_bytes", &bytes),
+        ("resolves", &res),
+        ("trunk_page_hits", &hits),
+        ("trunk_page_misses", &misses),
+        ("arena_resolved", &arena),
+        ("retained_copies", &copies),
+        ("retained_shared_hits", &shared),
+        ("retained_clone_fills", &fills),
+    ] {
+        println!("preimage\t{x}\t{r}\t{name}\t{}\t{:.2}\t{}\t{}", a.n, a.mean(), a.min, a.max);
+    }
+    println!(
+        "# preimage x={x} retained_clones={} arena_in_use={}",
+        b.db.retained_clone_count(),
+        b.db.branch_stats().arena_slots_in_use
+    );
+}
+
+/// Concurrent trunk writers for the active arm (amendment 9): each thread has its own trunk
+/// connection and commits one-row updates to its own rows of table `w` (never read by any check)
+/// until told to stop, retrying Busy.
+struct Writers {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handles: Vec<std::thread::JoinHandle<(u64, u64)>>,
+}
+
+fn start_writers(db: &Arc<Database>, n: usize) -> Writers {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handles = (0..n)
+        .map(|t| {
+            let (db, stop) = (db.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let conn = db.connect().unwrap();
+                conn.execute("PRAGMA synchronous = NORMAL").unwrap();
+                let (mut commits, mut busy) = (0u64, 0u64);
+                let mut i = 0u64;
+                while !stop.load(Ordering::Acquire) {
+                    let id = 1 + (t as u64) * 1000 + i % 1000;
+                    match conn.execute(format!("UPDATE w SET v = v + 1 WHERE id = {id}")) {
+                        Ok(()) => commits += 1,
+                        Err(turso_core::LimboError::Busy | turso_core::LimboError::BusySnapshot) => {
+                            busy += 1;
+                            std::thread::yield_now();
+                        }
+                        Err(e) => panic!("trunk writer {t}: {e}"),
+                    }
+                    i += 1;
+                }
+                (commits, busy)
+            })
+        })
+        .collect();
+    Writers { stop, handles }
+}
+
 /// The active ops, K cycles, with every held session still open.
 fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
     let k = b.args.active;
+    let writers = (b.args.trunk_writers > 0).then(|| start_writers(&b.db, b.args.trunk_writers));
+    let bufs0 = turso_core::io::temp_buffer_cache_counts();
+    let mut op_tl: [Acc; 5] = Default::default();
     let mut ops: [(Acc, Acc, Vec<Duration>); 5] = Default::default();
     // Per op: store-lock acquisitions and allocations (K12: what a multiplexed statement pays).
     let mut op_locks: [Acc; 5] = Default::default();
@@ -982,7 +1141,7 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
     let intx = b.args.mode == Mode::Intx;
     for c in 0..k {
         // 1. the trunk commits
-        let (r0, m0, l0) = (b.resolves(), mem(), b.lock_takes());
+        let (r0, m0, l0, t0) = (b.resolves(), mem(), b.lock_takes(), tl_bytes());
         let t = Instant::now();
         b.trunk_commit();
         ops[0].2.push(t.elapsed());
@@ -990,13 +1149,14 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
         ops[0].1.add(mem().bytes - m0.bytes);
         op_locks[0].add((b.lock_takes() - l0) as i64);
         op_allocs[0].add(mem().allocs - m0.allocs);
+        op_tl[0].add(tl_bytes() - t0);
 
         // 2 and 3. a held session reads its row, twice
         let si = b.rng.below(sessions.len());
         sessions[si].touched = true;
         for op in [1, 2] {
             let s = &sessions[si];
-            let (r0, m0, l0) = (b.resolves(), mem(), b.lock_takes());
+            let (r0, m0, l0, t0) = (b.resolves(), mem(), b.lock_takes(), tl_bytes());
             let t = Instant::now();
             let got = match &s.conn {
                 Some(conn) => read_v(conn, s.row),
@@ -1007,6 +1167,7 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
             ops[op].1.add(mem().bytes - m0.bytes);
             op_locks[op].add((b.lock_takes() - l0) as i64);
             op_allocs[op].add(mem().allocs - m0.allocs);
+            op_tl[op].add(tl_bytes() - t0);
             if got != s.expect(&b.model) {
                 not_a_result(&format!("held session {si} read {got} at active cycle {c}"));
             }
@@ -1015,7 +1176,7 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
         // 4. a fresh session, used once and reaped
         let row = row_for(1_000_000_000 + c);
         let at_fork = b.model.writes;
-        let (r0, m0, l0) = (b.resolves(), mem(), b.lock_takes());
+        let (r0, m0, l0, t0) = (b.resolves(), mem(), b.lock_takes(), tl_bytes());
         let t = Instant::now();
         let br = b.trunk.fork_branch().unwrap();
         let conn = br.connect().unwrap();
@@ -1027,12 +1188,13 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
         ops[3].1.add(mem().bytes - m0.bytes);
         op_locks[3].add((b.lock_takes() - l0) as i64);
         op_allocs[3].add(mem().allocs - m0.allocs);
+        op_tl[3].add(tl_bytes() - t0);
         if got != b.model.value_at(row, at_fork) || reaped.deferred {
             not_a_result(&format!("fresh session at cycle {c}: read {got}, {reaped:?}"));
         }
 
         // 5. a passive checkpoint
-        let (r0, m0, l0) = (b.resolves(), mem(), b.lock_takes());
+        let (r0, m0, l0, t0) = (b.resolves(), mem(), b.lock_takes(), tl_bytes());
         let t = Instant::now();
         let (bu, lg, ck) = b.checkpoint_passive();
         ops[4].2.push(t.elapsed());
@@ -1040,6 +1202,7 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
         ops[4].1.add(mem().bytes - m0.bytes);
         op_locks[4].add((b.lock_takes() - l0) as i64);
         op_allocs[4].add(mem().allocs - m0.allocs);
+        op_tl[4].add(tl_bytes() - t0);
         busy.add(bu);
         log.add(lg);
         ckpt.add(ck);
@@ -1068,6 +1231,12 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
             op_allocs[i].min,
             op_allocs[i].max
         );
+        println!(
+            "active_tl\t{x}\t{name}\t{k}\tmain_thread_bytes {:.2} [{},{}]",
+            op_tl[i].mean(),
+            op_tl[i].min,
+            op_tl[i].max
+        );
     }
     println!(
         "# active x={x} intx={intx} ckpt_busy_mean={:.3} ckpt_log_min={} ckpt_log_max={} \
@@ -1081,5 +1250,26 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
         CKPT_NONINT.load(Ordering::Relaxed),
         b.wal_bytes(),
         b.model.writes
+    );
+    let bufs1 = turso_core::io::temp_buffer_cache_counts();
+    let (mut commits, mut busy) = (0u64, 0u64);
+    if let Some(w) = writers {
+        w.stop.store(true, Ordering::Release);
+        for h in w.handles {
+            let (c, bz) = h.join().expect("a trunk writer panicked");
+            commits += c;
+            busy += bz;
+        }
+    }
+    println!(
+        "# active x={x} trunk_writers={} writer_commits={commits} writer_busy={busy} \
+         main_thread_buffer_cache page_before={} page_after={} walframe_before={} walframe_after={} \
+         wal_bytes_end={}",
+        b.args.trunk_writers,
+        bufs0.0,
+        bufs1.0,
+        bufs0.1,
+        bufs1.1,
+        b.wal_bytes()
     );
 }
