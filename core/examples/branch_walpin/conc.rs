@@ -357,12 +357,13 @@ fn reader(
     let mut samples = Vec::new();
     let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ ((tid as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
     let mut i = 0;
-    if sessions.is_empty() {
+    let n = sessions.len();
+    if n == 0 {
         return (samples, sessions);
     }
     while !sh.writers_done.load(Ordering::Acquire) {
         let s = &mut sessions[i];
-        i = (i + 1) % sessions.len();
+        i = (i + 1) % n;
         if c.m > 0 && s.reads >= c.m {
             refork(s, &trunk, sh, c.held);
         }
