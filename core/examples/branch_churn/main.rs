@@ -31,8 +31,11 @@
 //! total and max duration, fsyncs, last snapshot bytes); plus the log, arena and snapshot file sizes.
 //!
 //! Checks (`NOT A RESULT`, exit 1): the sampled reads against the harness's model; in serial mode
-//! every reap's outcome against the chain structure; at quiescence, arena pages in use = w x engine
-//! branches, and in serial mode engine branches = table entries + deferred links; teardown empty.
+//! every reap's outcome against the chain structure; at quiescence, in serial and batch mode, engine
+//! branches = table entries and arena pages in use = w x (engine branches + deferred links) (on the
+//! F7 durable port a deferred link is spliced into its child: out of the engine's count, its pages
+//! kept), and in lease mode arena pages = w x engine branches; teardown empty. Refused on the F7
+//! port: lease mode with --chain > 1, and any --chain/--w that puts two links of a chain on one leaf.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};

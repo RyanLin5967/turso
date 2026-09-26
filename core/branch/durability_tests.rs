@@ -2543,6 +2543,12 @@ fn a_chain_that_releases_its_oldest_keeps_only_its_live_branches() {
                 chain.len(),
                 "step {i}: a released branch with one kept child was kept"
             );
+            for b in &chain {
+                let c = b.connect().unwrap();
+                for (&row, v) in &expect[&b.id()] {
+                    assert_eq!(value(&c, row).as_ref(), Some(v), "step {i}: branch {:?} row {row}", b.id());
+                }
+            }
         }
         assert_eq!(expect.len(), LIVE);
         for b in &chain {
@@ -2854,14 +2860,19 @@ fn a_recovery_logs_the_close_of_a_branch_a_crash_left_held() {
         let at = |want: &journal::Record| records.iter().position(|r| r == want);
         let released = at(&journal::Record::ReleaseOpen { branch: p_id.0 });
         let closed = at(&journal::Record::Close { branch: p_id.0 });
-        let forked = at(&journal::Record::Fork {
-            child: d_id.0,
-            parent: c_id.0,
-        });
+        // Session 2's first record: c's commit (c made none in session 1).
+        let first_of_session_2 = records
+            .iter()
+            .position(|r| matches!(r, journal::Record::Commit { branch, .. } if *branch == c_id.0));
         assert!(
-            released.is_some() && closed > released && forked.is_some() && closed < forked,
-            "the recovery's Close of p is missing or out of order: {records:?}"
+            released.is_some()
+                && closed > released
+                && first_of_session_2.is_some()
+                && closed < first_of_session_2,
+            "the recovery's Close of p is missing or not ahead of session 2's records: {records:?}"
         );
+        // Session 3's state checks below cannot tell a missing Close from a present one on this
+        // schedule (the splice commutes with session 2's operations here); this order check can.
     }
     let db = reopen(&image, incarnation); // session 3
     assert_eq!(db.branch_ids().unwrap(), vec![d_id]);
