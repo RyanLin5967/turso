@@ -2,11 +2,13 @@
 //!
 //! # The model
 //!
-//! Every fork, of the trunk or of any branch, takes the next value `f` of one store-wide clock: the
-//! child records `f` as its `fork_epoch`, and the parent's `epoch` (the epoch its next write is born
-//! in) becomes `f + 1`, as does the child's. Per node, fork epochs therefore strictly increase, which
-//! is all the rules below use; one clock for every node is what lets a splice (see "Reclamation")
-//! move versions between a node and its child without rewriting a single epoch. A version of a page
+//! Every node in the branch tree — the trunk and each branch — carries an `epoch` that its own
+//! forks advance: a child forked from a node records the node's epoch at that moment as its
+//! `fork_epoch`, and the node's epoch then increments. A child's own epochs START one past its
+//! `fork_epoch` (epoch inheritance), so along any line of descent the epochs are nested: every
+//! value an ancestor gave a version its descendant can read is below every value the descendant
+//! uses. That order is what lets a splice (see "Reclamation") move versions between a node and its
+//! child without rewriting a single epoch, and it needs no store-wide clock. A version of a page
 //! that a node wrote in epoch `born` is visible to that node's children forked at any epoch
 //! `>= born`, until the node overwrites it in epoch `died`; after that it is visible only to
 //! children forked in `[born, died)`. A branch therefore sees, for each page:
@@ -81,8 +83,9 @@
 //!    size; `block-stream` moves the base into the top, `block-commit` the top into the base), and
 //!    the merged map is moved into `c` by swap. A zombie version of a page `c` has written is kept as
 //!    a retained version of `c`, `[born, c's first own version)`, if a child of `c` forked inside
-//!    that range, and freed otherwise. The clock is shared, so every zombie version is born before
-//!    every epoch of `c` and no key changes.
+//!    that range, and freed otherwise. Epochs are inherited (see "The model"): every zombie version
+//!    `c` reads was born at or before `c`'s fork epoch, and `c`'s own epochs start above it, so every
+//!    zombie version is born before every epoch of `c` and no key changes.
 //!
 //! After every store call, every zombie has at least two kept children, so the kept states number at
 //! most twice the live ones.
@@ -138,8 +141,6 @@ pub(crate) struct BranchStore {
 struct StoreInner {
     arena: Option<Arena>,
     next_id: u64,
-    /// The store-wide fork clock: the next fork's epoch (see "The model").
-    clock: u64,
     trunk: TrunkState,
     /// Branch states by id: a slot map, so churn leaves no tombstones and never rehashes (F8,
     /// see [`super::table`]).
@@ -373,7 +374,6 @@ impl BranchStore {
             inner: Mutex::new(StoreInner {
                 arena: None,
                 next_id: 1,
-                clock: 0,
                 trunk: TrunkState {
                     lineage: Lineage::default(),
                     written: HashMap::new(),
@@ -412,9 +412,8 @@ impl BranchStore {
         }
         let id = inner.branches.vacant_id();
         inner.next_id += 1;
-        let f = inner.clock;
-        inner.clock += 1;
-        inner.trunk.lineage.epoch = f + 1;
+        let f = inner.trunk.lineage.epoch;
+        inner.trunk.lineage.epoch += 1;
         inner.trunk.lineage.children.insert(f, id);
         inner.branches.insert(
             id,
@@ -429,12 +428,12 @@ impl BranchStore {
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         let mut inner = self.inner.lock();
         let id = inner.branches.vacant_id();
-        let f = inner.clock;
         let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
             return Err(LimboError::Busy);
         }
-        st.lineage.epoch = f + 1;
+        let f = st.lineage.epoch;
+        st.lineage.epoch += 1;
         st.lineage.children.insert(f, id);
         let schema = st.schema.clone();
         let (current, inherited) = (&st.current, &st.inherited);
@@ -450,7 +449,6 @@ impl BranchStore {
             .clone();
         let trunk_at = st.trunk_at;
         inner.next_id += 1;
-        inner.clock += 1;
         inner
             .branches
             .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
@@ -1079,10 +1077,9 @@ impl BranchState {
         Self {
             parent,
             fork_epoch,
-            // The child's first write is born after its fork epoch (see "The model"). Any start up to
-            // the child's first own fork epoch gives the same decisions, since every comparison is
-            // against this node's own children (r11-ever's mutant M6, starting at 0, survived every
-            // test for that reason); f + 1 keeps each node's epochs after its creation.
+            // Epoch inheritance (see "The model"): the child's epochs start above its fork epoch, so
+            // every version it reads through its parent is born before any epoch it uses. A splice
+            // relies on that order; starting at 0 would break it.
             lineage: Lineage {
                 epoch: fork_epoch + 1,
                 ..Lineage::default()

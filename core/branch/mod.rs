@@ -201,7 +201,7 @@ pub struct BranchResident {
     /// One more than the number of branches ever created. Since F8 it is a count, not an id: ids
     /// are slot and generation (see `table`).
     pub next_id: u64,
-    /// One past the store-wide fork clock's value at the trunk's latest fork.
+    /// The trunk's fork epoch, advanced once per trunk fork.
     pub trunk_epoch: u64,
     /// Live children of the trunk.
     pub trunk_children: usize,
