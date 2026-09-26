@@ -3690,13 +3690,20 @@ impl Pager {
         let wal = self.wal.as_ref().ok_or_else(|| {
             LimboError::InternalError("a branch pager reads the trunk through its WAL".into())
         })?;
+        // r11-walpin-conc instrument: this call's failed attempts, those that failed the store
+        // check alone, and whether it has read the trunk yet (observation only).
+        let (mut retries, mut store_retries, mut read_trunk) = (0u64, 0u64, false);
         for _ in 0..1_000 {
             let (nbackfills, max_frame, generation) = wal.fw3_snapshot().ok_or_else(|| {
                 LimboError::InternalError("FW3 needs the in-process WAL".into())
             })?;
             if let Some(read) = self.read_branch_page(branch, page_idx, frame_watermark)? {
+                if read_trunk {
+                    walpin::fw3_record_call(retries, store_retries, false);
+                }
                 return Ok(read);
             }
+            read_trunk = true;
             let frame = wal.fw3_find_frame(page_idx as u64, nbackfills + 1, max_frame);
             #[cfg(test)]
             fw3_test_hook::fire(page_idx);
@@ -3730,6 +3737,8 @@ impl Pager {
                     let retry_failed_read = true;
                     if retry_failed_read && frame.is_some() && !same_generation {
                         walpin::FW3_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        walpin::FW3_RETRY_READERR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        retries += 1;
                         continue;
                     }
                     return Err(err);
@@ -3739,10 +3748,19 @@ impl Pager {
             #[cfg(test)]
             let (still_trunk, same_generation) = fw3_test_hook::mutate(still_trunk, same_generation);
             if still_trunk && same_generation {
+                walpin::fw3_record_call(retries, store_retries, false);
                 return Ok((page, c));
             }
             walpin::FW3_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            retries += 1;
+            if same_generation {
+                walpin::FW3_RETRY_STORE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                store_retries += 1;
+            } else {
+                walpin::FW3_RETRY_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
+        walpin::fw3_record_call(retries, store_retries, true);
         Err(LimboError::Busy)
     }
 
@@ -7340,7 +7358,8 @@ pub(crate) mod fw3_test_hook {
         }
     }
     /// 0: none; 1: the store check always passes; 2: the generation check always passes; 3: a
-    /// failed frame read is never retried.
+    /// failed frame read is never retried; 4: the generation check always fails (r11-walpin-conc:
+    /// drives a read to the retry limit, to fire the Busy path and its counters).
     pub(crate) fn set_mutant(m: u8) {
         MUTANT.with(|c| c.set(m));
     }
@@ -7351,6 +7370,7 @@ pub(crate) mod fw3_test_hook {
         match MUTANT.with(|c| c.get()) {
             1 => (true, same_generation),
             2 => (still_trunk, true),
+            4 => (still_trunk, false),
             _ => (still_trunk, same_generation),
         }
     }

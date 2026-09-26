@@ -10,12 +10,16 @@
 //!             new one, so K read transactions are always open, each spanning K trunk commits
 //!   u3        `overlap 1` in the background; the trunk rewrites one row k times, then 3,000 rows on
 //!             other pages; then fresh branches read that row (the per-miss frame-list walk)
+//!   conc      T trunk writer threads and R reader threads over K branch sessions (r11-walpin-conc;
+//!             see conc.rs and that lane's PREREG)
 //!
 //! `--fix fw1,fw2,fw3` selects the lane's fixes (`turso_core::branch::walpin`); default none.
 //!
 //! Every branch read is checked against a model the harness keeps itself (never the engine); a
 //! mismatch prints `NOT A RESULT` and exits 1. Counters are engine integers; times (`--timing`
 //! only) are Instant around one trunk commit or one branch SELECT.
+
+mod conc;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -39,6 +43,7 @@ enum Arm {
     NoPin,
     Overlap,
     U3,
+    Conc,
 }
 
 struct Args {
@@ -49,6 +54,7 @@ struct Args {
     fixes: (bool, bool, bool),
     timing: bool,
     dir: Option<PathBuf>,
+    conc: conc::ConcArgs,
 }
 
 fn die(msg: &str) -> ! {
@@ -87,6 +93,7 @@ fn parse_args() -> Args {
         fixes: (false, false, false),
         timing: false,
         dir: None,
+        conc: conc::ConcArgs::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -98,6 +105,7 @@ fn parse_args() -> Args {
                     "nopin" => Arm::NoPin,
                     "overlap" => Arm::Overlap,
                     "u3" => Arm::U3,
+                    "conc" => Arm::Conc,
                     other => die(&format!("unknown arm {other}")),
                 })
             }
@@ -125,6 +133,42 @@ fn parse_args() -> Args {
                 }
             }
             "--timing" => args.timing = true,
+            "--t" => args.conc.t = val().parse().unwrap_or_else(|_| die("bad --t")),
+            "--r" => args.conc.r = val().parse().unwrap_or_else(|_| die("bad --r")),
+            "--m" => args.conc.m = val().parse().unwrap_or_else(|_| die("bad --m")),
+            "--conn" => {
+                args.conc.held = match val().as_str() {
+                    "mux" => false,
+                    "held" => true,
+                    other => die(&format!("unknown --conn {other}")),
+                }
+            }
+            "--rows" => {
+                let v = val();
+                args.conc.hot_leaves = match v.as_str() {
+                    "all" => None,
+                    _ => Some(
+                        v.strip_prefix("hot:")
+                            .and_then(|p| p.parse().ok())
+                            .filter(|&p: &u64| p > 0)
+                            .unwrap_or_else(|| die("--rows is all or hot:<leaves>")),
+                    ),
+                }
+            }
+            "--storm" => {
+                args.conc.storm = match val().as_str() {
+                    "none" => false,
+                    "truncate" => true,
+                    other => die(&format!("unknown --storm {other}")),
+                }
+            }
+            "--wbusy" => {
+                args.conc.wbusy_timeout = match val().as_str() {
+                    "spin" => false,
+                    "timeout" => true,
+                    other => die(&format!("unknown --wbusy {other}")),
+                }
+            }
             "--dir" => args.dir = Some(PathBuf::from(val())),
             other => die(&format!("unknown argument {other}")),
         }
@@ -469,6 +513,7 @@ fn main() {
         Arm::Pin | Arm::NoPin => run_pin(&mut bench, &args),
         Arm::Overlap => run_overlap(&mut bench, &args),
         Arm::U3 => run_u3(&mut bench, &args),
+        Arm::Conc => conc::run_conc(&mut bench, &args),
     }
     println!("# done");
 }

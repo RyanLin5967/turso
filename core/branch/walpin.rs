@@ -23,6 +23,42 @@ pub(crate) static FW2_SWITCHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW2_CKPT_REFUSED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW3_TRUNK_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW3_RETRIES: AtomicU64 = AtomicU64::new(0);
+// r11-walpin-conc: FW3's retries per call, by cause (frontier/round11/r11-walpin-conc/PREREG.md).
+pub(crate) static FW3_CALLS_TRUNK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW3_RETRY_STORE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW3_RETRY_GEN: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW3_RETRY_READERR: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW3_BUSY: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW3_MULTI_STORE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW3_MAX_RETRIES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW3_HIST: [AtomicU64; FW3_HIST_BUCKETS] = [const { AtomicU64::new(0) }; FW3_HIST_BUCKETS];
+
+/// Buckets of `WalPinCounters::fw3_hist`: a trunk call's retries 0, 1, 2, 3, 4-7, 8-15, 16-63,
+/// 64-255, 256-999, and Busy (the retry limit).
+pub const FW3_HIST_BUCKETS: usize = 10;
+
+/// Record one FW3 call that read the trunk at least once: `retries` failed attempts, `store` of them
+/// failed the store check alone; `busy` when it gave up.
+pub(crate) fn fw3_record_call(retries: u64, store: u64, busy: bool) {
+    FW3_CALLS_TRUNK.fetch_add(1, Relaxed);
+    let bucket = match retries {
+        _ if busy => 9,
+        0..=3 => retries as usize,
+        4..=7 => 4,
+        8..=15 => 5,
+        16..=63 => 6,
+        64..=255 => 7,
+        _ => 8,
+    };
+    FW3_HIST[bucket].fetch_add(1, Relaxed);
+    FW3_MAX_RETRIES.fetch_max(retries, Relaxed);
+    if store >= 2 {
+        FW3_MULTI_STORE.fetch_add(1, Relaxed);
+    }
+    if busy {
+        FW3_BUSY.fetch_add(1, Relaxed);
+    }
+}
 
 static FW1: AtomicBool = AtomicBool::new(false);
 static FW2: AtomicBool = AtomicBool::new(false);
@@ -64,6 +100,22 @@ pub struct WalPinCounters {
     pub fw3_trunk_reads: u64,
     /// FW3: those reads that failed validation and were retried.
     pub fw3_retries: u64,
+    /// FW3: calls (branch page misses) that read the trunk at least once.
+    pub fw3_calls_trunk: u64,
+    /// FW3 retries whose store check failed while the generation held.
+    pub fw3_retry_store: u64,
+    /// FW3 retries whose generation check failed (the read itself succeeded).
+    pub fw3_retry_gen: u64,
+    /// FW3 retries of a frame read that failed in a changed generation.
+    pub fw3_retry_readerr: u64,
+    /// FW3 calls that reached the retry limit and returned Busy.
+    pub fw3_busy: u64,
+    /// FW3 calls with two or more store-check retries.
+    pub fw3_multi_store: u64,
+    /// The most retries any FW3 call has made.
+    pub fw3_max_retries: u64,
+    /// FW3 calls by their retries (buckets in `FW3_HIST_BUCKETS`'s doc).
+    pub fw3_hist: [u64; FW3_HIST_BUCKETS],
 }
 
 pub fn counters() -> WalPinCounters {
@@ -77,6 +129,14 @@ pub fn counters() -> WalPinCounters {
         fw2_ckpt_refused: FW2_CKPT_REFUSED.load(Relaxed),
         fw3_trunk_reads: FW3_TRUNK_READS.load(Relaxed),
         fw3_retries: FW3_RETRIES.load(Relaxed),
+        fw3_calls_trunk: FW3_CALLS_TRUNK.load(Relaxed),
+        fw3_retry_store: FW3_RETRY_STORE.load(Relaxed),
+        fw3_retry_gen: FW3_RETRY_GEN.load(Relaxed),
+        fw3_retry_readerr: FW3_RETRY_READERR.load(Relaxed),
+        fw3_busy: FW3_BUSY.load(Relaxed),
+        fw3_multi_store: FW3_MULTI_STORE.load(Relaxed),
+        fw3_max_retries: FW3_MAX_RETRIES.load(Relaxed),
+        fw3_hist: std::array::from_fn(|i| FW3_HIST[i].load(Relaxed)),
     }
 }
 

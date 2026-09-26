@@ -462,3 +462,38 @@ fn without_the_retry_a_wal_truncated_in_the_window_fails_the_read() {
         "mutant 3 must fail the read, or this test cannot see the truncation"
     );
 }
+
+/// r11-walpin-conc: a read whose generation check always fails (mutant 4, switched inside the
+/// callee) gives up at the retry limit with Busy, and the per-call counters see exactly that: one
+/// Busy call in the Busy bucket, 1,000 generation retries. This fires the one path the concurrent
+/// arms predict never runs, so a zero there is a reading, not a blind spot. With the mutant off the
+/// same read returns the fork value. The counters are process-global: run with --test-threads=1.
+#[test]
+fn fw3_a_read_that_never_validates_is_busy_after_the_retry_limit() {
+    let (_dir, db) = open_db(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let branch = trunk.fork_branch().unwrap();
+    let conn = branch.connect().unwrap();
+    let before = walpin::counters();
+    fw3_test_hook::set_mutant(4);
+    let got = select_once(&conn, ROWS);
+    fw3_test_hook::set_mutant(0);
+    let after = walpin::counters();
+    assert!(
+        matches!(got, Err(LimboError::Busy)),
+        "mutant 4 must exhaust the retries: {got:?}"
+    );
+    assert_eq!(after.fw3_busy - before.fw3_busy, 1, "one call gave up");
+    assert_eq!(after.fw3_hist[9] - before.fw3_hist[9], 1, "in the Busy bucket");
+    assert_eq!(
+        after.fw3_retry_gen - before.fw3_retry_gen,
+        1_000,
+        "every attempt failed the generation check"
+    );
+    assert_eq!(after.fw3_retries - before.fw3_retries, 1_000);
+    assert!(after.fw3_max_retries >= 1_000);
+    drop(conn);
+    let conn = branch.connect().unwrap();
+    assert_eq!(value(&conn, ROWS), original(ROWS));
+}
