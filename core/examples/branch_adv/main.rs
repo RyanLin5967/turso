@@ -14,6 +14,11 @@
 
 use std::time::Instant;
 
+/// PREREG amendment 7c: the platform allocator (macOS xzone malloc) resizes its deferred-reclamation
+/// ring inside free(), a doubling stall charged to whichever reap frees; mimalloc has no such ring.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use turso_core::branch::bench::StoreBench;
 use turso_core::branch::{BranchId, BranchStats, BranchWork};
 
