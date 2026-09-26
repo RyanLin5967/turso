@@ -5,7 +5,10 @@
 //!
 //! Every node in the branch tree — the trunk and each branch — carries an `epoch` that its own
 //! forks advance: a child forked from a node records the node's epoch at that moment as its
-//! `fork_epoch`, and the node's epoch then increments. A version of a page that a node wrote in
+//! `fork_epoch`, and the node's epoch then increments. A child's own epochs START one past its
+//! `fork_epoch` (epoch inheritance, F7 durable port): along any line of descent the epochs nest, so
+//! every version an ancestor holds that a descendant can read was born below every epoch the
+//! descendant uses. A splice (see "Reclamation") relies on that order. A version of a page that a node wrote in
 //! epoch `born` is visible to that node's children forked at any epoch `>= born`, until the node
 //! overwrites it in epoch `died`; after that it is visible only to children forked in
 //! `[born, died)`. A branch therefore sees, for each page:
@@ -38,9 +41,28 @@
 //!
 //! A released branch with an open connection is kept whole until the connection goes. A released
 //! branch with live children is RETIRED (F4, UNBUILT): it keeps exactly the versions some live
-//! child can read — its current versions become retained ones that died at the release epoch, and
-//! any with no live child inside `[born, release)` are freed at the release itself — and it is
-//! freed whole when its last child goes, which may in turn free its parent.
+//! child can read — a current version is read by the children forked at or after its birth, so
+//! those born after its newest kept child's fork are freed at the release itself, and again each
+//! time its newest kept child goes — and it is freed whole when its last child goes, which may in
+//! turn free its parent. (Before the F7 durable port the kept ones became retained versions that
+//! died at the release epoch; they stay `current` now, indexed by `born`, so a splice can merge
+//! them by size.)
+//!
+//! A retired branch with exactly ONE kept child is SPLICED out (F7 durable port, r11-ever,
+//! UNBUILT; the volatile store's F7 at turso r11-ever fad7db24d/d9be3f03a; prior art: ZFS `zfs
+//! promote`, QEMU `block-stream`/`block-commit`, Neon `detach_ancestor`, Olive NSDI'06 s6.7): its
+//! child takes its place under its parent at the same fork epoch and inherits the versions it reads
+//! through it, merged into its own by iterating the smaller of the two and probing the larger
+//! (union by size, as the volatile store does; see `StoreInner::splice`), so a version inherited
+//! down a chain is not copied at every link. Without it a workload that forks from its newest branch
+//! and releases its oldest keeps every branch it ever created — in the snapshot, in every
+//! compaction, and on every read's ancestor walk (r11-ever-refute item 5). With it every kept
+//! released branch that no connection holds has at least two kept children, so those number under
+//! the live ones and kept branches under twice them. A splice is a pure function of the state,
+//! and live and replay collect at the same points:
+//! the one collect that happens outside a logged operation — a released branch's connection
+//! closing — now logs `Close`, and a release of an open branch logs `ReleaseOpen`, so replay holds
+//! the branch exactly as long as the live store did.
 //!
 //! # Leases (F5, UNBUILT)
 //!
@@ -88,6 +110,10 @@
 //! * One `Mutex` guards every branch, held across the durable store's fsyncs. Correct, and a named
 //!   wall under concurrent writers; the benchmark this lane ships is single-threaded and says so.
 //! * Resolution walks the ancestor chain: cost grows with DEPTH, not with the number of branches.
+//!   With the splice, the chain holds only live branches, held ones, and released ones with two
+//!   or more kept children, so its depth is bounded by twice the live count, never by the branches
+//!   ever created;
+//!   removing the depth term is the persistent page map's job (the volatile store's F4).
 //! * Recovery is eager: every branch map is materialised at open, O(live branch state).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -297,6 +323,12 @@ pub(crate) mod churn_counters {
     pub(crate) static COMPACT_NS_MAX: AtomicU64 = AtomicU64::new(0);
     pub(crate) static COMPACT_FSYNCS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static COMPACT_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+    /// Retired branches spliced out (F7 durable port).
+    pub(crate) static SPLICES: AtomicU64 = AtomicU64::new(0);
+    /// Splices that merged the child into the zombie's map (the child's side was smaller).
+    pub(crate) static SPLICE_COMMITS: AtomicU64 = AtomicU64::new(0);
+    /// Versions a splice visited: the zombie's retained ones plus the smaller side of the merge.
+    pub(crate) static SPLICE_ENTRIES: AtomicU64 = AtomicU64::new(0);
 }
 
 /// An expiry pass planned but not yet durable (see `BranchStore::expire_plan`).
@@ -339,8 +371,11 @@ struct BranchState {
     parent: BranchId,
     fork_epoch: u64,
     lineage: Lineage,
-    /// The branch's current version of every page it has committed.
+    /// The branch's current version of every page it has committed, or reads through a spliced-out
+    /// ancestor (F7 durable port).
     current: HashMap<u32, Owned>,
+    /// `current` as `(born, page)`, so the versions born after a given epoch are a range (retire).
+    current_by_born: BTreeSet<(u64, u32)>,
     /// Slots reserved by the open write transaction's copy decisions, not yet published.
     pending: HashMap<u32, Slot>,
     /// The branch's committed schema: shared with the parent at fork, replaced by a committed
@@ -357,29 +392,39 @@ struct BranchState {
 
 impl BranchState {
     /// F4. A released branch never reads its own `current` again, never writes, and takes no new
-    /// child. So each current version becomes a retained one that died at the branch's epoch — a
-    /// live child forked at `f` reads it exactly as before, because `born <= f < epoch` — and every
-    /// one that no live child forked inside `[born, epoch)` goes to `freed` NOW rather than when the
-    /// last child goes. That is the interval rule with the free epoch set to the release epoch
-    /// (ferrodb's `retire_arenas_by_rule`); `Lineage::child_gone` then frees the rest incrementally.
+    /// child, so a current version is read only by the kept children forked at or after its birth
+    /// (`resolve`: `born <= at`). Every one born after the newest kept child's fork is read by
+    /// nobody and goes to `freed` NOW rather than when the last child goes — the interval rule with
+    /// the free epoch set to the release epoch (ferrodb's `retire_arenas_by_rule`). The rest stay
+    /// current. `collect` runs this again whenever a child of a released branch goes, which frees
+    /// exactly what the newest child alone read; `Lineage::child_gone` frees the retained versions.
+    /// Cost: the versions freed, plus one range lookup.
     /// Only for a branch with no open connection: an open one still reads `current` at `u64::MAX`.
     fn retire_current(&mut self, freed: &mut Vec<Slot>) {
-        let epoch = self.lineage.epoch;
-        for (page, owned) in self.current.drain() {
-            if self.lineage.has_child_in(owned.born, epoch) {
-                self.lineage.retain(
-                    page,
-                    Retained {
-                        born: owned.born,
-                        died: epoch,
-                        slot: owned.slot,
-                        crc: owned.crc,
-                    },
-                );
-            } else {
-                freed.push(owned.slot);
-            }
+        let unread = match self.lineage.children.last_key_value() {
+            Some((&newest, _)) => Bound::Excluded((newest, u32::MAX)),
+            None => Bound::Unbounded,
+        };
+        let dead: Vec<(u64, u32)> = self
+            .current_by_born
+            .range((unread, Bound::Unbounded))
+            .copied()
+            .collect();
+        for (born, page) in dead {
+            self.current_by_born.remove(&(born, page));
+            let owned = self.current.remove(&page).expect("indexed current version");
+            freed.push(owned.slot);
         }
+    }
+
+    /// Set `page`'s current version, keeping `current_by_born` in step; returns the one it replaces.
+    fn set_current(&mut self, page: u32, owned: Owned) -> Option<Owned> {
+        let old = self.current.insert(page, owned);
+        if let Some(old) = old {
+            self.current_by_born.remove(&(old.born, page));
+        }
+        self.current_by_born.insert((owned.born, page));
+        old
     }
 }
 
@@ -583,8 +628,11 @@ impl BranchStore {
                         for record in &recovered.records {
                             inner.replay(record, &mut ignored)?;
                         }
-                        // A snapshot can hold a released branch that was kept only by an open
-                        // connection; after a restart nothing is open.
+                        // A snapshot or a `ReleaseOpen` can hold a released branch that was kept
+                        // only by an open connection; after a restart nothing is open.
+                        for st in inner.branches.values_mut() {
+                            st.open = false;
+                        }
                         inner.collect_released(&mut ignored);
                         let referenced = inner.referenced_slots();
                         inner.arena = Some(Arena::open_file(
@@ -780,10 +828,7 @@ impl BranchStore {
             return Ok(empty);
         }
         due.sort_by_key(|&id| (std::cmp::Reverse(inner.depth(id)), id));
-        let mut records: Vec<Record> = due
-            .iter()
-            .map(|id| Record::Release { branch: id.0 })
-            .collect();
+        let mut records: Vec<Record> = due.iter().map(|&id| inner.release_record(id)).collect();
         records.push(Record::Clock { now_ms: now });
         inner.lease.queued(now);
         Ok(ExpirePlan { due, records, now })
@@ -1030,9 +1075,27 @@ impl BranchStore {
     pub(crate) fn close(&self, id: BranchId) {
         let mut inner = self.inner.lock();
         let mut freed = Vec::new();
+        // A released branch is collected (and possibly spliced) here, outside any other logged
+        // operation, so the close is logged: replay then collects it at this same point (F7
+        // durable port). Flushed, not buffered: a buffered `Close` could land after a compaction
+        // whose snapshot no longer has the branch, and replay refuses a `Close` of a missing one.
+        // A `Close` that cannot be made durable leaves the store fail-stopped (every failed flush
+        // poisons the journal), so no record can follow it: recovery replays to the release, finds
+        // nothing open, and collects the branch at its end, freeing at least what this collect
+        // frees (a splice moves references and never adds one). So it is collected either way.
+        let held = inner
+            .branches
+            .get(&id)
+            .is_some_and(|st| st.open && st.handle == Handle::Released);
+        if held {
+            if let Err(e) = self.log(&mut inner, Record::Close { branch: id.0 }) {
+                tracing::warn!("released branch {} closed, the Close not durable: {e}", id.0);
+            }
+        }
         if let Some(st) = inner.branches.get_mut(&id) {
             st.open = false;
             st.writer = false;
+            // The pending reservations were never named by a record.
             freed.extend(st.pending.drain().map(|(_, slot)| slot));
         }
         inner.collect(id, &mut freed);
@@ -1064,7 +1127,8 @@ impl BranchStore {
             }
             Handle::Attached | Handle::Detached => {}
         }
-        if let Err(e) = self.log(&mut inner, Record::Release { branch: id.0 }) {
+        let record = inner.release_record(id);
+        if let Err(e) = self.log(&mut inner, record) {
             // The release is not durable, so nothing may be freed — now or ever in this process:
             // after a restart the branch comes back (detached), and its slots must still hold
             // what it names. ReleasePending is the state `collect` never frees.
@@ -1079,7 +1143,7 @@ impl BranchStore {
             )));
         }
         let mut freed = Vec::new();
-        inner.apply_release(id, &mut freed);
+        let spliced = inner.apply_release(id, &mut freed);
         let freed_pages = freed.len();
         inner.release_slots(freed);
         self.sync_trunk_children(&inner);
@@ -1087,7 +1151,7 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         Ok(Reaped {
             freed_pages,
-            deferred: inner.branches.contains_key(&id),
+            deferred: spliced || inner.branches.contains_key(&id),
         })
     }
 
@@ -1132,7 +1196,7 @@ impl BranchStore {
         }
         let records = todo
             .iter()
-            .map(|&i| Record::Release { branch: ids[i].0 })
+            .map(|&i| inner.release_record(ids[i]))
             .collect();
         if let Err(e) = self.log_all(&mut inner, records) {
             tracing::warn!("{} branches released in memory only: {e}", todo.len());
@@ -1150,9 +1214,9 @@ impl BranchStore {
         let mut freed = Vec::new();
         for &i in &todo {
             let before = freed.len();
-            inner.apply_release(ids[i], &mut freed);
+            let spliced = inner.apply_release(ids[i], &mut freed);
             out[i].freed_pages = freed.len() - before;
-            out[i].deferred = inner.branches.contains_key(&ids[i]);
+            out[i].deferred = spliced || inner.branches.contains_key(&ids[i]);
         }
         inner.release_slots(freed);
         self.sync_trunk_children(&inner);
@@ -1851,8 +1915,15 @@ impl StoreInner {
             BranchState {
                 parent,
                 fork_epoch: f,
-                lineage: Lineage::default(),
+                // Epoch inheritance: the child's epochs start above its fork epoch (see "The
+                // model"). Starting at 0 would let a version it inherits in a splice be born at or
+                // after one of its own epochs.
+                lineage: Lineage {
+                    epoch: f + 1,
+                    ..Lineage::default()
+                },
                 current: HashMap::new(),
+                current_by_born: BTreeSet::new(),
                 pending: HashMap::new(),
                 schema,
                 handle,
@@ -1880,7 +1951,7 @@ impl StoreInner {
                 born: epoch,
                 crc,
             };
-            if let Some(old) = st.current.insert(page, new) {
+            if let Some(old) = st.set_current(page, new) {
                 if st.lineage.has_child_in(old.born, epoch) {
                     st.lineage.retain(
                         page,
@@ -1905,33 +1976,43 @@ impl StoreInner {
         *written = (*written).max(v.died);
     }
 
-    fn apply_release(&mut self, id: BranchId, freed: &mut Vec<Slot>) {
+    /// Returns whether `id` was spliced out (see `collect`).
+    fn apply_release(&mut self, id: BranchId, freed: &mut Vec<Slot>) -> bool {
         if let Some(st) = self.branches.get_mut(&id) {
             st.handle = Handle::Released;
             if let Some(deadline) = st.lease.take() {
                 self.leases.remove(&(deadline, id));
             }
         }
-        self.collect(id, freed);
+        self.collect(id, freed)
     }
 
     /// Free `id` if nothing can reach it any more, then its parent if that freed the parent's last
     /// reason to exist; a released `id` that still has live children is retired instead (see
-    /// `BranchState::retire_current`). Every freed slot goes to `freed`.
-    fn collect(&mut self, mut id: BranchId, freed: &mut Vec<Slot>) {
+    /// `BranchState::retire_current`), and spliced out if that leaves it exactly one kept child
+    /// (see `splice`). Every freed slot goes to `freed`. Returns whether `id` itself was spliced:
+    /// gone from the map like a branch freed whole, but its versions live on in its child, so its
+    /// release was deferred, not completed (the volatile store's `collect` reports the same).
+    fn collect(&mut self, mut id: BranchId, freed: &mut Vec<Slot>) -> bool {
+        let first = id;
         loop {
             let Some(st) = self.branches.get_mut(&id) else {
-                return;
+                return false;
             };
             // Exactly `Released`: a `ReleasePending` branch's release is not durable and nothing of
             // it is ever freed here (review R1).
             if st.handle != Handle::Released || st.open {
-                return;
+                return false;
             }
             if !st.lineage.children.is_empty() {
                 // F4: a released interior keeps only what a live child can still read.
                 st.retire_current(freed);
-                return;
+                // F7 durable port: with exactly one kept child left, it is spliced out.
+                if st.lineage.children.len() == 1 {
+                    self.splice(id, freed);
+                    return id == first;
+                }
+                return false;
             }
             let st = self.branches.remove(&id).expect("just looked it up");
             freed.extend(st.current.values().map(|o| o.slot));
@@ -1939,7 +2020,7 @@ impl StoreInner {
             st.lineage.release_all(freed);
             if st.parent.is_trunk() {
                 self.trunk.lineage.child_gone(st.fork_epoch, freed);
-                return;
+                return false;
             }
             let parent = self
                 .branches
@@ -1950,14 +2031,187 @@ impl StoreInner {
         }
     }
 
+    /// F7 durable port (UNBUILT) of the volatile store's splice (turso r11-ever fad7db24d, F7.1
+    /// a85f41ab2, F7' d9be3f03a): take the released zombie `zid` — no open connection, retired,
+    /// exactly one kept child `c` — out of the tree; `c` takes its place under its parent at the
+    /// same fork epoch and inherits the versions it reads through it.
+    ///
+    /// 1. `retire_current` has freed every current version born after `c`'s fork `f`, so the
+    ///    zombie's current versions are exactly the ones `c` reads of their pages.
+    /// 2. Each retained version holds `f` (`c` is the only child left, and `child_gone` frees what no
+    ///    kept child's fork lies inside), at most one per page, on a page whose current version was
+    ///    born after `f` and so is gone: it is what `c` reads of that page, and becomes current.
+    /// 3. Those versions are merged into `c`'s own by iterating the SMALLER side and probing the
+    ///    larger (union by size: `block-stream` moves the base into the top, `block-commit` the top
+    ///    into the base), and the merged map is `c`'s. A zombie version of a page `c` has a version
+    ///    of — current, or retained after `c` overwrote it (or retired it) — stays for `c`'s children
+    ///    forked before `c`'s first own version of that page, as a retained version of `c`, or is
+    ///    freed when there are none. Epoch inheritance puts every zombie version `c` reads below
+    ///    every epoch of `c` (`born <= f < c's epochs`), so no key changes.
+    ///
+    /// Deterministic, and run at the same point by the live store and by replay (the only collect
+    /// outside a logged operation, a released branch's close, logs `Close`), so it needs no record
+    /// of its own and replay derives every `born` exactly as the live store did. Cost: step 2 is
+    /// the zombie's retained versions, each made by one of its own commits; step 3 is the smaller
+    /// side. Observation-only counters: `SPLICES`, `SPLICE_COMMITS`, `SPLICE_ENTRIES`.
+    fn splice(&mut self, zid: BranchId, freed: &mut Vec<Slot>) {
+        let mut z = self.branches.remove(&zid).expect("the zombie is kept");
+        crate::turso_assert!(
+            z.handle == Handle::Released
+                && !z.open
+                && z.pending.is_empty()
+                && z.lineage.children.len() == 1,
+            "spliced a branch that is not a released zombie with one kept child"
+        );
+        let (&f, &cid) = z.lineage.children.iter().next().expect("one child");
+        crate::turso_assert!(
+            z.current_by_born.last().is_none_or(|&(born, _)| born <= f),
+            "spliced a zombie that was not retired: it holds a version its only child cannot read"
+        );
+        let mut visited = 0u64;
+        // 2. The retained versions become current.
+        let retained = std::mem::take(&mut z.lineage.retained);
+        z.lineage.retained_by_born.clear();
+        for (page, versions) in retained {
+            crate::turso_assert!(
+                versions.len() == 1,
+                "two retained versions of one page hold the only child's fork epoch"
+            );
+            let v = versions[0];
+            crate::turso_assert!(
+                v.born <= f && f < v.died && !z.current.contains_key(&page),
+                "a zombie's retained version does not hold its only child's fork epoch"
+            );
+            z.set_current(
+                page,
+                Owned {
+                    slot: v.slot,
+                    born: v.born,
+                    crc: v.crc,
+                },
+            );
+            visited += 1;
+        }
+        // 3. Merge into the child, smaller side iterated.
+        let c = self
+            .branches
+            .get_mut(&cid)
+            .expect("the zombie's child is kept");
+        crate::turso_assert!(c.parent == zid && c.fork_epoch == f, "child link mismatch");
+        // The child's first own version of `page`, if it has any (retained ones included: a
+        // retired child can hold retained versions of a page and no current one).
+        let first_own = |c: &BranchState, page: u32| -> Option<u64> {
+            let retained = c.lineage.retained.get(&page).into_iter().flatten();
+            c.current
+                .get(&page)
+                .map(|o| o.born)
+                .into_iter()
+                .chain(retained.map(|r| r.born))
+                .min()
+        };
+        // A zombie version of a page the child has a version of: kept for the child's children
+        // forked before the child's first own version, else freed.
+        let shadowed = |c: &mut BranchState, page: u32, zo: Owned, first: u64, freed: &mut Vec<Slot>| {
+            if c.lineage.has_child_in(zo.born, first) {
+                c.lineage.retain(
+                    page,
+                    Retained {
+                        born: zo.born,
+                        died: first,
+                        slot: zo.slot,
+                        crc: zo.crc,
+                    },
+                );
+            } else {
+                freed.push(zo.slot);
+            }
+        };
+        let c_pages = c.current.len() + c.lineage.retained.len();
+        let commit = z.current.len() > c_pages;
+        if !commit {
+            // Stream: the zombie's versions into the child.
+            z.current_by_born.clear();
+            for (page, zo) in std::mem::take(&mut z.current) {
+                visited += 1;
+                match first_own(c, page) {
+                    None => {
+                        c.set_current(page, zo);
+                    }
+                    Some(first) => shadowed(c, page, zo, first, freed),
+                }
+            }
+        } else {
+            // Commit: the child's versions into the zombie's map, which then becomes the child's.
+            let own: Vec<u32> = c
+                .current
+                .keys()
+                .chain(c.lineage.retained.keys())
+                .copied()
+                .collect();
+            for page in own {
+                visited += 1;
+                if let Some(zo) = z.current.remove(&page) {
+                    z.current_by_born.remove(&(zo.born, page));
+                    let first = first_own(c, page).expect("the child has a version of its own page");
+                    shadowed(c, page, zo, first, freed);
+                }
+            }
+            // One insert per child entry: `BTreeSet::append` rebuilds from both sides, O(larger)
+            // (the volatile store's F7.1).
+            for (page, co) in c.current.drain() {
+                z.current.insert(page, co);
+            }
+            for entry in std::mem::take(&mut c.current_by_born) {
+                z.current_by_born.insert(entry);
+            }
+            std::mem::swap(&mut c.current, &mut z.current);
+            std::mem::swap(&mut c.current_by_born, &mut z.current_by_born);
+        }
+        // 4. The child takes the zombie's place.
+        c.parent = z.parent;
+        c.fork_epoch = z.fork_epoch;
+        let siblings = if z.parent.is_trunk() {
+            &mut self.trunk.lineage.children
+        } else {
+            &mut self
+                .branches
+                .get_mut(&z.parent)
+                .expect("a kept branch's parent is kept")
+                .lineage
+                .children
+        };
+        let was = siblings.insert(z.fork_epoch, cid);
+        crate::turso_assert!(was == Some(zid), "the zombie's parent did not list it");
+        {
+            use churn_counters::*;
+            use std::sync::atomic::Ordering::Relaxed;
+            SPLICES.fetch_add(1, Relaxed);
+            SPLICE_COMMITS.fetch_add(u64::from(commit), Relaxed);
+            SPLICE_ENTRIES.fetch_add(visited, Relaxed);
+        }
+    }
+
+    /// The record that releases `id`: `ReleaseOpen` while a connection holds it (replay must hold
+    /// it until that connection's `Close`, as the live store does), else `Release`.
+    fn release_record(&self, id: BranchId) -> Record {
+        if self.branches.get(&id).is_some_and(|st| st.open) {
+            Record::ReleaseOpen { branch: id.0 }
+        } else {
+            Record::Release { branch: id.0 }
+        }
+    }
+
     /// Collect every released branch that nothing reads through any more.
     fn collect_released(&mut self, freed: &mut Vec<Slot>) {
-        let released: Vec<BranchId> = self
+        let mut released: Vec<BranchId> = self
             .branches
             .iter()
             .filter(|(_, st)| st.handle == Handle::Released)
             .map(|(&id, _)| id)
             .collect();
+        // In id order, not the map's: which zombie is spliced first can change which of two
+        // equivalent representations recovery ends with, and an open should be deterministic.
+        released.sort_unstable();
         for id in released {
             self.collect(id, freed);
         }
@@ -2037,6 +2291,22 @@ impl StoreInner {
                 self.apply_release(id, freed);
                 Ok(())
             }
+            Record::ReleaseOpen { branch } => {
+                // Released while a connection held it: hold it, as the live store did, until the
+                // matching `Close` (or the end of recovery, since nothing is open after a restart).
+                let id = BranchId(*branch);
+                let st = self.branches.get_mut(&id).ok_or_else(|| corrupt(gone(id)))?;
+                st.open = true;
+                self.apply_release(id, freed);
+                Ok(())
+            }
+            Record::Close { branch } => {
+                let id = BranchId(*branch);
+                let st = self.branches.get_mut(&id).ok_or_else(|| corrupt(gone(id)))?;
+                st.open = false;
+                self.collect(id, freed);
+                Ok(())
+            }
             Record::Lease {
                 branch,
                 deadline_ms,
@@ -2095,6 +2365,7 @@ impl StoreInner {
                     fork_epoch: st.fork_epoch,
                     epoch: st.lineage.epoch,
                     released: st.handle == Handle::Released,
+                    held_open: st.handle == Handle::Released && st.open,
                     // Deadline + 1, so that a real deadline of 0 is not read back as "no lease"
                     // (review R7). A saturated u64::MAX deadline comes back 1 ms shorter.
                     lease_deadline_ms: st.lease.map_or(0, |d| d.saturating_add(1)),
@@ -2145,11 +2416,12 @@ impl StoreInner {
                     },
                 );
             }
-            let current = b
+            let current: HashMap<u32, Owned> = b
                 .current
                 .into_iter()
                 .map(|(page, slot, born, crc)| (page, Owned { slot, born, crc }))
                 .collect();
+            let current_by_born = current.iter().map(|(&page, o)| (o.born, page)).collect();
             edges.push((BranchId(b.parent), b.fork_epoch, BranchId(b.id)));
             let lease = (b.lease_deadline_ms != 0 && !b.released).then(|| b.lease_deadline_ms - 1);
             if let Some(deadline) = lease {
@@ -2162,6 +2434,7 @@ impl StoreInner {
                     fork_epoch: b.fork_epoch,
                     lineage,
                     current,
+                    current_by_born,
                     pending: HashMap::new(),
                     schema: None,
                     handle: if b.released {
@@ -2169,7 +2442,8 @@ impl StoreInner {
                     } else {
                         Handle::Detached
                     },
-                    open: false,
+                    // Held until its `Close` in the log that follows (or the end of recovery).
+                    open: b.held_open,
                     writer: false,
                     lease,
                 },

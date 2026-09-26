@@ -2460,3 +2460,282 @@ fn an_expiry_pass_rides_on_the_forks_own_flush() {
     let db = reopen(&path, incarnation);
     assert_eq!(db.branch_ids().unwrap().len(), 1, "the reaped branch came back");
 }
+
+// ---- r11-ever: the F7 durable port (UNBUILT; r11-ever PREREG amendment 13) ----
+//
+// r11-ever-refute item 5: this store kept every released branch that still had a kept child, so a
+// workload that forks from its newest branch and releases its oldest (r11-restart's E5) kept every
+// branch it ever created — in the snapshot, in every compaction, and on every read's ancestor walk.
+// The port splices a released branch with exactly one kept child out of the tree.
+
+/// Reads every live branch against its expected view, keeping every handle (a dropped handle is a
+/// release, so each one is detached again).
+fn check_views(db: &Arc<Database>, expect: &BTreeMap<BranchId, BTreeMap<i64, String>>, what: &str) {
+    for (&id, view) in expect {
+        let b = db.branch(id).unwrap();
+        let c = b.connect().unwrap();
+        for (&row, v) in view {
+            assert_eq!(value(&c, row).as_ref(), Some(v), "{what}: branch {id:?} row {row}");
+        }
+        drop(c);
+        let _ = b.into_id();
+    }
+}
+
+/// E5's shape, eleven releases deep: after every step the kept states are exactly the live ones,
+/// every live branch reads its own view (its ancestors' writes as of each fork, then its own, and
+/// the trunk as of the first fork), and a replay-only restart and then a snapshot restart land on
+/// the same slots and the same reads. Each parent also writes once after its child's fork (a
+/// version its release must free before the splice), and rows repeat every four steps (versions
+/// the splice finds shadowed by the child's own).
+#[test]
+fn a_chain_that_releases_its_oldest_keeps_only_its_live_branches() {
+    const LIVE: usize = 3;
+    const STEPS: usize = 14;
+    let rows = [7i64, 60, 110, 170];
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let slots;
+    let mut expect: BTreeMap<BranchId, BTreeMap<i64, String>> = BTreeMap::new();
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let mut chain: std::collections::VecDeque<Branch> = Default::default();
+        // What the newest branch reads once it has written: every row it or an ancestor wrote
+        // before the fork below it, and the trunk as of the first fork for the rest.
+        let mut view: BTreeMap<i64, String> = [7i64, 60, 110, 150, 170]
+            .into_iter()
+            .map(|row| (row, original(row)))
+            .collect();
+        for i in 0..STEPS {
+            let b = match chain.back() {
+                None => trunk.fork_branch().unwrap(),
+                Some(newest) => newest.fork().unwrap(),
+            };
+            if i == 0 {
+                // A trunk write after the chain's first fork: every branch must keep reading the
+                // pre-image, through each splice (a relink at the wrong fork epoch reads this).
+                set(&trunk, 150, "trunk-late");
+            }
+            let row = rows[i % rows.len()];
+            set(&b.connect().unwrap(), row, &format!("s{i}"));
+            view.insert(row, format!("s{i}"));
+            expect.insert(b.id(), view.clone());
+            if let Some(parent) = chain.back() {
+                let late = rows[(i + 1) % rows.len()];
+                set(&parent.connect().unwrap(), late, &format!("late{i}"));
+                expect.get_mut(&parent.id()).unwrap().insert(late, format!("late{i}"));
+            }
+            chain.push_back(b);
+            if chain.len() > LIVE {
+                let oldest = chain.pop_front().unwrap();
+                expect.remove(&oldest.id());
+                let reaped = oldest.reap().unwrap();
+                assert!(reaped.deferred, "step {i}: an interior with a live child was freed whole");
+            }
+            assert_eq!(
+                db.branch_stats().unwrap().live_branches,
+                chain.len(),
+                "step {i}: a released branch with one kept child was kept"
+            );
+        }
+        assert_eq!(expect.len(), LIVE);
+        for b in &chain {
+            let c = b.connect().unwrap();
+            for (&row, v) in &expect[&b.id()] {
+                assert_eq!(value(&c, row).as_ref(), Some(v), "branch {:?} row {row}", b.id());
+            }
+        }
+        assert_eq!(value(&trunk, 150), Some("trunk-late".to_string()));
+        slots = in_use(&db);
+        for b in chain {
+            let _ = b.into_id();
+        }
+    }
+
+    // Replay only (the log is far below the compaction threshold): the same splices at the same
+    // points, so the same slots.
+    let db = reopen(&path, incarnation);
+    let ids: Vec<BranchId> = expect.keys().copied().collect();
+    assert_eq!(db.branch_ids().unwrap(), ids, "replay kept or lost a branch");
+    assert_eq!(db.branch_stats().unwrap().live_branches, LIVE, "replay kept a spliced branch");
+    assert_eq!(in_use(&db), slots, "replay spliced to a different set of slots");
+    check_views(&db, &expect, "after replay");
+
+    // A snapshot of the spliced state, then a restart from it.
+    db.branch_compact_now().unwrap();
+    let incarnation = db.incarnation;
+    drop(db);
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_stats().unwrap().live_branches, LIVE, "the snapshot kept a spliced branch");
+    assert_eq!(in_use(&db), slots, "the snapshot restart landed on other slots");
+    check_views(&db, &expect, "after the snapshot");
+}
+
+/// A branch released while its connection is open is held (`ReleaseOpen`) until that close, which
+/// is logged (`Close`) and then retires and splices it: the version born after its child's fork is
+/// freed, the version its child has overwritten is freed (the child has no child of its own to
+/// read it), and the one its child reads moves into the child. A snapshot taken inside the window
+/// records the hold (`held_open`), the log after it carries the `Close`, and a crash image taken
+/// inside the window, with no `Close` in it, reaches the same state at the end of recovery.
+#[test]
+fn a_branch_released_under_its_open_connection_is_spliced_at_the_close() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let p_id;
+    let c_id;
+    let p7;
+    let p60;
+    let p110;
+    let c60;
+    let slots;
+    let image_before;
+    let image_after;
+    for sub in ["before", "after"] {
+        std::fs::create_dir(dir.path().join(sub)).unwrap();
+    }
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        let pc = p.connect().unwrap();
+        let s0 = in_use(&db);
+        set(&pc, 7, "p-pre");
+        let s1 = in_use(&db);
+        set(&pc, 60, "p-pre");
+        let s2 = in_use(&db);
+        let c = p.fork().unwrap();
+        set(&c.connect().unwrap(), 60, "c");
+        let s3 = in_use(&db);
+        set(&pc, 110, "p-post");
+        let s4 = in_use(&db);
+        let diff = |a: &BTreeSet<u32>, b: &BTreeSet<u32>| -> BTreeSet<u32> {
+            b.difference(a).copied().collect()
+        };
+        p7 = diff(&s0, &s1);
+        p60 = diff(&s1, &s2);
+        c60 = diff(&s2, &s3);
+        p110 = diff(&s3, &s4);
+        // The premise: an inherited version, a shadowed one, and one born after the fork, each on
+        // its own slots.
+        for (name, written) in [("p7", &p7), ("p60", &p60), ("c60", &c60), ("p110", &p110)] {
+            assert!(!written.is_empty(), "{name}: the write took no slot of its own");
+        }
+        assert_eq!(
+            s4.len(),
+            s0.len() + p7.len() + p60.len() + c60.len() + p110.len(),
+            "a write freed a slot, so the four sets above are not what each write added"
+        );
+        p_id = p.id();
+        drop(p); // released while pc is open: held
+        assert_eq!(db.branch_stats().unwrap().live_branches, 2, "the open connection did not hold it");
+        image_before = crash_image(&path, &dir.path().join("before"));
+        db.branch_compact_now().unwrap(); // a snapshot inside the window
+        image_after = crash_image(&path, &dir.path().join("after"));
+        drop(pc); // the close: logged, then retire and splice
+        assert_eq!(db.branch_stats().unwrap().live_branches, 1, "the close did not splice it");
+        for slot in p110.iter().chain(p60.iter()) {
+            assert!(db.branch_slot_is_free(*slot), "slot {slot}: nobody reads it, still held");
+        }
+        for slot in p7.iter().chain(c60.iter()) {
+            assert!(!db.branch_slot_is_free(*slot), "slot {slot}: the child reads it, freed");
+        }
+        let cc = c.connect().unwrap();
+        assert_eq!(value(&cc, 7), Some("p-pre".to_string()));
+        assert_eq!(value(&cc, 60), Some("c".to_string()));
+        assert_eq!(value(&cc, 110), Some(original(110)));
+        drop(cc);
+        slots = in_use(&db);
+        c_id = c.into_id();
+    }
+
+    // What the log says: the release under the open connection, and the close.
+    let files = |p: &Path| journal::BranchFiles::for_db(p.to_str().unwrap());
+    {
+        let before = journal::Journal::recover(&files(&image_before), false).unwrap().unwrap();
+        assert!(
+            before.records.contains(&journal::Record::ReleaseOpen { branch: p_id.0 }),
+            "the release of a branch held open was logged as a plain Release: {:?}",
+            before.records
+        );
+        let after = journal::Journal::recover(&files(&path), false).unwrap().unwrap();
+        let held = after.snapshot.as_ref().expect("the compaction wrote a snapshot");
+        assert!(
+            held.branches.iter().any(|b| b.id == p_id.0 && b.released && b.held_open),
+            "the snapshot does not record the hold"
+        );
+        assert!(
+            after.records.contains(&journal::Record::Close { branch: p_id.0 }),
+            "the close of a held branch was not logged: {:?}",
+            after.records
+        );
+    }
+
+    let expect = BTreeMap::from([(
+        c_id,
+        BTreeMap::from([
+            (7, "p-pre".to_string()),
+            (60, "c".to_string()),
+            (110, original(110)),
+        ]),
+    )]);
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_ids().unwrap(), vec![c_id]);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 1, "replay kept the spliced branch");
+    assert_eq!(in_use(&db), slots, "replay of the Close landed on other slots");
+    check_views(&db, &expect, "after the snapshot and the Close");
+    drop(db);
+    for image in [&image_before, &image_after] {
+        let crashed = open_at(image, durable()).unwrap();
+        assert_eq!(
+            crashed.branch_stats().unwrap().live_branches,
+            1,
+            "{image:?}: recovery kept a released branch nothing holds any more"
+        );
+        assert_eq!(in_use(&crashed), slots, "{image:?}: recovery spliced to other slots");
+        check_views(&crashed, &expect, &format!("{image:?}"));
+    }
+}
+
+/// Epoch inheritance is load-bearing for the splice: the configuration of the volatile store's
+/// mutant M6 (a child's epochs starting at 0), killed there at F7'. The parent writes after three
+/// forks, so its version is born at its fourth epoch; its child, forked right after, forks a
+/// grandchild. With inheritance the grandchild's fork epoch lies above the version's birth and it
+/// reads the parent's write once the parent is spliced into its child; with epochs starting at 0 it
+/// lies below, and the grandchild would read the trunk's row instead.
+#[test]
+fn a_grandchild_reads_a_spliced_parents_write() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let expect;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        let siblings: Vec<Branch> = (0..3).map(|_| p.fork().unwrap()).collect();
+        set(&p.connect().unwrap(), 7, "p-after-three-forks");
+        let c = p.fork().unwrap();
+        let g = c.fork().unwrap();
+        drop(siblings); // leaves, freed whole: p is left with one kept child
+        let reaped = p.reap().unwrap();
+        assert!(reaped.deferred && reaped.freed_pages == 0, "{reaped:?}");
+        assert_eq!(db.branch_stats().unwrap().live_branches, 2, "p was not spliced");
+        let want = Some("p-after-three-forks".to_string());
+        assert_eq!(value(&g.connect().unwrap(), 7), want, "the grandchild lost the spliced write");
+        assert_eq!(value(&c.connect().unwrap(), 7), want);
+        let row = BTreeMap::from([(7, "p-after-three-forks".to_string())]);
+        expect = BTreeMap::from([(c.into_id(), row.clone()), (g.into_id(), row)]);
+    }
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 2);
+    check_views(&db, &expect, "after replay");
+}

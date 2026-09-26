@@ -219,6 +219,11 @@ pub struct ChurnCounters {
     pub compact_ns_max: u64,
     pub compact_fsyncs: u64,
     pub compact_bytes_last: u64,
+    /// F7 durable port: retired branches spliced out, splices that merged the child into the
+    /// zombie's map, and versions splices visited.
+    pub splices: u64,
+    pub splice_commits: u64,
+    pub splice_entries: u64,
 }
 
 #[doc(hidden)]
@@ -238,6 +243,9 @@ pub fn churn_counters() -> ChurnCounters {
         compact_ns_max: COMPACT_NS_MAX.load(Relaxed),
         compact_fsyncs: COMPACT_FSYNCS.load(Relaxed),
         compact_bytes_last: COMPACT_BYTES_LAST.load(Relaxed),
+        splices: SPLICES.load(Relaxed),
+        splice_commits: SPLICE_COMMITS.load(Relaxed),
+        splice_entries: SPLICE_ENTRIES.load(Relaxed),
     }
 }
 
