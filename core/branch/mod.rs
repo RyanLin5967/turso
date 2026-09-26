@@ -175,6 +175,8 @@ pub struct BranchStats {
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
+    /// Of `arena_slots_in_use`, the trunk's retained versions (its own arena domain).
+    pub trunk_slots_in_use: usize,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -228,6 +230,12 @@ pub struct BranchWork {
     pub trunk_lock_contended: u64,
     pub trunk_lock_wait_ns: u64,
     pub trunk_lock_hold_ns: u64,
+    /// Resolutions that fell through to the trunk for a page the trunk rewrote after the reader's
+    /// `trunk_at`, so that only a retained version can answer them (lane r11-k3-trunklock, K3).
+    /// Counted under the reader's shard lock.
+    pub resolve_trunk_rewritten: u64,
+    /// Of those, the ones answered under the trunk's lock. Counted under it.
+    pub resolve_trunk_locked: u64,
 }
 
 impl BranchWork {
@@ -249,6 +257,8 @@ impl BranchWork {
             trunk_lock_contended,
             trunk_lock_wait_ns,
             trunk_lock_hold_ns,
+            resolve_trunk_rewritten,
+            resolve_trunk_locked,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -265,6 +275,8 @@ impl BranchWork {
         self.trunk_lock_contended += trunk_lock_contended;
         self.trunk_lock_wait_ns += trunk_lock_wait_ns;
         self.trunk_lock_hold_ns += trunk_lock_hold_ns;
+        self.resolve_trunk_rewritten += resolve_trunk_rewritten;
+        self.resolve_trunk_locked += resolve_trunk_locked;
     }
 }
 

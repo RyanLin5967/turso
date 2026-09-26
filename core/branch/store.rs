@@ -1064,6 +1064,7 @@ impl BranchStore {
                         shard.work.trunk_page_misses += 1;
                         return Ok(Resolved::Trunk(key));
                     }
+                    shard.work.resolve_trunk_rewritten += 1;
                     (at, None)
                 }
             }
@@ -1075,6 +1076,7 @@ impl BranchStore {
             return Ok(Resolved::Filled);
         }
         let mut trunk = self.trunk();
+        trunk.work.resolve_trunk_locked += 1;
         let mut examined = 0;
         let found = trunk.lineage.retained_at(page, at, &mut examined);
         trunk.work.resolve_retained_examined += examined;
@@ -1104,6 +1106,7 @@ impl BranchStore {
         {
             let trunk = self.trunk();
             add(&mut stats, &trunk.work, &trunk.domain);
+            stats.trunk_slots_in_use = trunk.domain.in_use();
             stats.work.trunk_lock_acquisitions = trunk.work.lock_acquisitions;
             stats.work.trunk_lock_contended = trunk.work.lock_contended;
             stats.work.trunk_lock_wait_ns = trunk.work.lock_wait_ns;
