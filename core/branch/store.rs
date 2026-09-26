@@ -145,8 +145,8 @@ use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::{
-    BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchStats, BranchWork, Expired,
-    Reaped,
+    BranchDiff, BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchShapeCounters,
+    BranchStats, BranchWork, Expired, Reaped,
 };
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
@@ -203,6 +203,8 @@ struct StoreInner {
     /// Page-map inserts made by the last `derive_page_maps` (r11-restart's open instrument, extended
     /// by the sota-durable lane; observing only).
     derived_inserts: u64,
+    /// The githost-shape lane's cumulative observing counters (the gauges are filled at read).
+    shape: BranchShapeCounters,
 }
 
 /// The lease clock: milliseconds of time the database has been OPEN, summed across every open.
@@ -1012,17 +1014,25 @@ impl BranchStore {
     }
 
     fn compact(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
+        let started = Instant::now();
         let snapshot = inner.snapshot();
         let StoreInner {
             journal,
             arena,
             lease,
+            shape,
             ..
         } = inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
         journal.compact(&snapshot, arena, fail_after_rename)?;
+        // Observing only (githost-shape lane).
+        let ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        shape.compactions += 1;
+        shape.compact_bytes += journal.lens().1;
+        shape.compact_ns += ns;
+        shape.compact_max_ns = shape.compact_max_ns.max(ns);
         // The snapshot carries the clock, and it replaced every buffered stamp.
         lease.queued(snapshot.lease_now_ms);
         lease.flushed();
@@ -1218,7 +1228,8 @@ impl BranchStore {
     /// Every unreleased branch. Refused on a trunk-only store, where "none" would be a lie.
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        let started = Instant::now();
         let mut ids: Vec<BranchId> = inner
             .branches
             .iter()
@@ -1226,7 +1237,63 @@ impl BranchStore {
             .map(|(&id, _)| id)
             .collect();
         ids.sort();
+        // Observing only (githost-shape lane).
+        let visited = inner.branches.len() as u64;
+        let shape = &mut inner.shape;
+        shape.ids_calls += 1;
+        shape.ids_visited += visited;
+        shape.ids_lock_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         Ok(ids)
+    }
+
+    /// The githost-shape lane's observing counters, with the gauges read now.
+    pub(crate) fn shape_counters(&self) -> BranchShapeCounters {
+        let inner = self.inner.lock();
+        let (log_bytes, snapshot_bytes) = inner.journal.as_ref().map_or((0, 0), |j| j.lens());
+        BranchShapeCounters {
+            branches_len: inner.branches.len() as u64,
+            branches_capacity: inner.branches.capacity() as u64,
+            trunk_written: inner.trunk.written.len() as u64,
+            trunk_retained: inner.trunk.lineage.by_born.len() as u64,
+            trunk_children: inner.trunk.lineage.children.len() as u64,
+            log_bytes,
+            snapshot_bytes,
+            ..inner.shape
+        }
+    }
+
+    /// DIFF(`id`, TRUNK), r11-diff-list's D-written arm (see [`BranchDiff`]). Read-only.
+    pub(crate) fn diff_trunk(&self, id: BranchId) -> Result<BranchDiff> {
+        self.refuse_if_trunk_only("diffing a branch")?;
+        let inner = self.inner.lock();
+        let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
+        if st.handle.is_released() {
+            return Err(gone(id));
+        }
+        let mut diff = BranchDiff::default();
+        let mut pages: BTreeSet<u32> = BTreeSet::new();
+        for &page in st.current.keys() {
+            diff.own_entries += 1;
+            pages.insert(page);
+        }
+        let (nodes, entries) = st.inherited.for_each_page(|page| {
+            pages.insert(page);
+        });
+        diff.inherited_nodes = nodes;
+        diff.inherited_entries = entries;
+        // A trunk page the trunk wrote after this branch's ancestry left it (`written > trunk_at`)
+        // is read from a retained version (or a nearer version of the branch's own), never the
+        // trunk's current one. `written` survives recovery as a lower bound that stays above every
+        // live fork epoch inside the interval (module doc), so the test holds after a reopen too.
+        for (&page, &epoch) in &inner.trunk.written {
+            diff.written_visited += 1;
+            if epoch > st.trunk_at {
+                diff.written_hits += 1;
+                pages.insert(page);
+            }
+        }
+        diff.pages = pages.into_iter().collect();
+        Ok(diff)
     }
 
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
@@ -1675,6 +1742,16 @@ fn reaped(id: BranchId) -> LimboError {
 }
 
 impl StoreInner {
+    /// Observing only (githost-shape lane): called just before an insert into `branches`; a resize
+    /// happens inside the insert exactly when the table is full, and moves every entry.
+    fn observe_table_insert(&mut self) {
+        let (len, cap) = (self.branches.len(), self.branches.capacity());
+        if len == cap {
+            self.shape.table_resizes += 1;
+            self.shape.table_moved += len as u64;
+        }
+    }
+
     fn fresh(files: Option<BranchFiles>, sync: bool, default_lease: Option<Duration>) -> Self {
         Self {
             arena: None,
@@ -1694,6 +1771,7 @@ impl StoreInner {
             default_lease,
             work: BranchWork::default(),
             derived_inserts: 0,
+            shape: BranchShapeCounters::default(),
         }
     }
 
@@ -1896,6 +1974,7 @@ impl StoreInner {
             (f, inherited, st.trunk_at)
         };
         self.next_id = self.next_id.max(child.0 + 1);
+        self.observe_table_insert();
         self.branches.insert(
             child,
             BranchState {
@@ -2263,6 +2342,7 @@ impl StoreInner {
             if let Some(deadline) = lease {
                 self.leases.insert((deadline, BranchId(b.id)));
             }
+            self.observe_table_insert();
             self.branches.insert(
                 BranchId(b.id),
                 BranchState {
