@@ -538,7 +538,7 @@ fn do_reap(db: &Arc<Database>, t: u64) {
 /// Run one schedule step; with `ops`, time and count each op kind.
 fn step(db: &Arc<Database>, trunk: &Arc<Connection>, model: &mut Model, mut ops: Option<&mut Ops>) {
     let plan = model.advance();
-    let mut timed = |series: Option<&mut Series>, f: &mut dyn FnMut()| {
+    let timed = |series: Option<&mut Series>, f: &mut dyn FnMut()| {
         if let Some(series) = series {
             let a = snap(db);
             let t = Instant::now();
@@ -562,25 +562,40 @@ fn step(db: &Arc<Database>, trunk: &Arc<Connection>, model: &mut Model, mut ops:
     }
 }
 
-/// Exact invariants: live states == the model's live count; every live branch owns exactly two current
-/// pages and no branch retains anything (no branch has a child), so the arena holds 2 x live + the trunk's
-/// retained versions.
+/// Exact invariants: live states == the model's live count == the trunk's children; the arena holds
+/// exactly the slots the store names (every branch's current and retained entries plus the trunk's
+/// retained versions); no branch retains anything (none has a child); every live branch holds at least
+/// its two own pages. (A branch's UPDATE can rebalance the table and copy more pages: the smoke run's
+/// branch 4159 committed five, githost-shape raw/smoke_grow_1024_5000.txt.)
 fn check_invariants(db: &Arc<Database>, model: &Model, what: &str) {
     let st = db.branch_stats().unwrap();
     let sh = db.branch_shape();
+    let (current, retained) = db.branch_slot_census();
     if st.live_branches as u64 != model.live {
         not_a_result(&format!("{what}: store has {} branch states, model {}", st.live_branches, model.live));
-    }
-    let expect = 2 * model.live + sh.trunk_retained;
-    if st.arena_slots_in_use as u64 != expect {
-        not_a_result(&format!(
-            "{what}: arena in use {} != 2 x live {} + trunk retained {}",
-            st.arena_slots_in_use, model.live, sh.trunk_retained
-        ));
     }
     if sh.trunk_children != model.live {
         not_a_result(&format!("{what}: trunk children {} != live {}", sh.trunk_children, model.live));
     }
+    if retained != 0 {
+        not_a_result(&format!("{what}: branches retain {retained} versions, but no branch has a child"));
+    }
+    if current < 2 * model.live {
+        not_a_result(&format!("{what}: {current} current entries < 2 x live {}", model.live));
+    }
+    if st.arena_slots_in_use as u64 != current + sh.trunk_retained {
+        not_a_result(&format!(
+            "{what}: arena in use {} != branch current {current} + trunk retained {}",
+            st.arena_slots_in_use, sh.trunk_retained
+        ));
+    }
+    println!(
+        "# invariants {what}: live={} current_entries={current} extra_pages={} trunk_retained={} arena_in_use={}",
+        model.live,
+        current - 2 * model.live,
+        sh.trunk_retained,
+        st.arena_slots_in_use
+    );
 }
 
 /// One read probe, planned (expected values computed) before it is timed.
@@ -811,7 +826,7 @@ fn probe(args: &Args) {
     s.print("list", n, label);
 
     // DIFF(branch, TRUNK) by D-written; the first 20 of each series cross-checked by D-scan.
-    let mut diff_series = |name: &str, ids: Vec<u64>| {
+    let diff_series = |name: &str, ids: Vec<u64>| {
         let mut s = Series::default();
         let mut scanned = 0;
         for (i, &id) in ids.iter().enumerate() {

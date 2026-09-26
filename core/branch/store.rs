@@ -1701,6 +1701,20 @@ impl BranchStore {
         }
     }
 
+    /// githost-shape instrument (read-only, O(branch states): call it only outside a measured
+    /// operation): `(current entries, retained entries)` summed over every branch state. With the
+    /// trunk's retained versions these are every slot the store names.
+    pub(crate) fn slot_census(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        let current = inner.branches.values().map(|b| b.current.len() as u64).sum();
+        let retained = inner
+            .branches
+            .values()
+            .map(|b| b.lineage.retained.values().map(|v| v.len() as u64).sum::<u64>())
+            .sum();
+        (current, retained)
+    }
+
     /// D-written (githost-shape instrument, read-only): the branch's own pages, plus every page the
     /// trunk last wrote after the branch's fork. For a trunk child `inherited` is empty (its parent
     /// has no page map), so this is the whole page-level diff; other branches are refused.
@@ -2033,7 +2047,11 @@ impl StoreInner {
                 view: None,
             },
         );
-        if self.branches.capacity() != cap_before {
+        // hashbrown's `capacity()` is items + growth_left: reusing a tombstone raises it by exactly
+        // one and moves nothing. A reallocation, or an in-place rehash, raises it by more, and
+        // either moves every entry (the smoke run at N = 2,000 counted 23 "resizes" before this
+        // rule; githost-shape raw/smoke_grow_1024_2000.txt).
+        if self.branches.capacity() > cap_before + 1 {
             self.shape.resize_events += 1;
             self.shape.resize_moved += len_before as u64;
         }

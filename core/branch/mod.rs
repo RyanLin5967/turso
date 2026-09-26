@@ -619,6 +619,13 @@ impl Database {
         self.branches.shape()
     }
 
+    /// `(current entries, retained entries)` over every branch state (githost-shape instrument;
+    /// O(branch states), never inside a measured operation).
+    #[doc(hidden)]
+    pub fn branch_slot_census(&self) -> (u64, u64) {
+        self.branches.slot_census()
+    }
+
     /// Page-level DIFF(`id`, TRUNK) by the trunk's last-write map (D-written; githost-shape
     /// instrument). Trunk children only.
     #[doc(hidden)]
