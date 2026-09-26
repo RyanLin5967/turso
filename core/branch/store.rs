@@ -132,6 +132,9 @@ pub(super) struct MergeState {
     pub(super) table_stamps: HashMap<i64, u64>,
     /// Record each branch's page reads; the physical install's structural guard needs them.
     pub(super) track_reads: bool,
+    /// Times read tracking was turned off. A branch forked while tracking was on, at this count,
+    /// has had every read tracked if the count has not moved since.
+    track_off: u64,
 }
 
 /// What one trunk write transaction wrote while the trunk had a live child, kept by the writing
@@ -143,6 +146,9 @@ pub(super) struct MergeState {
 pub(crate) struct TrunkPending {
     /// Pages first-written in the transaction.
     pub(crate) pages: HashSet<u32>,
+    /// Those of `pages` that were interior b-tree pages just before that first write: the version
+    /// every child forked before the transaction reads.
+    pub(crate) interior: HashSet<u32>,
     /// Rows written or deleted, as (table root, rowid).
     pub(crate) rows: HashSet<(i64, i64)>,
     /// Tables written without naming the rows.
@@ -273,6 +279,9 @@ struct BranchState {
     ddl: bool,
     /// Pages this branch read, while the store tracks reads.
     reads: HashSet<u32>,
+    /// The store's `track_off` at this branch's fork if tracking was on then: `reads` holds every
+    /// read if it still equals the count.
+    reads_from: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -472,6 +481,7 @@ impl BranchStore {
         inner.trunk.lineage.children.insert(f, id);
         let mut st = BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default());
         st.commits_at_fork = inner.merge.trunk_commits;
+        st.reads_from = inner.merge.track_reads.then_some(inner.merge.track_off);
         inner.branches.insert(id, st);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
@@ -850,7 +860,12 @@ impl BranchStore {
     }
 
     pub(crate) fn set_track_reads(&self, on: bool) {
-        self.inner.lock().merge.track_reads = on;
+        let mut inner = self.inner.lock();
+        let merge = &mut inner.merge;
+        if merge.track_reads && !on {
+            merge.track_off += 1;
+        }
+        merge.track_reads = on;
     }
 
     pub(crate) fn tracks_reads(&self) -> bool {
@@ -892,6 +907,8 @@ impl BranchStore {
             Some("the branch committed a DDL")
         } else if st.bulk {
             Some("the branch wrote a table without naming the rows")
+        } else if physical && st.reads_from != Some(merge.track_off) {
+            Some("the branch's reads were not all tracked, which the physical install needs")
         } else {
             None
         };
@@ -964,7 +981,13 @@ impl BranchStore {
             let mut unused = 0;
             for &q in &st.reads {
                 work.merge_structural_probes += 1;
-                if written(q) <= at && !batch.pages.contains(&q) {
+                if written(q) <= at {
+                    // Not committed since the fork. An earlier member of this batch may have
+                    // written it; the branch read the version before this transaction's first
+                    // write of it, whose kind the pager recorded.
+                    if batch.interior.contains(&q) {
+                        return true;
+                    }
                     continue;
                 }
                 let Some(slot) = trunk.lineage.retained_at(q, at, &mut unused) else {
@@ -1127,6 +1150,7 @@ impl BranchState {
             bulk: false,
             ddl: false,
             reads: HashSet::new(),
+            reads_from: None,
         }
     }
 }

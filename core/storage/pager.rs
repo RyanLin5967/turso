@@ -3181,6 +3181,9 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
+        // A transaction that ended without passing commit_tx or rollback_tx left its merge writes
+        // here; this one starts from none.
+        *self.trunk_pending.lock() = TrunkPending::default();
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
@@ -3820,7 +3823,13 @@ impl Pager {
         }
         if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() {
-                self.trunk_pending.lock().pages.insert(page_no);
+                let before = page.get_contents().as_slice();
+                let mut pending = self.trunk_pending.lock();
+                pending.pages.insert(page_no);
+                if matches!(before[if page_no == 1 { 100 } else { 0 }], 0x02 | 0x05) {
+                    pending.interior.insert(page_no);
+                }
+                drop(pending);
                 store.first_write_trunk(page_no, page.get_contents().as_slice());
             }
         }
@@ -3849,6 +3858,9 @@ impl Pager {
     /// miss them.
     pub(crate) fn note_rows_installed(&self, rows: &[(i64, i64)]) {
         if let Some(store) = self.branch_store.get() {
+            if !store.trunk_has_children() {
+                return;
+            }
             if crate::branch::store::mutant(30) {
                 store.trunk_rows_written(rows);
             } else {

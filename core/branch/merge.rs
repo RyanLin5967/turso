@@ -5,7 +5,9 @@
 //! A branch B forked from the trunk at trunk epoch `trunk_at` has written some pages and some rows.
 //! Merging it makes B's changes the trunk's, inside ONE trunk write transaction (`BEGIN IMMEDIATE`
 //! … `COMMIT`), so that validation and install both run under the trunk's WAL write lock: no trunk
-//! commit — and no fork, which takes the same lock — can fall between deciding and writing. The
+//! commit can fall between deciding and writing. A fork can, where forks take no WAL lock; the
+//! merge's writes are stamped at its commit's decision like any trunk commit's, so a child forked
+//! meanwhile is refused on them (frontier/round11/r11-merge PREREG A15). The
 //! semantics are a three-way merge's (git, Dolt): base = the trunk as B forked it, ours = the trunk
 //! now, theirs = B. B's change is refused when the trunk changed the same thing after the fork; what
 //! B only read is not validated (write-write conflicts only, snapshot-isolation shaped).
@@ -1224,6 +1226,32 @@ mod tests {
         assert!(matches!(r, Err(LimboError::InvalidArgument(_))), "{r:?}");
         trunk.execute("ROLLBACK").unwrap();
         assert_eq!(int(&trunk, "SELECT count(*) FROM t WHERE v = 'a'"), 1);
+    }
+
+    /// The physical install's guard reads the pages a branch read, so a branch forked before read
+    /// tracking was on is refused as out of scope; one forked after merges.
+    #[test]
+    fn a_branch_forked_before_read_tracking_cannot_merge_physically() {
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        let b = one_row_and_a_branch(&trunk);
+        db.set_branch_read_tracking(true);
+        let physical = MergePolicy {
+            validation: Validation::PageStamp,
+            install: Install::Physical,
+        };
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let o = merger.merge(b, physical).unwrap();
+        assert_eq!(o.refused, Some(Refusal::Scope), "{o:?}");
+        assert!(o.scope.is_some_and(|s| s.contains("tracked")), "{o:?}");
+        let c = trunk.fork_branch().unwrap();
+        c.connect()
+            .unwrap()
+            .execute("UPDATE t SET v = 'c' WHERE id = 1")
+            .unwrap();
+        let o = merger.merge(c, physical).unwrap();
+        assert_eq!(o.refused, None, "{o:?}");
+        assert_eq!(int(&trunk, "SELECT count(*) FROM t WHERE v = 'c'"), 1);
     }
 
     /// A foreign key the engine cannot resolve (its parent table does not exist) refuses a member
