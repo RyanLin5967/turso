@@ -1840,20 +1840,37 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 continue;
             }
             // F-K3's version-list garbage: nodes allocated beyond the live versions, at the cell's
-            // start, while the pin (if any) still held, and at its end.
+            // start, while the pin (if any) still held, and at its end. Under F-K3v that difference
+            // is 0 by construction, so what can show a pool that held nodes is its bytes against
+            // the bound its peak allows, checked at every sample (PREREG amendment 3e, D2).
             let garbage = |st: &BranchStats| st.k3_nodes_live as i64 - st.trunk_slots_in_use as i64;
+            let olc = b.db.branch_k3_mode() == "olc";
+            for (when, st) in [("start", Some(&start_stats)), ("pinned", pinned.as_ref()), ("end", Some(&s))] {
+                if let Some(st) = st.filter(|st| olc && st.k3_node_bytes_live > st.k3_olc_pool_bound_bytes) {
+                    not_a_result(&format!(
+                        "cell N={n} T={t} draw={draw} ({when}): F-K3v pools hold {} B, above the {} B \
+                         that {} nodes at peak allow",
+                        st.k3_node_bytes_live, st.k3_olc_pool_bound_bytes, st.k3_olc_peak_in_use
+                    ));
+                }
+            }
             let (p_nodes, p_bytes, p_garbage) =
                 pinned.as_ref().map_or((-1, -1, -1), |p| (p.k3_nodes_live as i64, p.k3_node_bytes_live as i64, garbage(p)));
             println!(
                 "# k3gc N={n} T={t} draw={draw} pinned={} trunk_writes={writes} gc_freed={gc_freed} \
                  garbage_start={} garbage_pinned={p_garbage} nodes_pinned={p_nodes} node_bytes_pinned={p_bytes} \
-                 garbage_end={} nodes_end={} node_bytes_end={} olc_restarts={}",
+                 garbage_end={} nodes_end={} node_bytes_end={} olc_restarts={} olc_head_spins={} \
+                 olc_fallbacks={} olc_peak_in_use={} olc_pool_bound_bytes={}",
                 args.pin,
                 garbage(&start_stats),
                 garbage(&s),
                 s.k3_nodes_live,
                 s.k3_node_bytes_live,
                 s.k3_olc_restarts - start_stats.k3_olc_restarts,
+                s.k3_olc_head_spins - start_stats.k3_olc_head_spins,
+                s.k3_olc_fallbacks - start_stats.k3_olc_fallbacks,
+                s.k3_olc_peak_in_use,
+                s.k3_olc_pool_bound_bytes,
             );
         }
     }

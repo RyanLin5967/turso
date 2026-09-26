@@ -133,9 +133,11 @@
 //! Without F-K3 the store is F5 exactly: no list is kept, and the lookup runs under the lock.
 //!
 //! Epoch reclamation has one known wall: a reader stalled while pinned keeps every node removed
-//! after it pinned. F-K3v (`TURSO_K3=olc`, lane r11-k3-trunklock amendment 3.2) keeps the same lists
-//! with one writer and optimistic readers over type-stable nodes that are reused at once, so a
-//! stalled reader holds nothing (see `super::olc`).
+//! after it pinned. F-K3v (`TURSO_K3=olc`, lane r11-k3-trunklock amendments 3.2 and 3e) keeps the
+//! same lists with one writer and optimistic readers over type-stable nodes that are reused at once,
+//! so a stalled reader holds nothing (see `super::olc`). Its readers take no lock but are NOT
+//! lock-free: a writer stopped mid-change blocks readers whose path crosses the node it is changing,
+//! so a search that fails 64 attempts falls back to F5's lookup under the trunk's lock (counted).
 //!
 //! # What this does not do
 //!
@@ -162,7 +164,7 @@ use crossbeam_utils::CachePadded;
 
 use super::arena::{Arena, Chunks, Slot};
 use super::page_map::PageMap;
-use super::olc::{OlcLists, OlcVersion};
+use super::olc::{OlcLists, OlcLookup, OlcVersion};
 use super::radix::Radix;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
@@ -516,8 +518,8 @@ pub(crate) enum K3Mode {
     Off,
     /// F-K3: crossbeam's lock-free skip list, nodes reclaimed by epochs (`TURSO_K3=lockfree`).
     Ebr,
-    /// F-K3v: single-writer skip lists read optimistically over type-stable nodes
-    /// (`TURSO_K3=olc`; see `super::olc`).
+    /// F-K3v: single-writer skip lists read optimistically over type-stable nodes, with a locked
+    /// fallback after 64 failed attempts (`TURSO_K3=olc`; see `super::olc`).
     Olc,
 }
 
@@ -568,13 +570,26 @@ impl SharedVersions {
         }
     }
 
-    /// The version of `page` a child forked at `f` sees, without the trunk's lock. Under F-K3 the
-    /// epoch guard covers the search only: the version found cannot be released while the reader's
-    /// branch lives, so copying its bytes needs no guard.
-    fn covering(&self, page: u32, f: u64) -> Option<Retained> {
+    /// The version of `page` a child forked at `f` sees, without the trunk's lock: `Ok(found)`, or
+    /// `Err(())` when F-K3v's bounded optimistic search gave up and the caller must answer under the
+    /// lock. Under F-K3 the epoch guard covers the search only: the version found cannot be released
+    /// while the reader's branch lives, so copying its bytes needs no guard.
+    fn covering(&self, page: u32, f: u64) -> std::result::Result<Option<Retained>, ()> {
+        match self {
+            SharedVersions::Ebr(e) => Ok(e.covering(page, f, &epoch::pin())),
+            SharedVersions::Olc(o) => match o.covering(page, f) {
+                OlcLookup::Found(v) => Ok(Some(v.into())),
+                OlcLookup::Absent => Ok(None),
+                OlcLookup::GaveUp => Err(()),
+            },
+        }
+    }
+
+    /// `covering` for a caller that holds the trunk's lock: no writer can run, so it always answers.
+    fn covering_locked(&self, page: u32, f: u64) -> Option<Retained> {
         match self {
             SharedVersions::Ebr(e) => e.covering(page, f, &epoch::pin()),
-            SharedVersions::Olc(o) => o.covering(page, f).map(Retained::from),
+            SharedVersions::Olc(o) => o.covering_locked(page, f).map(Retained::from),
         }
     }
 
@@ -595,10 +610,18 @@ impl SharedVersions {
         }
     }
 
-    fn restarts(&self) -> u64 {
+    /// F-K3v's reader accounting and pool bound, all 0 under F-K3: (restarts, head spins,
+    /// fallbacks to the locked lookup, peak nodes in use, pool bytes allowed for that peak).
+    fn olc_counts(&self) -> (u64, u64, u64, u64, u64) {
         match self {
-            SharedVersions::Ebr(_) => 0,
-            SharedVersions::Olc(o) => o.restarts(),
+            SharedVersions::Ebr(_) => (0, 0, 0, 0, 0),
+            SharedVersions::Olc(o) => (
+                o.restarts(),
+                o.head_spins(),
+                o.fallbacks(),
+                o.peak_in_use(),
+                o.pool_bound_bytes(),
+            ),
         }
     }
 }
@@ -783,7 +806,7 @@ impl Lineage {
     fn retained_at(&self, page: u32, f: u64, examined: &mut u64) -> Option<Slot> {
         if let Some(shared) = &self.shared {
             *examined += 1;
-            return shared.covering(page, f).map(|v| v.slot);
+            return shared.covering_locked(page, f).map(|v| v.slot);
         }
         let (_, v) = self.retained.get(&page)?.range(..=f).next_back()?;
         *examined += 1;
@@ -1370,10 +1393,11 @@ impl BranchStore {
             out.copy_from_slice(take(&self.shards[d], self.timed(), None).domain.page(slot));
             return Ok(Resolved::Filled);
         }
-        if let Some(shared) = &self.k3 {
-            // F-K3/F-K3v: no trunk lock (see "Reads of rewritten trunk pages without the trunk's
-            // lock").
-            if let Some(v) = shared.covering(page, at) {
+        // F-K3/F-K3v: no trunk lock (see "Reads of rewritten trunk pages without the trunk's
+        // lock"). F-K3v's search may give up after too many failed attempts; it then takes F5's path.
+        let lockfree = self.k3.as_ref().map(|shared| shared.covering(page, at));
+        if let Some(Ok(found)) = lockfree {
+            if let Some(v) = found {
                 crate::turso_assert!(
                     domain_of(v.slot) == TRUNK_DOMAIN,
                     "a trunk version outside the trunk's arena"
@@ -1389,6 +1413,7 @@ impl BranchStore {
                 return Ok(Resolved::Filled);
             }
         } else {
+            // F5, or F-K3v's fallback: under the trunk's lock no writer runs.
             let mut trunk = self.trunk(TrunkSite::Resolve);
             trunk.work.resolve_trunk_locked += 1;
             let mut examined = 0;
@@ -1425,7 +1450,13 @@ impl BranchStore {
             if let Some(k3) = &self.k3 {
                 stats.k3_nodes_live = k3.nodes_live();
                 stats.k3_node_bytes_live = k3.node_bytes();
-                stats.k3_olc_restarts = k3.restarts();
+                (
+                    stats.k3_olc_restarts,
+                    stats.k3_olc_head_spins,
+                    stats.k3_olc_fallbacks,
+                    stats.k3_olc_peak_in_use,
+                    stats.k3_olc_pool_bound_bytes,
+                ) = k3.olc_counts();
             }
             stats.work.trunk_lock_acquisitions = trunk.work.lock_acquisitions;
             stats.work.trunk_lock_contended = trunk.work.lock_contended;
@@ -2134,9 +2165,20 @@ mod tests {
              {writes}, resolutions of rewritten trunk pages {}",
             stats.work.resolve_trunk_rewritten
         );
-        // F5 takes the trunk's lock for every such resolution, F-K3 for none.
-        let expect_locked = if mode.lockfree() { 0 } else { stats.work.resolve_trunk_rewritten };
+        // F5 takes the trunk's lock for every rewritten-page read, F-K3 for none, F-K3v only for the
+        // searches that gave up.
+        let expect_locked = match mode {
+            K3Mode::Off => stats.work.resolve_trunk_rewritten,
+            K3Mode::Ebr => 0,
+            K3Mode::Olc => stats.k3_olc_fallbacks,
+        };
         assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {mode:?}: trunk-locked reads");
+        // F-K3v's concurrent validation must have run: a run where no reader ever met a node that
+        // changed under it is void, not a pass.
+        assert!(
+            mode != K3Mode::Olc || stats.k3_olc_restarts > 0,
+            "k3 {mode:?}: no reader restarted, so the optimistic race was not run"
+        );
         assert_eq!(stats.live_branches, 0, "branches leaked");
         assert_eq!(stats.arena_slots_in_use, 0, "slots leaked");
     }
@@ -2285,8 +2327,20 @@ mod tests {
              resolutions of rewritten trunk pages {}",
             stats.work.resolve_trunk_rewritten
         );
-        let expect_locked = if mode.lockfree() { 0 } else { stats.work.resolve_trunk_rewritten };
+        // F5 takes the trunk's lock for every rewritten-page read, F-K3 for none, F-K3v only for the
+        // searches that gave up.
+        let expect_locked = match mode {
+            K3Mode::Off => stats.work.resolve_trunk_rewritten,
+            K3Mode::Ebr => 0,
+            K3Mode::Olc => stats.k3_olc_fallbacks,
+        };
         assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {mode:?}: trunk-locked reads");
+        // F-K3v's concurrent validation must have run: a run where no reader ever met a node that
+        // changed under it is void, not a pass.
+        assert!(
+            mode != K3Mode::Olc || stats.k3_olc_restarts > 0,
+            "k3 {mode:?}: no reader restarted, so the optimistic race was not run"
+        );
         assert_eq!(stats.live_branches, 0, "k3 {mode:?}: branches leaked");
         assert_eq!(stats.arena_slots_in_use, 0, "k3 {mode:?}: slots leaked");
     }
@@ -2327,14 +2381,16 @@ mod tests {
         );
     }
 
-    /// F-K3v under the same pinned guard holds nothing: a removed node goes back to the pool at once
-    /// and the next insert reuses it, so 1,000 rounds of retain-and-reap under a pin leave the pool
-    /// at the size its first round made it (a pool that deferred or leaked would grow with the rounds).
+    /// F-K3v reuses a removed node at once: 1,000 rounds of retain-and-reap (six versions each)
+    /// never hold more than six nodes, and the pools never exceed whole chunks for each height's
+    /// peak (a pool that deferred or leaked would outgrow that bound within the rounds). A REUSE
+    /// test only: F-K3v's readers never touch the epoch, so the pinned guard here stalls nothing
+    /// of theirs (PREREG amendment 3e, D3); the stalled-reader claim rests on reading plus
+    /// `olc::tests::a_stalled_reader_holds_nothing`.
     #[test]
     fn olc_holds_no_garbage_under_a_pinned_guard() {
         let store = BranchStore::with_k3(K3Mode::Olc);
         let _pinned = epoch::pin();
-        let mut pool = None;
         for round in 0..1_000u64 {
             let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
             for page in 0..PAGES {
@@ -2343,9 +2399,13 @@ mod tests {
             assert_eq!(store.release_handle(id).freed_pages, PAGES as usize);
             let s = store.stats();
             assert_eq!((s.k3_nodes_live, s.trunk_slots_in_use), (0, 0), "round {round}");
-            let bytes = *pool.get_or_insert(s.k3_node_bytes_live);
-            assert!(bytes > 0);
-            assert_eq!(s.k3_node_bytes_live, bytes, "round {round}: the pool grew under a pin");
+            assert_eq!(s.k3_olc_peak_in_use, u64::from(PAGES), "round {round}: a node was not reused");
+            assert!(
+                s.k3_node_bytes_live > 0 && s.k3_node_bytes_live <= s.k3_olc_pool_bound_bytes,
+                "round {round}: pools {} B above the {} B their peak allows",
+                s.k3_node_bytes_live,
+                s.k3_olc_pool_bound_bytes
+            );
         }
     }
 

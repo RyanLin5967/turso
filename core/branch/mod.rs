@@ -183,12 +183,25 @@ pub struct BranchStats {
     /// bytes. A removed node is freed only when epoch reclamation says no reader can reach it, so
     /// `k3_nodes_live - trunk_slots_in_use` is the garbage reclamation still holds. Both counts are 0
     /// without F-K3, which keeps no lists; the difference means nothing there.
-    /// Under F-K3v (`TURSO_K3=olc`) removed nodes return to a pool at once, so `k3_nodes_live` is
-    /// exactly the live versions, and `k3_node_bytes_live` is the whole pool's bytes.
+    /// Under F-K3v (`TURSO_K3=olc`) removed nodes return to their height's pool at once, so
+    /// `k3_nodes_live` is exactly the live versions (garbage 0 by construction; the free pools,
+    /// high-water minus live, are held for the store's life), and `k3_node_bytes_live` is the
+    /// pools' bytes, in use or free.
     pub k3_nodes_live: u64,
     pub k3_node_bytes_live: u64,
-    /// F-K3v: reader restarts (a validation that failed because the writer changed a node under it).
+    /// F-K3v readers' failed attempts: validations that failed because the writer changed a node
+    /// under them (`restarts`), laps that found a list's head mid-change (`head_spins`), and
+    /// searches that gave up after 64 failed attempts and were answered under the trunk's lock
+    /// (`fallbacks`). F-K3v readers take no lock unless they fall back, but they are not lock-free:
+    /// a writer stopped mid-change blocks the readers whose path crosses the node it is changing.
     pub k3_olc_restarts: u64,
+    pub k3_olc_head_spins: u64,
+    pub k3_olc_fallbacks: u64,
+    /// F-K3v: the most nodes in lists at once, and the pool bytes that peak allows (whole chunks per
+    /// height for that height's peak). `k3_node_bytes_live` above this bound is a pool that grew
+    /// while it had free nodes.
+    pub k3_olc_peak_in_use: u64,
+    pub k3_olc_pool_bound_bytes: u64,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }

@@ -1,5 +1,5 @@
-//! F-K3v (lane r11-k3-trunklock, PREREG amendment 3.2): the trunk's retained versions of each page as
-//! a skip list with ONE writer and optimistic readers over type-stable nodes.
+//! F-K3v (lane r11-k3-trunklock, PREREG amendments 3.2, 3b, 3e): the trunk's retained versions of each
+//! page as a skip list with ONE writer and optimistic readers over type-stable nodes.
 //!
 //! F-K3 keeps these lists in crossbeam's lock-free skip list, whose removed nodes are freed by epoch
 //! reclamation: a reader that stalls while pinned (descheduled, stopped) keeps every node removed
@@ -7,27 +7,36 @@
 //! trunk's lock, so a list needs no lock-free WRITE protocol, only readers that take no lock and
 //! hold nothing:
 //!
-//! * **Type-stable nodes.** Nodes come from a pool the lists own and are never returned to the
-//!   allocator while the lists live; a removed node goes back to the pool at once and may be reused
-//!   by the next insert, in any page's list (type-stable memory, Greenwald and Cheriton, OSDI 1996;
-//!   immediate reuse checked by versions, as in VBR, Sheffi, Herlihy and Petrank, 2021). A pointer
-//!   a reader holds therefore always points at a node, never at freed memory.
+//! * **Type-stable nodes, one pool per height.** Nodes come from pools the lists own, one per tower
+//!   height, and are never returned to the allocator while the lists live; a removed node goes back
+//!   to its height's pool at once and may be reused by the next insert of that height, in any page's
+//!   list (type-stable memory, Greenwald and Cheriton, OSDI 1996; immediate reuse checked by
+//!   versions, as in VBR, Sheffi, Herlihy and Petrank, 2021). A node never changes height, so a
+//!   pointer a reader holds always points at a node with at least as many links as the level it was
+//!   reached through, never at freed memory. A node is 32 + 8h bytes.
 //! * **Versions.** Every node carries a version that the writer makes odd before it changes the node
 //!   and even again after, and that only ever grows; a free node's version is odd. A reader reads a
 //!   node between two loads of its version and trusts what it read only if they are equal and even —
 //!   a seqlock per node, taken hand over hand down the list (optimistic lock coupling, Leis et al.,
 //!   DaMoN 2016). Unlinking a node changes its predecessor, so a reader that followed the pointer
 //!   finds the predecessor's version moved and starts again from the head.
-//! * **Nothing held.** A stalled reader holds no epoch and no reference: its next validation fails
-//!   and it restarts. Garbage is 0 whatever readers do; the pool's size is the most versions the
-//!   lists ever held at once.
+//! * **Nothing held; not lock-free.** A stalled reader holds no epoch and no reference: its next
+//!   validation fails and it restarts. Garbage is 0 whatever readers do; the free pools (high-water
+//!   minus live) are held for the lists' life. But a reader CAN wait on the writer: a writer stopped
+//!   between making a node odd and making it even blocks every reader whose path crosses that node.
+//!   So after [`MAX_FAILED_LAPS`] failed attempts a reader gives up and the store answers under the
+//!   trunk's lock instead (a pessimistic fallback behind optimistic latches, as in hybrid latches,
+//!   Böttcher et al., DaMoN 2019); failed attempts and fallbacks are counted.
 //!
 //! A reader's answer — the version of a page a child forked at `f` sees — is validated like every
 //! other hop, and it cannot go stale after that: the store keeps that version while the reading
 //! branch lives (see the store's "Reads of rewritten trunk pages without the trunk's lock").
 
+use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{fence, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+
+use crossbeam_utils::CachePadded;
 
 use crate::sync::Mutex;
 
@@ -36,41 +45,31 @@ use super::radix::Radix;
 /// Tower height cap. With p = 1/4 a list of n versions needs about log4 n levels: 7 at the 12.7k
 /// versions per page of a steady 10^6-branch trunk (r11-space P2), so 12 is ample.
 const MAX_H: usize = 12;
-/// Nodes allocated per pool refill.
+/// Nodes allocated per refill of one height's pool.
 const CHUNK: usize = 1024;
+/// Failed attempts (restarts and laps that found the head being written) after which a reader
+/// stops and the store answers under the trunk's lock.
+pub(crate) const MAX_FAILED_LAPS: u32 = 64;
+/// Bytes of a node's fixed part; its links follow it.
+const HEADER: usize = std::mem::size_of::<Node>();
 
-/// One retained version, as the store keeps it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OlcVersion {
-    pub(crate) born: u64,
-    pub(crate) died: u64,
-    pub(crate) slot: u32,
-}
-
-/// A list node. Every field is an atomic so that a reader racing the writer reads stale values, not
-/// undefined behaviour; the version tells it whether they belong together.
+/// A list node's fixed part. Its `h` links follow it in the same allocation, so a node is
+/// `HEADER + 8h` bytes; they are reached only through a [`NodePtr`], whose pointer carries the
+/// provenance of the whole chunk. Every field is an atomic so that a reader racing the writer reads
+/// stale values, not undefined behaviour; the version tells it whether they belong together.
+#[repr(C)]
 struct Node {
     version: AtomicU64,
     born: AtomicU64,
     died: AtomicU64,
     slot: AtomicU32,
+    /// Fixed when the node's chunk is made; never changes.
     height: AtomicU32,
-    next: [AtomicPtr<Node>; MAX_H],
 }
 
-impl Node {
-    /// A free node: odd version, no links.
-    fn free() -> Self {
-        Self {
-            version: AtomicU64::new(1),
-            born: AtomicU64::new(0),
-            died: AtomicU64::new(0),
-            slot: AtomicU32::new(0),
-            height: AtomicU32::new(0),
-            next: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-        }
-    }
+const _: () = assert!(HEADER == 32, "a node's fixed part is 4 words");
 
+impl Node {
     /// The writer starts changing this node: its version goes odd before any field changes.
     fn begin_write(&self) {
         let v = self.version.load(Ordering::Relaxed);
@@ -94,58 +93,182 @@ impl Node {
     }
 }
 
-/// The head of one page's list: a node that is never freed and holds no version of its own.
-struct List {
-    head: Node,
-}
+/// A pointer to a node, with the provenance of the allocation the node lives in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NodePtr(NonNull<Node>);
 
-impl Default for List {
-    fn default() -> Self {
-        let head = Node::free();
-        // The head is never free: even from the start, with every level empty.
-        head.version.store(0, Ordering::Relaxed);
-        head.height.store(MAX_H as u32, Ordering::Relaxed);
-        Self { head }
+// SAFETY: a `NodePtr` points into memory the lists own until they drop; every access through it is
+// an atomic load or store, and the writer's stores happen only under the trunk's lock.
+unsafe impl Send for NodePtr {}
+unsafe impl Sync for NodePtr {}
+
+impl NodePtr {
+    fn new(p: *mut Node) -> Option<Self> {
+        NonNull::new(p).map(NodePtr)
+    }
+
+    fn raw(self) -> *mut Node {
+        self.0.as_ptr()
+    }
+
+    /// The fixed part.
+    fn hdr<'a>(self) -> &'a Node {
+        // SAFETY: the node lives as long as the lists that handed out this pointer, and the
+        // reference covers only the fixed part.
+        unsafe { self.0.as_ref() }
+    }
+
+    /// Link `l`, which the node must have (`l < height`).
+    fn link<'a>(self, l: usize) -> &'a AtomicPtr<Node> {
+        // SAFETY: links follow the fixed part in the same allocation, and the pointer carries that
+        // allocation's provenance; callers only ask for a level the node was reached at or linked
+        // at, which is below its height (a node never changes height).
+        unsafe {
+            &*self
+                .0
+                .as_ptr()
+                .cast::<u8>()
+                .add(HEADER + l * std::mem::size_of::<AtomicPtr<Node>>())
+                .cast::<AtomicPtr<Node>>()
+        }
     }
 }
 
-/// A node pointer the writer keeps in the pool. Only the writer (under the trunk lock) uses it.
-#[derive(Clone, Copy)]
-struct NodePtr(NonNull<Node>);
+/// Bytes of one node of height `h`.
+fn node_size(h: usize) -> usize {
+    HEADER + h * std::mem::size_of::<AtomicPtr<Node>>()
+}
 
-// SAFETY: a `NodePtr` points into a chunk the pool owns and never frees while the lists live; only
-// the writer, under the trunk lock (and so under the pool's mutex), dereferences it mutably.
-unsafe impl Send for NodePtr {}
+/// One zeroed allocation of `n` nodes of height `h`, each made free (odd version) with its height.
+struct RawChunk {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
 
-/// The writer's state: node chunks (never freed until the lists drop), the free nodes, and the
-/// height generator.
-struct Writer {
-    chunks: Vec<Box<[Node]>>,
+// SAFETY: the chunk is owned memory, freed once in `Writer::drop`.
+unsafe impl Send for RawChunk {}
+
+impl RawChunk {
+    fn new(h: usize, n: usize) -> Self {
+        let layout = Layout::from_size_align(node_size(h) * n, std::mem::align_of::<Node>())
+            .expect("a chunk's size fits a layout");
+        // SAFETY: the layout is non-zero-sized; zeroed bytes are valid atomics and null links.
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })
+            .unwrap_or_else(|| handle_alloc_error(layout));
+        let chunk = Self { ptr, layout };
+        for i in 0..n {
+            let node = chunk.node(h, i).hdr();
+            node.version.store(1, Ordering::Relaxed);
+            node.height.store(h as u32, Ordering::Relaxed);
+        }
+        chunk
+    }
+
+    fn node(&self, h: usize, i: usize) -> NodePtr {
+        // SAFETY: `i` is below the chunk's node count, so the offset stays inside the allocation.
+        NodePtr(unsafe {
+            NonNull::new_unchecked(self.ptr.as_ptr().add(i * node_size(h)).cast::<Node>())
+        })
+    }
+}
+
+/// One height's pool.
+#[derive(Default)]
+struct Class {
+    chunks: Vec<RawChunk>,
     free: Vec<NodePtr>,
+    in_use: u64,
+    /// The most nodes of this height ever in lists at once.
+    peak: u64,
+}
+
+/// The writer's state: one pool per height (index `h - 1`) and the height generator.
+struct Writer {
+    classes: [Class; MAX_H],
     rng: u64,
 }
 
 impl Writer {
-    fn alloc(&mut self) -> NodePtr {
-        if self.free.is_empty() {
-            // Pointers are taken from the chunk once it is in place: moving a `Box` retags it, and
-            // a pointer taken before the move would not be valid after it (Stacked Borrows).
-            self.chunks
-                .push((0..CHUNK).map(|_| Node::free()).collect());
-            let chunk = self.chunks.last().expect("just pushed");
-            self.free
-                .extend(chunk.iter().map(|n| NodePtr(NonNull::from(n))));
+    fn alloc(&mut self, h: usize) -> NodePtr {
+        let class = &mut self.classes[h - 1];
+        if class.free.is_empty() {
+            let chunk = RawChunk::new(h, CHUNK);
+            class.free.extend((0..CHUNK).rev().map(|i| chunk.node(h, i)));
+            class.chunks.push(chunk);
         }
-        self.free.pop().expect("just refilled")
+        class.in_use += 1;
+        class.peak = class.peak.max(class.in_use);
+        class.free.pop().expect("just refilled")
+    }
+
+    fn free(&mut self, n: NodePtr, h: usize) {
+        let class = &mut self.classes[h - 1];
+        class.in_use -= 1;
+        class.free.push(n);
     }
 
     fn height(&mut self) -> usize {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
-        // p = 1/4: one more level per two trailing zero bits.
+        // p = 1/4: one more level per two trailing zero bits; E[h] = 4/3.
         (1 + (self.rng.trailing_zeros() as usize) / 2).min(MAX_H)
     }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        for class in &mut self.classes {
+            for chunk in class.chunks.drain(..) {
+                // SAFETY: allocated in `RawChunk::new` with this layout, freed once, here; no reader
+                // can exist while the lists drop.
+                unsafe { dealloc(chunk.ptr.as_ptr(), chunk.layout) };
+            }
+        }
+    }
+}
+
+/// The head of one page's list: a node of the full height that is never freed and holds no
+/// version of its own.
+struct List {
+    head: NodePtr,
+    chunk: RawChunk,
+}
+
+impl Default for List {
+    fn default() -> Self {
+        let chunk = RawChunk::new(MAX_H, 1);
+        let head = chunk.node(MAX_H, 0);
+        // The head is never free: even from the start, with every level empty.
+        head.hdr().version.store(0, Ordering::Relaxed);
+        Self { head, chunk }
+    }
+}
+
+impl Drop for List {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `RawChunk::new` with this layout, freed once, here.
+        unsafe { dealloc(self.chunk.ptr.as_ptr(), self.chunk.layout) };
+    }
+}
+
+/// What a bounded optimistic search found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OlcLookup {
+    Found(OlcVersion),
+    /// No version of the page covers `f`.
+    Absent,
+    /// [`MAX_FAILED_LAPS`] attempts failed: the writer kept changing the path, or is stopped in the
+    /// middle of a change. The caller answers under the trunk's lock.
+    GaveUp,
+}
+
+/// One retained version, as the store keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OlcVersion {
+    pub(crate) born: u64,
+    pub(crate) died: u64,
+    pub(crate) slot: u32,
 }
 
 /// F-K3v's per-page version lists (see the module doc).
@@ -154,24 +277,37 @@ pub(crate) struct OlcLists {
     /// The writer's state. Only a caller holding the trunk's lock takes it, so it is never contended;
     /// it is here, not in the trunk's lock, so that the lists are one self-contained structure.
     writer: Mutex<Writer>,
-    /// Nodes in lists (allocated from the pool and not free), for the store's garbage count.
+    /// Nodes in lists, and the most there have been at once; written only by the writer.
     in_use: AtomicU64,
-    /// Reader restarts: validations that failed because the writer changed a node under a reader.
-    /// Counted only on a restart, so a read that does not restart writes nothing shared.
-    restarts: AtomicU64,
+    peak: AtomicU64,
+    /// Readers' failed attempts, each on its own line so readers stuck on a stopped writer do not
+    /// share a line with each other's counters or with the writer's: validations that failed
+    /// (`restarts`), laps that found the head odd (`head_spins`), and searches that gave up
+    /// (`fallbacks`). Written only when an attempt fails.
+    restarts: CachePadded<AtomicU64>,
+    head_spins: CachePadded<AtomicU64>,
+    fallbacks: CachePadded<AtomicU64>,
 }
+
+// SAFETY: the node pointers inside are only dereferenced through `&self` methods whose writes happen
+// under the trunk's lock (and the writer mutex) and whose reads are validated by versions; the memory
+// they point at is owned by these lists until they drop.
+unsafe impl Send for List {}
+unsafe impl Sync for List {}
 
 impl OlcLists {
     pub(crate) fn new() -> Self {
         Self {
             lists: Radix::new(),
             writer: Mutex::new(Writer {
-                chunks: Vec::new(),
-                free: Vec::new(),
+                classes: std::array::from_fn(|_| Class::default()),
                 rng: 0x9E37_79B9_7F4A_7C15,
             }),
             in_use: AtomicU64::new(0),
-            restarts: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            restarts: CachePadded::new(AtomicU64::new(0)),
+            head_spins: CachePadded::new(AtomicU64::new(0)),
+            fallbacks: CachePadded::new(AtomicU64::new(0)),
         }
     }
 
@@ -179,13 +315,38 @@ impl OlcLists {
         self.in_use.load(Ordering::Relaxed)
     }
 
-    /// Bytes of every node the pool holds, in use or free.
+    /// The most nodes the lists have held at once.
+    pub(crate) fn peak_in_use(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of every node the pools hold, in use or free.
     pub(crate) fn pool_bytes(&self) -> u64 {
-        (self.writer.lock().chunks.len() * CHUNK * std::mem::size_of::<Node>()) as u64
+        let w = self.writer.lock();
+        (1..=MAX_H)
+            .map(|h| (w.classes[h - 1].chunks.len() * CHUNK * node_size(h)) as u64)
+            .sum()
+    }
+
+    /// The most the pools may hold if every removed node is reused: for each height, whole chunks
+    /// enough for that height's peak. A pool above this grew while it had free nodes of its height.
+    pub(crate) fn pool_bound_bytes(&self) -> u64 {
+        let w = self.writer.lock();
+        (1..=MAX_H)
+            .map(|h| (w.classes[h - 1].peak.div_ceil(CHUNK as u64) * (CHUNK * node_size(h)) as u64))
+            .sum()
     }
 
     pub(crate) fn restarts(&self) -> u64 {
         self.restarts.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn head_spins(&self) -> u64 {
+        self.head_spins.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn fallbacks(&self) -> u64 {
+        self.fallbacks.load(Ordering::Relaxed)
     }
 
     fn list(&self, page: u32) -> Option<&List> {
@@ -194,18 +355,12 @@ impl OlcLists {
 
     /// The writer's descent: for every level, the last node whose `born` is below `born` (the head
     /// if none). The writer is the only one changing links, so it reads them without validation.
-    fn preds(list: &List, born: u64) -> [&Node; MAX_H] {
-        let mut preds = [&list.head; MAX_H];
-        let mut x = &list.head;
+    fn preds(list: &List, born: u64) -> [NodePtr; MAX_H] {
+        let mut preds = [list.head; MAX_H];
+        let mut x = list.head;
         for l in (0..MAX_H).rev() {
-            loop {
-                let next = x.next[l].load(Ordering::Acquire);
-                if next.is_null() {
-                    break;
-                }
-                // SAFETY: linked nodes live in the pool's chunks.
-                let n = unsafe { &*next };
-                if n.born.load(Ordering::Relaxed) >= born {
+            while let Some(n) = NodePtr::new(x.link(l).load(Ordering::Acquire)) {
+                if n.hdr().born.load(Ordering::Relaxed) >= born {
                     break;
                 }
                 x = n;
@@ -223,70 +378,65 @@ impl OlcLists {
             .get_or_init(List::default);
         let mut w = self.writer.lock();
         let h = w.height();
-        let NodePtr(p) = w.alloc();
+        let n = w.alloc(h);
         drop(w);
-        // SAFETY: the node lives in a chunk these lists own until they drop.
-        let n = unsafe { p.as_ref() };
         let preds = Self::preds(list, v.born);
+        let node = n.hdr();
         // A fresh incarnation: fields first, under the free node's odd version, then even. The node
         // may have been freed by another thread (ordered with this one only by the trunk's lock),
         // so this thread's own release fence must precede its field stores for a reader that sees
         // a new field to see the odd (or a newer) version too (Boehm's seqlock argument).
-        debug_assert!(n.version.load(Ordering::Relaxed) % 2 == 1, "reusing a node that is not free");
+        debug_assert!(node.version.load(Ordering::Relaxed) % 2 == 1, "reusing a node that is not free");
+        debug_assert_eq!(node.height.load(Ordering::Relaxed) as usize, h);
         fence(Ordering::Release);
-        n.born.store(v.born, Ordering::Relaxed);
-        n.died.store(v.died, Ordering::Relaxed);
-        n.slot.store(v.slot, Ordering::Relaxed);
-        n.height.store(h as u32, Ordering::Relaxed);
-        for (l, pred) in preds.iter().enumerate() {
-            let next = if l < h {
-                pred.next[l].load(Ordering::Relaxed)
-            } else {
-                ptr::null_mut()
-            };
-            n.next[l].store(next, Ordering::Relaxed);
-        }
-        n.end_write();
+        node.born.store(v.born, Ordering::Relaxed);
+        node.died.store(v.died, Ordering::Relaxed);
+        node.slot.store(v.slot, Ordering::Relaxed);
         for (l, pred) in preds.iter().enumerate().take(h) {
-            pred.begin_write();
-            pred.next[l].store(ptr::from_ref(n).cast_mut(), Ordering::Relaxed);
-            pred.end_write();
+            n.link(l)
+                .store(pred.link(l).load(Ordering::Relaxed), Ordering::Relaxed);
         }
-        self.in_use.fetch_add(1, Ordering::Relaxed);
+        node.end_write();
+        for (l, pred) in preds.iter().enumerate().take(h) {
+            pred.hdr().begin_write();
+            pred.link(l).store(n.raw(), Ordering::Relaxed);
+            pred.hdr().end_write();
+        }
+        let now = self.in_use.fetch_add(1, Ordering::Relaxed) + 1;
+        if now > self.peak.load(Ordering::Relaxed) {
+            self.peak.store(now, Ordering::Relaxed);
+        }
     }
 
-    /// Unlink the version of `page` born at `born` and return its node to the pool. The caller
-    /// holds the trunk's lock.
+    /// Unlink the version of `page` born at `born` and return its node to its height's pool. The
+    /// caller holds the trunk's lock.
     pub(crate) fn remove(&self, page: u32, born: u64) -> Option<OlcVersion> {
         let list = self.list(page)?;
         let preds = Self::preds(list, born);
-        let target = preds[0].next[0].load(Ordering::Acquire);
-        if target.is_null() {
-            return None;
-        }
-        // SAFETY: linked nodes live in the pool's chunks.
-        let n = unsafe { &*target };
-        if n.born.load(Ordering::Relaxed) != born {
+        let n = NodePtr::new(preds[0].link(0).load(Ordering::Acquire))?;
+        let node = n.hdr();
+        if node.born.load(Ordering::Relaxed) != born {
             return None;
         }
         let v = OlcVersion {
             born,
-            died: n.died.load(Ordering::Relaxed),
-            slot: n.slot.load(Ordering::Relaxed),
+            died: node.died.load(Ordering::Relaxed),
+            slot: node.slot.load(Ordering::Relaxed),
         };
-        let h = n.height.load(Ordering::Relaxed) as usize;
+        let h = node.height.load(Ordering::Relaxed) as usize;
         // Top down, so a reader never reaches the node through a level it is already gone from
         // below; each predecessor's version moves, so a reader that followed it there restarts.
         for l in (0..h).rev() {
             let pred = preds[l];
-            debug_assert!(ptr::eq(pred.next[l].load(Ordering::Relaxed), target));
-            pred.begin_write();
-            pred.next[l].store(n.next[l].load(Ordering::Relaxed), Ordering::Relaxed);
-            pred.end_write();
+            debug_assert!(ptr::eq(pred.link(l).load(Ordering::Relaxed), n.raw()));
+            pred.hdr().begin_write();
+            pred.link(l)
+                .store(n.link(l).load(Ordering::Relaxed), Ordering::Relaxed);
+            pred.hdr().end_write();
         }
         // Free: odd, and so refused by any reader that still holds it.
-        n.begin_write();
-        self.writer.lock().free.push(NodePtr(NonNull::from(n)));
+        node.begin_write();
+        self.writer.lock().free(n, h);
         self.in_use.fetch_sub(1, Ordering::Relaxed);
         Some(v)
     }
@@ -294,64 +444,90 @@ impl OlcLists {
     /// The newest version of `page`. The caller holds the trunk's lock.
     pub(crate) fn last(&self, page: u32) -> Option<OlcVersion> {
         let list = self.list(page)?;
-        let preds = Self::preds(list, u64::MAX);
-        let x = preds[0];
-        if ptr::eq(x, &list.head) {
+        let x = Self::preds(list, u64::MAX)[0];
+        if x == list.head {
             return None;
         }
+        let node = x.hdr();
         Some(OlcVersion {
-            born: x.born.load(Ordering::Relaxed),
-            died: x.died.load(Ordering::Relaxed),
-            slot: x.slot.load(Ordering::Relaxed),
+            born: node.born.load(Ordering::Relaxed),
+            died: node.died.load(Ordering::Relaxed),
+            slot: node.slot.load(Ordering::Relaxed),
         })
     }
 
     /// The version of `page` a child forked at `f` sees — the born-predecessor of `f`, if it was
-    /// still current at `f` — without a lock and without writing anything shared (except a
-    /// restart's count).
-    pub(crate) fn covering(&self, page: u32, f: u64) -> Option<OlcVersion> {
-        self.covering_with(page, f, |_| {})
+    /// still current at `f` — without a lock and without writing anything shared (except a failed
+    /// attempt's count), or [`OlcLookup::GaveUp`] after [`MAX_FAILED_LAPS`] failed attempts.
+    pub(crate) fn covering(&self, page: u32, f: u64) -> OlcLookup {
+        self.covering_with(page, f, Some(MAX_FAILED_LAPS), |_| {}, |_| {})
     }
 
-    /// `covering`, calling `between` with each pointer it reads, before the read is validated: the
-    /// tests' way to change the list at exactly the moment a reader must notice.
+    /// `covering` for a caller that holds the trunk's lock: no writer can run, so the first
+    /// attempt succeeds and there is no bound to give up at.
+    pub(crate) fn covering_locked(&self, page: u32, f: u64) -> Option<OlcVersion> {
+        match self.covering_with(page, f, None, |_| {}, |_| {}) {
+            OlcLookup::Found(v) => Some(v),
+            OlcLookup::Absent => None,
+            OlcLookup::GaveUp => unreachable!("an unbounded search does not give up"),
+        }
+    }
+
+    /// `covering`, calling `before_check` with each pointer it reads before the node it was read from
+    /// is re-validated, and `before_deref` with each non-null pointer after that check and before the
+    /// node it points to is read: the tests' way to change the list at exactly the moment a reader
+    /// must notice. `max_failed` bounds the failed attempts (`None`: unbounded).
     fn covering_with(
         &self,
         page: u32,
         f: u64,
-        mut between: impl FnMut(*const Node),
-    ) -> Option<OlcVersion> {
-        let list = self.list(page)?;
+        max_failed: Option<u32>,
+        mut before_check: impl FnMut(*const Node),
+        mut before_deref: impl FnMut(*const Node),
+    ) -> OlcLookup {
+        let Some(list) = self.list(page) else {
+            return OlcLookup::Absent;
+        };
+        let mut failed = 0u32;
         'restart: loop {
-            let mut x = &list.head;
-            let mut xv = x.version.load(Ordering::Acquire);
+            if max_failed.is_some_and(|k| failed >= k) {
+                self.fallbacks.fetch_add(1, Ordering::Relaxed);
+                return OlcLookup::GaveUp;
+            }
+            let mut x = list.head;
+            let mut xv = x.hdr().version.load(Ordering::Acquire);
             if xv % 2 == 1 {
                 // The writer is changing the head's links right now.
+                self.head_spins.fetch_add(1, Ordering::Relaxed);
+                failed += 1;
                 std::hint::spin_loop();
                 continue 'restart;
             }
             let mut level = MAX_H;
             while level > 0 {
                 let l = level - 1;
-                let next = x.next[l].load(Ordering::Relaxed);
-                between(next);
-                if !x.unchanged(xv) {
+                let next = x.link(l).load(Ordering::Relaxed);
+                before_check(next.cast_const());
+                if !x.hdr().unchanged(xv) {
                     self.restarts.fetch_add(1, Ordering::Relaxed);
+                    failed += 1;
                     continue 'restart;
                 }
-                if next.is_null() {
+                let Some(n) = NodePtr::new(next) else {
                     level -= 1;
                     continue;
-                }
-                // SAFETY: nodes are never freed while the lists live (type-stable pool), so `next`
-                // points at a node, possibly a newer incarnation; the versions decide.
-                let n = unsafe { &*next };
-                let nv = n.version.load(Ordering::Acquire);
-                let born = n.born.load(Ordering::Relaxed);
-                // `n` belongs to this read only if it was `x`'s successor (x unchanged) and was not
-                // changed while its `born` was read (n unchanged and even).
-                if nv % 2 == 1 || !n.unchanged(nv) || !x.unchanged(xv) {
+                };
+                before_deref(next.cast_const());
+                // `n` points at a node, possibly a newer incarnation in another list (type-stable
+                // pools); the versions decide. It has more than `l` links: it was linked at level
+                // `l`, and a node never changes height.
+                let nv = n.hdr().version.load(Ordering::Acquire);
+                let born = n.hdr().born.load(Ordering::Relaxed);
+                // `n` belongs to this read only if it was not changed while its `born` was read (n
+                // unchanged and even) and was still `x`'s successor after that (x unchanged).
+                if nv % 2 == 1 || !n.hdr().unchanged(nv) || !x.hdr().unchanged(xv) {
                     self.restarts.fetch_add(1, Ordering::Relaxed);
+                    failed += 1;
                     continue 'restart;
                 }
                 if born <= f {
@@ -361,19 +537,25 @@ impl OlcLists {
                     level -= 1;
                 }
             }
-            if ptr::eq(x, &list.head) {
-                return None;
+            if x == list.head {
+                return OlcLookup::Absent;
             }
+            let node = x.hdr();
             let v = OlcVersion {
-                born: x.born.load(Ordering::Relaxed),
-                died: x.died.load(Ordering::Relaxed),
-                slot: x.slot.load(Ordering::Relaxed),
+                born: node.born.load(Ordering::Relaxed),
+                died: node.died.load(Ordering::Relaxed),
+                slot: node.slot.load(Ordering::Relaxed),
             };
-            if !x.unchanged(xv) {
+            if !node.unchanged(xv) {
                 self.restarts.fetch_add(1, Ordering::Relaxed);
+                failed += 1;
                 continue 'restart;
             }
-            return (f < v.died).then_some(v);
+            return if f < v.died {
+                OlcLookup::Found(v)
+            } else {
+                OlcLookup::Absent
+            };
         }
     }
 }
@@ -390,9 +572,22 @@ mod tests {
         }
     }
 
+    fn found(l: OlcLookup) -> Option<OlcVersion> {
+        match l {
+            OlcLookup::Found(v) => Some(v),
+            OlcLookup::Absent => None,
+            OlcLookup::GaveUp => panic!("a search with no writer running gave up"),
+        }
+    }
+
+    /// The `born` a raw pointer's node holds now, for the hooks.
+    fn born_of(p: *const Node) -> Option<u64> {
+        NodePtr::new(p.cast_mut()).map(|n| n.hdr().born.load(Ordering::Relaxed))
+    }
+
     /// Inserts, removals and the predecessor query against a BTreeMap model, including node reuse
-    /// across pages: every removed node goes back to the pool and the next insert, in any page,
-    /// takes it.
+    /// across pages: every removed node goes back to its height's pool and the next insert of that
+    /// height, in any page, takes it. The pools never exceed whole chunks for each height's peak.
     #[test]
     fn lists_match_a_model_with_immediate_reuse() {
         let lists = OlcLists::new();
@@ -417,18 +612,26 @@ mod tests {
                 assert_eq!(lists.last(p as u32), m.values().next_back().copied(), "step {step}");
                 for f in [0, 1, next_born[p] / 2, next_born[p].saturating_sub(1), next_born[p]] {
                     let want = m.range(..=f).next_back().map(|(_, v)| *v).filter(|v| f < v.died);
-                    assert_eq!(lists.covering(p as u32, f), want, "step {step} page {p} f {f}");
+                    assert_eq!(found(lists.covering(p as u32, f)), want, "step {step} page {p} f {f}");
+                    assert_eq!(lists.covering_locked(p as u32, f), want, "step {step} page {p} f {f}");
                 }
             }
         }
         let live: u64 = model.iter().map(|m| m.len() as u64).sum();
         assert_eq!(lists.nodes_in_use(), live);
-        assert_eq!(lists.restarts(), 0, "no writer ran during a read");
+        assert!(lists.peak_in_use() >= live);
+        assert!(lists.pool_bytes() <= lists.pool_bound_bytes(), "a pool grew while it had free nodes");
+        assert_eq!(
+            (lists.restarts(), lists.head_spins(), lists.fallbacks()),
+            (0, 0, 0),
+            "no writer ran during a read"
+        );
     }
 
-    /// The validation, forced to fire: between reading a pointer and validating it, the reader's
-    /// path is changed — the node it is about to step to is removed and its node reused in another
-    /// page's list. The reader must restart (counted) and still answer from the list as it now is.
+    /// The first hook, before the source node's re-check: while the reader holds a pointer to the
+    /// version it wants (born 50), that version is removed and its node reused in page 1 (born 52,
+    /// below f). The removal changes the reader's source node, so the reader restarts at its first
+    /// check and answers from the list as it now is.
     #[test]
     fn a_reader_restarts_when_its_next_node_is_freed_and_reused_under_it() {
         let lists = OlcLists::new();
@@ -436,29 +639,60 @@ mod tests {
             lists.insert(0, v(born * 10, born * 10 + 10));
         }
         let mut fired = false;
-        let got = lists.covering_with(0, 55, |next| {
-            // SAFETY: nodes live as long as `lists`.
-            let born = (!next.is_null()).then(|| unsafe { (*next).born.load(Ordering::Relaxed) });
-            if !fired && born == Some(50) {
-                fired = true;
-                // The reader has just read a pointer to the version it wants (born 50): remove it
-                // and reuse its node in page 1's list, born 52 <= 55, before the reader validates.
-                // A reader that stepped onto it anyway would search page 1 and answer (52, 1000).
-                assert!(lists.remove(0, 50).is_some());
-                lists.insert(1, v(52, 1_000));
-            }
-        });
+        let got = lists.covering_with(
+            0,
+            55,
+            None,
+            |next| {
+                if !fired && born_of(next) == Some(50) {
+                    fired = true;
+                    assert!(lists.remove(0, 50).is_some());
+                    lists.insert(1, v(52, 1_000));
+                }
+            },
+            |_| {},
+        );
         assert!(fired);
         assert!(lists.restarts() >= 1, "the reader did not notice its path change");
-        assert_eq!(got, None, "born 50 is gone and born 40 died at 50 <= 55");
-        assert_eq!(lists.covering(0, 45), Some(v(40, 50)));
-        assert_eq!(lists.covering(1, 53), Some(v(52, 1_000)));
+        assert_eq!(found(got), None, "born 50 is gone and born 40 died at 50 <= 55");
+        assert_eq!(found(lists.covering(0, 45)), Some(v(40, 50)));
+        assert_eq!(found(lists.covering(1, 53)), Some(v(52, 1_000)));
+    }
+
+    /// The twin at the second hook, after the source node's first re-check and before the pointed-to
+    /// node is read: the same removal and reuse there leave only the re-check of the source node
+    /// AFTER the pointed-to node's `born` is read to notice. A reader without that re-check steps
+    /// onto the reused node, now in page 1, and answers (52, 1000) — mutant M4 must fail here.
+    #[test]
+    fn a_reader_rechecks_its_source_after_reading_a_node_reused_under_it() {
+        let lists = OlcLists::new();
+        for born in 1..=8 {
+            lists.insert(0, v(born * 10, born * 10 + 10));
+        }
+        let mut fired = false;
+        let got = lists.covering_with(
+            0,
+            55,
+            None,
+            |_| {},
+            |next| {
+                if !fired && born_of(next) == Some(50) {
+                    fired = true;
+                    assert!(lists.remove(0, 50).is_some());
+                    lists.insert(1, v(52, 1_000));
+                }
+            },
+        );
+        assert!(fired);
+        assert!(lists.restarts() >= 1, "the reader did not notice its path change");
+        assert_eq!(found(got), None, "a reader that stepped onto the reused node answers (52, 1000)");
+        assert_eq!(found(lists.covering(1, 53)), Some(v(52, 1_000)));
     }
 
     /// A reader stalled inside a search holds nothing: while it is parked between reading a pointer
-    /// and validating it, 3,000 versions are retained and removed in another page, and the pool
-    /// stays at its one chunk of 1,024 nodes (a scheme that deferred those frees past the stalled
-    /// reader would need three); the reader then answers from its own page as it is.
+    /// and validating it, 3,000 versions are retained and removed in another page, and the pools stay
+    /// as they were (a scheme that deferred those frees past the stalled reader would need 3,000
+    /// nodes more); the reader then answers from its own page as it is.
     #[test]
     fn a_stalled_reader_holds_nothing() {
         let lists = OlcLists::new();
@@ -467,18 +701,45 @@ mod tests {
         }
         let pool = lists.pool_bytes();
         let mut fired = false;
-        let got = lists.covering_with(0, 55, |_| {
-            if !fired {
-                fired = true;
-                for i in 0..3_000u64 {
-                    lists.insert(1, v(100 + 2 * i, 101 + 2 * i));
-                    assert_eq!(lists.remove(1, 100 + 2 * i), Some(v(100 + 2 * i, 101 + 2 * i)));
+        let got = lists.covering_with(
+            0,
+            55,
+            None,
+            |_| {
+                if !fired {
+                    fired = true;
+                    for i in 0..3_000u64 {
+                        lists.insert(1, v(100 + 2 * i, 101 + 2 * i));
+                        assert_eq!(lists.remove(1, 100 + 2 * i), Some(v(100 + 2 * i, 101 + 2 * i)));
+                    }
                 }
-            }
-        });
+            },
+            |_| {},
+        );
         assert!(fired);
-        assert_eq!(lists.pool_bytes(), pool, "the pool grew while a reader was stalled");
-        assert_eq!(got, Some(v(50, 60)));
+        assert!(
+            lists.pool_bytes() <= pool + (CHUNK * node_size(MAX_H) * MAX_H) as u64,
+            "the pools grew by more than one chunk per height while a reader was stalled"
+        );
+        assert!(lists.pool_bytes() <= lists.pool_bound_bytes());
+        assert_eq!(found(got), Some(v(50, 60)));
         assert_eq!(lists.nodes_in_use(), 8);
+    }
+
+    /// A reader that keeps failing gives up after MAX_FAILED_LAPS attempts instead of spinning on a
+    /// writer stopped mid-change: here the head is held odd, as a writer stopped between
+    /// `begin_write` and `end_write` on it would leave it. The bounded search gives up and counts a
+    /// fallback and 64 head spins; once the head is even again the search answers.
+    #[test]
+    fn a_reader_gives_up_on_a_writer_stopped_mid_change() {
+        let lists = OlcLists::new();
+        lists.insert(0, v(10, 20));
+        let head = lists.list(0).expect("page 0 has a list").head;
+        head.hdr().begin_write();
+        assert_eq!(lists.covering(0, 15), OlcLookup::GaveUp);
+        assert_eq!(lists.fallbacks(), 1);
+        assert_eq!(lists.head_spins(), u64::from(MAX_FAILED_LAPS));
+        head.hdr().end_write();
+        assert_eq!(found(lists.covering(0, 15)), Some(v(10, 20)));
     }
 }
