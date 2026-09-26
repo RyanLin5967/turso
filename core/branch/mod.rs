@@ -54,6 +54,23 @@
 
 pub(crate) mod arena;
 pub(crate) mod olc;
+
+/// FIRE-CHECK SCHEMA (throwaway branch r11-k3-trunklock-firecheck; never merged): mutant `n` is live
+/// when the test process runs with `K3_MUTANT=n`.
+#[cfg(test)]
+pub(crate) fn k3_mutant(n: u32) -> bool {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("K3_MUTANT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }) == n
+}
+#[cfg(not(test))]
+pub(crate) const fn k3_mutant(_: u32) -> bool {
+    false
+}
 pub(crate) mod page_map;
 pub(crate) mod radix;
 pub(crate) mod store;

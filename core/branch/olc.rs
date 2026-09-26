@@ -208,7 +208,10 @@ impl Writer {
     fn free(&mut self, n: NodePtr, h: usize) {
         let class = &mut self.classes[h - 1];
         class.in_use -= 1;
-        class.free.push(n);
+        if !super::k3_mutant(6) {
+            // M6 drops the node from the free list: no reuse.
+            class.free.push(n);
+        }
     }
 
     fn height(&mut self) -> usize {
@@ -515,7 +518,10 @@ impl OlcLists {
         }
         // Free: odd, and so refused by any reader that still holds it.
         node.begin_write();
-        self.writer.lock().free(n, h);
+        if !super::k3_mutant(5) {
+            // M5 deletes this free.
+            self.writer.lock().free(n, h);
+        }
         self.in_use.fetch_sub(1, Ordering::Relaxed);
         Some(v)
     }
@@ -610,7 +616,11 @@ impl OlcLists {
                 let born = n.hdr().born.load(Ordering::Relaxed);
                 // `n` belongs to this read only if it was not changed while its `born` was read (n
                 // unchanged and even) and was still `x`'s successor after that (x unchanged).
-                if nv % 2 == 1 || !n.hdr().unchanged(nv) || !x.hdr().unchanged(xv) {
+                // M4: drop the source node's re-check after reading `n`.
+                if nv % 2 == 1
+                    || !n.hdr().unchanged(nv)
+                    || (!super::k3_mutant(4) && !x.hdr().unchanged(xv))
+                {
                     self.restarts.fetch_add(1, Ordering::Relaxed);
                     failed += 1;
                     continue 'restart;
