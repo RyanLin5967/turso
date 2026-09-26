@@ -2144,6 +2144,8 @@ impl BranchStore {
             shape.trunk_cache_versions = c.trunk_cache.values().map(|v| v.len() as u64).sum();
             shape.trunk_cache_pages = c.trunk_cache.len() as u64;
             shape.trunk_known_pages = c.trunk_known.len() as u64;
+            shape.trunk_probes = c.trunk_probes;
+            shape.trunk_rows = c.trunk_rows;
         }
         shape
     }

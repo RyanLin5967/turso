@@ -376,6 +376,10 @@ pub struct BranchCatShape {
     pub trunk_known_pages: u64,
     /// The log's whole-record length.
     pub log_len: u64,
+    /// C-P's trunk-version probes and range reads since open, and the version rows they returned
+    /// (cumulative; the open's own share is also in `BranchOpenStats`).
+    pub trunk_probes: u64,
+    pub trunk_rows: u64,
 }
 
 /// A snapshot of the branch arena's accounting.
