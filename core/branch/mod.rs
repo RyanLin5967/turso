@@ -270,6 +270,30 @@ pub struct BranchStats {
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
+    /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
+    pub work: BranchWork,
+}
+
+/// Cumulative counts of the store's per-call work since the database opened. Observation only:
+/// nothing in the mechanism reads them. Each is updated once per call under the lock the call
+/// already holds, from a loop index the call computes anyway, so counting adds no per-element step.
+/// (Ported from the volatile store's counters, turso `c41a1909b`, so durable and volatile runs of
+/// the same workload can be compared integer for integer. Recovery's replay counts too.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchWork {
+    /// Page resolutions against the branch tree (one per branch-pager page read).
+    pub resolve_calls: u64,
+    /// Nodes visited by those resolutions: the branch, each ancestor, and the trunk when reached.
+    pub resolve_levels: u64,
+    /// Retained versions compared against the fork epoch while resolving (`Lineage::retained_at`):
+    /// at most one per lineage consulted, the page's born-predecessor. The O(log V) descent that
+    /// finds it is not counted; time is the only instrument for it.
+    pub resolve_retained_examined: u64,
+    /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
+    /// index this counted a position scan's comparisons.)
+    pub gc_examined: u64,
+    /// Index entries (`by_born` and `by_died`) visited by `child_gone`'s garbage query.
+    pub gc_range_entries: u64,
 }
 
 impl Branch {

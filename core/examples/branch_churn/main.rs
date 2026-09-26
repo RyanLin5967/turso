@@ -72,6 +72,9 @@ struct Args {
     expire_every: Duration,
     batch_max: usize,
     reap_every: Duration,
+    /// Amendment 5: one trunk UPDATE per arrival, of the next row of the `spread` walk.
+    trunk_writes: bool,
+    synchronous: &'static str,
     verify_every: usize,
     seed: u64,
 }
@@ -101,6 +104,8 @@ fn parse_args() -> Args {
         expire_every: Duration::from_millis(100),
         batch_max: 4096,
         reap_every: Duration::from_millis(100),
+        trunk_writes: false,
+        synchronous: "OFF",
         verify_every: 100,
         seed: 0x9E37_79B9_7F4A_7C15,
     };
@@ -137,6 +142,21 @@ fn parse_args() -> Args {
             "--expire-every-ms" => args.expire_every = ms(val(), "--expire-every-ms"),
             "--batch-max" => args.batch_max = val().parse().unwrap_or_else(|_| die("bad --batch-max")),
             "--reap-every-ms" => args.reap_every = ms(val(), "--reap-every-ms"),
+            "--trunk-writes" => {
+                args.trunk_writes = match val().as_str() {
+                    "spread" => true,
+                    "none" => false,
+                    other => die(&format!("unknown --trunk-writes {other}")),
+                }
+            }
+            "--synchronous" => {
+                args.synchronous = match val().as_str() {
+                    "off" => "OFF",
+                    "normal" => "NORMAL",
+                    "full" => "FULL",
+                    other => die(&format!("unknown --synchronous {other}")),
+                }
+            }
             "--verify-every" => {
                 args.verify_every = val().parse().unwrap_or_else(|_| die("bad --verify-every"))
             }
@@ -158,6 +178,9 @@ fn parse_args() -> Args {
     }
     if args.pause_at.is_some_and(|at| at < args.lease || at + args.pause >= args.duration) {
         die("the pause must start after the first lease period and end before --duration-ms");
+    }
+    if args.trunk_writes && args.chain != 1 {
+        die("--trunk-writes needs --chain 1 (the read model tracks the trunk as of each fork)");
     }
     if args.mode == Mode::Lease && args.pause_at.is_some() {
         die("--pause-at-ms is for --mode serial (in lease mode every fork reaps what is due)");
@@ -192,6 +215,47 @@ fn rows_of(n: u64, w: usize) -> Vec<i64> {
     (0..w as i64)
         .map(|j| (first + j * PAGE_STRIDE) % TRUNK_ROWS + 1)
         .collect()
+}
+
+/// Amendment 5: the trunk's `g`-th write, same length as the original, so it rewrites in place.
+fn trunk_gen_value(g: u64) -> String {
+    format!("t{:0>width$}", g, width = VALUE_LEN - 1)
+}
+
+/// The `spread` walk (branch_arms): the row of the trunk's `g`-th write. 37 is coprime with the
+/// row count, so the walk visits every row, one leaf further each time.
+fn spread_row(g: u64) -> i64 {
+    ((g * 37) % TRUNK_ROWS as u64) as i64 + 1
+}
+
+/// The trunk's write history, kept by the harness (never read from the engine): what a branch
+/// forked after `at` trunk writes must read for each row the trunk rewrote.
+#[derive(Default)]
+struct TrunkModel {
+    writes: u64,
+    history: std::collections::HashMap<i64, Vec<u64>>,
+}
+
+impl TrunkModel {
+    fn record(&mut self, row: i64) -> u64 {
+        let g = self.writes;
+        self.writes += 1;
+        self.history.entry(row).or_default().push(g);
+        g
+    }
+    fn value_at(&self, row: i64, at: u64) -> String {
+        match self.history.get(&row) {
+            None => trunk_value(row),
+            Some(h) => {
+                let k = h.partition_point(|&g| g < at);
+                if k == 0 {
+                    trunk_value(row)
+                } else {
+                    trunk_gen_value(h[k - 1])
+                }
+            }
+        }
+    }
 }
 
 fn read_v(conn: &Arc<Connection>, id: i64) -> String {
@@ -242,6 +306,8 @@ fn clock_tick_ns() -> f64 {
 struct Entry {
     /// Arrival index.
     n: u64,
+    /// Trunk writes committed when this branch was forked (amendment 5's read model).
+    trunk_at: u64,
     deadline: Instant,
     branch: Option<Branch>,
     id: BranchId,
@@ -275,6 +341,9 @@ struct Shared {
     bg_reaped: AtomicU64,
     /// The chain link the forker keeps attached (lease mode) and must not be attached by a read.
     newest: AtomicU64,
+    /// Amendment 5: the largest backlog any reaper pop found in the current window. The backlog
+    /// only falls at a pop, so its peak between two pops is what the later pop finds.
+    pop_max: AtomicU64,
 }
 
 struct Files {
@@ -314,8 +383,11 @@ fn main() {
     )
     .unwrap();
     let trunk = db.connect().unwrap();
-    // The trunk is written only at setup; its sync mode is not on any measured path.
-    trunk.execute("PRAGMA synchronous = OFF").unwrap();
+    // Without --trunk-writes the trunk is written only at setup. With them, amendment 5 runs it
+    // under NORMAL: OFF re-checkpoints the whole WAL at every commit on this fork (round 10's B1).
+    trunk
+        .execute(format!("PRAGMA synchronous = {}", args.synchronous))
+        .unwrap();
     trunk
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -336,7 +408,8 @@ fn main() {
     println!(
         "# mode={:?} durability={:?} lambda={} lease_ms={} duration_ms={} w={} chain={} \
          pause_at_ms={} pause_ms={} sample_ms={} expire_every_ms={} batch_max={} reap_every_ms={} \
-         verify_every={} seed={:#x} trunk_rows={TRUNK_ROWS} page_size={page_size} little_L={:.0}",
+         trunk_writes={} synchronous={} verify_every={} seed={:#x} trunk_rows={TRUNK_ROWS} \
+         page_size={page_size} little_L={:.0}",
         args.mode,
         args.durability,
         args.lambda,
@@ -350,6 +423,8 @@ fn main() {
         args.expire_every.as_millis(),
         args.batch_max,
         args.reap_every.as_millis(),
+        args.trunk_writes,
+        args.synchronous,
         args.verify_every,
         args.seed,
         args.lambda * lease_s,
@@ -371,7 +446,8 @@ fn main() {
          cascades_in_window | fsyncs_total reaper_thread_fsyncs expire_passes_with_due \
          expire_reaped expire_freed_pages expire_fsyncs bg_passes bg_reaped store_leases \
          store_leases_due compactions compact_ms_total compact_ms_max compact_fsyncs \
-         snapshot_bytes_last log_bytes arena_file_bytes snap_file_bytes"
+         snapshot_bytes_last log_bytes arena_file_bytes snap_file_bytes | pop_max_backlog \
+         gc_range_in_window gc_examined_in_window"
     );
 
     let shared = Arc::new(Shared {
@@ -390,6 +466,7 @@ fn main() {
         bg_passes: AtomicU64::new(0),
         bg_reaped: AtomicU64::new(0),
         newest: AtomicU64::new(u64::MAX),
+        pop_max: AtomicU64::new(0),
     });
     let t0 = Instant::now();
     // What one pop takes when the reaper keeps up: lambda x (2 ms) for the serial reaper, and
@@ -434,7 +511,9 @@ fn main() {
 
     let stats = db.branch_stats().unwrap();
     let engine = stats.live_branches as u64;
-    if stats.arena_slots_in_use as u64 != args.w as u64 * engine {
+    // With trunk writes the arena also holds the trunk's retained pre-images; teardown still
+    // requires it empty once every branch is released.
+    if !args.trunk_writes && stats.arena_slots_in_use as u64 != args.w as u64 * engine {
         not_a_result(&format!(
             "arena holds {} pages for {engine} branches of w={} pages each",
             stats.arena_slots_in_use, args.w
@@ -484,7 +563,13 @@ fn main() {
     // defer until its tip goes). Lease: run the lease clock past every deadline and let one pass
     // reap everything.
     let rest: Vec<Entry> = shared.queue.lock().unwrap().drain(..).collect();
-    drop(rest);
+    if args.mode == Mode::Batch {
+        // One flush for the whole remainder (a 10^6 teardown one release at a time is 10^6 fsyncs).
+        let handles: Vec<Branch> = rest.into_iter().filter_map(|e| e.branch).collect();
+        db.reap_branches(handles).unwrap();
+    } else {
+        drop(rest);
+    }
     if args.mode == Mode::Lease {
         db.branch_lease_clock_advance(args.lease * 4);
         db.expire_branches().unwrap();
@@ -511,6 +596,7 @@ fn forker_loop(
     let interval = 1.0 / args.lambda;
     // Lease mode: the newest link, kept attached so the chain's next arrival can fork from it.
     let mut parent: Option<(u64, Branch)> = None;
+    let mut model = TrunkModel::default();
     let mut n: u64 = 0;
     loop {
         let due = t0 + Duration::from_secs_f64(n as f64 * interval);
@@ -525,6 +611,7 @@ fn forker_loop(
             shared.lag_max_ns.fetch_max(lag, Ordering::Relaxed);
         }
         let start = Instant::now();
+        let trunk_at = model.writes;
         let branch = if n % chain == 0 {
             trunk.fork_branch().unwrap()
         } else {
@@ -565,10 +652,20 @@ fn forker_loop(
             conn.execute("COMMIT").unwrap();
         }
         drop(conn);
+        if args.trunk_writes {
+            // One trunk write per arrival, after the fork: the branch just forked can see the page
+            // it rewrites, so the trunk keeps a pre-image for it (a TrunkRetain record).
+            let row = spread_row(model.writes);
+            let g = model.record(row);
+            trunk
+                .execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_gen_value(g)))
+                .unwrap();
+        }
         let id = branch.id();
         let entry = match args.mode {
             Mode::Serial | Mode::Batch => Entry {
                 n,
+                trunk_at,
                 deadline,
                 branch: Some(branch),
                 id,
@@ -587,6 +684,7 @@ fn forker_loop(
                 }
                 Entry {
                     n,
+                    trunk_at,
                     deadline,
                     branch: None,
                     id,
@@ -599,7 +697,7 @@ fn forker_loop(
         shared.arrivals.fetch_add(1, Ordering::Release);
         n += 1;
         if n % args.verify_every as u64 == 0 {
-            verify_one(shared, db, &mut rng, args);
+            verify_one(shared, db, &mut rng, args, &model);
         }
     }
     if let Some((_, p)) = parent.take() {
@@ -610,7 +708,13 @@ fn forker_loop(
 /// Read a random leased branch's own row, its chain root's first row, and a random row, against
 /// the model: a branch sees branch_value for every row its chain prefix (root .. itself) wrote, and
 /// trunk_value for every other row (the trunk is never written after setup).
-fn verify_one(shared: &Shared, db: &Arc<Database>, rng: &mut Rng, args: &Args) {
+fn verify_one(
+    shared: &Shared,
+    db: &Arc<Database>,
+    rng: &mut Rng,
+    args: &Args,
+    model: &TrunkModel,
+) {
     let q = shared.queue.lock().unwrap();
     if q.is_empty() {
         return;
@@ -622,12 +726,20 @@ fn verify_one(shared: &Shared, db: &Arc<Database>, rng: &mut Rng, args: &Args) {
     let own = rows_of(e.n, args.w)[0];
     let root_row = rows_of(root, args.w)[0];
     let other = rng.below(TRUNK_ROWS as usize) as i64 + 1;
+    // With trunk writes: the row of the trunk's first write after this fork, which the branch must
+    // read as its pre-image (a retained version) — or the trunk's value if no write came after.
+    let rewritten = if model.writes > e.trunk_at {
+        spread_row(e.trunk_at)
+    } else {
+        other
+    };
     let check = |conn: &Arc<Connection>| {
-        for row in [own, root_row, other] {
+        for row in [own, root_row, other, rewritten] {
             let want = if written(row) {
                 branch_value(row)
             } else {
-                trunk_value(row)
+                // The trunk as of this branch's fork (chain 1 only when the trunk is written).
+                model.value_at(row, e.trunk_at)
             };
             if read_v(conn, row) != want {
                 not_a_result(&format!("arrival {} read the wrong version of row {row}", e.n));
@@ -686,6 +798,7 @@ fn reaper_loop(
             let mut q = shared.queue.lock().unwrap();
             let due = q.partition_point(|e| e.deadline <= now);
             shared.in_hand.store(due as u64, Ordering::Release);
+            shared.pop_max.fetch_max(due as u64, Ordering::AcqRel);
             q.drain(..due).collect()
         };
         if let Some((from, reaped0)) = resumed {
@@ -796,6 +909,9 @@ struct Win {
     c: ChurnCounters,
     reaper_fsyncs: u64,
     compactions: u64,
+    pop_max: u64,
+    gc_range: u64,
+    gc_examined: u64,
 }
 
 fn sampler_loop(
@@ -807,6 +923,8 @@ fn sampler_loop(
 ) -> Vec<Win> {
     let mut out = Vec::new();
     let mut next = t0 + sample;
+    let mut work0 = db.branch_stats().unwrap().work;
+    let mut compactions0 = churn_counters().compactions;
     loop {
         let now = Instant::now();
         if now < next {
@@ -845,10 +963,28 @@ fn sampler_loop(
         let t = now - t0;
         let deferred = shared.deferred_now.load(Ordering::Acquire);
         let reaper_fsyncs = shared.reaper_fsyncs.load(Ordering::Acquire);
+        // Amendment 5: the backlog peak at call granularity, and the reap path's work counters.
+        let pop_max = shared.pop_max.swap(0, Ordering::AcqRel);
+        let work = stats.work;
+        let gc_range = work.gc_range_entries - work0.gc_range_entries;
+        let gc_examined = work.gc_examined - work0.gc_examined;
+        work0 = work;
+        if c.compactions > compactions0 {
+            println!(
+                "# compaction t_ms={} count={} compact_ms_max_so_far={:.1} snapshot_bytes={} \
+                 pop_max_in_window={pop_max} backlog_at_sample={backlog}",
+                t.as_millis(),
+                c.compactions - compactions0,
+                c.compact_ns_max as f64 / 1e6,
+                c.compact_bytes_last
+            );
+            compactions0 = c.compactions;
+        }
         println!(
             "# s {} {arrivals} {expired} {reaped} {backlog} {leased} {} {deferred} {} {} {lag:.3} \
              {:.2} {:.2} {} {:.2} {:.2} {:.2} {} {} {} | {} {reaper_fsyncs} {} {} {} {} {} {} \
-             {store_leases} {store_due} {} {:.1} {:.1} {} {} {} {} {}",
+             {store_leases} {store_due} {} {:.1} {:.1} {} {} {} {} {} | {pop_max} {gc_range} \
+             {gc_examined}",
             t.as_millis(),
             stats.live_branches,
             stats.arena_slots_in_use,
@@ -891,6 +1027,9 @@ fn sampler_loop(
             c,
             reaper_fsyncs,
             compactions: c.compactions,
+            pop_max,
+            gc_range,
+            gc_examined,
         });
         if done {
             return out;
@@ -952,6 +1091,29 @@ fn summarize(args: &Args, wins: &[Win], shared: &Shared) {
                 / (last.c.expire_passes_with_due - first.c.expire_passes_with_due).max(1) as f64,
             last.c.expire_piggybacked - first.c.expire_piggybacked,
             last.compactions - first.compactions,
+        );
+        // Amendment 5: the call-granularity backlog peak over the steady windows (and where), and
+        // the reap path's work per reaped branch.
+        let peak = steady.iter().max_by_key(|w| w.pop_max).unwrap();
+        let reaped_n = (last.reaped - first.reaped).max(1) as f64;
+        let gc_range: u64 = steady.iter().skip(1).map(|w| w.gc_range).sum();
+        let gc_examined: u64 = steady.iter().skip(1).map(|w| w.gc_examined).sum();
+        println!(
+            "# summary pop steady: pop_max={} at_t_ms={} gc_range_per_reaped={:.3} \
+             gc_examined_per_reaped={:.3}",
+            peak.pop_max,
+            peak.t.as_millis(),
+            gc_range as f64 / reaped_n,
+            gc_examined as f64 / reaped_n,
+        );
+    }
+    // Over the whole run, including the ramp, the pause and the drain.
+    let all = wins.iter().max_by_key(|w| w.pop_max);
+    if let Some(w) = all {
+        println!(
+            "# summary pop whole run: pop_max={} at_t_ms={}",
+            w.pop_max,
+            w.t.as_millis()
         );
     }
     match (pause, drain) {
