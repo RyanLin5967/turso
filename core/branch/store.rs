@@ -724,10 +724,13 @@ impl EbrVersions {
     /// The version of `page` a child forked at `f` sees: the born-predecessor of `f`, if it was
     /// still current at `f`. Lock-free; `guard` keeps the nodes the search passes alive.
     fn covering(&self, page: u32, f: u64, guard: &Guard) -> Option<Retained> {
-        let v = *self
-            .list(page)?
-            .upper_bound(Bound::Included(&f), guard)?
-            .value();
+        // M2: Excluded(f) in place of Included(f).
+        let bound = if super::k3_mutant(2) {
+            Bound::Excluded(&f)
+        } else {
+            Bound::Included(&f)
+        };
+        let v = *self.list(page)?.upper_bound(bound, guard)?.value();
         (f < v.died).then_some(v)
     }
 }
@@ -1283,6 +1286,13 @@ impl BranchStore {
             return;
         }
         if lineage.has_child_in(born, epoch) {
+            if super::k3_mutant(3) {
+                // M3: publish `written` before the version is in the list, with a planted spin.
+                self.written.get_or_insert(page).store(epoch, Ordering::Release);
+                for _ in 0..20_000 {
+                    std::hint::spin_loop();
+                }
+            }
             let slot = domain.alloc(self.page_size());
             domain.page_mut(slot).copy_from_slice(pre_image);
             if self.k3.is_some() {
@@ -1405,6 +1415,14 @@ impl BranchStore {
         let lockfree = self.k3.as_ref().map(|shared| shared.covering(page, at));
         if let Some(Ok(found)) = lockfree {
             if let Some(v) = found {
+                if super::k3_mutant(1) {
+                    // M1: answer with the trunk's CURRENT version instead of the retained one.
+                    return Ok(Resolved::Trunk(TrunkPageKey {
+                        page,
+                        epoch: self.written(page),
+                        generation: self.trunk_pages.generation.load(Ordering::Acquire),
+                    }));
+                }
                 crate::turso_assert!(
                     domain_of(v.slot) == TRUNK_DOMAIN,
                     "a trunk version outside the trunk's arena"
