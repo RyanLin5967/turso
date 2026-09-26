@@ -252,7 +252,9 @@ pub struct Reaped {
     /// ancestor was retaining only for it.
     pub freed_pages: usize,
     /// True when the branch could not be freed yet (an open connection or a live child still reads
-    /// through it); its pages are freed when the last of those goes away.
+    /// through it); its pages are freed when the last of those goes away. Also true when it was
+    /// spliced out (its only live child now holds what it read through it): it has left the store's
+    /// branch states, but its pages live on in that child.
     pub deferred: bool,
 }
 
@@ -334,7 +336,9 @@ pub struct BranchOpenStats {
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
-    /// Branch states that exist, including reaped branches kept alive by a live child.
+    /// Branch states that exist, including reaped branches kept alive by an open connection or by
+    /// two or more live children (one with exactly one is spliced into it and is not counted, while
+    /// its pages are: they now belong to that child).
     pub live_branches: usize,
     /// Arena pages owned by some branch (or retained for one).
     pub arena_slots_in_use: usize,
@@ -366,6 +370,12 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// Index entries (`by_born` and `by_died`) visited by `child_gone`'s garbage query.
     pub gc_range_entries: u64,
+    /// F7 durable port: released branches spliced into their only live child, splices that merged
+    /// the child into the zombie's map (the child's side was the smaller), and versions the splices
+    /// visited (the zombie's retained ones plus the smaller side of each merge).
+    pub splices: u64,
+    pub splice_commits: u64,
+    pub splice_entries: u64,
 }
 
 impl Branch {

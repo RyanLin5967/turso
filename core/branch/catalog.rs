@@ -69,8 +69,10 @@ const SCHEMA: &[&str] = &[
      lease INTEGER, n_children INTEGER NOT NULL)",
     "CREATE INDEX IF NOT EXISTS branch_children ON branch(parent, fork_epoch)",
     "CREATE INDEX IF NOT EXISTS branch_lease ON branch(lease)",
-    // Released branches with no live child: only these can be collected at an open (a released
-    // interior with children is retired and stays), so an open never walks retired interiors.
+    // `released` is 0, 1, or 2 for a branch released while a connection held it open (r11-ever's
+    // F7 durable port): only those can be collected at an open (a released branch no connection
+    // held was collected at its release: freed, retired or spliced), so an open reads them alone and
+    // never walks retired interiors.
     "CREATE INDEX IF NOT EXISTS branch_released ON branch(released, n_children)",
     // k = branch << 32 | page: one B-tree lookup per (branch, page), one range per branch.
     "CREATE TABLE IF NOT EXISTS cur(k INTEGER PRIMARY KEY, slot INTEGER NOT NULL, \
@@ -99,7 +101,8 @@ const LOOKUPS: &[&str] = &[
     "SELECT id FROM branch WHERE lease > -1 AND lease <= ?1",
     "SELECT lease FROM branch WHERE lease > -1 ORDER BY lease ASC LIMIT 1",
     "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
-    "SELECT id FROM branch WHERE released = 1 AND n_children = 0",
+    "SELECT id FROM branch WHERE released = 2",
+    "SELECT id FROM branch WHERE parent = ?1 AND fork_epoch = ?2",
     "SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2",
     "SELECT slot FROM free WHERE slot > -1 ORDER BY slot ASC LIMIT ?1",
     "SELECT 1 FROM free WHERE slot = ?1",
@@ -110,6 +113,7 @@ const LOOKUPS: &[&str] = &[
     "DELETE FROM free WHERE slot = ?1",
     "DELETE FROM branch WHERE id = ?1",
     "UPDATE branch SET epoch = ?2, released = ?3, lease = ?4, n_children = ?5 WHERE id = ?1",
+    "UPDATE branch SET parent = ?2, fork_epoch = ?3 WHERE id = ?1",
 ];
 
 const META_GENERATION: i64 = 1;
@@ -144,6 +148,9 @@ pub(crate) struct CatBranch {
     pub(crate) fork_epoch: u64,
     pub(crate) epoch: u64,
     pub(crate) released: bool,
+    /// Released while a connection held it open: kept whole until that connection's `Close`, or the
+    /// end of the next recovery (`released` column 2; r11-ever's F7 durable port).
+    pub(crate) held_open: bool,
     pub(crate) lease: Option<u64>,
     pub(crate) n_children: u64,
     /// (page, slot, born, crc)
@@ -182,6 +189,15 @@ fn ret_row(row: &[Value]) -> Result<(u32, u64, u64, Slot, u32)> {
         get(row, 3)? as Slot,
         get(row, 4)? as u32,
     ))
+}
+
+/// The `released` column: 0, 1, or 2 when released while a connection held it open.
+fn released_code(b: &CatBranch) -> Value {
+    Value::from_i64(match (b.released, b.held_open) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    })
 }
 
 /// The catalog key of `(branch, page)`. Refused past 2^31 branch ids rather than wrapped.
@@ -239,6 +255,7 @@ pub(crate) struct Catalog {
     branch_get: Stmt,
     branch_put: Stmt,
     branch_update: Stmt,
+    branch_rekey: Stmt,
     branch_del: Stmt,
     cur_range: Stmt,
     cur_del_range: Stmt,
@@ -255,6 +272,7 @@ pub(crate) struct Catalog {
     child_in: Stmt,
     child_below: Stmt,
     child_above: Stmt,
+    child_at: Stmt,
     lease_due: Stmt,
     lease_min: Stmt,
     lease_min_after: Stmt,
@@ -309,6 +327,7 @@ impl Catalog {
             branch_update: p(
                 "UPDATE branch SET epoch = ?2, released = ?3, lease = ?4, n_children = ?5 WHERE id = ?1",
             )?,
+            branch_rekey: p("UPDATE branch SET parent = ?2, fork_epoch = ?3 WHERE id = ?1")?,
             branch_del: p("DELETE FROM branch WHERE id = ?1")?,
             cur_range: p("SELECT k, slot, born, crc FROM cur WHERE k >= ?1 AND k < ?2")?,
             cur_del_range: p("DELETE FROM cur WHERE k >= ?1 AND k < ?2")?,
@@ -345,6 +364,7 @@ impl Catalog {
                 "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch > ?2 \
                  ORDER BY fork_epoch ASC LIMIT ?3",
             )?,
+            child_at: p("SELECT id FROM branch WHERE parent = ?1 AND fork_epoch = ?2")?,
             // Range seeks on `branch_lease`: NULL sorts first in the index, so `lease > -1` skips
             // every unleased row instead of walking them (deadlines are never negative).
             lease_due: p("SELECT id FROM branch WHERE lease > -1 AND lease <= ?1")?,
@@ -352,7 +372,7 @@ impl Catalog {
             lease_min_after: p(
                 "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
             )?,
-            released: p("SELECT id FROM branch WHERE released = 1 AND n_children = 0")?,
+            released: p("SELECT id FROM branch WHERE released = 2")?,
             unreleased: p("SELECT id FROM branch WHERE released = 0")?,
             free_after: p("SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2")?,
             free_first: p("SELECT slot FROM free WHERE slot > -1 ORDER BY slot ASC LIMIT ?1")?,
@@ -480,11 +500,22 @@ impl Catalog {
             parent: get(row, 0)?,
             fork_epoch: get(row, 1)?,
             epoch: get(row, 2)?,
-            released: get(row, 3)? != 0,
+            released: false,
+            held_open: false,
             lease,
             n_children: get(row, 5)?,
             current: Vec::new(),
             retained: Vec::new(),
+        };
+        (b.released, b.held_open) = match get(row, 3)? {
+            0 => (false, false),
+            1 => (true, false),
+            2 => (true, true),
+            other => {
+                return Err(LimboError::Corrupt(format!(
+                    "branch catalog: branch {id} has released = {other}"
+                )))
+            }
         };
         let lo = cur_key(id, 0)?;
         let hi = lo + (1i64 << 32);
@@ -513,18 +544,26 @@ impl Catalog {
     }
 
     /// Rewrite the mutable columns of a branch row the catalog already holds (parent and fork
-    /// epoch never change, so the children index is not touched).
+    /// epoch change only in a splice, which `rekey` writes; this leaves the children index alone).
     pub(crate) fn update_row(&mut self, b: &CatBranch) -> Result<()> {
         self.branch_update.exec(
             &[
                 int(b.id),
                 int(b.epoch),
-                Value::from_i64(b.released as i64),
+                released_code(b),
                 b.lease.map_or(Value::Null, int),
                 int(b.n_children),
             ],
             &mut self.counters,
         )
+    }
+
+    /// Move a branch row to a new (parent, fork epoch) key: a splice put it in its spliced-out
+    /// parent's place (r11-ever's F7 durable port, finding U6). The `branch_children` index follows
+    /// the row, so the parent's children are listed under the key they are queried by.
+    pub(crate) fn rekey(&mut self, b: &CatBranch) -> Result<()> {
+        self.branch_rekey
+            .exec(&[int(b.id), int(b.parent), int(b.fork_epoch)], &mut self.counters)
     }
 
     /// Replace a branch's `cur` rows.
@@ -575,7 +614,7 @@ impl Catalog {
                 int(b.parent),
                 int(b.fork_epoch),
                 int(b.epoch),
-                Value::from_i64(b.released as i64),
+                released_code(b),
                 b.lease.map_or(Value::Null, int),
                 int(b.n_children),
             ],
@@ -747,6 +786,15 @@ impl Catalog {
         }
     }
 
+    /// The child `parent` forked at `f`, if the catalog lists one (its id: the child queries above
+    /// return only fork epochs).
+    pub(crate) fn child_at(&mut self, parent: u64, f: u64) -> Result<Option<u64>> {
+        let rows = self.child_at.rows(&[int(parent), int(f)], &mut self.counters)?;
+        rows.first().map(|row| get(row, 0)).transpose()
+    }
+
+    /// Branches released while a connection held them open: what an open collects (see the
+    /// `branch_released` index).
     pub(crate) fn released_ids(&mut self) -> Result<Vec<u64>> {
         self.released
             .rows(&[], &mut self.counters)?

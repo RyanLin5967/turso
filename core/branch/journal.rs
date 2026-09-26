@@ -58,7 +58,12 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// Version 1 stored the deadline itself and could not tell a deadline of 0 from none, so a version
 /// 1 snapshot read by this code would come back with every deadline 1 ms early. Another version is
 /// refused, never reinterpreted.
-const FORMAT_VERSION: u32 = 2;
+///
+/// 3 (r11-ever, F7 durable port, UNBUILT): a child's epochs start above its fork epoch (epoch
+/// inheritance), so the epochs replay derives for a version-2 log would differ from the ones it was
+/// written under; the log gains `ReleaseOpen` and `Close`, and a snapshot's `released` byte gains 2
+/// (released while a connection holds it open). A version-2 file is refused like any other.
+const FORMAT_VERSION: u32 = 3;
 const LOG_HEADER_LEN: usize = 32;
 const FRAME_HEADER_LEN: usize = 8;
 /// Compact once the log is larger than this and larger than twice the last snapshot, so the log is
@@ -134,6 +139,16 @@ pub(crate) enum Record {
     Release {
         branch: u64,
     },
+    /// The release of a branch that a connection still holds open: replay releases it and holds it,
+    /// exactly as the live store does, until the matching `Close` (F7 durable port).
+    ReleaseOpen {
+        branch: u64,
+    },
+    /// The connection holding a released branch closed: replay collects the branch here, where the
+    /// live store did, so a splice or a free happens at the same point in both (F7 durable port).
+    Close {
+        branch: u64,
+    },
     /// A branch's lease deadline on the lease clock, and the clock when it was set.
     Lease {
         branch: u64,
@@ -152,6 +167,8 @@ const TAG_TRUNK_RETAIN: u8 = 3;
 const TAG_RELEASE: u8 = 4;
 const TAG_LEASE: u8 = 5;
 const TAG_CLOCK: u8 = 6;
+const TAG_RELEASE_OPEN: u8 = 7;
+const TAG_CLOSE: u8 = 8;
 
 impl Record {
     fn encode(&self, out: &mut Vec<u8>) {
@@ -187,6 +204,14 @@ impl Record {
             }
             Record::Release { branch } => {
                 out.push(TAG_RELEASE);
+                put_u64(out, *branch);
+            }
+            Record::ReleaseOpen { branch } => {
+                out.push(TAG_RELEASE_OPEN);
+                put_u64(out, *branch);
+            }
+            Record::Close { branch } => {
+                out.push(TAG_CLOSE);
                 put_u64(out, *branch);
             }
             Record::Lease {
@@ -230,6 +255,8 @@ impl Record {
                 crc: r.u32()?,
             },
             TAG_RELEASE => Record::Release { branch: r.u64()? },
+            TAG_RELEASE_OPEN => Record::ReleaseOpen { branch: r.u64()? },
+            TAG_CLOSE => Record::Close { branch: r.u64()? },
             TAG_LEASE => Record::Lease {
                 branch: r.u64()?,
                 deadline_ms: r.u64()?,
@@ -263,6 +290,9 @@ pub(crate) struct SnapBranch {
     pub(crate) fork_epoch: u64,
     pub(crate) epoch: u64,
     pub(crate) released: bool,
+    /// Released, and a connection still holds it open: kept whole until that connection's `Close`
+    /// (encoded as `released` byte 2).
+    pub(crate) held_open: bool,
     /// The lease deadline on the lease clock PLUS ONE; 0 = no lease (a real deadline may be 0).
     pub(crate) lease_deadline_ms: u64,
     /// (page, slot, born, crc)
@@ -283,7 +313,11 @@ impl SnapshotState {
             put_u64(out, b.parent);
             put_u64(out, b.fork_epoch);
             put_u64(out, b.epoch);
-            out.push(b.released as u8);
+            out.push(match (b.released, b.held_open) {
+                (false, _) => 0,
+                (true, false) => 1,
+                (true, true) => 2,
+            });
             put_u64(out, b.lease_deadline_ms);
             put_u64(out, b.current.len() as u64);
             for &(page, slot, born, crc) in &b.current {
@@ -309,9 +343,10 @@ impl SnapshotState {
             let parent = r.u64()?;
             let fork_epoch = r.u64()?;
             let epoch = r.u64()?;
-            let released = match r.u8()? {
-                0 => false,
-                1 => true,
+            let (released, held_open) = match r.u8()? {
+                0 => (false, false),
+                1 => (true, false),
+                2 => (true, true),
                 _ => return None,
             };
             let lease_deadline_ms = r.u64()?;
@@ -327,6 +362,7 @@ impl SnapshotState {
                 fork_epoch,
                 epoch,
                 released,
+                held_open,
                 lease_deadline_ms,
                 current,
                 retained,
@@ -1196,6 +1232,8 @@ mod tests {
                 crc: 99,
             },
             Record::Release { branch: 7 },
+            Record::ReleaseOpen { branch: 7 },
+            Record::Close { branch: 7 },
         ];
         for record in records {
             let mut payload = Vec::new();
@@ -1598,6 +1636,7 @@ mod tests {
                     fork_epoch: 0,
                     epoch: 2,
                     released: false,
+                    held_open: false,
                     lease_deadline_ms: 120_000,
                     current: vec![(4, 5, 1, 6), (9, 10, 0, 11)],
                     retained: vec![(4, 0, 1, 3, 77)],
@@ -1608,8 +1647,21 @@ mod tests {
                     fork_epoch: 1,
                     epoch: 0,
                     released: true,
+                    held_open: false,
                     lease_deadline_ms: 0,
                     current: vec![],
+                    retained: vec![],
+                },
+                // Format 3: released while a connection holds it open.
+                SnapBranch {
+                    id: 12,
+                    parent: 1,
+                    fork_epoch: 1,
+                    epoch: 2,
+                    released: true,
+                    held_open: true,
+                    lease_deadline_ms: 0,
+                    current: vec![(4, 20, 0, 21)],
                     retained: vec![],
                 },
             ],
