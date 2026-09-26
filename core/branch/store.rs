@@ -189,6 +189,10 @@ pub(crate) struct BranchStore {
     /// F-FZ: set from a fuzzy checkpoint's install until its WAL truncation ends; no checkpoint
     /// starts meanwhile, whose capture would pin a read mark and make the truncation busy.
     truncating: Arc<AtomicBool>,
+    /// F-FZ: fuzzy-checkpoint installs so far, and a condvar the install signals; back-pressure
+    /// waits on it, so every waiting operation (not only one that happens to join the thread)
+    /// waits for the install, and none waits for the WAL truncation after it.
+    installs: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
     /// Live children of the trunk. Read without the lock on every trunk first-write so that a
     /// database with no branches pays one atomic load per written page and nothing else.
     ///
@@ -307,6 +311,10 @@ struct CatState {
     /// The catalog generation the last checkpoint committed. The log's generation can lag it by
     /// one, until the log is rewritten to the checkpoint's suffix (F-FZ).
     generation: u64,
+    /// The generation the next checkpoint attempt takes: consumed by every capture, committed or
+    /// not, so no two `Record::Checkpoint` markers in a log share a generation, and recovery's cut at
+    /// the committed one can never land on a stale one (second fresh-context review, finding 1).
+    next_generation: u64,
     /// A checkpoint has captured and not yet installed: the catalog connection holds a pinned
     /// read snapshot, the catalog free table is not refilled from, and no checkpoint starts.
     flight: bool,
@@ -416,6 +424,7 @@ impl CatState {
         Ok(Self {
             writer,
             generation,
+            next_generation: generation + 1,
             flight: false,
             ckpt: CkptCounters::default(),
             catalog,
@@ -1095,6 +1104,7 @@ fn run_flight(
     hold: Arc<AtomicU8>,
     over_hard: Arc<AtomicBool>,
     truncating: Arc<AtomicBool>,
+    installs: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
 ) {
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
@@ -1130,15 +1140,23 @@ fn run_flight(
         // Set under the store mutex, so no capture can slip in before the truncation.
         truncating.store(installed.is_ok(), Ordering::Release);
         over_hard.store(false, Ordering::Release);
+        let (count, signal) = &*installs;
+        *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        signal.notify_all();
         installed
     };
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
         Ok(()) => {
-            truncate_catalog_wal(&mut writer.lock());
+            // A panic here must not leave `truncating` set: no checkpoint would start again.
+            let truncated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                truncate_catalog_wal(&mut writer.lock())
+            }));
             truncating.store(false, Ordering::Release);
-            over_hard.store(false, Ordering::Release);
+            if truncated.is_err() {
+                tracing::warn!("the branch catalog WAL truncation panicked");
+            }
         }
         Err(e) => tracing::warn!("branch catalog fuzzy checkpoint failed: {e}"),
     }
@@ -1146,13 +1164,28 @@ fn run_flight(
 
 /// F-FZ back-pressure: declared BEFORE the store mutex's guard in an operation that can grow the
 /// log, so it drops after the guard: if a fuzzy checkpoint is in flight and the log is past twice
-/// the threshold, the operation waits for the install without holding the store mutex.
+/// the threshold, the operation waits for the install without holding the store mutex. It waits
+/// on the install counter, 60 s at most (a flight that never installs is a bug, logged, not a hang).
 struct Backpressure<'a>(&'a BranchStore);
 
 impl Drop for Backpressure<'_> {
     fn drop(&mut self) {
-        if self.0.over_hard.load(Ordering::Acquire) {
-            self.0.join_flights();
+        if !self.0.over_hard.load(Ordering::Acquire) {
+            return;
+        }
+        let (count, installed) = &*self.0.installs;
+        let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = *n;
+        let started = Instant::now();
+        while *n == seen && self.0.over_hard.load(Ordering::Acquire) {
+            if started.elapsed() > Duration::from_secs(60) {
+                tracing::warn!("branch store back-pressure: no checkpoint install in 60 s");
+                return;
+            }
+            n = installed
+                .wait_timeout(n, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 }
@@ -1213,6 +1246,7 @@ impl BranchStore {
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
             truncating: Arc::new(AtomicBool::new(false)),
+            installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             trunk_children: AtomicUsize::new(0),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
@@ -1352,6 +1386,7 @@ impl BranchStore {
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
             truncating: Arc::new(AtomicBool::new(false)),
+            installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
             trunk_only: false,
@@ -1436,6 +1471,18 @@ impl BranchStore {
         inner.n_states = meta.states;
         inner.lease.recovered(meta.lease_now_ms);
         let mut cat = CatState::new(catalog, sync, meta.generation)?;
+        // Past every checkpoint marker the log still holds, committed or not (F-FZ).
+        let marked = recovered
+            .records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Checkpoint { generation } => Some(*generation),
+                _ => None,
+            })
+            .max();
+        if let Some(g) = marked {
+            cat.next_generation = cat.next_generation.max(g + 1);
+        }
         cat.lease_floor = cat.catalog.lease_min()?;
         inner.cat = Some(cat);
         // Replay, remembering every slot a record names (in use) and every slot its replay frees,
@@ -1831,11 +1878,13 @@ impl BranchStore {
             }
             return;
         }
-        // Past twice the threshold with a checkpoint in flight (or still truncating its WAL, which
-        // keeps the next one from starting): this operation waits for it once the mutex is released.
+        // Past twice the threshold with a checkpoint in flight: this operation waits for its
+        // install once the mutex is released. Set only under the mutex while `flight` holds, and
+        // cleared by the install under the same mutex, so it is never left set with no flight.
+        // (During a WAL truncation no checkpoint starts and none waits: the log can pass twice the
+        // threshold by what that truncation's time appends.)
         if !self.start_flight(inner)
-            && (inner.cat.as_ref().is_some_and(|c| c.flight)
-                || self.truncating.load(Ordering::Acquire))
+            && inner.cat.as_ref().is_some_and(|c| c.flight)
             && inner.journal.as_ref().is_some_and(|j| j.past_hard_limit())
         {
             self.over_hard.store(true, Ordering::Release);
@@ -1886,6 +1935,7 @@ impl BranchStore {
         let hold = self.flight_hold.clone();
         let over_hard = self.over_hard.clone();
         let truncating = self.truncating.clone();
+        let installs = self.installs.clone();
         let mut flights = self.flights.lock();
         if flights.len() >= FLIGHTS_KEPT {
             // Past its install long ago (only one checkpoint is ever in flight), so this join
@@ -1894,7 +1944,7 @@ impl BranchStore {
         }
         let spawned = crate::thread::Builder::new()
             .name("branch-checkpoint".to_string())
-            .spawn(move || run_flight(shared, writer, cap, hold, over_hard, truncating));
+            .spawn(move || run_flight(shared, writer, cap, hold, over_hard, truncating, installs));
         match spawned {
             Ok(handle) => {
                 flights.push(handle);
@@ -3478,7 +3528,8 @@ impl StoreInner {
                     .to_string(),
             ));
         }
-        let generation = cat.generation + 1;
+        let generation = cat.next_generation;
+        cat.next_generation += 1;
         let dirty = std::mem::take(&mut cat.dirty);
         let rows: Vec<(CatBranch, u8)> = dirty
             .iter()
