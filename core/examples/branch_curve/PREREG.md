@@ -512,3 +512,470 @@ changes only how the one level is looked up. Counters equal the before file's ex
 control). Amendment 4's OFF runs attribute F1+F2 like-for-like against the curve lane's OFF before files.
 
 **Erratum (appended 2026-09-25T03:09:41Z):** amendment 6 was committed at 2026-09-25T03:09:34Z (`2f2a2934d`); its header's "03:15Z" was typed, not read from the clock.
+
+### Amendment 7 — written 2026-09-25T04:46:28Z: the concurrency axis, T threads at live N up to 10^6; before its first build or run
+
+Lane `turso_conc` (agent `inv-turso-conc`), worktree `turso-inv-conc-noindex`, base `0f4232957` (F1+F2+F4, the `final`
+store of amendment 6). Nothing below changes amendments 1-6 or any of their runs.
+
+**Why.** Every run so far is single-threaded, so the store's one `Mutex` has never been contended (`turso_curve/REPORT.md`
+§6). The store's own module doc calls that Mutex "a known wall under concurrent writers on different branches". BranchBench
+(arXiv 2604.17180) reports Dolt's throughput plateauing at T=4 [from the lead's brief; not read by this lane].
+
+**Engine change: lock accounting, observation only (this commit).** Every acquisition of the store's lock goes through
+`BranchStore::lock`: `try_lock`, and only when that fails, a timed blocking `lock`. Four counters in `BranchWork`, written
+under the lock itself: `lock_acquisitions`, `lock_contended` (acquisitions whose `try_lock` failed), `lock_wait_ns` (their
+wait, clock read by the waiting thread only) and `lock_hold_ns`. The last counts only while lock timing is on
+(`Database::set_branch_lock_timing`, default off). It is the one counter that adds work inside the critical section: two
+clock reads per acquisition. Nothing in the mechanism reads the counters. `core/sync.rs` re-exports parking_lot's
+`MutexGuard` (the shuttle adapter already defines one). Fire-check, run before any conc run:
+`store::tests::lock_accounting_counts_a_forced_wait_and_nothing_else`. One thread makes 11 calls and must count exactly 11
+acquisitions, 0 contended, 0 wait, 0 hold. A thread holding the lock 500 ms while another asks must produce exactly 1
+contended acquisition, wait > 0, and hold ≥ 500 ms with timing on.
+
+**Harness: `branch_arms --arm conc`.** One trunk table as in every arm (20,000 rows, checkpointed; the trunk never writes
+here, so nothing is retained). N branches are grown single-threaded, each forked from the trunk and writing one row. Then,
+at each N, one cell per T in the `--threads` list, first forward (draw 0) and then reversed (draw 1). Each cell:
+1. The null workload: T threads, each running the same 10^8-step xorshift loop, sharing nothing. `null_ops_per_s` is the
+   box's parallelism at that moment.
+2. The N live branches are dealt round-robin into T shares. Each thread gets its own trunk connection.
+3. After a barrier, each thread runs C = `--cycles` cycles:
+   - `fork` a branch from its trunk connection;
+   - `open` a connection on it;
+   - `first_write`: one autocommit UPDATE of row `row_for(g)` on it; drop the connection;
+   - `read_open` a connection on a random branch of the share;
+   - `read_own`: SELECT that branch's own row;
+   - `read_inh`: SELECT a far row, the trunk's, on the same connection; drop the connection;
+   - `reap` a random branch of the share. The new branch joins the share after the victim is drawn, so N is fixed.
+4. Every read is checked against the value the harness knows. Every reap must free exactly 1 page, not deferred. After the
+   cell, the engine must report exactly N live branches and N arena pages. Otherwise the run prints `NOT A RESULT` and exits 1.
+5. `Busy`/`BusySnapshot` from any op is retried after a `yield_now` and counted per op. A trunk fork holds the trunk's WAL
+   write lock (`mod.rs` `fork_trunk`), so two threads forking at once is the one expected source of Busy. Any other
+   error is not a result.
+
+Printed per cell:
+- per op: p50/p90/p99/max over T·C samples, plus its Busy retries;
+- `cellsum`: cycles, wall (barrier release to the last join), `cycles_per_s`, `null_ops_per_s`, the slowest and fastest
+  thread's elapsed, process user and sys CPU (getrusage), the four lock counters over the cell, and RSS.
+
+The two connection drops (`Store::close`) sit inside the wall time but outside every timed op.
+
+**Definitions (pre-registered).**
+- X(N,T,d) = T·C / wall. S(T) = X(T)/X(1) and Sn(T) = null(T)/null(1), each within one N and one draw.
+- E(T) = S(T)/Sn(T): parallel efficiency against what the box gives T threads that share nothing.
+- **Scales** at T: E(T) ≥ 0.7 in both draws. **Wall** at T: E(T) < 0.5 in both draws. Anything else is inconclusive and
+  reported so. When X for the two draws of one (N,T) differs by more than 15%, the cell has drifted and no verdict is taken.
+- W = lock_wait_ns / (T · wall): the fraction of thread-time spent waiting for the store's lock.
+- U = lock_hold_ns / wall: the fraction of wall time the lock is held (`conc_hold` only).
+- The store lock **is the wall** at (N,T) when all three hold: E < 0.5, W ≥ 0.25 (`conc_main`), and U ≥ 0.6 (`conc_hold`).
+- When E < 0.5 but W < 0.10, the wall is outside the store lock. It is attributed only through `conc_prof`'s profile, and
+  it stays a candidate until a counter confirms it.
+
+**Runs** (`turso_conc/run_conc.sh`: lockrun `turso-conc`, `taskpolicy -b` for the build, `timeout` on every step, each raw
+file committed before it is read):
+1. `tests_conc`: `cargo test -p turso_core --lib branch::`. Every branch test must pass, the fire-check included, or
+   nothing below runs. Then `mutate_conc`: two mutants of the accounting, each applied to `store.rs`, tested the same way,
+   and restored from git. M1: `try_lock` replaced by a blocking `lock`, so nothing is ever counted contended. M2: the hold
+   time is never added. Each must fail the fire-check, or nothing below runs.
+2. `build_conc`: a release build of `branch_arms` from the commit that carries this amendment, copied out of the tree.
+3. `conc_smoke`: `--arm conc --threads 1,2 --checkpoints 16 --cycles 200`. Assertions only; NOT A RESULT.
+4. `conc_main`: `--arm conc --threads 1,2,4,8,16 --checkpoints 1000,100000,1000000 --cycles 20000 --lock-timing off`.
+   Throughput, latency, W. All E and S verdicts are read from this run.
+5. `conc_hold`: the same arguments with `--lock-timing on`. Gives U. Its X against `conc_main`'s is the cost of the
+   instrument.
+6. `conc_prof`: `--arm conc --threads 16 --checkpoints 1000,1000000 --cycles 60000`. `/usr/bin/sample <pid> 3` is taken
+   1 s after each `# cell N=… T=16 draw=0 start` line. Only the two profiles are read from this run.
+
+**Predictions** (read from source; each is inferred, I, unverified):
+- **P7.1 (integer, load-immune).** Lock acquisitions per cycle:
+  - identical within ±0.5% across T and draws at each N, and across N;
+  - in [19, 40]. That is 9 resolutions (open 1, first_write 3, read_open 1, read_own 3, read_inh 1, as the banked
+    `resolves_per_op` of `c1_fix`/`a1_fix` read with the root cached for read_inh), fork 1, store.open 2, begin_write,
+    first_write_branch, commit_pages and end_write 4, close 2, release_handle 1, plus an unknown number of
+    `holds_writer` calls from the VDBE.
+  - An `open` Busy retry adds 2 (open, then close); the report subtracts those.
+- **P7.2.** `lock_contended` = 0 exactly at T=1, where one thread holds every acquisition. `busy_fork` = 0 exactly at T=1.
+  Both > 0 in every T=16 cell. A zero there means the detector did not fire; that is not a clean result.
+- **P7.3 (hold, `conc_hold`, T=1).** Hold per cycle:
+  - at N=10^6, in [1, 10] µs;
+  - at N=10^6, at least 1.3× its value at N=10^3. The branch-state lookups and the reap's tree walks miss the caches at
+    10^6, and every one of them runs under the lock.
+- **P7.4.** X(1) in [15k, 35k] cycles/s at every N. The op p50s summed over one cycle, from `control_fix`/`c1_fix`, come to
+  ~35 µs, plus the drops.
+- **P7.5 (the wall).**
+  - At N=10^6: E(16) < 0.5 in both draws, with W(16) ≥ 0.25 and U(16) ≥ 0.5.
+  - The Amdahl bound from P7.3's hold is s = hold/cycle ≈ 0.12, so S(16) ≤ 1/(s + (1-s)/16) ≈ 5.7. Sn(16) on 6 Super + 12
+    Performance cores is ≈ 12-14, if the box is otherwise idle.
+  - At N=10^3 (s ≈ 0.045, S(16) ≤ ≈ 9.5): no verdict is predicted.
+  - E(16) at 10^6 < E(16) at 10^3 in both draws.
+  - E(2) ≥ 0.8 at every N.
+- **P7.6.** Correctness: no NOT A RESULT; after every cell, arena = live = N; every reap frees exactly 1 page.
+- **P7.7 (the instrument's cost).** `conc_hold`'s X is within ±10% of `conc_main`'s at T=1 at every N, and ≥ 0.8× at T=16.
+  If that breaks, U is reported as perturbed: an upper bound on the unperturbed hold.
+
+**Falsifiers.**
+- E(16) ≥ 0.7 at N=10^6 in both draws: no wall at T ≤ 16 on this box for this workload. W and U are then reported as
+  headroom.
+- E(16) < 0.5 with W < 0.10: the wall is not the store lock. The profile names a candidate; the fix waits for a counter.
+- Acquisitions per cycle differing across T by more than 0.5% after open retries are subtracted: the counter or the
+  harness is broken, and no lock attribution is made.
+
+**What follows.** If a wall is found, amendment 8 names the standard fix and its prior art, and pre-registers its
+predictions, before its build. It re-runs `conc_main`, `conc_hold` and `conc_prof` unchanged on the fixed store. The
+report lists what still does not scale, with its mechanism read from source and the counter that proves it.
+
+### Amendment 8 — written 2026-09-25T05:40:30Z: amendment 7's wall is the kernel's read path, not the store lock; its attribution run and its fix (F6), before either runs
+
+**What amendment 7's runs showed** (all banked in `turso_conc/raw/`, each committed before it was read; verdicts by
+`turso_conc/analyze_conc.py`, committed at `8c144a9` before any data):
+- The tests and the fire-check passed (`tests_conc`, 38/38). Both accounting mutants were killed by the assertion aimed at
+  each (`mutate_conc`).
+- `conc_main` (`9c83fbf`) and `conc_hold` (`d36c6fe`): 5 of 40 registered checks broken, all of them in P7.5.
+  - Throughput stops scaling at T=4 for N ≥ 10^5, where the verdict is WALL. At T=16, X is below X(1): 0.76–0.94×, and
+    E(16) is 0.05–0.08.
+  - The store lock is not the wall: W(16) ≈ 0.10 and U(16) ≈ 0.18, against the registered 0.25 and 0.5. E(2) is
+    0.50–0.64, against a registered floor of 0.8.
+  - What held: acquisitions per cycle 19.95 ± 0.005 at every N and T (P7.1); both detectors silent at T=1 and firing at
+    T=16 (P7.2); hold per cycle 3.7–4.6 µs at 10^6 against 1.6–1.8 at 10^3 (P7.3); X(1) 27.4k–29.4k (P7.4); the
+    instrument's cost within bounds (P7.7).
+- System CPU per cycle rises from 4.6–5.8 µs at T=1 to 370–390 µs at T=16 (N ≥ 10^5), 73% of all CPU (getrusage, from
+  the `cellsum` lines).
+- `conc_prof` (`9a9390c`), `/usr/bin/sample` at T=16, excluding the main thread's `join`:
+  - `pread` is at the top of 64–70% of worker samples;
+  - 64% of those are inside `connect_branch`, the rest in statements' page reads;
+  - parking_lot's slow path under `BranchStore` (`swtch_pri`, `__psynch_cvwait`) takes ~17%.
+- **Mechanism, read from source.** Every branch connection starts with an empty page cache. It pays:
+  - `_init`'s two reads of the trunk's file: the 512-byte header (`read_db_header_buf`) and page 1 (`ReadPage1`);
+  - the page-1 read `connect_branch` makes through the branch;
+  - one read per trunk page its statements touch.
+
+  The WAL is empty in this arm, so each read is a `pread` of the one database file every thread shares. The count per
+  cycle is ~12, INFERRED from the banked `resolves_per_op` and the code; no counter measured it in amendment 7.
+- **Two walls in series:** the kernel's `pread` path, then the store lock.
+
+**A. Attribution run `e_pread`: which kernel structure serialises the reads** (`turso_conc/pread_mb.c`, `e_pread.sh`).
+- The file: 545 pages of 4 KiB in `$TMPDIR`, the volume the harness's TempDir uses, warmed before every run.
+- T threads each `pread` ONE 4 KiB page M = 100,000 times. Six modes:
+  - `same_shared`: every thread the same page, through one shared descriptor;
+  - `diff_shared`: page 1+16i for thread i, through the shared descriptor;
+  - `same_own`: the same page, each thread through its own descriptor;
+  - `diff_own`: its own page, its own descriptor;
+  - `same_mmap` / `diff_mmap`: a `memcpy` from one read-only `MAP_SHARED` mapping instead of a syscall.
+- T in {1,2,4,8,16}, the list forward and then reversed. S(T) = reads/s(T) / reads/s(1).
+- Predictions:
+  - `same_shared`: S(16) ≤ 2. Every connect reads page 1, and the profile puts most of the wall there.
+  - `same_mmap` and `diff_mmap`: S(16) ≥ 8.
+  - None for the other three modes, which classify the serialiser:
+    - per page if `same_*` collapse and `diff_*` scale;
+    - per file if all four syscall modes collapse;
+    - per descriptor if `*_shared` collapse and `*_own` scale.
+- The fix below does not depend on the class, because it removes the syscall. The class goes into the report as the
+  mechanism.
+
+**B. F6: a shared, versioned trunk-page cache for branch reads (this commit).**
+- **Store.**
+  - `BranchStore` keeps the trunk's pages as branches have read them, keyed by (page, trunk epoch of its last write,
+    cache generation), in a lock-free three-level radix of `ArcSwapOption`.
+  - `resolve_into` answers "the trunk's current version" only when the trunk's last write to the page came at or before
+    the branch's `trunk_at`. That epoch was closed by a fork, which holds the WAL write lock, so the version under the
+    key is immutable. The cache serves it when it holds it; otherwise it returns the key, and the pager, once its read
+    of the WAL or file has loaded the page, calls `fill_trunk_page`. The callback is a `CompletionGroup` of one.
+  - The one gap: a trunk with no live child writes without a copy decision, so `written` does not move. The trunk's last
+    child going therefore bumps the generation, and older entries are never served.
+- **Connect.** `connect_branch` builds its pager with `Database::_init_branch`. The page format (page size and reserved
+  byte) comes from the store, recorded at the first fork, instead of the header read. The pager is bound before page 1
+  is read, so page 1 comes through the branch, and nothing of the trunk's is ever in the pager, so `clear_page_cache`
+  is gone.
+- **Prior art.** The shared buffer pool of every server DBMS (PostgreSQL `shared_buffers`, the InnoDB buffer pool,
+  SQLite's shared-cache mode), with the version in the key as in a buffer tag with its LSN (the (page, LSN) keys of
+  Neon's page cache [RECALLED]). No novelty is claimed.
+- **Counters.** `trunk_page_hits` and `trunk_page_misses` in `BranchWork`. The harness prints them and the resolutions in
+  `cellsum`; the change is additive and times nothing new.
+- **Tests.**
+  - `store::tests::the_trunk_page_cache_serves_each_branch_the_version_it_forked_from`: a model with trunk writes with
+    and without children, the last child going, and every read checked. It asserts hits > 0, childless writes > 0, and
+    that the last child went.
+  - `mechanism_tests::a_trunk_write_with_no_branch_alive_is_never_served_from_the_trunk_page_cache`, through SQL: a
+    second branch hits and misses nothing, and a row the trunk rewrote with no branch alive reads new.
+- **Mutants** (`mutate_F6.sh`; each must fail a `branch::` test, or no F6 run proceeds):
+  - F6M1: the generation never bumped;
+  - F6M2: the epoch not compared on a hit;
+  - F6M3: the pager never fills.
+
+**Runs** (`turso_conc/run_F6.sh`, lockrun `turso-conc`, `taskpolicy -b` on cargo, `timeout` everywhere, raw committed
+before read):
+- `e_pread`;
+- then `tests_F6`, `mutate_F6`, `build_F6`;
+- then `F6_smoke`, `F6_main`, `F6_hold`, `F6_prof`, with amendment 7's arguments unchanged. Their before files are
+  `conc_*`.
+
+**Predictions for F6** (I = inferred):
+- **Counters (integers).**
+  - `trunk_page_misses` ≤ 700 in the first cell of each run (the ~545-page working set fills once), and ≤ 0.01 per cycle
+    in every later cell.
+  - Acquisitions per cycle equal across T within 0.5% at each N, and within ±1.0 of amendment 7's 19.95. The cache adds
+    no acquisition, and a connect still resolves page 1 once.
+- **System CPU per cycle.** ≤ 1.5 µs at T=1 and ≤ 30 µs at T=16 at every N. Amendment 7: 4.6–5.8 and 118–389.
+- **Throughput.**
+  - X(1) ≥ 1.15× `conc_main`'s at every N (~12 syscalls of ~0.5 µs each removed from a ~35 µs cycle, I).
+  - X(16) ≥ 2× `conc_main`'s at N=10^6 and ≥ 3× at N=10^3.
+- **The next wall.** At N=10^6 the store lock becomes the wall: E(16) < 0.5 in both draws, with W(16) ≥ 0.25 (`F6_main`)
+  and U(16) ≥ 0.6 (`F6_hold`). The hold per cycle, 3.7–4.6 µs at 10^6, caps X near 1/hold ≈ 220–270k cycles/s. At
+  N=10^3 no verdict is predicted.
+- **Profile.** In `F6_prof`, `pread` is < 5% of worker samples at both N, and parking_lot's slow path under
+  `BranchStore` is the largest remaining wait.
+- **Correctness.** No NOT A RESULT; after every cell, arena = live = N; every reap frees exactly 1 page.
+
+**Falsifiers.**
+- System CPU per cycle at T=16 ≥ 100 µs with misses ≈ 0: the kernel time was not the reads', and the attribution to
+  `pread` is withdrawn.
+- X(16) not above `conc_main`'s: the reads were not what bound throughput.
+- Misses per cycle not ≈ 0: the cache is not doing what it claims, and no F6 number is read as its effect.
+
+**What follows.** If the store lock is then the wall, amendment 9 pre-registers F5 on top of F6, before its build. F5
+is the store striped into 64 shards, each owning its branches and an arena domain, with the trunk behind its own lock
+and read without it through a lock-free epoch radix. Its draft is `turso_conc/fix_draft/`.
+
+**Erratum to amendment 8 (appended 2026-09-25T05:48:49Z; doc only, before any F6 build or run).** Two profile shares in "What
+amendment 7's runs showed" were computed against the wrong denominator: the total of `sample`'s "top of stack (when >= 5)"
+list, which leaves out part of the samples. Against the authoritative denominator (16 worker threads × each thread's
+root count, from the `Call graph` section: 16 × 2,108 at 10^6, 21,344 samples at 10^3):
+- `pread` is at the top of **61.0%** of worker samples at N=10^6 and **71.5%** at 10^3, not "64–70%";
+- parking_lot's slow path under `BranchStore` takes **12.8%** at 10^6 and **5.8%** at 10^3, not "~17%".
+
+The share of `pread` samples inside `connect_branch` is unchanged: 64.1% and 64.5%. No prediction or run of amendment 8
+depends on these two figures.
+
+### Amendment 8a — written 2026-09-25T06:13:06Z: a fresh-context review of amendment 8, its corrections, and three runs added before any F6 build or run
+
+A read-only reviewer that had not seen the work attacked amendment 8. The lane verified each point below from the raw
+files before writing it here.
+
+**Corrections to amendment 8's summary of amendment 7.**
+- System CPU per cycle at T=16 and N ≥ 10^5 is **307–389 µs, 67–74%** of all CPU. The earlier "370–390 µs, 73%" left
+  out N=10^5 draw 1.
+- **When the wall is in the kernel, and when it is not.** Per-cycle thread-time growth over T=1, from `conc_main`'s
+  `cellsum` lines:
+  - At T=2 and T=4, where the first WALL verdicts are, 71–78% of the growth is **user** CPU. At T=8 it is 57–63%.
+  - The kernel dominates only at T=16 with N ≥ 10^5: sys is 72–78% of the growth.
+  - At N=10^3, T=16 stays user-dominated in `conc_main` (61–64%).
+  - The only profile was taken at T=16, so the user-mode growth at T=2–8 is **unattributed**.
+- **Regimes differ between runs.** The N=10^3, T=16 cell ran with sys at 118–136 µs/cycle in `conc_main`, 297–301 in
+  `conc_hold`, and 390–401 in `conc_prof`. The 10^3 profile therefore describes `conc_prof`'s regime, not
+  `conc_main`'s.
+- **Where the store lock is ruled out.** W(16) ≈ 0.10 holds only at N=10^6 in `conc_main`; it is 0.20–0.22 at N=10^3.
+  By amendment 7's rule, "outside the store lock" is established at T=4 at every N and in 2 of the 6 T=16 cells. The T=8
+  cells and 4 of the T=16 cells are "attribution open".
+- **Profile shares.** `pread` is 60.4–61.0% of worker samples at 10^6 and 70.5–71.5% at 10^3. The range spans the two
+  ways of counting: `sample`'s own top-of-stack total, and the sum over call-graph leaves (224 more at 10^6). Of those
+  samples, 64–65% are inside `connect_branch`. This supersedes the erratum's single figures.
+- **Not every sys cycle is `pread`.** `swtch_pri` (parking_lot yielding: a trap, counted as sys) is 8.7% of worker
+  samples at 10^6.
+- **A missed expectation.** P7.5's parenthetical "Sn(16) ≈ 12–14" missed in all 12 T=16 cells (11.4–15.7). It was not
+  one of the 40 registered checks.
+
+**Corrections to amendment 8's design and predictions.**
+- **e_pread cannot tell per-file from per-process or system-wide serialisation.** All its syscall modes use one file in
+  one process. The class "per file" is withdrawn until `e_pread2` below. Its low-T comparisons (S(2), and whether
+  same-page is worse at T ≤ 2) rest on one run of 28–43 ms per point, with T=1 varying up to 35% between passes, and are
+  not read. Only the collapse at T ≥ 8 is.
+- **F6 adds hold time.** On a hit, the 4 KiB copy runs under the store's one lock. F6's hold per cycle at T=1 is
+  predicted at amendment 7's value plus 1–3 µs (I). The "cap near 1/hold" in amendment 8 is lowered accordingly. No
+  registered bound changes.
+- **F6 keeps at most one version per trunk page ever read, stale generations included**, until replaced. Memory stays
+  at or below the trunk's size.
+- **The attribution criterion for F6 is the profile, not total sys CPU.** A store lock under contention yields through
+  `swtch_pri`, which is sys time. So amendment 8's falsifier "sys ≥ 100 µs/cycle at T=16" is replaced for the
+  attribution by: **`pread` ≥ 10% of worker samples in `F6_prof`** withdraws the pread attribution. The registered
+  sys predictions stand and are reported as registered. The pair "W(16) ≥ 0.25 and sys ≤ 30 µs" may break on
+  `swtch_pri` alone; if it does, the report says which half.
+
+**Added before any F6 run.**
+- **Test.** `mechanism_tests::branches_read_their_fork_while_the_trunk_writes_concurrently`, with real threads:
+  - one thread rewrites rows and forks 300 branches in a recorded order;
+  - four readers check every branch's rows and full table, on two connections, while the trunk keeps writing;
+  - the trunk also passes through moments with no live child.
+
+  It must pass in `tests_F6`, and it is expected to kill F6M1 and F6M2 as well.
+- **Run `e_pread2`** (`pread_mb.c` gains two modes; `e_pread2.sh`): `same_shared` as a baseline, `same_ownfile`, and
+  `same_procs`, at T in {1,2,4,8,16}, forward and reversed, M = 100,000.
+  - `same_ownfile`: each thread reads page 0 of its own copy of the file.
+  - `same_procs`: T processes, one thread each, read page 0 of the one file.
+  - Read only for S(16) ≥ 8 (scales) against S(16) ≤ 2 (collapses):
+    - `same_ownfile` scales and `same_procs` collapses: **per file**, system-wide.
+    - both collapse: **system-wide beyond one file**.
+    - `same_procs` scales and `same_ownfile` collapses: **per process**.
+  - No prediction.
+- **Runs `conc_prof4` and `F6_prof4`**, to attribute the T=2–4 wall:
+  - arguments `--arm conc --threads 4 --checkpoints 1000000 --cycles 100000`;
+  - `/usr/bin/sample <pid> 3` taken 1 s after `# cell N=1000000 T=4 draw=0 start`;
+  - `conc_prof4` on the amendment-7 binary (sha256 `52995fc3…`, built from `323dbfd79`), `F6_prof4` on F6's.
+  - Only the profiles are read. No prediction: the user-mode growth has no mechanism named yet.
+
+### Amendment 9 — written 2026-09-25T06:18:25Z: F5, the striped store, pre-registered SOURCE-ONLY and UNBUILT; its runs follow F6's
+
+**Status.** Quiet mode (Ryan, 05:27Z) forbids local compute. On the lead's instruction this commit is source-only:
+- F5 is on branch `inv-conc-F5-noindex`, a child of `4ae0841ee` (F6 plus amendment 8a);
+- it has never been compiled, and no test of it has run;
+- the F6 chain runs first, on branch `inv-conc-noindex`.
+
+A compile fix is an amendment only if it changes what is timed or asserted.
+
+**Why F5.**
+- Amendment 7 measured the store lock's hold at T=1: 1.6–1.8 µs per cycle at 10^3 and 3.7–4.6 at 10^6. At T=16 it was
+  held 11–18% of the time, while throughput was capped by the kernel's read path.
+- F6 removes that read path (amendment 8). F6 also copies each cache hit under the same lock (amendment 8a).
+- Throughput should then rise until the store lock saturates, near 1/hold ≈ 150–270k cycles/s at 10^6 (I). Amendment
+  8 predicts the store lock as F6's wall at 10^6.
+
+**Design** (`core/branch/store.rs` on this branch).
+- **Shards.** 64 shards, `CachePadded<Mutex<Shard>>`. Branch `id` lives in shard `id % 64`, with its state and an arena
+  domain from which its own pages are allocated. A slot's top 7 bits name its domain, and a release into the wrong
+  domain is refused.
+- **Trunk.** The trunk's lineage and retained versions sit behind their own lock.
+- **Lock-free reads.** `written` (the trunk epoch of each page's last write) and F6's trunk-page cache are lock-free
+  radixes: three levels, installed once, never unlinked. A branch reading a page the trunk has not rewritten since its
+  fork takes only its own shard's lock; the cache hit and its counter are taken under that lock.
+- **Two locks, never at once.** A fork takes the parent's (or the trunk's) lock, then the child's shard lock. A reap
+  takes the child's shard lock, then the parent's lock. The windows between are argued in the code
+  (`fork_trunk`, `collect`).
+- **Generation bump.** F6's bump on the trunk's last child is made under the trunk lock.
+- **Counters.** `lock_*` is summed over all locks; `trunk_lock_*` is the trunk's lock alone; `stats` takes each lock
+  once.
+
+**Prior art, no novelty claimed.**
+- Lock striping: the segments of Java's `ConcurrentHashMap` (JSR 166) [RECALLED].
+- The read side of RCU for a structure that is only ever installed, never unlinked (McKenney) [RECALLED].
+- A per-stripe allocator domain, like per-CPU slab magazines (Bonwick 1994/2001) and per-thread arenas
+  (jemalloc, tcmalloc) [RECALLED].
+
+**Lock acquisitions per `conc` cycle, READ FROM THE CODE on this branch.**
+- The trunk lock is taken exactly twice per cycle: `fork_trunk` (the epoch, the children insert) and the reap's
+  `collect` (`child_gone` on the trunk). No other op in this arm takes it. The trunk never writes here, so no copy
+  decision runs, and resolutions of trunk pages stay on the lock-free path.
+- Every other store call takes exactly its branch's shard lock:
+  - `open` and `close`;
+  - `begin_write`, `end_write` and `holds_writer`;
+  - `first_write_branch` and `commit_pages`;
+  - every resolution: own pages, and trunk pages through the cache.
+
+  Trunk children have no `inherited` pages, so no cross-shard copy occurs in this arm.
+- So F5's `lock_acquisitions` per cycle = F6's + 2 (fork and reap each take one lock more), and `trunk_lock` = 2.
+
+**Which ops scale, and which residuals will not.**
+- **Scale by construction:** everything that touches one branch. In this arm that is every resolution, open, close,
+  write and commit. Threads share shards (64 stripes, ~20 acquisitions per cycle per thread) but never a branch.
+- **Serialised by construction in F5:**
+  - (i) Every trunk fork. It holds the trunk's WAL write lock in Turso (`Connection::fork_trunk`, where a concurrent
+    forker gets Busy and the harness retries after `yield_now`), and it takes the trunk lock.
+  - (ii) Every reap of a trunk child. It takes the trunk lock for `child_gone`: a removal and two neighbour probes on a
+    `BTreeMap` of N fork epochs, plus two index range queries.
+- **Residuals read from Turso code that neither F5 nor F6 touches.** These are candidates for amendment 8a's
+  unattributed user-CPU growth at T=2–8, unverified until `conc_prof4`/`F6_prof4`:
+  - the WAL read path of every branch statement and connect (`WalFile::begin_read_tx`/`end_read_tx`). It takes a
+    parking_lot read of `RwLock<WalFileShared>`, clones and read-locks it again for `VacuumLockGuard`, and acquires
+    `read_locks[0]` shared. These are atomic read-modify-writes on a handful of cache lines every thread shares;
+  - shared reference counts: the trunk's `Arc<Schema>` is cloned by every branch open and released by every connection
+    drop, all trunk children sharing one; `Arc<Database>` likewise;
+  - the buffer pool's atomic slot bitmap (`buffer_pool.get_page` on every read);
+  - `Database::schema`'s mutex in every trunk fork (`clone_schema`).
+
+**Predictions** (I; judged against `F6_main`/`F6_hold`, amendment 7's arguments unchanged):
+- **P9.1 (integers).** `trunk_lock_acquisitions` per cycle = 2.000 ± 0.001 at every N, T and draw; the `stats` calls
+  add ≤ 2/(T·C). `lock_acquisitions` per cycle = `F6_main`'s in the same cell + 2.00 ± 0.02.
+- **P9.2.** The shard contended fraction, (lock_contended − trunk_lock_contended) / (lock_acquisitions −
+  trunk_lock_acquisitions), is 0 at T=1 and ≤ 0.02 in every cell.
+- **P9.3.** W (all locks) ≤ 0.05 at T=16 at every N. The trunk lock's U_trunk = trunk_lock_hold_ns / wall ≤ 0.3 at
+  every N (`F5_hold`). Its hold is a fork's insert plus a reap's `child_gone` on an N-entry map: 0.3–1.5 µs per cycle at
+  10^6.
+- **P9.4.** X(1) within ±10% of `F6_main`'s at every N.
+- **P9.5.**
+  - If `F6_main` shows the store lock as the wall at 10^6 (E < 0.5, W ≥ 0.25, U ≥ 0.6): `F5_main`'s X(16) there is ≥ 1.5×
+    `F6_main`'s.
+  - If it does not: `F5_main`'s X(16) is within ±20% of `F6_main`'s at every N, a wall removed that did not bind.
+- **P9.6 (the residual).** E(16) < 0.7 at N=10^6 in both draws: F5+F6 does not reach "scales" at T=16. In `F5_prof`, frames
+  under `BranchStore` are < 10% of worker samples, and the largest waits lie outside the branch store, among the four
+  residuals above.
+- **P9.7.** `busy_fork` per cycle at T=16 ≥ `F6_main`'s. Fork's p99 at T=16 ≥ 5× its p99 at T=1 at every N (forks
+  serialise on the WAL write lock while every other op gets cheaper).
+- **Correctness.** No NOT A RESULT; after every cell, arena = live = N; every reap frees exactly 1 page.
+
+**Tests in this commit (unrun).**
+- `store::tests::striped_store_under_threads_reads_every_fork_as_it_was`:
+  - four workers grow trees (trunk forks, forks of their own branches, writes, reaps) and resolve every page after every
+    step;
+  - a fifth thread rewrites trunk pages, under the WAL-lock and snapshot discipline the pager imposes;
+  - a miss is filled into the cache under the reader's snapshot;
+  - it asserts that cross-shard forks, deferred reaps, trunk writes and trunk-locked resolutions all occurred.
+- `lock_accounting_counts_a_forced_wait_and_nothing_else`: 65 acquisitions per `stats`, and the contended hold counted
+  against the trunk's class.
+- Every model, cache and mechanism test of F1–F6.
+
+**Mutants** (`turso_conc/mutate_F5.sh`; anchors checked unique against this commit's `store.rs`):
+- F5M1: the trunk never consulted;
+- F5M2: a trunk child never detached;
+- F5M3: a child filed in its parent's shard;
+- F5M4: a foreign slot read from the reader's own shard;
+- F5M5: the trunk's write epoch never published;
+- F6M1 and F6M2 again, on the cache code as it moved.
+
+Each must fail a `branch::` test, or no F5 run proceeds.
+
+**Runs, QUEUED-FOR-FANS, after F6's chain.** The worktree is switched to this branch. `tests_F5`, `mutate_F5`,
+`build_F5`, `F5_smoke`, `F5_main`, `F5_hold`, `F5_prof`, `F5_prof4`, with amendment 7's arguments unchanged. Before files:
+`F6_*`.
+
+### Amendment 8b — written 2026-09-25T13:38:39Z: F6's first test run hung; the cause is in Turso's CompletionGroup; the fix, before any timed F6 run
+
+**What happened.** `tests_F6` (`turso_conc/raw/tests_F6.txt`, banked `0c5f2bd`, rc 101) passed 40 of 41 tests. It hung in
+`mechanism_tests::indexes_and_overflow_pages_branch_like_table_leaves` at the branch UPDATE on line 696. I stopped it by
+pid after 10 minutes, and the chain refused to continue. A `/usr/bin/sample` of the hung thread shows the VDBE
+re-polling a pending IO completion that never finishes (`Program::normal_step` → `IOCompletions::finished`). No timed
+F6 run had started.
+
+**Cause, read from source.**
+- F6's `read_page_no_cache` returns a `CompletionGroup` of one (the read, plus the cache fill).
+- `CompletionGroup::build`, when every child has already finished (a synchronous `pread`), calls the group's callback
+  directly. It never runs the group Completion's own `callback`, so the group's parent slot is never claimed.
+- Btree balance collects sibling page loads, the completions `read_page` returns, into its own `CompletionGroup`
+  (`btree.rs`, `pending_sibling_load_completions`). Linking the finished inner group succeeds because the slot is
+  open, and the outer group then waits for a notification that was skipped.
+- This is a latent Turso bug: any group that finishes during `build` hangs an outer group it is nested in. F6 exposed it
+  by returning a group where callers had only ever seen plain read completions.
+
+**Fix (this commit).** `CompletionGroup::build` finishes a group that completes during `build` through
+`Completion::callback`, on both the success and the error path. That runs the group's callback once, records the result
+and claims the parent slot. Test: `io::completions::tests::a_group_finished_during_build_counts_as_finished_in_an_outer_group`
+nests a finished group (and a failed one) in an outer group, and asserts that the outer one is finished (and failed).
+
+**Added runs, before any timed F6 run.**
+- `tests_F6` now runs `branch::` and `io::completions` together.
+- `tests_F6_core`: the whole `turso_core` lib suite. This change touches core IO, not only the branch module.
+- `mutate_F6` gains F6M4, which reverts the fix and is tested with the `io::completions` filter; the new test must fail.
+
+Nothing timed or asserted in amendments 7, 8 or 8a changes. The same fix goes onto F5's branch before F5 builds.
+
+### Amendment 8c — written 2026-09-25T15:05:20Z: the mutation gate miscounted; the verdict now comes from the tests (doc only; nothing timed or asserted changes)
+
+`mutate_F6` (`turso_conc/raw/mutate_F6.txt`, banked `86da8e2`) reported "applied 4, killed 3". The gate counted a kill as
+cargo exit code 101, and that misread two of the four mutants:
+- **F6M2 (epoch not compared) was KILLED, not a survivor.** Two registered tests printed FAILED on it:
+  `store::tests::the_trunk_page_cache_serves_each_branch_the_version_it_forked_from` and
+  `mechanism_tests::a_random_workload_matches_a_model_of_independent_copies`. Another test then hung on the corrupted
+  data, so the run hit its timeout (rc 124).
+- **F6M4 was UNTESTED, not killed.** Its compile failed on a stale incremental-cache session ("failed to create
+  dependency graph … dep-graph.part.bin: No such file or directory", the same fault as `raw/aborted/tests_F6_incremental_dep_graph_error_1408Z.txt`);
+  rc 101 came from the compiler, and no test ran.
+- F6M1 and F6M3 were killed by FAILED tests (listed in the file).
+
+**Gate from now on** (`mutate_F6.sh`, `mutate_F5.sh`, `run_F6.sh`, `run_F5.sh`). Each mutant's verdict comes from its
+test output:
+- **KILLED:** at least one `test … FAILED` line;
+- **INVALID:** a compile error;
+- **SURVIVED:** rc 0;
+- **INCONCLUSIVE:** anything else.
+
+A chain proceeds only if every registered mutant is KILLED. Mutant builds run with `CARGO_INCREMENTAL=0`, so the
+stale-cache fault cannot recur there; the per-mutant timeout is 900 s. No mutant is added, dropped or changed. All four
+F6 mutants re-run as `mutate_F6b` (`raw/mutate_F6.txt` stays as banked). The source is unchanged from `00f2a88c6`, where
+`tests_F6` (`68129c4`) and the whole-lib `tests_F6_core` (`58d41dc`) passed; this commit changes only this file.

@@ -12,6 +12,8 @@
 //!   churn_spread churn, plus the trunk rewrites the `spread` walk's next row in every cycle (amendment 3)
 //!   pages      every branch writes w pages in one transaction; x axis = N, one block per w
 //!   spread_trunk the `spread` arm's trunk writes with NO branches (amendment 2); x = trunk writes
+//!   conc       T threads churn their own shares of N live branches (amendment 7); one cell per (N, T)
+//!   forks      T threads fork from the trunk and reap, against an optional trunk writer (r11-forklock)
 //!
 //! `--no-autocheckpoint` disables the trunk connection's WAL auto-actions (auto-checkpoint and WAL
 //! restart), amendment 2. Every state line prints the WAL file's size.
@@ -23,6 +25,18 @@
 //! uniformly random live branch, or the oldest one, which is the order uniform-TTL lease expiry
 //! reaps in (amendment 3).
 //!
+//! `--writer 64,1,0` (forks only, default 0): the trunk writers to run cells with, in this order, each
+//! beside the fork threads — none; an autocommit single-row UPDATE once per fork; or `BEGIN IMMEDIATE`
+//! + 64 single-row UPDATEs on 64 distinct leaves + `COMMIT` once per 64 forks (r11-forklock PREREG
+//! amendment 1). `--writer-cycles` (forks only) is the cycles per thread in a cell with a writer
+//! (default `--cycles`). `--cell-deadline-s` (forks only, default 120) stops a cell's fork threads
+//! early; the cell then reports the forks it completed.
+//!
+//! `--threads 1,2,4,...` (conc and forks) is the T list; each N runs it forward and then reversed.
+//! `--cycles` is then the cycles EACH thread runs per cell. `--lock-timing on|off` (conc only,
+//! default off) turns on the store's lock-hold timing, the one lock counter that adds work under the
+//! lock (amendment 7).
+//!
 //! Every read a sample makes is checked against a model the harness keeps itself (never against
 //! the engine), and the engine's own counts are checked against the workload before a number is
 //! printed; a mismatch prints `NOT A RESULT` and exits 1. Beside each latency the harness prints
@@ -31,12 +45,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use turso_core::branch::{Branch, BranchWork};
 use turso_core::{
-    Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO,
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, SqliteDialect, Value,
+    IO,
 };
 
 const TRUNK_ROWS: i64 = 20_000;
@@ -57,6 +72,8 @@ enum Arm {
     ChurnSpread,
     Pages,
     SpreadTrunk,
+    Conc,
+    Forks,
 }
 
 /// Which live branch a churn cycle reaps.
@@ -77,6 +94,11 @@ struct Args {
     w_list: Vec<usize>,
     no_autocheckpoint: bool,
     synchronous: String,
+    threads: Vec<usize>,
+    lock_timing: bool,
+    writers: Vec<usize>,
+    writer_cycles: Option<usize>,
+    cell_deadline_s: u64,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -98,6 +120,11 @@ fn parse_args() -> Args {
         w_list: vec![1],
         no_autocheckpoint: false,
         synchronous: "OFF".to_string(),
+        threads: Vec::new(),
+        lock_timing: false,
+        writers: vec![0],
+        writer_cycles: None,
+        cell_deadline_s: 120,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -113,6 +140,8 @@ fn parse_args() -> Args {
                     "churn_spread" => Arm::ChurnSpread,
                     "pages" => Arm::Pages,
                     "spread_trunk" => Arm::SpreadTrunk,
+                    "conc" => Arm::Conc,
+                    "forks" => Arm::Forks,
                     other => die(&format!("unknown arm {other}")),
                 })
             }
@@ -131,6 +160,32 @@ fn parse_args() -> Args {
                     other => die(&format!("unknown --synchronous {other}")),
                 }
                 .to_string()
+            }
+            "--threads" => args.threads = parse_list(&val(), "--threads"),
+            "--writer" => {
+                args.writers = parse_list(&val(), "--writer");
+                if args.writers.iter().any(|w| ![0, 1, 64].contains(w)) {
+                    die("--writer entries must be 0, 1 or 64");
+                }
+            }
+            "--writer-cycles" => {
+                args.writer_cycles = Some(
+                    val()
+                        .parse()
+                        .unwrap_or_else(|_| die("bad --writer-cycles")),
+                )
+            }
+            "--cell-deadline-s" => {
+                args.cell_deadline_s = val()
+                    .parse()
+                    .unwrap_or_else(|_| die("bad --cell-deadline-s"))
+            }
+            "--lock-timing" => {
+                args.lock_timing = match val().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => die(&format!("unknown --lock-timing {other}")),
+                }
             }
             "--victim" => {
                 args.victim = match val().as_str() {
@@ -157,6 +212,19 @@ fn parse_args() -> Args {
     }
     if args.w_list.is_empty() || args.w_list.iter().any(|&w| w == 0 || w > 64) {
         die("--w entries must be in 1..=64");
+    }
+    if matches!(args.arm, Arm::Conc | Arm::Forks) {
+        if args.threads.is_empty() || args.threads.contains(&0) {
+            die("--arm conc and forks need --threads, every entry positive");
+        }
+        if args.checkpoints.iter().any(|&n| n < *args.threads.iter().max().unwrap()) {
+            die("--arm conc and forks need every checkpoint N >= the largest T, so each thread owns a branch");
+        }
+    } else if !args.threads.is_empty() || args.lock_timing {
+        die("--threads and --lock-timing apply to --arm conc and forks only");
+    }
+    if args.arm != Arm::Forks && (args.writers != [0] || args.writer_cycles.is_some()) {
+        die("--writer and --writer-cycles apply to --arm forks only");
     }
     args
 }
@@ -547,6 +615,8 @@ fn main() {
         Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread => arm_churn(&mut bench, &args),
         Arm::Pages => arm_pages(&mut bench, &args),
         Arm::SpreadTrunk => arm_spread_trunk(&mut bench, &args),
+        Arm::Conc => arm_conc(&mut bench, &args),
+        Arm::Forks => arm_forks(&mut bench, &args),
     }
     let end = db.branch_stats();
     if end.live_branches != 0 || end.arena_slots_in_use != 0 {
@@ -1195,4 +1265,782 @@ fn arm_spread_trunk(b: &mut Bench, args: &Args) {
         b.print_state(n, "");
     }
     b.print_slopes(&args.checkpoints, &["trunk_write"]);
+}
+
+/// The ops of one `conc` cycle, in the order a cycle runs them.
+const CONC_OPS: [&str; 7] = [
+    "fork",
+    "open",
+    "first_write",
+    "read_open",
+    "read_own",
+    "read_inh",
+    "reap",
+];
+
+const CONC_HEADER: &str = "N\tT\tdraw\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\tbusy_retries";
+
+/// What one `conc` thread hands back: its share of the live branches, one latency per cycle per op,
+/// and the `Busy` answers it retried, per op.
+struct ConcOut {
+    share: Vec<Live>,
+    ops: [Vec<Duration>; 7],
+    busy: [u64; 7],
+    elapsed: Duration,
+}
+
+/// Run `f` until it does not answer `Busy`/`BusySnapshot`, counting those answers. Anything else
+/// is not a result.
+fn busy_retry<T>(busy: &mut u64, what: &str, mut f: impl FnMut() -> turso_core::Result<T>) -> T {
+    loop {
+        match f() {
+            Ok(v) => return v,
+            Err(LimboError::Busy | LimboError::BusySnapshot) => {
+                *busy += 1;
+                std::thread::yield_now();
+            }
+            Err(e) => not_a_result(&format!("conc {what} failed: {e}")),
+        }
+    }
+}
+
+fn select_v(conn: &Arc<Connection>, id: i64) -> turso_core::Result<Vec<Vec<Value>>> {
+    conn.prepare(format!("SELECT v FROM t WHERE id = {id}"))?
+        .run_collect_rows()
+}
+
+fn check_v(rows: &[Vec<Value>], id: i64, expect: &str) {
+    match rows {
+        [row] => match &row[0] {
+            Value::Text(t) if t.as_str() == expect => {}
+            other => not_a_result(&format!("conc read of row {id}: got {other:?}, expected {expect}")),
+        },
+        _ => not_a_result(&format!("conc read of row {id}: {} rows", rows.len())),
+    }
+}
+
+/// One `conc` thread: `cycles` cycles against its own trunk connection and its own share. Each
+/// cycle forks a branch, writes row `row_for(base + c)` on it, opens a random branch of the share
+/// and reads its own row and a far row (the trunk's), then reaps a random branch of the share
+/// (never the one forked this cycle, which joins the share after the draw), so the share's size is
+/// fixed. Every read is checked against what the harness knows the branch holds; the trunk never
+/// writes in this arm, so a far row is always the trunk's original value.
+fn conc_thread(
+    trunk: Arc<Connection>,
+    mut share: Vec<Live>,
+    barrier: &Barrier,
+    seed: u64,
+    base: usize,
+    cycles: usize,
+) -> ConcOut {
+    let mut rng = Rng(seed | 1);
+    let mut ops: [Vec<Duration>; 7] = Default::default();
+    for op in ops.iter_mut() {
+        op.reserve_exact(cycles);
+    }
+    let mut busy = [0u64; 7];
+    barrier.wait();
+    let start = Instant::now();
+    for c in 0..cycles {
+        let row = row_for(base + c);
+        let t0 = Instant::now();
+        let branch = busy_retry(&mut busy[0], "fork", || trunk.fork_branch());
+        let t1 = Instant::now();
+        let conn = busy_retry(&mut busy[1], "open", || branch.connect());
+        let t2 = Instant::now();
+        busy_retry(&mut busy[2], "first_write", || {
+            conn.execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", branch_value(row)))
+        });
+        let t3 = Instant::now();
+        drop(conn);
+        let target = &share[rng.below(share.len())];
+        let own = target.rows[0];
+        let far = (own - 1 + TRUNK_ROWS / 2) % TRUNK_ROWS + 1;
+        let t4 = Instant::now();
+        let conn = busy_retry(&mut busy[3], "read_open", || target.branch.connect());
+        let t5 = Instant::now();
+        let got_own = busy_retry(&mut busy[4], "read_own", || select_v(&conn, own));
+        let t6 = Instant::now();
+        let got_far = busy_retry(&mut busy[5], "read_inh", || select_v(&conn, far));
+        let t7 = Instant::now();
+        drop(conn);
+        check_v(&got_own, own, &branch_value(own));
+        check_v(&got_far, far, &trunk_value(far));
+        let victim = share.swap_remove(rng.below(share.len()));
+        share.push(Live {
+            branch,
+            rows: vec![row],
+            trunk_writes_at_fork: 0,
+        });
+        let t8 = Instant::now();
+        let reaped = victim.branch.reap().unwrap_or_else(|e| not_a_result(&format!("conc reap failed: {e}")));
+        let t9 = Instant::now();
+        if reaped.deferred || reaped.freed_pages != 1 {
+            not_a_result(&format!("a conc reap freed {reaped:?}, expected exactly 1 page"));
+        }
+        for (op, d) in ops.iter_mut().zip([
+            t1 - t0,
+            t2 - t1,
+            t3 - t2,
+            t5 - t4,
+            t6 - t5,
+            t7 - t6,
+            t9 - t8,
+        ]) {
+            op.push(d);
+        }
+    }
+    ConcOut {
+        share,
+        ops,
+        busy,
+        elapsed: start.elapsed(),
+    }
+}
+
+/// The box's parallelism at this moment, with nothing shared: `t` threads each run the same fixed
+/// xorshift loop. Operations per second over the slowest thread's finish.
+fn null_ops_per_s(t: usize) -> f64 {
+    const ITER: u64 = 100_000_000;
+    let barrier = Barrier::new(t + 1);
+    let wall = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..t)
+            .map(|i| {
+                let barrier = &barrier;
+                s.spawn(move || {
+                    let mut r = Rng(0x2545_F491_4F6C_DD1D ^ (i as u64 + 1));
+                    barrier.wait();
+                    let mut acc = 0u64;
+                    for _ in 0..ITER {
+                        acc = acc.wrapping_add(r.next());
+                    }
+                    std::hint::black_box(acc)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let start = Instant::now();
+        for h in handles {
+            h.join().unwrap();
+        }
+        start.elapsed()
+    });
+    (t as u64 * ITER) as f64 / wall.as_secs_f64()
+}
+
+/// User and system CPU time of the whole process so far, in nanoseconds.
+fn cpu_ns() -> (u64, u64) {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        not_a_result("getrusage failed");
+    }
+    let ns = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000_000 + tv.tv_usec as u64 * 1_000;
+    (ns(ru.ru_utime), ns(ru.ru_stime))
+}
+
+/// Arm (f) `conc` (amendment 7): T threads, each churning its own share of N live branches with
+/// fork -> first write -> reads -> reap (see [`conc_thread`]). One cell per (N, T); the T list runs
+/// forward and then reversed at each N (draws 0 and 1), so drift across a block shows as the
+/// difference between one T's two draws. Before each cell, the null workload measures what the box
+/// gives T threads that share nothing. Per cell: throughput, per-op latency, Busy retries, process
+/// CPU time, and the store's lock counters (acquisitions, contended acquisitions, wait, hold).
+fn arm_conc(b: &mut Bench, args: &Args) {
+    let tmax = *args.threads.iter().max().unwrap();
+    b.db.set_branch_lock_timing(args.lock_timing);
+    // One trunk connection per thread: a connection serves one thread at a time.
+    let trunks: Vec<Arc<Connection>> = (0..tmax).map(|_| b.db.connect().unwrap()).collect();
+    println!(
+        "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={}",
+        args.threads, args.cycles, args.lock_timing
+    );
+    println!("{CONC_HEADER}");
+    let mut live: Vec<Live> = Vec::new();
+    let mut grown = 0usize;
+    let c = args.cycles;
+    for &n in &args.checkpoints {
+        let t = Instant::now();
+        while live.len() < n {
+            live.push(grow_from_trunk(b, row_for(grown)));
+            grown += 1;
+        }
+        let grow_us = t.elapsed().as_secs_f64() * 1e6;
+        let s = b.db.branch_stats();
+        if s.live_branches != n || s.arena_slots_in_use != n {
+            not_a_result(&format!("expected {n} branches and {n} arena pages before the block: {s:?}"));
+        }
+        b.print_state(n, &format!("grow_total_us={grow_us:.0}"));
+        let order = args
+            .threads
+            .iter()
+            .map(|&t| (t, 0u64))
+            .chain(args.threads.iter().rev().map(|&t| (t, 1u64)));
+        for (t, draw) in order {
+            let null = null_ops_per_s(t);
+            // Deal the live branches round-robin, so every share holds branches of every age.
+            let mut shares: Vec<Vec<Live>> = (0..t).map(|_| Vec::with_capacity(n / t + 1)).collect();
+            for (i, l) in live.drain(..).enumerate() {
+                shares[i % t].push(l);
+            }
+            let barrier = Barrier::new(t + 1);
+            println!("# cell N={n} T={t} draw={draw} start");
+            let before = b.db.branch_stats().work;
+            let cpu0 = cpu_ns();
+            let (wall, outs) = std::thread::scope(|s| {
+                let handles: Vec<_> = shares
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, share)| {
+                        let trunk = trunks[i].clone();
+                        let barrier = &barrier;
+                        let seed = args.seed
+                            ^ (i as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03)
+                            ^ ((n as u64) << 24)
+                            ^ (draw << 56)
+                            ^ ((t as u64) << 48);
+                        let base = grown + i * c;
+                        s.spawn(move || conc_thread(trunk, share, barrier, seed, base, c))
+                    })
+                    .collect();
+                barrier.wait();
+                let start = Instant::now();
+                let outs: Vec<ConcOut> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                (start.elapsed(), outs)
+            });
+            let cpu1 = cpu_ns();
+            let after = b.db.branch_stats().work;
+            grown += t * c;
+            let mut ops: [Vec<Duration>; 7] = Default::default();
+            let mut busy = [0u64; 7];
+            let (mut th_min, mut th_max) = (Duration::MAX, Duration::ZERO);
+            for out in outs {
+                live.extend(out.share);
+                for (i, mut samples) in out.ops.into_iter().enumerate() {
+                    ops[i].append(&mut samples);
+                    busy[i] += out.busy[i];
+                }
+                th_min = th_min.min(out.elapsed);
+                th_max = th_max.max(out.elapsed);
+            }
+            let s = b.db.branch_stats();
+            if s.live_branches != n || s.arena_slots_in_use != n || live.len() != n {
+                not_a_result(&format!(
+                    "cell N={n} T={t} draw={draw} did not return to {n} branches and {n} arena pages \
+                     (harness holds {}): {s:?}",
+                    live.len()
+                ));
+            }
+            for (i, samples) in ops.iter().enumerate() {
+                let mut us: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+                us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!(
+                    "{n}\t{t}\t{draw}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}",
+                    CONC_OPS[i],
+                    us.len(),
+                    percentile(&us, 50.0),
+                    percentile(&us, 90.0),
+                    percentile(&us, 99.0),
+                    us[us.len() - 1],
+                    busy[i]
+                );
+            }
+            let cycles = (t * c) as f64;
+            let wall_ns = wall.as_nanos() as f64;
+            let d = |from: u64, to: u64| to - from;
+            let acq = d(before.lock_acquisitions, after.lock_acquisitions);
+            let contended = d(before.lock_contended, after.lock_contended);
+            let wait_ns = d(before.lock_wait_ns, after.lock_wait_ns);
+            let hold_ns = d(before.lock_hold_ns, after.lock_hold_ns);
+            println!(
+                "# cellsum N={n} T={t} draw={draw} cycles={} wall_ns={} cycles_per_s={:.1} \
+                 null_ops_per_s={null:.0} thread_ms_min={:.3} thread_ms_max={:.3} user_ns={} sys_ns={} \
+                 lock_acq={acq} lock_contended={contended} lock_wait_ns={wait_ns} lock_hold_ns={hold_ns} \
+                 acq_per_cycle={:.3} contended_frac={:.4} wait_frac={:.4} hold_util={:.4} \
+                 busy_fork={} busy_open={} busy_other={} rss_bytes={} resolves={} \
+                 trunk_page_hits={} trunk_page_misses={} trunk_lock_acq={} trunk_lock_contended={} \
+                 trunk_lock_wait_ns={} trunk_lock_hold_ns={}",
+                t * c,
+                wall.as_nanos(),
+                cycles / wall.as_secs_f64(),
+                th_min.as_secs_f64() * 1e3,
+                th_max.as_secs_f64() * 1e3,
+                cpu1.0 - cpu0.0,
+                cpu1.1 - cpu0.1,
+                acq as f64 / cycles,
+                contended as f64 / acq as f64,
+                wait_ns as f64 / (t as f64 * wall_ns),
+                hold_ns as f64 / wall_ns,
+                busy[0],
+                busy[1],
+                busy[2..].iter().sum::<u64>(),
+                rss_bytes(),
+                d(before.resolve_calls, after.resolve_calls),
+                d(before.trunk_page_hits, after.trunk_page_hits),
+                d(before.trunk_page_misses, after.trunk_page_misses),
+                d(before.trunk_lock_acquisitions, after.trunk_lock_acquisitions),
+                d(before.trunk_lock_contended, after.trunk_lock_contended),
+                d(before.trunk_lock_wait_ns, after.trunk_lock_wait_ns),
+                d(before.trunk_lock_hold_ns, after.trunk_lock_hold_ns),
+            );
+        }
+    }
+    drop(live);
+    drop(trunks);
+}
+
+/// The trunk writer's rows in `forks`: the hot row for `--writer 1` (and for `--writer 0`, whose check
+/// reads it), 64 rows on 64 distinct leaves for `--writer 64` — disjoint from the hot row, so each row
+/// set has one writer and one clock.
+fn writer_rows(w: usize) -> Vec<i64> {
+    match w {
+        0 | 1 => vec![HOT_ROW],
+        _ => page_rows(1, w),
+    }
+}
+
+/// The writer transaction number a value of a writer row names: 0 for the row's original value.
+fn writer_k(row: i64, v: &str) -> Option<u64> {
+    if v == trunk_value(row) {
+        return Some(0);
+    }
+    v.strip_prefix('t')?.parse().ok()
+}
+
+/// What the `forks` arm's trunk writer publishes to the fork threads: transactions begun and
+/// transactions whose COMMIT returned, both counted from 1 across the whole run.
+#[derive(Default)]
+struct WriterClock {
+    started: std::sync::atomic::AtomicU64,
+    done: std::sync::atomic::AtomicU64,
+}
+
+struct WriterOut {
+    commits: u64,
+    busy: u64,
+    txn: Vec<Duration>,
+    elapsed: Duration,
+}
+
+/// The `forks` arm's trunk writer: one transaction per `w` forks the fork threads complete (`forks`),
+/// until `stop`, each writing k (its number, from 1, on this row set's clock) into every writer row, so
+/// any committed state holds one k in all of them. Pacing by forks bounds the versions retained for
+/// the live branches at about one page per fork (amendment 1).
+fn forks_writer(
+    conn: Arc<Connection>,
+    w: usize,
+    clock: &WriterClock,
+    forks: &std::sync::atomic::AtomicU64,
+    stop: &std::sync::atomic::AtomicBool,
+    barrier: &Barrier,
+) -> WriterOut {
+    use std::sync::atomic::Ordering;
+    let rows = writer_rows(w);
+    let mut out = WriterOut {
+        commits: 0,
+        busy: 0,
+        txn: Vec::new(),
+        elapsed: Duration::ZERO,
+    };
+    barrier.wait();
+    let start = Instant::now();
+    loop {
+        while !stop.load(Ordering::Acquire)
+            && forks.load(Ordering::Acquire) < (out.commits + 1) * w as u64
+        {
+            std::thread::yield_now();
+        }
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let k = clock.started.fetch_add(1, Ordering::AcqRel) + 1;
+        let v = trunk_gen_value(k);
+        let t0 = Instant::now();
+        if w == 1 {
+            let sql = format!("UPDATE t SET v = '{v}' WHERE id = {HOT_ROW}");
+            busy_retry(&mut out.busy, "writer update", || conn.execute(&sql));
+        } else {
+            busy_retry(&mut out.busy, "writer begin", || conn.execute("BEGIN IMMEDIATE"));
+            for &row in &rows {
+                conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {row}"))
+                    .unwrap_or_else(|e| not_a_result(&format!("writer update failed: {e}")));
+            }
+            conn.execute("COMMIT")
+                .unwrap_or_else(|e| not_a_result(&format!("writer commit failed: {e}")));
+        }
+        out.txn.push(t0.elapsed());
+        clock.done.fetch_add(1, Ordering::AcqRel);
+        out.commits += 1;
+    }
+    out.elapsed = start.elapsed();
+    out
+}
+
+/// A branch a fork thread set aside to check after the cell: the writer's commits returned before
+/// its fork was called, and the writer's transactions begun when the fork returned.
+struct Sampled {
+    live: Live,
+    lo: u64,
+    hi: u64,
+}
+
+struct ForksOut {
+    share: Vec<Live>,
+    sampled: Vec<Sampled>,
+    fork: Vec<Duration>,
+    reap: Vec<Duration>,
+    busy: u64,
+    forks: usize,
+    elapsed: Duration,
+}
+
+/// One `forks` thread: up to `cycles` cycles against its own trunk connection, each a trunk fork
+/// (Busy answers retried and counted) and the reap of a random branch of its share, so the share's
+/// size is fixed. Every 64th fork is SAMPLED instead: kept out of the share, with the writer's clock
+/// read around the fork, and no victim reaped that cycle. Stops early at `deadline`.
+fn forks_thread(
+    trunk: Arc<Connection>,
+    mut share: Vec<Live>,
+    clock: &WriterClock,
+    forks: &std::sync::atomic::AtomicU64,
+    barrier: &Barrier,
+    seed: u64,
+    cycles: usize,
+    deadline: Duration,
+) -> ForksOut {
+    use std::sync::atomic::Ordering;
+    let mut rng = Rng(seed | 1);
+    let mut out = ForksOut {
+        share: Vec::new(),
+        sampled: Vec::new(),
+        fork: Vec::with_capacity(cycles),
+        reap: Vec::with_capacity(cycles),
+        busy: 0,
+        forks: 0,
+        elapsed: Duration::ZERO,
+    };
+    barrier.wait();
+    let start = Instant::now();
+    for c in 0..cycles {
+        if start.elapsed() >= deadline {
+            break;
+        }
+        let lo = clock.done.load(Ordering::Acquire);
+        let t0 = Instant::now();
+        let branch = busy_retry(&mut out.busy, "fork", || trunk.fork_branch());
+        out.fork.push(t0.elapsed());
+        let hi = clock.started.load(Ordering::Acquire);
+        out.forks += 1;
+        forks.fetch_add(1, Ordering::AcqRel);
+        let live = Live {
+            branch,
+            rows: Vec::new(),
+            trunk_writes_at_fork: 0,
+        };
+        if c % 64 == 63 {
+            out.sampled.push(Sampled { live, lo, hi });
+            continue;
+        }
+        let victim = share.swap_remove(rng.below(share.len()));
+        share.push(live);
+        let own = victim.rows.len();
+        let t1 = Instant::now();
+        let reaped = victim
+            .branch
+            .reap()
+            .unwrap_or_else(|e| not_a_result(&format!("forks reap failed: {e}")));
+        out.reap.push(t1.elapsed());
+        if reaped.deferred || reaped.freed_pages < own {
+            not_a_result(&format!("a forks reap freed {reaped:?}, expected at least {own} pages"));
+        }
+    }
+    out.elapsed = start.elapsed();
+    out.share = share;
+    out
+}
+
+/// Check one sampled branch: every writer row holds one k, on two connections, with lo <= k <= hi.
+fn check_sampled(s: &Sampled, rows: &[i64]) {
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let conn = s
+            .live
+            .branch
+            .connect()
+            .unwrap_or_else(|e| not_a_result(&format!("sampled branch connect failed: {e}")));
+        let ks: Vec<Option<u64>> = rows
+            .iter()
+            .map(|&row| {
+                let got = select_v(&conn, row)
+                    .unwrap_or_else(|e| not_a_result(&format!("sampled read failed: {e}")));
+                match got.as_slice() {
+                    [r] => match &r[0] {
+                        Value::Text(t) => writer_k(row, t.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            })
+            .collect();
+        drop(conn);
+        let k = ks[0];
+        if k.is_none() || ks.iter().any(|&x| x != k) {
+            not_a_result(&format!(
+                "sampled branch {} reads a torn or unknown writer state: {ks:?}",
+                s.live.branch.id().0
+            ));
+        }
+        seen.push(k.unwrap());
+    }
+    if seen[0] != seen[1] {
+        not_a_result(&format!(
+            "sampled branch {} changed between two connections: k {} then {}",
+            s.live.branch.id().0,
+            seen[0],
+            seen[1]
+        ));
+    }
+    let k = seen[0];
+    if k < s.lo || k > s.hi {
+        not_a_result(&format!(
+            "sampled branch {} reads writer txn {k}, outside [{}, {}] (commits returned before \
+             the fork, txns begun when it returned)",
+            s.live.branch.id().0,
+            s.lo,
+            s.hi
+        ));
+    }
+}
+
+const FORKS_HEADER: &str = "N\tT\tW\tdraw\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us";
+
+fn print_lat(n: usize, t: usize, w: usize, draw: u64, name: &str, samples: &mut [Duration]) {
+    if samples.is_empty() {
+        println!("{n}\t{t}\t{w}\t{draw}\t{name}\t0\t-\t-\t-\t-");
+        return;
+    }
+    let mut us: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+    us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "{n}\t{t}\t{w}\t{draw}\t{name}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+        us.len(),
+        percentile(&us, 50.0),
+        percentile(&us, 90.0),
+        percentile(&us, 99.0),
+        us[us.len() - 1]
+    );
+}
+
+/// Arm `forks` (r11-forklock PREREG §0): T threads fork from the trunk and reap, keeping N live trunk
+/// children, beside a trunk writer (`--writer`). One cell per (N, T); the T list runs forward and then
+/// reversed. Per cell: forks/s, fork and reap latency, Busy answers, the writer's commits, Busy answers
+/// and transaction latency, the store's trunk-fork and lock counters, and a check of every sampled
+/// branch against the writer's clock.
+fn arm_forks(b: &mut Bench, args: &Args) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tmax = *args.threads.iter().max().unwrap();
+    b.db.set_branch_lock_timing(args.lock_timing);
+    let trunks: Vec<Arc<Connection>> = (0..tmax).map(|_| b.db.connect().unwrap()).collect();
+    let writer = b.db.connect().unwrap();
+    writer
+        .execute(format!("PRAGMA synchronous = {}", args.synchronous))
+        .unwrap();
+    // One clock per row set: the hot row (`--writer 1`, read by `--writer 0`'s check) and the batch's.
+    let (clock_hot, clock_batch) = (WriterClock::default(), WriterClock::default());
+    let writer_cycles = args.writer_cycles.unwrap_or(args.cycles);
+    println!(
+        "# forks: threads={:?} (forward, then reversed) writers={:?} cycles_per_thread={} \
+         writer_cycles_per_thread={writer_cycles} lock_timing={} cell_deadline_s={} \
+         writer_synchronous={}",
+        args.threads,
+        args.writers,
+        args.cycles,
+        args.lock_timing,
+        args.cell_deadline_s,
+        args.synchronous
+    );
+    println!("{FORKS_HEADER}");
+    let mut live: Vec<Live> = Vec::new();
+    let mut grown = 0usize;
+    for &n in &args.checkpoints {
+        let t = Instant::now();
+        while live.len() < n {
+            live.push(grow_from_trunk(b, row_for(grown)));
+            grown += 1;
+        }
+        let grow_us = t.elapsed().as_secs_f64() * 1e6;
+        b.print_state(n, &format!("grow_total_us={grow_us:.0}"));
+        let order: Vec<(usize, usize, u64)> = args
+            .writers
+            .iter()
+            .flat_map(|&w| {
+                args.threads
+                    .iter()
+                    .map(move |&t| (w, t, 0u64))
+                    .chain(args.threads.iter().rev().map(move |&t| (w, t, 1u64)))
+            })
+            .collect();
+        for (w, t, draw) in order {
+            let rows = writer_rows(w);
+            let clock = if w == 64 { &clock_batch } else { &clock_hot };
+            let cycles_here = if w == 0 { args.cycles } else { writer_cycles };
+            let forks_done = std::sync::atomic::AtomicU64::new(0);
+            let null = null_ops_per_s(t);
+            let written_before = live.iter().filter(|l| !l.rows.is_empty()).count();
+            let mut shares: Vec<Vec<Live>> =
+                (0..t).map(|_| Vec::with_capacity(n / t + 1)).collect();
+            for (i, l) in live.drain(..).enumerate() {
+                shares[i % t].push(l);
+            }
+            // The fork threads, the writer if there is one, and this thread.
+            let barrier = Barrier::new(t + usize::from(w > 0) + 1);
+            let stop = AtomicBool::new(false);
+            println!("# cell N={n} T={t} W={w} draw={draw} start");
+            let before = b.db.branch_stats().work;
+            let done0 = clock.done.load(Ordering::Acquire);
+            let cpu0 = cpu_ns();
+            let deadline = Duration::from_secs(args.cell_deadline_s);
+            let (wall, outs, wout) = std::thread::scope(|s| {
+                let wh = (w > 0).then(|| {
+                    let conn = writer.clone();
+                    let (stop, barrier, forks_done) = (&stop, &barrier, &forks_done);
+                    s.spawn(move || forks_writer(conn, w, clock, forks_done, stop, barrier))
+                });
+                let handles: Vec<_> = shares
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, share)| {
+                        let trunk = trunks[i].clone();
+                        let (barrier, forks_done) = (&barrier, &forks_done);
+                        let seed = args.seed
+                            ^ (i as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03)
+                            ^ ((n as u64) << 24)
+                            ^ (draw << 56)
+                            ^ ((t as u64) << 48)
+                            ^ ((w as u64) << 40);
+                        s.spawn(move || {
+                            forks_thread(
+                                trunk, share, clock, forks_done, barrier, seed, cycles_here,
+                                deadline,
+                            )
+                        })
+                    })
+                    .collect();
+                barrier.wait();
+                let start = Instant::now();
+                let outs: Vec<ForksOut> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                let wall = start.elapsed();
+                stop.store(true, Ordering::Release);
+                let wout = wh.map(|h| h.join().unwrap());
+                (wall, outs, wout)
+            });
+            let cpu1 = cpu_ns();
+            let after = b.db.branch_stats().work;
+            let done1 = clock.done.load(Ordering::Acquire);
+            let (mut fork, mut reap, mut sampled) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut busy, mut forks) = (0u64, 0usize);
+            let (mut th_min, mut th_max) = (Duration::MAX, Duration::ZERO);
+            let mut shares = Vec::new();
+            for mut out in outs {
+                fork.append(&mut out.fork);
+                reap.append(&mut out.reap);
+                sampled.append(&mut out.sampled);
+                busy += out.busy;
+                forks += out.forks;
+                th_min = th_min.min(out.elapsed);
+                th_max = th_max.max(out.elapsed);
+                shares.push(out.share);
+            }
+            // The writer has stopped: check every sampled branch, then give each back to a share and
+            // reap one extra victim for it, so live returns to N.
+            for smp in &sampled {
+                check_sampled(smp, &rows);
+            }
+            let verified = sampled.len();
+            let mut rng =
+                Rng(args.seed ^ (n as u64) ^ ((t as u64) << 40) ^ (draw << 60) ^ ((w as u64) << 32) | 1);
+            for (i, smp) in sampled.into_iter().enumerate() {
+                let share = &mut shares[i % t];
+                let victim = share.swap_remove(rng.below(share.len()));
+                share.push(smp.live);
+                let own = victim.rows.len();
+                let reaped = victim.branch.reap().unwrap_or_else(|e| {
+                    not_a_result(&format!("forks extra reap failed: {e}"))
+                });
+                if reaped.deferred || reaped.freed_pages < own {
+                    not_a_result(&format!("a forks extra reap freed {reaped:?}, expected >= {own}"));
+                }
+            }
+            for share in shares {
+                live.extend(share);
+            }
+            let st = b.db.branch_stats();
+            let written = live.iter().filter(|l| !l.rows.is_empty()).count();
+            if st.live_branches != n || live.len() != n {
+                not_a_result(&format!(
+                    "cell N={n} T={t} W={w} draw={draw} did not return to {n} branches (harness holds \
+                     {}): {st:?}",
+                    live.len()
+                ));
+            }
+            if st.arena_slots_in_use < written || (w == 0 && st.arena_slots_in_use != written) {
+                not_a_result(&format!(
+                    "cell N={n} T={t} W={w} draw={draw}: {} arena pages for {written} written branches \
+                     ({written_before} before the cell)",
+                    st.arena_slots_in_use
+                ));
+            }
+            print_lat(n, t, w, draw, "fork", &mut fork);
+            print_lat(n, t, w, draw, "reap", &mut reap);
+            let (wcommits, wbusy, wper_s) = match &wout {
+                Some(o) => (o.commits, o.busy, o.commits as f64 / o.elapsed.as_secs_f64()),
+                None => (0, 0, 0.0),
+            };
+            if let Some(mut o) = wout {
+                print_lat(n, t, w, draw, "writer_txn", &mut o.txn);
+            }
+            let d = |f: fn(&BranchWork) -> u64| f(&after) - f(&before);
+            println!(
+                "# forkcell N={n} T={t} W={w} draw={draw} forks={forks} wall_ns={} forks_per_s={:.1} \
+                 null_ops_per_s={null:.0} thread_ms_min={:.3} thread_ms_max={:.3} busy_fork={busy} \
+                 busy_per_fork={:.4} writer_commits={wcommits} writer_commits_clock={} \
+                 writer_per_s={wper_s:.1} writer_busy={wbusy} sampled_verified={verified} \
+                 user_ns={} sys_ns={} rss_bytes={} arena_in_use={} \
+                 trunk_forks={} trunk_fork_read_txs={} trunk_fork_wal_locks={} trunk_fork_wal_hold_ns={} \
+                 trunk_forks_fast={} trunk_forks_locked={} trunk_fork_gate_retries={} \
+                 trunk_commits_decided={} trunk_pre_images_captured={} trunk_pre_images_retained={} \
+                 trunk_lock_acq={} trunk_lock_contended={} trunk_lock_wait_ns={} trunk_lock_hold_ns={} \
+                 lock_acq={} lock_contended={} lock_wait_ns={} lock_hold_ns={}",
+                wall.as_nanos(),
+                forks as f64 / wall.as_secs_f64(),
+                th_min.as_secs_f64() * 1e3,
+                th_max.as_secs_f64() * 1e3,
+                busy as f64 / forks.max(1) as f64,
+                done1 - done0,
+                cpu1.0 - cpu0.0,
+                cpu1.1 - cpu0.1,
+                rss_bytes(),
+                st.arena_slots_in_use,
+                d(|x| x.trunk_forks),
+                d(|x| x.trunk_fork_read_txs),
+                d(|x| x.trunk_fork_wal_locks),
+                d(|x| x.trunk_fork_wal_hold_ns),
+                d(|x| x.trunk_forks_fast),
+                d(|x| x.trunk_forks_locked),
+                d(|x| x.trunk_fork_gate_retries),
+                d(|x| x.trunk_commits_decided),
+                d(|x| x.trunk_pre_images_captured),
+                d(|x| x.trunk_pre_images_retained),
+                d(|x| x.trunk_lock_acquisitions),
+                d(|x| x.trunk_lock_contended),
+                d(|x| x.trunk_lock_wait_ns),
+                d(|x| x.trunk_lock_hold_ns),
+                d(|x| x.lock_acquisitions),
+                d(|x| x.lock_contended),
+                d(|x| x.lock_wait_ns),
+                d(|x| x.lock_hold_ns),
+            );
+        }
+    }
+    drop(live);
+    drop(trunks);
+    drop(writer);
 }

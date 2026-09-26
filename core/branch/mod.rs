@@ -189,6 +189,9 @@ pub struct BranchStats {
 /// Cumulative counts of the store's per-call work since the database opened. Observation only:
 /// nothing in the mechanism reads them. Each is updated once per call under the lock the call
 /// already holds, from a loop index the call computes anyway, so counting adds no per-element step.
+/// The `lock_*` counters describe the store's locks themselves, summed over all of them (the trunk's
+/// and every shard's); `trunk_lock_*` is the trunk's alone. Only the `*_hold_ns` pair adds work under
+/// a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchWork {
     /// Page resolutions against the branch tree (one per branch-pager page read).
@@ -199,7 +202,9 @@ pub struct BranchWork {
     pub resolve_levels: u64,
     /// Retained versions compared against the fork epoch while resolving (`Lineage::retained_at`):
     /// at most one per lineage consulted, the page's born-predecessor. The O(log V) descent that
-    /// finds it is not counted; time is the only instrument for it.
+    /// finds it is not counted; time is the only instrument for it. Since the striped store, the
+    /// trunk's retained versions are consulted only for a page the trunk rewrote after the reader's
+    /// fork, so a version the unlocked check proves irrelevant is no longer compared or counted.
     pub resolve_retained_examined: u64,
     /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
     /// index this counted a position scan's comparisons.)
@@ -232,6 +237,142 @@ pub struct BranchWork {
     pub merge_rows_installed: u64,
     /// Trunk write transactions committed with a page while the trunk had a child.
     pub trunk_commits: u64,
+    /// Acquisitions of the store's locks. Every store entry point takes at least one (a `stats`
+    /// call counts its own: one per lock), so this is an integer the workload fixes and load
+    /// cannot move.
+    pub lock_acquisitions: u64,
+    /// Acquisitions that found the lock held by another thread and waited for it.
+    pub lock_contended: u64,
+    /// Nanoseconds those acquisitions waited, summed. The clock is read only on the contended path,
+    /// by the waiting thread.
+    pub lock_wait_ns: u64,
+    /// Nanoseconds the lock was held, summed over acquisitions made while lock timing was on
+    /// ([`Database::set_branch_lock_timing`]); 0 while it is off. The one counter that adds work
+    /// inside the critical section: two clock reads per acquisition.
+    pub lock_hold_ns: u64,
+    /// Resolutions of a trunk page that the shared trunk-page cache answered.
+    pub trunk_page_hits: u64,
+    /// Resolutions of a trunk page it did not hold, which the pager then read through the WAL or
+    /// the database file.
+    pub trunk_page_misses: u64,
+    /// The trunk's lock alone: trunk forks, trunk copy decisions, reaps of trunk children, and
+    /// resolutions of pages the trunk rewrote after the reader's fork.
+    pub trunk_lock_acquisitions: u64,
+    pub trunk_lock_contended: u64,
+    pub trunk_lock_wait_ns: u64,
+    pub trunk_lock_hold_ns: u64,
+    /// Children of the trunk registered by a fork.
+    pub trunk_forks: u64,
+    /// WAL read transactions begun by the trunk forks that registered: one each, plus one per internal
+    /// `BusySnapshot` retry. A fork that answered `Busy` never registers and is not counted here.
+    pub trunk_fork_read_txs: u64,
+    /// WAL write-lock acquisitions by the trunk forks that registered: one each, plus one per internal
+    /// `BusySnapshot` retry (which acquired the lock and released it).
+    pub trunk_fork_wal_locks: u64,
+    /// Nanoseconds trunk forks held the WAL write lock, summed; 0 while lock timing is off.
+    pub trunk_fork_wal_hold_ns: u64,
+    /// Trunk forks registered without the WAL write lock, against the commit gate.
+    pub trunk_forks_fast: u64,
+    /// Trunk forks registered under the WAL write lock: the trunk's first live child, or a fork
+    /// that lost to trunk commits on every lock-free attempt.
+    pub trunk_forks_locked: u64,
+    /// Lock-free attempts, by the trunk forks that registered, abandoned because a trunk commit took
+    /// its copy decisions in between (or was taking them).
+    pub trunk_fork_gate_retries: u64,
+    /// Trunk commits that took their copy decisions in the store (`begin_trunk_commit`).
+    pub trunk_commits_decided: u64,
+    /// Pages those commits wrote with a pre-image the pager had captured.
+    pub trunk_pre_images_captured: u64,
+    /// Captured pre-images kept as retained versions, because a live child could see them.
+    pub trunk_pre_images_retained: u64,
+}
+
+impl BranchWork {
+    /// Add every counter of `other` into this one.
+    pub(crate) fn add(&mut self, other: &BranchWork) {
+        let BranchWork {
+            resolve_calls,
+            resolve_levels,
+            resolve_retained_examined,
+            gc_examined,
+            gc_range_entries,
+            lock_acquisitions,
+            lock_contended,
+            lock_wait_ns,
+            lock_hold_ns,
+            trunk_page_hits,
+            trunk_page_misses,
+            trunk_lock_acquisitions,
+            trunk_lock_contended,
+            trunk_lock_wait_ns,
+            trunk_lock_hold_ns,
+            trunk_forks,
+            trunk_fork_read_txs,
+            trunk_fork_wal_locks,
+            trunk_fork_wal_hold_ns,
+            trunk_forks_fast,
+            trunk_forks_locked,
+            trunk_fork_gate_retries,
+            trunk_commits_decided,
+            trunk_pre_images_captured,
+            trunk_pre_images_retained,
+            merge_attempts,
+            merge_commits,
+            merge_refused_scalar,
+            merge_refused_log,
+            merge_refused_page,
+            merge_refused_key,
+            merge_refused_structural,
+            merge_refused_install,
+            merge_refused_scope,
+            merge_probes,
+            merge_log_entries_scanned,
+            merge_structural_probes,
+            merge_pages_installed,
+            merge_rows_installed,
+            trunk_commits,
+        } = *other;
+        self.resolve_calls += resolve_calls;
+        self.resolve_levels += resolve_levels;
+        self.resolve_retained_examined += resolve_retained_examined;
+        self.gc_examined += gc_examined;
+        self.gc_range_entries += gc_range_entries;
+        self.lock_acquisitions += lock_acquisitions;
+        self.lock_contended += lock_contended;
+        self.lock_wait_ns += lock_wait_ns;
+        self.lock_hold_ns += lock_hold_ns;
+        self.trunk_page_hits += trunk_page_hits;
+        self.trunk_page_misses += trunk_page_misses;
+        self.trunk_lock_acquisitions += trunk_lock_acquisitions;
+        self.trunk_lock_contended += trunk_lock_contended;
+        self.trunk_lock_wait_ns += trunk_lock_wait_ns;
+        self.trunk_lock_hold_ns += trunk_lock_hold_ns;
+        self.trunk_forks += trunk_forks;
+        self.trunk_fork_read_txs += trunk_fork_read_txs;
+        self.trunk_fork_wal_locks += trunk_fork_wal_locks;
+        self.trunk_fork_wal_hold_ns += trunk_fork_wal_hold_ns;
+        self.trunk_forks_fast += trunk_forks_fast;
+        self.trunk_forks_locked += trunk_forks_locked;
+        self.trunk_fork_gate_retries += trunk_fork_gate_retries;
+        self.trunk_commits_decided += trunk_commits_decided;
+        self.trunk_pre_images_captured += trunk_pre_images_captured;
+        self.trunk_pre_images_retained += trunk_pre_images_retained;
+        self.merge_attempts += merge_attempts;
+        self.merge_commits += merge_commits;
+        self.merge_refused_scalar += merge_refused_scalar;
+        self.merge_refused_log += merge_refused_log;
+        self.merge_refused_page += merge_refused_page;
+        self.merge_refused_key += merge_refused_key;
+        self.merge_refused_structural += merge_refused_structural;
+        self.merge_refused_install += merge_refused_install;
+        self.merge_refused_scope += merge_refused_scope;
+        self.merge_probes += merge_probes;
+        self.merge_log_entries_scanned += merge_log_entries_scanned;
+        self.merge_structural_probes += merge_structural_probes;
+        self.merge_pages_installed += merge_pages_installed;
+        self.merge_rows_installed += merge_rows_installed;
+        self.trunk_commits += trunk_commits;
+    }
 }
 
 impl Branch {
@@ -334,21 +475,63 @@ impl Connection {
         Ok(Branch::new(self.db.clone(), id))
     }
 
-    /// Fork the trunk under its WAL write lock. The lock is the point: a trunk write transaction
-    /// in flight across the fork took its copy decisions for the previous epoch, so the pages it
-    /// commits afterwards would be visible to the new branch. Holding the writer lock means there
-    /// is no such transaction, and the read snapshot it forces is the latest commit.
+    /// Fork the trunk. A trunk commit takes its copy decisions at its serialization point, against
+    /// the epoch there (see the store's "Trunk commits and forks"), so a fork needs no WAL write
+    /// lock: it takes a read snapshot between two commits' decisions and registers under the trunk's
+    /// lock if no commit took its decisions since, which a trunk write transaction in flight does
+    /// only at its commit. It never waits out a write transaction and never serialises with another
+    /// fork on the WAL.
+    ///
+    /// The trunk's first live child is forked under the WAL write lock instead, as every fork was
+    /// before: a writer that saw no child captured no pre-images, so no child may appear before its
+    /// commit. So is a fork that lost to trunk commits on every lock-free attempt, so a stream of
+    /// commits cannot starve it.
     fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
+        const LOCK_FREE_ATTEMPTS: usize = 8;
+        let store = &self.db.branches;
+        // Observation only (see `BranchWork::trunk_fork_*`): read txs begun, WAL write-lock
+        // acquisitions and lock-free attempts lost, handed to the store at the registration.
+        let mut attempts = store::ForkAttempts::default();
+        for _ in 0..LOCK_FREE_ATTEMPTS {
+            let seen = store.trunk_commit_seq();
+            if seen % 2 == 1 {
+                // A trunk commit is between its copy decisions and its publication.
+                attempts.gate_retries += 1;
+                pager.io.yield_now();
+                continue;
+            }
+            pager.begin_read_tx()?;
+            attempts.read_txs += 1;
+            let forked = self.fork_trunk_registered(pager, Some(seen), attempts);
+            pager.end_read_tx();
+            match forked? {
+                store::TrunkFork::Forked(id) => return Ok(id),
+                store::TrunkFork::Retry => attempts.gate_retries += 1,
+                store::TrunkFork::NeedsWriterLock => break,
+            }
+        }
+        self.fork_trunk_locked(pager, attempts)
+    }
+
+    /// Fork the trunk under its WAL write lock: no trunk write transaction is in flight, and the
+    /// read snapshot the lock forces is the latest commit.
+    fn fork_trunk_locked(
+        self: &Arc<Connection>,
+        pager: &Arc<Pager>,
+        mut attempts: store::ForkAttempts,
+    ) -> Result<BranchId> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
         loop {
             pager.begin_read_tx()?;
+            attempts.read_txs += 1;
             let begun = pager
                 .io
                 .block(|| pager.begin_write_tx(WalAutoActions::empty()));
             match begun {
-                Ok(()) => {}
+                Ok(()) => attempts.wal_locks += 1,
                 Err(LimboError::BusySnapshot) if attempt < SNAPSHOT_RETRIES => {
+                    attempts.wal_locks += 1;
                     pager.end_read_tx();
                     attempt += 1;
                     continue;
@@ -358,14 +541,33 @@ impl Connection {
                     return Err(err);
                 }
             }
-            let forked = self.fork_trunk_locked(pager);
+            let held = self.db.branches.timed().then(std::time::Instant::now);
+            let forked = self.fork_trunk_registered(pager, None, attempts);
             pager.end_write_tx();
+            if let Some(held) = held {
+                self.db
+                    .branches
+                    .add_fork_wal_hold(held.elapsed().as_nanos() as u64);
+            }
             pager.end_read_tx();
-            return forked;
+            return match forked? {
+                store::TrunkFork::Forked(id) => Ok(id),
+                _ => Err(LimboError::InternalError(
+                    "a trunk fork under the WAL write lock was not registered".to_string(),
+                )),
+            };
         }
     }
 
-    fn fork_trunk_locked(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
+    /// Register a trunk fork against the caller's read snapshot: `seen` is the commit gate's count
+    /// read before the snapshot began, or `None` under the WAL write lock (see
+    /// [`BranchStore::fork_trunk`]).
+    fn fork_trunk_registered(
+        self: &Arc<Connection>,
+        pager: &Arc<Pager>,
+        seen: Option<u64>,
+        attempts: store::ForkAttempts,
+    ) -> Result<store::TrunkFork> {
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
@@ -378,7 +580,14 @@ impl Connection {
             .find(|schema| schema.schema_version == cookie)
             .ok_or(LimboError::SchemaUpdated)?;
         let page_size = pager.get_page_size_unchecked().get() as usize;
-        self.db.branches.fork_trunk(schema, page_size)
+        let reserved_space = pager.get_reserved_space().ok_or_else(|| {
+            LimboError::InternalError(
+                "an initialized database's pager has no reserved-space byte".to_string(),
+            )
+        })?;
+        self.db
+            .branches
+            .fork_trunk(schema, page_size, reserved_space, seen, attempts)
     }
 
     /// The branch this connection is open on, if any.
@@ -398,6 +607,13 @@ impl Database {
         self.branches.set_track_reads(on);
     }
 
+    /// Time how long each acquisition holds the branch store's lock, into
+    /// [`BranchWork::lock_hold_ns`]. Observation only; off by default.
+    #[doc(hidden)]
+    pub fn set_branch_lock_timing(&self, on: bool) {
+        self.branches.set_lock_timing(on);
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
@@ -412,6 +628,9 @@ impl Database {
 
     /// Open a connection on branch `id`: an ordinary connection whose pager is bound to the branch
     /// and whose schema is the branch's own.
+    ///
+    /// The pager is built by `_init_branch`, bound before it reads anything, so page 1 — like every
+    /// page after it — is read as the BRANCH sees it, and nothing of the trunk's can be left in it.
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
         let schema = self.branches.open(id)?;
         // Built before anything fallible below, so an error there still closes the branch.
@@ -419,12 +638,8 @@ impl Database {
             store: self.branches.clone(),
             id,
         };
-        let pager = self._init(None, None)?;
-        // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may
-        // survive into the branch's view.
-        pager.clear_page_cache(false);
+        let pager = self._init_branch(binding)?;
         pager.set_schema_cookie(None);
-        pager.bind_branch(binding)?;
         let pager = Arc::new(pager);
         let default_cache_size = pager
             .io
