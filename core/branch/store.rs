@@ -381,7 +381,6 @@ pub(crate) fn mutant(_n: u32) -> bool {
     false
 }
 
-
 /// A lock-protected structure that counts its own lock.
 trait Counted {
     fn work(&mut self) -> &mut BranchWork;
@@ -1214,6 +1213,7 @@ impl BranchStore {
     /// commit, so no live child can see what it overwrites — asserted, as the writer tells the store
     /// nothing else about that page (the cache's generation covers it; see "Trunk pages without the
     /// file").
+    #[cfg(test)]
     pub(crate) fn begin_trunk_commit<'a, 'p>(
         &'a self,
         pages: impl IntoIterator<Item = (u32, Option<&'p [u8]>)>,
