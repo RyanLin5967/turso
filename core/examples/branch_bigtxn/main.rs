@@ -216,7 +216,8 @@ fn snap(db: &Arc<Database>) -> Snap {
 const HEADER: &str = "phase\tD\tN\trep\tus\tlock_holds\tlocked_copy_bytes\tmax_hold_pages\tmax_hold_copy_bytes\t\
 max_hold_realloc_moved\tmax_hold_ns\tresolve_calls\tevict_calls\tevict_examined\tevict_full\t\
 over_capacity_admits\tevictable_scan\tspill_scan\tsubjournal_pages\tarena_in_use\tcache_len\tview_build_pages\t\
-holds_timed\thold_p50_ns\thold_p99_ns\thold_p999_ns";
+holds_timed\thold_p50_ns\thold_p99_ns\thold_p999_ns\tmax_hold_realloc_bytes\tmax_hold_node_copies\t\
+max_hold_zeroed_bytes\tholds_ge_16us";
 
 struct Ctx {
     db: Arc<Database>,
@@ -245,6 +246,13 @@ impl Ctx {
         let m: HoldMax = self.db.branch_take_hold_max();
         let hist = self.db.branch_take_hold_hist();
         let timed: u64 = hist.iter().sum();
+        // Holds of 16 µs or more (buckets from floor(8 * log2(16,384)) = 112 on): a count per phase
+        // separates a growing term (more long holds as D grows) from a tail (a fixed few).
+        let long = if self.timing {
+            hist.iter().skip(112).sum::<u64>().to_string()
+        } else {
+            "-".to_string()
+        };
         // The lower edge (ns) of the bucket holding the q-quantile of this phase's hold durations.
         let q = |q: f64| -> String {
             if !self.timing || timed == 0 {
@@ -271,7 +279,7 @@ impl Ctx {
             "-".to_string()
         };
         println!(
-            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}",
+            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}\t{}\t{}\t{}\t{long}",
             b.w.lock_holds - a.w.lock_holds,
             b.w.locked_copy_bytes - a.w.locked_copy_bytes,
             m.pages,
@@ -291,6 +299,9 @@ impl Ctx {
             q(0.5),
             q(0.99),
             q(0.999),
+            m.realloc_bytes,
+            m.node_copies,
+            m.zeroed_bytes,
         );
         (out, el)
     }

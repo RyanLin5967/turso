@@ -107,6 +107,12 @@ struct HoldAcc {
     pages: u64,
     copy_bytes: u64,
     realloc_moved: u64,
+    /// Bytes those growths moved.
+    realloc_bytes: u64,
+    /// Page-map nodes path-copied (an `Arc::make_mut` on a shared node).
+    node_copies: u64,
+    /// Arena chunk bytes newly allocated, zero-filled, inside the hold.
+    zeroed_bytes: u64,
 }
 
 /// A hold of the store mutex that accounts for itself when it is released.
@@ -116,6 +122,8 @@ struct Hold<'a> {
     /// The arena's vector capacities at acquisition: a growth inside the hold moved the old
     /// contents, which the realloc counter charges to it.
     arena_caps: [usize; 3],
+    /// The arena's chunk bytes at acquisition, for `zeroed_bytes`.
+    arena_chunk_bytes: usize,
 }
 
 impl Deref for Hold<'_> {
@@ -138,15 +146,22 @@ impl Drop for Hold<'_> {
         let caps = inner.arena.as_ref().map_or([0; 3], |a| a.capacities());
         for (old, new) in self.arena_caps.iter().zip(caps) {
             if new != *old {
+                // Each of the arena's growable vectors holds one block pointer per entry.
                 acc.realloc_moved += *old as u64;
+                acc.realloc_bytes += (*old * std::mem::size_of::<usize>()) as u64;
             }
         }
+        let chunk_bytes = inner.arena.as_ref().map_or(0, |a| a.chunk_bytes());
+        acc.zeroed_bytes += chunk_bytes.saturating_sub(self.arena_chunk_bytes) as u64;
         inner.work.lock_holds += 1;
         inner.work.locked_copy_bytes += acc.copy_bytes;
         let max = &mut inner.hold_max;
         max.pages = max.pages.max(acc.pages);
         max.copy_bytes = max.copy_bytes.max(acc.copy_bytes);
         max.realloc_moved = max.realloc_moved.max(acc.realloc_moved);
+        max.realloc_bytes = max.realloc_bytes.max(acc.realloc_bytes);
+        max.node_copies = max.node_copies.max(acc.node_copies);
+        max.zeroed_bytes = max.zeroed_bytes.max(acc.zeroed_bytes);
         if let Some(start) = self.start {
             let ns = start.elapsed().as_nanos() as u64;
             max.ns = max.ns.max(ns);
@@ -161,16 +176,22 @@ impl Drop for Hold<'_> {
 const HOLD_BATCH: usize = 64;
 
 /// `map.insert`, charging the entries a growth moved to the current hold.
-fn insert_counted<K: Hash + Eq, V>(
-    map: &mut HashMap<K, V>,
+///
+/// std's `capacity()` is `len + growth_left`, so an insert that reuses a tombstone raises it by
+/// exactly one while moving nothing; counting every change charged `len` for those (the probe arm
+/// read N+3 in every phase). Only a reserve — a growth into more buckets, or an in-place rehash,
+/// both of which move every entry — raises it by more than one.
+fn insert_counted<K: Hash + Eq, V, S: std::hash::BuildHasher>(
+    map: &mut HashMap<K, V, S>,
     acc: &mut HoldAcc,
     k: K,
     v: V,
 ) -> Option<V> {
     let (len, cap) = (map.len(), map.capacity());
     let old = map.insert(k, v);
-    if map.capacity() != cap {
+    if map.capacity() > cap + 1 {
         acc.realloc_moved += len as u64;
+        acc.realloc_bytes += (len * std::mem::size_of::<(K, V)>()) as u64;
     }
     old
 }
@@ -549,10 +570,12 @@ impl BranchStore {
             .load(std::sync::atomic::Ordering::Relaxed)
             .then(std::time::Instant::now);
         let arena_caps = guard.arena.as_ref().map_or([0; 3], |a| a.capacities());
+        let arena_chunk_bytes = guard.arena.as_ref().map_or(0, |a| a.chunk_bytes());
         Hold {
             guard,
             start,
             arena_caps,
+            arena_chunk_bytes,
         }
     }
 
@@ -896,7 +919,7 @@ impl BranchStore {
                     None => {}
                 }
                 if let Some(view) = view.as_mut() {
-                    view.insert(page, slot);
+                    hold.node_copies += view.insert(page, slot) as u64;
                 }
             }
             hold.pages += batch.len() as u64;
@@ -1120,40 +1143,80 @@ impl BranchStore {
     /// `[born, died)` — with no interleaving that is exactly `born > lo && died <= hi`.
     fn reclaim_both(&self, node: BranchId, bounds: (u64, u64, u64)) -> usize {
         let mut seen: [Vec<(u64, u32, u64)>; 2] = Default::default();
+        // One hold's visits, at most HOLD_BATCH per side, in buffers whose capacity is reserved
+        // here and never grows; they move to `seen` after the hold drops. `seen` grows with the
+        // garbage, D-sized after a large transaction, and its doubling inside a hold moved every
+        // entry seen so far under the mutex (12.6 MB at D = 10^6; r11-bigtxn-refute S1).
+        let mut visits: [Vec<(u64, u32, u64)>; 2] = [
+            Vec::with_capacity(HOLD_BATCH),
+            Vec::with_capacity(HOLD_BATCH),
+        ];
         let mut resume: [Option<(u64, u32, u64)>; 2] = [None, None];
-        let finished = 'walk: loop {
-            let mut inner = self.lock();
-            let StoreInner {
-                trunk,
-                branches,
-                work,
-                hold,
-                ..
-            } = &mut *inner;
-            let lineage = if node.is_trunk() {
-                &trunk.lineage
-            } else {
-                match branches.get(&node) {
-                    Some(st) => &st.lineage,
-                    None => return 0,
-                }
-            };
-            for _ in 0..HOLD_BATCH {
-                for side in 0..2 {
-                    match lineage.lockstep_next(side, bounds, resume[side]) {
-                        Some(v @ (born, page, died)) => {
-                            work.gc_range_entries += 1;
-                            hold.pages += 1;
-                            seen[side].push(v);
-                            resume[side] = Some(if side == 0 {
-                                (born, page, died)
-                            } else {
-                                (died, page, born)
-                            });
+        let finished = loop {
+            let mut ended = None;
+            {
+                let mut inner = self.lock();
+                let StoreInner {
+                    trunk,
+                    branches,
+                    work,
+                    hold,
+                    ..
+                } = &mut *inner;
+                let lineage = if node.is_trunk() {
+                    &trunk.lineage
+                } else {
+                    match branches.get(&node) {
+                        Some(st) => &st.lineage,
+                        None => return 0,
+                    }
+                };
+                let caps = [
+                    visits[0].capacity(),
+                    visits[1].capacity(),
+                    seen[0].capacity(),
+                    seen[1].capacity(),
+                ];
+                'hold: for _ in 0..HOLD_BATCH {
+                    for side in 0..2 {
+                        match lineage.lockstep_next(side, bounds, resume[side]) {
+                            Some(v @ (born, page, died)) => {
+                                work.gc_range_entries += 1;
+                                hold.pages += 1;
+                                visits[side].push(v);
+                                resume[side] = Some(if side == 0 {
+                                    (born, page, died)
+                                } else {
+                                    (died, page, born)
+                                });
+                            }
+                            None => {
+                                ended = Some(side);
+                                break 'hold;
+                            }
                         }
-                        None => break 'walk side,
                     }
                 }
+                // Any of these growing inside the hold moved its entries under the mutex.
+                let now = [
+                    visits[0].capacity(),
+                    visits[1].capacity(),
+                    seen[0].capacity(),
+                    seen[1].capacity(),
+                ];
+                for (old, new) in caps.into_iter().zip(now) {
+                    if new != old {
+                        hold.realloc_moved += old as u64;
+                        hold.realloc_bytes +=
+                            (old * std::mem::size_of::<(u64, u32, u64)>()) as u64;
+                    }
+                }
+            }
+            for (side, list) in seen.iter_mut().enumerate() {
+                list.append(&mut visits[side]);
+            }
+            if let Some(side) = ended {
+                break side;
             }
         };
         let mut freed = 0;
@@ -1780,5 +1843,75 @@ mod tests {
         store.release_handle(child);
         store.release_handle(id);
         assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
+    }
+
+    /// S1 (r11-bigtxn-refute): the two-sided walk keeps every entry it visits, a list that grows
+    /// with the garbage. Growing it inside a hold moved every entry seen so far under the mutex; each
+    /// hold's visits must land in a buffer of fixed capacity and join the list after the hold drops.
+    /// Asserts what one hold MOVES, not only how many pages it touches.
+    #[test]
+    fn a_two_sided_reap_moves_nothing_large_inside_a_hold() {
+        const D: u32 = 20_000;
+        let store = BranchStore::new();
+        let p = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        let write = |gen: u64| {
+            store.begin_write(p).unwrap();
+            commit_all(&store, p, D, gen);
+            store.end_write(p);
+        };
+        write(1);
+        let c1 = store.fork_branch(p).unwrap();
+        write(2);
+        let c2 = store.fork_branch(p).unwrap();
+        write(3);
+        let c3 = store.fork_branch(p).unwrap();
+        let _ = store.take_hold_max();
+        let reaped = store.release_handle(c2);
+        let max = store.take_hold_max();
+        assert_eq!(reaped.freed_pages, D as usize, "the middle child's garbage");
+        assert!(
+            max.realloc_bytes <= 1024,
+            "one hold moved {} bytes of growing containers ({} entries)",
+            max.realloc_bytes,
+            max.realloc_moved
+        );
+        for id in [c1, c3, p] {
+            store.release_handle(id);
+        }
+        assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
+    }
+
+    /// The realloc counter charges a reserve and nothing else. A map filled to exactly its capacity
+    /// has crowded groups, so removing a key usually leaves a tombstone, and re-inserting the key
+    /// reuses it: `capacity()` (len + growth_left) rises by one while nothing moves. The counter
+    /// used to charge `len` for each of those (r11-bigtxn-refute: N+3 in every probe phase). The next
+    /// insert past capacity is a real growth and must be charged exactly the entries it moved.
+    #[test]
+    fn insert_counted_charges_a_growth_and_not_a_tombstone_reuse() {
+        use std::hash::{BuildHasherDefault, DefaultHasher};
+        let mut map: HashMap<u64, u64, BuildHasherDefault<DefaultHasher>> = HashMap::default();
+        let mut acc = HoldAcc::default();
+        for k in 0..896 {
+            insert_counted(&mut map, &mut acc, k, k);
+        }
+        assert_eq!(map.capacity(), 896, "a table of 1,024 buckets holds 896");
+        let grown = acc.realloc_moved;
+        let mut reuses = 0;
+        for k in 0..896 {
+            map.remove(&k);
+            let cap = map.capacity();
+            insert_counted(&mut map, &mut acc, k, k);
+            if map.capacity() == cap + 1 {
+                reuses += 1;
+            }
+        }
+        assert!(reuses > 0, "no re-insert reused a tombstone: the scenario tests nothing");
+        assert_eq!(
+            acc.realloc_moved, grown,
+            "{reuses} tombstone reuses were charged as moves"
+        );
+        insert_counted(&mut map, &mut acc, 896, 896);
+        assert_eq!(acc.realloc_moved - grown, 896, "the growth past 896 moved 896 entries");
+        assert_eq!(acc.realloc_bytes, acc.realloc_moved * 16, "(u64, u64) entries are 16 bytes");
     }
 }

@@ -215,8 +215,15 @@ pub struct HoldMax {
     pub pages: u64,
     /// Arena page bytes memcpy'd inside one hold.
     pub copy_bytes: u64,
-    /// Entries moved by std `HashMap` growth inside one hold.
+    /// Entries moved by container growth inside one hold: a std `HashMap` reserve (growth or
+    /// in-place rehash), an arena vector, or a reap's visit list.
     pub realloc_moved: u64,
+    /// Bytes moved by that growth inside one hold.
+    pub realloc_bytes: u64,
+    /// Page-map nodes path-copied inside one hold (each `size_of::<Node>()` bytes).
+    pub node_copies: u64,
+    /// Arena chunk bytes allocated and zero-filled inside one hold.
+    pub zeroed_bytes: u64,
     /// Nanoseconds of one hold, from acquisition to release; 0 unless [`set_hold_timing`] is on.
     pub ns: u64,
 }

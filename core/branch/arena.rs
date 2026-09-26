@@ -213,6 +213,11 @@ impl Arena {
         self.free.len()
     }
 
+    /// Bytes of page memory the arena has allocated (whole chunks). Observation only.
+    pub(crate) fn chunk_bytes(&self) -> usize {
+        self.chunks.len() * SLOTS_PER_CHUNK * self.page_size
+    }
+
     /// The capacities of the arena's growable vectors (free list, free bits, chunk table), for the
     /// store's realloc counter. Observation only.
     pub(crate) fn capacities(&self) -> [usize; 3] {
