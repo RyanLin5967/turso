@@ -1557,6 +1557,12 @@ fn arm_conc(b: &mut Bench, args: &Args) {
         committed: CachePadded::new(AtomicU64::new(0)),
         stop: AtomicBool::new(false),
     };
+    if args.trunk_writer && !args.no_autocheckpoint {
+        // Branch read transactions hold WAL read marks, so the trunk's auto-checkpoint cannot
+        // backfill and every trunk commit past 1,000 frames re-runs it (r11-walpin's U1-U3; the
+        // counter smoke measured r = 0.03 there). Checkpoints happen between cells instead.
+        die("--trunk-writer needs --no-autocheckpoint (r11-k3-trunklock PREREG amendment 2)");
+    }
     let writer_conn = if args.trunk_writer {
         let conn = b.db.connect().unwrap();
         if args.no_autocheckpoint {
@@ -1633,6 +1639,20 @@ fn arm_conc(b: &mut Bench, args: &Args) {
             let mut shares: Vec<Vec<Live>> = (0..t).map(|_| Vec::with_capacity(n / t + 1)).collect();
             for (i, l) in live.drain(..).enumerate() {
                 shares[i % t].push(l);
+            }
+            if writer_conn.is_some() {
+                // No branch connection is open between cells, so a TRUNCATE checkpoint empties the
+                // WAL: every cell starts from an empty WAL instead of inheriting the frames of every
+                // earlier one (r11-k3-trunklock PREREG amendment 2).
+                let rows = b
+                    .trunk
+                    .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                if !matches!(rows.first().and_then(|r| r.first()), Some(Value::Integer(0))) {
+                    not_a_result(&format!("the TRUNCATE checkpoint before a cell was refused: {rows:?}"));
+                }
             }
             let barrier = Barrier::new(t + 1 + usize::from(writer_conn.is_some()));
             writer.forks.store(0, Ordering::Release);
