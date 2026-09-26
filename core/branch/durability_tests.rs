@@ -2739,3 +2739,51 @@ fn a_grandchild_reads_a_spliced_parents_write() {
     assert_eq!(db.branch_stats().unwrap().live_branches, 2);
     check_views(&db, &expect, "after replay");
 }
+
+/// The splice's stream direction (the zombie's side is the smaller) and the shadow rule with a
+/// retained version in the child: C overwrites the page it inherited from P, forks D, and
+/// overwrites it again, so C holds that page twice (current, and the version D reads). When P is
+/// spliced into C, P's version of the page is read by nobody: C's children all forked after C's
+/// FIRST own version of it, which is retained, not current. It is freed, D reads C's first version,
+/// C its second, and a restart agrees.
+#[test]
+fn a_splice_frees_a_version_the_child_shadowed_before_its_own_child_forked() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let p7;
+    let slots;
+    let expect;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        let s0 = in_use(&db);
+        set(&p.connect().unwrap(), 7, "p");
+        p7 = in_use(&db).difference(&s0).copied().collect::<BTreeSet<u32>>();
+        assert!(!p7.is_empty(), "p's write took no slot of its own");
+        let c = p.fork().unwrap();
+        set(&c.connect().unwrap(), 7, "c-first");
+        let d = c.fork().unwrap();
+        set(&c.connect().unwrap(), 7, "c-second");
+        let reaped = p.reap().unwrap();
+        assert!(reaped.deferred, "{reaped:?}");
+        assert_eq!(db.branch_stats().unwrap().live_branches, 2, "p was not spliced");
+        for slot in &p7 {
+            assert!(db.branch_slot_is_free(*slot), "slot {slot}: shadowed for every reader, still held");
+        }
+        assert_eq!(value(&d.connect().unwrap(), 7), Some("c-first".to_string()));
+        assert_eq!(value(&c.connect().unwrap(), 7), Some("c-second".to_string()));
+        slots = in_use(&db);
+        expect = BTreeMap::from([
+            (c.into_id(), BTreeMap::from([(7, "c-second".to_string())])),
+            (d.into_id(), BTreeMap::from([(7, "c-first".to_string())])),
+        ]);
+    }
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 2);
+    assert_eq!(in_use(&db), slots, "replay of the splice landed on other slots");
+    check_views(&db, &expect, "after replay");
+}
