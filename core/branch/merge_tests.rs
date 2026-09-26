@@ -717,6 +717,57 @@ fn a_rolled_back_trunk_write_refuses_no_merge() {
     assert_eq!(texts(&trunk, "SELECT v FROM t WHERE id = 1"), ["b1"]);
 }
 
+/// (A15) Row stamps with forks that take no WAL write lock (r11-forklock's F-L): B is forked while
+/// a trunk transaction sits between its row write and its commit. The commit retains its pages for
+/// B, so B never sees the trunk's value, and the row stamp must say the same, or B's merge installs
+/// over a committed update that no validator saw. Stamped at the write (mutant 30), the stamp
+/// equals B's fork epoch and this merge commits B's value over the trunk's.
+#[test]
+fn a_fork_inside_a_trunk_transaction_is_refused_on_the_rows_it_wrote() {
+    let (_dir, db) = open_db();
+    let writer = db.connect().unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for id in 1..=40 {
+        writer
+            .execute(format!("INSERT INTO t VALUES ({id}, 'v{id}')"))
+            .unwrap();
+    }
+    let forker = db.connect().unwrap();
+    // The trunk's first child is forked under the WAL write lock; the next one takes none.
+    let _first = forker.fork_branch().unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("UPDATE t SET v = 'trunk' WHERE id = 5")
+        .unwrap();
+    let b = forker
+        .fork_branch()
+        .expect("a fork inside a trunk transaction is admitted");
+    writer.execute("COMMIT").unwrap();
+    let work = db.branch_stats().work;
+    assert_eq!(
+        work.trunk_forks_fast, 1,
+        "premise: B was forked without the WAL write lock: {work:?}"
+    );
+    let bc = b.connect().unwrap();
+    assert_eq!(
+        texts(&bc, "SELECT v FROM t WHERE id = 5"),
+        ["v5"],
+        "premise: B does not see the commit"
+    );
+    bc.execute("UPDATE t SET v = 'branch' WHERE id = 5").unwrap();
+    drop(bc);
+    let mut merger = Merger::new(writer.clone()).unwrap();
+    let o = merger.merge(b, key_replay()).unwrap();
+    assert!(
+        o.page_conflict,
+        "control: the page stamp, taken at the commit, sees the commit: {o:?}"
+    );
+    assert_eq!(refusal(&o), "Some(Key)", "{o:?}");
+    assert_eq!(texts(&writer, "SELECT v FROM t WHERE id = 5"), ["trunk"]);
+}
+
 /// (a1) A trigger fires when a statement runs, and the rows it wrote are rows too. The branch
 /// changes only w; the trunk's trigger on v recorded the trunk's own later update of another row.
 /// Applying the branch's row must not fire that trigger again: s.last stays the trunk's 't7'.
