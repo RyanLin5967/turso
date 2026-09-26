@@ -245,6 +245,30 @@ struct StoreInner {
     /// Commits parked by recovery, and parked Commits applied since (observing only).
     parked_records: u64,
     parked_applied: u64,
+    /// githost-shape lane instrument (observing only): see [`super::BranchCatShape`].
+    shape: ShapeCounters,
+}
+
+/// githost-shape lane instrument (observing only): the cumulative fields of
+/// [`super::BranchCatShape`]. Each is bumped under the store mutex by the call that does the work,
+/// from a length that call has in hand; nothing in the mechanism reads them.
+#[derive(Default)]
+struct ShapeCounters {
+    checkpoints: u64,
+    checkpoint_ns: u64,
+    ckpt_trunk_inserted: u64,
+    ckpt_trunk_deleted: u64,
+    ckpt_branch_rows: u64,
+    ckpt_rows_written: u64,
+    ckpt_states_walked: u64,
+    ids_calls: u64,
+    ids_resident_visited: u64,
+    ids_catalog_rows: u64,
+    ids_build_rows: u64,
+    table_grows: u64,
+    table_moved: u64,
+    evictions: u64,
+    evicted_states: u64,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -1667,6 +1691,10 @@ impl BranchStore {
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
         let mut inner = self.inner.lock();
+        // githost-shape instrument (observing only): what the listing visits under the mutex.
+        let resident = inner.branches.len() as u64;
+        inner.shape.ids_calls += 1;
+        inner.shape.ids_resident_visited += resident;
         let mut ids: Vec<BranchId> = inner
             .branches
             .iter()
@@ -1675,9 +1703,16 @@ impl BranchStore {
             .collect();
         // Catalog stores: every unreleased row, less what memory knows better (resident states
         // are listed above; removed ones are gone).
-        let StoreInner { cat, branches, .. } = &mut *inner;
+        let StoreInner {
+            cat,
+            branches,
+            shape,
+            ..
+        } = &mut *inner;
         if let Some(cat) = cat.as_mut() {
-            for id in cat.catalog.unreleased_ids()?.into_iter().map(BranchId) {
+            let rows = cat.catalog.unreleased_ids()?;
+            shape.ids_catalog_rows += rows.len() as u64;
+            for id in rows.into_iter().map(BranchId) {
                 if !branches.contains_key(&id) && !cat.removed.contains(&id) {
                     ids.push(id);
                 }
@@ -2072,6 +2107,47 @@ impl BranchStore {
             .map_or(0, |c| c.catalog.counters.rows_written)
     }
 
+    /// githost-shape instrument (observing only): see [`super::BranchCatShape`]. Runs no catalog
+    /// query, so it does not move the catalog counters it sits beside.
+    pub(crate) fn cat_shape(&self) -> super::BranchCatShape {
+        let inner = self.inner.lock();
+        let s = &inner.shape;
+        let mut shape = super::BranchCatShape {
+            checkpoints: s.checkpoints,
+            checkpoint_ns: s.checkpoint_ns,
+            ckpt_trunk_inserted: s.ckpt_trunk_inserted,
+            ckpt_trunk_deleted: s.ckpt_trunk_deleted,
+            ckpt_branch_rows: s.ckpt_branch_rows,
+            ckpt_rows_written: s.ckpt_rows_written,
+            ckpt_states_walked: s.ckpt_states_walked,
+            ids_calls: s.ids_calls,
+            ids_resident_visited: s.ids_resident_visited,
+            ids_catalog_rows: s.ids_catalog_rows,
+            ids_build_rows: s.ids_build_rows,
+            table_grows: s.table_grows,
+            table_moved: s.table_moved,
+            evictions: s.evictions,
+            evicted_states: s.evicted_states,
+            resident_states: inner.branches.len() as u64,
+            trunk_overlay_versions: inner
+                .trunk
+                .lineage
+                .retained
+                .values()
+                .map(|v| v.len() as u64)
+                .sum(),
+            log_len: inner.journal.as_ref().map_or(0, |j| j.log_len()),
+            ..Default::default()
+        };
+        if let Some(c) = inner.cat.as_ref() {
+            shape.dirty_branches = c.dirty.len() as u64;
+            shape.trunk_cache_versions = c.trunk_cache.values().map(|v| v.len() as u64).sum();
+            shape.trunk_cache_pages = c.trunk_cache.len() as u64;
+            shape.trunk_known_pages = c.trunk_known.len() as u64;
+        }
+        shape
+    }
+
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
     /// read)` since open (r11-restart lane instrument; zeros for a snapshot store).
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {
@@ -2273,6 +2349,18 @@ impl StoreInner {
             deferred_freed: Vec::new(),
             parked_records: 0,
             parked_applied: 0,
+            shape: ShapeCounters::default(),
+        }
+    }
+
+    /// githost-shape instrument (observing only): an insert into `branches` that raised its
+    /// capacity by more than one reallocated or rehashed the table, which moved every entry it held
+    /// before the insert. (hashbrown's `capacity()` is items + growth_left, so reusing a tombstone
+    /// raises it by exactly one and moves nothing: githost-shape r2, da8d26a7d.)
+    fn note_table_growth(&mut self, len_before: usize, cap_before: usize) {
+        if self.branches.capacity() > cap_before + 1 {
+            self.shape.table_grows += 1;
+            self.shape.table_moved += len_before as u64;
         }
     }
 
@@ -2469,6 +2557,7 @@ impl StoreInner {
         if let Some(deadline) = lease {
             self.leases.insert((deadline, id));
         }
+        let (len_before, cap_before) = (self.branches.len(), self.branches.capacity());
         self.branches.insert(
             id,
             BranchState {
@@ -2491,6 +2580,7 @@ impl StoreInner {
                 view: None,
             },
         );
+        self.note_table_growth(len_before, cap_before);
     }
 
     /// Catalog stores: make the trunk's `written` epoch of `page` at least the `died` of the page's
@@ -2851,6 +2941,9 @@ impl StoreInner {
         else {
             return Ok(());
         };
+        // githost-shape instrument (observing only).
+        let started = Instant::now();
+        let rows_written_before = cat.catalog.counters.rows_written;
         journal.check_live()?;
         // Every slot the catalog is about to name must be durable first.
         if self.sync {
@@ -2881,6 +2974,10 @@ impl StoreInner {
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
         let trunk_gone: Vec<(u32, u64)> = cat.trunk_gone.iter().copied().collect();
+        // githost-shape instrument (observing only): the walk below visits every resident state.
+        let (n_rows, n_trunk_new, n_trunk_gone) =
+            (rows.len() as u64, trunk_new.len() as u64, trunk_gone.len() as u64);
+        self.shape.ckpt_states_walked += self.branches.len() as u64;
         // Slots reserved by open write transactions are named by no durable state: the catalog
         // lists them free (a crash frees them), and this process keeps them as taken.
         let reserved: Vec<Slot> = self
@@ -2980,6 +3077,13 @@ impl StoreInner {
             Ok(_) => {}
             Err(e) => tracing::warn!("branch catalog WAL truncation failed: {e}"),
         }
+        // githost-shape instrument (observing only): the time is taken before the counting.
+        self.shape.checkpoint_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.shape.checkpoints += 1;
+        self.shape.ckpt_trunk_inserted += n_trunk_new;
+        self.shape.ckpt_trunk_deleted += n_trunk_gone;
+        self.shape.ckpt_branch_rows += n_rows;
+        self.shape.ckpt_rows_written += cat.catalog.counters.rows_written - rows_written_before;
         cat.dirty.clear();
         cat.removed.clear();
         cat.trunk_gone.clear();
@@ -3057,6 +3161,7 @@ impl StoreInner {
         };
         self.children.insert(parent, f, child);
         self.next_id = self.next_id.max(child.0 + 1);
+        let (len_before, cap_before) = (self.branches.len(), self.branches.capacity());
         self.branches.insert(
             child,
             BranchState {
@@ -3075,6 +3180,7 @@ impl StoreInner {
                 view: None,
             },
         );
+        self.note_table_growth(len_before, cap_before);
         self.n_states += 1;
         self.mark_dirty(parent, DIRTY_ROW);
         self.mark_dirty(child, DIRTY_NEW);

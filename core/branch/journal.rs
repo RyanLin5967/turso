@@ -732,6 +732,11 @@ impl Journal {
         self.generation
     }
 
+    /// Bytes of the log holding whole records, header included (githost-shape instrument).
+    pub(crate) fn log_len(&self) -> u64 {
+        self.len
+    }
+
     /// A catalog checkpoint at `generation` has committed: drop the records it covers (buffered
     /// ones included — their effects are in the catalog) and start the log over at that
     /// generation. A failure poisons the journal, as a failed compaction does after its rename.
