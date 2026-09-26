@@ -2817,9 +2817,10 @@ impl StoreInner {
                 })
                 .collect();
             eprintln!(
-                "R11SLOT checkpoint gen={generation} rows={named:?} removed={:?} trunk_pages={:?} cursor={:?} taken={:?} free_mem={:?} reserved={reserved:?} hw={} in_use={}",
+                "R11SLOT checkpoint gen={generation} rows={named:?} removed={:?} trunk_new={:?} trunk_gone={:?} cursor={:?} taken={:?} free_mem={:?} reserved={reserved:?} hw={} in_use={}",
                 cat.removed,
-                trunk_pages,
+                trunk_new,
+                trunk_gone,
                 cat.free_cursor,
                 cat.taken,
                 arena.free_list(),
