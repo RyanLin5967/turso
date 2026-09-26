@@ -420,3 +420,115 @@ fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
         let _ = b.into_id();
     }
 }
+
+// ---- r11-ever: the F7 durable port on the composed base (UNBUILT; r11-ever amendment 14) ----
+
+fn set(conn: &Arc<Connection>, id: i64, v: &str) {
+    conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {id}")).unwrap();
+}
+
+/// U6 (r11-invariant-matrix): a splice moves a child to its spliced-out parent's key, and a catalog
+/// store must move the child's row, and its `branch_children` entry, with it. P writes a page, forks
+/// Z and then Q, and rewrites the page, so P keeps its first version for BOTH Z's key and Q's; Z
+/// forks C. After a checkpoint (all of them catalog rows) Z's release splices C into Z's key under
+/// P, and a second checkpoint writes that. After a reopen, C is read from the catalog under P (a row
+/// still naming the deleted Z would be "a missing parent"), Q's reap keeps P's first version (C, at
+/// Z's old key, is its neighbour below; were C not listed there, the version would be garbage),
+/// and C still reads it and releases cleanly.
+#[test]
+fn a_spliced_child_is_listed_under_its_new_parent_after_a_checkpoint_and_a_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let (p_id, q_id, c_id, p7);
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let p = trunk.fork_branch().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&p.connect().unwrap(), 7, "p-first");
+        p7 = db
+            .branch_slots_in_use()
+            .into_iter()
+            .filter(|s| !s0.contains(s))
+            .collect::<Vec<u32>>();
+        assert!(!p7.is_empty(), "p's write took no slot of its own");
+        let z = p.fork().unwrap();
+        let q = p.fork().unwrap();
+        set(&p.connect().unwrap(), 7, "p-second"); // P retains its first version for Z and Q
+        let c = z.fork().unwrap();
+        db.branch_compact_now().unwrap(); // P, Z, Q and C are catalog rows
+        let reaped = z.reap().unwrap(); // one live child: C takes Z's key under P
+        assert!(reaped.deferred, "{reaped:?}");
+        db.branch_compact_now().unwrap(); // Z deleted, C re-keyed
+        assert_eq!(db.branch_stats().unwrap().live_branches, 3);
+        p_id = p.into_id();
+        q_id = q.into_id();
+        c_id = c.into_id();
+    }
+    let db = open_at(&path, catalog()).unwrap();
+    let c = db.branch(c_id).expect("the spliced child names a missing parent");
+    assert_eq!(value(&c.connect().unwrap(), 7), "p-first");
+    let _ = c.into_id();
+    let reaped = db.branch(q_id).unwrap().reap().unwrap();
+    assert!(!reaped.deferred, "{reaped:?}");
+    for slot in &p7 {
+        assert!(!db.branch_slot_is_free(*slot), "slot {slot}: C still reads it, freed by Q's reap");
+    }
+    let c = db.branch(c_id).unwrap();
+    assert_eq!(value(&c.connect().unwrap(), 7), "p-first", "C lost P's first version");
+    let reaped = c.reap().unwrap();
+    assert!(!reaped.deferred, "{reaped:?}");
+    for slot in &p7 {
+        assert!(db.branch_slot_is_free(*slot), "slot {slot}: no reader is left, still held");
+    }
+    assert_eq!(db.branch_stats().unwrap().live_branches, 1, "P alone should be left");
+    let _ = db.branch(p_id).unwrap().into_id();
+}
+
+/// U7 (r11-invariant-matrix, as the refuter corrected it: the node never made resident is the
+/// zombie's CHILD): redo on demand parks a replayed Commit of a branch recovery did not read, and a
+/// splice moves that branch's maps. Z and its one child C are catalog rows; C's Commit, rewriting
+/// the page it read through Z, sits in the log's tail; a crash follows. Recovery parks the Commit
+/// (C is not read). Z's release then splices Z into C, which must make C resident, its parked Commit
+/// applied, before any map moves: C keeps its own version, and Z's version, which only C's own write
+/// shadowed, is freed.
+#[test]
+fn a_splice_after_recovery_applies_the_childs_parked_commit_first() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let (z_id, c_id, z7, image);
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let z = trunk.fork_branch().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&z.connect().unwrap(), 7, "z");
+        z7 = db
+            .branch_slots_in_use()
+            .into_iter()
+            .filter(|s| !s0.contains(s))
+            .collect::<Vec<u32>>();
+        assert!(!z7.is_empty(), "z's write took no slot of its own");
+        let c = z.fork().unwrap();
+        db.branch_compact_now().unwrap(); // Z and C are catalog rows
+        set(&c.connect().unwrap(), 7, "c"); // a Commit in the tail
+        image = crash_image(&path, dir.path());
+        z_id = z.into_id();
+        c_id = c.into_id();
+    }
+    let db = open_at(&image, catalog()).unwrap();
+    let s = db.branch_open_stats();
+    assert_eq!(s.parked_records, 1, "premise: C's Commit was not parked: {s:?}");
+    assert_eq!(s.branch_loads, 0, "premise: recovery read a branch: {s:?}");
+    let reaped = db.branch(z_id).unwrap().reap().unwrap();
+    assert!(reaped.deferred, "{reaped:?}");
+    assert_eq!(db.branch_stats().unwrap().live_branches, 1, "z was not spliced");
+    for slot in &z7 {
+        assert!(db.branch_slot_is_free(*slot), "slot {slot}: shadowed by C's own write, still held");
+    }
+    let c = db.branch(c_id).unwrap();
+    assert_eq!(value(&c.connect().unwrap(), 7), "c", "C lost its parked Commit");
+    let _ = c.into_id();
+}
