@@ -317,6 +317,40 @@ impl Live {
 struct Op {
     samples: Vec<Duration>,
     work: WorkSum,
+    /// r11-adversarial tail instrument: samples of >= 1 ms on the wall clock, as (wall us, thread
+    /// CPU us, [minor faults, major faults, voluntary and involuntary context switches]).
+    tails: Vec<(f64, f64, [i64; 4])>,
+    wall_ge_1ms: u64,
+    cpu_ge_1ms: u64,
+}
+
+fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        die("clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+    }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Process minor and major faults and context switches; this harness drives the engine from one
+/// thread, so a delta across one sample is that sample's (background I/O threads aside).
+fn rusage() -> [i64; 4] {
+    // SAFETY: an all-zero `rusage` is a valid out-value, and the pointer is valid for the call.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        die("getrusage failed");
+    }
+    [
+        ru.ru_minflt as i64,
+        ru.ru_majflt as i64,
+        ru.ru_nvcsw as i64,
+        ru.ru_nivcsw as i64,
+    ]
 }
 
 #[derive(Default, Clone, Copy)]
@@ -357,9 +391,26 @@ impl Bench {
     /// sit outside the timed window.
     fn timed<T>(&self, op: &mut Op, f: impl FnOnce() -> T) -> T {
         let before = self.work();
+        let r0 = rusage();
+        let c0 = thread_cpu_ns();
         let t = Instant::now();
         let out = f();
-        op.samples.push(t.elapsed());
+        let d = t.elapsed();
+        let cpu_us = (thread_cpu_ns() - c0) as f64 / 1e3;
+        let r1 = rusage();
+        op.samples.push(d);
+        let wall_us = d.as_secs_f64() * 1e6;
+        if cpu_us >= 1000.0 {
+            op.cpu_ge_1ms += 1;
+        }
+        if wall_us >= 1000.0 {
+            op.wall_ge_1ms += 1;
+            let mut ru = [0i64; 4];
+            for i in 0..4 {
+                ru[i] = r1[i] - r0[i];
+            }
+            op.tails.push((wall_us, cpu_us, ru));
+        }
         op.work.add(before, self.work());
         out
     }
@@ -389,6 +440,22 @@ impl Bench {
             per(op.work.gc_examined),
             per(op.work.gc_range_entries),
         );
+        let mut tails = op.tails.clone();
+        tails.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        println!(
+            "# tails x={x} op={name} samples={} wall_ge_1ms={} cpu_ge_1ms={} tail_cpu_max_us={:.1}",
+            us.len(),
+            op.wall_ge_1ms,
+            op.cpu_ge_1ms,
+            tails.iter().map(|t| t.1).fold(0.0, f64::max)
+        );
+        for (wall, cpu, ru) in tails.iter().take(300) {
+            println!(
+                "# tail x={x} op={name} wall_us={wall:.1} cpu_us={cpu:.1} minflt={} majflt={} nvcsw={} \
+                 nivcsw={}",
+                ru[0], ru[1], ru[2], ru[3]
+            );
+        }
         self.summary.push((
             x,
             name,
@@ -981,6 +1048,9 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                     percentile(&us, 99.0)
                 );
                 all[i].samples.append(&mut op.samples);
+                all[i].tails.append(&mut op.tails);
+                all[i].wall_ge_1ms += op.wall_ge_1ms;
+                all[i].cpu_ge_1ms += op.cpu_ge_1ms;
                 let w = op.work;
                 all[i].work.resolve_calls += w.resolve_calls;
                 all[i].work.resolve_levels += w.resolve_levels;
