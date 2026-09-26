@@ -52,6 +52,7 @@ enum Shape {
     Cat,
     Beam,
     Hub,
+    Deadfork,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -83,6 +84,8 @@ struct Args {
     timing: bool,
     samples: usize,
     needed: bool,
+    pages: usize,
+    pre: bool,
     refcounted: bool,
 }
 
@@ -114,6 +117,8 @@ fn parse_args() -> Args {
         timing: false,
         samples: 200,
         needed: true,
+        pages: 10,
+        pre: false,
         refcounted: false,
     };
     let mut shape = None;
@@ -128,6 +133,7 @@ fn parse_args() -> Args {
                     "cat" => Shape::Cat,
                     "beam" => Shape::Beam,
                     "hub" => Shape::Hub,
+                    "deadfork" => Shape::Deadfork,
                     other => die(&format!("unknown shape {other}")),
                 })
             }
@@ -160,6 +166,8 @@ fn parse_args() -> Args {
             "--timing" => args.timing = true,
             "--samples" => args.samples = num(val(), "--samples") as usize,
             "--no-needed" => args.needed = false,
+            "--pages" => args.pages = num(val(), "--pages") as usize,
+            "--pre" => args.pre = true,
             "--refcounted" => args.refcounted = true,
             other => die(&format!("unknown argument {other}")),
         }
@@ -713,6 +721,85 @@ fn shape_cat(b: &mut Bench, args: &Args) {
 /// The hub (r11-sweep-n SWEEP.md row T1): one root-level branch writes its row, then repeats {fork a
 /// child; rewrite its row}. The children never write; each reads the hub's row once, checked. So every
 /// child pins the version of the hub's page, and of its page-map path, that it forked from. x = children.
+/// Rows between two of one parent's writes in `deadfork`: more than a leaf holds (~37), so
+/// `--pages` <= 64 rows land on that many distinct leaves.
+const PAGE_STRIDE: i64 = 312;
+
+/// r11-adversarial's W9 input (deadfork), for r11-bushy term (b): each parent is a trunk child that
+/// forks two children, keeps them, writes `--pages` distinct pages in one transaction, and then
+/// loses its handle. Written after its last fork, those pages are readable by no one. `--pre` is the
+/// control: the parent writes BEFORE forking, so its children read the pages and they must stay.
+/// Each child reads the parent's first row at its fork and again after the parent is released.
+/// x = parents.
+fn shape_deadfork(b: &mut Bench, args: &Args) {
+    if args.pages == 0 || args.pages > 64 {
+        die("--pages must be in 1..=64");
+    }
+    if args.rows != Rows::Spread {
+        // The model's hot-rows shortcut assumes no node writes a row other than row 1.
+        die("--shape deadfork needs --rows spread");
+    }
+    let w0 = b.work();
+    let mut parents = 0u64;
+    let write_pages = |b: &mut Bench, id: u32, conn: &Arc<Connection>, rows: &[i64]| {
+        conn.execute("BEGIN").unwrap();
+        for (j, &r) in rows.iter().enumerate() {
+            let g = b.generation;
+            b.generation += 1;
+            if j == 0 {
+                // The model tracks the first row; the others are distinct pages written alongside.
+                let n = &mut b.nodes[id as usize];
+                n.writes.push((n.epoch, g));
+            }
+            update_to(conn, r, &node_value(id, g));
+        }
+        conn.execute("COMMIT").unwrap();
+    };
+    let check_read = |b: &mut Bench, child: u32, branch: &Branch, row: i64| {
+        let conn = branch.connect().unwrap();
+        let got = read_v(&conn, row);
+        drop(conn);
+        if got != b.expect(child, row) {
+            not_a_result(&format!("deadfork child {child} read row {row} as {got}"));
+        }
+        b.reads_checked += 1;
+    };
+    for &x in &args.checkpoints {
+        while parents < x {
+            let (p, branch) = b.fork(TRUNK);
+            let base = row_for(p);
+            let rows: Vec<i64> = (0..args.pages as i64)
+                .map(|j| (base - 1 + j * PAGE_STRIDE) % TRUNK_ROWS + 1)
+                .collect();
+            b.nodes[p as usize].row = rows[0];
+            b.keep(p, branch);
+            if args.pre {
+                let conn = b.nodes[p as usize].branch.as_ref().expect("the parent").connect().unwrap();
+                write_pages(b, p, &conn, &rows);
+                drop(conn);
+            }
+            let mut kids = Vec::new();
+            for _ in 0..2 {
+                let (c, cb) = b.fork(p);
+                check_read(b, c, &cb, rows[0]);
+                kids.push((c, cb));
+            }
+            if !args.pre {
+                let conn = b.nodes[p as usize].branch.as_ref().expect("the parent").connect().unwrap();
+                write_pages(b, p, &conn, &rows);
+                drop(conn);
+            }
+            b.release_interior(p);
+            for (c, cb) in kids {
+                check_read(b, c, &cb, rows[0]);
+                b.keep(c, cb);
+            }
+            parents += 1;
+        }
+        b.checkpoint(args, x, None, w0, &format!(" parents={parents} pages={} pre={}", args.pages, args.pre));
+    }
+}
+
 fn shape_hub(b: &mut Bench, args: &Args) {
     let w0 = b.work();
     let mut timing_rng = Rng(args.seed ^ 0xA5A5_A5A5_A5A5_A5A5);
@@ -882,6 +969,7 @@ fn main() {
         Shape::Cat => shape_cat(&mut b, &args),
         Shape::Beam => shape_beam(&mut b, &args),
         Shape::Hub => shape_hub(&mut b, &args),
+        Shape::Deadfork => shape_deadfork(&mut b, &args),
     }
     b.teardown(args.timing);
 }
