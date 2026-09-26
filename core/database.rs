@@ -52,7 +52,7 @@ use crate::{
     PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
     TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwapOption;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 #[cfg(host_shared_wal)]
 use std::path::Path;
@@ -538,6 +538,8 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     #[cfg(host_shared_wal)]
     shared_wal_coordination: OnceLock<Arc<MappedSharedWalCoordination>>,
     init_lock: Arc<Mutex<()>>,
+    /// r11-coherence FU: per-thread anchors of the objects a connection's pager and WAL reach (empty without FU).
+    anchors: crate::anchor::Anchors,
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
@@ -693,6 +695,7 @@ impl Database {
             io: io.clone(),
             open_flags: flags,
             init_lock: Arc::new(Mutex::new(())),
+            anchors: crate::anchor::Anchors::new(),
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
@@ -2400,9 +2403,11 @@ impl Database {
     ) -> Result<Arc<Connection>> {
         let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
+        // The Arc<Database> clone and its drop at the connection's close.
+        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
         let conn = Arc::new(Connection {
             db: self.clone(),
-            pager: ArcSwap::new(pager),
+            pager: crate::connection::PagerSlot::new(pager),
             schema: RwLock::new(schema.unwrap_or_else(|| self.schema.lock().clone())),
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
@@ -2934,6 +2939,18 @@ impl Database {
         }
     }
 
+    /// r11-coherence FU: this thread's anchor of the objects a pager reaches, or `None` without FU.
+    pub(crate) fn anchor(&self) -> Option<Arc<crate::anchor::Anchor>> {
+        self.anchors.get(|| crate::anchor::Anchor {
+            io: Arc::new(crate::io::IoFwd(self.io.clone())),
+            db_file: self.db_file.clone(),
+            branches: self.branches.clone(),
+            shared_wal: self.shared_wal.clone(),
+            init_lock: self.init_lock.clone(),
+            init_page_1: self.init_page_1.clone(),
+        })
+    }
+
     pub(crate) fn build_wal(
         &self,
         last_checksum_and_max_frame: ((u32, u32), u64),
@@ -2950,9 +2967,22 @@ impl Database {
             )));
         }
 
-        Ok(Arc::new(WalFile::new(
-            self.io.clone(),
-            self.shared_wal.clone(),
+        // FU: the shared WAL state through this thread's anchor, and the anchor's IO forwarder.
+        let (io, shared) = match self.anchor() {
+            Some(a) => (
+                a.io.clone(),
+                crate::anchor::DbRef::anchored(&a, |a| &a.shared_wal),
+            ),
+            None => {
+                // The IO and shared-WAL Arc clones and their drops at the connection's close.
+                crate::coherence::bump(crate::coherence::Class::DbArc, 2);
+                crate::coherence::bump(crate::coherence::Class::WalArc, 2);
+                (self.io.clone(), self.shared_wal.clone().into())
+            }
+        };
+        Ok(Arc::new(WalFile::new_refs(
+            io,
+            shared,
             last_checksum_and_max_frame,
             buffer_pool,
         )))
@@ -3037,6 +3067,10 @@ impl Database {
         let page_size =
             self.determine_actual_page_size(&shared_wal, requested_page_size, header_page_size)?;
 
+        // FU: the database-owned objects through this thread's anchor (see `crate::anchor`); the buffer pool is not
+        // covered (its handle is a concrete `Arc<BufferPool>` that the pager and the WAL pass on by value).
+        let anchor = self.anchor();
+        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
         let buffer_pool = self.buffer_pool.clone();
         if self.initialized() {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
@@ -3046,21 +3080,45 @@ impl Database {
         let last_checksum_and_max_frame = shared_wal.last_checksum_and_max_frame();
         drop(shared_wal);
         let pager_wal: Option<Arc<dyn Wal>> = if wal_enabled {
+            // The WAL's own buffer-pool Arc clone and its drop.
+            crate::coherence::bump(crate::coherence::Class::DbArc, 2);
             Some(self.build_wal(last_checksum_and_max_frame, buffer_pool.clone())?)
         } else {
             None
         };
 
-        let pager = Pager::new(
-            self.db_file.clone(),
-            pager_wal,
-            self.io.clone(),
-            PageCache::default(),
-            buffer_pool,
-            self.init_lock.clone(),
-            self.init_page_1.clone(),
-        )?;
-        pager.set_branch_store(self.branches.clone());
+        let pager = match &anchor {
+            Some(a) => Pager::new_refs(
+                crate::anchor::DbRef::anchored(a, |a| &a.db_file),
+                pager_wal,
+                a.io.clone(),
+                PageCache::default(),
+                buffer_pool,
+                crate::anchor::DbRef::anchored(a, |a| &a.init_lock),
+                crate::anchor::DbRef::anchored(a, |a| &a.init_page_1),
+            )?,
+            None => {
+                // The storage, IO, init-lock and page-1 Arc clones and their drops.
+                crate::coherence::bump(crate::coherence::Class::DbArc, 4);
+                crate::coherence::bump(crate::coherence::Class::DbArcInit, 4);
+                Pager::new_refs(
+                    self.db_file.clone().into(),
+                    pager_wal,
+                    self.io.clone(),
+                    PageCache::default(),
+                    buffer_pool,
+                    self.init_lock.clone().into(),
+                    self.init_page_1.clone().into(),
+                )?
+            }
+        };
+        pager.set_branch_store(match &anchor {
+            Some(a) => crate::anchor::DbRef::anchored(a, |a| &a.branches),
+            None => {
+                crate::coherence::bump(crate::coherence::Class::DbArc, 2);
+                self.branches.clone().into()
+            }
+        });
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);

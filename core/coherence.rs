@@ -37,19 +37,23 @@ pub enum Class {
     Builtin,
     /// Arc<Schema> clones and drops at the sweep's sites.
     SchemaArc,
-    /// Arc clones and drops of handles that live as long as the Database, per connection.
+    /// Arc clones and drops of handles that live as long as the Database, per connection: the buffer pool, IO,
+    /// storage and branch-store handles of a connection's pager and WAL, the connection's and a branch handle's
+    /// Arc<Database> (the five lines the census names; amendment 16).
     DbArc,
     /// Database::n_connections and the Database::schema Mutex.
     DbHot,
     /// The branch store's global atomics: next_id, live, trunk_children.
     StoreGlobal,
+    /// The pager's init-lock and page-1-slot Arc clones and drops, per connection (amendment 16).
+    DbArcInit,
     /// Heap allocations (counted by a harness allocator through [`bump`]).
     Malloc,
     /// Heap frees.
     Free,
 }
 
-pub const CLASSES: usize = 16;
+pub const CLASSES: usize = 17;
 
 pub const NAMES: [&str; CLASSES] = [
     "wal_rw_read",
@@ -66,6 +70,7 @@ pub const NAMES: [&str; CLASSES] = [
     "db_arc",
     "db_hot",
     "store_global",
+    "db_arc_init",
     "malloc",
     "free",
 ];
@@ -130,6 +135,20 @@ pub const FIX_GATE: u32 = 32;
 pub const FIX_TRUNKIDX: u32 = 64;
 /// FX: trunk-cache hits copy their page after the shard lock is released (amendment 13).
 pub const FIX_COPYOUT: u32 = 128;
+/// FM: the branch store striped 1024 ways instead of 64 (amendment 15).
+pub const FIX_STRIPES: u32 = 256;
+/// FY: the connection's pager held as a plain Arc (it is never swapped), so a connection's drop walks no arc-swap
+/// debt lists (amendment 15).
+pub const FIX_PAGER: u32 = 512;
+/// FU: the Pager and WalFile reach Database-owned objects through handles anchored per (thread, database), so a
+/// connection's open and close write no shared reference count of those objects (amendment 15).
+pub const FIX_ANCHOR: u32 = 1024;
+/// FH: per-thread heaps (the harness's global allocator; the engine ignores it) (amendment 15).
+pub const FIX_HEAP: u32 = 2048;
+/// R: the harness forks from per-thread replicas of the trunk (the engine ignores it) (amendment 15).
+pub const FIX_REPLICA: u32 = 4096;
+/// V: the harness gives each thread private databases (the engine ignores it) (amendment 15).
+pub const FIX_PRIVATE: u32 = 8192;
 
 static FIXES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
@@ -153,6 +172,12 @@ pub fn parse_fixes(s: &str) -> Option<u32> {
             "G" => FIX_GATE,
             "K" => FIX_TRUNKIDX,
             "X" => FIX_COPYOUT,
+            "M" => FIX_STRIPES,
+            "Y" => FIX_PAGER,
+            "U" => FIX_ANCHOR,
+            "H" => FIX_HEAP,
+            "R" => FIX_REPLICA,
+            "V" => FIX_PRIVATE,
             _ => return None,
         };
     }
@@ -167,7 +192,7 @@ pub fn set_fixes(mask: u32) -> bool {
 /// The fixes this process runs with.
 pub fn fixes() -> u32 {
     *FIXES.get_or_init(|| match std::env::var("TURSO_R11_FIX") {
-        Ok(s) => parse_fixes(&s).unwrap_or_else(|| panic!("TURSO_R11_FIX={s}: expected none, all or W,B,P,S")),
+        Ok(s) => parse_fixes(&s).unwrap_or_else(|| panic!("TURSO_R11_FIX={s}: expected none, all or letters from W,B,P,S,A,G,K,X,M,Y,U,H,R,V")),
         Err(_) => 0,
     })
 }

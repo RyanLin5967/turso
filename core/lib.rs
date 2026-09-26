@@ -49,6 +49,8 @@ pub(crate) mod sync;
 #[doc(hidden)]
 pub mod coherence;
 pub(crate) mod bravo;
+#[doc(hidden)]
+pub mod anchor;
 pub(crate) mod seqlock;
 pub(crate) mod thread;
 

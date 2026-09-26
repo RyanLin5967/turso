@@ -1001,13 +1001,15 @@ pub trait Wal: Debug + Send + Sync {
 
 #[derive(Debug)]
 struct InProcessWalCoordination {
-    shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
+    shared: crate::anchor::DbRef<crate::bravo::BravoRwLock<WalFileShared>>,
 }
 
 impl InProcessWalCoordination {
     /// Build the in-process coordination backend over the existing shared WAL state.
-    fn new(shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>) -> Self {
-        Self { shared }
+    fn new(shared: impl Into<crate::anchor::DbRef<crate::bravo::BravoRwLock<WalFileShared>>>) -> Self {
+        Self {
+            shared: shared.into(),
+        }
     }
 
     /// `self.rd()`, counted by the coherence instrument.
@@ -1551,12 +1553,12 @@ impl WalCoordination for InProcessWalCoordination {
 
     #[cfg(test)]
     fn shared_ptr(&self) -> usize {
-        Arc::as_ptr(&self.shared) as usize
+        self.shared.as_ptr() as usize
     }
 
     fn shared_wal_state(&self) -> Arc<crate::bravo::BravoRwLock<WalFileShared>> {
         crate::coherence::bump(crate::coherence::Class::WalArc, 1);
-        self.shared.clone()
+        self.shared.to_arc()
     }
 
     fn shared_wal_ptr(&self) -> std::ptr::NonNull<crate::bravo::BravoRwLock<WalFileShared>> {
@@ -4939,6 +4941,17 @@ impl WalFile {
     pub fn new(
         io: Arc<dyn IO>,
         shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
+        (last_checksum, max_frame): ((u32, u32), u64),
+        buffer_pool: Arc<BufferPool>,
+    ) -> Self {
+        Self::new_refs(io, shared.into(), (last_checksum, max_frame), buffer_pool)
+    }
+
+    /// [`WalFile::new`] with the shared state through a handle that may borrow through a thread's anchor, and `io`
+    /// possibly the anchor's per-thread forwarder (r11-coherence FU).
+    pub(crate) fn new_refs(
+        io: Arc<dyn IO>,
+        shared: crate::anchor::DbRef<crate::bravo::BravoRwLock<WalFileShared>>,
         (last_checksum, max_frame): ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Self {

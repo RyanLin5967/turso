@@ -248,3 +248,80 @@ fn forking_an_mvcc_database_is_refused() {
     };
     assert!(err.contains("experimental_mvcc"), "unexpected refusal: {err}");
 }
+
+/// r11-coherence FG fire-check (amendment 16): with the fork gate, a trunk fork is refused while a trunk write
+/// transaction is open, exactly as the WAL write lock refused it before the gate. Red if a trunk write transaction
+/// does not take the gate (`fork_gate_write_enter` removed from `begin_write_tx`): the fork would then run inside
+/// the writer's transaction, whose copy decisions were taken for the previous epoch.
+#[test]
+fn with_the_fork_gate_a_trunk_fork_waits_for_an_open_trunk_write() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let forker = db.connect().unwrap();
+        trunk.execute("BEGIN").unwrap();
+        set(&trunk, 7, "in-flight");
+        match forker.fork_branch() {
+            Err(LimboError::Busy) => {}
+            Err(e) => panic!("mask {mask}: fork during an open trunk write failed with {e}, expected Busy"),
+            Ok(_) => panic!("mask {mask}: a trunk fork ran inside an open trunk write transaction"),
+        }
+        trunk.execute("COMMIT").unwrap();
+        let b = forker.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        assert_eq!(value(&bc, 7), "in-flight", "mask {mask}: a fork after the commit must see it");
+        drop(bc);
+        drop(b);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// r11-coherence FK (amendment 16): the schedule r11-coherence's model finds stale when a trunk write that meets no
+/// live child is not stamped (model/k_cond_a.py, FIRE_K_without_stamping), replayed deterministically: A, the trunk's
+/// only child, has the page cached; A is reaped, and between its depart and its generation bump the trunk rewrites
+/// the row, B forks, and B reads it. B must read the new value. With FK every trunk write stamps `written`, so B's
+/// cache key is not A's; red if FK's writes are stamped only while a child lives.
+#[test]
+fn with_fk_a_fork_between_the_last_depart_and_the_bump_reads_the_new_trunk_page() {
+    for mask in [0, crate::coherence::FIX_TRUNKIDX] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let a = trunk.fork_branch().unwrap();
+        let ac = a.connect().unwrap();
+        assert_eq!(value(&ac, 7), original(7));
+        drop(ac);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        // The hook runs only on FK's reap path; without FK the reap bumps the generation under the trunk lock.
+        if mask != 0 {
+            let (trunk, seen) = (trunk.clone(), seen.clone());
+            crate::branch::store::set_k_depart_hook_for_test(Box::new(move || {
+                set(&trunk, 7, "trunk-after-the-last-depart");
+                let b = trunk.fork_branch().unwrap();
+                let bc = b.connect().unwrap();
+                *seen.lock().unwrap() = Some(value(&bc, 7));
+                drop(bc);
+                drop(b);
+            }));
+        }
+        a.reap().unwrap();
+        if mask == 0 {
+            set(&trunk, 7, "trunk-after-the-last-depart");
+        } else {
+            assert_eq!(
+                seen.lock().unwrap().as_deref(),
+                Some("trunk-after-the-last-depart"),
+                "a fork inside the reap's depart window read the page A had cached"
+            );
+        }
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        assert_eq!(value(&bc, 7), "trunk-after-the-last-depart");
+        drop(bc);
+        drop(b);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}

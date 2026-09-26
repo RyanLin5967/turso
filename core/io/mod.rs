@@ -519,6 +519,84 @@ pub trait IO: Clock + Send + Sync {
     }
 }
 
+/// r11-coherence FU (amendment 15): a per-thread forwarder to a database's IO. Every method, the defaulted ones
+/// included, calls the wrapped IO's own, so a backend's overrides are kept. A connection's pager and WAL clone this
+/// thread's forwarder instead of the database's `Arc<dyn IO>`, so the clone and its drop write the forwarder's count,
+/// which only this thread's connections touch, not the count every thread's connections share.
+pub struct IoFwd(pub Arc<dyn IO>);
+
+impl Clock for IoFwd {
+    fn current_time_monotonic(&self) -> clock::MonotonicInstant {
+        self.0.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> clock::WallClockInstant {
+        self.0.current_time_wall_clock()
+    }
+}
+
+impl IO for IoFwd {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        self.0.open_file(path, flags, direct)
+    }
+
+    fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
+        self.0.open_shared_wal_file(path)
+    }
+
+    fn remove_file(&self, path: &str) -> Result<()> {
+        self.0.remove_file(path)
+    }
+
+    fn supports_shared_wal_coordination(&self) -> bool {
+        self.0.supports_shared_wal_coordination()
+    }
+
+    fn step(&self) -> Result<()> {
+        self.0.step()
+    }
+
+    fn cancel(&self, c: &[Completion]) -> Result<()> {
+        self.0.cancel(c)
+    }
+
+    fn drain_completions(&self, completions: &[Completion]) -> Result<()> {
+        self.0.drain_completions(completions)
+    }
+
+    fn wait_for_completion(&self, c: Completion) -> Result<()> {
+        self.0.wait_for_completion(c)
+    }
+
+    fn generate_random_number(&self) -> i64 {
+        self.0.generate_random_number()
+    }
+
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        self.0.fill_bytes(dest)
+    }
+
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        self.0.get_memory_io()
+    }
+
+    fn register_fixed_buffer(&self, ptr: NonNull<u8>, len: usize) -> Result<u32> {
+        self.0.register_fixed_buffer(ptr, len)
+    }
+
+    fn yield_now(&self) {
+        self.0.yield_now()
+    }
+
+    fn sleep(&self, duration: std::time::Duration) {
+        self.0.sleep(duration)
+    }
+
+    fn file_id(&self, path: &str) -> Result<FileId> {
+        self.0.file_id(path)
+    }
+}
+
 /// Batches multiple vectored writes for submission.
 pub struct WriteBatch<'a> {
     file: Arc<dyn File>,

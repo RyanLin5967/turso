@@ -144,19 +144,23 @@ use arc_swap::ArcSwapOption;
 
 /// Shards of the branch map: branch `id` lives, with every page it owns, in shard `id % SHARDS`.
 const SHARDS: usize = 64;
-/// The arena domain of the trunk's retained versions. Shard `i` allocates from domain `i`.
-const TRUNK_DOMAIN: usize = SHARDS;
+/// r11-coherence FM (amendment 15): the stripe count with finer stripes. A store picks `SHARDS` or this once, at
+/// its construction; both are powers of two, so a branch's shard is `id & (n - 1)`.
+const SHARDS_FINE: usize = 1024;
+/// The arena domain of the trunk's retained versions. Shard `i` allocates from domain `i`. The same number for
+/// either stripe count, so the slot layout does not depend on the arm.
+const TRUNK_DOMAIN: usize = SHARDS_FINE;
 /// A slot carries its domain in its top bits and the domain arena's own slot number below them.
-/// 65 domains need 7 bits, which leaves 2^25 slots per domain, and no global slot reaches
-/// `u32::MAX` (the page map's empty marker).
-const LOCAL_BITS: u32 = 25;
+/// Up to 1025 domains need 11 bits, which leaves 2^21 slots per domain, and no global slot reaches
+/// `u32::MAX` (the page map's empty marker). (Before FM: 7 and 25.)
+const LOCAL_BITS: u32 = 21;
 
 fn domain_of(slot: Slot) -> usize {
     (slot >> LOCAL_BITS) as usize
 }
 
-fn shard_of(id: BranchId) -> usize {
-    (id.0 % SHARDS as u64) as usize
+fn shard_of(id: BranchId, shards: usize) -> usize {
+    (id.0 & (shards as u64 - 1)) as usize
 }
 
 pub(crate) struct BranchStore {
@@ -209,6 +213,25 @@ pub(crate) struct BranchStore {
     k_retained: CachePadded<AtomicUsize>,
     /// r11-coherence FX: copy trunk-cache hits outside the shard lock.
     copy_out: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static K_DEPART_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: run `f` once, on this thread, inside FK's reap of the trunk's last child, after its depart and before its
+/// generation bump (no store lock is held there).
+#[cfg(test)]
+pub(crate) fn set_k_depart_hook_for_test(f: Box<dyn FnOnce()>) {
+    K_DEPART_HOOK.with(|h| *h.borrow_mut() = Some(f));
+}
+
+#[cfg(test)]
+fn run_k_depart_hook() {
+    if let Some(f) = K_DEPART_HOOK.with(|h| h.borrow_mut().take()) {
+        f();
+    }
 }
 
 /// FS: ids a thread takes per trip to the store's counter.
@@ -696,7 +719,11 @@ fn gone(id: BranchId) -> LimboError {
 impl BranchStore {
     pub(crate) fn new() -> Self {
         Self {
-            shards: (0..SHARDS)
+            shards: (0..if crate::coherence::fix(crate::coherence::FIX_STRIPES) {
+                SHARDS_FINE
+            } else {
+                SHARDS
+            })
                 .map(|i| {
                     CachePadded::new(Mutex::new(Shard {
                         branches: HashMap::new(),
@@ -808,7 +835,7 @@ impl BranchStore {
     }
 
     fn shard(&self, id: BranchId) -> Held<'_, Shard> {
-        take(&self.shards[shard_of(id)], self.timed())
+        take(&self.shards[shard_of(id, self.shards.len())], self.timed())
     }
 
     fn trunk(&self) -> Held<'_, TrunkInner> {
@@ -1193,7 +1220,7 @@ impl BranchStore {
                 .or_else(|| st.inherited.get(page));
             let at = st.trunk_at;
             match found {
-                Some(slot) if domain_of(slot) == shard_of(id) => {
+                Some(slot) if domain_of(slot) == shard_of(id, self.shards.len()) => {
                     out.copy_from_slice(shard.domain.page(slot));
                     return Ok(Resolved::Filled);
                 }
@@ -1241,7 +1268,7 @@ impl BranchStore {
         }
         if let Some(slot) = elsewhere {
             let d = domain_of(slot);
-            crate::turso_assert!(d < SHARDS, "a branch's page map named a trunk slot");
+            crate::turso_assert!(d < self.shards.len(), "a branch's page map named a trunk slot");
             out.copy_from_slice(take(&self.shards[d], self.timed()).domain.page(slot));
             return Ok(Resolved::Filled);
         }
@@ -1311,7 +1338,7 @@ impl BranchStore {
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
         match domain_of(slot) {
             TRUNK_DOMAIN => self.trunk().domain.is_free(slot),
-            d if d < SHARDS => take(&self.shards[d], self.timed()).domain.is_free(slot),
+            d if d < self.shards.len() => take(&self.shards[d], self.timed()).domain.is_free(slot),
             _ => false,
         }
     }
@@ -1369,6 +1396,10 @@ impl BranchStore {
                 }
                 crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
                 if self.trunk_children_ctr().fetch_sub(1, Ordering::AcqRel) == 1 {
+                    // The window r11-coherence's model (model/k_cond_a.py, FIRE_K_without_stamping) finds a stale read
+                    // in when writes are not all stamped; a test replays it here (amendment 16).
+                    #[cfg(test)]
+                    run_k_depart_hook();
                     // Kept, but not relied on: with FK every trunk write stamps `written` whether or not the trunk
                     // has children (`stamps_every_trunk_write`), so a cache key names its version exactly and the
                     // generation guards nothing. It must not: forks no longer take the trunk lock, so one can run
@@ -1620,7 +1651,7 @@ mod tests {
         }
         let quiet = store.stats().work;
         // `stats` takes the trunk's lock and every shard's, once each.
-        let per_call = SHARDS as u64 + 1;
+        let per_call = store.shards.len() as u64 + 1;
         assert_eq!(quiet.lock_acquisitions - base.lock_acquisitions, 11 * per_call);
         assert_eq!(quiet.trunk_lock_acquisitions - base.trunk_lock_acquisitions, 11);
         assert_eq!(
@@ -1871,7 +1902,7 @@ mod tests {
                             2..=3 if !live.is_empty() && live.len() < 16 => {
                                 let p = live[rng.below(live.len() as u64) as usize];
                                 let id = store.fork_branch(nodes[p].id).unwrap();
-                                if shard_of(id) != shard_of(nodes[p].id) {
+                                if shard_of(id, store.shards.len()) != shard_of(nodes[p].id, store.shards.len()) {
                                     cross_shard += 1;
                                 }
                                 let (sees, depth) = (nodes[p].sees.clone(), nodes[p].depth + 1);

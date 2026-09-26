@@ -366,6 +366,52 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+/// r11-coherence FY (amendment 15): the connection's pager. Nothing in the crate ever swaps it (every use is
+/// `load()`), so with FY it is a plain `Arc`, `load()` hands out a clone of it (a write to this connection's own
+/// pager count, not to a line other threads write), and the connection's drop walks no arc-swap debt lists
+/// (arc-swap pays every thread's outstanding debts when an `ArcSwap` is dropped). Without FY it is the `ArcSwap` it
+/// always was.
+pub(crate) enum PagerSlot {
+    Swap(ArcSwap<Pager>),
+    Plain(Arc<Pager>),
+}
+
+/// What [`PagerSlot::load`] returns: dereferences to the `Arc<Pager>`, as arc-swap's guard does, and borrows
+/// nothing, as the guard does not.
+pub(crate) enum PagerRef {
+    Guard(arc_swap::Guard<Arc<Pager>>),
+    Owned(Arc<Pager>),
+}
+
+impl std::ops::Deref for PagerRef {
+    type Target = Arc<Pager>;
+    #[inline]
+    fn deref(&self) -> &Arc<Pager> {
+        match self {
+            PagerRef::Guard(g) => g,
+            PagerRef::Owned(a) => a,
+        }
+    }
+}
+
+impl PagerSlot {
+    pub(crate) fn new(pager: Arc<Pager>) -> Self {
+        if crate::coherence::fix(crate::coherence::FIX_PAGER) {
+            PagerSlot::Plain(pager)
+        } else {
+            PagerSlot::Swap(ArcSwap::new(pager))
+        }
+    }
+
+    #[inline]
+    pub(crate) fn load(&self) -> PagerRef {
+        match self {
+            PagerSlot::Swap(s) => PagerRef::Guard(s.load()),
+            PagerSlot::Plain(a) => PagerRef::Owned(a.clone()),
+        }
+    }
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -373,7 +419,7 @@ impl Drop for ExplicitCheckpointGuard {
 /// statements know they need to be reprepared.
 pub struct Connection {
     pub(crate) db: Arc<Database>,
-    pub(crate) pager: ArcSwap<Pager>,
+    pub(crate) pager: PagerSlot,
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
@@ -968,28 +1014,34 @@ impl Connection {
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
         // FA: translate under the connection's own schema read lock (a per-connection lock) instead of cloning the
-        // shared Arc<Schema>, whose strong count every branch connection writes.
-        let schema_guard;
-        let schema_clone;
-        let schema: &Arc<Schema> = if crate::coherence::fix(crate::coherence::FIX_ARC) {
-            schema_guard = self.schema.read();
-            &schema_guard
-        } else {
-            crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
-            schema_clone = self.schema.read().clone();
-            &schema_clone
+        // shared Arc<Schema>, whose strong count every branch connection writes. The guard lives for the translate
+        // call only: the retry below takes the same lock for writing (maybe_reparse_schema -> with_schema_mut, and
+        // maybe_update_schema), and parking_lot's RwLock is not reentrant, so holding it across the match
+        // self-deadlocked the multi-process retry (r11-coherence-refute part 4; amendment 16).
+        let translated = {
+            let schema_guard;
+            let schema_clone;
+            let schema: &Arc<Schema> = if crate::coherence::fix(crate::coherence::FIX_ARC) {
+                schema_guard = self.schema.read();
+                &schema_guard
+            } else {
+                crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
+                schema_clone = self.schema.read().clone();
+                &schema_clone
+            };
+            translate::translate(
+                schema,
+                stmt,
+                pager.clone(),
+                self.clone(),
+                &syms,
+                mode,
+                input,
+                origin,
+                prepare_options,
+            )
         };
-        match translate::translate(
-            schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-            origin,
-            prepare_options,
-        ) {
+        match translated {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
                 // Cold path: re-parse the SQL from scratch after schema refresh rather

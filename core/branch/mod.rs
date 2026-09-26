@@ -293,6 +293,7 @@ impl Branch {
     /// from the trunk, and journal-mode changes are refused while any branch exists.
     pub fn fork(&self) -> Result<Branch> {
         let id = self.db.branches.fork_branch(self.id)?;
+        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
         Ok(Branch::new(self.db.clone(), id))
     }
 
@@ -322,7 +323,7 @@ impl Drop for Branch {
 /// lock an abandoned transaction still held. A `Drop`, not a call at `close()`: a connection can go
 /// away without `close()`, and the next writer would then wait on a lock nobody holds.
 pub(crate) struct BranchBinding {
-    pub(crate) store: Arc<BranchStore>,
+    pub(crate) store: crate::anchor::DbRef<BranchStore>,
     pub(crate) id: BranchId,
 }
 
@@ -365,6 +366,8 @@ impl Connection {
             Some(parent) => self.db.branches.fork_branch(parent)?,
             None => self.fork_trunk(&pager)?,
         };
+        // The branch handle's Arc<Database> clone and its drop at the reap.
+        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
         Ok(Branch::new(self.db.clone(), id))
     }
 
@@ -500,8 +503,15 @@ impl Database {
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
         let schema = self.branches.open(id)?;
         // Built before anything fallible below, so an error there still closes the branch.
+        // FU: the store through this thread's anchor.
         let binding = BranchBinding {
-            store: self.branches.clone(),
+            store: match self.anchor() {
+                Some(a) => crate::anchor::DbRef::anchored(&a, |a| &a.branches),
+                None => {
+                    crate::coherence::bump(crate::coherence::Class::DbArc, 2);
+                    self.branches.clone().into()
+                }
+            },
             id,
         };
         let pager = self._init_branch(binding)?;

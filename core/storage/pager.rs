@@ -1451,7 +1451,7 @@ impl Savepoint {
 /// transaction management.
 pub struct Pager {
     /// Source of the database pages.
-    pub db_file: Arc<dyn DatabaseStorage>,
+    pub db_file: crate::anchor::DbRef<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
     pub(crate) wal: Option<Arc<dyn Wal>>,
@@ -1478,7 +1478,7 @@ pub struct Pager {
     syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
     /// Mutex for synchronizing database initialization to prevent race conditions
-    init_lock: Arc<Mutex<()>>,
+    init_lock: crate::anchor::DbRef<Mutex<()>>,
     /// The state of the current allocate page operation.
     allocate_page_state: RwLock<AllocatePageState>,
     /// The state of the current allocate page1 operation.
@@ -1507,7 +1507,7 @@ pub struct Pager {
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
     /// In Memory Page 1 for Empty Dbs
-    init_page_1: Arc<ArcSwapOption<Page>>,
+    init_page_1: crate::anchor::DbRef<ArcSwapOption<Page>>,
     /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
@@ -1519,7 +1519,7 @@ pub struct Pager {
     /// The database's branch store. Every pager built for a database carries it; on a TRUNK
     /// pager it is what the copy decision in [`Pager::add_dirty`] consults before overwriting a
     /// page that a live branch can still see.
-    branch_store: OnceLock<Arc<BranchStore>>,
+    branch_store: OnceLock<crate::anchor::DbRef<BranchStore>>,
     /// Set when this pager serves a branch instead of the trunk: reads resolve through the
     /// branch's page space and commits go to it, never to the WAL.
     branch: OnceLock<BranchBinding>,
@@ -1758,6 +1758,28 @@ impl Pager {
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
     ) -> Result<Self> {
+        Self::new_refs(
+            db_file.into(),
+            wal,
+            io,
+            page_cache,
+            buffer_pool,
+            init_lock.into(),
+            init_page_1.into(),
+        )
+    }
+
+    /// [`Pager::new`] over handles that may borrow through a thread's anchor (r11-coherence FU). `io` may be the
+    /// anchor's per-thread forwarder ([`crate::io::IoFwd`]).
+    pub(crate) fn new_refs(
+        db_file: crate::anchor::DbRef<dyn DatabaseStorage>,
+        wal: Option<Arc<dyn Wal>>,
+        io: Arc<dyn crate::io::IO>,
+        page_cache: PageCache,
+        buffer_pool: Arc<BufferPool>,
+        init_lock: crate::anchor::DbRef<Mutex<()>>,
+        init_page_1: crate::anchor::DbRef<ArcSwapOption<Page>>,
+    ) -> Result<Self> {
         let allocate_page1_state = if init_page_1.load().is_some() {
             RwLock::new(AllocatePage1State::Start)
         } else {
@@ -1815,7 +1837,7 @@ impl Pager {
         })
     }
 
-    pub(crate) fn set_branch_store(&self, store: Arc<BranchStore>) {
+    pub(crate) fn set_branch_store(&self, store: crate::anchor::DbRef<BranchStore>) {
         let _ = self.branch_store.set(store);
     }
 
@@ -1964,7 +1986,7 @@ impl Pager {
     }
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
-        self.init_page_1.clone()
+        self.init_page_1.to_arc()
     }
 
     /// Read page 1 (the database header page) using the header_ref_state state machine.
