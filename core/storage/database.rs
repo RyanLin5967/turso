@@ -145,6 +145,7 @@ impl DatabaseStorage for DatabaseFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion> {
+        crate::branch::count_page_io(0, 1);
         // casting to i64 to check some weird casting that could've happened before. This should be
         // okay since page numbers should be u32
         turso_assert_greater_than_or_equal!(page_idx as i64, 0);
@@ -284,6 +285,7 @@ impl DatabaseStorage for DatabaseFile {
         io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion> {
+        crate::branch::count_page_io(1, 1);
         let buffer_size = buffer.len();
         turso_assert_greater_than!(page_idx, 0);
         turso_assert_greater_than_or_equal!(buffer_size, 512);
@@ -310,6 +312,7 @@ impl DatabaseStorage for DatabaseFile {
         io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion> {
+        crate::branch::count_page_io(1, buffers.len() as u64);
         turso_assert_greater_than!(first_page_idx, 0);
         turso_assert_greater_than_or_equal!(page_size, 512);
         turso_assert_less_than_or_equal!(page_size, 65536);
