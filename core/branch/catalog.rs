@@ -93,6 +93,7 @@ const LOOKUPS: &[&str] = &[
     "DELETE FROM cur WHERE k >= ?1 AND k < ?2",
     "DELETE FROM ret WHERE owner = ?1",
     "DELETE FROM ret WHERE owner = ?1 AND page = ?2",
+    "DELETE FROM ret WHERE owner = ?1 AND page = ?2 AND born = ?3",
     "DELETE FROM free WHERE slot <= ?1",
     "DELETE FROM free WHERE slot = ?1",
     "DELETE FROM branch WHERE id = ?1",
@@ -224,6 +225,8 @@ pub(crate) struct Catalog {
     ret_pages_born: Stmt,
     ret_del_owner: Stmt,
     ret_del_page: Stmt,
+    /// C-FIX (githost-shape): one trunk version by its key, for per-version checkpoint deltas.
+    ret_del_version: Stmt,
     ret_put: Stmt,
     ret_any: Stmt,
     child_in: Stmt,
@@ -295,6 +298,7 @@ impl Catalog {
             )?,
             ret_del_owner: p("DELETE FROM ret WHERE owner = ?1")?,
             ret_del_page: p("DELETE FROM ret WHERE owner = ?1 AND page = ?2")?,
+            ret_del_version: p("DELETE FROM ret WHERE owner = ?1 AND page = ?2 AND born = ?3")?,
             ret_put: p(
                 "INSERT INTO ret(owner, page, born, died, slot, crc) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?,
@@ -608,6 +612,10 @@ impl Catalog {
             .collect()
     }
 
+    /// Superseded by per-version deltas (githost-shape C-FIX: `put_trunk_version`,
+    /// `delete_trunk_version`); no caller left. Kept, with its statement, so the plan test still
+    /// covers what an older catalog's code ran.
+    #[allow(dead_code)]
     pub(crate) fn put_trunk_page(&mut self, page: u32, versions: &[(u64, u64, Slot, u32)]) -> Result<()> {
         self.ret_del_page
             .exec(&[int(0), int(page as u64)], &mut self.counters)?;
@@ -625,6 +633,34 @@ impl Catalog {
             )?;
         }
         Ok(())
+    }
+
+    /// C-FIX (githost-shape): insert one trunk version (a version is immutable once retained).
+    pub(crate) fn put_trunk_version(
+        &mut self,
+        page: u32,
+        born: u64,
+        died: u64,
+        slot: Slot,
+        crc: u32,
+    ) -> Result<()> {
+        self.ret_put.exec(
+            &[
+                int(0),
+                int(page as u64),
+                int(born),
+                int(died),
+                int(slot as u64),
+                int(crc as u64),
+            ],
+            &mut self.counters,
+        )
+    }
+
+    /// C-FIX (githost-shape): delete one trunk version by its key `(0, page, born)`.
+    pub(crate) fn delete_trunk_version(&mut self, page: u32, born: u64) -> Result<()> {
+        self.ret_del_version
+            .exec(&[int(0), int(page as u64), int(born)], &mut self.counters)
     }
 
     /// Trunk pages holding a retained version born in `(lo, hi]` (`lo = None`: unbounded below).

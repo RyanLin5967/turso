@@ -174,6 +174,15 @@ struct CatState {
     /// Trunk pages whose retained versions are in memory, and those changed since the checkpoint.
     trunk_loaded: HashSet<u32>,
     trunk_dirty: HashSet<u32>,
+    /// C-FIX (githost-shape lane): the checkpoint writes trunk versions as DELTAS, not whole pages.
+    /// Versions retained since the last checkpoint (not in the catalog yet), with their immutable
+    /// contents `(died, slot, crc)`, and versions freed since it that the catalog still lists. A
+    /// version retained and freed between two checkpoints cancels out and never reaches the catalog.
+    /// Before this, a checkpoint rewrote EVERY version of every trunk page written since the last
+    /// one (`put_trunk_page`), which in the git-hosting shape is about every trunk version there is:
+    /// Theta(N) rows per checkpoint at a constant checkpoint rate (githost-shape PREREG G1.5 C2).
+    trunk_added: BTreeMap<(u32, u64), (u64, Slot, u32)>,
+    trunk_removed: BTreeSet<(u32, u64)>,
     /// No catalog row that is not loaded has a lease deadline below this (`None`: no lease).
     lease_floor: Option<u64>,
     /// The highest catalog free slot moved into the arena's in-memory free list.
@@ -205,6 +214,8 @@ impl CatState {
             removed: HashSet::new(),
             trunk_loaded: HashSet::new(),
             trunk_dirty: HashSet::new(),
+            trunk_added: BTreeMap::new(),
+            trunk_removed: BTreeSet::new(),
             lease_floor: None,
             free_cursor: None,
             free_exhausted: false,
@@ -583,14 +594,14 @@ impl Lineage {
 
     /// The child forked at `f` is gone (already removed from the child index, whose nearest live
     /// siblings are `lo` below and `hi` above): every retained version only it could see goes to
-    /// `freed`. Returns the pages whose retained versions changed.
+    /// `freed`. Returns the versions freed, as `(born, page)`.
     fn child_gone(
         &mut self,
         f: u64,
         lo: Option<u64>,
         hi: Option<u64>,
         freed: &mut Vec<Slot>,
-    ) -> Vec<u32> {
+    ) -> Vec<(u64, u32)> {
         self.n_children -= 1;
         // A version containing f is garbage iff its range [born, died) now holds no live child:
         // born > lo (nothing live below) and died <= hi (nothing live above).
@@ -626,7 +637,7 @@ impl Lineage {
             }
             freed.push(v.slot);
         }
-        dead.into_iter().map(|(_, page)| page).collect()
+        dead
     }
 
     fn release_all(self, freed: &mut Vec<Slot>) {
@@ -1633,6 +1644,7 @@ impl BranchStore {
             trunk.lineage.retain(page, retained);
             if let Some(cat) = cat.as_mut() {
                 cat.trunk_dirty.insert(page);
+                cat.trunk_added.insert((page, born), (epoch, slot, crc));
             }
             if let Some(journal) = journal.as_mut() {
                 journal.buffer(&Record::TrunkRetain {
@@ -2516,15 +2528,12 @@ impl StoreInner {
                 retained: st.lineage.retained_list(),
             }, what))
             .collect();
-        let trunk_pages: Vec<(u32, Vec<(u64, u64, Slot, u32)>)> = cat
-            .trunk_dirty
+        // C-FIX: the trunk's changes since the last checkpoint, one row each.
+        let trunk_deletes: Vec<(u32, u64)> = cat.trunk_removed.iter().copied().collect();
+        let trunk_inserts: Vec<(u32, u64, u64, Slot, u32)> = cat
+            .trunk_added
             .iter()
-            .map(|&page| {
-                let versions = self.trunk.lineage.retained.get(&page).map_or_else(Vec::new, |vs| {
-                    vs.iter().map(|v| (v.born, v.died, v.slot, v.crc)).collect()
-                });
-                (page, versions)
-            })
+            .map(|(&(page, born), &(died, slot, crc))| (page, born, died, slot, crc))
             .collect();
         // Slots reserved by open write transactions are named by no durable state: the catalog
         // lists them free (a crash frees them), and this process keeps them as taken.
@@ -2554,9 +2563,10 @@ impl StoreInner {
                 })
                 .collect();
             eprintln!(
-                "R11SLOT checkpoint gen={generation} rows={named:?} removed={:?} trunk_pages={:?} cursor={:?} taken={:?} free_mem={:?} reserved={reserved:?} hw={} in_use={}",
+                "R11SLOT checkpoint gen={generation} rows={named:?} removed={:?} trunk_inserts={:?} trunk_deletes={:?} cursor={:?} taken={:?} free_mem={:?} reserved={reserved:?} hw={} in_use={}",
                 cat.removed,
-                trunk_pages,
+                trunk_inserts,
+                trunk_deletes,
                 cat.free_cursor,
                 cat.taken,
                 arena.free_list(),
@@ -2585,8 +2595,11 @@ impl StoreInner {
             for &id in &cat.removed {
                 catalog.delete_branch(id.0)?;
             }
-            for (page, versions) in &trunk_pages {
-                catalog.put_trunk_page(*page, versions)?;
+            for &(page, born) in &trunk_deletes {
+                catalog.delete_trunk_version(page, born)?;
+            }
+            for &(page, born, died, slot, crc) in &trunk_inserts {
+                catalog.put_trunk_version(page, born, died, slot, crc)?;
             }
             if let Some(cursor) = cat.free_cursor {
                 catalog.free_delete_upto(cursor)?;
@@ -2624,13 +2637,20 @@ impl StoreInner {
         // githost-shape instrument (observing only): the time is taken before the counting.
         cat.ckpt_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         cat.ckpts += 1;
-        cat.ckpt_trunk_pages += trunk_pages.len() as u64;
-        cat.ckpt_trunk_versions += trunk_pages.iter().map(|(_, v)| v.len() as u64).sum::<u64>();
+        cat.ckpt_trunk_pages += trunk_deletes
+            .iter()
+            .map(|&(page, _)| page)
+            .chain(trunk_inserts.iter().map(|&(page, ..)| page))
+            .collect::<BTreeSet<u32>>()
+            .len() as u64;
+        cat.ckpt_trunk_versions += (trunk_deletes.len() + trunk_inserts.len()) as u64;
         cat.ckpt_branch_rows += rows.len() as u64;
         cat.ckpt_rows_written += cat.catalog.counters.rows_written - rows_written_before;
         cat.dirty.clear();
         cat.removed.clear();
         cat.trunk_dirty.clear();
+        cat.trunk_added.clear();
+        cat.trunk_removed.clear();
         self.children.map.clear();
         self.children.removed.clear();
         // Every free slot is in the catalog now: the in-memory list is dropped and refetched.
@@ -2759,6 +2779,9 @@ impl StoreInner {
         let written = self.trunk.written.entry(page).or_insert(0);
         *written = (*written).max(v.died);
         self.mark_trunk_page(page);
+        if let Some(cat) = self.cat.as_mut() {
+            cat.trunk_added.insert((page, v.born), (v.died, v.slot, v.crc));
+        }
         Ok(())
     }
 
@@ -2825,8 +2848,14 @@ impl StoreInner {
                         self.ensure_trunk_page(page)?;
                     }
                 }
-                for page in self.trunk.lineage.child_gone(f, lo, hi, freed) {
+                for (born, page) in self.trunk.lineage.child_gone(f, lo, hi, freed) {
                     self.mark_trunk_page(page);
+                    // C-FIX: a version the catalog never saw cancels; one it lists is deleted.
+                    if let Some(cat) = self.cat.as_mut() {
+                        if cat.trunk_added.remove(&(page, born)).is_none() {
+                            cat.trunk_removed.insert((page, born));
+                        }
+                    }
                 }
                 return Ok(());
             }
