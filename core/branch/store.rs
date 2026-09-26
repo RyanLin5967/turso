@@ -721,6 +721,24 @@ impl BranchStore {
         Ok(())
     }
 
+    /// K13 RED ONLY: write `bytes` into the slot `current` names for `page` (the naive steal).
+    pub(crate) fn write_decided_slot(&self, id: BranchId, page: u32, bytes: &[u8]) -> Result<()> {
+        let mut inner = self.lock();
+        let StoreInner {
+            arena, branches, ..
+        } = &mut *inner;
+        let st = branches.get(&id).ok_or_else(|| gone(id))?;
+        let owned = st.current.get(&page).copied().ok_or_else(|| {
+            LimboError::InternalError(format!("spilled branch page {page} has no copy decision"))
+        })?;
+        arena
+            .as_mut()
+            .expect("a branch exists, so the arena does")
+            .page_mut(owned.slot)
+            .copy_from_slice(bytes);
+        Ok(())
+    }
+
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
         let mut inner = self.lock();
         inner.branches.get_mut(&id).ok_or_else(|| gone(id))?.schema = schema;

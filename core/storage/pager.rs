@@ -4117,11 +4117,23 @@ impl Pager {
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn try_spill_dirty_pages(&self) -> Result<IOResult<()>> {
-        if self.branch.get().is_some() {
-            // Spilling writes uncommitted pages to the WAL. A branch's pages never go there, and
-            // writing them into the branch's own slots before commit would make a rollback
-            // unrecoverable, so they stay resident: the capacity is a soft limit (see
-            // `cache_insert`) and the cache admits them over it.
+        if let Some(branch) = self.branch.get() {
+            // K13 RED ONLY (branch r11-bigtxn-k13-red, never a fix): a NAIVE steal that spills a
+            // dirty branch page into the slot its copy decision named, as the comment this replaces
+            // warned against. It exists to show the K13 test failing on the base design.
+            let pages = match self.page_cache.read().check_spill(IOV_MAX) {
+                SpillResult::PagesToSpill(pages) => pages,
+                _ => return Ok(IOResult::Done(())),
+            };
+            let mut cache = self.page_cache.write();
+            for page in &pages {
+                let id = page.get().id;
+                branch
+                    .store
+                    .write_decided_slot(branch.id, id as u32, page.get_contents().as_slice())?;
+                cache.notify_page_spilled(PageCacheKey::new(id));
+                page.set_spilled();
+            }
             return Ok(IOResult::Done(()));
         }
         loop {
