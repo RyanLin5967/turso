@@ -235,7 +235,7 @@ fn stats_line(s: &BranchOpenStats) -> String {
          retained_entries={} trunk_retained={} trunk_children={} referenced_slots={} \
          arena_high_water={} arena_free={} derived_map_inserts={} states={} released_scanned={} \
          branch_loads={} trunk_page_loads={} cat_queries={} cat_rows_read={} touched_slots={} \
-         trunk_probes={} trunk_rows={}",
+         trunk_probes={} trunk_rows={} parked_records={} parked_applied={}",
         s.snap_bytes,
         s.log_bytes,
         s.records,
@@ -257,7 +257,9 @@ fn stats_line(s: &BranchOpenStats) -> String {
         s.cat_rows_read,
         s.touched_slots,
         s.trunk_probes,
-        s.trunk_rows
+        s.trunk_rows,
+        s.parked_records,
+        s.parked_applied
     )
 }
 
@@ -456,7 +458,20 @@ fn open(args: &Args) {
     let rss1 = rss_bytes();
     let s = db.branch_open_stats();
     let reads = db.branch_read_counters();
+    // branch_stats applies the parked Commits (C-R) before counting slots: timed apart from the open.
+    let (loads0, _, _, rows0) = db.branch_catalog_counters();
+    let t = Instant::now();
     let st = db.branch_stats().unwrap();
+    let t_settle = t.elapsed();
+    let (loads1, _, _, rows1) = db.branch_catalog_counters();
+    println!(
+        "SETTLE\tn={}\tlabel={}\tsettle_us={:.1}\tsettle_branch_loads={}\tsettle_cat_rows={}",
+        args.n,
+        args.label,
+        t_settle.as_secs_f64() * 1e6,
+        loads1 - loads0,
+        rows1 - rows0
+    );
     let tr = db.branch_trunk_retained();
     // Every branch owns one page and the arena also holds the trunk's retained versions, unless the
     // victim said otherwise (a churn victim's parents retain the versions their children forked on).

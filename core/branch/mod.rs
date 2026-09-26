@@ -324,6 +324,11 @@ pub struct BranchOpenStats {
     /// loaded whole).
     pub trunk_probes: u64,
     pub trunk_rows: u64,
+    /// Catalog stores (a12-durable-open C-R, redo on demand): the log tail's Commits parked because
+    /// their branch was not resident, and how many of them the open itself applied (a later record
+    /// of the tail, a release or the expiry pass touched the branch).
+    pub parked_records: u64,
+    pub parked_applied: u64,
 }
 
 /// A snapshot of the branch arena's accounting.

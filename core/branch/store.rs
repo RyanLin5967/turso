@@ -230,6 +230,21 @@ struct StoreInner {
     /// Page-map inserts made deriving page maps since open: by `derive_page_maps` after a snapshot
     /// load, and by `ensure` for each branch it makes resident (observing only).
     derived_inserts: u64,
+    /// C-R, redo on demand (catalog recovery): the tail's Commits to branches that were not
+    /// resident, per branch, in log order with their log positions. Applied when something first
+    /// makes the branch resident (`ensure`), and all of them before any checkpoint (`settle`).
+    parked: HashMap<BranchId, Vec<(u64, Vec<(u32, Slot, u32)>)>>,
+    /// The last log position of the tail that names each slot: a slot a parked Commit frees, which
+    /// a LATER record names, was reused by the free list and is not freed again.
+    named_at: HashMap<Slot, u64>,
+    /// The log position of the record being replayed.
+    replay_pos: u64,
+    /// Slots a parked Commit freed while recovery was still replaying (the arena does not exist
+    /// yet): recovery marks them free in record order.
+    deferred_freed: Vec<Slot>,
+    /// Commits parked by recovery, and parked Commits applied since (observing only).
+    parked_records: u64,
+    parked_applied: u64,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -1040,6 +1055,8 @@ impl BranchStore {
             stats.trunk_children = inner.trunk.lineage.n_children;
             stats.states = inner.n_states;
             stats.derived_map_inserts = inner.derived_inserts;
+            stats.parked_records = inner.parked_records;
+            stats.parked_applied = inner.parked_applied;
             if let Some(cat) = inner.cat.as_ref() {
                 stats.branch_loads = cat.branch_loads;
                 stats.trunk_page_loads = cat.trunk_page_loads;
@@ -1094,20 +1111,26 @@ impl BranchStore {
         // in order: the last word on each slot wins.
         let t = Instant::now();
         let mut touched: HashMap<Slot, bool> = HashMap::new();
-        for record in &recovered.records {
+        for (pos, record) in recovered.records.iter().enumerate() {
+            let pos = pos as u64;
             match record {
                 Record::Commit { pages, .. } => {
                     for &(_, slot, _) in pages {
                         touched.insert(slot, true);
+                        inner.named_at.insert(slot, pos);
                     }
                 }
                 Record::TrunkRetain { slot, .. } => {
                     touched.insert(*slot, true);
+                    inner.named_at.insert(*slot, pos);
                 }
                 _ => {}
             }
+            inner.replay_pos = pos;
             let mut freed = Vec::new();
             inner.replay(record, &mut freed)?;
+            // A parked Commit applied during this record (C-R) freed its slots here, in order.
+            freed.append(&mut inner.deferred_freed);
             for slot in freed {
                 touched.insert(slot, false);
             }
@@ -1116,8 +1139,12 @@ impl BranchStore {
         let t = Instant::now();
         let mut freed = Vec::new();
         stats.released_scanned = inner.collect_released(&mut freed)?;
+        freed.append(&mut inner.deferred_freed);
         for slot in freed {
             touched.insert(slot, false);
+        }
+        if inner.parked.is_empty() {
+            inner.named_at = HashMap::new();
         }
         stats.collect_ns = ns(t);
         // The arena: the catalog's free table as of the checkpoint, overridden by what the replay
@@ -2068,7 +2095,9 @@ impl BranchStore {
 
     pub(crate) fn stats(&self) -> Result<BranchStats> {
         self.refuse_if_trunk_only("branch statistics")?;
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        // The slot counts the log describes: parked Commits applied first (C-R).
+        inner.settle()?;
         Ok(BranchStats {
             live_branches: inner.n_states as usize,
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
@@ -2082,6 +2111,9 @@ impl BranchStore {
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
         let mut inner = self.inner.lock();
+        if let Err(e) = inner.settle() {
+            tracing::warn!("branch store: parked commits not applied: {e}");
+        }
         let _ = inner.ensure(id);
         let Some(st) = inner.branches.get(&id) else {
             return Vec::new();
@@ -2095,6 +2127,9 @@ impl BranchStore {
 
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
         let mut inner = self.inner.lock();
+        if let Err(e) = inner.settle() {
+            tracing::warn!("branch store: parked commits not applied: {e}");
+        }
         let StoreInner { arena, cat, .. } = &mut *inner;
         let Some(arena) = arena.as_ref() else {
             return Vec::new();
@@ -2123,6 +2158,9 @@ impl BranchStore {
 
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
         let mut inner = self.inner.lock();
+        if let Err(e) = inner.settle() {
+            tracing::warn!("branch store: parked commits not applied: {e}");
+        }
         let StoreInner { arena, cat, .. } = &mut *inner;
         if arena.as_ref().is_some_and(|a| a.is_free(slot)) {
             return true;
@@ -2229,6 +2267,12 @@ impl StoreInner {
             cat: None,
             work: BranchWork::default(),
             derived_inserts: 0,
+            parked: HashMap::new(),
+            named_at: HashMap::new(),
+            replay_pos: 0,
+            deferred_freed: Vec::new(),
+            parked_records: 0,
+            parked_applied: 0,
         }
     }
 
@@ -2332,9 +2376,55 @@ impl StoreInner {
             chain.push(b);
         }
         while let Some(b) = chain.pop() {
+            let loaded = BranchId(b.id);
             self.insert_loaded(b);
+            self.apply_parked(loaded)?;
         }
         Ok(true)
+    }
+
+    /// C-R: apply `id`'s parked Commits, in log order, now that it is resident. A slot one of them
+    /// frees that a later record of the tail names was reused already, and stays in use.
+    fn apply_parked(&mut self, id: BranchId) -> Result<()> {
+        let Some(list) = self.parked.remove(&id) else {
+            return Ok(());
+        };
+        for (pos, pages) in list {
+            let mut freed = Vec::new();
+            self.apply_commit(id, &pages, &mut freed)?;
+            freed.retain(|s| self.named_at.get(s).is_none_or(|&p| p <= pos));
+            self.parked_applied += 1;
+            self.free_deferred(freed);
+        }
+        if self.parked.is_empty() {
+            self.named_at = HashMap::new();
+        }
+        Ok(())
+    }
+
+    /// Free slots a parked Commit freed: to the arena once it exists; during recovery's replay,
+    /// to the list recovery marks free in record order.
+    fn free_deferred(&mut self, freed: Vec<Slot>) {
+        if self.arena.is_some() {
+            self.release_slots(freed);
+        } else {
+            self.deferred_freed.extend(freed);
+        }
+    }
+
+    /// C-R: make every parked branch resident (applying its parked Commits). Before a checkpoint,
+    /// whose catalog must hold the state the log describes, and before the slot instruments.
+    fn settle(&mut self) -> Result<()> {
+        let ids: Vec<BranchId> = self.parked.keys().copied().collect();
+        for id in ids {
+            if !self.ensure(id)? {
+                return Err(LimboError::Corrupt(format!(
+                    "branch log replay: branch {} named by a Commit is not in the catalog",
+                    id.0
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Install a branch read from the catalog, whose parent is resident: its F1 per-page maps and F2
@@ -2753,6 +2843,8 @@ impl StoreInner {
     /// the snapshot's rename is in snapshot mode. The work is proportional to what changed since
     /// the last checkpoint, which the log's size bounds, not to the live state.
     fn checkpoint_catalog(&mut self, fail_after_commit: bool) -> Result<()> {
+        // The catalog must hold the state the log describes: parked Commits first (C-R).
+        self.settle()?;
         let now = self.lease.now_ms();
         let (Some(journal), Some(arena), Some(cat)) =
             (self.journal.as_mut(), self.arena.as_mut(), self.cat.as_mut())
@@ -2933,7 +3025,14 @@ impl StoreInner {
         schema: Option<Arc<Schema>>,
         handle: Handle,
     ) -> Result<()> {
-        if child.is_trunk() || self.ensure(child)? {
+        // An id at or past `next_id` was never allocated, so the catalog cannot hold it (C-R): only
+        // an older id is looked up there.
+        let exists = if child.0 >= self.next_id {
+            self.branches.contains_key(&child)
+        } else {
+            self.ensure(child)?
+        };
+        if child.is_trunk() || exists {
             return Err(LimboError::Corrupt(format!(
                 "branch {} forked twice",
                 child.0
@@ -3034,7 +3133,12 @@ impl StoreInner {
     }
 
     fn apply_trunk_retain(&mut self, page: u32, v: Retained) -> Result<()> {
-        self.trunk_written_known(page)?;
+        // Replay only (and the snapshot load). Blind redo (C-R): the record's `died` is the page's
+        // latest trunk write, and every catalog version of the page died at or before its `born`,
+        // so `written` is known from the record, without reading the catalog.
+        if let Some(cat) = self.cat.as_mut() {
+            cat.trunk_known.insert(page);
+        }
         self.trunk.lineage.retain(page, v);
         let written = self.trunk.written.entry(page).or_insert(0);
         *written = (*written).max(v.died);
@@ -3092,6 +3196,14 @@ impl StoreInner {
             freed.extend(st.pending.values().copied());
             st.lineage.release_all(freed);
             let (parent, f) = (st.parent, st.fork_epoch);
+            // The parent resident (its parked Commits applied, C-R) while the child is still listed:
+            // each of those Commits decides retain-or-free as it did when the child was alive.
+            if !parent.is_trunk() && !self.ensure(parent)? {
+                return Err(LimboError::Corrupt(format!(
+                    "branch {} names a missing parent {}",
+                    id.0, parent.0
+                )));
+            }
             let catalog_mode = self.cat.is_some();
             let catalog = self.cat.as_mut().map(|c| &mut c.catalog);
             let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode)?;
@@ -3246,8 +3358,20 @@ impl StoreInner {
                 .apply_fork(BranchId(*parent), BranchId(*child), None, Handle::Detached)
                 .map_err(corrupt),
             Record::Commit { branch, pages } => {
-                self.apply_commit(BranchId(*branch), pages, freed)
-                    .map_err(corrupt)
+                let id = BranchId(*branch);
+                // C-R: in catalog recovery (the arena is not open yet), a Commit to a branch that is
+                // not resident is parked, not replayed: the branch is not read until it is touched.
+                let recovering = self.cat.is_some() && self.arena.is_none();
+                let removed = self.cat.as_ref().is_some_and(|c| c.removed.contains(&id));
+                if recovering && !removed && (!self.branches.contains_key(&id) || self.parked.contains_key(&id)) {
+                    self.parked
+                        .entry(id)
+                        .or_default()
+                        .push((self.replay_pos, pages.clone()));
+                    self.parked_records += 1;
+                    return Ok(());
+                }
+                self.apply_commit(id, pages, freed).map_err(corrupt)
             }
             Record::TrunkRetain {
                 page,

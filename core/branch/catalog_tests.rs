@@ -355,3 +355,62 @@ fn trunk_versions_are_read_in_place_whatever_a_page_holds() {
     );
     assert!(per_k[0].0 <= 8 && per_k[0].1 <= 8, "{per_k:?}");
 }
+
+/// a12-durable-open C-R: a crash after commits to OLD branches (the steady state: agents committing to
+/// branches that existed at the last checkpoint) recovers without reading those branches — their Commits
+/// are parked and applied at first touch — and every branch then reads its last commit, the slot set
+/// equals the crashed store's, and the next checkpoint and reopen keep all of it.
+#[test]
+fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let (ids, image, slots_before);
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        ids = grow(&db, 60);
+        // A child of every tenth branch, so some committing branches retain versions for a child.
+        for &id in ids.iter().step_by(10) {
+            let b = db.branch(id).unwrap();
+            let _ = b.fork().unwrap().into_id();
+            let _ = b.into_id();
+        }
+        db.branch_compact_now().unwrap();
+        for round in 0..3 {
+            for (i, &id) in ids.iter().enumerate().step_by(3) {
+                let b = db.branch(id).unwrap();
+                let row = 1 + (i % 400) as i64;
+                b.connect()
+                    .unwrap()
+                    .execute(format!("UPDATE t SET v = 'r{round}-{}' WHERE id = {row}", id.0))
+                    .unwrap();
+                let _ = b.into_id();
+            }
+        }
+        slots_before = db.branch_stats().unwrap().arena_slots_in_use;
+        image = crash_image(&path, dir.path());
+    }
+    let db = open_at(&image, catalog()).unwrap();
+    let s = db.branch_open_stats();
+    assert_eq!(s.branch_loads, 0, "recovery read branches: {s:?}");
+    assert_eq!(s.parked_records, 60, "20 branches x 3 rounds were not all parked: {s:?}");
+    assert!(s.cat_queries <= 5, "recovery queried the catalog per record: {s:?}");
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, slots_before, "the slot count moved");
+    for (i, &id) in ids.iter().enumerate() {
+        let b = db.branch(id).unwrap();
+        let row = 1 + (i % 400) as i64;
+        let want = if i % 3 == 0 { format!("r2-{}", id.0) } else { format!("b{}", id.0) };
+        assert_eq!(value(&b.connect().unwrap(), row), want, "branch {} after recovery", id.0);
+        let _ = b.into_id();
+    }
+    db.branch_compact_now().unwrap();
+    drop(db);
+    let db = open_at(&image, catalog()).unwrap();
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, slots_before, "after a checkpoint and reopen");
+    for (i, &id) in ids.iter().enumerate().step_by(3) {
+        let b = db.branch(id).unwrap();
+        let row = 1 + (i % 400) as i64;
+        assert_eq!(value(&b.connect().unwrap(), row), format!("r2-{}", id.0));
+        let _ = b.into_id();
+    }
+}
