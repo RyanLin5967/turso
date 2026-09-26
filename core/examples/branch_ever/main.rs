@@ -249,6 +249,10 @@ fn parse_args() -> Args {
     if a.window == 0 || a.read_every == 0 {
         die("--window and --read-every must be positive");
     }
+    if a.seed == 0 {
+        // The workload stream's salt is 0, so seed 0 is xorshift's zero state: every draw 0.
+        die("--seed 0 is refused: the workload stream would be xorshift's zero state");
+    }
     a
 }
 
