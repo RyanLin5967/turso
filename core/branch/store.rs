@@ -339,7 +339,16 @@ impl GcTask {
             // for the versions that existed when the task was queued, but a version split off since
             // can hold a child forked since (when the reaped child was the newest, `hi` is open), so
             // each candidate is checked against the children as they are.
-            if lineage.by_born.contains(&v) && !lineage.has_child_in(born, died) {
+            // r11-space-refute fire-check plants (inert unless R11_REFUTE_PLANT is set in a test run).
+            let queue_time = born > self.lo && born <= self.f && self.f < died && self.hi.is_none_or(|hi| died <= hi);
+            let free = if refute_plant(1) {
+                queue_time
+            } else if refute_plant(2) {
+                true
+            } else {
+                !lineage.has_child_in(born, died)
+            };
+            if lineage.by_born.contains(&v) && free {
                 lineage.release(v, chunks, work);
                 *freed += 1;
             }
@@ -1314,6 +1323,23 @@ impl BranchState {
     }
 }
 
+/// r11-space-refute fire-check switch (adversary worktree only): R11_REFUTE_PLANT=i turns plant i on.
+#[cfg(test)]
+fn refute_plant(i: u32) -> bool {
+    static P: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        std::env::var("R11_REFUTE_PLANT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }) == i
+}
+
+#[cfg(not(test))]
+fn refute_plant(_: u32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1869,5 +1895,270 @@ mod tests {
         assert_eq!(store.stats().live_branches, 0, "seed {seed:#x}: branches leaked");
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
         assert_eq!(store.stats().chunk_slots_in_use, 0, "seed {seed:#x}: chunks leaked");
+    }
+    /// r11-space-refute (adversary, not part of the lane): bounded reclamation under branch TREES.
+    /// The lane's bounded test runs trunk children only (no fork_branch, no deferred reap, no open
+    /// connection, no branch write) at one budget (2) and 3 seeds; its tree test runs eager. This one
+    /// runs budgets 1, 2, 3 and 7 with chunked trunk writes (random chunk subsets, sometimes none,
+    /// sometimes several transactions in one epoch), forks from the trunk and from branches, branch
+    /// writes, handles dropped while children live (deferred reaps that later cascade into a trunk
+    /// child's reap), connections opened and closed, and explicit drains. After EVERY step every
+    /// branch still in the store reads every page byte for byte as its model says, and whenever the
+    /// trunk has no child left the store holds no trunk version, chunk or pending image.
+    /// R11_REFUTE_PLANT=1 restores the pre-fix S2b predicate (queue-time bounds, 2f1195ece);
+    /// =2 frees every candidate; the test must fail under both.
+    #[test]
+    fn refute_bounded_reclamation_under_branch_trees() {
+        let seeds: u64 = std::env::var("R11_REFUTE_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let mut t = [0u64; 7];
+        for budget in [1usize, 2, 3, 7] {
+            for s in 0..seeds {
+                let seed = (0x9E37_79B9_7F4A_7C15u64 ^ s.wrapping_mul(0xD1B5_4A32_D192_ED03))
+                    .rotate_left(budget as u32)
+                    | 1;
+                let r = run_refute(seed, budget);
+                for i in 0..7 {
+                    t[i] += r[i];
+                }
+            }
+        }
+        eprintln!(
+            "refute shapes: deferred reaps {}, calls leaving a task queued {}, trunk-child reaps by \
+             cascade {}, chunks overlaid {}, closes that collected {}, max depth {}, drains {}",
+            t[0], t[1], t[2], t[3], t[4], t[5], t[6]
+        );
+        assert!(
+            t.iter().all(|&x| x > 0),
+            "a shape never occurred, so a green run says nothing about it: {t:?}"
+        );
+    }
+
+    struct RNode {
+        id: BranchId,
+        parent: Option<usize>,
+        sees: HashMap<u32, [u64; CPP]>,
+        handle: bool,
+        open: bool,
+        kids: usize,
+        in_store: bool,
+        depth: u64,
+    }
+
+    /// Mirror of `collect`: a node leaves the store once it has no handle, no connection and no
+    /// child in the store, and that may release its parent in turn. Returns how many trunk
+    /// children it removed.
+    fn settle(nodes: &mut [RNode], mut i: usize) -> u64 {
+        loop {
+            let n = &nodes[i];
+            if !n.in_store || n.handle || n.open || n.kids > 0 {
+                return 0;
+            }
+            nodes[i].in_store = false;
+            match nodes[i].parent {
+                None => return 1,
+                Some(p) => {
+                    nodes[p].kids -= 1;
+                    i = p;
+                }
+            }
+        }
+    }
+
+    fn run_refute(seed: u64, budget: usize) -> [u64; 7] {
+        let store = BranchStore::with_config(CHUNK, Some(budget));
+        let mut rng = Rng(seed);
+        let mut trunk: HashMap<u32, [u64; CPP]> = (0..PAGES).map(|p| (p, [0; CPP])).collect();
+        let mut nodes: Vec<RNode> = Vec::new();
+        let mut generation = 0u64;
+        let mut shapes = [0u64; 7];
+        let queued = |store: &BranchStore| !store.inner.lock().trunk.gc_tasks.is_empty();
+        for step in 0..2000 {
+            let in_store: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].in_store).collect();
+            let handles: Vec<usize> = in_store.iter().copied().filter(|&i| nodes[i].handle).collect();
+            match rng.below(20) {
+                0..=1 if in_store.len() < 60 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    nodes.push(RNode {
+                        id,
+                        parent: None,
+                        sees: trunk.clone(),
+                        handle: true,
+                        open: false,
+                        kids: 0,
+                        in_store: true,
+                        depth: 1,
+                    });
+                }
+                2..=4 if !handles.is_empty() && in_store.len() < 60 => {
+                    let p = if rng.below(2) == 0 {
+                        *handles.last().unwrap()
+                    } else {
+                        handles[rng.below(handles.len() as u64) as usize]
+                    };
+                    let id = store.fork_branch(nodes[p].id).unwrap();
+                    let (sees, depth) = (nodes[p].sees.clone(), nodes[p].depth + 1);
+                    nodes[p].kids += 1;
+                    shapes[5] = shapes[5].max(depth);
+                    nodes.push(RNode {
+                        id,
+                        parent: Some(p),
+                        sees,
+                        handle: true,
+                        open: false,
+                        kids: 0,
+                        in_store: true,
+                        depth,
+                    });
+                }
+                5..=9 => {
+                    // One or two trunk transactions in this epoch, each first-writing up to three
+                    // pages; a write changes a random subset of chunks (possibly none: a rollback).
+                    for _ in 0..=rng.below(2) {
+                        let mut written: Vec<u32> = Vec::new();
+                        for _ in 0..=rng.below(3) {
+                            let page = rng.below(PAGES as u64) as u32;
+                            if !written.contains(&page) {
+                                written.push(page);
+                                if store.trunk_has_children() {
+                                    store.first_write_trunk(page, &chunked(&trunk[&page]));
+                                    shapes[1] += u64::from(queued(&store));
+                                }
+                            }
+                            let mut gens = trunk[&page];
+                            let rewrite = rng.below(4);
+                            for g in gens.iter_mut() {
+                                if rewrite > 0 && rng.below(2) == 0 {
+                                    generation += 1;
+                                    *g = generation;
+                                }
+                            }
+                            trunk.insert(page, gens);
+                        }
+                    }
+                }
+                10..=12 if !handles.is_empty() => {
+                    let v = handles[rng.below(handles.len() as u64) as usize];
+                    let id = nodes[v].id;
+                    store.begin_write(id).unwrap();
+                    let mut committed: Vec<PageRef> = Vec::new();
+                    for _ in 0..=rng.below(2) {
+                        let page = rng.below(u64::from(PAGES)) as u32;
+                        if committed.iter().any(|p| p.get().id == page as usize) {
+                            continue;
+                        }
+                        store
+                            .first_write_branch(id, page, &chunked(&nodes[v].sees[&page]))
+                            .unwrap();
+                        generation += 1;
+                        committed.push(page_with(page, generation));
+                        nodes[v].sees.insert(page, [generation; CPP]);
+                    }
+                    store.commit_pages(id, &committed).unwrap();
+                    store.end_write(id);
+                }
+                13..=15 if !handles.is_empty() => {
+                    let v = handles[rng.below(handles.len() as u64) as usize];
+                    nodes[v].handle = false;
+                    let reaped = store.release_handle(nodes[v].id);
+                    shapes[1] += u64::from(queued(&store));
+                    let removed_trunk_kids = settle(&mut nodes, v);
+                    if reaped.deferred {
+                        shapes[0] += 1;
+                    }
+                    if removed_trunk_kids > 0 && nodes[v].parent.is_some() {
+                        shapes[2] += 1;
+                    }
+                    assert_eq!(
+                        reaped.deferred,
+                        nodes[v].in_store,
+                        "seed {seed:#x} K={budget} step {step}: the store and the model disagree on \
+                         whether branch {} was kept",
+                        nodes[v].id.0
+                    );
+                }
+                16 => {
+                    let closed: Vec<usize> =
+                        handles.iter().copied().filter(|&i| !nodes[i].open).collect();
+                    if !closed.is_empty() {
+                        let v = closed[rng.below(closed.len() as u64) as usize];
+                        store.open(nodes[v].id).unwrap();
+                        nodes[v].open = true;
+                    }
+                }
+                17 => {
+                    let open: Vec<usize> = in_store.iter().copied().filter(|&i| nodes[i].open).collect();
+                    if !open.is_empty() {
+                        let v = open[rng.below(open.len() as u64) as usize];
+                        store.close(nodes[v].id);
+                        nodes[v].open = false;
+                        let was = nodes[v].in_store;
+                        settle(&mut nodes, v);
+                        if was && !nodes[v].in_store {
+                            shapes[4] += 1;
+                        }
+                    }
+                }
+                18 => {
+                    store.drain_reclamation();
+                    shapes[6] += 1;
+                }
+                _ => {}
+            }
+            // Every branch still in the store reads every page as its model says. A branch whose
+            // handle is gone is still read: its children read through it.
+            let mut buf = vec![0u8; PAGE];
+            for n in nodes.iter().filter(|n| n.in_store) {
+                for page in 0..PAGES {
+                    let got = if store.resolve_into(n.id, page, &mut buf).unwrap_or_else(|e| {
+                        panic!("seed {seed:#x} K={budget} step {step}: branch {} page {page}: {e}", n.id.0)
+                    }) {
+                        buf.clone()
+                    } else {
+                        chunked(&trunk[&page])
+                    };
+                    assert_eq!(
+                        got,
+                        chunked(&n.sees[&page]),
+                        "seed {seed:#x} K={budget} step {step}: branch {} (depth {}, handle {}, open \
+                         {}) read the wrong page {page}",
+                        n.id.0,
+                        n.depth,
+                        n.handle,
+                        n.open
+                    );
+                }
+            }
+            if !nodes.iter().any(|n| n.in_store && n.parent.is_none()) {
+                let s = store.stats();
+                assert_eq!(
+                    (s.trunk_versions, s.chunk_slots_in_use, s.trunk_pending_pages),
+                    (0, 0, 0),
+                    "seed {seed:#x} K={budget} step {step}: the trunk has no child but keeps versions"
+                );
+            }
+        }
+        shapes[3] = store.stats().work.resolve_chunks_overlaid;
+        for i in 0..nodes.len() {
+            if nodes[i].in_store && nodes[i].open {
+                store.close(nodes[i].id);
+                nodes[i].open = false;
+            }
+        }
+        for i in 0..nodes.len() {
+            if nodes[i].in_store && nodes[i].handle {
+                nodes[i].handle = false;
+                store.release_handle(nodes[i].id);
+            }
+        }
+        let s = store.stats();
+        assert_eq!(
+            (s.live_branches, s.arena_slots_in_use, s.chunk_slots_in_use, s.trunk_versions, s.trunk_pending_pages),
+            (0, 0, 0, 0, 0),
+            "seed {seed:#x} K={budget}: leaked at teardown"
+        );
+        shapes
     }
 }
