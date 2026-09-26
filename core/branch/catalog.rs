@@ -27,7 +27,9 @@
 //! The catalog holds the state as of generation `g` (its meta row); the log holds generation `g`'s
 //! records since. A checkpoint commits the catalog at `g + 1` and only then starts the log over at
 //! `g + 1`, so a crash between the two leaves an older-generation log, which recovery ignores —
-//! the snapshot's rename rule, with the catalog commit as the commit point. The arena is synced
+//! the snapshot's rename rule, with the catalog commit as the commit point. (r11-restart-r2, F-FZ:
+//! except the records after the checkpoint's own `Record::Checkpoint`, which it replays; see
+//! "The fuzzy checkpoint" below.) The arena is synced
 //! before the catalog commits, as before a snapshot. Frees derived by the log's replay are applied
 //! to the free table (they are the effects of durable records); a slot allocated after the
 //! checkpoint that no durable record names is free after a crash, because the catalog still lists
@@ -59,9 +61,9 @@
 //! the catalog writes, the commit or the WAL backfill. A second connection ([`Catalog::writer`])
 //! writes the captured rows while the store's own connection serves on-demand reads from a snapshot
 //! pinned at the capture ([`Catalog::begin_read_snapshot`]), which in-memory state overrides exactly
-//! as it does between checkpoints. The meta row records the log position the capture covered
-//! (`log_from`), so the log is cut to its suffix only after the commit, and a crash between the two
-//! replays just that suffix (see `Journal::recover_catalog`).
+//! as it does between checkpoints. The capture appends a `Record::Checkpoint` to the log (ARIES's
+//! begin-checkpoint record), so the log is cut to what follows it only after the commit, and a crash
+//! between the two replays just that suffix (see `Journal::recover_catalog`).
 
 use std::num::NonZero;
 use std::path::Path;
@@ -133,10 +135,6 @@ const META_LEASE_NOW: i64 = 6;
 const META_ARENA_HW: i64 = 7;
 const META_IN_USE: i64 = 8;
 const META_STATES: i64 = 9;
-/// F-FZ (r11-restart-r2): the log generation and byte a fuzzy checkpoint captured up to; -1 for
-/// none (a sharp checkpoint, or a catalog written before F-FZ, whose meta row has keys 1-9 only).
-const META_LOG_FROM_GEN: i64 = 10;
-const META_LOG_FROM_OFF: i64 = 11;
 
 /// Pages of Turso page cache each catalog connection keeps (r11-restart-r2, item 4): sized to hold
 /// a checkpoint window's dirty leaves (~31.8k commits at 33 B in a 1 MiB log) so the writer does
@@ -165,8 +163,6 @@ pub(crate) struct Meta {
     pub(crate) arena_hw: u32,
     pub(crate) in_use: u64,
     pub(crate) states: u64,
-    /// F-FZ: `(log generation, byte)` the checkpoint that wrote this row captured up to.
-    pub(crate) log_from: Option<(u64, u64)>,
 }
 
 /// One branch as the catalog holds it.
@@ -429,7 +425,6 @@ impl Catalog {
         }
         let mut m = Meta::default();
         let mut seen = 0u32;
-        let (mut log_from_gen, mut log_from_off) = (None, None);
         for row in rows {
             let (k, v) = (get(&row, 0)? as i64, get(&row, 1)?);
             match k {
@@ -442,23 +437,15 @@ impl Catalog {
                 META_ARENA_HW => m.arena_hw = v as u32,
                 META_IN_USE => m.in_use = v,
                 META_STATES => m.states = v,
-                META_LOG_FROM_GEN => log_from_gen = Some(v),
-                META_LOG_FROM_OFF => log_from_off = Some(v),
                 _ => return Err(LimboError::Corrupt(format!("branch catalog: meta key {k}"))),
             }
             seen += 1;
         }
-        // 9 keys: written before F-FZ; 11: with the fuzzy checkpoint's log position.
-        if seen != 9 && seen != 11 {
+        if seen != 9 {
             return Err(LimboError::Corrupt(format!(
-                "branch catalog: meta row has {seen} keys, not 9 or 11"
+                "branch catalog: meta row has {seen} of 9 keys"
             )));
         }
-        m.log_from = match (log_from_gen, log_from_off) {
-            // -1 as stored, read back through `as u64`.
-            (Some(g), Some(off)) if g != u64::MAX => Some((g, off)),
-            _ => None,
-        };
         Ok(Some(m))
     }
 
@@ -525,15 +512,6 @@ impl Catalog {
             self.meta_put
                 .exec(&[Value::from_i64(k), int(v)], &mut self.counters)?;
         }
-        // Always both keys, so a sharp checkpoint overwrites a fuzzy one's position.
-        let (g, off) = match m.log_from {
-            Some((g, off)) => (int(g), int(off)),
-            None => (Value::from_i64(-1), Value::from_i64(-1)),
-        };
-        self.meta_put
-            .exec(&[Value::from_i64(META_LOG_FROM_GEN), g], &mut self.counters)?;
-        self.meta_put
-            .exec(&[Value::from_i64(META_LOG_FROM_OFF), off], &mut self.counters)?;
         Ok(())
     }
 

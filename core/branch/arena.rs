@@ -165,16 +165,6 @@ impl Arena {
         &self.free
     }
 
-    /// Empty the in-memory free list (a catalog checkpoint has written it to the catalog).
-    pub(crate) fn drain_free(&mut self) {
-        if trace_slots() {
-            eprintln!("R11SLOT drain_free {:?}", self.free);
-        }
-        for slot in std::mem::take(&mut self.free) {
-            self.set_free_bit(slot, false);
-        }
-    }
-
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
     }

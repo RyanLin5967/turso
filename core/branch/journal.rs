@@ -152,6 +152,13 @@ pub(crate) enum Record {
     Clock {
         now_ms: u64,
     },
+    /// A catalog store's fuzzy checkpoint to `generation` captured the state as of here
+    /// (r11-restart-r2, F-FZ; ARIES's begin-checkpoint record). If the catalog reaches `generation`
+    /// while the log is still an older one, recovery replays only the records after this one.
+    /// Replaying it changes nothing.
+    Checkpoint {
+        generation: u64,
+    },
 }
 
 const TAG_FORK: u8 = 1;
@@ -160,6 +167,7 @@ const TAG_TRUNK_RETAIN: u8 = 3;
 const TAG_RELEASE: u8 = 4;
 const TAG_LEASE: u8 = 5;
 const TAG_CLOCK: u8 = 6;
+const TAG_CHECKPOINT: u8 = 7;
 
 impl Record {
     fn encode(&self, out: &mut Vec<u8>) {
@@ -211,6 +219,10 @@ impl Record {
                 out.push(TAG_CLOCK);
                 put_u64(out, *now_ms);
             }
+            Record::Checkpoint { generation } => {
+                out.push(TAG_CHECKPOINT);
+                put_u64(out, *generation);
+            }
         }
     }
 
@@ -244,6 +256,9 @@ impl Record {
                 now_ms: r.u64()?,
             },
             TAG_CLOCK => Record::Clock { now_ms: r.u64()? },
+            TAG_CHECKPOINT => Record::Checkpoint {
+                generation: r.u64()?,
+            },
             _ => return None,
         };
         // Trailing bytes inside a frame whose CRC matched are a format error, not a torn tail.
@@ -558,19 +573,19 @@ impl Journal {
         Self::recover_base(files, sync, None)
     }
 
-    /// `recover` for a catalog store: the catalog's meta row, `(page_size, generation, log_from)`,
-    /// stands where the snapshot's header does, and no snapshot is read. `None`: the catalog has no
-    /// meta row (a crash while the store was being created).
+    /// `recover` for a catalog store: the catalog's meta row, `(page_size, generation)`, stands
+    /// where the snapshot's header does, and no snapshot is read. `None`: the catalog has no meta
+    /// row (a crash while the store was being created).
     ///
-    /// `log_from` (r11-restart-r2, F-FZ): a fuzzy checkpoint committed the catalog at `generation`
-    /// having captured the log of generation `log_from.0` up to byte `log_from.1`. If the log on
-    /// disk is still that older generation (a crash between the catalog commit and the log's
-    /// rewrite), only its records from that byte on are replayed, and the log is rewritten to them
-    /// under `generation` before the open goes on.
+    /// A log of an OLDER generation than the catalog (r11-restart-r2, F-FZ): a checkpoint committed
+    /// the catalog and the process stopped before the log was cut to what followed its capture.
+    /// Only the records after that checkpoint's `Record::Checkpoint { generation }` are replayed
+    /// (none if it never reached the disk: nothing written after it did either), and the log is
+    /// rewritten to them under the catalog's generation before the open goes on.
     pub(crate) fn recover_catalog(
         files: &BranchFiles,
         sync: bool,
-        base: Option<(u32, u64, Option<(u64, u64)>)>,
+        base: Option<(u32, u64)>,
     ) -> Result<Option<Recovered>> {
         Self::recover_base(files, sync, Some(base))
     }
@@ -578,7 +593,7 @@ impl Journal {
     fn recover_base(
         files: &BranchFiles,
         sync: bool,
-        catalog: Option<Option<(u32, u64, Option<(u64, u64)>)>>,
+        catalog: Option<Option<(u32, u64)>>,
     ) -> Result<Option<Recovered>> {
         // Lock before reading or discarding anything (review N1): the temp snapshot removed below
         // could be a live store's compaction in flight.
@@ -587,12 +602,11 @@ impl Journal {
         let snapshot = match catalog {
             None if files.snap.exists() => Some(read_snapshot(&files.snap)?),
             None => None,
-            Some(base) => base.map(|(ps, g, _)| (ps, g, SnapshotState::default(), 0)),
+            Some(base) => base.map(|(ps, g)| (ps, g, SnapshotState::default(), 0)),
         };
-        let log_from = catalog.flatten().and_then(|(_, _, from)| from);
         // A stale temp snapshot is a compaction that never reached its rename: discard it. So is a
         // stale temp log: a fuzzy checkpoint's rewrite that never reached its rename (the log it
-        // would have replaced is intact, and the catalog's `log_from` still names it).
+        // would have replaced is intact, and holds the checkpoint's marker).
         let tmp = files.snap_tmp();
         if tmp.exists() {
             std::fs::remove_file(&tmp).map_err(|e| io_error(e, "remove stale branch snapshot"))?;
@@ -601,6 +615,7 @@ impl Journal {
         if tmp.exists() {
             std::fs::remove_file(&tmp).map_err(|e| io_error(e, "remove stale branch log rewrite"))?;
         }
+        let catalog_store = catalog.is_some();
         let bytes = read_all(&mut file)?;
         let header = parse_log_header(&bytes)?;
 
@@ -633,27 +648,17 @@ impl Journal {
         };
 
         let mut records = Vec::new();
-        // Where replay starts: the whole log of the catalog's (or snapshot's) generation, or the
-        // suffix of an older one that a fuzzy checkpoint's `log_from` names (F-FZ).
-        let replay_from = match header {
-            Some((_, log_gen)) if log_gen == generation => Some(LOG_HEADER_LEN),
-            Some((_, log_gen)) if log_from.is_some_and(|(g, _)| g == log_gen && g < generation) => {
-                let off = log_from.expect("checked above").1;
-                if off < LOG_HEADER_LEN as u64 {
-                    return Err(corrupt("the catalog's log_from points into the log header"));
-                }
-                // Past the file's end: no record after the capture became durable.
-                Some(usize::try_from(off).unwrap_or(usize::MAX).min(bytes.len()))
-            }
-            _ => None,
-        };
+        // The end offset of each record in `records`, for the cut an older log needs (F-FZ).
+        let mut ends: Vec<usize> = Vec::new();
+        // Replayed: the log of the snapshot's or catalog's own generation; and in a catalog store,
+        // an older one, cut at the checkpoint's marker below (F-FZ).
+        let replayable = |log_gen: u64| log_gen == generation || (catalog_store && log_gen < generation);
         match header {
-            Some((log_ps, _)) if replay_from.is_some() => {
+            Some((log_ps, log_gen)) if replayable(log_gen) => {
                 if log_ps != page_size {
                     return Err(corrupt("log and snapshot disagree on the page size"));
                 }
-                let start = replay_from.expect("checked above");
-                let mut pos = start;
+                let mut pos = LOG_HEADER_LEN;
                 loop {
                     let Some(frame) = bytes.get(pos..pos + FRAME_HEADER_LEN) else {
                         break;
@@ -706,6 +711,7 @@ impl Journal {
                         Record::decode(payload).ok_or_else(|| corrupt("undecodable log record"))?;
                     records.push(record);
                     pos = start + len;
+                    ends.push(pos);
                 }
                 journal.len = pos as u64;
                 if (pos as u64) < bytes.len() as u64 {
@@ -719,18 +725,31 @@ impl Journal {
                         fsync_file(&journal.file)?;
                     }
                 }
-                if start != LOG_HEADER_LEN || header.is_some_and(|(_, g)| g != generation) {
-                    // An older generation's suffix (F-FZ, crash state S1): make it the log of the
-                    // catalog's generation now, so appends and the next checkpoint see one log.
-                    journal.generation = header.map_or(generation, |(_, g)| g);
-                    journal.rewrite_from(start as u64, generation)?;
+                if log_gen != generation {
+                    // F-FZ crash state S1: the catalog holds everything up to its checkpoint's
+                    // marker. Replay what follows it, and make that the log of the catalog's
+                    // generation now, so appends and the next checkpoint see one log.
+                    let marker = Record::Checkpoint { generation };
+                    let cut = match records.iter().rposition(|r| *r == marker) {
+                        Some(i) => {
+                            let at = ends[i];
+                            records.drain(..=i);
+                            at
+                        }
+                        None => {
+                            records.clear();
+                            pos
+                        }
+                    };
+                    journal.generation = log_gen;
+                    journal.rewrite_from(cut as u64, generation)?;
                 }
             }
             Some((_, log_gen)) if log_gen > generation => {
                 return Err(corrupt("log generation is ahead of the snapshot"));
             }
-            // An older generation (a compaction crashed after its rename, before the log reset)
-            // or a torn header: nothing in it is newer than the snapshot. (A whole header of
+            // An older generation in a snapshot store (a compaction crashed after its rename, before
+            // the log reset) or a torn header: nothing in it is newer than the snapshot. (A whole header of
             // another format version never gets here: `parse_log_header` refused it.)
             _ => journal.reset_log(generation)?,
         }
@@ -784,9 +803,13 @@ impl Journal {
     /// the logical log position `from` (see [`Journal::mark`]; records buffered but not yet written
     /// count). Keep only the records after `from`, under a header of `generation`: the suffix is
     /// written to a temp file that this journal locks first, synced, and renamed over the log, so a
-    /// crash leaves either the old log (which the catalog's `log_from` still names) or the new one
+    /// crash leaves either the old log (whose `Record::Checkpoint` marks the cut) or the new one
     /// (F-FZ). Buffered records before `from` are dropped, their effects being in the catalog. A
     /// failure before the rename leaves the old log in use; one after it poisons the journal.
+    ///
+    /// Blind spot: POSIX rename over a file this process holds open. On Windows that rename fails,
+    /// so a catalog store there cannot cut its log (nor reopen from crash state S1); catalog mode
+    /// is unix-only as written.
     pub(crate) fn rewrite_from(&mut self, from: u64, generation: u64) -> Result<()> {
         self.check_live()?;
         let end = self.mark();
@@ -948,6 +971,14 @@ impl Journal {
 
     pub(crate) fn wants_compaction(&self) -> bool {
         self.len > COMPACT_MIN_LOG_BYTES.max(2 * self.snapshot_len)
+    }
+
+    /// Twice the compaction threshold: while a fuzzy checkpoint is in flight, an operation that
+    /// finds the log past this waits for its install (InnoDB's synchronous flush point beside its
+    /// asynchronous one), so the log stays within twice the threshold plus the operations in
+    /// flight (r11-restart-r2, F-FZ).
+    pub(crate) fn past_hard_limit(&self) -> bool {
+        self.len > 2 * COMPACT_MIN_LOG_BYTES.max(2 * self.snapshot_len)
     }
 
     /// Replace the log with a snapshot of `state`. `fail_after_rename` is the crash failpoint.
@@ -1599,6 +1630,7 @@ mod tests {
                 now_ms: 0,
             },
             Record::Clock { now_ms: 0 },
+            Record::Checkpoint { generation: 0 },
         ];
         for record in records {
             let mut payload = Vec::new();

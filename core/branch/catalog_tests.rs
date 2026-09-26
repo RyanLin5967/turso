@@ -598,8 +598,40 @@ fn a_crash_before_a_fuzzy_commit_replays_the_whole_log() {
     }
     let db = open_at(&image, catalog()).unwrap();
     let s = db.branch_open_stats();
-    assert_eq!(s.records, records, "the uncommitted checkpoint cut the log: {s:?}");
+    // Plus the checkpoint's own marker (`Record::Checkpoint`), which the first write after the
+    // capture flushed with its own record.
+    assert_eq!(s.records, records + 1, "the uncommitted checkpoint cut the log: {s:?}");
     check(&db, &model);
+}
+
+/// F-FZ's log bound: with fuzzy checkpoints the log may pass the threshold while one is in flight,
+/// but an operation that finds it past twice the threshold waits for the install, so the log never
+/// exceeds twice the threshold plus one operation's records. (The sharp checkpoint's bound, the
+/// threshold plus one operation, is `the_log_stays_under_the_checkpoint_threshold`, which holds with
+/// `R11_CKPT=sharp` only: PREREG A14 addendum.)
+#[test]
+fn the_log_stays_under_twice_the_threshold_with_fuzzy_checkpoints() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    seed(&db.connect().unwrap());
+    let files = journal::BranchFiles::for_db(path.to_str().unwrap());
+    let trunk = db.connect().unwrap();
+    let mut max_log = 0;
+    for i in 0..60_000u64 {
+        let b = trunk.fork_branch().unwrap();
+        let row = 1 + (i % 400) as i64;
+        b.connect()
+            .unwrap()
+            .execute(format!("UPDATE t SET v = 'b{i}' WHERE id = {row}"))
+            .unwrap();
+        let _ = b.into_id();
+        max_log = max_log.max(std::fs::metadata(&files.log).unwrap().len());
+    }
+    db.branch_checkpoint_wait();
+    let c = db.branch_checkpoint_counters();
+    assert!(c[1] >= 2, "fewer than two fuzzy checkpoints ran: {c:?}");
+    assert!(max_log <= (2 << 20) + 256, "the log grew to {max_log} bytes: {c:?}");
 }
 
 /// C-R's settle in bounded batches (PREREG A14): after a crash whose tail commits to 200 old

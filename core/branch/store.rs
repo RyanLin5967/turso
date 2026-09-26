@@ -183,6 +183,12 @@ pub(crate) struct BranchStore {
     /// fuzzy checkpoint in flight waits at that point (its catalog rows written but not committed;
     /// or committed but not installed), so a caller can act on the store there, or image its files.
     flight_hold: Arc<AtomicU8>,
+    /// F-FZ back-pressure: set while a fuzzy checkpoint is in flight and the log is past twice the
+    /// threshold; an operation that sees it after releasing the store mutex waits for the install.
+    over_hard: Arc<AtomicBool>,
+    /// F-FZ: set from a fuzzy checkpoint's install until its WAL truncation ends; no checkpoint
+    /// starts meanwhile, whose capture would pin a read mark and make the truncation busy.
+    truncating: Arc<AtomicBool>,
     /// Live children of the trunk. Read without the lock on every trunk first-write so that a
     /// database with no branches pays one atomic load per written page and nothing else.
     ///
@@ -1087,13 +1093,27 @@ fn run_flight(
     writer: Arc<Mutex<Catalog>>,
     cap: Box<Captured>,
     hold: Arc<AtomicU8>,
+    over_hard: Arc<AtomicBool>,
+    truncating: Arc<AtomicBool>,
 ) {
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
-    let written = {
+    // A panic in the writer must still reach the install (with an error), or `flight` would stay
+    // set: no checkpoint would start again and the read snapshot would stay pinned.
+    let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut w = writer.lock();
-        checkpoint_write(&mut w, &cap, Some(&*hold))
-    };
+        let written = checkpoint_write(&mut w, &cap, Some(&*hold));
+        if written.is_err() {
+            w.rollback();
+        }
+        written
+    }))
+    .unwrap_or_else(|_| {
+        writer.lock().rollback();
+        Err(LimboError::InternalError(
+            "the branch catalog checkpoint's writer panicked".to_string(),
+        ))
+    });
     let write_ns = ns(t);
     if written.is_ok() {
         pause_at(Some(&*hold), HOLD_AFTER_COMMIT);
@@ -1107,13 +1127,33 @@ fn run_flight(
             cat.ckpt.hold(hold_ns);
             cat.ckpt.flight_ns += write_ns;
         }
+        // Set under the store mutex, so no capture can slip in before the truncation.
+        truncating.store(installed.is_ok(), Ordering::Release);
+        over_hard.store(false, Ordering::Release);
         installed
     };
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
-        Ok(()) => truncate_catalog_wal(&mut writer.lock()),
+        Ok(()) => {
+            truncate_catalog_wal(&mut writer.lock());
+            truncating.store(false, Ordering::Release);
+            over_hard.store(false, Ordering::Release);
+        }
         Err(e) => tracing::warn!("branch catalog fuzzy checkpoint failed: {e}"),
+    }
+}
+
+/// F-FZ back-pressure: declared BEFORE the store mutex's guard in an operation that can grow the
+/// log, so it drops after the guard: if a fuzzy checkpoint is in flight and the log is past twice
+/// the threshold, the operation waits for the install without holding the store mutex.
+struct Backpressure<'a>(&'a BranchStore);
+
+impl Drop for Backpressure<'_> {
+    fn drop(&mut self) {
+        if self.0.over_hard.load(Ordering::Acquire) {
+            self.0.join_flights();
+        }
     }
 }
 
@@ -1171,6 +1211,8 @@ impl BranchStore {
             inner: Arc::new(Mutex::new(StoreInner::fresh(None, false, None))),
             flights: Mutex::new(Vec::new()),
             flight_hold: Arc::new(AtomicU8::new(0)),
+            over_hard: Arc::new(AtomicBool::new(false)),
+            truncating: Arc::new(AtomicBool::new(false)),
             trunk_children: AtomicUsize::new(0),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
@@ -1308,6 +1350,8 @@ impl BranchStore {
             inner: Arc::new(Mutex::new(inner)),
             flights: Mutex::new(Vec::new()),
             flight_hold: Arc::new(AtomicU8::new(0)),
+            over_hard: Arc::new(AtomicBool::new(false)),
+            truncating: Arc::new(AtomicBool::new(false)),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
             trunk_only: false,
@@ -1375,7 +1419,7 @@ impl BranchStore {
         stats.catalog_ns = ns(t);
         let t = Instant::now();
         let recovered =
-            Journal::recover_catalog(files, sync, meta.map(|m| (m.page_size, m.generation, m.log_from)))?;
+            Journal::recover_catalog(files, sync, meta.map(|m| (m.page_size, m.generation)))?;
         stats.recover_ns = ns(t);
         let Some(recovered) = recovered else {
             return Ok(());
@@ -1510,7 +1554,7 @@ impl BranchStore {
     /// Call after anything that adds or removes a lease.
     fn sync_lease_flag(&self, inner: &StoreInner) {
         self.leases_outstanding.store(
-            inner.journal.is_some() && !inner.leases.is_empty(),
+            inner.journal.is_some() && inner.leases_exist(),
             Ordering::Release,
         );
     }
@@ -1548,6 +1592,8 @@ impl BranchStore {
     /// forward (Chubby §2.8: the master "is free to advance this timeout further into the future,
     /// but may not move it backwards in time").
     pub(crate) fn set_lease(&self, id: BranchId, ttl: Duration) -> Result<()> {
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         // A lease that has run out is not renewable: reap first, so a late renewal is refused
         // rather than reviving the branch.
@@ -1581,6 +1627,8 @@ impl BranchStore {
     /// spent open survives a restart even if nothing expired.
     pub(crate) fn expire_now(&self) -> Result<Expired> {
         self.refuse_if_trunk_only("the expiry pass")?;
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         // A fail-stopped pass reaps nothing and stamps nothing: an empty `Expired` would say
         // "nothing was due" when the truth is "could not run" (review N4).
@@ -1594,7 +1642,7 @@ impl BranchStore {
         let mut all = Expired::default();
         loop {
             let (pass, _) = self.expire(&mut inner, Stamp::Flush)?;
-            let more = inner.expire_more;
+            let more = inner.expire_more && !inner.poisoned();
             all.freed_pages += pass.freed_pages;
             all.reaped.extend(pass.reaped);
             if !more {
@@ -1639,6 +1687,7 @@ impl BranchStore {
     /// together, before anything is freed.
     fn expire(&self, inner: &mut StoreInner, stamp: Stamp) -> Result<(Expired, u64)> {
         let now = inner.lease.now_ms();
+        inner.expire_more = false;
         // A fail-stopped store cannot make a Release durable, so it reaps nothing (and frees
         // nothing); reads stay available and the next open recovers from disk.
         if inner.poisoned() {
@@ -1647,7 +1696,6 @@ impl BranchStore {
         // Catalog stores: a lease a branch not yet resident carries is in the catalog's lease
         // index; the rows due are made resident, which puts their deadlines in `leases`. F-EXP: at
         // most `expire_batch()` rows per pass, in a keyset sweep that the next pass continues.
-        inner.expire_more = false;
         if let Some(cat) = inner.cat.as_mut() {
             if cat.lease_floor.is_some_and(|floor| floor <= now) {
                 let (due_rows, complete) =
@@ -1676,7 +1724,7 @@ impl BranchStore {
             inner.expire_more = true;
         }
         if due.is_empty() {
-            if !inner.leases.is_empty() {
+            if inner.leases_exist() {
                 match stamp {
                     Stamp::No => {}
                     Stamp::Queue => {
@@ -1783,14 +1831,25 @@ impl BranchStore {
             }
             return;
         }
-        self.start_flight(inner);
+        // Past twice the threshold with a checkpoint in flight (or still truncating its WAL, which
+        // keeps the next one from starting): this operation waits for it once the mutex is released.
+        if !self.start_flight(inner)
+            && (inner.cat.as_ref().is_some_and(|c| c.flight)
+                || self.truncating.load(Ordering::Acquire))
+            && inner.journal.as_ref().is_some_and(|j| j.past_hard_limit())
+        {
+            self.over_hard.store(true, Ordering::Release);
+        }
     }
 
     /// F-FZ: start a fuzzy checkpoint unless one is in flight. Parked Commits (C-R) are settled
     /// first, at most `SETTLE_BATCH` branches per call, and the checkpoint waits for the next call
     /// while any remain. Returns whether a checkpoint started.
     fn start_flight(&self, inner: &mut StoreInner) -> bool {
-        if inner.cat.as_ref().is_none_or(|c| c.flight) || inner.poisoned() {
+        if inner.cat.as_ref().is_none_or(|c| c.flight)
+            || inner.poisoned()
+            || self.truncating.load(Ordering::Acquire)
+        {
             return false;
         }
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1825,6 +1884,8 @@ impl BranchStore {
         let dirty = cap.dirty.clone();
         let shared = self.inner.clone();
         let hold = self.flight_hold.clone();
+        let over_hard = self.over_hard.clone();
+        let truncating = self.truncating.clone();
         let mut flights = self.flights.lock();
         if flights.len() >= FLIGHTS_KEPT {
             // Past its install long ago (only one checkpoint is ever in flight), so this join
@@ -1833,7 +1894,7 @@ impl BranchStore {
         }
         let spawned = crate::thread::Builder::new()
             .name("branch-checkpoint".to_string())
-            .spawn(move || run_flight(shared, writer, cap, hold));
+            .spawn(move || run_flight(shared, writer, cap, hold, over_hard, truncating));
         match spawned {
             Ok(handle) => {
                 flights.push(handle);
@@ -1893,6 +1954,8 @@ impl BranchStore {
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         inner.ensure_backing(page_size)?;
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
@@ -1915,6 +1978,8 @@ impl BranchStore {
     /// Fork a child of a branch. Refused while the parent has a write transaction in progress, for
     /// the same reason a trunk fork takes the WAL write lock, and refused on a released branch.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         // Reap what has expired first, so a parent whose lease ran out is refused rather than
         // revived by a child that would pin it (Neon refuses to "create children from expiring
@@ -1950,6 +2015,8 @@ impl BranchStore {
     /// page cache of the same page space, and nothing would tell one that the other had committed
     /// — a silently stale read, so it is refused.
     pub(crate) fn open_conn(&self, id: BranchId) -> Result<Option<Arc<Schema>>> {
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         // Nor is an expired branch openable: the same pass, the same refusal.
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
@@ -2013,6 +2080,8 @@ impl BranchStore {
     /// An error when the release could not be made durable (review N4): the branch is then kept —
     /// nothing is freed in this process — and comes back, detached, at the next open.
     pub(crate) fn release_handle(&self, id: BranchId) -> Result<Reaped> {
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         inner.ensure(id)?;
         let Some(st) = inner.branches.get(&id) else {
@@ -2118,6 +2187,8 @@ impl BranchStore {
     }
 
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         // A fail-stopped store takes no write: a commit would write its pages into the arena
         // before its record failed, possibly into a slot durable state still names (review R1).
@@ -2125,6 +2196,9 @@ impl BranchStore {
             return Err(fail_stopped(inner.journal.as_ref(), id, "no write transaction"));
         }
         inner.ensure(id)?;
+        // F-EXP: a branch whose lease ran out takes no write, though no bounded pass reached it.
+        let now = inner.lease.now_ms();
+        self.reap_if_due(&mut inner, id, now)?;
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         // A released branch takes no writes: its Release record is already durable, and a commit
         // logged after it would name a branch that recovery has already freed.
@@ -2288,16 +2362,18 @@ impl BranchStore {
         {
             return Ok(());
         }
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         // Re-read under the lock: `first_write_trunk` sets it while holding it.
         let unsynced = self.unsynced.load(Ordering::Acquire);
+        let leases_exist = inner.leases_exist();
         let StoreInner {
             journal,
             arena,
             failpoint,
             orphans,
             lease,
-            leases,
             ..
         } = &mut *inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
@@ -2309,7 +2385,7 @@ impl BranchStore {
             // a lost stamp lengthens leases and loses no data. But a failed flush POISONS the
             // journal, as every failed flush does: from then on every branch write and every trunk
             // commit that needs a pre-image is refused until the database is reopened.
-            if journal.is_poisoned() || leases.is_empty() {
+            if journal.is_poisoned() || !leases_exist {
                 return Ok(());
             }
             let now = lease.now_ms();
@@ -2341,7 +2417,7 @@ impl BranchStore {
                     .to_string(),
             ));
         }
-        if !leases.is_empty() {
+        if leases_exist {
             let now = lease.now_ms();
             if now >= lease.queued_ms.saturating_add(STAMP_EVERY_MS) {
                 journal.buffer(&Record::Clock { now_ms: now })?;
@@ -2358,6 +2434,8 @@ impl BranchStore {
     /// Commit a branch's dirty pages: write each into the slot its copy decision reserved, make
     /// that durable with the `Commit` record, and only then move the branch's map.
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         // Refuse BEFORE any slot is written: after the journal failed, this commit's record can
         // never be durable, so its pages have no business in the arena.
@@ -2423,7 +2501,7 @@ impl BranchStore {
         }];
         // The commit pays for a flush anyway: while a lease is outstanding, stamp the clock in it,
         // so a crash cannot lose the open time an agent spent committing (review R2).
-        if !inner.leases.is_empty() {
+        if inner.leases_exist() {
             let now = inner.lease.now_ms();
             if now > inner.lease.queued_ms {
                 records.push(Record::Clock { now_ms: now });
@@ -2693,7 +2771,7 @@ impl Drop for BranchStore {
         let now = inner.lease.now_ms();
         // With no lease outstanding the clock's value constrains nothing, so a close writes nothing.
         // Compared with what is DURABLE: a stamp only queued dies here with the journal (N3).
-        if !inner.leases.is_empty() && now > inner.lease.durable_ms {
+        if inner.leases_exist() && now > inner.lease.durable_ms {
             inner.lease.queued(now);
             if let Err(e) = self.log(&mut inner, Record::Clock { now_ms: now }) {
                 tracing::debug!("branch lease clock not stamped at close: {e}");
@@ -2811,6 +2889,14 @@ impl StoreInner {
 
     fn poisoned(&self) -> bool {
         self.journal.as_ref().is_some_and(|j| j.is_poisoned())
+    }
+
+    /// A lease is outstanding: on a resident branch, or on a catalog row not loaded. (r11-restart-r2:
+    /// a reopened catalog store holds no resident branch until one is touched, and with `leases`
+    /// alone its trunk commits and its close never stamped the lease clock, so a crash lost all the
+    /// time since open — the safe direction, leases only lengthen, but the clock stood still.)
+    fn leases_exist(&self) -> bool {
+        !self.leases.is_empty() || self.cat.as_ref().is_some_and(|c| c.lease_floor.is_some())
     }
 
     /// Fail-stop after a catalog read failed in the middle of an operation: the in-memory state
@@ -3328,7 +3414,7 @@ impl StoreInner {
     /// Catalog mode's compaction, an incremental checkpoint: every branch and trunk page changed
     /// since the last checkpoint, the free-space changes and the meta row go to the catalog in ONE
     /// transaction; then the log keeps only what follows the capture. The catalog commit is the
-    /// commit point (a crash after it replays only the suffix its meta row's `log_from` names), as
+    /// commit point (a crash after it replays only what follows the capture's `Record::Checkpoint`), as
     /// the snapshot's rename is in snapshot mode. The work is proportional to what changed since
     /// the last checkpoint, which the log's size bounds, not to the live state.
     ///
@@ -3424,6 +3510,11 @@ impl StoreInner {
             .values()
             .flat_map(|st| st.pending.values().copied())
             .collect();
+        // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
+        if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
+            cat.dirty = dirty;
+            return Err(e);
+        }
         let log_from = journal.mark();
         let meta = Meta {
             generation,
@@ -3435,7 +3526,6 @@ impl StoreInner {
             arena_hw: arena.high_water(),
             in_use: (arena.in_use() - reserved.len()) as u64,
             states: self.n_states,
-            log_from: Some((journal.generation(), log_from)),
         };
         if super::arena::trace_slots() {
             let named: Vec<(u64, Vec<Slot>)> = rows
@@ -3526,8 +3616,8 @@ impl StoreInner {
                 "failpoint: branch checkpoint stopped after the catalog commit".to_string(),
             ));
         }
-        // A failure before its rename leaves the old log in use, which the catalog's `log_from`
-        // names: correct, only longer. The install below must happen either way.
+        // A failure before its rename leaves the old log in use, whose checkpoint marker says
+        // where recovery cuts it: correct, only longer. The install below must happen either way.
         let rewritten = journal.rewrite_from(cap.log_from, cap.generation);
         for id in &cap.removed {
             cat.removed.remove(id);
@@ -4007,6 +4097,9 @@ impl StoreInner {
                 self.lease.recovered(*now_ms);
                 Ok(())
             }
+            // A checkpoint that did not commit (or did, and this is the log recovery cut after
+            // it): nothing to redo (F-FZ).
+            Record::Checkpoint { .. } => Ok(()),
         }
     }
 
