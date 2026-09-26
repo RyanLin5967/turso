@@ -142,7 +142,8 @@ pub(super) struct Prepared {
 
 /// The trunk statements that write one table's rows.
 struct TableStmts {
-    update: Statement,
+    /// Sets every column but the rowid alias. `None` when the alias is the only column.
+    update: Option<Statement>,
     insert: Statement,
     delete: Statement,
     /// Columns in order; the rowid alias, if any, carries the rowid.
@@ -399,16 +400,23 @@ impl Merger {
                     step_to_end(&mut stmts.delete)?;
                 }
                 [row] => {
-                    stmts
-                        .update
-                        .bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
-                    for (i, v) in row.iter().enumerate() {
-                        stmts
-                            .update
-                            .bind_at((i + 2).try_into().unwrap(), v.clone())?;
-                    }
-                    step_to_end(&mut stmts.update)?;
-                    if self.trunk.changes() == 0 {
+                    let updated = match stmts.update.as_mut() {
+                        Some(update) => {
+                            update.bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
+                            let mut param = 2usize;
+                            for (i, v) in row.iter().enumerate() {
+                                if stmts.alias == Some(i) {
+                                    continue;
+                                }
+                                update.bind_at(param.try_into().unwrap(), v.clone())?;
+                                param += 1;
+                            }
+                            step_to_end(update)?;
+                            self.trunk.changes() > 0
+                        }
+                        None => false,
+                    };
+                    if !updated {
                         let base = match stmts.alias {
                             Some(_) => 1,
                             None => {
@@ -454,13 +462,23 @@ impl Merger {
             .collect();
         let alias = table.get_rowid_alias_column().map(|(i, _)| i);
         let t = quote(&table.name);
+        // The rowid alias stays out of the SET list: the row keeps its rowid, and assigning the alias
+        // makes the engine run a two-pass update through an ephemeral table, a temporary file per
+        // statement, which was 82% of the replay's time (frontier/round11/r11-merge A10).
         let sets: Vec<String> = names
             .iter()
             .enumerate()
-            .map(|(i, n)| format!("{n} = ?{}", i + 2))
+            .filter(|(i, _)| alias != Some(*i))
+            .enumerate()
+            .map(|(param, (_, n))| format!("{n} = ?{}", param + 2))
             .collect();
-        let update = format!("UPDATE {t} SET {} WHERE rowid = ?1", sets.join(", "));
+        let update = (!sets.is_empty())
+            .then(|| format!("UPDATE {t} SET {} WHERE rowid = ?1", sets.join(", ")));
         let insert = match alias {
+            Some(_) if names.len() == 1 => {
+                // The alias is the only column: the row is its rowid, and an existing one is kept.
+                format!("INSERT OR IGNORE INTO {t}({}) VALUES (?1)", names[0])
+            }
             Some(_) => {
                 let params: Vec<String> = (1..=names.len()).map(|i| format!("?{i}")).collect();
                 format!(
@@ -480,7 +498,7 @@ impl Merger {
         };
         let delete = format!("DELETE FROM {t} WHERE rowid = ?1");
         Ok(TableStmts {
-            update: self.trunk.prepare(update)?,
+            update: update.map(|sql| self.trunk.prepare(sql)).transpose()?,
             insert: self.trunk.prepare(insert)?,
             delete: self.trunk.prepare(delete)?,
             columns: names.len(),
