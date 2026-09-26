@@ -62,7 +62,9 @@
 //! and live and replay collect at the same points:
 //! the one collect that happens outside a logged operation — a released branch's connection
 //! closing — now logs `Close`, and a release of an open branch logs `ReleaseOpen`, so replay holds
-//! the branch exactly as long as the live store did.
+//! the branch exactly as long as the live store did; the end of recovery, which collects every
+//! branch a crash left held, logs a `Close` for each too. A spliced branch leaves the map like one
+//! freed whole, so a stale id of it errs as `gone`, as it would had its last child gone first.
 //!
 //! # Leases (F5, UNBUILT)
 //!
@@ -633,19 +635,41 @@ impl BranchStore {
                             inner.replay(record, &mut ignored)?;
                         }
                         // A snapshot or a `ReleaseOpen` can hold a released branch that was kept
-                        // only by an open connection; after a restart nothing is open.
-                        for st in inner.branches.values_mut() {
-                            st.open = false;
+                        // only by an open connection; after a restart nothing is open. Each such
+                        // collect is logged as that branch's `Close`, in id order, and flushed
+                        // before this open returns, so the NEXT recovery collects it at this same
+                        // point and replays this session's records on the tree they were made on
+                        // (F7 durable port; review finding 3).
+                        let mut journal = recovered.journal;
+                        let mut held: Vec<BranchId> = inner
+                            .branches
+                            .iter()
+                            .filter(|(_, st)| st.open)
+                            .map(|(&id, _)| id)
+                            .collect();
+                        held.sort_unstable();
+                        for &id in &held {
+                            journal.buffer(&Record::Close { branch: id.0 })?;
+                            if let Some(st) = inner.branches.get_mut(&id) {
+                                st.open = false;
+                            }
+                            inner.collect(id, &mut ignored);
                         }
+                        // Nothing else is held or collectable after replay (a snapshot is taken
+                        // from a state the live store had already collected): a safety net.
                         inner.collect_released(&mut ignored);
                         let referenced = inner.referenced_slots();
-                        inner.arena = Some(Arena::open_file(
+                        let mut arena = Arena::open_file(
                             &files.arena,
                             recovered.page_size,
                             false,
                             &referenced,
-                        )?);
-                        inner.journal = Some(recovered.journal);
+                        )?;
+                        if !held.is_empty() {
+                            journal.flush(&mut arena)?;
+                        }
+                        inner.arena = Some(arena);
+                        inner.journal = Some(journal);
                     }
                 }
                 inner
@@ -1081,8 +1105,9 @@ impl BranchStore {
         let mut freed = Vec::new();
         // A released branch is collected (and possibly spliced) here, outside any other logged
         // operation, so the close is logged: replay then collects it at this same point (F7
-        // durable port). Flushed, not buffered: a buffered `Close` could land after a compaction
-        // whose snapshot no longer has the branch, and replay refuses a `Close` of a missing one.
+        // durable port). Flushed, like a `Release`, rather than buffered: the buffer then holds
+        // only what the trunk barrier expects (stamps, or records it flushes under `unsynced`),
+        // and this path is rare (a release under an open connection).
         // A `Close` that cannot be made durable leaves the store fail-stopped (every failed flush
         // poisons the journal), so no record can follow it: recovery replays to the release, finds
         // nothing open, and collects the branch at its end, freeing at least what this collect

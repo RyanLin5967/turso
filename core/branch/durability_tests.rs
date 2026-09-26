@@ -2506,7 +2506,7 @@ fn a_chain_that_releases_its_oldest_keeps_only_its_live_branches() {
         let mut chain: std::collections::VecDeque<Branch> = Default::default();
         // What the newest branch reads once it has written: every row it or an ancestor wrote
         // before the fork below it, and the trunk as of the first fork for the rest.
-        let mut view: BTreeMap<i64, String> = [7i64, 60, 110, 150, 170]
+        let mut view: BTreeMap<i64, String> = [7i64, 60, 110, 130, 170]
             .into_iter()
             .map(|row| (row, original(row)))
             .collect();
@@ -2516,9 +2516,11 @@ fn a_chain_that_releases_its_oldest_keeps_only_its_live_branches() {
                 Some(newest) => newest.fork().unwrap(),
             };
             if i == 0 {
-                // A trunk write after the chain's first fork: every branch must keep reading the
-                // pre-image, through each splice (a relink at the wrong fork epoch reads this).
-                set(&trunk, 150, "trunk-late");
+                // A trunk write after the chain's first fork, on a leaf no branch writes (rows
+                // 112-148; the branches write 7, 60, 110 and 170, on leaves 1, 2, 3 and 5): every
+                // branch reads it through the relinked head of the chain, and must keep reading
+                // the pre-image through each splice (a relink at the wrong fork epoch reads this).
+                set(&trunk, 130, "trunk-late");
             }
             let row = rows[i % rows.len()];
             set(&b.connect().unwrap(), row, &format!("s{i}"));
@@ -2549,7 +2551,7 @@ fn a_chain_that_releases_its_oldest_keeps_only_its_live_branches() {
                 assert_eq!(value(&c, row).as_ref(), Some(v), "branch {:?} row {row}", b.id());
             }
         }
-        assert_eq!(value(&trunk, 150), Some("trunk-late".to_string()));
+        assert_eq!(value(&trunk, 130), Some("trunk-late".to_string()));
         slots = in_use(&db);
         for b in chain {
             let _ = b.into_id();
@@ -2789,4 +2791,89 @@ fn a_splice_frees_a_version_the_child_shadowed_before_its_own_child_forked() {
     assert_eq!(db.branch_stats().unwrap().live_branches, 2);
     assert_eq!(in_use(&db), slots, "replay of the splice landed on other slots");
     check_views(&db, &expect, "after replay");
+}
+
+/// Review finding 3 (of a84bad66f): the end of recovery collects every branch a crash left held,
+/// outside any record of the log it replays, so it logs each of those `Close`s itself. Session 1
+/// releases p under its open connection (p has one child, c) and crashes (an image taken inside the
+/// window); session 2 opens the image, whose recovery splices p into c, then works on c (a commit, a
+/// fork, and a release that splices c into its child d); session 3 must land on session 2's state,
+/// replaying session 2's records on the tree they were made on. The image's log shows the
+/// recovery's `Close` of p ahead of every record session 2 made.
+#[test]
+fn a_recovery_logs_the_close_of_a_branch_a_crash_left_held() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    std::fs::create_dir(dir.path().join("img")).unwrap();
+    let image;
+    let p_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        let pc = p.connect().unwrap();
+        set(&pc, 7, "p");
+        let c = p.fork().unwrap();
+        p_id = p.id();
+        drop(p); // released, held by pc
+        image = crash_image(&path, &dir.path().join("img"));
+        let _ = c.into_id();
+        drop(pc);
+    }
+    let c_id;
+    let d_id;
+    let slots;
+    let incarnation;
+    {
+        let db = open_at(&image, durable()).unwrap(); // session 2: recovery splices p into c
+        incarnation = db.incarnation;
+        assert_eq!(db.branch_stats().unwrap().live_branches, 1, "recovery kept the held branch");
+        let ids = db.branch_ids().unwrap();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        c_id = ids[0];
+        let c = db.branch(c_id).unwrap();
+        set(&c.connect().unwrap(), 60, "c");
+        let d = c.fork().unwrap();
+        d_id = d.id();
+        set(&d.connect().unwrap(), 110, "d");
+        let reaped = c.reap().unwrap(); // one kept child: spliced into d
+        assert!(reaped.deferred, "{reaped:?}");
+        assert_eq!(db.branch_stats().unwrap().live_branches, 1, "c was not spliced into d");
+        let dc = d.connect().unwrap();
+        assert_eq!(value(&dc, 7), Some("p".to_string()));
+        assert_eq!(value(&dc, 60), Some("c".to_string()));
+        assert_eq!(value(&dc, 110), Some("d".to_string()));
+        drop(dc);
+        slots = in_use(&db);
+        let _ = d.into_id();
+    }
+    {
+        let files = journal::BranchFiles::for_db(image.to_str().unwrap());
+        let records = journal::Journal::recover(&files, false).unwrap().unwrap().records;
+        let at = |want: &journal::Record| records.iter().position(|r| r == want);
+        let released = at(&journal::Record::ReleaseOpen { branch: p_id.0 });
+        let closed = at(&journal::Record::Close { branch: p_id.0 });
+        let forked = at(&journal::Record::Fork {
+            child: d_id.0,
+            parent: c_id.0,
+        });
+        assert!(
+            released.is_some() && closed > released && forked.is_some() && closed < forked,
+            "the recovery's Close of p is missing or out of order: {records:?}"
+        );
+    }
+    let db = reopen(&image, incarnation); // session 3
+    assert_eq!(db.branch_ids().unwrap(), vec![d_id]);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 1, "replay kept a spliced branch");
+    assert_eq!(in_use(&db), slots, "session 3 replayed session 2 onto another tree");
+    let expect = BTreeMap::from([(
+        d_id,
+        BTreeMap::from([
+            (7, "p".to_string()),
+            (60, "c".to_string()),
+            (110, "d".to_string()),
+        ]),
+    )]);
+    check_views(&db, &expect, "session 3");
 }
