@@ -1599,6 +1599,13 @@ mod tests {
         let reaped = store.release_handle(z);
         assert!(reaped.deferred && reaped.freed_pages == 0, "an open zombie was freed: {reaped:?}");
         assert_eq!(store.stats().live_branches, 2);
+        // Reads through the zombie while its connection holds it (r11-ever-refute coverage caveat
+        // iii): its child reads the page it inherits, the zombie its own page the child overwrote.
+        let mut buf = vec![0u8; PAGE];
+        assert!(store.resolve_into(c, 0, &mut buf).unwrap());
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), z_gen[0], "c misread through the held zombie");
+        assert!(store.resolve_into(z, 1, &mut buf).unwrap());
+        assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), z_gen[1], "the held zombie lost its own page");
         store.begin_write(c).unwrap();
         store.first_write_branch(c, 2, &image(z_gen[2])).unwrap();
         let before = store.stats();
