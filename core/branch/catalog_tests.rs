@@ -556,3 +556,68 @@ fn a_checkpoint_evicts_clean_states_above_the_cap_and_they_read_back() {
         let _ = b.into_id();
     }
 }
+
+/// F-W1 (githost-shape lane, PREREG G5.3): a listing after the first of a process reads no catalog row
+/// and visits no resident state while it holds the store mutex, and still lists exactly the live
+/// branches through forks, reaps of branches resident and not, and checkpoints that evict. The first
+/// listing builds the live-id set from the catalog once (counted as `ids_build_rows`). On the store
+/// before F-W1 every listing reads every unreleased catalog row under the mutex, so the first
+/// assertion on a later listing fails.
+#[test]
+fn a_listing_after_the_first_reads_nothing_under_the_mutex() {
+    use std::collections::BTreeSet;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let ids;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        ids = grow(&db, 200);
+        db.branch_compact_now().unwrap();
+    }
+    let db = open_at(&path, catalog()).unwrap();
+    let listed = |db: &Arc<Database>| -> BTreeSet<u64> { db.branch_ids().unwrap().iter().map(|b| b.0).collect() };
+    let mut want: BTreeSet<u64> = ids.iter().map(|b| b.0).collect();
+    let s0 = db.branch_cat_shape();
+    assert_eq!(listed(&db), want, "the first listing after a reopen");
+    let s1 = db.branch_cat_shape();
+    // After the first listing: forks, reaps (the reaped are read back from the catalog first), and
+    // a checkpoint that evicts all but four states.
+    let trunk = db.connect().unwrap();
+    for _ in 0..5 {
+        let b = trunk.fork_branch().unwrap();
+        want.insert(b.id().0);
+        let _ = b.into_id();
+    }
+    for &id in ids.iter().step_by(7) {
+        let r = db.branch(id).unwrap().reap().unwrap();
+        assert!(!r.deferred);
+        want.remove(&id.0);
+    }
+    db.branch_set_resident_cap(Some(4));
+    db.branch_compact_now().unwrap();
+    for &id in ids.iter().skip(3).step_by(11) {
+        if want.remove(&id.0) {
+            db.branch(id).unwrap().reap().unwrap();
+        }
+    }
+    let s2 = db.branch_cat_shape();
+    for _ in 0..3 {
+        assert_eq!(listed(&db), want, "a later listing");
+    }
+    let s3 = db.branch_cat_shape();
+    assert_eq!(s3.ids_calls - s2.ids_calls, 3);
+    assert_eq!(s3.ids_catalog_rows - s2.ids_catalog_rows, 0, "a later listing read catalog rows: {s3:?}");
+    assert_eq!(
+        s3.ids_resident_visited - s2.ids_resident_visited,
+        0,
+        "a later listing walked the resident states: {s3:?}"
+    );
+    assert_eq!(s1.ids_build_rows - s0.ids_build_rows, 200, "the set is built from the catalog once: {s1:?}");
+    assert_eq!(s3.ids_build_rows, s1.ids_build_rows, "the set was built again: {s3:?}");
+    // A reopen builds it again, from what the checkpoint and the log hold.
+    drop(trunk);
+    drop(db);
+    let db = open_at(&path, catalog()).unwrap();
+    assert_eq!(listed(&db), want, "the first listing after the second reopen");
+}
