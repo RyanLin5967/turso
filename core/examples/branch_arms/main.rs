@@ -1585,7 +1585,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
     };
     println!(
         "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={} \
-         trunk_writer={} reads={} k3_lockfree={} k3_mode={} pin={}",
+         trunk_writer={} reads={} k3_lockfree={} k3_mode={} pin={} trunk_spin_ns={}",
         args.threads,
         args.cycles,
         args.lock_timing,
@@ -1593,7 +1593,8 @@ fn arm_conc(b: &mut Bench, args: &Args) {
         args.reads,
         b.db.branch_trunk_reads_lockfree(),
         b.db.branch_k3_mode(),
-        args.pin
+        args.pin,
+        std::env::var("TURSO_K3_TRUNKSPIN").unwrap_or_else(|_| "0".to_string())
     );
     println!("{CONC_HEADER}");
     let mut live: Vec<Live> = Vec::new();
@@ -1822,7 +1823,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                  busy_writer={writer_busy} rewritten={rewritten} locked={locked} \
                  rewritten_per_cycle={:.4} locked_per_cycle={:.4} trunk_acq_per_cycle={:.4} \
                  trunk_wait_frac={:.5} trunk_wait_ns_per_cycle={:.1} retained_examined={} gc_freed={gc_freed} \
-                 trunk_slots_in_use={} wal_bytes={}",
+                 trunk_slots_in_use={} wal_bytes={} trunk_blocking_per_cycle={:.4}",
                 t * c,
                 args.reads,
                 writes as f64 / cycles,
@@ -1834,6 +1835,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 d(before.resolve_retained_examined, after.resolve_retained_examined),
                 s.trunk_slots_in_use,
                 std::fs::metadata(&b.wal_path).map_or(0, |m| m.len()),
+                d(before.trunk_lock_blocking, after.trunk_lock_blocking) as f64 / cycles,
             );
             print_sites(n, t, draw, cycles, &before, &after);
             if !b.db.branch_trunk_reads_lockfree() {

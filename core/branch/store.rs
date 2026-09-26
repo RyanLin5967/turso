@@ -226,6 +226,8 @@ pub(crate) struct BranchStore {
     /// Whether [`take`] times how long each acquisition holds its lock. Off by default: it is the
     /// one part of the lock accounting that adds work inside a critical section.
     lock_timing: AtomicBool,
+    /// Spin-then-park for the trunk's lock (see [`take`]); from `TURSO_K3_TRUNKSPIN` (ns) at construction.
+    trunk_spin_ns: AtomicU64,
     /// F-K3: the trunk's retained versions, searchable without the trunk's lock (the same `Arc` as
     /// the trunk lineage's `shared`). `None` is F5's locked lookup.
     k3: Option<std::sync::Arc<SharedVersions>>,
@@ -318,13 +320,36 @@ enum TrunkSite {
 /// so counting adds no shared write the lock does not already make, and the clock is read only on
 /// the contended path, by the thread that is waiting anyway — except with `timed`, which reads it
 /// once more at the acquisition and once at the release.
-fn take<T: Counted>(lock: &Mutex<T>, timed: bool, site: Option<usize>) -> Held<'_, T> {
-    let (mut guard, waited) = match lock.try_lock() {
-        Some(guard) => (guard, None),
+///
+/// With `spin_ns > 0` a waiter first re-tries the lock, spinning, for up to `spin_ns` before it blocks
+/// in `lock()` (spin-then-park: Ousterhout 1982; Karlin et al. 1991), so a waiter whose holder is about
+/// to release does not pay a block and a wake. Acquisitions that reached the blocking `lock()` are
+/// counted (`lock_blocking`).
+fn take<T: Counted>(
+    lock: &Mutex<T>,
+    timed: bool,
+    site: Option<usize>,
+    spin_ns: u64,
+) -> Held<'_, T> {
+    let (mut guard, waited, blocked) = match lock.try_lock() {
+        Some(guard) => (guard, None, false),
         None => {
             let start = Instant::now();
-            let guard = lock.lock();
-            (guard, Some(start.elapsed()))
+            let mut spun = None;
+            while spin_ns > 0 && (start.elapsed().as_nanos() as u64) < spin_ns {
+                std::hint::spin_loop();
+                if let Some(guard) = lock.try_lock() {
+                    spun = Some(guard);
+                    break;
+                }
+            }
+            match spun {
+                Some(guard) => (guard, Some(start.elapsed()), false),
+                None => {
+                    let guard = lock.lock();
+                    (guard, Some(start.elapsed()), true)
+                }
+            }
         }
     };
     let work = guard.work();
@@ -332,6 +357,9 @@ fn take<T: Counted>(lock: &Mutex<T>, timed: bool, site: Option<usize>) -> Held<'
     if let Some(waited) = waited {
         work.lock_contended += 1;
         work.lock_wait_ns += waited.as_nanos() as u64;
+    }
+    if blocked {
+        work.lock_blocking += 1;
     }
     if let Some(site) = site {
         work.trunk_sites.acquisitions[site] += 1;
@@ -988,6 +1016,13 @@ impl BranchStore {
             live: AtomicUsize::new(0),
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
+            trunk_spin_ns: AtomicU64::new(match std::env::var("TURSO_K3_TRUNKSPIN") {
+                Err(std::env::VarError::NotPresent) => 0,
+                Ok(v) => v
+                    .parse()
+                    .unwrap_or_else(|_| panic!("TURSO_K3_TRUNKSPIN={v:?}: expected nanoseconds")),
+                Err(e) => panic!("TURSO_K3_TRUNKSPIN: {e}"),
+            }),
             k3,
             k3_mode: mode,
             trunk_chunks: OnceLock::new(),
@@ -1010,11 +1045,22 @@ impl BranchStore {
 
     /// The shard of branch `id`, locked.
     fn shard(&self, id: BranchId) -> Held<'_, Shard> {
-        take(&self.shards[shard_of(id)], self.timed(), None)
+        take(&self.shards[shard_of(id)], self.timed(), None, 0)
     }
 
     fn trunk(&self, site: TrunkSite) -> Held<'_, TrunkInner> {
-        take(&self.trunk, self.timed(), Some(site as usize))
+        take(
+            &self.trunk,
+            self.timed(),
+            Some(site as usize),
+            self.trunk_spin_ns.load(Ordering::Relaxed),
+        )
+    }
+
+    /// How long a waiter for the trunk's lock spins before it blocks (PREREG amendment 5); 0: it
+    /// blocks at once, as every other lock of the store does.
+    pub(crate) fn set_trunk_spin_ns(&self, ns: u64) {
+        self.trunk_spin_ns.store(ns, Ordering::Relaxed);
     }
 
     /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
@@ -1397,7 +1443,7 @@ impl BranchStore {
         if let Some(slot) = elsewhere {
             let d = domain_of(slot);
             crate::turso_assert!(d < SHARDS, "a branch's page map named a trunk slot");
-            out.copy_from_slice(take(&self.shards[d], self.timed(), None).domain.page(slot));
+            out.copy_from_slice(take(&self.shards[d], self.timed(), None, 0).domain.page(slot));
             return Ok(Resolved::Filled);
         }
         // F-K3/F-K3v: no trunk lock (see "Reads of rewritten trunk pages without the trunk's
@@ -1476,9 +1522,10 @@ impl BranchStore {
             stats.work.trunk_lock_contended = trunk.work.lock_contended;
             stats.work.trunk_lock_wait_ns = trunk.work.lock_wait_ns;
             stats.work.trunk_lock_hold_ns = trunk.work.lock_hold_ns;
+            stats.work.trunk_lock_blocking = trunk.work.lock_blocking;
         }
         for lock in self.shards.iter() {
-            let shard = take(lock, self.timed(), None);
+            let shard = take(lock, self.timed(), None, 0);
             stats.live_branches += shard.branches.len();
             add(&mut stats, &shard.work, &shard.domain);
         }
@@ -1500,7 +1547,7 @@ impl BranchStore {
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
         let mut slots: Vec<u32> = self.trunk(TrunkSite::Observe).domain.slots_in_use().collect();
         for lock in self.shards.iter() {
-            slots.extend(take(lock, self.timed(), None).domain.slots_in_use());
+            slots.extend(take(lock, self.timed(), None, 0).domain.slots_in_use());
         }
         slots
     }
@@ -1508,7 +1555,7 @@ impl BranchStore {
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
         match domain_of(slot) {
             TRUNK_DOMAIN => self.trunk(TrunkSite::Observe).domain.is_free(slot),
-            d if d < SHARDS => take(&self.shards[d], self.timed(), None).domain.is_free(slot),
+            d if d < SHARDS => take(&self.shards[d], self.timed(), None, 0).domain.is_free(slot),
             _ => false,
         }
     }
@@ -1833,6 +1880,43 @@ mod tests {
         assert_eq!(sites.contended[observe], 1, "the wait was not counted at its site");
         assert_eq!(sites.contended.iter().sum::<u64>(), 1, "a wait was counted at another site");
         assert!(sites.wait_ns[observe] > 0 && sites.hold_ns[observe] >= hold.as_nanos() as u64);
+    }
+
+    /// Spin-then-park on the trunk's lock (PREREG amendment 5), its counter forced to fire both ways:
+    /// a holder keeps the lock 20 ms while another thread asks for it. With a 5 s spin the waiter gets
+    /// the lock while spinning and never blocks; with no spin it blocks. Either way the acquisition is
+    /// contended and waited.
+    #[test]
+    fn trunk_spin_waits_out_a_short_hold_without_blocking() {
+        for (spin_ns, blocks) in [(5_000_000_000u64, 0u64), (0, 1)] {
+            let store = Arc::new(BranchStore::with_k3(K3Mode::Off));
+            store.set_trunk_spin_ns(spin_ns);
+            let before = store.stats().work;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let holder = {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let held = store.trunk(TrunkSite::Observe);
+                    tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    drop(held);
+                })
+            };
+            rx.recv().unwrap();
+            let after = store.stats().work;
+            holder.join().unwrap();
+            assert_eq!(
+                after.trunk_lock_contended - before.trunk_lock_contended,
+                1,
+                "spin {spin_ns}: the waiting acquisition was not counted"
+            );
+            assert_eq!(
+                after.trunk_lock_blocking - before.trunk_lock_blocking,
+                blocks,
+                "spin {spin_ns}: blocking acquisitions"
+            );
+            assert!(after.trunk_lock_wait_ns > before.trunk_lock_wait_ns);
+        }
     }
 
     /// The trunk lock's per-site accounting, one site at a time: a trunk fork, a trunk copy

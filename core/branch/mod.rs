@@ -262,6 +262,10 @@ pub struct BranchWork {
     pub trunk_lock_contended: u64,
     pub trunk_lock_wait_ns: u64,
     pub trunk_lock_hold_ns: u64,
+    /// Acquisitions that reached a lock's blocking `lock()` (all locks), and the trunk's alone: with the
+    /// trunk's spin-then-park (PREREG amendment 5) a waiter that got the lock while spinning is not one.
+    pub lock_blocking: u64,
+    pub trunk_lock_blocking: u64,
     /// Resolutions that fell through to the trunk for a page the trunk rewrote after the reader's
     /// `trunk_at`, so that only a retained version can answer them (lane r11-k3-trunklock, K3).
     /// Counted under the reader's shard lock.
@@ -320,6 +324,8 @@ impl BranchWork {
             trunk_lock_contended,
             trunk_lock_wait_ns,
             trunk_lock_hold_ns,
+            lock_blocking,
+            trunk_lock_blocking,
             resolve_trunk_rewritten,
             resolve_trunk_locked,
             trunk_sites,
@@ -339,6 +345,8 @@ impl BranchWork {
         self.trunk_lock_contended += trunk_lock_contended;
         self.trunk_lock_wait_ns += trunk_lock_wait_ns;
         self.trunk_lock_hold_ns += trunk_lock_hold_ns;
+        self.lock_blocking += lock_blocking;
+        self.trunk_lock_blocking += trunk_lock_blocking;
         self.resolve_trunk_rewritten += resolve_trunk_rewritten;
         self.resolve_trunk_locked += resolve_trunk_locked;
         self.trunk_sites.add(&trunk_sites);
