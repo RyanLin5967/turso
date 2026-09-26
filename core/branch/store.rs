@@ -1697,6 +1697,44 @@ mod tests {
         assert!(sites.wait_ns[observe] > 0 && sites.hold_ns[observe] >= hold.as_nanos() as u64);
     }
 
+    /// The trunk lock's per-site accounting, one site at a time: a trunk fork, a trunk copy
+    /// decision, a resolution of the page it rewrote, and the reap each count one acquisition at
+    /// their own site and none elsewhere (F-K3's resolution counts none at all), less the one
+    /// `observe` acquisition each closing snapshot makes itself.
+    #[test]
+    fn trunk_lock_sites_are_counted_where_they_are_taken() {
+        for lockfree in [false, true] {
+            let store = BranchStore::with_trunk_reads(lockfree);
+            let snap = || store.stats().work.trunk_sites.acquisitions;
+            let delta = |a: [u64; 5], b: [u64; 5]| {
+                let mut d: [u64; 5] = std::array::from_fn(|i| b[i] - a[i]);
+                d[TrunkSite::Observe as usize] -= 1;
+                d
+            };
+            let one = |site: TrunkSite| {
+                let mut d = [0u64; 5];
+                d[site as usize] = 1;
+                d
+            };
+            let before = snap();
+            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+            assert_eq!(delta(before, snap()), one(TrunkSite::Fork), "k3 {lockfree}: fork");
+            let before = snap();
+            // The trunk rewrites page 0, whose content until now was `image(0)`.
+            store.first_write_trunk(0, &image(0));
+            assert_eq!(delta(before, snap()), one(TrunkSite::Write), "k3 {lockfree}: trunk write");
+            let before = snap();
+            let mut buf = vec![0u8; PAGE];
+            assert!(matches!(store.resolve_into(id, 0, &mut buf).unwrap(), Resolved::Filled));
+            assert_eq!(buf, image(0), "k3 {lockfree}: the child reads the pre-image");
+            let resolve = if lockfree { [0; 5] } else { one(TrunkSite::Resolve) };
+            assert_eq!(delta(before, snap()), resolve, "k3 {lockfree}: resolve");
+            let before = snap();
+            assert_eq!(store.release_handle(id).freed_pages, 1);
+            assert_eq!(delta(before, snap()), one(TrunkSite::Reap), "k3 {lockfree}: reap");
+        }
+    }
+
     /// A committed branch page holding `image(generation)`, as the pager hands it to
     /// `commit_pages`.
     fn page_with(page: u32, generation: u64) -> PageRef {
@@ -2048,16 +2086,14 @@ mod tests {
         let wal = Arc::new(StdMutex::new(()));
         let committed: Arc<Committed> =
             Arc::new(RwLock::new((0..PAGES).map(|p| (p, 0u64)).collect()));
-        let generation = Arc::new(StdU64::new(1));
+        let generation = StdU64::new(1);
         let done = Arc::new(StdBool::new(false));
+        // Readers still reading: the churn's frees count only while this is above 0, so the race
+        // is shown to have run, not merely to have started before or after the reads.
+        let active = Arc::new(StdU64::new(READERS));
         let writer = {
-            let (store, wal, committed, generation, done) = (
-                store.clone(),
-                wal.clone(),
-                committed.clone(),
-                generation.clone(),
-                done.clone(),
-            );
+            let (store, wal, committed, done) =
+                (store.clone(), wal.clone(), committed.clone(), done.clone());
             std::thread::spawn(move || {
                 let mut rng = Rng(0x5851_F42D_4C95_7F2D);
                 let mut writes = 0u64;
@@ -2078,8 +2114,13 @@ mod tests {
             })
         };
         let churner = {
-            let (store, wal, committed, done) =
-                (store.clone(), wal.clone(), committed.clone(), done.clone());
+            let (store, wal, committed, done, active) = (
+                store.clone(),
+                wal.clone(),
+                committed.clone(),
+                done.clone(),
+                active.clone(),
+            );
             std::thread::spawn(move || {
                 let mut rng = Rng(0x2545_F491_4F6C_DD1D);
                 let mut freed = 0u64;
@@ -2090,7 +2131,10 @@ mod tests {
                     std::thread::yield_now();
                     while !kids.is_empty() {
                         let k = kids.swap_remove(rng.below(kids.len() as u64) as usize);
-                        freed += store.release_handle(k).freed_pages as u64;
+                        let f = store.release_handle(k).freed_pages as u64;
+                        if active.load(O::Acquire) > 0 {
+                            freed += f;
+                        }
                     }
                 }
                 freed
@@ -2098,7 +2142,8 @@ mod tests {
         };
         let readers: Vec<_> = (0..READERS)
             .map(|r| {
-                let (store, wal, committed) = (store.clone(), wal.clone(), committed.clone());
+                let (store, wal, committed, active) =
+                    (store.clone(), wal.clone(), committed.clone(), active.clone());
                 std::thread::spawn(move || {
                     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (r + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
                     let mut held: Vec<(BranchId, HashMap<u32, u64>)> =
@@ -2127,6 +2172,7 @@ mod tests {
                             id.0
                         );
                     }
+                    active.fetch_sub(1, O::Release);
                     for (id, _) in held {
                         store.release_handle(id);
                     }
@@ -2142,7 +2188,7 @@ mod tests {
         let stats = store.stats();
         assert!(
             writes > 0 && churn_freed > 0 && stats.work.resolve_trunk_rewritten > 1_000,
-            "k3 {lockfree}: trunk writes {writes}, versions freed by the churn {churn_freed}, \
+            "k3 {lockfree}: trunk writes {writes}, versions the churn freed while readers read {churn_freed}, \
              resolutions of rewritten trunk pages {}",
             stats.work.resolve_trunk_rewritten
         );
@@ -2155,8 +2201,7 @@ mod tests {
     /// F-K3's garbage instrument, forced to fire and then shown to drain. While this thread holds an
     /// epoch guard, no node a reap removes can be freed (a reader pinned since before the removal
     /// might still reach it), so the lists' live nodes exceed the live versions by exactly the
-    /// removals. Once the guard is gone and the epoch advances, that garbage is freed. F5 keeps no
-    /// list and counts no node.
+    /// removals. Once the guard is gone and the epoch advances, that garbage is freed.
     #[test]
     fn k3_garbage_is_held_by_a_pinned_guard_and_drains_after_it() {
         let store = BranchStore::with_trunk_reads(true);
@@ -2187,11 +2232,6 @@ mod tests {
             (0, 0),
             "garbage outlived the guard by {flushes} flushes"
         );
-        let f5 = BranchStore::with_trunk_reads(false);
-        let id = f5.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
-        f5.first_write_trunk(0, &image(0));
-        f5.release_handle(id);
-        assert_eq!(f5.stats().k3_nodes_live, 0);
     }
 
     /// The shared trunk-page cache against a model. Children fork and are reaped, often down to

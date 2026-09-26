@@ -179,7 +179,8 @@ pub struct BranchStats {
     pub trunk_slots_in_use: usize,
     /// F-K3: skip-list nodes of the trunk's version lists allocated and not yet freed, and their
     /// bytes. A removed node is freed only when epoch reclamation says no reader can reach it, so
-    /// `k3_nodes_live - trunk_slots_in_use` is the garbage reclamation still holds (0 without F-K3).
+    /// `k3_nodes_live - trunk_slots_in_use` is the garbage reclamation still holds. Both counts are 0
+    /// without F-K3, which keeps no lists; the difference means nothing there.
     pub k3_nodes_live: u64,
     pub k3_node_bytes_live: u64,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.

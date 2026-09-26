@@ -386,7 +386,7 @@ struct WorkSum {
 }
 
 impl WorkSum {
-    fn add(&mut self, a: BranchWork, b: BranchWork) {
+    fn add(&mut self, a: &BranchWork, b: &BranchWork) {
         self.resolve_calls += b.resolve_calls - a.resolve_calls;
         self.resolve_levels += b.resolve_levels - a.resolve_levels;
         self.resolve_retained_examined += b.resolve_retained_examined - a.resolve_retained_examined;
@@ -417,7 +417,7 @@ impl Bench {
         let t = Instant::now();
         let out = f();
         op.samples.push(t.elapsed());
-        op.work.add(before, self.work());
+        op.work.add(&before, &self.work());
         out
     }
 
@@ -1777,8 +1777,11 @@ fn arm_conc(b: &mut Bench, args: &Args) {
             let contended = d(before.lock_contended, after.lock_contended);
             let wait_ns = d(before.lock_wait_ns, after.lock_wait_ns);
             let hold_ns = d(before.lock_hold_ns, after.lock_hold_ns);
-            // The second snapshot's own trunk acquisition is inside the delta; nothing else is.
-            let trunk_acq = d(before.trunk_lock_acquisitions, after.trunk_lock_acquisitions) - 1;
+            // The second snapshot's own trunk acquisition is inside the delta, and with --pin so is
+            // the pinned sample's; nothing else is.
+            let trunk_acq = d(before.trunk_lock_acquisitions, after.trunk_lock_acquisitions)
+                - 1
+                - u64::from(args.pin);
             let rewritten = d(before.resolve_trunk_rewritten, after.resolve_trunk_rewritten);
             let locked = d(before.resolve_trunk_locked, after.resolve_trunk_locked);
             let trunk_wait_ns = d(before.trunk_lock_wait_ns, after.trunk_lock_wait_ns);
@@ -1831,6 +1834,9 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 std::fs::metadata(&b.wal_path).map_or(0, |m| m.len()),
             );
             print_sites(n, t, draw, cycles, &before, &after);
+            if !b.db.branch_trunk_reads_lockfree() {
+                continue;
+            }
             // F-K3's version-list garbage: nodes allocated beyond the live versions, at the cell's
             // start, while the pin (if any) still held, and at its end.
             let garbage = |st: &BranchStats| st.k3_nodes_live as i64 - st.trunk_slots_in_use as i64;
@@ -1854,7 +1860,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
 
 /// The trunk's lock per site over one cell (amendment 3): acquisitions and contended acquisitions per
 /// cycle, wait per cycle, and hold per acquisition (0 unless `--lock-timing on`). The cell's closing
-/// `branch_stats` call is one of the `observe` acquisitions.
+/// `branch_stats` call is one of the `observe` acquisitions, and with `--pin` so is the pinned sample.
 fn print_sites(n: usize, t: usize, draw: u64, cycles: f64, before: &BranchWork, after: &BranchWork) {
     let (a, b) = (&before.trunk_sites, &after.trunk_sites);
     let mut line = format!("# sites N={n} T={t} draw={draw}");
