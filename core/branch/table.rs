@@ -131,6 +131,15 @@ impl<T> BranchTable<T> {
     }
 }
 
+impl<'a, T> IntoIterator for &'a BranchTable<T> {
+    type Item = (&'a BranchId, &'a T);
+    type IntoIter = Box<dyn Iterator<Item = (&'a BranchId, &'a T)> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
 /// As `HashMap`'s: panics when the id has no state.
 impl<T> std::ops::Index<&BranchId> for BranchTable<T> {
     type Output = T;
