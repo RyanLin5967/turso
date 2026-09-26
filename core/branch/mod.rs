@@ -285,6 +285,16 @@ pub struct BranchWork {
     pub trunk_pre_images_captured: u64,
     /// Captured pre-images kept as retained versions, because a live child could see them.
     pub trunk_pre_images_retained: u64,
+    /// Rows a trunk commit decision stamped for the merge record (V3), summed over decisions.
+    pub trunk_commit_rows_stamped: u64,
+    /// Pages the decisions examined (every page each commit handed over).
+    pub trunk_commit_pages_decided: u64,
+    /// Nanoseconds inside the decision's trunk-lock hold spent stamping rows and tables and
+    /// logging the write set, deciding pages, and pruning the merge record; summed, and read only
+    /// while lock timing is on (0 otherwise). U14's split (frontier/round11/r11-merge PREREG A17).
+    pub trunk_commit_row_ns: u64,
+    pub trunk_commit_page_ns: u64,
+    pub trunk_commit_prune_ns: u64,
 }
 
 impl BranchWork {
@@ -316,6 +326,11 @@ impl BranchWork {
             trunk_commits_decided,
             trunk_pre_images_captured,
             trunk_pre_images_retained,
+            trunk_commit_rows_stamped,
+            trunk_commit_pages_decided,
+            trunk_commit_row_ns,
+            trunk_commit_page_ns,
+            trunk_commit_prune_ns,
             merge_attempts,
             merge_commits,
             merge_refused_scalar,
@@ -357,6 +372,11 @@ impl BranchWork {
         self.trunk_commits_decided += trunk_commits_decided;
         self.trunk_pre_images_captured += trunk_pre_images_captured;
         self.trunk_pre_images_retained += trunk_pre_images_retained;
+        self.trunk_commit_rows_stamped += trunk_commit_rows_stamped;
+        self.trunk_commit_pages_decided += trunk_commit_pages_decided;
+        self.trunk_commit_row_ns += trunk_commit_row_ns;
+        self.trunk_commit_page_ns += trunk_commit_page_ns;
+        self.trunk_commit_prune_ns += trunk_commit_prune_ns;
         self.merge_attempts += merge_attempts;
         self.merge_commits += merge_commits;
         self.merge_refused_scalar += merge_refused_scalar;

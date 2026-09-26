@@ -56,6 +56,9 @@ struct Args {
     seed: u64,
     synchronous: String,
     timing: bool,
+    /// U14 (PREREG A17): time the store's locks and print the trunk commit decision's hold split
+    /// into row stamps, page decisions and the prune. Needs `--timing` (it prints nanoseconds).
+    lock_timing: bool,
     straggler: bool,
     skip_final_check: bool,
 }
@@ -84,6 +87,7 @@ fn parse_args() -> Args {
         seed: 0x9E37_79B9_7F4A_7C15,
         synchronous: "NORMAL".to_string(),
         timing: false,
+        lock_timing: false,
         straggler: false,
         skip_final_check: false,
     };
@@ -133,6 +137,7 @@ fn parse_args() -> Args {
                 .to_string()
             }
             "--timing" => a.timing = true,
+            "--lock-timing" => a.lock_timing = true,
             "--straggler" => a.straggler = true,
             "--skip-final-check" => a.skip_final_check = true,
             other => die(&format!("unknown argument {other}")),
@@ -146,6 +151,9 @@ fn parse_args() -> Args {
     }
     if a.g > a.inflight {
         die("--g must not exceed --inflight");
+    }
+    if a.lock_timing && !a.timing {
+        die("--lock-timing prints nanoseconds, so it needs --timing (and the fleet lock)");
     }
     a
 }
@@ -441,10 +449,26 @@ fn print_window(run: &Run, index: usize, merged_total: usize, w: &mut Window, a:
             w.attempts as f64 / wall.as_secs_f64(),
         );
     }
+    if run.args.lock_timing {
+        print!(
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            d(|w| w.trunk_commits_decided),
+            d(|w| w.trunk_commit_rows_stamped),
+            d(|w| w.trunk_commit_pages_decided),
+            d(|w| w.trunk_commit_row_ns),
+            d(|w| w.trunk_commit_page_ns),
+            d(|w| w.trunk_commit_prune_ns),
+            d(|w| w.trunk_lock_acquisitions),
+            d(|w| w.trunk_lock_hold_ns),
+        );
+    }
     println!();
 }
 
 const HEADER: &str = "window\tmerged_total\tattempts\tcommitted\trefused\ttrue_conflicts\tfalse_refusals\tobs_scalar\tobs_page\tobs_key\tobs_struct\tobs_page_false\tfalse_refusal_rate\tpage_false_rate\tcommits_since_fork\tpages_written\trows_written\tprobes_per_merge\tlog_entries_per_merge\tstruct_probes_per_merge\tinstalled_per_merge\ttrunk_commits\tlog_entries_held\trow_stamps_held\tlive_branches\tarena_in_use\trefused_by\trss_bytes\twal_bytes";
+/// Window deltas of the trunk commit decision's instrument (U14): decisions, rows stamped, pages
+/// decided, the hold's three parts in ns, and the trunk lock's acquisitions and total hold ns.
+const LOCK_HEADER: &str = "\tdecisions\tdecision_rows\tdecision_pages\tdecision_row_ns\tdecision_page_ns\tdecision_prune_ns\ttrunk_lock_acq\ttrunk_lock_hold_ns";
 const TIMING_HEADER: &str = "\tmerge_p50_us\tmerge_p90_us\tmerge_p99_us\tmerge_max_us\tmerges_per_s_merge_time\tcommits_per_s_merge_time\tattempts_per_s_wall";
 
 fn main() {
@@ -493,6 +517,9 @@ fn main() {
     let page_size = int("PRAGMA page_size");
     if args.install == Install::Physical {
         db.set_branch_read_tracking(true);
+    }
+    if args.lock_timing {
+        db.set_branch_lock_timing(true);
     }
     let mut rng = Rng(args.seed);
     let mut perm: Vec<u32> = (0..args.rows as u32).collect();
@@ -567,8 +594,9 @@ fn main() {
         if run.args.timing { format!(" warm_s={warm_s:.1}") } else { String::new() }
     );
     println!(
-        "{HEADER}{}",
-        if run.args.timing { TIMING_HEADER } else { "" }
+        "{HEADER}{}{}",
+        if run.args.timing { TIMING_HEADER } else { "" },
+        if run.args.lock_timing { LOCK_HEADER } else { "" }
     );
 
     let per_window = run.args.merges / run.args.windows;

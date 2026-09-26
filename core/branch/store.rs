@@ -1245,6 +1245,12 @@ impl BranchStore {
         } = &mut *trunk;
         let epoch = lineage.epoch;
         work.trunk_commits_decided += 1;
+        // U14's instrument (observation only, frontier/round11/r11-merge PREREG A17): this hold's
+        // time split into the merge record's row stamps, the page decisions and the prune, read
+        // only while lock timing is on, so the untimed path adds no clock read.
+        let timed = self.timed();
+        let t_rows = timed.then(Instant::now);
+        work.trunk_commit_rows_stamped += tx.rows.len() as u64;
         for (root, rowid) in tx.rows {
             merge.stamp_row(root, rowid, epoch);
         }
@@ -1258,7 +1264,9 @@ impl BranchStore {
             work.trunk_commits += 1;
             merge.log.push_back((epoch, logged));
         }
+        let t_pages = timed.then(Instant::now);
         for (page, pre_image) in pages {
+            work.trunk_commit_pages_decided += 1;
             let born = self.written(page);
             let Some(pre_image) = pre_image else {
                 crate::turso_assert!(
@@ -1287,8 +1295,14 @@ impl BranchStore {
             }
             self.written.get_or_insert(page).store(epoch, Ordering::Release);
         }
+        let t_prune = timed.then(Instant::now);
         // Pruned here, in the hold the commit already takes, not in a second one after it.
         merge.prune(lineage.children.keys().next().copied());
+        if let (Some(r), Some(p), Some(q)) = (t_rows, t_pages, t_prune) {
+            work.trunk_commit_row_ns += p.duration_since(r).as_nanos() as u64;
+            work.trunk_commit_page_ns += q.duration_since(p).as_nanos() as u64;
+            work.trunk_commit_prune_ns += q.elapsed().as_nanos() as u64;
+        }
         gate
     }
 
