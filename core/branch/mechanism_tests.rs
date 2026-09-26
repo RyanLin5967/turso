@@ -849,3 +849,55 @@ fn a_spilled_branch_transaction_rolls_back_to_every_pre_transaction_row() {
     check(&bc, "fresh connection");
     assert_eq!(rows(&bc, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
 }
+
+/// K13, the per-case form: as the test above, but both writes keep every row's length, so only leaf
+/// pages are dirtied (no rebalance) and a failure shows which case lost the pre-transaction image:
+/// pages the branch already owned (rewritten in place by 0f4232957) or pages it did not (a fresh copy
+/// slot named at the first write).
+#[test]
+fn a_spilled_same_length_rewrite_rolls_back_every_owned_and_not_owned_row() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20_000);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    bc.execute("UPDATE t SET v = 'O' || substr(v, 2) WHERE id <= 10000")
+        .unwrap();
+    let before = table(&bc);
+    assert_eq!(before.len(), 20_000);
+    let pages = rows(&bc, "PRAGMA page_count")[0][0].as_int().unwrap();
+    bc.execute("PRAGMA cache_size = 10").unwrap();
+    bc.execute("BEGIN").unwrap();
+    bc.execute("UPDATE t SET v = 'R' || substr(v, 2)").unwrap();
+    let cached = bc.page_cache_len() as i64;
+    assert!(
+        cached < pages / 2,
+        "nothing spilled: the cache holds {cached} of {pages} pages"
+    );
+    bc.execute("ROLLBACK").unwrap();
+    let check = |conn: &Arc<Connection>, when: &str| {
+        let after = table(conn);
+        assert_eq!(after.len(), before.len(), "{when}: row count");
+        let (mut owned_bad, mut not_owned_bad, mut first) = (0, 0, None);
+        for (id, v) in &before {
+            if after.get(id) != Some(v) {
+                if *id <= 10_000 {
+                    owned_bad += 1;
+                } else {
+                    not_owned_bad += 1;
+                }
+                first.get_or_insert((*id, after.get(id).cloned()));
+            }
+        }
+        assert!(
+            owned_bad == 0 && not_owned_bad == 0,
+            "{when}: after ROLLBACK, {owned_bad} owned-page rows and {not_owned_bad} not-owned rows \
+             read the rolled-back write (first: {first:?})"
+        );
+    };
+    check(&bc, "same connection");
+    drop(bc);
+    let bc = b.connect().unwrap();
+    check(&bc, "fresh connection");
+    assert_eq!(rows(&bc, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
+}
