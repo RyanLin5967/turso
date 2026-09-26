@@ -55,6 +55,8 @@ struct Args {
     n: u64,
     page_size: u64,
     label: String,
+    /// Trunk `PRAGMA synchronous` during growth: "default" leaves the engine's default.
+    trunk_sync: String,
 }
 
 fn parse_args() -> Args {
@@ -66,6 +68,7 @@ fn parse_args() -> Args {
         n: 0,
         page_size: 1024,
         label: String::new(),
+        trunk_sync: "default".to_string(),
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -74,6 +77,7 @@ fn parse_args() -> Args {
             "--to" | "--n" => args.n = val().parse().unwrap_or_else(|_| die("bad --n/--to")),
             "--page-size" => args.page_size = val().parse().unwrap_or_else(|_| die("bad --page-size")),
             "--label" => args.label = val(),
+            "--trunk-sync" => args.trunk_sync = val(),
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -674,8 +678,14 @@ fn grow(args: &Args) {
     if ps != args.page_size {
         not_a_result(&format!("page_size {ps}, expected {}", args.page_size));
     }
-    // Trunk durability during growth only: the probe opens with the default.
-    let _ = trunk.execute("PRAGMA synchronous = OFF");
+    // Trunk durability during growth only (the probe opens with the default). The smoke run under OFF
+    // never restarted the trunk WAL (githost-shape raw/smoke2_grow_1024_5000.txt): the default is the
+    // registered setting, OFF an arm.
+    if args.trunk_sync != "default" {
+        exec(&trunk, &format!("PRAGMA synchronous = {}", args.trunk_sync));
+    }
+    println!("# trunk synchronous during growth: {} ({})", int(&trunk, "PRAGMA synchronous"), args.trunk_sync);
+    let wal_path = PathBuf::from(format!("{}-wal", args.db.to_str().unwrap()));
     let mut model = Model::replay(steps0);
     check_invariants(&db, &model, "grow start");
     let s0 = db.branch_shape();
@@ -686,11 +696,12 @@ fn grow(args: &Args) {
         if model.live >= next_report {
             let sh = db.branch_shape();
             println!(
-                "# grow live={} steps={} elapsed_s={:.1} rss={} {}",
+                "# grow live={} steps={} elapsed_s={:.1} rss={} wal_bytes={} {}",
                 model.live,
                 model.steps,
                 t0.elapsed().as_secs_f64(),
                 rss_bytes(),
+                size_of(&wal_path),
                 shape_line(&sh)
             );
             let _ = std::io::stdout().flush();
