@@ -830,26 +830,34 @@ fn arm_chain(b: &mut Bench, args: &Args) {
             "read_anc",
         ],
     );
-    // The cascade: release every ancestor handle (each deferred: a live child reads through it),
-    // then reap the tip, which frees the whole chain in one call. One sample, labelled as such.
+    // The cascade: release every ancestor handle, root first, then reap the tip, which frees what
+    // is left of the chain in one call. One sample, labelled as such. On the F7 durable port
+    // (r11-ever-durable-cat) each released root has one live child and is spliced into it
+    // (`deferred`), and a page of it that the child wrote too is freed at that splice (the child's
+    // own copy shadows it and the child's children forked after its write): at most one page per
+    // ancestor, and the chain's d pages in all. (Before the port: 0 per ancestor, d at the tip.)
     let d = chain.len();
     let tip = chain.pop().unwrap();
+    let mut freed_early = 0;
     for l in chain {
         let r = l.branch.reap().unwrap();
-        if !r.deferred || r.freed_pages != 0 {
+        if !r.deferred || r.freed_pages > 1 {
             not_a_result(&format!("an ancestor with a live child was freed: {r:?}"));
         }
+        freed_early += r.freed_pages;
     }
     let before = b.work();
     let t = Instant::now();
     let r = tip.branch.reap().unwrap();
     let us = t.elapsed().as_secs_f64() * 1e6;
     let after = b.work();
-    if r.deferred || r.freed_pages != d {
-        not_a_result(&format!("the cascade freed {r:?}, expected {d} pages"));
+    if r.deferred || freed_early + r.freed_pages != d {
+        not_a_result(&format!(
+            "the cascade freed {r:?} after {freed_early} pages at the splices, expected {d} in all"
+        ));
     }
     println!(
-        "# cascade_reap d={d} us={us:.2} freed_pages={} gc_range_entries={} (ONE sample)",
+        "# cascade_reap d={d} us={us:.2} freed_pages={} freed_at_splices={freed_early} gc_range_entries={} (ONE sample)",
         r.freed_pages,
         after.gc_range_entries - before.gc_range_entries
     );
