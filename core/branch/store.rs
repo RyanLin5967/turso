@@ -145,7 +145,8 @@ use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::{
-    BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchStats, BranchWork, Expired,
+    BranchDiff, BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchShape, BranchStats,
+    BranchWork, Expired,
     Reaped,
 };
 use crate::schema::Schema;
@@ -203,6 +204,30 @@ struct StoreInner {
     /// Page-map inserts made by the last `derive_page_maps` (r11-restart's open instrument, extended
     /// by the sota-durable lane; observing only).
     derived_inserts: u64,
+    /// githost-shape lane instrument (observing only); see [`ShapeCounters`].
+    shape: ShapeCounters,
+}
+
+/// githost-shape lane instrument (observing only): cumulative counts of the whole-state work the
+/// lane's walls G2-G4 predict, each updated under the lock its call already holds. Nothing reads
+/// them back.
+#[derive(Clone, Copy, Default)]
+struct ShapeCounters {
+    /// `compact` calls that wrote a snapshot.
+    compactions: u64,
+    /// Snapshot bytes those compactions wrote.
+    snap_bytes: u64,
+    /// Branch states plus retained versions (trunk and branch) those snapshots encoded.
+    snap_entries: u64,
+    /// Nanoseconds inside `compact` (snapshot build, encode, write, syncs, rename, log reset).
+    compact_ns: u64,
+    /// Capacity changes of the `branches` table seen at a fork's insert, and the entries each moved
+    /// (the table's length before the insert that changed it).
+    resize_events: u64,
+    resize_moved: u64,
+    /// `ids()` calls and the branch states they visited.
+    ids_calls: u64,
+    ids_visited: u64,
 }
 
 /// The lease clock: milliseconds of time the database has been OPEN, summed across every open.
@@ -1012,17 +1037,27 @@ impl BranchStore {
     }
 
     fn compact(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
+        let started = Instant::now();
         let snapshot = inner.snapshot();
         let StoreInner {
             journal,
             arena,
             lease,
+            shape,
             ..
         } = inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
         journal.compact(&snapshot, arena, fail_after_rename)?;
+        // githost-shape instrument (observing only): the time is taken before the counting pass.
+        shape.compact_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        shape.compactions += 1;
+        shape.snap_bytes += journal.snapshot_len();
+        shape.snap_entries += (snapshot.branches.len()
+            + snapshot.trunk_retained.len()
+            + snapshot.branches.iter().map(|b| b.retained.len()).sum::<usize>())
+            as u64;
         // The snapshot carries the clock, and it replaced every buffered stamp.
         lease.queued(snapshot.lease_now_ms);
         lease.flushed();
@@ -1218,7 +1253,10 @@ impl BranchStore {
     /// Every unreleased branch. Refused on a trunk-only store, where "none" would be a lie.
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        // githost-shape instrument (observing only).
+        inner.shape.ids_calls += 1;
+        inner.shape.ids_visited += inner.branches.len() as u64;
         let mut ids: Vec<BranchId> = inner
             .branches
             .iter()
@@ -1631,6 +1669,83 @@ impl BranchStore {
         self.compact(&mut inner, fail)
     }
 
+    /// githost-shape instrument (observing only): see [`BranchShape`].
+    pub(crate) fn shape(&self) -> BranchShape {
+        let inner = self.inner.lock();
+        let s = inner.shape;
+        let trunk = &inner.trunk;
+        BranchShape {
+            compactions: s.compactions,
+            snap_bytes: s.snap_bytes,
+            snap_entries: s.snap_entries,
+            compact_ns: s.compact_ns,
+            resize_events: s.resize_events,
+            resize_moved: s.resize_moved,
+            table_len: inner.branches.len() as u64,
+            table_capacity: inner.branches.capacity() as u64,
+            ids_calls: s.ids_calls,
+            ids_visited: s.ids_visited,
+            trunk_retained: trunk.lineage.retained.values().map(|v| v.len() as u64).sum(),
+            trunk_version_pages: trunk.lineage.retained.len() as u64,
+            trunk_versions_max: trunk
+                .lineage
+                .retained
+                .values()
+                .map(|v| v.len() as u64)
+                .max()
+                .unwrap_or(0),
+            trunk_written: trunk.written.len() as u64,
+            trunk_children: trunk.lineage.children.len() as u64,
+            log_len: inner.journal.as_ref().map_or(0, |j| j.log_len()),
+            snapshot_len: inner.journal.as_ref().map_or(0, |j| j.snapshot_len()),
+        }
+    }
+
+    /// D-written (githost-shape instrument, read-only): the branch's own pages, plus every page the
+    /// trunk last wrote after the branch's fork. For a trunk child `inherited` is empty (its parent
+    /// has no page map), so this is the whole page-level diff; other branches are refused.
+    pub(crate) fn diff_trunk(&self, id: BranchId) -> Result<BranchDiff> {
+        let inner = self.inner.lock();
+        let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
+        if !st.parent.is_trunk() {
+            return Err(LimboError::InvalidArgument(format!(
+                "the diff instrument covers trunk children only; branch {} is not one",
+                id.0
+            )));
+        }
+        let mut diff = BranchDiff::default();
+        let mut pages: BTreeSet<u32> = BTreeSet::new();
+        for &page in st.current.keys() {
+            diff.own_visited += 1;
+            pages.insert(page);
+        }
+        for (&page, &written) in &inner.trunk.written {
+            diff.written_visited += 1;
+            if written > st.trunk_at {
+                pages.insert(page);
+            }
+        }
+        diff.pages = pages.into_iter().collect();
+        Ok(diff)
+    }
+
+    /// D-scan (githost-shape instrument, read-only): resolve pages `1..=max_page` on the branch; a
+    /// page differs from the trunk's current version exactly when the branch resolves it into the
+    /// arena (its own version, an inherited one, or a trunk version retained because the trunk
+    /// overwrote the page after the fork). Uses `retained_at`, not `written`: an independent path.
+    pub(crate) fn diff_trunk_scan(&self, id: BranchId, max_page: u32) -> Result<BranchDiff> {
+        let inner = self.inner.lock();
+        let mut diff = BranchDiff::default();
+        let (mut levels, mut examined) = (0, 0);
+        for page in 1..=max_page {
+            diff.resolved += 1;
+            if inner.resolve(id, page, &mut levels, &mut examined)?.is_some() {
+                diff.pages.push(page);
+            }
+        }
+        Ok(diff)
+    }
+
     pub(crate) fn log_path(&self) -> Option<PathBuf> {
         self.inner
             .lock()
@@ -1694,6 +1809,7 @@ impl StoreInner {
             default_lease,
             work: BranchWork::default(),
             derived_inserts: 0,
+            shape: ShapeCounters::default(),
         }
     }
 
@@ -1896,6 +2012,9 @@ impl StoreInner {
             (f, inherited, st.trunk_at)
         };
         self.next_id = self.next_id.max(child.0 + 1);
+        // githost-shape instrument (observing only): a capacity change at this insert moved every
+        // entry the table held.
+        let (len_before, cap_before) = (self.branches.len(), self.branches.capacity());
         self.branches.insert(
             child,
             BranchState {
@@ -1914,6 +2033,10 @@ impl StoreInner {
                 view: None,
             },
         );
+        if self.branches.capacity() != cap_before {
+            self.shape.resize_events += 1;
+            self.shape.resize_moved += len_before as u64;
+        }
         Ok(())
     }
 

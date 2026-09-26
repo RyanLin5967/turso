@@ -311,6 +311,51 @@ pub struct BranchWork {
     pub gc_range_entries: u64,
 }
 
+/// githost-shape lane instrument (observing only): the store's whole-state counters and sizes, read
+/// under the store mutex. Cumulative fields count since the open.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchShape {
+    /// Compactions that wrote a snapshot, the snapshot bytes and entries (branch states + retained
+    /// versions) they wrote, and the nanoseconds spent inside them.
+    pub compactions: u64,
+    pub snap_bytes: u64,
+    pub snap_entries: u64,
+    pub compact_ns: u64,
+    /// Capacity changes of the branch table seen at a fork, and the entries they moved.
+    pub resize_events: u64,
+    pub resize_moved: u64,
+    /// The branch table's length and capacity now.
+    pub table_len: u64,
+    pub table_capacity: u64,
+    /// `branch_ids` calls and the branch states they visited.
+    pub ids_calls: u64,
+    pub ids_visited: u64,
+    /// Trunk retained versions, pages holding at least one, and the most on one page.
+    pub trunk_retained: u64,
+    pub trunk_version_pages: u64,
+    pub trunk_versions_max: u64,
+    /// Entries in the trunk's last-write map, and its live children.
+    pub trunk_written: u64,
+    pub trunk_children: u64,
+    /// The log's whole-record length and the last snapshot's length (0 when volatile).
+    pub log_len: u64,
+    pub snapshot_len: u64,
+}
+
+/// What one page-level DIFF(branch, TRUNK) did (githost-shape instrument; r11-diff-list's D-written
+/// arm on the durable store). `pages` is sorted.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BranchDiff {
+    pub pages: Vec<u32>,
+    /// Entries visited: the branch's own current map, and the trunk's last-write map.
+    pub own_visited: u64,
+    pub written_visited: u64,
+    /// Pages resolved (D-scan only).
+    pub resolved: u64,
+}
+
 impl Branch {
     fn new(db: Arc<Database>, id: BranchId) -> Self {
         Self {
@@ -566,6 +611,26 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_failpoint_orphans(&self) -> Vec<u32> {
         self.branches.failpoint_orphans()
+    }
+
+    /// The store's whole-state counters and sizes (githost-shape instrument).
+    #[doc(hidden)]
+    pub fn branch_shape(&self) -> BranchShape {
+        self.branches.shape()
+    }
+
+    /// Page-level DIFF(`id`, TRUNK) by the trunk's last-write map (D-written; githost-shape
+    /// instrument). Trunk children only.
+    #[doc(hidden)]
+    pub fn branch_diff_trunk(&self, id: BranchId) -> Result<BranchDiff> {
+        self.branches.diff_trunk(id)
+    }
+
+    /// The same diff by resolving every page `1..=max_page` on the branch (D-scan): a page differs
+    /// exactly when the branch resolves it into the arena. The cross-check for `branch_diff_trunk`.
+    #[doc(hidden)]
+    pub fn branch_diff_trunk_scan(&self, id: BranchId, max_page: u32) -> Result<BranchDiff> {
+        self.branches.diff_trunk_scan(id, max_page)
     }
 
     /// Compact the branch log into a snapshot now. A no-op for volatile branches.

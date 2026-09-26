@@ -678,6 +678,16 @@ impl Journal {
     }
 
     /// Whether this journal may write nothing more: an I/O failure, a crash failpoint, or a fork.
+    /// Bytes of the log holding whole records, header included (githost-shape instrument).
+    pub(crate) fn log_len(&self) -> u64 {
+        self.len
+    }
+
+    /// Bytes of the last snapshot this journal wrote or recovered (githost-shape instrument).
+    pub(crate) fn snapshot_len(&self) -> u64 {
+        self.snapshot_len
+    }
+
     pub(crate) fn is_poisoned(&self) -> bool {
         self.poisoned || self.forked()
     }
