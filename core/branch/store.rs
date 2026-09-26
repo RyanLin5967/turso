@@ -186,6 +186,15 @@ struct CatState {
     /// Branch states and trunk pages read from the catalog since open (instrument).
     branch_loads: u64,
     trunk_page_loads: u64,
+    /// githost-shape lane instrument (observing only): checkpoints, the nanoseconds inside them,
+    /// the trunk pages and trunk versions they rewrote, the branch states they wrote, and the
+    /// catalog rows they wrote.
+    ckpts: u64,
+    ckpt_ns: u64,
+    ckpt_trunk_pages: u64,
+    ckpt_trunk_versions: u64,
+    ckpt_branch_rows: u64,
+    ckpt_rows_written: u64,
 }
 
 impl CatState {
@@ -202,6 +211,12 @@ impl CatState {
             taken: HashSet::new(),
             branch_loads: 0,
             trunk_page_loads: 0,
+            ckpts: 0,
+            ckpt_ns: 0,
+            ckpt_trunk_pages: 0,
+            ckpt_trunk_versions: 0,
+            ckpt_branch_rows: 0,
+            ckpt_rows_written: 0,
         }
     }
 }
@@ -1846,6 +1861,58 @@ impl BranchStore {
         resident + others
     }
 
+    /// githost-shape instrument (observing only): see [`super::BranchCatShape`]. Runs no catalog
+    /// query, so it does not move the catalog counters it reports.
+    pub(crate) fn cat_shape(&self) -> super::BranchCatShape {
+        let inner = self.inner.lock();
+        let resident = &inner.trunk.lineage.retained;
+        let mut shape = super::BranchCatShape {
+            trunk_resident_versions: resident.values().map(|v| v.len() as u64).sum(),
+            trunk_resident_pages: resident.len() as u64,
+            trunk_resident_versions_max: resident.values().map(|v| v.len() as u64).max().unwrap_or(0),
+            resident_states: inner.branches.len() as u64,
+            log_len: inner.journal.as_ref().map_or(0, |j| j.log_len()),
+            ..Default::default()
+        };
+        if let Some(c) = inner.cat.as_ref() {
+            shape.checkpoints = c.ckpts;
+            shape.checkpoint_ns = c.ckpt_ns;
+            shape.ckpt_trunk_pages = c.ckpt_trunk_pages;
+            shape.ckpt_trunk_versions = c.ckpt_trunk_versions;
+            shape.ckpt_branch_rows = c.ckpt_branch_rows;
+            shape.ckpt_rows_written = c.ckpt_rows_written;
+            shape.trunk_loaded_pages = c.trunk_loaded.len() as u64;
+            shape.trunk_dirty_pages = c.trunk_dirty.len() as u64;
+            shape.dirty_branches = c.dirty.len() as u64;
+        }
+        shape
+    }
+
+    /// githost-shape instrument: `(trunk versions, trunk pages holding any, most on one page)`,
+    /// resident plus not-yet-resident. It QUERIES the catalog (moving its counters): call it only
+    /// outside a measured operation.
+    pub(crate) fn trunk_version_census(&self) -> (u64, u64, u64) {
+        let mut inner = self.inner.lock();
+        let mut per_page: HashMap<u32, u64> = inner
+            .trunk
+            .lineage
+            .retained
+            .iter()
+            .map(|(&p, v)| (p, v.len() as u64))
+            .collect();
+        let StoreInner { cat, .. } = &mut *inner;
+        if let Some(cat) = cat.as_mut() {
+            for (page, n) in cat.catalog.trunk_version_counts().unwrap_or_default() {
+                if !cat.trunk_loaded.contains(&page) {
+                    per_page.insert(page, n);
+                }
+            }
+        }
+        let total = per_page.values().sum();
+        let max = per_page.values().copied().max().unwrap_or(0);
+        (total, per_page.values().filter(|&&n| n > 0).count() as u64, max)
+    }
+
     /// Catalog statements that wrote a row, since open (r11-restart lane instrument).
     pub(crate) fn catalog_rows_written(&self) -> u64 {
         self.inner
@@ -2420,6 +2487,9 @@ impl StoreInner {
         else {
             return Ok(());
         };
+        // githost-shape instrument (observing only).
+        let started = Instant::now();
+        let rows_written_before = cat.catalog.counters.rows_written;
         journal.check_live()?;
         // Every slot the catalog is about to name must be durable first.
         if self.sync {
@@ -2551,6 +2621,13 @@ impl StoreInner {
             Ok(_) => {}
             Err(e) => tracing::warn!("branch catalog WAL truncation failed: {e}"),
         }
+        // githost-shape instrument (observing only): the time is taken before the counting.
+        cat.ckpt_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        cat.ckpts += 1;
+        cat.ckpt_trunk_pages += trunk_pages.len() as u64;
+        cat.ckpt_trunk_versions += trunk_pages.iter().map(|(_, v)| v.len() as u64).sum::<u64>();
+        cat.ckpt_branch_rows += rows.len() as u64;
+        cat.ckpt_rows_written += cat.catalog.counters.rows_written - rows_written_before;
         cat.dirty.clear();
         cat.removed.clear();
         cat.trunk_dirty.clear();

@@ -728,6 +728,11 @@ impl Journal {
         self.page_size as usize
     }
 
+    /// Bytes of the log holding whole records, header included (githost-shape instrument).
+    pub(crate) fn log_len(&self) -> u64 {
+        self.len
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }

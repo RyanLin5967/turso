@@ -317,6 +317,33 @@ pub struct BranchOpenStats {
     pub touched_slots: u64,
 }
 
+/// githost-shape lane instrument (observing only): the catalog store's checkpoint work and its
+/// resident trunk census. Cumulative fields count since the open.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchCatShape {
+    pub checkpoints: u64,
+    pub checkpoint_ns: u64,
+    /// Trunk pages and trunk versions the checkpoints rewrote (`put_trunk_page`).
+    pub ckpt_trunk_pages: u64,
+    pub ckpt_trunk_versions: u64,
+    /// Branch states the checkpoints wrote, and catalog rows written by them in all.
+    pub ckpt_branch_rows: u64,
+    pub ckpt_rows_written: u64,
+    /// Trunk pages resident (loaded or written since open), and dirty now; dirty branches now.
+    pub trunk_loaded_pages: u64,
+    pub trunk_dirty_pages: u64,
+    pub dirty_branches: u64,
+    /// Resident trunk versions, the pages holding them, and the most on one page.
+    pub trunk_resident_versions: u64,
+    pub trunk_resident_pages: u64,
+    pub trunk_resident_versions_max: u64,
+    /// Branch states resident in memory.
+    pub resident_states: u64,
+    /// The log's whole-record length.
+    pub log_len: u64,
+}
+
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
@@ -522,6 +549,20 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_catalog_counters(&self) -> (u64, u64, u64, u64) {
         self.branches.catalog_counters()
+    }
+
+    /// The catalog store's checkpoint work and resident trunk census (githost-shape instrument;
+    /// runs no catalog query).
+    #[doc(hidden)]
+    pub fn branch_cat_shape(&self) -> BranchCatShape {
+        self.branches.cat_shape()
+    }
+
+    /// `(trunk versions, pages holding any, most on one page)`, resident or not (githost-shape
+    /// instrument). It queries the catalog: never call it inside a measured operation.
+    #[doc(hidden)]
+    pub fn branch_trunk_version_census(&self) -> (u64, u64, u64) {
+        self.branches.trunk_version_census()
     }
 
     /// Catalog statements that wrote a row since open; 0 for a store that is not a catalog store.
