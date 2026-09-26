@@ -373,6 +373,17 @@ impl Database {
         self.branches.set_fw3(on);
     }
 
+    /// r11-walpin-conc amendment 5: restart the trunk log under SQLite's rule (read mark 0 stays
+    /// shared) or turso's (mark 0 upgraded). In-process WAL only.
+    #[doc(hidden)]
+    pub fn walpin_set_sqlite_restart(&self, on: bool) {
+        self.shared_wal
+            .read()
+            .runtime
+            .sqlite_restart
+            .store(on, crate::sync::atomic::Ordering::Relaxed);
+    }
+
     /// FW2: open the second WAL file (`<wal>2`). Call once, right after open, before any write.
     #[doc(hidden)]
     pub fn walpin_open_wal2(&self) -> Result<()> {

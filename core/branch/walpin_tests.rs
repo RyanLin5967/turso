@@ -497,3 +497,137 @@ fn fw3_a_read_that_never_validates_is_busy_after_the_retry_limit() {
     let conn = branch.connect().unwrap();
     assert_eq!(value(&conn, ROWS), original(ROWS));
 }
+
+/// r11-walpin-conc amendment 5: a trunk reader that began on a fully backfilled WAL holds read mark
+/// 0. Under turso's restart rule the next writer cannot upgrade mark 0 past it, so the log does not
+/// restart (gate 3); under SQLite's rule (walRestartLog: mark 0 stays shared, marks 1..4 exclusive)
+/// it restarts (gate 5). Under both rules the reader keeps its snapshot while the writer writes into
+/// the restarted log and a PASSIVE checkpoint is attempted (it needs mark 0 exclusively), and every
+/// row reads back after the reader ends and a TRUNCATE checkpoint. Returns whether the log
+/// restarted and the restart-gate deltas. The gate counters are process-global: run with
+/// --test-threads=1.
+fn restart_under_a_mark0_reader(sqlite_rule: bool) -> (bool, [u64; walpin::RESTART_GATES]) {
+    let (_dir, db) = open_db(false);
+    db.walpin_set_sqlite_restart(sqlite_rule);
+    let writer = db.connect().unwrap();
+    seed(&writer);
+    set(&writer, 1, "one");
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let s = db.walpin_stats();
+    assert!(
+        s.nbackfills > 0 && s.nbackfills == s.max_frame,
+        "the WAL is fully backfilled: {s:?}"
+    );
+    let reader = db.connect().unwrap();
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(value(&reader, 2), original(2));
+    let seq0 = db.walpin_stats().checkpoint_seq;
+    let g0 = walpin::counters().restart_gate;
+    set(&writer, 2, "two");
+    let restarted = db.walpin_stats().checkpoint_seq != seq0;
+    let g1 = walpin::counters().restart_gate;
+    assert_eq!(value(&reader, 2), original(2), "the mark-0 reader keeps its snapshot");
+    set(&writer, 3, "three");
+    let _ = writer.execute("PRAGMA wal_checkpoint(PASSIVE)");
+    assert_eq!(value(&reader, 2), original(2), "no checkpoint rewrote the file under it");
+    assert_eq!(value(&reader, 3), original(3));
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(value(&reader, 2), "two");
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let fresh = db.connect().unwrap();
+    for id in 1..=ROWS {
+        let want = match id {
+            1 => "one".to_string(),
+            2 => "two".to_string(),
+            3 => "three".to_string(),
+            _ => original(id),
+        };
+        assert_eq!(value(&fresh, id), want, "row {id} after TRUNCATE");
+    }
+    (restarted, std::array::from_fn(|i| g1[i] - g0[i]))
+}
+
+#[test]
+fn turso_rule_a_mark0_reader_refuses_the_restart() {
+    let (restarted, gates) = restart_under_a_mark0_reader(false);
+    assert!(!restarted, "turso's rule needs mark 0 alone");
+    assert_eq!(gates[3], 1, "refused at the mark-0 upgrade: {gates:?}");
+    assert_eq!(gates[5], 0);
+}
+
+#[test]
+fn sqlite_rule_restarts_under_a_mark0_reader() {
+    let (restarted, gates) = restart_under_a_mark0_reader(true);
+    assert!(restarted, "SQLite's rule lets mark-0 readers proceed");
+    assert_eq!(gates[5], 1, "restarted: {gates:?}");
+    assert_eq!(gates[3], 0);
+}
+
+/// r11-walpin-conc amendment 5: the wal2-specific window. FW2 is on for this process (FW1+FW2 are
+/// process switches), FW3 for this database. The branch finds its leaf in a frame of wal2 file 0;
+/// between that lookup and the read, the trunk fills file 0, switches to file 1, has file 0
+/// checkpointed, fills file 1 and switches back, so file 0 is reused and the frame's slot holds
+/// another page. Returns what the branch read, the retries it took and the switches in the window.
+fn wal2_reuse_in_the_window(mutant: u8) -> (Option<String>, u64, u64) {
+    let (fw1, fw2, fw3) = (walpin::fw1(), walpin::fw2(), walpin::fw3());
+    walpin::set_fixes(true, true, false);
+    let (_dir, db) = open_db(true);
+    db.walpin_open_wal2().unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    set(&trunk, ROWS, "in-wal-at-fork");
+    let branch = trunk.fork_branch().unwrap();
+    let conn = branch.connect().unwrap();
+    assert_eq!(value(&conn, 1), original(1));
+    let trunk2 = trunk.clone();
+    let switches = Arc::new(std::sync::Mutex::new(0u64));
+    let seen = switches.clone();
+    fw3_test_hook::set(Box::new(move |_page| {
+        let sw0 = walpin::counters().fw2_switches;
+        for i in 0..1_100 {
+            set(&trunk2, 1, &format!("fill-a-{i}"));
+        }
+        trunk2.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        for i in 0..1_100 {
+            set(&trunk2, 1, &format!("fill-b-{i}"));
+        }
+        *seen.lock().unwrap() = walpin::counters().fw2_switches - sw0;
+    }));
+    fw3_test_hook::set_mutant(mutant);
+    let before = walpin::counters().fw3_retries;
+    let got = try_value(&conn, ROWS);
+    let retries = walpin::counters().fw3_retries - before;
+    fw3_test_hook::set_mutant(0);
+    let switched = *switches.lock().unwrap();
+    drop(conn);
+    drop(branch);
+    walpin::set_fixes(fw1, fw2, fw3);
+    (got, retries, switched)
+}
+
+#[test]
+#[ignore = "sets the process-global FW2 switch: run alone with --test-threads=1 --include-ignored"]
+fn fw2_fw3_a_reused_wal2_file_in_the_window_is_retried() {
+    let (got, retries, switched) = wal2_reuse_in_the_window(0);
+    assert!(switched >= 2, "file 0 was reused in the window: {switched} switches");
+    assert_eq!(got.as_deref(), Some("in-wal-at-fork"));
+    assert!(retries >= 1, "the read was retried");
+}
+
+#[test]
+#[ignore = "sets the process-global FW2 switch: run alone with --test-threads=1 --include-ignored"]
+fn fw2_fw3_the_generation_check_is_not_what_catches_a_reused_wal2_file() {
+    // Mutant 2 passes every generation check. The stale frame maps to no slot of either file, so
+    // the read itself fails and the failed-read retry recovers the fork value without it.
+    let (got, _, switched) = wal2_reuse_in_the_window(2);
+    assert!(switched >= 2);
+    assert_eq!(got.as_deref(), Some("in-wal-at-fork"));
+}
+
+#[test]
+#[ignore = "sets the process-global FW2 switch: run alone with --test-threads=1 --include-ignored"]
+fn fw2_fw3_without_the_failed_read_retry_a_reused_wal2_file_fails_the_read() {
+    let (got, _, switched) = wal2_reuse_in_the_window(3);
+    assert!(switched >= 2);
+    assert_eq!(got, None, "mutant 3 must fail the read, or this test cannot see the retry");
+}

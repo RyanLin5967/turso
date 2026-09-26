@@ -970,6 +970,34 @@ impl InProcessWalCoordination {
     fn unlock_checkpoint_lock(&self) {
         self.shared.read().runtime.checkpoint_lock.unlock();
     }
+
+    /// `begin_restart`'s body. `reset_mark0` is false under SQLite's restart rule, where the
+    /// caller holds read mark 0 only shared (r11-walpin-conc amendment 5).
+    fn begin_restart_marks(&self, io: &dyn IO, reset_mark0: bool) -> Result<WalSnapshot> {
+        if walpin::fw2() && self.shared.read().runtime.wal2.lock().readers != [0; 4] {
+            // FW2 readers hold no read mark, so the marks below cannot see them.
+            return Err(LimboError::Busy);
+        }
+        for idx in 1..5 {
+            if !self.try_read_mark_exclusive(idx) {
+                for j in 1..idx {
+                    self.unlock_read_mark(j);
+                }
+                return Err(LimboError::Busy);
+            }
+            self.set_read_mark_value_exclusive(idx, READMARK_NOT_USED);
+        }
+        let mut shared = self.shared.write();
+        shared.restart_wal_header(io, reset_mark0);
+        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        Ok(WalSnapshot {
+            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
+            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
+            last_checksum: shared.metadata.last_checksum,
+            checkpoint_seq,
+            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
+        })
+    }
 }
 
 impl WalCoordination for InProcessWalCoordination {
@@ -1224,13 +1252,20 @@ impl WalCoordination for InProcessWalCoordination {
         &self,
         mode: CheckpointMode,
     ) -> Result<CoordinationCheckpointGuardKind> {
+        let passive = matches!(mode, CheckpointMode::Passive { .. });
         if !self.try_checkpoint_lock() {
+            if passive {
+                // r11-walpin-conc amendment 5 (R1): Passive checkpoint outcome 0.
+                walpin::CKPT_OUTCOME[0].fetch_add(1, Relaxed);
+            }
             tracing::trace!("CheckpointGuard::new: checkpoint lock failed, returning Busy");
             return Err(LimboError::Busy);
         }
         match mode {
             CheckpointMode::Passive { .. } => {
                 if !self.try_read_mark_exclusive(0) {
+                    // r11-walpin-conc amendment 5 (R1): Passive checkpoint outcome 1.
+                    walpin::CKPT_OUTCOME[1].fetch_add(1, Relaxed);
                     self.unlock_checkpoint_lock();
                     tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
                     return Err(LimboError::Busy);
@@ -1330,29 +1365,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn begin_restart(&self, io: &dyn IO) -> Result<WalSnapshot> {
-        if walpin::fw2() && self.shared.read().runtime.wal2.lock().readers != [0; 4] {
-            // FW2 readers hold no read mark, so the marks below cannot see them.
-            return Err(LimboError::Busy);
-        }
-        for idx in 1..5 {
-            if !self.try_read_mark_exclusive(idx) {
-                for j in 1..idx {
-                    self.unlock_read_mark(j);
-                }
-                return Err(LimboError::Busy);
-            }
-            self.set_read_mark_value_exclusive(idx, READMARK_NOT_USED);
-        }
-        let mut shared = self.shared.write();
-        shared.restart_wal_header(io);
-        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
-        Ok(WalSnapshot {
-            max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
-            nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
-            last_checksum: shared.metadata.last_checksum,
-            checkpoint_seq,
-            transaction_count: shared.metadata.transaction_count.load(Ordering::Acquire),
-        })
+        self.begin_restart_marks(io, true)
     }
 
     fn end_restart(&self) {
@@ -1362,10 +1375,26 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn try_restart_log_for_write(&self, io: &dyn IO) -> Result<Option<WalSnapshot>> {
+        if self
+            .shared
+            .read()
+            .runtime
+            .sqlite_restart
+            .load(Ordering::Relaxed)
+        {
+            // r11-walpin-conc amendment 5, SQLite's walRestartLog: the writer keeps read mark 0
+            // SHARED and takes only marks 1..4 exclusively. Other readers on mark 0 read the
+            // database file alone (ReadGuardKind::DbFile), and every checkpoint mode takes mark 0
+            // exclusively before it rewrites that file (`acquire_checkpoint_guard`), so the
+            // restarted log is invisible to them. Mark 0's value is always 0 and stays untouched.
+            let snapshot = self.begin_restart_marks(io, false)?;
+            self.end_restart();
+            return Ok(Some(snapshot));
+        }
         if !self.try_upgrade_read_mark(0) {
             return Ok(None);
         }
-        let result = self.begin_restart(io);
+        let result = self.begin_restart_marks(io, true);
         self.downgrade_read_mark(0);
         match result {
             Ok(snapshot) => {
@@ -3223,6 +3252,11 @@ pub struct WalSharedRuntime {
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
+    /// r11-walpin-conc amendment 5: a writer restarts the log under SQLite's rule (walRestartLog:
+    /// read mark 0 stays shared, marks 1..4 exclusive) instead of upgrading mark 0. In-process
+    /// coordination only. Taken from `walpin::sqlite_restart()` when the shared WAL is built, or set
+    /// per database by a test.
+    pub sqlite_restart: AtomicBool,
 }
 
 /// Drivable result of [`WalFileShared::open_shared_if_exists_begin`]. Either an
@@ -3960,6 +3994,18 @@ impl Wal for WalFile {
             page.get().id,
             frame_id
         );
+        // r11-walpin-conc amendment 5: under FW2 a frame found before its file was reused maps to
+        // no slot of any file (frame numbers are global; the reused file starts after a newer
+        // base). `frame_offset` would underflow there (a panic in debug, a wrapped offset in
+        // release), so refuse it as an error the caller can retry. Only an FW3 read can hold such
+        // a frame number: every other reader's mark or wal2 class blocks the reuse.
+        if let Some((_, base)) = self.coordination.wal2_frame_file(frame_id) {
+            if frame_id <= base {
+                return Err(LimboError::InternalError(format!(
+                    "FW2: frame {frame_id} is no longer in any wal2 file (file base {base})"
+                )));
+            }
+        }
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
@@ -5237,6 +5283,9 @@ impl WalFile {
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode, lock_source)?;
+                    // r11-walpin-conc amendment 5 (R1): the frame count this Passive checkpoint's
+                    // safe frame is computed against (observation only).
+                    let wal_max_at_guard = self.load_coordination_snapshot().max_frame;
                     let mut max_frame = match self
                         .coordination
                         .wal2_max_safe(matches!(mode, CheckpointMode::Passive { .. }))
@@ -5244,6 +5293,10 @@ impl WalFile {
                         Some(safe) => safe,
                         None => self.determine_max_safe_checkpoint_frame(),
                     };
+                    if matches!(mode, CheckpointMode::Passive { .. }) && !walpin::fw2() {
+                        let outcome = if max_frame < wal_max_at_guard { 2 } else { 3 };
+                        walpin::CKPT_OUTCOME[outcome].fetch_add(1, Relaxed);
+                    }
 
                     if let CheckpointMode::Truncate {
                         upper_bound_inclusive: Some(upper_bound),
@@ -5570,8 +5623,13 @@ impl WalFile {
     /// 3. nbackfills > 0 - otherwise nothing was backfilled and there is no reason to truncate header
     /// 4. max_frame == nbackfills - otherwise there are some non-checkpointed frames in the WAL and we can't truncate the log
     pub fn try_restart_log_before_write(&self) -> Result<()> {
+        // r11-walpin-conc amendment 5 (R1): count this attempt's outcome by the gate that decides it.
+        let gate = |g: usize| {
+            walpin::RESTART_GATE[g].fetch_add(1, Relaxed);
+        };
         let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if max_frame_read_lock_index != 0 {
+            gate(0);
             tracing::debug!(
                 "try_restart_log_before_write: max_frame_read_lock_index={max_frame_read_lock_index}, writer use WAL - can't restart the log"
             );
@@ -5581,6 +5639,7 @@ impl WalFile {
         let max_frame = snapshot.max_frame;
         let nbackfills = snapshot.nbackfills;
         if nbackfills == 0 {
+            gate(1);
             tracing::debug!(
                 "try_restart_log_before_write: nbackfills={nbackfills}, nothing were backfilled - can't restart the log"
             );
@@ -5591,17 +5650,26 @@ impl WalFile {
             "backfills can't be more than max_frame"
         );
         if max_frame != nbackfills {
+            gate(2);
             tracing::debug!(
                 "try_restart_log_before_write: max_frame={max_frame}, nbackfills={nbackfills}, not everything is backfilled to the DB file - can't restart the log"
             );
             return Ok(());
         }
-        let Some(snapshot) = self
-            .coordination
-            .try_restart_log_for_write(self.io.as_ref())?
-        else {
-            return Ok(());
+        let snapshot = match self.coordination.try_restart_log_for_write(self.io.as_ref()) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                gate(3);
+                return Ok(());
+            }
+            Err(err) => {
+                if matches!(err, LimboError::Busy) {
+                    gate(4);
+                }
+                return Err(err);
+            }
         };
+        gate(5);
         self.apply_restart_snapshot(snapshot);
         self.increment_checkpoint_epoch();
         let result = Ok(());
@@ -6197,6 +6265,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                sqlite_restart: AtomicBool::new(walpin::sqlite_restart()),
             },
         };
         Ok(Arc::new(RwLock::new(shared)))
@@ -6275,6 +6344,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                sqlite_restart: AtomicBool::new(walpin::sqlite_restart()),
             },
         };
         Arc::new(RwLock::new(shared))
@@ -6319,6 +6389,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                sqlite_restart: AtomicBool::new(walpin::sqlite_restart()),
             },
         };
         Ok(Arc::new(RwLock::new(shared)))
@@ -6343,7 +6414,10 @@ impl WalFileShared {
     /// This function updates the shared-memory structures so that the next
     /// client to write to the database (which may be this one) does so by
     /// writing frames into the start of the log file.
-    fn restart_wal_header(&mut self, io: &dyn IO) {
+    ///
+    /// `reset_mark0` is false when the restarting writer holds read mark 0 only shared (SQLite's
+    /// rule, r11-walpin-conc amendment 5): mark 0's value is 0 already.
+    fn restart_wal_header(&mut self, io: &dyn IO, reset_mark0: bool) {
         walpin::RESTARTS.fetch_add(1, Relaxed);
         {
             let mut hdr = self.metadata.wal_header.lock();
@@ -6371,7 +6445,14 @@ impl WalFileShared {
             .frame_cache_high_water
             .store(0, Ordering::Release);
         // read-marks
-        self.runtime.read_locks[0].set_value_exclusive(0);
+        if reset_mark0 {
+            self.runtime.read_locks[0].set_value_exclusive(0);
+        } else {
+            turso_assert!(
+                self.runtime.read_locks[0].get_value() == 0,
+                "read mark 0's value is always 0"
+            );
+        }
         self.runtime.read_locks[1].set_value_exclusive(0);
         for lock in &self.runtime.read_locks[2..] {
             lock.set_value_exclusive(READMARK_NOT_USED);

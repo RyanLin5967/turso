@@ -1506,6 +1506,7 @@ impl BuildSharedWal {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                sqlite_restart: AtomicBool::new(crate::branch::walpin::sqlite_restart()),
             },
         }));
 

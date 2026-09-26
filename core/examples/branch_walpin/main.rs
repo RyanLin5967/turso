@@ -52,6 +52,8 @@ struct Args {
     k: u64,
     samples: usize,
     fixes: (bool, bool, bool),
+    /// r11-walpin-conc amendment 5: SQLite's restart rule (`--fix sqlrestart`).
+    sqlrestart: bool,
     timing: bool,
     dir: Option<PathBuf>,
     conc: conc::ConcArgs,
@@ -91,6 +93,7 @@ fn parse_args() -> Args {
         k: 1,
         samples: 200,
         fixes: (false, false, false),
+        sqlrestart: false,
         timing: false,
         dir: None,
         conc: conc::ConcArgs::default(),
@@ -128,6 +131,7 @@ fn parse_args() -> Args {
                         "fw1" => args.fixes.0 = true,
                         "fw2" => args.fixes.1 = true,
                         "fw3" => args.fixes.2 = true,
+                        "sqlrestart" => args.sqlrestart = true,
                         other => die(&format!("unknown fix {other}")),
                     }
                 }
@@ -437,6 +441,7 @@ fn main() {
     let args = parse_args();
     let (fw1, fw2, fw3) = args.fixes;
     walpin::set_fixes(fw1, fw2, fw3);
+    walpin::set_sqlite_restart(args.sqlrestart);
     let base_dir = args.dir.clone().unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&base_dir).unwrap();
     let dir = tempfile::TempDir::new_in(&base_dir).unwrap();
@@ -478,9 +483,18 @@ fn main() {
 
     println!("# branch_walpin — Turso fork, trunk WAL under branch readers, r11-walpin PREREG");
     println!(
-        "# arm={:?} points={:?} k={} samples={} fixes=fw1:{} fw2:{} fw3:{} timing={} trunk_rows={TRUNK_ROWS} \
-         value_len={VALUE_LEN} page_size={page_size} trunk_pages={trunk_pages} trunk_synchronous={synchronous}",
-        args.arm, args.points, args.k, args.samples, fw1 || fw2, fw2, fw3, args.timing
+        "# arm={:?} points={:?} k={} samples={} fixes=fw1:{} fw2:{} fw3:{} sqlrestart:{} timing={} \
+         trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} page_size={page_size} trunk_pages={trunk_pages} \
+         trunk_synchronous={synchronous}",
+        args.arm,
+        args.points,
+        args.k,
+        args.samples,
+        fw1 || fw2,
+        fw2,
+        fw3,
+        args.sqlrestart,
+        args.timing
     );
     println!(
         "# clock tick {:.0} ns (Instant); build: {}; rss_base_bytes={}",

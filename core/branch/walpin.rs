@@ -38,6 +38,24 @@ pub(crate) static FW3_HIST: [AtomicU64; FW3_HIST_BUCKETS] = [const { AtomicU64::
 pub(crate) static STORE_LOCKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub(crate) static STORE_CONTENDED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// r11-walpin-conc amendment 5 (R1): every restart attempt at a write's start, by the first gate
+/// that refused it (or 5, restarted), and every Passive checkpoint by its outcome.
+pub(crate) static RESTART_GATE: [AtomicU64; RESTART_GATES] =
+    [const { AtomicU64::new(0) }; RESTART_GATES];
+pub(crate) static CKPT_OUTCOME: [AtomicU64; CKPT_OUTCOMES] =
+    [const { AtomicU64::new(0) }; CKPT_OUTCOMES];
+
+/// Outcomes of `WalFile::try_restart_log_before_write`, in the order it checks them: 0 the writer's
+/// read tx is on a mark 1..4 (it began while max_frame > nbackfills); 1 nbackfills == 0; 2
+/// max_frame != nbackfills; 3 mark 0 could not be upgraded (another reader holds mark 0: turso's
+/// gate, which SQLite's walRestartLog does not have); 4 a mark 1..4 is held (a reader of WAL
+/// frames); 5 restarted.
+pub const RESTART_GATES: usize = 6;
+/// Outcomes of a Passive checkpoint that had frames to copy: 0 the checkpoint lock was busy; 1 read
+/// mark 0 was busy (a reader of the database file); 2 a reader's mark capped it below max_frame; 3
+/// it reached max_frame.
+pub const CKPT_OUTCOMES: usize = 4;
+
 /// Buckets of `WalPinCounters::fw3_hist`: a trunk call's retries 0, 1, 2, 3, 4-7, 8-15, 16-63,
 /// 64-255, 256-999, and Busy (the retry limit).
 pub const FW3_HIST_BUCKETS: usize = 10;
@@ -68,6 +86,9 @@ pub(crate) fn fw3_record_call(retries: u64, store: u64, busy: bool) {
 static FW1: AtomicBool = AtomicBool::new(false);
 static FW2: AtomicBool = AtomicBool::new(false);
 static FW3: AtomicBool = AtomicBool::new(false);
+/// r11-walpin-conc amendment 5: SQLite's restart rule for new databases (see
+/// `WalSharedRuntime::sqlite_restart`).
+static SQLITE_RESTART: AtomicBool = AtomicBool::new(false);
 static ENV_INIT: std::sync::Once = std::sync::Once::new();
 
 /// `TURSO_WALPIN_FIX=fw1,fw2,fw3` sets the switches at first use, so an existing test suite can be
@@ -79,6 +100,7 @@ fn init_from_env() {
             FW1.store(has("fw1") || has("fw2"), Relaxed);
             FW2.store(has("fw2"), Relaxed);
             FW3.store(has("fw3"), Relaxed);
+            SQLITE_RESTART.store(has("sqlrestart"), Relaxed);
         }
     });
 }
@@ -125,6 +147,10 @@ pub struct WalPinCounters {
     pub store_locks: [u64; 3],
     /// Those acquisitions whose `try_lock` failed (the caller waited).
     pub store_contended: [u64; 3],
+    /// Restart attempts at a write's start by outcome (`RESTART_GATES`).
+    pub restart_gate: [u64; RESTART_GATES],
+    /// Passive checkpoints with frames to copy, by outcome (`CKPT_OUTCOMES`).
+    pub ckpt_outcome: [u64; CKPT_OUTCOMES],
 }
 
 pub fn counters() -> WalPinCounters {
@@ -148,6 +174,8 @@ pub fn counters() -> WalPinCounters {
         fw3_hist: std::array::from_fn(|i| FW3_HIST[i].load(Relaxed)),
         store_locks: std::array::from_fn(|i| STORE_LOCKS[i].load(Relaxed)),
         store_contended: std::array::from_fn(|i| STORE_CONTENDED[i].load(Relaxed)),
+        restart_gate: std::array::from_fn(|i| RESTART_GATE[i].load(Relaxed)),
+        ckpt_outcome: std::array::from_fn(|i| CKPT_OUTCOME[i].load(Relaxed)),
     }
 }
 
@@ -158,6 +186,19 @@ pub fn set_fixes(fw1: bool, fw2: bool, fw3: bool) {
     FW1.store(fw1 || fw2, Relaxed);
     FW2.store(fw2, Relaxed);
     FW3.store(fw3, Relaxed);
+}
+
+/// r11-walpin-conc amendment 5: open new databases with SQLite's restart rule (the writer keeps read
+/// mark 0 shared; only marks 1..4 must be free). Call before opening.
+pub fn set_sqlite_restart(on: bool) {
+    init_from_env();
+    SQLITE_RESTART.store(on, Relaxed);
+}
+
+#[inline]
+pub(crate) fn sqlite_restart() -> bool {
+    init_from_env();
+    SQLITE_RESTART.load(Relaxed)
 }
 
 #[inline]
