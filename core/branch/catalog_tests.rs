@@ -394,7 +394,13 @@ fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
     let s = db.branch_open_stats();
     assert_eq!(s.branch_loads, 0, "recovery read branches: {s:?}");
     assert_eq!(s.parked_records, 60, "20 branches x 3 rounds were not all parked: {s:?}");
-    assert!(s.cat_queries <= 5, "recovery queried the catalog per record: {s:?}");
+    // No branch state read: exactly the rows an open with an empty tail reads (meta, lease floor,
+    // released list). The queries also hold one free-table probe per slot the tail names below the
+    // checkpoint's high-water mark (the arena rebuild's `free_has`, which returns no row for a slot
+    // in use), so they are bounded by the tail's slots, not by its records' branches.
+    // (Was `cat_queries <= 5`: a wrong premise, which the free-table probes broke: PREREG A8.)
+    assert_eq!(s.cat_rows_read, 9, "recovery read catalog rows beyond the open's own: {s:?}");
+    assert!(s.cat_queries <= 3 + s.touched_slots, "recovery queried the catalog beyond the tail's slots: {s:?}");
     assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, slots_before, "the slot count moved");
     for (i, &id) in ids.iter().enumerate() {
         let b = db.branch(id).unwrap();
