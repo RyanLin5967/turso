@@ -2389,6 +2389,59 @@ impl StoreInner {
         }
     }
 
+    /// F-W3 (githost-shape lane, PREREG G5.3): evict clean branch states while more than
+    /// `resident_cap` are resident. Called when a catalog checkpoint has committed, so the catalog
+    /// holds every state that is not dirty. A state is clean when the catalog holds all of it and
+    /// this process holds nothing of its own in it: not dirty, no parked Commit, handle Detached or
+    /// Released (an attached handle is this process's), no connection, no write transaction, no
+    /// reserved slot. What else it carries is derived and rebuilt on its next touch (its F4 page map
+    /// from its parent, its child view, its schema), and its lease deadline is in the catalog's lease
+    /// index, which `lease_floor` (just recomputed) covers. So an evicted state is exactly a state no
+    /// one has touched since the open, and `ensure` reads it back the same way (on-demand recovery,
+    /// Graefe and Sauer). Prior art: a buffer pool's eviction of clean pages (ARC, Megiddo and Modha,
+    /// FAST 2003); the victims here are in table order, random replacement, since the claim is a
+    /// bound on what stays resident, not a hit rate. The trunk-version read cache (clean copies of
+    /// catalog rows) is dropped when it holds more than the cap.
+    fn evict_clean(&mut self) {
+        let Some(cap) = self.resident_cap else {
+            return;
+        };
+        let Some(cat) = self.cat.as_mut() else {
+            return;
+        };
+        if self.branches.len() > cap {
+            let excess = self.branches.len() - cap;
+            let parked = &self.parked;
+            let victims: Vec<BranchId> = self
+                .branches
+                .iter()
+                .filter(|(id, st)| {
+                    !cat.dirty.contains_key(*id)
+                        && !parked.contains_key(*id)
+                        && matches!(st.handle, Handle::Detached | Handle::Released)
+                        && !st.open
+                        && !st.writer
+                        && st.pending.is_empty()
+                })
+                .map(|(&id, _)| id)
+                .take(excess)
+                .collect();
+            for id in &victims {
+                if let Some(st) = self.branches.remove(id) {
+                    if let Some(deadline) = st.lease {
+                        self.leases.remove(&(deadline, *id));
+                    }
+                }
+            }
+            self.shape.evictions += 1;
+            self.shape.evicted_states += victims.len() as u64;
+        }
+        let cached: usize = cat.trunk_cache.values().map(BTreeMap::len).sum();
+        if cached > cap {
+            cat.trunk_cache.clear();
+        }
+    }
+
     /// The records a fork writes — the fork, and the default lease if there is one, flushed
     /// together so a fork is never durable without the lease it was given — and that lease's
     /// `(deadline, now)`, which the caller applies after the flush.
@@ -3140,6 +3193,8 @@ impl StoreInner {
         cat.lease_floor = cat.catalog.lease_min()?;
         self.lease.queued(now);
         self.lease.flushed();
+        // F-W3: the catalog now holds every state that is not dirty (none is, after this commit).
+        self.evict_clean();
         Ok(())
     }
 
@@ -3897,27 +3952,44 @@ mod sota_helpers {
         generation.to_le_bytes().repeat(PAGE / 8)
     }
 
-    /// The store modes the lane tests run in (a12-durable-open lane: catalog mode added).
+    /// The store modes the lane tests run in (a12-durable-open lane: catalog mode added;
+    /// githost-shape lane: catalog mode with a resident cap of 0, so every checkpoint evicts every
+    /// clean state (F-W3) and the tests' reads after it go through `ensure`'s reload).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum Mode {
         Volatile,
         Durable,
         Catalog,
+        CatalogEvict,
     }
 
-    pub(super) const MODES: [Mode; 3] = [Mode::Volatile, Mode::Durable, Mode::Catalog];
+    pub(super) const MODES: [Mode; 4] = [Mode::Volatile, Mode::Durable, Mode::Catalog, Mode::CatalogEvict];
 
     impl Mode {
         fn durability(self) -> BranchDurability {
             match self {
                 Mode::Volatile => BranchDurability::Volatile,
                 Mode::Durable => BranchDurability::Durable { sync: false },
-                Mode::Catalog => BranchDurability::Catalog { sync: false },
+                Mode::Catalog | Mode::CatalogEvict => BranchDurability::Catalog { sync: false },
             }
         }
 
         pub(super) fn durable(self) -> bool {
             self != Mode::Volatile
+        }
+
+        /// A catalog store, evicting or not.
+        pub(super) fn catalog(self) -> bool {
+            matches!(self, Mode::Catalog | Mode::CatalogEvict)
+        }
+
+        /// Open a store of this mode at `path` (F-W3's cap applied for `CatalogEvict`).
+        fn open_at(self, path: &str) -> BranchStore {
+            let store = BranchStore::open(self.durability(), None, path).unwrap();
+            if self == Mode::CatalogEvict {
+                store.set_resident_cap(Some(0));
+            }
+            store
         }
     }
 
@@ -3928,7 +4000,7 @@ mod sota_helpers {
         } else {
             ":memory:".to_string()
         };
-        BranchStore::open(mode.durability(), None, &path).unwrap()
+        mode.open_at(&path)
     }
 
     /// Copy every branch file of the store at `dir/name` to `dir/<image>` while it is open, and
@@ -3950,7 +4022,7 @@ mod sota_helpers {
                 std::fs::copy(&src, &dst).unwrap();
             }
         }
-        BranchStore::open(mode.durability(), None, to_str(&dir.join(image))).unwrap()
+        mode.open_at(to_str(&dir.join(image)))
     }
 
     fn to_str(p: &std::path::Path) -> &str {
@@ -4095,7 +4167,7 @@ mod sota_index_tests {
                     // place, in doubling batches (at most 4x the smaller range plus 64) or one range
                     // whose entries are garbage or reaped since the checkpoint: so at most the
                     // contract, plus max(64, 8 (contract + 1)), plus the versions reaped since.
-                    if mode == Mode::Catalog {
+                    if mode.catalog() {
                         let bound = contract + (8 * (contract + 1)).max(64) + store.trunk_gone_len();
                         assert!(
                             visited <= bound,
@@ -4382,7 +4454,7 @@ mod sota_tree_tests {
     /// empty, so no recovery leaked a slot or freed one twice.
     #[test]
     fn every_branch_reads_as_the_model_says_after_a_kill_at_any_failpoint() {
-        for mode in [Mode::Durable, Mode::Catalog] {
+        for mode in [Mode::Durable, Mode::Catalog, Mode::CatalogEvict] {
             for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
                 run_killed(seed, mode);
             }
