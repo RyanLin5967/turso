@@ -81,6 +81,7 @@ pub(crate) fn count_page_io(which: usize, n: u64) {
     PAGE_IO[which].fetch_add(n, crate::sync::atomic::Ordering::Relaxed);
 }
 pub(crate) mod catalog;
+pub(crate) mod id_set;
 pub(crate) mod journal;
 pub(crate) mod page_map;
 pub(crate) mod store;

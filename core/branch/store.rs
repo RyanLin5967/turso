@@ -161,6 +161,7 @@ use std::time::{Duration, Instant};
 
 use super::arena::{Arena, Slot};
 use super::catalog::{CatBranch, Catalog, Meta};
+use super::id_set::{IdSet, IdSetWork};
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::page_map::PageMap;
 use super::{
@@ -256,6 +257,19 @@ struct StoreInner {
     /// F-W3 (githost-shape lane): the most branch states a catalog store keeps resident after a
     /// checkpoint. `None` keeps every state it has touched since the open (the catalog as published).
     resident_cap: Option<usize>,
+    /// F-W1 (githost-shape lane; F-cat-snap, r11-diff-list 8c0945ebb / 421e2e125, as r2 ported it in
+    /// 8618d2e46): every unreleased branch id, as a persistent set a listing clones in O(1) under the
+    /// mutex and walks after releasing it. Built by the first listing of a process (`None` until
+    /// then, so an open reads nothing for it), and kept current from then on by every fork and every
+    /// release.
+    live_ids: Option<IdSet>,
+}
+
+/// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
+/// trie, and is refused rather than truncated (githost-shape r2, 8618d2e46).
+fn id_key(id: BranchId) -> u32 {
+    u32::try_from(id.0)
+        .unwrap_or_else(|_| panic!("branch id {} is past the live-id set's u32 keys", id.0))
 }
 
 /// githost-shape lane instrument (observing only): the cumulative fields of
@@ -1645,6 +1659,8 @@ impl BranchStore {
             if let Some(st) = inner.branches.get_mut(&id) {
                 st.handle = Handle::ReleasePending;
             }
+            // F-W1: gone from the caller's point of view, so not listed (as `is_released` says).
+            inner.live_ids_remove(id);
             return Err(LimboError::InternalError(format!(
                 "branch {} was not released durably ({e}); it is kept, and comes back at the next \
                  open",
@@ -1697,38 +1713,27 @@ impl BranchStore {
     }
 
     /// Every unreleased branch. Refused on a trunk-only store, where "none" would be a lie.
+    ///
+    /// F-W1 (githost-shape lane; F-cat-snap, r11-diff-list, as r2 ported it): the live-id set is
+    /// cloned under the mutex in O(1) and walked after it is released, in id order, so a listing of
+    /// every branch holds the lock for a reference-count increment, not for a scan of the resident
+    /// states, a catalog query over every unreleased row, and a sort. The first listing of a process
+    /// builds the set once (`build_live_ids`: the same scan and query, under the mutex, counted).
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
-        let mut inner = self.inner.lock();
-        // githost-shape instrument (observing only): what the listing visits under the mutex.
-        let resident = inner.branches.len() as u64;
-        inner.shape.ids_calls += 1;
-        inner.shape.ids_resident_visited += resident;
-        let mut ids: Vec<BranchId> = inner
-            .branches
-            .iter()
-            .filter(|(_, st)| !st.handle.is_released())
-            .map(|(&id, _)| id)
-            .collect();
-        // Catalog stores: every unreleased row, less what memory knows better (resident states
-        // are listed above; removed ones are gone).
-        let StoreInner {
-            cat,
-            branches,
-            shape,
-            ..
-        } = &mut *inner;
-        if let Some(cat) = cat.as_mut() {
-            let rows = cat.catalog.unreleased_ids()?;
-            shape.ids_catalog_rows += rows.len() as u64;
-            for id in rows.into_iter().map(BranchId) {
-                if !branches.contains_key(&id) && !cat.removed.contains(&id) {
-                    ids.push(id);
-                }
+        let snapshot = {
+            let mut inner = self.inner.lock();
+            // githost-shape instrument (observing only).
+            inner.shape.ids_calls += 1;
+            if inner.live_ids.is_none() {
+                let set = inner.build_live_ids()?;
+                inner.live_ids = Some(set);
             }
-        }
-        ids.sort();
-        ids.dedup();
+            inner.live_ids.clone().expect("built above")
+        };
+        let mut ids = Vec::with_capacity(snapshot.len() as usize);
+        let mut work = IdSetWork::default();
+        snapshot.for_each(&mut work, &mut |key| ids.push(BranchId(u64::from(key))));
         Ok(ids)
     }
 
@@ -2375,6 +2380,45 @@ impl StoreInner {
             shape: ShapeCounters::default(),
             pending_holders: HashSet::new(),
             resident_cap: None,
+            live_ids: None,
+        }
+    }
+
+    /// F-W1: the live-id set as the listing before it computed the list: every resident state that
+    /// is not released, and every unreleased catalog row that is neither resident (memory knows
+    /// better) nor removed since the last checkpoint. Once per process, under the mutex; its catalog
+    /// rows are counted as `ids_build_rows`, apart from a listing's.
+    fn build_live_ids(&mut self) -> Result<IdSet> {
+        let mut set = IdSet::default();
+        for (&id, st) in &self.branches {
+            if !st.handle.is_released() {
+                set.insert(id_key(id));
+            }
+        }
+        self.shape.ids_resident_visited += self.branches.len() as u64;
+        if let Some(cat) = self.cat.as_mut() {
+            let rows = cat.catalog.unreleased_ids()?;
+            self.shape.ids_build_rows += rows.len() as u64;
+            for id in rows.into_iter().map(BranchId) {
+                if !self.branches.contains_key(&id) && !cat.removed.contains(&id) {
+                    set.insert(id_key(id));
+                }
+            }
+        }
+        Ok(set)
+    }
+
+    /// F-W1: `id` is listed from now on (a fork), if the set exists.
+    fn live_ids_insert(&mut self, id: BranchId) {
+        if let Some(set) = self.live_ids.as_mut() {
+            set.insert(id_key(id));
+        }
+    }
+
+    /// F-W1: `id` is not listed from now on (a release, durable or not), if the set exists.
+    fn live_ids_remove(&mut self, id: BranchId) {
+        if let Some(set) = self.live_ids.as_mut() {
+            set.remove(id_key(id));
         }
     }
 
@@ -3267,6 +3311,8 @@ impl StoreInner {
             },
         );
         self.note_table_growth(len_before, cap_before);
+        // F-W1: a new branch is listed (no fork is ever of a released branch).
+        self.live_ids_insert(child);
         self.n_states += 1;
         self.mark_dirty(parent, DIRTY_ROW);
         self.mark_dirty(child, DIRTY_NEW);
@@ -3345,6 +3391,8 @@ impl StoreInner {
                 self.leases.remove(&(deadline, id));
             }
         }
+        // F-W1: a released branch is not listed.
+        self.live_ids_remove(id);
         self.mark_dirty(id, DIRTY_ROW);
         self.collect(id, freed)
     }
