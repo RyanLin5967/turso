@@ -109,6 +109,29 @@
 //! Every acquisition of every lock goes through `take`, which counts it (see [`BranchWork`]), so
 //! what still serialises can be read from integers rather than inferred from a latency curve.
 //!
+//! # Reads of rewritten trunk pages without the trunk's lock (F-K3, lane r11-k3-trunklock)
+//!
+//! Under a writing trunk nearly every trunk page a branch reads has been rewritten since the
+//! branch's `trunk_at` (with W pages on a walk and N live children the fraction is
+//! ((N+1)/W)(1-(N/(N+1))^W), 0.9997 at N = 10^6), so the lock-free read above rarely applies and
+//! the trunk's lock carries nearly every such read. With F-K3 (`TURSO_K3=lockfree`, chosen at
+//! construction) each page's retained versions are also a lock-free skip list keyed by `born` —
+//! Fraser's skip list with epoch-based reclamation (Fraser 2004; `crate::skiplist` is crossbeam's)
+//! — written only under the trunk's lock, as before, and searched without it:
+//!
+//! * the version a branch forked at `f` sees is retained while a child forked at `f` lives, which
+//!   the reading branch guarantees (it is that child or keeps it alive), so it cannot be released
+//!   during the read, and its arena slot cannot be reused;
+//! * versions of one page have disjoint `[born, died)`, so no concurrent insert or removal can put
+//!   a key between that version's `born` and `f`: the predecessor search finds it whatever else
+//!   the list is doing;
+//! * a retain inserts the version before it stores `written` (Release), and the reader loads
+//!   `written` (Acquire) before it searches, so a reader that sees the rewrite sees the version;
+//! * removed list nodes are reclaimed by epochs, and a page's bytes are read through the trunk
+//!   arena's chunks, which never move ([`Chunks`]).
+//!
+//! Without F-K3 the store is F5 exactly: no list is kept, and the lookup runs under the lock.
+//!
 //! # What this does not do
 //!
 //! * The persistent page maps are an index over slots the lineages own; they own nothing. A
@@ -132,10 +155,12 @@ use std::time::Instant;
 
 use crossbeam_utils::CachePadded;
 
-use super::arena::{Arena, Slot};
+use super::arena::{Arena, Chunks, Slot};
 use super::page_map::PageMap;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
+use crate::skiplist::SkipList;
+use crossbeam_epoch::{self as epoch, Guard};
 use crate::storage::pager::PageRef;
 use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -190,6 +215,12 @@ pub(crate) struct BranchStore {
     /// Whether [`take`] times how long each acquisition holds its lock. Off by default: it is the
     /// one part of the lock accounting that adds work inside a critical section.
     lock_timing: AtomicBool,
+    /// F-K3: the trunk's retained versions, searchable without the trunk's lock (the same `Arc` as
+    /// the trunk lineage's `shared`). `None` is F5's locked lookup.
+    k3: Option<std::sync::Arc<SharedVersions>>,
+    /// F-K3: the trunk arena's pages, for reading a retained version without the trunk's lock. Set
+    /// under the trunk lock by the first retain, before that version is published.
+    trunk_chunks: OnceLock<std::sync::Arc<Chunks>>,
 }
 
 /// One stripe of the branch map.
@@ -468,6 +499,9 @@ struct Lineage {
     by_born: BTreeSet<(u64, u32, u64)>,
     /// The same versions as `(died, page, born)`, for the reclamation range query by death.
     by_died: BTreeSet<(u64, u32, u64)>,
+    /// F-K3, the trunk's lineage only: when set, the per-page versions live here instead of in
+    /// `retained`, still written only under this lineage's lock.
+    shared: Option<std::sync::Arc<SharedVersions>>,
 }
 
 /// No page has this number (SQLite's largest is `u32::MAX - 1`; [`Lineage::retain`] refuses it), so
@@ -479,6 +513,60 @@ struct Retained {
     born: u64,
     died: u64,
     slot: Slot,
+}
+
+/// F-K3: the trunk's retained versions of each page as a lock-free skip list ordered by `born`
+/// (see "Reads of rewritten trunk pages without the trunk's lock"). Every write — `insert`,
+/// `remove` — happens under the trunk's lock, from the lineage; `covering` is the reader's, and
+/// takes no lock. A page's list is created once and lives as long as the store.
+struct SharedVersions {
+    pages: Radix<OnceLock<SkipList<u64, Retained>>>,
+}
+
+impl SharedVersions {
+    fn new() -> Self {
+        Self {
+            pages: Radix::new(),
+        }
+    }
+
+    fn list(&self, page: u32) -> Option<&SkipList<u64, Retained>> {
+        self.pages.get(page)?.get()
+    }
+
+    fn insert(&self, page: u32, v: Retained) {
+        let list = self
+            .pages
+            .get_or_insert(page)
+            .get_or_init(|| SkipList::new(epoch::default_collector().clone()));
+        let guard = epoch::pin();
+        list.insert(v.born, v, &guard).release(&guard);
+    }
+
+    fn remove(&self, page: u32, born: u64) -> Option<Retained> {
+        let list = self.list(page)?;
+        let guard = epoch::pin();
+        let entry = list.remove(&born, &guard)?;
+        let v = *entry.value();
+        entry.release(&guard);
+        Some(v)
+    }
+
+    /// The newest retained version of `page`.
+    fn last(&self, page: u32) -> Option<Retained> {
+        let guard = epoch::pin();
+        self.list(page)?.back(&guard).map(|e| *e.value())
+    }
+
+    /// The version of `page` a child forked at `f` sees: the born-predecessor of `f`, if it was
+    /// still current at `f`. Lock-free; `guard` keeps the nodes the search passes alive.
+    fn covering(&self, page: u32, f: u64, guard: &Guard) -> Option<Retained> {
+        let v = *self
+            .list(page)?
+            .upper_bound(Bound::Included(&f), guard)?
+            .value();
+        (f < v.died).then_some(v)
+    }
 }
 
 struct BranchState {
@@ -519,16 +607,25 @@ impl Lineage {
     }
 
     fn retain(&mut self, page: u32, v: Retained) {
-        let versions = self.retained.entry(page).or_default();
+        let last = match &self.shared {
+            Some(shared) => shared.last(page),
+            None => self
+                .retained
+                .get(&page)
+                .and_then(|versions| versions.last_key_value().map(|(_, last)| *last)),
+        };
         crate::turso_assert!(
-            versions
-                .last_key_value()
-                .is_none_or(|(_, last)| last.died <= v.born),
+            last.is_none_or(|last| last.died <= v.born),
             "a retained version overlaps an older one of the same page; the born-ordered lookup \
              would return the wrong one"
         );
         crate::turso_assert!(page != NO_PAGE, "page number u32::MAX is the index sentinel");
-        versions.insert(v.born, v);
+        match &self.shared {
+            Some(shared) => shared.insert(page, v),
+            None => {
+                self.retained.entry(page).or_default().insert(v.born, v);
+            }
+        }
         self.by_born.insert((v.born, page, v.died));
         self.by_died.insert((v.died, page, v.born));
     }
@@ -537,6 +634,10 @@ impl Lineage {
     /// `f`, if it was still current at `f`. `examined` counts the versions compared against `f` —
     /// at most one; the O(log V) descent that finds it is not counted.
     fn retained_at(&self, page: u32, f: u64, examined: &mut u64) -> Option<Slot> {
+        if let Some(shared) = &self.shared {
+            *examined += 1;
+            return shared.covering(page, f, &epoch::pin()).map(|v| v.slot);
+        }
         let (_, v) = self.retained.get(&page)?.range(..=f).next_back()?;
         *examined += 1;
         (f < v.died).then_some(v.slot)
@@ -550,12 +651,18 @@ impl Lineage {
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
         let dead = self.garbage(f, lo, hi, work);
         for &(born, page, died) in &dead {
-            let versions = self.retained.get_mut(&page).expect("indexed version is listed");
-            let v = versions.remove(&born).expect("indexed version is listed");
+            let v = match &self.shared {
+                Some(shared) => shared.remove(page, born).expect("indexed version is listed"),
+                None => {
+                    let versions = self.retained.get_mut(&page).expect("indexed version is listed");
+                    let v = versions.remove(&born).expect("indexed version is listed");
+                    if versions.is_empty() {
+                        self.retained.remove(&page);
+                    }
+                    v
+                }
+            };
             work.gc_examined += 1;
-            if versions.is_empty() {
-                self.retained.remove(&page);
-            }
             let indexed = self.by_born.remove(&(born, page, died))
                 && self.by_died.remove(&(died, page, born));
             crate::turso_assert!(indexed, "a released version was missing from an index");
@@ -654,7 +761,21 @@ fn gone(id: BranchId) -> LimboError {
 }
 
 impl BranchStore {
+    /// A store whose trunk reads follow `TURSO_K3`: `lockfree` for F-K3, unset (or `off`) for F5's
+    /// locked lookup. Any other value is refused: a run must not measure a mode it did not name.
     pub(crate) fn new() -> Self {
+        let lockfree = match std::env::var("TURSO_K3") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(v) if v.is_empty() || v == "off" => false,
+            Ok(v) if v == "lockfree" => true,
+            other => panic!("TURSO_K3={other:?}: expected `lockfree` or `off`"),
+        };
+        Self::with_trunk_reads(lockfree)
+    }
+
+    /// A store with F-K3's lock-free reads of rewritten trunk pages, or F5's locked ones.
+    pub(crate) fn with_trunk_reads(lockfree: bool) -> Self {
+        let k3 = lockfree.then(|| std::sync::Arc::new(SharedVersions::new()));
         Self {
             shards: (0..SHARDS)
                 .map(|i| {
@@ -666,7 +787,10 @@ impl BranchStore {
                 })
                 .collect(),
             trunk: CachePadded::new(Mutex::new(TrunkInner {
-                lineage: Lineage::default(),
+                lineage: Lineage {
+                    shared: k3.clone(),
+                    ..Lineage::default()
+                },
                 domain: Domain::new(TRUNK_DOMAIN),
                 work: BranchWork::default(),
             })),
@@ -680,7 +804,14 @@ impl BranchStore {
             live: AtomicUsize::new(0),
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
+            k3,
+            trunk_chunks: OnceLock::new(),
         }
+    }
+
+    /// Whether this store reads rewritten trunk pages without the trunk's lock (F-K3).
+    pub(crate) fn lockfree_trunk_reads(&self) -> bool {
+        self.k3.is_some()
     }
 
     fn timed(&self) -> bool {
@@ -964,6 +1095,10 @@ impl BranchStore {
         if lineage.has_child_in(born, epoch) {
             let slot = domain.alloc(self.page_size());
             domain.page_mut(slot).copy_from_slice(pre_image);
+            if self.k3.is_some() {
+                // Before the version is published: a reader that finds it reads through these.
+                self.trunk_chunks.get_or_init(|| domain.arena().chunks());
+            }
             lineage.retain(
                 page,
                 Retained {
@@ -1075,14 +1210,34 @@ impl BranchStore {
             out.copy_from_slice(take(&self.shards[d], self.timed()).domain.page(slot));
             return Ok(Resolved::Filled);
         }
-        let mut trunk = self.trunk();
-        trunk.work.resolve_trunk_locked += 1;
-        let mut examined = 0;
-        let found = trunk.lineage.retained_at(page, at, &mut examined);
-        trunk.work.resolve_retained_examined += examined;
-        if let Some(slot) = found {
-            out.copy_from_slice(trunk.domain.page(slot));
-            return Ok(Resolved::Filled);
+        if let Some(shared) = &self.k3 {
+            // F-K3: no trunk lock (see "Reads of rewritten trunk pages without the trunk's lock").
+            let guard = epoch::pin();
+            if let Some(v) = shared.covering(page, at, &guard) {
+                crate::turso_assert!(
+                    domain_of(v.slot) == TRUNK_DOMAIN,
+                    "a trunk version outside the trunk's arena"
+                );
+                let chunks = self
+                    .trunk_chunks
+                    .get()
+                    .expect("a retained version was allocated, so the trunk arena exists");
+                // SAFETY: the version stays retained, and its slot unwritten, while this branch
+                // lives; its bytes were written before the retain published it, which the load of
+                // `written` above ordered before this read.
+                unsafe { chunks.read(v.slot & ((1 << LOCAL_BITS) - 1), out) };
+                return Ok(Resolved::Filled);
+            }
+        } else {
+            let mut trunk = self.trunk();
+            trunk.work.resolve_trunk_locked += 1;
+            let mut examined = 0;
+            let found = trunk.lineage.retained_at(page, at, &mut examined);
+            trunk.work.resolve_retained_examined += examined;
+            if let Some(slot) = found {
+                out.copy_from_slice(trunk.domain.page(slot));
+                return Ok(Resolved::Filled);
+            }
         }
         // The trunk overwrote this page after the fork and nothing was retained: the ordinary
         // read path would return the NEW version. Refuse rather than serve it.
@@ -1269,13 +1424,15 @@ mod tests {
     /// exactly the versions whose `[born, died)` still contains a live child's fork epoch.
     #[test]
     fn retained_versions_match_a_model_under_forks_rewrites_and_reaps_in_every_order() {
-        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
-            run(seed);
+        for lockfree in [false, true] {
+            for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+                run(seed, lockfree);
+            }
         }
     }
 
-    fn run(seed: u64) {
-        let store = BranchStore::new();
+    fn run(seed: u64, lockfree: bool) {
+        let store = BranchStore::with_trunk_reads(lockfree);
         let mut rng = Rng(seed);
         // The trunk's current generation of each page, and each live child's view at its fork.
         let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
@@ -1331,11 +1488,11 @@ mod tests {
                     let before = store.stats();
                     let reaped = store.release_handle(id);
                     let after = store.stats();
-                    assert!(!reaped.deferred, "seed {seed:#x} step {step}");
+                    assert!(!reaped.deferred, "seed {seed:#x} k3 {lockfree} step {step}");
                     assert_eq!(
                         before.arena_slots_in_use - after.arena_slots_in_use,
                         reaped.freed_pages,
-                        "seed {seed:#x} step {step}: the reap's report disagrees with the arena"
+                        "seed {seed:#x} k3 {lockfree} step {step}: the reap's report disagrees with the arena"
                     );
                     let visited = after.work.gc_range_entries - before.work.gc_range_entries;
                     let contract = match (lo, hi) {
@@ -1345,7 +1502,7 @@ mod tests {
                     };
                     assert_eq!(
                         visited, contract,
-                        "seed {seed:#x} step {step}: reaping the child forked at {f} (lo {lo:?}, \
+                        "seed {seed:#x} k3 {lockfree} step {step}: reaping the child forked at {f} (lo {lo:?}, \
                          hi {hi:?}, |B| {b}, |D| {d}) visited {visited} index entries"
                     );
                     if reaped.freed_pages > 0 {
@@ -1366,7 +1523,7 @@ mod tests {
             assert_eq!(
                 store.stats().arena_slots_in_use,
                 alive.len(),
-                "seed {seed:#x} step {step}: the arena holds a version no live child can see, or \
+                "seed {seed:#x} k3 {lockfree} step {step}: the arena holds a version no live child can see, or \
                  lost one a live child can"
             );
             // A version no live child can see never becomes visible again.
@@ -1385,7 +1542,7 @@ mod tests {
                     };
                     assert_eq!(
                         got, view[&page],
-                        "seed {seed:#x} step {step}: child forked at {f} read the wrong page {page}"
+                        "seed {seed:#x} k3 {lockfree} step {step}: child forked at {f} read the wrong page {page}"
                     );
                 }
             }
@@ -1394,13 +1551,13 @@ mod tests {
         // otherwise a green run says nothing about the shape it skipped.
         assert!(
             freed_oldest > 0 && freed_newest > 0 && freed_middle > 0,
-            "seed {seed:#x}: reaps that freed versions: oldest {freed_oldest}, newest \
+            "seed {seed:#x} k3 {lockfree}: reaps that freed versions: oldest {freed_oldest}, newest \
              {freed_newest}, middle {freed_middle}"
         );
         for (id, _, _) in live {
             store.release_handle(id);
         }
-        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {lockfree}: versions leaked");
     }
 
     /// The lock accounting, forced to fire and shown not to fire spuriously. One thread alone makes
@@ -1470,8 +1627,10 @@ mod tests {
     /// `resolve_into`, the path the pager uses.
     #[test]
     fn every_branch_of_a_random_tree_reads_its_parent_as_of_its_fork() {
-        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
-            run_tree(seed);
+        for lockfree in [false, true] {
+            for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+                run_tree(seed, lockfree);
+            }
         }
     }
 
@@ -1484,8 +1643,8 @@ mod tests {
         forked: bool,
     }
 
-    fn run_tree(seed: u64) {
-        let store = BranchStore::new();
+    fn run_tree(seed: u64, lockfree: bool) {
+        let store = BranchStore::with_trunk_reads(lockfree);
         let mut rng = Rng(seed);
         let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
         let mut nodes: Vec<Node> = Vec::new();
@@ -1577,7 +1736,7 @@ mod tests {
                     assert_eq!(
                         got,
                         n.sees[&page],
-                        "seed {seed:#x} step {step}: branch {} at depth {} read the wrong page {page}",
+                        "seed {seed:#x} k3 {lockfree} step {step}: branch {} at depth {} read the wrong page {page}",
                         n.id.0,
                         n.depth
                     );
@@ -1587,14 +1746,14 @@ mod tests {
         // The shapes the page maps exist for must have occurred, or a green run says nothing.
         assert!(
             max_depth >= 10 && deferred > 0 && wrote_after_fork > 0,
-            "seed {seed:#x}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
+            "seed {seed:#x} k3 {lockfree}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
              after its first fork {wrote_after_fork}"
         );
         for n in nodes.iter().filter(|n| n.handle) {
             store.release_handle(n.id);
         }
-        assert_eq!(store.stats().live_branches, 0, "seed {seed:#x}: branches leaked");
-        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
+        assert_eq!(store.stats().live_branches, 0, "seed {seed:#x} k3 {lockfree}: branches leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {lockfree}: slots leaked");
     }
 
     /// The striped store under threads, against a model. Four workers each grow their own trees —
@@ -1611,11 +1770,17 @@ mod tests {
     /// lock, and reaps deferred by a live child.
     #[test]
     fn striped_store_under_threads_reads_every_fork_as_it_was() {
+        for lockfree in [false, true] {
+            striped_threads(lockfree);
+        }
+    }
+
+    fn striped_threads(lockfree: bool) {
         use std::sync::atomic::{AtomicBool as StdBool, AtomicU64 as StdU64};
         use std::sync::{Mutex as StdMutex, RwLock};
         const WORKERS: u64 = 4;
         const STEPS: usize = 600;
-        let store = Arc::new(BranchStore::new());
+        let store = Arc::new(BranchStore::with_trunk_reads(lockfree));
         let wal = Arc::new(StdMutex::new(()));
         let committed = Arc::new(RwLock::new(
             (0..PAGES).map(|p| (p, 0u64)).collect::<HashMap<u32, u64>>(),
@@ -1746,13 +1911,158 @@ mod tests {
         let writes = writer.join().unwrap();
         let stats = store.stats();
         assert!(
-            cross_shard > 0 && deferred > 0 && writes > 0 && stats.work.resolve_retained_examined > 0,
-            "cross-shard forks {cross_shard}, deferred reaps {deferred}, trunk writes {writes}, \
-             trunk-locked resolutions that examined a version {}",
-            stats.work.resolve_retained_examined
+            cross_shard > 0 && deferred > 0 && writes > 0 && stats.work.resolve_trunk_rewritten > 0,
+            "k3 {lockfree}: cross-shard forks {cross_shard}, deferred reaps {deferred}, trunk writes \
+             {writes}, resolutions of rewritten trunk pages {}",
+            stats.work.resolve_trunk_rewritten
         );
+        // F5 takes the trunk's lock for every such resolution, F-K3 for none.
+        let expect_locked = if lockfree { 0 } else { stats.work.resolve_trunk_rewritten };
+        assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {lockfree}: trunk-locked reads");
         assert_eq!(stats.live_branches, 0, "branches leaked");
         assert_eq!(stats.arena_slots_in_use, 0, "slots leaked");
+    }
+
+    /// F-K3 under threads (lane r11-k3-trunklock): readers resolve trunk pages the trunk rewrote
+    /// after their fork while a writer retains new versions of the same pages and a churner forks
+    /// and reaps trunk children between theirs, so `child_gone` removes versions next to the readers'
+    /// from the very lists they are searching; each reader also swaps its own children now and then.
+    /// The discipline is the pager's, as in `striped_store_under_threads_reads_every_fork_as_it_was`.
+    /// Every read must return the page as of the reader's fork; F-K3 must answer every rewritten
+    /// read without the trunk's lock and F5 every one under it; the churn must have freed versions
+    /// while the readers read (or the race was not run); and nothing may leak.
+    #[test]
+    fn rewritten_trunk_reads_race_retains_and_reaps() {
+        for lockfree in [false, true] {
+            race(lockfree);
+        }
+    }
+
+    type Committed = std::sync::RwLock<HashMap<u32, u64>>;
+
+    /// Fork a trunk child as the pager does: under the WAL write lock, seeing the committed pages.
+    fn fork_seeing(
+        store: &BranchStore,
+        wal: &std::sync::Mutex<()>,
+        committed: &Committed,
+    ) -> (BranchId, HashMap<u32, u64>) {
+        let _w = wal.lock().unwrap();
+        let sees = committed.read().unwrap().clone();
+        (store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap(), sees)
+    }
+
+    fn race(lockfree: bool) {
+        use std::sync::atomic::{AtomicBool as StdBool, AtomicU64 as StdU64, Ordering as O};
+        use std::sync::{Mutex as StdMutex, RwLock};
+        const READERS: u64 = 4;
+        const HELD: usize = 6;
+        const READS: usize = 6_000;
+        let store = Arc::new(BranchStore::with_trunk_reads(lockfree));
+        let wal = Arc::new(StdMutex::new(()));
+        let committed: Arc<Committed> =
+            Arc::new(RwLock::new((0..PAGES).map(|p| (p, 0u64)).collect()));
+        let generation = Arc::new(StdU64::new(1));
+        let done = Arc::new(StdBool::new(false));
+        let writer = {
+            let (store, wal, committed, generation, done) = (
+                store.clone(),
+                wal.clone(),
+                committed.clone(),
+                generation.clone(),
+                done.clone(),
+            );
+            std::thread::spawn(move || {
+                let mut rng = Rng(0x5851_F42D_4C95_7F2D);
+                let mut writes = 0u64;
+                while !done.load(O::Acquire) {
+                    let _w = wal.lock().unwrap();
+                    let page = rng.below(u64::from(PAGES)) as u32;
+                    if store.trunk_has_children() {
+                        let before = committed.read().unwrap()[&page];
+                        store.first_write_trunk(page, &image(before));
+                    }
+                    let g = generation.fetch_add(1, O::Relaxed);
+                    committed.write().unwrap().insert(page, g);
+                    writes += 1;
+                    drop(_w);
+                    std::thread::yield_now();
+                }
+                writes
+            })
+        };
+        let churner = {
+            let (store, wal, committed, done) =
+                (store.clone(), wal.clone(), committed.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+                let mut freed = 0u64;
+                while !done.load(O::Acquire) {
+                    let mut kids: Vec<BranchId> = (0..=rng.below(3))
+                        .map(|_| fork_seeing(&store, &wal, &committed).0)
+                        .collect();
+                    std::thread::yield_now();
+                    while !kids.is_empty() {
+                        let k = kids.swap_remove(rng.below(kids.len() as u64) as usize);
+                        freed += store.release_handle(k).freed_pages as u64;
+                    }
+                }
+                freed
+            })
+        };
+        let readers: Vec<_> = (0..READERS)
+            .map(|r| {
+                let (store, wal, committed) = (store.clone(), wal.clone(), committed.clone());
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (r + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
+                    let mut held: Vec<(BranchId, HashMap<u32, u64>)> =
+                        (0..HELD).map(|_| fork_seeing(&store, &wal, &committed)).collect();
+                    let mut buf = vec![0u8; PAGE];
+                    for i in 0..READS {
+                        if i % 500 == 499 {
+                            let (old, _) = held.swap_remove(rng.below(HELD as u64) as usize);
+                            store.release_handle(old);
+                            held.push(fork_seeing(&store, &wal, &committed));
+                        }
+                        let (id, sees) = &held[rng.below(HELD as u64) as usize];
+                        let page = rng.below(u64::from(PAGES)) as u32;
+                        let snapshot = committed.read().unwrap();
+                        let got = match store.resolve_into(*id, page, &mut buf).unwrap() {
+                            Resolved::Filled => u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                            Resolved::Trunk(key) => {
+                                store.fill_trunk_page(key, &image(snapshot[&page]));
+                                snapshot[&page]
+                            }
+                        };
+                        drop(snapshot);
+                        assert_eq!(
+                            got, sees[&page],
+                            "k3 {lockfree}: reader {r} read {i}: branch {} read the wrong page {page}",
+                            id.0
+                        );
+                    }
+                    for (id, _) in held {
+                        store.release_handle(id);
+                    }
+                })
+            })
+            .collect();
+        for r in readers {
+            r.join().unwrap();
+        }
+        done.store(true, O::Release);
+        let writes = writer.join().unwrap();
+        let churn_freed = churner.join().unwrap();
+        let stats = store.stats();
+        assert!(
+            writes > 0 && churn_freed > 0 && stats.work.resolve_trunk_rewritten > 1_000,
+            "k3 {lockfree}: trunk writes {writes}, versions freed by the churn {churn_freed}, \
+             resolutions of rewritten trunk pages {}",
+            stats.work.resolve_trunk_rewritten
+        );
+        let expect_locked = if lockfree { 0 } else { stats.work.resolve_trunk_rewritten };
+        assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {lockfree}: trunk-locked reads");
+        assert_eq!(stats.live_branches, 0, "k3 {lockfree}: branches leaked");
+        assert_eq!(stats.arena_slots_in_use, 0, "k3 {lockfree}: slots leaked");
     }
 
     /// The shared trunk-page cache against a model. Children fork and are reaped, often down to
@@ -1764,13 +2074,15 @@ mod tests {
     /// cache must have served reads: a cache that never hits has not been tested.
     #[test]
     fn the_trunk_page_cache_serves_each_branch_the_version_it_forked_from() {
-        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
-            run_cache(seed);
+        for lockfree in [false, true] {
+            for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+                run_cache(seed, lockfree);
+            }
         }
     }
 
-    fn run_cache(seed: u64) {
-        let store = BranchStore::new();
+    fn run_cache(seed: u64, lockfree: bool) {
+        let store = BranchStore::with_trunk_reads(lockfree);
         let mut rng = Rng(seed);
         let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
         let mut live: Vec<(BranchId, HashMap<u32, u64>)> = Vec::new();
@@ -1812,7 +2124,7 @@ mod tests {
                     };
                     assert_eq!(
                         got, view[&page],
-                        "seed {seed:#x} step {step}: branch {} read the wrong page {page}",
+                        "seed {seed:#x} k3 {lockfree} step {step}: branch {} read the wrong page {page}",
                         id.0
                     );
                 }
@@ -1821,13 +2133,13 @@ mod tests {
         let work = store.stats().work;
         assert!(
             work.trunk_page_hits > 0 && childless_writes > 0 && emptied > 0,
-            "seed {seed:#x}: cache hits {}, trunk writes with no child {childless_writes}, times the \
+            "seed {seed:#x} k3 {lockfree}: cache hits {}, trunk writes with no child {childless_writes}, times the \
              last child went {emptied}",
             work.trunk_page_hits
         );
         for (id, _) in live {
             store.release_handle(id);
         }
-        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {lockfree}: versions leaked");
     }
 }

@@ -1576,8 +1576,13 @@ fn arm_conc(b: &mut Bench, args: &Args) {
     };
     println!(
         "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={} \
-         trunk_writer={} reads={}",
-        args.threads, args.cycles, args.lock_timing, args.trunk_writer, args.reads
+         trunk_writer={} reads={} k3_lockfree={}",
+        args.threads,
+        args.cycles,
+        args.lock_timing,
+        args.trunk_writer,
+        args.reads,
+        b.db.branch_trunk_reads_lockfree()
     );
     println!("{CONC_HEADER}");
     let mut live: Vec<Live> = Vec::new();

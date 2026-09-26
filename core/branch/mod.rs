@@ -200,6 +200,7 @@ pub struct BranchWork {
     /// finds it is not counted; time is the only instrument for it. Since the striped store, the
     /// trunk's retained versions are consulted only for a page the trunk rewrote after the reader's
     /// fork, so a version the unlocked check proves irrelevant is no longer compared or counted.
+    /// F-K3's lock-free lookup is not counted here (it would need a shared write per read).
     pub resolve_retained_examined: u64,
     /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
     /// index this counted a position scan's comparisons.)
@@ -234,7 +235,8 @@ pub struct BranchWork {
     /// `trunk_at`, so that only a retained version can answer them (lane r11-k3-trunklock, K3).
     /// Counted under the reader's shard lock.
     pub resolve_trunk_rewritten: u64,
-    /// Of those, the ones answered under the trunk's lock. Counted under it.
+    /// Of those, the ones answered under the trunk's lock. Counted under it. Always 0 under F-K3,
+    /// which answers them without the lock (`Database::branch_trunk_reads_lockfree`).
     pub resolve_trunk_locked: u64,
 }
 
@@ -448,6 +450,13 @@ impl Database {
     #[doc(hidden)]
     pub fn set_branch_lock_timing(&self, on: bool) {
         self.branches.set_lock_timing(on);
+    }
+
+    /// Whether the branch store reads pages the trunk rewrote after a branch's fork without the
+    /// trunk's lock (F-K3, `TURSO_K3=lockfree` when the database opened). Observation only.
+    #[doc(hidden)]
+    pub fn branch_trunk_reads_lockfree(&self) -> bool {
+        self.branches.lockfree_trunk_reads()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.
