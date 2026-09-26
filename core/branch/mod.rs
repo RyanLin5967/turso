@@ -53,9 +53,11 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+pub(crate) mod id_set;
 pub(crate) mod journal;
 pub(crate) mod page_map;
 pub(crate) mod store;
+pub(crate) mod table;
 
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};

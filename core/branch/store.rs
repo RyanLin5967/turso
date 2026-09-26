@@ -142,6 +142,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::arena::{Arena, Slot};
+use super::id_set::{IdSet, IdSetWork};
+use super::table::BranchTable;
 use super::page_map::PageMap;
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::{
@@ -191,7 +193,11 @@ struct StoreInner {
     sync: bool,
     next_id: u64,
     trunk: TrunkState,
-    branches: HashMap<BranchId, BranchState>,
+    /// F8′ (r11-ever's F8, 5d580203f, ported): chunks that never move, so no fork moves the table.
+    branches: BranchTable<BranchState>,
+    /// F-cat-snap (r11-diff-list, 8c0945ebb, ported): every unreleased id, as a persistent set that
+    /// `ids()` clones in O(1) under the mutex and walks after releasing it.
+    live_ids: IdSet,
     failpoint: Option<BranchFailpoint>,
     orphans: Vec<Slot>,
     lease: LeaseClock,
@@ -630,6 +636,14 @@ impl Lineage {
         out.sort_unstable();
         out
     }
+}
+
+/// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
+/// trie, and is refused rather than truncated.
+fn id_key(id: BranchId) -> u32 {
+    u32::try_from(id.0).unwrap_or_else(|_| {
+        panic!("branch id {} is past the live-id set's u32 keys", id.0)
+    })
 }
 
 fn gone(id: BranchId) -> LimboError {
@@ -1204,6 +1218,8 @@ impl BranchStore {
             if let Some(st) = inner.branches.get_mut(&id) {
                 st.handle = Handle::ReleasePending;
             }
+            // Gone from the caller's point of view: not listed (F-cat-snap).
+            inner.live_ids.remove(id_key(id));
             return Err(LimboError::InternalError(format!(
                 "branch {} was not released durably ({e}); it is kept, and comes back at the next \
                  open",
@@ -1250,20 +1266,22 @@ impl BranchStore {
         }
     }
 
-    /// Every unreleased branch. Refused on a trunk-only store, where "none" would be a lie.
+    /// Every unreleased branch, ascending. Refused on a trunk-only store, where "none" would be a lie.
+    ///
+    /// F-cat-snap (r11-diff-list, ported): the live set is cloned under the mutex in O(1) and walked
+    /// after it is released, in id order, so a listing of every branch holds the lock for a
+    /// reference-count increment, not for a scan and a sort of the branch table.
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
-        let mut inner = self.inner.lock();
-        // githost-shape instrument (observing only).
-        inner.shape.ids_calls += 1;
-        inner.shape.ids_visited += inner.branches.len() as u64;
-        let mut ids: Vec<BranchId> = inner
-            .branches
-            .iter()
-            .filter(|(_, st)| !st.handle.is_released())
-            .map(|(&id, _)| id)
-            .collect();
-        ids.sort();
+        let snapshot = {
+            let mut inner = self.inner.lock();
+            // githost-shape instrument (observing only): entries visited UNDER the store mutex.
+            inner.shape.ids_calls += 1;
+            inner.live_ids.clone()
+        };
+        let mut ids = Vec::with_capacity(snapshot.len() as usize);
+        let mut work = IdSetWork::default();
+        snapshot.for_each(&mut work, &mut |key| ids.push(BranchId(u64::from(key))));
         Ok(ids)
     }
 
@@ -1815,7 +1833,8 @@ impl StoreInner {
                 lineage: Lineage::default(),
                 written: HashMap::new(),
             },
-            branches: HashMap::new(),
+            branches: BranchTable::new(),
+            live_ids: IdSet::default(),
             failpoint: None,
             orphans: Vec::new(),
             lease: LeaseClock::new(),
@@ -2028,7 +2047,8 @@ impl StoreInner {
         self.next_id = self.next_id.max(child.0 + 1);
         // githost-shape instrument (observing only): a capacity change at this insert moved every
         // entry the table held.
-        let (len_before, cap_before) = (self.branches.len(), self.branches.capacity());
+        let (grows_before, moved_before) = self.branches.growth();
+        self.live_ids.insert(id_key(child));
         self.branches.insert(
             child,
             BranchState {
@@ -2047,14 +2067,11 @@ impl StoreInner {
                 view: None,
             },
         );
-        // hashbrown's `capacity()` is items + growth_left: reusing a tombstone raises it by exactly
-        // one and moves nothing. A reallocation, or an in-place rehash, raises it by more, and
-        // either moves every entry (the smoke run at N = 2,000 counted 23 "resizes" before this
-        // rule; githost-shape raw/smoke_grow_1024_2000.txt).
-        if self.branches.capacity() > cap_before + 1 {
-            self.shape.resize_events += 1;
-            self.shape.resize_moved += len_before as u64;
-        }
+        // F8′: a growth moves no branch state, only (at a directory reallocation) chunk pointers,
+        // which is what these count now.
+        let (grows, moved) = self.branches.growth();
+        self.shape.resize_events += grows - grows_before;
+        self.shape.resize_moved += moved - moved_before;
         Ok(())
     }
 
@@ -2109,6 +2126,7 @@ impl StoreInner {
                 self.leases.remove(&(deadline, id));
             }
         }
+        self.live_ids.remove(id_key(id));
         self.collect(id, freed);
     }
 
@@ -2416,6 +2434,7 @@ impl StoreInner {
                     handle: if b.released {
                         Handle::Released
                     } else {
+                        self.live_ids.insert(id_key(BranchId(b.id)));
                         Handle::Detached
                     },
                     open: false,
