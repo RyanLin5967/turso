@@ -3149,13 +3149,7 @@ impl Pager {
             return Ok(());
         };
         let changed = wal.begin_read_tx()?;
-        // A branch pager keeps its cache (r11-sessions FS2). Only the trunk writes this WAL: a
-        // branch's commits go to its own page space, and a branch serves one connection. And a
-        // trunk commit cannot change a page the branch sees: the branch sees the trunk as of its
-        // fork, and a trunk write to a page after that retains the pre-image for it (the copy
-        // decision in `add_dirty`). So every page and the schema cookie a branch pager cached are
-        // still the branch's — the per-page validation always passes, and is skipped.
-        if changed && self.branch.get().is_none() {
+        if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
             // Invalidate cached schema cookie to force re-read on next access
