@@ -164,7 +164,7 @@ use crossbeam_utils::CachePadded;
 
 use super::arena::{Arena, Chunks, Slot};
 use super::page_map::PageMap;
-use super::olc::{OlcLists, OlcLookup, OlcVersion};
+use super::olc::{OlcCounts, OlcLists, OlcLookup, OlcVersion};
 use super::radix::Radix;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
@@ -610,18 +610,11 @@ impl SharedVersions {
         }
     }
 
-    /// F-K3v's reader accounting and pool bound, all 0 under F-K3: (restarts, head spins,
-    /// fallbacks to the locked lookup, peak nodes in use, pool bytes allowed for that peak).
-    fn olc_counts(&self) -> (u64, u64, u64, u64, u64) {
+    /// F-K3v's reader and pool accounting (see [`OlcCounts`]), all 0 under F-K3.
+    fn olc_counts(&self) -> OlcCounts {
         match self {
-            SharedVersions::Ebr(_) => (0, 0, 0, 0, 0),
-            SharedVersions::Olc(o) => (
-                o.restarts(),
-                o.head_spins(),
-                o.fallbacks(),
-                o.peak_in_use(),
-                o.pool_bound_bytes(),
-            ),
+            SharedVersions::Ebr(_) => OlcCounts::default(),
+            SharedVersions::Olc(o) => o.counts(),
         }
     }
 }
@@ -947,12 +940,26 @@ impl BranchStore {
 
     /// A store whose reads of rewritten trunk pages take the path `mode` names.
     pub(crate) fn with_k3(mode: K3Mode) -> Self {
-        let k3 = match mode {
+        let shared = match mode {
             K3Mode::Off => None,
             K3Mode::Ebr => Some(SharedVersions::Ebr(EbrVersions::new())),
             K3Mode::Olc => Some(SharedVersions::Olc(OlcLists::new())),
-        }
-        .map(std::sync::Arc::new);
+        };
+        Self::with_shared(mode, shared)
+    }
+
+    /// F-K3v with unlocked searches that give up after `max_failed` failed attempts; 0 sends every
+    /// read of a rewritten page to the locked fallback (PREREG amendment 3f, N4a).
+    #[cfg(test)]
+    fn with_olc_max_failed(max_failed: u32) -> Self {
+        Self::with_shared(
+            K3Mode::Olc,
+            Some(SharedVersions::Olc(OlcLists::with_max_failed(max_failed))),
+        )
+    }
+
+    fn with_shared(mode: K3Mode, shared: Option<SharedVersions>) -> Self {
+        let k3 = shared.map(std::sync::Arc::new);
         Self {
             shards: (0..SHARDS)
                 .map(|i| {
@@ -1450,13 +1457,14 @@ impl BranchStore {
             if let Some(k3) = &self.k3 {
                 stats.k3_nodes_live = k3.nodes_live();
                 stats.k3_node_bytes_live = k3.node_bytes();
-                (
-                    stats.k3_olc_restarts,
-                    stats.k3_olc_head_spins,
-                    stats.k3_olc_fallbacks,
-                    stats.k3_olc_peak_in_use,
-                    stats.k3_olc_pool_bound_bytes,
-                ) = k3.olc_counts();
+                let olc = k3.olc_counts();
+                stats.k3_olc_restarts = olc.restarts;
+                stats.k3_olc_head_spins = olc.head_spins;
+                stats.k3_olc_fallbacks = olc.fallbacks;
+                stats.k3_olc_peak_in_use = olc.peak_in_use;
+                stats.k3_olc_pool_bound_bytes = olc.pool_bound_bytes;
+                stats.k3_olc_pool_in_use = olc.pool_in_use;
+                stats.k3_olc_max_class_chunks = olc.max_class_chunks;
             }
             stats.work.trunk_lock_acquisitions = trunk.work.lock_acquisitions;
             stats.work.trunk_lock_contended = trunk.work.lock_contended;
@@ -2173,11 +2181,27 @@ mod tests {
             K3Mode::Olc => stats.k3_olc_fallbacks,
         };
         assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {mode:?}: trunk-locked reads");
+        // N6: the margin, printed for the run's record (`--nocapture`).
+        println!(
+            "striped k3 {mode:?}: rewritten reads {}, locked {}, olc restarts {}, head spins {}, \
+             fallbacks {}",
+            stats.work.resolve_trunk_rewritten,
+            stats.work.resolve_trunk_locked,
+            stats.k3_olc_restarts,
+            stats.k3_olc_head_spins,
+            stats.k3_olc_fallbacks
+        );
         // F-K3v's concurrent validation must have run: a run where no reader ever met a node that
-        // changed under it is void, not a pass.
+        // changed under it is VOID (a starved box can produce one), not a pass.
         assert!(
             mode != K3Mode::Olc || stats.k3_olc_restarts > 0,
-            "k3 {mode:?}: no reader restarted, so the optimistic race was not run"
+            "k3 {mode:?}: no reader restarted, so the optimistic race was not run (VOID)"
+        );
+        assert!(
+            mode != K3Mode::Olc || stats.k3_olc_pool_in_use == stats.k3_nodes_live,
+            "k3 {mode:?}: the pools lost track of removed nodes ({} handed out, {} in lists)",
+            stats.k3_olc_pool_in_use,
+            stats.k3_nodes_live
         );
         assert_eq!(stats.live_branches, 0, "branches leaked");
         assert_eq!(stats.arena_slots_in_use, 0, "slots leaked");
@@ -2194,8 +2218,16 @@ mod tests {
     #[test]
     fn rewritten_trunk_reads_race_retains_and_reaps() {
         for mode in K3Mode::ALL {
-            race(mode);
+            race(BranchStore::with_k3(mode), mode, false);
         }
+    }
+
+    /// F-K3v's fallback, run on every read (PREREG amendment 3f, N4a): with unlocked searches that
+    /// give up at once, every read of a rewritten page must be answered on F5's path under the
+    /// trunk's lock, correctly (the race's own checks), and be counted as a fallback.
+    #[test]
+    fn every_rewritten_read_can_fall_back_to_the_trunk_lock() {
+        race(BranchStore::with_olc_max_failed(0), K3Mode::Olc, true);
     }
 
     type Committed = std::sync::RwLock<HashMap<u32, u64>>;
@@ -2211,13 +2243,15 @@ mod tests {
         (store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap(), sees)
     }
 
-    fn race(mode: K3Mode) {
+    /// The race on `store`, which reads rewritten pages as `mode` says; with `always_fallback`, every
+    /// F-K3v search gives up at once and falls back (see `every_rewritten_read_can_fall_back_...`).
+    fn race(store: BranchStore, mode: K3Mode, always_fallback: bool) {
         use std::sync::atomic::{AtomicBool as StdBool, AtomicU64 as StdU64, Ordering as O};
         use std::sync::{Mutex as StdMutex, RwLock};
         const READERS: u64 = 4;
         const HELD: usize = 6;
         const READS: usize = 6_000;
-        let store = Arc::new(BranchStore::with_k3(mode));
+        let store = Arc::new(store);
         let wal = Arc::new(StdMutex::new(()));
         let committed: Arc<Committed> =
             Arc::new(RwLock::new((0..PAGES).map(|p| (p, 0u64)).collect()));
@@ -2335,11 +2369,35 @@ mod tests {
             K3Mode::Olc => stats.k3_olc_fallbacks,
         };
         assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {mode:?}: trunk-locked reads");
-        // F-K3v's concurrent validation must have run: a run where no reader ever met a node that
-        // changed under it is void, not a pass.
+        // N6: the margin, printed for the run's record (`--nocapture`).
+        println!(
+            "race k3 {mode:?} always_fallback={always_fallback}: rewritten reads {}, locked {}, olc \
+             restarts {}, head spins {}, fallbacks {}",
+            stats.work.resolve_trunk_rewritten,
+            stats.work.resolve_trunk_locked,
+            stats.k3_olc_restarts,
+            stats.k3_olc_head_spins,
+            stats.k3_olc_fallbacks
+        );
+        if always_fallback {
+            assert_eq!(
+                (stats.k3_olc_fallbacks, stats.work.resolve_trunk_locked),
+                (stats.work.resolve_trunk_rewritten, stats.work.resolve_trunk_rewritten),
+                "every rewritten read must have fallen back and been answered under the lock"
+            );
+        } else {
+            // F-K3v's concurrent validation must have run: a run where no reader ever met a node
+            // that changed under it is VOID (a starved box can produce one), not a pass.
+            assert!(
+                mode != K3Mode::Olc || stats.k3_olc_restarts > 0,
+                "k3 {mode:?}: no reader restarted, so the optimistic race was not run (VOID)"
+            );
+        }
         assert!(
-            mode != K3Mode::Olc || stats.k3_olc_restarts > 0,
-            "k3 {mode:?}: no reader restarted, so the optimistic race was not run"
+            mode != K3Mode::Olc || stats.k3_olc_pool_in_use == stats.k3_nodes_live,
+            "k3 {mode:?}: the pools lost track of removed nodes ({} handed out, {} in lists)",
+            stats.k3_olc_pool_in_use,
+            stats.k3_nodes_live
         );
         assert_eq!(stats.live_branches, 0, "k3 {mode:?}: branches leaked");
         assert_eq!(stats.arena_slots_in_use, 0, "k3 {mode:?}: slots leaked");
@@ -2382,8 +2440,9 @@ mod tests {
     }
 
     /// F-K3v reuses a removed node at once: 1,000 rounds of retain-and-reap (six versions each)
-    /// never hold more than six nodes, and the pools never exceed whole chunks for each height's
-    /// peak (a pool that deferred or leaked would outgrow that bound within the rounds). A REUSE
+    /// never hold more than six nodes, so every height's pool stays at one chunk and the pools' own
+    /// count matches the lists' (a pool that deferred or leaked would grow chunks within ~230 rounds,
+    /// and its count would drift). A REUSE
     /// test only: F-K3v's readers never touch the epoch, so the pinned guard here stalls nothing
     /// of theirs (PREREG amendment 3e, D3); the stalled-reader claim rests on reading plus
     /// `olc::tests::a_stalled_reader_holds_nothing`.
@@ -2399,7 +2458,10 @@ mod tests {
             assert_eq!(store.release_handle(id).freed_pages, PAGES as usize);
             let s = store.stats();
             assert_eq!((s.k3_nodes_live, s.trunk_slots_in_use), (0, 0), "round {round}");
-            assert_eq!(s.k3_olc_peak_in_use, u64::from(PAGES), "round {round}: a node was not reused");
+            // At most six nodes are ever live, so a pool that reuses keeps one chunk per height; one
+            // that did not get its nodes back would pass 1,024 nodes of height 1 by round ~230.
+            assert!(s.k3_olc_max_class_chunks <= 1, "round {round}: a node was not reused");
+            assert_eq!(s.k3_olc_pool_in_use, s.k3_nodes_live, "round {round}: the pools lost track of a node");
             assert!(
                 s.k3_node_bytes_live > 0 && s.k3_node_bytes_live <= s.k3_olc_pool_bound_bytes,
                 "round {round}: pools {} B above the {} B their peak allows",

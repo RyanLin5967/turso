@@ -202,6 +202,12 @@ pub struct BranchStats {
     /// while it had free nodes.
     pub k3_olc_peak_in_use: u64,
     pub k3_olc_pool_bound_bytes: u64,
+    /// F-K3v: the pools' own count of nodes handed out and not given back. It equals
+    /// `k3_nodes_live` unless the pools lost track of a removed node (never freed, or held back),
+    /// which the pool bound above cannot see (PREREG amendment 3f, N2).
+    pub k3_olc_pool_in_use: u64,
+    /// F-K3v: the most chunks (of 1,024 nodes) any one height's pool holds.
+    pub k3_olc_max_class_chunks: u64,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }

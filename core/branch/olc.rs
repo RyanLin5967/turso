@@ -50,6 +50,10 @@ const CHUNK: usize = 1024;
 /// Failed attempts (restarts and laps that found the head being written) after which a reader
 /// stops and the store answers under the trunk's lock.
 pub(crate) const MAX_FAILED_LAPS: u32 = 64;
+/// The bound for a search under the trunk's lock, where no writer can run and the first attempt
+/// succeeds unless an invariant is broken (a node left odd): past it the store panics rather than
+/// spin for ever while holding the lock.
+const LOCKED_MAX_FAILED: u32 = 1 << 20;
 /// Bytes of a node's fixed part; its links follow it.
 const HEADER: usize = std::mem::size_of::<Node>();
 
@@ -271,6 +275,26 @@ pub(crate) struct OlcVersion {
     pub(crate) slot: u32,
 }
 
+/// A consistent snapshot of the lists' accounting, taken under the writer mutex.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OlcCounts {
+    /// Readers' failed attempts and give-ups (see [`OlcLists`]).
+    pub(crate) restarts: u64,
+    pub(crate) head_spins: u64,
+    pub(crate) fallbacks: u64,
+    /// Nodes in lists (the list-side count) and the most at once.
+    pub(crate) in_use: u64,
+    pub(crate) peak_in_use: u64,
+    /// The pools' own count of nodes handed out and not given back: equal to `in_use` unless the
+    /// pools lost track of a removed node (never freed, or held back).
+    pub(crate) pool_in_use: u64,
+    /// Bytes of every node the pools hold, and the bytes whole chunks for each height's peak allow.
+    pub(crate) pool_bytes: u64,
+    pub(crate) pool_bound_bytes: u64,
+    /// The most chunks any one height's pool holds.
+    pub(crate) max_class_chunks: u64,
+}
+
 /// F-K3v's per-page version lists (see the module doc).
 pub(crate) struct OlcLists {
     lists: Radix<std::sync::OnceLock<List>>,
@@ -287,6 +311,9 @@ pub(crate) struct OlcLists {
     restarts: CachePadded<AtomicU64>,
     head_spins: CachePadded<AtomicU64>,
     fallbacks: CachePadded<AtomicU64>,
+    /// Failed attempts after which an unlocked search gives up: [`MAX_FAILED_LAPS`], or a test's
+    /// choice (0 makes every search that has a list fall back to the trunk's lock).
+    max_failed: u32,
 }
 
 // SAFETY: the node pointers inside are only dereferenced through `&self` methods whose writes happen
@@ -297,7 +324,13 @@ unsafe impl Sync for List {}
 
 impl OlcLists {
     pub(crate) fn new() -> Self {
+        Self::with_max_failed(MAX_FAILED_LAPS)
+    }
+
+    /// Lists whose unlocked searches give up after `max_failed` failed attempts.
+    pub(crate) fn with_max_failed(max_failed: u32) -> Self {
         Self {
+            max_failed,
             lists: Radix::new(),
             writer: Mutex::new(Writer {
                 classes: std::array::from_fn(|_| Class::default()),
@@ -320,6 +353,43 @@ impl OlcLists {
         self.peak.load(Ordering::Relaxed)
     }
 
+    /// Every count at once, the pool side read under the writer mutex. The caller holds the trunk's
+    /// lock for the list side to be exact with it.
+    pub(crate) fn counts(&self) -> OlcCounts {
+        let w = self.writer.lock();
+        OlcCounts {
+            restarts: self.restarts(),
+            head_spins: self.head_spins(),
+            fallbacks: self.fallbacks(),
+            in_use: self.nodes_in_use(),
+            peak_in_use: self.peak_in_use(),
+            pool_in_use: w.classes.iter().map(|c| c.in_use).sum(),
+            pool_bytes: Self::bytes(&w, |c| c.chunks.len() as u64),
+            pool_bound_bytes: Self::bytes(&w, |c| c.peak.div_ceil(CHUNK as u64)),
+            max_class_chunks: w.classes.iter().map(|c| c.chunks.len() as u64).max().unwrap_or(0),
+        }
+    }
+
+    /// Bytes of `chunks(class)` chunks in every height's pool.
+    fn bytes(w: &Writer, chunks: impl Fn(&Class) -> u64) -> u64 {
+        (1..=MAX_H)
+            .map(|h| chunks(&w.classes[h - 1]) * (CHUNK * node_size(h)) as u64)
+            .sum()
+    }
+
+    /// The pools' count of nodes handed out and not given back (see [`OlcCounts::pool_in_use`]).
+    #[cfg(test)]
+    fn pool_in_use(&self) -> u64 {
+        self.writer.lock().classes.iter().map(|c| c.in_use).sum()
+    }
+
+    /// Chunks per height's pool, index `h - 1`.
+    #[cfg(test)]
+    fn class_chunks(&self) -> [usize; MAX_H] {
+        let w = self.writer.lock();
+        std::array::from_fn(|i| w.classes[i].chunks.len())
+    }
+
     /// Bytes of every node the pools hold, in use or free.
     pub(crate) fn pool_bytes(&self) -> u64 {
         let w = self.writer.lock();
@@ -330,7 +400,8 @@ impl OlcLists {
 
     /// The most the pools may hold if every removed node is reused: for each height, whole chunks
     /// enough for that height's peak. A pool above this grew while it had free nodes of its height.
-    pub(crate) fn pool_bound_bytes(&self) -> u64 {
+    #[cfg(test)]
+    fn pool_bound_bytes(&self) -> u64 {
         let w = self.writer.lock();
         (1..=MAX_H)
             .map(|h| (w.classes[h - 1].peak.div_ceil(CHUNK as u64) * (CHUNK * node_size(h)) as u64))
@@ -372,12 +443,20 @@ impl OlcLists {
 
     /// Link version `v` into `page`'s list. The caller holds the trunk's lock.
     pub(crate) fn insert(&self, page: u32, v: OlcVersion) {
+        self.insert_at_height(page, v, None);
+    }
+
+    /// `insert` with the tower height drawn (`None`) or chosen (a test's way to make the next insert
+    /// reuse a given node: a freed node goes back to its own height's pool, and that pool hands out
+    /// last in, first out).
+    fn insert_at_height(&self, page: u32, v: OlcVersion, height: Option<usize>) {
         let list = self
             .lists
             .get_or_insert(page)
             .get_or_init(List::default);
         let mut w = self.writer.lock();
-        let h = w.height();
+        let h = height.unwrap_or_else(|| w.height());
+        debug_assert!((1..=MAX_H).contains(&h));
         let n = w.alloc(h);
         drop(w);
         let preds = Self::preds(list, v.born);
@@ -460,16 +539,22 @@ impl OlcLists {
     /// still current at `f` — without a lock and without writing anything shared (except a failed
     /// attempt's count), or [`OlcLookup::GaveUp`] after [`MAX_FAILED_LAPS`] failed attempts.
     pub(crate) fn covering(&self, page: u32, f: u64) -> OlcLookup {
-        self.covering_with(page, f, Some(MAX_FAILED_LAPS), |_| {}, |_| {})
+        self.covering_with(page, f, Some(self.max_failed), |_| {}, |_| {})
     }
 
-    /// `covering` for a caller that holds the trunk's lock: no writer can run, so the first
-    /// attempt succeeds and there is no bound to give up at.
+    /// `covering` for a caller that holds the trunk's lock: no writer can run, so the first attempt
+    /// succeeds. Bounded all the same: a node left odd under the lock (an invariant broken) panics
+    /// here instead of spinning for ever with the trunk's lock held.
     pub(crate) fn covering_locked(&self, page: u32, f: u64) -> Option<OlcVersion> {
-        match self.covering_with(page, f, None, |_| {}, |_| {}) {
+        let found = self.covering_with(page, f, Some(LOCKED_MAX_FAILED), |_| {}, |_| {});
+        crate::turso_assert!(
+            found != OlcLookup::GaveUp,
+            "a search under the trunk's lock failed 2^20 attempts: a list node was left mid-change"
+        );
+        match found {
             OlcLookup::Found(v) => Some(v),
             OlcLookup::Absent => None,
-            OlcLookup::GaveUp => unreachable!("an unbounded search does not give up"),
+            OlcLookup::GaveUp => unreachable!("asserted above"),
         }
     }
 
@@ -619,6 +704,8 @@ mod tests {
         }
         let live: u64 = model.iter().map(|m| m.len() as u64).sum();
         assert_eq!(lists.nodes_in_use(), live);
+        assert_eq!(lists.pool_in_use(), live, "the pools lost track of removed nodes");
+        assert_eq!(lists.counts().pool_in_use, lists.counts().in_use);
         assert!(lists.peak_in_use() >= live);
         assert!(lists.pool_bytes() <= lists.pool_bound_bytes(), "a pool grew while it had free nodes");
         assert_eq!(
@@ -628,78 +715,74 @@ mod tests {
         );
     }
 
-    /// The first hook, before the source node's re-check: while the reader holds a pointer to the
-    /// version it wants (born 50), that version is removed and its node reused in page 1 (born 52,
-    /// below f). The removal changes the reader's source node, so the reader restarts at its first
-    /// check and answers from the list as it now is.
-    #[test]
-    fn a_reader_restarts_when_its_next_node_is_freed_and_reused_under_it() {
+    /// Page 0 holds born 10, 20, ..., 80 (died born + 10), every node of height 1, so all eight share
+    /// one pool and the reader walks level 0. Inside `hook`'s moment (when the reader holds a pointer
+    /// to born 50) born 50 is removed and its node reused at once for page 1 as (52, 1000) — height 1
+    /// too, so its pool hands node 50 straight back — and the hook asserts that reuse by pointer.
+    fn reuse_fifty(lists: &OlcLists, next: *const Node, fired: &mut bool) {
+        if *fired || born_of(next) != Some(50) {
+            return;
+        }
+        *fired = true;
+        assert!(lists.remove(0, 50).is_some());
+        lists.insert_at_height(1, v(52, 1_000), Some(1));
+        let first = lists.list(1).expect("page 1 has a list").head.link(0).load(Ordering::Relaxed);
+        assert!(ptr::eq(first, next), "page 1's new node is not the node the reader holds");
+    }
+
+    fn fifty_list() -> OlcLists {
         let lists = OlcLists::new();
         for born in 1..=8 {
-            lists.insert(0, v(born * 10, born * 10 + 10));
+            lists.insert_at_height(0, v(born * 10, born * 10 + 10), Some(1));
         }
+        lists
+    }
+
+    /// The first hook, before the source node's re-check: born 50 is removed and its node reused
+    /// in page 1 below f (see `reuse_fifty`). The removal changes the reader's source node (born 40),
+    /// so the reader restarts at its first check and answers from the list as it now is.
+    #[test]
+    fn a_reader_restarts_when_its_next_node_is_freed_and_reused_under_it() {
+        let lists = fifty_list();
         let mut fired = false;
-        let got = lists.covering_with(
-            0,
-            55,
-            None,
-            |next| {
-                if !fired && born_of(next) == Some(50) {
-                    fired = true;
-                    assert!(lists.remove(0, 50).is_some());
-                    lists.insert(1, v(52, 1_000));
-                }
-            },
-            |_| {},
-        );
+        let got = lists.covering_with(0, 55, None, |next| reuse_fifty(&lists, next, &mut fired), |_| {});
         assert!(fired);
         assert!(lists.restarts() >= 1, "the reader did not notice its path change");
         assert_eq!(found(got), None, "born 50 is gone and born 40 died at 50 <= 55");
         assert_eq!(found(lists.covering(0, 45)), Some(v(40, 50)));
         assert_eq!(found(lists.covering(1, 53)), Some(v(52, 1_000)));
+        assert_eq!(lists.pool_in_use(), lists.nodes_in_use());
     }
 
     /// The twin at the second hook, after the source node's first re-check and before the pointed-to
-    /// node is read: the same removal and reuse there leave only the re-check of the source node
-    /// AFTER the pointed-to node's `born` is read to notice. A reader without that re-check steps
-    /// onto the reused node, now in page 1, and answers (52, 1000) — mutant M4 must fail here.
+    /// node is read: the same removal and reuse there leave the reused node even and unchanged while
+    /// the reader reads it, so only the re-check of the source node AFTER the pointed-to node's `born`
+    /// is read can notice. A reader without that re-check (mutant M4) steps onto the reused node, now
+    /// in page 1, and answers (52, 1000).
     #[test]
     fn a_reader_rechecks_its_source_after_reading_a_node_reused_under_it() {
-        let lists = OlcLists::new();
-        for born in 1..=8 {
-            lists.insert(0, v(born * 10, born * 10 + 10));
-        }
+        let lists = fifty_list();
         let mut fired = false;
-        let got = lists.covering_with(
-            0,
-            55,
-            None,
-            |_| {},
-            |next| {
-                if !fired && born_of(next) == Some(50) {
-                    fired = true;
-                    assert!(lists.remove(0, 50).is_some());
-                    lists.insert(1, v(52, 1_000));
-                }
-            },
-        );
+        let got = lists.covering_with(0, 55, None, |_| {}, |next| reuse_fifty(&lists, next, &mut fired));
         assert!(fired);
         assert!(lists.restarts() >= 1, "the reader did not notice its path change");
         assert_eq!(found(got), None, "a reader that stepped onto the reused node answers (52, 1000)");
         assert_eq!(found(lists.covering(1, 53)), Some(v(52, 1_000)));
+        assert_eq!(lists.pool_in_use(), lists.nodes_in_use());
     }
 
     /// A reader stalled inside a search holds nothing: while it is parked between reading a pointer
-    /// and validating it, 3,000 versions are retained and removed in another page, and the pools stay
-    /// as they were (a scheme that deferred those frees past the stalled reader would need 3,000
-    /// nodes more); the reader then answers from its own page as it is.
+    /// and validating it, 3,000 versions are retained and removed in another page. At most nine
+    /// nodes are ever live, so a pool that reuses needs one chunk per height; one that deferred the
+    /// 3,000 frees past the stalled reader would need about three chunks of height 1. And the pools'
+    /// own count of nodes handed out matches the lists' count. The reader then answers from its own
+    /// page as it is.
     #[test]
     fn a_stalled_reader_holds_nothing() {
         let lists = OlcLists::new();
         for born in 1..=8 {
             lists.insert(0, v(born * 10, born * 10 + 10));
         }
-        let pool = lists.pool_bytes();
         let mut fired = false;
         let got = lists.covering_with(
             0,
@@ -717,10 +800,9 @@ mod tests {
             |_| {},
         );
         assert!(fired);
-        assert!(
-            lists.pool_bytes() <= pool + (CHUNK * node_size(MAX_H) * MAX_H) as u64,
-            "the pools grew by more than one chunk per height while a reader was stalled"
-        );
+        let chunks = lists.class_chunks();
+        assert!(chunks.iter().all(|&c| c <= 1), "a pool grew past one chunk while a reader was stalled: {chunks:?}");
+        assert_eq!(lists.pool_in_use(), lists.nodes_in_use(), "the pools lost track of removed nodes");
         assert!(lists.pool_bytes() <= lists.pool_bound_bytes());
         assert_eq!(found(got), Some(v(50, 60)));
         assert_eq!(lists.nodes_in_use(), 8);
