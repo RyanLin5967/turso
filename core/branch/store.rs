@@ -2259,6 +2259,8 @@ mod tests {
         // Workload strengthened (PREREG amendment 3h, the lead's race-test decision): long enough that
         // the churn below completes many rounds while the readers still read.
         const READS: usize = 40_000;
+        // Churn rounds the readers keep reading for, past READS if need be (up to 4 x READS).
+        const MIN_CHURN_ROUNDS: u64 = 50;
         let store = Arc::new(store);
         let wal = Arc::new(StdMutex::new(()));
         let committed: Arc<Committed> =
@@ -2268,9 +2270,11 @@ mod tests {
         // Readers still reading: the churn's frees count only while this is above 0, so the race
         // is shown to have run, not merely to have started before or after the reads.
         let active = Arc::new(StdU64::new(READERS));
-        // Trunk writes so far, published by the writer so the churner can keep its children alive
-        // across rewrites (amendment 3h).
+        // Trunk write ROUNDS so far (each round rewrites every page), published by the writer so the
+        // churner can fork right after one and keep its children alive across two more; and churn
+        // rounds done, so the readers keep reading until enough of them ran (amendment 3h).
         let wcount = Arc::new(StdU64::new(0));
+        let crounds = Arc::new(StdU64::new(0));
         let writer = {
             let (store, wal, committed, done, wcount) = (
                 store.clone(),
@@ -2280,19 +2284,24 @@ mod tests {
                 wcount.clone(),
             );
             std::thread::spawn(move || {
-                let mut rng = Rng(0x5851_F42D_4C95_7F2D);
                 let mut writes = 0u64;
+                let mut rounds = 0u64;
                 while !done.load(O::Acquire) {
+                    // One trunk transaction rewriting every page (amendment 3h): each page's newest
+                    // version is then born at the round, so a child forked after it and reaped after
+                    // the next rounds is alone in the versions those rounds retain.
                     let _w = wal.lock().unwrap();
-                    let page = rng.below(u64::from(PAGES)) as u32;
-                    if store.trunk_has_children() {
-                        let before = committed.read().unwrap()[&page];
-                        store.first_write_trunk(page, &image(before));
+                    for page in 0..PAGES {
+                        if store.trunk_has_children() {
+                            let before = committed.read().unwrap()[&page];
+                            store.first_write_trunk(page, &image(before));
+                        }
+                        let g = generation.fetch_add(1, O::Relaxed);
+                        committed.write().unwrap().insert(page, g);
+                        writes += 1;
                     }
-                    let g = generation.fetch_add(1, O::Relaxed);
-                    committed.write().unwrap().insert(page, g);
-                    writes += 1;
-                    wcount.store(writes, O::Release);
+                    rounds += 1;
+                    wcount.store(rounds, O::Release);
                     drop(_w);
                     std::thread::yield_now();
                 }
@@ -2300,24 +2309,30 @@ mod tests {
             })
         };
         let churner = {
-            let (store, wal, committed, done, active, wcount) = (
+            let (store, wal, committed, done, active, wcount, crounds) = (
                 store.clone(),
                 wal.clone(),
                 committed.clone(),
                 done.clone(),
                 active.clone(),
                 wcount,
+                crounds.clone(),
             );
             std::thread::spawn(move || {
                 let mut rng = Rng(0x2545_F491_4F6C_DD1D);
                 let mut freed = 0u64;
                 while !done.load(O::Acquire) {
+                    // Fork right after a fresh write round, and keep the children alive across two
+                    // more (amendment 3h): the versions retained for them alone are then there for
+                    // their reaps to free.
+                    let after = wcount.load(O::Acquire);
+                    while wcount.load(O::Acquire) == after && !done.load(O::Acquire) {
+                        std::thread::yield_now();
+                    }
                     let mut kids: Vec<BranchId> = (0..=rng.below(3))
                         .map(|_| fork_seeing(&store, &wal, &committed).0)
                         .collect();
-                    // The children outlive two trunk writes per page (amendment 3h): the versions
-                    // retained for them alone are then there for their reaps to free.
-                    let target = wcount.load(O::Acquire) + 2 * u64::from(PAGES);
+                    let target = wcount.load(O::Acquire) + 2;
                     while wcount.load(O::Acquire) < target && !done.load(O::Acquire) {
                         std::thread::yield_now();
                     }
@@ -2328,20 +2343,29 @@ mod tests {
                             freed += f;
                         }
                     }
+                    crounds.fetch_add(1, O::Release);
                 }
                 freed
             })
         };
         let readers: Vec<_> = (0..READERS)
             .map(|r| {
-                let (store, wal, committed, active) =
-                    (store.clone(), wal.clone(), committed.clone(), active.clone());
+                let (store, wal, committed, active, crounds) = (
+                    store.clone(),
+                    wal.clone(),
+                    committed.clone(),
+                    active.clone(),
+                    crounds.clone(),
+                );
                 std::thread::spawn(move || {
                     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (r + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
                     let mut held: Vec<(BranchId, HashMap<u32, u64>)> =
                         (0..HELD).map(|_| fork_seeing(&store, &wal, &committed)).collect();
                     let mut buf = vec![0u8; PAGE];
-                    for i in 0..READS {
+                    // At least READS reads, and on while the churn has not yet run MIN_CHURN_ROUNDS
+                    // rounds during them, up to 4 x READS (amendment 3h).
+                    let mut i = 0;
+                    while i < READS || (crounds.load(O::Acquire) < MIN_CHURN_ROUNDS && i < 4 * READS) {
                         if i % 500 == 499 {
                             let (old, _) = held.swap_remove(rng.below(HELD as u64) as usize);
                             store.release_handle(old);
@@ -2363,6 +2387,7 @@ mod tests {
                             "k3 {mode:?}: reader {r} read {i}: branch {} read the wrong page {page}",
                             id.0
                         );
+                        i += 1;
                     }
                     active.fetch_sub(1, O::Release);
                     for (id, _) in held {
