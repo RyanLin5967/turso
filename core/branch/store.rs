@@ -1858,7 +1858,8 @@ impl BranchStore {
     }
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        self.mature(&mut inner);
         let Some(st) = inner.branches.get(&id) else {
             return Vec::new();
         };
@@ -1870,19 +1871,19 @@ impl BranchStore {
     }
 
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
-        self.inner
-            .lock()
+        // Deferred frees a flush has covered are free (amendment 4): return them first.
+        let mut inner = self.inner.lock();
+        self.mature(&mut inner);
+        inner
             .arena
             .as_ref()
             .map_or_else(Vec::new, |a| a.slots_in_use())
     }
 
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
-        self.inner
-            .lock()
-            .arena
-            .as_ref()
-            .is_some_and(|a| a.is_free(slot))
+        let mut inner = self.inner.lock();
+        self.mature(&mut inner);
+        inner.arena.as_ref().is_some_and(|a| a.is_free(slot))
     }
 
     pub(crate) fn set_failpoint(&self, failpoint: Option<BranchFailpoint>) {
