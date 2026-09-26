@@ -604,10 +604,15 @@ fn ckpt2(args: &Args) {
         size_of(&files.snap),
     );
     let w0 = db.branch_catalog_rows_written();
+    let io0 = turso_core::branch::page_io();
+    let res0 = resident_pages(&files.cat);
     let t = Instant::now();
     db.branch_compact_now().unwrap();
     let t_ck = t.elapsed();
+    let io1 = turso_core::branch::page_io();
+    let res1 = resident_pages(&files.cat);
     let rows_written = db.branch_catalog_rows_written() - w0;
+    let io = [io1[0] - io0[0], io1[1] - io0[1], io1[2] - io0[2], io1[3] - io0[3]];
     let (log1, cat1, catw1, snap1) = (
         size_of(&files.log),
         size_of(&files.cat),
@@ -630,16 +635,62 @@ fn ckpt2(args: &Args) {
     }
     println!(
         "CKPT2\tn={}\twrites={}\tdistinct={}\tcommits_total_us={:.1}\tlog_before_ckpt={log0}\tckpt_us={:.1}\tcat_rows_written={rows_written}\t\
+         ckpt_db_page_reads={}\tckpt_db_page_writes={}\tckpt_wal_frame_reads={}\tckpt_wal_frame_writes={}\t\
+         cat_resident_before={}\tcat_resident_after={}\tcat_pages={}\t\
          snap_before={snap0}\tsnap_after={snap1}\tcat_before={cat0}\tcat_after={cat1}\tcat_wal_before={catw0}\t\
          cat_wal_after={catw1}\tlog_after={log1}\tsettled: {settled}",
         args.n,
         args.writes,
         distinct.len(),
         t_commits.as_secs_f64() * 1e6,
-        t_ck.as_secs_f64() * 1e6
+        t_ck.as_secs_f64() * 1e6,
+        io[0],
+        io[1],
+        io[2],
+        io[3],
+        res0.0,
+        res1.0,
+        res1.1
     );
     drop(trunk);
     drop(db);
+}
+
+/// `(resident pages, pages)` of a file in the OS page cache, by mmap + mincore; `(0, 0)` if absent.
+/// Maps read-only and touches nothing (the r11-restart resident.py instrument, in-process).
+fn resident_pages(path: &Path) -> (u64, u64) {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::File::open(path) else {
+        return (0, 0);
+    };
+    let len = file.metadata().map_or(0, |m| m.len()) as usize;
+    if len == 0 {
+        return (0, 0);
+    }
+    let page = 16384usize; // the VM page on this arm64 host; the result is in these pages
+    let pages = len.div_ceil(page);
+    let mut vec = vec![0u8; pages];
+    // SAFETY: a read-only shared mapping of `len` bytes of an open file, unmapped before return;
+    // mincore writes one byte per page into `vec`, which holds `pages` bytes.
+    unsafe {
+        let addr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        if addr == libc::MAP_FAILED {
+            return (0, pages as u64);
+        }
+        let rc = libc::mincore(addr, len, vec.as_mut_ptr() as *mut _);
+        libc::munmap(addr, len);
+        if rc != 0 {
+            return (0, pages as u64);
+        }
+    }
+    (vec.iter().filter(|&&b| b & 1 != 0).count() as u64, pages as u64)
 }
 
 /// (b2) victim: open, checkpoint once (so the log holds only what follows), then `--writes` branch

@@ -3558,6 +3558,7 @@ impl Wal for WalFile {
         page: PageRef,
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Completion> {
+        crate::branch::count_page_io(2, 1);
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
             page.get().id,
@@ -3939,6 +3940,7 @@ impl Wal for WalFile {
             &page_transform,
         )?;
         let c = Completion::new_write(|_| {});
+        crate::branch::count_page_io(3, 1);
         let c = file.pwrite(offset, frame_bytes, c)?;
         self.io.wait_for_completion(c)?;
         self.complete_append_frame(page_id, frame_id, checksums);
@@ -4344,6 +4346,7 @@ impl Wal for WalFile {
         db_size_on_commit: Option<u32>,
         prev: Option<&PreparedFrames>,
     ) -> Result<PreparedFrames> {
+        crate::branch::count_page_io(3, pages.len() as u64);
         turso_assert!(
             !pages.is_empty(),
             "prepare_frames requires at least one page"
@@ -4500,6 +4503,7 @@ impl Wal for WalFile {
     /// the commit path should use prepare_frames + commit_prepared_frames instead,
     /// as it prevents prematurely modifing WAL state before durability is ensured.
     fn append_frames_vectored(&self, pages: Vec<PageRef>, page_sz: PageSize) -> Result<Completion> {
+        crate::branch::count_page_io(3, pages.len() as u64);
         turso_assert!(
             pages.len() <= IOV_MAX,
             "we limit number of iovecs to IOV_MAX"

@@ -53,6 +53,33 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+
+/// Process-wide page I/O counters (r11-restart lane instrument, observing only): pages read from
+/// and written to database files (`DatabaseFile::read_page` / `write_page(s)`) and WAL frames read
+/// and appended, across every database in the process. `[db reads, db writes, wal reads, wal writes]`.
+#[doc(hidden)]
+pub static PAGE_IO: [crate::sync::atomic::AtomicU64; 4] = [
+    crate::sync::atomic::AtomicU64::new(0),
+    crate::sync::atomic::AtomicU64::new(0),
+    crate::sync::atomic::AtomicU64::new(0),
+    crate::sync::atomic::AtomicU64::new(0),
+];
+
+/// A snapshot of [`PAGE_IO`].
+#[doc(hidden)]
+pub fn page_io() -> [u64; 4] {
+    use crate::sync::atomic::Ordering::Relaxed;
+    [
+        PAGE_IO[0].load(Relaxed),
+        PAGE_IO[1].load(Relaxed),
+        PAGE_IO[2].load(Relaxed),
+        PAGE_IO[3].load(Relaxed),
+    ]
+}
+
+pub(crate) fn count_page_io(which: usize, n: u64) {
+    PAGE_IO[which].fetch_add(n, crate::sync::atomic::Ordering::Relaxed);
+}
 pub(crate) mod catalog;
 pub(crate) mod journal;
 pub(crate) mod store;
