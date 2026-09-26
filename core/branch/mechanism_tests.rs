@@ -1085,9 +1085,16 @@ fn a_branch_connection_reserves_no_checkpoint_read_slots() {
     let reserved = |c: &Arc<Connection>| c.pager.load().wal.as_ref().unwrap().inflight_reads_capacity();
     assert_eq!(reserved(&bc), 0, "a branch connection reserved checkpoint read slots");
     set(&trunk, 8, "after");
-    let r = rows(&trunk, "PRAGMA wal_checkpoint(TRUNCATE)");
+    // The positive control checkpoints from a FRESH trunk connection: the writer's own connection
+    // backfills from its page cache and issues no WAL reads, so its slots stay at 0 (v2_tests,
+    // 2eef5909). A connection without those pages in its cache must read the frames.
+    let checkpointer = db.connect().unwrap();
+    let r = rows(&checkpointer, "PRAGMA wal_checkpoint(TRUNCATE)");
     assert_eq!(r[0][0].as_int(), Some(0));
-    assert!(reserved(&trunk) > 0, "the checkpointing trunk connection issued no reads (test is blind)");
+    assert!(
+        reserved(&checkpointer) > 0,
+        "the checkpointing trunk connection issued no reads (test is blind)"
+    );
 }
 
 /// FS9. Branches forked before a trunk rewrite share ONE clone of the pre-image the trunk retained

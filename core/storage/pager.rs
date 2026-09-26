@@ -1853,6 +1853,11 @@ impl Pager {
         self.page_cache.read().len()
     }
 
+    /// This pager's private page-cache capacity, in pages. Observation only.
+    pub(crate) fn page_cache_capacity(&self) -> usize {
+        self.page_cache.read().capacity()
+    }
+
     /// Paths that rewrite pages WITHOUT going through `add_dirty` take no copy decision, so they
     /// would change what a branch reads. They refuse while any branch exists, and on a branch.
     fn refuse_if_branching(&self, what: &str) -> Result<()> {

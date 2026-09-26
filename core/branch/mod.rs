@@ -172,6 +172,8 @@ pub(crate) fn session_probe(label: &'static str) {
 pub struct SessionFootprint {
     /// Pages in the connection's private page cache.
     pub cached_pages: usize,
+    /// The capacity of that cache, in pages (r11-walpin-conc's K × min(capacity, pages touched)).
+    pub cache_capacity: usize,
     /// The connection's pager holds a WAL read lock (a read transaction is open).
     pub holds_read_lock: bool,
     /// On a branch: the connection's schema is the very `Arc` the branch store holds, not a copy.
@@ -478,6 +480,7 @@ impl Connection {
         let syms = self.syms.read();
         SessionFootprint {
             cached_pages: pager.page_cache_len(),
+            cache_capacity: pager.page_cache_capacity(),
             holds_read_lock: pager.holds_read_lock(),
             schema_shared_with_store,
             sym_functions: syms.functions.len(),

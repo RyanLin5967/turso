@@ -164,6 +164,9 @@ enum Mode {
     Read,
     Write,
     Intx,
+    /// A full scan of t (count and total length of v): every leaf, ~550 pages, held in the private
+    /// cache afterwards (r11-walpin-conc's K × min(capacity, pages touched) term, amendment 11).
+    Scan,
 }
 
 struct Args {
@@ -224,6 +227,7 @@ fn parse_args() -> Args {
                     "read" => Mode::Read,
                     "write" => Mode::Write,
                     "intx" => Mode::Intx,
+                    "scan" => Mode::Scan,
                     other => die(&format!("unknown mode {other}")),
                 })
             }
@@ -633,6 +637,17 @@ impl Bench {
                 .unwrap();
                 wrote = true;
             }
+            Mode::Scan => {
+                let rows = conn
+                    .prepare("SELECT count(*), sum(length(v)) FROM t")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                let want = (TRUNK_ROWS, TRUNK_ROWS * VALUE_LEN as i64);
+                if (rows[0][0].as_int(), rows[0][1].as_int()) != (Some(want.0), Some(want.1)) {
+                    not_a_result(&format!("session {i} scanned {:?}", rows[0]));
+                }
+            }
             Mode::Intx => {
                 conn.execute("BEGIN").unwrap();
                 let got = read_v(&conn, row);
@@ -694,6 +709,7 @@ impl Bench {
 /// has not used (their idle footprint), and `touched` counts the others.
 fn footprints(sessions: &[Session]) -> (u64, u64, u64, u64, u64, u64, SessionFootprint) {
     let (mut pages, mut pmin, mut pmax, mut locks, mut shared) = (0u64, u64::MAX, 0u64, 0u64, 0u64);
+    let mut capacity = 0u64;
     let mut touched = 0u64;
     for s in sessions {
         let Some(conn) = &s.conn else {
@@ -701,6 +717,7 @@ fn footprints(sessions: &[Session]) -> (u64, u64, u64, u64, u64, u64, SessionFoo
         };
         let f = conn.session_footprint();
         pages += f.cached_pages as u64;
+        capacity += f.cache_capacity as u64;
         if s.touched {
             touched += 1;
         } else {
@@ -715,8 +732,12 @@ fn footprints(sessions: &[Session]) -> (u64, u64, u64, u64, u64, u64, SessionFoo
         .and_then(|s| s.conn.as_ref())
         .map(|c| c.session_footprint())
         .unwrap_or_default();
+    CACHE_CAPACITY_TOTAL.store(capacity, Ordering::Relaxed);
     (pages, pmin, pmax, locks, shared, touched, first)
 }
+
+/// Sum of held sessions' page-cache capacities at the last footprint scan.
+static CACHE_CAPACITY_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn main() {
     let args = parse_args();
@@ -907,7 +928,7 @@ fn main() {
             "# x={x} added={added} interval_bytes_per_session={:.2} interval_allocs_per_session={:.3} \
              live_bytes={} live_allocs={} bytes_per_session_total={:.2} fds={} fds_delta_interval={} \
              cached_pages_total={pages} cached_pages_min={pmin} cached_pages_max={pmax} \
-             sessions_touched_by_active={touched} \
+             sessions_touched_by_active={touched} cache_capacity_total={} \
              sessions_holding_read_lock={locks} sessions_schema_shared={shared} \
              arena_in_use={} arena_expected_own={expect_arena} rss_bytes={} swap_used_mib={} \
              memory_level={} wal_bytes={} grow_s={grow_s:.1}",
@@ -926,6 +947,7 @@ fn main() {
             (mem_after.bytes - base.bytes) as f64 / x.max(1) as f64,
             fds_after,
             fds_after as i64 - fds_before as i64,
+            CACHE_CAPACITY_TOTAL.load(Ordering::Relaxed),
             st.arena_slots_in_use,
             rss_bytes(),
             swap_used_mib(),
