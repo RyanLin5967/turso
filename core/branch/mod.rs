@@ -224,6 +224,9 @@ pub struct ChurnCounters {
     pub splices: u64,
     pub splice_commits: u64,
     pub splice_entries: u64,
+    /// Page reads resolved through the branch store, and the branch states their walks visited.
+    pub resolve_calls: u64,
+    pub resolve_nodes: u64,
 }
 
 #[doc(hidden)]
@@ -246,6 +249,8 @@ pub fn churn_counters() -> ChurnCounters {
         splices: SPLICES.load(Relaxed),
         splice_commits: SPLICE_COMMITS.load(Relaxed),
         splice_entries: SPLICE_ENTRIES.load(Relaxed),
+        resolve_calls: RESOLVE_CALLS.load(Relaxed),
+        resolve_nodes: RESOLVE_NODES.load(Relaxed),
     }
 }
 

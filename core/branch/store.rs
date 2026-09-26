@@ -329,6 +329,10 @@ pub(crate) mod churn_counters {
     pub(crate) static SPLICE_COMMITS: AtomicU64 = AtomicU64::new(0);
     /// Versions a splice visited: the zombie's retained ones plus the smaller side of the merge.
     pub(crate) static SPLICE_ENTRIES: AtomicU64 = AtomicU64::new(0);
+    /// Page reads resolved through the store, and the branch states their ancestor walks visited:
+    /// the walk's depth per read, which the splice bounds by the kept tree (r11-ever amendment 13).
+    pub(crate) static RESOLVE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static RESOLVE_NODES: AtomicU64 = AtomicU64::new(0);
 }
 
 /// An expiry pass planned but not yet durable (see `BranchStore::expire_plan`).
@@ -2218,6 +2222,15 @@ impl StoreInner {
     }
 
     fn resolve(&self, id: BranchId, page: u32) -> Result<Option<(Slot, u32)>> {
+        let mut nodes = 0u64;
+        let found = self.resolve_walk(id, page, &mut nodes);
+        churn_counters::RESOLVE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        churn_counters::RESOLVE_NODES.fetch_add(nodes, std::sync::atomic::Ordering::Relaxed);
+        found
+    }
+
+    /// `resolve`'s ancestor walk; `nodes` counts the branch states it visits (the trunk is not one).
+    fn resolve_walk(&self, id: BranchId, page: u32, nodes: &mut u64) -> Result<Option<(Slot, u32)>> {
         let mut node = id;
         // A branch sees all of its own versions; its ancestors only as of the fork.
         let mut at = u64::MAX;
@@ -2239,6 +2252,7 @@ impl StoreInner {
                 return Ok(None);
             }
             let st = self.branches.get(&node).ok_or_else(|| gone(node))?;
+            *nodes += 1;
             if let Some(owned) = st.current.get(&page) {
                 if owned.born <= at {
                     return Ok(Some((owned.slot, owned.crc)));
