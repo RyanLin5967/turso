@@ -472,3 +472,87 @@ fn a_checkpoint_walks_only_the_branches_that_reserved_a_slot() {
     assert_eq!(value(&o.connect().unwrap(), 5), "other");
     let _ = o.into_id();
 }
+
+/// F-W3 (githost-shape lane, PREREG G5.3): with a resident cap, a checkpoint evicts clean branch
+/// states until at most the cap stay resident; a state this process holds something of (an attached
+/// handle with a connection) stays. Every evicted branch then reads back exactly (its own row, and a
+/// trunk row the trunk rewrote after its fork, as of its fork), takes a write, and is reaped, as a
+/// branch no one had touched since the open would; after a reopen the listing, the rows and the slot
+/// count are what the store held. On the store before F-W3 nothing is evicted, so the residency
+/// assertion fails.
+#[test]
+fn a_checkpoint_evicts_clean_states_above_the_cap_and_they_read_back() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    db.branch_set_resident_cap(Some(16));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let ids = grow(&db, 300);
+    // After every fork: each branch must still read row 400 as it was when it forked.
+    trunk.execute("UPDATE t SET v = 'moved' WHERE id = 400").unwrap();
+    let old_400 = format!("trunk-0400-{}", "x".repeat(80));
+    // One branch stays attached, with a connection: it may not be evicted.
+    let pinned = db.branch(ids[3]).unwrap();
+    let pinned_conn = pinned.connect().unwrap();
+    db.branch_compact_now().unwrap();
+    let s = db.branch_cat_shape();
+    assert!(s.resident_states <= 16, "resident after the checkpoint: {s:?}");
+    assert!(s.evicted_states >= 300 - 16, "evicted: {s:?}");
+    assert_eq!(value(&pinned_conn, 4), format!("b{}", ids[3].0));
+    assert_eq!(value(&pinned_conn, 400), old_400);
+    // Every other branch reads back as before; one in three takes a write.
+    for (i, &id) in ids.iter().enumerate() {
+        if i == 3 {
+            continue;
+        }
+        let b = db.branch(id).unwrap();
+        let conn = b.connect().unwrap();
+        let row = 1 + (i % 400) as i64;
+        assert_eq!(value(&conn, row), format!("b{}", id.0), "branch {} after eviction", id.0);
+        assert_eq!(value(&conn, 400), old_400, "branch {}: trunk row 400 as of its fork", id.0);
+        if i % 3 == 0 {
+            conn.execute(format!("UPDATE t SET v = 'w{}' WHERE id = {row}", id.0)).unwrap();
+        }
+        drop(conn);
+        let _ = b.into_id();
+    }
+    // Evicted again by this checkpoint, then one in five is reaped from the catalog.
+    db.branch_compact_now().unwrap();
+    assert!(db.branch_cat_shape().resident_states <= 16, "resident after the second checkpoint");
+    let mut live = vec![(3usize, ids[3])];
+    for (i, &id) in ids.iter().enumerate() {
+        if i == 3 {
+            continue;
+        }
+        if i % 5 == 0 {
+            let r = db.branch(id).unwrap().reap().unwrap();
+            assert!(!r.deferred, "branch {} has no child", id.0);
+        } else {
+            live.push((i, id));
+        }
+    }
+    drop(pinned_conn);
+    let _ = pinned.into_id();
+    let in_use = db.branch_stats().unwrap().arena_slots_in_use;
+    db.branch_compact_now().unwrap();
+    drop(trunk);
+    drop(db);
+    let db = open_at(&path, catalog()).unwrap();
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, in_use, "the slot count moved across a reopen");
+    let mut listed: Vec<u64> = db.branch_ids().unwrap().iter().map(|b| b.0).collect();
+    listed.sort_unstable();
+    let mut want: Vec<u64> = live.iter().map(|&(_, id)| id.0).collect();
+    want.sort_unstable();
+    assert_eq!(listed, want, "the listing after a reopen");
+    for &(i, id) in &live {
+        let b = db.branch(id).unwrap();
+        let conn = b.connect().unwrap();
+        let row = 1 + (i % 400) as i64;
+        let own = if i % 3 == 0 && i != 3 { format!("w{}", id.0) } else { format!("b{}", id.0) };
+        assert_eq!(value(&conn, row), own, "branch {} after the reopen", id.0);
+        assert_eq!(value(&conn, 400), old_400, "branch {}: trunk row 400 after the reopen", id.0);
+        drop(conn);
+        let _ = b.into_id();
+    }
+}

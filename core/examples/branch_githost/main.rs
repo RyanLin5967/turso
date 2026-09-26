@@ -269,7 +269,7 @@ impl Model {
 
 fn open_db(path: &Path, sync: bool) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    Database::open_file_with_flags(
+    let db = Database::open_file_with_flags(
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
@@ -277,7 +277,13 @@ fn open_db(path: &Path, sync: bool) -> Arc<Database> {
         None,
         Arc::new(SqliteDialect),
     )
-    .unwrap_or_else(|e| not_a_result(&format!("open failed: {e}")))
+    .unwrap_or_else(|e| not_a_result(&format!("open failed: {e}")));
+    // F-W3's knob (githost-shape PREREG G5.3): unset keeps every touched state resident (COMP).
+    if let Ok(v) = std::env::var("R11_RESIDENT_CAP") {
+        let cap: usize = v.parse().unwrap_or_else(|_| die(&format!("bad R11_RESIDENT_CAP {v:?}")));
+        db.branch_set_resident_cap(Some(cap));
+    }
+    db
 }
 
 fn sidecar(db: &Path) -> PathBuf {
@@ -986,7 +992,8 @@ fn main() {
     if cfg!(debug_assertions) {
         println!("# DEBUG build: not a timing result");
     }
-    // F-W3's knob (githost-shape PREREG G5.3), read by the store at open; recorded with every run.
+    // F-W3's knob (githost-shape PREREG G5.3), applied by `open_db` right after each open; recorded
+    // with every run.
     println!(
         "# R11_RESIDENT_CAP={}",
         std::env::var("R11_RESIDENT_CAP").unwrap_or_else(|_| "unset".to_string())

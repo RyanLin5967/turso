@@ -622,6 +622,13 @@ impl Database {
         self.branches.cat_shape()
     }
 
+    /// Catalog stores: keep at most `cap` branch states resident after each checkpoint, evicting
+    /// clean ones (githost-shape lane F-W3); `None` keeps every state touched since the open.
+    #[doc(hidden)]
+    pub fn branch_set_resident_cap(&self, cap: Option<usize>) {
+        self.branches.set_resident_cap(cap)
+    }
+
     /// Catalog statements that wrote a row since open; 0 for a store that is not a catalog store.
     #[doc(hidden)]
     pub fn branch_catalog_rows_written(&self) -> u64 {

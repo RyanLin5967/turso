@@ -253,6 +253,9 @@ struct StoreInner {
     /// these alone instead of walking every resident state (a dirty list, as ARIES's dirty page
     /// table is for pages).
     pending_holders: HashSet<BranchId>,
+    /// F-W3 (githost-shape lane): the most branch states a catalog store keeps resident after a
+    /// checkpoint. `None` keeps every state it has touched since the open (the catalog as published).
+    resident_cap: Option<usize>,
 }
 
 /// githost-shape lane instrument (observing only): the cumulative fields of
@@ -2118,6 +2121,13 @@ impl BranchStore {
             .map_or(0, |c| c.catalog.counters.rows_written)
     }
 
+    /// F-W3 (githost-shape lane): the most branch states a catalog store keeps resident after each
+    /// checkpoint; `None` keeps every state touched since the open. It takes effect at the next
+    /// checkpoint.
+    pub(crate) fn set_resident_cap(&self, cap: Option<usize>) {
+        self.inner.lock().resident_cap = cap;
+    }
+
     /// githost-shape instrument (observing only): see [`super::BranchCatShape`]. Runs no catalog
     /// query, so it does not move the catalog counters it sits beside.
     pub(crate) fn cat_shape(&self) -> super::BranchCatShape {
@@ -2364,6 +2374,7 @@ impl StoreInner {
             parked_applied: 0,
             shape: ShapeCounters::default(),
             pending_holders: HashSet::new(),
+            resident_cap: None,
         }
     }
 
