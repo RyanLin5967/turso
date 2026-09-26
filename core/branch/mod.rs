@@ -319,6 +319,11 @@ pub struct BranchOpenStats {
     pub cat_rows_read: u64,
     /// Catalog stores: arena slots the log's replay named or freed.
     pub touched_slots: u64,
+    /// Catalog stores (a12-durable-open C-P): trunk-version probes and range reads made during the
+    /// open, and the trunk version rows they returned (`trunk_page_loads` stays 0: no trunk page is
+    /// loaded whole).
+    pub trunk_probes: u64,
+    pub trunk_rows: u64,
 }
 
 /// A snapshot of the branch arena's accounting.

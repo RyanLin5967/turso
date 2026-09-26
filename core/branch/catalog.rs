@@ -40,7 +40,17 @@
 //!   bitmap, so the arena's double-free and use-after-free assertions do not see it.
 //! * `ids()` and `slots_in_use()` scan the catalog: they are Θ(N) by what they return.
 //! * A checkpoint rewrites every row of a dirty branch (its current map and retained versions),
-//!   not only the changed pages.
+//!   not only the changed pages. (The TRUNK's versions are written one row each: C-P below.)
+//!
+//! # The trunk's versions, read in place (a12-durable-open C-P)
+//!
+//! A trunk page can hold one retained version per child forked between two of its writes, so a
+//! page's version list grows with the branch count. The trunk's `ret` rows (owner 0) are therefore
+//! never loaded a page at a time: a resolve is one descending probe of `ret_page` (the version with
+//! the greatest `born <= f`; Becker et al.'s multiversion B-tree answers "the version of key k live at
+//! time t" with one root-to-leaf search), a trunk write or a replayed pre-image reads only the page's
+//! last version, a trunk child's reap reads F2's two ranges from `ret_born` and `ret_died` (ZFS keeps
+//! its deadlists on disk and splits them in place), and a checkpoint inserts and deletes single rows.
 
 use std::num::NonZero;
 use std::path::Path;
@@ -69,6 +79,8 @@ const SCHEMA: &[&str] = &[
      born INTEGER NOT NULL, died INTEGER NOT NULL, slot INTEGER NOT NULL, crc INTEGER NOT NULL)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ret_page ON ret(owner, page, born)",
     "CREATE INDEX IF NOT EXISTS ret_born ON ret(owner, born)",
+    // a12-durable-open C-P: F2's other side, read in place for the trunk (owner 0).
+    "CREATE INDEX IF NOT EXISTS ret_died ON ret(owner, died)",
     "CREATE TABLE IF NOT EXISTS free(slot INTEGER PRIMARY KEY)",
 ];
 
@@ -78,8 +90,9 @@ const LOOKUPS: &[&str] = &[
     "SELECT parent, fork_epoch, epoch, released, lease, n_children FROM branch WHERE id = ?1",
     "SELECT k, slot, born, crc FROM cur WHERE k >= ?1 AND k < ?2",
     "SELECT page, born, died, slot, crc FROM ret WHERE owner = ?1",
-    "SELECT born, died, slot, crc FROM ret WHERE owner = ?1 AND page = ?2",
-    "SELECT page FROM ret WHERE owner = ?1 AND born > ?2 AND born <= ?3",
+    "SELECT born, died, slot, crc FROM ret WHERE owner = ?1 AND page = ?2 AND born <= ?3 ORDER BY born DESC LIMIT 1",
+    "SELECT page, born, died, slot, crc FROM ret WHERE owner = ?1 AND born > ?2 AND born <= ?3 ORDER BY born ASC LIMIT ?4",
+    "SELECT page, born, died, slot, crc FROM ret WHERE owner = ?1 AND died > ?2 AND died <= ?3 ORDER BY died ASC LIMIT ?4",
     "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch >= ?2 AND fork_epoch < ?3 ORDER BY fork_epoch ASC LIMIT ?4",
     "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch < ?2 ORDER BY fork_epoch DESC LIMIT ?3",
     "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch > ?2 ORDER BY fork_epoch ASC LIMIT ?3",
@@ -92,7 +105,7 @@ const LOOKUPS: &[&str] = &[
     "SELECT 1 FROM free WHERE slot = ?1",
     "DELETE FROM cur WHERE k >= ?1 AND k < ?2",
     "DELETE FROM ret WHERE owner = ?1",
-    "DELETE FROM ret WHERE owner = ?1 AND page = ?2",
+    "DELETE FROM ret WHERE owner = ?1 AND page = ?2 AND born = ?3",
     "DELETE FROM free WHERE slot <= ?1",
     "DELETE FROM free WHERE slot = ?1",
     "DELETE FROM branch WHERE id = ?1",
@@ -160,6 +173,17 @@ fn get(row: &[Value], at: usize) -> Result<u64> {
         .ok_or_else(|| LimboError::Corrupt(format!("branch catalog: column {at} is not an integer")))
 }
 
+/// A `ret` row as (page, born, died, slot, crc).
+fn ret_row(row: &[Value]) -> Result<(u32, u64, u64, Slot, u32)> {
+    Ok((
+        get(row, 0)? as u32,
+        get(row, 1)?,
+        get(row, 2)?,
+        get(row, 3)? as Slot,
+        get(row, 4)? as u32,
+    ))
+}
+
 /// The catalog key of `(branch, page)`. Refused past 2^31 branch ids rather than wrapped.
 fn cur_key(branch: u64, page: u32) -> Result<i64> {
     if branch >= 1 << 31 {
@@ -220,10 +244,12 @@ pub(crate) struct Catalog {
     cur_del_range: Stmt,
     cur_put: Stmt,
     ret_owner: Stmt,
-    ret_page: Stmt,
-    ret_pages_born: Stmt,
+    ret_pred: Stmt,
+    ret_born_range: Stmt,
+    ret_died_range: Stmt,
+    ret_count: Stmt,
     ret_del_owner: Stmt,
-    ret_del_page: Stmt,
+    ret_del_one: Stmt,
     ret_put: Stmt,
     ret_any: Stmt,
     child_in: Stmt,
@@ -232,7 +258,6 @@ pub(crate) struct Catalog {
     lease_due: Stmt,
     lease_min: Stmt,
     lease_min_after: Stmt,
-    trunk_counts: Stmt,
     released: Stmt,
     unreleased: Stmt,
     free_after: Stmt,
@@ -289,12 +314,21 @@ impl Catalog {
             cur_del_range: p("DELETE FROM cur WHERE k >= ?1 AND k < ?2")?,
             cur_put: p("INSERT OR REPLACE INTO cur(k, slot, born, crc) VALUES (?1, ?2, ?3, ?4)")?,
             ret_owner: p("SELECT page, born, died, slot, crc FROM ret WHERE owner = ?1")?,
-            ret_page: p("SELECT born, died, slot, crc FROM ret WHERE owner = ?1 AND page = ?2")?,
-            ret_pages_born: p(
-                "SELECT page FROM ret WHERE owner = ?1 AND born > ?2 AND born <= ?3",
+            ret_pred: p(
+                "SELECT born, died, slot, crc FROM ret WHERE owner = ?1 AND page = ?2 AND born <= ?3 \
+                 ORDER BY born DESC LIMIT 1",
             )?,
+            ret_born_range: p(
+                "SELECT page, born, died, slot, crc FROM ret WHERE owner = ?1 AND born > ?2 \
+                 AND born <= ?3 ORDER BY born ASC LIMIT ?4",
+            )?,
+            ret_died_range: p(
+                "SELECT page, born, died, slot, crc FROM ret WHERE owner = ?1 AND died > ?2 \
+                 AND died <= ?3 ORDER BY died ASC LIMIT ?4",
+            )?,
+            ret_count: p("SELECT count(*) FROM ret WHERE owner = ?1")?,
             ret_del_owner: p("DELETE FROM ret WHERE owner = ?1")?,
-            ret_del_page: p("DELETE FROM ret WHERE owner = ?1 AND page = ?2")?,
+            ret_del_one: p("DELETE FROM ret WHERE owner = ?1 AND page = ?2 AND born = ?3")?,
             ret_put: p(
                 "INSERT INTO ret(owner, page, born, died, slot, crc) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?,
@@ -318,7 +352,6 @@ impl Catalog {
             lease_min_after: p(
                 "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
             )?,
-            trunk_counts: p("SELECT page, count(*) FROM ret WHERE owner = 0 GROUP BY page")?,
             released: p("SELECT id FROM branch WHERE released = 1 AND n_children = 0")?,
             unreleased: p("SELECT id FROM branch WHERE released = 0")?,
             free_after: p("SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2")?,
@@ -592,53 +625,67 @@ impl Catalog {
         Ok(())
     }
 
-    /// The trunk's retained versions of `page`: (born, died, slot, crc).
-    pub(crate) fn trunk_page(&mut self, page: u32) -> Result<Vec<(u64, u64, Slot, u32)>> {
-        self.ret_page
-            .rows(&[int(0), int(page as u64)], &mut self.counters)?
-            .iter()
-            .map(|row| {
-                Ok((
-                    get(row, 0)?,
-                    get(row, 1)?,
-                    get(row, 2)? as Slot,
-                    get(row, 3)? as u32,
-                ))
-            })
-            .collect()
+    /// The trunk's version of `page` with the greatest `born <= at` — the only one that can hold a
+    /// child forked at `at`, since a page's versions are disjoint — or, with `at = u64::MAX`, the
+    /// page's last version (whose `died` is the trunk's last write of the page). One index probe
+    /// (`ret_page`, descending): the multiversion B-tree's "version of key k at time t" (C-P).
+    pub(crate) fn trunk_pred(&mut self, page: u32, at: u64) -> Result<Option<(u64, u64, Slot, u32)>> {
+        let rows = self
+            .ret_pred
+            .rows(&[int(0), int(page as u64), int(at)], &mut self.counters)?;
+        rows.first()
+            .map(|row| Ok((get(row, 0)?, get(row, 1)?, get(row, 2)? as Slot, get(row, 3)? as u32)))
+            .transpose()
     }
 
-    pub(crate) fn put_trunk_page(&mut self, page: u32, versions: &[(u64, u64, Slot, u32)]) -> Result<()> {
-        self.ret_del_page
-            .exec(&[int(0), int(page as u64)], &mut self.counters)?;
-        for &(born, died, slot, crc) in versions {
-            self.ret_put.exec(
-                &[
-                    int(0),
-                    int(page as u64),
-                    int(born),
-                    int(died),
-                    int(slot as u64),
-                    int(crc as u64),
-                ],
-                &mut self.counters,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Trunk pages holding a retained version born in `(lo, hi]` (`lo = None`: unbounded below).
-    pub(crate) fn trunk_pages_born_in(&mut self, lo: Option<u64>, hi: u64) -> Result<Vec<u32>> {
+    /// Up to `limit` trunk versions born in `(lo, hi]` (`lo = None`: unbounded below), ascending by
+    /// `born`: F2's by-birth range, read in place from `ret_born`. (page, born, died, slot, crc).
+    pub(crate) fn trunk_born_range(
+        &mut self,
+        lo: Option<u64>,
+        hi: u64,
+        limit: u64,
+    ) -> Result<Vec<(u32, u64, u64, Slot, u32)>> {
         let lo = lo.map_or(Value::from_i64(-1), int);
-        let mut pages: Vec<u32> = self
-            .ret_pages_born
-            .rows(&[int(0), lo, int(hi)], &mut self.counters)?
-            .iter()
-            .map(|row| get(row, 0).map(|p| p as u32))
-            .collect::<Result<_>>()?;
-        pages.sort_unstable();
-        pages.dedup();
-        Ok(pages)
+        let rows = self
+            .ret_born_range
+            .rows(&[int(0), lo, int(hi), int(limit)], &mut self.counters)?;
+        rows.iter().map(|r| ret_row(r)).collect()
+    }
+
+    /// Up to `limit` trunk versions that died in `(lo, hi]` (`hi = None`: unbounded above),
+    /// ascending by `died`: F2's by-death range, read in place from `ret_died`.
+    pub(crate) fn trunk_died_range(
+        &mut self,
+        lo: u64,
+        hi: Option<u64>,
+        limit: u64,
+    ) -> Result<Vec<(u32, u64, u64, Slot, u32)>> {
+        let hi = hi.map_or(Value::from_i64(i64::MAX), int);
+        let rows = self
+            .ret_died_range
+            .rows(&[int(0), int(lo), hi, int(limit)], &mut self.counters)?;
+        rows.iter().map(|r| ret_row(r)).collect()
+    }
+
+    /// Delete one trunk version (a checkpoint, for a version reaped since the last one).
+    pub(crate) fn trunk_delete(&mut self, page: u32, born: u64) -> Result<()> {
+        self.ret_del_one
+            .exec(&[int(0), int(page as u64), int(born)], &mut self.counters)
+    }
+
+    /// Insert one trunk version (a checkpoint, for a version retained since the last one).
+    pub(crate) fn trunk_insert(&mut self, page: u32, born: u64, died: u64, slot: Slot, crc: u32) -> Result<()> {
+        self.ret_put.exec(
+            &[int(0), int(page as u64), int(born), int(died), int(slot as u64), int(crc as u64)],
+            &mut self.counters,
+        )
+    }
+
+    /// Trunk versions in the catalog (an instrument's count, not a per-operation lookup).
+    pub(crate) fn trunk_count(&mut self) -> Result<u64> {
+        let rows = self.ret_count.rows(&[int(0)], &mut self.counters)?;
+        rows.first().map_or(Ok(0), |r| get(r, 0))
     }
 
     pub(crate) fn any_retained(&mut self) -> Result<bool> {
@@ -698,15 +745,6 @@ impl Catalog {
             None | Some(Value::Null) => Ok(None),
             Some(v) => Ok(v.as_int().map(|v| v as u64)),
         }
-    }
-
-    /// `(page, versions)` for every trunk page with retained versions (an instrument's scan).
-    pub(crate) fn trunk_version_counts(&mut self) -> Result<Vec<(u32, u64)>> {
-        self.trunk_counts
-            .rows(&[], &mut self.counters)?
-            .iter()
-            .map(|row| Ok((get(row, 0)? as u32, get(row, 1)?)))
-            .collect()
     }
 
     pub(crate) fn released_ids(&mut self) -> Result<Vec<u64>> {

@@ -284,3 +284,74 @@ fn releasing_many_siblings_reads_linear_catalog_rows() {
     );
     assert_eq!(db.branch_stats().unwrap().live_branches, 0);
 }
+
+/// a12-durable-open C-P: the trunk's retained versions are read in place, one version per probe,
+/// never a page's whole version list. K versions of ONE trunk page, each held by its own child;
+/// after a checkpoint and a reopen: the open reads none; a child's first read of that page, the
+/// oldest child's reap, and a crash recovery replaying one pre-image record of that page each read
+/// a number of catalog rows that does not depend on K; and every child still reads its version.
+#[test]
+fn trunk_versions_are_read_in_place_whatever_a_page_holds() {
+    let mut per_k = Vec::new();
+    for k in [40usize, 400] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let mut kids = Vec::new();
+        let seen = |i: usize| -> String {
+            if i == 0 {
+                format!("trunk-0001-{}", "x".repeat(80))
+            } else {
+                format!("u{}", i - 1)
+            }
+        };
+        {
+            let db = open_at(&path, catalog()).unwrap();
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            for i in 0..k {
+                kids.push(trunk.fork_branch().unwrap().into_id());
+                trunk.execute(format!("UPDATE t SET v = 'u{i}' WHERE id = 1")).unwrap();
+            }
+            assert!(db.branch_trunk_retained() >= k as u64, "k={k}: the trunk writes retained too little");
+            db.branch_compact_now().unwrap();
+        }
+        let db = open_at(&path, catalog()).unwrap();
+        let s = db.branch_open_stats();
+        assert_eq!(
+            (s.records, s.trunk_probes, s.trunk_rows, s.trunk_page_loads, s.branch_loads),
+            (0, 0, 0, 0, 0),
+            "k={k}: the open read state: {s:?}"
+        );
+        let rows = |db: &Arc<Database>| db.branch_catalog_counters().3;
+        let mid = k / 2;
+        let r0 = rows(&db);
+        let b = db.branch(kids[mid]).unwrap();
+        assert_eq!(value(&b.connect().unwrap(), 1), seen(mid), "k={k}: child {mid} read the wrong row 1");
+        let _ = b.into_id();
+        let r1 = rows(&db);
+        db.branch(kids[0]).unwrap().reap().unwrap();
+        let r2 = rows(&db);
+        // One more child, then a trunk write of the hot page: its pre-image record is the tail.
+        let trunk = db.connect().unwrap();
+        kids.push(trunk.fork_branch().unwrap().into_id());
+        trunk.execute("UPDATE t SET v = 'after' WHERE id = 1").unwrap();
+        let image = crash_image(&path, dir.path());
+        drop(trunk);
+        drop(db);
+        let db = open_at(&image, catalog()).unwrap();
+        let s = db.branch_open_stats();
+        per_k.push((r1 - r0, r2 - r1, s.records, s.cat_rows_read, s.trunk_rows, s.trunk_page_loads));
+        for i in [1, mid, k - 1, k] {
+            let b = db.branch(kids[i]).unwrap();
+            assert_eq!(value(&b.connect().unwrap(), 1), seen(i), "k={k}: after recovery child {i}");
+            let _ = b.into_id();
+        }
+        assert_eq!(db.branch_stats().unwrap().live_branches, k, "k={k}");
+    }
+    assert_eq!(
+        per_k[0], per_k[1],
+        "catalog rows read (first read, oldest reap, recovery records / rows / trunk rows / page \
+         loads) depend on the versions one trunk page holds: {per_k:?}"
+    );
+    assert!(per_k[0].0 <= 8 && per_k[0].1 <= 8, "{per_k:?}");
+}

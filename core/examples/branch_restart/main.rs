@@ -227,7 +227,8 @@ fn stats_line(s: &BranchOpenStats) -> String {
         "snap_bytes={} log_bytes={} records={} snap_branches={} branches={} current_entries={} \
          retained_entries={} trunk_retained={} trunk_children={} referenced_slots={} \
          arena_high_water={} arena_free={} derived_map_inserts={} states={} released_scanned={} \
-         branch_loads={} trunk_page_loads={} cat_queries={} cat_rows_read={} touched_slots={}",
+         branch_loads={} trunk_page_loads={} cat_queries={} cat_rows_read={} touched_slots={} \
+         trunk_probes={} trunk_rows={}",
         s.snap_bytes,
         s.log_bytes,
         s.records,
@@ -247,7 +248,9 @@ fn stats_line(s: &BranchOpenStats) -> String {
         s.trunk_page_loads,
         s.cat_queries,
         s.cat_rows_read,
-        s.touched_slots
+        s.touched_slots,
+        s.trunk_probes,
+        s.trunk_rows
     )
 }
 

@@ -147,7 +147,12 @@
 //! `[from, to)`" test come from it, and a lineage keeps only its child count. In catalog mode a
 //! branch's F1 maps and F2 indexes are rebuilt from its own `ret` rows when `ensure` first makes it
 //! resident, and its F4 page map from its parent's state at its fork epoch. The trunk's retained
-//! versions are made resident a page at a time, as r11-restart built it.
+//! versions are NOT made resident a page at a time (C-L did that, as r11-restart built it, and a
+//! recovery then read every version of every page its log tail touched: all of them, ∝ N, when the
+//! trunk keeps writing). They are read in place (C-P; `catalog.rs`): the trunk's lineage holds only
+//! the versions retained since the last checkpoint, `trunk_version_at` probes the catalog for the
+//! version holding a fork epoch, `trunk_written_known` reads a page's last version once, and a trunk
+//! child's reap adds the catalog's garbage (`trunk_catalog_garbage`) to what F2 finds in memory.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
@@ -237,9 +242,16 @@ struct CatState {
     /// Branches removed since the last checkpoint: deleted from the catalog at the next one, and
     /// never loaded from it again.
     removed: HashSet<BranchId>,
-    /// Trunk pages whose retained versions are in memory, and those changed since the checkpoint.
-    trunk_loaded: HashSet<u32>,
-    trunk_dirty: HashSet<u32>,
+    /// Trunk pages whose `written` epoch this process has reconciled with the catalog: the `died`
+    /// of the page's last catalog version (C-P).
+    trunk_known: HashSet<u32>,
+    /// Trunk versions this process has read from the catalog (clean copies), consulted only by
+    /// containment: a known version holding the fork epoch asked about is the answer, since one
+    /// page's versions are disjoint (C-P).
+    trunk_cache: HashMap<u32, BTreeMap<u64, Retained>>,
+    /// Catalog trunk versions reaped since the last checkpoint, as (page, born): skipped by every
+    /// catalog read and deleted by the next checkpoint (C-P).
+    trunk_gone: HashSet<(u32, u64)>,
     /// No catalog row that is not loaded has a lease deadline below this (`None`: no lease).
     lease_floor: Option<u64>,
     /// The highest catalog free slot moved into the arena's in-memory free list.
@@ -252,6 +264,9 @@ struct CatState {
     /// Branch states and trunk pages read from the catalog since open (instrument).
     branch_loads: u64,
     trunk_page_loads: u64,
+    /// Trunk-version probes and range reads, and the version rows they returned (C-P).
+    trunk_probes: u64,
+    trunk_rows: u64,
 }
 
 impl CatState {
@@ -260,14 +275,17 @@ impl CatState {
             catalog,
             dirty: HashMap::new(),
             removed: HashSet::new(),
-            trunk_loaded: HashSet::new(),
-            trunk_dirty: HashSet::new(),
+            trunk_known: HashSet::new(),
+            trunk_cache: HashMap::new(),
+            trunk_gone: HashSet::new(),
             lease_floor: None,
             free_cursor: None,
             free_exhausted: false,
             taken: HashSet::new(),
             branch_loads: 0,
             trunk_page_loads: 0,
+            trunk_probes: 0,
+            trunk_rows: 0,
         }
     }
 }
@@ -1025,6 +1043,8 @@ impl BranchStore {
             if let Some(cat) = inner.cat.as_ref() {
                 stats.branch_loads = cat.branch_loads;
                 stats.trunk_page_loads = cat.trunk_page_loads;
+                stats.trunk_probes = cat.trunk_probes;
+                stats.trunk_rows = cat.trunk_rows;
                 stats.cat_queries = cat.catalog.counters.queries;
                 stats.cat_rows_read = cat.catalog.counters.rows_read;
             }
@@ -1740,8 +1760,8 @@ impl BranchStore {
         // write would retain no pre-image for the branches on disk.
         self.refuse_if_trunk_only("a trunk page write")?;
         let mut inner = self.inner.lock();
-        // Catalog stores: the page's retained versions (and so its `written` epoch) first.
-        inner.ensure_trunk_page(page)?;
+        // Catalog stores: the page's `written` epoch, from its last catalog version, first.
+        inner.trunk_written_known(page)?;
         let epoch = inner.trunk.lineage.epoch;
         let born = inner.trunk.written.get(&page).copied().unwrap_or(0);
         if born >= epoch {
@@ -1758,7 +1778,6 @@ impl BranchStore {
             arena,
             trunk,
             journal,
-            cat,
             ..
         } = &mut *inner;
         if keep {
@@ -1787,9 +1806,6 @@ impl BranchStore {
                 crc,
             };
             trunk.lineage.retain(page, retained);
-            if let Some(cat) = cat.as_mut() {
-                cat.trunk_dirty.insert(page);
-            }
             if let Some(journal) = journal.as_mut() {
                 journal.buffer(&Record::TrunkRetain {
                     page,
@@ -2005,18 +2021,16 @@ impl BranchStore {
 
     pub(crate) fn trunk_retained_count(&self) -> u64 {
         let mut inner = self.inner.lock();
+        // In memory: every version (eager) or the versions retained since the last checkpoint.
         let resident: u64 = inner.trunk.lineage.retained.values().map(|v| v.len() as u64).sum();
-        // Catalog stores: plus the versions of trunk pages not yet resident (an instrument's scan).
+        // Catalog stores: plus the catalog's, less those reaped since (an instrument's count).
         let StoreInner { cat, .. } = &mut *inner;
         let others = match cat.as_mut() {
             Some(cat) => cat
                 .catalog
-                .trunk_version_counts()
+                .trunk_count()
                 .unwrap_or_default()
-                .into_iter()
-                .filter(|(page, _)| !cat.trunk_loaded.contains(page))
-                .map(|(_, n)| n)
-                .sum(),
+                .saturating_sub(cat.trunk_gone.len() as u64),
             None => 0,
         };
         resident + others
@@ -2389,26 +2403,144 @@ impl StoreInner {
         );
     }
 
-    /// Make the trunk's retained versions of `page` resident (catalog stores), and rebuild the
-    /// page's `written` epoch from them as an eager recovery does: the largest `died`.
-    fn ensure_trunk_page(&mut self, page: u32) -> Result<()> {
+    /// Catalog stores: make the trunk's `written` epoch of `page` at least the `died` of the page's
+    /// last catalog version, as an eager recovery rebuilds it (the largest `died`), by ONE probe per
+    /// page per process. The page's other versions are not read (C-P).
+    fn trunk_written_known(&mut self, page: u32) -> Result<()> {
         let Some(cat) = self.cat.as_mut() else {
             return Ok(());
         };
-        if cat.trunk_loaded.contains(&page) {
+        if !cat.trunk_known.insert(page) {
             return Ok(());
         }
-        let mut versions = cat.catalog.trunk_page(page)?;
-        // F1's per-page map takes a page's versions in `born` order.
-        versions.sort_unstable_by_key(|v| v.0);
-        cat.trunk_loaded.insert(page);
-        cat.trunk_page_loads += 1;
-        for (born, died, slot, crc) in versions {
-            self.trunk
-                .lineage
-                .retain(page, Retained { born, died, slot, crc });
+        cat.trunk_probes += 1;
+        if let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, u64::MAX)? {
+            cat.trunk_rows += 1;
+            // A version reaped since the checkpoint still dates the page's last write.
+            if !cat.trunk_gone.contains(&(page, born)) {
+                cat.trunk_cache
+                    .entry(page)
+                    .or_default()
+                    .insert(born, Retained { born, died, slot, crc });
+            }
             let written = self.trunk.written.entry(page).or_insert(0);
             *written = (*written).max(died);
+        }
+        Ok(())
+    }
+
+    /// The trunk's version of `page` a child forked at `at` sees, if one was retained. In memory:
+    /// every version (eager), or those retained since the last checkpoint (catalog), which are
+    /// newer than every catalog version of the page, so a predecessor there is the answer. Else a
+    /// cached catalog version holding `at`, else one probe of the catalog (C-P).
+    fn trunk_version_at(
+        &mut self,
+        page: u32,
+        at: u64,
+        examined: &mut u64,
+    ) -> Result<Option<(Slot, u32)>> {
+        if let Some((_, v)) = self
+            .trunk
+            .lineage
+            .retained
+            .get(&page)
+            .and_then(|vs| vs.range(..=at).next_back())
+        {
+            *examined += 1;
+            return Ok((at < v.died).then_some((v.slot, v.crc)));
+        }
+        let Some(cat) = self.cat.as_mut() else {
+            return Ok(None);
+        };
+        if let Some((_, v)) = cat
+            .trunk_cache
+            .get(&page)
+            .and_then(|vs| vs.range(..=at).next_back())
+        {
+            if at < v.died {
+                *examined += 1;
+                return Ok(Some((v.slot, v.crc)));
+            }
+        }
+        cat.trunk_probes += 1;
+        let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, at)? else {
+            return Ok(None);
+        };
+        cat.trunk_rows += 1;
+        *examined += 1;
+        // A reaped version held no live child, so it cannot be the one a live child reads.
+        if at >= died || cat.trunk_gone.contains(&(page, born)) {
+            return Ok(None);
+        }
+        cat.trunk_cache
+            .entry(page)
+            .or_default()
+            .insert(born, Retained { born, died, slot, crc });
+        Ok(Some((slot, crc)))
+    }
+
+    /// Catalog stores: F2's garbage query over the trunk's CATALOG versions, for the child forked
+    /// at `f` whose nearest live siblings were `lo` and `hi`: the versions with `born` in `(lo, f]`
+    /// and `died` in `(f, hi]`, read in place. With one neighbour missing every entry of the one
+    /// range is garbage (or reaped already), so that range alone is read; with both, the two ranges
+    /// are read in doubling batches until one ends, and that one is filtered — so the rows read are
+    /// at most 4x the smaller range, plus 64 (C-P). Each garbage version is marked reaped (deleted
+    /// by the next checkpoint) and its slot goes to `freed`.
+    fn trunk_catalog_garbage(
+        &mut self,
+        f: u64,
+        lo: Option<u64>,
+        hi: Option<u64>,
+        freed: &mut Vec<Slot>,
+    ) -> Result<()> {
+        let Some(cat) = self.cat.as_mut() else {
+            return Ok(());
+        };
+        let only_f = |born: u64, died: u64| {
+            lo.is_none_or(|lo| born > lo) && born <= f && f < died && hi.is_none_or(|hi| died <= hi)
+        };
+        let mut candidates = match (lo, hi) {
+            (None, _) => {
+                cat.trunk_probes += 1;
+                cat.catalog.trunk_died_range(f, hi, u64::MAX >> 1)?
+            }
+            (Some(_), None) => {
+                cat.trunk_probes += 1;
+                cat.catalog.trunk_born_range(lo, f, u64::MAX >> 1)?
+            }
+            (Some(_), Some(_)) => {
+                let mut batch = 16u64;
+                loop {
+                    cat.trunk_probes += 2;
+                    let by_born = cat.catalog.trunk_born_range(lo, f, batch)?;
+                    let by_died = cat.catalog.trunk_died_range(f, hi, batch)?;
+                    let fetched = (by_born.len() + by_died.len()) as u64;
+                    cat.trunk_rows += fetched;
+                    self.work.gc_range_entries += fetched;
+                    if (by_born.len() as u64) < batch {
+                        break by_born;
+                    }
+                    if (by_died.len() as u64) < batch {
+                        break by_died;
+                    }
+                    batch *= 2;
+                }
+            }
+        };
+        if lo.is_none() || hi.is_none() {
+            cat.trunk_rows += candidates.len() as u64;
+            self.work.gc_range_entries += candidates.len() as u64;
+        }
+        candidates.retain(|&(page, born, died, _, _)| {
+            only_f(born, died) && !cat.trunk_gone.contains(&(page, born))
+        });
+        for (page, born, _, slot, _) in candidates {
+            cat.trunk_gone.insert((page, born));
+            if let Some(vs) = cat.trunk_cache.get_mut(&page) {
+                vs.remove(&born);
+            }
+            self.work.gc_examined += 1;
+            freed.push(slot);
         }
         Ok(())
     }
@@ -2419,12 +2551,6 @@ impl StoreInner {
             if !id.is_trunk() {
                 *cat.dirty.entry(id).or_insert(0) |= what;
             }
-        }
-    }
-
-    fn mark_trunk_page(&mut self, page: u32) {
-        if let Some(cat) = self.cat.as_mut() {
-            cat.trunk_dirty.insert(page);
         }
     }
 
@@ -2659,16 +2785,10 @@ impl StoreInner {
                 retained: st.lineage.retained_list(),
             }, what))
             .collect();
-        let trunk_pages: Vec<(u32, Vec<(u64, u64, Slot, u32)>)> = cat
-            .trunk_dirty
-            .iter()
-            .map(|&page| {
-                let versions = self.trunk.lineage.retained.get(&page).map_or_else(Vec::new, |vs| {
-                    vs.values().map(|v| (v.born, v.died, v.slot, v.crc)).collect()
-                });
-                (page, versions)
-            })
-            .collect();
+        // The trunk: the versions retained since the last checkpoint (all in memory, none in the
+        // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
+        let trunk_new = self.trunk.lineage.retained_list();
+        let trunk_gone: Vec<(u32, u64)> = cat.trunk_gone.iter().copied().collect();
         // Slots reserved by open write transactions are named by no durable state: the catalog
         // lists them free (a crash frees them), and this process keeps them as taken.
         let reserved: Vec<Slot> = self
@@ -2728,8 +2848,11 @@ impl StoreInner {
             for &id in &cat.removed {
                 catalog.delete_branch(id.0)?;
             }
-            for (page, versions) in &trunk_pages {
-                catalog.put_trunk_page(*page, versions)?;
+            for &(page, born) in &trunk_gone {
+                catalog.trunk_delete(page, born)?;
+            }
+            for &(page, born, died, slot, crc) in &trunk_new {
+                catalog.trunk_insert(page, born, died, slot, crc)?;
             }
             if let Some(cursor) = cat.free_cursor {
                 catalog.free_delete_upto(cursor)?;
@@ -2766,7 +2889,19 @@ impl StoreInner {
         }
         cat.dirty.clear();
         cat.removed.clear();
-        cat.trunk_dirty.clear();
+        cat.trunk_gone.clear();
+        // The trunk's in-memory versions are catalog versions now: they move to the read cache, so
+        // that what stays in the lineage is again only what the catalog does not hold.
+        for (page, born, died, slot, crc) in trunk_new {
+            cat.trunk_cache
+                .entry(page)
+                .or_default()
+                .insert(born, Retained { born, died, slot, crc });
+        }
+        let lineage = &mut self.trunk.lineage;
+        lineage.retained.clear();
+        lineage.by_born.clear();
+        lineage.by_died.clear();
         self.children.map.clear();
         self.children.removed.clear();
         // Every free slot is in the catalog now: the in-memory list is dropped and refetched.
@@ -2898,11 +3033,10 @@ impl StoreInner {
     }
 
     fn apply_trunk_retain(&mut self, page: u32, v: Retained) -> Result<()> {
-        self.ensure_trunk_page(page)?;
+        self.trunk_written_known(page)?;
         self.trunk.lineage.retain(page, v);
         let written = self.trunk.written.entry(page).or_insert(0);
         *written = (*written).max(v.died);
-        self.mark_trunk_page(page);
         Ok(())
     }
 
@@ -2962,16 +3096,11 @@ impl StoreInner {
             let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode)?;
             crate::turso_assert!(listed, "detached a child the parent does not list");
             if parent.is_trunk() {
-                // Catalog stores: every trunk page holding a version the garbage range can reach
-                // is made resident first, so the in-memory range query sees all of them.
-                if let Some(cat) = self.catalog() {
-                    for page in cat.trunk_pages_born_in(lo, f)? {
-                        self.ensure_trunk_page(page)?;
-                    }
-                }
-                for page in self.trunk.lineage.child_gone(f, lo, hi, freed, &mut self.work) {
-                    self.mark_trunk_page(page);
-                }
+                // In memory: every version (eager), or those retained since the last checkpoint
+                // (catalog), whose garbage F2's walk finds as before. Catalog stores add the
+                // catalog's garbage, read in place (C-P).
+                self.trunk.lineage.child_gone(f, lo, hi, freed, &mut self.work);
+                self.trunk_catalog_garbage(f, lo, hi, freed)?;
                 return Ok(());
             }
             if !self.ensure(parent)? {
@@ -3034,8 +3163,8 @@ impl StoreInner {
         }
         *levels += 1;
         let at = st.trunk_at;
-        self.ensure_trunk_page(page)?;
-        if let Some(found) = self.trunk.lineage.retained_at(page, at, examined) {
+        self.trunk_written_known(page)?;
+        if let Some(found) = self.trunk_version_at(page, at, examined)? {
             return Ok(Some(found));
         }
         let born = self.trunk.written.get(&page).copied().unwrap_or(0);
@@ -3587,6 +3716,11 @@ impl Lineage {
 
 #[cfg(test)]
 impl BranchStore {
+    /// Catalog trunk versions reaped since the last checkpoint (C-P; 0 for other modes).
+    fn trunk_gone_len(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.trunk_gone.len() as u64)
+    }
+
     /// Every lineage's retained versions agree across the per-page maps and both indexes.
     fn check_indexes(&self) {
         let inner = self.inner.lock();
@@ -3694,11 +3828,26 @@ mod sota_index_tests {
                         _ if b <= d => 2 * b,
                         _ => 2 * d + 1,
                     };
-                    assert_eq!(
-                        visited, contract,
-                        "{mode:?} seed {seed:#x} step {step}: reaping the child forked at {f} (lo {lo:?}, \
-                         hi {hi:?}, |B| {b}, |D| {d}) visited {visited} index entries"
-                    );
+                    // Eager modes: F2's exact in-memory contract. Catalog mode (C-P) walks the
+                    // in-memory versions under the same contract and reads the catalog's ranges in
+                    // place, in doubling batches (at most 4x the smaller range plus 64) or one range
+                    // whose entries are garbage or reaped since the checkpoint: so at most the
+                    // contract, plus max(64, 8 (contract + 1)), plus the versions reaped since.
+                    if mode == Mode::Catalog {
+                        let bound = contract + (8 * (contract + 1)).max(64) + store.trunk_gone_len();
+                        assert!(
+                            visited <= bound,
+                            "{mode:?} seed {seed:#x} step {step}: reaping the child forked at {f} (lo \
+                             {lo:?}, hi {hi:?}, |B| {b}, |D| {d}) visited {visited} index entries, \
+                             bound {bound}"
+                        );
+                    } else {
+                        assert_eq!(
+                            visited, contract,
+                            "{mode:?} seed {seed:#x} step {step}: reaping the child forked at {f} (lo {lo:?}, \
+                             hi {hi:?}, |B| {b}, |D| {d}) visited {visited} index entries"
+                        );
+                    }
                     if reaped.freed_pages > 0 {
                         match at {
                             0 => freed_oldest += 1,
