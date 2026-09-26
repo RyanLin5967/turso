@@ -59,6 +59,11 @@ impl SlotPtr {
 /// memory only as its slots are touched; the chunk size bounds the granularity, not the footprint.
 const SLOTS_PER_CHUNK: usize = 256;
 
+/// Slots per free-list segment. The free list is a stack of these, so pushing a freed slot never
+/// moves the list: a flat `Vec<Slot>` doubled inside one store-mutex hold and moved 4 B per free
+/// slot (2 MB at a million), stalling every branch for the copy.
+const FREE_SEGMENT: usize = 4096;
+
 pub(crate) struct Arena {
     page_size: usize,
     /// Zero-filled allocations of `SLOTS_PER_CHUNK * page_size` bytes, never moved or freed before
@@ -68,7 +73,10 @@ pub(crate) struct Arena {
     chunks: Vec<NonNull<u8>>,
     /// Slots below this have been handed out at least once.
     high_water: u32,
-    free: Vec<Slot>,
+    /// The free slots: `free_len` of them, in segments of [`FREE_SEGMENT`], the last partly filled.
+    /// Segments are kept once allocated (the arena never shrinks), so a pop never frees one.
+    free: Vec<Box<[Slot; FREE_SEGMENT]>>,
+    free_len: usize,
     /// One bit per slot below `high_water`, set while the slot is on the free list. The list alone
     /// cannot answer "is this slot free" without a scan, and releasing an already-free slot must be
     /// caught AT the release — found later, it is two owners of one page and nothing says which.
@@ -96,6 +104,7 @@ impl Arena {
             chunks: Vec::new(),
             high_water: 0,
             free: Vec::new(),
+            free_len: 0,
             free_bits: Vec::new(),
         }
     }
@@ -105,7 +114,9 @@ impl Arena {
     }
 
     pub(crate) fn alloc(&mut self) -> Slot {
-        if let Some(slot) = self.free.pop() {
+        if self.free_len > 0 {
+            self.free_len -= 1;
+            let slot = self.free[self.free_len / FREE_SEGMENT][self.free_len % FREE_SEGMENT];
             self.set_free_bit(slot, false);
             return slot;
         }
@@ -130,7 +141,12 @@ impl Arena {
         turso_assert!(slot < self.high_water, "released a slot the arena never handed out");
         turso_assert!(!self.is_free(slot), "released an arena slot that was already free");
         self.set_free_bit(slot, true);
-        self.free.push(slot);
+        let (segment, offset) = (self.free_len / FREE_SEGMENT, self.free_len % FREE_SEGMENT);
+        if segment == self.free.len() {
+            self.free.push(Box::new([0; FREE_SEGMENT]));
+        }
+        self.free[segment][offset] = slot;
+        self.free_len += 1;
     }
 
     pub(crate) fn is_free(&self, slot: Slot) -> bool {
@@ -141,7 +157,7 @@ impl Arena {
     }
 
     pub(crate) fn in_use(&self) -> usize {
-        self.high_water as usize - self.free.len()
+        self.high_water as usize - self.free_len
     }
 
     /// Every slot currently handed out, for membership checks.
@@ -150,7 +166,7 @@ impl Arena {
     }
 
     pub(crate) fn free_count(&self) -> usize {
-        self.free.len()
+        self.free_len
     }
 
     /// The capacities of the arena's growable vectors (free list, free bits, chunk table), for the
@@ -257,5 +273,23 @@ mod tests {
         for &s in &slots {
             assert!(arena.page(s).iter().all(|&x| x == (s % 251) as u8), "slot {s} aliased");
         }
+    }
+
+    #[test]
+    fn a_mass_release_reuses_slots_last_in_first_out_across_segments() {
+        let mut arena = Arena::new(8);
+        let n = FREE_SEGMENT * 2 + 7;
+        let slots: Vec<Slot> = (0..n).map(|_| arena.alloc()).collect();
+        for &s in &slots {
+            arena.release(s);
+        }
+        assert_eq!(arena.free_count(), n);
+        assert_eq!(arena.free.len(), 3, "segments");
+        for &s in slots.iter().rev() {
+            assert_eq!(arena.alloc(), s, "the free list is a stack");
+        }
+        assert_eq!(arena.free_count(), 0);
+        assert_eq!(arena.in_use(), n);
+        assert_eq!(arena.alloc() as usize, n, "an empty free list grows the arena");
     }
 }
