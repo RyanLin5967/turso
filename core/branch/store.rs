@@ -1434,4 +1434,63 @@ mod tests {
         assert!(store.slots_in_use().is_empty(), "seed {seed:#x}: a slot is not free");
         assert!(!store.trunk_has_children(), "seed {seed:#x}: a trunk_at is still counted");
     }
+
+    /// FRS under threads, the release race (added after mutants M1 and M2 survived the test above,
+    /// whose shared root outlives the threads, so no node another thread shares is ever released).
+    /// Each round, a hub — a trunk child with pages written across four leaves — is forked by every
+    /// thread; then, released together behind a barrier, one thread drops the hub while every
+    /// thread copies a page of the hub away on each of its children and releases them. Nodes the
+    /// hub and its children share are dropped by different threads at the same moment, so a node
+    /// whose last references go on two threads must still be taken by exactly one of them and its
+    /// slots counted down, or the arena leaks. After every round the arena must be empty.
+    #[test]
+    fn threads_releasing_a_shared_hub_and_its_children_at_once_leak_nothing() {
+        let store = BranchStore::new();
+        let barrier = std::sync::Barrier::new(THREADS as usize);
+        let hub: Mutex<Option<(BranchId, HashMap<u32, u64>)>> = Mutex::new(None);
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let (store, barrier, hub) = (&store, &barrier, &hub);
+                s.spawn(move || {
+                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (t + 1).wrapping_mul(0xA24B_AED4_963E_E407));
+                    let mut generation = (t + 1) << 40;
+                    for round in 0..300u64 {
+                        if t == 0 {
+                            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                            let mut view = HashMap::new();
+                            let pages: Vec<(u32, u64)> = (0..128).step_by(4).map(|p| (p, 1_000_000 + round)).collect();
+                            write_pages(store, id, &mut view, &pages);
+                            *hub.lock() = Some((id, view));
+                        }
+                        barrier.wait();
+                        let (id, view) = hub.lock().clone().expect("thread 0 made the round's hub");
+                        let children: Vec<(BranchId, HashMap<u32, u64>)> =
+                            (0..6).map(|_| (store.fork_branch(id).unwrap(), view.clone())).collect();
+                        barrier.wait();
+                        if t == 0 {
+                            store.release_handle(id);
+                        }
+                        for (child, mut view) in children {
+                            // Half the children copy one page away first; the others release a pure clone.
+                            if rng.below(2) == 0 {
+                                generation += 1;
+                                let page = (rng.below(32) * 4) as u32;
+                                write_pages(store, child, &mut view, &[(page, generation)]);
+                                check_reads(store, child, &view, &format!("thread {t} round {round}"));
+                            }
+                            store.release_handle(child);
+                        }
+                        barrier.wait();
+                        if t == 0 {
+                            let stats = store.stats();
+                            assert_eq!(stats.live_branches, 0, "round {round}: branches leaked");
+                            assert_eq!(stats.arena_slots_in_use, 0, "round {round}: a slot outlived every map");
+                            assert!(store.slots_in_use().is_empty(), "round {round}: a slot is not free");
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+    }
 }
