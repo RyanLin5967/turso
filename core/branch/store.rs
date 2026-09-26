@@ -1438,59 +1438,138 @@ mod tests {
     /// FRS under threads, the release race (added after mutants M1 and M2 survived the test above,
     /// whose shared root outlives the threads, so no node another thread shares is ever released).
     /// Each round, a hub — a trunk child with pages written across four leaves — is forked by every
-    /// thread; then, released together behind a barrier, one thread drops the hub while every
-    /// thread copies a page of the hub away on each of its children and releases them. Nodes the
-    /// hub and its children share are dropped by different threads at the same moment, so a node
-    /// whose last references go on two threads must still be taken by exactly one of them and its
-    /// slots counted down, or the arena leaks. After every round the arena must be empty.
+    /// thread and then dropped. In even rounds each thread walks its children, copying a page of the
+    /// hub away on half of them and releasing each at once, so one thread copies a node while
+    /// another drops the last other reference to it (the race mutant M2 opens). In odd rounds the
+    /// copies come first, and then the children go in bursts, one per thread per burst, lined up by
+    /// a barrier, so the last references to the hub's nodes go on different threads at the same
+    /// moment (the race M1 opens). A node whose last references go on two threads must still be
+    /// taken by exactly one of them and its slots counted down, or the arena leaks; after every
+    /// round it must be empty.
+    ///
+    /// A failure on one thread must not strand the others on a barrier (the first version hung
+    /// under mutant M2: thread 0's assertion panicked and the rest waited forever). So every
+    /// stretch between barriers runs under `catch_unwind`; a failure is recorded and raises `stop`,
+    /// every thread reads `stop` right after the next barrier — the same value, since the barrier
+    /// orders the write before every read — and they leave together; the test then fails at an
+    /// assertion with the recorded message.
     #[test]
     fn threads_releasing_a_shared_hub_and_its_children_at_once_leak_nothing() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::atomic::AtomicBool;
+        const ROUNDS: u64 = 500;
+        const CHILDREN: usize = 6;
         let store = BranchStore::new();
         let barrier = std::sync::Barrier::new(THREADS as usize);
         let hub: Mutex<Option<(BranchId, HashMap<u32, u64>)>> = Mutex::new(None);
+        let failure: Mutex<Option<String>> = Mutex::new(None);
+        let stop = AtomicBool::new(false);
+        // Run one stretch between barriers; a panic in it is recorded, not propagated.
+        let guarded = |what: &str, f: &mut dyn FnMut()| {
+            if let Err(e) = catch_unwind(AssertUnwindSafe(f)) {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|m| m.to_string()))
+                    .unwrap_or_else(|| "a non-string panic".to_string());
+                failure.lock().get_or_insert(format!("{what}: {msg}"));
+                stop.store(true, Ordering::SeqCst);
+            }
+        };
+        let (store_ref, barrier_ref, hub_ref, stop_ref, guarded_ref) = (&store, &barrier, &hub, &stop, &guarded);
         std::thread::scope(|s| {
             for t in 0..THREADS {
-                let (store, barrier, hub) = (&store, &barrier, &hub);
                 s.spawn(move || {
+                    let (store, barrier, hub, stop, guarded) = (store_ref, barrier_ref, hub_ref, stop_ref, guarded_ref);
                     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (t + 1).wrapping_mul(0xA24B_AED4_963E_E407));
                     let mut generation = (t + 1) << 40;
-                    for round in 0..300u64 {
-                        if t == 0 {
-                            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
-                            let mut view = HashMap::new();
-                            let pages: Vec<(u32, u64)> = (0..128).step_by(4).map(|p| (p, 1_000_000 + round)).collect();
-                            write_pages(store, id, &mut view, &pages);
-                            *hub.lock() = Some((id, view));
-                        }
+                    // Each stretch is followed by a barrier; after it, every thread sees the same `stop`.
+                    let sync = || {
                         barrier.wait();
-                        let (id, view) = hub.lock().clone().expect("thread 0 made the round's hub");
-                        let children: Vec<(BranchId, HashMap<u32, u64>)> =
-                            (0..6).map(|_| (store.fork_branch(id).unwrap(), view.clone())).collect();
-                        barrier.wait();
+                        stop.load(Ordering::SeqCst)
+                    };
+                    'rounds: for round in 0..ROUNDS {
+                        let what = format!("thread {t} round {round}");
                         if t == 0 {
-                            store.release_handle(id);
+                            guarded(&format!("{what} hub"), &mut || {
+                                let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                                let mut view = HashMap::new();
+                                let pages: Vec<(u32, u64)> =
+                                    (0..128).step_by(4).map(|p| (p, 1_000_000 + round)).collect();
+                                write_pages(store, id, &mut view, &pages);
+                                *hub.lock() = Some((id, view));
+                            });
                         }
-                        for (child, mut view) in children {
-                            // Half the children copy one page away first; the others release a pure clone.
-                            if rng.below(2) == 0 {
-                                generation += 1;
-                                let page = (rng.below(32) * 4) as u32;
-                                write_pages(store, child, &mut view, &[(page, generation)]);
-                                check_reads(store, child, &view, &format!("thread {t} round {round}"));
+                        if sync() {
+                            break 'rounds;
+                        }
+                        let mut children: Vec<(BranchId, HashMap<u32, u64>)> = Vec::new();
+                        guarded(&format!("{what} fork"), &mut || {
+                            let (id, view) = hub.lock().clone().expect("thread 0 made the round's hub");
+                            children = (0..CHILDREN).map(|_| (store.fork_branch(id).unwrap(), view.clone())).collect();
+                        });
+                        if sync() {
+                            break 'rounds;
+                        }
+                        if t == 0 {
+                            guarded(&format!("{what} hub release"), &mut || {
+                                let (id, _) = hub.lock().take().expect("the round's hub");
+                                store.release_handle(id);
+                            });
+                        }
+                        if sync() {
+                            break 'rounds;
+                        }
+                        // Half the children copy one page of the hub away, on every thread at once;
+                        // in even rounds each child is released as soon as it is done with.
+                        let interleaved = round % 2 == 0;
+                        guarded(&format!("{what} copy"), &mut || {
+                            for (child, view) in children.iter_mut() {
+                                if rng.below(2) == 0 {
+                                    generation += 1;
+                                    let page = (rng.below(32) * 4) as u32;
+                                    write_pages(store, *child, view, &[(page, generation)]);
+                                    check_reads(store, *child, view, &what);
+                                }
+                                if interleaved {
+                                    store.release_handle(*child);
+                                }
                             }
-                            store.release_handle(child);
+                            if interleaved {
+                                children.clear();
+                            }
+                        });
+                        if sync() {
+                            break 'rounds;
                         }
-                        barrier.wait();
+                        // Release bursts (odd rounds): every thread drops its k-th child at the same moment.
+                        for k in 0..CHILDREN {
+                            guarded(&format!("{what} release {k}"), &mut || {
+                                if let Some((child, _)) = children.get(k) {
+                                    store.release_handle(*child);
+                                }
+                            });
+                            if sync() {
+                                break 'rounds;
+                            }
+                        }
                         if t == 0 {
-                            let stats = store.stats();
-                            assert_eq!(stats.live_branches, 0, "round {round}: branches leaked");
-                            assert_eq!(stats.arena_slots_in_use, 0, "round {round}: a slot outlived every map");
-                            assert!(store.slots_in_use().is_empty(), "round {round}: a slot is not free");
+                            guarded(&format!("{what} empty"), &mut || {
+                                let stats = store.stats();
+                                assert_eq!(stats.live_branches, 0, "branches leaked");
+                                assert_eq!(stats.arena_slots_in_use, 0, "a slot outlived every map");
+                                assert!(store.slots_in_use().is_empty(), "a slot is not free");
+                                assert!(!store.trunk_has_children(), "a trunk_at is still counted");
+                            });
                         }
-                        barrier.wait();
+                        if sync() {
+                            break 'rounds;
+                        }
                     }
                 });
             }
         });
+        let failure = failure.lock().take();
+        assert!(failure.is_none(), "{}", failure.unwrap_or_default());
     }
 }
