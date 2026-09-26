@@ -429,12 +429,13 @@ fn set(conn: &Arc<Connection>, id: i64, v: &str) {
 
 /// U6 (r11-invariant-matrix): a splice moves a child to its spliced-out parent's key, and a catalog
 /// store must move the child's row, and its `branch_children` entry, with it. P writes a page, forks
-/// Z and then Q, and rewrites the page, so P keeps its first version for BOTH Z's key and Q's; Z
+/// Z, Q1 and Q2, and rewrites the page, so P keeps its first version for Z's key and both Q's; Z
 /// forks C. After a checkpoint (all of them catalog rows) Z's release splices C into Z's key under
-/// P, and a second checkpoint writes that. After a reopen, C is read from the catalog under P (a row
-/// still naming the deleted Z would be "a missing parent"), Q's reap keeps P's first version (C, at
-/// Z's old key, is its neighbour below; were C not listed there, the version would be garbage),
-/// and C still reads it and releases cleanly.
+/// P. Q1's reap, BEFORE the next checkpoint (the matrix's interleaving: the catalog still lists Z
+/// at that key, the in-memory index C), keeps P's first version: C, at Z's key, is its neighbour
+/// below. A second checkpoint writes the splice. After a reopen, C is read from the catalog under P
+/// (a row still naming the deleted Z would be "a missing parent"), Q2's reap keeps the version the
+/// same way (now from the re-keyed catalog row), and C still reads it and releases cleanly.
 #[test]
 fn a_spliced_child_is_listed_under_its_new_parent_after_a_checkpoint_and_a_reopen() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -454,12 +455,19 @@ fn a_spliced_child_is_listed_under_its_new_parent_after_a_checkpoint_and_a_reope
             .collect::<Vec<u32>>();
         assert!(!p7.is_empty(), "p's write took no slot of its own");
         let z = p.fork().unwrap();
+        let q1 = p.fork().unwrap();
         let q = p.fork().unwrap();
-        set(&p.connect().unwrap(), 7, "p-second"); // P retains its first version for Z and Q
+        set(&p.connect().unwrap(), 7, "p-second"); // P retains its first version for Z, Q1 and Q
         let c = z.fork().unwrap();
-        db.branch_compact_now().unwrap(); // P, Z, Q and C are catalog rows
+        db.branch_compact_now().unwrap(); // P, Z, Q1, Q and C are catalog rows
         let reaped = z.reap().unwrap(); // one live child: C takes Z's key under P
         assert!(reaped.deferred, "{reaped:?}");
+        let reaped = q1.reap().unwrap();
+        assert!(!reaped.deferred, "{reaped:?}");
+        for slot in &p7 {
+            assert!(!db.branch_slot_is_free(*slot), "slot {slot}: C still reads it, freed by Q1's reap");
+        }
+        assert_eq!(value(&c.connect().unwrap(), 7), "p-first");
         db.branch_compact_now().unwrap(); // Z deleted, C re-keyed
         assert_eq!(db.branch_stats().unwrap().live_branches, 3);
         p_id = p.into_id();
@@ -531,4 +539,65 @@ fn a_splice_after_recovery_applies_the_childs_parked_commit_first() {
     let c = db.branch(c_id).unwrap();
     assert_eq!(value(&c.connect().unwrap(), 7), "c", "C lost its parked Commit");
     let _ = c.into_id();
+}
+
+/// Review of c47df7e64, finding 1: a held branch's catalog row must stop saying held once its
+/// connection closes. Otherwise a checkpoint after the close leaves `released = 2` with the `Close`
+/// gone from the log, a restart holds the branch again, and replay skips the collects the live store
+/// made since: here C2's reap, which retires P a second time (freeing P's page written between
+/// C1's fork and C2's) and splices it into C1. D then reuses that slot, and at the end of that
+/// recovery the late collect would free it under D's page. P, released while its connection is
+/// open, has two children; the close retires it; checkpoint; C2's reap; D's commit; crash. The image
+/// must keep D's slot in use and read D's page.
+#[test]
+fn a_closed_branch_is_not_held_again_after_a_checkpoint_and_a_crash() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let (image, d_id, d_slots, c1_id, in_use_live);
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let p = trunk.fork_branch().unwrap();
+        let c1 = p.fork().unwrap();
+        let pc = p.connect().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&pc, 7, "p-between");
+        let x: Vec<u32> = db
+            .branch_slots_in_use()
+            .into_iter()
+            .filter(|s| !s0.contains(s))
+            .collect();
+        assert_eq!(x.len(), 1, "premise: p's write took one slot");
+        let c2 = p.fork().unwrap();
+        drop(p); // released under pc: held
+        db.branch_compact_now().unwrap(); // the row says released = 2
+        drop(pc); // Close: P retired, two children kept
+        db.branch_compact_now().unwrap(); // the row must say 1 now; the Close leaves the log
+        let reaped = c2.reap().unwrap(); // P retired again (x is freed) and spliced into C1
+        assert!(!reaped.deferred, "{reaped:?}");
+        assert!(db.branch_slot_is_free(x[0]), "premise: C2's reap did not free p's page");
+        let d = trunk.fork_branch().unwrap();
+        set(&d.connect().unwrap(), 150, "d");
+        d_slots = d.owned_slots();
+        assert!(d_slots.contains(&x[0]), "premise: d did not reuse the freed slot: {d_slots:?}");
+        in_use_live = db.branch_slots_in_use();
+        image = crash_image(&path, dir.path());
+        d_id = d.into_id();
+        c1_id = c1.into_id();
+    }
+    let db = open_at(&image, catalog()).unwrap();
+    for slot in &d_slots {
+        assert!(!db.branch_slot_is_free(*slot), "slot {slot}: d's page, freed by the recovery");
+    }
+    let mut got = db.branch_slots_in_use();
+    got.sort_unstable();
+    let mut want = in_use_live;
+    want.sort_unstable();
+    assert_eq!(got, want, "the recovery's slot set is not the crashed store's");
+    assert_eq!(db.branch_stats().unwrap().live_branches, 2, "c1 and d should be left");
+    let d = db.branch(d_id).unwrap();
+    assert_eq!(value(&d.connect().unwrap(), 150), "d");
+    let _ = d.into_id();
+    let _ = db.branch(c1_id).unwrap().into_id();
 }

@@ -1504,6 +1504,8 @@ mod tests {
                 crc: 0,
             },
             Record::Release { branch: 0 },
+            Record::ReleaseOpen { branch: 0 },
+            Record::Close { branch: 0 },
             Record::Lease {
                 branch: 0,
                 deadline_ms: 0,

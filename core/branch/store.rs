@@ -1694,6 +1694,10 @@ impl BranchStore {
             if let Err(e) = self.log(&mut inner, Record::Close { branch: id.0 }) {
                 tracing::warn!("released branch {} closed, the Close not durable: {e}", id.0);
             }
+            // The catalog row must stop saying held (`released = 2`): a checkpoint after this close
+            // drops the `Close` from the log, and a row still marked held would be held again at the
+            // next recovery, which would then skip the collects made since (review of c47df7e64).
+            inner.mark_dirty(id, DIRTY_ROW);
         }
         if let Some(st) = inner.branches.get_mut(&id) {
             st.open = false;
@@ -3647,6 +3651,8 @@ impl StoreInner {
             st.open = false;
             journal.buffer(&Record::Close { branch: id.0 })?;
             logged = true;
+            // The catalog row stops saying held at the next checkpoint (see `close`).
+            self.mark_dirty(id, DIRTY_ROW);
             self.collect(id, freed)?;
         }
         Ok((ids.len() as u64, logged))
@@ -3817,6 +3823,8 @@ impl StoreInner {
                 if let Some(st) = self.branches.get_mut(&id) {
                     st.open = false;
                 }
+                // The catalog row stops saying held at the next checkpoint (see `close`).
+                self.mark_dirty(id, DIRTY_ROW);
                 self.collect(id, freed).map(|_| ()).map_err(corrupt)
             }
             Record::Lease {

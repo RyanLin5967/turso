@@ -297,7 +297,7 @@ pub struct BranchOpenStats {
     pub load_ns: u64,
     /// Replay (records).
     pub replay_ns: u64,
-    /// `collect_released` (branches scanned).
+    /// `close_held`: closing and collecting what a crash left held (`released_scanned`).
     pub collect_ns: u64,
     /// `referenced_slots` (referenced_slots).
     pub referenced_ns: u64,

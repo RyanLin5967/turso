@@ -2703,6 +2703,16 @@ fn a_grandchild_reads_a_spliced_parents_write() {
     let db = reopen(&path, incarnation);
     assert_eq!(db.branch_stats().unwrap().live_branches, 2);
     check_views(&db, &expect, "after replay");
+    // The page maps a replay builds come from each fork, as live; a snapshot or catalog checkpoint
+    // makes the next open DERIVE them from the lineages (`derive_page_maps`, `insert_loaded`), from
+    // the born epochs: that is where epochs starting at 0 would send the grandchild to the trunk
+    // (review of c47df7e64, finding 3).
+    db.branch_compact_now().unwrap();
+    let incarnation = db.incarnation;
+    drop(db);
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_stats().unwrap().live_branches, 2);
+    check_views(&db, &expect, "after a checkpoint and a reopen");
 }
 
 /// The splice's stream direction (the zombie's side is the smaller) and the shadow rule with a
@@ -2733,8 +2743,12 @@ fn a_splice_frees_a_version_the_child_shadowed_before_its_own_child_forked() {
         set(&c.connect().unwrap(), 7, "c-first");
         let d = c.fork().unwrap();
         set(&c.connect().unwrap(), 7, "c-second");
+        let work = db.branch_stats().unwrap().work;
         let reaped = p.reap().unwrap();
         assert!(reaped.deferred, "{reaped:?}");
+        let after = db.branch_stats().unwrap().work;
+        assert_eq!(after.splices, work.splices + 1);
+        assert_eq!(after.splice_commits, work.splice_commits, "premise: the splice took the commit direction");
         assert_eq!(db.branch_stats().unwrap().live_branches, 2, "p was not spliced");
         for slot in &p7 {
             assert!(db.branch_slot_is_free(*slot), "slot {slot}: shadowed for every reader, still held");
