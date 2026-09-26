@@ -1458,6 +1458,12 @@ impl BranchStore {
                 stats.k3_nodes_live = k3.nodes_live();
                 stats.k3_node_bytes_live = k3.node_bytes();
                 let olc = k3.olc_counts();
+                if matches!(**k3, SharedVersions::Olc(_)) {
+                    // One snapshot for the list side and the pool side, so the harness can compare
+                    // them exactly.
+                    stats.k3_nodes_live = olc.in_use;
+                    stats.k3_node_bytes_live = olc.pool_bytes;
+                }
                 stats.k3_olc_restarts = olc.restarts;
                 stats.k3_olc_head_spins = olc.head_spins;
                 stats.k3_olc_fallbacks = olc.fallbacks;
