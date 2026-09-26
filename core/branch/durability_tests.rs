@@ -2635,6 +2635,9 @@ fn a_branch_released_under_its_open_connection_is_spliced_at_the_close() {
         p_id = p.id();
         drop(p); // released while pc is open: held
         assert_eq!(db.branch_stats().unwrap().live_branches, 2, "the open connection did not hold it");
+        // The child reads through the held branch (r11-ever-refute coverage caveat iii).
+        assert_eq!(value(&c.connect().unwrap(), 7), Some("p-pre".to_string()));
+        assert_eq!(value(&pc, 110), Some("p-post".to_string()), "the held branch lost its own write");
         image_before = crash_image(&path, &dir.path().join("before"));
         db.branch_compact_now().unwrap(); // a snapshot inside the window
         image_after = crash_image(&path, &dir.path().join("after"));
