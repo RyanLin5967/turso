@@ -409,13 +409,14 @@ fn pause_at(hold: Option<&AtomicU8>, stage: u8) {
     }
 }
 
-/// F-FZ's arm switch: `R11_CKPT=sharp` makes `maybe_compact` checkpoint a catalog store the base's
-/// way (settle everything, then capture, write and install under the store mutex): the BEFORE arm
-/// of the stall measurement, and the control for any test that fails only with the fuzzy path.
-/// Anything else, or unset: fuzzy.
+/// F-FZ's arm switch (lead decision 27960c3d): `maybe_compact` checkpoints a catalog store the
+/// base's way (settle everything, then capture, write and install under the store mutex) unless
+/// `R11_CKPT=fuzzy`, which opts into the fuzzy checkpoint. The default suite therefore runs the base's
+/// checkpoint, and every measurement arm names its mode. (`compact_now`, and the tests' and harness's
+/// `checkpoint_fuzzy_now`, choose their own path whatever the switch says.)
 fn fuzzy_checkpoints() -> bool {
     static FUZZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FUZZY.get_or_init(|| std::env::var("R11_CKPT").map_or(true, |v| v != "sharp"))
+    *FUZZY.get_or_init(|| std::env::var("R11_CKPT").is_ok_and(|v| v == "fuzzy"))
 }
 
 impl CatState {
@@ -1866,8 +1867,9 @@ impl BranchStore {
     /// operation that triggered it is already durable, and a failure before the rename leaves the
     /// log intact; a failure after it fail-stops the journal (see `Journal::compact`).
     ///
-    /// A catalog store checkpoints FUZZILY instead (F-FZ): C-R's parked Commits first, a bounded
-    /// batch per call; then a capture under this mutex, and the write on a thread of its own.
+    /// With `R11_CKPT=fuzzy`, a catalog store checkpoints FUZZILY instead (F-FZ): C-R's parked Commits
+    /// first, a bounded batch per call; then a capture under this mutex, and the write on a thread of
+    /// its own.
     fn maybe_compact(&self, inner: &mut StoreInner) {
         if !inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
             return;

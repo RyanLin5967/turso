@@ -40,8 +40,8 @@
 //! * `ckpt2` also prints the catalog checkpoint counters and the WAL backfill's reads.
 //! * `ckpt3 --writes M` (F-FZ's stall arm): a second thread commits over the upper half of the
 //!   branches, timing every commit, while this thread's M commits over the lower half cross the
-//!   store's own 1 MiB trigger, so the store checkpoints as it would (fuzzy; `R11_CKPT=sharp` for the
-//!   BEFORE arm). One line: both threads' commit latencies and the checkpoint counters.
+//!   store's own 1 MiB trigger, so the store checkpoints as it would (`R11_CKPT=fuzzy` for the AFTER
+//!   arm; sharp is the default, the BEFORE arm). One line: both threads' latencies and the counters.
 //! * `fifo --writes K` (K4): release the K oldest trunk children one at a time, each read by a
 //!   fresh `Database::branch`, with the catalog rows each reap read and the versions it freed.
 //! * `grow --lease-ms L` gives every fork a lease of L ms. `leasedown` is a kill -9 VICTIM: open,
@@ -873,7 +873,7 @@ fn ckpt3(args: &Args) {
          settle_loads={}\tsettle_max_loads={}",
         args.n,
         args.writes,
-        std::env::var("R11_CKPT").unwrap_or_else(|_| "fuzzy".to_string()),
+        std::env::var("R11_CKPT").unwrap_or_else(|_| "sharp (default)".to_string()),
         bg_lat.len(),
         d[0],
         d[1],

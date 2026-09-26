@@ -607,9 +607,11 @@ fn a_crash_before_a_fuzzy_commit_replays_the_whole_log() {
 /// F-FZ's log bound: with fuzzy checkpoints the log may pass the threshold while one is in flight,
 /// but an operation that finds it past twice the threshold waits for the install, so the log never
 /// exceeds twice the threshold plus one operation's records. (The sharp checkpoint's bound, the
-/// threshold plus one operation, is `the_log_stays_under_the_checkpoint_threshold`, which holds with
-/// `R11_CKPT=sharp` only: PREREG A14 addendum.)
+/// threshold plus one operation, is `the_log_stays_under_the_checkpoint_threshold`, which holds in
+/// the default, sharp mode: PREREG A15 addendum.) Fuzzy mode only, so it is ignored in the default
+/// suite and run by name with `R11_CKPT=fuzzy --ignored` (q7.sh `tests fuzzy`).
 #[test]
+#[ignore = "fuzzy mode only: run with R11_CKPT=fuzzy and --ignored"]
 fn the_log_stays_under_twice_the_threshold_with_fuzzy_checkpoints() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("c.db");
