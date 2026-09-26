@@ -520,7 +520,7 @@ struct WorkSum {
 }
 
 impl WorkSum {
-    fn add(&mut self, a: BranchWork, b: BranchWork) {
+    fn add(&mut self, a: &BranchWork, b: &BranchWork) {
         self.resolve_calls += b.resolve_calls - a.resolve_calls;
         self.resolve_levels += b.resolve_levels - a.resolve_levels;
         self.resolve_retained_examined += b.resolve_retained_examined - a.resolve_retained_examined;
@@ -551,7 +551,7 @@ impl Bench {
         let t = Instant::now();
         let out = f();
         op.samples.push(t.elapsed());
-        op.work.add(before, self.work());
+        op.work.add(&before, &self.work());
         out
     }
 
@@ -2119,8 +2119,10 @@ fn run_cells(
     }
 }
 
-/// The trunk lock per site, per cell: r11-k3-trunklock a328c4d05's `# sites` line, same fields and format, so the
-/// two lanes' files are read by one parser (amendment 16).
+/// The trunk lock per site, per cell: r11-k3-trunklock's `# sites` line (a328c4d05, unchanged at 2f1c9c088), same
+/// fields and format, so the two lanes' files are read by one parser (amendment 16): acquisitions and contended
+/// acquisitions per cycle, wait per cycle, and hold per acquisition (0 unless `--lock-timing on`). The cell's closing
+/// `branch_stats` call is one of the `observe` acquisitions (one per database: 48 in V).
 fn print_sites(n: usize, t: usize, draw: u64, cycles: f64, before: &BranchWork, after: &BranchWork) {
     let (a, b) = (&before.trunk_sites, &after.trunk_sites);
     let mut line = format!("# sites N={n} T={t} draw={draw}");

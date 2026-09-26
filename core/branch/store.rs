@@ -1727,6 +1727,48 @@ mod tests {
         assert!(sites.wait_ns[observe] > 0 && sites.hold_ns[observe] >= hold.as_nanos() as u64);
     }
 
+    /// The trunk lock's per-site accounting, one site at a time (r11-k3-trunklock 5e9450cf0's test, ported to this
+    /// store's modes): a trunk fork, a trunk copy decision, a resolution of the page it rewrote, and the reap each
+    /// count one acquisition at their own site and none elsewhere, less the one `observe` acquisition each closing
+    /// snapshot makes itself. With FK a trunk fork takes no trunk lock; its reap takes it for the garbage pass,
+    /// since the write retained a version for the child.
+    #[test]
+    fn trunk_lock_sites_are_counted_where_they_are_taken() {
+        for mask in [0, crate::coherence::FIX_TRUNKIDX] {
+            crate::coherence::force_fixes_for_test(mask);
+            let fk = mask != 0;
+            let store = BranchStore::new();
+            let snap = || store.stats().work.trunk_sites.acquisitions;
+            let delta = |a: [u64; 5], b: [u64; 5]| {
+                let mut d: [u64; 5] = std::array::from_fn(|i| b[i] - a[i]);
+                d[TrunkSite::Observe as usize] -= 1;
+                d
+            };
+            let one = |site: TrunkSite| {
+                let mut d = [0u64; 5];
+                d[site as usize] = 1;
+                d
+            };
+            let before = snap();
+            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+            let fork = if fk { [0; 5] } else { one(TrunkSite::Fork) };
+            assert_eq!(delta(before, snap()), fork, "fk {fk}: fork");
+            let before = snap();
+            // The trunk rewrites page 0, whose content until now was `image(0)`.
+            store.first_write_trunk(0, &image(0));
+            assert_eq!(delta(before, snap()), one(TrunkSite::Write), "fk {fk}: trunk write");
+            let before = snap();
+            let mut buf = vec![0u8; PAGE];
+            assert!(matches!(store.resolve_into(id, 0, &mut buf).unwrap(), Resolved::Filled));
+            assert_eq!(buf, image(0), "fk {fk}: the child reads the pre-image");
+            assert_eq!(delta(before, snap()), one(TrunkSite::Resolve), "fk {fk}: resolve");
+            let before = snap();
+            assert_eq!(store.release_handle(id).freed_pages, 1);
+            assert_eq!(delta(before, snap()), one(TrunkSite::Reap), "fk {fk}: reap");
+        }
+        crate::coherence::force_fixes_for_test(0);
+    }
+
     /// A committed branch page holding `image(generation)`, as the pager hands it to
     /// `commit_pages`.
     fn page_with(page: u32, generation: u64) -> PageRef {
