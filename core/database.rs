@@ -2200,6 +2200,9 @@ impl Database {
                     };
 
                     self.shared_wal = shared_wal;
+                    // FU: an anchor built before this point holds the placeholder WAL state (the open's first
+                    // pager built one); the next pager on each thread must anchor the real one.
+                    self.anchors = crate::anchor::Anchors::new();
                     let last_checksum_and_max_frame =
                         self.shared_wal.read().last_checksum_and_max_frame();
                     let wal =
