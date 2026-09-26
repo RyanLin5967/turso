@@ -1651,7 +1651,7 @@ mod tests {
                 let (store, wal, committed, generation) =
                     (store.clone(), wal.clone(), committed.clone(), generation.clone());
                 std::thread::spawn(move || {
-                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ ((w + 1) * 0xD1B5_4A32_D192_ED03));
+                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (w + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
                     let mut nodes: Vec<Node> = Vec::new();
                     let (mut cross_shard, mut deferred) = (0u64, 0u64);
                     let mut buf = vec![0u8; PAGE];
