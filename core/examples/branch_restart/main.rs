@@ -240,7 +240,7 @@ fn stats_line(s: &BranchOpenStats) -> String {
         s.referenced_slots,
         s.arena_high_water,
         s.arena_free,
-        s.derived_map_inserts
+        s.derived_map_inserts,
         s.states,
         s.released_scanned,
         s.branch_loads,
