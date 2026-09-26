@@ -149,12 +149,31 @@ fn thread_cpu_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-/// One measured op: counter deltas, and (with `--time`) wall and thread-CPU microseconds.
+/// Process resource counters: minor faults, major faults, voluntary and involuntary context
+/// switches. The driver is single-threaded, so a delta across one op is that op's.
+fn rusage() -> [i64; 4] {
+    // SAFETY: an all-zero `rusage` is a valid out-value, and the pointer is valid for the call.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        die("getrusage failed");
+    }
+    [
+        ru.ru_minflt as i64,
+        ru.ru_majflt as i64,
+        ru.ru_nvcsw as i64,
+        ru.ru_nivcsw as i64,
+    ]
+}
+
+/// One measured op: counter deltas, and (with `--time`) wall and thread-CPU microseconds and the
+/// op's resource-counter deltas (read outside the timed window).
 struct Op<T> {
     out: T,
     d: [u64; NF],
     wall_us: f64,
     cpu_us: f64,
+    ru: [i64; 4],
 }
 
 struct Meter<'a> {
@@ -165,15 +184,21 @@ struct Meter<'a> {
 impl Meter<'_> {
     fn op<T>(&self, f: impl FnOnce() -> T) -> Op<T> {
         let before = fields(&self.s.stats().work);
-        let (out, wall_us, cpu_us) = if self.time {
+        let (out, wall_us, cpu_us, ru) = if self.time {
+            let r0 = rusage();
             let c0 = thread_cpu_ns();
             let t0 = Instant::now();
             let out = f();
             let wall = t0.elapsed().as_nanos() as f64 / 1e3;
             let cpu = (thread_cpu_ns() - c0) as f64 / 1e3;
-            (out, wall, cpu)
+            let r1 = rusage();
+            let mut ru = [0i64; 4];
+            for i in 0..4 {
+                ru[i] = r1[i] - r0[i];
+            }
+            (out, wall, cpu, ru)
         } else {
-            (f(), 0.0, 0.0)
+            (f(), 0.0, 0.0, [0; 4])
         };
         let after = fields(&self.s.stats().work);
         let mut d = [0u64; NF];
@@ -185,6 +210,7 @@ impl Meter<'_> {
             d,
             wall_us,
             cpu_us,
+            ru,
         }
     }
 }
@@ -255,7 +281,10 @@ fn nonzero(d: &[u64; NF]) -> String {
 
 fn timing<T>(op: &Op<T>, time: bool) -> String {
     if time {
-        format!(" cpu_us={:.1} wall_us={:.1}", op.cpu_us, op.wall_us)
+        format!(
+            " cpu_us={:.1} wall_us={:.1} minflt={} majflt={} nvcsw={} nivcsw={}",
+            op.cpu_us, op.wall_us, op.ru[0], op.ru[1], op.ru[2], op.ru[3]
+        )
     } else {
         String::new()
     }
