@@ -965,6 +965,16 @@ fn a_branch_connection_shares_its_store_schema_including_analyze_stats() {
     let bc = b.connect().unwrap();
     let f = bc.session_footprint();
     assert!(f.schema_shared_with_store, "the branch connection copied its schema");
+    // The point of FS3: sessions on different branches forked from one trunk state share ONE schema, not a
+    // copy each. (A connection that copied and then published its copy would still pass the check above.)
+    let other = trunk.fork_branch().unwrap();
+    let oc = other.connect().unwrap();
+    assert!(
+        Arc::ptr_eq(&bc.schema.read().clone(), &oc.schema.read().clone()),
+        "two branches' sessions hold two Schema copies"
+    );
+    drop(oc);
+    drop(other);
     let shared = bc.schema.read().clone();
     assert!(
         !shared.analyze_stats.needs_refresh(),
