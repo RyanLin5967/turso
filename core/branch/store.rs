@@ -3361,7 +3361,13 @@ impl StoreInner {
                 let id = BranchId(*branch);
                 // C-R: in catalog recovery (the arena is not open yet), a Commit to a branch that is
                 // not resident is parked, not replayed: the branch is not read until it is touched.
-                let recovering = self.cat.is_some() && self.arena.is_none();
+                // FIRE-CHECK MUTANT M-NOPARK (a12-durable-open PREREG A9 owed item 2; schemata branch, NEVER
+                // merged): with A12_MUTANT=noparking every replayed Commit loads its branch at once, as C-P's
+                // recovery did, so the C-R test's "no branch read at recovery" assertion must fail. Unset, the
+                // store is d7a2b8f6e's exactly.
+                let recovering = self.cat.is_some()
+                    && self.arena.is_none()
+                    && std::env::var("A12_MUTANT").as_deref() != Ok("noparking");
                 let removed = self.cat.as_ref().is_some_and(|c| c.removed.contains(&id));
                 if recovering && !removed && (!self.branches.contains_key(&id) || self.parked.contains_key(&id)) {
                     self.parked
