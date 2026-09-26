@@ -216,6 +216,8 @@ pub struct BranchWork {
     pub merge_refused_page: u64,
     pub merge_refused_key: u64,
     pub merge_refused_structural: u64,
+    /// Validated, but the install refused (a trunk constraint, or rows that no longer fit).
+    pub merge_refused_install: u64,
     pub merge_refused_scope: u64,
     /// Probes the ACTIVE validator made: 1 for the scalar gate, one per page or row checked for the
     /// stamps, one per logged page for the log. Each stops at its first conflict.

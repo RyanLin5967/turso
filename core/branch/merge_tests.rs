@@ -1,15 +1,27 @@
-//! Merges against a model the test keeps itself.
+//! Merges against a model the test keeps itself, judged by CONTENT, never by the validators' rules.
 //!
-//! The model is a map per branch and one for the trunk, and a per-row "last trunk write" time. It
-//! never asks the engine what a merge should do: it decides from its own history whether a merge
-//! conflicts at row level, applies a committed merge's rows itself, and then reads the trunk and
-//! every live branch back through SQL. Page-granular verdicts cannot be modelled without the
-//! engine's page layout, so they are checked by implication (a row conflict writes the row's page,
-//! so it is a page conflict; a page conflict is a commit since the fork) and by soundness: after
-//! every step the trunk must equal the model and pass `PRAGMA integrity_check`, which a physical
-//! install that copied a page the trunk had changed or restructured would break.
+//! The model holds three maps per merge: the trunk as the branch forked it (base), the trunk now
+//! (ours), and the branch's own view (theirs). The module promises a three-way merge that refuses
+//! write-write conflicts, so the oracle is merge3 by content:
+//!
+//! * COMPLETENESS: a row both sides changed, to different contents, is a true conflict, and every
+//!   validator must refuse the merge. (Refusing more is allowed; a refusal is always safe.)
+//! * SOUNDNESS: after a committed merge the trunk equals merge3(base, ours, theirs): theirs for
+//!   every row the branch changed by content, ours for every other row. The model computes that
+//!   from its own maps; it does not mirror how the replay or the page copy works.
+//!
+//! The trunk and every live branch are read back through SQL after every step, with `PRAGMA
+//! integrity_check`. Page verdicts are checked by implication (a row conflict writes the row's
+//! page, so it is a page conflict; a page conflict needs a trunk write since the fork, inside a
+//! batch too). An earlier version checked the row verdict against a copy of the row-stamp rule,
+//! which could only confirm the rule against itself (frontier/round11/r11-merge-refute).
+//!
+//! The tests after the model test each reproduce one install defect the refuter found by reading:
+//! a re-fired trigger, a stale statement after a trunk ALTER, an FK action or a REPLACE reverting a
+//! trunk-only row, a UNIQUE move replayed in rowid order, a batch member's error dropping the batch,
+//! and colliding automatic rowids. Each asserts a refusal or the three-way result.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::merge::{Install, MergeOutcome, MergePolicy, Merger, Refusal, Validation};
 use super::*;
@@ -77,16 +89,44 @@ fn texts(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every cell of every row of `sql`, as text: NULL as "NULL", an integer in decimal.
+fn cells(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    conn.prepare(sql)
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .flat_map(|r| r.into_iter())
+        .map(|v| match &v {
+            Value::Null => "NULL".to_string(),
+            Value::Text(t) => t.as_str().to_string(),
+            other => other
+                .as_int()
+                .map_or_else(|| format!("{other:?}"), |i| i.to_string()),
+        })
+        .collect()
+}
+
 fn integrity(conn: &Arc<Connection>) -> Vec<String> {
     texts(conn, "PRAGMA integrity_check")
 }
 
-/// What the model knows about a branch.
+/// What the model knows about a branch: the trunk as it forked, and its own view since.
 struct Model {
+    base: BTreeMap<i64, String>,
     view: BTreeMap<i64, String>,
+    /// Rows a cursor wrote on the branch (the engine's row write set must equal it).
     written: HashSet<i64>,
-    /// Model trunk time at the fork.
-    forked_at: u64,
+}
+
+/// Rows the branch changed by content: its view differs from the fork's.
+fn changed(m: &Model) -> BTreeSet<i64> {
+    m.base
+        .keys()
+        .chain(m.view.keys())
+        .copied()
+        .filter(|id| m.base.get(id) != m.view.get(id))
+        .collect()
 }
 
 struct Live {
@@ -171,52 +211,55 @@ const POLICIES: [MergePolicy; 7] = [
 /// The trunk's model state.
 struct Trunk {
     rows: BTreeMap<i64, String>,
-    /// Advances at every trunk row write; `stamp` is each row's last.
-    time: u64,
-    stamp: HashMap<i64, u64>,
 }
 
 impl Trunk {
-    fn key_conflict(&self, m: &Model) -> bool {
-        m.written
-            .iter()
-            .any(|r| self.stamp.get(r).is_some_and(|&s| s > m.forked_at))
+    /// A true conflict by content: a row both sides changed since the fork, to different contents.
+    fn semantic_conflict(&self, m: &Model) -> bool {
+        changed(m).into_iter().any(|id| {
+            let ours = self.rows.get(&id);
+            ours != m.base.get(&id) && ours != m.view.get(&id)
+        })
     }
 
-    /// A committed merge: every row the branch wrote takes the branch's value, and is stamped when
-    /// a trunk cursor wrote it (the row exists on one side or the other). The physical install
-    /// stamps every row the branch wrote, having no cursor to say which exist.
-    fn apply(&mut self, m: &Model, install: Install) {
-        let mut ids: Vec<i64> = m.written.iter().copied().collect();
-        ids.sort_unstable();
-        for id in ids {
-            let had = self.rows.contains_key(&id);
+    /// merge3(base, ours, theirs): theirs where the branch changed a row, ours everywhere else.
+    fn merge3(&self, m: &Model) -> BTreeMap<i64, String> {
+        let mut out = self.rows.clone();
+        for id in changed(m) {
             match m.view.get(&id) {
-                Some(v) => self.rows.insert(id, v.clone()),
-                None => self.rows.remove(&id),
-            };
-            if had || m.view.contains_key(&id) || install == Install::Physical {
-                self.time += 1;
-                self.stamp.insert(id, self.time);
+                Some(v) => {
+                    out.insert(id, v.clone());
+                }
+                None => {
+                    out.remove(&id);
+                }
             }
         }
+        out
     }
 
-    /// Check one merge's verdicts against the model, before applying it. `batched`: an earlier
-    /// member of the same batch may have written the trunk without a commit yet.
+    /// A committed merge: the trunk becomes merge3. The next read-back compares the real trunk.
+    fn apply(&mut self, m: &Model) {
+        self.rows = self.merge3(m);
+    }
+
+    /// Check one merge's verdicts, before applying it. `batched`: an earlier member of the same
+    /// batch may have written the trunk without a commit yet.
     fn check(&self, seed: u64, o: &MergeOutcome, m: &Model, policy: MergePolicy, batched: bool) {
-        assert_eq!(
-            o.key_conflict,
-            self.key_conflict(m),
-            "seed {seed:#x}: the row verdict disagrees with the model: {o:?}"
-        );
+        if self.semantic_conflict(m) {
+            assert!(
+                o.refused.is_some(),
+                "seed {seed:#x}: a true conflict (both sides changed a row, by content) was merged: \
+                 {o:?}"
+            );
+        }
         assert!(
             !o.key_conflict || o.page_conflict,
             "seed {seed:#x}: a row conflict without a page conflict: {o:?}"
         );
         assert!(
             !o.page_conflict || o.scalar_conflict,
-            "seed {seed:#x}: a page conflict without a commit since the fork: {o:?}"
+            "seed {seed:#x}: a page conflict without a trunk write since the fork: {o:?}"
         );
         if batched {
             assert!(o.scalar_conflict || o.commits_since_fork == 0, "{o:?}");
@@ -230,7 +273,11 @@ impl Trunk {
                 "seed {seed:#x}: the log and the page stamps disagree: {o:?}"
             );
         }
-        assert_eq!(o.rows_written, m.written.len(), "seed {seed:#x}: {o:?}");
+        assert_eq!(
+            o.rows_written,
+            m.written.len(),
+            "seed {seed:#x}: the engine's row write set is not the rows the branch wrote: {o:?}"
+        );
         let active = match policy.validation {
             Validation::Scalar => o.scalar_conflict.then_some(Refusal::Scalar),
             Validation::Log => o.page_conflict.then_some(Refusal::Log),
@@ -264,8 +311,6 @@ fn run(seed: u64, with_index: bool) -> Tally {
     }
     let mut t = Trunk {
         rows: BTreeMap::new(),
-        time: 0,
-        stamp: HashMap::new(),
     };
     trunk.execute("BEGIN").unwrap();
     for i in 1..=ROWS {
@@ -288,9 +333,9 @@ fn run(seed: u64, with_index: bool) -> Tally {
                 live.push(Live {
                     branch: trunk.fork_branch().unwrap(),
                     m: Model {
+                        base: t.rows.clone(),
                         view: t.rows.clone(),
                         written: HashSet::new(),
-                        forked_at: t.time,
                     },
                 });
             }
@@ -307,10 +352,7 @@ fn run(seed: u64, with_index: bool) -> Tally {
                 conn.execute("COMMIT").unwrap();
             }
             10..=12 => {
-                if let Some(id) = write_one(&mut rng, &trunk, &mut t.rows, &mut gen, "t") {
-                    t.time += 1;
-                    t.stamp.insert(id, t.time);
-                }
+                write_one(&mut rng, &trunk, &mut t.rows, &mut gen, "t");
             }
             13..=16 if !live.is_empty() => {
                 let Live { branch, m } = live.swap_remove(rng.below(live.len() as u64) as usize);
@@ -319,7 +361,7 @@ fn run(seed: u64, with_index: bool) -> Tally {
                 t.check(seed, &o, &m, policy, false);
                 match o.refused {
                     None => {
-                        t.apply(&m, policy.install);
+                        t.apply(&m);
                         *tally
                             .committed
                             .entry((policy.validation, policy.install))
@@ -342,7 +384,7 @@ fn run(seed: u64, with_index: bool) -> Tally {
                 for (o, m) in outcomes.iter().zip(&models) {
                     t.check(seed, o, m, policy, true);
                     if o.refused.is_none() {
-                        t.apply(m, policy.install);
+                        t.apply(m);
                         tally.batch_committed += 1;
                     } else {
                         tally.batch_refused += 1;
@@ -502,6 +544,18 @@ fn out_of_scope_merges_are_refused_not_merged() {
     trunk.execute("CREATE TABLE w(x)").unwrap();
     let o = merger.merge(b, key).unwrap();
     assert_eq!(o.refused, Some(Refusal::Scope), "{o:?}");
+    // A write to an AUTOINCREMENT table also writes sqlite_sequence, which a merge does not take.
+    trunk
+        .execute("CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, x TEXT)")
+        .unwrap();
+    let b = trunk.fork_branch().unwrap();
+    b.connect()
+        .unwrap()
+        .execute("INSERT INTO ai(x) VALUES ('b')")
+        .unwrap();
+    let o = merger.merge(b, key).unwrap();
+    assert_eq!(o.refused, Some(Refusal::Scope), "{o:?}");
+    assert_eq!(cells(&trunk, "SELECT count(*) FROM ai"), ["0"]);
     // Nothing above reached the trunk.
     assert_eq!(texts(&trunk, "SELECT v FROM t"), ["a"]);
     // The physical install without read tracking, and a batch under a validator that cannot see
@@ -589,4 +643,318 @@ fn the_structural_guard_also_refuses_a_restructure_that_left_the_branch_leaf_alo
         }
     }
     assert!(guard_alone > 0, "the sweep never restructured above an untouched branch leaf");
+}
+
+fn key_replay() -> MergePolicy {
+    MergePolicy {
+        validation: Validation::KeyStamp,
+        install: Install::Replay,
+    }
+}
+
+/// A batch member is validated against the members installed before it in the same transaction:
+/// the second of two branches that wrote one row is refused, and the scalar verdict sees the first
+/// member's uncommitted write (no trunk commit happened since either fork).
+#[test]
+fn a_batch_member_sees_the_members_installed_before_it() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    trunk.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let (x, y) = (trunk.fork_branch().unwrap(), trunk.fork_branch().unwrap());
+    x.connect()
+        .unwrap()
+        .execute("UPDATE t SET v = 'x' WHERE id = 1")
+        .unwrap();
+    y.connect()
+        .unwrap()
+        .execute("UPDATE t SET v = 'y' WHERE id = 1")
+        .unwrap();
+    let outcomes = merger.merge_batch(vec![x, y], key_replay()).unwrap();
+    assert_eq!(outcomes[0].refused, None, "{outcomes:?}");
+    let o = &outcomes[1];
+    assert_eq!(o.refused, Some(Refusal::Key), "{o:?}");
+    assert_eq!(o.commits_since_fork, 0, "{o:?}");
+    assert!(o.page_conflict && o.scalar_conflict, "{o:?}");
+    assert_eq!(texts(&trunk, "SELECT v FROM t WHERE id = 1"), ["x"]);
+}
+
+/// (a1) A trigger fires when a statement runs, and the rows it wrote are rows too. The branch
+/// changes only w; the trunk's trigger on v recorded the trunk's own later update of another row.
+/// Applying the branch's row must not fire that trigger again: s.last stays the trunk's 't7'.
+#[test]
+fn a_trunk_trigger_does_not_fire_when_the_branch_rows_are_applied() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w TEXT)")
+        .unwrap();
+    trunk
+        .execute("CREATE TABLE s(id INTEGER PRIMARY KEY, last TEXT)")
+        .unwrap();
+    trunk.execute("INSERT INTO s VALUES (1, 'none')").unwrap();
+    trunk
+        .execute(
+            "CREATE TRIGGER tv AFTER UPDATE OF v ON t BEGIN \
+             UPDATE s SET last = NEW.v WHERE id = 1; END",
+        )
+        .unwrap();
+    for id in 1..=9 {
+        trunk
+            .execute(format!("INSERT INTO t VALUES ({id}, 'v{id}', 'w{id}')"))
+            .unwrap();
+    }
+    let b = trunk.fork_branch().unwrap();
+    trunk.execute("UPDATE t SET v = 't7' WHERE id = 7").unwrap();
+    assert_eq!(texts(&trunk, "SELECT last FROM s"), ["t7"], "premise: the trigger fired");
+    b.connect()
+        .unwrap()
+        .execute("UPDATE t SET w = 'b5' WHERE id = 5")
+        .unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let o = merger.merge(b, key_replay()).unwrap();
+    assert_eq!(o.refused, None, "{o:?}");
+    assert_eq!(
+        texts(&trunk, "SELECT last FROM s"),
+        ["t7"],
+        "applying the branch's row fired the trunk's trigger again"
+    );
+    assert_eq!(texts(&trunk, "SELECT v || '/' || w FROM t WHERE id = 5"), ["v5/b5"]);
+    assert_eq!(texts(&trunk, "SELECT v FROM t WHERE id = 7"), ["t7"]);
+}
+
+/// (a2) The branch's own trigger already counted its insert (c.n = 1 in the branch, a row of its
+/// write set). The counter table is created first, so its root sorts before t's: replayed in rowid
+/// order at the base, the counter's image goes in and then t's insert fires the trigger again.
+/// The trunk must end with n = 1: counted once.
+#[test]
+fn a_branch_trigger_effect_is_applied_once() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE c(id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    trunk.execute("INSERT INTO c VALUES (1, 0)").unwrap();
+    trunk
+        .execute(
+            "CREATE TRIGGER ti AFTER INSERT ON t BEGIN \
+             UPDATE c SET n = n + 1 WHERE id = 1; END",
+        )
+        .unwrap();
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    bc.execute("INSERT INTO t VALUES (10, 'x')").unwrap();
+    assert_eq!(cells(&bc, "SELECT n FROM c"), ["1"], "premise: the branch's trigger fired");
+    drop(bc);
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let o = merger.merge(b, key_replay()).unwrap();
+    assert_eq!(o.refused, None, "{o:?}");
+    assert_eq!(cells(&trunk, "SELECT n FROM c"), ["1"], "the insert was counted twice");
+    assert_eq!(texts(&trunk, "SELECT v FROM t WHERE id = 10"), ["x"]);
+}
+
+/// (b) A merger that lives across a trunk ALTER TABLE ADD COLUMN must not write a later branch's
+/// rows with statements prepared for the old column list: the branch's w must reach the trunk.
+#[test]
+fn a_merger_prepares_again_after_a_trunk_alter() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    trunk
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let b0 = trunk.fork_branch().unwrap();
+    b0.connect()
+        .unwrap()
+        .execute("UPDATE t SET v = 'a0' WHERE id = 1")
+        .unwrap();
+    let o = merger.merge(b0, key_replay()).unwrap();
+    assert_eq!(o.refused, None, "{o:?}");
+    trunk.execute("ALTER TABLE t ADD COLUMN w TEXT").unwrap();
+    let b1 = trunk.fork_branch().unwrap();
+    b1.connect()
+        .unwrap()
+        .execute("UPDATE t SET w = 'bw' WHERE id = 2")
+        .unwrap();
+    let o = merger.merge(b1, key_replay()).unwrap();
+    assert_eq!(o.refused, None, "{o:?}");
+    assert_eq!(
+        cells(&trunk, "SELECT v, w FROM t WHERE id = 2"),
+        ["b", "bw"],
+        "the branch's write to the new column was dropped"
+    );
+    assert_eq!(cells(&trunk, "SELECT v, w FROM t WHERE id = 1"), ["a0", "NULL"]);
+}
+
+/// (c1) With foreign keys enforced and ON DELETE CASCADE, the trunk adds a child of p1 after the
+/// fork and the branch deletes p1. A three-way merge keeps the trunk's child and takes the
+/// branch's delete, which leaves the child without a parent, so the merge must be refused, and
+/// the trunk must keep both rows. (Re-running the cascade would delete a row only the trunk wrote.)
+#[test]
+fn a_cascade_does_not_delete_a_trunk_only_child() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk.execute("PRAGMA foreign_keys = ON").unwrap();
+    trunk
+        .execute("CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    trunk
+        .execute(
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+        )
+        .unwrap();
+    trunk
+        .execute("INSERT INTO p VALUES (1, 'p1'), (2, 'p2')")
+        .unwrap();
+    let b = trunk.fork_branch().unwrap();
+    trunk.execute("INSERT INTO c VALUES (10, 1)").unwrap();
+    b.connect()
+        .unwrap()
+        .execute("DELETE FROM p WHERE id = 1")
+        .unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let o = merger.merge(b, key_replay()).unwrap();
+    assert_eq!(o.refused, Some(Refusal::Install), "{o:?}");
+    assert_eq!(cells(&trunk, "SELECT id FROM p ORDER BY id"), ["1", "2"]);
+    assert_eq!(cells(&trunk, "SELECT id, pid FROM c"), ["10", "1"]);
+    assert!(trunk.foreign_keys_enabled(), "the merger must restore foreign_keys");
+}
+
+/// (c2) A column declared UNIQUE ON CONFLICT REPLACE: the trunk inserts q with u = 'x' after the
+/// fork, and the branch sets u = 'x' on another row. The constraint's REPLACE would delete the
+/// trunk's row; the install must refuse instead and leave both rows as they were.
+#[test]
+fn a_replace_constraint_does_not_delete_a_trunk_only_row() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE ON CONFLICT REPLACE, v TEXT)")
+        .unwrap();
+    trunk
+        .execute("INSERT INTO t VALUES (1, 'a', '1'), (2, 'b', '2')")
+        .unwrap();
+    let b = trunk.fork_branch().unwrap();
+    trunk.execute("INSERT INTO t VALUES (3, 'x', 'trunk')").unwrap();
+    b.connect()
+        .unwrap()
+        .execute("UPDATE t SET u = 'x' WHERE id = 2")
+        .unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let o = merger.merge(b, key_replay()).unwrap();
+    assert_eq!(o.refused, Some(Refusal::Install), "{o:?}");
+    assert_eq!(
+        cells(&trunk, "SELECT id, u FROM t ORDER BY id"),
+        ["1", "a", "2", "b", "3", "x"]
+    );
+}
+
+fn unique_table(trunk: &Arc<Connection>, rows: i64) {
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE, v TEXT)")
+        .unwrap();
+    for id in 1..=rows {
+        trunk
+            .execute(format!("INSERT INTO t VALUES ({id}, NULL, 'v{id}')"))
+            .unwrap();
+    }
+    trunk.execute("UPDATE t SET u = 'x' WHERE id = 9").unwrap();
+}
+
+/// (d1) The branch moves a UNIQUE value from rowid 9 to rowid 5: first it clears 9, then it sets 5.
+/// Replayed in rowid order, 5 would take 'x' while 9 still holds it. In the branch's own order the
+/// merge goes through.
+#[test]
+fn a_unique_move_is_replayed_in_the_branch_order() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    unique_table(&trunk, 12);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    bc.execute("UPDATE t SET u = NULL WHERE id = 9").unwrap();
+    bc.execute("UPDATE t SET u = 'x' WHERE id = 5").unwrap();
+    drop(bc);
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let o = merger.merge(b, key_replay()).unwrap();
+    assert_eq!(o.refused, None, "{o:?}");
+    assert_eq!(cells(&trunk, "SELECT id FROM t WHERE u = 'x'"), ["5"]);
+    assert_eq!(cells(&trunk, "SELECT u FROM t WHERE id = 9"), ["NULL"]);
+}
+
+/// (d2) Four branches in one batch. The third inserts u = 'z' under a new rowid, as the second did:
+/// validation passes (different rows) and the install hits the UNIQUE index. Only that member is
+/// refused; the other three, the UNIQUE move among them, commit.
+#[test]
+fn one_member_refused_at_install_leaves_the_rest_of_the_batch() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    unique_table(&trunk, 20);
+    let branches: Vec<Branch> = (0..4).map(|_| trunk.fork_branch().unwrap()).collect();
+    let sql = [
+        vec![
+            "UPDATE t SET u = NULL WHERE id = 9",
+            "UPDATE t SET u = 'x' WHERE id = 5",
+        ],
+        vec!["INSERT INTO t VALUES (31, 'z', 'b2')"],
+        vec!["INSERT INTO t VALUES (30, 'z', 'b3')"],
+        vec!["UPDATE t SET v = 'b4' WHERE id = 2"],
+    ];
+    for (b, stmts) in branches.iter().zip(&sql) {
+        let conn = b.connect().unwrap();
+        for s in stmts {
+            conn.execute(*s).unwrap();
+        }
+    }
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let outcomes = merger.merge_batch(branches, key_replay()).unwrap();
+    let refused: Vec<Option<Refusal>> = outcomes.iter().map(|o| o.refused).collect();
+    assert_eq!(
+        refused,
+        [None, None, Some(Refusal::Install), None],
+        "{outcomes:?}"
+    );
+    assert!(outcomes[2].install_error.is_some(), "{outcomes:?}");
+    assert_eq!(cells(&trunk, "SELECT id FROM t WHERE u = 'x'"), ["5"]);
+    assert_eq!(cells(&trunk, "SELECT id FROM t WHERE u = 'z'"), ["31"]);
+    assert_eq!(cells(&trunk, "SELECT count(*) FROM t WHERE id = 30"), ["0"]);
+    assert_eq!(texts(&trunk, "SELECT v FROM t WHERE id = 2"), ["b4"]);
+    assert_eq!(integrity(&trunk), ["ok"]);
+}
+
+/// (e) Two branches from one fork each INSERT with no id: both take max(rowid) + 1, so they wrote
+/// the same row, and the second merge is refused as a row conflict. This is the stated scope limit
+/// (automatic rowids are not partitioned between branches), not a defect this lane fixes.
+#[test]
+fn automatic_rowids_from_one_fork_collide() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    trunk
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    let (b1, b2) = (trunk.fork_branch().unwrap(), trunk.fork_branch().unwrap());
+    b1.connect()
+        .unwrap()
+        .execute("INSERT INTO t(v) VALUES ('one')")
+        .unwrap();
+    b2.connect()
+        .unwrap()
+        .execute("INSERT INTO t(v) VALUES ('two')")
+        .unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let o = merger.merge(b1, key_replay()).unwrap();
+    assert_eq!(o.refused, None, "{o:?}");
+    let o = merger.merge(b2, key_replay()).unwrap();
+    assert_eq!(o.refused, Some(Refusal::Key), "{o:?}");
+    assert_eq!(cells(&trunk, "SELECT id, v FROM t WHERE id = 4"), ["4", "one"]);
 }

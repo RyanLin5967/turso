@@ -787,6 +787,9 @@ pub fn get_triggers_including_temp(
     updated_column_indices: Option<ColumnMask>,
     table: &BTreeTable,
 ) -> Vec<Arc<Trigger>> {
+    if resolver.triggers_disabled {
+        return Vec::new();
+    }
     let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
         get_relevant_triggers_type_and_time(
             s,
@@ -843,6 +846,9 @@ pub fn has_triggers_including_temp(
     updated_column_indices: Option<&ColumnMask>,
     table: &BTreeTable,
 ) -> bool {
+    if resolver.triggers_disabled {
+        return false;
+    }
     let found = resolver.with_schema(database_id, |s| {
         has_relevant_triggers_type_only(s, event.clone(), updated_column_indices, table)
     });

@@ -244,6 +244,7 @@ fn refusal_name(r: Refusal) -> &'static str {
         Refusal::Page => "page",
         Refusal::Key => "key",
         Refusal::Structural => "structural",
+        Refusal::Install => "install",
     }
 }
 

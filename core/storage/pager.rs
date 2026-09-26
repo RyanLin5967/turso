@@ -3825,7 +3825,7 @@ impl Pager {
         if let Some(branch) = self.branch.get() {
             branch.store.branch_row_written(branch.id, root, rowid);
         } else if let Some(store) = self.branch_store.get() {
-            if store.trunk_has_children() {
+            if store.trunk_has_children() && !crate::branch::store::mutant(13) {
                 store.trunk_row_written(root, rowid);
             }
         }

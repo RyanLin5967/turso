@@ -6581,7 +6581,11 @@ impl CursorTrait for BTreeCursor {
         return_if_io!(self.insert_into_page(key));
         // The branch store's merge record (see `branch::merge`): a table row, or an index b-tree.
         match (key.maybe_rowid(), &self.index_info) {
-            (Some(rowid), None) => self.pager.note_row_write(self.root_page, rowid),
+            (Some(rowid), None) => {
+                if !crate::branch::store::mutant(11) {
+                    self.pager.note_row_write(self.root_page, rowid)
+                }
+            }
             _ => self.pager.note_index_write(self.root_page),
         }
         self.invalidate_count_cache();
@@ -6636,7 +6640,9 @@ impl CursorTrait for BTreeCursor {
                             return Ok(IOResult::Done(()));
                         };
                         // The branch store's merge record (see `branch::merge`).
-                        self.pager.note_row_write(self.root_page, rowid);
+                        if !crate::branch::store::mutant(12) {
+                            self.pager.note_row_write(self.root_page, rowid);
+                        }
                     } else if !self.has_record() {
                         self.state = CursorState::None;
                         return Ok(IOResult::Done(()));

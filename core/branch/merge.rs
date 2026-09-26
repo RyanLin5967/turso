@@ -50,14 +50,22 @@
 //!   refuses as out of scope), no free-without-write path was found in this fork, so in the
 //!   measured workloads every structural refusal is a false conflict (frontier/round11/r11-merge).
 //! * [`Install::Replay`] — the logical install: each row B wrote is copied from B into the trunk
-//!   through the trunk's own SQL path (UPDATE, INSERT if the trunk lacks it, DELETE if B does), so
-//!   splits, page allocation and indexes are the trunk's. Works under every validator.
+//!   as a ROW IMAGE through the trunk's own SQL path (UPDATE, INSERT if the trunk lacks it, DELETE
+//!   if B does), so splits, page allocation and indexes are the trunk's. Works under every
+//!   validator. A row image is final: B's triggers and foreign-key actions already wrote their own
+//!   rows, which are in B's write set, so the trunk compiles the install with no triggers and no
+//!   foreign-key actions (PostgreSQL's `session_replication_role = replica`), and when the trunk
+//!   enforces foreign keys it checks them after each member instead. Statements say OR ABORT, so a
+//!   constraint-level REPLACE can never delete a row only the trunk has; rows go in B's last-write
+//!   order, so a UNIQUE value B moved leaves its old row before it reaches the new one.
 //!
 //! [`Merger::merge_batch`] validates and installs several branches in one trunk transaction (group
 //! commit); each member is validated after the members before it installed, which only the stamp
-//! validators can see, so a batch requires one of them.
+//! validators can see, so a batch requires one of them. Each member installs inside its own
+//! SAVEPOINT: a constraint that refuses one member ([`Refusal::Install`]) rolls back only that
+//! member, never the batch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::store::BranchStore;
 use super::{Branch, BranchId};
@@ -98,6 +106,10 @@ pub enum Refusal {
     Key,
     /// The physical install's guard: the trunk restructured the tree above B's pages.
     Structural,
+    /// Validation passed but installing refused: a trunk constraint (UNIQUE, NOT NULL, CHECK, or a
+    /// foreign key checked after the row images went in) rejects the branch's rows, or the rows no
+    /// longer fit the table's column list. Only this member is rolled back (its own SAVEPOINT).
+    Install,
 }
 
 /// One merge's result, with every validator's verdict beside the one that decided.
@@ -120,6 +132,8 @@ pub struct MergeOutcome {
     pub pages_written: usize,
     /// Rows the branch's table cursors wrote.
     pub rows_written: usize,
+    /// Why the install refused, when `refused` is [`Refusal::Install`].
+    pub install_error: Option<String>,
 }
 
 /// What [`BranchStore::merge_prepare`] reads for a merge under one hold of the store lock.
@@ -134,7 +148,7 @@ pub(super) struct Prepared {
     pub(super) pages_written: usize,
     /// The branch's pages, for the physical install (empty otherwise).
     pub(super) pages: Vec<(u32, Vec<u8>)>,
-    /// The branch's rows, sorted.
+    /// The branch's rows, in the order of each row's last write on the branch.
     pub(super) rows: Vec<(i64, i64)>,
     pub(super) index_roots: Vec<i64>,
     pub(super) schema: Arc<Schema>,
@@ -152,11 +166,12 @@ struct TableStmts {
 }
 
 /// Merges branches into the trunk through one trunk connection, keeping the trunk statements the
-/// replay install prepares.
+/// replay install prepares, per table root AND trunk schema version: a statement prepared for an
+/// older column list must never write a row of a newer one.
 pub struct Merger {
     trunk: Arc<Connection>,
     store: Arc<BranchStore>,
-    stmts: HashMap<i64, TableStmts>,
+    stmts: HashMap<(i64, u32), TableStmts>,
 }
 
 fn quote(name: &str) -> String {
@@ -206,10 +221,24 @@ fn row_scope(prep: &Prepared) -> Option<&'static str> {
     None
 }
 
+/// Run `stmt` to completion and reset it, even when it fails, so a cached statement is reusable.
 fn step_to_end(stmt: &mut Statement) -> Result<()> {
-    stmt.run_ignore_rows()?;
-    stmt.reset()
+    let ran = stmt.run_ignore_rows();
+    stmt.reset()?;
+    ran
 }
+
+/// A constraint error while installing refuses the member (`Ok(Some(reason))`); any other error
+/// aborts the batch.
+fn member_error(err: LimboError) -> Result<Option<String>> {
+    match err {
+        LimboError::Constraint(msg) | LimboError::ForeignKeyConstraint(msg) => Ok(Some(msg)),
+        other => Err(other),
+    }
+}
+
+/// The savepoint that brackets one batch member's install.
+const MEMBER: &str = "r11_merge_member";
 
 impl Merger {
     /// A merger writing through `trunk`, which must be a trunk connection.
@@ -237,6 +266,14 @@ impl Merger {
 
     /// Merge `branches` in one trunk transaction, in order (group commit). Every branch is
     /// released afterwards, merged or refused.
+    ///
+    /// The branch's rows are applied as ROW IMAGES: what the branch's own statements, triggers and
+    /// foreign-key actions wrote is already in its row write set, so for the length of the batch
+    /// the trunk connection compiles with no triggers and no foreign-key actions (PostgreSQL's
+    /// `session_replication_role = replica`; MySQL row-based replication applies row events the
+    /// same way). Firing them again would run a trigger twice, or run a trunk-side action on rows
+    /// only the trunk changed. When the trunk enforces foreign keys, each member is checked after
+    /// its rows go in, and a violation refuses that member.
     pub fn merge_batch(
         &mut self,
         branches: Vec<Branch>,
@@ -268,17 +305,12 @@ impl Merger {
                     .to_string(),
             ));
         }
-        self.trunk.execute("BEGIN IMMEDIATE")?;
-        let result = self.validate_and_install(&branches, policy);
-        match &result {
-            Ok(outcomes) if outcomes.iter().any(|o| o.refused.is_none()) => {
-                if let Err(err) = self.trunk.execute("COMMIT") {
-                    let _ = self.trunk.execute("ROLLBACK");
-                    return Err(err);
-                }
-            }
-            _ => self.trunk.execute("ROLLBACK")?,
-        }
+        let fk_on = self.trunk.foreign_keys_enabled();
+        self.trunk.set_foreign_keys_enabled(false);
+        self.trunk.set_row_image_apply(true);
+        let result = self.run_batch(&branches, policy, fk_on);
+        self.trunk.set_row_image_apply(false);
+        self.trunk.set_foreign_keys_enabled(fk_on);
         let outcomes = result?;
         self.store.merge_counted(|w| {
             for o in &outcomes {
@@ -290,6 +322,7 @@ impl Merger {
                     Some(Refusal::Page) => w.merge_refused_page += 1,
                     Some(Refusal::Key) => w.merge_refused_key += 1,
                     Some(Refusal::Structural) => w.merge_refused_structural += 1,
+                    Some(Refusal::Install) => w.merge_refused_install += 1,
                 }
             }
         });
@@ -297,10 +330,31 @@ impl Merger {
         Ok(outcomes)
     }
 
+    fn run_batch(
+        &mut self,
+        branches: &[Branch],
+        policy: MergePolicy,
+        fk_on: bool,
+    ) -> Result<Vec<MergeOutcome>> {
+        self.trunk.execute("BEGIN IMMEDIATE")?;
+        let result = self.validate_and_install(branches, policy, fk_on);
+        match &result {
+            Ok(outcomes) if outcomes.iter().any(|o| o.refused.is_none()) => {
+                if let Err(err) = self.trunk.execute("COMMIT") {
+                    let _ = self.trunk.execute("ROLLBACK");
+                    return Err(err);
+                }
+            }
+            _ => self.trunk.execute("ROLLBACK")?,
+        }
+        result
+    }
+
     fn validate_and_install(
         &mut self,
         branches: &[Branch],
         policy: MergePolicy,
+        fk_on: bool,
     ) -> Result<Vec<MergeOutcome>> {
         let physical = policy.install == Install::Physical;
         let mut outcomes = Vec::with_capacity(branches.len());
@@ -309,11 +363,20 @@ impl Merger {
                 .store
                 .merge_prepare(branch.id, policy.validation, physical)?;
             let trunk_schema = self.trunk.schema.read().schema_version;
-            let scope = prep.scope.or_else(|| row_scope(&prep)).or_else(|| {
-                (prep.schema.schema_version != trunk_schema)
-                    .then_some("the trunk changed its schema since the fork")
-            });
-            let refused = if scope.is_some() {
+            let scope = prep
+                .scope
+                .or_else(|| {
+                    if super::store::mutant(19) {
+                        None
+                    } else {
+                        row_scope(&prep)
+                    }
+                })
+                .or_else(|| {
+                    (prep.schema.schema_version != trunk_schema && !super::store::mutant(20))
+                        .then_some("the trunk changed its schema since the fork")
+                });
+            let mut refused = if scope.is_some() {
                 Some(Refusal::Scope)
             } else {
                 let conflict = match policy.validation {
@@ -324,11 +387,11 @@ impl Merger {
                 };
                 conflict.or((prep.structural == Some(true)).then_some(Refusal::Structural))
             };
+            let mut install_error = None;
             if refused.is_none() {
-                if physical {
-                    self.install_pages(&prep)?;
-                } else {
-                    self.install_rows(branch, &prep)?;
+                if let Some(reason) = self.install_member(branch, &prep, physical, fk_on)? {
+                    refused = Some(Refusal::Install);
+                    install_error = Some(reason);
                 }
             }
             outcomes.push(MergeOutcome {
@@ -343,9 +406,56 @@ impl Merger {
                 structural_conflict: prep.structural,
                 pages_written: prep.pages_written,
                 rows_written: prep.rows.len(),
+                install_error,
             });
         }
         Ok(outcomes)
+    }
+
+    /// Install one validated member inside its own SAVEPOINT. `Ok(Some(reason))`: the install
+    /// refused, and everything this member wrote is rolled back while the members before it stay.
+    fn install_member(
+        &mut self,
+        branch: &Branch,
+        prep: &Prepared,
+        physical: bool,
+        fk_on: bool,
+    ) -> Result<Option<String>> {
+        let savepoints = !super::store::mutant(21);
+        if savepoints {
+            self.trunk.execute(format!("SAVEPOINT {MEMBER}"))?;
+        }
+        let installed = if physical {
+            self.install_pages(prep).map(|()| None)
+        } else {
+            self.install_rows(branch, prep)
+        };
+        let installed = match installed {
+            Ok(None) if fk_on && !super::store::mutant(23) => self.foreign_key_violation(prep),
+            other => other,
+        };
+        match installed {
+            Ok(None) => {
+                if savepoints {
+                    self.trunk.execute(format!("RELEASE {MEMBER}"))?;
+                }
+                Ok(None)
+            }
+            Ok(Some(reason)) if savepoints => {
+                self.trunk.execute(format!("ROLLBACK TO {MEMBER}"))?;
+                self.trunk.execute(format!("RELEASE {MEMBER}"))?;
+                Ok(Some(reason))
+            }
+            // Mutant 21: without a savepoint a member's refusal can only fail the whole batch.
+            Ok(Some(reason)) => Err(LimboError::Constraint(reason)),
+            Err(err) => {
+                if savepoints {
+                    let _ = self.trunk.execute(format!("ROLLBACK TO {MEMBER}"));
+                    let _ = self.trunk.execute(format!("RELEASE {MEMBER}"));
+                }
+                Err(err)
+            }
+        }
     }
 
     fn install_pages(&self, prep: &Prepared) -> Result<()> {
@@ -362,17 +472,23 @@ impl Merger {
         Ok(())
     }
 
-    fn install_rows(&mut self, branch: &Branch, prep: &Prepared) -> Result<()> {
+    /// Replay the branch's rows as row images, in the branch's last-write order. `Ok(Some(reason))`
+    /// when a trunk constraint refuses a row or a row no longer fits its table's column list.
+    fn install_rows(&mut self, branch: &Branch, prep: &Prepared) -> Result<Option<String>> {
         if prep.rows.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
+        let version = self.trunk.schema.read().schema_version;
         let from = branch.connect()?;
         let mut selects: HashMap<i64, Statement> = HashMap::new();
         for &(root, rowid) in &prep.rows {
             let table = table_at(&prep.schema, root).expect("row_scope admitted this table");
-            if !self.stmts.contains_key(&root) {
+            let key = (root, if super::store::mutant(18) { 0 } else { version });
+            if !self.stmts.contains_key(&key) {
                 let stmts = self.prepare_table(&table)?;
-                self.stmts.insert(root, stmts);
+                // Statements for an older schema version of this table can never run again.
+                self.stmts.retain(|&(r, v), _| r != root || v == key.1);
+                self.stmts.insert(key, stmts);
             }
             if !selects.contains_key(&root) {
                 let cols: Vec<String> = table
@@ -389,17 +505,31 @@ impl Merger {
             }
             let select = selects.get_mut(&root).expect("just prepared");
             select.bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
-            let found = select.run_collect_rows()?;
+            let found = select.run_collect_rows();
             select.reset()?;
-            let stmts = self.stmts.get_mut(&root).expect("just prepared");
+            let found = found?;
+            let stmts = self.stmts.get_mut(&key).expect("just prepared");
             match found.as_slice() {
                 [] => {
-                    stmts
-                        .delete
-                        .bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
-                    step_to_end(&mut stmts.delete)?;
+                    if !super::store::mutant(17) {
+                        stmts
+                            .delete
+                            .bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
+                        if let Err(err) = step_to_end(&mut stmts.delete) {
+                            return member_error(err);
+                        }
+                    }
                 }
                 [row] => {
+                    if row.len() != stmts.columns {
+                        return Ok(Some(format!(
+                            "branch {} row {rowid} has {} columns; the trunk statement for {} has {}",
+                            branch.id.0,
+                            row.len(),
+                            table.name,
+                            stmts.columns
+                        )));
+                    }
                     let updated = match stmts.update.as_mut() {
                         Some(update) => {
                             update.bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
@@ -411,12 +541,14 @@ impl Merger {
                                 update.bind_at(param.try_into().unwrap(), v.clone())?;
                                 param += 1;
                             }
-                            step_to_end(update)?;
+                            if let Err(err) = step_to_end(update) {
+                                return member_error(err);
+                            }
                             self.trunk.changes() > 0
                         }
                         None => false,
                     };
-                    if !updated {
+                    if !updated && !super::store::mutant(16) {
                         let base = match stmts.alias {
                             Some(_) => 1,
                             None => {
@@ -434,9 +566,10 @@ impl Merger {
                             };
                             stmts.insert.bind_at((i + base).try_into().unwrap(), v)?;
                         }
-                        step_to_end(&mut stmts.insert)?;
+                        if let Err(err) = step_to_end(&mut stmts.insert) {
+                            return member_error(err);
+                        }
                     }
-                    debug_assert_eq!(row.len(), stmts.columns);
                 }
                 _ => {
                     return Err(LimboError::Corrupt(format!(
@@ -451,7 +584,89 @@ impl Merger {
         drop(from);
         self.store
             .merge_counted(|w| w.merge_rows_installed += prep.rows.len() as u64);
-        Ok(())
+        Ok(None)
+    }
+
+    /// With foreign keys enforced, the row images went in with no FK action and no FK check, so
+    /// every foreign key that touches a table this member wrote (as child or as parent) is checked
+    /// now: a child row whose key is wholly non-NULL and matches no parent refuses the member.
+    /// A full scan of each such child table: correctness first, and only when foreign keys exist.
+    fn foreign_key_violation(&self, prep: &Prepared) -> Result<Option<String>> {
+        let written: HashSet<String> = prep
+            .rows
+            .iter()
+            .filter_map(|&(root, _)| table_at(&prep.schema, root).map(|t| t.name.to_lowercase()))
+            .collect();
+        if written.is_empty() {
+            return Ok(None);
+        }
+        for t in prep.schema.tables.values() {
+            let Table::BTree(child) = t.as_ref() else {
+                continue;
+            };
+            for fk in &child.foreign_keys {
+                if !written.contains(&child.name.to_lowercase())
+                    && !written.contains(&fk.parent_table.to_lowercase())
+                {
+                    continue;
+                }
+                let Some(parent) = prep.schema.get_btree_table(&fk.parent_table) else {
+                    return Ok(Some(format!(
+                        "a foreign key of {} names a table that does not exist: {}",
+                        child.name, fk.parent_table
+                    )));
+                };
+                let parent_cols: Vec<String> = if !fk.parent_columns.is_empty() {
+                    fk.parent_columns.iter().map(|c| quote(c)).collect()
+                } else if !parent.primary_key_columns.is_empty() {
+                    parent
+                        .primary_key_columns
+                        .iter()
+                        .map(|(c, _)| quote(c))
+                        .collect()
+                } else {
+                    vec!["rowid".to_string()]
+                };
+                if parent_cols.len() != fk.child_columns.len() {
+                    return Ok(Some(format!(
+                        "foreign key mismatch: {} referencing {}",
+                        child.name, parent.name
+                    )));
+                }
+                let not_null: Vec<String> = fk
+                    .child_columns
+                    .iter()
+                    .map(|c| format!("c.{} IS NOT NULL", quote(c)))
+                    .collect();
+                let matches: Vec<String> = fk
+                    .child_columns
+                    .iter()
+                    .zip(&parent_cols)
+                    .map(|(c, p)| format!("p.{p} = c.{}", quote(c)))
+                    .collect();
+                let sql = format!(
+                    "SELECT count(*) FROM {} AS c WHERE {} AND NOT EXISTS \
+                     (SELECT 1 FROM {} AS p WHERE {})",
+                    quote(&child.name),
+                    not_null.join(" AND "),
+                    quote(&parent.name),
+                    matches.join(" AND ")
+                );
+                let rows = self.trunk.prepare(sql)?.run_collect_rows()?;
+                let orphans = rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                if orphans > 0 {
+                    return Ok(Some(format!(
+                        "{orphans} row(s) of {} reference no row of {} after the merge",
+                        child.name, parent.name
+                    )));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn prepare_table(&self, table: &BTreeTable) -> Result<TableStmts> {
@@ -465,6 +680,9 @@ impl Merger {
         // The rowid alias stays out of the SET list: the row keeps its rowid, and assigning the alias
         // makes the engine run a two-pass update through an ephemeral table, a temporary file per
         // statement, which was 82% of the replay's time (frontier/round11/r11-merge A10).
+        // OR ABORT overrides a constraint-level ON CONFLICT REPLACE (the statement's clause wins, as
+        // in SQLite), so installing a row can never delete a row only the trunk has: a collision
+        // is an error, and the member is refused.
         let sets: Vec<String> = names
             .iter()
             .enumerate()
@@ -473,7 +691,7 @@ impl Merger {
             .map(|(param, (_, n))| format!("{n} = ?{}", param + 2))
             .collect();
         let update = (!sets.is_empty())
-            .then(|| format!("UPDATE {t} SET {} WHERE rowid = ?1", sets.join(", ")));
+            .then(|| format!("UPDATE OR ABORT {t} SET {} WHERE rowid = ?1", sets.join(", ")));
         let insert = match alias {
             Some(_) if names.len() == 1 => {
                 // The alias is the only column: the row is its rowid, and an existing one is kept.
@@ -482,7 +700,7 @@ impl Merger {
             Some(_) => {
                 let params: Vec<String> = (1..=names.len()).map(|i| format!("?{i}")).collect();
                 format!(
-                    "INSERT INTO {t}({}) VALUES ({})",
+                    "INSERT OR ABORT INTO {t}({}) VALUES ({})",
                     names.join(", "),
                     params.join(", ")
                 )
@@ -490,7 +708,7 @@ impl Merger {
             None => {
                 let params: Vec<String> = (2..=names.len() + 1).map(|i| format!("?{i}")).collect();
                 format!(
-                    "INSERT INTO {t}(rowid, {}) VALUES (?1, {})",
+                    "INSERT OR ABORT INTO {t}(rowid, {}) VALUES (?1, {})",
                     names.join(", "),
                     params.join(", ")
                 )

@@ -174,8 +174,10 @@ struct Lineage {
     by_died: BTreeSet<(u64, u32, u64)>,
 }
 
-/// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge validation mechanism n, so
-/// the model test can be shown to fail for each (frontier/round11/r11-merge). Always false otherwise.
+/// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
+/// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
+/// scope gate and the install's isolation, 11-24), so each test can be shown to fail for it
+/// (frontier/round11/r11-merge PREREG A6, A13). Always false otherwise.
 #[cfg(test)]
 pub(crate) fn mutant(n: u32) -> bool {
     static CHOSEN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -237,9 +239,12 @@ struct BranchState {
     view: Option<PageMap>,
     /// Trunk commits counted when this branch forked (V0). Meaningful for trunk children only.
     commits_at_fork: u64,
-    /// Rows this branch's table cursors wrote, as (table root, rowid): its row write set. Kept
-    /// through a rollback, so it can only over-state what the branch changed.
-    rows: HashSet<(i64, i64)>,
+    /// Rows this branch's table cursors wrote, as (table root, rowid): its row write set, each with
+    /// the sequence number of its LAST write, so a merge can replay the rows in the branch's order.
+    /// Kept through a rollback, so it can only over-state what the branch changed.
+    rows: HashMap<(i64, i64), u64>,
+    /// The last sequence number handed to `rows`.
+    row_seq: u64,
     /// Roots of b-trees this branch wrote through index cursors (indexes, WITHOUT ROWID tables).
     index_roots: HashSet<i64>,
     /// This branch wrote a table without naming the rows (clear, destroy, incremental blob I/O).
@@ -760,7 +765,8 @@ impl BranchStore {
     /// A table cursor on branch `id` wrote or deleted `rowid` in the b-tree rooted at `root`.
     pub(crate) fn branch_row_written(&self, id: BranchId, root: i64, rowid: i64) {
         if let Some(st) = self.inner.lock().branches.get_mut(&id) {
-            st.rows.insert((root, rowid));
+            st.row_seq += 1;
+            st.rows.insert((root, rowid), st.row_seq);
         }
     }
 
@@ -888,7 +894,8 @@ impl BranchStore {
         // earlier member of the same batch).
         let commits_since_fork = merge.trunk_commits - st.commits_at_fork;
         count(Validation::Scalar, &mut probes);
-        let scalar = commits_since_fork > u64::from(mutant(1)) || !merge.tx_pages.is_empty();
+        let scalar = commits_since_fork > u64::from(mutant(1))
+            || (!merge.tx_pages.is_empty() && !mutant(24));
         // V2: any page this branch wrote that the trunk wrote after the fork.
         let mut page = false;
         for &p in st.current.keys() {
@@ -900,7 +907,7 @@ impl BranchStore {
         }
         // V3: any row this branch wrote that the trunk wrote after the fork.
         let mut key = false;
-        for &(root, rowid) in &st.rows {
+        for &(root, rowid) in st.rows.keys() {
             count(Validation::KeyStamp, &mut probes);
             let row = merge.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
             let table = merge.table_stamps.get(&root).copied().unwrap_or(0);
@@ -964,8 +971,15 @@ impl BranchStore {
         } else {
             Vec::new()
         };
-        let mut rows: Vec<(i64, i64)> = st.rows.iter().copied().collect();
-        rows.sort_unstable();
+        // The replay applies rows in the branch's last-write order: a UNIQUE value the branch moved
+        // from one row to another must leave the first before it reaches the second.
+        let mut ordered: Vec<((i64, i64), u64)> = st.rows.iter().map(|(&k, &s)| (k, s)).collect();
+        if mutant(15) {
+            ordered.sort_unstable_by_key(|&(k, _)| k);
+        } else {
+            ordered.sort_unstable_by_key(|&(_, s)| s);
+        }
+        let rows: Vec<(i64, i64)> = ordered.into_iter().map(|(k, _)| k).collect();
         Ok(Prepared {
             scope,
             commits_since_fork,
@@ -1086,7 +1100,8 @@ impl BranchState {
             inherited,
             view: None,
             commits_at_fork: 0,
-            rows: HashSet::new(),
+            rows: HashMap::new(),
+            row_seq: 0,
             index_roots: HashSet::new(),
             bulk: false,
             ddl: false,
