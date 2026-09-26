@@ -140,7 +140,6 @@ pub struct DatabaseFile {
 impl DatabaseStorage for DatabaseFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_header(&self, c: Completion) -> Result<Completion> {
-        crate::branch::count_page_io(1, buffers.len() as u64);
         self.file.pread(0, c)
     }
 
@@ -313,6 +312,7 @@ impl DatabaseStorage for DatabaseFile {
         io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion> {
+        crate::branch::count_page_io(1, buffers.len() as u64);
         turso_assert_greater_than!(first_page_idx, 0);
         turso_assert_greater_than_or_equal!(page_size, 512);
         turso_assert_less_than_or_equal!(page_size, 65536);

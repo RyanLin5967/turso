@@ -3623,6 +3623,7 @@ impl Wal for WalFile {
         turso_assert!(page_size > 0, "WAL page size must be initialized");
         let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
         let count = pages.len();
+        crate::branch::count_page_io(2, count as u64);
         let total = frame_size * count;
         let offset = self.frame_offset(start_frame);
         if let Some(buf) = &scratch_buf {
@@ -3765,6 +3766,7 @@ impl Wal for WalFile {
     // todo(sivukhin): change API to accept Buffer or some other owned type
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
     fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
+        crate::branch::count_page_io(2, 1);
         tracing::debug!("read_frame_raw({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + self.page_size() as usize;
