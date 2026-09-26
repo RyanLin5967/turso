@@ -1120,6 +1120,33 @@ impl BranchStore {
             touched.insert(slot, false);
         }
         stats.collect_ns = ns(t);
+        // FIRE-CHECK MUTANT M-EAGER (a12-durable-open PREREG A3; schemata branch, NEVER merged): with
+        // A12_MUTANT=eager the open makes every branch and every trunk version resident, as an eager
+        // open does, so the open counters must show it. Unset, the store is C-P's exactly.
+        if std::env::var("A12_MUTANT").as_deref() == Ok("eager") {
+            let mut ids = match inner.catalog() {
+                Some(c) => c.unreleased_ids()?,
+                None => Vec::new(),
+            };
+            if let Some(c) = inner.catalog() {
+                ids.extend(c.released_ids()?);
+            }
+            for id in ids {
+                inner.ensure(BranchId(id))?;
+            }
+            if let Some(cat) = inner.cat.as_mut() {
+                cat.trunk_probes += 1;
+                for (page, born, died, slot, crc) in
+                    cat.catalog.trunk_born_range(None, u64::MAX >> 1, u64::MAX >> 1)?
+                {
+                    cat.trunk_rows += 1;
+                    cat.trunk_cache
+                        .entry(page)
+                        .or_default()
+                        .insert(born, Retained { born, died, slot, crc });
+                }
+            }
+        }
         // The arena: the catalog's free table as of the checkpoint, overridden by what the replay
         // touched, plus every untouched slot past the checkpoint's high-water mark (written by an
         // operation whose record never became durable, or never written at all).
@@ -2425,6 +2452,27 @@ impl StoreInner {
             }
             let written = self.trunk.written.entry(page).or_insert(0);
             *written = (*written).max(died);
+        }
+        // FIRE-CHECK MUTANT M-PAGE (a12-durable-open; schemata branch, NEVER merged): with
+        // A12_MUTANT=page the first touch of a trunk page reads every version it holds, newest
+        // first, one probe each: C-L's page granularity, so trunk_rows must grow with the page's list.
+        if std::env::var("A12_MUTANT").as_deref() == Ok("page") {
+            let cat = self.cat.as_mut().expect("checked above");
+            let mut at = u64::MAX;
+            while let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, at)? {
+                cat.trunk_probes += 1;
+                cat.trunk_rows += 1;
+                if !cat.trunk_gone.contains(&(page, born)) {
+                    cat.trunk_cache
+                        .entry(page)
+                        .or_default()
+                        .insert(born, Retained { born, died, slot, crc });
+                }
+                if born == 0 {
+                    break;
+                }
+                at = born - 1;
+            }
         }
         Ok(())
     }
