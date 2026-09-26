@@ -132,6 +132,11 @@
 //!
 //! Without F-K3 the store is F5 exactly: no list is kept, and the lookup runs under the lock.
 //!
+//! Epoch reclamation has one known wall: a reader stalled while pinned keeps every node removed
+//! after it pinned. F-K3v (`TURSO_K3=olc`, lane r11-k3-trunklock amendment 3.2) keeps the same lists
+//! with one writer and optimistic readers over type-stable nodes that are reused at once, so a
+//! stalled reader holds nothing (see `super::olc`).
+//!
 //! # What this does not do
 //!
 //! * The persistent page maps are an index over slots the lineages own; they own nothing. A
@@ -157,6 +162,8 @@ use crossbeam_utils::CachePadded;
 
 use super::arena::{Arena, Chunks, Slot};
 use super::page_map::PageMap;
+use super::olc::{OlcLists, OlcVersion};
+use super::radix::Radix;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
 use crate::schema::Schema;
@@ -220,6 +227,7 @@ pub(crate) struct BranchStore {
     /// F-K3: the trunk's retained versions, searchable without the trunk's lock (the same `Arc` as
     /// the trunk lineage's `shared`). `None` is F5's locked lookup.
     k3: Option<std::sync::Arc<SharedVersions>>,
+    k3_mode: K3Mode,
     /// F-K3: the trunk arena's pages, for reading a retained version without the trunk's lock. Set
     /// under the trunk lock by the first retain, before that version is published.
     trunk_chunks: OnceLock<std::sync::Arc<Chunks>>,
@@ -425,47 +433,6 @@ pub(crate) struct TrunkPageKey {
     generation: u64,
 }
 
-/// A map from page number to `T` that any thread can read without a lock: three levels of 2^10,
-/// 2^10 and 2^12 entries over the 32-bit page number, each installed once and never freed or moved
-/// until the store drops. A lookup is three acquire loads and no write, so readers share the lines
-/// they read instead of taking them from one another.
-struct Radix<T> {
-    top: OnceLock<Box<[OnceLock<Box<[OnceLock<Box<[T]>>]>>]>>,
-}
-
-impl<T: Default> Radix<T> {
-    const TOP: usize = 1 << 10;
-    const MID: usize = 1 << 10;
-    const LEAF: usize = 1 << 12;
-
-    fn new() -> Self {
-        Self {
-            top: OnceLock::new(),
-        }
-    }
-
-    fn split(page: u32) -> (usize, usize, usize) {
-        let page = page as usize;
-        (page >> 22, (page >> 12) & (Self::MID - 1), page & (Self::LEAF - 1))
-    }
-
-    fn get(&self, page: u32) -> Option<&T> {
-        let (t, m, l) = Self::split(page);
-        let leaf = self.top.get()?[t].get()?[m].get()?;
-        Some(&leaf[l])
-    }
-
-    fn get_or_insert(&self, page: u32) -> &T {
-        let (t, m, l) = Self::split(page);
-        let top = self
-            .top
-            .get_or_init(|| (0..Self::TOP).map(|_| OnceLock::new()).collect());
-        let mid = top[t].get_or_init(|| (0..Self::MID).map(|_| OnceLock::new()).collect());
-        let leaf = mid[m].get_or_init(|| (0..Self::LEAF).map(|_| T::default()).collect());
-        &leaf[l]
-    }
-}
-
 /// One cached trunk page. `std::sync::Arc`, as `arc_swap` requires.
 struct CachedPage {
     generation: u64,
@@ -542,11 +509,123 @@ struct Retained {
     slot: Slot,
 }
 
-/// F-K3: the trunk's retained versions of each page as a lock-free skip list ordered by `born`
-/// (see "Reads of rewritten trunk pages without the trunk's lock"). Every write — `insert`,
-/// `remove` — happens under the trunk's lock, from the lineage; `covering` is the reader's, and
-/// takes no lock. A page's list is created once and lives as long as the store.
-struct SharedVersions {
+/// Which read path the store takes for a page the trunk rewrote after the reader's fork.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum K3Mode {
+    /// F5: a predecessor search under the trunk's lock.
+    Off,
+    /// F-K3: crossbeam's lock-free skip list, nodes reclaimed by epochs (`TURSO_K3=lockfree`).
+    Ebr,
+    /// F-K3v: single-writer skip lists read optimistically over type-stable nodes
+    /// (`TURSO_K3=olc`; see `super::olc`).
+    Olc,
+}
+
+impl K3Mode {
+    #[cfg(test)]
+    const ALL: [K3Mode; 3] = [K3Mode::Off, K3Mode::Ebr, K3Mode::Olc];
+
+    fn lockfree(self) -> bool {
+        self != K3Mode::Off
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            K3Mode::Off => "off",
+            K3Mode::Ebr => "lockfree",
+            K3Mode::Olc => "olc",
+        }
+    }
+}
+
+/// F-K3 and F-K3v: the trunk's retained versions of each page, ordered by `born`, searchable without
+/// the trunk's lock (see "Reads of rewritten trunk pages without the trunk's lock"). Every write —
+/// `insert`, `remove` — happens under the trunk's lock, from the lineage; `covering` is the reader's.
+enum SharedVersions {
+    Ebr(EbrVersions),
+    Olc(OlcLists),
+}
+
+impl SharedVersions {
+    fn insert(&self, page: u32, v: Retained) {
+        match self {
+            SharedVersions::Ebr(e) => e.insert(page, v),
+            SharedVersions::Olc(o) => o.insert(page, v.into()),
+        }
+    }
+
+    fn remove(&self, page: u32, born: u64) -> Option<Retained> {
+        match self {
+            SharedVersions::Ebr(e) => e.remove(page, born),
+            SharedVersions::Olc(o) => o.remove(page, born).map(Retained::from),
+        }
+    }
+
+    fn last(&self, page: u32) -> Option<Retained> {
+        match self {
+            SharedVersions::Ebr(e) => e.last(page),
+            SharedVersions::Olc(o) => o.last(page).map(Retained::from),
+        }
+    }
+
+    /// The version of `page` a child forked at `f` sees, without the trunk's lock. Under F-K3 the
+    /// epoch guard covers the search only: the version found cannot be released while the reader's
+    /// branch lives, so copying its bytes needs no guard.
+    fn covering(&self, page: u32, f: u64) -> Option<Retained> {
+        match self {
+            SharedVersions::Ebr(e) => e.covering(page, f, &epoch::pin()),
+            SharedVersions::Olc(o) => o.covering(page, f).map(Retained::from),
+        }
+    }
+
+    /// List nodes allocated and not free: live versions plus the garbage reclamation holds (F-K3),
+    /// or exactly the live versions (F-K3v).
+    fn nodes_live(&self) -> u64 {
+        match self {
+            SharedVersions::Ebr(e) => e.counts.nodes.load(std::sync::atomic::Ordering::Relaxed),
+            SharedVersions::Olc(o) => o.nodes_in_use(),
+        }
+    }
+
+    /// F-K3: bytes of those nodes; F-K3v: bytes of the whole node pool, in use or free.
+    fn node_bytes(&self) -> u64 {
+        match self {
+            SharedVersions::Ebr(e) => e.counts.bytes.load(std::sync::atomic::Ordering::Relaxed),
+            SharedVersions::Olc(o) => o.pool_bytes(),
+        }
+    }
+
+    fn restarts(&self) -> u64 {
+        match self {
+            SharedVersions::Ebr(_) => 0,
+            SharedVersions::Olc(o) => o.restarts(),
+        }
+    }
+}
+
+impl From<OlcVersion> for Retained {
+    fn from(v: OlcVersion) -> Self {
+        Retained {
+            born: v.born,
+            died: v.died,
+            slot: v.slot,
+        }
+    }
+}
+
+impl From<Retained> for OlcVersion {
+    fn from(v: Retained) -> Self {
+        OlcVersion {
+            born: v.born,
+            died: v.died,
+            slot: v.slot,
+        }
+    }
+}
+
+/// F-K3: the trunk's retained versions of each page as crossbeam's lock-free skip list; removed
+/// nodes are freed by epoch reclamation. A page's list is created once and lives as long as the store.
+struct EbrVersions {
     pages: Radix<OnceLock<VersionList>>,
     /// The lists' allocator's counts (see [`NodeAlloc`]).
     counts: &'static NodeCounts,
@@ -591,7 +670,7 @@ unsafe impl ApiAllocator for NodeAlloc {
     }
 }
 
-impl SharedVersions {
+impl EbrVersions {
     fn new() -> Self {
         Self {
             pages: Radix::new(),
@@ -704,7 +783,7 @@ impl Lineage {
     fn retained_at(&self, page: u32, f: u64, examined: &mut u64) -> Option<Slot> {
         if let Some(shared) = &self.shared {
             *examined += 1;
-            return shared.covering(page, f, &epoch::pin()).map(|v| v.slot);
+            return shared.covering(page, f).map(|v| v.slot);
         }
         let (_, v) = self.retained.get(&page)?.range(..=f).next_back()?;
         *examined += 1;
@@ -829,21 +908,28 @@ fn gone(id: BranchId) -> LimboError {
 }
 
 impl BranchStore {
-    /// A store whose trunk reads follow `TURSO_K3`: `lockfree` for F-K3, unset (or `off`) for F5's
-    /// locked lookup. Any other value is refused: a run must not measure a mode it did not name.
+    /// A store whose trunk reads follow `TURSO_K3`: `lockfree` for F-K3, `olc` for F-K3v, unset (or
+    /// `off`) for F5's locked lookup. Any other value is refused: a run must not measure a mode it
+    /// did not name.
     pub(crate) fn new() -> Self {
-        let lockfree = match std::env::var("TURSO_K3") {
-            Err(std::env::VarError::NotPresent) => false,
-            Ok(v) if v.is_empty() || v == "off" => false,
-            Ok(v) if v == "lockfree" => true,
-            other => panic!("TURSO_K3={other:?}: expected `lockfree` or `off`"),
+        let mode = match std::env::var("TURSO_K3") {
+            Err(std::env::VarError::NotPresent) => K3Mode::Off,
+            Ok(v) if v.is_empty() || v == "off" => K3Mode::Off,
+            Ok(v) if v == "lockfree" => K3Mode::Ebr,
+            Ok(v) if v == "olc" => K3Mode::Olc,
+            other => panic!("TURSO_K3={other:?}: expected `lockfree`, `olc` or `off`"),
         };
-        Self::with_trunk_reads(lockfree)
+        Self::with_k3(mode)
     }
 
-    /// A store with F-K3's lock-free reads of rewritten trunk pages, or F5's locked ones.
-    pub(crate) fn with_trunk_reads(lockfree: bool) -> Self {
-        let k3 = lockfree.then(|| std::sync::Arc::new(SharedVersions::new()));
+    /// A store whose reads of rewritten trunk pages take the path `mode` names.
+    pub(crate) fn with_k3(mode: K3Mode) -> Self {
+        let k3 = match mode {
+            K3Mode::Off => None,
+            K3Mode::Ebr => Some(SharedVersions::Ebr(EbrVersions::new())),
+            K3Mode::Olc => Some(SharedVersions::Olc(OlcLists::new())),
+        }
+        .map(std::sync::Arc::new);
         Self {
             shards: (0..SHARDS)
                 .map(|i| {
@@ -873,13 +959,19 @@ impl BranchStore {
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
             k3,
+            k3_mode: mode,
             trunk_chunks: OnceLock::new(),
         }
     }
 
-    /// Whether this store reads rewritten trunk pages without the trunk's lock (F-K3).
+    /// Whether this store reads rewritten trunk pages without the trunk's lock (F-K3 or F-K3v).
     pub(crate) fn lockfree_trunk_reads(&self) -> bool {
-        self.k3.is_some()
+        self.k3_mode.lockfree()
+    }
+
+    /// The trunk-read mode's name: `off`, `lockfree` or `olc`.
+    pub(crate) fn k3_mode(&self) -> &'static str {
+        self.k3_mode.name()
     }
 
     fn timed(&self) -> bool {
@@ -1279,9 +1371,9 @@ impl BranchStore {
             return Ok(Resolved::Filled);
         }
         if let Some(shared) = &self.k3 {
-            // F-K3: no trunk lock (see "Reads of rewritten trunk pages without the trunk's lock").
-            let guard = epoch::pin();
-            if let Some(v) = shared.covering(page, at, &guard) {
+            // F-K3/F-K3v: no trunk lock (see "Reads of rewritten trunk pages without the trunk's
+            // lock").
+            if let Some(v) = shared.covering(page, at) {
                 crate::turso_assert!(
                     domain_of(v.slot) == TRUNK_DOMAIN,
                     "a trunk version outside the trunk's arena"
@@ -1331,8 +1423,9 @@ impl BranchStore {
             add(&mut stats, &trunk.work, &trunk.domain);
             stats.trunk_slots_in_use = trunk.domain.in_use();
             if let Some(k3) = &self.k3 {
-                stats.k3_nodes_live = k3.counts.nodes.load(std::sync::atomic::Ordering::Relaxed);
-                stats.k3_node_bytes_live = k3.counts.bytes.load(std::sync::atomic::Ordering::Relaxed);
+                stats.k3_nodes_live = k3.nodes_live();
+                stats.k3_node_bytes_live = k3.node_bytes();
+                stats.k3_olc_restarts = k3.restarts();
             }
             stats.work.trunk_lock_acquisitions = trunk.work.lock_acquisitions;
             stats.work.trunk_lock_contended = trunk.work.lock_contended;
@@ -1496,15 +1589,15 @@ mod tests {
     /// exactly the versions whose `[born, died)` still contains a live child's fork epoch.
     #[test]
     fn retained_versions_match_a_model_under_forks_rewrites_and_reaps_in_every_order() {
-        for lockfree in [false, true] {
+        for mode in K3Mode::ALL {
             for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
-                run(seed, lockfree);
+                run(seed, mode);
             }
         }
     }
 
-    fn run(seed: u64, lockfree: bool) {
-        let store = BranchStore::with_trunk_reads(lockfree);
+    fn run(seed: u64, mode: K3Mode) {
+        let store = BranchStore::with_k3(mode);
         let mut rng = Rng(seed);
         // The trunk's current generation of each page, and each live child's view at its fork.
         let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
@@ -1560,11 +1653,11 @@ mod tests {
                     let before = store.stats();
                     let reaped = store.release_handle(id);
                     let after = store.stats();
-                    assert!(!reaped.deferred, "seed {seed:#x} k3 {lockfree} step {step}");
+                    assert!(!reaped.deferred, "seed {seed:#x} k3 {mode:?} step {step}");
                     assert_eq!(
                         before.arena_slots_in_use - after.arena_slots_in_use,
                         reaped.freed_pages,
-                        "seed {seed:#x} k3 {lockfree} step {step}: the reap's report disagrees with the arena"
+                        "seed {seed:#x} k3 {mode:?} step {step}: the reap's report disagrees with the arena"
                     );
                     let visited = after.work.gc_range_entries - before.work.gc_range_entries;
                     let contract = match (lo, hi) {
@@ -1574,7 +1667,7 @@ mod tests {
                     };
                     assert_eq!(
                         visited, contract,
-                        "seed {seed:#x} k3 {lockfree} step {step}: reaping the child forked at {f} (lo {lo:?}, \
+                        "seed {seed:#x} k3 {mode:?} step {step}: reaping the child forked at {f} (lo {lo:?}, \
                          hi {hi:?}, |B| {b}, |D| {d}) visited {visited} index entries"
                     );
                     if reaped.freed_pages > 0 {
@@ -1595,7 +1688,7 @@ mod tests {
             assert_eq!(
                 store.stats().arena_slots_in_use,
                 alive.len(),
-                "seed {seed:#x} k3 {lockfree} step {step}: the arena holds a version no live child can see, or \
+                "seed {seed:#x} k3 {mode:?} step {step}: the arena holds a version no live child can see, or \
                  lost one a live child can"
             );
             // A version no live child can see never becomes visible again.
@@ -1614,7 +1707,7 @@ mod tests {
                     };
                     assert_eq!(
                         got, view[&page],
-                        "seed {seed:#x} k3 {lockfree} step {step}: child forked at {f} read the wrong page {page}"
+                        "seed {seed:#x} k3 {mode:?} step {step}: child forked at {f} read the wrong page {page}"
                     );
                 }
             }
@@ -1623,13 +1716,13 @@ mod tests {
         // otherwise a green run says nothing about the shape it skipped.
         assert!(
             freed_oldest > 0 && freed_newest > 0 && freed_middle > 0,
-            "seed {seed:#x} k3 {lockfree}: reaps that freed versions: oldest {freed_oldest}, newest \
+            "seed {seed:#x} k3 {mode:?}: reaps that freed versions: oldest {freed_oldest}, newest \
              {freed_newest}, middle {freed_middle}"
         );
         for (id, _, _) in live {
             store.release_handle(id);
         }
-        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {lockfree}: versions leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {mode:?}: versions leaked");
     }
 
     /// The lock accounting, forced to fire and shown not to fire spuriously. One thread alone makes
@@ -1703,8 +1796,8 @@ mod tests {
     /// `observe` acquisition each closing snapshot makes itself.
     #[test]
     fn trunk_lock_sites_are_counted_where_they_are_taken() {
-        for lockfree in [false, true] {
-            let store = BranchStore::with_trunk_reads(lockfree);
+        for mode in K3Mode::ALL {
+            let store = BranchStore::with_k3(mode);
             let snap = || store.stats().work.trunk_sites.acquisitions;
             let delta = |a: [u64; 5], b: [u64; 5]| {
                 let mut d: [u64; 5] = std::array::from_fn(|i| b[i] - a[i]);
@@ -1718,20 +1811,20 @@ mod tests {
             };
             let before = snap();
             let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
-            assert_eq!(delta(before, snap()), one(TrunkSite::Fork), "k3 {lockfree}: fork");
+            assert_eq!(delta(before, snap()), one(TrunkSite::Fork), "k3 {mode:?}: fork");
             let before = snap();
             // The trunk rewrites page 0, whose content until now was `image(0)`.
             store.first_write_trunk(0, &image(0));
-            assert_eq!(delta(before, snap()), one(TrunkSite::Write), "k3 {lockfree}: trunk write");
+            assert_eq!(delta(before, snap()), one(TrunkSite::Write), "k3 {mode:?}: trunk write");
             let before = snap();
             let mut buf = vec![0u8; PAGE];
             assert!(matches!(store.resolve_into(id, 0, &mut buf).unwrap(), Resolved::Filled));
-            assert_eq!(buf, image(0), "k3 {lockfree}: the child reads the pre-image");
-            let resolve = if lockfree { [0; 5] } else { one(TrunkSite::Resolve) };
-            assert_eq!(delta(before, snap()), resolve, "k3 {lockfree}: resolve");
+            assert_eq!(buf, image(0), "k3 {mode:?}: the child reads the pre-image");
+            let resolve = if mode.lockfree() { [0; 5] } else { one(TrunkSite::Resolve) };
+            assert_eq!(delta(before, snap()), resolve, "k3 {mode:?}: resolve");
             let before = snap();
             assert_eq!(store.release_handle(id).freed_pages, 1);
-            assert_eq!(delta(before, snap()), one(TrunkSite::Reap), "k3 {lockfree}: reap");
+            assert_eq!(delta(before, snap()), one(TrunkSite::Reap), "k3 {mode:?}: reap");
         }
     }
 
@@ -1752,9 +1845,9 @@ mod tests {
     /// `resolve_into`, the path the pager uses.
     #[test]
     fn every_branch_of_a_random_tree_reads_its_parent_as_of_its_fork() {
-        for lockfree in [false, true] {
+        for mode in K3Mode::ALL {
             for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
-                run_tree(seed, lockfree);
+                run_tree(seed, mode);
             }
         }
     }
@@ -1768,8 +1861,8 @@ mod tests {
         forked: bool,
     }
 
-    fn run_tree(seed: u64, lockfree: bool) {
-        let store = BranchStore::with_trunk_reads(lockfree);
+    fn run_tree(seed: u64, mode: K3Mode) {
+        let store = BranchStore::with_k3(mode);
         let mut rng = Rng(seed);
         let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
         let mut nodes: Vec<Node> = Vec::new();
@@ -1861,7 +1954,7 @@ mod tests {
                     assert_eq!(
                         got,
                         n.sees[&page],
-                        "seed {seed:#x} k3 {lockfree} step {step}: branch {} at depth {} read the wrong page {page}",
+                        "seed {seed:#x} k3 {mode:?} step {step}: branch {} at depth {} read the wrong page {page}",
                         n.id.0,
                         n.depth
                     );
@@ -1871,14 +1964,14 @@ mod tests {
         // The shapes the page maps exist for must have occurred, or a green run says nothing.
         assert!(
             max_depth >= 10 && deferred > 0 && wrote_after_fork > 0,
-            "seed {seed:#x} k3 {lockfree}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
+            "seed {seed:#x} k3 {mode:?}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
              after its first fork {wrote_after_fork}"
         );
         for n in nodes.iter().filter(|n| n.handle) {
             store.release_handle(n.id);
         }
-        assert_eq!(store.stats().live_branches, 0, "seed {seed:#x} k3 {lockfree}: branches leaked");
-        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {lockfree}: slots leaked");
+        assert_eq!(store.stats().live_branches, 0, "seed {seed:#x} k3 {mode:?}: branches leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {mode:?}: slots leaked");
     }
 
     /// The striped store under threads, against a model. Four workers each grow their own trees —
@@ -1895,17 +1988,17 @@ mod tests {
     /// lock, and reaps deferred by a live child.
     #[test]
     fn striped_store_under_threads_reads_every_fork_as_it_was() {
-        for lockfree in [false, true] {
-            striped_threads(lockfree);
+        for mode in K3Mode::ALL {
+            striped_threads(mode);
         }
     }
 
-    fn striped_threads(lockfree: bool) {
+    fn striped_threads(mode: K3Mode) {
         use std::sync::atomic::{AtomicBool as StdBool, AtomicU64 as StdU64};
         use std::sync::{Mutex as StdMutex, RwLock};
         const WORKERS: u64 = 4;
         const STEPS: usize = 600;
-        let store = Arc::new(BranchStore::with_trunk_reads(lockfree));
+        let store = Arc::new(BranchStore::with_k3(mode));
         let wal = Arc::new(StdMutex::new(()));
         let committed = Arc::new(RwLock::new(
             (0..PAGES).map(|p| (p, 0u64)).collect::<HashMap<u32, u64>>(),
@@ -2037,13 +2130,13 @@ mod tests {
         let stats = store.stats();
         assert!(
             cross_shard > 0 && deferred > 0 && writes > 0 && stats.work.resolve_trunk_rewritten > 0,
-            "k3 {lockfree}: cross-shard forks {cross_shard}, deferred reaps {deferred}, trunk writes \
+            "k3 {mode:?}: cross-shard forks {cross_shard}, deferred reaps {deferred}, trunk writes \
              {writes}, resolutions of rewritten trunk pages {}",
             stats.work.resolve_trunk_rewritten
         );
         // F5 takes the trunk's lock for every such resolution, F-K3 for none.
-        let expect_locked = if lockfree { 0 } else { stats.work.resolve_trunk_rewritten };
-        assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {lockfree}: trunk-locked reads");
+        let expect_locked = if mode.lockfree() { 0 } else { stats.work.resolve_trunk_rewritten };
+        assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {mode:?}: trunk-locked reads");
         assert_eq!(stats.live_branches, 0, "branches leaked");
         assert_eq!(stats.arena_slots_in_use, 0, "slots leaked");
     }
@@ -2058,8 +2151,8 @@ mod tests {
     /// while the readers read (or the race was not run); and nothing may leak.
     #[test]
     fn rewritten_trunk_reads_race_retains_and_reaps() {
-        for lockfree in [false, true] {
-            race(lockfree);
+        for mode in K3Mode::ALL {
+            race(mode);
         }
     }
 
@@ -2076,13 +2169,13 @@ mod tests {
         (store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap(), sees)
     }
 
-    fn race(lockfree: bool) {
+    fn race(mode: K3Mode) {
         use std::sync::atomic::{AtomicBool as StdBool, AtomicU64 as StdU64, Ordering as O};
         use std::sync::{Mutex as StdMutex, RwLock};
         const READERS: u64 = 4;
         const HELD: usize = 6;
         const READS: usize = 6_000;
-        let store = Arc::new(BranchStore::with_trunk_reads(lockfree));
+        let store = Arc::new(BranchStore::with_k3(mode));
         let wal = Arc::new(StdMutex::new(()));
         let committed: Arc<Committed> =
             Arc::new(RwLock::new((0..PAGES).map(|p| (p, 0u64)).collect()));
@@ -2168,7 +2261,7 @@ mod tests {
                         drop(snapshot);
                         assert_eq!(
                             got, sees[&page],
-                            "k3 {lockfree}: reader {r} read {i}: branch {} read the wrong page {page}",
+                            "k3 {mode:?}: reader {r} read {i}: branch {} read the wrong page {page}",
                             id.0
                         );
                     }
@@ -2188,14 +2281,14 @@ mod tests {
         let stats = store.stats();
         assert!(
             writes > 0 && churn_freed > 0 && stats.work.resolve_trunk_rewritten > 1_000,
-            "k3 {lockfree}: trunk writes {writes}, versions the churn freed while readers read {churn_freed}, \
+            "k3 {mode:?}: trunk writes {writes}, versions the churn freed while readers read {churn_freed}, \
              resolutions of rewritten trunk pages {}",
             stats.work.resolve_trunk_rewritten
         );
-        let expect_locked = if lockfree { 0 } else { stats.work.resolve_trunk_rewritten };
-        assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {lockfree}: trunk-locked reads");
-        assert_eq!(stats.live_branches, 0, "k3 {lockfree}: branches leaked");
-        assert_eq!(stats.arena_slots_in_use, 0, "k3 {lockfree}: slots leaked");
+        let expect_locked = if mode.lockfree() { 0 } else { stats.work.resolve_trunk_rewritten };
+        assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {mode:?}: trunk-locked reads");
+        assert_eq!(stats.live_branches, 0, "k3 {mode:?}: branches leaked");
+        assert_eq!(stats.arena_slots_in_use, 0, "k3 {mode:?}: slots leaked");
     }
 
     /// F-K3's garbage instrument, forced to fire and then shown to drain. While this thread holds an
@@ -2204,7 +2297,7 @@ mod tests {
     /// removals. Once the guard is gone and the epoch advances, that garbage is freed.
     #[test]
     fn k3_garbage_is_held_by_a_pinned_guard_and_drains_after_it() {
-        let store = BranchStore::with_trunk_reads(true);
+        let store = BranchStore::with_k3(K3Mode::Ebr);
         let pinned = epoch::pin();
         let mut removed = 0u64;
         for round in 0..20u64 {
@@ -2234,6 +2327,28 @@ mod tests {
         );
     }
 
+    /// F-K3v under the same pinned guard holds nothing: a removed node goes back to the pool at once
+    /// and the next insert reuses it, so 1,000 rounds of retain-and-reap under a pin leave the pool
+    /// at the size its first round made it (a pool that deferred or leaked would grow with the rounds).
+    #[test]
+    fn olc_holds_no_garbage_under_a_pinned_guard() {
+        let store = BranchStore::with_k3(K3Mode::Olc);
+        let _pinned = epoch::pin();
+        let mut pool = None;
+        for round in 0..1_000u64 {
+            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+            for page in 0..PAGES {
+                store.first_write_trunk(page, &image(round));
+            }
+            assert_eq!(store.release_handle(id).freed_pages, PAGES as usize);
+            let s = store.stats();
+            assert_eq!((s.k3_nodes_live, s.trunk_slots_in_use), (0, 0), "round {round}");
+            let bytes = *pool.get_or_insert(s.k3_node_bytes_live);
+            assert!(bytes > 0);
+            assert_eq!(s.k3_node_bytes_live, bytes, "round {round}: the pool grew under a pin");
+        }
+    }
+
     /// The shared trunk-page cache against a model. Children fork and are reaped, often down to
     /// none, so the trunk also writes pages while it has no child — as the pager then does, with no
     /// copy decision and so nothing the store can see. The trunk rewrites pages with and without
@@ -2243,15 +2358,15 @@ mod tests {
     /// cache must have served reads: a cache that never hits has not been tested.
     #[test]
     fn the_trunk_page_cache_serves_each_branch_the_version_it_forked_from() {
-        for lockfree in [false, true] {
+        for mode in K3Mode::ALL {
             for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
-                run_cache(seed, lockfree);
+                run_cache(seed, mode);
             }
         }
     }
 
-    fn run_cache(seed: u64, lockfree: bool) {
-        let store = BranchStore::with_trunk_reads(lockfree);
+    fn run_cache(seed: u64, mode: K3Mode) {
+        let store = BranchStore::with_k3(mode);
         let mut rng = Rng(seed);
         let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
         let mut live: Vec<(BranchId, HashMap<u32, u64>)> = Vec::new();
@@ -2293,7 +2408,7 @@ mod tests {
                     };
                     assert_eq!(
                         got, view[&page],
-                        "seed {seed:#x} k3 {lockfree} step {step}: branch {} read the wrong page {page}",
+                        "seed {seed:#x} k3 {mode:?} step {step}: branch {} read the wrong page {page}",
                         id.0
                     );
                 }
@@ -2302,13 +2417,13 @@ mod tests {
         let work = store.stats().work;
         assert!(
             work.trunk_page_hits > 0 && childless_writes > 0 && emptied > 0,
-            "seed {seed:#x} k3 {lockfree}: cache hits {}, trunk writes with no child {childless_writes}, times the \
+            "seed {seed:#x} k3 {mode:?}: cache hits {}, trunk writes with no child {childless_writes}, times the \
              last child went {emptied}",
             work.trunk_page_hits
         );
         for (id, _) in live {
             store.release_handle(id);
         }
-        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {lockfree}: versions leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {mode:?}: versions leaked");
     }
 }

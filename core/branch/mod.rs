@@ -53,7 +53,9 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+pub(crate) mod olc;
 pub(crate) mod page_map;
+pub(crate) mod radix;
 pub(crate) mod store;
 
 use crate::error::LimboError;
@@ -181,8 +183,12 @@ pub struct BranchStats {
     /// bytes. A removed node is freed only when epoch reclamation says no reader can reach it, so
     /// `k3_nodes_live - trunk_slots_in_use` is the garbage reclamation still holds. Both counts are 0
     /// without F-K3, which keeps no lists; the difference means nothing there.
+    /// Under F-K3v (`TURSO_K3=olc`) removed nodes return to a pool at once, so `k3_nodes_live` is
+    /// exactly the live versions, and `k3_node_bytes_live` is the whole pool's bytes.
     pub k3_nodes_live: u64,
     pub k3_node_bytes_live: u64,
+    /// F-K3v: reader restarts (a validation that failed because the writer changed a node under it).
+    pub k3_olc_restarts: u64,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -495,6 +501,12 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_trunk_reads_lockfree(&self) -> bool {
         self.branches.lockfree_trunk_reads()
+    }
+
+    /// The branch store's trunk-read mode: `off` (F5), `lockfree` (F-K3) or `olc` (F-K3v).
+    #[doc(hidden)]
+    pub fn branch_k3_mode(&self) -> &'static str {
+        self.branches.k3_mode()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.

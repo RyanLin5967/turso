@@ -1585,13 +1585,15 @@ fn arm_conc(b: &mut Bench, args: &Args) {
     };
     println!(
         "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={} \
-         trunk_writer={} reads={} k3_lockfree={}",
+         trunk_writer={} reads={} k3_lockfree={} k3_mode={} pin={}",
         args.threads,
         args.cycles,
         args.lock_timing,
         args.trunk_writer,
         args.reads,
-        b.db.branch_trunk_reads_lockfree()
+        b.db.branch_trunk_reads_lockfree(),
+        b.db.branch_k3_mode(),
+        args.pin
     );
     println!("{CONC_HEADER}");
     let mut live: Vec<Live> = Vec::new();
@@ -1845,12 +1847,13 @@ fn arm_conc(b: &mut Bench, args: &Args) {
             println!(
                 "# k3gc N={n} T={t} draw={draw} pinned={} trunk_writes={writes} gc_freed={gc_freed} \
                  garbage_start={} garbage_pinned={p_garbage} nodes_pinned={p_nodes} node_bytes_pinned={p_bytes} \
-                 garbage_end={} nodes_end={} node_bytes_end={}",
+                 garbage_end={} nodes_end={} node_bytes_end={} olc_restarts={}",
                 args.pin,
                 garbage(&start_stats),
                 garbage(&s),
                 s.k3_nodes_live,
                 s.k3_node_bytes_live,
+                s.k3_olc_restarts - start_stats.k3_olc_restarts,
             );
         }
     }
