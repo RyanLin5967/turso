@@ -177,6 +177,11 @@ pub struct BranchStats {
     pub arena_slots_free: usize,
     /// Of `arena_slots_in_use`, the trunk's retained versions (its own arena domain).
     pub trunk_slots_in_use: usize,
+    /// F-K3: skip-list nodes of the trunk's version lists allocated and not yet freed, and their
+    /// bytes. A removed node is freed only when epoch reclamation says no reader can reach it, so
+    /// `k3_nodes_live - trunk_slots_in_use` is the garbage reclamation still holds (0 without F-K3).
+    pub k3_nodes_live: u64,
+    pub k3_node_bytes_live: u64,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -238,6 +243,36 @@ pub struct BranchWork {
     /// Of those, the ones answered under the trunk's lock. Counted under it. Always 0 under F-K3,
     /// which answers them without the lock (`Database::branch_trunk_reads_lockfree`).
     pub resolve_trunk_locked: u64,
+    /// The trunk's lock per site (lane r11-k3-trunklock amendment 3).
+    pub trunk_sites: TrunkSites,
+}
+
+/// The sites at which the store takes the trunk's lock, in the order of [`TrunkSites`]' arrays:
+/// a trunk fork, the reap of a trunk child (`child_gone`), a resolution of a page the trunk
+/// rewrote (F5 only), a trunk copy decision (`first_write_trunk`), and accounting and membership
+/// queries.
+pub const TRUNK_LOCK_SITES: [&str; 5] = ["fork_trunk", "reap", "resolve", "trunk_write", "observe"];
+
+/// The trunk lock's accounting per site ([`TRUNK_LOCK_SITES`]), counted under the lock itself.
+/// Observation only. `hold_ns` is counted only while lock timing is on, since timing a hold adds
+/// two clock reads inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrunkSites {
+    pub acquisitions: [u64; 5],
+    pub contended: [u64; 5],
+    pub wait_ns: [u64; 5],
+    pub hold_ns: [u64; 5],
+}
+
+impl TrunkSites {
+    fn add(&mut self, other: &TrunkSites) {
+        for i in 0..TRUNK_LOCK_SITES.len() {
+            self.acquisitions[i] += other.acquisitions[i];
+            self.contended[i] += other.contended[i];
+            self.wait_ns[i] += other.wait_ns[i];
+            self.hold_ns[i] += other.hold_ns[i];
+        }
+    }
 }
 
 impl BranchWork {
@@ -261,6 +296,7 @@ impl BranchWork {
             trunk_lock_hold_ns,
             resolve_trunk_rewritten,
             resolve_trunk_locked,
+            trunk_sites,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -279,6 +315,7 @@ impl BranchWork {
         self.trunk_lock_hold_ns += trunk_lock_hold_ns;
         self.resolve_trunk_rewritten += resolve_trunk_rewritten;
         self.resolve_trunk_locked += resolve_trunk_locked;
+        self.trunk_sites.add(&trunk_sites);
     }
 }
 

@@ -158,7 +158,9 @@ use crossbeam_utils::CachePadded;
 use super::arena::{Arena, Chunks, Slot};
 use super::page_map::PageMap;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
+use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
 use crate::schema::Schema;
+use crate::skiplist::comparator::BasicComparator;
 use crate::skiplist::SkipList;
 use crossbeam_epoch::{self as epoch, Guard};
 use crate::storage::pager::PageRef;
@@ -260,6 +262,8 @@ impl Counted for TrunkInner {
 struct Held<'a, T: Counted> {
     guard: MutexGuard<'a, T>,
     since: Option<Instant>,
+    /// The trunk lock's site (see [`TrunkSite`]); `None` for a shard's lock.
+    site: Option<usize>,
 }
 
 impl<T: Counted> Deref for Held<'_, T> {
@@ -278,9 +282,25 @@ impl<T: Counted> DerefMut for Held<'_, T> {
 impl<T: Counted> Drop for Held<'_, T> {
     fn drop(&mut self) {
         if let Some(since) = self.since {
-            self.guard.work().lock_hold_ns += since.elapsed().as_nanos() as u64;
+            let held = since.elapsed().as_nanos() as u64;
+            let work = self.guard.work();
+            work.lock_hold_ns += held;
+            if let Some(site) = self.site {
+                work.trunk_sites.hold_ns[site] += held;
+            }
         }
     }
+}
+
+/// Where the store takes the trunk's lock, as an index into [`super::TrunkSites`]' arrays
+/// ([`super::TRUNK_LOCK_SITES`]). Observation only.
+#[derive(Clone, Copy)]
+enum TrunkSite {
+    Fork = 0,
+    Reap = 1,
+    Resolve = 2,
+    Write = 3,
+    Observe = 4,
 }
 
 /// Take `lock`, counting the acquisition into the structure it guards: every one, the ones that
@@ -288,7 +308,7 @@ impl<T: Counted> Drop for Held<'_, T> {
 /// so counting adds no shared write the lock does not already make, and the clock is read only on
 /// the contended path, by the thread that is waiting anyway — except with `timed`, which reads it
 /// once more at the acquisition and once at the release.
-fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
+fn take<T: Counted>(lock: &Mutex<T>, timed: bool, site: Option<usize>) -> Held<'_, T> {
     let (mut guard, waited) = match lock.try_lock() {
         Some(guard) => (guard, None),
         None => {
@@ -303,8 +323,15 @@ fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
         work.lock_contended += 1;
         work.lock_wait_ns += waited.as_nanos() as u64;
     }
+    if let Some(site) = site {
+        work.trunk_sites.acquisitions[site] += 1;
+        if let Some(waited) = waited {
+            work.trunk_sites.contended[site] += 1;
+            work.trunk_sites.wait_ns[site] += waited.as_nanos() as u64;
+        }
+    }
     let since = timed.then(Instant::now);
-    Held { guard, since }
+    Held { guard, since, site }
 }
 
 /// One arena domain: a shard's pages, or the trunk's retained versions. Slots it hands out carry
@@ -520,25 +547,66 @@ struct Retained {
 /// `remove` — happens under the trunk's lock, from the lineage; `covering` is the reader's, and
 /// takes no lock. A page's list is created once and lives as long as the store.
 struct SharedVersions {
-    pages: Radix<OnceLock<SkipList<u64, Retained>>>,
+    pages: Radix<OnceLock<VersionList>>,
+    /// The lists' allocator's counts (see [`NodeAlloc`]).
+    counts: &'static NodeCounts,
+}
+
+type VersionList = SkipList<u64, Retained, BasicComparator, NodeAlloc>;
+
+/// F-K3's instrument: nodes and bytes of the trunk's version lists that are allocated and not yet
+/// freed. A node removed from its list is freed only when epoch reclamation finds no reader can
+/// still reach it, so these minus the live versions are the garbage reclamation holds back.
+/// Observation only: one relaxed add per node allocation and per free.
+#[derive(Default)]
+struct NodeCounts {
+    nodes: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+/// The version lists' allocator: the global one, counting into [`NodeCounts`]. A `&'static`, so the
+/// copy each deferred free captures costs no reference count; one small `NodeCounts` is leaked per
+/// F-K3 store.
+#[derive(Clone, Copy)]
+struct NodeAlloc(&'static NodeCounts);
+
+// SAFETY: delegates every allocation and free to `Global` unchanged; it only counts them.
+unsafe impl ApiAllocator for NodeAlloc {
+    fn allocate(&self, layout: Layout) -> std::result::Result<std::ptr::NonNull<[u8]>, AllocError> {
+        let block = <Global as ApiAllocator>::allocate(&Global, layout)?;
+        self.0.nodes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .bytes
+            .fetch_add(layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(block)
+    }
+
+    unsafe fn deallocate(&self, ptr: std::ptr::NonNull<u8>, layout: Layout) {
+        self.0.nodes.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .bytes
+            .fetch_sub(layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the caller's contract, passed through.
+        unsafe { <Global as ApiAllocator>::deallocate(&Global, ptr, layout) }
+    }
 }
 
 impl SharedVersions {
     fn new() -> Self {
         Self {
             pages: Radix::new(),
+            counts: Box::leak(Box::default()),
         }
     }
 
-    fn list(&self, page: u32) -> Option<&SkipList<u64, Retained>> {
+    fn list(&self, page: u32) -> Option<&VersionList> {
         self.pages.get(page)?.get()
     }
 
     fn insert(&self, page: u32, v: Retained) {
-        let list = self
-            .pages
-            .get_or_insert(page)
-            .get_or_init(|| SkipList::new(epoch::default_collector().clone()));
+        let list = self.pages.get_or_insert(page).get_or_init(|| {
+            SkipList::new_in(epoch::default_collector().clone(), NodeAlloc(self.counts))
+        });
         let guard = epoch::pin();
         list.insert(v.born, v, &guard).release(&guard);
     }
@@ -820,11 +888,11 @@ impl BranchStore {
 
     /// The shard of branch `id`, locked.
     fn shard(&self, id: BranchId) -> Held<'_, Shard> {
-        take(&self.shards[shard_of(id)], self.timed())
+        take(&self.shards[shard_of(id)], self.timed(), None)
     }
 
-    fn trunk(&self) -> Held<'_, TrunkInner> {
-        take(&self.trunk, self.timed())
+    fn trunk(&self, site: TrunkSite) -> Held<'_, TrunkInner> {
+        take(&self.trunk, self.timed(), Some(site as usize))
     }
 
     /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
@@ -895,7 +963,7 @@ impl BranchStore {
             )));
         }
         let (id, f) = {
-            let mut trunk = self.trunk();
+            let mut trunk = self.trunk(TrunkSite::Fork);
             let id = BranchId(self.next_id.fetch_add(1, Ordering::Relaxed));
             let f = trunk.lineage.epoch;
             trunk.lineage.epoch += 1;
@@ -1083,7 +1151,7 @@ impl BranchStore {
     /// the WAL, so a reader whose WAL snapshot holds the new version also sees the new epoch, and
     /// looks the page up under the trunk's lock (see [`BranchStore::resolve_into`]).
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
-        let mut trunk = self.trunk();
+        let mut trunk = self.trunk(TrunkSite::Write);
         let TrunkInner {
             lineage, domain, ..
         } = &mut *trunk;
@@ -1207,7 +1275,7 @@ impl BranchStore {
         if let Some(slot) = elsewhere {
             let d = domain_of(slot);
             crate::turso_assert!(d < SHARDS, "a branch's page map named a trunk slot");
-            out.copy_from_slice(take(&self.shards[d], self.timed()).domain.page(slot));
+            out.copy_from_slice(take(&self.shards[d], self.timed(), None).domain.page(slot));
             return Ok(Resolved::Filled);
         }
         if let Some(shared) = &self.k3 {
@@ -1229,7 +1297,7 @@ impl BranchStore {
                 return Ok(Resolved::Filled);
             }
         } else {
-            let mut trunk = self.trunk();
+            let mut trunk = self.trunk(TrunkSite::Resolve);
             trunk.work.resolve_trunk_locked += 1;
             let mut examined = 0;
             let found = trunk.lineage.retained_at(page, at, &mut examined);
@@ -1259,16 +1327,20 @@ impl BranchStore {
         }
         let mut stats = BranchStats::default();
         {
-            let trunk = self.trunk();
+            let trunk = self.trunk(TrunkSite::Observe);
             add(&mut stats, &trunk.work, &trunk.domain);
             stats.trunk_slots_in_use = trunk.domain.in_use();
+            if let Some(k3) = &self.k3 {
+                stats.k3_nodes_live = k3.counts.nodes.load(std::sync::atomic::Ordering::Relaxed);
+                stats.k3_node_bytes_live = k3.counts.bytes.load(std::sync::atomic::Ordering::Relaxed);
+            }
             stats.work.trunk_lock_acquisitions = trunk.work.lock_acquisitions;
             stats.work.trunk_lock_contended = trunk.work.lock_contended;
             stats.work.trunk_lock_wait_ns = trunk.work.lock_wait_ns;
             stats.work.trunk_lock_hold_ns = trunk.work.lock_hold_ns;
         }
         for lock in self.shards.iter() {
-            let shard = take(lock, self.timed());
+            let shard = take(lock, self.timed(), None);
             stats.live_branches += shard.branches.len();
             add(&mut stats, &shard.work, &shard.domain);
         }
@@ -1288,17 +1360,17 @@ impl BranchStore {
     }
 
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
-        let mut slots: Vec<u32> = self.trunk().domain.slots_in_use().collect();
+        let mut slots: Vec<u32> = self.trunk(TrunkSite::Observe).domain.slots_in_use().collect();
         for lock in self.shards.iter() {
-            slots.extend(take(lock, self.timed()).domain.slots_in_use());
+            slots.extend(take(lock, self.timed(), None).domain.slots_in_use());
         }
         slots
     }
 
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
         match domain_of(slot) {
-            TRUNK_DOMAIN => self.trunk().domain.is_free(slot),
-            d if d < SHARDS => take(&self.shards[d], self.timed()).domain.is_free(slot),
+            TRUNK_DOMAIN => self.trunk(TrunkSite::Observe).domain.is_free(slot),
+            d if d < SHARDS => take(&self.shards[d], self.timed(), None).domain.is_free(slot),
             _ => false,
         }
     }
@@ -1333,7 +1405,7 @@ impl BranchStore {
             freed += st.lineage.release_all(domain).len();
             drop(shard);
             if st.parent.is_trunk() {
-                let mut trunk = self.trunk();
+                let mut trunk = self.trunk(TrunkSite::Reap);
                 let TrunkInner {
                     lineage,
                     domain,
@@ -1579,6 +1651,17 @@ mod tests {
         let per_call = SHARDS as u64 + 1;
         assert_eq!(quiet.lock_acquisitions - base.lock_acquisitions, 11 * per_call);
         assert_eq!(quiet.trunk_lock_acquisitions - base.trunk_lock_acquisitions, 11);
+        let observe = TrunkSite::Observe as usize;
+        assert_eq!(
+            quiet.trunk_sites.acquisitions[observe] - base.trunk_sites.acquisitions[observe],
+            11,
+            "`stats` is an observe site"
+        );
+        assert_eq!(
+            quiet.trunk_sites.acquisitions.iter().sum::<u64>(),
+            quiet.trunk_lock_acquisitions,
+            "every trunk acquisition is counted at exactly one site"
+        );
         assert_eq!(
             (quiet.lock_contended, quiet.lock_wait_ns, quiet.lock_hold_ns),
             (0, 0, 0),
@@ -1591,7 +1674,7 @@ mod tests {
         let holder = {
             let store = store.clone();
             std::thread::spawn(move || {
-                let held = store.trunk();
+                let held = store.trunk(TrunkSite::Observe);
                 tx.send(()).unwrap();
                 std::thread::sleep(hold);
                 drop(held);
@@ -1608,6 +1691,10 @@ mod tests {
             "the holder's {hold:?} was counted as {} ns",
             forced.trunk_lock_hold_ns
         );
+        let sites = forced.trunk_sites;
+        assert_eq!(sites.contended[observe], 1, "the wait was not counted at its site");
+        assert_eq!(sites.contended.iter().sum::<u64>(), 1, "a wait was counted at another site");
+        assert!(sites.wait_ns[observe] > 0 && sites.hold_ns[observe] >= hold.as_nanos() as u64);
     }
 
     /// A committed branch page holding `image(generation)`, as the pager hands it to
@@ -2063,6 +2150,48 @@ mod tests {
         assert_eq!(stats.work.resolve_trunk_locked, expect_locked, "k3 {lockfree}: trunk-locked reads");
         assert_eq!(stats.live_branches, 0, "k3 {lockfree}: branches leaked");
         assert_eq!(stats.arena_slots_in_use, 0, "k3 {lockfree}: slots leaked");
+    }
+
+    /// F-K3's garbage instrument, forced to fire and then shown to drain. While this thread holds an
+    /// epoch guard, no node a reap removes can be freed (a reader pinned since before the removal
+    /// might still reach it), so the lists' live nodes exceed the live versions by exactly the
+    /// removals. Once the guard is gone and the epoch advances, that garbage is freed. F5 keeps no
+    /// list and counts no node.
+    #[test]
+    fn k3_garbage_is_held_by_a_pinned_guard_and_drains_after_it() {
+        let store = BranchStore::with_trunk_reads(true);
+        let pinned = epoch::pin();
+        let mut removed = 0u64;
+        for round in 0..20u64 {
+            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+            for page in 0..PAGES {
+                store.first_write_trunk(page, &image(round));
+            }
+            removed += store.release_handle(id).freed_pages as u64;
+        }
+        let held = store.stats();
+        assert_eq!(removed, 20 * u64::from(PAGES), "each round retains and frees one version per page");
+        assert_eq!(held.trunk_slots_in_use, 0, "every version was reaped");
+        assert_eq!(held.k3_nodes_live, removed, "a removed node was freed under a pinned guard");
+        assert!(held.k3_node_bytes_live > 0);
+        drop(pinned);
+        let mut flushes = 0;
+        while store.stats().k3_nodes_live > 0 && flushes < 1_000_000 {
+            epoch::pin().flush();
+            std::thread::yield_now();
+            flushes += 1;
+        }
+        let drained = store.stats();
+        assert_eq!(
+            (drained.k3_nodes_live, drained.k3_node_bytes_live),
+            (0, 0),
+            "garbage outlived the guard by {flushes} flushes"
+        );
+        let f5 = BranchStore::with_trunk_reads(false);
+        let id = f5.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        f5.first_write_trunk(0, &image(0));
+        f5.release_handle(id);
+        assert_eq!(f5.stats().k3_nodes_live, 0);
     }
 
     /// The shared trunk-page cache against a model. Children fork and are reaped, often down to

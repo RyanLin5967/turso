@@ -32,7 +32,10 @@
 //! `--trunk-writer` (conc only; lane r11-k3-trunklock PREREG §0.3) adds one thread that rewrites the
 //! trunk on the `spread` walk, paced at one write per fork, so that branch reads meet pages the trunk
 //! rewrote after their fork (the K3 exposure). `--reads R` (conc only, default 0) adds R reads of
-//! uniform rows per cycle on the read connection (op `read_more`).
+//! uniform rows per cycle on the read connection (op `read_more`). `--pin` (with `--trunk-writer`;
+//! amendment 3) adds a thread that holds an epoch guard for the whole of every cell, as a reader
+//! descheduled inside a lock-free lookup would, and samples the garbage it holds back before letting
+//! go.
 //!
 //! Every read a sample makes is checked against a model the harness keeps itself (never against
 //! the engine), and the engine's own counts are checked against the workload before a number is
@@ -47,7 +50,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use crossbeam_utils::CachePadded;
-use turso_core::branch::{Branch, BranchWork};
+use turso_core::branch::{Branch, BranchStats, BranchWork, TRUNK_LOCK_SITES};
 use turso_core::{
     Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, SqliteDialect, Value,
     IO,
@@ -96,6 +99,7 @@ struct Args {
     lock_timing: bool,
     trunk_writer: bool,
     reads: usize,
+    pin: bool,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -121,6 +125,7 @@ fn parse_args() -> Args {
         lock_timing: false,
         trunk_writer: false,
         reads: 0,
+        pin: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -165,6 +170,7 @@ fn parse_args() -> Args {
                 }
             }
             "--trunk-writer" => args.trunk_writer = true,
+            "--pin" => args.pin = true,
             "--reads" => args.reads = val().parse().unwrap_or_else(|_| die("bad --reads")),
             "--victim" => {
                 args.victim = match val().as_str() {
@@ -201,6 +207,9 @@ fn parse_args() -> Args {
         }
     } else if !args.threads.is_empty() || args.lock_timing || args.trunk_writer || args.reads > 0 {
         die("--threads, --lock-timing, --trunk-writer and --reads apply to --arm conc only");
+    }
+    if args.pin && !args.trunk_writer {
+        die("--pin needs --trunk-writer: without trunk writes no version is ever removed");
     }
     args
 }
@@ -1659,15 +1668,33 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                     not_a_result(&format!("the TRUNCATE checkpoint before a cell was refused: {rows:?}"));
                 }
             }
-            let barrier = Barrier::new(t + 1 + usize::from(writer_conn.is_some()));
+            let barrier = Barrier::new(
+                t + 1 + usize::from(writer_conn.is_some()) + usize::from(args.pin),
+            );
+            let unpin = AtomicBool::new(false);
             writer.forks.store(0, Ordering::Release);
             writer.stop.store(false, Ordering::Release);
             let writes0 = writer.committed.load(Ordering::Acquire);
             println!("# cell N={n} T={t} draw={draw} start");
-            let before = b.db.branch_stats().work;
+            let start_stats = b.db.branch_stats();
+            let before = start_stats.work;
             let cpu0 = cpu_ns();
-            let (wall, outs, writer_busy) = std::thread::scope(|s| {
+            let db = &b.db;
+            let (wall, outs, writer_busy, pinned) = std::thread::scope(|s| {
                 let writer = &writer;
+                // Amendment 3: an epoch guard held from before the first cycle until the garbage
+                // has been sampled, as a reader descheduled inside a lock-free lookup would hold it.
+                let pinner = args.pin.then(|| {
+                    let (barrier, unpin) = (&barrier, &unpin);
+                    s.spawn(move || {
+                        let guard = crossbeam_epoch::pin();
+                        barrier.wait();
+                        while !unpin.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        drop(guard);
+                    })
+                });
                 let handles: Vec<_> = shares
                     .into_iter()
                     .enumerate()
@@ -1695,7 +1722,13 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 let wall = start.elapsed();
                 writer.stop.store(true, Ordering::Release);
                 let writer_busy = wh.map_or(0, |h| h.join().unwrap());
-                (wall, outs, writer_busy)
+                let pinned = pinner.map(|h| {
+                    let held = db.branch_stats();
+                    unpin.store(true, Ordering::Release);
+                    h.join().unwrap();
+                    held
+                });
+                (wall, outs, writer_busy, pinned)
             });
             let cpu1 = cpu_ns();
             let after = b.db.branch_stats().work;
@@ -1797,8 +1830,44 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 s.trunk_slots_in_use,
                 std::fs::metadata(&b.wal_path).map_or(0, |m| m.len()),
             );
+            print_sites(n, t, draw, cycles, &before, &after);
+            // F-K3's version-list garbage: nodes allocated beyond the live versions, at the cell's
+            // start, while the pin (if any) still held, and at its end.
+            let garbage = |st: &BranchStats| st.k3_nodes_live as i64 - st.trunk_slots_in_use as i64;
+            let (p_nodes, p_bytes, p_garbage) =
+                pinned.as_ref().map_or((-1, -1, -1), |p| (p.k3_nodes_live as i64, p.k3_node_bytes_live as i64, garbage(p)));
+            println!(
+                "# k3gc N={n} T={t} draw={draw} pinned={} trunk_writes={writes} gc_freed={gc_freed} \
+                 garbage_start={} garbage_pinned={p_garbage} nodes_pinned={p_nodes} node_bytes_pinned={p_bytes} \
+                 garbage_end={} nodes_end={} node_bytes_end={}",
+                args.pin,
+                garbage(&start_stats),
+                garbage(&s),
+                s.k3_nodes_live,
+                s.k3_node_bytes_live,
+            );
         }
     }
     drop(live);
     drop(trunks);
+}
+
+/// The trunk's lock per site over one cell (amendment 3): acquisitions and contended acquisitions per
+/// cycle, wait per cycle, and hold per acquisition (0 unless `--lock-timing on`). The cell's closing
+/// `branch_stats` call is one of the `observe` acquisitions.
+fn print_sites(n: usize, t: usize, draw: u64, cycles: f64, before: &BranchWork, after: &BranchWork) {
+    let (a, b) = (&before.trunk_sites, &after.trunk_sites);
+    let mut line = format!("# sites N={n} T={t} draw={draw}");
+    for (i, site) in TRUNK_LOCK_SITES.iter().enumerate() {
+        let acq = b.acquisitions[i] - a.acquisitions[i];
+        let hold = b.hold_ns[i] - a.hold_ns[i];
+        line += &format!(
+            " {site}_acq_pc={:.4} {site}_cont_pc={:.4} {site}_wait_ns_pc={:.1} {site}_hold_ns_pa={:.1}",
+            acq as f64 / cycles,
+            (b.contended[i] - a.contended[i]) as f64 / cycles,
+            (b.wait_ns[i] - a.wait_ns[i]) as f64 / cycles,
+            if acq > 0 { hold as f64 / acq as f64 } else { 0.0 },
+        );
+    }
+    println!("{line}");
 }
