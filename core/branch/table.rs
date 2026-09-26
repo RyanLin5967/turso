@@ -131,6 +131,15 @@ impl<T> BranchTable<T> {
     }
 }
 
+/// As `HashMap`'s: panics when the id has no state.
+impl<T> std::ops::Index<&BranchId> for BranchTable<T> {
+    type Output = T;
+
+    fn index(&self, id: &BranchId) -> &T {
+        self.get(id).expect("no branch state for this id")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
