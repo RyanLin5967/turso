@@ -53,6 +53,7 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+pub(crate) mod catalog;
 pub(crate) mod journal;
 pub(crate) mod page_map;
 pub(crate) mod store;
@@ -166,6 +167,11 @@ pub enum BranchDurability {
     /// recovered at open. `sync: false` writes the files without fsync: a measurement arm, not a
     /// durability guarantee.
     Durable { sync: bool },
+    /// Durable, with the published fixes for an open that grows with the number of branches
+    /// (r11-restart lane prototype; see `catalog.rs`): the same operation log, checkpointed
+    /// incrementally into a B-tree catalog `<db>-branch-cat` instead of a whole-state snapshot, and
+    /// read back on demand. `sync` as for `Durable`.
+    Catalog { sync: bool },
 }
 
 /// Failure injection for the durability tests.
@@ -272,6 +278,20 @@ pub struct BranchOpenStats {
     pub expire_ns: u64,
     /// The whole `BranchStore::open`.
     pub total_ns: u64,
+    /// Branch states that exist, resident or not (catalog stores keep most on disk).
+    pub states: u64,
+    /// Released branches the open's collection pass examined.
+    pub released_scanned: u64,
+    /// Catalog stores: opening the catalog and reading its meta row.
+    pub catalog_ns: u64,
+    /// Catalog stores: branch states and trunk pages read from the catalog during the open.
+    pub branch_loads: u64,
+    pub trunk_page_loads: u64,
+    /// Catalog stores: catalog queries run and rows read during the open.
+    pub cat_queries: u64,
+    pub cat_rows_read: u64,
+    /// Catalog stores: arena slots the log's replay named or freed.
+    pub touched_slots: u64,
 }
 
 /// A snapshot of the branch arena's accounting.
@@ -500,10 +520,29 @@ impl Database {
         self.branches.open_stats()
     }
 
+    /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
+    /// read)` since open; zeros for a store that is not a catalog store (r11-restart instrument).
+    #[doc(hidden)]
+    pub fn branch_catalog_counters(&self) -> (u64, u64, u64, u64) {
+        self.branches.catalog_counters()
+    }
+
+    /// Catalog statements that wrote a row since open; 0 for a store that is not a catalog store.
+    #[doc(hidden)]
+    pub fn branch_catalog_rows_written(&self) -> u64 {
+        self.branches.catalog_rows_written()
+    }
+
     /// `(resolve calls, arena slot reads)` since open (r11-restart lane instrument).
     #[doc(hidden)]
     pub fn branch_read_counters(&self) -> (u64, u64) {
         self.branches.read_counters()
+    }
+
+    /// Trunk pre-images the store holds now (r11-restart lane instrument).
+    #[doc(hidden)]
+    pub fn branch_trunk_retained(&self) -> u64 {
+        self.branches.trunk_retained_count()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.
@@ -723,6 +762,9 @@ mod mechanism_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod durability_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod catalog_tests;
 
 #[cfg(test)]
 mod tests {
