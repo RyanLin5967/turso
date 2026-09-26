@@ -128,10 +128,13 @@ struct Writer {
 impl Writer {
     fn alloc(&mut self) -> NodePtr {
         if self.free.is_empty() {
-            let chunk: Box<[Node]> = (0..CHUNK).map(|_| Node::free()).collect();
+            // Pointers are taken from the chunk once it is in place: moving a `Box` retags it, and
+            // a pointer taken before the move would not be valid after it (Stacked Borrows).
+            self.chunks
+                .push((0..CHUNK).map(|_| Node::free()).collect());
+            let chunk = self.chunks.last().expect("just pushed");
             self.free
                 .extend(chunk.iter().map(|n| NodePtr(NonNull::from(n))));
-            self.chunks.push(chunk);
         }
         self.free.pop().expect("just refilled")
     }
@@ -191,7 +194,7 @@ impl OlcLists {
 
     /// The writer's descent: for every level, the last node whose `born` is below `born` (the head
     /// if none). The writer is the only one changing links, so it reads them without validation.
-    fn preds<'a>(list: &'a List, born: u64) -> [&'a Node; MAX_H] {
+    fn preds(list: &List, born: u64) -> [&Node; MAX_H] {
         let mut preds = [&list.head; MAX_H];
         let mut x = &list.head;
         for l in (0..MAX_H).rev() {
@@ -225,7 +228,12 @@ impl OlcLists {
         // SAFETY: the node lives in a chunk these lists own until they drop.
         let n = unsafe { p.as_ref() };
         let preds = Self::preds(list, v.born);
-        // A fresh incarnation: fields first, under the free node's odd version, then even.
+        // A fresh incarnation: fields first, under the free node's odd version, then even. The node
+        // may have been freed by another thread (ordered with this one only by the trunk's lock),
+        // so this thread's own release fence must precede its field stores for a reader that sees
+        // a new field to see the odd (or a newer) version too (Boehm's seqlock argument).
+        debug_assert!(n.version.load(Ordering::Relaxed) % 2 == 1, "reusing a node that is not free");
+        fence(Ordering::Release);
         n.born.store(v.born, Ordering::Relaxed);
         n.died.store(v.died, Ordering::Relaxed);
         n.slot.store(v.slot, Ordering::Relaxed);
@@ -434,15 +442,43 @@ mod tests {
             if !fired && born == Some(50) {
                 fired = true;
                 // The reader has just read a pointer to the version it wants (born 50): remove it
-                // and reuse its node in another page's list before the reader validates.
+                // and reuse its node in page 1's list, born 52 <= 55, before the reader validates.
+                // A reader that stepped onto it anyway would search page 1 and answer (52, 1000).
                 assert!(lists.remove(0, 50).is_some());
-                lists.insert(1, v(1_000, 2_000));
+                lists.insert(1, v(52, 1_000));
             }
         });
         assert!(fired);
         assert!(lists.restarts() >= 1, "the reader did not notice its path change");
         assert_eq!(got, None, "born 50 is gone and born 40 died at 50 <= 55");
         assert_eq!(lists.covering(0, 45), Some(v(40, 50)));
-        assert_eq!(lists.covering(1, 1_500), Some(v(1_000, 2_000)));
+        assert_eq!(lists.covering(1, 53), Some(v(52, 1_000)));
+    }
+
+    /// A reader stalled inside a search holds nothing: while it is parked between reading a pointer
+    /// and validating it, 3,000 versions are retained and removed in another page, and the pool
+    /// stays at its one chunk of 1,024 nodes (a scheme that deferred those frees past the stalled
+    /// reader would need three); the reader then answers from its own page as it is.
+    #[test]
+    fn a_stalled_reader_holds_nothing() {
+        let lists = OlcLists::new();
+        for born in 1..=8 {
+            lists.insert(0, v(born * 10, born * 10 + 10));
+        }
+        let pool = lists.pool_bytes();
+        let mut fired = false;
+        let got = lists.covering_with(0, 55, |_| {
+            if !fired {
+                fired = true;
+                for i in 0..3_000u64 {
+                    lists.insert(1, v(100 + 2 * i, 101 + 2 * i));
+                    assert_eq!(lists.remove(1, 100 + 2 * i), Some(v(100 + 2 * i, 101 + 2 * i)));
+                }
+            }
+        });
+        assert!(fired);
+        assert_eq!(lists.pool_bytes(), pool, "the pool grew while a reader was stalled");
+        assert_eq!(got, Some(v(50, 60)));
+        assert_eq!(lists.nodes_in_use(), 8);
     }
 }
