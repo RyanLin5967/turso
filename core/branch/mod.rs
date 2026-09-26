@@ -228,13 +228,37 @@ pub struct BranchWork {
     pub trunk_lock_contended: u64,
     pub trunk_lock_wait_ns: u64,
     pub trunk_lock_hold_ns: u64,
-    /// r11-coherence amendment 16: the trunk lock's acquisitions and, with lock timing on, its hold, split by the
-    /// two conc sites that take it: a trunk fork and the reap of a trunk child. The rest is `trunk_lock_*` minus
-    /// these.
-    pub trunk_fork_acq: u64,
-    pub trunk_fork_hold_ns: u64,
-    pub trunk_reap_acq: u64,
-    pub trunk_reap_hold_ns: u64,
+    /// The trunk's lock per site (r11-k3-trunklock amendment 3, a328c4d05; ported unchanged in meaning so both
+    /// lanes measure one quantity, r11-coherence amendment 16).
+    pub trunk_sites: TrunkSites,
+}
+
+/// The sites at which the store takes the trunk's lock, in the order of [`TrunkSites`]' arrays:
+/// a trunk fork, the reap of a trunk child (`child_gone`, or FK's garbage pass), a resolution of a
+/// page the trunk rewrote, a trunk copy decision (`first_write_trunk`), and accounting and
+/// membership queries.
+pub const TRUNK_LOCK_SITES: [&str; 5] = ["fork_trunk", "reap", "resolve", "trunk_write", "observe"];
+
+/// The trunk lock's accounting per site ([`TRUNK_LOCK_SITES`]), counted under the lock itself.
+/// Observation only. `hold_ns` is counted only while lock timing is on, since timing a hold adds
+/// two clock reads inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrunkSites {
+    pub acquisitions: [u64; 5],
+    pub contended: [u64; 5],
+    pub wait_ns: [u64; 5],
+    pub hold_ns: [u64; 5],
+}
+
+impl TrunkSites {
+    fn add(&mut self, other: &TrunkSites) {
+        for i in 0..TRUNK_LOCK_SITES.len() {
+            self.acquisitions[i] += other.acquisitions[i];
+            self.contended[i] += other.contended[i];
+            self.wait_ns[i] += other.wait_ns[i];
+            self.hold_ns[i] += other.hold_ns[i];
+        }
+    }
 }
 
 impl BranchWork {
@@ -256,10 +280,7 @@ impl BranchWork {
             trunk_lock_contended,
             trunk_lock_wait_ns,
             trunk_lock_hold_ns,
-            trunk_fork_acq,
-            trunk_fork_hold_ns,
-            trunk_reap_acq,
-            trunk_reap_hold_ns,
+            trunk_sites,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -276,10 +297,7 @@ impl BranchWork {
         self.trunk_lock_contended += trunk_lock_contended;
         self.trunk_lock_wait_ns += trunk_lock_wait_ns;
         self.trunk_lock_hold_ns += trunk_lock_hold_ns;
-        self.trunk_fork_acq += trunk_fork_acq;
-        self.trunk_fork_hold_ns += trunk_fork_hold_ns;
-        self.trunk_reap_acq += trunk_reap_acq;
-        self.trunk_reap_hold_ns += trunk_reap_hold_ns;
+        self.trunk_sites.add(&trunk_sites);
     }
 }
 

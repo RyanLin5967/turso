@@ -280,12 +280,9 @@ impl Counted for TrunkInner {
 struct Held<'a, T: Counted> {
     guard: MutexGuard<'a, T>,
     since: Option<Instant>,
-    /// Which conc site took the trunk lock (amendment 16): 0 none, [`SITE_FORK`], [`SITE_REAP`].
-    site: u8,
+    /// The trunk lock's site (see [`TrunkSite`]); `None` for a shard's lock.
+    site: Option<usize>,
 }
-
-const SITE_FORK: u8 = 1;
-const SITE_REAP: u8 = 2;
 
 impl<T: Counted> Deref for Held<'_, T> {
     type Target = T;
@@ -303,16 +300,25 @@ impl<T: Counted> DerefMut for Held<'_, T> {
 impl<T: Counted> Drop for Held<'_, T> {
     fn drop(&mut self) {
         if let Some(since) = self.since {
-            let ns = since.elapsed().as_nanos() as u64;
+            let held = since.elapsed().as_nanos() as u64;
             let work = self.guard.work();
-            work.lock_hold_ns += ns;
-            match self.site {
-                SITE_FORK => work.trunk_fork_hold_ns += ns,
-                SITE_REAP => work.trunk_reap_hold_ns += ns,
-                _ => {}
+            work.lock_hold_ns += held;
+            if let Some(site) = self.site {
+                work.trunk_sites.hold_ns[site] += held;
             }
         }
     }
+}
+
+/// Where the store takes the trunk's lock, as an index into [`super::TrunkSites`]' arrays
+/// ([`super::TRUNK_LOCK_SITES`]). Observation only. (r11-k3-trunklock a328c4d05's instrument.)
+#[derive(Clone, Copy)]
+enum TrunkSite {
+    Fork = 0,
+    Reap = 1,
+    Resolve = 2,
+    Write = 3,
+    Observe = 4,
 }
 
 /// Take `lock`, counting the acquisition into the structure it guards: every one, the ones that
@@ -320,7 +326,7 @@ impl<T: Counted> Drop for Held<'_, T> {
 /// so counting adds no shared write the lock does not already make, and the clock is read only on
 /// the contended path, by the thread that is waiting anyway — except with `timed`, which reads it
 /// once more at the acquisition and once at the release.
-fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
+fn take<T: Counted>(lock: &Mutex<T>, timed: bool, site: Option<usize>) -> Held<'_, T> {
     let (mut guard, waited) = match lock.try_lock() {
         Some(guard) => (guard, None),
         None => {
@@ -335,12 +341,15 @@ fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
         work.lock_contended += 1;
         work.lock_wait_ns += waited.as_nanos() as u64;
     }
-    let since = timed.then(Instant::now);
-    Held {
-        guard,
-        since,
-        site: 0,
+    if let Some(site) = site {
+        work.trunk_sites.acquisitions[site] += 1;
+        if let Some(waited) = waited {
+            work.trunk_sites.contended[site] += 1;
+            work.trunk_sites.wait_ns[site] += waited.as_nanos() as u64;
+        }
     }
+    let since = timed.then(Instant::now);
+    Held { guard, since, site }
 }
 
 /// One arena domain: a shard's pages, or the trunk's retained versions. Slots it hands out carry
@@ -852,23 +861,11 @@ impl BranchStore {
     }
 
     fn shard(&self, id: BranchId) -> Held<'_, Shard> {
-        take(&self.shards[shard_of(id, self.shards.len())], self.timed())
+        take(&self.shards[shard_of(id, self.shards.len())], self.timed(), None)
     }
 
-    fn trunk(&self) -> Held<'_, TrunkInner> {
-        take(&self.trunk, self.timed())
-    }
-
-    /// The trunk's lock, taken at conc site `site` ([`SITE_FORK`] or [`SITE_REAP`]), counted apart (amendment 16).
-    fn trunk_at(&self, site: u8) -> Held<'_, TrunkInner> {
-        let mut held = take(&self.trunk, self.timed());
-        match site {
-            SITE_FORK => held.guard.work.trunk_fork_acq += 1,
-            SITE_REAP => held.guard.work.trunk_reap_acq += 1,
-            _ => {}
-        }
-        held.site = site;
-        held
+    fn trunk(&self, site: TrunkSite) -> Held<'_, TrunkInner> {
+        take(&self.trunk, self.timed(), Some(site as usize))
     }
 
     /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
@@ -951,7 +948,7 @@ impl BranchStore {
             self.k_children.insert(f, id);
             (id, f)
         } else {
-            let mut trunk = self.trunk_at(SITE_FORK);
+            let mut trunk = self.trunk(TrunkSite::Fork);
             let id = self.next_branch_id();
             let f = trunk.lineage.epoch;
             trunk.lineage.epoch += 1;
@@ -1144,7 +1141,7 @@ impl BranchStore {
     /// the WAL, so a reader whose WAL snapshot holds the new version also sees the new epoch, and
     /// looks the page up under the trunk's lock (see [`BranchStore::resolve_into`]).
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
-        let mut trunk = self.trunk();
+        let mut trunk = self.trunk(TrunkSite::Write);
         let TrunkInner {
             lineage, domain, ..
         } = &mut *trunk;
@@ -1298,10 +1295,10 @@ impl BranchStore {
         if let Some(slot) = elsewhere {
             let d = domain_of(slot);
             crate::turso_assert!(d < self.shards.len(), "a branch's page map named a trunk slot");
-            out.copy_from_slice(take(&self.shards[d], self.timed()).domain.page(slot));
+            out.copy_from_slice(take(&self.shards[d], self.timed(), None).domain.page(slot));
             return Ok(Resolved::Filled);
         }
-        let mut trunk = self.trunk();
+        let mut trunk = self.trunk(TrunkSite::Resolve);
         let mut examined = 0;
         let found = trunk.lineage.retained_at(page, at, &mut examined);
         trunk.work.resolve_retained_examined += examined;
@@ -1329,19 +1326,15 @@ impl BranchStore {
         }
         let mut stats = BranchStats::default();
         {
-            let trunk = self.trunk();
+            let trunk = self.trunk(TrunkSite::Observe);
             add(&mut stats, &trunk.work, &trunk.domain);
             stats.work.trunk_lock_acquisitions = trunk.work.lock_acquisitions;
             stats.work.trunk_lock_contended = trunk.work.lock_contended;
             stats.work.trunk_lock_wait_ns = trunk.work.lock_wait_ns;
             stats.work.trunk_lock_hold_ns = trunk.work.lock_hold_ns;
-            stats.work.trunk_fork_acq = trunk.work.trunk_fork_acq;
-            stats.work.trunk_fork_hold_ns = trunk.work.trunk_fork_hold_ns;
-            stats.work.trunk_reap_acq = trunk.work.trunk_reap_acq;
-            stats.work.trunk_reap_hold_ns = trunk.work.trunk_reap_hold_ns;
         }
         for lock in self.shards.iter() {
-            let shard = take(lock, self.timed());
+            let shard = take(lock, self.timed(), None);
             stats.live_branches += shard.branches.len();
             add(&mut stats, &shard.work, &shard.domain);
         }
@@ -1361,17 +1354,17 @@ impl BranchStore {
     }
 
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
-        let mut slots: Vec<u32> = self.trunk().domain.slots_in_use().collect();
+        let mut slots: Vec<u32> = self.trunk(TrunkSite::Observe).domain.slots_in_use().collect();
         for lock in self.shards.iter() {
-            slots.extend(take(lock, self.timed()).domain.slots_in_use());
+            slots.extend(take(lock, self.timed(), None).domain.slots_in_use());
         }
         slots
     }
 
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
         match domain_of(slot) {
-            TRUNK_DOMAIN => self.trunk().domain.is_free(slot),
-            d if d < self.shards.len() => take(&self.shards[d], self.timed()).domain.is_free(slot),
+            TRUNK_DOMAIN => self.trunk(TrunkSite::Observe).domain.is_free(slot),
+            d if d < self.shards.len() => take(&self.shards[d], self.timed(), None).domain.is_free(slot),
             _ => false,
         }
     }
@@ -1414,7 +1407,7 @@ impl BranchStore {
                     // Garbage passes run one at a time under the trunk lock, each with the neighbours the
                     // skiplist lists at that moment, so two reaps of adjacent children cannot both keep a version
                     // only they held (the second pass sees the first child gone).
-                    let mut trunk = self.trunk_at(SITE_REAP);
+                    let mut trunk = self.trunk(TrunkSite::Reap);
                     let TrunkInner {
                         lineage,
                         domain,
@@ -1442,7 +1435,7 @@ impl BranchStore {
                 return (freed, true);
             }
             if st.parent.is_trunk() {
-                let mut trunk = self.trunk_at(SITE_REAP);
+                let mut trunk = self.trunk(TrunkSite::Reap);
                 let TrunkInner {
                     lineage,
                     domain,
@@ -1687,6 +1680,18 @@ mod tests {
         let per_call = store.shards.len() as u64 + 1;
         assert_eq!(quiet.lock_acquisitions - base.lock_acquisitions, 11 * per_call);
         assert_eq!(quiet.trunk_lock_acquisitions - base.trunk_lock_acquisitions, 11);
+        // The per-site accounting (r11-k3-trunklock a328c4d05's assertions, ported with its instrument).
+        let observe = TrunkSite::Observe as usize;
+        assert_eq!(
+            quiet.trunk_sites.acquisitions[observe] - base.trunk_sites.acquisitions[observe],
+            11,
+            "`stats` is an observe site"
+        );
+        assert_eq!(
+            quiet.trunk_sites.acquisitions.iter().sum::<u64>(),
+            quiet.trunk_lock_acquisitions,
+            "every trunk acquisition is counted at exactly one site"
+        );
         assert_eq!(
             (quiet.lock_contended, quiet.lock_wait_ns, quiet.lock_hold_ns),
             (0, 0, 0),
@@ -1699,7 +1704,7 @@ mod tests {
         let holder = {
             let store = store.clone();
             std::thread::spawn(move || {
-                let held = store.trunk();
+                let held = store.trunk(TrunkSite::Observe);
                 tx.send(()).unwrap();
                 std::thread::sleep(hold);
                 drop(held);
@@ -1716,6 +1721,10 @@ mod tests {
             "the holder's {hold:?} was counted as {} ns",
             forced.trunk_lock_hold_ns
         );
+        let sites = forced.trunk_sites;
+        assert_eq!(sites.contended[observe], 1, "the wait was not counted at its site");
+        assert_eq!(sites.contended.iter().sum::<u64>(), 1, "a wait was counted at another site");
+        assert!(sites.wait_ns[observe] > 0 && sites.hold_ns[observe] >= hold.as_nanos() as u64);
     }
 
     /// A committed branch page holding `image(generation)`, as the pager hands it to

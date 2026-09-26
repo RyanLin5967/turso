@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use turso_core::branch::{Branch, BranchWork};
+use turso_core::branch::{Branch, BranchWork, TRUNK_LOCK_SITES};
 use turso_core::coherence;
 use turso_core::{
     Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, SqliteDialect, Value,
@@ -2089,8 +2089,7 @@ fn run_cells(
              acq_per_cycle={:.3} contended_frac={:.4} wait_frac={:.4} hold_util={:.4} \
              busy_fork={} busy_open={} busy_other={} rss_bytes={} resolves={} \
              trunk_page_hits={} trunk_page_misses={} trunk_lock_acq={} trunk_lock_contended={} \
-             trunk_lock_wait_ns={} trunk_lock_hold_ns={} trunk_fork_acq={} trunk_fork_hold_ns={} \
-             trunk_reap_acq={} trunk_reap_hold_ns={} majflt={} minflt={} mode={mode:?}",
+             trunk_lock_wait_ns={} trunk_lock_hold_ns={} majflt={} minflt={} mode={mode:?}",
             t * c,
             wall.as_nanos(),
             cycles / wall.as_secs_f64(),
@@ -2113,12 +2112,28 @@ fn run_cells(
             d(before.trunk_lock_contended, after.trunk_lock_contended),
             d(before.trunk_lock_wait_ns, after.trunk_lock_wait_ns),
             d(before.trunk_lock_hold_ns, after.trunk_lock_hold_ns),
-            d(before.trunk_fork_acq, after.trunk_fork_acq),
-            d(before.trunk_fork_hold_ns, after.trunk_fork_hold_ns),
-            d(before.trunk_reap_acq, after.trunk_reap_acq),
-            d(before.trunk_reap_hold_ns, after.trunk_reap_hold_ns),
             flt1.0 - flt0.0,
             flt1.1 - flt0.1,
         );
+        print_sites(n, t, draw, cycles, &before, &after);
     }
+}
+
+/// The trunk lock per site, per cell: r11-k3-trunklock a328c4d05's `# sites` line, same fields and format, so the
+/// two lanes' files are read by one parser (amendment 16).
+fn print_sites(n: usize, t: usize, draw: u64, cycles: f64, before: &BranchWork, after: &BranchWork) {
+    let (a, b) = (&before.trunk_sites, &after.trunk_sites);
+    let mut line = format!("# sites N={n} T={t} draw={draw}");
+    for (i, site) in TRUNK_LOCK_SITES.iter().enumerate() {
+        let acq = b.acquisitions[i] - a.acquisitions[i];
+        let hold = b.hold_ns[i] - a.hold_ns[i];
+        line += &format!(
+            " {site}_acq_pc={:.4} {site}_cont_pc={:.4} {site}_wait_ns_pc={:.1} {site}_hold_ns_pa={:.1}",
+            acq as f64 / cycles,
+            (b.contended[i] - a.contended[i]) as f64 / cycles,
+            (b.wait_ns[i] - a.wait_ns[i]) as f64 / cycles,
+            if acq > 0 { hold as f64 / acq as f64 } else { 0.0 },
+        );
+    }
+    println!("{line}");
 }
