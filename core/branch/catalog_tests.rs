@@ -420,3 +420,55 @@ fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
         let _ = b.into_id();
     }
 }
+
+/// F-W2 (githost-shape lane, PREREG G5.3): a checkpoint collects the slots open write transactions
+/// reserved from the branches that reserved one since the last checkpoint, not by walking every
+/// resident state; and a slot reserved across the checkpoint stays the transaction's: no other
+/// write is handed it, and the commit that follows publishes it. On the store before F-W2 the walk
+/// visits every resident state (here the 300 grown branches), so the count assertion fails.
+#[test]
+fn a_checkpoint_walks_only_the_branches_that_reserved_a_slot() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let ids = grow(&db, 300);
+    db.branch_compact_now().unwrap();
+    // One write transaction open across the next checkpoint: its page copy holds a reserved slot.
+    let writer = db.branch(ids[7]).unwrap();
+    let conn = writer.connect().unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE t SET v = 'across' WHERE id = 5").unwrap();
+    let before = db.branch_cat_shape();
+    db.branch_compact_now().unwrap();
+    let after = db.branch_cat_shape();
+    assert_eq!(after.checkpoints - before.checkpoints, 1, "one checkpoint: {after:?}");
+    assert!(after.resident_states >= 300, "the grown branches are resident: {after:?}");
+    assert_eq!(
+        after.ckpt_states_walked - before.ckpt_states_walked,
+        1,
+        "the checkpoint walked more than the one branch holding a reserved slot, with {} resident",
+        after.resident_states
+    );
+    // Work after the checkpoint allocates slots; none may be the writer's reserved one.
+    let other = trunk.fork_branch().unwrap();
+    other.connect().unwrap().execute("UPDATE t SET v = 'other' WHERE id = 5").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(value(&conn, 5), "across");
+    assert_eq!(value(&other.connect().unwrap(), 5), "other");
+    drop(conn);
+    let (wid, oid) = (writer.into_id(), other.into_id());
+    let in_use = db.branch_stats().unwrap().arena_slots_in_use;
+    db.branch_compact_now().unwrap();
+    drop(trunk);
+    drop(db);
+    let db = open_at(&path, catalog()).unwrap();
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, in_use, "the slot count moved across a reopen");
+    let w = db.branch(wid).unwrap();
+    assert_eq!(value(&w.connect().unwrap(), 5), "across");
+    let _ = w.into_id();
+    let o = db.branch(oid).unwrap();
+    assert_eq!(value(&o.connect().unwrap(), 5), "other");
+    let _ = o.into_id();
+}
