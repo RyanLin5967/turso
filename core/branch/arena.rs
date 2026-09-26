@@ -96,8 +96,9 @@ impl<T: Copy + Default> Blocks<T> {
         if self.len == 0 {
             return None;
         }
+        let last = self.get(self.len - 1);
         self.len -= 1;
-        Some(self.get(self.len))
+        Some(last)
     }
 
     fn get(&self, i: usize) -> T {
