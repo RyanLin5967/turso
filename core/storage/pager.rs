@@ -3764,6 +3764,12 @@ impl Pager {
         Err(LimboError::Busy)
     }
 
+    /// r11-walpin-conc instrument: pages in this pager's private page cache, and its capacity.
+    pub(crate) fn walpin_cache_pages(&self) -> (usize, usize) {
+        let cache = self.page_cache.read();
+        (cache.len(), cache.capacity())
+    }
+
     fn begin_read_disk_page(
         &self,
         page_idx: usize,

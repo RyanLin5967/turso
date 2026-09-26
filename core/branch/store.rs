@@ -339,6 +339,22 @@ impl BranchStore {
         }
     }
 
+    /// r11-walpin-conc instrument: take the store mutex, counting the acquisition and whether the
+    /// caller had to wait (its `try_lock` failed), by call class: 0 `resolve_into`, 1 `sees_trunk`,
+    /// 2 every other caller. A failed try is followed by the same blocking lock, so nothing changes
+    /// but one relaxed counter per acquisition.
+    fn lock_inner(&self, class: usize) -> impl std::ops::DerefMut<Target = StoreInner> + '_ {
+        use std::sync::atomic::Ordering::Relaxed;
+        super::walpin::STORE_LOCKS[class].fetch_add(1, Relaxed);
+        match self.inner.try_lock() {
+            Some(guard) => guard,
+            None => {
+                super::walpin::STORE_CONTENDED[class].fetch_add(1, Relaxed);
+                self.inner.lock()
+            }
+        }
+    }
+
     pub(crate) fn fw3(&self) -> bool {
         self.fw3.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -354,14 +370,14 @@ impl BranchStore {
     /// Whether any branch state exists at all, including one kept alive only by a live child.
     /// Paths that rewrite the trunk without passing through `add_dirty` refuse while this holds.
     pub(crate) fn has_branches(&self) -> bool {
-        !self.inner.lock().branches.is_empty()
+        !self.lock_inner(2).branches.is_empty()
     }
 
     /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         match &inner.arena {
             None => inner.arena = Some(Arena::new(page_size)),
             Some(arena) if arena.page_size() != page_size => {
@@ -388,7 +404,7 @@ impl BranchStore {
     /// Fork a child of a branch. Refused while the parent has a write transaction in progress, for
     /// the same reason a trunk fork takes the WAL write lock.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         let id = BranchId(inner.next_id);
         let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
@@ -421,7 +437,7 @@ impl BranchStore {
     /// branch: two would each hold a private page cache of the same page space, and nothing would
     /// tell one that the other had committed — a silently stale read, so it is refused.
     pub(crate) fn open(&self, id: BranchId) -> Result<Arc<Schema>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.open {
             return Err(LimboError::InvalidArgument(format!(
@@ -437,7 +453,7 @@ impl BranchStore {
 
     /// The connection on `id` has gone. Releases its write lock if a transaction was abandoned.
     pub(crate) fn close(&self, id: BranchId) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         if let Some(st) = inner.branches.get_mut(&id) {
             st.open = false;
             st.writer = false;
@@ -447,7 +463,7 @@ impl BranchStore {
 
     /// The `Branch` handle has gone.
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         let Some(st) = inner.branches.get_mut(&id) else {
             return Reaped {
                 freed_pages: 0,
@@ -463,7 +479,7 @@ impl BranchStore {
     }
 
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.writer {
             return Err(LimboError::Busy);
@@ -473,7 +489,7 @@ impl BranchStore {
     }
 
     pub(crate) fn end_write(&self, id: BranchId) {
-        if let Some(st) = self.inner.lock().branches.get_mut(&id) {
+        if let Some(st) = self.lock_inner(2).branches.get_mut(&id) {
             st.writer = false;
         }
     }
@@ -487,7 +503,7 @@ impl BranchStore {
     }
 
     pub(crate) fn schema(&self, id: BranchId) -> Result<Arc<Schema>> {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner(2);
         Ok(inner.branches.get(&id).ok_or_else(|| gone(id))?.schema.clone())
     }
 
@@ -499,7 +515,7 @@ impl BranchStore {
         page: u32,
         pre_image: &[u8],
     ) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         let StoreInner {
             arena, branches, ..
         } = &mut *inner;
@@ -552,7 +568,7 @@ impl BranchStore {
     /// The copy decision for the trunk's first write to `page` in a transaction: if a live child
     /// can still see the version about to be overwritten, keep a copy of it for that child.
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         let StoreInner { arena, trunk, .. } = &mut *inner;
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
@@ -577,7 +593,7 @@ impl BranchStore {
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         let StoreInner {
             arena, branches, ..
         } = &mut *inner;
@@ -606,7 +622,7 @@ impl BranchStore {
     }
 
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(2);
         inner.branches.get_mut(&id).ok_or_else(|| gone(id))?.schema = schema;
         Ok(())
     }
@@ -615,7 +631,7 @@ impl BranchStore {
     /// means the branch sees the trunk's current version, which the caller reads through the
     /// ordinary WAL / database-file path.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner(0);
         let (mut levels, mut examined) = (0, 0);
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
         inner.work.resolve_calls += 1;
@@ -637,13 +653,13 @@ impl BranchStore {
     /// r11-walpin FW3: whether branch `id` still reads `page` from the trunk (the store holds no
     /// version of it for this branch). Not counted in the work counters.
     pub(crate) fn sees_trunk(&self, id: BranchId, page: u32) -> Result<bool> {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner(1);
         let (mut levels, mut examined) = (0, 0);
         Ok(inner.resolve(id, page, &mut levels, &mut examined)?.is_none())
     }
 
     pub(crate) fn stats(&self) -> BranchStats {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner(2);
         BranchStats {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
@@ -653,7 +669,7 @@ impl BranchStore {
     }
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner(2);
         let Some(st) = inner.branches.get(&id) else {
             return Vec::new();
         };

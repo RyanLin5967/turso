@@ -434,12 +434,17 @@ impl Lines {
         let hist: Vec<u64> = (0..FW3_HIST_BUCKETS)
             .map(|i| c.fw3_hist[i] - self.last_c.fw3_hist[i])
             .collect();
+        let locks: Vec<u64> = (0..3).map(|i| c.store_locks[i] - self.last_c.store_locks[i]).collect();
+        let contended: Vec<u64> = (0..3)
+            .map(|i| c.store_contended[i] - self.last_c.store_contended[i])
+            .collect();
         let (lc, ls) = (&self.last_c, &self.last_s);
         println!(
             "# conc {label} H={h} commits_now={} | d_commits={} d_w_busy={} d_w_busy_snapshot={} d_forks={} \
              d_fork_busy={} d_reaps={} d_reads={} d_read_busy={} d_connects={} d_storm_ok={} d_storm_busy={} | \
              fw3 d_trunk_reads={} d_calls_trunk={} d_retries={} d_store={} d_gen={} d_readerr={} d_busy={} \
-             d_multi_store={} max_retries={} d_hist={hist:?} | live_branches={} arena_in_use={} arena_free={}",
+             d_multi_store={} max_retries={} d_hist={hist:?} | store d_locks={locks:?} d_contended={contended:?} | \
+             live_branches={} arena_in_use={} arena_free={}",
             s.commits,
             s.commits - ls.commits,
             s.w_busy - ls.w_busy,
@@ -636,6 +641,19 @@ pub(crate) fn run_conc(bench: &mut Bench, args: &Args) {
         }
     }
 
+    // Resident page-cache pages of the sessions still holding a connection (held arms).
+    let pages: Vec<(usize, usize)> = sessions
+        .iter()
+        .filter_map(|s| s.conn.as_ref().map(|c| c.walpin_cache_pages()))
+        .collect();
+    let total: usize = pages.iter().map(|p| p.0).sum();
+    println!(
+        "# conc cache_pages held={} total={total} max={} min={} capacity={}",
+        pages.len(),
+        pages.iter().map(|p| p.0).max().unwrap_or(0),
+        pages.iter().map(|p| p.0).min().unwrap_or(0),
+        pages.iter().map(|p| p.1).max().unwrap_or(0),
+    );
     drop(sessions);
     let b = bench.db.branch_stats();
     println!(

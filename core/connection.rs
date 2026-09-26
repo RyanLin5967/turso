@@ -3898,6 +3898,12 @@ impl Connection {
         self.pager.load().clone()
     }
 
+    /// r11-walpin-conc instrument: (pages in this connection's page cache, its capacity).
+    #[doc(hidden)]
+    pub fn walpin_cache_pages(&self) -> (usize, usize) {
+        self.pager.load().walpin_cache_pages()
+    }
+
     pub fn get_query_only(&self) -> bool {
         self.is_query_only()
     }

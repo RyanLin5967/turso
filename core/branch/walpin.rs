@@ -33,6 +33,11 @@ pub(crate) static FW3_MULTI_STORE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW3_MAX_RETRIES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW3_HIST: [AtomicU64; FW3_HIST_BUCKETS] = [const { AtomicU64::new(0) }; FW3_HIST_BUCKETS];
 
+/// r11-walpin-conc: store-mutex acquisitions and contended acquisitions, by call class (0
+/// `resolve_into`, 1 `sees_trunk`, 2 other); see `BranchStore::lock_inner`.
+pub(crate) static STORE_LOCKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub(crate) static STORE_CONTENDED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Buckets of `WalPinCounters::fw3_hist`: a trunk call's retries 0, 1, 2, 3, 4-7, 8-15, 16-63,
 /// 64-255, 256-999, and Busy (the retry limit).
 pub const FW3_HIST_BUCKETS: usize = 10;
@@ -116,6 +121,10 @@ pub struct WalPinCounters {
     pub fw3_max_retries: u64,
     /// FW3 calls by their retries (buckets in `FW3_HIST_BUCKETS`'s doc).
     pub fw3_hist: [u64; FW3_HIST_BUCKETS],
+    /// Store-mutex acquisitions by call class: `resolve_into`, `sees_trunk`, other.
+    pub store_locks: [u64; 3],
+    /// Those acquisitions whose `try_lock` failed (the caller waited).
+    pub store_contended: [u64; 3],
 }
 
 pub fn counters() -> WalPinCounters {
@@ -137,6 +146,8 @@ pub fn counters() -> WalPinCounters {
         fw3_multi_store: FW3_MULTI_STORE.load(Relaxed),
         fw3_max_retries: FW3_MAX_RETRIES.load(Relaxed),
         fw3_hist: std::array::from_fn(|i| FW3_HIST[i].load(Relaxed)),
+        store_locks: std::array::from_fn(|i| STORE_LOCKS[i].load(Relaxed)),
+        store_contended: std::array::from_fn(|i| STORE_CONTENDED[i].load(Relaxed)),
     }
 }
 
