@@ -157,8 +157,12 @@ fn parse_args() -> Args {
     if args.reps == 0 || args.reps_last == 0 {
         die("--reps must be positive");
     }
-    if args.arm == Arm::Probe && (args.n_list.is_empty() || args.n_list.windows(2).any(|w| w[0] >= w[1])) {
-        die("--n must be strictly increasing");
+    // Strictly increasing grows the other branches between checkpoints; strictly decreasing
+    // reaps them, so a checkpoint can run LAST at a small N (separating N from run order).
+    let rising = args.n_list.windows(2).all(|w| w[0] < w[1]);
+    let falling = args.n_list.windows(2).all(|w| w[0] > w[1]);
+    if args.arm == Arm::Probe && (args.n_list.is_empty() || !(rising || falling)) {
+        die("--n must be strictly increasing or strictly decreasing");
     }
     args
 }
@@ -708,6 +712,10 @@ fn arm_probe(ctx: &Ctx, trunk: &Arc<Connection>, args: &Args) {
                     .unwrap();
             }
             others.push(b);
+        }
+        // Descending --n: reap the most recent branches down to N (each drop is a reap).
+        while others.len() > n {
+            others.pop();
         }
         let s = snap(&ctx.db);
         println!(
