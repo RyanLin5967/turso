@@ -284,3 +284,55 @@ fn releasing_many_siblings_reads_linear_catalog_rows() {
     );
     assert_eq!(db.branch_stats().unwrap().live_branches, 0);
 }
+
+/// githost-shape C-FIX: a checkpoint writes the trunk's version CHANGES, not every version of each
+/// trunk page it touched. Row 1's leaf collects V retained versions (fork, then rewrite row 1, V
+/// times), a checkpoint lists them in the catalog, then one more fork and rewrite retains ONE more
+/// version on that same page: the next checkpoint must write exactly one trunk row, at V = 20 and at
+/// V = 200 alike. (Before the fix `put_trunk_page` rewrote all V + 1 versions of the page.) After a
+/// reopen every branch still reads row 1 as it was at its fork, so the catalog holds the deltas' sum.
+#[test]
+fn a_checkpoint_writes_trunk_version_deltas_not_pages() {
+    let mut written = Vec::new();
+    for v in [20usize, 200] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("d.db");
+        // Same length as the seed's values (91 bytes), so no rewrite rebalances the leaf.
+        let gen_value = |g: usize| format!("g{g:08}-{}", "y".repeat(81));
+        let mut ids = Vec::new();
+        {
+            let db = open_at(&path, catalog()).unwrap();
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            for g in 0..v {
+                ids.push(trunk.fork_branch().unwrap().into_id());
+                trunk
+                    .execute(format!("UPDATE t SET v = '{}' WHERE id = 1", gen_value(g)))
+                    .unwrap();
+            }
+            db.branch_compact_now().unwrap();
+            let before = db.branch_cat_shape();
+            ids.push(trunk.fork_branch().unwrap().into_id());
+            trunk
+                .execute(format!("UPDATE t SET v = '{}' WHERE id = 1", gen_value(v)))
+                .unwrap();
+            db.branch_compact_now().unwrap();
+            let after = db.branch_cat_shape();
+            written.push(after.ckpt_trunk_versions - before.ckpt_trunk_versions);
+        }
+        let db = open_at(&path, catalog()).unwrap();
+        for (k, id) in ids.iter().enumerate() {
+            let branch = db.branch(*id).unwrap();
+            let conn = branch.connect().unwrap();
+            let want = if k == 0 {
+                format!("trunk-0001-{}", "x".repeat(80))
+            } else {
+                gen_value(k - 1)
+            };
+            assert_eq!(value(&conn, 1), want, "V={v}: branch {k} after the reopen");
+            drop(conn);
+            let _ = branch.into_id();
+        }
+    }
+    assert_eq!(written, vec![1, 1], "trunk rows written by the checkpoint after one retain");
+}
