@@ -156,6 +156,16 @@ fn parse_args() -> Args {
     if args.w == 0 || args.w > 64 || args.chain == 0 || args.verify_every == 0 {
         die("--w must be in 1..=64, --chain and --verify-every positive");
     }
+    if args.mode == Mode::Lease && args.chain > 1 {
+        die("--mode lease with --chain > 1 has no quiescence identity under the F7 durable port: the \
+             store reaps the links and splices them, and the harness does not see which");
+    }
+    if args.chain > 1 && chain_shares_a_leaf(args.chain as u64, args.w) {
+        die("--chain with this --w puts two links of a chain on one leaf: under the F7 durable port \
+             the splice frees the earlier link's copy of it at that link's reap, and this harness's \
+             chain model (per-reap pages, quiescence) does not model that (longest chains with every \
+             link on its own leaves: 184 at w=1, 85 at w=2, 14 at w=4, 9 at w=8)");
+    }
     if args.pause_at.is_some_and(|at| at < args.lease || at + args.pause >= args.duration) {
         die("the pause must start after the first lease period and end before --duration-ms");
     }
@@ -184,6 +194,26 @@ fn trunk_value(id: i64) -> String {
 
 fn branch_value(id: i64) -> String {
     format!("b{:0>width$}", id, width = VALUE_LEN - 1)
+}
+
+/// Trunk rows per leaf in the seeded table (20,000 rows of 100-byte values fill 541 leaves).
+const ROWS_PER_LEAF: i64 = 37;
+
+/// Whether two links of some chain of `chain` arrivals write rows on one leaf (see the refusal in
+/// `parse_args`). `rows_of` depends on the arrival only through `n * 2654435761 mod TRUNK_ROWS`, so
+/// the chains starting at 0, D, 2D, ... repeat within TRUNK_ROWS starts.
+fn chain_shares_a_leaf(chain: u64, w: usize) -> bool {
+    for k in 0..TRUNK_ROWS as u64 {
+        let mut seen = std::collections::HashSet::new();
+        for j in 0..chain {
+            for row in rows_of(k * chain + j, w) {
+                if !seen.insert((row - 1) / ROWS_PER_LEAF) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The rows arrival `n` writes: w rows on w distinct leaves.
@@ -434,24 +464,35 @@ fn main() {
 
     let stats = db.branch_stats().unwrap();
     let engine = stats.live_branches as u64;
-    if stats.arena_slots_in_use as u64 != args.w as u64 * engine {
+    // Under the F7 durable port (branch r11-ever-durable) a reaped link with one kept child is
+    // spliced into it: it leaves the engine's branch count while its w pages stay with its chain's
+    // later links (their rows lie on other leaves). So a deferred link counts in the arena, not in
+    // the engine: engine = leased, arena = w x (leased + deferred). With --chain 1 nothing is
+    // deferred and both read as before. (Lease mode with --chain > 1 is refused at startup: the
+    // store decides those reaps, so the harness has no count of deferred links.)
+    let (queued, deferred) = match args.mode {
+        Mode::Serial | Mode::Batch => (
+            shared.queue.lock().unwrap().len() as u64,
+            shared.deferred_now.load(Ordering::Acquire),
+        ),
+        Mode::Lease => (engine, 0),
+    };
+    if stats.arena_slots_in_use as u64 != args.w as u64 * (engine + deferred) {
         not_a_result(&format!(
-            "arena holds {} pages for {engine} branches of w={} pages each",
+            "arena holds {} pages for {engine} branches and {deferred} spliced links of w={} pages each",
             stats.arena_slots_in_use, args.w
         ));
     }
     match args.mode {
         Mode::Serial | Mode::Batch => {
-            let queued = shared.queue.lock().unwrap().len() as u64;
-            let deferred = shared.deferred_now.load(Ordering::Acquire);
-            if engine != queued + deferred {
+            if engine != queued {
                 not_a_result(&format!(
-                    "engine holds {engine} branches, the harness {queued} leased + {deferred} deferred"
+                    "engine holds {engine} branches, the harness {queued} leased ({deferred} deferred links spliced)"
                 ));
             }
             println!(
-                "# quiescent: engine_branches={engine} = leased_or_due {queued} + deferred {deferred}; \
-                 arena_in_use = w x engine"
+                "# quiescent: engine_branches={engine} = leased_or_due {queued}; deferred {deferred} spliced; \
+                 arena_in_use = w x (engine + deferred)"
             );
         }
         Mode::Lease => {
