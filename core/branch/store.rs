@@ -639,9 +639,10 @@ impl BranchStore {
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         loop {
             let mut inner = self.lock();
-            let id = BranchId(inner.next_id);
-            let StoreInner { branches, hold, .. } = &mut *inner;
-            let st = branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
+            let st = inner
+                .branches
+                .get_mut(&parent)
+                .ok_or_else(|| gone(parent))?;
             if st.writer {
                 return Err(LimboError::Busy);
             }
@@ -683,25 +684,36 @@ impl BranchStore {
                     .branches
                     .get_mut(&parent)
                     .expect("a branch being forked is kept by the handle or connection forking it");
-                st.view = Some(view);
+                st.view = Some(view.clone());
                 st.forking = false;
                 unwinding.armed = false;
-                continue;
+                // The child is created in the hold that installs the view. Released in between, a
+                // writer that waited on `forking` could take the writer flag first and turn this
+                // fork, which arrived first, into Busy.
+                return Self::attach_child(&mut inner, parent, view);
             };
-            let f = st.lineage.epoch;
-            st.lineage.epoch += 1;
-            st.lineage.children.insert(f, id);
-            let schema = st.schema.clone();
-            let trunk_at = st.trunk_at;
-            insert_counted(
-                branches,
-                hold,
-                id,
-                BranchState::new(parent, f, schema, trunk_at, view),
-            );
-            inner.next_id += 1;
-            return Ok(id);
+            return Self::attach_child(&mut inner, parent, view);
         }
+    }
+
+    /// Register a child of `parent` that inherits `view`, inside the caller's hold.
+    fn attach_child(inner: &mut StoreInner, parent: BranchId, view: PageMap) -> Result<BranchId> {
+        let id = BranchId(inner.next_id);
+        let StoreInner { branches, hold, .. } = &mut *inner;
+        let st = branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
+        let f = st.lineage.epoch;
+        st.lineage.epoch += 1;
+        st.lineage.children.insert(f, id);
+        let schema = st.schema.clone();
+        let trunk_at = st.trunk_at;
+        insert_counted(
+            branches,
+            hold,
+            id,
+            BranchState::new(parent, f, schema, trunk_at, view),
+        );
+        inner.next_id += 1;
+        Ok(id)
     }
 
     /// Mark the branch open for a connection and return its committed schema. One connection per
@@ -1913,5 +1925,45 @@ mod tests {
         insert_counted(&mut map, &mut acc, 896, 896);
         assert_eq!(acc.realloc_moved - grown, 896, "the growth past 896 moved 896 entries");
         assert_eq!(acc.realloc_bytes, acc.realloc_moved * 16, "(u64, u64) entries are 16 bytes");
+    }
+
+    /// The realloc counter's criterion on a map BELOW capacity, so that no reserve can happen inside
+    /// the loop (std's insert reserves whenever growth_left is 0, even with a tombstone free: the test
+    /// above missed that and failed on a real resize). At 800 of 896 entries growth_left stays at 96
+    /// whatever a remove leaves (a tombstone keeps it; an empty slot raises it and the re-insert lowers
+    /// it again), and each key goes back to its own slot. Re-inserts that reuse a tombstone raise
+    /// capacity() by one and must be charged nothing; filling to 896 moves nothing; the next insert is
+    /// a real growth, charged exactly 896.
+    #[test]
+    fn insert_counted_charges_nothing_for_tombstone_reuse_below_capacity() {
+        use std::hash::{BuildHasherDefault, DefaultHasher};
+        let mut map: HashMap<u64, u64, BuildHasherDefault<DefaultHasher>> = HashMap::default();
+        let mut acc = HoldAcc::default();
+        for k in 0..800 {
+            insert_counted(&mut map, &mut acc, k, k);
+        }
+        let grown = acc.realloc_moved;
+        assert_eq!(
+            grown,
+            3 + 7 + 14 + 28 + 56 + 112 + 224 + 448,
+            "hashbrown's growths to 1,024 buckets"
+        );
+        let mut reuses = 0;
+        for k in 0..800 {
+            map.remove(&k);
+            let cap = map.capacity();
+            insert_counted(&mut map, &mut acc, k, k);
+            if map.capacity() == cap + 1 {
+                reuses += 1;
+            }
+        }
+        assert!(reuses > 0, "no re-insert reused a tombstone: the scenario tests nothing");
+        assert_eq!(acc.realloc_moved, grown, "{reuses} tombstone reuses were charged as moves");
+        for k in 800..896 {
+            insert_counted(&mut map, &mut acc, k, k);
+        }
+        assert_eq!(acc.realloc_moved, grown, "filling to capacity moved nothing");
+        insert_counted(&mut map, &mut acc, 896, 896);
+        assert_eq!(acc.realloc_moved - grown, 896, "the growth past 896 moved 896 entries");
     }
 }
