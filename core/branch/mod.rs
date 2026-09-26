@@ -309,7 +309,10 @@ pub struct BranchOpenStats {
     pub total_ns: u64,
     /// Branch states that exist, resident or not (catalog stores keep most on disk).
     pub states: u64,
-    /// Released branches the open's collection pass examined.
+    /// Released branches the open's collection pass examined: since the F7 durable port, the ones a
+    /// crash left held (a snapshot's `held_open`, a catalog row's `released = 2`, or a replayed
+    /// `ReleaseOpen`), each closed and collected there. (Before: every released branch in memory,
+    /// plus the catalog's released rows with no child.)
     pub released_scanned: u64,
     /// Catalog stores: opening the catalog and reading its meta row.
     pub catalog_ns: u64,
