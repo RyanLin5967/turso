@@ -3,7 +3,7 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
-use crate::branch::store::BranchStore;
+use crate::branch::store::{BranchStore, TrunkPending};
 use crate::branch::{BranchBinding, BranchId};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -1511,6 +1511,11 @@ pub struct Pager {
     /// pager it is what the copy decision in [`Pager::add_dirty`] consults before overwriting a
     /// page that a live branch can still see.
     branch_store: OnceLock<Arc<BranchStore>>,
+    /// On a trunk pager: what the write transaction in progress wrote while the trunk had a live
+    /// child. Handed to the store at commit, which stamps it with the commit's epoch; dropped at
+    /// rollback. A savepoint rolled back keeps its entries: over-stating a write set can only refuse
+    /// a merge, never admit one.
+    trunk_pending: Mutex<TrunkPending>,
     /// Set when this pager serves a branch instead of the trunk: reads resolve through the
     /// branch's page space and commits go to it, never to the WAL.
     branch: OnceLock<BranchBinding>,
@@ -1802,6 +1807,7 @@ impl Pager {
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
             branch_store: OnceLock::new(),
+            trunk_pending: Mutex::new(TrunkPending::default()),
             branch: OnceLock::new(),
         })
     }
@@ -3290,7 +3296,8 @@ impl Pager {
                     ));
                     // The branch store's merge record: this transaction's write set is committed.
                     if let Some(store) = self.branch_store.get() {
-                        store.trunk_tx_end(true);
+                        let tx = std::mem::take(&mut *self.trunk_pending.lock());
+                        store.trunk_tx_end(Some(tx));
                     }
 
                     let schema_did_change = match connection.get_tx_state() {
@@ -3397,7 +3404,8 @@ impl Pager {
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
         if is_write && self.branch.get().is_none() {
             if let Some(store) = self.branch_store.get() {
-                store.trunk_tx_end(false);
+                *self.trunk_pending.lock() = TrunkPending::default();
+                store.trunk_tx_end(None);
             }
         }
         if is_write {
@@ -3812,6 +3820,7 @@ impl Pager {
         }
         if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() {
+                self.trunk_pending.lock().pages.insert(page_no);
                 store.first_write_trunk(page_no, page.get_contents().as_slice());
             }
         }
@@ -3819,16 +3828,39 @@ impl Pager {
     }
 
     /// A table cursor wrote or deleted `rowid` in the b-tree rooted at `root`. On a branch it joins
-    /// the branch's row write set; on the trunk, while it has a child, it stamps the row with the
-    /// current epoch. Both are what `branch::merge` validates with.
+    /// the branch's row write set; on the trunk, while it has a child, it joins the transaction's
+    /// pending writes, stamped when it commits. Both are what `branch::merge` validates with.
     pub(crate) fn note_row_write(&self, root: i64, rowid: i64) {
         if let Some(branch) = self.branch.get() {
             branch.store.branch_row_written(branch.id, root, rowid);
         } else if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() && !crate::branch::store::mutant(13) {
-                store.trunk_row_written(root, rowid);
+                if crate::branch::store::mutant(30) {
+                    store.trunk_row_written(root, rowid);
+                } else {
+                    self.trunk_pending.lock().rows.insert((root, rowid));
+                }
             }
         }
+    }
+
+    /// A merge's physical install wrote `rows` into the trunk without a cursor: they join the
+    /// transaction's pending writes as a cursor's would, or a later row-granular validation would
+    /// miss them.
+    pub(crate) fn note_rows_installed(&self, rows: &[(i64, i64)]) {
+        if let Some(store) = self.branch_store.get() {
+            if crate::branch::store::mutant(30) {
+                store.trunk_rows_written(rows);
+            } else {
+                self.trunk_pending.lock().rows.extend(rows.iter().copied());
+            }
+        }
+    }
+
+    /// Run `f` over what the trunk write transaction in progress has written so far.
+    pub(crate) fn with_trunk_pending<T>(&self, f: impl FnOnce(&TrunkPending) -> T) -> T {
+        let pending = self.trunk_pending.lock();
+        f(&*pending)
     }
 
     /// An index cursor wrote the b-tree rooted at `root` (an index, or a WITHOUT ROWID table).
@@ -3845,7 +3877,11 @@ impl Pager {
             branch.store.branch_bulk_written(branch.id);
         } else if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() {
-                store.trunk_bulk_written(root);
+                if crate::branch::store::mutant(30) {
+                    store.trunk_bulk_written(root);
+                } else {
+                    self.trunk_pending.lock().tables.insert(root);
+                }
             }
         }
     }

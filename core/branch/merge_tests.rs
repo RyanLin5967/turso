@@ -691,6 +691,32 @@ fn a_batch_member_sees_the_members_installed_before_it() {
     assert_eq!(texts(&trunk, "SELECT v FROM t WHERE id = 1"), ["x"]);
 }
 
+/// A trunk transaction that rolled back wrote nothing, so it refuses nothing: a row is stamped
+/// at its transaction's commit, never at the write (PREREG A15). Stamped at the write, the stale
+/// stamp refused this merge as a row conflict.
+#[test]
+fn a_rolled_back_trunk_write_refuses_no_merge() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    trunk.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+    let b = trunk.fork_branch().unwrap();
+    trunk.execute("BEGIN").unwrap();
+    trunk.execute("UPDATE t SET v = 'gone' WHERE id = 1").unwrap();
+    trunk.execute("ROLLBACK").unwrap();
+    b.connect()
+        .unwrap()
+        .execute("UPDATE t SET v = 'b1' WHERE id = 1")
+        .unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let o = merger.merge(b, key_replay()).unwrap();
+    assert_eq!(o.refused, None, "{o:?}");
+    assert!(!o.key_conflict, "a rolled-back write left a row stamp: {o:?}");
+    assert_eq!(texts(&trunk, "SELECT v FROM t WHERE id = 1"), ["b1"]);
+}
+
 /// (a1) A trigger fires when a statement runs, and the rows it wrote are rows too. The branch
 /// changes only w; the trunk's trigger on v recorded the trunk's own later update of another row.
 /// Applying the branch's row must not fire that trigger again: s.last stays the trunk's 't7'.

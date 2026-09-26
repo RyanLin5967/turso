@@ -121,8 +121,6 @@ struct StoreInner {
 pub(super) struct MergeState {
     /// Trunk write transactions committed with at least one page while the trunk had a child (V0).
     pub(super) trunk_commits: u64,
-    /// Pages first-written by the trunk write transaction in progress, for the log.
-    tx_pages: Vec<u32>,
     /// V1: committed trunk write sets as (epoch, pages sorted), oldest first, pruned below the
     /// oldest live child's fork epoch.
     pub(super) log: VecDeque<(u64, Vec<u32>)>,
@@ -136,7 +134,28 @@ pub(super) struct MergeState {
     pub(super) track_reads: bool,
 }
 
+/// What one trunk write transaction wrote while the trunk had a live child, kept by the writing
+/// connection's pager and handed to the store only if the transaction commits: its rows and tables
+/// are stamped with the epoch of the commit (Silo's TIDs are assigned at commit, SOSP 2013), and
+/// one that rolls back stamps nothing. A merge in progress validates its later batch members
+/// against it too, as the batch's own uncommitted writes (see `branch::merge`).
+#[derive(Default)]
+pub(crate) struct TrunkPending {
+    /// Pages first-written in the transaction.
+    pub(crate) pages: HashSet<u32>,
+    /// Rows written or deleted, as (table root, rowid).
+    pub(crate) rows: HashSet<(i64, i64)>,
+    /// Tables written without naming the rows.
+    pub(crate) tables: HashSet<i64>,
+}
+
 impl MergeState {
+    fn stamp_row(&mut self, root: i64, rowid: i64, epoch: u64) {
+        if self.row_stamps.insert((root, rowid), epoch) != Some(epoch) {
+            self.stamp_order.push_back((epoch, root, rowid));
+        }
+    }
+
     /// Drop every stamp and log entry at or below `oldest`, the oldest live trunk child's fork
     /// epoch: a record of epoch `e` refuses a branch only if `e > trunk_at`, and every live or
     /// future child has `trunk_at >= oldest`. `None` (no child) drops everything.
@@ -176,9 +195,9 @@ struct Lineage {
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-13 and 15-29; 14 is not built, since no SQL path
+/// scope gate and the install's isolation, 11-13 and 15-30; 14 is not built, since no SQL path
 /// without DDL clears a user table's b-tree), so each test can be shown to fail for it
-/// (frontier/round11/r11-merge PREREG A6, A13, A14). Always false otherwise.
+/// (frontier/round11/r11-merge PREREG A6, A13, A14, A15). Always false otherwise.
 #[cfg(test)]
 pub(crate) fn mutant(n: u32) -> bool {
     static CHOSEN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -626,15 +645,7 @@ impl BranchStore {
     /// can still see the version about to be overwritten, keep a copy of it for that child.
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
         let mut inner = self.inner.lock();
-        let StoreInner {
-            arena,
-            trunk,
-            merge,
-            ..
-        } = &mut *inner;
-        // Every page the transaction writes belongs to its write set, including one already
-        // written earlier in this epoch (which the early return below skips).
-        merge.tx_pages.push(page);
+        let StoreInner { arena, trunk, .. } = &mut *inner;
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
         if born >= epoch {
@@ -785,52 +796,55 @@ impl BranchStore {
         }
     }
 
-    /// The trunk wrote or deleted `rowid` in the b-tree rooted at `root`, while it has a child.
+    /// Mutant 30 only: stamp a trunk row at WRITE time, with the epoch current then, as this store
+    /// did before stamps moved to the commit (frontier/round11/r11-merge PREREG A15).
     pub(crate) fn trunk_row_written(&self, root: i64, rowid: i64) {
-        let mut inner = self.inner.lock();
-        let epoch = inner.trunk.lineage.epoch;
-        let merge = &mut inner.merge;
-        if merge.row_stamps.insert((root, rowid), epoch) != Some(epoch) {
-            merge.stamp_order.push_back((epoch, root, rowid));
-        }
+        self.trunk_rows_written(&[(root, rowid)]);
     }
 
-    /// Stamp `rows` as written by the trunk now: a physical merge install writes them without a
-    /// cursor, so without this a later row-granular validation would miss them.
+    /// Mutant 30 only: [`Self::trunk_row_written`] for several rows.
     pub(crate) fn trunk_rows_written(&self, rows: &[(i64, i64)]) {
         let mut inner = self.inner.lock();
         let epoch = inner.trunk.lineage.epoch;
-        let merge = &mut inner.merge;
         for &(root, rowid) in rows {
-            if merge.row_stamps.insert((root, rowid), epoch) != Some(epoch) {
-                merge.stamp_order.push_back((epoch, root, rowid));
-            }
+            inner.merge.stamp_row(root, rowid, epoch);
         }
     }
 
-    /// The trunk wrote the table rooted at `root` without naming the rows, while it has a child.
+    /// Mutant 30 only: a table stamp at write time.
     pub(crate) fn trunk_bulk_written(&self, root: i64) {
         let mut inner = self.inner.lock();
         let epoch = inner.trunk.lineage.epoch;
         inner.merge.table_stamps.insert(root, epoch);
     }
 
-    /// The trunk write transaction in progress committed (`true`) or rolled back. A committed one
-    /// that wrote a page while the trunk had a child is one trunk commit and one log entry. The
-    /// page and row stamps it set stay either way: a rolled-back write's stamp can only refuse a
-    /// merge that did not conflict, never admit one that did.
-    pub(crate) fn trunk_tx_end(&self, committed: bool) {
+    /// The trunk write transaction in progress committed (`Some`, with what it wrote while the
+    /// trunk had a child) or rolled back (`None`). A committed one's rows and tables are stamped
+    /// with the epoch of the commit, and one that wrote a page is one trunk commit and one log
+    /// entry; a rolled-back one stamps nothing. Page stamps (`written`) are set at the page's first
+    /// write instead, by the copy decision, and stay through a rollback: a stale stamp can only
+    /// refuse a merge that did not conflict, never admit one that did. On this store a fork takes
+    /// the trunk's WAL write lock, so the epoch cannot move inside a transaction, and the commit's
+    /// epoch is the one its first write saw.
+    pub(crate) fn trunk_tx_end(&self, committed: Option<TrunkPending>) {
         let mut inner = self.inner.lock();
         let oldest = inner.trunk.lineage.children.keys().next().copied();
         let epoch = inner.trunk.lineage.epoch;
         let StoreInner { merge, work, .. } = &mut *inner;
-        let mut pages = std::mem::take(&mut merge.tx_pages);
-        if committed && !pages.is_empty() {
-            pages.sort_unstable();
-            pages.dedup();
-            merge.trunk_commits += 1;
-            work.trunk_commits += 1;
-            merge.log.push_back((epoch, pages));
+        if let Some(tx) = committed {
+            for (root, rowid) in tx.rows {
+                merge.stamp_row(root, rowid, epoch);
+            }
+            for root in tx.tables {
+                merge.table_stamps.insert(root, epoch);
+            }
+            if !tx.pages.is_empty() {
+                let mut pages: Vec<u32> = tx.pages.into_iter().collect();
+                pages.sort_unstable();
+                merge.trunk_commits += 1;
+                work.trunk_commits += 1;
+                merge.log.push_back((epoch, pages));
+            }
         }
         merge.prune(oldest);
     }
@@ -845,11 +859,14 @@ impl BranchStore {
 
     /// Everything a merge of `id` needs from the store, under one hold of the lock: the scope
     /// check, every validator's verdict (the active one's probes counted), and what to install.
+    /// `batch` is what the batch's earlier members wrote in the transaction in progress, which no
+    /// stamp holds until it commits.
     pub(super) fn merge_prepare(
         &self,
         id: BranchId,
         active: super::merge::Validation,
         physical: bool,
+        batch: &TrunkPending,
     ) -> Result<super::merge::Prepared> {
         use super::merge::{Prepared, Validation};
         let mut inner = self.inner.lock();
@@ -896,12 +913,12 @@ impl BranchStore {
         let commits_since_fork = merge.trunk_commits - st.commits_at_fork;
         count(Validation::Scalar, &mut probes);
         let scalar = commits_since_fork > u64::from(mutant(1))
-            || (!merge.tx_pages.is_empty() && !mutant(24));
+            || (!batch.pages.is_empty() && !mutant(24));
         // V2: any page this branch wrote that the trunk wrote after the fork.
         let mut page = false;
         for &p in st.current.keys() {
             count(Validation::PageStamp, &mut probes);
-            if written(p) + u64::from(mutant(9)) > at + m2 {
+            if written(p) + u64::from(mutant(9)) > at + m2 || batch.pages.contains(&p) {
                 page = true;
                 break;
             }
@@ -912,7 +929,10 @@ impl BranchStore {
             count(Validation::KeyStamp, &mut probes);
             let row = merge.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
             let table = merge.table_stamps.get(&root).copied().unwrap_or(0);
-            if row.max(table) + u64::from(mutant(10)) > at + m3 {
+            if row.max(table) + u64::from(mutant(10)) > at + m3
+                || batch.rows.contains(&(root, rowid))
+                || batch.tables.contains(&root)
+            {
                 key = true;
                 break;
             }
@@ -944,7 +964,7 @@ impl BranchStore {
             let mut unused = 0;
             for &q in &st.reads {
                 work.merge_structural_probes += 1;
-                if written(q) <= at {
+                if written(q) <= at && !batch.pages.contains(&q) {
                     continue;
                 }
                 let Some(slot) = trunk.lineage.retained_at(q, at, &mut unused) else {

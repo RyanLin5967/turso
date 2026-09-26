@@ -499,9 +499,12 @@ impl Merger {
         let physical = policy.install == Install::Physical;
         let mut outcomes = Vec::with_capacity(branches.len());
         for branch in branches {
-            let prep = self
-                .store
-                .merge_prepare(branch.id, policy.validation, physical)?;
+            // The batch's earlier members' writes are pending in this connection's transaction.
+            let pager = self.trunk.pager.load().clone();
+            let prep = pager.with_trunk_pending(|batch| {
+                self.store
+                    .merge_prepare(branch.id, policy.validation, physical, batch)
+            })?;
             let trunk_schema = self.trunk.schema.read().schema_version;
             let scope = prep
                 .scope
@@ -637,7 +640,7 @@ impl Merger {
             pager.install_page_image(*page, image, db_size)?;
         }
         if !super::store::mutant(6) {
-            self.store.trunk_rows_written(&prep.rows);
+            pager.note_rows_installed(&prep.rows);
         }
         Ok(())
     }
