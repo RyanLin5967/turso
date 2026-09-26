@@ -19,8 +19,9 @@
 //! The tests after the model test each reproduce one install defect the refuter found by reading:
 //! a re-fired trigger, a stale statement after a trunk ALTER, an FK action or a REPLACE reverting a
 //! trunk-only row, a UNIQUE move replayed in rowid order, a batch member's error dropping the batch,
-//! and colliding automatic rowids; one more (c3) puts the branch's child under a parent the trunk
-//! deleted. Each asserts a refusal or the three-way result, and each compiles against the base
+//! and colliding automatic rowids; c3-c5 add the foreign-key cases the first check missed (a
+//! branch child under a parent the trunk deleted; a key matched under the parent's collation and
+//! affinity). Each asserts a refusal or the three-way result, and each compiles against the base
 //! (`f5b0708d5`), so its red step runs this file's own text there.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -734,10 +735,11 @@ fn a_trunk_trigger_does_not_fire_when_the_branch_rows_are_applied() {
     assert_eq!(texts(&trunk, "SELECT v FROM t WHERE id = 7"), ["t7"]);
 }
 
-/// (a2) The branch's own trigger already counted its insert (c.n = 1 in the branch, a row of its
-/// write set). The counter table is created first, so its root sorts before t's: replayed in rowid
-/// order at the base, the counter's image goes in and then t's insert fires the trigger again.
-/// The trunk must end with n = 1: counted once.
+/// (a2) The branch's own BEFORE INSERT trigger already counted its insert (c.n = 1 in the branch,
+/// a row of its write set, written before t's row). Replayed with the trigger live, the counter's
+/// image goes in first in either order (the branch's, or the base's root order, since c is
+/// created first) and then t's insert fires the trigger again: n = 2. The trunk must end with
+/// n = 1: counted once.
 #[test]
 fn a_branch_trigger_effect_is_applied_once() {
     let (_dir, db) = open_db();
@@ -751,7 +753,7 @@ fn a_branch_trigger_effect_is_applied_once() {
     trunk.execute("INSERT INTO c VALUES (1, 0)").unwrap();
     trunk
         .execute(
-            "CREATE TRIGGER ti AFTER INSERT ON t BEGIN \
+            "CREATE TRIGGER ti BEFORE INSERT ON t BEGIN \
              UPDATE c SET n = n + 1 WHERE id = 1; END",
         )
         .unwrap();
@@ -832,6 +834,7 @@ fn a_cascade_does_not_delete_a_trunk_only_child() {
     let mut merger = Merger::new(trunk.clone()).unwrap();
     let o = merger.merge(b, key_replay()).unwrap();
     assert_eq!(refusal(&o), "Some(Install)", "{o:?}");
+    assert!(format!("{o:?}").contains("lost its parent"), "{o:?}");
     assert_eq!(cells(&trunk, "SELECT id FROM p ORDER BY id"), ["1", "2"]);
     assert_eq!(cells(&trunk, "SELECT id, pid FROM c"), ["10", "1"]);
     assert!(trunk.foreign_keys_enabled(), "the merger must leave the caller's foreign_keys on");
@@ -863,8 +866,56 @@ fn a_branch_child_of_a_trunk_deleted_parent_is_refused() {
     let mut merger = Merger::new(trunk.clone()).unwrap();
     let o = merger.merge(b, key_replay()).unwrap();
     assert_eq!(refusal(&o), "Some(Install)", "{o:?}");
+    assert!(format!("{o:?}").contains("has no parent after the merge"), "{o:?}");
     assert_eq!(cells(&trunk, "SELECT id FROM p"), ["1"]);
     assert_eq!(cells(&trunk, "SELECT count(*) FROM c"), ["0"]);
+}
+
+/// A parent key the branch deletes, held by a child row the trunk has, where the child's value
+/// equals the key only as SQLite's foreign-key comparison sees it. The trunk turns foreign keys on
+/// after the setup, so the rows went in unchecked; the merge must refuse, as the engine would have
+/// refused the delete. `setup` creates p and c and inserts the parent row 1 and the child row 10.
+fn parent_delete_is_refused(setup: &[&str]) {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    for sql in setup {
+        trunk.execute(*sql).unwrap();
+    }
+    let b = trunk.fork_branch().unwrap();
+    b.connect()
+        .unwrap()
+        .execute("DELETE FROM p WHERE rowid = 1")
+        .unwrap();
+    trunk.execute("PRAGMA foreign_keys = ON").unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let o = merger.merge(b, key_replay()).unwrap();
+    assert_eq!(refusal(&o), "Some(Install)", "{o:?}");
+    assert!(format!("{o:?}").contains("lost its parent"), "{o:?}");
+    assert_eq!(cells(&trunk, "SELECT count(*) FROM p WHERE rowid = 1"), ["1"]);
+    assert_eq!(cells(&trunk, "SELECT count(*) FROM c"), ["1"]);
+}
+
+/// (c4) The parent key's collation decides: 'abc' holds the NOCASE key 'ABC'.
+#[test]
+fn a_parent_key_is_matched_under_the_parent_collation() {
+    parent_delete_is_refused(&[
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE UNIQUE)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, pk TEXT REFERENCES p(k))",
+        "INSERT INTO p VALUES (1, 'ABC'), (2, 'x')",
+        "INSERT INTO c VALUES (10, 'abc')",
+    ]);
+}
+
+/// (c5) The parent key's affinity decides: the text '1' in a column with no type holds the
+/// INTEGER key 1.
+#[test]
+fn a_parent_key_is_matched_under_the_parent_affinity() {
+    parent_delete_is_refused(&[
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id))",
+        "INSERT INTO p VALUES (1, 'one'), (2, 'two')",
+        "INSERT INTO c VALUES (10, '1')",
+    ]);
 }
 
 /// (c2) A column declared UNIQUE ON CONFLICT REPLACE: the trunk inserts q with u = 'x' after the
