@@ -47,11 +47,92 @@ use turso_core::{
     IO,
 };
 
+/// r11-coherence FH (amendment 15): the process's heap, chosen once, at the first allocation: per-thread heaps
+/// (mimalloc: free-list sharding, Leijen, Zorn and de Moura, APLAS 2019) when TURSO_R11_FIX lists `H`, else the
+/// system allocator. The choice reads the environment through libc's getenv, which allocates nothing, and the first
+/// allocation happens before any thread exists, so every block is freed by the allocator that made it.
+mod heap {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static CHOICE: AtomicU8 = AtomicU8::new(0);
+    const SYSTEM: u8 = 1;
+    const MIMALLOC: u8 = 2;
+
+    #[inline]
+    fn choice() -> u8 {
+        let c = CHOICE.load(Ordering::Relaxed);
+        if c != 0 {
+            return c;
+        }
+        let v = unsafe { libc::getenv(c"TURSO_R11_FIX".as_ptr()) };
+        let h = !v.is_null()
+            && unsafe { std::ffi::CStr::from_ptr(v) }
+                .to_bytes()
+                .split(|&b| b == b',')
+                .any(|part| part.trim_ascii() == b"H");
+        let c = if h { MIMALLOC } else { SYSTEM };
+        CHOICE.store(c, Ordering::Relaxed);
+        c
+    }
+
+    /// The heap this process runs on, for the output header.
+    pub fn name() -> &'static str {
+        if choice() == MIMALLOC {
+            "mimalloc"
+        } else {
+            "system"
+        }
+    }
+
+    pub struct Heap;
+
+    unsafe impl GlobalAlloc for Heap {
+        #[inline]
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if choice() == MIMALLOC {
+                mimalloc::MiMalloc.alloc(l)
+            } else {
+                System.alloc(l)
+            }
+        }
+        #[inline]
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if choice() == MIMALLOC {
+                mimalloc::MiMalloc.alloc_zeroed(l)
+            } else {
+                System.alloc_zeroed(l)
+            }
+        }
+        #[inline]
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if choice() == MIMALLOC {
+                mimalloc::MiMalloc.dealloc(p, l)
+            } else {
+                System.dealloc(p, l)
+            }
+        }
+        #[inline]
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            if choice() == MIMALLOC {
+                mimalloc::MiMalloc.realloc(p, l, n)
+            } else {
+                System.realloc(p, l, n)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "coherence"))]
+    #[global_allocator]
+    static A: Heap = Heap;
+}
+
 /// r11-coherence (PREREG §0 (a)): with the `coherence` feature, every heap allocation and free is counted into the
-/// calling thread's coherence counters. Without it the system allocator is used unchanged.
+/// calling thread's coherence counters, over the heap [`heap`] chose.
 #[cfg(feature = "coherence")]
 mod counting_alloc {
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use super::heap::Heap;
+    use std::alloc::{GlobalAlloc, Layout};
     use turso_core::coherence::{bump, Class};
 
     pub struct Counting;
@@ -59,20 +140,20 @@ mod counting_alloc {
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
             bump(Class::Malloc, 1);
-            System.alloc(l)
+            Heap.alloc(l)
         }
         unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
             bump(Class::Malloc, 1);
-            System.alloc_zeroed(l)
+            Heap.alloc_zeroed(l)
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
             bump(Class::Free, 1);
-            System.dealloc(p, l)
+            Heap.dealloc(p, l)
         }
         unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
             bump(Class::Malloc, 1);
             bump(Class::Free, 1);
-            System.realloc(p, l, n)
+            Heap.realloc(p, l, n)
         }
     }
 
@@ -113,6 +194,7 @@ enum Arm {
     Pages,
     SpreadTrunk,
     Conc,
+    BtreeMicro,
 }
 
 /// Which live branch a churn cycle reaps.
@@ -182,6 +264,7 @@ fn parse_args() -> Args {
                     "pages" => Arm::Pages,
                     "spread_trunk" => Arm::SpreadTrunk,
                     "conc" => Arm::Conc,
+                    "btree_micro" => Arm::BtreeMicro,
                     other => die(&format!("unknown arm {other}")),
                 })
             }
@@ -405,6 +488,9 @@ struct Live {
     rows: Vec<i64>,
     /// Trunk writes committed when it was forked.
     trunk_writes_at_fork: u64,
+    /// conc (amendment 15): the fork source it was forked from (a replica or a private database's trunk); 0
+    /// otherwise.
+    src: usize,
 }
 
 impl Live {
@@ -629,13 +715,15 @@ fn main() {
         clock_tick_ns()
     );
     println!(
-        "# build: {} ; rss_base_bytes={}",
+        "# build: {} ; rss_base_bytes={} ; heap={} ; fixes={:#x}",
         if cfg!(debug_assertions) {
             "DEBUG (not a timing result)"
         } else {
             "release"
         },
-        rss_bytes()
+        rss_bytes(),
+        heap::name(),
+        coherence::fixes()
     );
 
     let mut bench = Bench {
@@ -653,6 +741,7 @@ fn main() {
         Arm::Pages => arm_pages(&mut bench, &args),
         Arm::SpreadTrunk => arm_spread_trunk(&mut bench, &args),
         Arm::Conc => arm_conc(&mut bench, &args),
+        Arm::BtreeMicro => arm_btree_micro(&args),
     }
     let end = db.branch_stats();
     if end.live_branches != 0 || end.arena_slots_in_use != 0 {
@@ -671,6 +760,7 @@ fn grow_from_trunk(b: &mut Bench, row: i64) -> Live {
         branch,
         rows: vec![row],
         trunk_writes_at_fork: b.model.writes,
+        src: 0,
     };
     let conn = live.branch.connect().unwrap();
     update(&conn, row);
@@ -734,6 +824,7 @@ fn arm_trunk_writes(b: &mut Bench, args: &Args) {
                 branch,
                 rows: vec![row],
                 trunk_writes_at_fork: at_fork,
+                src: 0,
             });
             let trow = trunk_row(arm, b.model.writes);
             let g = b.model.record(trow);
@@ -835,6 +926,7 @@ fn arm_chain(b: &mut Bench, args: &Args) {
                 branch,
                 rows: vec![row],
                 trunk_writes_at_fork: 0,
+                src: 0,
             });
         }
         let s = b.db.branch_stats();
@@ -1014,6 +1106,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                     branch,
                     rows: vec![row],
                     trunk_writes_at_fork: at_fork,
+                    src: 0,
                 });
                 let reaped = b.timed(&mut win[4], || victim.branch.reap().unwrap());
                 if reaped.deferred || reaped.freed_pages < 1 {
@@ -1178,6 +1271,7 @@ fn arm_pages(b: &mut Bench, args: &Args) {
                     branch,
                     rows,
                     trunk_writes_at_fork: 0,
+                    src: 0,
                 });
             }
             let s = b.db.branch_stats();
@@ -1303,6 +1397,83 @@ fn arm_spread_trunk(b: &mut Bench, args: &Args) {
     b.print_slopes(&args.checkpoints, &["trunk_write"]);
 }
 
+/// Amendment 16: the trunk lock's critical sections without the engine. A bare `BTreeMap<u64, u64>` of N fork
+/// epochs (the trunk's children index before FK), driven as conc drives it: a fork inserts the next epoch, a reap
+/// removes a random live one and looks up its two neighbours (the garbage pass's range queries). One thread, no lock.
+/// Per checkpoint N: `samples` fork+reap pairs, each op timed alone; p50/p90/p99 in ns, and the log-log slope over
+/// the checkpoints. Resident size is N x ~40 bytes (keys, values, node overhead): 40 MB at 10^6.
+fn arm_btree_micro(args: &Args) {
+    use std::collections::BTreeMap;
+    println!("# btree_micro: BTreeMap<u64, u64> of N fork epochs; fork = insert(next), reap = remove(random) + neighbours");
+    println!("N\top\tsamples\tp50_ns\tp90_ns\tp99_ns\tmax_ns");
+    let mut rng = Rng(args.seed | 1);
+    let mut map: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut keys: Vec<u64> = Vec::new();
+    let mut next = 0u64;
+    let mut p50s: Vec<(f64, [f64; 3])> = Vec::new();
+    for &n in &args.checkpoints {
+        while keys.len() < n {
+            map.insert(next, next);
+            keys.push(next);
+            next += 1;
+        }
+        let mut t_ins = Vec::with_capacity(args.samples);
+        let mut t_rem = Vec::with_capacity(args.samples);
+        let mut t_nb = Vec::with_capacity(args.samples);
+        let mut sink = 0u64;
+        for _ in 0..args.samples {
+            let t0 = Instant::now();
+            map.insert(next, next);
+            let t1 = Instant::now();
+            keys.push(next);
+            next += 1;
+            let i = rng.below(keys.len());
+            let f = keys.swap_remove(i);
+            let t2 = Instant::now();
+            let removed = map.remove(&f);
+            let t3 = Instant::now();
+            let lo = map.range(..f).next_back().map(|(&k, _)| k);
+            let hi = map.range(f..).next().map(|(&k, _)| k);
+            let t4 = Instant::now();
+            sink = sink.wrapping_add(removed.unwrap_or(0) ^ lo.unwrap_or(0) ^ hi.unwrap_or(0));
+            t_ins.push((t1 - t0).as_nanos() as f64);
+            t_rem.push((t3 - t2).as_nanos() as f64);
+            t_nb.push((t4 - t3).as_nanos() as f64);
+        }
+        std::hint::black_box(sink);
+        if map.len() != n {
+            not_a_result(&format!("btree_micro: map holds {} at N={n}", map.len()));
+        }
+        let mut p = [0f64; 3];
+        for (k, (op, v)) in [("insert", &mut t_ins), ("remove", &mut t_rem), ("neighbours", &mut t_nb)]
+            .into_iter()
+            .enumerate()
+        {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            p[k] = percentile(v, 50.0);
+            println!(
+                "{n}\t{op}\t{}\t{:.0}\t{:.0}\t{:.0}\t{:.0}",
+                v.len(),
+                percentile(v, 50.0),
+                percentile(v, 90.0),
+                percentile(v, 99.0),
+                v[v.len() - 1]
+            );
+        }
+        println!("# x={n} rss_bytes={}", rss_bytes());
+        p50s.push((n as f64, p));
+    }
+    for (k, op) in ["insert", "remove", "neighbours"].iter().enumerate() {
+        let pts: Vec<(f64, f64)> = p50s.iter().map(|(n, p)| (n.ln(), p[k].max(1.0).ln())).collect();
+        let m = pts.len() as f64;
+        let (sx, sy) = pts.iter().fold((0.0, 0.0), |(a, b), (x, y)| (a + x, b + y));
+        let (mx, my) = (sx / m, sy / m);
+        let num: f64 = pts.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
+        let den: f64 = pts.iter().map(|(x, _)| (x - mx).powi(2)).sum();
+        println!("# slope\t{op}\t{:+.3}", num / den);
+    }
+}
+
 /// The ops of one `conc` cycle, in the order a cycle runs them.
 const CONC_OPS: [&str; 7] = [
     "fork",
@@ -1325,6 +1496,28 @@ struct ConcOut {
     elapsed: Duration,
     /// This thread's coherence counts over its cycles (all zero without the `coherence` feature).
     coh: [u64; coherence::CLASSES],
+}
+
+/// Where a conc thread forks from (amendment 15): a trunk connection (the shared arms, and each private database's
+/// trunk in `V`), or a replica branch of the trunk (`R`). `idx` is the source's number, which the branches forked from
+/// it carry, so a cell deals every thread the branches of its own sources.
+enum SrcKind {
+    Trunk(Arc<Connection>),
+    Replica(Branch),
+}
+
+struct Src {
+    idx: usize,
+    kind: SrcKind,
+}
+
+impl Src {
+    fn fork(&self) -> turso_core::Result<Branch> {
+        match &self.kind {
+            SrcKind::Trunk(conn) => conn.fork_branch(),
+            SrcKind::Replica(parent) => parent.fork(),
+        }
+    }
 }
 
 /// Run `f` until it does not answer `Busy`/`BusySnapshot`, counting those answers. Anything else
@@ -1364,7 +1557,7 @@ fn check_v(rows: &[Vec<Value>], id: i64, expect: &str) {
 /// fixed. Every read is checked against what the harness knows the branch holds; the trunk never
 /// writes in this arm, so a far row is always the trunk's original value.
 fn conc_thread(
-    trunk: Arc<Connection>,
+    srcs: Vec<&Src>,
     mut share: Vec<Live>,
     barrier: &Barrier,
     seed: u64,
@@ -1382,8 +1575,10 @@ fn conc_thread(
     let start = Instant::now();
     for c in 0..cycles {
         let row = row_for(base + c);
+        // One source in the shared arms; in R and V this thread's sources in turn (amendment 15).
+        let src = srcs[c % srcs.len()];
         let t0 = Instant::now();
-        let branch = busy_retry(&mut busy[0], "fork", || trunk.fork_branch());
+        let branch = busy_retry(&mut busy[0], "fork", || src.fork());
         let t1 = Instant::now();
         let conn = busy_retry(&mut busy[1], "open", || branch.connect());
         let t2 = Instant::now();
@@ -1410,6 +1605,7 @@ fn conc_thread(
             branch,
             rows: vec![row],
             trunk_writes_at_fork: 0,
+            src: src.idx,
         });
         let t8 = Instant::now();
         let reaped = victim.branch.reap().unwrap_or_else(|e| not_a_result(&format!("conc reap failed: {e}")));
@@ -1530,187 +1726,399 @@ fn print_addrs(addrs: &[(String, usize)]) {
     }
 }
 
+/// conc's fork sources (amendment 15): `Shared` (every registered arm: one trunk, each thread its own trunk
+/// connection), `Replica` (R: `REPLICAS` replica branches of the one trunk; each thread forks from and reaps among
+/// the replicas j = i mod T), `Private` (V: `REPLICAS` databases, each with its own trunk; thread i works only on the
+/// databases j = i mod T). `REPLICAS` = 48 divides every T in 1, 2, 3, 4, 6, 8, 12, 16, so each thread's working
+/// set is N/T branches in every mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConcMode {
+    Shared,
+    Replica,
+    Private,
+}
+
+const REPLICAS: usize = 48;
+
+/// A private database for `V`: the main database's trunk, rebuilt (amendment 15).
+fn private_trunk(args: &Args) -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("branch_arms_private.db");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let trunk = db.connect().unwrap();
+    if args.no_autocheckpoint {
+        trunk.wal_auto_actions_disable();
+    }
+    trunk
+        .execute(format!("PRAGMA synchronous = {}", args.synchronous))
+        .unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    trunk.execute("BEGIN").unwrap();
+    for id in 1..=TRUNK_ROWS {
+        trunk
+            .execute(format!("INSERT INTO t VALUES ({id}, '{}')", trunk_value(id)))
+            .unwrap();
+    }
+    trunk.execute("COMMIT").unwrap();
+    trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    (dir, db, trunk)
+}
+
+/// Every database's branch stats, summed.
+fn stats_sum(dbs: &[Arc<Database>]) -> turso_core::branch::BranchStats {
+    let mut sum = turso_core::branch::BranchStats::default();
+    for db in dbs {
+        let s = db.branch_stats();
+        sum.live_branches += s.live_branches;
+        sum.arena_slots_in_use += s.arena_slots_in_use;
+        sum.arena_slots_free += s.arena_slots_free;
+        sum.work.add(&s.work);
+    }
+    sum
+}
+
+/// This process's page faults so far (major, minor), for the per-cell deltas (amendment 16).
+fn faults() -> (u64, u64) {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        not_a_result("getrusage failed");
+    }
+    (ru.ru_majflt as u64, ru.ru_minflt as u64)
+}
+
 fn arm_conc(b: &mut Bench, args: &Args) {
     let tmax = *args.threads.iter().max().unwrap();
-    b.db.set_branch_lock_timing(args.lock_timing);
-    // One trunk connection per thread: a connection serves one thread at a time.
-    let trunks: Vec<Arc<Connection>> = (0..tmax).map(|_| b.db.connect().unwrap()).collect();
+    let mode = if coherence::fix(coherence::FIX_PRIVATE) {
+        ConcMode::Private
+    } else if coherence::fix(coherence::FIX_REPLICA) {
+        ConcMode::Replica
+    } else {
+        ConcMode::Shared
+    };
+    if mode != ConcMode::Shared {
+        for &t in &args.threads {
+            if REPLICAS % t != 0 {
+                die(&format!("conc {mode:?}: T={t} does not divide {REPLICAS}"));
+            }
+        }
+    }
+    // The databases whose stats a cell reads, the fork sources, and the private databases' directories.
+    let mut dirs = Vec::new();
+    let mut dbs: Vec<Arc<Database>> = vec![b.db.clone()];
+    let srcs: Vec<Src> = match mode {
+        // One trunk connection per thread: a connection serves one thread at a time.
+        ConcMode::Shared => (0..tmax)
+            .map(|idx| Src {
+                idx,
+                kind: SrcKind::Trunk(b.db.connect().unwrap()),
+            })
+            .collect(),
+        ConcMode::Replica => (0..REPLICAS)
+            .map(|idx| Src {
+                idx,
+                kind: SrcKind::Replica(b.trunk.fork_branch().unwrap()),
+            })
+            .collect(),
+        ConcMode::Private => {
+            dbs.clear();
+            (0..REPLICAS)
+                .map(|idx| {
+                    let (dir, db, trunk) = private_trunk(args);
+                    dirs.push(dir);
+                    dbs.push(db);
+                    Src {
+                        idx,
+                        kind: SrcKind::Trunk(trunk),
+                    }
+                })
+                .collect()
+        }
+    };
+    // Branches that exist besides the live ones: R's replicas.
+    let extra = if mode == ConcMode::Replica { REPLICAS } else { 0 };
+    for db in &dbs {
+        db.set_branch_lock_timing(args.lock_timing);
+    }
     println!(
-        "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={}",
-        args.threads, args.cycles, args.lock_timing
+        "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={} mode={mode:?} sources={}",
+        args.threads,
+        args.cycles,
+        args.lock_timing,
+        srcs.len()
     );
     println!("{CONC_HEADER}");
     let mut live: Vec<Live> = Vec::new();
     let mut grown = 0usize;
-    let c = args.cycles;
     for &n in &args.checkpoints {
         let t = Instant::now();
         while live.len() < n {
-            live.push(grow_from_trunk(b, row_for(grown)));
+            let row = row_for(grown);
+            let l = if mode == ConcMode::Shared {
+                grow_from_trunk(b, row)
+            } else {
+                // Grown round-robin over the sources, so each source holds N/48 of them.
+                let src = &srcs[live.len() % srcs.len()];
+                let branch = src.fork().unwrap();
+                let conn = branch.connect().unwrap();
+                update(&conn, row);
+                drop(conn);
+                Live {
+                    branch,
+                    rows: vec![row],
+                    trunk_writes_at_fork: 0,
+                    src: src.idx,
+                }
+            };
+            live.push(l);
             grown += 1;
         }
         let grow_us = t.elapsed().as_secs_f64() * 1e6;
-        let s = b.db.branch_stats();
-        if s.live_branches != n || s.arena_slots_in_use != n {
-            not_a_result(&format!("expected {n} branches and {n} arena pages before the block: {s:?}"));
+        let s = stats_sum(&dbs);
+        if s.live_branches != n + extra || s.arena_slots_in_use != n {
+            not_a_result(&format!(
+                "expected {n} (+{extra}) branches and {n} arena pages before the block: {s:?}"
+            ));
         }
-        b.print_state(n, &format!("grow_total_us={grow_us:.0}"));
-        if coherence::ENABLED {
-            print_addrs(&coh_addrs(b, &trunks[0]));
+        b.print_state(
+            n,
+            &format!(
+                "grow_total_us={grow_us:.0} mode={mode:?} all_live={} all_in_use={}",
+                s.live_branches, s.arena_slots_in_use
+            ),
+        );
+        if coherence::ENABLED && mode != ConcMode::Private {
+            // The address table names a trunk connection's schema, which is the database's own Arc<Schema>.
+            let trunk0 = match &srcs[0].kind {
+                SrcKind::Trunk(conn) => conn.clone(),
+                SrcKind::Replica(_) => b.trunk.clone(),
+            };
+            print_addrs(&coh_addrs(b, &trunk0));
         }
-        if args.census > 0 && n == args.census_at {
-            // Warm the caches as a steady cell would be, then run the census block on this thread alone.
-            let addrs = coh_addrs(b, &trunks[0]);
-            let lines: Vec<usize> = args
-                .census_lines
-                .iter()
-                .map(|name| {
-                    addrs
-                        .iter()
-                        .find(|(nm, _)| nm == name)
-                        .unwrap_or_else(|| die(&format!("no address named {name}")))
-                        .1
-                        & !127
-                })
-                .collect();
-            let one = Barrier::new(1);
-            let warm = conc_thread(trunks[0].clone(), std::mem::take(&mut live), &one, args.seed ^ 0xC3, grown, 200);
-            grown += 200;
-            coh_census_start(lines.as_ptr(), lines.len());
-            let out = conc_thread(trunks[0].clone(), warm.share, &one, args.seed ^ 0xC5, grown, args.census);
-            coh_census_stop();
-            grown += args.census;
-            println!(
-                "# census N={n} cycles={} lines={:?} ({})",
-                args.census,
-                lines.iter().map(|l| format!("{l:#x}")).collect::<Vec<_>>(),
-                args.census_lines.join(",")
-            );
-            print_coh(&format!("census N={n}"), &out.coh, args.census as f64);
-            live = out.share;
-            if live.len() != n {
-                not_a_result("the census block changed the live count");
-            }
-        }
-        let order = args
-            .threads
-            .iter()
-            .map(|&t| (t, 0u64))
-            .chain(args.threads.iter().rev().map(|&t| (t, 1u64)));
-        for (t, draw) in order {
-            let null = null_ops_per_s(t);
-            // Deal the live branches round-robin, so every share holds branches of every age.
-            let mut shares: Vec<Vec<Live>> = (0..t).map(|_| Vec::with_capacity(n / t + 1)).collect();
-            for (i, l) in live.drain(..).enumerate() {
-                shares[i % t].push(l);
-            }
-            let barrier = Barrier::new(t + 1);
-            println!("# cell N={n} T={t} draw={draw} start");
-            let before = b.db.branch_stats().work;
-            let cpu0 = cpu_ns();
-            let (wall, outs) = std::thread::scope(|s| {
-                let handles: Vec<_> = shares
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, share)| {
-                        let trunk = trunks[i].clone();
-                        let barrier = &barrier;
-                        let seed = args.seed
-                            ^ (i as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03)
-                            ^ ((n as u64) << 24)
-                            ^ (draw << 56)
-                            ^ ((t as u64) << 48);
-                        let base = grown + i * c;
-                        s.spawn(move || conc_thread(trunk, share, barrier, seed, base, c))
-                    })
-                    .collect();
-                barrier.wait();
-                let start = Instant::now();
-                let outs: Vec<ConcOut> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-                (start.elapsed(), outs)
-            });
-            let cpu1 = cpu_ns();
-            let after = b.db.branch_stats().work;
-            grown += t * c;
-            let mut ops: [Vec<Duration>; 7] = Default::default();
-            let mut busy = [0u64; 7];
-            let mut coh = [0u64; coherence::CLASSES];
-            let (mut th_min, mut th_max) = (Duration::MAX, Duration::ZERO);
-            for out in outs {
-                for (sum, x) in coh.iter_mut().zip(out.coh) {
-                    *sum += x;
-                }
-                live.extend(out.share);
-                for (i, mut samples) in out.ops.into_iter().enumerate() {
-                    ops[i].append(&mut samples);
-                    busy[i] += out.busy[i];
-                }
-                th_min = th_min.min(out.elapsed);
-                th_max = th_max.max(out.elapsed);
-            }
-            let s = b.db.branch_stats();
-            if s.live_branches != n || s.arena_slots_in_use != n || live.len() != n {
-                not_a_result(&format!(
-                    "cell N={n} T={t} draw={draw} did not return to {n} branches and {n} arena pages \
-                     (harness holds {}): {s:?}",
-                    live.len()
-                ));
-            }
-            for (i, samples) in ops.iter().enumerate() {
-                let mut us: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
-                us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                println!(
-                    "{n}\t{t}\t{draw}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}",
-                    CONC_OPS[i],
-                    us.len(),
-                    percentile(&us, 50.0),
-                    percentile(&us, 90.0),
-                    percentile(&us, 99.0),
-                    us[us.len() - 1],
-                    busy[i]
-                );
-            }
-            let cycles = (t * c) as f64;
-            print_coh(&format!("N={n} T={t} draw={draw}"), &coh, cycles);
-            let wall_ns = wall.as_nanos() as f64;
-            let d = |from: u64, to: u64| to - from;
-            let acq = d(before.lock_acquisitions, after.lock_acquisitions);
-            let contended = d(before.lock_contended, after.lock_contended);
-            let wait_ns = d(before.lock_wait_ns, after.lock_wait_ns);
-            let hold_ns = d(before.lock_hold_ns, after.lock_hold_ns);
-            println!(
-                "# cellsum N={n} T={t} draw={draw} cycles={} wall_ns={} cycles_per_s={:.1} \
-                 null_ops_per_s={null:.0} thread_ms_min={:.3} thread_ms_max={:.3} user_ns={} sys_ns={} \
-                 lock_acq={acq} lock_contended={contended} lock_wait_ns={wait_ns} lock_hold_ns={hold_ns} \
-                 acq_per_cycle={:.3} contended_frac={:.4} wait_frac={:.4} hold_util={:.4} \
-                 busy_fork={} busy_open={} busy_other={} rss_bytes={} resolves={} \
-                 trunk_page_hits={} trunk_page_misses={} trunk_lock_acq={} trunk_lock_contended={} \
-                 trunk_lock_wait_ns={} trunk_lock_hold_ns={}",
-                t * c,
-                wall.as_nanos(),
-                cycles / wall.as_secs_f64(),
-                th_min.as_secs_f64() * 1e3,
-                th_max.as_secs_f64() * 1e3,
-                cpu1.0 - cpu0.0,
-                cpu1.1 - cpu0.1,
-                acq as f64 / cycles,
-                contended as f64 / acq as f64,
-                wait_ns as f64 / (t as f64 * wall_ns),
-                hold_ns as f64 / wall_ns,
-                busy[0],
-                busy[1],
-                busy[2..].iter().sum::<u64>(),
-                rss_bytes(),
-                d(before.resolve_calls, after.resolve_calls),
-                d(before.trunk_page_hits, after.trunk_page_hits),
-                d(before.trunk_page_misses, after.trunk_page_misses),
-                d(before.trunk_lock_acquisitions, after.trunk_lock_acquisitions),
-                d(before.trunk_lock_contended, after.trunk_lock_contended),
-                d(before.trunk_lock_wait_ns, after.trunk_lock_wait_ns),
-                d(before.trunk_lock_hold_ns, after.trunk_lock_hold_ns),
-            );
-        }
+        continue_census(b, args, n, &srcs, &mut live, &mut grown, mode);
+        run_cells(args, n, &srcs, &dbs, &mut live, &mut grown, mode, extra);
     }
     drop(live);
-    drop(trunks);
+    drop(srcs);
+    if mode == ConcMode::Private {
+        for (i, db) in dbs.iter().enumerate() {
+            let s = db.branch_stats();
+            if s.live_branches != 0 || s.arena_slots_in_use != 0 {
+                not_a_result(&format!("private database {i} teardown leaked: {s:?}"));
+            }
+        }
+    }
+    drop(dbs);
+    drop(dirs);
+}
+
+/// The census block (unchanged from the registered arm; shared mode only: it runs on source 0 alone).
+fn continue_census(
+    b: &mut Bench,
+    args: &Args,
+    n: usize,
+    srcs: &[Src],
+    live: &mut Vec<Live>,
+    grown: &mut usize,
+    mode: ConcMode,
+) {
+    if args.census == 0 || n != args.census_at {
+        return;
+    }
+    if mode != ConcMode::Shared {
+        die("the census runs in the shared mode only");
+    }
+    let SrcKind::Trunk(trunk0) = &srcs[0].kind else {
+        unreachable!("shared sources are trunk connections")
+    };
+    // Warm the caches as a steady cell would be, then run the census block on this thread alone.
+    let addrs = coh_addrs(b, trunk0);
+    let lines: Vec<usize> = args
+        .census_lines
+        .iter()
+        .map(|name| {
+            addrs
+                .iter()
+                .find(|(nm, _)| nm == name)
+                .unwrap_or_else(|| die(&format!("no address named {name}")))
+                .1
+                & !127
+        })
+        .collect();
+    let one = Barrier::new(1);
+    let warm = conc_thread(vec![&srcs[0]], std::mem::take(live), &one, args.seed ^ 0xC3, *grown, 200);
+    *grown += 200;
+    coh_census_start(lines.as_ptr(), lines.len());
+    let out = conc_thread(vec![&srcs[0]], warm.share, &one, args.seed ^ 0xC5, *grown, args.census);
+    coh_census_stop();
+    *grown += args.census;
+    println!(
+        "# census N={n} cycles={} lines={:?} ({})",
+        args.census,
+        lines.iter().map(|l| format!("{l:#x}")).collect::<Vec<_>>(),
+        args.census_lines.join(",")
+    );
+    print_coh(&format!("census N={n}"), &out.coh, args.census as f64);
+    *live = out.share;
+    if live.len() != n {
+        not_a_result("the census block changed the live count");
+    }
+}
+
+/// The cells of one checkpoint: the T list forward, then reversed.
+#[allow(clippy::too_many_arguments)]
+fn run_cells(
+    args: &Args,
+    n: usize,
+    srcs: &[Src],
+    dbs: &[Arc<Database>],
+    live: &mut Vec<Live>,
+    grown: &mut usize,
+    mode: ConcMode,
+    extra: usize,
+) {
+    let c = args.cycles;
+    let order = args
+        .threads
+        .iter()
+        .map(|&t| (t, 0u64))
+        .chain(args.threads.iter().rev().map(|&t| (t, 1u64)));
+    for (t, draw) in order {
+        let null = null_ops_per_s(t);
+        // Shared: deal the live branches round-robin, so every share holds branches of every age. R and V: each
+        // thread gets the branches of its own sources (j = i mod T).
+        let mut shares: Vec<Vec<Live>> = (0..t).map(|_| Vec::with_capacity(n / t + 1)).collect();
+        for (i, l) in live.drain(..).enumerate() {
+            let to = if mode == ConcMode::Shared { i % t } else { l.src % t };
+            shares[to].push(l);
+        }
+        let barrier = Barrier::new(t + 1);
+        println!("# cell N={n} T={t} draw={draw} start");
+        let before = stats_sum(dbs).work;
+        let cpu0 = cpu_ns();
+        let flt0 = faults();
+        let (wall, outs) = std::thread::scope(|s| {
+            let handles: Vec<_> = shares
+                .into_iter()
+                .enumerate()
+                .map(|(i, share)| {
+                    let mine: Vec<&Src> = if mode == ConcMode::Shared {
+                        vec![&srcs[i]]
+                    } else {
+                        srcs.iter().filter(|src| src.idx % t == i).collect()
+                    };
+                    let barrier = &barrier;
+                    let seed = args.seed
+                        ^ (i as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03)
+                        ^ ((n as u64) << 24)
+                        ^ (draw << 56)
+                        ^ ((t as u64) << 48);
+                    let base = *grown + i * c;
+                    s.spawn(move || conc_thread(mine, share, barrier, seed, base, c))
+                })
+                .collect();
+            barrier.wait();
+            let start = Instant::now();
+            let outs: Vec<ConcOut> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            (start.elapsed(), outs)
+        });
+        let cpu1 = cpu_ns();
+        let flt1 = faults();
+        let after = stats_sum(dbs).work;
+        *grown += t * c;
+        let mut ops: [Vec<Duration>; 7] = Default::default();
+        let mut busy = [0u64; 7];
+        let mut coh = [0u64; coherence::CLASSES];
+        let (mut th_min, mut th_max) = (Duration::MAX, Duration::ZERO);
+        for out in outs {
+            for (sum, x) in coh.iter_mut().zip(out.coh) {
+                *sum += x;
+            }
+            live.extend(out.share);
+            for (i, mut samples) in out.ops.into_iter().enumerate() {
+                ops[i].append(&mut samples);
+                busy[i] += out.busy[i];
+            }
+            th_min = th_min.min(out.elapsed);
+            th_max = th_max.max(out.elapsed);
+        }
+        let s = stats_sum(dbs);
+        if s.live_branches != n + extra || s.arena_slots_in_use != n || live.len() != n {
+            not_a_result(&format!(
+                "cell N={n} T={t} draw={draw} did not return to {n} (+{extra}) branches and {n} arena pages \
+                 (harness holds {}): {s:?}",
+                live.len()
+            ));
+        }
+        for (i, samples) in ops.iter().enumerate() {
+            let mut us: Vec<f64> = samples.iter().map(|d| d.as_secs_f64() * 1e6).collect();
+            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "{n}\t{t}\t{draw}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}",
+                CONC_OPS[i],
+                us.len(),
+                percentile(&us, 50.0),
+                percentile(&us, 90.0),
+                percentile(&us, 99.0),
+                us[us.len() - 1],
+                busy[i]
+            );
+        }
+        let cycles = (t * c) as f64;
+        print_coh(&format!("N={n} T={t} draw={draw}"), &coh, cycles);
+        let wall_ns = wall.as_nanos() as f64;
+        let d = |from: u64, to: u64| to - from;
+        let acq = d(before.lock_acquisitions, after.lock_acquisitions);
+        let contended = d(before.lock_contended, after.lock_contended);
+        let wait_ns = d(before.lock_wait_ns, after.lock_wait_ns);
+        let hold_ns = d(before.lock_hold_ns, after.lock_hold_ns);
+        println!(
+            "# cellsum N={n} T={t} draw={draw} cycles={} wall_ns={} cycles_per_s={:.1} \
+             null_ops_per_s={null:.0} thread_ms_min={:.3} thread_ms_max={:.3} user_ns={} sys_ns={} \
+             lock_acq={acq} lock_contended={contended} lock_wait_ns={wait_ns} lock_hold_ns={hold_ns} \
+             acq_per_cycle={:.3} contended_frac={:.4} wait_frac={:.4} hold_util={:.4} \
+             busy_fork={} busy_open={} busy_other={} rss_bytes={} resolves={} \
+             trunk_page_hits={} trunk_page_misses={} trunk_lock_acq={} trunk_lock_contended={} \
+             trunk_lock_wait_ns={} trunk_lock_hold_ns={} trunk_fork_acq={} trunk_fork_hold_ns={} \
+             trunk_reap_acq={} trunk_reap_hold_ns={} majflt={} minflt={} mode={mode:?}",
+            t * c,
+            wall.as_nanos(),
+            cycles / wall.as_secs_f64(),
+            th_min.as_secs_f64() * 1e3,
+            th_max.as_secs_f64() * 1e3,
+            cpu1.0 - cpu0.0,
+            cpu1.1 - cpu0.1,
+            acq as f64 / cycles,
+            contended as f64 / acq as f64,
+            wait_ns as f64 / (t as f64 * wall_ns),
+            hold_ns as f64 / wall_ns,
+            busy[0],
+            busy[1],
+            busy[2..].iter().sum::<u64>(),
+            rss_bytes(),
+            d(before.resolve_calls, after.resolve_calls),
+            d(before.trunk_page_hits, after.trunk_page_hits),
+            d(before.trunk_page_misses, after.trunk_page_misses),
+            d(before.trunk_lock_acquisitions, after.trunk_lock_acquisitions),
+            d(before.trunk_lock_contended, after.trunk_lock_contended),
+            d(before.trunk_lock_wait_ns, after.trunk_lock_wait_ns),
+            d(before.trunk_lock_hold_ns, after.trunk_lock_hold_ns),
+            d(before.trunk_fork_acq, after.trunk_fork_acq),
+            d(before.trunk_fork_hold_ns, after.trunk_fork_hold_ns),
+            d(before.trunk_reap_acq, after.trunk_reap_acq),
+            d(before.trunk_reap_hold_ns, after.trunk_reap_hold_ns),
+            flt1.0 - flt0.0,
+            flt1.1 - flt0.1,
+        );
+    }
 }

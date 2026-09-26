@@ -280,7 +280,12 @@ impl Counted for TrunkInner {
 struct Held<'a, T: Counted> {
     guard: MutexGuard<'a, T>,
     since: Option<Instant>,
+    /// Which conc site took the trunk lock (amendment 16): 0 none, [`SITE_FORK`], [`SITE_REAP`].
+    site: u8,
 }
+
+const SITE_FORK: u8 = 1;
+const SITE_REAP: u8 = 2;
 
 impl<T: Counted> Deref for Held<'_, T> {
     type Target = T;
@@ -298,7 +303,14 @@ impl<T: Counted> DerefMut for Held<'_, T> {
 impl<T: Counted> Drop for Held<'_, T> {
     fn drop(&mut self) {
         if let Some(since) = self.since {
-            self.guard.work().lock_hold_ns += since.elapsed().as_nanos() as u64;
+            let ns = since.elapsed().as_nanos() as u64;
+            let work = self.guard.work();
+            work.lock_hold_ns += ns;
+            match self.site {
+                SITE_FORK => work.trunk_fork_hold_ns += ns,
+                SITE_REAP => work.trunk_reap_hold_ns += ns,
+                _ => {}
+            }
         }
     }
 }
@@ -324,7 +336,11 @@ fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
         work.lock_wait_ns += waited.as_nanos() as u64;
     }
     let since = timed.then(Instant::now);
-    Held { guard, since }
+    Held {
+        guard,
+        since,
+        site: 0,
+    }
 }
 
 /// One arena domain: a shard's pages, or the trunk's retained versions. Slots it hands out carry
@@ -842,6 +858,18 @@ impl BranchStore {
         take(&self.trunk, self.timed())
     }
 
+    /// The trunk's lock, taken at conc site `site` ([`SITE_FORK`] or [`SITE_REAP`]), counted apart (amendment 16).
+    fn trunk_at(&self, site: u8) -> Held<'_, TrunkInner> {
+        let mut held = take(&self.trunk, self.timed());
+        match site {
+            SITE_FORK => held.guard.work.trunk_fork_acq += 1,
+            SITE_REAP => held.guard.work.trunk_reap_acq += 1,
+            _ => {}
+        }
+        held.site = site;
+        held
+    }
+
     /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
     pub(crate) fn set_lock_timing(&self, on: bool) {
         self.lock_timing.store(on, Ordering::Relaxed);
@@ -922,7 +950,7 @@ impl BranchStore {
             self.k_children.insert(f, id);
             (id, f)
         } else {
-            let mut trunk = self.trunk();
+            let mut trunk = self.trunk_at(SITE_FORK);
             let id = self.next_branch_id();
             let f = trunk.lineage.epoch;
             trunk.lineage.epoch += 1;
@@ -1306,6 +1334,10 @@ impl BranchStore {
             stats.work.trunk_lock_contended = trunk.work.lock_contended;
             stats.work.trunk_lock_wait_ns = trunk.work.lock_wait_ns;
             stats.work.trunk_lock_hold_ns = trunk.work.lock_hold_ns;
+            stats.work.trunk_fork_acq = trunk.work.trunk_fork_acq;
+            stats.work.trunk_fork_hold_ns = trunk.work.trunk_fork_hold_ns;
+            stats.work.trunk_reap_acq = trunk.work.trunk_reap_acq;
+            stats.work.trunk_reap_hold_ns = trunk.work.trunk_reap_hold_ns;
         }
         for lock in self.shards.iter() {
             let shard = take(lock, self.timed());
@@ -1381,7 +1413,7 @@ impl BranchStore {
                     // Garbage passes run one at a time under the trunk lock, each with the neighbours the
                     // skiplist lists at that moment, so two reaps of adjacent children cannot both keep a version
                     // only they held (the second pass sees the first child gone).
-                    let mut trunk = self.trunk();
+                    let mut trunk = self.trunk_at(SITE_REAP);
                     let TrunkInner {
                         lineage,
                         domain,
@@ -1409,7 +1441,7 @@ impl BranchStore {
                 return (freed, true);
             }
             if st.parent.is_trunk() {
-                let mut trunk = self.trunk();
+                let mut trunk = self.trunk_at(SITE_REAP);
                 let TrunkInner {
                     lineage,
                     domain,

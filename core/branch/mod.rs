@@ -228,11 +228,18 @@ pub struct BranchWork {
     pub trunk_lock_contended: u64,
     pub trunk_lock_wait_ns: u64,
     pub trunk_lock_hold_ns: u64,
+    /// r11-coherence amendment 16: the trunk lock's acquisitions and, with lock timing on, its hold, split by the
+    /// two conc sites that take it: a trunk fork and the reap of a trunk child. The rest is `trunk_lock_*` minus
+    /// these.
+    pub trunk_fork_acq: u64,
+    pub trunk_fork_hold_ns: u64,
+    pub trunk_reap_acq: u64,
+    pub trunk_reap_hold_ns: u64,
 }
 
 impl BranchWork {
     /// Add every counter of `other` into this one.
-    pub(crate) fn add(&mut self, other: &BranchWork) {
+    pub fn add(&mut self, other: &BranchWork) {
         let BranchWork {
             resolve_calls,
             resolve_levels,
@@ -249,6 +256,10 @@ impl BranchWork {
             trunk_lock_contended,
             trunk_lock_wait_ns,
             trunk_lock_hold_ns,
+            trunk_fork_acq,
+            trunk_fork_hold_ns,
+            trunk_reap_acq,
+            trunk_reap_hold_ns,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -265,6 +276,10 @@ impl BranchWork {
         self.trunk_lock_contended += trunk_lock_contended;
         self.trunk_lock_wait_ns += trunk_lock_wait_ns;
         self.trunk_lock_hold_ns += trunk_lock_hold_ns;
+        self.trunk_fork_acq += trunk_fork_acq;
+        self.trunk_fork_hold_ns += trunk_fork_hold_ns;
+        self.trunk_reap_acq += trunk_reap_acq;
+        self.trunk_reap_hold_ns += trunk_reap_hold_ns;
     }
 }
 
