@@ -56,10 +56,80 @@ enum Shape {
     Refine,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Victim {
     Random,
     Oldest,
+    /// Earliest deadline first: every branch draws a lifetime from `Law` at birth (mean N_live
+    /// cycles), and each cycle reaps the live branch whose birth + lifetime is smallest, so the live
+    /// count stays fixed while the order of deaths follows the law (r11-ever amendment 13, after
+    /// r11-ever-refute's ever_heavy.py `edf:LAW`, whose samplers this copies).
+    Edf(Law),
+}
+
+/// A lifetime law with mean `n` cycles (r11-ever-refute w/ever_heavy.py `lifetime_sampler`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Law {
+    Exp,
+    /// Shape a, scale n (a - 1) / a.
+    Pareto(f64),
+    /// With probability p an exponential of mean k m, else of mean m; m = n / (p k + 1 - p).
+    Hyper(f64, f64),
+    /// Lognormal with shape s and mean n.
+    Lognorm(f64),
+}
+
+impl Law {
+    fn parse(spec: &str) -> Law {
+        let parts: Vec<&str> = spec.split(':').collect();
+        let num = |i: usize| -> f64 {
+            parts
+                .get(i)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| die(&format!("bad lifetime law {spec}")))
+        };
+        match parts[0] {
+            "exp" => Law::Exp,
+            "pareto" => Law::Pareto(num(1)),
+            "hyper" => Law::Hyper(num(1), num(2)),
+            "lognorm" => Law::Lognorm(num(1)),
+            o => die(&format!("unknown lifetime law {o}")),
+        }
+    }
+
+    fn sample(self, n: f64, rng: &mut Rng) -> f64 {
+        match self {
+            Law::Exp => -rng.unit().ln() * n,
+            Law::Pareto(a) => n * (a - 1.0) / a * rng.unit().powf(-1.0 / a),
+            Law::Hyper(p, k) => {
+                let m = n / (p * k + 1.0 - p);
+                let mean = if rng.unit() < p { k * m } else { m };
+                -rng.unit().ln() * mean
+            }
+            Law::Lognorm(sigma) => {
+                let mu = n.ln() - sigma * sigma / 2.0;
+                // Box-Muller.
+                let z = (-2.0 * rng.unit().ln()).sqrt()
+                    * (2.0 * std::f64::consts::PI * rng.unit()).cos();
+                (mu + sigma * z).exp()
+            }
+        }
+    }
+}
+
+/// A deadline ordered by `f64::total_cmp`, for the EDF heap.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Deadline(f64);
+impl Eq for Deadline {}
+impl PartialOrd for Deadline {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Deadline {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -114,9 +184,11 @@ fn parse_args() -> Args {
                 })
             }
             "--victim" => {
-                a.victim = match val().as_str() {
+                let v = val();
+                a.victim = match v.as_str() {
                     "random" => Victim::Random,
                     "oldest" => Victim::Oldest,
+                    o if o.starts_with("edf:") => Victim::Edf(Law::parse(&o[4..])),
                     o => die(&format!("unknown victim {o}")),
                 }
             }
@@ -193,6 +265,15 @@ impl Rng {
     }
     fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
+    }
+    /// Uniform in (0, 1].
+    fn unit(&mut self) -> f64 {
+        ((self.next() >> 11) as f64 + 1.0) / (1u64 << 53) as f64
+    }
+    /// A stream derived from `seed` for one purpose; xorshift needs a nonzero state.
+    fn stream(seed: u64, salt: u64) -> Rng {
+        let s = seed ^ salt;
+        Rng(if s == 0 { salt } else { s })
     }
 }
 
@@ -312,6 +393,8 @@ struct Live {
     generation: u64,
     parent_row: Option<(i64, String)>,
     trunk_writes_at_root: u64,
+    /// Birth cycle plus the drawn lifetime (EDF victims only; 0 otherwise).
+    deadline: f64,
 }
 
 impl Live {
@@ -548,7 +631,16 @@ fn main() {
         rss_bytes()
     );
 
-    let mut rng = Rng(args.seed);
+    // Three RNG streams (r11-ever amendment 13): the workload's parent and uniform-victim draws, the
+    // lifetime draws, and the periodic read's draws. So neither the read cadence nor the checkpoint
+    // list can move the fork and reap sequence, and a replicate differs only by --seed.
+    let mut rng = Rng::stream(args.seed, 0);
+    let mut lrng = Rng::stream(args.seed, 0xA076_1D64_78BD_642F);
+    let mut rrng = Rng::stream(args.seed, 0xE703_7ED1_A0B4_28DB);
+    // EDF bookkeeping: deadlines in a min-heap, and each live branch's index in `live` by tag.
+    let mut edf_heap: std::collections::BinaryHeap<std::cmp::Reverse<(Deadline, u64)>> =
+        std::collections::BinaryHeap::new();
+    let mut edf_pos: HashMap<u64, usize> = HashMap::new();
     let mut trunk_model = TrunkModel::default();
     let mut kept = KeptModel::default();
     let mut live: VecDeque<Live> = VecDeque::new();
@@ -634,6 +726,7 @@ fn main() {
             generation: 0,
             parent_row,
             trunk_writes_at_root: trunk_at,
+            deadline: 0.0,
         }
     };
 
@@ -647,6 +740,12 @@ fn main() {
             &mut trunk_model,
             &mut timer,
         );
+        let mut l = l;
+        if let Victim::Edf(law) = args.victim {
+            l.deadline = created as f64 + law.sample(args.live as f64, &mut lrng);
+            edf_heap.push(std::cmp::Reverse((Deadline(l.deadline), l.tag)));
+            edf_pos.insert(l.tag, live.len());
+        }
         created += 1;
         live.push_back(l);
         let (len, cap) = db.branch_table_shape();
@@ -691,7 +790,22 @@ fn main() {
                     live.swap_remove_back(k).unwrap()
                 }
                 Victim::Oldest => live.pop_front().unwrap(),
+                Victim::Edf(_) => {
+                    let std::cmp::Reverse((_, tag)) = edf_heap.pop().expect("a live branch");
+                    let k = edf_pos.remove(&tag).expect("indexed");
+                    let v = live.swap_remove_back(k).unwrap();
+                    if let Some(moved) = live.get(k) {
+                        edf_pos.insert(moved.tag, k);
+                    }
+                    v
+                }
             };
+            let mut new = new;
+            if let Victim::Edf(law) = args.victim {
+                new.deadline = (created - 1) as f64 + law.sample(args.live as f64, &mut lrng);
+                edf_heap.push(std::cmp::Reverse((Deadline(new.deadline), new.tag)));
+                edf_pos.insert(new.tag, live.len());
+            }
             live.push_back(new);
             let vid = victim.id;
             let reaped = timer.time(5, n_ever, || victim.branch.reap().unwrap());
@@ -704,8 +818,8 @@ fn main() {
                     if kept.nodes.contains_key(&vid) { "keeps" } else { "frees" }
                 ));
             }
-            if (created - prev_ckpt) % args.read_every == 0 {
-                let t = &live[rng.below(live.len())];
+            if created % args.read_every == 0 {
+                let t = &live[rrng.below(live.len())];
                 let conn = timer.time(6, n_ever, || t.branch.connect().unwrap());
                 let got_own = timer.time(7, n_ever, || read_v(&conn, t.own_row));
                 if got_own != t.own() {
@@ -721,7 +835,7 @@ fn main() {
                         ));
                     }
                 }
-                let inh = BRANCH_ROWS + 1 + rng.below((TRUNK_ROWS - BRANCH_ROWS) as usize) as i64;
+                let inh = BRANCH_ROWS + 1 + rrng.below((TRUNK_ROWS - BRANCH_ROWS) as usize) as i64;
                 let got = timer.time(9, n_ever, || read_v(&conn, inh));
                 if got != trunk_model.value_at(inh, t.trunk_writes_at_root) {
                     not_a_result(&format!(
@@ -782,7 +896,7 @@ fn main() {
              model_zombies={model_zombies} model_children={model_children} model_roots={roots} \
              predicted_arena_pages={} freed_states_total={freed_states_total} \
              reads_checked={reads_checked} rss_bytes={} harness_model_bytes={} \
-             harness_trunk_model_bytes={} db_bytes={} wal_bytes={} trunk_writes={}",
+             harness_trunk_model_bytes={} db_bytes={} wal_bytes={} trunk_writes={} oldest_live_age={}",
             live.len(),
             r.states,
             r.zombies,
@@ -827,6 +941,7 @@ fn main() {
             std::fs::metadata(&path).map_or(0, |m| m.len()),
             std::fs::metadata(&wal_path).map_or(0, |m| m.len()),
             trunk_model.writes,
+            ckpt as u64 + 1 - live.iter().map(|l| l.tag).min().unwrap_or(ckpt as u64 + 1),
         );
         table.min_cap_since_ckpt = usize::MAX;
         if live.len() != args.live {
