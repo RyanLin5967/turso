@@ -445,9 +445,14 @@ fn schema_share() -> bool {
 /// sequence backing table, no custom-types table and no `sqlite_stat1` were read, and it holds no
 /// virtual table other than the built-in table-valued functions, whose instances every connection of
 /// the database already shares through `clone_schema`. Each of these is a function of the rows, so
-/// an adopter with the same key would read none of them either.
+/// an adopter with the same key would read none of them either. It must also hold no materialized
+/// view (A2, r11-githost-attr-refute N2): `Schema::try_clone` copies an `incremental_views` entry's
+/// `Arc<Mutex<IncrementalView>>`, not the view, so copy-on-write separates only the outer `Schema`
+/// and two adopters would drive one DBSP circuit. (The fork path shares the trunk's Arc the same way;
+/// that is round11/r11-fatnode-lb C2 and is not changed here.)
 fn schema_shareable(schema: &crate::schema::Schema) -> bool {
-    schema.sequences.is_empty()
+    schema.incremental_views.is_empty()
+        && schema.sequences.is_empty()
         && schema.get_btree_table(crate::stats::STATS_TABLE).is_none()
         && !schema
             .tables
