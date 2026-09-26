@@ -247,6 +247,12 @@ struct StoreInner {
     parked_applied: u64,
     /// githost-shape lane instrument (observing only): see [`super::BranchCatShape`].
     shape: ShapeCounters,
+    /// F-W2 (githost-shape lane): every branch that reserved a slot (`first_write_branch`, the one
+    /// place a `pending` entry is made) since the last catalog checkpoint pruned this set; a superset
+    /// of the branches that hold a reserved slot now. The checkpoint collects reserved slots from
+    /// these alone instead of walking every resident state (a dirty list, as ARIES's dirty page
+    /// table is for pages).
+    pending_holders: HashSet<BranchId>,
 }
 
 /// githost-shape lane instrument (observing only): the cumulative fields of
@@ -1798,7 +1804,10 @@ impl BranchStore {
         }
         inner.refill_free()?;
         let StoreInner {
-            arena, branches, ..
+            arena,
+            branches,
+            pending_holders,
+            ..
         } = &mut *inner;
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
@@ -1810,6 +1819,8 @@ impl BranchStore {
         }
         if let std::collections::hash_map::Entry::Vacant(e) = st.pending.entry(page) {
             e.insert(arena.alloc());
+            // F-W2: this branch may hold a reserved slot at the next checkpoint.
+            pending_holders.insert(id);
         }
         Ok(())
     }
@@ -2352,6 +2363,7 @@ impl StoreInner {
             parked_records: 0,
             parked_applied: 0,
             shape: ShapeCounters::default(),
+            pending_holders: HashSet::new(),
         }
     }
 
@@ -2976,16 +2988,22 @@ impl StoreInner {
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
         let trunk_gone: Vec<(u32, u64)> = cat.trunk_gone.iter().copied().collect();
-        // githost-shape instrument (observing only): the walk below visits every resident state.
+        // githost-shape instrument (observing only): the walk below visits the pending holders.
         let (n_rows, n_trunk_new, n_trunk_gone) =
             (rows.len() as u64, trunk_new.len() as u64, trunk_gone.len() as u64);
-        self.shape.ckpt_states_walked += self.branches.len() as u64;
+        self.shape.ckpt_states_walked += self.pending_holders.len() as u64;
         // Slots reserved by open write transactions are named by no durable state: the catalog
         // lists them free (a crash frees them), and this process keeps them as taken.
+        // F-W2: only a branch that reserved a slot since the last prune can hold one, so the walk
+        // visits those alone; the ones holding none any more (committed, rolled back, closed,
+        // collected) leave the set here.
+        let branches = &self.branches;
+        self.pending_holders
+            .retain(|id| branches.get(id).is_some_and(|st| !st.pending.is_empty()));
         let reserved: Vec<Slot> = self
-            .branches
-            .values()
-            .flat_map(|st| st.pending.values().copied())
+            .pending_holders
+            .iter()
+            .flat_map(|id| branches[id].pending.values().copied())
             .collect();
         let meta = Meta {
             generation,
