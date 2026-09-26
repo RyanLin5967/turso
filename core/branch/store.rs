@@ -307,6 +307,9 @@ pub(super) struct MergeState {
     stamp_order: VecDeque<(u64, i64, i64)>,
     /// Tables the trunk wrote without naming the rows: root -> epoch.
     pub(super) table_stamps: HashMap<i64, u64>,
+    /// Times read tracking was turned off (see [`BranchStore::set_track_reads`]). A branch forked
+    /// while tracking was on, at this count, has had every read tracked if the count has not moved.
+    track_off: u64,
 }
 
 /// What one trunk write transaction wrote while the trunk had a live child, kept by the writing
@@ -318,6 +321,9 @@ pub(super) struct MergeState {
 pub(crate) struct TrunkPending {
     /// Pages first-written in the transaction.
     pub(crate) pages: HashSet<u32>,
+    /// Those of `pages` that were interior b-tree pages just before that first write: the version
+    /// every child forked before the transaction reads.
+    pub(crate) interior: HashSet<u32>,
     /// Rows written or deleted, as (table root, rowid).
     pub(crate) rows: HashSet<(i64, i64)>,
     /// Tables written without naming the rows.
@@ -689,6 +695,9 @@ struct BranchState {
     ddl: bool,
     /// Pages this branch read, while the store tracks reads.
     reads: HashSet<u32>,
+    /// The store's `track_off` at this branch's fork if tracking was on then: `reads` holds every
+    /// read if it still equals the count.
+    reads_from: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -972,7 +981,7 @@ impl BranchStore {
                 format.0, format.1
             )));
         }
-        let (id, f, commits_at_fork) = {
+        let (id, f, commits_at_fork, reads_from) = {
             let mut trunk = self.trunk();
             if let Some(seen) = seen {
                 if self.trunk_children.load(Ordering::Acquire) == 0 {
@@ -991,6 +1000,12 @@ impl BranchStore {
             // V0's count, read in the same hold as the registration: a commit decided before it is
             // in the child's snapshot, one decided after it is not.
             let commits_at_fork = trunk.merge.trunk_commits;
+            // Whether every read of this child will be tracked: the flag and the count read in the
+            // hold that `set_track_reads` changes them in.
+            let reads_from = self
+                .track_reads
+                .load(Ordering::SeqCst)
+                .then_some(trunk.merge.track_off);
             self.trunk_children.fetch_add(1, Ordering::AcqRel);
             let work = &mut trunk.work;
             work.trunk_forks += 1;
@@ -1002,7 +1017,7 @@ impl BranchStore {
             work.trunk_fork_read_txs += attempts.read_txs;
             work.trunk_fork_wal_locks += attempts.wal_locks;
             work.trunk_fork_gate_retries += attempts.gate_retries;
-            (id, f, commits_at_fork)
+            (id, f, commits_at_fork, reads_from)
         };
         #[cfg(test)]
         if let Some(hook) = self.after_fork_hold.lock().unwrap().as_ref() {
@@ -1011,6 +1026,7 @@ impl BranchStore {
         self.live.fetch_add(1, Ordering::AcqRel);
         let mut st = BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default());
         st.commits_at_fork = commits_at_fork;
+        st.reads_from = reads_from;
         self.shard(id).branches.insert(id, st);
         Ok(TrunkFork::Forked(id))
     }
@@ -1269,6 +1285,8 @@ impl BranchStore {
             }
             self.written.get_or_insert(page).store(epoch, Ordering::Release);
         }
+        // Pruned here, in the hold the commit already takes, not in a second one after it.
+        merge.prune(lineage.children.keys().next().copied());
         gate
     }
 
@@ -1505,32 +1523,42 @@ impl BranchStore {
     /// writes were normally handed to [`Self::begin_trunk_commit_with`] at the commit's decision,
     /// so `tx` is empty here; what is left (a commit that published without passing the decision)
     /// is stamped now, with an epoch at or above the decision's, which can only refuse more. A
-    /// rolled-back transaction stamps nothing.
+    /// rolled-back transaction stamps nothing. With nothing to stamp the trunk's lock is not taken:
+    /// the decision already pruned.
     pub(crate) fn trunk_tx_end(&self, committed: Option<TrunkPending>) {
+        let Some(tx) = committed else {
+            return;
+        };
+        if tx.pages.is_empty() && tx.rows.is_empty() && tx.tables.is_empty() {
+            return;
+        }
         let mut trunk = self.trunk();
         let oldest = trunk.lineage.children.keys().next().copied();
         let epoch = trunk.lineage.epoch;
         let TrunkInner { merge, work, .. } = &mut *trunk;
-        if let Some(tx) = committed {
-            for (root, rowid) in tx.rows {
-                merge.stamp_row(root, rowid, epoch);
-            }
-            for root in tx.tables {
-                merge.table_stamps.insert(root, epoch);
-            }
-            if !tx.pages.is_empty() {
-                let mut pages: Vec<u32> = tx.pages.into_iter().collect();
-                pages.sort_unstable();
-                merge.trunk_commits += 1;
-                work.trunk_commits += 1;
-                merge.log.push_back((epoch, pages));
-            }
+        for (root, rowid) in tx.rows {
+            merge.stamp_row(root, rowid, epoch);
+        }
+        for root in tx.tables {
+            merge.table_stamps.insert(root, epoch);
+        }
+        if !tx.pages.is_empty() {
+            let mut pages: Vec<u32> = tx.pages.into_iter().collect();
+            pages.sort_unstable();
+            merge.trunk_commits += 1;
+            work.trunk_commits += 1;
+            merge.log.push_back((epoch, pages));
         }
         merge.prune(oldest);
     }
 
     pub(crate) fn set_track_reads(&self, on: bool) {
-        self.track_reads.store(on, Ordering::Relaxed);
+        // Under the trunk's lock, where a fork reads the flag and the count together.
+        let mut trunk = self.trunk();
+        let was = self.track_reads.swap(on, Ordering::SeqCst);
+        if was && !on {
+            trunk.merge.track_off += 1;
+        }
     }
 
     pub(crate) fn tracks_reads(&self) -> bool {
@@ -1559,6 +1587,7 @@ impl BranchStore {
             scope: Option<&'static str>,
             at: u64,
             commits_at_fork: u64,
+            reads_from: Option<u64>,
             current: Vec<u32>,
             pages: Vec<(u32, Vec<u8>)>,
             rows: Vec<((i64, i64), u64)>,
@@ -1601,6 +1630,7 @@ impl BranchStore {
                 scope,
                 at: st.trunk_at,
                 commits_at_fork: st.commits_at_fork,
+                reads_from: st.reads_from,
                 current: st.current.keys().copied().collect(),
                 pages,
                 rows: st.rows.iter().map(|(&k, &s)| (k, s)).collect(),
@@ -1619,6 +1649,11 @@ impl BranchStore {
             merge,
         } = &mut *trunk;
         work.merge_attempts += 1;
+        // The last scope clause needs the trunk's count of tracking turned off.
+        let scope = b.scope.or_else(|| {
+            (physical && b.reads_from != Some(merge.track_off))
+                .then_some("the branch's reads were not all tracked, which the physical install needs")
+        });
         let at = b.at;
         let written = |page: u32| self.written(page);
         let (m2, m3, m4) = (
@@ -1691,7 +1726,13 @@ impl BranchStore {
             let mut unused = 0;
             for &q in &b.reads {
                 work.merge_structural_probes += 1;
-                if written(q) <= at && !batch.pages.contains(&q) {
+                if written(q) <= at {
+                    // Not committed since the fork. An earlier member of this batch may have
+                    // written it; the branch read the version before this transaction's first
+                    // write of it, whose kind the pager recorded.
+                    if batch.interior.contains(&q) {
+                        return true;
+                    }
                     continue;
                 }
                 let Some(slot) = lineage.retained_at(q, at, &mut unused) else {
@@ -1718,7 +1759,7 @@ impl BranchStore {
         }
         let rows: Vec<(i64, i64)> = ordered.into_iter().map(|(k, _)| k).collect();
         Ok(Prepared {
-            scope: b.scope,
+            scope,
             commits_since_fork,
             scalar,
             log,
@@ -1826,6 +1867,7 @@ impl BranchState {
             bulk: false,
             ddl: false,
             reads: HashSet::new(),
+            reads_from: None,
         }
     }
 }

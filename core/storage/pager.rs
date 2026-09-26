@@ -3196,7 +3196,8 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
-        // A transaction that rolled back left its captures here; this one starts from none.
+        // A transaction that rolled back left its captures and merge writes here; this one starts
+        // from none.
         self.trunk_pre_images.lock().clear();
         *self.trunk_pending.lock() = TrunkPending::default();
         // Must run after the upgrade (and any log restart it performed) so
@@ -3875,11 +3876,17 @@ impl Pager {
         }
         if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() {
-                self.trunk_pending.lock().pages.insert(page_no);
+                let before = page.get_contents().as_slice();
+                let mut pending = self.trunk_pending.lock();
+                pending.pages.insert(page_no);
+                if matches!(before[if page_no == 1 { 100 } else { 0 }], 0x02 | 0x05) {
+                    pending.interior.insert(page_no);
+                }
+                drop(pending);
                 self.trunk_pre_images
                     .lock()
                     .entry(page_no)
-                    .or_insert_with(|| page.get_contents().as_slice().into());
+                    .or_insert_with(|| before.into());
             }
         }
         Ok(())
@@ -3907,6 +3914,9 @@ impl Pager {
     /// miss them.
     pub(crate) fn note_rows_installed(&self, rows: &[(i64, i64)]) {
         if let Some(store) = self.branch_store.get() {
+            if !store.trunk_has_children() {
+                return;
+            }
             if crate::branch::store::mutant(30) {
                 store.trunk_rows_written(rows);
             } else {
