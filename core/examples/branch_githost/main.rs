@@ -47,10 +47,11 @@
 //!   - COLD vs WARM: an op on a branch created before this process opened the store and not touched by
 //!     it since is COLD, else WARM. pr_update, read_old and read_oldest print per-class OP lines
 //!     (`op=pr_update.cold` ...) beside the pooled ones, and one `OPREC` line per op.
-//!   - PAIRS: after the listings, 100 cold branches are updated twice in a row (`pair_update.cold`
-//!     then `.warm`, the same branch and the same code path), and 100 more read twice
-//!     (`pair_read.*`). The model follows, and the sidecar is then marked tainted, so no later process
-//!     can read these branches against a replayed schedule.
+//!   - PAIRS: after the reads and before the listings, 100 cold branches from the open-time update
+//!     window are updated twice in a row (`pair_update.cold` then `.warm`, the same branch and the
+//!     same code path), and 100 more read twice (`pair_read.*`). The model follows, and the sidecar
+//!     is then marked tainted, so no later process can read these branches against a replayed
+//!     schedule.
 //!   - Per-op counters: `BranchIoCounters` (arena pread / pwrite / fsync and record-flush time with
 //!     counts, resolution and catalog-load time, C-R's parked commits), Turso's process-wide page
 //!     reads (`page_io`), and getrusage split into minor / major faults, voluntary / involuntary
@@ -59,7 +60,11 @@
 //!     before reading or writing it (`ubc_*`); with `R11_CENSUS_OPS` set, the harness diffs the page
 //!     cache residency of the arena and catalog files across each pr_update, read and pair op
 //!     (`cen_*`, outside the timed window; -1 where not taken). `RESIDENT` lines give whole-file
-//!     residency at fixed points of the probe. Both cost system calls, so timed runs leave them unset.
+//!     residency at fixed points of the probe, also only with `R11_CENSUS_OPS`. Both cost system
+//!     calls and map files, so timed runs leave them unset and map nothing.
+//!   - M7 (A1): the store counts and times each schema reparse of a branch connection whose state
+//!     carries no schema. `R11_SCHEMA_SHARE` turns on arm F-S (a loaded branch adopts a schema
+//!     parsed in this process from byte-identical source rows instead of reparsing).
 //!   - `ubc-selftest --file DIR` fire-checks mincore on this OS: a sparse file's pages must read not
 //!     resident, pages it just read must read resident, and it reports whether an APFS clone starts
 //!     with its source's pages cached.
@@ -602,7 +607,15 @@ fn ubc_selftest(dir: &Path) {
     let nocache_after = read_resident(&n, &nocache_read);
 
     // (c), then the clone for (d) and the report.
-    let mut w = std::fs::File::create(&written).unwrap_or_else(|e| die(&format!("selftest written: {e}")));
+    // Read and write: `file_residency` maps with PROT_READ, which fails on a write-only descriptor
+    // (`File::create`), and that made (c) false on every run (r11-githost-attr-refute (c), A1).
+    let mut w = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&written)
+        .unwrap_or_else(|e| die(&format!("selftest written: {e}")));
     fill(&mut w);
     let written_resident = count(&w);
     let (src, dst) = (
@@ -811,8 +824,9 @@ fn snap(db: &Arc<Database>) -> Snap {
 /// `BranchIoCounters` deltas (`_ns` timers are load-dependent, their paired counts are not), Turso's
 /// process-wide page reads from database files and WAL frames (`pio_*`: the trunk's and the
 /// catalog's), and the census diffs (`cen_*`: pages that turned resident, left, or were appended
-/// resident, across the op; -1 where no census was taken).
-const NC: usize = 57;
+/// resident, across the op; -1 where no census was taken), then M7's schema reparses and F-S's
+/// source-key reads and adoptions (A1), each `_ns` paired with its count.
+const NC: usize = 62;
 const COUNTERS: [&str; NC] = [
     "resolve_calls",
     "arena_reads",
@@ -871,6 +885,11 @@ const COUNTERS: [&str; NC] = [
     "cen_cat_new",
     "cen_cat_gone",
     "cen_catwal_new",
+    "schema_reparses",
+    "schema_reparse_ns",
+    "schema_keys",
+    "schema_key_ns",
+    "schema_adoptions",
 ];
 
 /// `cen`: the census and its maps before and after the op, when one was taken.
@@ -943,12 +962,18 @@ fn delta(a: &Snap, b: &Snap, cen: Option<(&Census, &CensusMaps, &CensusMaps)>) -
         cat_new,
         cat_gone,
         if catwal_new < 0 { catwal_new } else { catwal_new + catwal_grown },
+        d(i.schema_reparses, j.schema_reparses),
+        d(i.schema_reparse_ns, j.schema_reparse_ns),
+        d(i.schema_keys, j.schema_keys),
+        d(i.schema_key_ns, j.schema_key_ns),
+        d(i.schema_adoptions, j.schema_adoptions),
     ]
 }
 
 /// The fields an `OPREC` line carries, by name from `COUNTERS`: what separates the registered
 /// mechanisms (PREREG section 3), one line per op, so any split can be made after the run.
-const OPREC_FIELDS: [&str; 30] = [
+const OPREC_FIELDS: [&str; 38] = [
+    "resolve_calls",
     "arena_reads",
     "cat_branch_loads",
     "cat_queries",
@@ -979,6 +1004,13 @@ const OPREC_FIELDS: [&str; 30] = [
     "cen_arena_new",
     "cen_arena_gone",
     "cen_cat_new",
+    "cat_loading_ensures",
+    "ubc_write_hits",
+    "schema_reparses",
+    "schema_reparse_ns",
+    "schema_keys",
+    "schema_key_ns",
+    "schema_adoptions",
 ];
 
 /// One `OPREC` line: the op, its sequence number in the probe, the branch, the branch's age in steps
@@ -1399,9 +1431,17 @@ fn probe(args: &Args) {
     let connect_us = t.elapsed().as_secs_f64() * 1e6;
     let rss1 = rss_bytes();
     // r11-githost-attr: whole-file page-cache residency at fixed points (system calls only; the
-    // files' data is never read by the census).
-    let whole = Census::open(&args.db);
-    println!("{}", whole.line(args.n, &args.label, "after_open"));
+    // files' data is never read by the census). Only with R11_CENSUS_OPS set (A1): a timed run maps
+    // nothing, as the banked harness did, because whether mapping and unmapping a file changes later
+    // write or fsync timing on APFS is unmeasured.
+    let census_on = std::env::var_os("R11_CENSUS_OPS").is_some();
+    let whole = census_on.then(|| Census::open(&args.db));
+    let resident = |n: u64, label: &str, at: &str| {
+        if let Some(whole) = &whole {
+            println!("{}", whole.line(n, label, at));
+        }
+    };
+    resident(args.n, &args.label, "after_open");
     let mut model = Model::replay(steps0);
     if model.live != args.n {
         not_a_result(&format!("probe --n {} but the model has {} live", args.n, model.live));
@@ -1425,7 +1465,7 @@ fn probe(args: &Args) {
         sh1.trunk_rows - sh0.trunk_rows,
         sh1.resident_states
     );
-    println!("{}", whole.line(args.n, &args.label, "after_settle"));
+    resident(args.n, &args.label, "after_settle");
     check_invariants(&db, &model, "after open");
     let os = db.branch_open_stats();
     let page_count = int(&trunk, "PRAGMA page_count") as u32;
@@ -1450,7 +1490,7 @@ fn probe(args: &Args) {
         pr_update_cold: Series::default(),
         pr_update_warm: Series::default(),
         touched: Touched::new(steps0),
-        census: std::env::var_os("R11_CENSUS_OPS").map(|_| Census::open(&args.db)),
+        census: census_on.then(|| Census::open(&args.db)),
     };
     for _ in 0..k_s {
         step(&db, &trunk, &mut model, Some(&mut ops));
@@ -1473,7 +1513,7 @@ fn probe(args: &Args) {
     reap.print("reap", n, label);
     pr_update_cold.print("pr_update.cold", n, label);
     pr_update_warm.print("pr_update.warm", n, label);
-    println!("{}", whole.line(n, label, "after_steady"));
+    resident(n, label, "after_steady");
 
     let live = model.live_ids();
     let timed = |series: &mut Series, f: &mut dyn FnMut() -> Vec<(String, i64)>| {
@@ -1506,40 +1546,28 @@ fn probe(args: &Args) {
     pooled.print("read_oldest", n, label);
     cold.print("read_oldest.cold", n, label);
     warm.print("read_oldest.warm", n, label);
-    println!("{}", whole.line(n, label, "after_reads"));
+    resident(n, label, "after_reads");
 
-    // List, checked against the model's live set.
-    let (want_sum, want_xor) = live.iter().fold((0u64, 0u64), |(a, x), &id| (a.wrapping_add(id), x ^ mix(id)));
-    let mut s = Series::default();
-    for _ in 0..5 {
-        timed(&mut s, &mut || {
-            let ids = db.branch_ids().unwrap();
-            let (sum, xor) = ids.iter().fold((0u64, 0u64), |(a, x), id| (a.wrapping_add(id.0), x ^ mix(id.0)));
-            if ids.len() != live.len() || sum != want_sum || xor != want_xor {
-                not_a_result(&format!("list: {} ids, model {}", ids.len(), live.len()));
-            }
-            vec![("out".to_string(), ids.len() as i64)]
-        });
-    }
-    s.print("list", n, label);
-
-    // PAIRS (r11-githost-attr PREREG section 3): 2 x PAIRS distinct cold branches, drawn from the live
-    // set by a fixed sequence. The first PAIRS are updated twice in a row, the rest read twice in a
-    // row: the second op of a pair is warm by construction, on the same branch through the same path,
-    // so its difference from the first is the cold cost at this N with nothing else changed.
-    let mut chosen: Vec<u64> = Vec::with_capacity(2 * PAIRS);
-    let mut seen = std::collections::HashSet::new();
-    let mut i = 0u64;
-    while chosen.len() < 2 * PAIRS && i < 10_000_000 {
-        let id = live[(mix(i ^ 0x71) % live.len() as u64) as usize];
-        if touched.is_cold(id) && seen.insert(id) {
-            chosen.push(id);
-        }
-        i += 1;
-    }
+    // PAIRS (r11-githost-attr PREREG section 3, as amended by A1): 2 x PAIRS distinct cold
+    // branches from the update window as it stood at the open (ids steps0 + 1 - W0 ..= steps0, W0 =
+    // ceil(0.0237 (steps0 + 1))): the pre-open part of every window the steady phase's pr_updates
+    // drew from. Order: by mix(id ^ 0x71), a fixed permutation. The first PAIRS are updated twice in
+    // a row, the rest read twice in a row: the second op of a pair is warm by construction, on the
+    // same branch through the same path. They run BEFORE `list`, whose first call (F-W1) reads the
+    // catalog. Known asymmetry (A1, d3): the warm update pops the slot the cold one just freed (LIFO
+    // free list), so its write lands in place; the judge's R5 compares the read side only.
+    let w0 = ((OPEN_WINDOW * (steps0 + 1) as f64).ceil() as u64).max(1);
+    let mut chosen: Vec<u64> = ((steps0 + 1).saturating_sub(w0)..=steps0)
+        .filter(|&id| id >= 1 && !model.dead[id as usize] && touched.is_cold(id))
+        .collect();
+    chosen.sort_by_key(|&id| (mix(id ^ 0x71), id));
     if chosen.len() < 2 * PAIRS {
-        not_a_result(&format!("pairs: only {} untouched branches from before the open", chosen.len()));
+        not_a_result(&format!(
+            "pairs: only {} untouched branches in the open-time update window of {w0}",
+            chosen.len()
+        ));
     }
+    chosen.truncate(2 * PAIRS);
     let (mut uc, mut uw) = (Series::default(), Series::default());
     for (seq, &id) in chosen[..PAIRS].iter().enumerate() {
         for warm in [false, true] {
@@ -1577,7 +1605,24 @@ fn probe(args: &Args) {
     }
     rc.print("pair_read.cold", n, label);
     rw.print("pair_read.warm", n, label);
-    println!("{}", whole.line(n, label, "after_pairs"));
+    resident(n, label, "after_pairs");
+
+    // List, checked against the model's live set.
+    let (want_sum, want_xor) = live.iter().fold((0u64, 0u64), |(a, x), &id| (a.wrapping_add(id), x ^ mix(id)));
+    let mut s = Series::default();
+    for _ in 0..5 {
+        timed(&mut s, &mut || {
+            let ids = db.branch_ids().unwrap();
+            let (sum, xor) = ids.iter().fold((0u64, 0u64), |(a, x), id| (a.wrapping_add(id.0), x ^ mix(id.0)));
+            if ids.len() != live.len() || sum != want_sum || xor != want_xor {
+                not_a_result(&format!("list: {} ids, model {}", ids.len(), live.len()));
+            }
+            vec![("out".to_string(), ids.len() as i64)]
+        });
+    }
+    s.print("list", n, label);
+
+    resident(n, label, "after_list");
 
     // (No DIFF in the catalog arm: its tree has no diff instrument; diff is measured on the port.)
 
@@ -1605,7 +1650,9 @@ fn probe(args: &Args) {
         shape_line(&sh).replace(' ', "\t")
     );
     // Reopened: a compaction may have replaced the log and snapshot files under the old handles.
-    println!("{}", Census::open(&args.db).line(n, label, "before_close"));
+    if census_on {
+        println!("{}", Census::open(&args.db).line(n, label, "before_close"));
+    }
     // The pair ops rewrote branches outside the schedule: no later process may replay against them.
     write_tainted_steps(&args.db, model.steps);
     let t = Instant::now();
@@ -1632,14 +1679,15 @@ fn main() {
     // r11-githost-attr: the mode and the two page-cache instruments, recorded with every run.
     let set = |k: &str| if std::env::var_os(k).is_some() { "set" } else { "unset" };
     println!(
-        "# r11-githost-attr: durability={} R11_UBC_PROBE={} R11_CENSUS_OPS={}",
+        "# r11-githost-attr: durability={} R11_UBC_PROBE={} R11_CENSUS_OPS={} R11_SCHEMA_SHARE={}",
         match (args.cmd.as_str(), args.eager) {
             ("ubc-selftest", _) => "n/a",
             (_, true) => "eager",
             (_, false) => "catalog",
         },
         set("R11_UBC_PROBE"),
-        set("R11_CENSUS_OPS")
+        set("R11_CENSUS_OPS"),
+        set("R11_SCHEMA_SHARE")
     );
     match args.cmd.as_str() {
         "grow" => grow(&args),
