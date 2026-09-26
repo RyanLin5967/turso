@@ -14,11 +14,14 @@
 //! its buddy (up to four at a time, so `m` tracks the entry count down as fast as it drops).
 //!
 //! Buckets are chains of boxed entries, each carrying its hash, so a split or merge relinks nodes
-//! and never re-hashes or reallocates an entry. They live in segments of doubling size (1, 1, 2,
-//! 4, …; the shape of Brodnik et al.'s resizable arrays, WADS 1999): allocating one is a zeroed
-//! allocation, which the allocator backs lazily, and an empty chain is a null pointer, so a new
-//! segment is ready without touching its buckets. The segment list itself holds at most 65
-//! pointers. So nothing ever relocates more than one bucket, plus at most 64 segment pointers.
+//! and never re-hashes or reallocates an entry. They live in segments: doubling ones (1, 1, 2, 4,
+//! … buckets) up to 8,192 buckets, so that a small map stays small, and past that FIXED segments of
+//! 8,192 buckets (64 KB) behind a two-level directory (Larson, "Dynamic hash tables", CACM 1988).
+//! A segment is a zeroed allocation, which the allocator backs lazily, and an empty chain is a
+//! null pointer, so a new segment is ready without touching its buckets. So no insert or remove
+//! relinks more than a bucket's entries or allocates or frees more than 64 KB of table. (Doubling
+//! segments all the way up freed a 4 MB segment in the one remove that emptied it: measured at
+//! 8 ms under the store mutex, PREREG amendment 6.)
 //!
 //! The hash is std's `RandomState` (keyed SipHash), so a caller who chooses the keys — page numbers
 //! come from the database — cannot aim collisions at one chain.
@@ -36,9 +39,24 @@ struct Node<K, V> {
 
 type Chain<K, V> = Option<Box<Node<K, V>>>;
 
+/// Buckets below this live in doubling segments; from it on, in fixed segments of this many.
+const FIXED: usize = 1 << 13;
+/// Fixed segments per second-level directory box.
+const DIR: usize = 1024;
+
+/// Where bucket `b` lives.
+enum Loc {
+    /// `segments[k][offset]`.
+    Small(usize, usize),
+    /// `big[top][inner]`, at `offset`.
+    Big(usize, usize, usize),
+}
+
 pub(crate) struct LinearMap<K, V> {
-    /// Segment 0 holds bucket 0; segment `k >= 1` holds buckets `[2^(k-1), 2^k)`.
+    /// Segment 0 holds bucket 0; segment `k` in `1..=13` holds buckets `[2^(k-1), 2^k)`.
     segments: Vec<Box<[Chain<K, V>]>>,
+    /// Fixed segment `j` holds buckets `[8192·(j+1), 8192·(j+2))`, at `big[j / 1024][j % 1024]`.
+    big: Vec<Box<[Option<Box<[Chain<K, V>]>>]>>,
     level: u32,
     split: usize,
     len: usize,
@@ -51,6 +69,7 @@ impl<K, V> Default for LinearMap<K, V> {
     fn default() -> Self {
         Self {
             segments: Vec::new(),
+            big: Vec::new(),
             level: 0,
             split: 0,
             len: 0,
@@ -84,13 +103,16 @@ fn free_empty_segment<K, V>(seg: Box<[Chain<K, V>]>) {
     unsafe { dealloc(Box::into_raw(seg) as *mut u8, layout) }
 }
 
-/// Segment and offset of bucket `b`.
-fn locate(b: usize) -> (usize, usize) {
+/// Where bucket `b` lives.
+fn locate(b: usize) -> Loc {
     if b == 0 {
-        (0, 0)
-    } else {
+        Loc::Small(0, 0)
+    } else if b < FIXED {
         let k = (usize::BITS - b.leading_zeros()) as usize;
-        (k, b - (1 << (k - 1)))
+        Loc::Small(k, b - (1 << (k - 1)))
+    } else {
+        let j = b / FIXED - 1;
+        Loc::Big(j / DIR, j % DIR, b % FIXED)
     }
 }
 
@@ -127,13 +149,17 @@ impl<K: Hash + Eq, V> LinearMap<K, V> {
     }
 
     fn bucket(&self, b: usize) -> &Chain<K, V> {
-        let (s, o) = locate(b);
-        &self.segments[s][o]
+        match locate(b) {
+            Loc::Small(k, o) => &self.segments[k][o],
+            Loc::Big(t, i, o) => &self.big[t][i].as_ref().expect("an allocated segment")[o],
+        }
     }
 
     fn bucket_mut(&mut self, b: usize) -> &mut Chain<K, V> {
-        let (s, o) = locate(b);
-        &mut self.segments[s][o]
+        match locate(b) {
+            Loc::Small(k, o) => &mut self.segments[k][o],
+            Loc::Big(t, i, o) => &mut self.big[t][i].as_mut().expect("an allocated segment")[o],
+        }
     }
 
     fn hash(&self, k: &K) -> u64 {
@@ -241,11 +267,23 @@ impl<K: Hash + Eq, V> LinearMap<K, V> {
     /// bit is set. Returns the entries relinked.
     fn grow(&mut self) -> u64 {
         let new = self.buckets();
-        let (s, _) = locate(new);
-        if s == self.segments.len() {
-            let size = if s == 0 { 1 } else { 1usize << (s - 1) };
-            self.segments.push(zeroed_segment(size));
-            self.seg_bytes[0] += (size * std::mem::size_of::<Chain<K, V>>()) as u64;
+        match locate(new) {
+            Loc::Small(k, _) if k == self.segments.len() => {
+                let size = if k == 0 { 1 } else { 1usize << (k - 1) };
+                self.segments.push(zeroed_segment(size));
+                self.seg_bytes[0] += (size * std::mem::size_of::<Chain<K, V>>()) as u64;
+            }
+            Loc::Big(t, i, 0) => {
+                if t == self.big.len() {
+                    // At most 512 boxes of 1,024 pointers each cover every bucket a u32 hash can
+                    // address, so this vector's own growth is bounded.
+                    self.big
+                        .push(std::iter::repeat_with(|| None).take(DIR).collect());
+                }
+                self.big[t][i] = Some(zeroed_segment(FIXED));
+                self.seg_bytes[0] += (FIXED * std::mem::size_of::<Chain<K, V>>()) as u64;
+            }
+            _ => {}
         }
         let bit = 1u64 << self.level;
         let mut chain = self.bucket_mut(self.split).take();
@@ -290,12 +328,22 @@ impl<K: Hash + Eq, V> LinearMap<K, V> {
             n.next = head.take();
             *head = Some(n);
         }
-        let (s, o) = locate(last);
-        if o == 0 && s > 0 {
-            // Bucket `last` opened segment `s`; with it gone, the segment is empty.
-            let seg = self.segments.pop().expect("segment s exists");
-            self.seg_bytes[1] += (seg.len() * std::mem::size_of::<Chain<K, V>>()) as u64;
-            free_empty_segment(seg);
+        // Bucket `last` opened its segment if it sits at offset 0; with it gone, the segment is empty.
+        match locate(last) {
+            Loc::Small(k, 0) if k > 0 => {
+                let seg = self.segments.pop().expect("segment k exists");
+                self.seg_bytes[1] += (seg.len() * std::mem::size_of::<Chain<K, V>>()) as u64;
+                free_empty_segment(seg);
+            }
+            Loc::Big(t, i, 0) => {
+                let seg = self.big[t][i].take().expect("an allocated segment");
+                self.seg_bytes[1] += (seg.len() * std::mem::size_of::<Chain<K, V>>()) as u64;
+                free_empty_segment(seg);
+                if i == 0 {
+                    self.big.pop();
+                }
+            }
+            _ => {}
         }
         relinked
     }
@@ -321,7 +369,8 @@ impl<K, V> Drop for LinearMap<K, V> {
     fn drop(&mut self) {
         // Unlink chains iteratively: a recursive `Box` drop down a chain is bounded by the chain's
         // length, which the hash keeps short, but nothing here needs to rely on that.
-        for seg in &mut self.segments {
+        let big = self.big.iter_mut().flat_map(|t| t.iter_mut().flatten());
+        for seg in self.segments.iter_mut().chain(big) {
             for head in seg.iter_mut() {
                 let mut chain = head.take();
                 while let Some(mut n) = chain {
@@ -356,9 +405,11 @@ mod tests {
         let mut map: LinearMap<u32, u64> = LinearMap::default();
         let mut model: HashMap<u32, u64> = HashMap::new();
         let mut max_moved = 0;
+        let mut max_seg_bytes = 0;
         for step in 0..200_000u64 {
             let growing = step < 100_000;
             let k = rng.below(40_000) as u32;
+            let seg_before = map.segment_bytes();
             let mut moved = 0;
             if rng.below(3) != 0 && growing || rng.below(5) == 0 && !growing {
                 assert_eq!(map.insert(k, step, &mut moved), model.insert(k, step));
@@ -366,6 +417,10 @@ mod tests {
                 assert_eq!(map.remove(&k, &mut moved), model.remove(&k));
             }
             max_moved = max_moved.max(moved);
+            let seg_after = map.segment_bytes();
+            max_seg_bytes = max_seg_bytes
+                .max(seg_after[0] - seg_before[0])
+                .max(seg_after[1] - seg_before[1]);
             assert_eq!(map.len(), model.len());
             if map.len() > 0 {
                 assert!(map.buckets() >= map.len(), "step {step}: fewer buckets than entries");
@@ -389,5 +444,14 @@ mod tests {
         }
         assert!(map.is_empty());
         assert!(max_moved <= 64, "one call relinked {max_moved} entries");
+        let segment = (FIXED * std::mem::size_of::<Chain<u32, u64>>()) as u64;
+        assert!(
+            max_seg_bytes <= segment,
+            "one call allocated or freed {max_seg_bytes} bytes of table"
+        );
+        assert!(
+            map.segment_bytes()[0] > 2 * segment,
+            "the map never grew past its fixed-segment boundary, so the test says nothing about it"
+        );
     }
 }
