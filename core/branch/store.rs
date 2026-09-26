@@ -734,12 +734,13 @@ fn gone(id: BranchId) -> LimboError {
 
 impl BranchStore {
     pub(crate) fn new() -> Self {
+        let n_shards = if crate::coherence::fix(crate::coherence::FIX_STRIPES) {
+            SHARDS_FINE
+        } else {
+            SHARDS
+        };
         Self {
-            shards: (0..if crate::coherence::fix(crate::coherence::FIX_STRIPES) {
-                SHARDS_FINE
-            } else {
-                SHARDS
-            })
+            shards: (0..n_shards)
                 .map(|i| {
                     CachePadded::new(Mutex::new(Shard {
                         branches: HashMap::new(),

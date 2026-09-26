@@ -84,7 +84,7 @@ unsafe impl<T: ?Sized> Sync for DbRef<T> where Arc<T>: Sync {}
 impl<T: ?Sized> DbRef<T> {
     /// A handle on the object `field` names in `anchor`.
     pub(crate) fn anchored(anchor: &Arc<Anchor>, field: impl FnOnce(&Anchor) -> &Arc<T>) -> Self {
-        let ptr = NonNull::from(field(anchor));
+        let ptr = NonNull::from(field(&**anchor));
         DbRef::Anchored(ptr, anchor.clone())
     }
 
