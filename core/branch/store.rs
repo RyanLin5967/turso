@@ -76,8 +76,9 @@
 //! "Trunk commits and forks" below), so a commit after the fork at `trunk_at` stamps its pages with
 //! a later epoch before it publishes them, and no trunk write can change the version the key names —
 //! the buffer tag with its LSN, where the LSN is the commit's epoch. The one gap is a trunk with no
-//! live child: it writes without telling the store (see [`BranchStore::begin_trunk_commit`]), so
-//! `written` can name an epoch whose page has since changed.
+//! live child: it writes without telling the store (see
+//! [`BranchStore::begin_trunk_commit_with`]), so `written` can name an epoch whose page has since
+//! changed.
 //! The trunk's last child going therefore bumps the cache's generation, and a version cached under
 //! an older generation is never served. The cache is filled by the pager after it reads a page for
 //! a branch ([`BranchStore::fill_trunk_page`]), under the key [`BranchStore::resolve_into`] gave.
@@ -93,11 +94,11 @@
 //!
 //! * **The writer** only CAPTURES, at a page's first write in the transaction, the page as it was
 //!   (the pager's write set), and only while the trunk has a live child. After the frames are
-//!   written and synced and before they are published, [`BranchStore::begin_trunk_commit`] takes
-//!   every decision in one section under the trunk's lock — retain `[born, epoch)` if a live child
-//!   forked in it, stamp `written` with `epoch` — and opens the COMMIT GATE (`trunk_commits` odd);
-//!   dropping the [`TrunkCommitGate`] after the publication closes it. A rolled-back transaction
-//!   leaves nothing in the store.
+//!   written and synced and before they are published,
+//!   [`BranchStore::begin_trunk_commit_with`] takes every decision in one section under the
+//!   trunk's lock — retain `[born, epoch)` if a live child forked in it, stamp `written` with
+//!   `epoch` — and opens the COMMIT GATE (`trunk_commits` odd); dropping the [`TrunkCommitGate`]
+//!   after the publication closes it. A rolled-back transaction leaves nothing in the store.
 //! * **A fork** reads `trunk_commits` (waiting out an open gate), begins a WAL read transaction, and
 //!   registers under the trunk's lock only if `trunk_commits` has not moved since: no commit has
 //!   taken its decisions since the fork's snapshot, so every commit decided before the registration
@@ -194,8 +195,8 @@ pub(crate) struct BranchStore {
     /// The trunk's lineage and the arena of its retained versions, behind their own lock.
     trunk: CachePadded<Mutex<TrunkInner>>,
     /// The trunk epoch of its last commit of each page, readable without a lock (see [`Radix`]).
-    /// Written only under `trunk`'s lock, by [`BranchStore::begin_trunk_commit`]. Absent reads as 0:
-    /// "before the first fork that was live at the time", the conservative answer.
+    /// Written only under `trunk`'s lock, by [`BranchStore::begin_trunk_commit_with`]. Absent reads
+    /// as 0: "before the first fork that was live at the time", the conservative answer.
     written: Radix<AtomicU64>,
     next_id: AtomicU64,
     /// The trunk's page size and reserved bytes per page, recorded at the first fork. Every arena
@@ -361,7 +362,7 @@ impl MergeState {
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-13 and 15-30; 14 is not built, since no SQL path
+/// scope gate and the install's isolation, 11-13 and 15-31; 14 is not built, since no SQL path
 /// without DDL clears a user table's b-tree), so each test can be shown to fail for it
 /// (frontier/round11/r11-merge PREREG A6, A13, A14, A15). Always false otherwise.
 #[cfg(test)]
@@ -1221,9 +1222,10 @@ impl BranchStore {
         self.begin_trunk_commit_with(pages, TrunkPending::default())
     }
 
-    /// [`Self::begin_trunk_commit`], also taking the merge record's decisions for the commit in the
-    /// same hold, at the same epoch: `tx`'s rows and tables are stamped with it, and a commit that
-    /// wrote a page while the trunk had a child is one trunk commit (V0) and one log entry (V1).
+    /// The copy decisions of `begin_trunk_commit` (above), also taking the merge record's decisions
+    /// for the commit in the same hold, at the same epoch: `tx`'s rows and tables are stamped with
+    /// it, and a commit that wrote a page while the trunk had a child is one trunk commit (V0) and
+    /// one log entry (V1).
     /// A child forked before this hold has `trunk_at` below the epoch, so it is refused on these
     /// rows, and its pages are retained for it here too; a child forked after it sees the commit.
     pub(crate) fn begin_trunk_commit_with<'a, 'p>(
@@ -1651,8 +1653,9 @@ impl BranchStore {
         work.merge_attempts += 1;
         // The last scope clause needs the trunk's count of tracking turned off.
         let scope = b.scope.or_else(|| {
-            (physical && b.reads_from != Some(merge.track_off))
-                .then_some("the branch's reads were not all tracked, which the physical install needs")
+            (physical && b.reads_from != Some(merge.track_off)).then_some(
+                "the branch's reads were not all tracked, which the physical install needs",
+            )
         });
         let at = b.at;
         let written = |page: u32| self.written(page);
@@ -1730,7 +1733,7 @@ impl BranchStore {
                     // Not committed since the fork. An earlier member of this batch may have
                     // written it; the branch read the version before this transaction's first
                     // write of it, whose kind the pager recorded.
-                    if batch.interior.contains(&q) {
+                    if batch.interior.contains(&q) && !mutant(31) {
                         return true;
                     }
                     continue;

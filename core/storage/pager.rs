@@ -1531,7 +1531,7 @@ pub struct Pager {
     /// On a TRUNK pager, the write set's pre-images: each page as it was before this write
     /// transaction first touched it, captured while the trunk had a live child. The branch store
     /// takes the transaction's copy decisions from them at its commit (see
-    /// [`BranchStore::begin_trunk_commit`]).
+    /// [`BranchStore::begin_trunk_commit_with`]).
     trunk_pre_images: Mutex<HashMap<u32, Box<[u8]>>>,
 }
 
