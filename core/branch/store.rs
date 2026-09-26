@@ -292,6 +292,20 @@ struct ShapeCounters {
     table_moved: u64,
     evictions: u64,
     evicted_states: u64,
+    /// r11-githost-attr instruments (observing only), each timer paired with its count: the
+    /// resolution of `resolve_into` (the arena read after it is timed by the arena; C-P's trunk
+    /// probes, counted by `trunk_probes`, and any `ensure` load, also in `cat_load_ns`, are inside);
+    /// every record flush (`log`, `log_all`, the trunk commit's barrier; not the barrier's
+    /// stamp-only flush, which runs only while a lease is outstanding), buffering included (the
+    /// arena fsync inside a flush is also in the arena's sync timer);
+    /// and `ensure` calls that loaded at least one state from the catalog, with the time they took
+    /// (the catalog queries, `insert_loaded` and C-R's parked commits).
+    resolve_ns: u64,
+    resolve_timed: u64,
+    flush_ns: u64,
+    flushes: u64,
+    cat_load_ns: u64,
+    cat_loading_ensures: u64,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -1289,16 +1303,21 @@ impl BranchStore {
             arena,
             failpoint,
             lease,
+            shape,
             ..
         } = inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
         injected_flush_failure(failpoint, journal)?;
+        let started = Instant::now();
         for record in &records {
             journal.buffer(record)?;
         }
         journal.flush(arena)?;
+        // r11-githost-attr instrument (observing only).
+        shape.flush_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        shape.flushes += 1;
         lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         Ok(())
@@ -1461,14 +1480,19 @@ impl BranchStore {
             arena,
             failpoint,
             lease,
+            shape,
             ..
         } = inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
             return Ok(());
         };
         injected_flush_failure(failpoint, journal)?;
+        let started = Instant::now();
         journal.buffer(&record)?;
         journal.flush(arena)?;
+        // r11-githost-attr instrument (observing only).
+        shape.flush_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        shape.flushes += 1;
         lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         Ok(())
@@ -1923,6 +1947,7 @@ impl BranchStore {
             orphans,
             lease,
             leases,
+            shape,
             ..
         } = &mut *inner;
         let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
@@ -1973,7 +1998,11 @@ impl BranchStore {
                 lease.queued(now);
             }
         }
+        let started = Instant::now();
         journal.flush(arena)?;
+        // r11-githost-attr instrument (observing only).
+        shape.flush_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        shape.flushes += 1;
         lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         self.maybe_compact(&mut inner);
@@ -2072,7 +2101,11 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         self.resolve_calls.fetch_add(1, Ordering::Relaxed);
         let (mut levels, mut examined) = (0, 0);
+        let started = Instant::now();
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
+        // r11-githost-attr instrument (observing only).
+        inner.shape.resolve_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        inner.shape.resolve_timed += 1;
         inner.work.resolve_calls += 1;
         inner.work.resolve_levels += levels;
         inner.work.resolve_retained_examined += examined;
@@ -2195,6 +2228,41 @@ impl BranchStore {
             self.resolve_calls.load(Ordering::Relaxed),
             self.arena_reads.load(Ordering::Relaxed),
         )
+    }
+
+    /// r11-githost-attr instrument (observing only): see [`super::BranchIoCounters`]. Reads memory
+    /// only; runs no catalog query and no I/O.
+    pub(crate) fn io_counters(&self) -> super::BranchIoCounters {
+        let inner = self.inner.lock();
+        let s = &inner.shape;
+        let mut c = super::BranchIoCounters {
+            resolve_ns: s.resolve_ns,
+            resolve_timed: s.resolve_timed,
+            flush_ns: s.flush_ns,
+            flushes: s.flushes,
+            cat_load_ns: s.cat_load_ns,
+            cat_loading_ensures: s.cat_loading_ensures,
+            parked_applied: inner.parked_applied,
+            ..Default::default()
+        };
+        if let Some(arena) = inner.arena.as_ref() {
+            let io = &arena.io;
+            let get = super::arena::ArenaIo::get;
+            c.arena_file_reads = get(&io.reads);
+            c.arena_read_ns = get(&io.read_ns);
+            c.arena_file_writes = get(&io.writes);
+            c.arena_write_ns = get(&io.write_ns);
+            c.arena_syncs = get(&io.syncs);
+            c.arena_sync_ns = get(&io.sync_ns);
+            c.ubc_read_hits = get(&io.ubc_read_hits);
+            c.ubc_read_misses = get(&io.ubc_read_misses);
+            c.ubc_read_unknown = get(&io.ubc_read_unknown);
+            c.ubc_write_hits = get(&io.ubc_write_hits);
+            c.ubc_write_misses = get(&io.ubc_write_misses);
+            c.ubc_write_appends = get(&io.ubc_write_appends);
+            c.ubc_write_unknown = get(&io.ubc_write_unknown);
+        }
+        c
     }
 
     pub(crate) fn stats(&self) -> Result<BranchStats> {
@@ -2562,6 +2630,7 @@ impl StoreInner {
         if self.cat.is_none() {
             return Ok(false);
         }
+        let started = Instant::now();
         let mut chain: Vec<CatBranch> = Vec::new();
         let mut next = id;
         while !next.is_trunk() && !self.branches.contains_key(&next) {
@@ -2590,6 +2659,9 @@ impl StoreInner {
             self.insert_loaded(b);
             self.apply_parked(loaded)?;
         }
+        // r11-githost-attr instrument (observing only): only an `ensure` that loaded gets here.
+        self.shape.cat_load_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.shape.cat_loading_ensures += 1;
         Ok(true)
     }
 

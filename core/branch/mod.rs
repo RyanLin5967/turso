@@ -54,6 +54,9 @@
 
 pub(crate) mod arena;
 
+#[doc(hidden)]
+pub use arena::{file_pages_resident, file_residency};
+
 /// Process-wide page I/O counters (r11-restart lane instrument, observing only): pages read from
 /// and written to database files (`DatabaseFile::read_page` / `write_page(s)`) and WAL frames read
 /// and appended, across every database in the process. `[db reads, db writes, wal reads, wal writes]`.
@@ -383,6 +386,44 @@ pub struct BranchCatShape {
     pub trunk_rows: u64,
 }
 
+/// Where a branch operation's time goes, for attributing a latency that grows while the work
+/// counters stay flat (r11-githost-attr lane instrument, observing only; cumulative since open).
+/// Each `_ns` timer is paired with the count of the calls it timed. The arena fields count the
+/// file arena's own system calls (zero for a memory arena). The `ubc_*` fields move only while
+/// `R11_UBC_PROBE` is set: the page-cache residency of each slot's VM page just before it is read
+/// or written ([`file_pages_resident`]); a write at or past the end of the file is an append.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchIoCounters {
+    pub arena_file_reads: u64,
+    pub arena_read_ns: u64,
+    pub arena_file_writes: u64,
+    pub arena_write_ns: u64,
+    pub arena_syncs: u64,
+    pub arena_sync_ns: u64,
+    pub ubc_read_hits: u64,
+    pub ubc_read_misses: u64,
+    pub ubc_read_unknown: u64,
+    pub ubc_write_hits: u64,
+    pub ubc_write_misses: u64,
+    pub ubc_write_appends: u64,
+    pub ubc_write_unknown: u64,
+    /// `resolve_into`'s resolution (C-P trunk probes and any catalog load inside it included; the
+    /// arena read after it excluded).
+    pub resolve_ns: u64,
+    pub resolve_timed: u64,
+    /// Record flushes (`log`, `log_all`, the trunk commit's barrier), buffering and the arena fsync
+    /// inside them included.
+    pub flush_ns: u64,
+    pub flushes: u64,
+    /// Catalog stores: `ensure` calls that loaded at least one state, and their time (catalog
+    /// queries, derivation, C-R's parked commits).
+    pub cat_load_ns: u64,
+    pub cat_loading_ensures: u64,
+    /// C-R: parked commits applied, cumulative from the open (whose own share `BranchOpenStats` has).
+    pub parked_applied: u64,
+}
+
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
@@ -640,6 +681,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_read_counters(&self) -> (u64, u64) {
         self.branches.read_counters()
+    }
+
+    /// Where branch operations' time went since open: arena I/O, page-cache residency, record
+    /// flushes, resolution and catalog loads (r11-githost-attr lane instrument; reads memory only).
+    #[doc(hidden)]
+    pub fn branch_io_counters(&self) -> BranchIoCounters {
+        self.branches.io_counters()
     }
 
     /// Trunk pre-images the store holds now (r11-restart lane instrument).

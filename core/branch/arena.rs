@@ -15,6 +15,8 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use super::journal::{fsync_file, open_rw, read_at, write_at};
 
@@ -22,6 +24,135 @@ use super::journal::{fsync_file, open_rw, read_at, write_at};
 pub(crate) fn trace_slots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("R11_TRACE_SLOTS").is_some())
+}
+
+/// r11-githost-attr lane instrument: `R11_UBC_PROBE` asks the OS, just before each file-arena slot
+/// read or write, whether the slot's page is in the page cache ([`file_pages_resident`]). Off by
+/// default: the probe costs three system calls inside the timed operation, so timed runs leave it
+/// unset and counter runs set it (observing only).
+fn ubc_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("R11_UBC_PROBE").is_some())
+}
+
+/// Page-cache residency of each VM page covering bytes `[offset, offset + len)` of `file`, first
+/// page first: mincore(2) on a read-only shared mapping of just those pages, made and dropped here.
+/// Mapping touches no page, so asking does not change the answer. `None` when the OS refuses the
+/// mapping or the query; callers count that apart, never as resident or not.
+/// Blind spots: residency is per VM page (16 KiB on Apple silicon), not per slot; a page can be
+/// evicted or read in between the answer and the caller's I/O; Apple targets only (elsewhere
+/// `None`); and whether mincore on a file mapping reports the page cache on this OS at all is itself
+/// a premise, fire-checked by the harness's `ubc-selftest` before any run that reads these counters
+/// (r11-githost-attr PREREG section 4). An observing instrument for the r11-githost-attr lane;
+/// nothing in the mechanism reads it.
+#[doc(hidden)]
+pub fn file_residency(file: &File, offset: u64, len: u64) -> Option<Vec<bool>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    // Apple only: the lane's box. Linux's mincore takes `unsigned char` and has no MINCORE_INCORE.
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: sysconf reads a constant.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return None;
+        }
+        let page = page as u64;
+        let start = offset / page * page;
+        let end = offset.checked_add(len)?.div_ceil(page) * page;
+        let span = usize::try_from(end - start).ok()?;
+        let at = libc::off_t::try_from(start).ok()?;
+        // SAFETY: a fresh read-only mapping the kernel places; the descriptor is owned by `file` and
+        // open for the whole call; the mapping is never dereferenced and is unmapped below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                span,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                at,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return None;
+        }
+        let pages = span / page as usize;
+        let mut vec: Vec<libc::c_char> = vec![0; pages];
+        // SAFETY: `addr..addr + span` is the mapping made above and `vec` holds one byte per page.
+        let rc = unsafe { libc::mincore(addr as *const libc::c_void, span, vec.as_mut_ptr()) };
+        // SAFETY: unmaps exactly the mapping made above.
+        unsafe { libc::munmap(addr, span) };
+        if rc != 0 {
+            return None;
+        }
+        Some(
+            vec.iter()
+                .map(|&v| i32::from(v) & libc::MINCORE_INCORE != 0)
+                .collect(),
+        )
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = (file, offset);
+        None
+    }
+}
+
+/// [`file_residency`] counted: `(resident pages, pages)`.
+#[doc(hidden)]
+pub fn file_pages_resident(file: &File, offset: u64, len: u64) -> Option<(u64, u64)> {
+    let map = file_residency(file, offset, len)?;
+    Some((map.iter().filter(|&&r| r).count() as u64, map.len() as u64))
+}
+
+/// r11-githost-attr lane instrument (observing only): the file arena's I/O, each timer paired with
+/// its count, and, while `R11_UBC_PROBE` is set, the page-cache residency of each slot just before
+/// it is read or written. A write at or past the file's end reads nothing back, so it is an append,
+/// not a hit or a miss; a write into a page that is not resident makes the OS read that page first
+/// (read-modify-write, INFERRED from the page cache's page granularity, not measured). Cumulative;
+/// atomics because `read_slot` takes `&self`.
+#[derive(Default)]
+pub(crate) struct ArenaIo {
+    pub(crate) reads: AtomicU64,
+    pub(crate) read_ns: AtomicU64,
+    pub(crate) writes: AtomicU64,
+    pub(crate) write_ns: AtomicU64,
+    pub(crate) syncs: AtomicU64,
+    pub(crate) sync_ns: AtomicU64,
+    pub(crate) ubc_read_hits: AtomicU64,
+    pub(crate) ubc_read_misses: AtomicU64,
+    pub(crate) ubc_read_unknown: AtomicU64,
+    pub(crate) ubc_write_hits: AtomicU64,
+    pub(crate) ubc_write_misses: AtomicU64,
+    pub(crate) ubc_write_appends: AtomicU64,
+    pub(crate) ubc_write_unknown: AtomicU64,
+}
+
+fn bump(c: &AtomicU64, by: u64) {
+    c.fetch_add(by, Ordering::Relaxed);
+}
+
+fn ns_since(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+impl ArenaIo {
+    /// Count one probe answer into (hit, miss, unknown). A slot never spans two VM pages when the
+    /// page size divides the VM page size, so "resident" means every page the slot touches is.
+    fn note(answer: Option<(u64, u64)>, hit: &AtomicU64, miss: &AtomicU64, unknown: &AtomicU64) {
+        match answer {
+            Some((r, n)) if r == n => bump(hit, 1),
+            Some(_) => bump(miss, 1),
+            None => bump(unknown, 1),
+        }
+    }
+
+    pub(crate) fn get(c: &AtomicU64) -> u64 {
+        c.load(Ordering::Relaxed)
+    }
 }
 use crate::{turso_assert, LimboError, Result};
 
@@ -50,6 +181,8 @@ pub(crate) struct Arena {
     /// Slots handed out and not released. Equal to `high_water - free.len()` except in a catalog
     /// store, whose free slots are mostly in the catalog's free table, not in `free`.
     in_use: usize,
+    /// r11-githost-attr instrument (observing only).
+    pub(crate) io: ArenaIo,
 }
 
 impl Arena {
@@ -61,6 +194,7 @@ impl Arena {
             free: Vec::new(),
             free_bits: Vec::new(),
             in_use: 0,
+            io: ArenaIo::default(),
         }
     }
 
@@ -114,6 +248,7 @@ impl Arena {
             in_use: high_water as usize - free.len(),
             free,
             free_bits,
+            io: ArenaIo::default(),
         })
     }
 
@@ -137,6 +272,7 @@ impl Arena {
             free: Vec::with_capacity(free.len()),
             free_bits: vec![0; (high_water as usize).div_ceil(64)],
             in_use: in_use as usize,
+            io: ArenaIo::default(),
         };
         for slot in free {
             arena.add_free(slot);
@@ -246,7 +382,23 @@ impl Arena {
         turso_assert!(bytes.len() == self.page_size, "arena write of a wrong-sized page");
         let offset = self.check(slot) as u64 * self.page_size as u64;
         if let Backing::File { file, dirty } = &mut self.backing {
+            let io = &self.io;
+            if ubc_probe() {
+                match file.metadata() {
+                    Ok(m) if offset >= m.len() => bump(&io.ubc_write_appends, 1),
+                    Ok(_) => ArenaIo::note(
+                        file_pages_resident(file, offset, bytes.len() as u64),
+                        &io.ubc_write_hits,
+                        &io.ubc_write_misses,
+                        &io.ubc_write_unknown,
+                    ),
+                    Err(_) => bump(&io.ubc_write_unknown, 1),
+                }
+            }
+            let t = Instant::now();
             write_at(file, bytes, offset)?;
+            bump(&io.write_ns, ns_since(t));
+            bump(&io.writes, 1);
             *dirty = true;
             return Ok(());
         }
@@ -258,7 +410,20 @@ impl Arena {
         turso_assert!(out.len() == self.page_size, "arena read into a wrong-sized buffer");
         let offset = self.check(slot) as u64 * self.page_size as u64;
         if let Backing::File { file, .. } = &self.backing {
-            return read_at(file, out, offset);
+            let io = &self.io;
+            if ubc_probe() {
+                ArenaIo::note(
+                    file_pages_resident(file, offset, out.len() as u64),
+                    &io.ubc_read_hits,
+                    &io.ubc_read_misses,
+                    &io.ubc_read_unknown,
+                );
+            }
+            let t = Instant::now();
+            let read = read_at(file, out, offset);
+            bump(&io.read_ns, ns_since(t));
+            bump(&io.reads, 1);
+            return read;
         }
         out.copy_from_slice(self.page(slot));
         Ok(())
@@ -268,7 +433,10 @@ impl Arena {
     pub(crate) fn sync(&mut self) -> Result<()> {
         if let Backing::File { file, dirty } = &mut self.backing {
             if *dirty {
+                let t = Instant::now();
                 fsync_file(file)?;
+                bump(&self.io.sync_ns, ns_since(t));
+                bump(&self.io.syncs, 1);
                 *dirty = false;
             }
         }
