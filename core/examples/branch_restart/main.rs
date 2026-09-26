@@ -67,6 +67,9 @@ struct Args {
     writes: usize,
     seed: u64,
     label: String,
+    /// `open --expect-in-use X`: the arena slots the recovered store must hold, as the victim that
+    /// made the state printed them (a churn victim's branches also retain versions for their children).
+    expect_in_use: Option<u64>,
     trunk_every: usize,
     child_every: usize,
     /// `catalog`: open with `BranchDurability::Catalog` (the published-fix prototype).
@@ -84,6 +87,7 @@ fn parse_args() -> Args {
         writes: 200,
         seed: 0x9E37_79B9_7F4A_7C15,
         label: String::new(),
+        expect_in_use: None,
         trunk_every: 0,
         child_every: 0,
         catalog: false,
@@ -97,6 +101,9 @@ fn parse_args() -> Args {
             "--writes" => args.writes = val().parse().unwrap_or_else(|_| die("bad --writes")),
             "--seed" => args.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
             "--label" => args.label = val(),
+            "--expect-in-use" => {
+                args.expect_in_use = Some(val().parse().unwrap_or_else(|_| die("bad --expect-in-use")))
+            }
             "--child-every" => args.child_every = val().parse().unwrap_or_else(|_| die("bad --child-every")),
             "--trunk-every" => args.trunk_every = val().parse().unwrap_or_else(|_| die("bad --trunk-every")),
             "--mode" => {
@@ -451,11 +458,13 @@ fn open(args: &Args) {
     let reads = db.branch_read_counters();
     let st = db.branch_stats().unwrap();
     let tr = db.branch_trunk_retained();
-    if st.live_branches != args.n || st.arena_slots_in_use as u64 != args.n as u64 + tr {
+    // Every branch owns one page and the arena also holds the trunk's retained versions, unless the
+    // victim said otherwise (a churn victim's parents retain the versions their children forked on).
+    let want = args.expect_in_use.unwrap_or(args.n as u64 + tr);
+    if st.live_branches != args.n || st.arena_slots_in_use as u64 != want {
         not_a_result(&format!(
-            "after open: {st:?} with {tr} trunk pre-images, expected {} branches and {} pages",
-            args.n,
-            args.n as u64 + tr
+            "after open: {st:?} with {tr} trunk pre-images, expected {} branches and {want} pages",
+            args.n
         ));
     }
     println!(
@@ -798,6 +807,13 @@ fn churn(args: &Args) {
         args.writes,
         distinct.len(),
         files.line()
+    );
+    let st = db.branch_stats().unwrap();
+    println!(
+        "# churn state: live={} arena_slots_in_use={} trunk_retained={}",
+        st.live_branches,
+        st.arena_slots_in_use,
+        db.branch_trunk_retained()
     );
     println!("READY n={} pid={}", args.n, std::process::id());
     std::io::stdout().flush().unwrap();
