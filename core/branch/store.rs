@@ -2256,7 +2256,9 @@ mod tests {
         use std::sync::{Mutex as StdMutex, RwLock};
         const READERS: u64 = 4;
         const HELD: usize = 6;
-        const READS: usize = 6_000;
+        // Workload strengthened (PREREG amendment 3h, the lead's race-test decision): long enough that
+        // the churn below completes many rounds while the readers still read.
+        const READS: usize = 40_000;
         let store = Arc::new(store);
         let wal = Arc::new(StdMutex::new(()));
         let committed: Arc<Committed> =
@@ -2266,9 +2268,17 @@ mod tests {
         // Readers still reading: the churn's frees count only while this is above 0, so the race
         // is shown to have run, not merely to have started before or after the reads.
         let active = Arc::new(StdU64::new(READERS));
+        // Trunk writes so far, published by the writer so the churner can keep its children alive
+        // across rewrites (amendment 3h).
+        let wcount = Arc::new(StdU64::new(0));
         let writer = {
-            let (store, wal, committed, done) =
-                (store.clone(), wal.clone(), committed.clone(), done.clone());
+            let (store, wal, committed, done, wcount) = (
+                store.clone(),
+                wal.clone(),
+                committed.clone(),
+                done.clone(),
+                wcount.clone(),
+            );
             std::thread::spawn(move || {
                 let mut rng = Rng(0x5851_F42D_4C95_7F2D);
                 let mut writes = 0u64;
@@ -2282,6 +2292,7 @@ mod tests {
                     let g = generation.fetch_add(1, O::Relaxed);
                     committed.write().unwrap().insert(page, g);
                     writes += 1;
+                    wcount.store(writes, O::Release);
                     drop(_w);
                     std::thread::yield_now();
                 }
@@ -2289,12 +2300,13 @@ mod tests {
             })
         };
         let churner = {
-            let (store, wal, committed, done, active) = (
+            let (store, wal, committed, done, active, wcount) = (
                 store.clone(),
                 wal.clone(),
                 committed.clone(),
                 done.clone(),
                 active.clone(),
+                wcount,
             );
             std::thread::spawn(move || {
                 let mut rng = Rng(0x2545_F491_4F6C_DD1D);
@@ -2303,7 +2315,12 @@ mod tests {
                     let mut kids: Vec<BranchId> = (0..=rng.below(3))
                         .map(|_| fork_seeing(&store, &wal, &committed).0)
                         .collect();
-                    std::thread::yield_now();
+                    // The children outlive two trunk writes per page (amendment 3h): the versions
+                    // retained for them alone are then there for their reaps to free.
+                    let target = wcount.load(O::Acquire) + 2 * u64::from(PAGES);
+                    while wcount.load(O::Acquire) < target && !done.load(O::Acquire) {
+                        std::thread::yield_now();
+                    }
                     while !kids.is_empty() {
                         let k = kids.swap_remove(rng.below(kids.len() as u64) as usize);
                         let f = store.release_handle(k).freed_pages as u64;
