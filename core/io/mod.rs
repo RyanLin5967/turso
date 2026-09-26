@@ -874,6 +874,17 @@ mod buffer_tests {
 /// A cache for temporary or any additional `Buffer` allocations beyond
 /// what the `BufferPool` has room for, or for use before the pool is
 /// fully initialized.
+/// Buffers parked in this thread's temporary-buffer cache: (page-sized, WAL-frame-sized).
+/// Observation only (r11-sessions: a freed buffer parked here is not a deallocation, so an
+/// allocator counter reads it as retained).
+#[doc(hidden)]
+pub fn temp_buffer_cache_counts() -> (usize, usize) {
+    TEMP_BUFFER_CACHE.with(|c| {
+        let c = c.borrow();
+        (c.page_buffers.len(), c.wal_frame_buffers.len())
+    })
+}
+
 pub(crate) struct TempBufferCache {
     /// The `[Database::page_size]` at the time the cache is initiated.
     page_size: usize,

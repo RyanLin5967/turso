@@ -923,6 +923,9 @@ fn branches_read_their_fork_while_the_trunk_writes_concurrently() {
 #[test]
 fn a_trunk_commit_does_not_invalidate_a_branch_cache_and_the_branch_still_reads_its_fork() {
     let (_dir, db) = open_db();
+    // FS2's own pager change was dropped for r11-walpin's FW3, which keeps a branch pager's cache
+    // for the same reason (a branch holds no trunk snapshot), so this runs with FW3 on.
+    db.walpin_set_fw3(true);
     let trunk = db.connect().unwrap();
     seed(&trunk, 300);
     let b = trunk.fork_branch().unwrap();
@@ -1066,4 +1069,60 @@ fn a_shared_trunk_page_is_copied_before_a_branch_writes_it() {
     drop(c2);
     let c2 = b2.connect().unwrap();
     assert_eq!(table(&c2), want, "the branch lost its writes");
+}
+
+/// FS4. A branch connection reserves no checkpoint read slots (it never checkpoints); a trunk
+/// connection grows them when it checkpoints. The `FS4_RESERVE` mutant (eager reservation) fails
+/// the first assertion.
+#[test]
+fn a_branch_connection_reserves_no_checkpoint_read_slots() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    assert_eq!(value(&bc, 7), Some(original(7)));
+    let reserved = |c: &Arc<Connection>| c.pager.load().wal.as_ref().unwrap().inflight_reads_capacity();
+    assert_eq!(reserved(&bc), 0, "a branch connection reserved checkpoint read slots");
+    set(&trunk, 8, "after");
+    let r = rows(&trunk, "PRAGMA wal_checkpoint(TRUNCATE)");
+    assert_eq!(r[0][0].as_int(), Some(0));
+    assert!(reserved(&trunk) > 0, "the checkpointing trunk connection issued no reads (test is blind)");
+}
+
+/// FS9. Branches forked before a trunk rewrite share ONE clone of the pre-image the trunk retained
+/// for them, and still read the old value; a branch forked between two rewrites reads the middle
+/// version, not the first one's clone (the `FS9_KEY_NO_BORN` mutant serves it the wrong one); and a
+/// clone goes when its version is released, while other branches live (`FS9_NO_EVICT` fails that).
+#[test]
+fn retained_trunk_pre_images_are_shared_by_version_and_released_with_it() {
+    let (_dir, db) = open_db();
+    db.set_fs9(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let b1 = trunk.fork_branch().unwrap();
+    let b2 = trunk.fork_branch().unwrap();
+    let (c1, c2) = (b1.connect().unwrap(), b2.connect().unwrap());
+    set(&trunk, 10, "first-rewrite");
+    let mid = trunk.fork_branch().unwrap();
+    let cm = mid.connect().unwrap();
+    set(&trunk, 10, "second-rewrite");
+    let before = db.branch_stats().work;
+    assert_eq!(value(&c1, 10), Some(original(10)));
+    assert_eq!(value(&c2, 10), Some(original(10)));
+    assert_eq!(value(&cm, 10), Some("first-rewrite".to_string()), "the middle branch read another version's clone");
+    let after = db.branch_stats().work;
+    assert_eq!(after.retained_copies - before.retained_copies, 0, "a pre-image was copied privately");
+    assert!(after.retained_shared_hits - before.retained_shared_hits >= 1, "no branch shared a clone");
+    assert_eq!(db.retained_clone_count(), 2, "one clone per retained version");
+    // The first version is released when b1 and b2 go; the middle branch keeps the second.
+    drop((c1, c2));
+    b1.reap().unwrap();
+    b2.reap().unwrap();
+    assert_eq!(db.retained_clone_count(), 1, "a released version's clone was kept");
+    assert_eq!(value(&cm, 10), Some("first-rewrite".to_string()));
+    assert_eq!(value(&trunk, 10), Some("second-rewrite".to_string()));
+    drop(cm);
+    mid.reap().unwrap();
+    assert_eq!(db.retained_clone_count(), 0);
 }

@@ -136,6 +136,8 @@ pub(crate) struct BranchStore {
     /// r11-walpin FW3 for this database's branches: taken from the process switch when the store
     /// is created (`walpin::set_fixes` before open), or set per database by a test.
     fw3: std::sync::atomic::AtomicBool,
+    /// FS9 (r11-sessions): serve retained trunk versions by reference (see `retained_clones`).
+    fs9: AtomicBool,
 }
 
 /// Where the page a branch asked for comes from.
@@ -294,6 +296,23 @@ struct StoreInner {
     branches: HashMap<BranchId, BranchState>,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
+    /// FS9 (r11-sessions): clones of retained trunk versions, keyed by (page, born). A version the
+    /// trunk retained for [born, died) is never written again, and `born` is unique per trunk page
+    /// (the fat node's disjointness), so a key names one immutable page image. Each clone is built
+    /// on its version's first resolution and handed out by reference, like FS5's trunk pages; it is
+    /// removed when `child_gone` releases the version. Prior art: Oracle's consistent-read clones in
+    /// the buffer cache [RECALLED].
+    retained_clones: HashMap<(u32, u64), Arc<crate::alloc::DynBoxedSlice<u8>>>,
+}
+
+/// Where `StoreInner::resolve_origin` found a page.
+enum Origin {
+    /// In the arena: the branch's own version or one inherited from an ancestor branch.
+    Arena(Slot),
+    /// In the arena: a version the TRUNK retained, born at `born`.
+    TrunkRetained { slot: Slot, born: u64 },
+    /// The trunk's current version.
+    Trunk,
 }
 
 #[derive(Default)]
@@ -386,13 +405,29 @@ impl Lineage {
     /// `f`, if it was still current at `f`. `examined` counts the versions compared against `f` —
     /// at most one; the O(log V) descent that finds it is not counted.
     fn retained_at(&self, page: u32, f: u64, examined: &mut u64) -> Option<Slot> {
+        self.retained_version_at(page, f, examined).map(|v| v.slot)
+    }
+
+    /// As `retained_at`, with the version's `born` (FS9's key).
+    fn retained_version_at(&self, page: u32, f: u64, examined: &mut u64) -> Option<Retained> {
         let (_, v) = self.retained.get(&page)?.range(..=f).next_back()?;
         *examined += 1;
-        (f < v.died).then_some(v.slot)
+        (f < v.died).then_some(*v)
     }
 
     /// Detach the child forked at `f` and release every retained version that only it could see.
     fn child_gone(&mut self, f: u64, arena: &mut Arena, work: &mut BranchWork) -> usize {
+        self.child_gone_noting(f, arena, work, None)
+    }
+
+    /// `child_gone`, also removing each released version's FS9 clone from `clones` (the trunk's).
+    fn child_gone_noting(
+        &mut self,
+        f: u64,
+        arena: &mut Arena,
+        work: &mut BranchWork,
+        mut clones: Option<&mut HashMap<(u32, u64), Arc<crate::alloc::DynBoxedSlice<u8>>>>,
+    ) -> usize {
         let removed = self.children.remove(&f);
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
@@ -401,6 +436,15 @@ impl Lineage {
         for &(born, page, died) in &dead {
             let versions = self.retained.get_mut(&page).expect("indexed version is listed");
             let v = versions.remove(&born).expect("indexed version is listed");
+            if let Some(clones) = clones.as_deref_mut() {
+                #[cfg(test)]
+                let evict = !mutants::on("FS9_NO_EVICT");
+                #[cfg(not(test))]
+                let evict = true;
+                if evict {
+                    clones.remove(&(page, born));
+                }
+            }
             work.gc_examined += 1;
             if versions.is_empty() {
                 self.retained.remove(&page);
@@ -498,6 +542,20 @@ impl Lineage {
     }
 }
 
+/// FS9's process default: `TURSO_R11S_FS9=1` turns it on for stores created afterwards.
+fn fs9_from_env() -> bool {
+    std::env::var("TURSO_R11S_FS9").is_ok_and(|v| v == "1")
+}
+
+/// Mutant schemata for this lane's fire-checks, compiled into test builds only and chosen per test
+/// run by `TURSO_R11S_MUTANT` (one name), so one compile serves every mutant.
+#[cfg(test)]
+pub(crate) mod mutants {
+    pub(crate) fn on(name: &str) -> bool {
+        std::env::var("TURSO_R11S_MUTANT").is_ok_and(|v| v == name)
+    }
+}
+
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
@@ -514,6 +572,7 @@ impl BranchStore {
                 },
                 branches: HashMap::new(),
                 work: BranchWork::default(),
+                retained_clones: HashMap::new(),
             }),
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
@@ -523,6 +582,7 @@ impl BranchStore {
             },
             trunk_format: OnceLock::new(),
             fw3: std::sync::atomic::AtomicBool::new(super::walpin::fw3()),
+            fs9: AtomicBool::new(fs9_from_env()),
         }
     }
 
@@ -541,6 +601,14 @@ impl BranchStore {
             "a trunk page to cache is not one page long"
         );
         self.trunk_pages.fill(key, bytes);
+    }
+
+    pub(crate) fn set_fs9(&self, on: bool) {
+        self.fs9.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn retained_clone_count(&self) -> usize {
+        self.lock().retained_clones.len()
     }
 
     pub(crate) fn fw3(&self) -> bool {
@@ -882,11 +950,44 @@ impl BranchStore {
     fn resolve_impl(&self, id: BranchId, page: u32, out: &mut [u8], share: bool) -> Result<Resolved> {
         let mut inner = self.lock();
         let (mut levels, mut examined) = (0, 0);
-        let resolved = inner.resolve(id, page, &mut levels, &mut examined);
+        let resolved = inner.resolve_origin(id, page, &mut levels, &mut examined);
         inner.work.resolve_calls += 1;
         inner.work.resolve_levels += levels;
         inner.work.resolve_retained_examined += examined;
-        let Some(slot) = resolved? else {
+        let slot = match resolved? {
+            Origin::Arena(slot) => slot,
+            Origin::TrunkRetained { slot, born } => {
+                if share && self.fs9.load(Ordering::Relaxed) {
+                    #[cfg(test)]
+                    let born = if mutants::on("FS9_KEY_NO_BORN") { 0 } else { born };
+                    let StoreInner {
+                        arena,
+                        retained_clones,
+                        work,
+                        ..
+                    } = &mut *inner;
+                    let bytes = match retained_clones.get(&(page, born)) {
+                        Some(bytes) => {
+                            work.retained_shared_hits += 1;
+                            bytes.clone()
+                        }
+                        None => {
+                            let image = arena
+                                .as_ref()
+                                .expect("a slot resolved, so the arena exists")
+                                .page(slot);
+                            let bytes = Arc::new(image.to_vec().into_boxed_slice());
+                            retained_clones.insert((page, born), bytes.clone());
+                            work.retained_clone_fills += 1;
+                            bytes
+                        }
+                    };
+                    return Ok(Resolved::Shared(bytes));
+                }
+                inner.work.retained_copies += 1;
+                slot
+            }
+            Origin::Trunk => {
             // `resolve` answered "the trunk's current version", so the trunk's last write to this
             // page came at or before the branch's `trunk_at`, in a closed epoch.
             let key = TrunkPageKey {
@@ -905,6 +1006,7 @@ impl BranchStore {
             }
             inner.work.trunk_page_misses += 1;
             return Ok(Resolved::Trunk(key));
+            }
         };
         out.copy_from_slice(
             inner
@@ -979,6 +1081,7 @@ impl BranchStore {
                 trunk,
                 branches,
                 work,
+                retained_clones,
                 ..
             } = &mut *inner;
             let arena = arena.as_mut().expect("a branch existed, so the arena does");
@@ -988,8 +1091,15 @@ impl BranchStore {
             }
             freed += st.lineage.release_all(arena).len();
             if st.parent.is_trunk() {
-                freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
+                freed += trunk.lineage.child_gone_noting(
+                    st.fork_epoch,
+                    arena,
+                    work,
+                    Some(retained_clones),
+                );
                 if self.trunk_children.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    // No trunk child is left, so the trunk retains nothing any more (FS9).
+                    retained_clones.clear();
                     // From here the trunk writes without telling the store, so no cached version
                     // can be trusted once a branch exists again. No branch can read in between:
                     // a fork needs this lock.
@@ -1016,20 +1126,36 @@ impl StoreInner {
         levels: &mut u64,
         examined: &mut u64,
     ) -> Result<Option<Slot>> {
+        Ok(match self.resolve_origin(id, page, levels, examined)? {
+            Origin::Arena(slot) | Origin::TrunkRetained { slot, .. } => Some(slot),
+            Origin::Trunk => None,
+        })
+    }
+
+    fn resolve_origin(
+        &self,
+        id: BranchId,
+        page: u32,
+        levels: &mut u64,
+        examined: &mut u64,
+    ) -> Result<Origin> {
         *levels += 1;
         let st = self.branches.get(&id).ok_or_else(|| gone(id))?;
         // A branch sees all of its own versions; its ancestors' as of its fork, which `inherited`
         // froze then.
         if let Some(owned) = st.current.get(&page) {
-            return Ok(Some(owned.slot));
+            return Ok(Origin::Arena(owned.slot));
         }
         if let Some(slot) = st.inherited.get(page) {
-            return Ok(Some(slot));
+            return Ok(Origin::Arena(slot));
         }
         *levels += 1;
         let at = st.trunk_at;
-        if let Some(slot) = self.trunk.lineage.retained_at(page, at, examined) {
-            return Ok(Some(slot));
+        if let Some(v) = self.trunk.lineage.retained_version_at(page, at, examined) {
+            return Ok(Origin::TrunkRetained {
+                slot: v.slot,
+                born: v.born,
+            });
         }
         let born = self.trunk.written.get(&page).copied().unwrap_or(0);
         if born > at {
@@ -1041,7 +1167,7 @@ impl StoreInner {
                 id.0
             )));
         }
-        Ok(None)
+        Ok(Origin::Trunk)
     }
 }
 

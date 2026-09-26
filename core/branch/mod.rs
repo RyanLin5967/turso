@@ -281,6 +281,13 @@ pub struct BranchWork {
     /// Resolutions of a trunk page it did not hold, which the pager then read through the WAL or
     /// the database file.
     pub trunk_page_misses: u64,
+    /// Resolutions answered with a version the TRUNK retained for this branch (a pre-image of a page
+    /// the trunk rewrote after the fork), copied into the caller's private buffer (FS9 off).
+    pub retained_copies: u64,
+    /// FS9: such resolutions answered by reference from the retained-version clone cache.
+    pub retained_shared_hits: u64,
+    /// FS9: clones built, one copy per retained trunk version, on its first resolution.
+    pub retained_clone_fills: u64,
 }
 
 impl Branch {
@@ -492,6 +499,19 @@ impl Database {
     #[doc(hidden)]
     pub fn set_branch_lock_timing(&self, on: bool) {
         self.branches.set_lock_timing(on);
+    }
+
+    /// FS9 (r11-sessions): serve trunk pre-images retained for branches by reference. Normally taken
+    /// from `TURSO_R11S_FS9=1` when the store is created; tests set it per database.
+    #[doc(hidden)]
+    pub fn set_fs9(&self, on: bool) {
+        self.branches.set_fs9(on);
+    }
+
+    /// FS9: retained trunk versions currently cloned for sharing. Observation only.
+    #[doc(hidden)]
+    pub fn retained_clone_count(&self) -> usize {
+        self.branches.retained_clone_count()
     }
 
     /// The trunk WAL's state, for the r11-walpin instrument (observation only).

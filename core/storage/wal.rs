@@ -687,6 +687,12 @@ pub trait Wal: Debug + Send + Sync {
     /// Returns true if this WAL instance currently holds a read lock.
     fn holds_read_lock(&self) -> bool;
 
+    /// Checkpoint inflight-read slots this WAL handle has reserved (FS4's test observes it).
+    #[cfg(test)]
+    fn inflight_reads_capacity(&self) -> usize {
+        0
+    }
+
     /// Returns true if this WAL instance currently holds the write lock.
     fn holds_write_lock(&self) -> bool;
 
@@ -3685,7 +3691,22 @@ impl WalFile {
     }
 }
 
+/// FS4 (r11-sessions): the checkpoint's inflight-read slots grow on first use. In test builds the
+/// `FS4_RESERVE` mutant restores the eager reservation, so the FS4 test can show it fails then.
+fn fs4_inflight_reads() -> Vec<InflightRead> {
+    #[cfg(test)]
+    if crate::branch::store::mutants::on("FS4_RESERVE") {
+        return Vec::with_capacity(MAX_INFLIGHT_READS);
+    }
+    Vec::new()
+}
+
 impl Wal for WalFile {
+    #[cfg(test)]
+    fn inflight_reads_capacity(&self) -> usize {
+        self.ongoing_checkpoint.read().inflight_reads.capacity()
+    }
+
     fn begin_read_tx(&self) -> Result<bool> {
         // Implement progressive backoff because transient lock contention
         // should resolve quickly, but under heavy contention busy-spinning wastes
@@ -5115,7 +5136,7 @@ impl WalFile {
                 // Grown on first use: only a connection that checkpoints issues these reads, and a
                 // branch connection never does, so reserving MAX_INFLIGHT_READS slots here put
                 // 12,288 bytes into every open branch session for nothing (r11-sessions, FS4).
-                inflight_reads: Vec::new(),
+                inflight_reads: fs4_inflight_reads(),
             }),
             checkpoint_threshold: 1000,
             buffer_pool,
