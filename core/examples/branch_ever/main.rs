@@ -48,6 +48,13 @@ const TRUNK_ROWS: i64 = 20_000;
 /// one resolves through every level to the trunk.
 const BRANCH_ROWS: i64 = 18_000;
 const VALUE_LEN: usize = 100;
+/// Trunk rows per leaf in the seeded table (20,000 rows of 100-byte values fill 541 leaves:
+/// `trunk_retained_pages=541` in raw/uf8b_e3_1k.txt). Used only by `TrunkModel::floor_versions`,
+/// whose agreement with the engine's `trunk_retained_versions` checks it.
+const ROWS_PER_LEAF: i64 = 37;
+/// Rows above the parent's that a live branch reads through deeper ancestors, checked by the
+/// periodic read (r11-ever-refute's coverage caveat (ii): those are the pages a splice moves).
+const ANCESTOR_ROWS: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shape {
@@ -367,6 +374,38 @@ impl TrunkModel {
             + self.history.values().map(|h| h.capacity() * 8).sum::<usize>()
     }
 
+    /// E6 (r11-ever amendment 13): the trunk page versions that some live branch's root fork reads
+    /// and that are no longer current, from the harness's own write history and fork points alone
+    /// (`forks`: every live branch's `trunk_writes_at_root`, sorted). A fork at write count `w` reads
+    /// the version its page had after the writes `g < w`, so the version a write `g` replaced is read
+    /// by the forks in `(previous write, g]`. This is the page-level minimum ANY exact-snapshot store
+    /// must hold for the trunk (r11-space-refute's m[S, rho, R] at page grain, for this run's fork
+    /// times), so an engine whose trunk retention is exact reports it as `trunk_retained_versions`.
+    /// `prune` keeps, per row, the last write before the oldest fork: enough, since no fork reads an
+    /// older version. Cost: the kept history, at checkpoints only.
+    fn floor_versions(&self, forks: &[u64]) -> u64 {
+        let mut pages: HashMap<i64, Vec<u64>> = HashMap::new();
+        for (&row, h) in &self.history {
+            pages
+                .entry((row - 1) / ROWS_PER_LEAF)
+                .or_default()
+                .extend_from_slice(h);
+        }
+        let mut floor = 0;
+        for writes in pages.values_mut() {
+            writes.sort_unstable();
+            let mut after: Option<u64> = None;
+            for &g in writes.iter() {
+                let first = after.map_or(0, |a| forks.partition_point(|&f| f <= a));
+                if first < forks.len() && forks[first] <= g {
+                    floor += 1;
+                }
+                after = Some(g);
+            }
+        }
+        floor
+    }
+
     fn value_at(&self, row: i64, writes_at: u64) -> String {
         let Some(h) = self.history.get(&row) else {
             return trunk_value(row);
@@ -392,6 +431,10 @@ struct Live {
     own_row: i64,
     generation: u64,
     parent_row: Option<(i64, String)>,
+    /// Up to `ANCESTOR_ROWS` rows written by ancestors above the parent, nearest first, each with the
+    /// value this branch must read (its nearest writer's, as of each fork on the way down). No
+    /// ancestor between that writer and this branch wrote the row: each branch writes only its own.
+    ancestors: Vec<(i64, String)>,
     trunk_writes_at_root: u64,
     /// Birth cycle plus the drawn lifetime (EDF victims only; 0 otherwise).
     deadline: f64,
@@ -681,15 +724,26 @@ fn main() {
             Shape::Refine => Some(live.len() - 1),
         };
         let n_ever = created + 1;
-        let (branch, parent_id, parent_row, trunk_at) = match parent_idx {
+        let (branch, parent_id, parent_row, ancestors, trunk_at) = match parent_idx {
             None => {
                 let b = timer.time(0, n_ever, || trunk.fork_branch().unwrap());
-                (b, 0u64, None, trunk_model.writes)
+                (b, 0u64, None, Vec::new(), trunk_model.writes)
             }
             Some(i) => {
                 let p = &live[i];
                 let b = timer.time(0, n_ever, || p.branch.fork().unwrap());
-                (b, p.id, Some((p.own_row, p.own())), p.trunk_writes_at_root)
+                // The parent's parent row and its own ancestors, nearest first, minus any row the
+                // parent itself writes (its value is `parent_row`'s), one entry per row.
+                let mut ancestors: Vec<(i64, String)> = Vec::with_capacity(ANCESTOR_ROWS);
+                for (row, v) in p.parent_row.iter().chain(p.ancestors.iter()) {
+                    if ancestors.len() == ANCESTOR_ROWS {
+                        break;
+                    }
+                    if *row != p.own_row && ancestors.iter().all(|(r, _)| r != row) {
+                        ancestors.push((*row, v.clone()));
+                    }
+                }
+                (b, p.id, Some((p.own_row, p.own())), ancestors, p.trunk_writes_at_root)
             }
         };
         let id = branch.id().0;
@@ -725,6 +779,7 @@ fn main() {
             own_row,
             generation: 0,
             parent_row,
+            ancestors,
             trunk_writes_at_root: trunk_at,
             deadline: 0.0,
         }
@@ -835,6 +890,18 @@ fn main() {
                         ));
                     }
                 }
+                if !t.ancestors.is_empty() {
+                    // Untimed: no op slot is spent on it, and the read stream alone picks the row.
+                    let (arow, aval) = &t.ancestors[rrng.below(t.ancestors.len())];
+                    let got = read_v(&conn, *arow);
+                    let want = if *arow == t.own_row { t.own() } else { aval.clone() };
+                    if got != want {
+                        not_a_result(&format!(
+                            "cycle {n_ever}: branch {} misread ancestor row {arow}",
+                            t.id
+                        ));
+                    }
+                }
                 let inh = BRANCH_ROWS + 1 + rrng.below((TRUNK_ROWS - BRANCH_ROWS) as usize) as i64;
                 let got = timer.time(9, n_ever, || read_v(&conn, inh));
                 if got != trunk_model.value_at(inh, t.trunk_writes_at_root) {
@@ -896,7 +963,8 @@ fn main() {
              model_zombies={model_zombies} model_children={model_children} model_roots={roots} \
              predicted_arena_pages={} freed_states_total={freed_states_total} \
              reads_checked={reads_checked} rss_bytes={} harness_model_bytes={} \
-             harness_trunk_model_bytes={} db_bytes={} wal_bytes={} trunk_writes={} oldest_live_age={}",
+             harness_trunk_model_bytes={} db_bytes={} wal_bytes={} trunk_writes={} oldest_live_age={} \
+             trunk_floor_versions={}",
             live.len(),
             r.states,
             r.zombies,
@@ -942,6 +1010,11 @@ fn main() {
             std::fs::metadata(&wal_path).map_or(0, |m| m.len()),
             trunk_model.writes,
             ckpt as u64 + 1 - live.iter().map(|l| l.tag).min().unwrap_or(ckpt as u64 + 1),
+            {
+                let mut forks: Vec<u64> = live.iter().map(|l| l.trunk_writes_at_root).collect();
+                forks.sort_unstable();
+                trunk_model.floor_versions(&forks)
+            },
         );
         table.min_cap_since_ckpt = usize::MAX;
         if live.len() != args.live {
