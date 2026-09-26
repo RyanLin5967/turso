@@ -3181,9 +3181,6 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
-        // A transaction that ended without passing commit_tx or rollback_tx left its merge writes
-        // here; this one starts from none.
-        *self.trunk_pending.lock() = TrunkPending::default();
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();

@@ -201,7 +201,7 @@ struct Lineage {
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-13 and 15-30; 14 is not built, since no SQL path
+/// scope gate and the install's isolation, 11-13 and 15-31; 14 is not built, since no SQL path
 /// without DDL clears a user table's b-tree), so each test can be shown to fail for it
 /// (frontier/round11/r11-merge PREREG A6, A13, A14, A15). Always false otherwise.
 #[cfg(test)]
@@ -985,7 +985,7 @@ impl BranchStore {
                     // Not committed since the fork. An earlier member of this batch may have
                     // written it; the branch read the version before this transaction's first
                     // write of it, whose kind the pager recorded.
-                    if batch.interior.contains(&q) {
+                    if batch.interior.contains(&q) && !mutant(31) {
                         return true;
                     }
                     continue;

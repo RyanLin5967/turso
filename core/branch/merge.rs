@@ -1254,6 +1254,72 @@ mod tests {
         assert_eq!(int(&trunk, "SELECT count(*) FROM t WHERE v = 'c'"), 1);
     }
 
+    /// Tracking turned off and on again after a fork leaves a gap in that branch's reads, so its
+    /// physical merge is refused as out of scope, although tracking is on at the merge.
+    #[test]
+    fn a_gap_in_read_tracking_refuses_the_physical_merge() {
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        db.set_branch_read_tracking(true);
+        let b = one_row_and_a_branch(&trunk);
+        db.set_branch_read_tracking(false);
+        db.set_branch_read_tracking(true);
+        let physical = MergePolicy {
+            validation: Validation::PageStamp,
+            install: Install::Physical,
+        };
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let o = merger.merge(b, physical).unwrap();
+        assert_eq!(o.refused, Some(Refusal::Scope), "{o:?}");
+        assert!(o.scope.is_some_and(|s| s.contains("tracked")), "{o:?}");
+    }
+
+    /// A physical batch: the first member's inserts split a leaf, which writes the table's root, an
+    /// interior page; the second member only read that root on its way to another leaf. The
+    /// second must be refused as structural: the root it navigated is not the one the batch now
+    /// holds. Where page stamps wait for the commit (r11-merge-fl), only the kind the pager
+    /// recorded at the root's first write in the batch says so (mutant 31 ignores it).
+    #[test]
+    fn a_batch_member_that_read_a_root_an_earlier_member_split_is_refused() {
+        let (_dir, db) = open_db();
+        db.set_branch_read_tracking(true);
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        trunk.execute("BEGIN").unwrap();
+        for id in 1..=400 {
+            trunk
+                .execute(format!("INSERT INTO t VALUES ({}, '{}')", id * 100, "x".repeat(100)))
+                .unwrap();
+        }
+        trunk.execute("COMMIT").unwrap();
+        let (splits, reads) = (trunk.fork_branch().unwrap(), trunk.fork_branch().unwrap());
+        let conn = splits.connect().unwrap();
+        conn.execute("BEGIN").unwrap();
+        for id in 1..=99 {
+            conn.execute(format!("INSERT INTO t VALUES ({id}, '{}')", "y".repeat(100)))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        drop(conn);
+        reads
+            .connect()
+            .unwrap()
+            .execute("UPDATE t SET v = 'r' WHERE id = 39900")
+            .unwrap();
+        let physical = MergePolicy {
+            validation: Validation::PageStamp,
+            install: Install::Physical,
+        };
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let o = merger.merge_batch(vec![splits, reads], physical).unwrap();
+        assert_eq!(o[0].refused, None, "{o:?}");
+        assert!(!o[1].page_conflict, "premise: the two wrote no page in common: {o:?}");
+        assert_eq!(o[1].structural_conflict, Some(true), "{o:?}");
+        assert_eq!(o[1].refused, Some(Refusal::Structural), "{o:?}");
+    }
+
     /// A foreign key the engine cannot resolve (its parent table does not exist) refuses a member
     /// that writes its table, as the engine refuses such a write with foreign keys on.
     #[test]
