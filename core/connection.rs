@@ -1332,6 +1332,107 @@ impl Connection {
         Ok(())
     }
 
+    /// F-S (r11-githost-attr PREREG A1; branch connections only, while `R11_SCHEMA_SHARE` is set):
+    /// the exact inputs a reparse of this connection's schema would read and keep, as bytes. They
+    /// are the page-1 schema cookie, the custom-types and generated-columns flags, the names of the
+    /// built-in table-valued functions the current (placeholder) schema carries, and every
+    /// `sqlite_schema` row in scan order, each value length-prefixed in its `Debug` form (injective
+    /// for `Value`). A reparse reads nothing else unless the parse finds sequences, the
+    /// custom-types table or `sqlite_stat1`; `schema_shareable` refuses to share such a schema.
+    /// The read runs in its own read transaction with a fresh schema carrying the branch's cookie
+    /// installed, as `init_reparse_building` does, so the statement does not reprepare. The
+    /// placeholder schema goes back before this returns, whatever the outcome, so a reparse after it
+    /// still captures the table-valued functions.
+    pub(crate) fn branch_schema_source_key(self: &Arc<Connection>) -> Result<Vec<u8>> {
+        if self.get_tx_state() != TransactionState::None {
+            return Err(LimboError::Busy);
+        }
+        if self.get_mv_tx().is_some() || self.next_attached_mv_tx().is_some() {
+            return Err(LimboError::Busy);
+        }
+        let placeholder = self.schema.read().clone();
+        let pager = self.pager.load().clone();
+        pager.clear_page_cache(false);
+        pager.set_schema_cookie(None);
+        pager.begin_read_tx()?;
+        self.set_tx_state(TransactionState::Read);
+
+        let key = self.read_branch_schema_source_key(&placeholder);
+
+        let previous = self.transaction_state.swap(TransactionState::None);
+        turso_assert!(
+            matches!(previous, TransactionState::None | TransactionState::Read),
+            "unexpected end transaction state"
+        );
+        if previous == TransactionState::Read {
+            pager.end_read_tx();
+        }
+        self.clear_internal_main_mvcc_tx(&pager);
+        *self.schema.write() = placeholder;
+        pager.set_schema_cookie(None);
+        key
+    }
+
+    fn read_branch_schema_source_key(self: &Arc<Connection>, placeholder: &Schema) -> Result<Vec<u8>> {
+        fn put(key: &mut Vec<u8>, bytes: &[u8]) {
+            key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            key.extend_from_slice(bytes);
+        }
+        let cookie = self.read_current_schema_cookie()?;
+        self.pager.load().set_schema_cookie(Some(cookie));
+        let mut fresh = Schema::with_options(
+            self.experimental_custom_types_enabled(),
+            self.db.dialect().as_ref(),
+        )?;
+        fresh.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
+        fresh.schema_version = cookie;
+        *self.schema.write() = Arc::new(fresh);
+
+        let mut key = Vec::new();
+        put(&mut key, b"r11-githost-attr F-S source v1");
+        key.extend_from_slice(&cookie.to_le_bytes());
+        key.push(u8::from(self.experimental_custom_types_enabled()));
+        key.push(u8::from(self.db.experimental_generated_columns_enabled()));
+        let mut tvfs: Vec<&str> = placeholder
+            .tables
+            .values()
+            .filter_map(|table| match table.as_ref() {
+                crate::schema::Table::Virtual(vtab)
+                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
+                {
+                    Some(vtab.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        tvfs.sort_unstable();
+        put(&mut key, &(tvfs.len() as u64).to_le_bytes());
+        for name in tvfs {
+            put(&mut key, name.as_bytes());
+        }
+        let mut stmt = self.prepare("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema")?;
+        let rows = stmt.run_collect_rows()?;
+        put(&mut key, &(rows.len() as u64).to_le_bytes());
+        for row in rows {
+            for value in row {
+                put(&mut key, format!("{value:?}").as_bytes());
+            }
+        }
+        Ok(key)
+    }
+
+    /// F-S: install `schema`, parsed on another branch connection of this database from exactly the
+    /// bytes `branch_schema_source_key` read here, in place of a reparse. It carries this branch's
+    /// page-1 cookie (the key holds it), so the pager's cached cookie is set to it as the reparse
+    /// would. The schema is shared by `Arc`: every mutation goes through `Schema::try_make_mut`
+    /// (`with_schema_mut`), which copies before writing, so this branch's DDL never reaches another.
+    pub(crate) fn adopt_branch_schema(self: &Arc<Connection>, schema: Arc<Schema>) {
+        self.pager
+            .load()
+            .set_schema_cookie(Some(schema.schema_version));
+        *self.schema.write() = schema;
+    }
+
     fn clear_internal_main_mvcc_tx(&self, pager: &Arc<Pager>) {
         let Some(tx_id) = self.get_mv_tx_id() else {
             return;

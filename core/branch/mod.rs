@@ -422,6 +422,42 @@ pub struct BranchIoCounters {
     pub cat_loading_ensures: u64,
     /// C-R: parked commits applied, cumulative from the open (whose own share `BranchOpenStats` has).
     pub parked_applied: u64,
+    /// M7 (r11-githost-attr PREREG A1): branch connections that reparsed their schema because the
+    /// state carried none (every state loaded at open or from the catalog), and the time the reparse
+    /// and its stats refresh took; F-S's source-key reads with their time, and adoptions.
+    pub schema_reparses: u64,
+    pub schema_reparse_ns: u64,
+    pub schema_keys: u64,
+    pub schema_key_ns: u64,
+    pub schema_adoptions: u64,
+}
+
+/// F-S (r11-githost-attr PREREG A1): `R11_SCHEMA_SHARE` set means a branch connection whose state
+/// carries no schema adopts one already parsed in this process from byte-identical source instead
+/// of reparsing. Unset (the default) leaves `connect_branch` as it was, apart from M7's counters.
+fn schema_share() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("R11_SCHEMA_SHARE").is_some())
+}
+
+/// F-S: whether a parsed schema may be offered to other connections. Its parse must have read
+/// nothing but the page-1 cookie and `sqlite_schema`'s rows (which the key holds exactly): no
+/// sequence backing table, no custom-types table and no `sqlite_stat1` were read, and it holds no
+/// virtual table other than the built-in table-valued functions, whose instances every connection of
+/// the database already shares through `clone_schema`. Each of these is a function of the rows, so
+/// an adopter with the same key would read none of them either.
+fn schema_shareable(schema: &crate::schema::Schema) -> bool {
+    schema.sequences.is_empty()
+        && schema.get_btree_table(crate::stats::STATS_TABLE).is_none()
+        && !schema
+            .tables
+            .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+        && schema.tables.values().all(|t| match t.as_ref() {
+            crate::schema::Table::Virtual(v) => {
+                matches!(v.kind, turso_ext::VTabKind::TableValuedFunction)
+            }
+            _ => true,
+        })
 }
 
 /// A snapshot of the branch arena's accounting.
@@ -807,9 +843,38 @@ impl Database {
                 default_cache_size,
                 Some(self.clone_schema()),
             )?;
+            // F-S (r11-githost-attr PREREG A1): with R11_SCHEMA_SHARE set, read the exact inputs a
+            // reparse would read (cookie and `sqlite_schema` rows, plus the flags and table-valued
+            // functions it keeps), and adopt a schema already parsed from the same bytes.
+            let key = if schema_share() {
+                let started = std::time::Instant::now();
+                let key = conn.branch_schema_source_key()?;
+                self.branches.note_schema_key(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                Some(key)
+            } else {
+                None
+            };
+            if let Some(shared) = key.as_ref().and_then(|k| self.branches.shared_schema(k)) {
+                conn.adopt_branch_schema(shared.clone());
+                self.branches.note_schema_adoption();
+                self.branches.set_schema(id, shared)?;
+                return Ok(conn);
+            }
+            // M7 (r11-githost-attr): the reparse and its stats refresh, timed and counted.
+            let started = std::time::Instant::now();
             conn.force_reparse_schema_without_publish()?;
             crate::stats::refresh_analyze_stats(&conn);
-            self.branches.set_schema(id, conn.schema.read().clone())?;
+            self.branches
+                .note_schema_reparse(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            let parsed = conn.schema.read().clone();
+            if let Some(key) = key {
+                if schema_shareable(&parsed) {
+                    self.branches.share_schema(key, parsed.clone());
+                }
+            }
+            self.branches.set_schema(id, parsed)?;
             return Ok(conn);
         };
         self._connect_with_pager_and_default_cache_size(

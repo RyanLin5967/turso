@@ -200,6 +200,18 @@ pub(crate) struct BranchStore {
     /// `resolve_into` calls and the arena slot reads they made (r11-restart lane instrument).
     resolve_calls: AtomicU64,
     arena_reads: AtomicU64,
+    /// r11-githost-attr M7 instruments (observing only), each timer paired with its count: branch
+    /// connections that reparsed their schema (`connect_branch`, a state with no schema), and F-S's
+    /// source-key reads and adoptions.
+    schema_reparses: AtomicU64,
+    schema_reparse_ns: AtomicU64,
+    schema_keys: AtomicU64,
+    schema_key_ns: AtomicU64,
+    schema_adoptions: AtomicU64,
+    /// F-S (r11-githost-attr PREREG A1; only while `R11_SCHEMA_SHARE` is set): parsed schemas by
+    /// the exact bytes a reparse of them would read (`Connection::branch_schema_source_key`). Its
+    /// own lock, never taken with `inner`.
+    shared_schemas: Mutex<HashMap<Vec<u8>, Arc<Schema>>>,
 }
 
 struct StoreInner {
@@ -954,6 +966,12 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+            schema_reparses: AtomicU64::new(0),
+            schema_reparse_ns: AtomicU64::new(0),
+            schema_keys: AtomicU64::new(0),
+            schema_key_ns: AtomicU64::new(0),
+            schema_adoptions: AtomicU64::new(0),
+            shared_schemas: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1088,6 +1106,12 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+            schema_reparses: AtomicU64::new(0),
+            schema_reparse_ns: AtomicU64::new(0),
+            schema_keys: AtomicU64::new(0),
+            schema_key_ns: AtomicU64::new(0),
+            schema_adoptions: AtomicU64::new(0),
+            shared_schemas: Mutex::new(HashMap::new()),
         };
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
@@ -2230,6 +2254,39 @@ impl BranchStore {
         )
     }
 
+    /// r11-githost-attr M7 instrument (observing only): one branch connection reparsed its schema.
+    pub(crate) fn note_schema_reparse(&self, ns: u64) {
+        self.schema_reparses.fetch_add(1, Ordering::Relaxed);
+        self.schema_reparse_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// r11-githost-attr F-S instrument (observing only): one source-key read, and its time.
+    pub(crate) fn note_schema_key(&self, ns: u64) {
+        self.schema_keys.fetch_add(1, Ordering::Relaxed);
+        self.schema_key_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// r11-githost-attr F-S instrument (observing only): one connection adopted a shared schema.
+    pub(crate) fn note_schema_adoption(&self) {
+        self.schema_adoptions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// F-S: the schema parsed in this process from exactly `key`, if one was shared.
+    pub(crate) fn shared_schema(&self, key: &[u8]) -> Option<Arc<Schema>> {
+        self.shared_schemas.lock().get(key).cloned()
+    }
+
+    /// F-S: offer `schema`, parsed from exactly `key`, to later connections. At most
+    /// `SHARED_SCHEMAS_MAX` distinct sources are kept; past that, later ones are not shared (they
+    /// reparse, as without F-S), so the map cannot grow with the number of branches.
+    pub(crate) fn share_schema(&self, key: Vec<u8>, schema: Arc<Schema>) {
+        const SHARED_SCHEMAS_MAX: usize = 64;
+        let mut shared = self.shared_schemas.lock();
+        if shared.len() < SHARED_SCHEMAS_MAX {
+            shared.entry(key).or_insert(schema);
+        }
+    }
+
     /// r11-githost-attr instrument (observing only): see [`super::BranchIoCounters`]. Reads memory
     /// only; runs no catalog query and no I/O.
     pub(crate) fn io_counters(&self) -> super::BranchIoCounters {
@@ -2243,6 +2300,11 @@ impl BranchStore {
             cat_load_ns: s.cat_load_ns,
             cat_loading_ensures: s.cat_loading_ensures,
             parked_applied: inner.parked_applied,
+            schema_reparses: self.schema_reparses.load(Ordering::Relaxed),
+            schema_reparse_ns: self.schema_reparse_ns.load(Ordering::Relaxed),
+            schema_keys: self.schema_keys.load(Ordering::Relaxed),
+            schema_key_ns: self.schema_key_ns.load(Ordering::Relaxed),
+            schema_adoptions: self.schema_adoptions.load(Ordering::Relaxed),
             ..Default::default()
         };
         if let Some(arena) = inner.arena.as_ref() {
