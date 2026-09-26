@@ -3692,7 +3692,7 @@ impl Wal for WalFile {
                 "begin_write_tx called while write lock already held according to connection state"
             );
         }
-        self.fork_gate_write_enter();
+        if std::env::var_os("R11_MUT_G").is_none() { self.fork_gate_write_enter(); }
 
         if !allowed_auto_actions.contains(WalAutoActions::Restart) {
             return Ok(());

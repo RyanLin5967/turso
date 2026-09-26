@@ -1041,6 +1041,7 @@ impl Connection {
                 prepare_options,
             )
         };
+        let _mut_a = std::env::var_os("R11_MUT_A").map(|_| self.schema.read());
         match translated {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {

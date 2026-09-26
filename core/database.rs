@@ -3102,7 +3102,9 @@ impl Database {
             )?,
             None => {
                 // The storage, IO, init-lock and page-1 Arc clones and their drops.
-                crate::coherence::bump(crate::coherence::Class::DbArc, 4);
+                if std::env::var_os("R11_MUT_DBARC").is_none() {
+                    crate::coherence::bump(crate::coherence::Class::DbArc, 4);
+                }
                 crate::coherence::bump(crate::coherence::Class::DbArcInit, 4);
                 Pager::new_refs(
                     self.db_file.clone().into(),

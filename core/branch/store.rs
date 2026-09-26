@@ -906,7 +906,7 @@ impl BranchStore {
 
     /// FK: whether every trunk write takes its copy decision (and stamps `written`) even with no child alive.
     pub(crate) fn stamps_every_trunk_write(&self) -> bool {
-        self.fk
+        self.fk && std::env::var_os("R11_MUT_K").is_none()
     }
 
     pub(crate) fn trunk_has_children(&self) -> bool {
