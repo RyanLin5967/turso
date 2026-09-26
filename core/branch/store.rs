@@ -207,6 +207,8 @@ pub(crate) struct BranchStore {
     k_epoch: CachePadded<AtomicU64>,
     k_children: crate::skiplist::SkipMap<u64, BranchId>,
     k_retained: CachePadded<AtomicUsize>,
+    /// r11-coherence FX: copy trunk-cache hits outside the shard lock.
+    copy_out: bool,
 }
 
 /// FS: ids a thread takes per trip to the store's counter.
@@ -727,6 +729,7 @@ impl BranchStore {
             k_epoch: CachePadded::new(AtomicU64::new(0)),
             k_children: crate::skiplist::SkipMap::new(),
             k_retained: CachePadded::new(AtomicUsize::new(0)),
+            copy_out: crate::coherence::fix(crate::coherence::FIX_COPYOUT),
         }
     }
 
@@ -1176,6 +1179,8 @@ impl BranchStore {
     /// it holds it — and no trunk lock is taken. The cache is consulted, and its hit or miss
     /// counted, under this branch's shard lock.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<Resolved> {
+        // FX: a trunk-cache key decided under the shard lock, copied after it is released.
+        let mut copy_after: Option<TrunkPageKey> = None;
         let (at, elsewhere) = {
             let mut shard = self.shard(id);
             shard.work.resolve_calls += 1;
@@ -1205,17 +1210,35 @@ impl BranchStore {
                             epoch,
                             generation: self.trunk_pages.generation.load(Ordering::Acquire),
                         };
-                        if self.trunk_pages.copy_into(key, out) {
+                        if self.copy_out {
+                            // Counted as a hit now; a miss (rare once the cache is warm) is corrected below.
                             shard.work.trunk_page_hits += 1;
-                            return Ok(Resolved::Filled);
+                            copy_after = Some(key);
+                            (at, None)
+                        } else {
+                            if self.trunk_pages.copy_into(key, out) {
+                                shard.work.trunk_page_hits += 1;
+                                return Ok(Resolved::Filled);
+                            }
+                            shard.work.trunk_page_misses += 1;
+                            return Ok(Resolved::Trunk(key));
                         }
-                        shard.work.trunk_page_misses += 1;
-                        return Ok(Resolved::Trunk(key));
+                    } else {
+                        (at, None)
                     }
-                    (at, None)
                 }
             }
         };
+        if let Some(key) = copy_after {
+            // The cache holds immutable versions under keys that name them exactly, so this copy needs no lock.
+            if self.trunk_pages.copy_into(key, out) {
+                return Ok(Resolved::Filled);
+            }
+            let mut shard = self.shard(id);
+            shard.work.trunk_page_hits -= 1;
+            shard.work.trunk_page_misses += 1;
+            return Ok(Resolved::Trunk(key));
+        }
         if let Some(slot) = elsewhere {
             let d = domain_of(slot);
             crate::turso_assert!(d < SHARDS, "a branch's page map named a trunk slot");

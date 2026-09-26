@@ -128,6 +128,8 @@ pub const FIX_ARC: u32 = 16;
 pub const FIX_GATE: u32 = 32;
 /// FK: the trunk's children index as a concurrent skiplist with an atomic fork-epoch counter (amendment 9).
 pub const FIX_TRUNKIDX: u32 = 64;
+/// FX: trunk-cache hits copy their page after the shard lock is released (amendment 13).
+pub const FIX_COPYOUT: u32 = 128;
 
 static FIXES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
@@ -150,6 +152,7 @@ pub fn parse_fixes(s: &str) -> Option<u32> {
             "A" => FIX_ARC,
             "G" => FIX_GATE,
             "K" => FIX_TRUNKIDX,
+            "X" => FIX_COPYOUT,
             _ => return None,
         };
     }
