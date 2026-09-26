@@ -19,7 +19,9 @@
 //! The tests after the model test each reproduce one install defect the refuter found by reading:
 //! a re-fired trigger, a stale statement after a trunk ALTER, an FK action or a REPLACE reverting a
 //! trunk-only row, a UNIQUE move replayed in rowid order, a batch member's error dropping the batch,
-//! and colliding automatic rowids. Each asserts a refusal or the three-way result.
+//! and colliding automatic rowids; one more (c3) puts the branch's child under a parent the trunk
+//! deleted. Each asserts a refusal or the three-way result, and each compiles against the base
+//! (`f5b0708d5`), so its red step runs this file's own text there.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -645,6 +647,12 @@ fn the_structural_guard_also_refuses_a_restructure_that_left_the_branch_leaf_alo
     assert!(guard_alone > 0, "the sweep never restructured above an untouched branch leaf");
 }
 
+/// The refusal as its Debug text: the repro tests name the install refusal this way so that they
+/// compile against the base, which has no `Refusal::Install` (and fail there, as predicted).
+fn refusal(o: &MergeOutcome) -> String {
+    format!("{:?}", o.refused)
+}
+
 fn key_replay() -> MergePolicy {
     MergePolicy {
         validation: Validation::KeyStamp,
@@ -823,10 +831,40 @@ fn a_cascade_does_not_delete_a_trunk_only_child() {
         .unwrap();
     let mut merger = Merger::new(trunk.clone()).unwrap();
     let o = merger.merge(b, key_replay()).unwrap();
-    assert_eq!(o.refused, Some(Refusal::Install), "{o:?}");
+    assert_eq!(refusal(&o), "Some(Install)", "{o:?}");
     assert_eq!(cells(&trunk, "SELECT id FROM p ORDER BY id"), ["1", "2"]);
     assert_eq!(cells(&trunk, "SELECT id, pid FROM c"), ["10", "1"]);
-    assert!(trunk.foreign_keys_enabled(), "the merger must restore foreign_keys");
+    assert!(trunk.foreign_keys_enabled(), "the merger must leave the caller's foreign_keys on");
+}
+
+/// (c3) The child side: the trunk deletes p2 after the fork (no child held it then), and the branch
+/// inserts a child of p2. The rows differ, so validation passes; the three-way result has a child
+/// without a parent, so the merge must be refused and the trunk keep neither the child nor p2.
+#[test]
+fn a_branch_child_of_a_trunk_deleted_parent_is_refused() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    trunk.execute("PRAGMA foreign_keys = ON").unwrap();
+    trunk
+        .execute("CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    trunk
+        .execute("CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id))")
+        .unwrap();
+    trunk
+        .execute("INSERT INTO p VALUES (1, 'p1'), (2, 'p2')")
+        .unwrap();
+    let b = trunk.fork_branch().unwrap();
+    trunk.execute("DELETE FROM p WHERE id = 2").unwrap();
+    b.connect()
+        .unwrap()
+        .execute("INSERT INTO c VALUES (20, 2)")
+        .unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let o = merger.merge(b, key_replay()).unwrap();
+    assert_eq!(refusal(&o), "Some(Install)", "{o:?}");
+    assert_eq!(cells(&trunk, "SELECT id FROM p"), ["1"]);
+    assert_eq!(cells(&trunk, "SELECT count(*) FROM c"), ["0"]);
 }
 
 /// (c2) A column declared UNIQUE ON CONFLICT REPLACE: the trunk inserts q with u = 'x' after the
@@ -850,7 +888,7 @@ fn a_replace_constraint_does_not_delete_a_trunk_only_row() {
         .unwrap();
     let mut merger = Merger::new(trunk.clone()).unwrap();
     let o = merger.merge(b, key_replay()).unwrap();
-    assert_eq!(o.refused, Some(Refusal::Install), "{o:?}");
+    assert_eq!(refusal(&o), "Some(Install)", "{o:?}");
     assert_eq!(
         cells(&trunk, "SELECT id, u FROM t ORDER BY id"),
         ["1", "a", "2", "b", "3", "x"]
@@ -915,13 +953,16 @@ fn one_member_refused_at_install_leaves_the_rest_of_the_batch() {
     }
     let mut merger = Merger::new(trunk.clone()).unwrap();
     let outcomes = merger.merge_batch(branches, key_replay()).unwrap();
-    let refused: Vec<Option<Refusal>> = outcomes.iter().map(|o| o.refused).collect();
+    let refused: Vec<String> = outcomes.iter().map(refusal).collect();
     assert_eq!(
         refused,
-        [None, None, Some(Refusal::Install), None],
+        ["None", "None", "Some(Install)", "None"],
         "{outcomes:?}"
     );
-    assert!(outcomes[2].install_error.is_some(), "{outcomes:?}");
+    assert!(
+        format!("{:?}", outcomes[2]).contains("install_error: Some("),
+        "{outcomes:?}"
+    );
     assert_eq!(cells(&trunk, "SELECT id FROM t WHERE u = 'x'"), ["5"]);
     assert_eq!(cells(&trunk, "SELECT id FROM t WHERE u = 'z'"), ["31"]);
     assert_eq!(cells(&trunk, "SELECT count(*) FROM t WHERE id = 30"), ["0"]);

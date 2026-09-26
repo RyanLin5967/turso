@@ -176,8 +176,9 @@ struct Lineage {
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-24), so each test can be shown to fail for it
-/// (frontier/round11/r11-merge PREREG A6, A13). Always false otherwise.
+/// scope gate and the install's isolation, 11-13 and 15-26; 14 is not built, since no SQL path
+/// without DDL clears a user table's b-tree), so each test can be shown to fail for it
+/// (frontier/round11/r11-merge PREREG A6, A13, A14). Always false otherwise.
 #[cfg(test)]
 pub(crate) fn mutant(n: u32) -> bool {
     static CHOSEN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();

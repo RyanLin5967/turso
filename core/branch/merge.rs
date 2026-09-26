@@ -54,8 +54,9 @@
 //!   if B does), so splits, page allocation and indexes are the trunk's. Works under every
 //!   validator. A row image is final: B's triggers and foreign-key actions already wrote their own
 //!   rows, which are in B's write set, so the trunk compiles the install with no triggers and no
-//!   foreign-key actions (PostgreSQL's `session_replication_role = replica`), and when the trunk
-//!   enforces foreign keys it checks them after each member instead. Statements say OR ABORT, so a
+//!   foreign-key actions (PostgreSQL's `session_replication_role = replica`), and when the
+//!   caller's connection enforces foreign keys they are checked after each member instead, over
+//!   the member's own rows and the parent keys they replaced. Statements say OR ABORT, so a
 //!   constraint-level REPLACE can never delete a row only the trunk has; rows go in B's last-write
 //!   order, so a UNIQUE value B moved leaves its old row before it reaches the new one.
 //!
@@ -65,11 +66,12 @@
 //! SAVEPOINT: a constraint that refuses one member ([`Refusal::Install`]) rolls back only that
 //! member, never the batch.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::store::BranchStore;
 use super::{Branch, BranchId};
-use crate::schema::{BTreeTable, Schema, Table};
+use crate::schema::{BTreeTable, ForeignKey, Schema, Table};
+use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::{Connection, LimboError, Result, Statement, Value};
 
@@ -165,13 +167,51 @@ struct TableStmts {
     alias: Option<usize>,
 }
 
-/// Merges branches into the trunk through one trunk connection, keeping the trunk statements the
-/// replay install prepares, per table root AND trunk schema version: a statement prepared for an
-/// older column list must never write a row of a newer one.
+/// One foreign key of the trunk's schema, as the per-member check runs it.
+struct FkCheck {
+    /// "child referencing parent", for the refusal's reason.
+    name: String,
+    /// `Err(reason)` when the key cannot be checked (its parent does not exist, or its column
+    /// count differs from the child's): SQLite then refuses every write to either table, and a
+    /// member that writes one is refused.
+    stmts: std::result::Result<FkStmts, String>,
+}
+
+struct FkStmts {
+    /// `?1` = a parent rowid: that row's key. `None` for a parent without rowids.
+    key: Option<Statement>,
+    /// `?1` = a child rowid: a row back when that child's key is wholly non-NULL and no parent
+    /// holds it. `None` for a child without rowids.
+    child: Option<Statement>,
+    /// `?1..?n` = a parent key: a row back when some child holds it and no parent does.
+    parent: Statement,
+}
+
+/// Every foreign key of one trunk schema version, indexed by the tables it touches.
+struct FkChecks {
+    version: u32,
+    checks: Vec<FkCheck>,
+    by_child: HashMap<i64, Vec<usize>>,
+    by_parent: HashMap<i64, Vec<usize>>,
+}
+
+/// Merges branches into the trunk, keeping the trunk statements the replay install prepares, per
+/// table root AND trunk schema version: a statement prepared for an older column list must never
+/// write a row of a newer one.
 pub struct Merger {
+    /// The caller's trunk connection. Read at every batch for its settings (foreign_keys,
+    /// synchronous, WAL auto-actions, data-sync retry); never written through.
+    caller: Arc<Connection>,
+    /// The merger's OWN trunk connection, which compiles for row images for its whole life: no
+    /// triggers and no foreign-key actions (see the module doc). Its own connection, so no statement
+    /// of the caller's ever compiles that way, a panic cannot leave the caller's connection in that
+    /// state, and the merger's cached statements are not prepared again at every batch (the setters
+    /// bump the prepare generation, so toggling them per batch would re-prepare every statement).
     trunk: Arc<Connection>,
     store: Arc<BranchStore>,
     stmts: HashMap<(i64, u32), TableStmts>,
+    /// The foreign-key checks, compiled for one schema version when foreign keys are enforced.
+    fks: Option<FkChecks>,
 }
 
 fn quote(name: &str) -> String {
@@ -222,10 +262,13 @@ fn row_scope(prep: &Prepared) -> Option<&'static str> {
 }
 
 /// Run `stmt` to completion and reset it, even when it fails, so a cached statement is reusable.
+/// The run's own error wins over a reset error: it is the one that says whether the member or the
+/// batch must go.
 fn step_to_end(stmt: &mut Statement) -> Result<()> {
     let ran = stmt.run_ignore_rows();
-    stmt.reset()?;
-    ran
+    let reset = stmt.reset();
+    ran?;
+    reset
 }
 
 /// A constraint error while installing refuses the member (`Ok(Some(reason))`); any other error
@@ -241,7 +284,8 @@ fn member_error(err: LimboError) -> Result<Option<String>> {
 const MEMBER: &str = "r11_merge_member";
 
 impl Merger {
-    /// A merger writing through `trunk`, which must be a trunk connection.
+    /// A merger for the trunk `trunk` is connected to, which must be a trunk connection. The
+    /// merger writes through a connection of its own (see [`Merger`]'s fields).
     pub fn new(trunk: Arc<Connection>) -> Result<Self> {
         if trunk.branch_id().is_some() {
             return Err(LimboError::InvalidArgument(
@@ -249,11 +293,40 @@ impl Merger {
             ));
         }
         let store = trunk.db.branches.clone();
+        let own = trunk.db.connect()?;
+        own.set_foreign_keys_enabled(false);
+        own.set_row_image_apply(true);
         Ok(Self {
-            trunk,
+            caller: trunk,
+            trunk: own,
             store,
             stmts: HashMap::new(),
+            fks: None,
         })
+    }
+
+    /// Give the merger's connection the caller's durability, WAL maintenance and busy-wait
+    /// settings, which a merge's commit must honour exactly as the caller's own commit would. Each
+    /// is set only when it differs, since a setter makes every cached statement prepare again. A
+    /// custom busy callback cannot be shared (it is a `Box`) and reads as no timeout, so under one
+    /// the merger's `BEGIN IMMEDIATE` returns Busy at once.
+    fn mirror_settings(&self) {
+        let mode = self.caller.get_sync_mode();
+        if self.trunk.get_sync_mode() != mode {
+            self.trunk.set_sync_mode(mode);
+        }
+        let retry = self.caller.get_data_sync_retry();
+        if self.trunk.get_data_sync_retry() != retry {
+            self.trunk.set_data_sync_retry(retry);
+        }
+        let busy = self.caller.get_busy_timeout();
+        if self.trunk.get_busy_timeout() != busy {
+            self.trunk.set_busy_timeout(busy);
+        }
+        self.trunk.wal_auto_actions.store(
+            self.caller.wal_auto_actions.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
     }
 
     /// Merge one branch. The branch is released afterwards, merged or refused.
@@ -268,12 +341,12 @@ impl Merger {
     /// released afterwards, merged or refused.
     ///
     /// The branch's rows are applied as ROW IMAGES: what the branch's own statements, triggers and
-    /// foreign-key actions wrote is already in its row write set, so for the length of the batch
-    /// the trunk connection compiles with no triggers and no foreign-key actions (PostgreSQL's
-    /// `session_replication_role = replica`; MySQL row-based replication applies row events the
-    /// same way). Firing them again would run a trigger twice, or run a trunk-side action on rows
-    /// only the trunk changed. When the trunk enforces foreign keys, each member is checked after
-    /// its rows go in, and a violation refuses that member.
+    /// foreign-key actions wrote is already in its row write set, so the merger's connection
+    /// compiles with no triggers and no foreign-key actions (PostgreSQL's
+    /// `session_replication_role = replica`). Firing them again would run a trigger twice, or run a
+    /// trunk-side action on rows only the trunk changed. When the caller's connection enforces
+    /// foreign keys, each member is checked after its rows go in, and a violation refuses that
+    /// member.
     pub fn merge_batch(
         &mut self,
         branches: Vec<Branch>,
@@ -305,13 +378,9 @@ impl Merger {
                     .to_string(),
             ));
         }
-        let fk_on = self.trunk.foreign_keys_enabled();
-        self.trunk.set_foreign_keys_enabled(false);
-        self.trunk.set_row_image_apply(true);
-        let result = self.run_batch(&branches, policy, fk_on);
-        self.trunk.set_row_image_apply(false);
-        self.trunk.set_foreign_keys_enabled(fk_on);
-        let outcomes = result?;
+        self.mirror_settings();
+        let fk_on = self.caller.foreign_keys_enabled();
+        let outcomes = self.run_batch(&branches, policy, fk_on)?;
         self.store.merge_counted(|w| {
             for o in &outcomes {
                 match o.refused {
@@ -336,6 +405,9 @@ impl Merger {
         policy: MergePolicy,
         fk_on: bool,
     ) -> Result<Vec<MergeOutcome>> {
+        // BEGIN IMMEDIATE checks the schema cookie once it holds the write lock and prepares again
+        // on a mismatch, so from here to COMMIT the merger's schema is the trunk's: a schema change
+        // the caller committed is seen by the scope gate and by the statement cache's key.
         self.trunk.execute("BEGIN IMMEDIATE")?;
         let result = self.validate_and_install(branches, policy, fk_on);
         match &result {
@@ -425,15 +497,7 @@ impl Merger {
         if savepoints {
             self.trunk.execute(format!("SAVEPOINT {MEMBER}"))?;
         }
-        let installed = if physical {
-            self.install_pages(prep).map(|()| None)
-        } else {
-            self.install_rows(branch, prep)
-        };
-        let installed = match installed {
-            Ok(None) if fk_on && !super::store::mutant(23) => self.foreign_key_violation(prep),
-            other => other,
-        };
+        let installed = self.install_checked(branch, prep, physical, fk_on);
         match installed {
             Ok(None) => {
                 if savepoints {
@@ -455,6 +519,32 @@ impl Merger {
                 }
                 Err(err)
             }
+        }
+    }
+
+    /// Install one member's rows or pages and, when the caller's connection enforces foreign
+    /// keys, check them (mutant 23 skips the whole check).
+    fn install_checked(
+        &mut self,
+        branch: &Branch,
+        prep: &Prepared,
+        physical: bool,
+        fk_on: bool,
+    ) -> Result<Option<String>> {
+        let fk = fk_on && !super::store::mutant(23);
+        let held = if fk {
+            self.parent_keys_before(prep)?
+        } else {
+            Vec::new()
+        };
+        let installed = if physical {
+            self.install_pages(prep).map(|()| None)?
+        } else {
+            self.install_rows(branch, prep)?
+        };
+        match installed {
+            None if fk => self.foreign_key_violation(prep, &held),
+            other => Ok(other),
         }
     }
 
@@ -481,8 +571,16 @@ impl Merger {
         let version = self.trunk.schema.read().schema_version;
         let from = branch.connect()?;
         let mut selects: HashMap<i64, Statement> = HashMap::new();
+        let mut tables: HashMap<i64, Arc<BTreeTable>> = HashMap::new();
         for &(root, rowid) in &prep.rows {
-            let table = table_at(&prep.schema, root).expect("row_scope admitted this table");
+            let table = match tables.get(&root) {
+                Some(t) => t.clone(),
+                None => {
+                    let t = table_at(&prep.schema, root).expect("row_scope admitted this table");
+                    tables.insert(root, t.clone());
+                    t
+                }
+            };
             let key = (root, if super::store::mutant(18) { 0 } else { version });
             if !self.stmts.contains_key(&key) {
                 let stmts = self.prepare_table(&table)?;
@@ -581,92 +679,239 @@ impl Merger {
             }
         }
         drop(selects);
+        drop(tables);
         drop(from);
         self.store
             .merge_counted(|w| w.merge_rows_installed += prep.rows.len() as u64);
         Ok(None)
     }
 
-    /// With foreign keys enforced, the row images went in with no FK action and no FK check, so
-    /// every foreign key that touches a table this member wrote (as child or as parent) is checked
-    /// now: a child row whose key is wholly non-NULL and matches no parent refuses the member.
-    /// A full scan of each such child table: correctness first, and only when foreign keys exist.
-    fn foreign_key_violation(&self, prep: &Prepared) -> Result<Option<String>> {
-        let written: HashSet<String> = prep
-            .rows
-            .iter()
-            .filter_map(|&(root, _)| table_at(&prep.schema, root).map(|t| t.name.to_lowercase()))
-            .collect();
-        if written.is_empty() {
-            return Ok(None);
+    /// The foreign-key checks for the trunk's current schema, compiled once per schema version.
+    fn fk_checks(&mut self) -> Result<&mut FkChecks> {
+        let version = self.trunk.schema.read().schema_version;
+        if self.fks.as_ref().map(|f| f.version) != Some(version) {
+            let schema = self.trunk.schema.read().clone();
+            let mut fks = FkChecks {
+                version,
+                checks: Vec::new(),
+                by_child: HashMap::new(),
+                by_parent: HashMap::new(),
+            };
+            for t in schema.tables.values() {
+                let Table::BTree(child) = t.as_ref() else {
+                    continue;
+                };
+                for fk in &child.foreign_keys {
+                    let parent = schema.get_btree_table(&fk.parent_table);
+                    let i = fks.checks.len();
+                    fks.by_child.entry(child.root_page).or_default().push(i);
+                    if let Some(p) = &parent {
+                        fks.by_parent.entry(p.root_page).or_default().push(i);
+                    }
+                    let stmts = match &parent {
+                        Some(p) => self.prepare_fk(child, p, fk),
+                        None => Err(format!(
+                            "a foreign key of {} names a table that does not exist: {}",
+                            child.name, fk.parent_table
+                        )),
+                    };
+                    fks.checks.push(FkCheck {
+                        name: format!("{} referencing {}", child.name, fk.parent_table),
+                        stmts,
+                    });
+                }
+            }
+            self.fks = Some(fks);
         }
-        for t in prep.schema.tables.values() {
-            let Table::BTree(child) = t.as_ref() else {
+        Ok(self.fks.as_mut().expect("just compiled"))
+    }
+
+    /// Before a member's rows go in: the key of every parent row among them that already exists,
+    /// which the rows may be about to change or remove. Mutant 25 skips it (the parent side).
+    fn parent_keys_before(&mut self, prep: &Prepared) -> Result<Vec<(usize, Vec<Value>)>> {
+        let mut held = Vec::new();
+        if super::store::mutant(25) {
+            return Ok(held);
+        }
+        let fks = self.fk_checks()?;
+        for &(root, rowid) in &prep.rows {
+            let Some(ids) = fks.by_parent.get(&root) else {
                 continue;
             };
-            for fk in &child.foreign_keys {
-                if !written.contains(&child.name.to_lowercase())
-                    && !written.contains(&fk.parent_table.to_lowercase())
-                {
+            for &i in ids {
+                // An uncheckable key refuses the member after its install, below.
+                let Ok(stmts) = fks.checks[i].stmts.as_mut() else {
                     continue;
-                }
-                let Some(parent) = prep.schema.get_btree_table(&fk.parent_table) else {
-                    return Ok(Some(format!(
-                        "a foreign key of {} names a table that does not exist: {}",
-                        child.name, fk.parent_table
-                    )));
                 };
-                let parent_cols: Vec<String> = if !fk.parent_columns.is_empty() {
-                    fk.parent_columns.iter().map(|c| quote(c)).collect()
-                } else if !parent.primary_key_columns.is_empty() {
-                    parent
-                        .primary_key_columns
-                        .iter()
-                        .map(|(c, _)| quote(c))
-                        .collect()
-                } else {
-                    vec!["rowid".to_string()]
+                let Some(key) = stmts.key.as_mut() else {
+                    continue;
                 };
-                if parent_cols.len() != fk.child_columns.len() {
-                    return Ok(Some(format!(
-                        "foreign key mismatch: {} referencing {}",
-                        child.name, parent.name
-                    )));
+                key.bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
+                let rows = key.run_collect_rows();
+                key.reset()?;
+                if let Some(row) = rows?.into_iter().next() {
+                    if !row.iter().any(|v| matches!(v, Value::Null)) {
+                        held.push((i, row));
+                    }
                 }
-                let not_null: Vec<String> = fk
-                    .child_columns
-                    .iter()
-                    .map(|c| format!("c.{} IS NOT NULL", quote(c)))
-                    .collect();
-                let matches: Vec<String> = fk
-                    .child_columns
-                    .iter()
-                    .zip(&parent_cols)
-                    .map(|(c, p)| format!("p.{p} = c.{}", quote(c)))
-                    .collect();
-                let sql = format!(
-                    "SELECT count(*) FROM {} AS c WHERE {} AND NOT EXISTS \
-                     (SELECT 1 FROM {} AS p WHERE {})",
-                    quote(&child.name),
-                    not_null.join(" AND "),
-                    quote(&parent.name),
-                    matches.join(" AND ")
-                );
-                let rows = self.trunk.prepare(sql)?.run_collect_rows()?;
-                let orphans = rows
-                    .first()
-                    .and_then(|r| r.first())
-                    .and_then(|v| v.as_int())
-                    .unwrap_or(0);
-                if orphans > 0 {
+            }
+        }
+        Ok(held)
+    }
+
+    /// After a member's rows went in with no FK action and no FK check: the foreign keys the
+    /// caller's connection enforces, over this member's rows only, so the cost is O(write set)
+    /// probes rather than a scan of every table it touched. A child row the member wrote whose key
+    /// is wholly non-NULL must find a parent (mutant 26 skips this side), and a parent key one of
+    /// its rows held before the install must be held by no child that lost its parent. The trunk
+    /// satisfied its constraints before the member, so any violation now is the member's.
+    ///
+    /// A child row that was already an orphan (written while foreign keys were off) refuses every
+    /// member that writes it and leaves it an orphan, as SQLite refuses such a write. Values are
+    /// matched as `parent.key = child.key`, so the parent column's collation applies (as in
+    /// SQLite); where the two columns' affinities differ, SQL comparison rules decide a match,
+    /// which can differ from SQLite's conversion to the parent's affinity. That the parent key is
+    /// a PRIMARY KEY or UNIQUE, which SQLite requires, is not checked.
+    fn foreign_key_violation(
+        &mut self,
+        prep: &Prepared,
+        held: &[(usize, Vec<Value>)],
+    ) -> Result<Option<String>> {
+        let fks = self.fk_checks()?;
+        for &(root, rowid) in &prep.rows {
+            let parents = fks.by_parent.get(&root).into_iter().flatten();
+            for &i in fks.by_child.get(&root).into_iter().flatten().chain(parents) {
+                if let Err(reason) = &fks.checks[i].stmts {
+                    return Ok(Some(reason.clone()));
+                }
+            }
+            if super::store::mutant(26) {
+                continue;
+            }
+            for &i in fks.by_child.get(&root).into_iter().flatten() {
+                let check = &mut fks.checks[i];
+                let Ok(stmts) = check.stmts.as_mut() else {
+                    continue;
+                };
+                let Some(child) = stmts.child.as_mut() else {
+                    continue;
+                };
+                child.bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
+                let rows = child.run_collect_rows();
+                child.reset()?;
+                if !rows?.is_empty() {
                     return Ok(Some(format!(
-                        "{orphans} row(s) of {} reference no row of {} after the merge",
-                        child.name, parent.name
+                        "foreign key {}: row {rowid} has no parent after the merge",
+                        check.name
                     )));
                 }
             }
         }
+        for (i, key) in held {
+            let check = &mut fks.checks[*i];
+            let Ok(stmts) = check.stmts.as_mut() else {
+                continue;
+            };
+            for (param, v) in key.iter().enumerate() {
+                stmts
+                    .parent
+                    .bind_at((param + 1).try_into().unwrap(), v.clone())?;
+            }
+            let rows = stmts.parent.run_collect_rows();
+            stmts.parent.reset()?;
+            if !rows?.is_empty() {
+                return Ok(Some(format!(
+                    "foreign key {}: a child still holds a key the merge removed from its parent",
+                    check.name
+                )));
+            }
+        }
         Ok(None)
+    }
+
+    /// The statements that check one foreign key, or why it cannot be checked. A statement that
+    /// does not prepare (a parent column that does not exist, say) makes the key uncheckable: it
+    /// depends on the schema alone, so it refuses the members that touch the key rather than every
+    /// batch.
+    fn prepare_fk(
+        &self,
+        child: &BTreeTable,
+        parent: &BTreeTable,
+        fk: &ForeignKey,
+    ) -> std::result::Result<FkStmts, String> {
+        let parent_cols: Vec<String> = if !fk.parent_columns.is_empty() {
+            fk.parent_columns.iter().map(|c| quote(c)).collect()
+        } else {
+            // No parent columns means the parent's PRIMARY KEY; with none declared SQLite reports a
+            // foreign key mismatch, and so does this check (the counts differ).
+            parent
+                .primary_key_columns
+                .iter()
+                .map(|(c, _)| quote(c))
+                .collect()
+        };
+        if parent_cols.len() != fk.child_columns.len() {
+            return Err(format!(
+                "foreign key mismatch: {} referencing {}",
+                child.name, parent.name
+            ));
+        }
+        let prepare = |sql: String| {
+            self.trunk.prepare(sql).map_err(|err| {
+                format!(
+                    "foreign key {} referencing {} cannot be checked: {err}",
+                    child.name, parent.name
+                )
+            })
+        };
+        let child_cols: Vec<String> = fk.child_columns.iter().map(|c| quote(c)).collect();
+        let (c, p) = (quote(&child.name), quote(&parent.name));
+        let matches: Vec<String> = child_cols
+            .iter()
+            .zip(&parent_cols)
+            .map(|(cc, pc)| format!("p.{pc} = c.{cc}"))
+            .collect();
+        let orphan = format!(
+            "NOT EXISTS (SELECT 1 FROM {p} AS p WHERE {})",
+            matches.join(" AND ")
+        );
+        let not_null: Vec<String> = child_cols
+            .iter()
+            .map(|cc| format!("c.{cc} IS NOT NULL"))
+            .collect();
+        let holds: Vec<String> = child_cols
+            .iter()
+            .enumerate()
+            .map(|(i, cc)| format!("c.{cc} = ?{}", i + 1))
+            .collect();
+        // A table without rowids is never a member's (row_scope), so it needs no rowid statement.
+        let key = parent
+            .has_rowid
+            .then(|| {
+                prepare(format!(
+                    "SELECT {} FROM {p} WHERE rowid = ?1",
+                    parent_cols.join(", ")
+                ))
+            })
+            .transpose()?;
+        let child_stmt = child
+            .has_rowid
+            .then(|| {
+                prepare(format!(
+                    "SELECT 1 FROM {c} AS c WHERE c.rowid = ?1 AND {} AND {orphan}",
+                    not_null.join(" AND ")
+                ))
+            })
+            .transpose()?;
+        let parent_stmt = prepare(format!(
+            "SELECT 1 FROM {c} AS c WHERE {} AND {orphan} LIMIT 1",
+            holds.join(" AND ")
+        ))?;
+        Ok(FkStmts {
+            key,
+            child: child_stmt,
+            parent: parent_stmt,
+        })
     }
 
     fn prepare_table(&self, table: &BTreeTable) -> Result<TableStmts> {
