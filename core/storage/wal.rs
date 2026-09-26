@@ -4945,6 +4945,7 @@ impl WalFile {
                         if let Some(cached_page) =
                             pager.cache_get_for_checkpoint(page_id as usize, target_frame, epoch)?
                         {
+                            crate::branch::count_backfill_io(0);
                             let buffer = cached_page
                                 .get_contents()
                                 .buffer
@@ -4965,6 +4966,7 @@ impl WalFile {
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
+                        crate::branch::count_backfill_io(1);
                         let inflight =
                             self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
                         group.add(&inflight.completion);

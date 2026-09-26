@@ -51,6 +51,17 @@
 //! time t" with one root-to-leaf search), a trunk write or a replayed pre-image reads only the page's
 //! last version, a trunk child's reap reads F2's two ranges from `ret_born` and `ret_died` (ZFS keeps
 //! its deadlists on disk and splits them in place), and a checkpoint inserts and deletes single rows.
+//!
+//! # The fuzzy checkpoint (r11-restart-r2, F-FZ; UNBUILT when written)
+//!
+//! ARIES's fuzzy checkpoint (Mohan et al., TODS 1992) in place of a sharp one: the store mutex is
+//! held to CAPTURE what changed since the last checkpoint and to install the result, never across
+//! the catalog writes, the commit or the WAL backfill. A second connection ([`Catalog::writer`])
+//! writes the captured rows while the store's own connection serves on-demand reads from a snapshot
+//! pinned at the capture ([`Catalog::begin_read_snapshot`]), which in-memory state overrides exactly
+//! as it does between checkpoints. The meta row records the log position the capture covered
+//! (`log_from`), so the log is cut to its suffix only after the commit, and a crash between the two
+//! replays just that suffix (see `Journal::recover_catalog`).
 
 use std::num::NonZero;
 use std::path::Path;
@@ -96,7 +107,8 @@ const LOOKUPS: &[&str] = &[
     "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch >= ?2 AND fork_epoch < ?3 ORDER BY fork_epoch ASC LIMIT ?4",
     "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch < ?2 ORDER BY fork_epoch DESC LIMIT ?3",
     "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch > ?2 ORDER BY fork_epoch ASC LIMIT ?3",
-    "SELECT id FROM branch WHERE lease > -1 AND lease <= ?1",
+    "SELECT id FROM branch WHERE lease = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
+    "SELECT id, lease FROM branch WHERE lease > ?2 AND lease <= ?1 ORDER BY lease ASC, id ASC LIMIT ?3",
     "SELECT lease FROM branch WHERE lease > -1 ORDER BY lease ASC LIMIT 1",
     "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
     "SELECT id FROM branch WHERE released = 1 AND n_children = 0",
@@ -121,6 +133,25 @@ const META_LEASE_NOW: i64 = 6;
 const META_ARENA_HW: i64 = 7;
 const META_IN_USE: i64 = 8;
 const META_STATES: i64 = 9;
+/// F-FZ (r11-restart-r2): the log generation and byte a fuzzy checkpoint captured up to; -1 for
+/// none (a sharp checkpoint, or a catalog written before F-FZ, whose meta row has keys 1-9 only).
+const META_LOG_FROM_GEN: i64 = 10;
+const META_LOG_FROM_OFF: i64 = 11;
+
+/// Pages of Turso page cache each catalog connection keeps (r11-restart-r2, item 4): sized to hold
+/// a checkpoint window's dirty leaves (~31.8k commits at 33 B in a 1 MiB log) so the writer does
+/// not spill mid-checkpoint, where Turso's default (2,000 pages) spilled at 1,800 and let the
+/// catalog's leaves go cold at 10^6 branches (R7, the r11-restart-refute report). Overridden by
+/// `R11_CAT_CACHE_PAGES` (a measurement arm).
+pub(crate) fn cat_cache_pages() -> u64 {
+    static PAGES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        std::env::var("R11_CAT_CACHE_PAGES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32_768)
+    })
+}
 
 /// The catalog's meta row: what an open needs before it touches any branch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -134,6 +165,8 @@ pub(crate) struct Meta {
     pub(crate) arena_hw: u32,
     pub(crate) in_use: u64,
     pub(crate) states: u64,
+    /// F-FZ: `(log generation, byte)` the checkpoint that wrote this row captured up to.
+    pub(crate) log_from: Option<(u64, u64)>,
 }
 
 /// One branch as the catalog holds it.
@@ -255,7 +288,8 @@ pub(crate) struct Catalog {
     child_in: Stmt,
     child_below: Stmt,
     child_above: Stmt,
-    lease_due: Stmt,
+    lease_tie: Stmt,
+    lease_page: Stmt,
     lease_min: Stmt,
     lease_min_after: Stmt,
     released: Stmt,
@@ -287,14 +321,28 @@ impl Catalog {
             Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
+        for sql in SCHEMA {
+            conn.execute(*sql)?;
+        }
+        Self::prepared(db, conn, sync)
+    }
+
+    /// A second handle on the same catalog database, over its own connection: the writer of a
+    /// fuzzy checkpoint (F-FZ), which runs without the store mutex while the store's own
+    /// connection keeps serving on-demand reads from a pinned snapshot.
+    pub(crate) fn writer(&self, sync: bool) -> Result<Catalog> {
+        let conn = self._db.connect()?;
+        Self::prepared(self._db.clone(), conn, sync)
+    }
+
+    /// Set a connection's pragmas and prepare every statement on it.
+    fn prepared(db: Arc<Database>, conn: Arc<Connection>, sync: bool) -> Result<Catalog> {
         conn.execute(if sync {
             "PRAGMA synchronous = FULL"
         } else {
             "PRAGMA synchronous = OFF"
         })?;
-        for sql in SCHEMA {
-            conn.execute(*sql)?;
-        }
+        conn.execute(format!("PRAGMA cache_size = {}", cat_cache_pages()))?;
         let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: conn.prepare(sql)? }) };
         Ok(Catalog {
             meta_all: p("SELECT k, v FROM meta")?,
@@ -347,7 +395,13 @@ impl Catalog {
             )?,
             // Range seeks on `branch_lease`: NULL sorts first in the index, so `lease > -1` skips
             // every unleased row instead of walking them (deadlines are never negative).
-            lease_due: p("SELECT id FROM branch WHERE lease > -1 AND lease <= ?1")?,
+            // F-EXP's keyset pages over `branch_lease`, whose entries sort by deadline then row id:
+            // the rest of one deadline, then the deadlines after it.
+            lease_tie: p("SELECT id FROM branch WHERE lease = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3")?,
+            lease_page: p(
+                "SELECT id, lease FROM branch WHERE lease > ?2 AND lease <= ?1 \
+                 ORDER BY lease ASC, id ASC LIMIT ?3",
+            )?,
             lease_min: p("SELECT lease FROM branch WHERE lease > -1 ORDER BY lease ASC LIMIT 1")?,
             lease_min_after: p(
                 "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
@@ -375,6 +429,7 @@ impl Catalog {
         }
         let mut m = Meta::default();
         let mut seen = 0u32;
+        let (mut log_from_gen, mut log_from_off) = (None, None);
         for row in rows {
             let (k, v) = (get(&row, 0)? as i64, get(&row, 1)?);
             match k {
@@ -387,15 +442,23 @@ impl Catalog {
                 META_ARENA_HW => m.arena_hw = v as u32,
                 META_IN_USE => m.in_use = v,
                 META_STATES => m.states = v,
+                META_LOG_FROM_GEN => log_from_gen = Some(v),
+                META_LOG_FROM_OFF => log_from_off = Some(v),
                 _ => return Err(LimboError::Corrupt(format!("branch catalog: meta key {k}"))),
             }
             seen += 1;
         }
-        if seen != 9 {
+        // 9 keys: written before F-FZ; 11: with the fuzzy checkpoint's log position.
+        if seen != 9 && seen != 11 {
             return Err(LimboError::Corrupt(format!(
-                "branch catalog: meta row has {seen} of 9 keys"
+                "branch catalog: meta row has {seen} keys, not 9 or 11"
             )));
         }
+        m.log_from = match (log_from_gen, log_from_off) {
+            // -1 as stored, read back through `as u64`.
+            (Some(g), Some(off)) if g != u64::MAX => Some((g, off)),
+            _ => None,
+        };
         Ok(Some(m))
     }
 
@@ -462,6 +525,45 @@ impl Catalog {
             self.meta_put
                 .exec(&[Value::from_i64(k), int(v)], &mut self.counters)?;
         }
+        // Always both keys, so a sharp checkpoint overwrites a fuzzy one's position.
+        let (g, off) = match m.log_from {
+            Some((g, off)) => (int(g), int(off)),
+            None => (Value::from_i64(-1), Value::from_i64(-1)),
+        };
+        self.meta_put
+            .exec(&[Value::from_i64(META_LOG_FROM_GEN), g], &mut self.counters)?;
+        self.meta_put
+            .exec(&[Value::from_i64(META_LOG_FROM_OFF), off], &mut self.counters)?;
+        Ok(())
+    }
+
+    /// Pin a read snapshot on this connection (F-FZ phase 1): a deferred BEGIN takes its snapshot
+    /// at its first read, so one is made now, before the checkpoint's writer can commit. Every read
+    /// on this connection until [`Catalog::end_read_snapshot`] sees the catalog as of here.
+    pub(crate) fn begin_read_snapshot(&mut self) -> Result<()> {
+        self.conn.execute("BEGIN")?;
+        if let Err(e) = self.meta_all.rows(&[], &mut self.counters) {
+            self.rollback();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// End the snapshot [`Catalog::begin_read_snapshot`] pinned (F-FZ phase 3). It wrote nothing,
+    /// so a failure to end it is a failure to release a read mark only.
+    pub(crate) fn end_read_snapshot(&mut self) {
+        if let Err(e) = self.conn.execute("COMMIT") {
+            tracing::warn!("branch catalog read snapshot not ended: {e}");
+            self.rollback();
+        }
+    }
+
+    /// A PASSIVE checkpoint of the catalog's WAL: backfill what no reader's mark holds back, block
+    /// nobody (F-FZ phase 4, before the TRUNCATE attempt).
+    pub(crate) fn wal_passive(&mut self) -> Result<()> {
+        self.conn
+            .prepare("PRAGMA wal_checkpoint(PASSIVE)")?
+            .run_collect_rows()?;
         Ok(())
     }
 
@@ -722,12 +824,39 @@ impl Catalog {
             .collect()
     }
 
-    pub(crate) fn lease_due(&mut self, now: u64) -> Result<Vec<u64>> {
-        self.lease_due
-            .rows(&[int(now)], &mut self.counters)?
-            .iter()
-            .map(|row| get(row, 0))
-            .collect()
+    /// F-EXP: up to `limit` rows `(id, deadline)` with a deadline at or before `now`, in (deadline,
+    /// id) order after the keyset cursor `after`, and whether the rows due ran out before `limit`.
+    /// Two range seeks on `branch_lease`, so a page costs what it returns, however many are due.
+    pub(crate) fn lease_due_page(
+        &mut self,
+        now: u64,
+        after: Option<(u64, u64)>,
+        limit: usize,
+    ) -> Result<(Vec<(u64, u64)>, bool)> {
+        let mut out = Vec::new();
+        let floor = match after {
+            Some((lease, id)) => {
+                for row in self
+                    .lease_tie
+                    .rows(&[int(lease), int(id), int(limit as u64)], &mut self.counters)?
+                {
+                    out.push((get(&row, 0)?, lease));
+                }
+                int(lease)
+            }
+            None => Value::from_i64(-1),
+        };
+        if out.len() < limit {
+            let rest = (limit - out.len()) as u64;
+            for row in self
+                .lease_page
+                .rows(&[int(now), floor, int(rest)], &mut self.counters)?
+            {
+                out.push((get(&row, 0)?, get(&row, 1)?));
+            }
+        }
+        let complete = out.len() < limit;
+        Ok((out, complete))
     }
 
     pub(crate) fn lease_min(&mut self) -> Result<Option<u64>> {
@@ -800,4 +929,109 @@ impl Catalog {
     pub(crate) fn free_put(&mut self, slot: Slot) -> Result<()> {
         self.free_put.exec(&[int(slot as u64)], &mut self.counters)
     }
+}
+
+/// A13 amended (r11-restart-r2): the catalog checkpoint's own cost against the catalog's size, with
+/// no branch store and no arena (a 10^8-branch arena would be 400 GB; the checkpoint's cost is
+/// catalog work). `measure = false` BUILDS a catalog at `path` holding branches `1..=n`, one `cur`
+/// row each on one of 1,000 pages, in transactions of 100,000 rows. `measure = true` runs, on such a
+/// catalog, the statements a checkpoint issues for `d` distinct random dirty branches (one `put_cur`
+/// each, as fix v3 writes a committed branch) and the meta row in ONE transaction, then the WAL
+/// backfill, and returns a line of counters. Exposed for the `branch_restart catonly` harness only.
+#[doc(hidden)]
+pub fn catalog_only_fixture(path: &Path, n: u64, d: u64, measure: bool, seed: u64) -> Result<String> {
+    let page = |id: u64| 2 + (id % 1000) as u32;
+    if !measure {
+        let mut cat = Catalog::open(path, false)?;
+        let mut lo = 1u64;
+        while lo <= n {
+            let hi = (lo + 99_999).min(n);
+            cat.begin()?;
+            let bulk = cat
+                .conn
+                .execute(format!(
+                    "INSERT INTO branch(id, parent, fork_epoch, epoch, released, lease, n_children) \
+                     SELECT value, 0, value - 1, 0, 0, NULL, 0 FROM generate_series({lo}, {hi})"
+                ))
+                .and_then(|_| {
+                    cat.conn.execute(format!(
+                        "INSERT INTO cur(k, slot, born, crc) SELECT (value << 32) | (2 + value % 1000), \
+                         value, 0, 0 FROM generate_series({lo}, {hi})"
+                    ))
+                });
+            if bulk.is_err() {
+                // No table-valued generate_series here: the same rows, one statement each.
+                cat.rollback();
+                cat.begin()?;
+                for id in lo..=hi {
+                    let b = CatBranch {
+                        id,
+                        fork_epoch: id - 1,
+                        current: vec![(page(id), id as Slot, 0, 0)],
+                        ..CatBranch::default()
+                    };
+                    cat.put_branch(&b)?;
+                }
+            }
+            cat.commit()?;
+            lo = hi + 1;
+        }
+        cat.truncate_wal()?;
+        let rows = cat.conn.prepare("SELECT count(*) FROM cur")?.run_collect_rows()?;
+        let count = rows.first().map_or(Ok(0), |r| get(r, 0))?;
+        if count != n {
+            return Err(LimboError::InternalError(format!(
+                "catalog-only fixture: {count} cur rows, expected {n}"
+            )));
+        }
+        return Ok(format!("CATONLY_BUILD\tn={n}\tcur_rows={count}"));
+    }
+    let mut cat = Catalog::open(path, true)?;
+    let mut x = seed | 1;
+    let mut ids = std::collections::HashSet::new();
+    while (ids.len() as u64) < d.min(n) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        ids.insert(1 + x % n);
+    }
+    let io0 = super::page_io();
+    let bf0 = super::backfill_io();
+    let t = std::time::Instant::now();
+    cat.begin()?;
+    for &id in &ids {
+        let b = CatBranch {
+            id,
+            current: vec![(page(id), id as Slot, 1, 1)],
+            ..CatBranch::default()
+        };
+        cat.put_cur(&b)?;
+    }
+    cat.put_meta(&Meta {
+        generation: 2,
+        ..Meta::default()
+    })?;
+    cat.commit()?;
+    let commit_us = t.elapsed().as_secs_f64() * 1e6;
+    let io1 = super::page_io();
+    let t = std::time::Instant::now();
+    let truncated = cat.truncate_wal()?;
+    let backfill_us = t.elapsed().as_secs_f64() * 1e6;
+    let io2 = super::page_io();
+    let bf2 = super::backfill_io();
+    Ok(format!(
+        "CATONLY\tn={n}\td={}\tcommit_us={commit_us:.1}\tbackfill_us={backfill_us:.1}\t\
+         commit_db_page_reads={}\tcommit_wal_frame_writes={}\tbackfill_db_page_writes={}\t\
+         backfill_db_page_reads={}\tbackfill_wal_frame_reads={}\tbackfill_cache_hits={}\t\
+         backfill_wal_reads_issued={}\ttruncate={truncated:?}\tcache_pages={}",
+        ids.len(),
+        io1[0] - io0[0],
+        io1[3] - io0[3],
+        io2[1] - io1[1],
+        io2[0] - io1[0],
+        io2[2] - io1[2],
+        bf2[0] - bf0[0],
+        bf2[1] - bf0[1],
+        cat_cache_pages()
+    ))
 }

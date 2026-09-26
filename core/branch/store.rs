@@ -169,12 +169,20 @@ use super::{
 };
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
-use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
 
 pub(crate) struct BranchStore {
-    inner: Mutex<StoreInner>,
+    /// Shared with a fuzzy checkpoint's thread, which takes it for its install (F-FZ).
+    inner: Arc<Mutex<StoreInner>>,
+    /// Threads of fuzzy checkpoints started (F-FZ): joined by `compact_now`, by `Drop`, and once
+    /// more than `FLIGHTS_KEPT` accumulate (the oldest is long past its install).
+    flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
+    /// Test and harness hook (F-FZ): while it holds `HOLD_BEFORE_COMMIT` or `HOLD_AFTER_COMMIT`, a
+    /// fuzzy checkpoint in flight waits at that point (its catalog rows written but not committed;
+    /// or committed but not installed), so a caller can act on the store there, or image its files.
+    flight_hold: Arc<AtomicU8>,
     /// Live children of the trunk. Read without the lock on every trunk first-write so that a
     /// database with no branches pays one atomic load per written page and nothing else.
     ///
@@ -245,6 +253,9 @@ struct StoreInner {
     /// Commits parked by recovery, and parked Commits applied since (observing only).
     parked_records: u64,
     parked_applied: u64,
+    /// F-EXP: the last expiry pass stopped at its bound with more due (in memory, or in the
+    /// catalog sweep): `expire_now` runs another.
+    expire_more: bool,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -269,6 +280,9 @@ struct CatState {
     trunk_gone: HashSet<(u32, u64)>,
     /// No catalog row that is not loaded has a lease deadline below this (`None`: no lease).
     lease_floor: Option<u64>,
+    /// F-EXP: where the bounded expiry passes' sweep of the catalog's due rows has got to, as
+    /// (deadline, id); `None` between sweeps.
+    lease_cursor: Option<(u64, u64)>,
     /// The highest catalog free slot moved into the arena's in-memory free list.
     free_cursor: Option<Slot>,
     /// The catalog has no free slot above `free_cursor`.
@@ -282,11 +296,122 @@ struct CatState {
     /// Trunk-version probes and range reads, and the version rows they returned (C-P).
     trunk_probes: u64,
     trunk_rows: u64,
+    /// The fuzzy checkpoint's writer: a second connection on the catalog (F-FZ).
+    writer: Arc<Mutex<Catalog>>,
+    /// The catalog generation the last checkpoint committed. The log's generation can lag it by
+    /// one, until the log is rewritten to the checkpoint's suffix (F-FZ).
+    generation: u64,
+    /// A checkpoint has captured and not yet installed: the catalog connection holds a pinned
+    /// read snapshot, the catalog free table is not refilled from, and no checkpoint starts.
+    flight: bool,
+    /// Checkpoint and settle counters (observing only).
+    ckpt: CkptCounters,
+}
+
+/// Catalog checkpoints and C-R settle batches, as counted (r11-restart-r2 instrument, observing
+/// only). Times are wall-clock ns.
+#[derive(Clone, Copy, Default)]
+struct CkptCounters {
+    /// Checkpoints installed (fuzzy and sharp).
+    count: u64,
+    /// Fuzzy checkpoints started (a thread spawned).
+    flights: u64,
+    /// Store-mutex hold inside checkpoints: capture + install (+ the write, on the sharp path).
+    hold_ns: u64,
+    hold_max_ns: u64,
+    /// The writer's time without the store mutex (fuzzy path; phase 2 only).
+    flight_ns: u64,
+    /// Catalog statements run while the store mutex was held inside a checkpoint.
+    stmts_locked: u64,
+    /// C-R settle batches run from `maybe_compact`, the branches they loaded, and the most loads in
+    /// one batch.
+    settle_batches: u64,
+    settle_loads: u64,
+    settle_max_loads: u64,
+}
+
+impl CkptCounters {
+    fn hold(&mut self, ns: u64) {
+        self.hold_ns += ns;
+        self.hold_max_ns = self.hold_max_ns.max(ns);
+    }
+
+    fn as_array(&self) -> [u64; 9] {
+        [
+            self.count,
+            self.flights,
+            self.hold_ns,
+            self.hold_max_ns,
+            self.flight_ns,
+            self.stmts_locked,
+            self.settle_batches,
+            self.settle_loads,
+            self.settle_max_loads,
+        ]
+    }
+}
+
+/// C-R's parked Commits settled per `maybe_compact` call, at most (in branches): Graefe's
+/// background redo in bounded quanta, so no one mutex hold loads a whole checkpoint window's
+/// branches (r11-restart-r2).
+const SETTLE_BATCH: usize = 64;
+
+/// F-EXP (r11-restart-r2): the most branches an expiry pass (at open, fork, open_conn, set_lease;
+/// `expire_now` runs passes until none is due) reaps, and the most catalog rows it sweeps. Redis's
+/// active expiry bounds each cycle the same way; a branch an operation names is reaped on access if
+/// due. `R11_EXPIRE=unbounded` restores the base's single unbounded pass: the BEFORE arm.
+fn expire_batch() -> usize {
+    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| match std::env::var("R11_EXPIRE") {
+        Ok(v) if v == "unbounded" => usize::MAX >> 1,
+        _ => 256,
+    })
+}
+
+/// F-FZ: fuzzy-checkpoint threads kept unjoined before the oldest is joined.
+const FLIGHTS_KEPT: usize = 64;
+
+/// F-FZ hook stages (`BranchStore::checkpoint_hold`): the writer has written the captured rows and
+/// not committed; or it has committed and the install has not run.
+pub(crate) const HOLD_BEFORE_COMMIT: u8 = 2;
+pub(crate) const HOLD_AFTER_COMMIT: u8 = 3;
+
+/// Or-ed into the hook's stage once the flight has arrived there (tests wait for it).
+pub(crate) const HOLD_ARRIVED: u8 = 0x80;
+
+/// If the hook is at `stage`, mark the arrival and wait until it is moved (tests and the harness
+/// release it by storing 0).
+fn pause_at(hold: Option<&AtomicU8>, stage: u8) {
+    if let Some(hold) = hold {
+        let arrived = stage | HOLD_ARRIVED;
+        if hold
+            .compare_exchange(stage, arrived, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            while hold.load(Ordering::Acquire) == arrived {
+                crate::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+/// F-FZ's arm switch: `R11_CKPT=sharp` makes `maybe_compact` checkpoint a catalog store the base's
+/// way (settle everything, then capture, write and install under the store mutex): the BEFORE arm
+/// of the stall measurement, and the control for any test that fails only with the fuzzy path.
+/// Anything else, or unset: fuzzy.
+fn fuzzy_checkpoints() -> bool {
+    static FUZZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FUZZY.get_or_init(|| std::env::var("R11_CKPT").map_or(true, |v| v != "sharp"))
 }
 
 impl CatState {
-    fn new(catalog: Catalog) -> Self {
-        Self {
+    fn new(catalog: Catalog, sync: bool, generation: u64) -> Result<Self> {
+        let writer = Arc::new(Mutex::new(catalog.writer(sync)?));
+        Ok(Self {
+            writer,
+            generation,
+            flight: false,
+            ckpt: CkptCounters::default(),
             catalog,
             dirty: HashMap::new(),
             removed: HashSet::new(),
@@ -294,6 +419,7 @@ impl CatState {
             trunk_cache: HashMap::new(),
             trunk_gone: HashSet::new(),
             lease_floor: None,
+            lease_cursor: None,
             free_cursor: None,
             free_exhausted: false,
             taken: HashSet::new(),
@@ -301,7 +427,7 @@ impl CatState {
             trunk_page_loads: 0,
             trunk_probes: 0,
             trunk_rows: 0,
-        }
+        })
     }
 }
 
@@ -385,6 +511,13 @@ impl LeaseClock {
     /// A flush succeeded: every buffered reading is durable.
     fn flushed(&mut self) {
         self.durable_ms = self.queued_ms;
+    }
+
+    /// A checkpoint made the reading `ms` durable in the catalog's meta row. Readings queued after
+    /// its capture are still only buffered (F-FZ), so they stay undurable.
+    fn durable_at_least(&mut self, ms: u64) {
+        self.queued_ms = self.queued_ms.max(ms);
+        self.durable_ms = self.durable_ms.max(ms);
     }
 }
 
@@ -817,6 +950,19 @@ impl Lineage {
         dead
     }
 
+    /// Remove one version, if this lineage holds it, from the per-page map and both indexes
+    /// (F-FZ: a checkpoint moved it to the catalog).
+    fn take_version(&mut self, page: u32, born: u64) -> Option<Retained> {
+        let versions = self.retained.get_mut(&page)?;
+        let v = versions.remove(&born)?;
+        if versions.is_empty() {
+            self.retained.remove(&page);
+        }
+        self.by_born.remove(&(v.born, page, v.died));
+        self.by_died.remove(&(v.died, page, v.born));
+        Some(v)
+    }
+
     fn release_all(self, freed: &mut Vec<Slot>) {
         for (_, versions) in self.retained {
             freed.extend(versions.into_values().map(|v| v.slot));
@@ -831,6 +977,143 @@ impl Lineage {
             .collect();
         out.sort_unstable();
         out
+    }
+}
+
+/// F-FZ: what a catalog checkpoint captured under the store mutex (phase 1), for its writer (phase
+/// 2, no store mutex) and its install (phase 3). See `catalog.rs`, "The fuzzy checkpoint".
+struct Captured {
+    /// The catalog generation this checkpoint commits.
+    generation: u64,
+    /// The logical log position the capture covers (`Journal::mark`).
+    log_from: u64,
+    rows: Vec<(CatBranch, u8)>,
+    /// The dirty map the capture swapped out: merged back if the write fails.
+    dirty: HashMap<BranchId, u8>,
+    removed: Vec<BranchId>,
+    trunk_new: Vec<(u32, u64, u64, Slot, u32)>,
+    trunk_gone: Vec<(u32, u64)>,
+    free_cursor: Option<Slot>,
+    taken: Vec<Slot>,
+    free_list: Vec<Slot>,
+    reserved: Vec<Slot>,
+    meta: Meta,
+    /// `ChildIndex` keys (children forked, and removal links) as of the capture.
+    child_keys: Vec<(u64, u64)>,
+    child_removed: Vec<(u64, u64)>,
+    /// A handle on the arena file: synced before the catalog names the slots.
+    arena: Option<std::fs::File>,
+    lease_now: u64,
+    fail_after_commit: bool,
+}
+
+/// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
+/// transaction. Holds no store lock: nothing here reads the store.
+fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU8>) -> Result<()> {
+    // Every slot the catalog is about to name must be durable first.
+    if let Some(file) = cap.arena.as_ref() {
+        super::journal::fsync_file(file)?;
+    }
+    catalog.begin()?;
+    let written = (|| -> Result<()> {
+        for (b, what) in &cap.rows {
+            if what & DIRTY_NEW != 0 {
+                catalog.put_branch(b)?;
+                continue;
+            }
+            if what & DIRTY_ROW != 0 {
+                catalog.update_row(b)?;
+            }
+            if what & DIRTY_CUR != 0 {
+                catalog.put_cur(b)?;
+            }
+            if what & DIRTY_RET != 0 {
+                catalog.put_ret(b)?;
+            }
+        }
+        for &id in &cap.removed {
+            catalog.delete_branch(id.0)?;
+        }
+        for &(page, born) in &cap.trunk_gone {
+            catalog.trunk_delete(page, born)?;
+        }
+        for &(page, born, died, slot, crc) in &cap.trunk_new {
+            catalog.trunk_insert(page, born, died, slot, crc)?;
+        }
+        if let Some(cursor) = cap.free_cursor {
+            catalog.free_delete_upto(cursor)?;
+        }
+        for &slot in &cap.taken {
+            catalog.free_delete(slot)?;
+        }
+        for &slot in cap.free_list.iter().chain(cap.reserved.iter()) {
+            catalog.free_put(slot)?;
+        }
+        catalog.put_meta(&cap.meta)
+    })()
+    .and_then(|()| {
+        pause_at(hold, HOLD_BEFORE_COMMIT);
+        catalog.commit()
+    });
+    if let Err(e) = written {
+        catalog.rollback();
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// F-FZ phase 4 (and the sharp path's last step): bound the catalog's WAL (fix v2, PREREG A7). A
+/// PASSIVE backfill first, which waits for no reader, then a TRUNCATE attempt. The checkpoint is
+/// already durable, so a failure costs only WAL length: it is logged, not returned.
+fn truncate_catalog_wal(catalog: &mut Catalog) {
+    if let Err(e) = catalog.wal_passive() {
+        tracing::warn!("branch catalog WAL backfill failed: {e}");
+    }
+    match catalog.truncate_wal() {
+        Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
+            tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("branch catalog WAL truncation failed: {e}"),
+    }
+}
+
+/// F-FZ: the body of a fuzzy checkpoint's thread. Phase 2 holds only the writer; phase 3 only the
+/// store mutex; phase 4 only the writer again. No path takes the writer while waiting for the store
+/// mutex, and the sharp path (which takes the store mutex, then the writer) refuses while a capture
+/// is in flight, so the two cannot deadlock.
+fn run_flight(
+    inner: Arc<Mutex<StoreInner>>,
+    writer: Arc<Mutex<Catalog>>,
+    cap: Box<Captured>,
+    hold: Arc<AtomicU8>,
+) {
+    let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let t = Instant::now();
+    let written = {
+        let mut w = writer.lock();
+        checkpoint_write(&mut w, &cap, Some(&*hold))
+    };
+    let write_ns = ns(t);
+    if written.is_ok() {
+        pause_at(Some(&*hold), HOLD_AFTER_COMMIT);
+    }
+    let installed = {
+        let mut guard = inner.lock();
+        let t = Instant::now();
+        let installed = guard.checkpoint_install(cap, written);
+        let hold_ns = ns(t);
+        if let Some(cat) = guard.cat.as_mut() {
+            cat.ckpt.hold(hold_ns);
+            cat.ckpt.flight_ns += write_ns;
+        }
+        installed
+    };
+    // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
+    // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
+    match installed {
+        Ok(()) => truncate_catalog_wal(&mut writer.lock()),
+        Err(e) => tracing::warn!("branch catalog fuzzy checkpoint failed: {e}"),
     }
 }
 
@@ -885,7 +1168,9 @@ impl BranchStore {
 
     fn trunk_only() -> Self {
         Self {
-            inner: Mutex::new(StoreInner::fresh(None, false, None)),
+            inner: Arc::new(Mutex::new(StoreInner::fresh(None, false, None))),
+            flights: Mutex::new(Vec::new()),
+            flight_hold: Arc::new(AtomicU8::new(0)),
             trunk_children: AtomicUsize::new(0),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
@@ -1020,7 +1305,9 @@ impl BranchStore {
         };
         let mut store = Self {
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
-            inner: Mutex::new(inner),
+            inner: Arc::new(Mutex::new(inner)),
+            flights: Mutex::new(Vec::new()),
+            flight_hold: Arc::new(AtomicU8::new(0)),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
             trunk_only: false,
@@ -1088,7 +1375,7 @@ impl BranchStore {
         stats.catalog_ns = ns(t);
         let t = Instant::now();
         let recovered =
-            Journal::recover_catalog(files, sync, meta.map(|m| (m.page_size, m.generation)))?;
+            Journal::recover_catalog(files, sync, meta.map(|m| (m.page_size, m.generation, m.log_from)))?;
         stats.recover_ns = ns(t);
         let Some(recovered) = recovered else {
             return Ok(());
@@ -1104,7 +1391,7 @@ impl BranchStore {
         inner.trunk.lineage.n_children = meta.trunk_children;
         inner.n_states = meta.states;
         inner.lease.recovered(meta.lease_now_ms);
-        let mut cat = CatState::new(catalog);
+        let mut cat = CatState::new(catalog, sync, meta.generation)?;
         cat.lease_floor = cat.catalog.lease_min()?;
         inner.cat = Some(cat);
         // Replay, remembering every slot a record names (in use) and every slot its replay frees,
@@ -1268,6 +1555,7 @@ impl BranchStore {
         // the pass judged the lease, not after the pass's own flush.
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
         inner.ensure(id)?;
+        self.reap_if_due(&mut inner, id, now)?;
         let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
         if st.handle.is_released() {
             return Err(reaped(id));
@@ -1302,7 +1590,45 @@ impl BranchStore {
                 fail_stop_cause(inner.journal.as_ref())
             )));
         }
-        Ok(self.expire(&mut inner, Stamp::Flush)?.0)
+        // Every branch due, in bounded passes (F-EXP), until a pass stops short of its bound.
+        let mut all = Expired::default();
+        loop {
+            let (pass, _) = self.expire(&mut inner, Stamp::Flush)?;
+            let more = inner.expire_more;
+            all.freed_pages += pass.freed_pages;
+            all.reaped.extend(pass.reaped);
+            if !more {
+                return Ok(all);
+            }
+        }
+    }
+
+    /// F-EXP: reap `id` now if its lease has run out and it is still live, so an operation naming
+    /// it is refused exactly as if the expiry pass had reaped it (a bounded pass may not have got
+    /// to it). A fail-stopped store reaps nothing, as the pass does; its callers refuse instead.
+    fn reap_if_due(&self, inner: &mut StoreInner, id: BranchId, now: u64) -> Result<()> {
+        if inner.poisoned() {
+            return Ok(());
+        }
+        let due = inner.branches.get(&id).is_some_and(|st| {
+            !st.handle.is_released() && st.lease.is_some_and(|deadline| deadline <= now)
+        });
+        if !due {
+            return Ok(());
+        }
+        inner.lease.queued(now);
+        self.log_all(
+            inner,
+            vec![Record::Release { branch: id.0 }, Record::Clock { now_ms: now }],
+        )?;
+        let mut freed = Vec::new();
+        if let Err(e) = inner.apply_release(id, &mut freed) {
+            return Err(inner.fatal(e));
+        }
+        inner.release_slots(freed);
+        self.sync_trunk_children(inner);
+        self.sync_lease_flag(inner);
+        Ok(())
     }
 
     /// Reap every branch whose lease has run out — non-cooperatively: attached, detached, or open
@@ -1319,22 +1645,36 @@ impl BranchStore {
             return Ok((Expired::default(), now));
         }
         // Catalog stores: a lease a branch not yet resident carries is in the catalog's lease
-        // index; the rows due are made resident, which puts their deadlines in `leases`.
+        // index; the rows due are made resident, which puts their deadlines in `leases`. F-EXP: at
+        // most `expire_batch()` rows per pass, in a keyset sweep that the next pass continues.
+        inner.expire_more = false;
         if let Some(cat) = inner.cat.as_mut() {
             if cat.lease_floor.is_some_and(|floor| floor <= now) {
-                let due_rows = cat.catalog.lease_due(now)?;
-                for id in due_rows {
+                let (due_rows, complete) =
+                    cat.catalog
+                        .lease_due_page(now, cat.lease_cursor, expire_batch())?;
+                cat.lease_cursor = if complete { None } else { due_rows.last().map(|&(id, lease)| (lease, id)) };
+                for &(id, _) in &due_rows {
                     inner.ensure(BranchId(id))?;
                 }
                 let cat = inner.cat.as_mut().expect("still a catalog store");
-                cat.lease_floor = cat.catalog.lease_min_after(now)?;
+                if complete {
+                    cat.lease_floor = cat.catalog.lease_min_after(now)?;
+                } else {
+                    inner.expire_more = true;
+                }
             }
         }
-        let due: Vec<BranchId> = inner
+        let mut due: Vec<BranchId> = inner
             .leases
             .range(..=(now, BranchId(u64::MAX)))
+            .take(expire_batch().saturating_add(1))
             .map(|&(_, id)| id)
             .collect();
+        if due.len() > expire_batch() {
+            due.truncate(expire_batch());
+            inner.expire_more = true;
+        }
         if due.is_empty() {
             if !inner.leases.is_empty() {
                 match stamp {
@@ -1430,10 +1770,97 @@ impl BranchStore {
     /// Compact the log into a snapshot if it has outgrown the live state. Best effort: the
     /// operation that triggered it is already durable, and a failure before the rename leaves the
     /// log intact; a failure after it fail-stops the journal (see `Journal::compact`).
+    ///
+    /// A catalog store checkpoints FUZZILY instead (F-FZ): C-R's parked Commits first, a bounded
+    /// batch per call; then a capture under this mutex, and the write on a thread of its own.
     fn maybe_compact(&self, inner: &mut StoreInner) {
-        if inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
+        if !inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
+            return;
+        }
+        if inner.cat.is_none() || !fuzzy_checkpoints() {
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
+            }
+            return;
+        }
+        self.start_flight(inner);
+    }
+
+    /// F-FZ: start a fuzzy checkpoint unless one is in flight. Parked Commits (C-R) are settled
+    /// first, at most `SETTLE_BATCH` branches per call, and the checkpoint waits for the next call
+    /// while any remain. Returns whether a checkpoint started.
+    fn start_flight(&self, inner: &mut StoreInner) -> bool {
+        if inner.cat.as_ref().is_none_or(|c| c.flight) || inner.poisoned() {
+            return false;
+        }
+        let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if !inner.parked.is_empty() {
+            let t = Instant::now();
+            if let Err(e) = inner.settle_batch(SETTLE_BATCH) {
+                tracing::warn!("branch store: parked commits not applied: {e}");
+                let _ = inner.fatal(e);
+                return false;
+            }
+            if let Some(cat) = inner.cat.as_mut() {
+                cat.ckpt.hold(ns(t));
+            }
+            if !inner.parked.is_empty() {
+                return false;
+            }
+        }
+        let t = Instant::now();
+        let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
+        let cap = match inner.checkpoint_capture(false) {
+            Ok(cap) => cap,
+            Err(e) => {
+                tracing::warn!("branch catalog checkpoint not started: {e}");
+                return false;
+            }
+        };
+        let cat = inner.cat.as_mut().expect("captured above");
+        cat.ckpt.hold(ns(t));
+        cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
+        cat.ckpt.flights += 1;
+        let writer = cat.writer.clone();
+        let dirty = cap.dirty.clone();
+        let shared = self.inner.clone();
+        let hold = self.flight_hold.clone();
+        let mut flights = self.flights.lock();
+        if flights.len() >= FLIGHTS_KEPT {
+            // Past its install long ago (only one checkpoint is ever in flight), so this join
+            // waits for nothing.
+            let _ = flights.remove(0).join();
+        }
+        let spawned = crate::thread::Builder::new()
+            .name("branch-checkpoint".to_string())
+            .spawn(move || run_flight(shared, writer, cap, hold));
+        match spawned {
+            Ok(handle) => {
+                flights.push(handle);
+                true
+            }
+            Err(e) => {
+                // Nothing was written: undo the capture (the thread's closure, and the capture
+                // with it, are gone).
+                tracing::warn!("branch catalog checkpoint thread not started: {e}");
+                let cat = inner.cat.as_mut().expect("captured above");
+                cat.catalog.end_read_snapshot();
+                cat.flight = false;
+                for (id, what) in dirty {
+                    *cat.dirty.entry(id).or_insert(0) |= what;
+                }
+                false
+            }
+        }
+    }
+
+    /// Wait for every fuzzy checkpoint thread started so far (F-FZ). Called without the store
+    /// mutex: a thread in flight takes it for its install.
+    fn join_flights(&self) {
+        let handles = std::mem::take(&mut *self.flights.lock());
+        for handle in handles {
+            if handle.join().is_err() {
+                tracing::warn!("a branch catalog checkpoint thread panicked");
             }
         }
     }
@@ -1494,6 +1921,7 @@ impl BranchStore {
         // branches").
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
         inner.ensure(parent)?;
+        self.reap_if_due(&mut inner, parent, now)?;
         let st = inner.branches.get(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
             return Err(LimboError::Busy);
@@ -1527,6 +1955,7 @@ impl BranchStore {
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
         let poisoned = inner.poisoned().then(|| fail_stop_cause(inner.journal.as_ref()));
         inner.ensure(id)?;
+        self.reap_if_due(&mut inner, id, now)?;
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.handle.is_released() {
             return Err(reaped(id));
@@ -2183,7 +2612,20 @@ impl BranchStore {
     }
 
     pub(crate) fn compact_now(&self) -> Result<()> {
-        let mut inner = self.inner.lock();
+        // A fuzzy checkpoint in flight finishes first: the sharp one may not overlap it (F-FZ). One
+        // another thread starts after the join is waited for once more; then this refuses.
+        let mut attempts = 0;
+        let mut inner = loop {
+            self.join_flights();
+            let inner = self.inner.lock();
+            if !inner.cat.as_ref().is_some_and(|c| c.flight) {
+                break inner;
+            }
+            attempts += 1;
+            if attempts == 3 {
+                return Err(LimboError::Busy);
+            }
+        };
         let fail = inner.failpoint == Some(BranchFailpoint::CompactAfterRenameBeforeLogReset);
         if fail {
             inner.failpoint = None;
@@ -2198,12 +2640,55 @@ impl BranchStore {
             .as_ref()
             .map(|j| j.log_path().to_path_buf())
     }
+
+    /// Checkpoint and settle counters (r11-restart-r2 instrument): `[checkpoints installed, fuzzy
+    /// flights started, store-mutex hold ns inside checkpoints (sum, max), writer ns without the
+    /// mutex, catalog statements under the mutex, settle batches, settle loads, most loads in one
+    /// batch]`. Zeros for a store that is not a catalog store.
+    pub(crate) fn checkpoint_counters(&self) -> [u64; 9] {
+        self.inner
+            .lock()
+            .cat
+            .as_ref()
+            .map_or([0; 9], |c| c.ckpt.as_array())
+    }
+
+    /// Start a fuzzy checkpoint now, whatever the log's length (F-FZ; tests and the harness), as
+    /// `maybe_compact` would: while C-R has parked Commits, this settles one bounded batch and
+    /// starts nothing. `Ok(false)`: nothing started (parked Commits remain, one is in flight, or
+    /// this is not a catalog store).
+    pub(crate) fn checkpoint_fuzzy_now(&self) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if inner.cat.is_none() || inner.journal.is_none() || inner.arena.is_none() {
+            return Ok(false);
+        }
+        Ok(self.start_flight(&mut inner))
+    }
+
+    /// Make a fuzzy checkpoint in flight wait at `stage` (`HOLD_BEFORE_COMMIT`,
+    /// `HOLD_AFTER_COMMIT`) until this is called with another value (0 releases it).
+    pub(crate) fn checkpoint_hold(&self, stage: u8) {
+        self.flight_hold.store(stage, Ordering::Release);
+    }
+
+    /// Wait for every fuzzy checkpoint started so far to install.
+    pub(crate) fn checkpoint_wait(&self) {
+        self.join_flights();
+    }
+
+    /// The hook's value: a stage, with `HOLD_ARRIVED` once a flight waits there.
+    pub(crate) fn checkpoint_held(&self) -> u8 {
+        self.flight_hold.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for BranchStore {
     /// A clean close stamps the lease clock, so the time spent open is not lost with the process.
     /// (A crash loses the time since the last stamp, which extends leases and never shortens one.)
+    /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files.
     fn drop(&mut self) {
+        self.flight_hold.store(0, Ordering::Release);
+        self.join_flights();
         let mut inner = self.inner.lock();
         let now = inner.lease.now_ms();
         // With no lease outstanding the clock's value constrains nothing, so a close writes nothing.
@@ -2273,6 +2758,7 @@ impl StoreInner {
             deferred_freed: Vec::new(),
             parked_records: 0,
             parked_applied: 0,
+            expire_more: false,
         }
     }
 
@@ -2649,7 +3135,10 @@ impl StoreInner {
         let (Some(cat), Some(arena)) = (self.cat.as_mut(), self.arena.as_mut()) else {
             return Ok(());
         };
-        while arena.free_count() == 0 && !cat.free_exhausted {
+        // Not while a checkpoint is in flight (F-FZ): the catalog connection reads the snapshot the
+        // capture pinned, whose free table the checkpoint is rewriting; allocations take the high
+        // water mark meanwhile, and the install reconciles the list with what it committed.
+        while arena.free_count() == 0 && !cat.free_exhausted && !cat.flight {
             let batch = cat.catalog.free_batch(cat.free_cursor, 256)?;
             match batch.last() {
                 None => cat.free_exhausted = true,
@@ -2759,7 +3248,7 @@ impl StoreInner {
                         catalog.rollback();
                         return Err(e);
                     }
-                    self.cat = Some(CatState::new(catalog));
+                    self.cat = Some(CatState::new(catalog, self.sync, 0)?);
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
                 // The journal's create synced the directory before the arena file existed.
@@ -2838,27 +3327,74 @@ impl StoreInner {
 
     /// Catalog mode's compaction, an incremental checkpoint: every branch and trunk page changed
     /// since the last checkpoint, the free-space changes and the meta row go to the catalog in ONE
-    /// transaction; then the log starts over at the next generation. The catalog commit is the
-    /// commit point (a crash after it leaves an older-generation log, which recovery ignores), as
+    /// transaction; then the log keeps only what follows the capture. The catalog commit is the
+    /// commit point (a crash after it replays only the suffix its meta row's `log_from` names), as
     /// the snapshot's rename is in snapshot mode. The work is proportional to what changed since
     /// the last checkpoint, which the log's size bounds, not to the live state.
+    ///
+    /// This is the SHARP form (`compact_now`, `restart_empty`, and every test that checkpoints on
+    /// purpose): capture, write and install back to back under the store mutex. `maybe_compact`
+    /// runs the same three steps as a fuzzy checkpoint instead, with the write on its own thread
+    /// and no store mutex held across it (F-FZ).
     fn checkpoint_catalog(&mut self, fail_after_commit: bool) -> Result<()> {
         // The catalog must hold the state the log describes: parked Commits first (C-R).
         self.settle()?;
+        if self.journal.is_none() || self.arena.is_none() {
+            return Ok(());
+        }
+        let Some(cat) = self.cat.as_ref() else {
+            return Ok(());
+        };
+        if cat.flight {
+            // A fuzzy checkpoint is between its capture and its install; this one would overlap it.
+            return Err(LimboError::Busy);
+        }
+        let t = Instant::now();
+        let writer = cat.writer.clone();
+        let q0 = cat.catalog.counters.queries;
+        let cap = self.checkpoint_capture(fail_after_commit)?;
+        let mut w = writer.lock();
+        let w0 = w.counters.queries;
+        let written = checkpoint_write(&mut w, &cap, None);
+        let wrote = w.counters.queries - w0;
+        let installed = self.checkpoint_install(cap, written);
+        if installed.is_ok() {
+            truncate_catalog_wal(&mut w);
+        }
+        drop(w);
+        if let Some(cat) = self.cat.as_mut() {
+            let q1 = cat.catalog.counters.queries;
+            cat.ckpt.stmts_locked += wrote + q1.saturating_sub(q0);
+            cat.ckpt.hold(u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+        installed
+    }
+
+    /// F-FZ phase 1, under the store mutex: capture what the checkpoint writes, as of the log's
+    /// current end, and pin the catalog connection's read snapshot there. Nothing parked may be
+    /// pending (the catalog must hold what the captured log describes) and no other checkpoint may
+    /// be in flight. The dirty map is swapped out (a branch changed after this is dirty again);
+    /// every other in-memory set stays as it is until the install, so between now and then the
+    /// store reads exactly as it does between checkpoints.
+    fn checkpoint_capture(&mut self, fail_after_commit: bool) -> Result<Box<Captured>> {
         let now = self.lease.now_ms();
         let (Some(journal), Some(arena), Some(cat)) =
             (self.journal.as_mut(), self.arena.as_mut(), self.cat.as_mut())
         else {
-            return Ok(());
+            return Err(LimboError::InternalError(
+                "a branch catalog checkpoint needs its log, arena and catalog".to_string(),
+            ));
         };
         journal.check_live()?;
-        // Every slot the catalog is about to name must be durable first.
-        if self.sync {
-            arena.sync()?;
+        if !self.parked.is_empty() || cat.flight {
+            return Err(LimboError::InternalError(
+                "a branch catalog checkpoint started with parked commits or another in flight"
+                    .to_string(),
+            ));
         }
-        let generation = journal.generation() + 1;
-        let rows: Vec<(CatBranch, u8)> = cat
-            .dirty
+        let generation = cat.generation + 1;
+        let dirty = std::mem::take(&mut cat.dirty);
+        let rows: Vec<(CatBranch, u8)> = dirty
             .iter()
             .filter_map(|(id, &what)| self.branches.get(id).map(|st| (id, st, what)))
             .map(|(&id, st, what)| (CatBranch {
@@ -2888,6 +3424,7 @@ impl StoreInner {
             .values()
             .flat_map(|st| st.pending.values().copied())
             .collect();
+        let log_from = journal.mark();
         let meta = Meta {
             generation,
             page_size: journal.page_size() as u32,
@@ -2898,6 +3435,7 @@ impl StoreInner {
             arena_hw: arena.high_water(),
             in_use: (arena.in_use() - reserved.len()) as u64,
             states: self.n_states,
+            log_from: Some((journal.generation(), log_from)),
         };
         if super::arena::trace_slots() {
             let named: Vec<(u64, Vec<Slot>)> = rows
@@ -2909,7 +3447,7 @@ impl StoreInner {
                 })
                 .collect();
             eprintln!(
-                "R11SLOT checkpoint gen={generation} rows={named:?} removed={:?} trunk_new={:?} trunk_gone={:?} cursor={:?} taken={:?} free_mem={:?} reserved={reserved:?} hw={} in_use={}",
+                "R11SLOT checkpoint gen={generation} log_from={log_from} rows={named:?} removed={:?} trunk_new={:?} trunk_gone={:?} cursor={:?} taken={:?} free_mem={:?} reserved={reserved:?} hw={} in_use={}",
                 cat.removed,
                 trunk_new,
                 trunk_gone,
@@ -2920,92 +3458,147 @@ impl StoreInner {
                 arena.in_use()
             );
         }
-        let catalog = &mut cat.catalog;
-        catalog.begin()?;
-        let written = (|| -> Result<()> {
-            for (b, what) in &rows {
-                if what & DIRTY_NEW != 0 {
-                    catalog.put_branch(b)?;
-                    continue;
-                }
-                if what & DIRTY_ROW != 0 {
-                    catalog.update_row(b)?;
-                }
-                if what & DIRTY_CUR != 0 {
-                    catalog.put_cur(b)?;
-                }
-                if what & DIRTY_RET != 0 {
-                    catalog.put_ret(b)?;
+        let arena_file = if self.sync {
+            match arena.sync_handle() {
+                Ok(f) => f,
+                Err(e) => {
+                    cat.dirty = dirty;
+                    return Err(e);
                 }
             }
-            for &id in &cat.removed {
-                catalog.delete_branch(id.0)?;
-            }
-            for &(page, born) in &trunk_gone {
-                catalog.trunk_delete(page, born)?;
-            }
-            for &(page, born, died, slot, crc) in &trunk_new {
-                catalog.trunk_insert(page, born, died, slot, crc)?;
-            }
-            if let Some(cursor) = cat.free_cursor {
-                catalog.free_delete_upto(cursor)?;
-            }
-            for &slot in &cat.taken {
-                catalog.free_delete(slot)?;
-            }
-            for &slot in arena.free_list().iter().chain(reserved.iter()) {
-                catalog.free_put(slot)?;
-            }
-            catalog.put_meta(&meta)
-        })()
-        .and_then(|()| catalog.commit());
-        if let Err(e) = written {
-            catalog.rollback();
+        } else {
+            None
+        };
+        if let Err(e) = cat.catalog.begin_read_snapshot() {
+            cat.dirty = dirty;
             return Err(e);
         }
-        // From here the catalog is the truth; the log is stale by generation.
-        if fail_after_commit {
+        cat.flight = true;
+        Ok(Box::new(Captured {
+            generation,
+            log_from,
+            rows,
+            dirty,
+            removed: cat.removed.iter().copied().collect(),
+            trunk_new,
+            trunk_gone,
+            free_cursor: cat.free_cursor,
+            taken: cat.taken.iter().copied().collect(),
+            free_list: arena.free_list().to_vec(),
+            reserved,
+            meta,
+            child_keys: self.children.map.keys().copied().collect(),
+            child_removed: self.children.removed.keys().copied().collect(),
+            arena: arena_file,
+            lease_now: now,
+            fail_after_commit,
+        }))
+    }
+
+    /// F-FZ phase 3, under the store mutex: end the pinned snapshot and, if the writer committed,
+    /// cut the log to what follows the capture and take out of memory exactly what the catalog now
+    /// holds — nothing that changed since the capture. If it did not commit, what the capture swapped
+    /// out is dirty again and nothing else has changed.
+    fn checkpoint_install(&mut self, cap: Box<Captured>, written: Result<()>) -> Result<()> {
+        let Some(cat) = self.cat.as_mut() else {
+            return written;
+        };
+        let q0 = cat.catalog.counters.queries;
+        cat.catalog.end_read_snapshot();
+        cat.flight = false;
+        if let Err(e) = written {
+            for (id, what) in cap.dirty {
+                *cat.dirty.entry(id).or_insert(0) |= what;
+            }
+            return Err(e);
+        }
+        cat.generation = cap.generation;
+        cat.ckpt.count += 1;
+        // From here the catalog is the truth up to the capture's log position.
+        let Some(journal) = self.journal.as_mut() else {
+            return Err(LimboError::InternalError(
+                "a branch catalog checkpoint lost its log".to_string(),
+            ));
+        };
+        if cap.fail_after_commit {
             journal.poison();
             return Err(LimboError::InternalError(
                 "failpoint: branch checkpoint stopped after the catalog commit".to_string(),
             ));
         }
-        journal.restart_at(generation)?;
-        // Fix v2 (PREREG A7): bound the catalog's own WAL. The checkpoint above is already durable, so
-        // a failure here costs only WAL length, never state: it is logged, not returned.
-        match cat.catalog.truncate_wal() {
-            Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
-                tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
+        // A failure before its rename leaves the old log in use, which the catalog's `log_from`
+        // names: correct, only longer. The install below must happen either way.
+        let rewritten = journal.rewrite_from(cap.log_from, cap.generation);
+        for id in &cap.removed {
+            cat.removed.remove(id);
+        }
+        for key in &cap.trunk_gone {
+            cat.trunk_gone.remove(key);
+        }
+        // The trunk's captured versions are catalog versions now: they move to the read cache, so
+        // that what stays in the lineage is again only what the catalog does not hold. One reaped
+        // since the capture is in the catalog anyway, so the next checkpoint deletes it.
+        for &(page, born, died, slot, crc) in &cap.trunk_new {
+            if self.trunk.lineage.take_version(page, born).is_some() {
+                cat.trunk_cache
+                    .entry(page)
+                    .or_default()
+                    .insert(born, Retained { born, died, slot, crc });
+            } else {
+                cat.trunk_gone.insert((page, born));
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("branch catalog WAL truncation failed: {e}"),
         }
-        cat.dirty.clear();
-        cat.removed.clear();
-        cat.trunk_gone.clear();
-        // The trunk's in-memory versions are catalog versions now: they move to the read cache, so
-        // that what stays in the lineage is again only what the catalog does not hold.
-        for (page, born, died, slot, crc) in trunk_new {
-            cat.trunk_cache
-                .entry(page)
-                .or_default()
-                .insert(born, Retained { born, died, slot, crc });
+        // Children forked before the capture have rows now; links of children removed before it
+        // pointed at rows that are deleted now.
+        for key in &cap.child_keys {
+            self.children.map.remove(key);
         }
-        let lineage = &mut self.trunk.lineage;
-        lineage.retained.clear();
-        lineage.by_born.clear();
-        lineage.by_died.clear();
-        self.children.map.clear();
-        self.children.removed.clear();
-        // Every free slot is in the catalog now: the in-memory list is dropped and refetched.
-        arena.drain_free();
+        for key in &cap.child_removed {
+            self.children.removed.remove(key);
+        }
+        // The free list: every slot the checkpoint listed free in the catalog leaves the in-memory
+        // list if it is still there; one that is not is in use (or reserved) now, and is taken.
+        // Slots freed since the capture stay on the list: the catalog does not hold them. (The
+        // free table is not read while a checkpoint is in flight, so nothing on the list came from
+        // it after the capture.)
+        if let Some(arena) = self.arena.as_mut() {
+            let listed: HashSet<Slot> = cap
+                .free_list
+                .iter()
+                .chain(cap.reserved.iter())
+                .copied()
+                .collect();
+            cat.taken = arena.remove_free(&listed).into_iter().collect();
+        }
         cat.free_cursor = None;
         cat.free_exhausted = false;
-        cat.taken = reserved.into_iter().collect();
         cat.lease_floor = cat.catalog.lease_min()?;
-        self.lease.queued(now);
-        self.lease.flushed();
-        Ok(())
+        cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
+        self.lease.durable_at_least(cap.lease_now);
+        rewritten
+    }
+
+    /// C-R's parked Commits, at most `max` branches per call with their unloaded ancestors:
+    /// Graefe's background redo in bounded quanta, run where a checkpoint wants to start
+    /// (r11-restart-r2). Returns the catalog loads it made.
+    fn settle_batch(&mut self, max: usize) -> Result<u64> {
+        let loads0 = self.cat.as_ref().map_or(0, |c| c.branch_loads);
+        let ids: Vec<BranchId> = self.parked.keys().take(max).copied().collect();
+        for id in ids {
+            if !self.ensure(id)? {
+                return Err(LimboError::Corrupt(format!(
+                    "branch log replay: branch {} named by a Commit is not in the catalog",
+                    id.0
+                )));
+            }
+        }
+        let loads = self.cat.as_ref().map_or(0, |c| c.branch_loads) - loads0;
+        if let Some(cat) = self.cat.as_mut() {
+            cat.ckpt.settle_batches += 1;
+            cat.ckpt.settle_loads += loads;
+            cat.ckpt.settle_max_loads = cat.ckpt.settle_max_loads.max(loads);
+        }
+        Ok(loads)
     }
 
     fn release_slots(&mut self, freed: Vec<Slot>) {

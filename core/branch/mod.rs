@@ -80,7 +80,29 @@ pub fn page_io() -> [u64; 4] {
 pub(crate) fn count_page_io(which: usize, n: u64) {
     PAGE_IO[which].fetch_add(n, crate::sync::atomic::Ordering::Relaxed);
 }
+
+/// The WAL checkpoint's backfill reads, process-wide (r11-restart-r2 item 4, observing only): pages
+/// the backfill found in the page cache at the frame it needed, and WAL frame reads it issued
+/// instead. R7 read "WAL frame reads 0" with no counter on this path (the r11-restart-refute report).
+#[doc(hidden)]
+pub static BACKFILL_IO: [crate::sync::atomic::AtomicU64; 2] = [
+    crate::sync::atomic::AtomicU64::new(0),
+    crate::sync::atomic::AtomicU64::new(0),
+];
+
+/// A snapshot of [`BACKFILL_IO`]: `[page-cache hits, WAL frame reads issued]`.
+#[doc(hidden)]
+pub fn backfill_io() -> [u64; 2] {
+    use crate::sync::atomic::Ordering::Relaxed;
+    [BACKFILL_IO[0].load(Relaxed), BACKFILL_IO[1].load(Relaxed)]
+}
+
+pub(crate) fn count_backfill_io(which: usize) {
+    BACKFILL_IO[which].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+}
 pub(crate) mod catalog;
+#[doc(hidden)]
+pub use catalog::catalog_only_fixture;
 pub(crate) mod journal;
 pub(crate) mod page_map;
 pub(crate) mod store;
@@ -648,6 +670,42 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_compact_now(&self) -> Result<()> {
         self.branches.compact_now()
+    }
+
+    /// Catalog checkpoint and settle counters (r11-restart-r2 instrument): `[checkpoints
+    /// installed, fuzzy flights started, store-mutex hold ns inside checkpoints (sum, max), writer
+    /// ns without the mutex, catalog statements under the mutex, settle batches, settle loads, most
+    /// loads in one batch]`.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_counters(&self) -> [u64; 9] {
+        self.branches.checkpoint_counters()
+    }
+
+    /// Start a fuzzy catalog checkpoint now (F-FZ): its write runs on a thread of its own. `false`:
+    /// nothing started (parked Commits remain after one bounded settle batch, one is in flight, or
+    /// this is not a catalog store).
+    #[doc(hidden)]
+    pub fn branch_checkpoint_fuzzy_now(&self) -> Result<bool> {
+        self.branches.checkpoint_fuzzy_now()
+    }
+
+    /// Make a fuzzy checkpoint in flight wait at `stage`: 2, its rows written and not committed;
+    /// 3, committed and not installed. Any other value (0) releases it.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_hold(&self, stage: u8) {
+        self.branches.checkpoint_hold(stage);
+    }
+
+    /// Wait for every fuzzy checkpoint started so far to install.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_wait(&self) {
+        self.branches.checkpoint_wait();
+    }
+
+    /// The fuzzy checkpoint hook's value: the stage set, with 0x80 once a checkpoint waits there.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_held(&self) -> u8 {
+        self.branches.checkpoint_held()
     }
 
     /// The branch log file, for tearing its tail in a test. `None` for volatile branches, and

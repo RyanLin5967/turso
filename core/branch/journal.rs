@@ -109,6 +109,14 @@ impl BranchFiles {
         name.push(".tmp");
         PathBuf::from(name)
     }
+
+    /// Where a catalog store's fuzzy checkpoint writes the log's kept suffix before renaming it
+    /// over the log (r11-restart-r2, F-FZ).
+    fn log_tmp(&self) -> PathBuf {
+        let mut name = self.log.clone().into_os_string();
+        name.push(".tmp");
+        PathBuf::from(name)
+    }
 }
 
 /// One entry of the operation log.
@@ -550,13 +558,19 @@ impl Journal {
         Self::recover_base(files, sync, None)
     }
 
-    /// `recover` for a catalog store: the catalog's meta row, `(page_size, generation)`, stands
-    /// where the snapshot's header does, and no snapshot is read. `None`: the catalog has no meta
-    /// row (a crash while the store was being created).
+    /// `recover` for a catalog store: the catalog's meta row, `(page_size, generation, log_from)`,
+    /// stands where the snapshot's header does, and no snapshot is read. `None`: the catalog has no
+    /// meta row (a crash while the store was being created).
+    ///
+    /// `log_from` (r11-restart-r2, F-FZ): a fuzzy checkpoint committed the catalog at `generation`
+    /// having captured the log of generation `log_from.0` up to byte `log_from.1`. If the log on
+    /// disk is still that older generation (a crash between the catalog commit and the log's
+    /// rewrite), only its records from that byte on are replayed, and the log is rewritten to them
+    /// under `generation` before the open goes on.
     pub(crate) fn recover_catalog(
         files: &BranchFiles,
         sync: bool,
-        base: Option<(u32, u64)>,
+        base: Option<(u32, u64, Option<(u64, u64)>)>,
     ) -> Result<Option<Recovered>> {
         Self::recover_base(files, sync, Some(base))
     }
@@ -564,7 +578,7 @@ impl Journal {
     fn recover_base(
         files: &BranchFiles,
         sync: bool,
-        catalog: Option<Option<(u32, u64)>>,
+        catalog: Option<Option<(u32, u64, Option<(u64, u64)>)>>,
     ) -> Result<Option<Recovered>> {
         // Lock before reading or discarding anything (review N1): the temp snapshot removed below
         // could be a live store's compaction in flight.
@@ -573,12 +587,19 @@ impl Journal {
         let snapshot = match catalog {
             None if files.snap.exists() => Some(read_snapshot(&files.snap)?),
             None => None,
-            Some(base) => base.map(|(ps, g)| (ps, g, SnapshotState::default(), 0)),
+            Some(base) => base.map(|(ps, g, _)| (ps, g, SnapshotState::default(), 0)),
         };
-        // A stale temp snapshot is a compaction that never reached its rename: discard it.
+        let log_from = catalog.flatten().and_then(|(_, _, from)| from);
+        // A stale temp snapshot is a compaction that never reached its rename: discard it. So is a
+        // stale temp log: a fuzzy checkpoint's rewrite that never reached its rename (the log it
+        // would have replaced is intact, and the catalog's `log_from` still names it).
         let tmp = files.snap_tmp();
         if tmp.exists() {
             std::fs::remove_file(&tmp).map_err(|e| io_error(e, "remove stale branch snapshot"))?;
+        }
+        let tmp = files.log_tmp();
+        if tmp.exists() {
+            std::fs::remove_file(&tmp).map_err(|e| io_error(e, "remove stale branch log rewrite"))?;
         }
         let bytes = read_all(&mut file)?;
         let header = parse_log_header(&bytes)?;
@@ -612,12 +633,27 @@ impl Journal {
         };
 
         let mut records = Vec::new();
+        // Where replay starts: the whole log of the catalog's (or snapshot's) generation, or the
+        // suffix of an older one that a fuzzy checkpoint's `log_from` names (F-FZ).
+        let replay_from = match header {
+            Some((_, log_gen)) if log_gen == generation => Some(LOG_HEADER_LEN),
+            Some((_, log_gen)) if log_from.is_some_and(|(g, _)| g == log_gen && g < generation) => {
+                let off = log_from.expect("checked above").1;
+                if off < LOG_HEADER_LEN as u64 {
+                    return Err(corrupt("the catalog's log_from points into the log header"));
+                }
+                // Past the file's end: no record after the capture became durable.
+                Some(usize::try_from(off).unwrap_or(usize::MAX).min(bytes.len()))
+            }
+            _ => None,
+        };
         match header {
-            Some((log_ps, log_gen)) if log_gen == generation => {
+            Some((log_ps, _)) if replay_from.is_some() => {
                 if log_ps != page_size {
                     return Err(corrupt("log and snapshot disagree on the page size"));
                 }
-                let mut pos = LOG_HEADER_LEN;
+                let start = replay_from.expect("checked above");
+                let mut pos = start;
                 loop {
                     let Some(frame) = bytes.get(pos..pos + FRAME_HEADER_LEN) else {
                         break;
@@ -683,6 +719,12 @@ impl Journal {
                         fsync_file(&journal.file)?;
                     }
                 }
+                if start != LOG_HEADER_LEN || header.is_some_and(|(_, g)| g != generation) {
+                    // An older generation's suffix (F-FZ, crash state S1): make it the log of the
+                    // catalog's generation now, so appends and the next checkpoint see one log.
+                    journal.generation = header.map_or(generation, |(_, g)| g);
+                    journal.rewrite_from(start as u64, generation)?;
+                }
             }
             Some((_, log_gen)) if log_gen > generation => {
                 return Err(corrupt("log generation is ahead of the snapshot"));
@@ -732,17 +774,74 @@ impl Journal {
         self.generation
     }
 
-    /// A catalog checkpoint at `generation` has committed: drop the records it covers (buffered
-    /// ones included — their effects are in the catalog) and start the log over at that
-    /// generation. A failure poisons the journal, as a failed compaction does after its rename.
-    pub(crate) fn restart_at(&mut self, generation: u64) -> Result<()> {
+    /// The log's logical end: the bytes in the file plus those still buffered. A fuzzy checkpoint
+    /// captures the state as of this position (r11-restart-r2, F-FZ); it is a frame boundary.
+    pub(crate) fn mark(&self) -> u64 {
+        self.len + self.pending.len() as u64
+    }
+
+    /// A fuzzy catalog checkpoint at `generation` has committed, having captured the state as of
+    /// the logical log position `from` (see [`Journal::mark`]; records buffered but not yet written
+    /// count). Keep only the records after `from`, under a header of `generation`: the suffix is
+    /// written to a temp file that this journal locks first, synced, and renamed over the log, so a
+    /// crash leaves either the old log (which the catalog's `log_from` still names) or the new one
+    /// (F-FZ). Buffered records before `from` are dropped, their effects being in the catalog. A
+    /// failure before the rename leaves the old log in use; one after it poisons the journal.
+    pub(crate) fn rewrite_from(&mut self, from: u64, generation: u64) -> Result<()> {
         self.check_live()?;
-        self.pending.clear();
-        self.pending_slots.clear();
+        let end = self.mark();
+        if from < LOG_HEADER_LEN as u64 || from > end {
+            return Err(LimboError::InternalError(format!(
+                "branch log rewrite from byte {from}, outside the log's [{LOG_HEADER_LEN}, {end}]"
+            )));
+        }
+        // The kept records already in the file.
+        let file_from = from.min(self.len);
+        let mut suffix = vec![0u8; (self.len - file_from) as usize];
+        if !suffix.is_empty() {
+            read_at(&self.file, &mut suffix, file_from)?;
+        }
+        let tmp = self.files.log_tmp();
+        let written = (|| -> Result<File> {
+            let f = open_rw(&tmp, true)?;
+            // Locked before it can become the log: a second store that opens the log path after
+            // the rename finds this lock, as it found the old one.
+            lock_exclusive(&f, &tmp)?;
+            write_at(&f, &log_header(self.page_size, generation), 0)?;
+            if !suffix.is_empty() {
+                write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
+            }
+            if self.sync {
+                fsync_file(&f)?;
+            }
+            Ok(f)
+        })();
+        let f = match written {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        if let Err(e) = std::fs::rename(&tmp, &self.files.log) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io_error(e, "rename branch log rewrite"));
+        }
+        // From here the new file is the log.
+        self.file = f;
+        self.generation = generation;
+        self.len = LOG_HEADER_LEN as u64 + suffix.len() as u64;
         self.snapshot_len = 0;
-        if let Err(e) = self.reset_log(generation) {
-            self.poisoned = true;
-            return Err(e);
+        let drop_pending = from.saturating_sub(file_from) as usize;
+        if drop_pending > 0 {
+            self.pending.drain(..drop_pending);
+            self.pending_slots = slots_named(&self.pending);
+        }
+        if self.sync {
+            if let Err(e) = fsync_dir_of(&self.files.log) {
+                self.poisoned = true;
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -911,15 +1010,7 @@ impl Journal {
 
     /// Truncate the log to a bare header for `generation`.
     fn reset_log(&mut self, generation: u64) -> Result<()> {
-        let mut header = Vec::with_capacity(LOG_HEADER_LEN);
-        header.extend_from_slice(LOG_MAGIC);
-        put_u32(&mut header, FORMAT_VERSION);
-        put_u32(&mut header, self.page_size);
-        put_u64(&mut header, generation);
-        let crc = crc32c::crc32c(&header);
-        put_u32(&mut header, crc);
-        put_u32(&mut header, 0);
-        debug_assert_eq!(header.len(), LOG_HEADER_LEN);
+        let header = log_header(self.page_size, generation);
         self.file
             .set_len(0)
             .map_err(|e| io_error(e, "truncate branch log"))?;
@@ -935,6 +1026,42 @@ impl Journal {
     pub(crate) fn log_path(&self) -> &Path {
         &self.files.log
     }
+}
+
+/// A log header for `generation` at `page_size`.
+fn log_header(page_size: u32, generation: u64) -> Vec<u8> {
+    let mut header = Vec::with_capacity(LOG_HEADER_LEN);
+    header.extend_from_slice(LOG_MAGIC);
+    put_u32(&mut header, FORMAT_VERSION);
+    put_u32(&mut header, page_size);
+    put_u64(&mut header, generation);
+    let crc = crc32c::crc32c(&header);
+    put_u32(&mut header, crc);
+    put_u32(&mut header, 0);
+    debug_assert_eq!(header.len(), LOG_HEADER_LEN);
+    header
+}
+
+/// The arena slots the records in `frames` (whole encoded frames, as `Journal::pending` holds
+/// them) name: what `Journal::buffer` pushes to `pending_slots`, re-derived after a prefix of the
+/// buffer was dropped (F-FZ). A frame that does not decode names nothing.
+fn slots_named(frames: &[u8]) -> Vec<Slot> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(head) = frames.get(pos..pos + FRAME_HEADER_LEN) {
+        let len = u32::from_le_bytes(head[0..4].try_into().expect("four bytes")) as usize;
+        let start = pos + FRAME_HEADER_LEN;
+        let Some(payload) = frames.get(start..start + len) else {
+            break;
+        };
+        match Record::decode(payload) {
+            Some(Record::TrunkRetain { slot, .. }) => out.push(slot),
+            Some(Record::Commit { pages, .. }) => out.extend(pages.iter().map(|p| p.1)),
+            _ => {}
+        }
+        pos = start + len;
+    }
+    out
 }
 
 /// Whether a failed `stat` of a branch sidecar means the file CANNOT be there (review 6 item 5,

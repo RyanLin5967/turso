@@ -275,6 +275,39 @@ impl Arena {
         Ok(())
     }
 
+    /// A second handle on the arena file, for a fuzzy checkpoint's writer to sync the slots its
+    /// rows name without the store mutex (r11-restart-r2, F-FZ): an fsync through any descriptor of
+    /// the file makes every write made before it durable. `None` for the memory backing.
+    pub(crate) fn sync_handle(&self) -> Result<Option<File>> {
+        match &self.backing {
+            Backing::File { file, .. } => file
+                .try_clone()
+                .map(Some)
+                .map_err(|e| crate::error::io_error(e, "clone branch arena handle")),
+            Backing::Memory { .. } => Ok(None),
+        }
+    }
+
+    /// Take `slots` off the in-memory free list if they are on it (a fuzzy checkpoint committed
+    /// them to the catalog's free table: the catalog lists them free now). Not an allocation: the
+    /// count in use does not change. Returns the slots that were NOT on the list.
+    pub(crate) fn remove_free(&mut self, slots: &std::collections::HashSet<Slot>) -> Vec<Slot> {
+        let mut absent: std::collections::HashSet<Slot> = slots.clone();
+        let mut kept = Vec::with_capacity(self.free.len());
+        for slot in std::mem::take(&mut self.free) {
+            if absent.remove(&slot) {
+                self.set_free_bit(slot, false);
+            } else {
+                kept.push(slot);
+            }
+        }
+        self.free = kept;
+        if trace_slots() {
+            eprintln!("R11SLOT remove_free {slots:?} absent={absent:?}");
+        }
+        absent.into_iter().collect()
+    }
+
     /// The bytes of a slot in a MEMORY arena.
     pub(crate) fn page(&self, slot: Slot) -> &[u8] {
         let (chunk, offset) = self.locate(slot);
