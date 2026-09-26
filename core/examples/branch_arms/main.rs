@@ -1650,7 +1650,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                     .unwrap()
                     .run_collect_rows()
                     .unwrap();
-                if !matches!(rows.first().and_then(|r| r.first()), Some(Value::Integer(0))) {
+                if rows.first().and_then(|r| r.first()).and_then(|v| v.as_int()) != Some(0) {
                     not_a_result(&format!("the TRUNCATE checkpoint before a cell was refused: {rows:?}"));
                 }
             }
