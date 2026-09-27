@@ -2150,6 +2150,19 @@ impl Database {
                         unreachable!("state is OpenWal");
                     };
 
+                    // r11-walpin-conc amendment 21 (A2): under FW2 the log is two files, recovered
+                    // together here, before any pager sees the WAL, so the schema below is read
+                    // from the recovered state.
+                    if crate::branch::walpin::fw2()
+                        && shared_wal.read().metadata.enabled.load(Ordering::Acquire)
+                    {
+                        WalFileShared::walpin_recover_wal2(
+                            &shared_wal,
+                            &self.io,
+                            &self.wal_path,
+                            self.open_flags,
+                        )?;
+                    }
                     self.shared_wal = shared_wal;
                     let last_checksum_and_max_frame =
                         self.shared_wal.read().last_checksum_and_max_frame();

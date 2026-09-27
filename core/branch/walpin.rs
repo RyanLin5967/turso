@@ -240,3 +240,56 @@ pub struct WalPinStats {
     pub log_frames: u64,
     pub log_bytes: u64,
 }
+
+/// r11-walpin-conc amendment 21: how the last FW2 open recovered the two WAL files (`Wal2Recovered::code`; 0 = none
+/// yet). Observation only.
+pub(crate) static WAL2_RECOVERY: AtomicU64 = AtomicU64::new(0);
+
+/// r11-walpin-conc amendment 21: the wal2 crash test's crash points and recovery mutants (test builds only). A child
+/// process of the lib test binary sets `TURSO_WALPIN_CRASH=<point>:<k>`; the point kills its own process with SIGKILL
+/// (no destructors, no close) at its first hit while the process has made exactly `k` FW2 switches.
+/// `TURSO_WALPIN_WAL2_MUTANT` selects a recovery mutant: `newer_only` (M1: where both files would be recovered, keep
+/// only the newer) or `wal0_only` (M0: the base, which recovers `-wal` alone).
+#[cfg(test)]
+pub(crate) mod crash {
+    use super::FW2_SWITCHES;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::OnceLock;
+
+    fn armed() -> Option<&'static (String, u64)> {
+        static ARMED: OnceLock<Option<(String, u64)>> = OnceLock::new();
+        ARMED
+            .get_or_init(|| {
+                let v = std::env::var("TURSO_WALPIN_CRASH").ok()?;
+                let (p, k) = v.rsplit_once(':')?;
+                Some((p.to_string(), k.parse().ok()?))
+            })
+            .as_ref()
+    }
+
+    /// Kill this process if `point` is the armed point and the switch count is its `k`.
+    pub(crate) fn point(point: &str) {
+        let Some((p, k)) = armed() else {
+            return;
+        };
+        if p == point && FW2_SWITCHES.load(Relaxed) == *k {
+            kill_self(&format!("{point}:{k}"));
+        }
+    }
+
+    /// Report the point on stderr, then SIGKILL this process: a crash, not an exit.
+    pub(crate) fn kill_self(what: &str) -> ! {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "walpin crash point {what} fired");
+        let _ = std::io::stderr().flush();
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        std::process::abort()
+    }
+
+    pub(crate) fn mutant() -> Option<String> {
+        std::env::var("TURSO_WALPIN_WAL2_MUTANT").ok()
+    }
+}

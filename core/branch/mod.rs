@@ -385,11 +385,23 @@ impl Database {
     }
 
     /// FW2: open the second WAL file (`<wal>2`). Call once, right after open, before any write.
+    /// With FW2 on at open, `Database::open` has already recovered and installed it (r11-walpin-conc
+    /// amendment 21), and this does nothing. With FW2 switched on after open, a `<wal>2` holding
+    /// more than a header was never recovered, and it is refused rather than silently dropped.
     #[doc(hidden)]
     pub fn walpin_open_wal2(&self) -> Result<()> {
+        if self.shared_wal.read().walpin_wal2_installed() {
+            return Ok(());
+        }
         let file = self
             .io
             .open_file(&format!("{}2", self.walpin_wal_path()), crate::OpenFlags::Create, false)?;
+        if file.size()? > crate::storage::sqlite3_ondisk::WAL_HEADER_SIZE as u64 {
+            return Err(crate::LimboError::InternalError(
+                "FW2: <wal>2 holds frames that were not recovered; switch FW2 on before opening"
+                    .into(),
+            ));
+        }
         self.shared_wal.read().walpin_set_wal2_file(file);
         Ok(())
     }
@@ -455,6 +467,9 @@ mod mechanism_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod walpin_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod walpin_crash_tests;
 
 #[cfg(test)]
 mod tests {

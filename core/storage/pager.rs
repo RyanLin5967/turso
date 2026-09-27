@@ -4848,6 +4848,9 @@ impl Pager {
                     commit_info.state = CommitState::WalCommitDone;
                 }
                 CommitState::WalCommitDone => {
+                    // r11-walpin-conc amendment 21: the commit's frames are written, not yet published.
+                    #[cfg(test)]
+                    crate::branch::walpin::crash::point("commit_written");
                     // all I/O complete, NOW it's safe to advance WAL state
                     let mut commit_info = self.commit_info.write();
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
@@ -5405,7 +5408,13 @@ impl Pager {
                             }
                         );
                     }
+                    // r11-walpin-conc amendment 21: the frames are in the synced database file; the
+                    // WAL does not yet say so, then does.
+                    #[cfg(test)]
+                    crate::branch::walpin::crash::point("ckpt_copied");
                     wal.publish_backfill(max_frame);
+                    #[cfg(test)]
+                    crate::branch::walpin::crash::point("ckpt_done");
                     let next_phase = {
                         let state = self.checkpoint_state.read();
                         if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) {

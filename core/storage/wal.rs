@@ -1442,7 +1442,7 @@ impl WalCoordination for InProcessWalCoordination {
         })
     }
 
-    fn wal2_try_switch(&self, io: &dyn IO) -> bool {
+    fn wal2_try_switch(&self, _io: &dyn IO) -> bool {
         if !walpin::fw2() {
             return false;
         }
@@ -1477,16 +1477,22 @@ impl WalCoordination for InProcessWalCoordination {
             });
             shared.runtime.frame_log.lock().drop_through(other_last);
         }
-        // A new generation for the reused file: new salts and checkpoint_seq, and the next append
-        // writes its header first (and truncates what it held).
+        // A new generation for the reused file, and the next append writes its header first, over
+        // what the file held. SQLite's wal2 (wal.c 4675-4676, 4925-4931; r11-walpin-conc amendment
+        // 21, P1): the new file's checkpoint counter is the old file's + 1 and its salts are the
+        // old file's last commit checksum, which is how recovery orders the two files and tells
+        // whether the newer one follows the older (`walpin_recover_wal2`).
         {
+            let last = shared.metadata.last_checksum;
             let mut hdr = shared.metadata.wal_header.lock();
             hdr.checkpoint_seq = hdr.checkpoint_seq.wrapping_add(1);
-            hdr.salt_1 = hdr.salt_1.wrapping_add(1);
-            hdr.salt_2 = io.generate_random_number() as u32;
+            hdr.salt_1 = last.0;
+            hdr.salt_2 = last.1;
         }
         shared.metadata.initialized.store(false, Ordering::Release);
         walpin::FW2_SWITCHES.fetch_add(1, Relaxed);
+        #[cfg(test)]
+        walpin::crash::point("switched");
         true
     }
 
@@ -3166,7 +3172,9 @@ impl FrameLog {
 ///   the other wal file").
 /// * Readers are counted in SQLite's four classes (PART1, PART1_FULL2, PART2_FULL1, PART2):
 ///   index `2 * (file the snapshot ends in) + (1 if it also reads the other file)`. No read mark.
-/// Not built: recovery from the two files on open (the harness never reopens), and snapshots.
+/// * Recovery (r11-walpin-conc amendment 21): `Database::open` recovers both files together
+///   (`WalFileShared::walpin_recover_wal2`, SQLite's walIndexRecover), and a restart empties both
+///   (`prepare_wal_start`). Not built: snapshots.
 #[derive(Default)]
 pub struct Wal2State {
     file1: Option<Arc<dyn File>>,
@@ -3198,6 +3206,80 @@ impl Wal2State {
 
     fn readers_ending_in(&self, f: usize) -> u32 {
         self.readers[2 * f] + self.readers[2 * f + 1]
+    }
+}
+
+/// r11-walpin-conc amendment 21: truncate a WAL file to nothing and sync it, blocking (a restart
+/// generation under FW2, and recovery's rule 1). A file already empty is left alone.
+fn walpin_empty_wal_file(io: &dyn IO, file: &dyn File) -> Result<()> {
+    if file.size()? == 0 {
+        return Ok(());
+    }
+    io.wait_for_completion(file.truncate(0, Completion::new_trunc(|_| {}))?)?;
+    io.wait_for_completion(file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?)?;
+    Ok(())
+}
+
+/// r11-walpin-conc amendment 21 (P3): what recovery read from one of the two WAL files, by turso's
+/// single-file recovery (SQLite's walIndexRecoverOne): whether the header is valid, its checkpoint
+/// counter and salts, the file's last commit frame (0: none) and the checksum at that commit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Wal2FileScan {
+    pub(crate) valid: bool,
+    pub(crate) seq: u32,
+    pub(crate) salts: (u32, u32),
+    pub(crate) max_frame: u64,
+    pub(crate) last_checksum: (u32, u32),
+}
+
+/// r11-walpin-conc amendment 21 (P3): the files recovery keeps. `Both { older }`: the older file's
+/// frames first, then the newer's, which is the current file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wal2Recovered {
+    Only(usize),
+    Both { older: usize },
+}
+
+impl Wal2Recovered {
+    /// SQLite's walIndexRecover (wal.c 2001-2035), with turso's u32 counters in place of SQLite's
+    /// 4-bit ones (`& 0x0F`), so "follows" is `+ 1` with wrapping. A file follows the other when its
+    /// counter is the other's + 1; both are used only if the follower holds a commit and its salts
+    /// are the other's last commit checksum (the switch sets them so, P1); otherwise the follower is
+    /// ignored. Counters that are not adjacent fall back to the lower one (an invalid header reads
+    /// as u64::MAX, SQLite's 0xFFFFFFFF).
+    pub(crate) fn decide(f0: &Wal2FileScan, f1: &Wal2FileScan) -> Self {
+        let follows = |newer: &Wal2FileScan, older: &Wal2FileScan| {
+            newer.valid && older.valid && newer.seq == older.seq.wrapping_add(1)
+        };
+        let chained = |newer: &Wal2FileScan, older: &Wal2FileScan| {
+            newer.max_frame > 0 && newer.salts == older.last_checksum
+        };
+        let counter = |f: &Wal2FileScan| if f.valid { f.seq as u64 } else { u64::MAX };
+        if follows(f1, f0) {
+            if chained(f1, f0) {
+                Self::Both { older: 0 }
+            } else {
+                Self::Only(0)
+            }
+        } else if follows(f0, f1) {
+            if chained(f0, f1) {
+                Self::Both { older: 1 }
+            } else {
+                Self::Only(1)
+            }
+        } else if counter(f0) <= counter(f1) {
+            Self::Only(0)
+        } else {
+            Self::Only(1)
+        }
+    }
+
+    /// For `walpin::WAL2_RECOVERY`: 1 + file for `Only`, 3 + older for `Both`.
+    pub(crate) fn code(self) -> u64 {
+        match self {
+            Self::Only(f) => 1 + f as u64,
+            Self::Both { older } => 3 + older as u64,
+        }
     }
 }
 
@@ -4731,6 +4813,32 @@ impl Wal for WalFile {
         };
         self.max_frame.store(local_max, Ordering::Release);
         let file = self.coordination.wal_file()?;
+        if walpin::fw2() {
+            if local_max == 0 {
+                // A restart (or first) generation under FW2 (r11-walpin-conc amendment 21, A1): a
+                // restart follows a full checkpoint, so both files are already in the database file.
+                // Empty -wal, then -wal2, each synced, before -wal's new header. With recovery's rule
+                // 1 (-wal <= 32 B empties -wal2) every crash state in between recovers to the
+                // database file alone; emptying -wal2 first could replay an older -wal over newer
+                // database pages.
+                walpin_empty_wal_file(self.io.as_ref(), file.as_ref())?;
+                #[cfg(test)]
+                walpin::crash::point("restart_wal0");
+                if let Some(other) = self.coordination.wal2_other_file() {
+                    walpin_empty_wal_file(self.io.as_ref(), other.as_ref())?;
+                }
+                #[cfg(test)]
+                walpin::crash::point("restart_wal1");
+            }
+            // A switch generation is written over the reused file's old frames, which fail the
+            // new salts (SQLite's wal2 truncates nothing at a switch, wal.c 4948; amendment 21,
+            // P2). Truncating it here would leave -wal at its header size while -wal2 still holds
+            // commits, which recovery's rule 1 would then throw away.
+            return Ok(Some(sqlite3_ondisk::begin_write_wal_header(
+                file.as_ref(),
+                &header,
+            )?));
+        }
         let header_c = sqlite3_ondisk::begin_write_wal_header(file.as_ref(), &header)?;
 
         // After a RESTART or try_restart_log_before_write the WAL file may
@@ -4780,6 +4888,8 @@ impl Wal for WalFile {
                 // in-memory initialized state consistent with what is on disk.
                 if res.is_ok() {
                     coordination.mark_initialized();
+                    #[cfg(test)]
+                    walpin::crash::point("header");
                 }
             }),
             sync_type,
@@ -6101,6 +6211,170 @@ impl WalFileShared {
     /// r11-walpin FW2: install the second WAL file.
     pub(crate) fn walpin_set_wal2_file(&self, file: Arc<dyn File>) {
         self.runtime.wal2.lock().file1 = Some(file);
+    }
+
+    /// r11-walpin FW2: whether the second WAL file is installed (by recovery at open, or by
+    /// `Database::walpin_open_wal2`).
+    pub(crate) fn walpin_wal2_installed(&self) -> bool {
+        self.runtime.wal2.lock().file1.is_some()
+    }
+
+    /// r11-walpin-conc amendment 21 (P3, A2): open `<wal>2` beside this WAL and recover both files
+    /// as SQLite's wal2 does (walIndexRecover, wal.c 1973-2049) into this shared WAL, which
+    /// `Database::open` has just built from `-wal` alone and not yet handed to any pager, so the
+    /// schema is read from the recovered state. Rule 1 first: a `-wal` of at most a header means
+    /// `-wal2` is left over, and it is emptied. Otherwise `-wal2` is scanned by the same single-file
+    /// recovery, `Wal2Recovered::decide` picks the files, and the frame index, FW1's frame log and
+    /// the wal2 state are rebuilt over them with global frame numbers, the older file's first.
+    /// nbackfills is 0, as SQLite zeroes the checkpoint info, so the next checkpoint copies the
+    /// older file again.
+    pub(crate) fn walpin_recover_wal2(
+        this: &Arc<RwLock<WalFileShared>>,
+        io: &Arc<dyn IO>,
+        wal_path: &str,
+        flags: crate::OpenFlags,
+    ) -> Result<Wal2Recovered> {
+        let read_only = flags.contains(crate::OpenFlags::ReadOnly);
+        let open_flags = if read_only {
+            crate::OpenFlags::ReadOnly
+        } else {
+            crate::OpenFlags::Create
+        };
+        let file1 = match io.open_file(&format!("{wal_path}2"), open_flags, false) {
+            Ok(file) => file,
+            // A read-only open with no `-wal2`: the WAL is `-wal` alone, as recovered.
+            Err(_) if read_only => {
+                walpin::WAL2_RECOVERY.store(Wal2Recovered::Only(0).code(), Relaxed);
+                return Ok(Wal2Recovered::Only(0));
+            }
+            Err(err) => return Err(err),
+        };
+        let size0 = match this.read().runtime.file.as_ref() {
+            Some(file) => file.size()?,
+            None => 0,
+        };
+        let decided = if size0 <= WAL_HEADER_SIZE as u64 {
+            // Rule 1 (wal.c 1885-1886, 1978-1980).
+            if !read_only {
+                walpin_empty_wal_file(io.as_ref(), file1.as_ref())?;
+            }
+            Wal2Recovered::Only(0)
+        } else {
+            let scan1 = sqlite3_ondisk::build_shared_wal(&file1, io)?;
+            let f0 = this.read().walpin_scan();
+            let f1 = scan1.read().walpin_scan();
+            #[allow(unused_mut)]
+            let mut decided = Wal2Recovered::decide(&f0, &f1);
+            #[cfg(test)]
+            match (walpin::crash::mutant().as_deref(), decided) {
+                (Some("newer_only"), Wal2Recovered::Both { older }) => {
+                    decided = Wal2Recovered::Only(1 - older)
+                }
+                (Some("wal0_only"), _) => decided = Wal2Recovered::Only(0),
+                _ => {}
+            }
+            let scan1 = scan1.read();
+            this.write()
+                .walpin_install_recovered(decided, &f0, &f1, &scan1);
+            decided
+        };
+        this.read().walpin_set_wal2_file(file1);
+        walpin::WAL2_RECOVERY.store(decided.code(), Relaxed);
+        Ok(decided)
+    }
+
+    /// r11-walpin-conc amendment 21: this WAL file as its recovery left it (`Wal2FileScan`).
+    fn walpin_scan(&self) -> Wal2FileScan {
+        let hdr = *self.metadata.wal_header.lock();
+        Wal2FileScan {
+            valid: self.metadata.initialized.load(Ordering::Acquire),
+            seq: hdr.checkpoint_seq,
+            salts: (hdr.salt_1, hdr.salt_2),
+            max_frame: self.metadata.max_frame.load(Ordering::Acquire),
+            last_checksum: self.metadata.last_checksum,
+        }
+    }
+
+    /// r11-walpin-conc amendment 21: install what two-file recovery decided. `self` holds `-wal`
+    /// as recovered alone (`f0`); `scan1` holds `-wal2` (`f1`), whose frame index is taken.
+    fn walpin_install_recovered(
+        &mut self,
+        decided: Wal2Recovered,
+        f0: &Wal2FileScan,
+        f1: &Wal2FileScan,
+        scan1: &WalFileShared,
+    ) {
+        let take1 = || std::mem::take(&mut *scan1.runtime.frame_cache.lock());
+        let (cur, base, max_frame) = match decided {
+            Wal2Recovered::Only(0) => (0, [0, 0], f0.max_frame),
+            Wal2Recovered::Only(_) => {
+                *self.runtime.frame_cache.lock() = take1();
+                *self.metadata.wal_header.lock() = *scan1.metadata.wal_header.lock();
+                self.metadata.last_checksum = f1.last_checksum;
+                self.metadata.initialized.store(f1.valid, Ordering::Release);
+                (1, [0, 0], f1.max_frame)
+            }
+            Wal2Recovered::Both { older } => {
+                let (older_max, newer) = if older == 0 {
+                    (f0.max_frame, f1)
+                } else {
+                    (f1.max_frame, f0)
+                };
+                let cache1 = take1();
+                let mut cache = self.runtime.frame_cache.lock();
+                let cache0 = std::mem::take(&mut *cache);
+                let (mut merged, newer_cache) = if older == 0 {
+                    (cache0, cache1)
+                } else {
+                    (cache1, cache0)
+                };
+                // Every newer frame follows every older one, so each page's list stays ascending.
+                for (page, frames) in newer_cache {
+                    merged
+                        .entry(page)
+                        .or_default()
+                        .extend(frames.into_iter().map(|f| f + older_max));
+                }
+                *cache = merged;
+                drop(cache);
+                if older == 0 {
+                    *self.metadata.wal_header.lock() = *scan1.metadata.wal_header.lock();
+                }
+                self.metadata.last_checksum = newer.last_checksum;
+                self.metadata.initialized.store(true, Ordering::Release);
+                let mut base = [0, 0];
+                base[1 - older] = older_max;
+                (1 - older, base, older_max + newer.max_frame)
+            }
+        };
+        self.metadata.max_frame.store(max_frame, Ordering::Release);
+        self.metadata.nbackfills.store(0, Ordering::Release);
+        self.runtime
+            .frame_cache_high_water
+            .store(max_frame, Ordering::Release);
+        self.runtime.overflow_fallback_coverage.lock().clear();
+        {
+            let mut w = self.runtime.wal2.lock();
+            w.cur = cur;
+            w.base = base;
+        }
+        // FW1's frame log over frames 1..=max_frame, the page of each (SQLite rebuilds both files'
+        // hash tables, wal.c 1832, 1880). Left empty, as before, if any frame has no page.
+        let mut pages = vec![0u32; max_frame as usize];
+        let mut complete = true;
+        for (page, frames) in self.runtime.frame_cache.lock().iter() {
+            for &f in frames {
+                match (f as usize).checked_sub(1).and_then(|i| pages.get_mut(i)) {
+                    Some(slot) => *slot = *page as u32,
+                    None => complete = false,
+                }
+            }
+        }
+        let mut log = self.runtime.frame_log.lock();
+        log.clear();
+        if complete && pages.iter().all(|&p| p != 0) {
+            log.pages = pages.into();
+        }
     }
 
     /// The WAL's state for the r11-walpin instrument, read under this lock and the frame_cache lock.
