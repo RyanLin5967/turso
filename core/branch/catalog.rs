@@ -154,6 +154,13 @@ pub(crate) fn cat_cache_pages() -> u64 {
     })
 }
 
+/// r12-catload's F2 fire-check (PREREG A2): `R12_MUTANT` names a deliberate defect in the prewarm, so the
+/// prewarm test can be shown to fail on it. Unset, every mutant is off. This branch is a lane prototype,
+/// never merged or pushed; the mutants would not survive a port.
+fn mutant(name: &str) -> bool {
+    std::env::var("R12_MUTANT").as_deref() == Ok(name)
+}
+
 /// Read page `idx` through the page cache and wait until it is loaded.
 fn read_loaded(pager: &Pager, idx: i64) -> Result<PageRef> {
     let (page, pending) = pager.io.block(|| pager.read_page(idx))?;
@@ -471,8 +478,10 @@ impl Catalog {
                 }
                 let pager = self.conn.pager.load().clone();
                 pager.begin_read_tx()?;
+                // F2 fire-check mutant (r12-catload PREREG A2; unset, no effect): `buffer1` reads page 1 only.
+                let last = if mutant("buffer1") { 1 } else { n };
                 let read = if mode == Prewarm::Buffer {
-                    (1..=n).try_for_each(|idx| -> Result<()> {
+                    (1..=last).try_for_each(|idx| -> Result<()> {
                         read_loaded(&pager, idx as i64)?;
                         st.pages += 1;
                         Ok(())
@@ -503,6 +512,10 @@ impl Catalog {
                 st.pages += 1;
                 let c = page.get_contents();
                 if c.is_leaf() {
+                    // F2 fire-check mutant (unset, no effect): `interiorall` reads the whole leaf level.
+                    if mutant("interiorall") {
+                        continue;
+                    }
                     return Ok(());
                 }
                 st.interior += 1;
