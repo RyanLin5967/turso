@@ -385,6 +385,9 @@ struct WorkSum {
     gc_range_entries: u64,
     tree_ops: u64,
     tree_entries: u64,
+    cg_calls: u64,
+    cg_ns: u64,
+    hold_ns: u64,
 }
 
 impl WorkSum {
@@ -396,6 +399,9 @@ impl WorkSum {
         self.gc_range_entries += b.gc_range_entries - a.gc_range_entries;
         self.tree_ops += b.child_gone_tree_ops - a.child_gone_tree_ops;
         self.tree_entries += b.child_gone_tree_entries - a.child_gone_tree_entries;
+        self.cg_calls += b.child_gone_calls - a.child_gone_calls;
+        self.cg_ns += b.child_gone_ns - a.child_gone_ns;
+        self.hold_ns += b.reap_hold_ns - a.reap_hold_ns;
     }
 }
 
@@ -460,7 +466,7 @@ impl Bench {
         let kept: Vec<f64> = us.iter().copied().filter(|&v| v <= p90).collect();
         let tmean = kept.iter().sum::<f64>() / kept.len() as f64;
         println!(
-            "{x}\t{name}\t{}\t{p50:.2}\t{:.2}\t{:.2}\t{:.2}\t{tmean:.4}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.1}",
+            "{x}\t{name}\t{}\t{p50:.2}\t{:.2}\t{:.2}\t{:.2}\t{tmean:.4}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.1}\t{:.3}\t{:.1}\t{:.1}",
             us.len(),
             p90,
             percentile(&us, 99.0),
@@ -472,6 +478,9 @@ impl Bench {
             per(op.work.gc_range_entries),
             per(op.work.tree_ops),
             per(op.work.tree_entries),
+            per(op.work.cg_calls),
+            per(op.work.cg_ns),
+            per(op.work.hold_ns),
         );
         let mut tails = op.tails.clone();
         tails.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
@@ -556,7 +565,7 @@ impl Bench {
     }
 }
 
-const HEADER: &str = "x\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\ttmean_le_p90_us\tresolves_per_op\tlevels_per_op\tret_examined_per_op\tgc_examined_per_op\tgc_range_per_op\ttree_ops_per_op\ttree_entries_per_op";
+const HEADER: &str = "x\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\ttmean_le_p90_us\tresolves_per_op\tlevels_per_op\tret_examined_per_op\tgc_examined_per_op\tgc_range_per_op\ttree_ops_per_op\ttree_entries_per_op\tchild_gone_calls_per_op\tchild_gone_ns_per_op\treap_hold_ns_per_op";
 
 fn main() {
     let args = parse_args();
@@ -1110,6 +1119,9 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 all[i].work.gc_range_entries += w.gc_range_entries;
                 all[i].work.tree_ops += w.tree_ops;
                 all[i].work.tree_entries += w.tree_entries;
+                all[i].work.cg_calls += w.cg_calls;
+                all[i].work.cg_ns += w.cg_ns;
+                all[i].work.hold_ns += w.hold_ns;
             }
             line += &format!(
                 " arena_in_use={} arena_high_water={} rss_bytes={}",

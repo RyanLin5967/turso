@@ -491,6 +491,7 @@ impl BranchStore {
 
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
         let mut inner = self.inner.lock();
+        let held = std::time::Instant::now();
         let Some(st) = inner.branches.get_mut(&id) else {
             return Reaped {
                 freed_pages: 0,
@@ -499,9 +500,11 @@ impl BranchStore {
         };
         st.handle = false;
         let freed_pages = self.collect(&mut inner, id);
+        let deferred = inner.branches.contains_key(&id);
+        inner.work.reap_hold_ns += held.elapsed().as_nanos() as u64;
         Reaped {
             freed_pages,
-            deferred: inner.branches.contains_key(&id),
+            deferred,
         }
     }
 
@@ -741,14 +744,20 @@ impl BranchStore {
             }
             freed += st.lineage.release_all(arena).len();
             if st.parent.is_trunk() {
+                let t = std::time::Instant::now();
                 freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
+                work.child_gone_ns += t.elapsed().as_nanos() as u64;
+                work.child_gone_calls += 1;
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
                 return freed;
             }
             let parent = branches
                 .get_mut(&st.parent)
                 .expect("a live branch's parent is kept while the branch lives");
+            let t = std::time::Instant::now();
             freed += parent.lineage.child_gone(st.fork_epoch, arena, work);
+            work.child_gone_ns += t.elapsed().as_nanos() as u64;
+            work.child_gone_calls += 1;
             id = st.parent;
         }
     }

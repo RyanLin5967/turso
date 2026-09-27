@@ -205,6 +205,12 @@ pub struct BranchWork {
     pub child_gone_tree_ops: u64,
     /// Entries of the trees those operations descend, summed per call (their depth is O(log) of this).
     pub child_gone_tree_entries: u64,
+    /// `child_gone` calls, and the wall nanoseconds they took (an `Instant` pair around each call, inside the
+    /// store lock). Observation only (r11-adversarial PREREG amendment 20).
+    pub child_gone_calls: u64,
+    pub child_gone_ns: u64,
+    /// Wall nanoseconds `release_handle` held the store lock: acquisition to just before it returns.
+    pub reap_hold_ns: u64,
 }
 
 impl Branch {
