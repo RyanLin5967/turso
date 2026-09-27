@@ -222,6 +222,9 @@ struct Args {
     census: usize,
     census_at: usize,
     census_lines: Vec<String>,
+    /// r11-coherence amendment 32: `PRAGMA page_size` before the table exists, so a 10^6-scale arena fits in memory
+    /// (512-byte pages for the trunk-domain capacity run). `None` keeps the engine's default.
+    page_size: Option<usize>,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -248,6 +251,7 @@ fn parse_args() -> Args {
         census: 0,
         census_at: 0,
         census_lines: Vec::new(),
+        page_size: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -285,6 +289,9 @@ fn parse_args() -> Args {
                 .to_string()
             }
             "--threads" => args.threads = parse_list(&val(), "--threads"),
+            "--page-size" => {
+                args.page_size = Some(val().parse().unwrap_or_else(|_| die("bad --page-size")))
+            }
             "--census" => args.census = val().parse().unwrap_or_else(|_| die("bad --census")),
             "--census-at" => {
                 args.census_at = val().parse().unwrap_or_else(|_| die("bad --census-at"))
@@ -674,6 +681,9 @@ fn main() {
     trunk
         .execute(format!("PRAGMA synchronous = {}", args.synchronous))
         .unwrap();
+    if let Some(ps) = args.page_size {
+        trunk.execute(format!("PRAGMA page_size = {ps}")).unwrap();
+    }
     trunk
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
@@ -691,6 +701,11 @@ fn main() {
             .unwrap()
     };
     let page_size = int("PRAGMA page_size");
+    if let Some(ps) = args.page_size {
+        if page_size != ps as i64 {
+            not_a_result(&format!("--page-size {ps} was asked for, but the database has {page_size}-byte pages"));
+        }
+    }
     let trunk_pages = int("PRAGMA page_count");
     let synchronous = int("PRAGMA synchronous");
 
@@ -1761,6 +1776,9 @@ fn private_trunk(args: &Args) -> (tempfile::TempDir, Arc<Database>, Arc<Connecti
     trunk
         .execute(format!("PRAGMA synchronous = {}", args.synchronous))
         .unwrap();
+    if let Some(ps) = args.page_size {
+        trunk.execute(format!("PRAGMA page_size = {ps}")).unwrap();
+    }
     trunk
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
         .unwrap();
