@@ -499,10 +499,6 @@ struct BranchState {
     writer: bool,
     /// The lease deadline on the lease clock; `None` = the branch never expires.
     lease: Option<u64>,
-    /// The log sequence number that makes this branch's `Release` durable, while it may not be: a
-    /// batch release, or an expiry pass riding on a fork that is not forced (r12-noforce). What a
-    /// later `close` frees because of that release waits for it (rule 2). 0 when durable at once.
-    release_lsn: u64,
 }
 
 impl BranchState {
@@ -1154,14 +1150,7 @@ impl BranchStore {
         let due = plan.due;
         let mut freed = Vec::new();
         for &id in &due {
-            if let Some(lsn) = defer_to {
-                inner.releasing_at(id, lsn);
-            }
             inner.apply_release(id, &mut freed);
-        }
-        if defer_to.is_some() {
-            // Applied before durable: a trunk commit must not overtake these releases.
-            self.unsynced.store(true, Ordering::Release);
         }
         let freed_pages = freed.len();
         {
@@ -1478,12 +1467,6 @@ impl BranchStore {
             st.writer = false;
             freed.extend(st.pending.drain().map(|(_, slot)| slot));
         }
-        // What the climb frees was made free by the releases of `id` and its ancestors. One of
-        // them may not be durable yet (a batch release in the air, or an expiry pass riding on a
-        // fork that is not forced): then the slots wait for it, as that release's own frees do
-        // (rule 2). Freed at once, a slot could be reused and a crash could bring the released
-        // branch back over another branch's page (r12-noforce adversary, finding 2).
-        let depends_on = inner.release_lsn_of_chain(id);
         inner.collect(id, &mut freed);
         // Rule 2 (review r12-merge1 R2): a branch an early release kept alive because it was open is
         // freed here, and its Release may still be only buffered. Hold the frees until every early
@@ -1618,14 +1601,11 @@ impl BranchStore {
         let mut freed = Vec::new();
         for &i in &todo {
             let before = freed.len();
-            inner.releasing_at(ids[i], lsn);
             inner.apply_release(ids[i], &mut freed);
             out[i].freed_pages = freed.len() - before;
             out[i].deferred = inner.branches.contains_key(&ids[i]);
         }
         inner.defer_frees(lsn, freed);
-        // Applied before durable: a trunk commit must not overtake these releases (see `unsynced`).
-        self.unsynced.store(true, Ordering::Release);
         self.sync_trunk_children(&inner);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
@@ -2392,25 +2372,6 @@ impl StoreInner {
         crash::mutant("no_id_floor") || id < self.id_floor_durable
     }
 
-    /// `id`'s `Release` is durable once `lsn` is (see `BranchState::release_lsn`); a no-op for a
-    /// branch the release freed at once.
-    fn releasing_at(&mut self, id: BranchId, lsn: u64) {
-        if let Some(st) = self.branches.get_mut(&id) {
-            st.release_lsn = st.release_lsn.max(lsn);
-        }
-    }
-
-    /// The latest `release_lsn` along `id` and its ancestors: what anything `collect(id)` frees
-    /// depends on.
-    fn release_lsn_of_chain(&self, mut id: BranchId) -> u64 {
-        let mut lsn = 0;
-        while let Some(st) = self.branches.get(&id) {
-            lsn = lsn.max(st.release_lsn);
-            id = st.parent;
-        }
-        lsn
-    }
-
     /// Raise the durable floor to every buffered floor a flush has covered.
     fn mature_id_floors(&mut self, durable: u64) {
         while let Some(&(lsn, floor)) = self.id_floor_pending.front() {
@@ -2495,7 +2456,6 @@ impl StoreInner {
                 open: false,
                 writer: false,
                 lease: None,
-                release_lsn: 0,
             },
         );
         Ok(())
@@ -2583,10 +2543,6 @@ impl StoreInner {
                 .get_mut(&st.parent)
                 .expect("a live branch's parent is kept while the branch lives");
             parent.lineage.child_gone(st.fork_epoch, freed);
-            // The parent no longer lists this child, so whatever it frees later (its own close, a
-            // retire) was made free by this child's release too: it inherits that release's lsn
-            // (r12-noforce review 2, finding 1).
-            parent.release_lsn = parent.release_lsn.max(st.release_lsn);
             id = st.parent;
         }
     }
@@ -2822,8 +2778,7 @@ impl StoreInner {
                     open: false,
                     writer: false,
                     lease,
-                    release_lsn: 0,
-                },
+                    },
             );
         }
         for (parent, f, child) in edges {
