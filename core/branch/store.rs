@@ -1893,26 +1893,31 @@ mod tests {
         assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
     }
 
-    /// The realloc counter charges a reserve and nothing else. A map filled to exactly its capacity
-    /// has crowded groups, so removing a key usually leaves a tombstone, and re-inserting the key
-    /// reuses it: `capacity()` (len + growth_left) rises by one while nothing moves. The counter
-    /// used to charge `len` for each of those (r11-bigtxn-refute: N+3 in every probe phase). The next
-    /// insert past capacity is a real growth and must be charged exactly the entries it moved.
+    /// The realloc counter charges a reserve and nothing else. Removing a key can leave a tombstone,
+    /// and re-inserting the key reuses it: `capacity()` (len + growth_left) rises by one while
+    /// nothing moves. The counter used to charge `len` for each of those (r11-bigtxn-refute: N+3 in
+    /// every probe phase). The loop runs at 800 of 896 entries because std's insert reserves whenever
+    /// growth_left is 0, even with a tombstone free: the exactly-full fixture this test first had
+    /// contained one real resize (retired by lead decision b17a73af; its failing run is banked as
+    /// tests_5b_3d589a1fc). Two premises are asserted, so the fixture cannot lose them silently: no
+    /// re-insert resized the table, and filled to 896 it is exactly full. The next insert is then a
+    /// real growth and must be charged exactly the entries it moved.
     #[test]
     fn insert_counted_charges_a_growth_and_not_a_tombstone_reuse() {
         use std::hash::{BuildHasherDefault, DefaultHasher};
         let mut map: HashMap<u64, u64, BuildHasherDefault<DefaultHasher>> = HashMap::default();
         let mut acc = HoldAcc::default();
-        for k in 0..896 {
+        for k in 0..800 {
             insert_counted(&mut map, &mut acc, k, k);
         }
         assert_eq!(map.capacity(), 896, "a table of 1,024 buckets holds 896");
         let grown = acc.realloc_moved;
         let mut reuses = 0;
-        for k in 0..896 {
+        for k in 0..800 {
             map.remove(&k);
             let cap = map.capacity();
             insert_counted(&mut map, &mut acc, k, k);
+            assert!(map.capacity() <= cap + 1, "premise: re-inserting {k} resized the table");
             if map.capacity() == cap + 1 {
                 reuses += 1;
             }
@@ -1922,48 +1927,16 @@ mod tests {
             acc.realloc_moved, grown,
             "{reuses} tombstone reuses were charged as moves"
         );
-        insert_counted(&mut map, &mut acc, 896, 896);
-        assert_eq!(acc.realloc_moved - grown, 896, "the growth past 896 moved 896 entries");
-        assert_eq!(acc.realloc_bytes, acc.realloc_moved * 16, "(u64, u64) entries are 16 bytes");
-    }
-
-    /// The realloc counter's criterion on a map BELOW capacity, so that no reserve can happen inside
-    /// the loop (std's insert reserves whenever growth_left is 0, even with a tombstone free: the test
-    /// above missed that and failed on a real resize). At 800 of 896 entries growth_left stays at 96
-    /// whatever a remove leaves (a tombstone keeps it; an empty slot raises it and the re-insert lowers
-    /// it again), and each key goes back to its own slot. Re-inserts that reuse a tombstone raise
-    /// capacity() by one and must be charged nothing; filling to 896 moves nothing; the next insert is
-    /// a real growth, charged exactly 896.
-    #[test]
-    fn insert_counted_charges_nothing_for_tombstone_reuse_below_capacity() {
-        use std::hash::{BuildHasherDefault, DefaultHasher};
-        let mut map: HashMap<u64, u64, BuildHasherDefault<DefaultHasher>> = HashMap::default();
-        let mut acc = HoldAcc::default();
-        for k in 0..800 {
-            insert_counted(&mut map, &mut acc, k, k);
-        }
-        let grown = acc.realloc_moved;
-        assert_eq!(
-            grown,
-            3 + 7 + 14 + 28 + 56 + 112 + 224 + 448,
-            "hashbrown's growths to 1,024 buckets"
-        );
-        let mut reuses = 0;
-        for k in 0..800 {
-            map.remove(&k);
-            let cap = map.capacity();
-            insert_counted(&mut map, &mut acc, k, k);
-            if map.capacity() == cap + 1 {
-                reuses += 1;
-            }
-        }
-        assert!(reuses > 0, "no re-insert reused a tombstone: the scenario tests nothing");
-        assert_eq!(acc.realloc_moved, grown, "{reuses} tombstone reuses were charged as moves");
         for k in 800..896 {
             insert_counted(&mut map, &mut acc, k, k);
         }
-        assert_eq!(acc.realloc_moved, grown, "filling to capacity moved nothing");
+        assert_eq!(
+            (map.len(), map.capacity()),
+            (896, 896),
+            "premise: the table is exactly full and never resized"
+        );
         insert_counted(&mut map, &mut acc, 896, 896);
         assert_eq!(acc.realloc_moved - grown, 896, "the growth past 896 moved 896 entries");
+        assert_eq!(acc.realloc_bytes, acc.realloc_moved * 16, "(u64, u64) entries are 16 bytes");
     }
 }
