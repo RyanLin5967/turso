@@ -2315,4 +2315,46 @@ mod tests {
             assert_eq!(replica.digest(&rtrunk), store.digest(&img), "k = {k}: the replica differs");
         }
     }
+
+    /// R4 (PREREG A5c, F-S3): for the same number of changes, an incremental's nodes visited per
+    /// record do not grow with the number of states in the store: 100 rewrites spread over 1,000
+    /// states and over 100,000 states agree within 1.2x (log32 of the ratio of store sizes allows
+    /// no more).
+    #[test]
+    fn an_incrementals_visits_per_record_do_not_grow_with_the_store_at_a_fixed_change() {
+        let per_record = |k: u64| -> f64 {
+            let store = BranchStore::new();
+            store.enable_shipping().unwrap();
+            let trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+            let mut ids = Vec::new();
+            for i in 0..k {
+                let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                write_page(&store, id, 1, &image(0), &image(20_000 + i));
+                ids.push(id);
+            }
+            let img = trunk_image(&trunk);
+            let full = store
+                .send(SendMode::FullFix, None, &img, false, Plant::None, false, None)
+                .unwrap();
+            for j in 0..100u64 {
+                write_page(&store, ids[(j * k / 100) as usize], 1, &image(0), &image(900_000 + j));
+            }
+            let rep = store
+                .send(SendMode::IncrFix, Some(full.to), &img, false, Plant::None, false, None)
+                .unwrap();
+            let records = rep.slot_records
+                + rep.trunk_page_records
+                + rep.ref_records
+                + rep.state_records
+                + rep.dead_records
+                + 3;
+            assert_eq!(rep.slot_records, 100, "k = {k}: {rep:?}");
+            rep.nodes_visited as f64 / records as f64
+        };
+        let (small, large) = (per_record(1_000), per_record(100_000));
+        assert!(
+            large <= small * 1.2,
+            "nodes visited per record grew from {small:.3} (1,000 states) to {large:.3} (100,000 states)"
+        );
+    }
 }
