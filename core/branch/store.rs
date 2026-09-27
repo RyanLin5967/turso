@@ -2013,10 +2013,13 @@ mod tests {
         };
         // Live children in fork order, with their fork epochs; the straggler is kept apart.
         let mut live: std::collections::VecDeque<(BranchId, u64)> = std::collections::VecDeque::new();
-        let straggler = (store.fork_trunk(Arc::new(Schema::default()), PS).unwrap(), epoch);
+        // One schema for every child, as connections share one: with a Schema per fork the first
+        // 10^6 runs reached 9.4 GB RSS during growth and the driver's guard killed them.
+        let schema = Arc::new(Schema::default());
+        let straggler = (store.fork_trunk(schema.clone(), PS).unwrap(), epoch);
         epoch += 1;
         for i in 1..n {
-            let id = store.fork_trunk(Arc::new(Schema::default()), PS).unwrap();
+            let id = store.fork_trunk(schema.clone(), PS).unwrap();
             live.push_back((id, epoch));
             epoch += 1;
             if i % every == 0 {
@@ -2056,7 +2059,7 @@ mod tests {
                 read(&store, id, f, p, &current, &writes);
             }
             freed_total += store.release_handle(head).freed_pages;
-            let id = store.fork_trunk(Arc::new(Schema::default()), PS).unwrap();
+            let id = store.fork_trunk(schema.clone(), PS).unwrap();
             live.push_back((id, epoch));
             epoch += 1;
             if cycle % every == 0 {
