@@ -323,6 +323,30 @@ impl Catalog {
         for sql in SCHEMA {
             conn.execute(*sql)?;
         }
+        // r12-e3 RES arm (run-time selected, off by default): the catalog connection's page cache sized
+        // by `R12_CAT_CACHE_KIB`, and with `R12_CAT_PREWARM` every B-tree a reap reads (the branch table,
+        // its children index, and the retained versions with their three indexes) read once at open,
+        // so a reap's catalog statements find their pages resident (a buffer pool sized to the working
+        // set, prewarmed).
+        if let Some(kib) = std::env::var("R12_CAT_CACHE_KIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            conn.execute(format!("PRAGMA cache_size = -{kib}"))?;
+        }
+        if std::env::var_os("R12_CAT_PREWARM").is_some() {
+            for sql in [
+                "SELECT sum(parent) FROM branch",
+                "SELECT fork_epoch FROM branch WHERE parent >= 0 ORDER BY parent, fork_epoch",
+                "SELECT sum(slot) FROM cur",
+                "SELECT sum(slot) FROM ret",
+                "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, page, born",
+                "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, born",
+                "SELECT died FROM ret WHERE owner >= 0 ORDER BY owner, died",
+            ] {
+                conn.prepare(sql)?.run_ignore_rows()?;
+            }
+        }
         let mut next_id = 0u8;
         let mut p = |sql: &str| -> Result<Stmt> {
             next_id += 1;
