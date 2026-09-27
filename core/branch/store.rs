@@ -437,6 +437,8 @@ impl BranchStore {
         st.lineage.children.insert(f, id);
         let schema = st.schema.clone();
         let (current, inherited) = (&st.current, &st.inherited);
+        // Observation only (r11-adversarial PREREG amendment 11): the entries the lazy build below inserts.
+        let view_build = if st.view.is_none() { current.len() as u64 } else { 0 };
         let view = st
             .view
             .get_or_insert_with(|| {
@@ -449,6 +451,7 @@ impl BranchStore {
             .clone();
         let trunk_at = st.trunk_at;
         inner.next_id += 1;
+        inner.work.view_build_entries += view_build;
         inner
             .branches
             .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
