@@ -1062,10 +1062,9 @@ impl BranchStore {
         Ok(())
     }
 
-    /// The store for a database whose sidecar files are named from `db_path`. A durable store
-    /// recovers whatever its files hold; a volatile one refuses a database whose files say it has
-    /// durable branches, because opened volatile, the trunk's writes would skip the pre-image
-    /// barrier and silently change what those branches read.
+    /// `open_mode` in the default arm: the tests' shorthand (the database opens through
+    /// `open_with_flags`, in the arm its options name).
+    #[cfg(test)]
     pub(crate) fn open(
         durability: BranchDurability,
         default_lease: Option<Duration>,
@@ -1074,7 +1073,11 @@ impl BranchStore {
         Self::open_mode(durability, default_lease, false, db_path)
     }
 
-    /// `open` in the F7 splice arm (`splice`) or not.
+    /// The store for a database whose sidecar files are named from `db_path`, in the F7 splice arm
+    /// (`splice`) or not. A durable store recovers whatever its files hold, if they were written in
+    /// the same arm; a volatile one refuses a database whose files say it has durable branches,
+    /// because opened volatile, the trunk's writes would skip the pre-image barrier and silently
+    /// change what those branches read.
     pub(crate) fn open_mode(
         durability: BranchDurability,
         default_lease: Option<Duration>,

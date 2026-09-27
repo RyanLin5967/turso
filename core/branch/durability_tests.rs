@@ -20,10 +20,7 @@ fn durable() -> DatabaseOpts {
     } else {
         BranchDurability::Durable { sync: true }
     };
-    // r11-ever amendment 15: R11_SPLICE=1 runs it in the F7 splice arm (off by default).
-    DatabaseOpts::new()
-        .with_branch_durability(durability)
-        .with_branch_splice(std::env::var_os("R11_SPLICE").is_some())
+    DatabaseOpts::new().with_branch_durability(durability)
 }
 
 fn open_read_only(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
@@ -2399,13 +2396,15 @@ fn attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused() {
 // splices a released branch with exactly one live child out of the tree. Every test here runs in
 // snapshot mode, and in catalog mode under R11_BRANCH_CATALOG, like the rest of this file. The
 // splice is an ARM, off by default (the lead's ruling, amendment 15): the tests that assert a splice
-// open in it explicitly (`spliced()`), whatever R11_SPLICE says; the last three test the switch.
+// open in it explicitly (`spliced()`); the switch's own tests name both arms. (Amendment 18: no env
+// variable moves this file's arm: a test that opens a second store through `BranchStore::open`, in the
+// default arm, would meet files the other arm wrote.)
 
 fn catalog_run() -> bool {
     std::env::var_os("R11_BRANCH_CATALOG").is_some()
 }
 
-/// `durable()` in the F7 splice arm, whatever R11_SPLICE says.
+/// `durable()` in the F7 splice arm.
 fn spliced() -> DatabaseOpts {
     durable().with_branch_splice(true)
 }

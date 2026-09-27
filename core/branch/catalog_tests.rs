@@ -7,10 +7,7 @@ use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value,
 use std::path::Path;
 
 fn catalog() -> DatabaseOpts {
-    // r11-ever amendment 15: R11_SPLICE=1 runs this file in the F7 splice arm (off by default).
-    DatabaseOpts::new()
-        .with_branch_durability(BranchDurability::Catalog { sync: true })
-        .with_branch_splice(std::env::var_os("R11_SPLICE").is_some())
+    DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: true })
 }
 
 fn open_at(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
@@ -426,7 +423,7 @@ fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
 
 // ---- r11-ever: the F7 durable port on the composed base (UNBUILT; r11-ever amendment 14) ----
 
-/// `catalog()` in the F7 splice arm, whatever R11_SPLICE says: the tests that assert a splice
+/// `catalog()` in the F7 splice arm: the tests that assert a splice
 /// (r11-ever amendment 15).
 fn spliced() -> DatabaseOpts {
     catalog().with_branch_splice(true)

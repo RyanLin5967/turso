@@ -607,13 +607,16 @@ impl Journal {
         Ok(())
     }
 
-    /// Reopen an existing store. `Ok(None)` means the files hold no state at all (a crash while
-    /// the log was being created, before its header was durable): the store starts empty.
+    /// `recover_as` at the default arm's format version: the tests' shorthand (the store opens
+    /// through `recover_as`, in its own arm).
+    #[cfg(test)]
     pub(crate) fn recover(files: &BranchFiles, sync: bool) -> Result<Option<Recovered>> {
         Self::recover_base(files, sync, None, FORMAT_VERSION)
     }
 
-    /// `recover`, reading (and refusing anything but) the given format version.
+    /// Reopen an existing store, reading (and refusing anything but) the given format version.
+    /// `Ok(None)` means the files hold no state at all (a crash while the log was being created,
+    /// before its header was durable): the store starts empty.
     pub(crate) fn recover_as(
         files: &BranchFiles,
         sync: bool,
@@ -622,18 +625,9 @@ impl Journal {
         Self::recover_base(files, sync, None, format)
     }
 
-    /// `recover` for a catalog store: the catalog's meta row, `(page_size, generation)`, stands
+    /// `recover_as` for a catalog store: the catalog's meta row, `(page_size, generation)`, stands
     /// where the snapshot's header does, and no snapshot is read. `None`: the catalog has no meta
     /// row (a crash while the store was being created).
-    pub(crate) fn recover_catalog(
-        files: &BranchFiles,
-        sync: bool,
-        base: Option<(u32, u64)>,
-    ) -> Result<Option<Recovered>> {
-        Self::recover_base(files, sync, Some(base), FORMAT_VERSION)
-    }
-
-    /// `recover_catalog`, reading (and refusing anything but) the given format version.
     pub(crate) fn recover_catalog_as(
         files: &BranchFiles,
         sync: bool,
