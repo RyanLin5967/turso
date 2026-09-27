@@ -290,6 +290,13 @@ pub struct BranchWork {
     pub retained_shared_hits: u64,
     /// FS9: clones built, one copy per retained trunk version, on its first resolution.
     pub retained_clone_fills: u64,
+    /// Resolutions answered with a version an ANCESTOR BRANCH holds for this branch (through the
+    /// inherited page map), copied into the caller's private buffer (FS9B off).
+    pub inherited_copies: u64,
+    /// FS9B: such resolutions answered by reference from the arena's slot clones.
+    pub inherited_shared_hits: u64,
+    /// FS9B: slot clones built, one copy per inherited slot, on its first resolution.
+    pub inherited_clone_fills: u64,
 }
 
 impl Branch {
@@ -523,6 +530,19 @@ impl Database {
     #[doc(hidden)]
     pub fn trunk_cache_pages(&self) -> usize {
         self.branches.trunk_cache_pages()
+    }
+
+    /// FS9B (r11-sessions): also serve versions inherited from ancestor BRANCHES by reference.
+    /// Normally taken from `TURSO_R11S_FS9=2` (which turns FS9 on too); tests set it per database.
+    #[doc(hidden)]
+    pub fn set_fs9b(&self, on: bool) {
+        self.branches.set_fs9b(on);
+    }
+
+    /// FS9B: arena slots currently cloned for sharing. Observation only.
+    #[doc(hidden)]
+    pub fn slot_clone_count(&self) -> usize {
+        self.branches.slot_clone_count()
     }
 
     /// FS9: retained trunk versions currently cloned for sharing. Observation only.

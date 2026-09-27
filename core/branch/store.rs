@@ -141,6 +141,8 @@ pub(crate) struct BranchStore {
     /// FS10 (r11-sessions): branch pagers release their private cache entries for pages held by
     /// reference when their connection's last statement ends (see `Pager::release_shared_pages`).
     fs10: AtomicBool,
+    /// FS9B (r11-sessions): serve inherited ancestor-branch versions by reference (`Arena::clones`).
+    fs9b: AtomicBool,
 }
 
 /// Where the page a branch asked for comes from.
@@ -322,8 +324,12 @@ struct StoreInner {
 
 /// Where `StoreInner::resolve_origin` found a page.
 enum Origin {
-    /// In the arena: the branch's own version or one inherited from an ancestor branch.
+    /// In the arena: the branch's own current version (mutable: the branch rewrites it in place
+    /// when no child can see it).
     Arena(Slot),
+    /// In the arena: a version the branch sees through an ANCESTOR branch (its inherited page map):
+    /// never written again while the branch lives.
+    Inherited(Slot),
     /// In the arena: a version the TRUNK retained, born at `born`.
     TrunkRetained { slot: Slot, born: u64 },
     /// The trunk's current version.
@@ -559,7 +565,12 @@ impl Lineage {
 
 /// FS9's process default: `TURSO_R11S_FS9=1` turns it on for stores created afterwards.
 fn fs9_from_env() -> bool {
-    std::env::var("TURSO_R11S_FS9").is_ok_and(|v| v == "1")
+    std::env::var("TURSO_R11S_FS9").is_ok_and(|v| v == "1" || v == "2")
+}
+
+/// FS9B's process default: `TURSO_R11S_FS9=2`.
+fn fs9b_from_env() -> bool {
+    std::env::var("TURSO_R11S_FS9").is_ok_and(|v| v == "2")
 }
 
 /// Mutant schemata for this lane's fire-checks, compiled into test builds only and chosen per test
@@ -599,6 +610,7 @@ impl BranchStore {
             fw3: std::sync::atomic::AtomicBool::new(super::walpin::fw3()),
             fs9: AtomicBool::new(fs9_from_env()),
             fs10: AtomicBool::new(std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "1")),
+            fs9b: AtomicBool::new(fs9b_from_env()),
         }
     }
 
@@ -621,6 +633,14 @@ impl BranchStore {
 
     pub(crate) fn set_fs9(&self, on: bool) {
         self.fs9.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_fs9b(&self, on: bool) {
+        self.fs9b.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn slot_clone_count(&self) -> usize {
+        self.lock().arena.as_ref().map_or(0, |a| a.clone_count())
     }
 
     pub(crate) fn set_fs10(&self, on: bool) {
@@ -985,7 +1005,23 @@ impl BranchStore {
         inner.work.resolve_levels += levels;
         inner.work.resolve_retained_examined += examined;
         let slot = match resolved? {
+            // The branch's own current page stays a private copy: it is the page the branch writes.
             Origin::Arena(slot) => slot,
+            Origin::Inherited(slot) => {
+                if share && self.fs9b.load(Ordering::Relaxed) {
+                    let StoreInner { arena, work, .. } = &mut *inner;
+                    let arena = arena.as_mut().expect("a slot resolved, so the arena exists");
+                    let (bytes, filled) = arena.shared_clone(slot);
+                    if filled {
+                        work.inherited_clone_fills += 1;
+                    } else {
+                        work.inherited_shared_hits += 1;
+                    }
+                    return Ok(Resolved::Shared(bytes));
+                }
+                inner.work.inherited_copies += 1;
+                slot
+            }
             Origin::TrunkRetained { slot, born } => {
                 if share && self.fs9.load(Ordering::Relaxed) {
                     #[cfg(test)]
@@ -1157,7 +1193,9 @@ impl StoreInner {
         examined: &mut u64,
     ) -> Result<Option<Slot>> {
         Ok(match self.resolve_origin(id, page, levels, examined)? {
-            Origin::Arena(slot) | Origin::TrunkRetained { slot, .. } => Some(slot),
+            Origin::Arena(slot) | Origin::Inherited(slot) | Origin::TrunkRetained { slot, .. } => {
+                Some(slot)
+            }
             Origin::Trunk => None,
         })
     }
@@ -1177,7 +1215,7 @@ impl StoreInner {
             return Ok(Origin::Arena(owned.slot));
         }
         if let Some(slot) = st.inherited.get(page) {
-            return Ok(Origin::Arena(slot));
+            return Ok(Origin::Inherited(slot));
         }
         *levels += 1;
         let at = st.trunk_at;

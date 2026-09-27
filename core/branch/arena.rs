@@ -30,6 +30,12 @@ pub(crate) struct Arena {
     /// cannot answer "is this slot free" without a scan, and releasing an already-free slot must be
     /// caught AT the release — found later, it is two owners of one page and nothing says which.
     free_bits: Vec<u64>,
+    /// FS9B (r11-sessions): shared copies of slots that descendants read through their inherited
+    /// page map, keyed by the slot. A slot names one (owner, page, version) until it is written or
+    /// released: while a descendant that inherited it lives, its owner retains it and writes a new
+    /// slot instead; once none does, the owner may rewrite it in place, and a later child inherits
+    /// the same slot. So `page_mut` (every write) and `release` both drop the clone.
+    clones: std::collections::HashMap<Slot, crate::sync::Arc<crate::alloc::DynBoxedSlice<u8>>>,
 }
 
 impl Arena {
@@ -40,7 +46,26 @@ impl Arena {
             high_water: 0,
             free: Vec::new(),
             free_bits: Vec::new(),
+            clones: std::collections::HashMap::new(),
         }
+    }
+
+    /// FS9B: the shared copy of `slot`, made on first use; `true` when this call made it.
+    pub(crate) fn shared_clone(
+        &mut self,
+        slot: Slot,
+    ) -> (crate::sync::Arc<crate::alloc::DynBoxedSlice<u8>>, bool) {
+        if let Some(bytes) = self.clones.get(&slot) {
+            return (bytes.clone(), false);
+        }
+        let bytes = crate::sync::Arc::new(self.page(slot).to_vec().into_boxed_slice());
+        self.clones.insert(slot, bytes.clone());
+        (bytes, true)
+    }
+
+    /// FS9B: slots currently cloned for sharing.
+    pub(crate) fn clone_count(&self) -> usize {
+        self.clones.len()
     }
 
     pub(crate) fn page_size(&self) -> usize {
@@ -69,6 +94,13 @@ impl Arena {
     pub(crate) fn release(&mut self, slot: Slot) {
         turso_assert!(slot < self.high_water, "released a slot the arena never handed out");
         turso_assert!(!self.is_free(slot), "released an arena slot that was already free");
+        #[cfg(test)]
+        let evict = !super::store::mutants::on("FS9B_NO_EVICT");
+        #[cfg(not(test))]
+        let evict = true;
+        if evict {
+            self.clones.remove(&slot);
+        }
         self.set_free_bit(slot, true);
         self.free.push(slot);
     }
@@ -99,6 +131,16 @@ impl Arena {
     }
 
     pub(crate) fn page_mut(&mut self, slot: Slot) -> &mut [u8] {
+        // FS9B: a slot's clone is exact only until the slot is written. A branch rewrites its own
+        // current page in place once no child can see it, and a later child inherits that same slot,
+        // so any write drops the clone.
+        #[cfg(test)]
+        let evict = !super::store::mutants::on("FS9B_NO_WRITE_EVICT");
+        #[cfg(not(test))]
+        let evict = true;
+        if evict {
+            self.clones.remove(&slot);
+        }
         let (chunk, offset) = self.locate(slot);
         let page_size = self.page_size;
         &mut self.chunks[chunk][offset..offset + page_size]

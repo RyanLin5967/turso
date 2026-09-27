@@ -1172,3 +1172,62 @@ fn a_held_idle_session_keeps_no_private_entry_for_a_shared_page() {
     assert_eq!(value(&c1, 10), Some(original(10)));
     assert_eq!(value(&trunk, 10), Some(original(10)));
 }
+
+/// FS9B. Branches forked from a chain read a version an interior ANCESTOR branch holds for them
+/// (its retained pre-image, and its current page) by reference, one shared copy per slot; the copy
+/// goes when the slot is released (`FS9B_NO_EVICT` keeps it) or written: once no child can see a
+/// branch's current page the branch rewrites it in place, and a child forked afterwards inherits the
+/// same slot (`FS9B_NO_WRITE_EVICT` serves it the stale copy).
+#[test]
+fn inherited_ancestor_versions_are_shared_by_slot_and_released_with_it() {
+    let (_dir, db) = open_db();
+    db.set_fs9b(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    // Chain: trunk -> a1 -> a2. a1 writes rows 10 and 200 before a2 forks.
+    let a1 = trunk.fork_branch().unwrap();
+    let a1c = a1.connect().unwrap();
+    set(&a1c, 10, "a1-v1");
+    set(&a1c, 200, "a1-v1");
+    let a2 = a1.fork();
+    let a2 = a2.unwrap();
+    // a1 rewrites row 10 after a2's fork: its v1 is retained for a2 and everything under it.
+    set(&a1c, 10, "a1-v2");
+    let (h1, h2) = (a2.fork().unwrap(), a2.fork().unwrap());
+    let (c1, c2) = (h1.connect().unwrap(), h2.connect().unwrap());
+    let before = db.branch_stats().work;
+    for c in [&c1, &c2] {
+        assert_eq!(value(c, 10), Some("a1-v1".to_string()));
+        assert_eq!(value(c, 200), Some("a1-v1".to_string()));
+    }
+    let after = db.branch_stats().work;
+    assert_eq!(after.inherited_copies - before.inherited_copies, 0, "an inherited version was copied");
+    assert!(after.inherited_shared_hits - before.inherited_shared_hits >= 2, "no session shared an inherited version");
+    assert_eq!(db.slot_clone_count(), 2, "one clone per inherited slot (row 10's retained v1, row 200's current)");
+    assert_eq!(value(&a1c, 10), Some("a1-v2".to_string()));
+    // A branch's own page is read, then rewritten in place (it has no child), then read again.
+    set(&c1, 250, "own-1");
+    assert_eq!(value(&c1, 250), Some("own-1".to_string()));
+    set(&c1, 250, "own-2");
+    assert_eq!(value(&c1, 250), Some("own-2".to_string()), "a branch read a stale copy of its own page");
+    // Release: when every branch that could see row 10's v1 is gone, its slot and clone go; row
+    // 200's slot is a1's CURRENT version, still live, and keeps its clone.
+    drop((c1, c2));
+    h1.reap().unwrap();
+    h2.reap().unwrap();
+    drop(a2);
+    assert_eq!(db.slot_clone_count(), 1, "a released slot's clone was kept (or a live one was lost)");
+    // With no child left, a1 rewrites row 200 IN PLACE: the write drops the clone, and a child
+    // forked afterwards inherits the same slot and must read the new bytes.
+    set(&a1c, 200, "a1-v2-in-place");
+    assert_eq!(db.slot_clone_count(), 0, "a rewritten slot kept its clone");
+    let a3 = a1.fork().unwrap();
+    let c3 = a3.connect().unwrap();
+    assert_eq!(
+        value(&c3, 200),
+        Some("a1-v2-in-place".to_string()),
+        "a child read a stale clone of a slot rewritten in place"
+    );
+    assert_eq!(value(&a1c, 10), Some("a1-v2".to_string()));
+    assert_eq!(value(&trunk, 10), Some(original(10)));
+}
