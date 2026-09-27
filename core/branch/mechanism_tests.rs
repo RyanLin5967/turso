@@ -1228,7 +1228,8 @@ fn arena_versions_are_read_by_reference_and_an_idle_writer_keeps_no_copy() {
         0,
         "the writer kept a private copy of the page it committed"
     );
-    // A second connection on the branch reads the branch's own page by reference.
+    // The branch's next connection (a branch serves one at a time) reads its own page by reference.
+    drop(c);
     let c2 = b.connect().unwrap();
     let before = db.branch_stats().work;
     assert_eq!(value(&c2, 10), Some("b-v1".to_string()));
@@ -1240,9 +1241,9 @@ fn arena_versions_are_read_by_reference_and_an_idle_writer_keeps_no_copy() {
     let child = b.fork().unwrap();
     let cc = child.connect().unwrap();
     assert_eq!(value(&cc, 10), Some("b-v1".to_string()));
-    set(&c, 10, "b-v2");
+    set(&c2, 10, "b-v2");
     assert_eq!(value(&cc, 10), Some("b-v1".to_string()));
-    assert_eq!(value(&c, 10), Some("b-v2".to_string()));
+    assert_eq!(value(&c2, 10), Some("b-v2".to_string()));
     assert_eq!(value(&trunk, 10), Some(original(10)));
     // A trunk pre-image is read by reference too.
     let b3 = trunk.fork_branch().unwrap();
