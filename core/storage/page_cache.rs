@@ -997,14 +997,15 @@ mod tests {
         use crate::branch::{
             pf_begin_prefetch, pf_end_prefetch, pf_new_serial, pf_settle, pf_slot, PF_COUNTERS,
         };
-        let cache = crate::sync::Mutex::new(PageCache::new_with_spill(4, true));
+        let cache_cell = crate::sync::Mutex::new(PageCache::new_with_spill(4, true));
+        let cache = &cache_cell;
         cache.lock().set_catalog_policy(false);
         for id in 1..=4 {
             insert_page(&mut cache.lock(), id);
         }
         // Own thread: tag one page, evict it with two untagged inserts, settle.
         std::thread::scope(|s| {
-            s.spawn(|| {
+            s.spawn(move || {
                 pf_settle();
                 pf_begin_prefetch(pf_new_serial());
                 insert_page(&mut cache.lock(), 100);
@@ -1030,7 +1031,7 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         std::thread::scope(|s| {
-            let owner = s.spawn(|| {
+            let owner = s.spawn(move || {
                 pf_settle();
                 pf_begin_prefetch(pf_new_serial());
                 insert_page(&mut cache.lock(), 200);
