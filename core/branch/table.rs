@@ -27,9 +27,19 @@
 //! slot holds its generation and the value's dense index, and a removal moves the last value into
 //! the hole, so values occupy `ceil(len / CHUNK)` chunks. Those chunks never move either (growth
 //! allocates one), and an emptied last chunk is freed, except for one spare kept against a count
-//! that oscillates across a chunk boundary (jemalloc's spare chunk). The slots themselves stay:
-//! 8 bytes per slot ever used, the price of never reissuing a generation. Their free list is
-//! threaded through the vacant slots (as in `slotmap`), so it takes no memory of its own.
+//! that oscillates across a chunk boundary (jemalloc's spare chunk).
+//!
+//! **The slots shrink too (lane r12-f9-shrink amendment 5).** A slot is 8 bytes (generation and
+//! link), and a table that kept every slot it ever used would hold 8 bytes per branch of the peak.
+//! So vacant slots are handed out lowest first from a bitmap (address-ordered first fit, as in the
+//! arena), which gathers the occupied slots at the bottom, and chunks of slots at the top that hold
+//! no occupied or retired slot are freed, keeping one vacant chunk above the highest used one (the
+//! spare rule again), with the chunk list shrunk under hysteresis. A freed chunk's generations must
+//! not be forgotten, or a stale id could name the next occupant: the table keeps one generation
+//! floor, the largest generation any freed slot had reached, and every slot re-created above it
+//! starts there. Every id ever issued for a freed slot carries a generation below its slot's
+//! (each removal bumps it), so below the floor, and every id issued after carries the floor or
+//! more: no stale id can match.
 
 use super::BranchId;
 
@@ -37,24 +47,36 @@ const CHUNK: usize = 1024;
 
 /// A link's top bit marks an occupied slot; the rest is then the value's dense index.
 const OCCUPIED: u32 = 1 << 31;
-/// End of the vacant-slot list. Not an index any slot can have (slots stay below it).
+/// The link of a vacant slot. Not an index any slot can have (slots stay below it).
 const NO_SLOT: u32 = OCCUPIED - 1;
+const WORDS: usize = CHUNK / 64;
 
 struct Entry {
     /// The generation the next (or current) occupant's id carries. Starts at 1, so no id is 0
     /// (`BranchId::TRUNK`).
     generation: u32,
-    /// Occupied: `OCCUPIED | dense index`. Vacant: the next vacant slot, or `NO_SLOT`.
+    /// Occupied: `OCCUPIED | dense index`. Vacant or retired: `NO_SLOT`.
     link: u32,
 }
 
 pub(crate) struct BranchTable<T> {
-    /// Slots by index, in chunks that never move and are never freed.
+    /// Slots by index, in chunks that never move; unpinned chunks at the top are freed (`trim`).
     chunks: Vec<Box<[Entry]>>,
-    /// Slots below this have been handed out at least once.
+    /// Slots below this have been handed out at least once since their chunk was created.
     high_water: u32,
-    /// First vacant slot below `high_water` (the list runs through `Entry::link`), or `NO_SLOT`.
-    free_head: u32,
+    /// One bit per slot of every chunk, set while the slot is below `high_water`, vacant and not
+    /// retired: the set first fit searches.
+    vacant_bits: Vec<u64>,
+    vacant_count: usize,
+    /// One bit per chunk, set while it has a vacant slot.
+    chunk_has_vacant: Vec<u64>,
+    /// No chunk below this has a vacant slot.
+    first_vacant_chunk: usize,
+    /// Per chunk, its occupied and retired slots: a chunk is freed only at 0.
+    chunk_pinned: Vec<u16>,
+    /// The generation a re-created slot starts at: 1, then the largest generation any freed slot
+    /// had reached.
+    gen_floor: u32,
     /// Values with the slot that owns each, packed: every chunk but the last holds exactly
     /// `CHUNK`, the last holds at least one. Each chunk is allocated with capacity `CHUNK` and never
     /// pushed past it, so it never reallocates.
@@ -71,7 +93,12 @@ impl<T> BranchTable<T> {
         Self {
             chunks: Vec::new(),
             high_water: 0,
-            free_head: NO_SLOT,
+            vacant_bits: Vec::new(),
+            vacant_count: 0,
+            chunk_has_vacant: Vec::new(),
+            first_vacant_chunk: 0,
+            chunk_pinned: Vec::new(),
+            gen_floor: 1,
             dense: Vec::new(),
             spare: None,
             len: 0,
@@ -103,23 +130,70 @@ impl<T> BranchTable<T> {
             .then_some((e.link & !OCCUPIED) as usize)
     }
 
+    /// The lowest vacant slot below `high_water`, if any.
+    fn lowest_vacant(&self) -> Option<u32> {
+        if self.vacant_count == 0 {
+            return None;
+        }
+        let mut w = self.first_vacant_chunk / 64;
+        let mut mask = !0u64 << (self.first_vacant_chunk % 64);
+        let c = loop {
+            let x = self
+                .chunk_has_vacant
+                .get(w)
+                .expect("vacant_count > 0, so some chunk has a vacant slot")
+                & mask;
+            if x != 0 {
+                break w * 64 + x.trailing_zeros() as usize;
+            }
+            w += 1;
+            mask = !0;
+        };
+        let words = &self.vacant_bits[c * WORDS..(c + 1) * WORDS];
+        let i = words.iter().position(|&w| w != 0).expect("the chunk has a vacant slot");
+        Some(((c * WORDS + i) * 64 + words[i].trailing_zeros() as usize) as u32)
+    }
+
+    fn set_vacant(&mut self, slot: u32, on: bool) {
+        let (s, c) = (slot as usize, slot as usize / CHUNK);
+        let b = 1u64 << (s % 64);
+        if on {
+            self.vacant_bits[s / 64] |= b;
+            self.vacant_count += 1;
+            self.chunk_has_vacant[c / 64] |= 1u64 << (c % 64);
+            self.first_vacant_chunk = self.first_vacant_chunk.min(c);
+        } else {
+            self.vacant_bits[s / 64] &= !b;
+            self.vacant_count -= 1;
+            if self.vacant_bits[c * WORDS..(c + 1) * WORDS].iter().all(|&w| w == 0) {
+                self.chunk_has_vacant[c / 64] &= !(1u64 << (c % 64));
+            }
+        }
+    }
+
     /// The id the next `insert` must use.
     pub(crate) fn vacant_id(&mut self) -> BranchId {
-        let slot = if self.free_head != NO_SLOT {
-            self.free_head
-        } else {
-            let slot = self.high_water;
-            crate::turso_assert!(slot < NO_SLOT, "the branch table has no slot left");
-            if slot as usize / CHUNK == self.chunks.len() {
-                let chunk: Vec<Entry> = (0..CHUNK)
-                    .map(|_| Entry {
-                        generation: 1,
-                        link: NO_SLOT,
-                    })
-                    .collect();
-                self.chunks.push(chunk.into_boxed_slice());
+        let slot = match self.lowest_vacant() {
+            Some(slot) => slot,
+            None => {
+                let slot = self.high_water;
+                crate::turso_assert!(slot < NO_SLOT, "the branch table has no slot left");
+                if slot as usize / CHUNK == self.chunks.len() {
+                    let generation = if super::mutant::on(12) { 1 } else { self.gen_floor };
+                    let chunk: Vec<Entry> = (0..CHUNK)
+                        .map(|_| Entry {
+                            generation,
+                            link: NO_SLOT,
+                        })
+                        .collect();
+                    self.chunks.push(chunk.into_boxed_slice());
+                    let n = self.chunks.len();
+                    self.vacant_bits.resize(n * WORDS, 0);
+                    self.chunk_has_vacant.resize(n.div_ceil(64), 0);
+                    self.chunk_pinned.resize(n, 0);
+                }
+                slot
             }
-            slot
         };
         let generation = self.entry(slot).expect("allocated above").generation;
         BranchId(u64::from(generation) << 32 | u64::from(slot))
@@ -128,11 +202,12 @@ impl<T> BranchTable<T> {
     pub(crate) fn insert(&mut self, id: BranchId, val: T) {
         crate::turso_assert!(id == self.vacant_id(), "insert with an id vacant_id did not issue");
         let (slot, _) = Self::split(id);
-        if self.free_head == slot {
-            self.free_head = self.entry(slot).expect("vacant slot exists").link;
+        if slot < self.high_water {
+            self.set_vacant(slot, false);
         } else {
             self.high_water += 1;
         }
+        self.chunk_pinned[slot as usize / CHUNK] += 1;
         crate::turso_assert!(self.len < NO_SLOT as usize, "the branch table is full");
         let d = self.len;
         if self.dense.last().is_none_or(|c| c.len() == CHUNK) {
@@ -193,26 +268,74 @@ impl<T> BranchTable<T> {
                 self.dense.shrink_to(2 * self.dense.len());
             }
         }
-        let free_head = self.free_head;
         let e = self.entry_mut(slot).expect("a live id's slot exists");
-        match e.generation.checked_add(1) {
-            _ if super::mutant::on(5) => {
-                e.link = free_head;
-                self.free_head = slot;
-            }
+        e.link = NO_SLOT;
+        let vacant = match e.generation.checked_add(1) {
+            _ if super::mutant::on(5) => true,
             Some(next) if next != u32::MAX => {
                 e.generation = next;
-                e.link = free_head;
-                self.free_head = slot;
+                true
             }
             _ => {
                 e.generation = u32::MAX;
-                e.link = NO_SLOT;
                 self.retired += 1;
+                false
             }
+        };
+        if vacant {
+            self.set_vacant(slot, true);
+            self.chunk_pinned[slot as usize / CHUNK] -= 1;
         }
         self.len -= 1;
+        self.trim();
         Some(val)
+    }
+
+    /// Free the chunks of slots at the top while the two highest hold no occupied or retired slot,
+    /// raising the generation floor to the largest generation each freed chunk had reached.
+    fn trim(&mut self) {
+        let before = self.chunks.len();
+        loop {
+            let n = self.chunks.len();
+            let unpinned = |i: usize| self.chunk_pinned[i] == 0;
+            let droppable = if super::mutant::on(13) {
+                n >= 2 && unpinned(n - 2)
+            } else {
+                n >= 2 && unpinned(n - 1) && unpinned(n - 2)
+            };
+            if !droppable {
+                break;
+            }
+            let chunk = self.chunks.pop().expect("n >= 2");
+            let top = chunk.iter().map(|e| e.generation).max().expect("a chunk has slots");
+            self.gen_floor = self.gen_floor.max(top);
+            let base = (n - 1) * CHUNK;
+            let hw = (self.high_water as usize).min(base);
+            self.vacant_count -= (hw..self.high_water as usize)
+                .filter(|&s| self.vacant_bits[s / 64] & (1u64 << (s % 64)) != 0)
+                .count();
+            self.high_water = hw as u32;
+            self.vacant_bits.truncate((n - 1) * WORDS);
+            self.chunk_pinned.truncate(n - 1);
+            self.chunk_has_vacant.truncate((n - 1).div_ceil(64));
+            if (n - 1) % 64 != 0 {
+                if let Some(last) = self.chunk_has_vacant.last_mut() {
+                    *last &= (1u64 << ((n - 1) % 64)) - 1;
+                }
+            }
+        }
+        if self.chunks.len() < before {
+            self.first_vacant_chunk = self.first_vacant_chunk.min(self.chunks.len());
+            fn shrink<V>(v: &mut Vec<V>) {
+                if v.capacity() > 64 && v.capacity() > 4 * v.len() {
+                    v.shrink_to(2 * v.len());
+                }
+            }
+            shrink(&mut self.chunks);
+            shrink(&mut self.vacant_bits);
+            shrink(&mut self.chunk_has_vacant);
+            shrink(&mut self.chunk_pinned);
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -223,7 +346,8 @@ impl<T> BranchTable<T> {
         self.len == 0
     }
 
-    /// Slots allocated (chunks × chunk size). It changes only when a chunk is added.
+    /// Slots allocated (chunks × chunk size): up by a chunk as the table grows, down as `trim`
+    /// frees the top.
     pub(crate) fn capacity(&self) -> usize {
         self.chunks.len() * CHUNK
     }
@@ -242,6 +366,9 @@ impl<T> BranchTable<T> {
             chunks * CHUNK * entry,
             self.chunks.len() * CHUNK * std::mem::size_of::<Entry>()
                 + self.chunks.capacity() * std::mem::size_of::<Box<[Entry]>>()
+                + (self.vacant_bits.capacity() + self.chunk_has_vacant.capacity())
+                    * std::mem::size_of::<u64>()
+                + self.chunk_pinned.capacity() * std::mem::size_of::<u16>()
                 + self.dense.capacity() * std::mem::size_of::<Vec<(u32, T)>>(),
             entry,
             chunks,
@@ -257,6 +384,59 @@ impl<T> BranchTable<T> {
 
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         self.dense.iter().flatten().map(|(_, v)| v)
+    }
+}
+
+#[cfg(test)]
+impl<T> BranchTable<T> {
+    /// Every structural invariant of the slots, by brute force. Test only.
+    fn check_slots(&self) {
+        let hw = self.high_water as usize;
+        let n = self.chunks.len();
+        assert!(hw <= n * CHUNK, "high_water above the chunks");
+        let (mut vacant, mut occupied, mut lowest) = (0, 0, None);
+        for c in 0..n {
+            let mut pinned = 0;
+            let mut has_vacant = false;
+            for i in 0..CHUNK {
+                let s = c * CHUNK + i;
+                let e = &self.chunks[c][i];
+                let occ = e.link & OCCUPIED != 0;
+                let vac = self.vacant_bits[s / 64] & (1u64 << (s % 64)) != 0;
+                if s >= hw {
+                    assert!(!occ && !vac, "slot {s} above high_water is in use or vacant-listed");
+                    continue;
+                }
+                if occ {
+                    assert!(!vac, "slot {s} occupied and vacant");
+                    let d = (e.link & !OCCUPIED) as usize;
+                    assert_eq!(self.dense[d / CHUNK][d % CHUNK].0 as usize, s, "dense back link");
+                    occupied += 1;
+                    pinned += 1;
+                } else if vac {
+                    vacant += 1;
+                    has_vacant = true;
+                } else {
+                    assert_eq!(e.generation, u32::MAX, "slot {s} neither occupied, vacant nor retired");
+                    pinned += 1;
+                }
+            }
+            assert_eq!(self.chunk_pinned[c] as usize, pinned, "chunk {c}: pinned count");
+            let bit = self.chunk_has_vacant[c / 64] & (1u64 << (c % 64)) != 0;
+            assert_eq!(bit, has_vacant, "chunk {c}: has-vacant bit");
+            if has_vacant && lowest.is_none() {
+                lowest = Some(c);
+            }
+        }
+        assert_eq!(vacant, self.vacant_count, "vacant_count");
+        assert_eq!(occupied, self.len, "len");
+        if let Some(l) = lowest {
+            assert!(self.first_vacant_chunk <= l, "first-fit start above the lowest vacant chunk");
+        }
+        assert!(
+            !(n >= 2 && self.chunk_pinned[n - 1] == 0 && self.chunk_pinned[n - 2] == 0),
+            "two unpinned chunks left on top (trim)"
+        );
     }
 }
 
@@ -411,5 +591,78 @@ mod f9_tests {
             }
             check(&t, &model, &dead);
         }
+    }
+
+    /// F9 T5 (amendment 5): the slots shrink. After a peak and a shrink to scattered survivors,
+    /// churn and then retire the survivors: the slot chunks fall to at most the chunk of the
+    /// highest occupied slot plus one vacant chunk; and no id issued at any time, before or after
+    /// a trim, is ever issued again or resolves after its removal. The trims must raise the
+    /// generation floor, or the walk proves nothing.
+    #[test]
+    fn slots_shrink_after_a_peak_and_no_id_is_ever_reissued() {
+        let mut t: BranchTable<u64> = BranchTable::new();
+        let mut model: HashMap<BranchId, u64> = HashMap::new();
+        let mut issued = std::collections::HashSet::new();
+        let mut dead: Vec<BranchId> = Vec::new();
+        let mut x = 0xD1B5_4A32_D192_ED03u64;
+        let mut below = |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        let mut next = 0u64;
+        let mut add = |t: &mut BranchTable<u64>, model: &mut HashMap<BranchId, u64>| {
+            let id = t.vacant_id();
+            assert!(issued.insert(id), "id {id:?} issued twice");
+            t.insert(id, next);
+            model.insert(id, next);
+            next += 1;
+            id
+        };
+        for round in 0..3 {
+            while model.len() < 20_000 {
+                add(&mut t, &mut model);
+            }
+            t.check_slots();
+            let mut ids: Vec<BranchId> = model.keys().copied().collect();
+            ids.sort();
+            while ids.len() > 5 {
+                let id = ids.swap_remove(below(ids.len()));
+                assert_eq!(t.remove(&id), model.remove(&id));
+                dead.push(id);
+            }
+            t.check_slots();
+            let survivors = ids.clone();
+            for _ in 0..3_000 {
+                let id = ids.swap_remove(below(ids.len()));
+                assert_eq!(t.remove(&id), model.remove(&id));
+                dead.push(id);
+                ids.push(add(&mut t, &mut model));
+                t.check_slots();
+            }
+            for id in survivors {
+                if let Some(pos) = ids.iter().position(|&i| i == id) {
+                    ids.swap_remove(pos);
+                    assert_eq!(t.remove(&id), model.remove(&id));
+                    dead.push(id);
+                    ids.push(add(&mut t, &mut model));
+                }
+            }
+            t.check_slots();
+            let top = model.keys().map(|id| id.0 as u32 as usize).max().expect("live ids");
+            assert!(
+                t.capacity() <= (top / CHUNK + 2) * CHUNK,
+                "round {round}: {} slots kept for a highest live slot of {top}",
+                t.capacity()
+            );
+            for (id, v) in &model {
+                assert_eq!(t.get(id), Some(v), "round {round}: a live id lost its value");
+            }
+            for id in &dead {
+                assert!(t.get(id).is_none(), "round {round}: a removed id resolves");
+            }
+        }
+        assert!(t.gen_floor > 1, "no trim raised the generation floor");
     }
 }

@@ -219,7 +219,8 @@ pub struct BranchResident {
     /// States with an open connection.
     pub open: usize,
     /// Slots allocated in the branch table (a slot map since F8: it grows by whole chunks and has no
-    /// tombstones; before F8 this was `HashMap::capacity`, items plus growth left).
+    /// tombstones; before F8 this was `HashMap::capacity`, items plus growth left). Since r12-f9-shrink
+    /// amendment 5 it also falls when the top chunks of slots are vacant.
     pub table_capacity: usize,
     /// One more than the number of branches ever created. Since F8 it is a count, not an id: ids
     /// are slot and generation (see `table`).
