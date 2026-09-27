@@ -192,6 +192,13 @@ pub struct BranchStats {
 /// The `lock_*` counters describe the store's locks themselves, summed over all of them (the trunk's
 /// and every shard's); `trunk_lock_*` is the trunk's alone. Only the `*_hold_ns` pair adds work under
 /// a lock.
+/// Where the trunk's lock is taken, for its per-site accounting (r11-merge PREREG A22): the index
+/// into [`BranchWork::trunk_site_acq`] and [`BranchWork::trunk_site_hold_ns`].
+pub const TRUNK_SITE_COUNT: usize = 9;
+pub const TRUNK_SITES: [&str; TRUNK_SITE_COUNT] = [
+    "fork", "decide", "resolve", "preprobe", "tx_end", "prepare", "counted", "release", "other",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchWork {
     /// Page resolutions against the branch tree (one per branch-pager page read).
@@ -319,6 +326,11 @@ pub struct BranchWork {
     pub merge_preprobe_misses: u64,
     pub merge_preprobe_ns: u64,
     pub post_release_prune_ns: u64,
+    /// A22: the trunk lock's acquisitions by call site (always counted) and its hold ns by call
+    /// site (while lock timing is on), indexed as [`TRUNK_SITES`]; they sum to
+    /// `trunk_lock_acquisitions` and `trunk_lock_hold_ns`.
+    pub trunk_site_acq: [u64; TRUNK_SITE_COUNT],
+    pub trunk_site_hold_ns: [u64; TRUNK_SITE_COUNT],
 }
 
 impl BranchWork {
@@ -367,6 +379,8 @@ impl BranchWork {
             merge_preprobe_misses,
             merge_preprobe_ns,
             post_release_prune_ns,
+            trunk_site_acq,
+            trunk_site_hold_ns,
             merge_attempts,
             merge_commits,
             merge_refused_scalar,
@@ -425,6 +439,12 @@ impl BranchWork {
         self.merge_preprobe_misses += merge_preprobe_misses;
         self.merge_preprobe_ns += merge_preprobe_ns;
         self.post_release_prune_ns += post_release_prune_ns;
+        for (mine, theirs) in self.trunk_site_acq.iter_mut().zip(trunk_site_acq) {
+            *mine += theirs;
+        }
+        for (mine, theirs) in self.trunk_site_hold_ns.iter_mut().zip(trunk_site_hold_ns) {
+            *mine += theirs;
+        }
         self.merge_attempts += merge_attempts;
         self.merge_commits += merge_commits;
         self.merge_refused_scalar += merge_refused_scalar;

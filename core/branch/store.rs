@@ -444,7 +444,7 @@ thread_local! {
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-13 and 15-38; 14 is not built, since no SQL path
+/// scope gate and the install's isolation, 11-13 and 15-39; 14 is not built, since no SQL path
 /// without DDL clears a user table's b-tree), so each test can be shown to fail for it
 /// (frontier/round11/r11-merge PREREG A6, A13, A14, A15). Always false otherwise.
 #[cfg(test)]
@@ -481,11 +481,24 @@ impl Counted for TrunkInner {
     }
 }
 
+/// A22: the trunk lock's call sites, as indexed in [`super::TRUNK_SITES`].
+const SITE_FORK: usize = 0;
+const SITE_DECIDE: usize = 1;
+const SITE_RESOLVE: usize = 2;
+const SITE_PREPROBE: usize = 3;
+const SITE_TX_END: usize = 4;
+const SITE_PREPARE: usize = 5;
+const SITE_COUNTED: usize = 6;
+const SITE_RELEASE: usize = 7;
+const SITE_OTHER: usize = 8;
+
 /// A lock of the store, held. Observation only: dropping it adds the time it was held to its
 /// structure's `lock_hold_ns` when lock timing was on at the acquisition, and does nothing else.
 struct Held<'a, T: Counted> {
     guard: MutexGuard<'a, T>,
     since: Option<Instant>,
+    /// A22: the trunk lock's call site ([`super::TRUNK_SITES`]); `None` for a shard's lock.
+    site: Option<usize>,
 }
 
 impl<T: Counted> Deref for Held<'_, T> {
@@ -504,7 +517,12 @@ impl<T: Counted> DerefMut for Held<'_, T> {
 impl<T: Counted> Drop for Held<'_, T> {
     fn drop(&mut self) {
         if let Some(since) = self.since {
-            self.guard.work().lock_hold_ns += since.elapsed().as_nanos() as u64;
+            let ns = since.elapsed().as_nanos() as u64;
+            let work = self.guard.work();
+            work.lock_hold_ns += ns;
+            if let Some(site) = self.site {
+                work.trunk_site_hold_ns[site] += ns;
+            }
         }
     }
 }
@@ -515,6 +533,11 @@ impl<T: Counted> Drop for Held<'_, T> {
 /// the contended path, by the thread that is waiting anyway — except with `timed`, which reads it
 /// once more at the acquisition and once at the release.
 fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
+    take_at(lock, timed, None)
+}
+
+/// [`take`], counting the acquisition (and, while timed, the hold) against `site` too (A22).
+fn take_at<T: Counted>(lock: &Mutex<T>, timed: bool, site: Option<usize>) -> Held<'_, T> {
     let (mut guard, waited) = match lock.try_lock() {
         Some(guard) => (guard, None),
         None => {
@@ -525,12 +548,16 @@ fn take<T: Counted>(lock: &Mutex<T>, timed: bool) -> Held<'_, T> {
     };
     let work = guard.work();
     work.lock_acquisitions += 1;
+    // Mutant 39 (A22): the release site's acquisitions go uncounted, so the sites no longer close.
+    if let Some(site) = site.filter(|&s| !(mutant(39) && s == SITE_RELEASE)) {
+        work.trunk_site_acq[site] += 1;
+    }
     if let Some(waited) = waited {
         work.lock_contended += 1;
         work.lock_wait_ns += waited.as_nanos() as u64;
     }
     let since = timed.then(Instant::now);
-    Held { guard, since }
+    Held { guard, since, site }
 }
 
 /// One arena domain: a shard's pages, or the trunk's retained versions. Slots it hands out carry
@@ -995,7 +1022,12 @@ impl BranchStore {
     }
 
     fn trunk(&self) -> Held<'_, TrunkInner> {
-        take(&self.trunk, self.timed())
+        self.trunk_at(SITE_OTHER)
+    }
+
+    /// The trunk's lock, taken at call site `site` (A22's per-site accounting).
+    fn trunk_at(&self, site: usize) -> Held<'_, TrunkInner> {
+        take_at(&self.trunk, self.timed(), Some(site))
     }
 
     /// W12's probe (tests only): whether the trunk lock is free now. `try_lock` never waits, so a
@@ -1095,7 +1127,7 @@ impl BranchStore {
             )));
         }
         let (id, f, commits_at_fork, reads_from) = {
-            let mut trunk = self.trunk();
+            let mut trunk = self.trunk_at(SITE_FORK);
             if let Some(seen) = seen {
                 if self.trunk_children.load(Ordering::Acquire) == 0 {
                     return Ok(TrunkFork::NeedsWriterLock);
@@ -1349,7 +1381,7 @@ impl BranchStore {
         pages: impl IntoIterator<Item = (u32, Option<&'p [u8]>)>,
         tx: TrunkPending,
     ) -> (TrunkCommitGate<'a>, TrunkStamps) {
-        let mut trunk = self.trunk();
+        let mut trunk = self.trunk_at(SITE_DECIDE);
         let opened = self.trunk_commits.fetch_add(1, Ordering::AcqRel);
         crate::turso_assert!(opened % 2 == 0, "two trunk commits inside the commit gate at once");
         let gate = TrunkCommitGate { store: self };
@@ -1589,7 +1621,7 @@ impl BranchStore {
             out.copy_from_slice(take(&self.shards[d], self.timed()).domain.page(slot));
             return Ok(Resolved::Filled);
         }
-        let mut trunk = self.trunk();
+        let mut trunk = self.trunk_at(SITE_RESOLVE);
         let mut examined = 0;
         let found = trunk.lineage.retained_at(page, at, &mut examined);
         trunk.work.resolve_retained_examined += examined;
@@ -1756,7 +1788,7 @@ impl BranchStore {
             let st = shard.branches.get(&id).ok_or_else(|| gone(id))?;
             (st.rows.keys().copied().collect(), st.trunk_at)
         };
-        let commits = self.trunk().merge.trunk_commits;
+        let commits = self.trunk_at(SITE_PREPROBE).merge.trunk_commits;
         let t = self.timed().then(Instant::now);
         let st = self.stamps();
         let (m3, m10) = (u64::from(mutant(3)), u64::from(mutant(10)));
@@ -1788,7 +1820,7 @@ impl BranchStore {
             return;
         }
         let (epoch, oldest) = {
-            let mut trunk = self.trunk();
+            let mut trunk = self.trunk_at(SITE_TX_END);
             let oldest = trunk.lineage.children.keys().next().copied();
             let epoch = trunk.lineage.epoch;
             let TrunkInner { merge, work, .. } = &mut *trunk;
@@ -1900,7 +1932,7 @@ impl BranchStore {
             }
         };
         let timed = self.timed();
-        let mut trunk = self.trunk();
+        let mut trunk = self.trunk_at(SITE_PREPARE);
         // A18a's split of this hold (observation only; the clock is read only while lock timing
         // is on): the log prune, V2's probes, and the whole hold.
         let t_hold = timed.then(Instant::now);
@@ -2091,7 +2123,7 @@ impl BranchStore {
 
     /// Count a merge's outcome.
     pub(super) fn merge_counted(&self, f: impl FnOnce(&mut BranchWork)) {
-        f(&mut self.trunk().work);
+        f(&mut self.trunk_at(SITE_COUNTED).work);
     }
 
     /// Free `id` — whose shard the caller holds — if nothing can reach it any more, then its parent
@@ -2124,7 +2156,7 @@ impl BranchStore {
             freed += st.lineage.release_all(domain).len();
             drop(shard);
             if st.parent.is_trunk() {
-                let mut trunk = self.trunk();
+                let mut trunk = self.trunk_at(SITE_RELEASE);
                 let TrunkInner {
                     lineage,
                     domain,

@@ -1521,6 +1521,44 @@ mod tests {
         assert_eq!(wal_held, 0, "{wal_held} of {n} stamps prunes ran under the WAL write lock");
     }
 
+    /// A22: the trunk lock's per-site accounting closes. Every trunk-lock acquisition is counted
+    /// against exactly one call site, and with lock timing on every hold against its site, so the
+    /// site arrays sum to the trunk lock's totals exactly; the merge path's sites are the ones taken.
+    #[test]
+    fn trunk_lock_sites_sum_to_the_trunk_lock_totals() {
+        let (_dir, db) = open_db();
+        db.set_branch_lock_timing(true);
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for id in 1..=50 {
+            trunk
+                .execute(format!("INSERT INTO t VALUES ({id}, 'a')"))
+                .unwrap();
+        }
+        let live = trunk.fork_branch().unwrap();
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        for id in 1..=20 {
+            let b = trunk.fork_branch().unwrap();
+            b.connect()
+                .unwrap()
+                .execute(format!("UPDATE t SET v = 'b' WHERE id = {id}"))
+                .unwrap();
+            let o = merger.merge(b, key_replay()).unwrap();
+            assert_eq!(o.refused, None, "{o:?}");
+        }
+        drop(live);
+        let w = db.branch_stats().work;
+        assert_eq!(w.trunk_site_acq.iter().sum::<u64>(), w.trunk_lock_acquisitions, "{w:?}");
+        assert_eq!(w.trunk_site_hold_ns.iter().sum::<u64>(), w.trunk_lock_hold_ns, "{w:?}");
+        let site = |name: &str| crate::branch::TRUNK_SITES.iter().position(|s| *s == name).unwrap();
+        for name in ["fork", "decide", "prepare", "release"] {
+            assert!(w.trunk_site_acq[site(name)] >= 20, "{name}: {:?}", w.trunk_site_acq);
+        }
+        assert!(w.trunk_lock_hold_ns > 0, "lock timing was on");
+    }
+
     /// A19a (mutant 36): the prune after the WAL lock keeps a stamp one epoch above the oldest live
     /// child. The sole child c forks at f; the trunk's update of row 5 is decided at f + 1 and
     /// pruned after with oldest f; c's update of row 5 must be refused. Mutant 36 prunes the stamp.

@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use turso_core::branch::merge::{Install, MergeOutcome, MergePolicy, Merger, Refusal, Validation};
-use turso_core::branch::{Branch, BranchWork};
+use turso_core::branch::{Branch, BranchWork, TRUNK_SITES};
 use turso_core::{
     Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO,
 };
@@ -483,6 +483,14 @@ fn print_window(run: &Run, index: usize, merged_total: usize, w: &mut Window, a:
             d(|w| w.merge_preprobe_ns),
             d(|w| w.post_release_prune_ns),
         );
+        // A22: the trunk lock by call site (acquisitions, then hold ns), and child_gone's work.
+        for i in 0..TRUNK_SITES.len() {
+            print!("\t{}", b.trunk_site_acq[i] - a.trunk_site_acq[i]);
+        }
+        for i in 0..TRUNK_SITES.len() {
+            print!("\t{}", b.trunk_site_hold_ns[i] - a.trunk_site_hold_ns[i]);
+        }
+        print!("\t{}\t{}", d(|w| w.gc_examined), d(|w| w.gc_range_entries));
     }
     println!();
 }
@@ -618,8 +626,17 @@ fn main() {
         rss_bytes(),
         if run.args.timing { format!(" warm_s={warm_s:.1}") } else { String::new() }
     );
+    // A22's columns follow LOCK_HEADER: site_<name>_acq for each trunk-lock call site, then
+    // site_<name>_hold_ns, then gc_examined and gc_range_entries.
+    let sites_header: String = if run.args.lock_timing {
+        let acq = TRUNK_SITES.iter().map(|s| format!("\tsite_{s}_acq"));
+        let hold = TRUNK_SITES.iter().map(|s| format!("\tsite_{s}_hold_ns"));
+        acq.chain(hold).collect::<String>() + "\tgc_examined\tgc_range_entries"
+    } else {
+        String::new()
+    };
     println!(
-        "{HEADER}{}{}",
+        "{HEADER}{}{}{sites_header}",
         if run.args.timing { TIMING_HEADER } else { "" },
         if run.args.lock_timing { LOCK_HEADER } else { "" }
     );
