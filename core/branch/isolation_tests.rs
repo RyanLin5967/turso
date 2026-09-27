@@ -374,6 +374,19 @@ fn wal_len(dir: &tempfile::TempDir) -> u64 {
     std::fs::metadata(dir.path().join("branching.db-wal")).map_or(0, |m| m.len())
 }
 
+/// The masks every Z test runs under (amendment 28): none, Z alone, and Z with every fix a Z number is quoted with
+/// (W,B,P,S,G,A,X,M,Y,U; H, R and V live in the harness). `force_fixes_for_test` REPLACES the process mask, so the
+/// gate's TURSO_R11_FIX does not reach these tests: each mask must be named here.
+const Z_MASKS: [u32; 3] = {
+    use crate::coherence::*;
+    [
+        0,
+        FIX_UARC,
+        FIX_WAL | FIX_BUILTIN | FIX_POOL | FIX_STORE | FIX_ARC | FIX_GATE | FIX_COPYOUT | FIX_STRIPES | FIX_PAGER
+            | FIX_ANCHOR | FIX_UARC,
+    ]
+};
+
 /// r11-coherence Z (amendment 25): Z leaves branch connections out of `n_connections`, so the LAST TRUNK close runs
 /// the shutdown checkpoint (TRUNCATE) while a branch connection is still open. Without Z the open branch connection
 /// counts and the trunk's close does not checkpoint. Premise: the WAL file is truncated with Z, and not without.
@@ -384,7 +397,7 @@ fn wal_len(dir: &tempfile::TempDir) -> u64 {
 /// (`Pager::copy_on_write_decision`).
 #[test]
 fn with_z_the_last_trunk_close_checkpoints_under_an_open_branch_and_the_branch_reads_the_same_bytes() {
-    for mask in [0, crate::coherence::FIX_UARC] {
+    for mask in Z_MASKS {
         crate::coherence::force_fixes_for_test(mask);
         let (dir, db) = open_db();
         let trunk = db.connect().unwrap();
@@ -449,7 +462,7 @@ fn with_z_the_last_trunk_close_checkpoints_under_an_open_branch_and_the_branch_r
 /// statement reads without holding the WAL read lock.
 #[test]
 fn with_z_the_last_trunk_close_leaves_the_wal_a_branch_statement_is_reading() {
-    for mask in [0, crate::coherence::FIX_UARC] {
+    for mask in Z_MASKS {
         crate::coherence::force_fixes_for_test(mask);
         let (dir, db) = open_db();
         let trunk = db.connect().unwrap();
@@ -503,7 +516,7 @@ fn with_z_the_last_trunk_close_leaves_the_wal_a_branch_statement_is_reading() {
 /// file. The expected rows are written out, not read from the subject.
 #[test]
 fn with_z_a_branch_that_read_nothing_reads_its_fork_after_the_last_trunk_close_and_a_rewrite() {
-    for mask in [0, crate::coherence::FIX_UARC] {
+    for mask in Z_MASKS {
         crate::coherence::force_fixes_for_test(mask);
         let (dir, db) = open_db();
         let trunk = db.connect().unwrap();
@@ -531,6 +544,73 @@ fn with_z_a_branch_that_read_nothing_reads_its_fork_after_the_last_trunk_close_a
         let bc2 = b.connect().unwrap();
         assert_eq!(all_rows(&bc2, "fresh branch after the rewrite"), expected, "mask {mask}: a fresh branch connection saw the rewrite");
         drop((bc2, t2));
+        drop(b);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// r11-coherence Z (amendment 28, T25d): the one read that is new under Z. A branch connection holds a WAL snapshot (it
+/// read one row of `t`) when the last trunk close runs; afterwards it reads table `u`, which nothing read before the
+/// close and nothing writes after the fork, so no arena slot and no cache holds u's pages: with Z the WAL is empty
+/// and they come from the database file the checkpoint backfilled. Premise: the store's trunk-page misses rise during
+/// that read. Then a new trunk connection rewrites `t` into the restarted WAL (frame numbers reused) and the branch
+/// reads `u` again. Expected rows are written out, not read from the subject.
+#[test]
+fn with_z_an_open_branch_reads_an_untouched_table_through_the_backfilled_file() {
+    fn other(id: i64) -> String {
+        format!("u-{id:04}-{}", "y".repeat(90))
+    }
+    fn u_rows(conn: &Arc<Connection>, who: &str) -> Vec<(i64, String)> {
+        let rows = match conn.prepare("SELECT id, w FROM u ORDER BY id").unwrap().run_collect_rows() {
+            Ok(rows) => rows,
+            Err(LimboError::Busy) => panic!("{who}: the read of u returned Busy"),
+            Err(e) => panic!("{who}: the read of u failed with {e}"),
+        };
+        rows.iter()
+            .map(|r| match (r[0].as_int(), &r[1]) {
+                (Some(id), Value::Text(v)) => (id, v.as_str().to_string()),
+                other => panic!("{who}: unexpected row {other:?}"),
+            })
+            .collect()
+    }
+    for mask in Z_MASKS {
+        crate::coherence::force_fixes_for_test(mask);
+        let (dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, w TEXT)").unwrap();
+        trunk.execute("BEGIN").unwrap();
+        for id in 1..=ROWS {
+            trunk.execute(format!("INSERT INTO u VALUES ({id}, '{}')", other(id))).unwrap();
+        }
+        trunk.execute("COMMIT").unwrap();
+        let expected: Vec<(i64, String)> = (1..=ROWS).map(|id| (id, other(id))).collect();
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        assert_eq!(value(&bc, 7), original(7), "mask {mask}: premise: the branch reads t before the close");
+        trunk.close().unwrap();
+        drop(trunk);
+        assert_eq!(
+            wal_len(&dir) == 0,
+            mask != 0,
+            "mask {mask}: premise: the last trunk close truncates the WAL with Z and not without"
+        );
+        let misses = db.branch_stats().work.trunk_page_misses;
+        assert_eq!(u_rows(&bc, "open branch, u after the close"), expected, "mask {mask}: u's rows moved across the close");
+        assert!(
+            db.branch_stats().work.trunk_page_misses > misses,
+            "mask {mask}: premise: u's pages were read through the WAL or the database file, not a cache"
+        );
+        let t2 = db.connect().unwrap();
+        t2.execute("BEGIN").unwrap();
+        for id in 1..=ROWS {
+            set(&t2, id, "after-the-close");
+        }
+        t2.execute("COMMIT").unwrap();
+        assert_eq!(value(&t2, 7), "after-the-close", "mask {mask}: premise: the trunk rewrote t");
+        assert_eq!(u_rows(&bc, "open branch, u after the rewrite"), expected, "mask {mask}: u's rows moved after the rewrite");
+        assert_eq!(value(&bc, 7), original(7), "mask {mask}: the branch saw the trunk's rewrite of t");
+        drop((bc, t2));
         drop(b);
     }
     crate::coherence::force_fixes_for_test(0);
