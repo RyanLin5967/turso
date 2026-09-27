@@ -1459,6 +1459,65 @@ mod tests {
         assert_eq!(s.work.merge_preprobe_hits, 200, "{:?}", s.work);
     }
 
+    /// W12 (PREREG A21): every stamps prune runs with the trunk's WAL write lock and the trunk
+    /// lock both free. Each prune calls the thread-local probe, which reads the real lock state at
+    /// that moment: the shared WAL write lock (tried, and released at once if it was free) and the
+    /// trunk lock (`try_lock`). Mutant 37 prunes at the pre-A19 site, under the committer's WAL
+    /// write lock; T-A19b, which checks only that the stamps stay bounded, passes on it.
+    #[test]
+    fn the_stamps_prune_runs_with_the_wal_write_lock_free() {
+        let (_dir, db) = open_db();
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0u64, 0u64, 0u64)));
+        {
+            let (db, seen) = (db.clone(), seen.clone());
+            crate::branch::store::PRUNE_PROBE.with(|p| {
+                *p.borrow_mut() = Some(Box::new(move || {
+                    let wal_free = match db.shared_wal.try_read() {
+                        Some(shared) => {
+                            let free = shared.runtime.write_lock.write();
+                            if free {
+                                shared.runtime.write_lock.unlock();
+                            }
+                            free
+                        }
+                        None => false,
+                    };
+                    let trunk_free = db.branches.trunk_lock_free();
+                    let (n, wal_held, trunk_held) = seen.get();
+                    seen.set((
+                        n + 1,
+                        wal_held + u64::from(!wal_free),
+                        trunk_held + u64::from(!trunk_free),
+                    ));
+                }));
+            });
+        }
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for id in 1..=300 {
+            trunk
+                .execute(format!("INSERT INTO t VALUES ({id}, 'a')"))
+                .unwrap();
+        }
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        for id in 1..=200 {
+            let b = trunk.fork_branch().unwrap();
+            b.connect()
+                .unwrap()
+                .execute(format!("UPDATE t SET v = 'b' WHERE id = {id}"))
+                .unwrap();
+            let o = merger.merge(b, key_replay()).unwrap();
+            assert_eq!(o.refused, None, "{o:?}");
+        }
+        crate::branch::store::PRUNE_PROBE.with(|p| *p.borrow_mut() = None);
+        let (n, wal_held, trunk_held) = seen.get();
+        assert!(n > 0, "no stamps prune ran");
+        assert_eq!(wal_held, 0, "{wal_held} of {n} stamps prunes ran under the WAL write lock");
+        assert_eq!(trunk_held, 0, "{trunk_held} of {n} stamps prunes ran under the trunk lock");
+    }
+
     /// A19a (mutant 36): the prune after the WAL lock keeps a stamp one epoch above the oldest live
     /// child. The sole child c forks at f; the trunk's update of row 5 is decided at f + 1 and
     /// pruned after with oldest f; c's update of row 5 must be refused. Mutant 36 prunes the stamp.

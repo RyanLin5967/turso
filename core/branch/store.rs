@@ -400,6 +400,12 @@ impl RowStamps {
     /// [`MergeState::prune`]'s rule for the stamps. A stale `oldest` (a smaller one) only keeps more.
     /// Mutant 36 (A19a) prunes one epoch above the oldest live child, which is unsound.
     fn prune(&mut self, oldest: Option<u64>) {
+        #[cfg(test)]
+        PRUNE_PROBE.with(|p| {
+            if let Some(probe) = p.borrow().as_ref() {
+                probe();
+            }
+        });
         let slack = u64::from(mutant(8) || mutant(36));
         let keep = |e: u64| oldest.is_some_and(|o| e > o + slack);
         while let Some(&(e, root, rowid)) = self.stamp_order.front() {
@@ -426,6 +432,14 @@ impl MergeState {
             self.log.pop_front();
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// W12 (PREREG A21): called by every stamps prune on this thread, so a test can read the real
+    /// lock state at the moment of the prune (tests only).
+    pub(crate) static PRUNE_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
@@ -984,6 +998,13 @@ impl BranchStore {
         take(&self.trunk, self.timed())
     }
 
+    /// W12's probe (tests only): whether the trunk lock is free now. `try_lock` never waits, so a
+    /// probe on the thread that holds it reads "held" instead of deadlocking.
+    #[cfg(test)]
+    pub(crate) fn trunk_lock_free(&self) -> bool {
+        self.trunk.try_lock().is_some()
+    }
+
     /// A18a's observation arm: stamp the rows inside the decision's hold (A18 off).
     pub(crate) fn set_stamp_in_gate(&self, on: bool) {
         self.stamp_in_gate.store(on, Ordering::Relaxed);
@@ -1441,7 +1462,11 @@ impl BranchStore {
             st.seq += 1;
         }
         // A19 (2): no prune here, under the WAL write lock; the connection prunes after releasing
-        // it ([`Self::prune_stamps`]), with this decision's oldest live child.
+        // it ([`Self::prune_stamps`]), with this decision's oldest live child. Mutant 37 (A21)
+        // prunes here as before A19.
+        if mutant(37) {
+            st.prune(s.oldest);
+        }
         st.prune_oldest = Some(s.oldest);
         self.stamps_held.store(st.row_stamps.len(), Ordering::Relaxed);
         drop(st);
