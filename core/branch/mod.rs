@@ -53,6 +53,8 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+#[doc(hidden)]
+pub mod bench;
 pub(crate) mod page_map;
 pub(crate) mod store;
 pub(crate) mod table;
