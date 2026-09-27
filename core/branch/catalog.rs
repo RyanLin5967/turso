@@ -254,6 +254,117 @@ impl Stmt {
     }
 }
 
+/// A SQLite varint at `at` in `d`: its value and its length in bytes (1 to 9; the ninth byte
+/// carries 8 bits). `None` past the end.
+fn varint(d: &[u8], at: usize) -> Option<(u64, usize)> {
+    let mut v = 0u64;
+    for i in 0..9 {
+        let b = *d.get(at + i)?;
+        if i == 8 {
+            return Some(((v << 8) | u64::from(b), 9));
+        }
+        v = (v << 7) | u64::from(b & 0x7f);
+        if b & 0x80 == 0 {
+            return Some((v, i + 1));
+        }
+    }
+    None
+}
+
+/// Adds one leaf page's cells to `c` (r11-ever amendment 35's census). `d` is the page, `h` its
+/// header's offset (100 on page 1); `table` is true for a table leaf (type 13: payload-length
+/// varint, rowid varint, record) and false for an index leaf (type 10: payload-length varint,
+/// record). A record is a header-length varint, one serial-type varint per field, then the body.
+/// `None` if a cell does not parse as the file format says.
+fn census_leaf(d: &[u8], h: usize, table: bool, c: &mut super::LeafCensus) -> Option<()> {
+    let usable = d.len();
+    let n = u16::from_be_bytes([*d.get(h + 3)?, *d.get(h + 4)?]) as usize;
+    // The largest payload a cell keeps on its page: U - 35 on a table leaf, and
+    // ((U - 12) * 64 / 255) - 23 on an index page (fileformat2, "B-tree Pages").
+    let max_local = if table { usable - 35 } else { (usable - 12) * 64 / 255 - 23 };
+    c.leaf_pages += 1;
+    c.used_bytes += 8 + 2 * n as u64;
+    for i in 0..n {
+        let p = h + 8 + 2 * i;
+        let at = u16::from_be_bytes([*d.get(p)?, *d.get(p + 1)?]) as usize;
+        let (len, l1) = varint(d, at)?;
+        let mut body = at + l1;
+        let mut cell = l1 as u64;
+        if table {
+            let (_, l2) = varint(d, body)?;
+            body += l2;
+            cell += l2 as u64;
+            c.rowid_varint_bytes += l2 as u64;
+        }
+        c.cells += 1;
+        if len as usize > max_local {
+            // Its on-page part needs the min-local rule; a spilled cell is counted, not measured.
+            c.overflow_cells += 1;
+            continue;
+        }
+        cell += len;
+        c.cell_bytes += cell;
+        c.used_bytes += cell;
+        let rec = d.get(body..body + len as usize)?;
+        let (hlen, l3) = varint(rec, 0)?;
+        let mut f = l3;
+        while f < hlen as usize {
+            let (t, l) = varint(rec, f)?;
+            f += l;
+            match t {
+                1..=6 => c.ints[t as usize - 1] += 1,
+                8 | 9 => c.ints[6] += 1,
+                _ => {}
+            }
+        }
+    }
+    Some(())
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+
+    /// The census reads integer widths and rowid varints as SQLite stores them: a planted table
+    /// whose rows straddle 2^21 (rowid varint 3 -> 4 bytes) and 2^23 (a value 3 -> 4 bytes).
+    #[test]
+    fn the_census_reads_integer_widths_and_rowid_varints_as_stored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cat = Catalog::open(&dir.path().join("c.db"), false).unwrap();
+        cat.conn
+            .execute("CREATE TABLE plant(k INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .unwrap();
+        for (k, v) in [(5i64, 5i64), ((1 << 21) - 1, (1 << 23) - 1), (1 << 21, 1 << 23)] {
+            cat.conn
+                .execute(format!("INSERT INTO plant VALUES ({k}, {v})"))
+                .unwrap();
+        }
+        let shape = cat.shape().unwrap();
+        assert_eq!(shape.unaccounted, 0, "{shape:?}");
+        let (_, c) = shape
+            .census
+            .iter()
+            .find(|(n, _)| n == "plant")
+            .expect("the planted table's census");
+        assert_eq!((c.leaf_pages, c.cells, c.overflow_cells), (1, 3, 0), "{c:?}");
+        // k is the rowid (stored as NULL in the record); v is 5, 2^23 - 1, 2^23.
+        assert_eq!(c.ints, [1, 0, 1, 1, 0, 0, 0], "{c:?}");
+        assert_eq!(c.rowid_varint_bytes, 1 + 3 + 4, "{c:?}");
+        assert_eq!(shape.page_size, 4096, "{shape:?}");
+    }
+
+    #[test]
+    fn a_varint_reads_as_the_file_format_writes_it() {
+        assert_eq!(varint(&[0x05], 0), Some((5, 1)));
+        assert_eq!(varint(&[0x81, 0x00], 0), Some((128, 2)));
+        // 2^21 - 1 is the largest 3-byte varint.
+        assert_eq!(varint(&[0xff, 0xff, 0x7f], 0), Some(((1 << 21) - 1, 3)));
+        assert_eq!(varint(&[0x81, 0x80, 0x80, 0x00], 0), Some((1 << 21, 4)));
+        assert_eq!(varint(&[0xff; 9], 0), Some((u64::MAX, 9)));
+        assert_eq!(varint(&[0x81], 0), None);
+    }
+}
+
 pub(crate) struct Catalog {
     _db: Arc<Database>,
     conn: Arc<Connection>,
@@ -493,15 +604,19 @@ impl Catalog {
                 .ok_or_else(|| bad(format!("a u32 past a page's end at {at}")))
         };
         let mut trees = Vec::new();
+        let mut census = Vec::new();
+        let mut page_size = 0u64;
         let mut in_trees = 0u64;
         for (name, root) in roots {
             let (mut levels, mut frontier) = (Vec::new(), vec![root]);
+            let mut leaves = super::LeafCensus::default();
             while !frontier.is_empty() {
                 levels.push(frontier.len() as u64);
                 in_trees += frontier.len() as u64;
                 let mut next = Vec::new();
                 for pgno in frontier {
                     let d = page(pgno)?;
+                    page_size = d.len() as u64;
                     let h = if pgno == 1 { 100 } else { 0 };
                     match d.get(h).copied() {
                         Some(0x02) | Some(0x05) => {
@@ -510,12 +625,14 @@ impl Catalog {
                             }
                             next.push(u32_at(&d, h + 8)?);
                         }
-                        Some(0x0A) | Some(0x0D) => {}
+                        Some(t @ (0x0A | 0x0D)) => census_leaf(&d, h, t == 0x0D, &mut leaves)
+                            .ok_or_else(|| bad(format!("a cell of leaf page {pgno} of {name} does not parse")))?,
                         other => return Err(bad(format!("page {pgno} of {name} has type {other:?}"))),
                     }
                 }
                 frontier = next;
             }
+            census.push((name.clone(), leaves));
             trees.push((name, levels));
         }
         Ok(super::CatalogShape {
@@ -524,6 +641,8 @@ impl Catalog {
             rows,
             trees,
             unaccounted: page_count as i64 - in_trees as i64 - freelist_count as i64,
+            census,
+            page_size,
         })
     }
 

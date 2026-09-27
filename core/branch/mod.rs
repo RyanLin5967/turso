@@ -352,6 +352,33 @@ pub struct CatalogShape {
     /// `page_count` less the trees' pages and the free list: overflow pages, or a tree this walk
     /// did not reach. 0 when the ledger closes.
     pub unaccounted: i64,
+    /// Per tree (the order of `trees`), what its leaf pages hold, field by field (r11-ever amendment
+    /// 35's census): so leaf growth can be split into bytes (wider integers) and fill.
+    pub census: Vec<(String, LeafCensus)>,
+    /// The page size the census read (bytes per page).
+    pub page_size: u64,
+}
+
+/// One B-tree's leaf pages, cell by cell (r11-ever amendment 35). SQLite's record format stores an
+/// integer in the fewest of 1, 2, 3, 4, 6 or 8 bytes that hold it (0 and 1 in none), and a rowid
+/// or a length as a varint, so a key or value that crosses 2^23 or a rowid that crosses 2^21 widens
+/// its cell by a byte with no other change. Observation only.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeafCensus {
+    pub leaf_pages: u64,
+    pub cells: u64,
+    /// Bytes of the cells: length and rowid varints plus the payload held on the page.
+    pub cell_bytes: u64,
+    /// `cell_bytes` plus each leaf page's 8-byte header and 2-byte cell pointers.
+    pub used_bytes: u64,
+    /// Integer fields stored in 1, 2, 3, 4, 6 and 8 bytes (serial types 1-6), then the 0/1
+    /// constants (serial types 8 and 9).
+    pub ints: [u64; 7],
+    /// Bytes of the rowid varints (table leaves only).
+    pub rowid_varint_bytes: u64,
+    /// Cells whose payload spills to an overflow page: counted, not width-parsed.
+    pub overflow_cells: u64,
 }
 
 /// A snapshot of the branch arena's accounting.

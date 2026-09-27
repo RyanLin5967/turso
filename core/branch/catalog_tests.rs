@@ -800,6 +800,45 @@ fn a_catalog_with_a_torn_log_header_opens_only_in_its_own_arm() {
     }
 }
 
+/// Amendment 35's census, made to fire before it is trusted: on a grown catalog every table tree's
+/// leaf cells are its rows, and every index tree's are its table's rows, so no leaf cell is missed
+/// or counted twice; the census walks the same pages as the shape (the ledger still closes).
+#[test]
+fn the_catalog_census_counts_every_row_once() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    seed(&db.connect().unwrap());
+    let _ids = grow(&db, 300);
+    db.branch_compact_now().unwrap();
+    let s = db.branch_catalog_shape().unwrap().expect("a catalog store has a shape");
+    assert_eq!(s.unaccounted, 0, "the ledger does not close: {s:?}");
+    let rows = |t: &str| s.rows.iter().find(|(n, _)| n == t).map(|(_, n)| *n).unwrap();
+    let cells = |t: &str| s.census.iter().find(|(n, _)| n == t).map(|(_, c)| c.cells).unwrap();
+    for (tree, table) in [
+        ("meta", "meta"),
+        ("branch", "branch"),
+        ("branch_children", "branch"),
+        ("branch_lease", "branch"),
+        ("branch_released", "branch"),
+        ("cur", "cur"),
+        ("ret", "ret"),
+        ("ret_page", "ret"),
+        ("ret_born", "ret"),
+        ("ret_died", "ret"),
+        ("free", "free"),
+    ] {
+        assert_eq!(cells(tree), rows(table), "{tree}'s leaf cells against {table}'s rows: {s:?}");
+    }
+    assert_eq!(rows("branch"), 300, "premise: {s:?}");
+    for (name, c) in &s.census {
+        assert_eq!(c.overflow_cells, 0, "{name} spilled a cell: {c:?}");
+        let levels = &s.trees.iter().find(|(n, _)| n == name).unwrap().1;
+        assert_eq!(c.leaf_pages, *levels.last().unwrap(), "{name}'s leaves against its last level: {s:?}");
+        assert!(c.used_bytes <= c.leaf_pages * s.page_size, "{name} uses more than its pages hold: {c:?}");
+    }
+}
+
 /// Amendment 19's instrument, made to fire before it is trusted: the catalog shape's ledger closes
 /// (every page is a tree page or a free-list page) on a grown catalog, its row counts are the
 /// store's, and a mass reap moves pages onto the free list without shrinking the file (no

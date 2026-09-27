@@ -35,7 +35,8 @@
 //!
 //! In catalog mode each checkpoint also prints `# catshape`: the catalog file's pages, its free list,
 //! each table's rows and each B-tree's pages per level, root first (r11-ever amendment 19; the walk
-//! reads every catalog page, outside any timed window).
+//! reads every catalog page, outside any timed window), then `# catcensus`: per tree, what its leaf
+//! pages hold, field by field (integer widths, rowid varint bytes, used bytes; r11-ever amendment 35).
 //!
 //! With `--reopen`, after the last checkpoint every live branch is detached, every holder of the
 //! database is dropped, and the database is reopened (recovery loads the snapshot and replays the
@@ -614,6 +615,36 @@ fn main() {
                 shape.unaccounted,
                 rows.join(","),
                 trees.join(",")
+            );
+            // Amendment 35's census: per tree, leaf_pages/cells/cell_bytes/used_bytes, integer
+            // fields stored in 1/2/3/4/6/8 bytes and as the 0/1 constants, rowid varint bytes,
+            // spilled cells.
+            let census: Vec<String> = shape
+                .census
+                .iter()
+                .map(|(t, c)| {
+                    format!(
+                        "{t}={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                        c.leaf_pages,
+                        c.cells,
+                        c.cell_bytes,
+                        c.used_bytes,
+                        c.ints[0],
+                        c.ints[1],
+                        c.ints[2],
+                        c.ints[3],
+                        c.ints[4],
+                        c.ints[5],
+                        c.ints[6],
+                        c.rowid_varint_bytes,
+                        c.overflow_cells
+                    )
+                })
+                .collect();
+            println!(
+                "# catcensus n_ever={ckpt} page_size={} {}",
+                shape.page_size,
+                census.join(" ")
             );
         }
         if stats.live_branches != kept.nodes.len() {
