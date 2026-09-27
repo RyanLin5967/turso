@@ -81,13 +81,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
+use std::time::Instant;
 
 use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
 use super::{BranchId, BranchResident, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
-use crate::sync::atomic::{AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
 
@@ -101,6 +102,9 @@ pub(crate) struct BranchStore {
     /// same lock. A 1-to-0 transition (a reap) racing the read only makes the writer take the lock
     /// and find nothing to do.
     trunk_children: AtomicUsize,
+    /// Time the phases of every reap (r11-ever amendment 34, instrument I). Read before the lock,
+    /// so the lock wait itself is one of the phases. Off unless a harness turns it on.
+    reap_phases: AtomicBool,
 }
 
 struct StoreInner {
@@ -110,6 +114,44 @@ struct StoreInner {
     branches: HashMap<BranchId, BranchState>,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
+    /// Observation only; see [`ReapProbe`].
+    probe: ReapProbe,
+}
+
+/// r11-ever amendment 34's instrument I and its mechanism-removed arm G. Observation only: nothing
+/// here changes what a reap frees or what any reader sees.
+#[derive(Default)]
+struct ReapProbe {
+    /// ns of the last reap's phases while [`BranchStore::reap_phases`] is on: lock, remove (the
+    /// table lookup and removal), release (the arena frees), child_gone (the parent's lineage),
+    /// drop (the removed state's destructor, i.e. the allocator's frees). Zeroed at each reap's
+    /// start; a reap that keeps its branch records only the phases it reached.
+    last: [u64; 5],
+    /// Arm G: a removed state is parked here instead of dropped, so no free reaches the allocator.
+    /// Never emptied while the arm is on: the harness leaks it.
+    graveyard: Option<Vec<BranchState>>,
+    /// The fire-check's planted stall: sleep this long inside the drop phase.
+    planted_drop_sleep_us: u64,
+}
+
+/// Adds the time since `mark` to `acc` and restarts `mark`; a no-op while the phase timers are off.
+fn lap(mark: &mut Option<Instant>, acc: &mut u64) {
+    if let Some(m) = mark {
+        let now = Instant::now();
+        *acc += now.duration_since(*m).as_nanos() as u64;
+        *m = now;
+    }
+}
+
+/// The drop phase of a reap: park the state in arm G's graveyard, or drop it.
+fn dispose(st: BranchState, probe: &mut ReapProbe) {
+    if probe.planted_drop_sleep_us > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(probe.planted_drop_sleep_us));
+    }
+    match probe.graveyard.as_mut() {
+        Some(g) => g.push(st),
+        None => drop(st),
+    }
 }
 
 #[derive(Default)]
@@ -330,8 +372,10 @@ impl BranchStore {
                 },
                 branches: HashMap::new(),
                 work: BranchWork::default(),
+                probe: ReapProbe::default(),
             }),
             trunk_children: AtomicUsize::new(0),
+            reap_phases: AtomicBool::new(false),
         }
     }
 
@@ -435,7 +479,12 @@ impl BranchStore {
 
     /// The `Branch` handle has gone.
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
+        let t_lock = self.reap_phases.load(Ordering::Relaxed).then(Instant::now);
         let mut inner = self.inner.lock();
+        let mut mark = t_lock.map(|_| Instant::now());
+        if let (Some(t), Some(m)) = (t_lock, mark) {
+            inner.probe.last = [m.duration_since(t).as_nanos() as u64, 0, 0, 0, 0];
+        }
         let Some(st) = inner.branches.get_mut(&id) else {
             return Reaped {
                 freed_pages: 0,
@@ -443,7 +492,7 @@ impl BranchStore {
             };
         };
         st.handle = false;
-        let freed_pages = self.collect(&mut inner, id);
+        let freed_pages = self.collect_timed(&mut inner, id, &mut mark);
         Reaped {
             freed_pages,
             deferred: inner.branches.contains_key(&id),
@@ -639,6 +688,79 @@ impl BranchStore {
         (inner.branches.len(), inner.branches.capacity())
     }
 
+    /// Amendment 34, instrument I: turn the per-reap phase timers on or off.
+    pub(crate) fn set_reap_phases(&self, on: bool) {
+        self.reap_phases.store(on, Ordering::Relaxed);
+    }
+
+    /// ns of the last reap's phases: lock, remove, release, child_gone, drop.
+    pub(crate) fn last_reap_phases(&self) -> [u64; 5] {
+        self.inner.lock().probe.last
+    }
+
+    /// Arm G: from now on park every removed state instead of dropping it (`Some(reserve)`, the
+    /// graveyard's capacity up front), or stop parking (`None`; the parked states are dropped).
+    /// Returns how many states were parked.
+    pub(crate) fn set_graveyard(&self, reserve: Option<usize>) -> usize {
+        let mut inner = self.inner.lock();
+        let parked = inner.probe.graveyard.as_ref().map_or(0, Vec::len);
+        inner.probe.graveyard = reserve.map(Vec::with_capacity);
+        parked
+    }
+
+    /// Arm G's end: stop parking and leak the parked states. Returns how many.
+    pub(crate) fn leak_graveyard(&self) -> usize {
+        let parked = self.inner.lock().probe.graveyard.take().unwrap_or_default();
+        let n = parked.len();
+        std::mem::forget(parked);
+        n
+    }
+
+    /// The fire-check's planted stall: sleep `us` inside every reap's drop phase (0: off).
+    pub(crate) fn plant_drop_sleep_us(&self, us: u64) {
+        self.inner.lock().probe.planted_drop_sleep_us = us;
+    }
+
+    /// Arm P: read the fields of `id`'s table entry, so the next reap of it finds the entry in
+    /// cache. Returns a value derived from them (0 if `id` is gone), for the caller to keep.
+    pub(crate) fn touch(&self, id: BranchId) -> u64 {
+        let inner = self.inner.lock();
+        inner.branches.get(&id).map_or(0, |st| {
+            st.fork_epoch ^ st.parent.0 ^ st.current.len() as u64 ^ u64::from(st.handle)
+        })
+    }
+
+    /// Arm R: reserve the arena's free list for `n` more slots, so no push during the next `n`
+    /// reaps moves it (this store's table has no free list).
+    pub(crate) fn reserve_free(&self, n: usize) {
+        if let Some(arena) = self.inner.lock().arena.as_mut() {
+            arena.reserve_free(n);
+        }
+    }
+
+    /// Arm T: rebuild the branch table compactly (hashbrown rehashes into the smallest table that
+    /// holds its entries, dropping every tombstone). Returns true.
+    pub(crate) fn shrink_table(&self) -> bool {
+        self.inner.lock().branches.shrink_to_fit();
+        true
+    }
+
+    /// Instrument I's locality counter: over the live (kept) states, the distinct `page_size`
+    /// pages holding their table entries, and holding the first value of each `current` map (its
+    /// heap block). Observation only; O(states).
+    pub(crate) fn live_entry_pages(&self, page_size: usize) -> (usize, usize) {
+        let inner = self.inner.lock();
+        let mut entries = std::collections::HashSet::new();
+        let mut maps = std::collections::HashSet::new();
+        for st in inner.branches.values() {
+            entries.insert(st as *const BranchState as usize / page_size);
+            if let Some(v) = st.current.values().next() {
+                maps.insert(v as *const Owned as usize / page_size);
+            }
+        }
+        (entries.len(), maps.len())
+    }
+
     /// Every resident structure's size, by a full scan under the lock. Observation only.
     pub(crate) fn resident(&self) -> BranchResident {
         let inner = self.inner.lock();
@@ -716,7 +838,18 @@ impl BranchStore {
 
     /// Free `id` if nothing can reach it any more, then its parent if that freed the parent's last
     /// reason to exist. Returns the number of arena pages released.
-    fn collect(&self, inner: &mut StoreInner, mut id: BranchId) -> usize {
+    fn collect(&self, inner: &mut StoreInner, id: BranchId) -> usize {
+        self.collect_timed(inner, id, &mut None)
+    }
+
+    /// [`Self::collect`], adding each phase's time to `inner.probe.last` while `mark` is set
+    /// (amendment 34; `release_handle` sets it only while the phase timers are on).
+    fn collect_timed(
+        &self,
+        inner: &mut StoreInner,
+        mut id: BranchId,
+        mark: &mut Option<Instant>,
+    ) -> usize {
         let mut freed = 0;
         loop {
             let Some(st) = inner.branches.get(&id) else {
@@ -731,24 +864,33 @@ impl BranchStore {
                 trunk,
                 branches,
                 work,
+                probe,
                 ..
             } = &mut *inner;
+            lap(mark, &mut probe.last[1]);
             let arena = arena.as_mut().expect("a branch existed, so the arena does");
             for owned in st.current.values() {
                 arena.release(owned.slot);
                 freed += 1;
             }
             freed += st.lineage.release_all(arena).len();
+            lap(mark, &mut probe.last[2]);
             if st.parent.is_trunk() {
                 freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
+                lap(mark, &mut probe.last[3]);
+                dispose(st, probe);
+                lap(mark, &mut probe.last[4]);
                 return freed;
             }
             let parent = branches
                 .get_mut(&st.parent)
                 .expect("a live branch's parent is kept while the branch lives");
             freed += parent.lineage.child_gone(st.fork_epoch, arena, work);
+            lap(mark, &mut probe.last[3]);
             id = st.parent;
+            dispose(st, probe);
+            lap(mark, &mut probe.last[4]);
         }
     }
 }
