@@ -304,6 +304,14 @@ pub struct BranchWork {
     pub trunk_commit_post_gate_ns: u64,
     /// Acquisitions of V3's stamps lock, the one store lock outside the `lock_*` sums (PREREG A18).
     pub stamps_lock_acquisitions: u64,
+    /// merge_prepare's trunk hold, split (ns; read only while lock timing is on; PREREG A18a): the
+    /// whole hold, the log prune, and V2's probes; then its stamps hold: the stamps prune and V3's
+    /// probes.
+    pub prepare_trunk_hold_ns: u64,
+    pub prepare_log_prune_ns: u64,
+    pub prepare_v2_ns: u64,
+    pub prepare_stamp_prune_ns: u64,
+    pub prepare_v3_ns: u64,
 }
 
 impl BranchWork {
@@ -343,6 +351,11 @@ impl BranchWork {
             merge_rows_stamped_post_gate,
             trunk_commit_post_gate_ns,
             stamps_lock_acquisitions,
+            prepare_trunk_hold_ns,
+            prepare_log_prune_ns,
+            prepare_v2_ns,
+            prepare_stamp_prune_ns,
+            prepare_v3_ns,
             merge_attempts,
             merge_commits,
             merge_refused_scalar,
@@ -392,6 +405,11 @@ impl BranchWork {
         self.merge_rows_stamped_post_gate += merge_rows_stamped_post_gate;
         self.trunk_commit_post_gate_ns += trunk_commit_post_gate_ns;
         self.stamps_lock_acquisitions += stamps_lock_acquisitions;
+        self.prepare_trunk_hold_ns += prepare_trunk_hold_ns;
+        self.prepare_log_prune_ns += prepare_log_prune_ns;
+        self.prepare_v2_ns += prepare_v2_ns;
+        self.prepare_stamp_prune_ns += prepare_stamp_prune_ns;
+        self.prepare_v3_ns += prepare_v3_ns;
         self.merge_attempts += merge_attempts;
         self.merge_commits += merge_commits;
         self.merge_refused_scalar += merge_refused_scalar;
@@ -640,6 +658,13 @@ impl Database {
     /// needs ([`merge::Install::Physical`]). Off by default.
     pub fn set_branch_read_tracking(&self, on: bool) {
         self.branches.set_track_reads(on);
+    }
+
+    /// A18a's observation arm (frontier/round11/r11-merge PREREG): stamp the merge record's rows
+    /// inside the trunk commit decision's hold, as before A18. Off by default.
+    #[doc(hidden)]
+    pub fn set_branch_stamp_in_gate(&self, on: bool) {
+        self.branches.set_stamp_in_gate(on);
     }
 
     /// Time how long each acquisition holds the branch store's lock, into

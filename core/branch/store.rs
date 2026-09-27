@@ -220,6 +220,12 @@ pub(crate) struct BranchStore {
     /// V3's stamps, behind their own lock (see [`RowStamps`]), and its counts, readable without it.
     stamps: CachePadded<Mutex<RowStamps>>,
     stamps_lock_acquisitions: AtomicU64,
+    /// Observation arm only (PREREG A18a): stamp the rows inside the decision's hold, as before
+    /// A18, so one binary measures A18 on and off. Off by default.
+    stamp_in_gate: AtomicBool,
+    /// merge_prepare's stamps hold, split (ns, read only while lock timing is on; A18a).
+    prepare_stamp_prune_ns: AtomicU64,
+    prepare_v3_ns: AtomicU64,
     stamps_held: AtomicUsize,
     rows_stamped_post_gate: AtomicU64,
     post_gate_ns: AtomicU64,
@@ -915,6 +921,9 @@ impl BranchStore {
             trunk_children: AtomicUsize::new(0),
             stamps: CachePadded::new(Mutex::new(RowStamps::default())),
             stamps_lock_acquisitions: AtomicU64::new(0),
+            stamp_in_gate: AtomicBool::new(false),
+            prepare_stamp_prune_ns: AtomicU64::new(0),
+            prepare_v3_ns: AtomicU64::new(0),
             stamps_held: AtomicUsize::new(0),
             rows_stamped_post_gate: AtomicU64::new(0),
             post_gate_ns: AtomicU64::new(0),
@@ -946,6 +955,11 @@ impl BranchStore {
 
     fn trunk(&self) -> Held<'_, TrunkInner> {
         take(&self.trunk, self.timed())
+    }
+
+    /// A18a's observation arm: stamp the rows inside the decision's hold (A18 off).
+    pub(crate) fn set_stamp_in_gate(&self, on: bool) {
+        self.stamp_in_gate.store(on, Ordering::Relaxed);
     }
 
     /// The stamps' lock, counted in `stamps_lock_acquisitions` (see [`RowStamps`]).
@@ -1359,7 +1373,7 @@ impl BranchStore {
             rows: tx.rows,
             tables: tx.tables,
         };
-        if mutant(33) {
+        if mutant(33) || self.stamp_in_gate.load(Ordering::Relaxed) {
             // The pre-A18 shape: the rows stamped inside the trunk-lock hold, with the gate open.
             work.trunk_commit_rows_stamped += stamps.rows.len() as u64;
             let mut st = self.stamps();
@@ -1557,6 +1571,8 @@ impl BranchStore {
         stats.work.merge_rows_stamped_post_gate = self.rows_stamped_post_gate.load(Ordering::Relaxed);
         stats.work.trunk_commit_post_gate_ns = self.post_gate_ns.load(Ordering::Relaxed);
         stats.work.merge_probes += self.v3_probes.load(Ordering::Relaxed);
+        stats.work.prepare_stamp_prune_ns = self.prepare_stamp_prune_ns.load(Ordering::Relaxed);
+        stats.work.prepare_v3_ns = self.prepare_v3_ns.load(Ordering::Relaxed);
         stats.work.trunk_fork_wal_hold_ns = self.fork_wal_hold_ns.load(Ordering::Relaxed);
         for lock in self.shards.iter() {
             let shard = take(lock, self.timed());
@@ -1763,9 +1779,14 @@ impl BranchStore {
                 schema: st.schema.clone(),
             }
         };
+        let timed = self.timed();
         let mut trunk = self.trunk();
+        // A18a's split of this hold (observation only; the clock is read only while lock timing
+        // is on): the log prune, V2's probes, and the whole hold.
+        let t_hold = timed.then(Instant::now);
         let oldest = trunk.lineage.children.keys().next().copied();
         trunk.merge.prune(oldest);
+        let t_pruned = timed.then(Instant::now);
         let TrunkInner {
             lineage,
             domain,
@@ -1773,6 +1794,9 @@ impl BranchStore {
             merge,
         } = &mut *trunk;
         work.merge_attempts += 1;
+        if let (Some(h), Some(p)) = (t_hold, t_pruned) {
+            work.prepare_log_prune_ns += p.duration_since(h).as_nanos() as u64;
+        }
         // The last scope clause needs the trunk's count of tracking turned off.
         let scope = b.scope.or_else(|| {
             (physical && b.reads_from != Some(merge.track_off)).then_some(
@@ -1801,12 +1825,16 @@ impl BranchStore {
         // V2: any page this branch wrote that the trunk wrote after the fork, or that an earlier
         // batch member wrote (a page stamp is taken only at the commit's decision).
         let mut page = false;
+        let t_v2 = timed.then(Instant::now);
         for &p in &b.current {
             count(Validation::PageStamp, &mut probes);
             if written(p) + u64::from(mutant(9)) > at + m2 || batch.pages.contains(&p) {
                 page = true;
                 break;
             }
+        }
+        if let Some(v) = t_v2 {
+            work.prepare_v2_ns += v.elapsed().as_nanos() as u64;
         }
         let current: HashSet<u32> = b.current.iter().copied().collect();
         // V1, computed only when active: every committed trunk write set since the fork, newest
@@ -1858,6 +1886,9 @@ impl BranchStore {
             }
             false
         });
+        if let Some(h) = t_hold {
+            work.prepare_trunk_hold_ns += h.elapsed().as_nanos() as u64;
+        }
         drop(trunk);
         // V3, under the stamps' own lock (A18): any row this branch wrote that the trunk wrote
         // after the fork, or that an earlier batch member wrote. The caller's WAL write lock keeps
@@ -1865,8 +1896,10 @@ impl BranchStore {
         let mut key = false;
         {
             let mut st = self.stamps();
+            let t_s = timed.then(Instant::now);
             st.prune(oldest);
             self.stamps_held.store(st.row_stamps.len(), Ordering::Relaxed);
+            let t_v3 = timed.then(Instant::now);
             let mut key_probes = 0u64;
             for &((root, rowid), _) in &b.rows {
                 if active == Validation::KeyStamp {
@@ -1883,6 +1916,12 @@ impl BranchStore {
                 }
             }
             self.v3_probes.fetch_add(key_probes, Ordering::Relaxed);
+            if let (Some(s), Some(v)) = (t_s, t_v3) {
+                self.prepare_stamp_prune_ns
+                    .fetch_add(v.duration_since(s).as_nanos() as u64, Ordering::Relaxed);
+                self.prepare_v3_ns
+                    .fetch_add(v.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
         }
         // The replay applies rows in the branch's last-write order: a UNIQUE value the branch moved
         // from one row to another must leave the first before it reaches the second.
