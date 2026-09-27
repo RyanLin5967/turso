@@ -239,6 +239,9 @@ pub enum BranchFailpoint {
     /// The next group flight (r11-churn amendment 4) — the flush that carries an early-released
     /// operation's records — fails as an I/O error would, after the operation was applied.
     GroupFlightFails,
+    /// The next compaction's arena sync, before its snapshot is written, fails as an I/O error
+    /// would (r11-churn amendment 6a).
+    CompactArenaSyncFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.

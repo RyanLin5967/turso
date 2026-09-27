@@ -458,6 +458,8 @@ pub(crate) struct Journal {
     pid: u32,
     /// See [`Journal::fail_next_write`].
     fail_next_write: bool,
+    /// See [`Journal::fail_next_compact_arena_sync`].
+    fail_next_compact_arena_sync: bool,
     /// Frame bytes ever buffered by this journal: the log sequence number a group flush makes
     /// durable up to (r11-churn amendment 4). Monotone across compactions, unlike `len`.
     lsn: u64,
@@ -523,6 +525,7 @@ impl Journal {
             poisoned: false,
             pid: std::process::id(),
             fail_next_write: false,
+            fail_next_compact_arena_sync: false,
             lsn: 0,
         })
     }
@@ -638,6 +641,7 @@ impl Journal {
             poisoned: false,
             pid: std::process::id(),
             fail_next_write: false,
+            fail_next_compact_arena_sync: false,
             lsn: 0,
         };
 
@@ -752,6 +756,12 @@ impl Journal {
     /// INSIDE `flush`, so the poisoning a test then observes is `flush`'s own (review 4 C7).
     pub(crate) fn fail_next_write(&mut self) {
         self.fail_next_write = true;
+    }
+
+    /// Fail the next compaction's arena sync as an I/O error would — the `CompactArenaSyncFails`
+    /// failpoint. It fails INSIDE `compact`, where a real sync failure would.
+    pub(crate) fn fail_next_compact_arena_sync(&mut self) {
+        self.fail_next_compact_arena_sync = true;
     }
 
     pub(crate) fn page_size(&self) -> usize {
@@ -1001,15 +1011,27 @@ impl Journal {
         arena: &mut Arena,
         fail_after_rename: bool,
     ) -> Result<()> {
+        // Taken first, so the failpoint is spent by exactly this call.
+        let fail_arena_sync = std::mem::take(&mut self.fail_next_compact_arena_sync);
         self.check_live()?;
         // The snapshot names slots that buffered-but-unwritten records also name; they must be
         // durable before the snapshot is.
         let arena_bytes = if self.sync {
-            match arena.sync() {
+            let synced = if fail_arena_sync {
+                Err(LimboError::InternalError(
+                    "failpoint: the compaction's arena sync failed".to_string(),
+                ))
+            } else {
+                arena.sync()
+            };
+            match synced {
                 Ok(bytes) => bytes,
-                // As the same error in `flush`: a failed fsync may have dropped the pages, and a
-                // retry on the same file can report success (review 2 F2).
                 Err(e) => {
+                    // A failed sync may have dropped the pages it was writing back, and a later
+                    // fsync of the same file can report success without them: fail-stop, as
+                    // `flush` does (r11-churn amendment 6a). Only the snapshot's own failures
+                    // leave the store healthy. (r11-churn gc3 19b8f8a29; r11-bigtxn's F2 was the
+                    // same fix; this keeps its byte count.)
                     self.poisoned = true;
                     return Err(e);
                 }

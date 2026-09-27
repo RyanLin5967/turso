@@ -362,11 +362,17 @@ pub(crate) struct BranchStore {
     /// The unlocked read is sound because the only transition that matters — 0 to 1 — happens in
     /// a trunk fork, which holds the trunk's WAL write lock; a trunk writer reading this holds the
     /// same lock. A 1-to-0 transition (a reap) racing the read only makes the writer take the lock
-    /// and find nothing to do.
+    /// and find nothing to do. An EARLY release that drops it sets `unsynced` first (see there).
     trunk_children: AtomicUsize,
     /// Trunk pre-image records wait in the journal's buffer between the trunk's `add_dirty` and its
     /// commit. The commit's barrier reads this without the lock, so a trunk commit with nothing to
     /// make durable pays one atomic load.
+    ///
+    /// An early release (a batch release, or an expiry pass riding on a fork's flight) sets it too,
+    /// until a flush covers it: that release may have removed the child a trunk write's copy
+    /// decision would have kept a pre-image for, so the next trunk commit must wait for it — and be
+    /// refused if its flight failed, when the child comes back at the next open (review r12-merge1
+    /// N1).
     unsynced: AtomicBool,
     /// Whether a durable store has any lease outstanding. A trunk commit's barrier reads it without
     /// the lock, so a trunk with no leases still pays one load for the stamp (review N2). A stale
@@ -499,6 +505,10 @@ struct StoreInner {
     publishing: u32,
     /// `MaybeCompactBetweenMapHolds`: the automatic check runs as if the log wanted compacting.
     force_compaction: bool,
+    /// The highest log sequence number of any early-released Release (a batch release, or an
+    /// expiry pass riding on a fork's flight); 0 if none. A branch such a release kept alive — open
+    /// at the time — is freed at its close, and those frees wait for this (review r12-merge1 R2).
+    early_released: u64,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -1941,6 +1951,14 @@ impl BranchStore {
         fsyncs: u64,
         defer_to: Option<u64>,
     ) -> Result<Expired> {
+        // Review r12-merge1 N1, as in `release_many`: a release riding on a fork's flight can drop
+        // the trunk's child count before that flight lands.
+        if defer_to.is_some_and(|lsn| lsn > 0) {
+            self.unsynced.store(true, Ordering::Release);
+        }
+        if let Some(lsn) = defer_to {
+            inner.early_released = inner.early_released.max(lsn);
+        }
         let due = plan.due;
         let mut freed = Vec::new();
         for &id in &due {
@@ -2012,9 +2030,11 @@ impl BranchStore {
         Ok(())
     }
 
-    /// Compact the log into a snapshot if it has outgrown the live state. Best effort: the
-    /// operation that triggered it is already durable, and a failure before the rename leaves the
-    /// log intact; a failure after it fail-stops the journal (see `Journal::compact`).
+    /// Compact the log into a snapshot if it has outgrown the live state. Best effort: a failure
+    /// before the rename leaves the log, its buffer and the store healthy, and the triggering
+    /// operation is made durable by its own flush (`commit_pages` and `release_many` compact
+    /// BEFORE they wait, so it need not be durable yet); a failure after the rename fail-stops the
+    /// journal (see `Journal::compact`).
     fn maybe_compact(&self, inner: &mut StoreInner) {
         let wants =
             inner.force_compaction || inner.journal.as_ref().is_some_and(|j| j.wants_compaction());
@@ -2296,11 +2316,14 @@ impl BranchStore {
             let _ = inner.fatal(e);
             return;
         }
-        // A branch released while its connection was open (release_many, or expiry riding on a
-        // fork) may have its Release record only buffered: its slots wait for everything buffered
-        // so far (review H3; rule 2). Reservations wait with them, which only delays them.
-        let now = inner.journal.as_ref().map_or(0, Journal::lsn);
-        inner.defer_frees(now, freed);
+        // Rule 2 (review r12-merge1 R2): a branch an early release kept alive because it was open is
+        // freed here, and its Release may still be only buffered. Hold the frees until every early
+        // Release so far is durable; `mature` returns them at once when it already is. (r11-churn
+        // gc3 b1f323eed; it supersedes r11-bigtxn's H3, which deferred to the journal's current
+        // position: equally safe, looser.)
+        let lsn = inner.early_released;
+        inner.defer_frees(lsn, freed);
+        self.mature(&mut inner);
         self.sync_trunk_children(&inner);
     }
 
@@ -2422,6 +2445,15 @@ impl BranchStore {
                 )));
             }
         };
+        // Review r12-merge1 N1: the releases below can drop the trunk's child count before this
+        // batch is durable, and a trunk commit that then retains no pre-image must not become
+        // durable ahead of it. `unsynced` sends that commit's barrier down its slow path, which
+        // waits out this batch's flight and is refused if it failed. Stored before
+        // `sync_trunk_children` publishes the new count, so a writer that sees the count sees this.
+        if lsn > 0 {
+            self.unsynced.store(true, Ordering::Release);
+        }
+        inner.early_released = inner.early_released.max(lsn);
         let mut freed = Vec::new();
         for &i in &todo {
             let before = freed.len();
@@ -3324,6 +3356,12 @@ impl BranchStore {
         if fail {
             inner.failpoint = None;
         }
+        if inner.failpoint == Some(BranchFailpoint::CompactArenaSyncFails) {
+            inner.failpoint = None;
+            if let Some(journal) = inner.journal.as_mut() {
+                journal.fail_next_compact_arena_sync();
+            }
+        }
         self.compact(&mut inner, fail)
     }
 
@@ -3425,6 +3463,7 @@ impl StoreInner {
             hold_hist: [0; HOLD_HIST_BUCKETS],
             publishing: 0,
             force_compaction: false,
+            early_released: 0,
         }
     }
 

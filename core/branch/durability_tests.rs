@@ -2573,3 +2573,183 @@ fn an_early_released_release_whose_flight_fails_frees_nothing_now_or_later() {
     assert_eq!(value(&a.connect().unwrap(), 10), Some("a".to_string()));
     let _ = a.into_id();
 }
+
+/// Review r12-merge1 N1 (artie-research frontier/round11/r11-bigtxn/merge1_review.md, part 6). An early-released
+/// batch release applies Release(c) and drops the trunk's child count before its flight lands, so a trunk write that
+/// follows retains no pre-image for c. That trunk commit must not become durable ahead of Release(c): when the flight
+/// fails, c comes back at the reopen and must still read the page as of its fork.
+#[test]
+fn a_trunk_commit_after_a_failed_batch_release_does_not_reach_the_branch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let c_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        // The trunk's only child: it reads original(7).
+        let c = trunk.fork_branch().unwrap();
+        c_id = c.id();
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(db.reap_branches(vec![c]).is_err(), "a batch whose flight failed reported success");
+        // Refused or not, it must not reach c.
+        let _ = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+    }
+    let db = reopen(&path, incarnation);
+    let c = db.branch(c_id).expect("its Release never became durable, so the branch is back");
+    assert_eq!(
+        value(&c.connect().unwrap(), 7),
+        Some(original(7)),
+        "the branch reads a trunk write made after its fork"
+    );
+    let _ = c.into_id();
+}
+
+/// N1 through the other early release: the expiry pass that rides on a BRANCH fork. `p`, an older trunk child, keeps
+/// the trunk's child count above zero, so the trunk's copy decision still runs, but it asks only for children forked
+/// since the page's last write: `c` alone, which the failed fork's pass has already released in memory.
+#[test]
+fn a_trunk_commit_after_a_failed_fork_that_reaped_a_trunk_child_does_not_reach_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let c_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        // Retained for p; the page's last trunk write is now after p's fork.
+        set(&trunk, 7, "t1");
+        let c = trunk.fork_branch().unwrap();
+        assert_eq!(value(&c.connect().unwrap(), 7), Some("t1".to_string()), "premise: c forked after 't1'");
+        c.lease(Duration::from_secs(10)).unwrap();
+        c_id = c.into_id();
+        db.branch_lease_clock_advance(Duration::from_secs(11));
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        // Its expiry pass reaps c, riding on this fork's flight, which fails.
+        assert!(p.fork().is_err(), "a fork whose flight failed reported success");
+        let _ = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+        let _ = p.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let c = db.branch(c_id).expect("its Release never became durable, so the branch is back");
+    assert_eq!(
+        value(&c.connect().unwrap(), 7),
+        Some("t1".to_string()),
+        "the branch reads a trunk write made after its fork"
+    );
+    let _ = c.into_id();
+}
+
+/// Review r12-merge1 R2 (part 3). An expiry pass riding on a fork releases an OPEN branch early; its slots must not go
+/// back to the arena at the connection's close before that Release is durable (rule 2). Here the fork's flight fails,
+/// so the Release never becomes durable, and the close must free nothing.
+#[test]
+fn a_close_frees_nothing_of_a_branch_whose_early_release_is_not_durable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let b_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        let cb = b.connect().unwrap();
+        set(&cb, 10, "b");
+        b.lease(Duration::from_secs(10)).unwrap();
+        let held = in_use(&db);
+        let own: BTreeSet<u32> = b.owned_slots().into_iter().collect();
+        assert!(!own.is_empty() && own.is_subset(&held), "premise: b owns slots in use");
+        db.branch_lease_clock_advance(Duration::from_secs(11));
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        // Its expiry pass releases b, which is open and so kept, riding on this fork's flight, which fails.
+        assert!(trunk.fork_branch().is_err(), "a fork whose flight failed reported success");
+        drop(cb);
+        assert_eq!(in_use(&db), held, "the close freed slots whose Release never became durable");
+        b_id = b.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let b = db.branch(b_id).expect("its Release never became durable, so the branch is back");
+    assert_eq!(value(&b.connect().unwrap(), 10), Some("b".to_string()));
+    let _ = b.into_id();
+}
+
+/// Review r12-merge1 R1 (part 2). A compaction that fails BEFORE its rename leaves the log, its buffer and the journal
+/// intact, so it must not fail-stop the store: a later branch write is taken and survives a reopen.
+#[test]
+fn a_compaction_that_fails_before_its_rename_does_not_fail_stop_later_writes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let b_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        let cb = b.connect().unwrap();
+        set(&cb, 10, "before");
+        // The temporary snapshot cannot be created: the compaction fails before its rename.
+        let tmp = std::path::PathBuf::from(format!("{}-branch-snap.tmp", path.display()));
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(db.branch_compact_now().is_err(), "the compaction did not fail");
+        std::fs::remove_dir(&tmp).unwrap();
+        let after = cb.execute("UPDATE t SET v = 'after' WHERE id = 11");
+        assert!(
+            after.is_ok(),
+            "a write after a compaction that failed before its rename was refused: {after:?}"
+        );
+        drop(cb);
+        b_id = b.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let b = db.branch(b_id).unwrap();
+    let cb = b.connect().unwrap();
+    assert_eq!(value(&cb, 10), Some("before".to_string()));
+    assert_eq!(value(&cb, 11), Some("after".to_string()));
+    drop(cb);
+    let _ = b.into_id();
+}
+
+/// The other half of R1, found by a fresh review of its fix (artie-research PREREG amendment 6a). A compaction can also
+/// fail before its rename at its ARENA sync. A failed sync may have dropped the pages it was writing back, and a later
+/// fsync of the same file can then report success without them, so that failure must fail-stop the store as a failed
+/// log flush does: a later branch write is refused, never acknowledged.
+#[test]
+fn a_compaction_whose_arena_sync_fails_fail_stops_the_store() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let b_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        let cb = b.connect().unwrap();
+        set(&cb, 10, "before");
+        db.branch_failpoint(Some(BranchFailpoint::CompactArenaSyncFails));
+        assert!(db.branch_compact_now().is_err(), "the failpoint did not fire");
+        assert!(
+            cb.execute("UPDATE t SET v = 'after' WHERE id = 11").is_err(),
+            "a write was acknowledged after the compaction's arena sync failed"
+        );
+        drop(cb);
+        b_id = b.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let b = db.branch(b_id).unwrap();
+    let cb = b.connect().unwrap();
+    assert_eq!(value(&cb, 10), Some("before".to_string()));
+    assert_eq!(value(&cb, 11), Some(original(11)));
+    drop(cb);
+    let _ = b.into_id();
+}
