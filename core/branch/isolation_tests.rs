@@ -657,24 +657,7 @@ fn a_fork_in_vacuums_refusal_gap_and_the_vacuum_never_both_succeed() {
             (1..=ROWS).filter(|id| id % 2 == 1).map(|id| (id, original(id))).collect();
         let (fork, vacuum, ran) = fork_in_the_refusal_gap(&db, &trunk, "VACUUM", crate::storage::pager::RefusalGap::AfterCheck);
         assert!(ran, "mask {mask}: premise: VACUUM passed its branch check and reached the gap");
-        match (fork.expect("the hook ran"), vacuum) {
-            (Ok(_), Ok(())) => panic!(
-                "mask {mask}: a fork landed between VACUUM's branch check and its exclusive WAL access, and VACUUM still ran"
-            ),
-            (Ok(b), Err(e)) => {
-                assert!(
-                    e.to_string().contains("while branches of this database exist"),
-                    "mask {mask}: VACUUM refused for another reason: {e}"
-                );
-                let bc = b.connect().unwrap();
-                assert_eq!(all_rows(&bc, &format!("mask {mask}: branch after the refused VACUUM")), expected);
-            }
-            (Err(fe), Ok(())) => assert!(
-                matches!(fe, LimboError::Busy),
-                "mask {mask}: the fork in the gap failed with {fe}, not Busy"
-            ),
-            (Err(fe), Err(ve)) => panic!("mask {mask}: both refused: fork {fe}, VACUUM {ve}"),
-        }
+        judge_refusal_gap(mask, "VACUUM", fork, vacuum, &expected, true);
     }
     crate::coherence::force_fixes_for_test(0);
 }
@@ -698,30 +681,7 @@ fn a_fork_in_journal_modes_refusal_gap_and_the_switch_never_both_succeed() {
             crate::storage::pager::RefusalGap::AfterCheck,
         );
         assert!(ran, "mask {mask}: premise: the switch passed its branch check and reached the gap");
-        let mode = trunk
-            .prepare("PRAGMA journal_mode")
-            .unwrap()
-            .run_collect_rows()
-            .map(|r| format!("{:?}", r[0][0]));
-        match (fork.expect("the hook ran"), switch) {
-            (Ok(_), Ok(())) => panic!(
-                "mask {mask}: a fork landed between journal_mode's branch check and its header write, and the switch \
-                 still ran (mode now {mode:?})"
-            ),
-            (Ok(b), Err(e)) => {
-                assert!(
-                    e.to_string().contains("while branches of this database exist"),
-                    "mask {mask}: the switch refused for another reason: {e}"
-                );
-                let bc = b.connect().unwrap();
-                assert_eq!(all_rows(&bc, &format!("mask {mask}: branch after the refused switch")), expected);
-            }
-            (Err(fe), Ok(())) => assert!(
-                matches!(fe, LimboError::Busy),
-                "mask {mask}: the fork in the gap failed with {fe}, not Busy"
-            ),
-            (Err(fe), Err(ve)) => panic!("mask {mask}: both refused: fork {fe}, switch {ve}"),
-        }
+        judge_refusal_gap(mask, "the journal-mode switch", fork, switch, &expected, true);
     }
     crate::coherence::force_fixes_for_test(0);
 }
@@ -833,8 +793,15 @@ fn judge_refusal_gap(
     fork: Option<Result<Branch>>,
     result: Result<()>,
     expected: &[(i64, String)],
+    must_land: bool,
 ) {
-    match (fork.expect("the hook ran"), result) {
+    let fork = fork.expect("the hook ran");
+    if must_land {
+        if let Err(e) = &fork {
+            panic!("mask {mask}: premise: the fork did not land in {what}'s gap (it failed with {e}), so the test is vacuous");
+        }
+    }
+    match (fork, result) {
         (Ok(_), Ok(())) => panic!("mask {mask}: a fork landed in {what}'s gap, and {what} still ran"),
         (Ok(b), Err(e)) => {
             assert!(
@@ -872,7 +839,7 @@ fn a_fork_inside_vacuums_exclusion_and_the_vacuum_never_both_succeed() {
             crate::storage::pager::RefusalGap::AfterRecheck,
         );
         assert!(ran, "mask {mask}: premise: VACUUM asked the branch question again and reached the hook");
-        judge_refusal_gap(mask, "VACUUM", fork, vacuum, &expected);
+        judge_refusal_gap(mask, "VACUUM", fork, vacuum, &expected, false);
     }
     crate::coherence::force_fixes_for_test(0);
 }
@@ -895,7 +862,73 @@ fn a_fork_inside_journal_modes_exclusion_and_the_switch_never_both_succeed() {
             crate::storage::pager::RefusalGap::AfterRecheck,
         );
         assert!(ran, "mask {mask}: premise: the switch asked the branch question again and reached the hook");
-        judge_refusal_gap(mask, "the journal-mode switch", fork, switch, &expected);
+        judge_refusal_gap(mask, "the journal-mode switch", fork, switch, &expected, false);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// r11-coherence round 12, VACUUM item (fix side), the reviewer's second route: a fork asks `check_forkable` before it
+/// holds anything, so a WAL -> MVCC switch can complete between that check and the fork's lock. The hook runs the whole
+/// switch there. The fork must then refuse (its own question, asked again under its lock) or the switch must refuse.
+/// Red under a mutant that drops the fork's re-check.
+#[test]
+fn a_journal_switch_between_a_forks_check_and_its_lock_and_the_fork_never_both_succeed() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let switcher = db.connect().unwrap();
+        let switched = std::rc::Rc::new(std::cell::RefCell::new(None));
+        {
+            let switched = switched.clone();
+            crate::storage::pager::set_branch_refusal_gap_hook_for_test(
+                crate::storage::pager::RefusalGap::ForkBeforeLock,
+                Box::new(move || {
+                    *switched.borrow_mut() = Some(switcher.execute("PRAGMA journal_mode = 'mvcc'"));
+                }),
+            );
+        }
+        let fork = trunk.fork_branch();
+        crate::storage::pager::clear_branch_refusal_gap_hook_for_test();
+        let switch = switched.borrow_mut().take().expect("premise: the hook ran between the fork's check and its lock");
+        match (fork, switch) {
+            (Ok(_), Ok(())) => panic!(
+                "mask {mask}: the database switched to MVCC between a fork's check and its lock, and the fork still ran"
+            ),
+            (Err(fe), Ok(())) => assert!(
+                fe.to_string().contains("experimental_mvcc"),
+                "mask {mask}: the fork refused for another reason: {fe}"
+            ),
+            (fork, Err(se)) => panic!(
+                "mask {mask}: premise: the switch in the fork's gap failed ({se}); fork: {:?}",
+                fork.map(|b| b.id())
+            ),
+        }
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// r11-coherence round 12, VACUUM item (fix side), the reviewer's first route: the switch must publish the new mode
+/// before it lets forks take their locks. The hook tries a fork after the header is written and before the mode is
+/// published, still inside the switch's exclusion. That fork must not succeed alongside the switch. Red under a mutant
+/// that releases the exclusion before the hook.
+#[test]
+fn a_fork_before_the_journal_switch_publishes_and_the_switch_never_both_succeed() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let expected: Vec<(i64, String)> = (1..=ROWS).map(|id| (id, original(id))).collect();
+        let (fork, switch, ran) = fork_in_the_refusal_gap(
+            &db,
+            &trunk,
+            "PRAGMA journal_mode = 'mvcc'",
+            crate::storage::pager::RefusalGap::BeforePublish,
+        );
+        assert!(ran, "mask {mask}: premise: the switch wrote its header and reached the hook before publishing");
+        judge_refusal_gap(mask, "the journal-mode switch", fork, switch, &expected, false);
     }
     crate::coherence::force_fixes_for_test(0);
 }

@@ -17995,29 +17995,41 @@ pub struct OpJournalModeState {
     /// successful bootstrap. If the statement is reset/dropped while parked at a
     /// bootstrap yield, dropping this guard restores in-memory state.
     pub bootstrap_guard: Option<MvccBootstrapGuard>,
-    /// r11-coherence round 12: the trunk write transaction held from the branch re-check to the header write.
-    pub branch_exclusion: Option<TrunkWriteExclusion>,
 }
 
-/// r11-coherence round 12: a trunk write transaction held across `PRAGMA journal_mode`'s header rewrite. The pragma runs
-/// with no transaction, so its branch check in `Start` held nothing a fork respects: a fork could land before the header
-/// is rewritten. Non-G forks need the WAL write lock, and G forks need the fork gate, which a write transaction holds
-/// exclusively; so under this guard the branch question, asked again, cannot change. Released when dropped: at
-/// `Finalize`, or with the op state when the statement errors or is reset.
-pub struct TrunkWriteExclusion {
+/// r11-coherence round 12: a trunk write transaction held across `PRAGMA journal_mode`'s header rewrite AND the
+/// publication of the new mode. The pragma runs with no transaction, so its branch check in `Start` held nothing a fork
+/// respects. Non-G forks need the WAL write lock, and G forks need the fork gate, which a write transaction holds
+/// exclusively; so under this guard the branch question, asked again, cannot change, and no fork takes its lock until
+/// the new mode is visible to the fork's own re-check (`fork_trunk_locked`). A local of one blocking section, never held
+/// across a yield: dropped on every exit, errors included.
+struct TrunkWriteExclusion {
     pager: Arc<Pager>,
 }
 
 impl TrunkWriteExclusion {
     fn take(pager: &Arc<Pager>) -> Result<Self> {
-        pager.begin_read_tx()?;
-        if let Err(e) = pager.io.block(|| pager.begin_write_tx(WalAutoActions::empty())) {
-            pager.end_read_tx();
-            return Err(e);
+        // As `fork_trunk`: a commit that lands between the read and the write begin makes the snapshot stale.
+        const SNAPSHOT_RETRIES: usize = 8;
+        let mut attempt = 0;
+        loop {
+            pager.begin_read_tx()?;
+            match pager.io.block(|| pager.begin_write_tx(WalAutoActions::empty())) {
+                Ok(()) => {
+                    return Ok(Self {
+                        pager: pager.clone(),
+                    })
+                }
+                Err(LimboError::BusySnapshot) if attempt < SNAPSHOT_RETRIES => {
+                    pager.end_read_tx();
+                    attempt += 1;
+                }
+                Err(e) => {
+                    pager.end_read_tx();
+                    return Err(e);
+                }
+            }
         }
-        Ok(Self {
-            pager: pager.clone(),
-        })
     }
 }
 
@@ -18286,23 +18298,6 @@ fn op_journal_mode_inner(
             }
 
             OpJournalModeSubState::UpdateHeader => {
-                if state.active_op_state.journal_mode().branch_exclusion.is_none() {
-                    let exclusion = TrunkWriteExclusion::take(pager)?;
-                    if program.connection.branch_id().is_some()
-                        || program.connection.db.branches.has_branches()
-                    {
-                        drop(exclusion);
-                        return Err(LimboError::InvalidArgument(
-                            "cannot change journal_mode while branches of this database exist"
-                                .to_string(),
-                        ));
-                    }
-                    state.active_op_state.journal_mode().branch_exclusion = Some(exclusion);
-                    #[cfg(test)]
-                    crate::storage::pager::run_branch_refusal_gap_hook(
-                        crate::storage::pager::RefusalGap::AfterRecheck,
-                    );
-                }
                 let new_mode = state
                     .active_op_state
                     .journal_mode()
@@ -18313,50 +18308,41 @@ fn op_journal_mode_inner(
                     .expect("Should be a supported Journal Mode");
                 let raw_version = RawVersion::from(new_version);
 
-                // Get the header page reference (handles both initialized and uninitialized databases)
-                // This uses the pager's cache and won't fail for empty database files
-                let header_ref =
-                    return_if_io!(crate::storage::pager::HeaderRefMut::from_pager(pager));
+                // r11-coherence round 12: from here to the publication of the new mode, one blocking section under a
+                // trunk write transaction (see `TrunkWriteExclusion`), so that no fork lands between the branch
+                // question asked again below and a database that is no longer branchable. Nothing here yields, and the
+                // exclusion is a local, so every exit (an error included) releases it.
+                let exclusion = TrunkWriteExclusion::take(pager)?;
+                if program.connection.branch_id().is_some()
+                    || program.connection.db.branches.has_branches()
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "cannot change journal_mode while branches of this database exist".to_string(),
+                    ));
+                }
+                #[cfg(test)]
+                crate::storage::pager::run_branch_refusal_gap_hook(
+                    crate::storage::pager::RefusalGap::AfterRecheck,
+                );
 
-                // Update the header version
+                // Get the header page reference (handles both initialized and uninitialized databases)
+                let header_ref =
+                    pager.io.block(|| crate::storage::pager::HeaderRefMut::from_pager(pager))?;
                 {
                     let header = header_ref.borrow_mut();
                     header.read_version = raw_version;
                     header.write_version = raw_version;
                 }
-
-                // Save the page reference for writing
-                state.active_op_state.journal_mode().page_ref = Some(header_ref.page().clone());
-                // Skip ReadPage and go directly to WritePage
-                state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::WritePage;
-            }
-
-            OpJournalModeSubState::WritePage => {
                 // Write page 1 to disk to flush the header
-                let page = state
-                    .active_op_state
-                    .journal_mode()
-                    .page_ref
-                    .as_ref()
-                    .expect("page_ref should be set");
-                let completion = begin_write_btree_page(pager, page)?;
-                state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Finalize;
-                return Ok(InsnFunctionStepResult::IO(IOCompletions(completion)));
-            }
-
-            OpJournalModeSubState::Finalize => {
-                // The header is written: release the trunk write transaction before the new mode is set up.
-                state.active_op_state.journal_mode().branch_exclusion = None;
-                let new_mode = state
-                    .active_op_state
-                    .journal_mode()
-                    .new_mode
-                    .expect("new_mode should be set");
-
-                // Clear page cache
+                let completion = begin_write_btree_page(pager, header_ref.page())?;
+                crate::io::IO::wait_for_completion(&*pager.io, completion)?;
                 pager.clear_page_cache(true);
+                #[cfg(test)]
+                crate::storage::pager::run_branch_refusal_gap_hook(
+                    crate::storage::pager::RefusalGap::BeforePublish,
+                );
 
-                // Setup new mode
+                // Publish the new mode while forks are still excluded.
                 if matches!(new_mode, journal_mode::JournalMode::Mvcc) {
                     let db_path = program.connection.get_database_canonical_path();
                     let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
@@ -18377,6 +18363,7 @@ fn op_journal_mode_inner(
                     // bootstrap yield restores in-memory state.
                     let guard = MvccBootstrapGuard::new(program.connection.clone());
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
+                    drop(exclusion);
                     program.connection.demote_to_mvcc_connection();
                     state.active_op_state.journal_mode().bootstrap_guard = Some(guard);
                     state.active_op_state.journal_mode().bootstrap_state =
@@ -18389,6 +18376,7 @@ fn op_journal_mode_inner(
                 if matches!(new_mode, journal_mode::JournalMode::Wal) {
                     program.connection.db.mv_store.store(None);
                 }
+                drop(exclusion);
 
                 // Return result
                 let ret: &'static str = new_mode.into();
@@ -18396,6 +18384,14 @@ fn op_journal_mode_inner(
                 state.pc += 1;
 
                 return Ok(InsnFunctionStepResult::Step);
+            }
+
+            // r11-coherence round 12: UpdateHeader now writes the header and publishes the new mode in one blocking
+            // section, so these two sub-states are no longer entered.
+            OpJournalModeSubState::WritePage | OpJournalModeSubState::Finalize => {
+                return Err(LimboError::InternalError(
+                    "journal_mode: WritePage and Finalize are folded into UpdateHeader".to_string(),
+                ));
             }
 
             OpJournalModeSubState::BootstrapMvStore => {

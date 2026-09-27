@@ -413,6 +413,8 @@ impl Connection {
     fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
+        #[cfg(test)]
+        crate::storage::pager::run_branch_refusal_gap_hook(crate::storage::pager::RefusalGap::ForkBeforeLock);
         if pager.fork_gate_on() {
             // r11-coherence FG: a reader of the fork gate. Trunk write transactions hold it exclusively for as long
             // as they hold the WAL write lock, so the guarantee below is the one the write lock gave, and forks no
@@ -462,6 +464,10 @@ impl Connection {
     }
 
     fn fork_trunk_locked(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
+        // r11-coherence round 12: `fork_branch` asked `check_forkable` before this fork held anything, so a journal-mode
+        // switch could complete in between. The switch publishes its new mode before releasing the write transaction
+        // this fork's lock needs, so asked again here, under that lock, the answer is current.
+        check_forkable(&self.db, pager)?;
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;

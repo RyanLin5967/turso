@@ -87,6 +87,11 @@ pub(crate) enum RefusalGap {
     AfterCheck,
     /// Right after the operation's branch check asked again under its exclusion (r11-coherence round 12's fix).
     AfterRecheck,
+    /// The journal-mode switch only: after the header is written, before the new mode is published; still inside the
+    /// exclusion.
+    BeforePublish,
+    /// A trunk fork: after its first `check_forkable`, before it takes the WAL write lock or the fork gate.
+    ForkBeforeLock,
 }
 
 /// Tests (r11-coherence round 12, VACUUM item): run `f` once, on this thread, right after a page-rewriting operation's
