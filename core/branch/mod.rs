@@ -285,20 +285,25 @@ pub struct BranchWork {
     pub trunk_pre_images_captured: u64,
     /// Captured pre-images kept as retained versions, because a live child could see them.
     pub trunk_pre_images_retained: u64,
-    /// Rows a trunk commit decision stamped for the merge record (V3), summed over decisions.
+    /// Rows a trunk commit decision stamped for the merge record (V3) inside its trunk-lock hold,
+    /// summed over decisions. 0 since A18 (the rows are stamped after the gate); mutant 33 restores
+    /// the in-hold stamping and counts here.
     pub trunk_commit_rows_stamped: u64,
     /// Pages the decisions examined (every page each commit handed over).
     pub trunk_commit_pages_decided: u64,
-    /// Nanoseconds inside the decision's trunk-lock hold spent stamping rows and tables and
-    /// logging the write set, deciding pages, and pruning the merge record; summed, and read only
+    /// Nanoseconds inside the decision's trunk-lock hold spent logging the write set (and, before
+    /// A18, stamping rows and tables), deciding pages, and pruning the log; summed, and read only
     /// while lock timing is on (0 otherwise). U14's split (frontier/round11/r11-merge PREREG A17).
     pub trunk_commit_row_ns: u64,
     pub trunk_commit_page_ns: u64,
     pub trunk_commit_prune_ns: u64,
     /// Rows stamped after the commit gate closed, under the stamps' own lock (PREREG A18).
     pub merge_rows_stamped_post_gate: u64,
-    /// Nanoseconds those post-gate stampings took, while lock timing is on (0 otherwise).
+    /// Nanoseconds those post-gate stampings took, the wait for their lock included, while lock
+    /// timing is on (0 otherwise).
     pub trunk_commit_post_gate_ns: u64,
+    /// Acquisitions of V3's stamps lock, the one store lock outside the `lock_*` sums (PREREG A18).
+    pub stamps_lock_acquisitions: u64,
 }
 
 impl BranchWork {
@@ -337,6 +342,7 @@ impl BranchWork {
             trunk_commit_prune_ns,
             merge_rows_stamped_post_gate,
             trunk_commit_post_gate_ns,
+            stamps_lock_acquisitions,
             merge_attempts,
             merge_commits,
             merge_refused_scalar,
@@ -385,6 +391,7 @@ impl BranchWork {
         self.trunk_commit_prune_ns += trunk_commit_prune_ns;
         self.merge_rows_stamped_post_gate += merge_rows_stamped_post_gate;
         self.trunk_commit_post_gate_ns += trunk_commit_post_gate_ns;
+        self.stamps_lock_acquisitions += stamps_lock_acquisitions;
         self.merge_attempts += merge_attempts;
         self.merge_commits += merge_commits;
         self.merge_refused_scalar += merge_refused_scalar;

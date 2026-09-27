@@ -142,7 +142,8 @@ pub struct MergeOutcome {
     pub install_error: Option<String>,
 }
 
-/// What [`BranchStore::merge_prepare`] reads for a merge under one hold of the store lock.
+/// What [`BranchStore::merge_prepare`] reads for a merge (its shard's, the trunk's and the stamps'
+/// holds, one at a time).
 pub(super) struct Prepared {
     pub(super) scope: Option<&'static str>,
     pub(super) commits_since_fork: u64,

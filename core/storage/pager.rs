@@ -3318,6 +3318,10 @@ impl Pager {
                     // The branch store's merge record: this transaction's write set is committed.
                     if let Some(store) = self.branch_store.get() {
                         let tx = std::mem::take(&mut *self.trunk_pending.lock());
+                        crate::turso_assert!(
+                            tx.rows.is_empty() && tx.tables.is_empty() || self.holds_write_lock(),
+                            "leftover merge rows are stamped before the WAL write lock is released"
+                        );
                         store.trunk_tx_end(Some(tx));
                     }
 
@@ -4939,9 +4943,10 @@ impl Pager {
                     let decided = self.decide_trunk_commit();
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
-                    wal.finish_append_frames_commit()?;
+                    let finished = wal.finish_append_frames_commit();
                     // The gate closes; the merge record's rows are stamped only now, off the trunk's
-                    // lock, and still under the WAL write lock (PREREG A18 of r11-merge).
+                    // lock, and still under the WAL write lock (PREREG A18 of r11-merge). Stamped
+                    // even if the publish failed: a stamp can only refuse more, never admit.
                     if let Some((gate, stamps)) = decided {
                         drop(gate);
                         crate::turso_assert!(
@@ -4953,6 +4958,7 @@ impl Pager {
                             store.stamp_committed(stamps);
                         }
                     }
+                    finished?;
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 
