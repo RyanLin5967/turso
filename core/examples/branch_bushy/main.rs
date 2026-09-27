@@ -37,6 +37,57 @@ use std::time::{Duration, Instant};
 use turso_core::branch::{Branch, BranchWork, MapWork, OBSERVE};
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO};
 
+/// r11-bushy amendment 10: with `branch-observe`, a global allocator that counts allocation calls and bytes (wrapping the
+/// default System allocator), so `--probe-forks` can attribute allocator work per fork. Timed builds (observe off) use System
+/// directly.
+#[cfg(feature = "branch-observe")]
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: Counting = Counting;
+}
+
+/// (allocation calls, bytes) so far in this process; (0, 0) without `branch-observe`.
+fn alloc_counts() -> (u64, u64) {
+    #[cfg(feature = "branch-observe")]
+    {
+        use std::sync::atomic::Ordering;
+        (counting::ALLOCS.load(Ordering::Relaxed), counting::BYTES.load(Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "branch-observe"))]
+    {
+        (0, 0)
+    }
+}
+
 const TRUNK_ROWS: i64 = 20_000;
 const VALUE_LEN: usize = 100;
 /// The row every node writes under `--rows hot`.
@@ -87,6 +138,7 @@ struct Args {
     pages: usize,
     pre: bool,
     refcounted: bool,
+    probe: usize,
 }
 
 fn die(msg: &str) -> ! {
@@ -120,6 +172,7 @@ fn parse_args() -> Args {
         pages: 10,
         pre: false,
         refcounted: false,
+        probe: 0,
     };
     let mut shape = None;
     let mut it = std::env::args().skip(1);
@@ -168,6 +221,7 @@ fn parse_args() -> Args {
             "--no-needed" => args.needed = false,
             "--pages" => args.pages = num(val(), "--pages") as usize,
             "--pre" => args.pre = true,
+            "--probe-forks" => args.probe = num(val(), "--probe-forks") as usize,
             "--refcounted" => args.refcounted = true,
             other => die(&format!("unknown argument {other}")),
         }
@@ -536,6 +590,49 @@ impl Bench {
         );
     }
 
+    /// `--probe-forks K` (amendment 10): K forks from `parents`, off the workload's stream, each child pruned at once, with
+    /// the work each fork does counted: allocations and bytes, page-map work, page-map nodes, the branch table's capacity.
+    /// Every snapshot sits outside the fork call; the fork call is the same `fork` the timed samples time.
+    fn probe_forks(&mut self, args: &Args, x: u64, parents: &[u32], rng: &mut Rng) {
+        let (mut allocs, mut allocs_max, mut bytes) = (0u64, 0u64, 0u64);
+        let (mut copied, mut built, mut refs, mut pmn_max) = (0u64, 0u64, 0u64, 0i64);
+        let (mut rel_nodes, mut rel_refs, mut resizes) = (0u64, 0u64, 0u64);
+        let cap_first = self.db.branch_table_capacity();
+        for _ in 0..args.probe {
+            let p = parents[rng.below(parents.len() as u64) as usize];
+            let s0 = self.db.branch_stats();
+            let cap0 = self.db.branch_table_capacity();
+            let (a0, b0) = alloc_counts();
+            let (id, branch) = self.fork(p);
+            let (a1, b1) = alloc_counts();
+            let s1 = self.db.branch_stats();
+            let cap1 = self.db.branch_table_capacity();
+            allocs += a1 - a0;
+            allocs_max = allocs_max.max(a1 - a0);
+            bytes += b1 - b0;
+            copied += s1.map_work.nodes_copied - s0.map_work.nodes_copied;
+            built += s1.map_work.nodes_built - s0.map_work.nodes_built;
+            refs += s1.map_work.refs_touched - s0.map_work.refs_touched;
+            pmn_max = pmn_max.max(s1.page_map_nodes as i64 - s0.page_map_nodes as i64);
+            if cap1 != cap0 {
+                resizes += 1;
+            }
+            self.prune(id, branch);
+            let s2 = self.db.branch_stats();
+            rel_nodes += s2.map_work.nodes_released - s1.map_work.nodes_released;
+            rel_refs += s2.map_work.refs_released - s1.map_work.refs_released;
+        }
+        println!(
+            "# forkprobe x={x} k={} allocs_sum={allocs} allocs_max={allocs_max} alloc_bytes_sum={bytes} \
+             nodes_copied={copied} nodes_built={built} refs_touched={refs} page_map_nodes_delta_max={pmn_max} \
+             reap_nodes_released={rel_nodes} reap_refs_released={rel_refs} table_capacity_before={cap_first} \
+             table_capacity_after={} resizes={resizes} table={}",
+            args.probe,
+            self.db.branch_table_capacity(),
+            if cfg!(feature = "branch-slab") { "slab" } else { "hash" },
+        );
+    }
+
     /// `--timing`: K steps off the workload's stream, each timed per op, each child pruned at once
     /// so the tree the counters describe is unchanged (the parents' epochs advance).
     fn sample(&mut self, args: &Args, x: u64, parents: &[u32], rng: &mut Rng) {
@@ -668,6 +765,12 @@ fn shape_bb(b: &mut Bench, args: &Args) {
             }
         }
         b.checkpoint(args, x, None, w0, &format!(" eligible={}", eligible.len()));
+        if args.probe > 0 {
+            let parents = eligible.clone();
+            b.probe_forks(args, x, &parents, &mut timing_rng);
+            // The probe children were pruned; they are never eligible.
+            pos.resize(b.nodes.len(), u32::MAX);
+        }
         if args.timing {
             let parents = eligible.clone();
             b.sample(args, x, &parents, &mut timing_rng);
@@ -711,6 +814,9 @@ fn shape_cat(b: &mut Bench, args: &Args) {
         }
         let x = (b.nodes.len() - 1) as u64;
         b.checkpoint(args, x, Some(level), w0, "");
+        if args.probe > 0 {
+            b.probe_forks(args, x, &[x_node], &mut timing_rng);
+        }
         if args.timing {
             b.sample(args, x, &[x_node], &mut timing_rng);
         }
@@ -911,7 +1017,7 @@ fn main() {
     println!(
         "# shape={:?} rows={:?} interior={:?} continue={} fr={} fi={} depth={} gamma_milli={} \
          fanout={} beam={} expand={} checkpoints={:?} seed={:#x} timing={} samples={} \
-         refcounted={} observe={OBSERVE} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
+         refcounted={} observe={OBSERVE} table={} probe_forks={} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
          trunk_pages={page_count} build={}",
         args.shape,
         args.rows,
@@ -929,6 +1035,8 @@ fn main() {
         args.timing,
         args.samples,
         args.refcounted,
+        if cfg!(feature = "branch-slab") { "slab" } else { "hash" },
+        args.probe,
         if cfg!(debug_assertions) { "DEBUG" } else { "release" },
     );
     if args.timing {

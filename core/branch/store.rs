@@ -100,6 +100,77 @@ pub(crate) struct BranchStore {
     trunk_children: AtomicUsize,
 }
 
+/// The branch table: a HashMap by default; with the `branch-slab` feature (r11-bushy amendment 10, a mechanism-removed arm for
+/// the fork slope) a Vec slab indexed by `id - 1`, which works because ids are dense and never reused.
+#[cfg(not(feature = "branch-slab"))]
+type BranchTable = HashMap<BranchId, BranchState>;
+
+#[cfg(feature = "branch-slab")]
+#[derive(Default)]
+struct BranchTable {
+    slots: Vec<Option<BranchState>>,
+    len: usize,
+}
+
+#[cfg(feature = "branch-slab")]
+impl BranchTable {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn index(id: &BranchId) -> Option<usize> {
+        id.0.checked_sub(1).map(|i| i as usize)
+    }
+
+    fn get(&self, id: &BranchId) -> Option<&BranchState> {
+        self.slots.get(Self::index(id)?)?.as_ref()
+    }
+
+    fn get_mut(&mut self, id: &BranchId) -> Option<&mut BranchState> {
+        self.slots.get_mut(Self::index(id)?)?.as_mut()
+    }
+
+    fn insert(&mut self, id: BranchId, st: BranchState) -> Option<BranchState> {
+        let i = Self::index(&id).expect("the trunk is never a table entry");
+        if self.slots.len() <= i {
+            self.slots.resize_with(i + 1, || None);
+        }
+        let old = self.slots[i].replace(st);
+        if old.is_none() {
+            self.len += 1;
+        }
+        old
+    }
+
+    fn remove(&mut self, id: &BranchId) -> Option<BranchState> {
+        let old = self.slots.get_mut(Self::index(id)?)?.take();
+        if old.is_some() {
+            self.len -= 1;
+        }
+        old
+    }
+
+    fn contains_key(&self, id: &BranchId) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &BranchState> {
+        self.slots.iter().flatten()
+    }
+}
+
 struct StoreInner {
     arena: Option<Arena>,
     /// How many page-map leaf nodes name each arena slot a branch wrote, indexed by slot (see
@@ -107,7 +178,7 @@ struct StoreInner {
     refs: Vec<u32>,
     next_id: u64,
     trunk: TrunkState,
-    branches: HashMap<BranchId, BranchState>,
+    branches: BranchTable,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
 }
@@ -308,7 +379,7 @@ impl BranchStore {
                     lineage: Lineage::default(),
                     written: HashMap::new(),
                 },
-                branches: HashMap::new(),
+                branches: BranchTable::new(),
                 work: BranchWork::default(),
             }),
             trunk_children: AtomicUsize::new(0),
@@ -594,6 +665,11 @@ impl BranchStore {
             map_work: page_map::map_work(),
             work: inner.work,
         }
+    }
+
+    /// The branch table's capacity (buckets for the HashMap, slots for the `branch-slab` Vec). Observation only.
+    pub(crate) fn table_capacity(&self) -> usize {
+        self.inner.lock().branches.capacity()
     }
 
     /// Branch states with no handle and no open connection. Observation only; O(branches). Such a

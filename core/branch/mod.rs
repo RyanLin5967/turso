@@ -395,6 +395,12 @@ impl Database {
         self.branches.needed_slots()
     }
 
+    /// The branch table's capacity (HashMap buckets, or Vec slots with `branch-slab`). Observation only.
+    #[doc(hidden)]
+    pub fn branch_table_capacity(&self) -> usize {
+        self.branches.table_capacity()
+    }
+
     /// Branch states with no handle and no open connection. O(branches). Always 0: such a state is
     /// freed the moment it arises.
     #[doc(hidden)]

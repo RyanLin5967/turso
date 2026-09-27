@@ -32,6 +32,8 @@ conn_raw_api = []
 # Branch-store observers that are process-global atomics (page-map live nodes, page-map work counts).
 # On for counter runs, off for timed runs: an observer inside a timed loop is part of what it times.
 branch-observe = []
+# Mechanism-removed arm (r11-bushy amendment 10): the branch table as a Vec slab indexed by id - 1 instead of a HashMap.
+branch-slab = []
 # Harness-side observability: turns on aristo's instrument surface so the
 # logical-log conformance DTs can read private LogicalLog state (header
 # version, pending running CRC) and construct LogRecords. Off by default;
