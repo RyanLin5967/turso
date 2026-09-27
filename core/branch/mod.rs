@@ -586,6 +586,16 @@ impl Database {
         self.branches.catalog_counters()
     }
 
+    /// What this open's catalog prewarm read (r12-catload instrument): `(mode, pages read through
+    /// the page cache, interior pages among them, bytes read from the files, page cache capacity
+    /// after it, nanoseconds)`; `None` for a store that did not recover a catalog.
+    #[doc(hidden)]
+    pub fn branch_catalog_prewarm(&self) -> Option<(&'static str, u64, u64, u64, u64, u64)> {
+        self.branches
+            .catalog_prewarm()
+            .map(|p| (p.mode.name(), p.pages, p.interior, p.bytes, p.cache_pages, p.ns))
+    }
+
     /// Catalog statements that wrote a row since open; 0 for a store that is not a catalog store.
     #[doc(hidden)]
     pub fn branch_catalog_rows_written(&self) -> u64 {

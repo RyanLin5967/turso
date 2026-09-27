@@ -69,7 +69,9 @@ use std::num::NonZero;
 use std::path::Path;
 
 use super::arena::Slot;
+use crate::storage::pager::{PageRef, Pager};
 use crate::sync::Arc;
+use crate::util::IOExt as _;
 use crate::{
     Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, Result, SqliteDialect,
     Statement, Value, IO,
@@ -149,6 +151,79 @@ pub(crate) fn cat_cache_pages() -> u64 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(32_768)
     })
+}
+
+/// The catalog prewarm a store's open performs (r12-catload; a measurement arm, `R12_PREWARM`, off
+/// when unset). The published answers to a cold first touch after a restart: PostgreSQL's
+/// pg_prewarm (`read` and `buffer` modes) and InnoDB's buffer pool load, whose hot set a B-tree's
+/// interior pages are.
+/// * `interior`: every interior page of every catalog B-tree into the page cache, level by level
+///   from its root. One leaf per tree is read to find the leaf level (a B-tree's leaves share one
+///   depth), so no other leaf is read.
+/// * `file`: the catalog file and its WAL read sequentially into the OS page cache (pg_prewarm
+///   `read`); the page cache is untouched.
+/// * `buffer`: every page of the catalog into the page cache (pg_prewarm `buffer`), the cache first
+///   resized to hold them all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Prewarm {
+    #[default]
+    Off,
+    Interior,
+    File,
+    Buffer,
+}
+
+impl Prewarm {
+    /// `R12_PREWARM`. A value this does not know refuses the open: a misspelt arm must not run as
+    /// the control.
+    pub(crate) fn from_env() -> Result<Prewarm> {
+        match std::env::var("R12_PREWARM") {
+            Err(std::env::VarError::NotPresent) => Ok(Prewarm::Off),
+            Ok(v) => match v.as_str() {
+                "" | "off" => Ok(Prewarm::Off),
+                "interior" => Ok(Prewarm::Interior),
+                "file" => Ok(Prewarm::File),
+                "buffer" => Ok(Prewarm::Buffer),
+                other => Err(LimboError::InvalidArgument(format!(
+                    "R12_PREWARM={other:?}: expected off, interior, file or buffer"
+                ))),
+            },
+            Err(e) => Err(LimboError::InvalidArgument(format!("R12_PREWARM: {e}"))),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Prewarm::Off => "off",
+            Prewarm::Interior => "interior",
+            Prewarm::File => "file",
+            Prewarm::Buffer => "buffer",
+        }
+    }
+}
+
+/// What an open's prewarm read (r12-catload instrument, observing only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PrewarmStats {
+    pub(crate) mode: Prewarm,
+    /// Pages requested through the page cache (`interior`, `buffer`).
+    pub(crate) pages: u64,
+    /// Interior pages among them (`interior`).
+    pub(crate) interior: u64,
+    /// Bytes read from the catalog's files (`file`).
+    pub(crate) bytes: u64,
+    /// The page cache's capacity after the prewarm, in pages.
+    pub(crate) cache_pages: u64,
+    pub(crate) ns: u64,
+}
+
+/// Read page `idx` through the page cache and wait until it is loaded.
+fn read_loaded(pager: &Pager, idx: i64) -> Result<PageRef> {
+    let (page, pending) = pager.io.block(|| pager.read_page(idx))?;
+    if let Some(c) = pending {
+        pager.io.wait_for_completion(c)?;
+    }
+    Ok(page)
 }
 
 /// The catalog's meta row: what an open needs before it touches any branch.
@@ -263,6 +338,8 @@ pub(crate) struct Catalog {
     _db: Arc<Database>,
     conn: Arc<Connection>,
     pub(crate) counters: CatalogCounters,
+    /// What this handle's open prewarmed (r12-catload; `Prewarm::Off` unless [`Catalog::prewarm`] ran).
+    pub(crate) prewarm: PrewarmStats,
     meta_all: Stmt,
     meta_put: Stmt,
     branch_get: Stmt,
@@ -412,9 +489,117 @@ impl Catalog {
             free_del: p("DELETE FROM free WHERE slot = ?1")?,
             free_put: p("INSERT OR REPLACE INTO free(slot) VALUES (?1)")?,
             counters: CatalogCounters::default(),
+            prewarm: PrewarmStats::default(),
             conn,
             _db: db,
         })
+    }
+
+    /// r12-catload: read what `mode` names into the OS page cache or this connection's page cache
+    /// (see [`Prewarm`]), once, at a store's open. `path` is the catalog file this handle opened.
+    pub(crate) fn prewarm(&mut self, path: &Path, mode: Prewarm) -> Result<()> {
+        let t = std::time::Instant::now();
+        let mut st = PrewarmStats {
+            mode,
+            cache_pages: cat_cache_pages(),
+            ..PrewarmStats::default()
+        };
+        match mode {
+            Prewarm::Off => {}
+            Prewarm::File => {
+                use std::io::Read;
+                let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+                let mut buf = vec![0u8; 1 << 20];
+                for file in [path, wal.as_path()] {
+                    let fail = |e: std::io::Error| {
+                        LimboError::InternalError(format!(
+                            "branch catalog prewarm: {}: {e}",
+                            file.display()
+                        ))
+                    };
+                    let mut f = match std::fs::File::open(file) {
+                        Ok(f) => f,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(fail(e)),
+                    };
+                    loop {
+                        let n = f.read(&mut buf).map_err(fail)?;
+                        if n == 0 {
+                            break;
+                        }
+                        st.bytes += n as u64;
+                    }
+                }
+            }
+            Prewarm::Interior | Prewarm::Buffer => {
+                let ints = |conn: &Arc<Connection>, sql: &str| -> Result<Vec<u64>> {
+                    conn.prepare(sql)?
+                        .run_collect_rows()?
+                        .iter()
+                        .map(|row| get(row, 0))
+                        .collect()
+                };
+                let n = ints(&self.conn, "PRAGMA page_count")?.first().copied().unwrap_or(0);
+                if mode == Prewarm::Buffer {
+                    st.cache_pages = st.cache_pages.max(n + 64);
+                    self.conn
+                        .execute(format!("PRAGMA cache_size = {}", st.cache_pages))?;
+                }
+                // Page 1 is sqlite_schema's root; every other tree's root is listed in it.
+                let mut roots = vec![1u64];
+                if mode == Prewarm::Interior {
+                    roots.extend(ints(
+                        &self.conn,
+                        "SELECT rootpage FROM sqlite_schema WHERE rootpage > 1",
+                    )?);
+                }
+                let pager = self.conn.pager.load().clone();
+                pager.begin_read_tx()?;
+                let read = if mode == Prewarm::Buffer {
+                    (1..=n).try_for_each(|idx| -> Result<()> {
+                        read_loaded(&pager, idx as i64)?;
+                        st.pages += 1;
+                        Ok(())
+                    })
+                } else {
+                    roots
+                        .iter()
+                        .try_for_each(|&root| Self::interior_walk(&pager, root as u32, &mut st))
+                };
+                pager.end_read_tx();
+                read?;
+            }
+        }
+        st.ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.prewarm = st;
+        Ok(())
+    }
+
+    /// Read one B-tree's interior pages, level by level from `root`. The first page of a level
+    /// tells whether the whole level is leaves, since a B-tree's leaves share one depth: that one
+    /// leaf is the only leaf read.
+    fn interior_walk(pager: &Pager, root: u32, st: &mut PrewarmStats) -> Result<()> {
+        let mut level = vec![root];
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for &idx in &level {
+                let page = read_loaded(pager, idx as i64)?;
+                st.pages += 1;
+                let c = page.get_contents();
+                if c.is_leaf() {
+                    return Ok(());
+                }
+                st.interior += 1;
+                for i in 0..c.cell_count() {
+                    next.push(c.cell_interior_read_left_child_page(i)?);
+                }
+                if let Some(right) = c.rightmost_pointer()? {
+                    next.push(right);
+                }
+            }
+            level = next;
+        }
+        Ok(())
     }
 
     /// The meta row, or `None` for a catalog no checkpoint has committed yet.
@@ -472,6 +657,17 @@ impl Catalog {
             .first()
             .map(|r| r.iter().map(|v| v.as_int().unwrap_or(-1)).collect())
             .unwrap_or_default())
+    }
+
+    /// One integer column of `sql`'s rows, on this handle's connection (r12-catload's prewarm test).
+    #[cfg(test)]
+    pub(crate) fn ints(&self, sql: &str) -> Result<Vec<u64>> {
+        self.conn
+            .prepare(sql)?
+            .run_collect_rows()?
+            .iter()
+            .map(|row| get(row, 0))
+            .collect()
     }
 
     /// `EXPLAIN QUERY PLAN` of every query the store runs on the catalog, for the test that

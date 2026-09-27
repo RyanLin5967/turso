@@ -50,6 +50,15 @@
 //!   bounded pass; `R11_EXPIRE=unbounded` for the BEFORE arm), then `expire_branches` for the rest.
 //! * `catonly --n N --writes D --phase build|measure` (A13 amended): the catalog-only fixture.
 //!
+//! r12-catload (frontier/round12/r12-catload/PREREG.md), observing only:
+//!
+//! * `open` prints the catalog's OS page-cache residency before it opens (mincore), a PREWARM line
+//!   (`R12_PREWARM`, see the store's catalog), and on SETTLE and on a new ATTACH line the PAGE_IO
+//!   page reads, device bytes read, instructions, cycles, CPU and runnable time
+//!   (proc_pid_rusage RUSAGE_INFO_V4, this thread's CPU clock) across the settle and each attach.
+//! * `--window W` (open's probes, churn's commits): draw branch ids from the W consecutive ids
+//!   centred in 1..=N instead of from all N (a confined working set); 0, the default, is all N.
+//!
 //! Any failed check prints `NOT A RESULT` and exits 1.
 
 use std::io::{BufRead, Write};
@@ -93,6 +102,8 @@ struct Args {
     lease_ms: u64,
     /// `catonly --phase build|measure`.
     phase: String,
+    /// `open --probes` / `churn --window W`: draw ids from W consecutive ids (0: all N; r12-catload).
+    window: usize,
 }
 
 fn parse_args() -> Args {
@@ -112,6 +123,7 @@ fn parse_args() -> Args {
         catalog: false,
         lease_ms: 0,
         phase: String::new(),
+        window: 0,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -129,6 +141,7 @@ fn parse_args() -> Args {
             "--trunk-every" => args.trunk_every = val().parse().unwrap_or_else(|_| die("bad --trunk-every")),
             "--lease-ms" => args.lease_ms = val().parse().unwrap_or_else(|_| die("bad --lease-ms")),
             "--phase" => args.phase = val(),
+            "--window" => args.window = val().parse().unwrap_or_else(|_| die("bad --window")),
             "--mode" => {
                 args.catalog = match val().as_str() {
                     "snapshot" => false,
@@ -142,7 +155,118 @@ fn parse_args() -> Args {
     if args.db.as_os_str().is_empty() || args.n == 0 {
         die("--db and --n/--to are required");
     }
+    if args.window > args.n {
+        die("--window exceeds --n");
+    }
     args
+}
+
+impl Args {
+    /// A branch id to touch: uniform over 1..=N, or over the `--window` ids centred in it.
+    fn pick(&self, rng: &mut Rng) -> u64 {
+        if self.window == 0 {
+            return 1 + rng.below(self.n) as u64;
+        }
+        let lo = 1 + (self.n - self.window) / 2;
+        (lo + rng.below(self.window)) as u64
+    }
+}
+
+/// This process's counters (proc_pid_rusage RUSAGE_INFO_V4) and this thread's CPU clock
+/// (r12-catload, observing only). Fire-checked by frontier/round12/r12-catload/rusage_fire.py: the
+/// device bytes read count a cold clone's bytes exactly and a warm re-read as 0; instructions and
+/// cycles scale 10.0x with 10x the work. Times in ns (the rusage times are Mach ticks).
+#[derive(Clone, Copy, Default)]
+struct Ru {
+    disk_read: u64,
+    pageins: u64,
+    instr: u64,
+    cycles: u64,
+    user_ns: u64,
+    sys_ns: u64,
+    runnable_ns: u64,
+    thread_ns: u64,
+}
+
+impl Ru {
+    fn now() -> Ru {
+        static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        // libc marks its binding deprecated (in favour of the mach2 crate); declared here instead.
+        #[repr(C)]
+        struct Timebase {
+            numer: u32,
+            denom: u32,
+        }
+        extern "C" {
+            fn mach_timebase_info(info: *mut Timebase) -> i32;
+        }
+        let &(numer, denom) = TIMEBASE.get_or_init(|| {
+            let mut tb = Timebase { numer: 0, denom: 0 };
+            // SAFETY: a valid out-pointer for the call.
+            let rc = unsafe { mach_timebase_info(&mut tb) };
+            if rc != 0 || tb.denom == 0 {
+                not_a_result("mach_timebase_info failed");
+            }
+            (tb.numer as u64, tb.denom as u64)
+        });
+        // SAFETY: a zeroed plain-integer struct, filled by the call.
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a rusage_info_v4, which RUSAGE_INFO_V4 writes.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as i32,
+                libc::RUSAGE_INFO_V4,
+                &mut info as *mut libc::rusage_info_v4 as *mut libc::rusage_info_t,
+            )
+        };
+        if rc != 0 {
+            not_a_result("proc_pid_rusage failed");
+        }
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid out-pointer for the call.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+            not_a_result("clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+        }
+        let ns = |ticks: u64| (ticks as u128 * numer as u128 / denom as u128) as u64;
+        Ru {
+            disk_read: info.ri_diskio_bytesread,
+            pageins: info.ri_pageins,
+            instr: info.ri_instructions,
+            cycles: info.ri_cycles,
+            user_ns: ns(info.ri_user_time),
+            sys_ns: ns(info.ri_system_time),
+            runnable_ns: ns(info.ri_runnable_time),
+            thread_ns: ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64,
+        }
+    }
+
+    fn since(&self, a: &Ru) -> Ru {
+        Ru {
+            disk_read: self.disk_read - a.disk_read,
+            pageins: self.pageins - a.pageins,
+            instr: self.instr - a.instr,
+            cycles: self.cycles - a.cycles,
+            user_ns: self.user_ns - a.user_ns,
+            sys_ns: self.sys_ns - a.sys_ns,
+            runnable_ns: self.runnable_ns - a.runnable_ns,
+            thread_ns: self.thread_ns - a.thread_ns,
+        }
+    }
+
+    fn fields(&self, p: &str) -> String {
+        format!(
+            "{p}disk_read={}\t{p}pageins={}\t{p}instr={}\t{p}cycles={}\t{p}user_us={:.1}\t{p}sys_us={:.1}\t\
+             {p}runnable_us={:.1}\t{p}thread_cpu_us={:.1}",
+            self.disk_read,
+            self.pageins,
+            self.instr,
+            self.cycles,
+            self.user_ns as f64 / 1e3,
+            self.sys_ns as f64 / 1e3,
+            self.runnable_ns as f64 / 1e3,
+            self.thread_ns as f64 / 1e3
+        )
+    }
 }
 
 struct Rng(u64);
@@ -476,11 +600,20 @@ fn summary(name: &str, n: usize, label: &str, v: &mut [f64], counters: &[(u64, u
 fn open(args: &Args) {
     let files = Files::new(&args.db);
     let files_before = files.line();
+    // r12-catload: how much of the catalog the OS page cache holds as this open starts.
+    let (cat_res, cat_pages) = resident_pages(&files.cat);
+    let (wal_res, wal_pages) = resident_pages(&files.cat_wal);
+    println!(
+        "RESIDENT\tn={}\tlabel={}\tcat_resident={cat_res}\tcat_vm_pages={cat_pages}\tcat_wal_resident={wal_res}\tcat_wal_vm_pages={wal_pages}",
+        args.n, args.label
+    );
     let rss0 = rss_bytes();
     let io0 = turso_core::branch::page_io();
+    let oru0 = Ru::now();
     let t = Instant::now();
     let db = open_db(&args.db, true, args.catalog);
     let t_db = t.elapsed();
+    let oru = Ru::now().since(&oru0);
     let io1 = turso_core::branch::page_io();
     let t = Instant::now();
     let trunk = db.connect().unwrap();
@@ -489,18 +622,25 @@ fn open(args: &Args) {
     let s = db.branch_open_stats();
     let reads = db.branch_read_counters();
     // branch_stats applies the parked Commits (C-R) before counting slots: timed apart from the open.
-    let (loads0, _, _, rows0) = db.branch_catalog_counters();
+    let (loads0, _, q0, rows0) = db.branch_catalog_counters();
+    let (sio0, sru0) = (turso_core::branch::page_io(), Ru::now());
     let t = Instant::now();
     let st = db.branch_stats().unwrap();
     let t_settle = t.elapsed();
-    let (loads1, _, _, rows1) = db.branch_catalog_counters();
+    let (sio1, sru1) = (turso_core::branch::page_io(), Ru::now());
+    let (loads1, _, q1, rows1) = db.branch_catalog_counters();
     println!(
-        "SETTLE\tn={}\tlabel={}\tsettle_us={:.1}\tsettle_branch_loads={}\tsettle_cat_rows={}",
+        "SETTLE\tn={}\tlabel={}\tsettle_us={:.1}\tsettle_branch_loads={}\tsettle_cat_rows={}\t\
+         settle_cat_queries={}\tsettle_db_page_reads={}\tsettle_wal_frame_reads={}\t{}",
         args.n,
         args.label,
         t_settle.as_secs_f64() * 1e6,
         loads1 - loads0,
-        rows1 - rows0
+        rows1 - rows0,
+        q1 - q0,
+        sio1[0] - sio0[0],
+        sio1[2] - sio0[2],
+        sru1.since(&sru0).fields("settle_")
     );
     let tr = db.branch_trunk_retained();
     // Every branch owns one page and the arena also holds the trunk's retained versions, unless the
@@ -532,6 +672,16 @@ fn open(args: &Args) {
         io1[2] - io0[2],
         io1[3] - io0[3]
     );
+    println!("OPENRU\tn={}\tlabel={}\t{}", args.n, args.label, oru.fields("open_"));
+    if let Some((mode, pages, interior, bytes, cache_pages, ns)) = db.branch_catalog_prewarm() {
+        println!(
+            "PREWARM\tn={}\tlabel={}\tmode={mode}\tpages={pages}\tinterior={interior}\tbytes={bytes}\t\
+             cache_pages={cache_pages}\tprewarm_us={:.1}",
+            args.n,
+            args.label,
+            ns as f64 / 1e3
+        );
+    }
     if args.probes > 0 {
         let mut rng = Rng(args.seed);
         let mut seen = std::collections::HashSet::new();
@@ -543,18 +693,23 @@ fn open(args: &Args) {
             let (l, t, _, r) = db.branch_catalog_counters();
             (l, t, r)
         };
-        let k = args.probes.min(args.n);
+        let k = args.probes.min(if args.window > 0 { args.window } else { args.n });
+        // r12-catload: per attach, (db page reads, counters) across it.
+        let mut attach_x: Vec<(u64, Ru)> = vec![];
         while seen.len() < k {
-            let id = 1 + rng.below(args.n) as u64;
+            let id = args.pick(&mut rng);
             if !seen.insert(id) {
                 continue;
             }
             let row = row_for(id);
             let other = far_row(row);
             let ka = cc(&db);
+            let (aio0, aru0) = (turso_core::branch::page_io(), Ru::now());
             let t_attach = Instant::now();
             let branch = db.branch(BranchId(id)).unwrap_or_else(|e| not_a_result(&format!("attach {id}: {e}")));
             attach_t.push(t_attach.elapsed().as_secs_f64() * 1e6);
+            let (aio1, aru1) = (turso_core::branch::page_io(), Ru::now());
+            attach_x.push((aio1[0] - aio0[0], aru1.since(&aru0)));
             let (c0, k0) = (db.branch_read_counters(), cc(&db));
             let t = Instant::now();
             let conn = branch.connect().unwrap();
@@ -593,6 +748,7 @@ fn open(args: &Args) {
             drop(conn);
             let _ = branch.into_id();
         }
+        attach_line(args, &attach_t, &attach_x);
         let no = vec![(0u64, 0u64); attach_t.len()];
         let nok = vec![(0u64, 0u64, 0u64); attach_t.len()];
         summary("attach", args.n, &args.label, &mut attach_t, &no, &nok);
@@ -616,6 +772,44 @@ fn open(args: &Args) {
         args.label,
         t_close.as_secs_f64() * 1e6,
         files.line()
+    );
+}
+
+/// r12-catload: the attaches' counters, per attach (means over the K attaches, and the medians of
+/// wall time, thread CPU and wall minus thread CPU).
+fn attach_line(args: &Args, wall_us: &[f64], x: &[(u64, Ru)]) {
+    if x.is_empty() {
+        return;
+    }
+    let k = x.len() as f64;
+    let mean = |v: Vec<f64>| v.iter().sum::<f64>() / k;
+    let per = |f: fn(&(u64, Ru)) -> f64| mean(x.iter().map(f).collect());
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        pct(&v, 50.0)
+    };
+    let cpu: Vec<f64> = x.iter().map(|(_, r)| r.thread_ns as f64 / 1e3).collect();
+    let off: Vec<f64> = wall_us.iter().zip(&cpu).map(|(w, c)| w - c).collect();
+    println!(
+        "ATTACH\tn={}\tlabel={}\twindow={}\tk={}\tp50_us={:.2}\tmean_us={:.2}\tthread_cpu_p50_us={:.2}\t\
+         offcpu_p50_us={:.2}\tdb_page_reads_per={:.3}\tdisk_read_per={:.1}\tpageins_per={:.3}\tinstr_per={:.0}\t\
+         cycles_per={:.0}\tthread_cpu_us_per={:.2}\tsys_us_per={:.2}\trunnable_us_per={:.2}",
+        args.n,
+        args.label,
+        args.window,
+        x.len(),
+        median(wall_us.to_vec()),
+        mean(wall_us.to_vec()),
+        median(cpu),
+        median(off),
+        per(|(p, _)| *p as f64),
+        per(|(_, r)| r.disk_read as f64),
+        per(|(_, r)| r.pageins as f64),
+        per(|(_, r)| r.instr as f64),
+        per(|(_, r)| r.cycles as f64),
+        per(|(_, r)| r.thread_ns as f64 / 1e3),
+        per(|(_, r)| r.sys_ns as f64 / 1e3),
+        per(|(_, r)| r.runnable_ns as f64 / 1e3)
     );
 }
 
@@ -1080,7 +1274,7 @@ fn churn(args: &Args) {
     let mut rng = Rng(args.seed);
     let mut distinct = std::collections::HashSet::new();
     for g in 0..args.writes {
-        let id = 1 + rng.below(args.n) as u64;
+        let id = args.pick(&mut rng);
         distinct.insert(id);
         let branch = db
             .branch(BranchId(id))
@@ -1096,10 +1290,11 @@ fn churn(args: &Args) {
         let _ = branch.into_id();
     }
     println!(
-        "# churn victim pid={} n={} writes={} distinct={} {}",
+        "# churn victim pid={} n={} writes={} window={} distinct={} {}",
         std::process::id(),
         args.n,
         args.writes,
+        args.window,
         distinct.len(),
         files.line()
     );

@@ -712,3 +712,57 @@ fn an_open_after_every_lease_ran_out_reaps_one_bounded_batch() {
     assert_eq!(rest.reaped.len(), live, "expire_branches did not reap the rest");
     assert_eq!(db.branch_stats().unwrap().live_branches, 0);
 }
+
+/// r12-catload: the catalog prewarm reads what its mode names, and changes no answer. A store of
+/// 3,000 branches is grown, checkpointed and closed; fresh handles on its catalog then prewarm in
+/// each mode. `off` reads nothing; `file` reads the catalog file and its WAL whole; `buffer`
+/// requests every page once and sizes the cache to hold them; `interior` requests every interior
+/// page and exactly one leaf per B-tree (the leaf that shows where the leaves start). Every branch
+/// then loads from each prewarmed handle exactly as from one that was not prewarmed.
+#[test]
+fn catalog_prewarm_reads_what_its_mode_names() {
+    use super::catalog::{Catalog, Prewarm};
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    seed(&db.connect().unwrap());
+    let ids = grow(&db, 3000);
+    db.branch_compact_now().unwrap();
+    drop(db);
+    let cat = std::path::PathBuf::from(format!("{}-branch-cat", path.display()));
+    let wal = std::path::PathBuf::from(format!("{}-wal", cat.display()));
+    let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+    let mut plain = Catalog::open(&cat, false).unwrap();
+    let pages = plain.ints("PRAGMA page_count").unwrap()[0];
+    let trees = 1 + plain
+        .ints("SELECT count(*) FROM sqlite_schema WHERE rootpage > 1")
+        .unwrap()[0];
+    let want: Vec<_> = ids.iter().map(|id| plain.load_branch(id.0).unwrap()).collect();
+    assert!(want.iter().all(Option::is_some), "a grown branch is missing from the catalog");
+    // One handle on the file at a time.
+    drop(plain);
+    for mode in [Prewarm::Off, Prewarm::File, Prewarm::Buffer, Prewarm::Interior] {
+        let mut c = Catalog::open(&cat, false).unwrap();
+        c.prewarm(&cat, mode).unwrap();
+        let st = c.prewarm;
+        assert_eq!(st.mode, mode);
+        match mode {
+            Prewarm::Off => assert_eq!((st.pages, st.bytes), (0, 0)),
+            Prewarm::File => {
+                assert_eq!(st.pages, 0);
+                assert_eq!(st.bytes, size(&cat) + size(&wal));
+            }
+            Prewarm::Buffer => {
+                assert_eq!(st.pages, pages);
+                assert!(st.cache_pages >= pages, "{st:?} cannot hold {pages} pages");
+            }
+            Prewarm::Interior => {
+                assert!(st.interior >= 1, "3,000 branches left every tree one page deep: {st:?}");
+                assert_eq!(st.pages - st.interior, trees, "not one leaf per tree: {st:?}");
+                assert!(st.pages < pages, "interior read the whole catalog: {st:?}");
+            }
+        }
+        let got: Vec<_> = ids.iter().map(|id| c.load_branch(id.0).unwrap()).collect();
+        assert!(got == want, "a branch loads differently after the {mode:?} prewarm");
+    }
+}

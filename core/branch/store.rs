@@ -160,7 +160,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::arena::{Arena, Slot};
-use super::catalog::{CatBranch, Catalog, Meta};
+use super::catalog::{CatBranch, Catalog, Meta, Prewarm, PrewarmStats};
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::page_map::PageMap;
 use super::{
@@ -1453,6 +1453,8 @@ impl BranchStore {
         let mut catalog = Catalog::open(&files.cat, sync)?;
         let meta = catalog.meta()?;
         stats.catalog_ns = ns(t);
+        // r12-catload: the catalog prewarm (`R12_PREWARM`, off when unset), before the replay reads.
+        catalog.prewarm(&files.cat, Prewarm::from_env()?)?;
         let t = Instant::now();
         let recovered =
             Journal::recover_catalog(files, sync, meta.map(|m| (m.page_size, m.generation)))?;
@@ -2629,6 +2631,13 @@ impl BranchStore {
             .cat
             .as_ref()
             .map_or(0, |c| c.catalog.counters.rows_written)
+    }
+
+    /// What this open's catalog prewarm read (r12-catload instrument); `None` for a store that did
+    /// not recover a catalog.
+    pub(crate) fn catalog_prewarm(&self) -> Option<PrewarmStats> {
+        let inner = self.inner.lock();
+        inner.cat.as_ref().map(|c| c.catalog.prewarm)
     }
 
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
