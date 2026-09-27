@@ -1826,7 +1826,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                  trunk_slots_in_use={} wal_bytes={} trunk_blocking_per_cycle={:.4} \
                  gc_range_entries={} gc_examined={} gc_range_per_cycle={:.4} \
                  resolves_per_cycle={:.4} res_first_pc={:.4} res_again_clear_pc={:.4} res_again_other_pc={:.4} \
-                 branch_cache_clears_pc={:.4} olc_restarts={} olc_fallbacks={}",
+                 branch_cache_clears_pc={:.4} olc_restarts={} olc_fallbacks={} branch_clears_skipped_pc={:.4}",
                 t * c,
                 args.reads,
                 writes as f64 / cycles,
@@ -1852,6 +1852,8 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 d(start_stats.branch_cache_clears, s.branch_cache_clears) as f64 / cycles,
                 d(start_stats.k3_olc_restarts, s.k3_olc_restarts),
                 d(start_stats.k3_olc_fallbacks, s.k3_olc_fallbacks),
+                // WAL changes branch pagers kept their caches across (lane r12-branch-noclear).
+                d(start_stats.branch_cache_clears_skipped, s.branch_cache_clears_skipped) as f64 / cycles,
             );
             print_sites(n, t, draw, cycles, &before, &after);
             if !b.db.branch_trunk_reads_lockfree() {

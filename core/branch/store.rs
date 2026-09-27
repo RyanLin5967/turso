@@ -228,8 +228,11 @@ pub(crate) struct BranchStore {
     lock_timing: AtomicBool,
     /// Spin-then-park for the trunk's lock (see [`take`]); from `TURSO_K3_TRUNKSPIN` (ns) at construction.
     trunk_spin_ns: AtomicU64,
-    /// Observation only (amendment 8.2): branch pagers' page caches emptied by a WAL change.
+    /// Observation only (amendment 8.2): branch pagers' page caches emptied, for any cause.
     branch_cache_clears: CachePadded<AtomicU64>,
+    /// Observation only (lane r12-branch-noclear): WAL changes a branch pager saw at the start of a
+    /// read transaction and kept its cache across.
+    branch_cache_clears_skipped: CachePadded<AtomicU64>,
     /// F-K3: the trunk's retained versions, searchable without the trunk's lock (the same `Arc` as
     /// the trunk lineage's `shared`). `None` is F5's locked lookup.
     k3: Option<std::sync::Arc<SharedVersions>>,
@@ -1030,6 +1033,7 @@ impl BranchStore {
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
             branch_cache_clears: CachePadded::new(AtomicU64::new(0)),
+            branch_cache_clears_skipped: CachePadded::new(AtomicU64::new(0)),
             trunk_spin_ns: AtomicU64::new(match std::env::var("TURSO_K3_TRUNKSPIN") {
                 Err(std::env::VarError::NotPresent) => 0,
                 Ok(v) => v
@@ -1071,9 +1075,14 @@ impl BranchStore {
         )
     }
 
-    /// A branch pager's page cache was emptied because the WAL changed (observation only).
+    /// A branch pager's page cache was emptied (observation only).
     pub(crate) fn note_branch_cache_clear(&self) {
         self.branch_cache_clears.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A branch pager saw the WAL changed and kept its page cache (observation only).
+    pub(crate) fn note_branch_cache_clear_skipped(&self) {
+        self.branch_cache_clears_skipped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// How long a waiter for the trunk's lock spins before it blocks (PREREG amendment 5); 0: it
@@ -1560,6 +1569,8 @@ impl BranchStore {
             stats.work.trunk_lock_hold_ns = trunk.work.lock_hold_ns;
             stats.work.trunk_lock_blocking = trunk.work.lock_blocking;
             stats.branch_cache_clears = self.branch_cache_clears.load(Ordering::Relaxed);
+            stats.branch_cache_clears_skipped =
+                self.branch_cache_clears_skipped.load(Ordering::Relaxed);
         }
         for lock in self.shards.iter() {
             let shard = take(lock, self.timed(), None, 0);

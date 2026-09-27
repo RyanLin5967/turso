@@ -208,8 +208,11 @@ pub struct BranchStats {
     pub k3_olc_pool_in_use: u64,
     /// F-K3v: the most chunks (of 1,024 nodes) any one height's pool holds.
     pub k3_olc_max_class_chunks: u64,
-    /// Branch pagers' page caches emptied because the WAL changed (amendment 8.2).
+    /// Branch pagers' page caches emptied, for any cause (amendment 8.2). A WAL change no longer
+    /// empties one (lane r12-branch-noclear); a branch's own write rollback still does.
     pub branch_cache_clears: u64,
+    /// WAL changes a branch pager saw and kept its page cache across (lane r12-branch-noclear).
+    pub branch_cache_clears_skipped: u64,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }

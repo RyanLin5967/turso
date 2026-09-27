@@ -1524,10 +1524,11 @@ pub struct Pager {
     /// branch's page space and commits go to it, never to the WAL.
     branch: OnceLock<BranchBinding>,
     /// Observation only (lane r11-k3-trunklock amendment 8.2): for a branch pager, the pages it has
-    /// resolved, each with the count of WAL-change cache clears at its last resolve, so each resolve
-    /// can be classed as a first read, a re-read after a clear, or another re-read.
+    /// resolved, each with the count of cache clears at its last resolve, so each resolve can be
+    /// classed as a first read, a re-read after a clear, or another re-read.
     branch_resolve_log: Mutex<rustc_hash::FxHashMap<u32, u64>>,
-    /// WAL-change cache clears of this pager (counted for branch pagers only).
+    /// Cache clears of this pager, for any cause (counted for branch pagers only). A WAL change no
+    /// longer clears a branch's cache (see `begin_read_tx`).
     branch_cache_clears: AtomicU64,
 }
 
@@ -3138,9 +3139,16 @@ impl Pager {
         let changed = wal.begin_read_tx()?;
         if changed {
             if let Some(branch) = self.branch.get() {
-                // Observation only (amendment 8.2): a branch's cache emptied by a trunk commit.
-                self.branch_cache_clears.fetch_add(1, Ordering::Relaxed);
-                branch.store.note_branch_cache_clear();
+                // A branch keeps its cache (lane r12-branch-noclear): a WAL change is a trunk
+                // commit or checkpoint, and neither changes what a branch sees. A trunk write
+                // retains the version a live branch sees before it reaches the WAL
+                // (`BranchStore::first_write_trunk`), paths that rewrite trunk pages without that
+                // decision are refused while branches exist, and the branch's own writes come
+                // through this pager alone (one connection per branch). So every page cached here,
+                // and the schema cookie read from its page 1, is still the branch's. This is the
+                // snapshot reader's rule; SQLite's change counter below is the trunk's.
+                branch.store.note_branch_cache_clear_skipped();
+                return Ok(());
             }
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
@@ -5459,6 +5467,11 @@ impl Pager {
     }
 
     pub fn clear_page_cache(&self, clear_dirty: bool) {
+        if let Some(branch) = self.branch.get() {
+            // Observation only (amendment 8.2): a branch's cache emptied, for any cause.
+            self.branch_cache_clears.fetch_add(1, Ordering::Relaxed);
+            branch.store.note_branch_cache_clear();
+        }
         self.invalidate_all_cursors();
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();

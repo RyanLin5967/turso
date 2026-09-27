@@ -277,3 +277,101 @@ fn a_branch_rollback_still_drops_the_pages_it_dirtied() {
         "the rolled-back write reached the branch"
     );
 }
+
+/// `rows`, retrying a statement that found the shared WAL's read lock busy: contention between
+/// connections, not a verdict.
+fn rows_retrying(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+    for _ in 0..10_000 {
+        match conn
+            .prepare(sql)
+            .and_then(|mut stmt| stmt.run_collect_rows())
+        {
+            Ok(rows) => return rows,
+            Err(LimboError::Busy | LimboError::BusySnapshot) => std::thread::yield_now(),
+            Err(e) => panic!("{sql}: {e}"),
+        }
+    }
+    panic!("{sql}: still Busy after 10,000 attempts");
+}
+
+/// Under a trunk that commits continuously, a branch connection keeps its cache across every one
+/// of those commits and still reads its fork in every statement: the pages it resolves for the
+/// first time are read at a WAL snapshot that moves under it, the pages it holds stay the fork's,
+/// and its cache is never emptied.
+#[test]
+fn a_branch_reads_its_fork_in_every_statement_while_the_trunk_commits_concurrently() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let db = db.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let conn = db.connect().unwrap();
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            let mut commits = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let id = (rng % ROWS as u64) as i64 + 1;
+                match conn.execute(format!("UPDATE t SET v = 'w{commits}' WHERE id = {id}")) {
+                    Ok(()) => commits += 1,
+                    Err(LimboError::Busy | LimboError::BusySnapshot) => std::thread::yield_now(),
+                    Err(e) => panic!("trunk writer: {e}"),
+                }
+            }
+            commits
+        })
+    };
+
+    let before = db.branch_stats();
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    for read in 0..2_000 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let id = (rng % ROWS as u64) as i64 + 1;
+        let r = rows_retrying(&bc, &format!("SELECT v FROM t WHERE id = {id}"));
+        assert_eq!(
+            r.len(),
+            1,
+            "statement {read}: row {id} must exist exactly once"
+        );
+        match &r[0][0] {
+            Value::Text(t) => assert_eq!(
+                t.as_str(),
+                original(id),
+                "statement {read}: the branch read row {id} as the trunk rewrote it"
+            ),
+            other => panic!("row {id}: expected text, got {other:?}"),
+        }
+    }
+    stop.store(true, Ordering::Release);
+    let commits = writer.join().unwrap();
+    let after = db.branch_stats();
+
+    let kept = after.branch_cache_clears_skipped - before.branch_cache_clears_skipped;
+    assert!(
+        commits > 0 && kept > 0,
+        "nothing was tested: {commits} trunk commits, {kept} WAL changes seen by the branch"
+    );
+    assert_eq!(
+        after.branch_cache_clears, before.branch_cache_clears,
+        "the branch's cache was emptied during the run ({kept} WAL changes kept across)"
+    );
+    let all = rows_retrying(&bc, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(all.len(), ROWS as usize);
+    for row in all {
+        let id = row[0].as_int().expect("integer id");
+        match &row[1] {
+            Value::Text(t) => assert_eq!(t.as_str(), original(id), "row {id} at the end"),
+            other => panic!("row {id}: expected text, got {other:?}"),
+        }
+    }
+}
