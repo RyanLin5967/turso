@@ -895,7 +895,8 @@ fn main() {
             interleave_arm(&mut b, n);
         } else {
             let cache = b.args.cache_size.unwrap_or_else(|| die("--capscan needs --cache-size"));
-            capscan_arm(&mut b, b.args.capscan.unwrap(), cache, n);
+            let rows = b.args.capscan.unwrap();
+            capscan_arm(&mut b, rows, cache, n);
         }
         let end = db.branch_stats();
         if end.live_branches != 0 || end.arena_slots_in_use != 0 {
