@@ -1620,4 +1620,172 @@ mod tests {
             Ok(_) => replica.digest(&rtrunk) != store.digest(&img),
         }
     }
+
+    /// A committed page holding exactly `bytes`.
+    fn page_from(page: u32, bytes: &[u8]) -> PageRef {
+        let p = Arc::new(crate::storage::pager::Page::new(i64::from(page)));
+        let buffer = Arc::new(crate::Buffer::new_temporary(PAGE));
+        buffer.as_mut_slice().copy_from_slice(bytes);
+        p.get().buffer = Some(buffer);
+        p
+    }
+
+    /// Commit `bytes` as `page` on branch `id` in one write transaction.
+    fn write_page(store: &BranchStore, id: crate::branch::BranchId, page: u32, pre: &[u8], bytes: &[u8]) {
+        store.begin_write(id).unwrap();
+        store.first_write_branch(id, page, pre).unwrap();
+        store.commit_pages(id, &[page_from(page, bytes)]).unwrap();
+        store.end_write(id);
+    }
+
+    /// The stream's writer: records whether the store lock was free at each write, and, the first
+    /// time it is, changes the store under the running send (a fork that writes, a reap, and an
+    /// in-place rewrite of the page the send serialises last).
+    struct Probe<'a> {
+        store: &'a BranchStore,
+        buf: Vec<u8>,
+        free: u64,
+        held: u64,
+        mutated: bool,
+        victim: crate::branch::BranchId,
+        last: crate::branch::BranchId,
+    }
+
+    impl Write for Probe<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            match self.store.inner.try_lock() {
+                None => self.held += 1,
+                Some(guard) => {
+                    drop(guard);
+                    self.free += 1;
+                    if !self.mutated {
+                        self.mutated = true;
+                        let d = self.store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                        write_page(self.store, d, 3, &image(0), &image(4242));
+                        self.store.release_handle(self.victim);
+                        write_page(self.store, self.last, 1, &image(0), &image(9999));
+                    }
+                }
+            }
+            self.buf.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// R1 (PREREG A5, F-S1): a send holds no store lock while it serialises, and ships the state
+    /// it started from even though the store changes under it. The stream is made larger than the
+    /// sink's 1 MiB buffer so that the writer runs while records are still being produced.
+    #[test]
+    fn a_send_runs_without_the_store_lock_and_ships_the_state_it_started_from() {
+        let store = BranchStore::new();
+        store.enable_shipping().unwrap();
+        let trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut ids = Vec::new();
+        // 3,000 states × 6 pages of 64 B: about 1.4 MB of slot records.
+        for k in 0..3000u64 {
+            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+            for page in 1..=PAGES {
+                write_page(&store, id, page, &image(0), &image(10_000 + k * 8 + u64::from(page)));
+            }
+            ids.push(id);
+        }
+        let img = trunk_image(&trunk);
+        let want = store.digest(&img);
+        let mut probe = Probe {
+            store: &store,
+            buf: Vec::new(),
+            free: 0,
+            held: 0,
+            mutated: false,
+            victim: ids[0],
+            last: *ids.last().unwrap(),
+        };
+        store
+            .send(SendMode::FullFix, None, &img, false, Plant::None, true, Some(&mut probe))
+            .unwrap();
+        let (free, held, mutated, buf) = (probe.free, probe.held, probe.mutated, probe.buf);
+        assert!(
+            held == 0 && free >= 2 && mutated,
+            "the send held the store lock at {held} of {} writes",
+            free + held
+        );
+        let replica = BranchStore::new();
+        let (mut rtrunk, mut at) = (TrunkImage::empty(PAGE), None);
+        replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false).unwrap();
+        assert_eq!(
+            replica.digest(&rtrunk),
+            want,
+            "the stream carried changes made after the send began"
+        );
+    }
+
+    /// R2 (PREREG A5, the refuter's point): with deltas on, every branch page travels as a
+    /// run-diff against its FORK BASE, and the replica decodes it. The trunk rewrites the page after
+    /// the fork, so the same-path base (the trunk's current page) is all different and only the fork
+    /// base is close.
+    #[test]
+    fn a_delta_stream_encodes_each_page_against_its_fork_base_and_the_replica_decodes_it() {
+        let store = BranchStore::new();
+        store.enable_shipping().unwrap();
+        // Trunk pages as explicit bytes; image page 2 is `tpages[1]`.
+        let mut tpages: Vec<Vec<u8>> = (0..PAGES).map(|p| image(u64::from(p) + 1)).collect();
+        for k in 0..20u8 {
+            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+            let mut bytes = tpages[1].clone();
+            bytes[5] = k;
+            bytes[40] = k ^ 0x55;
+            write_page(&store, id, 2, &tpages[1], &bytes);
+            // The trunk edits page 2 after this fork; the child keeps the version it forked from.
+            store.first_write_trunk(2, &tpages[1]);
+            tpages[1][20] = k.wrapping_add(100);
+            tpages[1][60] = k;
+        }
+        let img = TrunkImage::new(PAGE, tpages.concat());
+        let want = store.digest(&img);
+        let mut buf = Vec::new();
+        let rep = store
+            .send(SendMode::FullFix, None, &img, true, Plant::None, true, Some(&mut buf))
+            .unwrap();
+        assert_eq!(
+            rep.payload_shipped, rep.payload_delta_fork,
+            "the stream's payloads are not the fork-base deltas: {rep:?}"
+        );
+        assert!(rep.payload_delta_fork < rep.payload_raw / 2, "{rep:?}");
+        let replica = BranchStore::new();
+        let (mut rtrunk, mut at) = (TrunkImage::empty(PAGE), None);
+        replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false).unwrap();
+        assert_eq!(replica.digest(&rtrunk), want, "the replica decoded the deltas wrongly");
+    }
+
+    /// R3 (PREREG A5, F-S2 bound; green at the base too, see A5): after one state changes among
+    /// K, an incremental send's visits are bounded by a constant, not by K.
+    #[test]
+    fn an_incremental_after_one_change_among_many_states_visits_a_bounded_number_of_things() {
+        for k in [200u64, 2000] {
+            let store = BranchStore::new();
+            store.enable_shipping().unwrap();
+            let trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+            let mut ids = Vec::new();
+            for i in 0..k {
+                let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                write_page(&store, id, 1, &image(0), &image(20_000 + i));
+                ids.push(id);
+            }
+            let img = trunk_image(&trunk);
+            let mut buf = Vec::new();
+            let full = store
+                .send(SendMode::FullFix, None, &img, false, Plant::None, true, Some(&mut buf))
+                .unwrap();
+            write_page(&store, ids[(k / 2) as usize], 1, &image(0), &image(77));
+            let rep = store
+                .send(SendMode::IncrFix, Some(full.to), &img, false, Plant::None, true, None)
+                .unwrap();
+            let visits = rep.states_visited + rep.entries_visited + rep.slots_visited + rep.index_visited;
+            assert!(visits <= 64, "k = {k}: an incremental after one change visited {visits}: {rep:?}");
+            assert_eq!((rep.state_records, rep.slot_records), (1, 1), "k = {k}: {rep:?}");
+        }
+    }
 }
