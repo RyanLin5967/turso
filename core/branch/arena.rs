@@ -52,6 +52,7 @@ impl Arena {
             self.set_free_bit(slot, false);
             return slot;
         }
+        turso_assert!(self.high_water < Slot::MAX, "an arena domain is out of slots");
         let slot = self.high_water;
         let chunk = slot as usize / SLOTS_PER_CHUNK;
         if chunk == self.chunks.len() {

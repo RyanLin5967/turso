@@ -86,7 +86,7 @@ fn set(conn: &Arc<Connection>, id: i64, v: &str) {
         .unwrap();
 }
 
-fn in_use(db: &Database) -> BTreeSet<u32> {
+fn in_use(db: &Database) -> BTreeSet<u64> {
     db.branch_slots_in_use().into_iter().collect()
 }
 

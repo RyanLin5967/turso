@@ -132,7 +132,7 @@ use std::time::Instant;
 
 use crossbeam_utils::CachePadded;
 
-use super::arena::{Arena, Slot};
+use super::arena::{Arena, Slot as Local};
 use super::page_map::PageMap;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
@@ -150,10 +150,13 @@ const SHARDS_FINE: usize = 1024;
 /// The arena domain of the trunk's retained versions. Shard `i` allocates from domain `i`. The same number for
 /// either stripe count, so the slot layout does not depend on the arm.
 const TRUNK_DOMAIN: usize = SHARDS_FINE;
-/// A slot carries its domain in its top bits and the domain arena's own slot number below them.
-/// Up to 1025 domains need 11 bits, which leaves 2^21 slots per domain, and no global slot reaches
-/// `u32::MAX` (the page map's empty marker). (Before FM: 7 and 25.)
-const LOCAL_BITS: u32 = 21;
+/// A slot names one page-sized arena slot store-wide: its domain in the high 32 bits and the domain arena's own
+/// slot number ([`Local`], a `u32`) in the low 32. Every domain holds `u32::MAX` slots in every arm, and no slot
+/// reaches `u64::MAX` (the page map's empty marker). r11-coherence amendment 29: FM had packed both into a `u32` as
+/// 11 domain bits and 21 local bits (7 and 25 before it), so a store with 2^21 + 1 trunk versions retained for live
+/// children, or one shard with 2^21 + 1 branch pages, fired the domain's out-of-slots assert.
+pub(crate) type Slot = u64;
+const LOCAL_BITS: u32 = 32;
 
 fn domain_of(slot: Slot) -> usize {
     (slot >> LOCAL_BITS) as usize
@@ -383,9 +386,9 @@ impl Domain {
         Self { id, arena: None }
     }
 
-    fn local(&self, slot: Slot) -> Slot {
+    fn local(&self, slot: Slot) -> Local {
         crate::turso_assert!(domain_of(slot) == self.id, "an arena slot of another domain");
-        slot & ((1 << LOCAL_BITS) - 1)
+        (slot & ((1 << LOCAL_BITS) - 1)) as Local
     }
 
     fn arena(&self) -> &Arena {
@@ -394,8 +397,7 @@ impl Domain {
 
     fn alloc(&mut self, page_size: usize) -> Slot {
         let local = self.arena.get_or_insert_with(|| Arena::new(page_size)).alloc();
-        crate::turso_assert!(local < 1 << LOCAL_BITS, "an arena domain is out of slots");
-        ((self.id as u32) << LOCAL_BITS) | local
+        ((self.id as Slot) << LOCAL_BITS) | Slot::from(local)
     }
 
     fn release(&mut self, slot: Slot) {
@@ -427,11 +429,11 @@ impl Domain {
     }
 
     fn slots_in_use(&self) -> impl Iterator<Item = Slot> + '_ {
-        let id = (self.id as u32) << LOCAL_BITS;
+        let id = (self.id as Slot) << LOCAL_BITS;
         self.arena
             .iter()
             .flat_map(|a| a.slots_in_use())
-            .map(move |local| id | local)
+            .map(move |local| id | Slot::from(local))
     }
 
     fn is_free(&self, slot: Slot) -> bool {
@@ -1452,27 +1454,27 @@ impl BranchStore {
         stats
     }
 
-    pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
+    pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<Slot> {
         let shard = self.shard(id);
         let Some(st) = shard.branches.get(&id) else {
             return Vec::new();
         };
-        let mut slots: Vec<u32> = st.current.values().map(|o| o.slot).collect();
+        let mut slots: Vec<Slot> = st.current.values().map(|o| o.slot).collect();
         for versions in st.lineage.retained.values() {
             slots.extend(versions.values().map(|v| v.slot));
         }
         slots
     }
 
-    pub(crate) fn slots_in_use(&self) -> Vec<u32> {
-        let mut slots: Vec<u32> = self.trunk(TrunkSite::Observe).domain.slots_in_use().collect();
+    pub(crate) fn slots_in_use(&self) -> Vec<Slot> {
+        let mut slots: Vec<Slot> = self.trunk(TrunkSite::Observe).domain.slots_in_use().collect();
         for lock in self.shards.iter() {
             slots.extend(take(lock, self.timed(), None).domain.slots_in_use());
         }
         slots
     }
 
-    pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
+    pub(crate) fn slot_is_free(&self, slot: Slot) -> bool {
         match domain_of(slot) {
             TRUNK_DOMAIN => self.trunk(TrunkSite::Observe).domain.is_free(slot),
             d if d < self.shards.len() => take(&self.shards[d], self.timed(), None).domain.is_free(slot),

@@ -342,7 +342,7 @@ impl Branch {
 
     /// The arena slots this branch currently owns or retains, for membership assertions.
     #[doc(hidden)]
-    pub fn owned_slots(&self) -> Vec<u32> {
+    pub fn owned_slots(&self) -> Vec<u64> {
         self.db.branches.owned_slots(self.id)
     }
 }
@@ -520,13 +520,13 @@ impl Database {
 
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
-    pub fn branch_slot_is_free(&self, slot: u32) -> bool {
+    pub fn branch_slot_is_free(&self, slot: u64) -> bool {
         self.branches.slot_is_free(slot)
     }
 
     /// Every arena slot currently owned or retained, for membership assertions.
     #[doc(hidden)]
-    pub fn branch_slots_in_use(&self) -> Vec<u32> {
+    pub fn branch_slots_in_use(&self) -> Vec<u64> {
         self.branches.slots_in_use()
     }
 

@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use super::arena::Slot;
+use super::store::Slot;
 
 const BITS: u32 = 5;
 const WIDTH: usize = 1 << BITS;
@@ -83,7 +83,7 @@ impl PageMap {
     /// Map `page` to `slot`, replacing any previous mapping. Every other version of this map —
     /// every clone taken before this call — keeps the mapping it had.
     pub(crate) fn insert(&mut self, page: u32, slot: Slot) {
-        crate::turso_assert!(slot != EMPTY, "arena slot u32::MAX is the page map's empty marker");
+        crate::turso_assert!(slot != EMPTY, "slot u64::MAX is the page map's empty marker");
         if self.root.is_none() {
             self.root = Some(Arc::new(Node::empty(0)));
             self.height = 0;
@@ -144,8 +144,8 @@ mod tests {
                     1 => (rng.next() % 5000) as u32,
                     _ => (rng.next() % u64::from(u32::MAX)) as u32,
                 };
-                map.insert(page, step);
-                model.insert(page, step);
+                map.insert(page, Slot::from(step));
+                model.insert(page, Slot::from(step));
             }
             versions.push((map, model));
         }
