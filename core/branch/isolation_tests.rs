@@ -496,3 +496,42 @@ fn with_z_the_last_trunk_close_leaves_the_wal_a_branch_statement_is_reading() {
     }
     crate::coherence::force_fixes_for_test(0);
 }
+
+/// r11-coherence Z (amendment 25, P25.4): as the first Z test, but the branch reads NOTHING before the last trunk close
+/// and the rewrite, so no page of the fork sits in the branch's page cache or in the store's shared trunk-page cache.
+/// Every byte it reads afterwards must come from the trunk's first-write pre-images in the arena or from the database
+/// file. The expected rows are written out, not read from the subject.
+#[test]
+fn with_z_a_branch_that_read_nothing_reads_its_fork_after_the_last_trunk_close_and_a_rewrite() {
+    for mask in [0, crate::coherence::FIX_UARC] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let expected: Vec<(i64, String)> = (1..=ROWS).map(|id| (id, original(id))).collect();
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        trunk.close().unwrap();
+        drop(trunk);
+        assert_eq!(
+            wal_len(&dir) == 0,
+            mask != 0,
+            "mask {mask}: premise: the last trunk close truncates the WAL with Z and not without"
+        );
+        let t2 = db.connect().unwrap();
+        t2.execute("BEGIN").unwrap();
+        for id in 1..=ROWS {
+            set(&t2, id, "after-the-close");
+        }
+        t2.execute("COMMIT").unwrap();
+        assert_eq!(value(&t2, 7), "after-the-close", "mask {mask}: premise: the trunk rewrote the rows");
+        assert_eq!(all_rows(&bc, "open branch after the rewrite"), expected, "mask {mask}: the branch saw the rewrite");
+        bc.close().unwrap();
+        drop(bc);
+        let bc2 = b.connect().unwrap();
+        assert_eq!(all_rows(&bc2, "fresh branch after the rewrite"), expected, "mask {mask}: a fresh branch connection saw the rewrite");
+        drop((bc2, t2));
+        drop(b);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
