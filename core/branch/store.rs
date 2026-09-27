@@ -722,11 +722,12 @@ impl BranchStore {
     }
 
     /// Arm P: read the fields of `id`'s table entry, so the next reap of it finds the entry in
-    /// cache. Returns a value derived from them (0 if `id` is gone), for the caller to keep.
+    /// cache. Returns a value derived from them with the top bit set (0 only if `id` is gone), for
+    /// the caller to keep.
     pub(crate) fn touch(&self, id: BranchId) -> u64 {
         let inner = self.inner.lock();
         inner.branches.get(&id).map_or(0, |st| {
-            st.fork_epoch ^ st.parent.0 ^ st.current.len() as u64 ^ u64::from(st.handle)
+            (st.fork_epoch ^ st.parent.0 ^ st.current.len() as u64 ^ u64::from(st.handle)) | 1 << 63
         })
     }
 
