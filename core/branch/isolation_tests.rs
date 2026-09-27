@@ -805,7 +805,7 @@ fn judge_refusal_gap(
         (Ok(_), Ok(())) => panic!("mask {mask}: a fork landed in {what}'s gap, and {what} still ran"),
         (Ok(b), Err(e)) => {
             assert!(
-                e.to_string().contains("while branches of this database exist"),
+                e.to_string().contains("while branches of this database exist") || matches!(e, LimboError::Busy),
                 "mask {mask}: {what} refused for another reason: {e}"
             );
             let bc = b.connect().unwrap();
@@ -929,6 +929,67 @@ fn a_fork_before_the_journal_switch_publishes_and_the_switch_never_both_succeed(
         );
         assert!(ran, "mask {mask}: premise: the switch wrote its header and reached the hook before publishing");
         judge_refusal_gap(mask, "the journal-mode switch", fork, switch, &expected, false);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// r11-coherence round 12, VACUUM item (fix side), the reverse order the same-thread hook cannot reach (review finding
+/// 7): a fork on ANOTHER thread already holds its lock (the WAL write lock, or the fork gate as a reader) when the
+/// page-rewriting operation starts, so the operation must wait for it or refuse (Busy). Under G the journal-mode
+/// switch's write transaction waits in the gate's write_raw until the fork leaves; asked again then, the branch
+/// question must see the fork's branch. The fork holds its lock for 300 ms inside a hook.
+fn fork_holding_its_lock_while(stmt: &'static str, mask: u32) {
+    crate::coherence::force_fixes_for_test(mask);
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    if stmt == "VACUUM" {
+        trunk.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
+    }
+    let expected: Vec<(i64, String)> = if stmt == "VACUUM" {
+        (1..=ROWS).filter(|id| id % 2 == 1).map(|id| (id, original(id))).collect()
+    } else {
+        (1..=ROWS).map(|id| (id, original(id))).collect()
+    };
+    let forker = db.connect().unwrap();
+    let inside = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fork_thread = {
+        let inside = inside.clone();
+        std::thread::spawn(move || {
+            crate::coherence::force_fixes_for_test(mask);
+            crate::storage::pager::set_branch_refusal_gap_hook_for_test(
+                crate::storage::pager::RefusalGap::ForkInsideLock,
+                Box::new(move || {
+                    inside.store(true, std::sync::atomic::Ordering::Release);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }),
+            );
+            let fork = forker.fork_branch();
+            crate::storage::pager::clear_branch_refusal_gap_hook_for_test();
+            fork
+        })
+    };
+    while !inside.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let result = trunk.execute(stmt);
+    let fork = fork_thread.join().unwrap();
+    assert!(fork.is_ok(), "mask {mask}: premise: the fork on the other thread failed: {:?}", fork.as_ref().err());
+    judge_refusal_gap(mask, stmt, Some(fork), result, &expected, true);
+}
+
+#[test]
+fn a_journal_switch_started_while_a_fork_holds_its_lock_and_the_fork_never_both_succeed() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        fork_holding_its_lock_while("PRAGMA journal_mode = 'mvcc'", mask);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+#[test]
+fn a_vacuum_started_while_a_fork_holds_its_lock_and_the_fork_never_both_succeed() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        fork_holding_its_lock_while("VACUUM", mask);
     }
     crate::coherence::force_fixes_for_test(0);
 }

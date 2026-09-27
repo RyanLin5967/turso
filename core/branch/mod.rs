@@ -468,6 +468,8 @@ impl Connection {
         // switch could complete in between. The switch publishes its new mode before releasing the write transaction
         // this fork's lock needs, so asked again here, under that lock, the answer is current.
         check_forkable(&self.db, pager)?;
+        #[cfg(test)]
+        crate::storage::pager::run_branch_refusal_gap_hook(crate::storage::pager::RefusalGap::ForkInsideLock);
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;

@@ -92,6 +92,8 @@ pub(crate) enum RefusalGap {
     BeforePublish,
     /// A trunk fork: after its first `check_forkable`, before it takes the WAL write lock or the fork gate.
     ForkBeforeLock,
+    /// A trunk fork: holding its lock (the WAL write lock, or the fork gate), after its re-check.
+    ForkInsideLock,
 }
 
 /// Tests (r11-coherence round 12, VACUUM item): run `f` once, on this thread, right after a page-rewriting operation's
