@@ -689,7 +689,11 @@ impl Journal {
         let replayable = |log_gen: u64| log_gen == generation || (catalog_store && log_gen < generation);
         match header {
             Some((log_ps, log_gen)) if replayable(log_gen) => {
-                if log_ps != page_size {
+                // An older-generation catalog log may carry the page size the store had before a
+                // restart whose checkpoint committed the new one and whose log cut did not happen
+                // (merge 1b(ii) review F2). Frames do not depend on the page size; it is checked
+                // after the cut below, where nothing may follow such a checkpoint's marker.
+                if log_ps != page_size && log_gen == generation {
                     return Err(corrupt("log and snapshot disagree on the page size"));
                 }
                 let mut pos = LOG_HEADER_LEN;
@@ -775,6 +779,14 @@ impl Journal {
                             pos
                         }
                     };
+                    if log_ps != page_size && !records.is_empty() {
+                        // A restart runs on an empty store and fail-stops if its log cut fails,
+                        // so no record can follow its checkpoint at the old page size.
+                        return Err(corrupt(
+                            "records follow a page-size restart's checkpoint in a log of the old \
+                             page size",
+                        ));
+                    }
                     journal.generation = log_gen;
                     journal.rewrite_from(cut as u64, generation)?;
                 }
@@ -823,6 +835,12 @@ impl Journal {
     /// failpoint. It fails INSIDE `compact`, where a real sync failure would.
     pub(crate) fn fail_next_compact_arena_sync(&mut self) {
         self.fail_next_compact_arena_sync = true;
+    }
+
+    /// Spend the `CompactArenaSyncFails` failpoint, for a compaction that syncs the arena itself: a
+    /// catalog store's sharp checkpoint (merge 1b(ii) review F4). Whether it was armed.
+    pub(crate) fn take_compact_arena_sync_failpoint(&mut self) -> bool {
+        std::mem::take(&mut self.fail_next_compact_arena_sync)
     }
 
     pub(crate) fn page_size(&self) -> usize {
@@ -1473,6 +1491,21 @@ fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
                     format!("cannot lock branch log {}: {err}", path.display())
                 },
             ));
+        }
+        // The path must still name the file just locked (merge 1b(ii) review F3): a catalog
+        // store's log cut renames a new file over the log, so a descriptor opened before that
+        // rename holds a file no store uses any more, and a lock on it guards nothing.
+        use std::os::unix::fs::MetadataExt;
+        let held = file
+            .metadata()
+            .map_err(|e| io_error(e, "stat locked branch file"))?;
+        let named = std::fs::metadata(path).map_err(|e| io_error(e, "stat branch file"))?;
+        if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(LimboError::LockingError(format!(
+                "branch log {} was replaced while it was being opened (another branch store \
+                 rewrote it); open the database again",
+                path.display()
+            )));
         }
     }
     #[cfg(not(unix))]

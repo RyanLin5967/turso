@@ -298,6 +298,17 @@ impl Drop for Publishing<'_> {
             }
         }
         inner.publishing -= 1;
+        if inner.publishing == 0 {
+            // The last commit between its holds: a compaction refused meanwhile runs now, and the
+            // commits waiting for it go on (merge 1b(ii) review F6). Not from a panicking hold:
+            // the journal is fail-stopped, and a waiter's own check finds that.
+            if inner.compaction_deferred && !std::thread::panicking() {
+                self.0.maybe_compact(&mut inner);
+            }
+            let (count, drained) = &self.0.drained;
+            *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            drained.notify_all();
+        }
     }
 }
 
@@ -397,6 +408,9 @@ pub(crate) struct BranchStore {
     /// Test hook (merge 1b(ii) review F6): while it holds `HOLD_BETWEEN_MAP_HOLDS`, a commit that
     /// maps in more than two holds waits before its third, with no lock held.
     publish_hold: AtomicU8,
+    /// Times `publishing` drained to 0, and a condvar signalled then (merge 1b(ii) review F6): a
+    /// commit waiting behind a deferred compaction waits on it.
+    drained: (std::sync::Mutex<u64>, std::sync::Condvar),
     /// Live children of the trunk. Read without the lock on every trunk first-write so that a
     /// database with no branches pays one atomic load per written page and nothing else.
     ///
@@ -580,6 +594,10 @@ struct StoreInner {
     publishing: u32,
     /// `MaybeCompactBetweenMapHolds`: the automatic check runs as if the log wanted compacting.
     force_compaction: bool,
+    /// The automatic check wanted a compaction while a commit was between its holds, and was
+    /// refused (merge 1b(ii) review F6): the commit that drains `publishing` to 0 runs it, and a
+    /// new commit waits for that before its first hold, so overlapping commits cannot starve it.
+    compaction_deferred: bool,
     /// The highest log sequence number of any early-released Release (a batch release, or an
     /// expiry pass riding on a fork's flight); 0 if none. A branch such a release kept alive — open
     /// at the time — is freed at its close, and those frees wait for this (review r12-merge1 R2).
@@ -1385,6 +1403,10 @@ struct Captured {
     arena: Option<std::fs::File>,
     lease_now: u64,
     fail_after_commit: bool,
+    /// Failpoints (merge 1b(ii) review F4): `CheckpointCommitFails`, and `CompactArenaSyncFails`
+    /// for the fuzzy writer's arena fsync.
+    fail_commit: bool,
+    fail_arena_sync: bool,
 }
 
 /// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
@@ -1406,7 +1428,7 @@ fn checkpoint_write(
     // Every slot the catalog is about to name must be durable first.
     if let Some(file) = cap.arena.as_ref() {
         *in_doubt = true;
-        sync_arena_in_group(group, file)?;
+        sync_arena_in_group(group, file, cap.fail_arena_sync)?;
         *in_doubt = false;
     }
     catalog.begin()?;
@@ -1450,6 +1472,11 @@ fn checkpoint_write(
     .and_then(|()| {
         pause_at(hold, HOLD_BEFORE_COMMIT);
         *in_doubt = true;
+        if cap.fail_commit {
+            return Err(LimboError::InternalError(
+                "failpoint: the branch catalog checkpoint's COMMIT failed".to_string(),
+            ));
+        }
         catalog.commit()?;
         *in_doubt = false;
         Ok(())
@@ -1467,8 +1494,17 @@ fn checkpoint_write(
 /// report durable); a failure of its own, or a panic, poisons the group as the slot is released. So
 /// no flight syncs the arena between this fsync's failure and the install's fail-stop, and the
 /// catalog never names pages a failed flight's fsync lost. The store mutex is not held here, and
-/// the slot's other holders never wait for the writer. Without a group, a plain fsync.
-fn sync_arena_in_group(group: Option<&Group>, file: &std::fs::File) -> Result<()> {
+/// the slot's other holders never wait for the writer. Without a group, a plain fsync. `fail`: the
+/// `CompactArenaSyncFails` failpoint, failing it as an I/O error would.
+fn sync_arena_in_group(group: Option<&Group>, file: &std::fs::File, fail: bool) -> Result<()> {
+    let fsync = || {
+        if fail {
+            return Err(LimboError::InternalError(
+                "failpoint: the fuzzy checkpoint's arena sync failed".to_string(),
+            ));
+        }
+        super::journal::fsync_file(file)
+    };
     /// Releases the slot on every exit; `ok` still false then poisons the group.
     struct FlightSlot<'a> {
         group: &'a Group,
@@ -1485,7 +1521,7 @@ fn sync_arena_in_group(group: Option<&Group>, file: &std::fs::File) -> Result<()
         }
     }
     let Some(group) = group else {
-        return super::journal::fsync_file(file);
+        return fsync();
     };
     {
         let mut g = group.state.lock().unwrap();
@@ -1498,7 +1534,7 @@ fn sync_arena_in_group(group: Option<&Group>, file: &std::fs::File) -> Result<()
         g.flushing = true;
     }
     let mut slot = FlightSlot { group, ok: false };
-    let synced = super::journal::fsync_file(file);
+    let synced = fsync();
     slot.ok = synced.is_ok();
     drop(slot);
     synced
@@ -1711,6 +1747,7 @@ impl BranchStore {
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             publish_hold: AtomicU8::new(0),
+            drained: (std::sync::Mutex::new(0), std::sync::Condvar::new()),
             trunk_children: AtomicUsize::new(0),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
@@ -1855,6 +1892,7 @@ impl BranchStore {
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             publish_hold: AtomicU8::new(0),
+            drained: (std::sync::Mutex::new(0), std::sync::Condvar::new()),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
             trunk_only: false,
@@ -1958,8 +1996,22 @@ impl BranchStore {
         inner.cat = Some(cat);
         // Replay, remembering every slot a record names (in use) and every slot its replay frees,
         // in order: the last word on each slot wins.
-        let t = Instant::now();
         let mut touched: HashMap<Slot, bool> = HashMap::new();
+        // The catalog's released branches were released as of its checkpoint, so they are
+        // collected HERE, at the checkpoint's place in the history, before the log's suffix is
+        // replayed. This process may have collected one after the checkpoint (at the close of its
+        // last connection, which writes no record), freed its slots, and let a later record name
+        // them: that record is then the last word on them. (Merge 1b(ii) review F1: they were
+        // collected after the replay, and those frees overrode the replay's "in use", so a slot
+        // a live branch committed into came back free.)
+        let t = Instant::now();
+        let mut freed = Vec::new();
+        stats.released_scanned = inner.collect_released(&mut freed)?;
+        for slot in freed {
+            touched.insert(slot, false);
+        }
+        stats.collect_ns = ns(t);
+        let t = Instant::now();
         for (pos, record) in recovered.records.iter().enumerate() {
             let pos = pos as u64;
             match record {
@@ -1985,9 +2037,11 @@ impl BranchStore {
             }
         }
         stats.replay_ns = ns(t);
+        // Anything the replay released and left resident (the catalog's own released branches were
+        // collected above; one retired then, with a live child, is only looked at again).
         let t = Instant::now();
         let mut freed = Vec::new();
-        stats.released_scanned = inner.collect_released(&mut freed)?;
+        stats.released_scanned += inner.collect_released(&mut freed)?;
         freed.append(&mut inner.deferred_freed);
         for slot in freed {
             touched.insert(slot, false);
@@ -1995,7 +2049,7 @@ impl BranchStore {
         if inner.parked.is_empty() {
             inner.named_at = HashMap::new();
         }
-        stats.collect_ns = ns(t);
+        stats.collect_ns += ns(t);
         // The arena: the catalog's free table as of the checkpoint, overridden by what the replay
         // touched, plus every untouched slot past the checkpoint's high-water mark (written by an
         // operation whose record never became durable, or never written at all).
@@ -2226,6 +2280,25 @@ impl BranchStore {
                 return;
             }
             inner.mature_frees(durable, HOLD_BATCH);
+        }
+    }
+
+    /// Wait, holding no lock, until `publishing` has drained to 0 since the count `seen` (read
+    /// under the store mutex); 60 s at most (a commit that never finishes is a bug, logged, not a
+    /// hang).
+    fn wait_drained(&self, seen: u64) {
+        let (count, drained) = &self.drained;
+        let mut n = count.lock().unwrap_or_else(|e| e.into_inner());
+        let started = Instant::now();
+        while *n == seen {
+            if started.elapsed() > Duration::from_secs(60) {
+                tracing::warn!("branch store: no commit drained in 60 s while a compaction waited");
+                return;
+            }
+            n = drained
+                .wait_timeout(n, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 
@@ -2643,18 +2716,23 @@ impl BranchStore {
     /// first, a bounded batch per call; then a capture under this mutex, and the write on a thread of
     /// its own.
     fn maybe_compact(&self, inner: &mut StoreInner) {
-        let wants =
-            inner.force_compaction || inner.journal.as_ref().is_some_and(|j| j.wants_compaction());
+        let wants = inner.force_compaction
+            || inner.compaction_deferred
+            || inner.journal.as_ref().is_some_and(|j| j.wants_compaction());
         if !wants {
             return;
         }
         // A commit between its holds has its record buffered and half its pages mapped: a
         // snapshot now would drop the record and keep half the commit, and a fuzzy capture would
-        // cover the record with half its pages. The last hold of that commit tries again.
+        // cover the record with half its pages. Remembered: the commit that drains `publishing`
+        // runs it (`Publishing`), and new commits wait for that (`publish`), so commits that keep
+        // overlapping cannot starve it (merge 1b(ii) review F6).
         if inner.publishing > 0 {
             inner.work.compactions_refused += 1;
+            inner.compaction_deferred = true;
             return;
         }
+        inner.compaction_deferred = false;
         if inner.cat.is_some() && fuzzy_checkpoints() {
             // Past twice the threshold with a checkpoint in flight: this operation waits for its
             // install once the mutex is released. Set only under the mutex while `flight` holds,
@@ -2824,10 +2902,16 @@ impl BranchStore {
         let poisoned = inner.journal.as_ref().is_some_and(Journal::is_poisoned);
         match &compacted {
             // Everything applied is durable: past the commit point a later failure (the catalog's
-            // lease floor, say) loses nothing (review 2 F1).
-            Ok(()) | Err(_) if advanced && !poisoned => {
+            // lease floor, a log cut, the directory sync after it) loses nothing (review 2 F1). If
+            // it left the journal fail-stopped, nothing after becomes durable: the group is
+            // poisoned once the waiters the compaction covers are released (merge 1b(ii) review
+            // F5, as a fuzzy checkpoint's install does).
+            _ if advanced => {
                 inner.work.compactions += 1;
                 self.land(lsn, true);
+                if poisoned {
+                    self.group.poison();
+                }
             }
             // Nothing was compacted (no catalog or arena yet): nothing more is durable.
             Ok(()) => self.land_unchanged(),
@@ -2895,15 +2979,22 @@ impl BranchStore {
             // log): no flight may be writing it. None can start while this holds the mutex.
             self.quiesce();
         }
-        inner.ensure_backing(page_size)?;
-        if restart {
-            // It did (it refuses otherwise): the empty snapshot supersedes everything buffered.
+        let committed = inner.committed_generation();
+        let backed = inner.ensure_backing(page_size);
+        if restart && inner.committed_generation() != committed {
+            // The restart's empty snapshot (or checkpoint) committed: it supersedes everything
+            // buffered, whatever failed after it (review 2 F1's commit point; merge 1b(ii) review
+            // F5). A failure after it fail-stopped the journal: then nothing more becomes durable.
             let lsn = inner.journal.as_ref().map_or(0, Journal::lsn);
             self.land(lsn, true);
+            if inner.poisoned() {
+                self.group.poison();
+            }
             // Deferred frees name slots of the arena the restart replaced: returned to the new one
             // they would free slots it never handed out.
             inner.pending_free.clear();
         }
+        backed?;
         self.mature(&mut inner);
         // The expiry pass rides on the fork's own flush (group commit, r11-churn amendment 2): the
         // same records in the same order as the pass's own flush followed by the fork's, made
@@ -3437,6 +3528,21 @@ impl BranchStore {
         // 1. The record.
         let lsn = {
             let mut inner = self.lock();
+            // A compaction refused while commits were between their holds waits for them to
+            // drain; this commit waits with it, before its first hold, so that they do drain
+            // (merge 1b(ii) review F6: commits that kept overlapping starved it). With none left
+            // between their holds, it runs here.
+            while inner.compaction_deferred {
+                if inner.publishing == 0 {
+                    self.maybe_compact(&mut inner);
+                    break;
+                }
+                inner.work.publish_gate_waits += 1;
+                let seen = *self.drained.0.lock().unwrap_or_else(|e| e.into_inner());
+                drop(inner);
+                self.wait_drained(seen);
+                inner = self.lock();
+            }
             self.mature(&mut inner);
             // Refuse BEFORE the record: after the journal failed, it can never be durable. The
             // slots stay reserved; the rollback that follows returns them.
@@ -4285,6 +4391,7 @@ impl StoreInner {
             hold_hist: [0; HOLD_HIST_BUCKETS],
             publishing: 0,
             force_compaction: false,
+            compaction_deferred: false,
             early_released: 0,
             expire_more: false,
         }
@@ -4825,7 +4932,17 @@ impl StoreInner {
             if let Some(journal) = self.journal.as_mut() {
                 journal.set_page_size(page_size);
             }
+            let committed = self.committed_generation();
             if let Err(e) = self.checkpoint_catalog(false, true) {
+                if self.committed_generation() != committed {
+                    // The catalog committed the new page size and the log was not cut to it: the
+                    // log and the arena in memory disagree with the catalog now. Fail-stop;
+                    // recovery reads the files, where the catalog decides (merge 1b(ii) review F2).
+                    if let Some(journal) = self.journal.as_mut() {
+                        journal.poison();
+                    }
+                    return Err(e);
+                }
                 if let (Some(journal), Some(old)) = (self.journal.as_mut(), old) {
                     journal.set_page_size(old);
                 }
@@ -4909,8 +5026,18 @@ impl StoreInner {
         // its writer, through the capture's handle, with no mutex held.)
         if let (Some(journal), Some(arena)) = (self.journal.as_mut(), self.arena.as_mut()) {
             journal.check_live()?;
+            // `CompactArenaSyncFails` (armed by `compact_now`) fails this sync as it fails a
+            // snapshot compaction's (merge 1b(ii) review F4).
+            let fail = journal.take_compact_arena_sync_failpoint();
             if self.sync {
-                match arena.sync() {
+                let synced = if fail {
+                    Err(LimboError::InternalError(
+                        "failpoint: the catalog checkpoint's arena sync failed".to_string(),
+                    ))
+                } else {
+                    arena.sync()
+                };
+                match synced {
                     Ok(bytes) => self.work.compact_locked_bytes += bytes,
                     Err(e) => {
                         journal.poison();
@@ -5081,6 +5208,13 @@ impl StoreInner {
             return Err(e);
         }
         cat.flight = true;
+        // Spent by this checkpoint, which now runs its write.
+        let fail_commit = self.failpoint == Some(BranchFailpoint::CheckpointCommitFails);
+        let fail_arena_sync = arena_file.is_some()
+            && self.failpoint == Some(BranchFailpoint::CompactArenaSyncFails);
+        if fail_commit || fail_arena_sync {
+            self.failpoint = None;
+        }
         // Moved whole (O(1) under the mutex; adopted from the quarantined c8552d0d2).
         let covered = if restart {
             VecDeque::new()
@@ -5108,6 +5242,8 @@ impl StoreInner {
             arena: arena_file,
             lease_now: now,
             fail_after_commit,
+            fail_commit,
+            fail_arena_sync,
         }))
     }
 
