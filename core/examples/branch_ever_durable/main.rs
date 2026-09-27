@@ -33,6 +33,10 @@
 //! default there): it opens the store in the F7 splice arm or not, and the kept-state model follows
 //! the same rule (the volatile harness's `--expect splice` or `--expect keep`). The header names it.
 //!
+//! In catalog mode each checkpoint also prints `# catshape`: the catalog file's pages, its free list,
+//! each table's rows and each B-tree's pages per level, root first (r11-ever amendment 19; the walk
+//! reads every catalog page, outside any timed window).
+//!
 //! With `--reopen`, after the last checkpoint every live branch is detached, every holder of the
 //! database is dropped, and the database is reopened (recovery loads the snapshot and replays the
 //! log): the harness asserts the same branch ids, the same arena slots in use and the same kept
@@ -590,6 +594,28 @@ fn main() {
             size_of(&path, "-branch-cat-wal"),
             rss_bytes(),
         );
+        // Amendment 19: where the catalog file's pages go (catalog stores only; reads every page).
+        if let Some(shape) = db.branch_catalog_shape().unwrap_or_else(|e| {
+            not_a_result(&format!("n_ever {ckpt}: the catalog shape is unreadable: {e}"))
+        }) {
+            let rows: Vec<String> = shape.rows.iter().map(|(t, n)| format!("{t}:{n}")).collect();
+            let trees: Vec<String> = shape
+                .trees
+                .iter()
+                .map(|(t, levels)| {
+                    let l: Vec<String> = levels.iter().map(|n| n.to_string()).collect();
+                    format!("{t}:{}", l.join("/"))
+                })
+                .collect();
+            println!(
+                "# catshape n_ever={ckpt} page_count={} freelist={} unaccounted={} rows={} trees={}",
+                shape.page_count,
+                shape.freelist_count,
+                shape.unaccounted,
+                rows.join(","),
+                trees.join(",")
+            );
+        }
         if stats.live_branches != kept.nodes.len() {
             not_a_result(&format!(
                 "n_ever {ckpt}: the store keeps {} branch states, the rule {}",

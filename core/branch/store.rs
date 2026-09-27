@@ -2273,6 +2273,16 @@ impl BranchStore {
         resident + others
     }
 
+    /// The catalog file's shape, read under the store's lock so no checkpoint writes it meanwhile
+    /// (r11-ever amendment 19; observation only).
+    pub(crate) fn catalog_shape(&self) -> Result<Option<super::CatalogShape>> {
+        let inner = self.inner.lock();
+        match inner.cat.as_ref() {
+            Some(c) => c.catalog.shape().map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Catalog statements that wrote a row, since open (r11-restart lane instrument).
     pub(crate) fn catalog_rows_written(&self) -> u64 {
         self.inner

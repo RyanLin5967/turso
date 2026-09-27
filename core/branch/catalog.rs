@@ -429,6 +429,95 @@ impl Catalog {
         Ok(Some(m))
     }
 
+    /// The file's shape (see `CatalogShape`): `PRAGMA page_count` and `freelist_count`, each
+    /// table's rows, and each B-tree's pages per level, walked from its root through the interior
+    /// pages' child pointers (SQLite's file format: an interior page, type 2 or 5, lists a left child
+    /// in the first four bytes of each cell and its right-most child at header offset 8; page 1's
+    /// header starts at byte 100). Pages are read through `sqlite_dbpage` on this connection, so the
+    /// WAL's latest versions count. Unprepared statements, outside `counters`: an instrument.
+    pub(crate) fn shape(&self) -> Result<super::CatalogShape> {
+        let bad = |what: String| LimboError::Corrupt(format!("branch catalog shape: {what}"));
+        let one_int = |sql: &str| -> Result<u64> {
+            let rows = self.conn.prepare(sql)?.run_collect_rows()?;
+            rows.first()
+                .and_then(|r| r.first())
+                .and_then(Value::as_int)
+                .map(|v| v as u64)
+                .ok_or_else(|| bad(format!("{sql} returned no integer")))
+        };
+        let page_count = one_int("PRAGMA page_count")?;
+        let freelist_count = one_int("PRAGMA freelist_count")?;
+        let mut rows = Vec::new();
+        for table in ["meta", "branch", "cur", "ret", "free"] {
+            rows.push((table.to_string(), one_int(&format!("SELECT count(*) FROM {table}"))?));
+        }
+        let mut roots = vec![("sqlite_schema".to_string(), 1u64)];
+        for row in self
+            .conn
+            .prepare("SELECT name, rootpage FROM sqlite_schema WHERE rootpage > 0 ORDER BY name")?
+            .run_collect_rows()?
+        {
+            match (row.first(), row.get(1).and_then(Value::as_int)) {
+                (Some(Value::Text(name)), Some(root)) => roots.push((name.as_str().to_string(), root as u64)),
+                _ => return Err(bad("an unreadable sqlite_schema row".to_string())),
+            }
+        }
+        let page = |pgno: u64| -> Result<Vec<u8>> {
+            let rows = self
+                .conn
+                .prepare(format!("SELECT data FROM sqlite_dbpage WHERE pgno = {pgno}"))?
+                .run_collect_rows()?;
+            rows.first()
+                .and_then(|r| r.first())
+                .and_then(Value::to_blob)
+                .map(|b| b.to_vec())
+                .ok_or_else(|| bad(format!("page {pgno} unreadable")))
+        };
+        let u16_at = |d: &[u8], at: usize| -> Result<usize> {
+            d.get(at..at + 2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+                .ok_or_else(|| bad(format!("a u16 past a page's end at {at}")))
+        };
+        let u32_at = |d: &[u8], at: usize| -> Result<u64> {
+            d.get(at..at + 4)
+                .map(|b| u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])))
+                .ok_or_else(|| bad(format!("a u32 past a page's end at {at}")))
+        };
+        let mut trees = Vec::new();
+        let mut in_trees = 0u64;
+        for (name, root) in roots {
+            let (mut levels, mut frontier) = (Vec::new(), vec![root]);
+            while !frontier.is_empty() {
+                levels.push(frontier.len() as u64);
+                in_trees += frontier.len() as u64;
+                let mut next = Vec::new();
+                for pgno in frontier {
+                    let d = page(pgno)?;
+                    let h = if pgno == 1 { 100 } else { 0 };
+                    match d.get(h).copied() {
+                        Some(0x02) | Some(0x05) => {
+                            for i in 0..u16_at(&d, h + 3)? {
+                                next.push(u32_at(&d, u16_at(&d, h + 12 + 2 * i)?)?);
+                            }
+                            next.push(u32_at(&d, h + 8)?);
+                        }
+                        Some(0x0A) | Some(0x0D) => {}
+                        other => return Err(bad(format!("page {pgno} of {name} has type {other:?}"))),
+                    }
+                }
+                frontier = next;
+            }
+            trees.push((name, levels));
+        }
+        Ok(super::CatalogShape {
+            page_count,
+            freelist_count,
+            rows,
+            trees,
+            unaccounted: page_count as i64 - in_trees as i64 - freelist_count as i64,
+        })
+    }
+
     pub(crate) fn begin(&mut self) -> Result<()> {
         self.conn.execute("BEGIN")?;
         Ok(())

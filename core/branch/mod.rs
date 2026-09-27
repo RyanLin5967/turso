@@ -336,6 +336,24 @@ pub struct BranchOpenStats {
     pub parked_applied: u64,
 }
 
+/// The catalog file's shape (r11-ever amendment 19): what its pages hold, so a size can be
+/// attributed to rows, tree levels or the free list. Observation only; it reads every page of the
+/// catalog, so it is an instrument for a harness's checkpoints, never a store path.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogShape {
+    /// Pages in the catalog file, and on its free list (SQLite's header count: trunks and leaves).
+    pub page_count: u64,
+    pub freelist_count: u64,
+    /// Rows per table.
+    pub rows: Vec<(String, u64)>,
+    /// Pages per B-tree level, root first, per table and index (`sqlite_schema` first).
+    pub trees: Vec<(String, Vec<u64>)>,
+    /// `page_count` less the trees' pages and the free list: overflow pages, or a tree this walk
+    /// did not reach. 0 when the ledger closes.
+    pub unaccounted: i64,
+}
+
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
@@ -586,6 +604,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_catalog_rows_written(&self) -> u64 {
         self.branches.catalog_rows_written()
+    }
+
+    /// The catalog file's shape (see [`CatalogShape`]); `None` for a store that is not a catalog
+    /// store or has no catalog yet. Reads every catalog page.
+    #[doc(hidden)]
+    pub fn branch_catalog_shape(&self) -> Result<Option<CatalogShape>> {
+        self.branches.catalog_shape()
     }
 
     /// `(resolve calls, arena slot reads)` since open (r11-restart lane instrument).

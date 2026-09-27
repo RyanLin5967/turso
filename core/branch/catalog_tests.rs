@@ -799,3 +799,35 @@ fn a_catalog_with_a_torn_log_header_opens_only_in_its_own_arm() {
         assert!(open_at(&path, own).is_err(), "{what}: a catalog written before the port opened");
     }
 }
+
+/// Amendment 19's instrument, made to fire before it is trusted: the catalog shape's ledger closes
+/// (every page is a tree page or a free-list page) on a grown catalog, its row counts are the
+/// store's, and a mass reap moves pages onto the free list without shrinking the file (no
+/// auto_vacuum), so a freelist count of zero in the run is a reading, not a blind spot.
+#[test]
+fn the_catalog_shape_closes_its_ledger_and_sees_freed_pages() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    seed(&db.connect().unwrap());
+    let ids = grow(&db, 300);
+    db.branch_compact_now().unwrap();
+    let grown = db.branch_catalog_shape().unwrap().expect("a catalog store has a shape");
+    assert_eq!(grown.unaccounted, 0, "the ledger does not close: {grown:?}");
+    let rows = |s: &CatalogShape, t: &str| s.rows.iter().find(|(n, _)| n == t).map(|(_, n)| *n);
+    assert_eq!(rows(&grown, "branch"), Some(300), "{grown:?}");
+    assert_eq!(rows(&grown, "meta"), Some(9), "{grown:?}");
+    assert!(rows(&grown, "cur").unwrap() >= 300, "each branch wrote a page: {grown:?}");
+    let cur = grown.trees.iter().find(|(n, _)| n == "cur").expect("the cur table's tree");
+    assert_eq!(cur.1[0], 1, "a tree has one root: {grown:?}");
+    assert!(cur.1.len() >= 2, "premise: the cur table outgrew one page: {grown:?}");
+    for id in ids {
+        db.branch(id).unwrap().reap().unwrap();
+    }
+    db.branch_compact_now().unwrap();
+    let reaped = db.branch_catalog_shape().unwrap().unwrap();
+    assert_eq!(reaped.unaccounted, 0, "the ledger does not close: {reaped:?}");
+    assert_eq!(rows(&reaped, "branch"), Some(0), "{reaped:?}");
+    assert!(reaped.freelist_count > 0, "a mass delete freed no page: {reaped:?}");
+    assert_eq!(reaped.page_count, grown.page_count, "the file shrank without a vacuum: {reaped:?}");
+}
