@@ -98,6 +98,8 @@ struct Args {
     threads: Vec<usize>,
     lock_timing: bool,
     trunk_writer: bool,
+    /// `--writer-period-us`: the trunk writer's minimum interval between writes (lane r12-branch-noclear).
+    writer_period_us: u64,
     reads: usize,
     pin: bool,
 }
@@ -124,6 +126,7 @@ fn parse_args() -> Args {
         threads: Vec::new(),
         lock_timing: false,
         trunk_writer: false,
+        writer_period_us: 0,
         reads: 0,
         pin: false,
     };
@@ -170,6 +173,11 @@ fn parse_args() -> Args {
                 }
             }
             "--trunk-writer" => args.trunk_writer = true,
+            "--writer-period-us" => {
+                args.writer_period_us = val()
+                    .parse()
+                    .unwrap_or_else(|_| die("bad --writer-period-us"))
+            }
             "--pin" => args.pin = true,
             "--reads" => args.reads = val().parse().unwrap_or_else(|_| die("bad --reads")),
             "--victim" => {
@@ -210,6 +218,9 @@ fn parse_args() -> Args {
     }
     if args.pin && !args.trunk_writer {
         die("--pin needs --trunk-writer: without trunk writes no version is ever removed");
+    }
+    if args.writer_period_us > 0 && !args.trunk_writer {
+        die("--writer-period-us needs --trunk-writer");
     }
     args
 }
@@ -1296,6 +1307,8 @@ struct TrunkWriter {
     started: CachePadded<AtomicU64>,
     committed: CachePadded<AtomicU64>,
     stop: AtomicBool,
+    /// `--writer-period-us`: the least time between two writes' starts; zero paces by forks alone.
+    period: Duration,
 }
 
 /// `g` with `spread_row(g) = x` are `g ≡ (x - 1) · 37⁻¹ (mod TRUNK_ROWS)`; 37 · 12,973 = 480,001.
@@ -1484,10 +1497,21 @@ fn trunk_writer_thread(conn: &Arc<Connection>, w: &TrunkWriter, barrier: &Barrie
     let mut busy = 0u64;
     let mut in_cell = 0u64;
     barrier.wait();
+    let mut next = Instant::now();
     while !w.stop.load(Ordering::Acquire) {
         if in_cell >= w.forks.load(Ordering::Acquire) {
             std::thread::yield_now();
             continue;
+        }
+        if !w.period.is_zero() {
+            // At most one write per period (lane r12-branch-noclear's documented-rate arm); sleeps are
+            // short so a cell's end (`stop`) is seen within a millisecond.
+            let now = Instant::now();
+            if now < next {
+                std::thread::sleep((next - now).min(Duration::from_millis(1)));
+                continue;
+            }
+            next = now + w.period;
         }
         let g = w.started.load(Ordering::Relaxed);
         w.started.store(g + 1, Ordering::Release);
@@ -1565,6 +1589,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
         started: CachePadded::new(AtomicU64::new(0)),
         committed: CachePadded::new(AtomicU64::new(0)),
         stop: AtomicBool::new(false),
+        period: Duration::from_micros(args.writer_period_us),
     };
     if args.trunk_writer && !args.no_autocheckpoint {
         // Branch read transactions hold WAL read marks, so the trunk's auto-checkpoint cannot
@@ -1585,7 +1610,8 @@ fn arm_conc(b: &mut Bench, args: &Args) {
     };
     println!(
         "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={} \
-         trunk_writer={} reads={} k3_lockfree={} k3_mode={} pin={} trunk_spin_ns={}",
+         trunk_writer={} reads={} k3_lockfree={} k3_mode={} pin={} trunk_spin_ns={} \
+         branch_clear={} writer_period_us={}",
         args.threads,
         args.cycles,
         args.lock_timing,
@@ -1594,7 +1620,9 @@ fn arm_conc(b: &mut Bench, args: &Args) {
         b.db.branch_trunk_reads_lockfree(),
         b.db.branch_k3_mode(),
         args.pin,
-        std::env::var("TURSO_K3_TRUNKSPIN").unwrap_or_else(|_| "0".to_string())
+        std::env::var("TURSO_K3_TRUNKSPIN").unwrap_or_else(|_| "0".to_string()),
+        if b.db.branch_clear_always() { "always" } else { "keep" },
+        args.writer_period_us
     );
     println!("{CONC_HEADER}");
     let mut live: Vec<Live> = Vec::new();

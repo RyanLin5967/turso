@@ -566,6 +566,13 @@ impl Database {
         self.branches.k3_mode()
     }
 
+    /// Whether branch pagers empty their cache on every WAL change (`TURSO_BRANCH_CLEAR=always` when
+    /// the database opened; lane r12-branch-noclear's timed arms). Observation only.
+    #[doc(hidden)]
+    pub fn branch_clear_always(&self) -> bool {
+        self.branches.branch_clear_always()
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {

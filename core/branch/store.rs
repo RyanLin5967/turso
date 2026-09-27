@@ -233,6 +233,9 @@ pub(crate) struct BranchStore {
     /// Observation only (lane r12-branch-noclear): WAL changes a branch pager saw at the start of a
     /// read transaction and kept its cache across.
     branch_cache_clears_skipped: CachePadded<AtomicU64>,
+    /// `TURSO_BRANCH_CLEAR=always` at construction: branch pagers empty their cache on every WAL change,
+    /// as before lane r12-branch-noclear, so one binary times both (PREREG amendment 10). Unset: they keep it.
+    branch_clear_always: bool,
     /// F-K3: the trunk's retained versions, searchable without the trunk's lock (the same `Arc` as
     /// the trunk lineage's `shared`). `None` is F5's locked lookup.
     k3: Option<std::sync::Arc<SharedVersions>>,
@@ -1034,6 +1037,12 @@ impl BranchStore {
             lock_timing: AtomicBool::new(false),
             branch_cache_clears: CachePadded::new(AtomicU64::new(0)),
             branch_cache_clears_skipped: CachePadded::new(AtomicU64::new(0)),
+            branch_clear_always: match std::env::var("TURSO_BRANCH_CLEAR") {
+                Err(std::env::VarError::NotPresent) => false,
+                Ok(v) if v.is_empty() || v == "keep" => false,
+                Ok(v) if v == "always" => true,
+                other => panic!("TURSO_BRANCH_CLEAR={other:?}: expected `keep` or `always`"),
+            },
             trunk_spin_ns: AtomicU64::new(match std::env::var("TURSO_K3_TRUNKSPIN") {
                 Err(std::env::VarError::NotPresent) => 0,
                 Ok(v) => v
@@ -1083,6 +1092,11 @@ impl BranchStore {
     /// A branch pager saw the WAL changed and kept its page cache (observation only).
     pub(crate) fn note_branch_cache_clear_skipped(&self) {
         self.branch_cache_clears_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether branch pagers empty their cache on every WAL change (`TURSO_BRANCH_CLEAR=always`).
+    pub(crate) fn branch_clear_always(&self) -> bool {
+        self.branch_clear_always
     }
 
     /// How long a waiter for the trunk's lock spins before it blocks (PREREG amendment 5); 0: it

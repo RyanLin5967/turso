@@ -3138,7 +3138,7 @@ impl Pager {
         };
         let changed = wal.begin_read_tx()?;
         if changed {
-            if let Some(branch) = self.branch.get() {
+            if let Some(branch) = self.branch.get().filter(|b| !b.store.branch_clear_always()) {
                 // A branch keeps its cache (lane r12-branch-noclear): a WAL change is a trunk
                 // commit or checkpoint, and neither changes what a branch sees. A trunk write
                 // retains the version a live branch sees before it reaches the WAL
