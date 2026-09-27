@@ -741,3 +741,80 @@ fn with_no_branch_vacuum_and_the_journal_mode_switch_still_run() {
     }
     crate::coherence::force_fixes_for_test(0);
 }
+
+/// r11-coherence round 12, the race amendment 25 left unmeasured: with Z, the last trunk close runs a TRUNCATE
+/// checkpoint while a branch connection on ANOTHER thread keeps beginning read transactions. `begin_read_tx` retries
+/// up to 100 times with backoff before it returns Busy (about 9.96 s by the constants, arithmetic). Over `ROUNDS`
+/// rounds this counts the branch's `begin_read_tx` calls that returned Busy, how many rounds truncated the WAL (the
+/// race exercised), and the slowest call, and prints them. The claim under test: no Busy.
+#[test]
+fn with_z_branch_read_begins_racing_the_last_trunk_close_never_return_busy() {
+    const ROUNDS: usize = 200;
+    let mask = crate::coherence::FIX_UARC;
+    crate::coherence::force_fixes_for_test(mask);
+    let (mut calls, mut busy, mut truncated, mut overlapped) = (0u64, 0u64, 0usize, 0usize);
+    let mut slowest = std::time::Duration::ZERO;
+    let mut lat: Vec<std::time::Duration> = Vec::new();
+    for round in 0..ROUNDS {
+        let (dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (stop, started, bc) = (stop.clone(), started.clone(), bc.clone());
+            std::thread::spawn(move || {
+                crate::coherence::force_fixes_for_test(mask);
+                let pager = bc.get_pager();
+                let (mut calls, mut busy) = (0u64, 0u64);
+                let mut lat = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let t = std::time::Instant::now();
+                    let r = pager.begin_read_tx();
+                    lat.push(t.elapsed());
+                    calls += 1;
+                    started.store(true, std::sync::atomic::Ordering::Release);
+                    match r {
+                        Ok(_) => pager.end_read_tx(),
+                        Err(LimboError::Busy) => busy += 1,
+                        Err(e) => panic!("round {round}: a branch read begin failed with {e}"),
+                    }
+                }
+                (calls, busy, lat)
+            })
+        };
+        while !started.load(std::sync::atomic::Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        trunk.close().unwrap();
+        drop(trunk);
+        let during = wal_len(&dir) == 0;
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let (c, bz, l) = reader.join().unwrap();
+        calls += c;
+        busy += bz;
+        if during {
+            truncated += 1;
+        }
+        if c > 1 {
+            overlapped += 1;
+        }
+        slowest = slowest.max(l.iter().copied().max().unwrap_or_default());
+        lat.extend(l);
+        drop((bc, b));
+    }
+    lat.sort();
+    let p = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
+    println!(
+        "r11-coherence begin_read_tx race: rounds {ROUNDS}, rounds that truncated the WAL {truncated}, rounds with more \
+         than one begin {overlapped}, begins {calls}, Busy {busy}, p50 {:?}, p99 {:?}, p99.9 {:?}, max {slowest:?}",
+        p(0.5),
+        p(0.99),
+        p(0.999)
+    );
+    assert!(truncated > 0, "premise: no round's last trunk close truncated the WAL, so the race never ran");
+    assert_eq!(busy, 0, "a branch read begin returned Busy while the last trunk close truncated the WAL");
+    crate::coherence::force_fixes_for_test(0);
+}
