@@ -2601,9 +2601,10 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
             d(before.trunk_sites.acquisitions[0], after.trunk_sites.acquisitions[0]) as f64 / cycles,
         );
         print_sites(n, t, draw, cycles, &before, &after);
-        if let Some(w) = &writer_out {
-            print_gate(&format!("N={n} T={t} draw={draw}"), w, &fork_gate, cycles);
-        }
+        // With no writer the writer's fields read zero and the forks' side is the no-writer control (r12-phasefair
+        // amendment 6 (c)): their gate holds, header reads and page-1 misses with no trunk commit.
+        let no_writer = WriterOut::default();
+        print_gate(&format!("N={n} T={t} draw={draw}"), writer_out.as_ref().unwrap_or(&no_writer), &fork_gate, cycles);
         if mode != ConcMode::Shared || !b.db.branch_trunk_reads_lockfree() {
             continue;
         }
