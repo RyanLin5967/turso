@@ -230,6 +230,10 @@ pub(crate) struct BranchStore {
     /// superseded (a savepoint rolled the write back, or it changed nothing), so no byte-identical
     /// arena page outlives the transaction (`TURSO_R11S_FS13=1`).
     fs13: AtomicBool,
+    /// FS10D (r11-sessions amendment 18b, base B): a page the sub-page store composes for a reader
+    /// (FS9 off) is handed back as a one-owner shared buffer, so an idle session drops it
+    /// (`TURSO_R11S_FS10D=1`).
+    fs10d: AtomicBool,
     /// FS9B (r11-sessions): serve inherited ancestor-branch versions by reference (`Arena::clones`).
     fs9b: AtomicBool,
 }
@@ -1055,6 +1059,7 @@ impl BranchStore {
             fs10_fill: AtomicBool::new(std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "2")),
             fs11: AtomicBool::new(std::env::var("TURSO_R11S_FS11").is_ok_and(|v| v == "1")),
             fs13: AtomicBool::new(std::env::var("TURSO_R11S_FS13").is_ok_and(|v| v == "1")),
+            fs10d: AtomicBool::new(std::env::var("TURSO_R11S_FS10D").is_ok_and(|v| v == "1")),
             fs9b: AtomicBool::new(fs9b_from_env()),
         }
     }
@@ -1100,6 +1105,10 @@ impl BranchStore {
 
     pub(crate) fn fs10(&self) -> bool {
         self.fs10.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_fs10d(&self, on: bool) {
+        self.fs10d.store(on, Ordering::Relaxed);
     }
 
     pub(crate) fn set_fs13(&self, on: bool) {
@@ -1678,6 +1687,20 @@ impl BranchStore {
                         }
                     };
                     return Ok(Resolved::Shared(bytes));
+                }
+                #[cfg(test)]
+                let fs10d = self.fs10d.load(Ordering::Relaxed) && !mutants::on("FS10D_COMPOSE_PRIVATE");
+                #[cfg(not(test))]
+                let fs10d = self.fs10d.load(Ordering::Relaxed);
+                if share && fs10d {
+                    // FS10D: the composed page is held as a one-owner shared buffer, so the reader's
+                    // idle release (FS10) drops it; the next statement composes it again.
+                    let mut image = arena.page(base).to_vec();
+                    let mut examined = 0;
+                    work.resolve_chunks_overlaid += trunk.overlay(page, at, &mut image, &mut examined);
+                    work.resolve_retained_examined += examined;
+                    work.retained_copies += 1;
+                    return Ok(Resolved::Shared(Arc::new(image.into_boxed_slice())));
                 }
                 out.copy_from_slice(arena.page(base));
                 let mut examined = 0;

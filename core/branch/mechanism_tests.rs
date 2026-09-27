@@ -1384,6 +1384,36 @@ fn a_branch_write_never_changes_a_version_another_reader_sees() {
     assert_eq!(table(&trunk), before);
 }
 
+/// FS10D (r11-sessions amendment 18b, the sub-page store). A page the store composes for a reader —
+/// the trunk's pending image with the chunk versions containing the reader's fork laid over it — is
+/// held as a one-owner shared buffer, so an idle session drops it like any page held by reference
+/// (`FS10D_COMPOSE_PRIVATE` keeps it private). It reads the same afterwards, and a write still copies.
+#[test]
+fn a_composed_trunk_version_is_dropped_by_an_idle_session() {
+    let (_dir, db) = open_db();
+    db.set_fs10(true);
+    db.set_fs10_fill(true);
+    db.set_fs10d(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let b = trunk.fork_branch().unwrap();
+    let c = b.connect().unwrap();
+    // Two trunk writes after b's fork: b's version of row 10's page is the pending image with a
+    // chunk version laid over it.
+    set(&trunk, 10, "trunk-v1");
+    set(&trunk, 10, "trunk-v2");
+    assert_eq!(value(&c, 10), Some(original(10)));
+    assert_eq!(
+        c.pager.load().page_cache_len(),
+        0,
+        "an idle session kept the page composed for it"
+    );
+    assert_eq!(value(&c, 10), Some(original(10)));
+    set(&c, 10, "b-write");
+    assert_eq!(value(&c, 10), Some("b-write".to_string()));
+    assert_eq!(value(&trunk, 10), Some("trunk-v2".to_string()));
+}
+
 /// FS9B. Branches forked from a chain read a version an interior ANCESTOR branch holds for them
 /// (its retained pre-image, and its current page) by reference, one shared copy per slot; the copy
 /// goes when the slot is released (`FS9B_NO_EVICT` keeps it) or written: once no child can see a
