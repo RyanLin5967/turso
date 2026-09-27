@@ -1011,7 +1011,7 @@ fn reaprate(args: &Args) {
     let mut trunk = db.connect().unwrap();
     println!(
         "# reaprate n={} open_us={:.0} threads={:?} cells={:?} reaps={} round={} victim={} prefetch={} \
-         trunk_every={} seed={:#x} {} rss_bytes={}",
+         trunk_every={} seed={:#x} {} rss_bytes={} env={:?}",
         args.n,
         t.elapsed().as_secs_f64() * 1e6,
         args.threads,
@@ -1023,7 +1023,10 @@ fn reaprate(args: &Args) {
         args.trunk_every,
         args.seed,
         files.line(),
-        rss_bytes()
+        rss_bytes(),
+        // r12-e3 amendments 3 and 7: the run-time arms, as this process saw them.
+        ["R12_CAT_CACHE_KIB", "R12_CAT_PREWARM", "R12_SIEVE_BEHIND", "R12_RERUN_CAP"]
+            .map(|k| format!("{k}={}", std::env::var(k).unwrap_or_else(|_| "-".to_string())))
     );
     let st = db.branch_stats().unwrap();
     if st.live_branches != args.n {
@@ -1081,6 +1084,8 @@ fn reaprate(args: &Args) {
             let (mut cpu_user, mut cpu_sys) = (0u64, 0u64);
             let io0 = turso_core::branch::page_io();
             let fs0 = turso_core::branch::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
+            let cc = || turso_core::branch::CAT_CACHE.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+            let cc0 = cc();
             for _ in 0..rounds {
                 // This round's victims, dealt to the reapers round-robin.
                 let mut victims = Vec::with_capacity(args.round);
@@ -1193,6 +1198,36 @@ fn reaprate(args: &Args) {
                 per(&|s| s.log_ns) / 1e3,
                 per(&|s| s.collect_ns) / 1e3,
                 per(&|s| s.prefetch_ns) / 1e3,
+            );
+            // r12-e3 amendment 7: the attribution counters, over every reap of the cell.
+            let cc1 = cc();
+            let removed: Vec<u64> = (0..turso_core::branch::PF_COUNTERS)
+                .map(|i| sum(&|s| s.pf_removed[i]))
+                .collect();
+            let mut reruns: Vec<u64> = samples.iter().map(|s| s.reruns).collect();
+            reruns.sort_unstable();
+            if args.prefetch && sum(&|s| s.prefetch_reads) > 0 && cc1[0] == cc0[0] {
+                not_a_result("prefetches read pages but the catalog cache counted no insert (instrument not attached)");
+            }
+            println!(
+                "# rrpf N={} kind={kind} T={t} draw={draw} cat_cache_pages={} cat_inserts={} cat_evictions={} \
+                 late_giveup={} late_passed={} reruns_p50={} reruns_p99={} reruns_max={} prefetch_reads_total={} \
+                 pend_self={:?} pend_other={:?} pend_touched={} pend_deleted={} pend_cleared={}",
+                args.n,
+                turso_core::branch::CAT_CACHE_PAGES.load(std::sync::atomic::Ordering::Relaxed),
+                cc1[0] - cc0[0],
+                cc1[1] - cc0[1],
+                sum(&|s| if s.gave_up { s.late } else { 0 }),
+                sum(&|s| if s.gave_up { 0 } else { s.late }),
+                pct_u64(&reruns, 50.0),
+                pct_u64(&reruns, 99.0),
+                reruns.last().copied().unwrap_or(0),
+                sum(&|s| s.prefetch_reads),
+                &removed[0..5],
+                &removed[5..10],
+                removed[10],
+                removed[11],
+                removed[12],
             );
             if n_ckpt > 0 {
                 let ck: Vec<&turso_core::branch::ReapSample> = samples.iter().filter(|s| s.ckpt).collect();

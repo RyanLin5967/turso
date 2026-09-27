@@ -3752,6 +3752,13 @@ impl Pager {
         Ok(page)
     }
 
+    /// r12-e3 amendment 7: mark this pager's page cache as the branch catalog's (its removals of
+    /// prefetched pages are counted) and choose where a new page enters its clock. Returns the
+    /// capacity in pages.
+    pub fn set_catalog_cache_policy(&self, insert_behind_hand: bool) -> usize {
+        self.page_cache.write().set_catalog_policy(insert_behind_hand)
+    }
+
     /// Changes the size of the page cache.
     pub fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
         let mut page_cache = self.page_cache.write();

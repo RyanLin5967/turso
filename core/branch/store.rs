@@ -1678,11 +1678,17 @@ impl BranchStore {
     /// statement with I/O under the catalog's own lock only, and starts over. When the plan passes,
     /// every page the release will read is in the catalog's page cache, and the release runs with
     /// the gate COUNTING any miss it did not foresee (a late miss). The checkpoint a release may
-    /// trigger runs with the gate off and is counted apart.
+    /// trigger runs with the gate off and is counted apart. After `pf_rerun_cap()` re-runs (64
+    /// unless `R12_RERUN_CAP` says otherwise; a liveness bound the r12-e3 PREREG did not register,
+    /// disclosed in its amendment 6) the reap gives up and runs its section with the gate counting.
     pub(crate) fn release_handle(&self, id: BranchId) -> Result<Reaped> {
         let prefetch = self.prefetch.load(Ordering::Relaxed);
+        let cap = super::pf_rerun_cap();
         let mut sample = ReapSample::default();
         let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        // r12-e3 amendment 7: this reap's serial once it prefetches (0: never), which makes it
+        // pending until its section starts.
+        let mut serial = 0u64;
         loop {
             let asked = Instant::now();
             let mut inner = self.inner.lock();
@@ -1690,7 +1696,7 @@ impl BranchStore {
             sample.wait_ns += ns(held - asked);
             // The final hold's counts start here, so its plan (loads, statements) counts too.
             let base = Self::section_base(&inner);
-            if prefetch && inner.cat.is_some() && sample.reruns < 64 {
+            if prefetch && inner.cat.is_some() && sample.reruns < cap {
                 let reads = super::thread_page_reads();
                 let gate = super::set_io_mode(super::IO_REFUSE);
                 let planned = inner.plan_reap(id);
@@ -1700,6 +1706,9 @@ impl BranchStore {
                     let cat = inner.cat.as_ref().expect("checked above");
                     let missed = cat.catalog.lock().counters.miss.take();
                     let Some((stmt, params)) = missed else {
+                        if serial != 0 {
+                            super::pf_settle();
+                        }
                         return Err(e);
                     };
                     let catalog = cat.catalog.clone();
@@ -1708,7 +1717,16 @@ impl BranchStore {
                     // The prefetch: outside the store mutex, under the catalog's lock alone.
                     let started = Instant::now();
                     let reads = super::thread_page_reads();
-                    catalog.lock().rerun(stmt, &params)?;
+                    if serial == 0 {
+                        serial = super::pf_new_serial();
+                    }
+                    super::pf_begin_prefetch(serial);
+                    let rerun = catalog.lock().rerun(stmt, &params);
+                    super::pf_end_prefetch();
+                    if let Err(e) = rerun {
+                        super::pf_settle();
+                        return Err(e);
+                    }
                     sample.prefetch_reads += super::thread_page_reads() - reads;
                     sample.prefetch_ns += ns(started.elapsed());
                     sample.reruns += 1;
@@ -1716,6 +1734,9 @@ impl BranchStore {
                 }
             } else if prefetch && inner.cat.is_some() {
                 sample.gave_up = true;
+            }
+            if serial != 0 {
+                sample.pf_removed = super::pf_settle();
             }
             let gate = if prefetch {
                 super::set_io_mode(super::IO_COUNT)

@@ -155,6 +155,130 @@ pub(crate) fn count_fsync() {
     THREAD_FSYNCS.with(|c| c.set(c.get() + 1));
 }
 
+// r12-e3 amendment 7 (observing): a reap is PENDING from its first prefetch until its section
+// starts. Every page one of its prefetches inserted into the branch catalog's page cache and that
+// leaves that cache while it is pending is counted here, for the reap to take when it settles.
+// A reaper thread owns one slot; a tag is (slot << 48) | the reap's process-wide serial, so a
+// stale page (an earlier reap's) never matches a later reap. With at most 64 reaper threads alive,
+// two live threads never share a slot (blind spot beyond that, stated).
+const PF_SLOTS: usize = 64;
+const PF_SERIAL_BITS: u32 = 48;
+/// Age buckets (in the cache's inserts after the page's own): <= 2, 3-16, 17-256, 257-4096, more.
+pub const PF_AGE_LIMITS: [u64; 4] = [2, 16, 256, 4096];
+/// Counters per slot: evicted by this reap's own thread by age bucket (0..5), by another thread
+/// by age bucket (5..10), evicted after being read again (10), deleted (11), cleared (12).
+pub const PF_COUNTERS: usize = 13;
+static PF_PENDING: [crate::sync::atomic::AtomicU64; PF_SLOTS] =
+    [const { crate::sync::atomic::AtomicU64::new(0) }; PF_SLOTS];
+static PF_REMOVED: [crate::sync::atomic::AtomicU64; PF_SLOTS * PF_COUNTERS] =
+    [const { crate::sync::atomic::AtomicU64::new(0) }; PF_SLOTS * PF_COUNTERS];
+static PF_SERIAL: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(1);
+static PF_NEXT_SLOT: crate::sync::atomic::AtomicUsize = crate::sync::atomic::AtomicUsize::new(0);
+/// The branch catalog's page cache, process-wide: [inserts, evictions] (r12-e3 amendment 7).
+#[doc(hidden)]
+pub static CAT_CACHE: [crate::sync::atomic::AtomicU64; 2] =
+    [const { crate::sync::atomic::AtomicU64::new(0) }; 2];
+/// The branch catalog's page-cache capacity in pages, as its last open set it.
+#[doc(hidden)]
+pub static CAT_CACHE_PAGES: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static PF_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// Set while this thread runs a prefetch: the tag its inserts carry.
+    static PF_TAG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn pf_slot() -> usize {
+    PF_SLOT.with(|c| {
+        if c.get() == usize::MAX {
+            c.set(PF_NEXT_SLOT.fetch_add(1, crate::sync::atomic::Ordering::Relaxed) % PF_SLOTS);
+        }
+        c.get()
+    })
+}
+
+/// How a page left the catalog's cache.
+pub(crate) enum PfRemoval {
+    Evicted { age: u64, touched: bool },
+    Deleted,
+    Cleared,
+}
+
+/// The tag the current thread's inserts carry (0 outside a prefetch).
+pub(crate) fn pf_tag() -> u64 {
+    PF_TAG.with(|t| t.get())
+}
+
+/// A new reap's serial (never 0).
+pub(crate) fn pf_new_serial() -> u64 {
+    PF_SERIAL.fetch_add(1, crate::sync::atomic::Ordering::Relaxed) & ((1 << PF_SERIAL_BITS) - 1)
+}
+
+/// Mark reap `serial` pending on this thread and tag this thread's inserts until `pf_end_prefetch`.
+pub(crate) fn pf_begin_prefetch(serial: u64) {
+    let slot = pf_slot();
+    PF_PENDING[slot].store(serial, crate::sync::atomic::Ordering::Relaxed);
+    PF_TAG.with(|t| t.set(((slot as u64) << PF_SERIAL_BITS) | serial));
+}
+
+pub(crate) fn pf_end_prefetch() {
+    PF_TAG.with(|t| t.set(0));
+}
+
+/// End this thread's pending window and take its counts.
+pub(crate) fn pf_settle() -> [u64; PF_COUNTERS] {
+    let slot = pf_slot();
+    PF_PENDING[slot].store(0, crate::sync::atomic::Ordering::Relaxed);
+    let mut out = [0u64; PF_COUNTERS];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = PF_REMOVED[slot * PF_COUNTERS + i].swap(0, crate::sync::atomic::Ordering::Relaxed);
+    }
+    out
+}
+
+/// Called by the catalog's page cache when a tagged page leaves it.
+pub(crate) fn pf_removed(tag: u64, how: PfRemoval) {
+    use crate::sync::atomic::Ordering::Relaxed;
+    let slot = (tag >> PF_SERIAL_BITS) as usize % PF_SLOTS;
+    let serial = tag & ((1 << PF_SERIAL_BITS) - 1);
+    if serial == 0 || PF_PENDING[slot].load(Relaxed) != serial {
+        return;
+    }
+    let base = slot * PF_COUNTERS;
+    match how {
+        PfRemoval::Evicted { age, touched } => {
+            let bucket = PF_AGE_LIMITS.iter().position(|&l| age <= l).unwrap_or(4);
+            let by_other = if pf_slot() == slot { 0 } else { 5 };
+            PF_REMOVED[base + by_other + bucket].fetch_add(1, Relaxed);
+            if touched {
+                PF_REMOVED[base + 10].fetch_add(1, Relaxed);
+            }
+        }
+        PfRemoval::Deleted => {
+            PF_REMOVED[base + 11].fetch_add(1, Relaxed);
+        }
+        PfRemoval::Cleared => {
+            PF_REMOVED[base + 12].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// The catalog cache's inserts (0) and evictions (1).
+pub(crate) fn count_cat_cache(which: usize) {
+    CAT_CACHE[which].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+}
+
+/// The prefetch arm's re-run cap: `R12_RERUN_CAP` (r12-e3 amendment 7 NOCAP arm), else 64.
+pub(crate) fn pf_rerun_cap() -> u64 {
+    static CAP: crate::sync::OnceLock<u64> = crate::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("R12_RERUN_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+    })
+}
+
 /// One reap of a branch, as the store saw it (r12-e3 instrument; see
 /// [`Database::branch_reap_sampling`]). Times are nanoseconds; counts are this reap's own.
 #[doc(hidden)]
@@ -193,8 +317,12 @@ pub struct ReapSample {
     pub prefetch_reads: u64,
     pub plan_reads: u64,
     pub late: u64,
-    /// Prefetch arm: the reap stopped re-running after 64 misses and ran its section anyway.
+    /// Prefetch arm: the reap stopped re-running at the cap (`pf_rerun_cap`: 64 unless
+    /// `R12_RERUN_CAP` says otherwise) and ran its section anyway.
     pub gave_up: bool,
+    /// Prefetch arm (r12-e3 amendment 7): pages this reap's prefetches inserted into the catalog's
+    /// cache that left it while the reap was pending, laid out as `PF_COUNTERS`.
+    pub pf_removed: [u64; PF_COUNTERS],
 }
 pub(crate) mod catalog;
 pub(crate) mod journal;

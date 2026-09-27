@@ -334,6 +334,12 @@ impl Catalog {
         {
             conn.execute(format!("PRAGMA cache_size = -{kib}"))?;
         }
+        // r12-e3 amendment 7: this connection's cache reports removals of prefetched pages, and
+        // with `R12_SIEVE_BEHIND` (the POL arm) inserts new pages behind the clock hand.
+        let pages = conn
+            .get_pager()
+            .set_catalog_cache_policy(std::env::var_os("R12_SIEVE_BEHIND").is_some());
+        super::CAT_CACHE_PAGES.store(pages as u64, crate::sync::atomic::Ordering::Relaxed);
         if std::env::var_os("R12_CAT_PREWARM").is_some() {
             for sql in [
                 "SELECT sum(parent) FROM branch",

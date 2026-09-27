@@ -46,6 +46,11 @@ struct PageCacheEntry {
     ref_bit: u8,
     /// Intrusive link for SIEVE queue
     link: LinkedListLink,
+    /// r12-e3 amendment 7 (observing): the branch-store prefetch that inserted this page (0: none),
+    /// the cache's insert count at its insert, and whether it was referenced again since.
+    pf_tag: u64,
+    ins_seq: u64,
+    touched: bool,
 }
 
 intrusive_adapter!(EntryAdapter = Box<PageCacheEntry>: PageCacheEntry { link: LinkedListLink });
@@ -57,12 +62,16 @@ impl PageCacheEntry {
             page,
             ref_bit: CLEAR,
             link: LinkedListLink::new(),
+            pf_tag: 0,
+            ins_seq: 0,
+            touched: false,
         })
     }
 
     #[inline]
     fn bump_ref(&mut self) {
         self.ref_bit = std::cmp::min(self.ref_bit + 1, REF_MAX);
+        self.touched = true;
     }
 
     #[inline]
@@ -110,6 +119,14 @@ pub struct PageCache {
     spill_enabled: bool,
     /// Conservative estimation of pages that are evictable based on dirty/spilled state.
     evictable_count: usize,
+    /// r12-e3 amendment 7: pages inserted so far (the age clock of `PageCacheEntry::ins_seq`).
+    inserts: u64,
+    /// r12-e3 amendment 7: this is the branch catalog's cache, whose removals of prefetched pages
+    /// are reported to `crate::branch` (off for every other cache).
+    instrumented: bool,
+    /// r12-e3 amendment 7 POL arm: a new page enters just BEFORE the clock hand, so the hand reaches
+    /// it after a full revolution (classic CLOCK placement), instead of right after it.
+    insert_behind_hand: bool,
 }
 
 unsafe impl Send for PageCache {}
@@ -165,7 +182,18 @@ impl PageCache {
             spill_threshold: spill_threshold.max(1),
             spill_enabled,
             evictable_count: 0,
+            inserts: 0,
+            instrumented: false,
+            insert_behind_hand: false,
         }
+    }
+
+    /// r12-e3 amendment 7: mark this cache as the branch catalog's and choose where a new page
+    /// enters the clock. Returns the capacity in pages.
+    pub fn set_catalog_policy(&mut self, insert_behind_hand: bool) -> usize {
+        self.instrumented = true;
+        self.insert_behind_hand = insert_behind_hand;
+        self.capacity
     }
 
     /// Advances the clock hand to the next entry in the circular queue.
@@ -291,12 +319,22 @@ impl PageCache {
         }
 
         // Key doesn't exist, proceed with new entry
-        self.make_room_for(1, bypass_capacity)?;
+        // Counted before making room, so an eviction this insert causes sees it (r12-e3 A7 age).
+        self.inserts += 1;
+        if let Err(e) = self.make_room_for(1, bypass_capacity) {
+            self.inserts -= 1;
+            return Err(e);
+        }
 
         // Track evictable count for the new page
         let is_evictable = Self::counted_as_evictable(&value);
 
-        let entry = PageCacheEntry::new(key, value);
+        let mut entry = PageCacheEntry::new(key, value);
+        entry.ins_seq = self.inserts;
+        if self.instrumented {
+            entry.pf_tag = crate::branch::pf_tag();
+            crate::branch::count_cat_cache(0);
+        }
 
         if self.clock_hand.is_null() {
             // First entry - just push it
@@ -304,6 +342,17 @@ impl PageCache {
             let entry_ptr = self.queue.back().get().unwrap() as *const _ as *mut PageCacheEntry;
             self.map.insert(key, entry_ptr);
             self.clock_hand = entry_ptr;
+        } else if self.insert_behind_hand {
+            // r12-e3 POL arm: just before the hand, so the hand, moving `next`, reaches it last.
+            unsafe {
+                let mut cursor = self.queue.cursor_mut_from_ptr(self.clock_hand);
+                cursor.insert_before(entry);
+                cursor.move_prev();
+                let entry_ptr = cursor.get().ok_or_else(|| {
+                    CacheError::InternalError("Failed to get inserted entry pointer".into())
+                })? as *const PageCacheEntry as *mut PageCacheEntry;
+                self.map.insert(key, entry_ptr);
+            }
         } else {
             // Insert after clock hand (in circular list semantics, this makes it the new head/MRU)
             unsafe {
@@ -352,6 +401,9 @@ impl PageCache {
 
         // Track evictable count before removing
         let was_evictable = Self::counted_as_evictable(page);
+        if self.instrumented && entry.pf_tag != 0 {
+            crate::branch::pf_removed(entry.pf_tag, crate::branch::PfRemoval::Deleted);
+        }
 
         if clean_page {
             page.clear_loaded();
@@ -667,6 +719,18 @@ impl PageCache {
                     Self::counted_as_evictable(page),
                     "mismatched evictable count state"
                 );
+                if self.instrumented {
+                    crate::branch::count_cat_cache(1);
+                    if entry.pf_tag != 0 {
+                        crate::branch::pf_removed(
+                            entry.pf_tag,
+                            crate::branch::PfRemoval::Evicted {
+                                age: self.inserts - entry.ins_seq,
+                                touched: entry.touched,
+                            },
+                        );
+                    }
+                }
 
                 // Evict this entry
                 self.advance_clock_hand();
@@ -719,6 +783,9 @@ impl PageCache {
         // Clean all pages
         for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
+            if self.instrumented && entry.pf_tag != 0 {
+                crate::branch::pf_removed(entry.pf_tag, crate::branch::PfRemoval::Cleared);
+            }
             entry.page.clear_loaded();
             let _ = entry.page.get().buffer.take();
         }
@@ -888,6 +955,102 @@ mod tests {
             .insert(key, page)
             .unwrap_or_else(|e| panic!("Failed to insert page {id}: {e:?}"));
         key
+    }
+
+    /// r12-e3 amendment 7 (u1): with the base placement (right after the hand) an untouched page
+    /// inserted into a full cache is evicted by the second later insert, at any capacity; placed
+    /// just before the hand (the POL arm) it survives at least capacity - 1 later inserts.
+    #[test]
+    fn a_fresh_page_lives_two_inserts_after_the_hand_and_a_revolution_behind_it() {
+        for cap in [16usize, 2000] {
+            for behind in [false, true] {
+                let mut c = PageCache::new_with_spill(cap, true);
+                c.insert_behind_hand = behind;
+                let mut next = 1usize;
+                for _ in 0..3 * cap {
+                    insert_page(&mut c, next);
+                    next += 1;
+                }
+                assert_eq!(c.len(), cap);
+                let probe = insert_page(&mut c, next);
+                next += 1;
+                let mut lived = 0;
+                while c.contains_key(&probe) && lived < 2 * cap {
+                    insert_page(&mut c, next);
+                    next += 1;
+                    lived += 1;
+                }
+                if behind {
+                    assert!(lived + 1 >= cap, "cap {cap} behind: evicted after {lived} inserts");
+                } else {
+                    assert!(lived <= 2, "cap {cap} after the hand: lived {lived} inserts");
+                }
+                c.verify_cache_integrity();
+            }
+        }
+    }
+
+    /// r12-e3 amendment 7 (u2): the pending counter counts a pending reap's prefetched page when it
+    /// is evicted (by its own thread or another), and counts nothing once the reap has settled.
+    #[test]
+    fn pending_prefetch_evictions_count_until_the_reap_settles() {
+        use crate::branch::{
+            pf_begin_prefetch, pf_end_prefetch, pf_new_serial, pf_settle, pf_slot, PF_COUNTERS,
+        };
+        let cache = crate::sync::Mutex::new(PageCache::new_with_spill(4, true));
+        cache.lock().set_catalog_policy(false);
+        for id in 1..=4 {
+            insert_page(&mut cache.lock(), id);
+        }
+        // Own thread: tag one page, evict it with two untagged inserts, settle.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                pf_settle();
+                pf_begin_prefetch(pf_new_serial());
+                insert_page(&mut cache.lock(), 100);
+                pf_end_prefetch();
+                insert_page(&mut cache.lock(), 101);
+                insert_page(&mut cache.lock(), 102);
+                assert!(!cache.lock().contains_key(&create_key(100)));
+                let n = pf_settle();
+                assert_eq!(n[0], 1, "own eviction at age <= 2: {n:?}");
+                assert_eq!(n.iter().sum::<u64>(), 1, "{n:?}");
+                // Settled: the next tagged page's eviction after its settle is not counted.
+                pf_begin_prefetch(pf_new_serial());
+                insert_page(&mut cache.lock(), 103);
+                pf_end_prefetch();
+                assert_eq!(pf_settle(), [0; PF_COUNTERS]);
+                insert_page(&mut cache.lock(), 104);
+                insert_page(&mut cache.lock(), 105);
+                assert!(!cache.lock().contains_key(&create_key(103)));
+                assert_eq!(pf_settle(), [0; PF_COUNTERS]);
+            });
+        });
+        // Another thread's inserts evict a pending page.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let owner = s.spawn(|| {
+                pf_settle();
+                pf_begin_prefetch(pf_new_serial());
+                insert_page(&mut cache.lock(), 200);
+                pf_end_prefetch();
+                ready_tx.send(pf_slot()).unwrap();
+                go_rx.recv().unwrap();
+                pf_settle()
+            });
+            let owner_slot = ready_rx.recv().unwrap();
+            insert_page(&mut cache.lock(), 201);
+            insert_page(&mut cache.lock(), 202);
+            assert!(!cache.lock().contains_key(&create_key(200)));
+            go_tx.send(()).unwrap();
+            let n = owner.join().unwrap();
+            assert_eq!(n.iter().sum::<u64>(), 1, "{n:?}");
+            if owner_slot != pf_slot() {
+                assert_eq!(n[5], 1, "another thread's eviction at age <= 2: {n:?}");
+            }
+        });
+        cache.lock().verify_cache_integrity();
     }
 
     #[test]
