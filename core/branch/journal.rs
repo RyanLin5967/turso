@@ -900,7 +900,14 @@ impl Journal {
             } else {
                 arena.sync()
             };
-            synced?;
+            if let Err(e) = synced {
+                // A failed sync may have dropped the pages it was writing back, and a later fsync
+                // of the same file can report success without them: fail-stop, as `flush` does
+                // (r11-churn amendment 6a). Only the snapshot's own failures leave the store
+                // healthy.
+                self.poisoned = true;
+                return Err(e);
+            }
         }
         let generation = self.generation + 1;
         let mut out = Vec::with_capacity(64);
