@@ -2112,6 +2112,7 @@ impl Pager {
 
         let c = subjournal.write_page(write_offset, page_size, buffer, c)?;
         turso_assert!(c.succeeded(), "memory IO should complete immediately");
+        super::page_cache::count_subjournal_page();
         Ok(())
     }
 
@@ -3750,6 +3751,11 @@ impl Pager {
         Ok(page)
     }
 
+    /// Pages currently held in this pager's page cache. Observation only.
+    pub(crate) fn page_cache_len(&self) -> usize {
+        self.page_cache.read().len()
+    }
+
     /// Changes the size of the page cache.
     pub fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
         let mut page_cache = self.page_cache.write();
@@ -4336,12 +4342,18 @@ impl Pager {
 
     /// Finish a spill operation for ephemeral tables
     fn finish_ephemeral_spill(&self, pages: &[PinGuard]) {
+        let mut cache = self.page_cache.write();
         for page in pages {
             let tag = page.get().wal_tag.load(Ordering::Acquire);
             // wal tag is set to TAG_UNSET when adding to dirty_pages, meaning that this
             // page was dirtied after the spill started, so we don't clear the dirty flag in that case
             if tag != TAG_UNSET {
                 page.clear_dirty();
+            }
+            // A spilled page is clean now: if a sweep parked it while it was dirty, it must go
+            // back to the queue or no sweep would ever evict it again.
+            if !page.is_dirty() {
+                cache.unpark_clean(PageCacheKey::new(page.get().id));
             }
         }
     }
@@ -4740,6 +4752,8 @@ impl Pager {
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
                     self.dirty_pages.write().clear();
+                    // The committed pages are clean: return any the sweep parked to its queue.
+                    self.page_cache.write().unpark_all();
                     commit_info.prepared_frames.clear();
 
                     let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
@@ -4867,6 +4881,8 @@ impl Pager {
                 }
             }
             dirty_pages.clear();
+            // The committed pages are clean: return any the sweep parked to its queue.
+            cache.unpark_all();
         }
         Ok(WalFrameInfo {
             page_no: header.page_number,

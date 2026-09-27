@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use rustc_hash::FxHashMap as HashMap;
 use tracing::trace;
@@ -26,6 +27,65 @@ pub const MINIMUM_PAGE_CACHE_SIZE_IN_PAGES: usize = 200;
 /// The spill threshold as a fraction of capacity.
 const DEFAULT_SPILL_THRESHOLD_PERCENT: usize = 90;
 
+/// Process-wide counts of the page caches' replacement work, for attributing a large
+/// transaction's cost (branch lane r11-bigtxn). Observation only: nothing reads them but
+/// [`cache_work`], and each is added once per call from a count the call keeps anyway.
+struct CacheCounters {
+    evict_calls: AtomicU64,
+    evict_examined: AtomicU64,
+    evict_full: AtomicU64,
+    over_capacity_admits: AtomicU64,
+    evictable_scan_entries: AtomicU64,
+    spill_scan_entries: AtomicU64,
+    subjournal_pages: AtomicU64,
+}
+
+static CACHE_COUNTERS: CacheCounters = CacheCounters {
+    evict_calls: AtomicU64::new(0),
+    evict_examined: AtomicU64::new(0),
+    evict_full: AtomicU64::new(0),
+    over_capacity_admits: AtomicU64::new(0),
+    evictable_scan_entries: AtomicU64::new(0),
+    spill_scan_entries: AtomicU64::new(0),
+    subjournal_pages: AtomicU64::new(0),
+};
+
+/// A snapshot of [`cache_work`]'s counters, summed over every page cache in the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CacheWork {
+    /// Calls to the SIEVE eviction (`evict_one`).
+    pub evict_calls: u64,
+    /// Entries the SIEVE hand stepped over or evicted.
+    pub evict_examined: u64,
+    /// Eviction calls that found nothing evictable (`CacheError::Full`).
+    pub evict_full: u64,
+    /// Pages admitted over capacity because nothing could be evicted.
+    pub over_capacity_admits: u64,
+    /// Entries visited by the spill check's evictable-page count.
+    pub evictable_scan_entries: u64,
+    /// Entries visited while collecting pages to spill.
+    pub spill_scan_entries: u64,
+    /// Pages written to a statement journal (subjournal).
+    pub subjournal_pages: u64,
+}
+
+pub fn cache_work() -> CacheWork {
+    let c = &CACHE_COUNTERS;
+    CacheWork {
+        evict_calls: c.evict_calls.load(Relaxed),
+        evict_examined: c.evict_examined.load(Relaxed),
+        evict_full: c.evict_full.load(Relaxed),
+        over_capacity_admits: c.over_capacity_admits.load(Relaxed),
+        evictable_scan_entries: c.evictable_scan_entries.load(Relaxed),
+        spill_scan_entries: c.spill_scan_entries.load(Relaxed),
+        subjournal_pages: c.subjournal_pages.load(Relaxed),
+    }
+}
+
+pub(crate) fn count_subjournal_page() {
+    CACHE_COUNTERS.subjournal_pages.fetch_add(1, Relaxed);
+}
+
 #[derive(Debug, Copy, Eq, Hash, PartialEq, Clone)]
 #[repr(transparent)]
 pub struct PageCacheKey(usize);
@@ -44,6 +104,8 @@ struct PageCacheEntry {
     /// Reference counter (SIEVE/GClock): starts at zero, bumped on access,
     /// decremented during eviction, only pages at 0 are evicted.
     ref_bit: u8,
+    /// On `PageCache::parked` instead of the SIEVE queue (see there).
+    parked: bool,
     /// Intrusive link for SIEVE queue
     link: LinkedListLink,
 }
@@ -56,6 +118,7 @@ impl PageCacheEntry {
             key,
             page,
             ref_bit: CLEAR,
+            parked: false,
             link: LinkedListLink::new(),
         })
     }
@@ -103,6 +166,15 @@ pub struct PageCache {
     map: HashMap<PageCacheKey, *mut PageCacheEntry>,
     /// The eviction queue (intrusive doubly-linked list)
     queue: LinkedList<EntryAdapter>,
+    /// Entries taken off `queue` because they are dirty and unspilled, so no sweep can evict
+    /// them until their transaction ends or they are spilled. Every entry in `map` is on exactly
+    /// one of the two lists. Without this a transaction dirtying more pages than the capacity
+    /// (a branch pager cannot spill) made every insert sweep the whole cache twice, Theta(D^2)
+    /// per transaction. The sweep culls such an entry the first time it meets it, as Linux's
+    /// vmscan culls pages to its unevictable LRU; `notify_page_spilled` and `unpark_all` put
+    /// them back, like SQLite's pcache, whose LRU holds no dirty page.
+    parked: LinkedList<EntryAdapter>,
+    parked_len: usize,
     /// Clock hand cursor for SIEVE eviction (pointer to an entry in the queue, or null)
     clock_hand: *mut PageCacheEntry,
     /// Threshold number of pages at which we start spilling dirty pages.
@@ -161,6 +233,8 @@ impl PageCache {
             capacity,
             map: HashMap::default(),
             queue: LinkedList::new(EntryAdapter::new()),
+            parked: LinkedList::new(EntryAdapter::new()),
+            parked_len: 0,
             clock_hand: std::ptr::null_mut(),
             spill_threshold: spill_threshold.max(1),
             spill_enabled,
@@ -194,6 +268,68 @@ impl PageCache {
                 }
             }
         }
+    }
+
+    /// Link `entry` into the SIEVE queue as its newest entry, just after the hand.
+    fn link_into_queue(&mut self, entry: Box<PageCacheEntry>) {
+        if self.clock_hand.is_null() {
+            self.queue.push_back(entry);
+            self.clock_hand = self.queue.back().get().unwrap() as *const _ as *mut PageCacheEntry;
+        } else {
+            unsafe {
+                let mut cursor = self.queue.cursor_mut_from_ptr(self.clock_hand);
+                cursor.insert_after(entry);
+            }
+        }
+    }
+
+    /// Move a queue entry that no sweep can evict before its transaction ends to `parked`. The
+    /// entry keeps its address (the box moves between lists), so `map` still points at it.
+    fn park(&mut self, entry_ptr: *mut PageCacheEntry) {
+        self.advance_clock_hand();
+        if self.clock_hand == entry_ptr {
+            self.clock_hand = std::ptr::null_mut();
+        }
+        let mut entry = unsafe { self.queue.cursor_mut_from_ptr(entry_ptr).remove() }
+            .expect("a queued entry is on the queue");
+        entry.parked = true;
+        self.parked.push_back(entry);
+        self.parked_len += 1;
+    }
+
+    fn unpark(&mut self, entry_ptr: *mut PageCacheEntry) {
+        let mut entry = unsafe { self.parked.cursor_mut_from_ptr(entry_ptr).remove() }
+            .expect("a parked entry is on the parked list");
+        entry.parked = false;
+        self.parked_len -= 1;
+        self.link_into_queue(entry);
+    }
+
+    /// Return every parked entry to the SIEVE queue. The pager calls this when a transaction's
+    /// dirty pages become clean (commit) so that they are evictable again.
+    pub fn unpark_all(&mut self) {
+        while let Some(mut entry) = self.parked.pop_front() {
+            entry.parked = false;
+            self.link_into_queue(entry);
+        }
+        self.parked_len = 0;
+    }
+
+    /// Return `key`'s entry to the queue if a sweep parked it and its page is clean again (a spill
+    /// path that cleans pages instead of marking them spilled: the ephemeral one).
+    pub fn unpark_clean(&mut self, key: PageCacheKey) {
+        if let Some(&entry_ptr) = self.map.get(&key) {
+            let entry = unsafe { &*entry_ptr };
+            if entry.parked && !entry.page.is_dirty() {
+                self.unpark(entry_ptr);
+            }
+        }
+    }
+
+    /// A page no sweep may evict until its transaction ends or it is spilled.
+    #[inline]
+    fn parkable(page: &PageRef) -> bool {
+        page.is_dirty() && !page.is_spilled()
     }
 
     pub fn contains_key(&self, key: &PageCacheKey) -> bool {
@@ -352,6 +488,7 @@ impl PageCache {
 
         // Track evictable count before removing
         let was_evictable = Self::counted_as_evictable(page);
+        let parked = entry.parked;
 
         if clean_page {
             page.clear_loaded();
@@ -361,19 +498,26 @@ impl PageCache {
         // Remove from map first
         self.map.remove(&key);
 
-        // If clock hand points to this entry, advance it before removing
-        if self.clock_hand == entry_ptr {
-            self.advance_clock_hand();
-            // If hand is still pointing to the same entry after advance, we're removing the last entry
-            if self.clock_hand == entry_ptr {
-                self.clock_hand = std::ptr::null_mut();
+        if parked {
+            unsafe {
+                self.parked.cursor_mut_from_ptr(entry_ptr).remove();
             }
-        }
+            self.parked_len -= 1;
+        } else {
+            // If clock hand points to this entry, advance it before removing
+            if self.clock_hand == entry_ptr {
+                self.advance_clock_hand();
+                // If hand is still pointing to the same entry after advance, we're removing the last entry
+                if self.clock_hand == entry_ptr {
+                    self.clock_hand = std::ptr::null_mut();
+                }
+            }
 
-        // Remove the entry from the queue
-        unsafe {
-            let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
-            cursor.remove();
+            // Remove the entry from the queue
+            unsafe {
+                let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
+                cursor.remove();
+            }
         }
 
         // Update evictable count after successful removal
@@ -482,6 +626,9 @@ impl PageCache {
     #[inline]
     /// Count pages that can be evicted without spilling.
     fn count_evictable_pages(&self) -> usize {
+        CACHE_COUNTERS
+            .evictable_scan_entries
+            .fetch_add(self.map.len() as u64, Relaxed);
         self.map
             .values()
             .filter(|&&entry_ptr| {
@@ -554,6 +701,9 @@ impl PageCache {
             if page.get().id != DatabaseHeader::PAGE_ID {
                 self.evictable_count += 1;
             }
+            if entry.parked {
+                self.unpark(entry_ptr);
+            }
         }
     }
 
@@ -572,7 +722,9 @@ impl PageCache {
         const EST_SPILL: usize = 128;
         let mut spillable: Vec<PinGuard> = Vec::with_capacity(EST_SPILL);
 
+        let mut scanned = 0u64;
         for (_, &entry_ptr) in self.map.iter() {
+            scanned += 1;
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             if Self::spillable(page) {
@@ -582,6 +734,9 @@ impl PageCache {
                 break;
             }
         }
+        CACHE_COUNTERS
+            .spill_scan_entries
+            .fetch_add(scanned, Relaxed);
         spillable.sort_by_key(|pg| pg.get().id);
         spillable
     }
@@ -614,6 +769,9 @@ impl PageCache {
     /// Returns `CacheError::Full` if not enough pages can be evicted
     fn make_room_for(&mut self, n: usize, bypass_capacity: bool) -> Result<(), CacheError> {
         if bypass_capacity {
+            if self.len() + n > self.capacity {
+                CACHE_COUNTERS.over_capacity_admits.fetch_add(1, Relaxed);
+            }
             return Ok(());
         }
         if n > self.capacity {
@@ -645,15 +803,15 @@ impl PageCache {
         }
 
         let mut examined = 0usize;
-        let max_examinations = self.len().saturating_mul(REF_MAX as usize + 1);
+        // Only the queue is swept: a parked entry cannot be evicted.
+        let max_examinations = (self.len() - self.parked_len).saturating_mul(REF_MAX as usize + 1);
+        CACHE_COUNTERS.evict_calls.fetch_add(1, Relaxed);
 
         while examined < max_examinations {
-            // Clock hand should never be null here since we checked len() > 0
-            turso_assert!(
-                !self.clock_hand.is_null(),
-                "page_cache: clock hand is null during eviction",
-                { "entries": self.len() }
-            );
+            // The hand is null only when every entry is parked.
+            if self.clock_hand.is_null() {
+                break;
+            }
 
             let entry_ptr = self.clock_hand;
             let entry = unsafe { &mut *entry_ptr };
@@ -689,11 +847,18 @@ impl PageCache {
                 // Update evictable count after successful eviction
                 self.evictable_count = self.evictable_count.saturating_sub(1);
 
+                CACHE_COUNTERS
+                    .evict_examined
+                    .fetch_add(examined as u64 + 1, Relaxed);
                 return Ok(());
             } else if evictable {
                 // Decrement ref bit and continue
                 entry.decrement_ref();
                 self.advance_clock_hand();
+                examined += 1;
+            } else if Self::parkable(page) {
+                // Dirty and unspilled: no later sweep need step over it again.
+                self.park(entry_ptr);
                 examined += 1;
             } else {
                 // Skip unevictable page
@@ -702,6 +867,10 @@ impl PageCache {
             }
         }
 
+        CACHE_COUNTERS
+            .evict_examined
+            .fetch_add(examined as u64, Relaxed);
+        CACHE_COUNTERS.evict_full.fetch_add(1, Relaxed);
         Err(CacheError::Full)
     }
 
@@ -725,6 +894,8 @@ impl PageCache {
 
         self.map.clear();
         self.queue.clear();
+        self.parked.clear();
+        self.parked_len = 0;
         self.clock_hand = std::ptr::null_mut();
         self.evictable_count = 0;
         Ok(())
@@ -819,11 +990,21 @@ impl PageCache {
 
         while let Some(entry) = cursor.get() {
             queue_len += 1;
+            assert!(!entry.parked, "a queued entry is marked parked");
             seen_keys.insert(entry.key);
             cursor.move_next();
         }
+        let mut parked_len = 0;
+        let mut cursor = self.parked.front();
+        while let Some(entry) = cursor.get() {
+            parked_len += 1;
+            assert!(entry.parked, "a parked entry is not marked parked");
+            seen_keys.insert(entry.key);
+            cursor.move_next();
+        }
+        assert_eq!(parked_len, self.parked_len, "parked length mismatch");
 
-        assert_eq!(map_len, queue_len, "map and queue length mismatch");
+        assert_eq!(map_len, queue_len + parked_len, "map and queue length mismatch");
         assert_eq!(map_len, seen_keys.len(), "duplicate keys in queue");
 
         // Verify all map entries are in queue
@@ -840,7 +1021,7 @@ impl PageCache {
                 "clock hand points to non-existent entry"
             );
         } else {
-            assert_eq!(map_len, 0, "clock hand null but map not empty");
+            assert_eq!(queue_len, 0, "clock hand null but queue not empty");
         }
     }
 
@@ -1144,6 +1325,72 @@ mod tests {
 
         assert_eq!(cache.len(), 2);
         assert!(cache.contains_key(&key4));
+        cache.verify_cache_integrity();
+    }
+
+    /// A transaction dirtying more pages than the capacity, which cannot spill: the sweep parks
+    /// each dirty page the first time it meets it, so later inserts step over none of them, and
+    /// they return to the queue when they are spilled or when the transaction ends.
+    #[test]
+    fn dirty_pages_over_capacity_are_parked_once_and_return_when_evictable() {
+        let mut cache = PageCache::new_with_spill(4, true);
+        let mut keys = Vec::new();
+        for id in 1..=40 {
+            let key = create_key(id + 1);
+            let page = page_with_content(id + 1);
+            cache.force_insert_page(key, page).unwrap();
+            cache.notify_page_dirty(key);
+            cache.peek(&key, false).unwrap().set_dirty();
+            keys.push(key);
+            cache.verify_cache_integrity();
+        }
+        assert_eq!(cache.len(), 40);
+        // Each over-capacity insert's failing sweep parked the dirty pages it met, each once: all
+        // but the newest, which no sweep has reached yet.
+        assert_eq!(cache.parked_len, 39);
+        // The next failing sweep parks the last one: nothing on the queue is left to step over.
+        assert_eq!(cache.insert(create_key(100), page_with_content(100)), Err(CacheError::Full));
+        assert_eq!(cache.parked_len, 40);
+        assert!(cache.clock_hand.is_null(), "an empty queue has no hand");
+        cache.verify_cache_integrity();
+        // A clean page admitted over capacity goes on the queue, and the next insert evicts it
+        // without sweeping the 40 parked pages.
+        cache.force_insert_page(create_key(100), page_with_content(100)).unwrap();
+        assert_eq!(cache.parked_len, 40);
+        cache.force_insert_page(create_key(101), page_with_content(101)).unwrap();
+        assert!(!cache.contains_key(&create_key(100)));
+        assert!(cache.contains_key(&create_key(101)));
+        cache.verify_cache_integrity();
+        // A spilled page leaves the parked list at once.
+        cache.notify_page_spilled(keys[0]);
+        cache.peek(&keys[0], false).unwrap().set_spilled();
+        assert_eq!(cache.parked_len, 39);
+        cache.verify_cache_integrity();
+        // A parked page can still be read and deleted.
+        assert!(cache.get(&keys[5]).unwrap().is_some());
+        cache.peek(&keys[5], false).unwrap().clear_dirty();
+        cache.delete(keys[5]).unwrap();
+        assert_eq!(cache.parked_len, 38);
+        cache.verify_cache_integrity();
+        // A spill path that cleans pages instead of marking them spilled (the ephemeral one)
+        // returns each with `unpark_clean`; a page still dirty stays parked.
+        cache.peek(&keys[6], false).unwrap().clear_dirty();
+        cache.unpark_clean(keys[6]);
+        cache.unpark_clean(keys[7]);
+        assert_eq!(cache.parked_len, 37);
+        cache.verify_cache_integrity();
+        // The transaction ends: its pages are clean and back on the queue, and inserts drain the
+        // cache under capacity again.
+        for key in &keys[1..] {
+            if let Some(page) = cache.peek(key, false) {
+                page.clear_dirty();
+            }
+        }
+        cache.unpark_all();
+        assert_eq!(cache.parked_len, 0);
+        cache.verify_cache_integrity();
+        cache.insert(create_key(102), page_with_content(102)).unwrap();
+        assert!(cache.len() <= 4, "len {}", cache.len());
         cache.verify_cache_integrity();
     }
 
