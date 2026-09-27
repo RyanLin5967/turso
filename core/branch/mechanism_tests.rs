@@ -1133,3 +1133,42 @@ fn retained_trunk_pre_images_are_shared_by_version_and_released_with_it() {
     mid.reap().unwrap();
     assert_eq!(db.retained_clone_count(), 0);
 }
+
+/// FS10 (red first). A held session that has finished its statements keeps no private cache entry
+/// for a page it holds by reference from the shared trunk-page cache (PostgreSQL's backends pin
+/// shared buffers and cache nothing privately between queries). The session still reads and writes
+/// correctly afterwards, and a page it holds a PRIVATE copy of (its first-touch read, before the
+/// shared cache had the page) stays cached: the release is selective (the `FS10_KEEP_PRIVATE`
+/// mutant keeps every entry and fails the first assertion).
+#[test]
+fn a_held_idle_session_keeps_no_private_entry_for_a_shared_page() {
+    let (_dir, db) = open_db();
+    db.set_fs10(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let before: BTreeMap<i64, String> = (1..=300).map(|id| (id, original(id))).collect();
+    let pages = rows(&trunk, "PRAGMA page_count")[0][0].as_int().unwrap() as usize;
+    // The first reader misses the shared cache and fills it: its pages are private copies.
+    let b1 = trunk.fork_branch().unwrap();
+    let c1 = b1.connect().unwrap();
+    assert_eq!(table(&c1), before);
+    // The second reader is served every page by reference.
+    let b2 = trunk.fork_branch().unwrap();
+    let c2 = b2.connect().unwrap();
+    assert_eq!(table(&c2), before);
+    assert_eq!(
+        c2.pager.load().shared_cached_pages(pages),
+        0,
+        "an idle session kept private cache entries for pages it holds by reference"
+    );
+    assert!(
+        c1.pager.load().page_cache_len() > 0,
+        "the first reader's private copies were released too: the release is not selective"
+    );
+    // Correct after the release: it re-resolves, and writes copy before writing.
+    assert_eq!(table(&c2), before);
+    set(&c2, 10, "b2-after-release");
+    assert_eq!(value(&c2, 10), Some("b2-after-release".to_string()));
+    assert_eq!(value(&c1, 10), Some(original(10)));
+    assert_eq!(value(&trunk, 10), Some(original(10)));
+}

@@ -511,6 +511,14 @@ impl Database {
         self.branches.set_fs9(on);
     }
 
+    /// FS10 (r11-sessions): a branch session releases its private page-cache entries for pages it
+    /// holds by reference from a shared pool (F6's cache, FS9's clones) when its last statement
+    /// ends. Normally taken from `TURSO_R11S_FS10=1`; tests set it per database.
+    #[doc(hidden)]
+    pub fn set_fs10(&self, on: bool) {
+        let _ = on; // red commit: the switch exists, the release does not
+    }
+
     /// FS9: retained trunk versions currently cloned for sharing. Observation only.
     #[doc(hidden)]
     pub fn retained_clone_count(&self) -> usize {
