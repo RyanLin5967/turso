@@ -205,9 +205,69 @@ struct StoreInner {
     /// Observation only, filled while hold timing is on: holds by duration, eight buckets per
     /// octave of nanoseconds (see [`hold_bucket`]), since the last [`BranchStore::take_hold_hist`].
     hold_hist: [u64; HOLD_HIST_BUCKETS],
+    /// Lane r12-composition arm M2-P (see [`M2Clones`]).
+    clones: M2Clones,
 }
 
 const HOLD_HIST_BUCKETS: usize = 8 * 40;
+
+/// Lane r12-composition arm M2-P (artie-research frontier/round12/r12-composition/PREREG.md §4):
+/// r11-sessions' FS9 clone cache (1b4869727: clones of retained TRUNK versions keyed by
+/// `(page, born)`, built on a version's first resolution) ported onto F-reclaim, where a reap's
+/// `child_gone` only unlinks and the versions are freed later by `release_version`. The mode is
+/// read from `TURSO_M2` when the store is built:
+/// - `off` (or unset): no clones; the store is e7d0fd4a7 exactly.
+/// - `composed`: evicted only where FS9 evicts — as `child_gone` releases a version, which under
+///   F-reclaim it never does — and all cleared when the trunk's last child goes.
+/// - `fix`: also evicted where F-reclaim frees a trunk version (`reclaim_range`/`reclaim_both`,
+///   right after `release_version`).
+///
+/// A clone is served only for the live version its key names, and a trunk version's `born` is
+/// never reused while the trunk has a child, so a stale clone costs memory, never a wrong read.
+#[derive(Default)]
+struct M2Clones {
+    mode: M2Mode,
+    map: HashMap<(u32, u64), Box<[u8]>>,
+    fills: u64,
+    hits: u64,
+    evicted: u64,
+    cleared: u64,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum M2Mode {
+    #[default]
+    Off,
+    Composed,
+    Fix,
+}
+
+impl M2Mode {
+    fn from_env() -> Self {
+        match std::env::var("TURSO_M2") {
+            Err(std::env::VarError::NotPresent) => M2Mode::Off,
+            Ok(v) if v.is_empty() || v == "off" => M2Mode::Off,
+            Ok(v) if v == "composed" => M2Mode::Composed,
+            Ok(v) if v == "fix" => M2Mode::Fix,
+            other => panic!("TURSO_M2={other:?}: expected `off`, `composed` or `fix`"),
+        }
+    }
+}
+
+/// M2-P's counters: clone fills and hits, clones held, clones held whose version is no longer
+/// retained (orphaned), trunk versions retained, clones evicted where their version was freed, and
+/// clones dropped by the last-child clear. Read by the store tests only.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct M2Counters {
+    pub(crate) fills: u64,
+    pub(crate) hits: u64,
+    pub(crate) held: u64,
+    pub(crate) orphaned: u64,
+    pub(crate) trunk_retained: u64,
+    pub(crate) evicted: u64,
+    pub(crate) cleared: u64,
+}
 
 /// The histogram bucket of a hold of `ns` nanoseconds: floor(8 * log2(ns)).
 fn hold_bucket(ns: u64) -> usize {
@@ -532,11 +592,23 @@ impl BranchStore {
                 hold: HoldAcc::default(),
                 hold_max: HoldMax::default(),
                 hold_hist: [0; HOLD_HIST_BUCKETS],
+                clones: M2Clones {
+                    mode: M2Mode::from_env(),
+                    ..M2Clones::default()
+                },
             }),
             trunk_children: AtomicUsize::new(0),
             #[cfg(test)]
             fork_build_pause: Mutex::new(None),
         }
+    }
+
+    /// M2-P: a store with the given clone mode, whatever `TURSO_M2` says (tests run in one process).
+    #[cfg(test)]
+    fn with_m2(mode: M2Mode) -> Self {
+        let store = Self::new();
+        store.inner.lock().clones.mode = mode;
+        store
     }
 
     /// Take the store mutex for the mechanism. Every hold it returns is counted in
@@ -944,6 +1016,26 @@ impl BranchStore {
         };
         inner.hold.pages += 1;
         inner.hold.copy_bytes += out.len() as u64;
+        if inner.clones.mode != M2Mode::Off {
+            if let Some((born, vslot)) = inner.trunk_version_read(id, page) {
+                crate::turso_assert!(vslot == slot, "M2-P: the trunk version read is not the one resolved");
+                let StoreInner { clones, arena, .. } = &mut *inner;
+                if let Some(c) = clones.map.get(&(page, born)) {
+                    out.copy_from_slice(c);
+                    clones.hits += 1;
+                } else {
+                    let bytes: Box<[u8]> = arena
+                        .as_ref()
+                        .expect("a slot resolved, so the arena exists")
+                        .page(slot)
+                        .into();
+                    out.copy_from_slice(&bytes);
+                    clones.map.insert((page, born), bytes);
+                    clones.fills += 1;
+                }
+                return Ok(true);
+            }
+        }
         out.copy_from_slice(
             inner
                 .arena
@@ -952,6 +1044,28 @@ impl BranchStore {
                 .page(slot),
         );
         Ok(true)
+    }
+
+    /// M2-P's counters (see [`M2Counters`]); observation only, O(clones held + pages retained).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn m2_counters(&self) -> M2Counters {
+        let inner = self.inner.lock();
+        let retained = &inner.trunk.lineage.retained;
+        let orphaned = inner
+            .clones
+            .map
+            .keys()
+            .filter(|(page, born)| !retained.get(page).is_some_and(|vs| vs.contains_key(born)))
+            .count() as u64;
+        M2Counters {
+            fills: inner.clones.fills,
+            hits: inner.clones.hits,
+            held: inner.clones.map.len() as u64,
+            orphaned,
+            trunk_retained: retained.values().map(|vs| vs.len() as u64).sum(),
+            evicted: inner.clones.evicted,
+            cleared: inner.clones.cleared,
+        }
     }
 
     pub(crate) fn stats(&self) -> BranchStats {
@@ -1019,7 +1133,11 @@ impl BranchStore {
             };
             reclaim.ranges.push((parent, lineage.child_gone(fork_epoch)));
             if parent.is_trunk() {
-                self.trunk_children.fetch_sub(1, Ordering::AcqRel);
+                if self.trunk_children.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    // M2-P, both modes (FS9's rule): no trunk child is left, so no clone can be read.
+                    inner.clones.cleared += inner.clones.map.len() as u64;
+                    inner.clones.map.clear();
+                }
                 return;
             }
             id = parent;
@@ -1069,6 +1187,7 @@ impl BranchStore {
                 branches,
                 work,
                 hold,
+                clones,
                 ..
             } = &mut *inner;
             let lineage = if node.is_trunk() {
@@ -1087,6 +1206,7 @@ impl BranchStore {
                 work.gc_range_entries += 1;
                 if !lineage.has_child_in(born, died) {
                     lineage.release_version(born, page, died, arena, work);
+                    clones.evict_freed(node, page, born);
                     freed += 1;
                 }
             }
@@ -1165,6 +1285,7 @@ impl BranchStore {
                 branches,
                 work,
                 hold,
+                clones,
                 ..
             } = &mut *inner;
             let lineage = if node.is_trunk() {
@@ -1179,6 +1300,7 @@ impl BranchStore {
             for &(born, page, died) in batch {
                 if lineage.holds(born, page, died) && !lineage.has_child_in(born, died) {
                     lineage.release_version(born, page, died, arena, work);
+                    clones.evict_freed(node, page, born);
                     freed += 1;
                 }
             }
@@ -1188,7 +1310,28 @@ impl BranchStore {
     }
 }
 
+impl M2Clones {
+    /// M2-P: `node` just freed its version `(page, born)`. Under `fix` its clone goes with it; under
+    /// `composed` FS9's eviction site (`child_gone`) is the only one, so nothing happens here.
+    fn evict_freed(&mut self, node: BranchId, page: u32, born: u64) {
+        if self.mode == M2Mode::Fix && node.is_trunk() && self.map.remove(&(page, born)).is_some() {
+            self.evicted += 1;
+        }
+    }
+}
+
 impl StoreInner {
+    /// M2-P: the trunk version branch `id` reads for `page`, as `(born, slot)`, when its read goes
+    /// to a retained trunk version (the same tail `resolve` takes); `None` otherwise.
+    fn trunk_version_read(&self, id: BranchId, page: u32) -> Option<(u64, Slot)> {
+        let st = self.branches.get(&id)?;
+        if st.current.contains_key(&page) || st.inherited.get(page).is_some() {
+            return None;
+        }
+        let (_, v) = self.trunk.lineage.retained.get(&page)?.range(..=st.trunk_at).next_back()?;
+        (st.trunk_at < v.died).then_some((v.born, v.slot))
+    }
+
     /// `levels` counts the nodes consulted — the branch (its own pages and its `inherited` map),
     /// then the trunk if neither holds the page — and `examined` the retained versions compared.
     fn resolve(
@@ -1780,5 +1923,162 @@ mod tests {
         store.release_handle(child);
         store.release_handle(id);
         assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
+    }
+
+    /// M2-P (r12-composition PREREG §4): FS9's clone cache ported onto F-reclaim. Child A reads a
+    /// trunk version only it can see, a straggler S keeps the trunk's child count above zero, and A
+    /// is reaped, so F-reclaim frees the version in `reclaim_range`. Under `fix` the clone goes with
+    /// it; under `composed` (FS9's eviction site, `child_gone`, frees nothing here) it stays,
+    /// orphaned, until the trunk's last child goes.
+    #[test]
+    fn m2_a_clone_outlives_its_version_unless_evicted_where_it_is_freed() {
+        for mode in [M2Mode::Composed, M2Mode::Fix] {
+            let store = BranchStore::with_m2(mode);
+            let a = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+            // The trunk rewrites page 1 after A's fork: the pre-image [0, 1) is retained for A alone.
+            store.first_write_trunk(1, &image(7));
+            let s = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+            let mut buf = vec![0u8; PAGE];
+            assert!(store.resolve_into(a, 1, &mut buf).unwrap(), "{mode:?}: A reads the retained version");
+            assert_eq!(buf, image(7), "{mode:?}: the fill");
+            buf.fill(0);
+            assert!(store.resolve_into(a, 1, &mut buf).unwrap());
+            assert_eq!(buf, image(7), "{mode:?}: the hit");
+            assert!(!store.resolve_into(s, 1, &mut buf).unwrap(), "{mode:?}: S sees the trunk's current page");
+            let c = store.m2_counters();
+            assert_eq!(
+                (c.fills, c.hits, c.held, c.orphaned, c.trunk_retained),
+                (1, 1, 1, 0, 1),
+                "{mode:?}: {c:?}"
+            );
+            let reaped = store.release_handle(a);
+            assert_eq!(reaped.freed_pages, 1, "{mode:?}: the version only A saw is freed");
+            let c = store.m2_counters();
+            assert_eq!(c.trunk_retained, 0, "{mode:?}: {c:?}");
+            match mode {
+                M2Mode::Fix => assert_eq!((c.held, c.orphaned, c.evicted), (0, 0, 1), "{mode:?}: {c:?}"),
+                _ => assert_eq!(
+                    (c.held, c.orphaned, c.evicted),
+                    (1, 1, 0),
+                    "{mode:?}: the clone outlives its version: {c:?}"
+                ),
+            }
+            store.release_handle(s);
+            let c = store.m2_counters();
+            assert_eq!((c.held, c.orphaned), (0, 0), "{mode:?}: the last-child clear drops every clone: {c:?}");
+            assert_eq!(store.stats().arena_slots_in_use, 0, "{mode:?}: slots leaked");
+        }
+    }
+
+    /// M2-P's measured arm (r12-composition PREREG §4 and its amendments); counters only. Run alone:
+    /// `M2_MODE=composed|fix|off M2_N=<live> [M2_CYCLES=10000] [M2_EVERY=10] [M2_PAGES=541]
+    /// cargo test --release -p turso_core --lib m2_scale -- --ignored --exact --nocapture`.
+    ///
+    /// N children are forked from the trunk with one trunk write of a random page after every
+    /// `EVERY` forks (so V ~ N/EVERY), the first child is a straggler that lives to the end, and then
+    /// each cycle reaps the OLDEST other child (FIFO, so versions die at every N), forks one, writes
+    /// one random trunk page every `EVERY` cycles, and reads 8 random pages through the FIFO head
+    /// (the next child reaped) and 8 through random live children. Every read is checked against a
+    /// model (the trunk page's generation as of the reader's fork), so a clone served for the wrong
+    /// version fails the run. Page images are 4,096 bytes.
+    #[test]
+    #[ignore]
+    fn m2_scale() {
+        let var = |k: &str, d: u64| std::env::var(k).map_or(d, |v| v.parse().expect(k));
+        let mode = match std::env::var("M2_MODE").as_deref() {
+            Ok("composed") => M2Mode::Composed,
+            Ok("fix") => M2Mode::Fix,
+            Ok("off") => M2Mode::Off,
+            other => panic!("M2_MODE={other:?}: expected composed, fix or off"),
+        };
+        let n = var("M2_N", 1000);
+        let cycles = var("M2_CYCLES", 10_000);
+        let every = var("M2_EVERY", 10);
+        let pages = var("M2_PAGES", 541) as u32;
+        const PS: usize = 4096;
+        let img = |g: u64| g.to_le_bytes().repeat(PS / 8);
+        let store = BranchStore::with_m2(mode);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        // Each page's current generation, and its writes as (epoch, generation) in epoch order.
+        let mut current: Vec<u64> = (0..pages as u64).collect();
+        let mut writes: Vec<Vec<(u64, u64)>> = vec![Vec::new(); pages as usize];
+        let mut next_gen = 1_000_000u64;
+        let mut epoch = 0u64;
+        let mut trunk_write = |store: &BranchStore, rng: &mut Rng, epoch: u64, current: &mut Vec<u64>, writes: &mut Vec<Vec<(u64, u64)>>| {
+            let p = rng.below(pages as u64) as u32;
+            store.first_write_trunk(p, &img(current[p as usize]));
+            next_gen += 1;
+            current[p as usize] = next_gen;
+            writes[p as usize].push((epoch, next_gen));
+        };
+        // Live children in fork order, with their fork epochs; the straggler is kept apart.
+        let mut live: std::collections::VecDeque<(BranchId, u64)> = std::collections::VecDeque::new();
+        let straggler = (store.fork_trunk(Arc::new(Schema::default()), PS).unwrap(), epoch);
+        epoch += 1;
+        for i in 1..n {
+            let id = store.fork_trunk(Arc::new(Schema::default()), PS).unwrap();
+            live.push_back((id, epoch));
+            epoch += 1;
+            if i % every == 0 {
+                trunk_write(&store, &mut rng, epoch, &mut current, &mut writes);
+            }
+        }
+        let seen = |writes: &Vec<Vec<(u64, u64)>>, p: u32, f: u64| -> u64 {
+            writes[p as usize].iter().rev().find(|&&(e, _)| e <= f).map_or(p as u64, |&(_, g)| g)
+        };
+        let mut buf = vec![0u8; PS];
+        let mut read = |store: &BranchStore, id: BranchId, f: u64, p: u32, current: &Vec<u64>, writes: &Vec<Vec<(u64, u64)>>| {
+            let want = seen(writes, p, f);
+            if store.resolve_into(id, p, &mut buf).unwrap() {
+                assert_eq!(u64::from_le_bytes(buf[..8].try_into().unwrap()), want, "page {p} for the child forked at {f}");
+                assert!(buf == img(want), "page {p} for the child forked at {f}: torn image");
+            } else {
+                assert_eq!(current[p as usize], want, "page {p} for the child forked at {f}: the trunk's page is not its view");
+            }
+        };
+        let st = store.stats();
+        let c = store.m2_counters();
+        println!(
+            "# m2_scale mode={mode:?} n={n} cycles={cycles} every={every} pages={pages} page_size={PS} grown: live={} arena_in_use={} trunk_retained={}",
+            st.live_branches, st.arena_slots_in_use, c.trunk_retained
+        );
+        println!("M2\tmode\tn\tcycle\tfills\thits\theld\torphaned\ttrunk_retained\tevicted\tcleared\tarena_in_use\tlive\tfreed_total");
+        let mut freed_total = 0usize;
+        for cycle in 1..=cycles {
+            let (head, fh) = live.pop_front().expect("n >= 2");
+            for _ in 0..8 {
+                let p = rng.below(pages as u64) as u32;
+                read(&store, head, fh, p, &current, &writes);
+            }
+            for _ in 0..8 {
+                let (id, f) = live[rng.below(live.len() as u64) as usize];
+                let p = rng.below(pages as u64) as u32;
+                read(&store, id, f, p, &current, &writes);
+            }
+            freed_total += store.release_handle(head).freed_pages;
+            let id = store.fork_trunk(Arc::new(Schema::default()), PS).unwrap();
+            live.push_back((id, epoch));
+            epoch += 1;
+            if cycle % every == 0 {
+                trunk_write(&store, &mut rng, epoch, &mut current, &mut writes);
+            }
+            if cycle % 1000 == 0 || cycle == cycles {
+                let c = store.m2_counters();
+                let st = store.stats();
+                println!(
+                    "M2\t{mode:?}\t{n}\t{cycle}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{freed_total}",
+                    c.fills, c.hits, c.held, c.orphaned, c.trunk_retained, c.evicted, c.cleared,
+                    st.arena_slots_in_use, st.live_branches
+                );
+            }
+        }
+        for (id, _) in live.drain(..) {
+            store.release_handle(id);
+        }
+        store.release_handle(straggler.0);
+        let c = store.m2_counters();
+        let st = store.stats();
+        println!("# m2_scale end: held={} orphaned={} arena_in_use={} live={}", c.held, c.orphaned, st.arena_slots_in_use, st.live_branches);
+        assert_eq!((c.held, st.arena_slots_in_use, st.live_branches), (0, 0, 0), "everything reaped: {c:?}");
     }
 }
