@@ -347,6 +347,26 @@ impl Drop for TrunkCommitGate<'_> {
     }
 }
 
+/// FL's refusals, the startup error a run gets instead of a composition nobody reviewed (lead ruling (b) on the
+/// port, 2026-09-27): FL with FK (both register trunk forks, FL under the trunk lock against the commit gate, FK
+/// without the lock in a skiplist) and FL with F-FB (a batch's epoch assumes every member excludes trunk writers,
+/// which FL's forks do not). Each message names both switches.
+pub(crate) fn fl_refusal(fl: bool, fk: bool, fork_batch: bool) -> Option<&'static str> {
+    if fl && fk {
+        return Some(
+            "TURSO_R11_FIX lists both L and K: FL registers trunk forks under the trunk lock against a commit gate, FK \
+             without that lock in a skiplist; not composed; refused",
+        );
+    }
+    if fl && fork_batch {
+        return Some(
+            "TURSO_R11_FIX lists L with TURSO_FORK_BATCH=on: F-FB's batch epoch assumes every member excludes trunk \
+             writers, which FL's forks do not; not composed; refused",
+        );
+    }
+    None
+}
+
 /// FL's mutant schemata (r12-phasefair PREREG section "F-L (r11-forklock)", FL.3; test builds only): `FL_MUTANT=n`,
 /// read once. 1 ignores the commit gate; 2 does not restamp at the commit; 3 captures nothing; 4 admits a lock-free
 /// first child; 5 treats a page born in the previous epoch as born in this one; 6 moves the arrive after the hold.
@@ -1219,17 +1239,12 @@ impl BranchStore {
             panic!("TURSO_FORK_BATCH=on with r11-coherence's FK: FK forks without the trunk lock; refused");
         }
         let fl = crate::coherence::fix(crate::coherence::FIX_FORKOCC);
-        if fl && crate::coherence::fix(crate::coherence::FIX_TRUNKIDX) {
-            panic!(
-                "TURSO_R11_FIX with L and K: FL registers forks under the trunk lock against a commit gate, FK \
-                 without that lock; not composed; refused"
-            );
-        }
-        if fl && fork_batch {
-            panic!(
-                "TURSO_FORK_BATCH=on with FL: F-FB's batch epoch assumes every member excludes trunk writers, which \
-                 FL's forks do not; refused"
-            );
+        if let Some(refusal) = fl_refusal(
+            fl,
+            crate::coherence::fix(crate::coherence::FIX_TRUNKIDX),
+            fork_batch,
+        ) {
+            panic!("{refusal}");
         }
         let k3 = shared.map(std::sync::Arc::new);
         let n_shards = if crate::coherence::fix(crate::coherence::FIX_STRIPES) {
@@ -3961,5 +3976,44 @@ mod tests {
         );
         assert_eq!(store.stats().live_branches, 0, "k3 {mode:?}: branches leaked");
         assert_eq!(store.stats().arena_slots_in_use, 0, "k3 {mode:?}: versions leaked");
+    }
+
+    /// FL's refusals (lead ruling (b)): exactly the pairs L+K and L+F-FB are refused, and each message names both
+    /// switches.
+    #[test]
+    fn fl_refusal_names_both_switches_for_exactly_the_refused_pairs() {
+        for fl in [false, true] {
+            for fk in [false, true] {
+                for fb in [false, true] {
+                    let r = fl_refusal(fl, fk, fb);
+                    assert_eq!(r.is_some(), fl && (fk || fb), "fl {fl} fk {fk} fb {fb}: {r:?}");
+                    if let Some(msg) = r {
+                        assert!(msg.contains(" L "), "the refusal does not name L: {msg}");
+                        assert!(
+                            if fk { msg.contains(" K:") } else { msg.contains("TURSO_FORK_BATCH=on") },
+                            "the refusal does not name the other switch: {msg}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// FL with FK refuses at the store's construction, naming both letters.
+    #[test]
+    #[should_panic(expected = "TURSO_R11_FIX lists both L and K")]
+    fn fl_with_fk_refuses_at_construction() {
+        crate::coherence::force_fixes_for_test(crate::coherence::FIX_FORKOCC | crate::coherence::FIX_TRUNKIDX);
+        let _store = BranchStore::with_k3(K3Mode::Off);
+    }
+
+    /// FL with F-FB refuses at the store's construction, naming both switches. F-FB is chosen by the environment,
+    /// so this runs only when asked, with TURSO_FORK_BATCH=on set (fltests.sh step fl_refuse_fb).
+    #[test]
+    #[ignore = "needs TURSO_FORK_BATCH=on in the environment (fltests.sh)"]
+    #[should_panic(expected = "TURSO_R11_FIX lists L with TURSO_FORK_BATCH=on")]
+    fn fl_with_fork_batch_env_refuses_at_construction() {
+        crate::coherence::force_fixes_for_test(crate::coherence::FIX_FORKOCC);
+        let _store = BranchStore::with_k3(K3Mode::Off);
     }
 }
