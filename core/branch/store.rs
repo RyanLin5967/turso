@@ -1224,6 +1224,54 @@ mod tests {
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
     }
 
+    /// A reap of 2^20 pages holds the store mutex for at most a batch of 64 frees at a time,
+    /// whichever structure held the pages (r12-async-destroy PREREG §4, T-red): 2^20 versions the
+    /// trunk retained for one child alone (the heap side of a reap), and 2^20 pages one branch wrote
+    /// itself (the page-map side). A store that frees inside the reap's one hold frees all 2^20 in
+    /// it.
+    #[test]
+    fn a_reap_of_2_20_pages_holds_the_store_mutex_for_at_most_a_batch_of_frees() {
+        const K: u32 = 1 << 20;
+        const B: u64 = 64;
+        for own in [false, true] {
+            let store = BranchStore::new();
+            let schema = Arc::new(Schema::default());
+            let child = store.fork_trunk(schema.clone(), PAGE).unwrap();
+            let pre = image(0);
+            if own {
+                store.begin_write(child).unwrap();
+                for page in 1..=K {
+                    store.first_write_branch(child, page, &pre).unwrap();
+                }
+                store.end_write(child);
+            } else {
+                for page in 1..=K {
+                    store.first_write_trunk(page, &pre);
+                }
+            }
+            // A younger live sibling, so the trunk side's garbage has a neighbour to be filed under.
+            let sibling = store.fork_trunk(schema, PAGE).unwrap();
+            assert_eq!(store.stats().arena_slots_in_use, K as usize, "own {own}");
+            store.take_hold_max();
+            let reaped = store.release_handle(child);
+            let h = store.take_hold_max();
+            assert_eq!(reaped.freed_pages, K as usize, "own {own}");
+            assert_eq!(store.stats().arena_slots_in_use, 0, "own {own}");
+            assert!(
+                h.freed <= B && h.slot_decrefs <= B && h.map_nodes <= B && h.heap_examined <= B,
+                "own {own}: one hold of the reap freed {} slots, dropped {} slot references, visited \
+                 {} map nodes and examined {} heap roots, against at most {B} each ({} holds)",
+                h.freed,
+                h.slot_decrefs,
+                h.map_nodes,
+                h.heap_examined,
+                h.holds
+            );
+            store.release_handle(sibling);
+            assert_eq!(store.stats().live_branches, 0, "own {own}");
+        }
+    }
+
     /// One committed write transaction on `id` of `pages`, each holding `image(generation)`.
 fn commit(store: &BranchStore, id: BranchId, pages: &[u32], before: u64, generation: u64) {
     store.begin_write(id).unwrap();
