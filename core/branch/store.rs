@@ -1003,6 +1003,8 @@ impl BranchStore {
         let opened = Instant::now();
         let mut stats = BranchOpenStats::default();
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // F-PW: an invalid R11_PREWARM_SLOTS refuses the open rather than run on a default.
+        let prewarm = super::arena::prewarm_cap()?.is_some();
         let inner = match durability {
             BranchDurability::Volatile => {
                 if !memory && BranchFiles::for_db(db_path).exist() {
@@ -1097,6 +1099,9 @@ impl BranchStore {
                 inner
             }
         };
+        if prewarm {
+            Self::prewarm(&inner, &mut stats);
+        }
         let mut store = Self {
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             inner: Mutex::new(inner),
@@ -1153,6 +1158,50 @@ impl BranchStore {
         }
         store.open_stats = stats;
         Ok(store)
+    }
+
+    /// F-PW (r11-githost-attr PREREG A3): read the slots `<db>-branch-hot` names into the OS page
+    /// cache, before the expiry pass and before any caller, as pg_prewarm's `read` mode does. The
+    /// arena itself started remembering this process's slots when it was created. Never fails the
+    /// open: a missing, refused or unreadable list only means no prewarm, and `prewarm_file` says
+    /// which. A store with no arena yet (a new one) has nothing to warm.
+    fn prewarm(inner: &StoreInner, stats: &mut BranchOpenStats) {
+        let (Some(files), Some(arena)) = (inner.files.as_ref(), inner.arena.as_ref()) else {
+            return;
+        };
+        if !arena.is_file_backed() {
+            return;
+        }
+        let t = Instant::now();
+        match std::fs::read(&files.hot) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => stats.prewarm_file = 0,
+            Err(e) => {
+                stats.prewarm_file = 3;
+                tracing::debug!("branch hot list not read: {e}");
+            }
+            Ok(bytes) => match super::arena::decode_hot(&bytes, arena.page_size()) {
+                Err(why) => {
+                    stats.prewarm_file = 2;
+                    tracing::debug!("branch hot list refused: {why}");
+                }
+                Ok(slots) => {
+                    stats.prewarm_slots = slots.len() as u64;
+                    match arena.prewarm(&slots) {
+                        Ok(p) => {
+                            stats.prewarm_file = 1;
+                            stats.prewarm_read_slots = p.read_slots;
+                            stats.prewarm_bytes = p.bytes;
+                            stats.prewarm_ranges = p.ranges;
+                        }
+                        Err(e) => {
+                            stats.prewarm_file = 3;
+                            tracing::debug!("branch prewarm read failed: {e}");
+                        }
+                    }
+                }
+            },
+        }
+        stats.prewarm_ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     }
 
     /// Catalog-mode recovery (on demand): open the catalog and read its meta row, replay the log's
@@ -2446,6 +2495,15 @@ impl Drop for BranchStore {
             inner.lease.queued(now);
             if let Err(e) = self.log(&mut inner, Record::Clock { now_ms: now }) {
                 tracing::debug!("branch lease clock not stamped at close: {e}");
+            }
+        }
+        // F-PW (r11-githost-attr PREREG A3): name the slots this process used most recently, for
+        // the next open to read back (`arena::write_hot`: a hint, never state).
+        if let (Some(files), Some(arena)) = (inner.files.as_ref(), inner.arena.as_ref()) {
+            if let Some(slots) = arena.hot_slots() {
+                if let Err(e) = super::arena::write_hot(&files.hot, arena.page_size(), &slots) {
+                    tracing::debug!("branch hot list not written at close: {e}");
+                }
             }
         }
     }

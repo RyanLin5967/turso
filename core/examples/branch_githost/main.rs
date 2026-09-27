@@ -418,14 +418,16 @@ fn size_of(path: &Path) -> u64 {
 fn files_line(db: &Path) -> String {
     let with = |suffix: &str| PathBuf::from(format!("{}{suffix}", db.to_str().unwrap()));
     format!(
-        "db_bytes={} wal_bytes={} log_bytes={} snap_bytes={} arena_bytes={} cat_bytes={} catwal_bytes={}",
+        "db_bytes={} wal_bytes={} log_bytes={} snap_bytes={} arena_bytes={} cat_bytes={} catwal_bytes={} \
+         hot_bytes={}",
         size_of(db),
         size_of(&with("-wal")),
         size_of(&with("-branch-log")),
         size_of(&with("-branch-snap")),
         size_of(&with("-branch-arena")),
         size_of(&with("-branch-cat")),
-        size_of(&with("-branch-cat-wal"))
+        size_of(&with("-branch-cat-wal")),
+        size_of(&with("-branch-hot"))
     )
 }
 
@@ -710,7 +712,9 @@ fn open_line(s: &BranchOpenStats) -> String {
          arena_free={} states={} released_scanned={} branch_loads={} trunk_page_loads={} cat_queries={} \
          cat_rows_read={} touched_slots={} trunk_probes={} trunk_rows={} parked_records={} parked_applied={} \
          catalog_us={:.1} recover_us={:.1} load_us={:.1} replay_us={:.1} \
-         collect_us={:.1} referenced_us={:.1} arena_us={:.1} expire_us={:.1} store_total_us={:.1}",
+         collect_us={:.1} referenced_us={:.1} arena_us={:.1} expire_us={:.1} store_total_us={:.1} \
+         prewarm_file={} prewarm_slots={} prewarm_read_slots={} prewarm_bytes={} prewarm_ranges={} \
+         prewarm_us={:.1}",
         s.snap_bytes,
         s.log_bytes,
         s.records,
@@ -742,7 +746,13 @@ fn open_line(s: &BranchOpenStats) -> String {
         s.referenced_ns as f64 / 1e3,
         s.arena_ns as f64 / 1e3,
         s.expire_ns as f64 / 1e3,
-        s.total_ns as f64 / 1e3
+        s.total_ns as f64 / 1e3,
+        s.prewarm_file,
+        s.prewarm_slots,
+        s.prewarm_read_slots,
+        s.prewarm_bytes,
+        s.prewarm_ranges,
+        s.prewarm_ns as f64 / 1e3
     )
 }
 
@@ -1679,7 +1689,8 @@ fn main() {
     // r11-githost-attr: the mode and the two page-cache instruments, recorded with every run.
     let set = |k: &str| if std::env::var_os(k).is_some() { "set" } else { "unset" };
     println!(
-        "# r11-githost-attr: durability={} R11_UBC_PROBE={} R11_CENSUS_OPS={} R11_SCHEMA_SHARE={}",
+        "# r11-githost-attr: durability={} R11_UBC_PROBE={} R11_CENSUS_OPS={} R11_SCHEMA_SHARE={} \
+         R11_PREWARM={} R11_PREWARM_SLOTS={}",
         match (args.cmd.as_str(), args.eager) {
             ("ubc-selftest", _) => "n/a",
             (_, true) => "eager",
@@ -1687,7 +1698,9 @@ fn main() {
         },
         set("R11_UBC_PROBE"),
         set("R11_CENSUS_OPS"),
-        set("R11_SCHEMA_SHARE")
+        set("R11_SCHEMA_SHARE"),
+        set("R11_PREWARM"),
+        std::env::var("R11_PREWARM_SLOTS").unwrap_or_else(|_| "unset".to_string())
     );
     match args.cmd.as_str() {
         "grow" => grow(&args),

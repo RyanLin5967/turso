@@ -333,6 +333,16 @@ pub struct BranchOpenStats {
     /// of the tail, a release or the expiry pass touched the branch).
     pub parked_records: u64,
     pub parked_applied: u64,
+    /// F-PW (r11-githost-attr PREREG A3), while `R11_PREWARM` is set: what became of
+    /// `<db>-branch-hot` (0 none, or prewarm off; 1 read back; 2 refused by its checks; 3 a read
+    /// failed), the slots it named, the named slots read (past the arena's end skipped), bytes read
+    /// (bridged gaps included), read runs, and the time, inside `total_ns`.
+    pub prewarm_file: u64,
+    pub prewarm_slots: u64,
+    pub prewarm_read_slots: u64,
+    pub prewarm_bytes: u64,
+    pub prewarm_ranges: u64,
+    pub prewarm_ns: u64,
 }
 
 /// githost-shape lane instrument (observing only; r3, on a12-durable-open's C-P + C-R): the catalog
