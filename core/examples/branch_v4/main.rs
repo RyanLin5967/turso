@@ -139,15 +139,17 @@ fn trunk_write_value(g: u64) -> String {
     format!("t{:0>width$}", g, width = VALUE_LEN - 1)
 }
 
-fn read_v(conn: &Arc<Connection>, id: i64) -> String {
-    let mut stmt = conn.prepare(format!("SELECT v FROM t WHERE id = {id}")).unwrap();
-    let rows = stmt.run_collect_rows().unwrap();
+/// B's row `id`, read after the counters: an error or a wrong shape is the store's, so it is
+/// returned for a FINDING rather than ending the run.
+fn try_read_v(conn: &Arc<Connection>, id: i64) -> Result<String, String> {
+    let mut stmt = conn.prepare(format!("SELECT v FROM t WHERE id = {id}")).map_err(|e| e.to_string())?;
+    let rows = stmt.run_collect_rows().map_err(|e| e.to_string())?;
     match rows.as_slice() {
         [row] => match &row[0] {
-            Value::Text(t) => t.as_str().to_string(),
-            other => not_a_result(&format!("row {id}: expected text, got {other:?}")),
+            Value::Text(t) => Ok(t.as_str().to_string()),
+            other => Err(format!("expected text, got {other:?}")),
         },
-        _ => not_a_result(&format!("row {id}: {} rows", rows.len())),
+        _ => Err(format!("{} rows", rows.len())),
     }
 }
 
@@ -278,24 +280,30 @@ fn victim(args: &Args) {
     }
 }
 
-fn varint(b: &[u8], mut at: usize) -> (u64, usize) {
+fn varint(b: &[u8], mut at: usize) -> Result<(u64, usize), String> {
     let mut v = 0u64;
     for i in 0..9 {
-        let byte = *b.get(at).unwrap_or_else(|| not_a_result("varint runs off the page"));
+        let byte = *b.get(at).ok_or("a varint runs off the page")?;
         at += 1;
         if i == 8 {
-            return ((v << 8) | byte as u64, at);
+            return Ok(((v << 8) | byte as u64, at));
         }
         v = (v << 7) | (byte & 0x7f) as u64;
         if byte & 0x80 == 0 {
-            return (v, at);
+            return Ok((v, at));
         }
     }
     unreachable!()
 }
 
-fn be16(b: &[u8], at: usize) -> usize {
-    u16::from_be_bytes([b[at], b[at + 1]]) as usize
+fn bytes<const N: usize>(b: &[u8], at: usize) -> Result<[u8; N], String> {
+    b.get(at..at + N)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| format!("{N} bytes at {at} run off the page"))
+}
+
+fn be16(b: &[u8], at: usize) -> Result<usize, String> {
+    Ok(u16::from_be_bytes(bytes(b, at)?) as usize)
 }
 
 /// A table b-tree page: the child to descend for `key` (interior), or the key's cell's `v`
@@ -305,49 +313,50 @@ enum Step {
     Leaf(Option<String>),
 }
 
-fn step(page: u32, buf: &[u8], usable: usize, key: i64) -> Step {
+/// One page of the descent to `key`. An error names what the page does not satisfy: the caller
+/// decides whose fault that is (the file's is the harness's premise; the store's is a FINDING).
+fn step(page: u32, buf: &[u8], usable: usize, key: i64) -> Result<Step, String> {
     let h = if page == 1 { 100 } else { 0 };
-    let n = be16(buf, h + 3);
-    match buf[h] {
-        0x05 => {
+    let n = be16(buf, h + 3)?;
+    match buf.get(h).copied() {
+        Some(0x05) => {
             let cells = h + 12;
             for i in 0..n {
-                let off = be16(buf, cells + 2 * i);
-                let child = u32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
-                let (k, _) = varint(buf, off + 4);
+                let off = be16(buf, cells + 2 * i)?;
+                let child = u32::from_be_bytes(bytes(buf, off)?);
+                let (k, _) = varint(buf, off + 4)?;
                 if key <= k as i64 {
-                    return Step::Child(child);
+                    return Ok(Step::Child(child));
                 }
             }
-            Step::Child(u32::from_be_bytes(buf[h + 8..h + 12].try_into().unwrap()))
+            Ok(Step::Child(u32::from_be_bytes(bytes(buf, h + 8)?)))
         }
-        0x0d => {
+        Some(0x0d) => {
             let cells = h + 8;
             for i in 0..n {
-                let off = be16(buf, cells + 2 * i);
-                let (len, at) = varint(buf, off);
-                let (rowid, at) = varint(buf, at);
+                let off = be16(buf, cells + 2 * i)?;
+                let (len, at) = varint(buf, off)?;
+                let (rowid, at) = varint(buf, at)?;
                 if rowid as i64 != key {
                     continue;
                 }
                 if len as usize > usable - 35 {
-                    not_a_result(&format!("page {page}: key {key}'s payload ({len} bytes) overflows"));
+                    return Err(format!("key {key}'s payload ({len} bytes) overflows"));
                 }
-                let rec = &buf[at..at + len as usize];
-                let (hs, mut p) = varint(rec, 0);
-                let (t0, q) = varint(rec, p);
-                p = q;
-                let (t1, _) = varint(rec, p);
+                let rec = buf.get(at..at + len as usize).ok_or("a cell runs off the page")?;
+                let (hs, p) = varint(rec, 0)?;
+                let (t0, p) = varint(rec, p)?;
+                let (t1, _) = varint(rec, p)?;
                 if t0 != 0 || t1 < 13 || t1 % 2 == 0 {
-                    not_a_result(&format!("page {page}: key {key}'s record has serial types {t0}, {t1}"));
+                    return Err(format!("key {key}'s record has serial types {t0}, {t1}"));
                 }
-                let body = hs as usize;
-                let tlen = ((t1 - 13) / 2) as usize;
-                return Step::Leaf(Some(String::from_utf8_lossy(&rec[body..body + tlen]).into_owned()));
+                let (body, tlen) = (hs as usize, ((t1 - 13) / 2) as usize);
+                let text = rec.get(body..body + tlen).ok_or("a record runs off its cell")?;
+                return Ok(Step::Leaf(Some(String::from_utf8_lossy(text).into_owned())));
             }
-            Step::Leaf(None)
+            Ok(Step::Leaf(None))
         }
-        other => not_a_result(&format!("page {page}: page type {other:#x} is not a table b-tree page")),
+        other => Err(format!("page type {other:?} is not a table b-tree page")),
     }
 }
 
@@ -371,8 +380,9 @@ fn current_path(file: &mut DbFile, root: u32, usable: usize, key: i64) -> (Vec<u
         path.push(page);
         file.read(page, &mut buf);
         match step(page, &buf, usable, key) {
-            Step::Child(c) => page = c,
-            Step::Leaf(v) => return (path, v),
+            Ok(Step::Child(c)) => page = c,
+            Ok(Step::Leaf(v)) => return (path, v),
+            Err(e) => not_a_result(&format!("database file page {page}: {e}")),
         }
         if path.len() > 64 {
             not_a_result(&format!("key {key}: no leaf after 64 levels"));
@@ -448,11 +458,17 @@ fn reopen(args: &Args) {
                 file.read(page, &mut buf);
             }
             match step(page, &buf, usable, k) {
-                Step::Child(c) => page = c,
-                Step::Leaf(v) => break Some(v),
+                Ok(Step::Child(c)) => page = c,
+                Ok(Step::Leaf(v)) => break Some(v),
+                Err(e) if arena => {
+                    findings.push(format!("key {k}: base page {page} at depth {depth}, from the arena: {e}"));
+                    break None;
+                }
+                Err(e) => not_a_result(&format!("database file page {page}: {e}")),
             }
             if path.len() > 64 {
-                not_a_result(&format!("key {k}: no base leaf after 64 levels"));
+                findings.push(format!("key {k}: no base leaf after 64 levels"));
+                break None;
             }
         };
         path_pages.push(path.len() as u64);
@@ -526,35 +542,53 @@ fn reopen(args: &Args) {
         delta(io0, io1),
         delta(io1, io2)
     );
+    // A wrong store answer is a FINDING, printed before any harness check can end the run.
+    for f in &findings {
+        println!("FINDING: {f}");
+    }
+    let _ = std::io::stdout().flush();
     if v4_1.1 - v4_0.1 != arena {
         not_a_result(&format!("the store counted {} arena base reads, the harness {arena}", v4_1.1 - v4_0.1));
     }
 
     // Theirs, after the counters are taken (these reads go through the ordinary resolve path).
-    let branch = db.branch(B).unwrap_or_else(|e| not_a_result(&format!("attach {B:?}: {e}")));
-    let conn = branch.connect().unwrap();
-    for &k in &d.keys {
-        let theirs = read_v(&conn, k);
-        if theirs != branch_value(k) {
-            not_a_result(&format!("key {k}: B reads {theirs}, expected {}", branch_value(k)));
+    let mut later = Vec::new();
+    match db.branch(B) {
+        Ok(branch) => {
+            match branch.connect() {
+                Ok(conn) => {
+                    for &k in &d.keys {
+                        match try_read_v(&conn, k) {
+                            Ok(theirs) if theirs == branch_value(k) => {}
+                            Ok(theirs) => later.push(format!("key {k}: B reads {theirs}, expected {}", branch_value(k))),
+                            Err(e) => later.push(format!("key {k}: B's read failed: {e}")),
+                        }
+                    }
+                }
+                Err(e) => later.push(format!("connect to {B:?}: {e}")),
+            }
+            let _ = branch.into_id();
         }
+        Err(e) => later.push(format!("attach {B:?}: {e}")),
     }
-    drop(conn);
-    let _ = branch.into_id();
-    let st = db.branch_stats().unwrap();
-    println!(
-        "# reopen after: theirs checked {n}/{n}; live_branches={} trunk_retained={} {}",
-        st.live_branches,
-        db.branch_trunk_retained(),
-        files_line(&args.db)
-    );
-    if st.live_branches != 1 {
-        not_a_result(&format!("after the reopen: {st:?}, expected 1 live branch"));
-    }
-    if !findings.is_empty() {
-        for f in &findings {
-            println!("FINDING: {f}");
+    match db.branch_stats() {
+        Ok(st) => {
+            println!(
+                "# reopen after: theirs checked {n} keys; live_branches={} trunk_retained={} {}",
+                st.live_branches,
+                db.branch_trunk_retained(),
+                files_line(&args.db)
+            );
+            if st.live_branches != 1 {
+                later.push(format!("after the reopen: {st:?}, expected 1 live branch"));
+            }
         }
+        Err(e) => later.push(format!("branch_stats after the reopen: {e}")),
+    }
+    for f in &later {
+        println!("FINDING: {f}");
+    }
+    if !findings.is_empty() || !later.is_empty() {
         let _ = std::io::stdout().flush();
         std::process::exit(3);
     }

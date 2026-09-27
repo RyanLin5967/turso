@@ -2070,19 +2070,26 @@ impl BranchStore {
         let Some((slot, crc)) = resolved? else {
             return Ok(false);
         };
-        inner.v4.base_arena += 1;
         let arena = inner
             .arena
             .as_ref()
             .expect("a slot resolved, so the arena exists");
-        arena.read_slot(slot, out)?;
-        if arena.is_file_backed() && crc32c::crc32c(out) != crc {
-            return Err(LimboError::Corrupt(format!(
-                "branch {}'s base page {page} (arena slot {slot}) failed its checksum",
-                id.0
-            )));
+        // An arena read counts only once its page is read and checked; a failed read or checksum
+        // is a refusal, as the caller sees it.
+        let read = arena.read_slot(slot, out).and_then(|()| {
+            if arena.is_file_backed() && crc32c::crc32c(out) != crc {
+                return Err(LimboError::Corrupt(format!(
+                    "branch {}'s base page {page} (arena slot {slot}) failed its checksum",
+                    id.0
+                )));
+            }
+            Ok(())
+        });
+        match &read {
+            Ok(()) => inner.v4.base_arena += 1,
+            Err(_) => inner.v4.base_refused += 1,
         }
-        Ok(true)
+        read.map(|()| true)
     }
 
     /// `(base reads, arena-resolved, refused, retained versions examined, C-P trunk probes, C-P
