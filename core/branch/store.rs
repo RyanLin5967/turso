@@ -1122,9 +1122,11 @@ impl BranchStore {
         Ok(())
     }
 
-    /// Compact the log into a snapshot if it has outgrown the live state. Best effort: the
-    /// operation that triggered it is already durable, and a failure before the rename leaves the
-    /// log intact; a failure after it fail-stops the journal (see `Journal::compact`).
+    /// Compact the log into a snapshot if it has outgrown the live state. Best effort: a failure
+    /// before the rename leaves the log, its buffer and the store healthy, and the triggering
+    /// operation is made durable by its own flush (`commit_pages` and `release_many` compact
+    /// BEFORE they wait, so it need not be durable yet); a failure after the rename fail-stops the
+    /// journal (see `Journal::compact`).
     fn maybe_compact(&self, inner: &mut StoreInner) {
         if inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
             let t = Instant::now();
@@ -1162,7 +1164,17 @@ impl BranchStore {
         drop(g);
         let lsn = inner.journal.as_ref().map_or(0, Journal::lsn);
         let compacted = self.compact_quiesced(inner, fail_after_rename);
-        self.land(lsn, compacted.is_ok());
+        if compacted.is_ok() || inner.poisoned() {
+            self.land(lsn, compacted.is_ok());
+        } else {
+            // Review r12-merge1 R1: a failure before the rename left the log, its buffer and the
+            // journal intact — nothing became durable and nothing was lost. Hand the flight slot
+            // back without poisoning the group: a poisoned group under a healthy journal admits
+            // every later write (each guard reads the journal) and then fails it at its wait.
+            let mut g = self.group.state.lock().unwrap();
+            g.flushing = false;
+            self.group.cv.notify_all();
+        }
         compacted
     }
 
