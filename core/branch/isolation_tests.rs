@@ -338,8 +338,8 @@ fn all_rows(conn: &Arc<Connection>, who: &str) -> Vec<(i64, String)> {
         Err(e) => panic!("{who}: the read failed with {e}"),
     };
     rows.iter()
-        .map(|r| match (&r[0], &r[1]) {
-            (Value::Integer(id), Value::Text(v)) => (*id, v.as_str().to_string()),
+        .map(|r| match (r[0].as_int(), &r[1]) {
+            (Some(id), Value::Text(v)) => (id, v.as_str().to_string()),
             other => panic!("{who}: unexpected row {other:?}"),
         })
         .collect()
@@ -463,8 +463,8 @@ fn with_z_the_last_trunk_close_leaves_the_wal_a_branch_statement_is_reading() {
             match st.step() {
                 Ok(crate::StepResult::Row) => {
                     let r: Vec<Value> = st.row().unwrap().get_values().cloned().collect();
-                    match (&r[0], &r[1]) {
-                        (Value::Integer(id), Value::Text(v)) => got.push((*id, v.as_str().to_string())),
+                    match (r[0].as_int(), &r[1]) {
+                        (Some(id), Value::Text(v)) => got.push((id, v.as_str().to_string())),
                         other => panic!("mask {mask}: unexpected row {other:?}"),
                     }
                 }
