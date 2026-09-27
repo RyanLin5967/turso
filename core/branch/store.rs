@@ -217,6 +217,8 @@ pub(crate) struct BranchStore {
     /// the read only makes the writer capture a pre-image nobody needs. Changed only under the
     /// trunk's lock.
     trunk_children: AtomicUsize,
+    /// V3's stamps, behind their own lock (see [`RowStamps`]).
+    stamps: CachePadded<Mutex<RowStamps>>,
     /// Record each branch's page reads; the physical merge install's structural guard needs them.
     /// Read on every branch resolution, so it is an atomic rather than a field behind the trunk's
     /// lock.
@@ -302,12 +304,6 @@ pub(super) struct MergeState {
     /// V1: committed trunk write sets as (epoch, pages sorted), oldest first, pruned below the
     /// oldest live child's fork epoch.
     pub(super) log: VecDeque<(u64, Vec<u32>)>,
-    /// V3: (table root, rowid) -> the epoch of the trunk's last write of that row.
-    pub(super) row_stamps: HashMap<(i64, i64), u64>,
-    /// `row_stamps` in stamping order (epochs ascend), for pruning.
-    stamp_order: VecDeque<(u64, i64, i64)>,
-    /// Tables the trunk wrote without naming the rows: root -> epoch.
-    pub(super) table_stamps: HashMap<i64, u64>,
     /// Times read tracking was turned off (see [`BranchStore::set_track_reads`]). A branch forked
     /// while tracking was on, at this count, has had every read tracked if the count has not moved.
     track_off: u64,
@@ -331,22 +327,51 @@ pub(crate) struct TrunkPending {
     pub(crate) tables: HashSet<i64>,
 }
 
-impl MergeState {
+/// V3's row and table stamps, behind a lock of their own (frontier/round11/r11-merge PREREG A18,
+/// the U14 arm). A trunk commit stamps its rows AFTER its commit gate closes, off the trunk's lock,
+/// with the epoch its decision took ([`TrunkStamps`]), and BEFORE it releases the WAL write lock.
+/// Every reader is a validator running inside a trunk write transaction, which that same WAL write
+/// lock serialises with the committing one, so no validator reads between a commit's decision and
+/// its stamps. Both sides assert it: the writer in `Pager::commit_wal`, the validator in
+/// `Merger::validate_and_install`. Forks read nothing here.
+#[derive(Default)]
+struct RowStamps {
+    /// (table root, rowid) -> the epoch of the trunk's last committed write of that row.
+    row_stamps: HashMap<(i64, i64), u64>,
+    /// `row_stamps` in stamping order (epochs ascend), for pruning.
+    stamp_order: VecDeque<(u64, i64, i64)>,
+    /// Tables the trunk wrote without naming the rows: root -> epoch.
+    table_stamps: HashMap<i64, u64>,
+    /// Observation only. This lock is counted into its `lock_*` fields.
+    work: BranchWork,
+}
+
+impl Counted for RowStamps {
+    fn work(&mut self) -> &mut BranchWork {
+        &mut self.work
+    }
+}
+
+/// A committed trunk transaction's rows and tables, with the epoch and oldest live child its commit
+/// decision saw, to stamp once the commit gate has closed ([`BranchStore::stamp_committed`]).
+pub(crate) struct TrunkStamps {
+    epoch: u64,
+    oldest: Option<u64>,
+    rows: HashSet<(i64, i64)>,
+    tables: HashSet<i64>,
+}
+
+impl RowStamps {
     fn stamp_row(&mut self, root: i64, rowid: i64, epoch: u64) {
         if self.row_stamps.insert((root, rowid), epoch) != Some(epoch) {
             self.stamp_order.push_back((epoch, root, rowid));
         }
     }
 
-    /// Drop every stamp and log entry at or below `oldest`, the oldest live trunk child's fork
-    /// epoch: a record of epoch `e` refuses a branch only if `e > trunk_at`, and every live or
-    /// future child has `trunk_at >= oldest`. `None` (no child) drops everything.
-    pub(super) fn prune(&mut self, oldest: Option<u64>) {
+    /// [`MergeState::prune`]'s rule for the stamps. A stale `oldest` (a smaller one) only keeps more.
+    fn prune(&mut self, oldest: Option<u64>) {
         let slack = u64::from(mutant(8));
         let keep = |e: u64| oldest.is_some_and(|o| e > o + slack);
-        while self.log.front().is_some_and(|&(e, _)| !keep(e)) {
-            self.log.pop_front();
-        }
         while let Some(&(e, root, rowid)) = self.stamp_order.front() {
             if keep(e) {
                 break;
@@ -360,9 +385,22 @@ impl MergeState {
     }
 }
 
+impl MergeState {
+    /// Drop every log entry at or below `oldest`, the oldest live trunk child's fork epoch: a
+    /// record of epoch `e` refuses a branch only if `e > trunk_at`, and every live or future child
+    /// has `trunk_at >= oldest`. `None` (no child) drops everything.
+    pub(super) fn prune(&mut self, oldest: Option<u64>) {
+        let slack = u64::from(mutant(8));
+        let keep = |e: u64| oldest.is_some_and(|o| e > o + slack);
+        while self.log.front().is_some_and(|&(e, _)| !keep(e)) {
+            self.log.pop_front();
+        }
+    }
+}
+
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-13 and 15-31; 14 is not built, since no SQL path
+/// scope gate and the install's isolation, 11-13 and 15-32; 14 is not built, since no SQL path
 /// without DDL clears a user table's b-tree), so each test can be shown to fail for it
 /// (frontier/round11/r11-merge PREREG A6, A13, A14, A15). Always false otherwise.
 #[cfg(test)]
@@ -874,6 +912,7 @@ impl BranchStore {
             },
             live: AtomicUsize::new(0),
             trunk_children: AtomicUsize::new(0),
+            stamps: CachePadded::new(Mutex::new(RowStamps::default())),
             track_reads: AtomicBool::new(false),
             trunk_commits: AtomicU64::new(0),
             lock_timing: AtomicBool::new(false),
@@ -901,6 +940,10 @@ impl BranchStore {
 
     fn trunk(&self) -> Held<'_, TrunkInner> {
         take(&self.trunk, self.timed())
+    }
+
+    fn stamps(&self) -> Held<'_, RowStamps> {
+        take(&self.stamps, self.timed())
     }
 
     /// Turn the lock-hold timing on or off (see [`BranchWork::lock_hold_ns`]).
@@ -1219,20 +1262,23 @@ impl BranchStore {
         &'a self,
         pages: impl IntoIterator<Item = (u32, Option<&'p [u8]>)>,
     ) -> TrunkCommitGate<'a> {
-        self.begin_trunk_commit_with(pages, TrunkPending::default())
+        self.begin_trunk_commit_with(pages, TrunkPending::default()).0
     }
 
-    /// The copy decisions of `begin_trunk_commit` (above), also taking the merge record's decisions
-    /// for the commit in the same hold, at the same epoch: `tx`'s rows and tables are stamped with
-    /// it, and a commit that wrote a page while the trunk had a child is one trunk commit (V0) and
-    /// one log entry (V1).
-    /// A child forked before this hold has `trunk_at` below the epoch, so it is refused on these
-    /// rows, and its pages are retained for it here too; a child forked after it sees the commit.
+    /// The copy decisions of `begin_trunk_commit` (above), also taking the merge record's O(1)
+    /// decisions for the commit in the same hold, at the same epoch: a commit that wrote a page
+    /// while the trunk had a child is one trunk commit (V0) and one log entry (V1). `tx`'s rows and
+    /// tables come back as [`TrunkStamps`] with this epoch, to be stamped after the gate closes and
+    /// before the WAL write lock is released ([`Self::stamp_committed`]; PREREG A18): the hold stays
+    /// O(pages) + O(1), whatever the transaction's row count. A child forked before this hold has
+    /// `trunk_at` below the epoch, so it is refused on these rows once stamped (no validator reads
+    /// before then; see [`RowStamps`]), and its pages are retained for it here; a child forked
+    /// after the gate sees the commit.
     pub(crate) fn begin_trunk_commit_with<'a, 'p>(
         &'a self,
         pages: impl IntoIterator<Item = (u32, Option<&'p [u8]>)>,
         tx: TrunkPending,
-    ) -> TrunkCommitGate<'a> {
+    ) -> (TrunkCommitGate<'a>, TrunkStamps) {
         let mut trunk = self.trunk();
         let opened = self.trunk_commits.fetch_add(1, Ordering::AcqRel);
         crate::turso_assert!(opened % 2 == 0, "two trunk commits inside the commit gate at once");
@@ -1249,14 +1295,9 @@ impl BranchStore {
         // time split into the merge record's row stamps, the page decisions and the prune, read
         // only while lock timing is on, so the untimed path adds no clock read.
         let timed = self.timed();
+        // Since A18 the hold stamps no row (trunk_commit_rows_stamped stays 0): its "row" part is
+        // the log entry alone.
         let t_rows = timed.then(Instant::now);
-        work.trunk_commit_rows_stamped += tx.rows.len() as u64;
-        for (root, rowid) in tx.rows {
-            merge.stamp_row(root, rowid, epoch);
-        }
-        for root in tx.tables {
-            merge.table_stamps.insert(root, epoch);
-        }
         if !tx.pages.is_empty() {
             let mut logged: Vec<u32> = tx.pages.into_iter().collect();
             logged.sort_unstable();
@@ -1297,13 +1338,46 @@ impl BranchStore {
         }
         let t_prune = timed.then(Instant::now);
         // Pruned here, in the hold the commit already takes, not in a second one after it.
-        merge.prune(lineage.children.keys().next().copied());
+        let oldest = lineage.children.keys().next().copied();
+        merge.prune(oldest);
         if let (Some(r), Some(p), Some(q)) = (t_rows, t_pages, t_prune) {
             work.trunk_commit_row_ns += p.duration_since(r).as_nanos() as u64;
             work.trunk_commit_page_ns += q.duration_since(p).as_nanos() as u64;
             work.trunk_commit_prune_ns += q.elapsed().as_nanos() as u64;
         }
-        gate
+        let stamps = TrunkStamps {
+            epoch,
+            oldest,
+            rows: tx.rows,
+            tables: tx.tables,
+        };
+        (gate, stamps)
+    }
+
+    /// Stamp a committed trunk transaction's rows and tables with its decision's epoch, under the
+    /// stamps' own lock, after its commit gate closed. The caller holds the trunk's WAL write lock
+    /// (asserted there): that is what keeps every validator from reading before this runs. Mutant
+    /// 32 drops the stamps.
+    pub(crate) fn stamp_committed(&self, s: TrunkStamps) {
+        if s.rows.is_empty() && s.tables.is_empty() {
+            return;
+        }
+        let t = self.timed().then(Instant::now);
+        let mut st = self.stamps();
+        let n = s.rows.len() as u64;
+        if !mutant(32) {
+            for (root, rowid) in s.rows {
+                st.stamp_row(root, rowid, s.epoch);
+            }
+            for root in s.tables {
+                st.table_stamps.insert(root, s.epoch);
+            }
+        }
+        st.prune(s.oldest);
+        st.work.merge_rows_stamped_post_gate += n;
+        if let Some(t) = t {
+            st.work.trunk_commit_post_gate_ns += t.elapsed().as_nanos() as u64;
+        }
     }
 
     /// The copy decision for one page, as a one-page trunk commit: for the store's model tests,
@@ -1451,7 +1525,11 @@ impl BranchStore {
             stats.work.trunk_lock_hold_ns = trunk.work.lock_hold_ns;
             stats.merge_log_entries = trunk.merge.log.len();
             stats.merge_log_pages = trunk.merge.log.iter().map(|(_, p)| p.len()).sum();
-            stats.row_stamps = trunk.merge.row_stamps.len();
+        }
+        {
+            let stamps = self.stamps();
+            stats.row_stamps = stamps.row_stamps.len();
+            stats.work.add(&stamps.work);
         }
         stats.work.trunk_fork_wal_hold_ns = self.fork_wal_hold_ns.load(Ordering::Relaxed);
         for lock in self.shards.iter() {
@@ -1521,18 +1599,17 @@ impl BranchStore {
 
     /// Mutant 30 only: [`Self::trunk_row_written`] for several rows.
     pub(crate) fn trunk_rows_written(&self, rows: &[(i64, i64)]) {
-        let mut trunk = self.trunk();
-        let epoch = trunk.lineage.epoch;
+        let epoch = self.trunk().lineage.epoch;
+        let mut st = self.stamps();
         for &(root, rowid) in rows {
-            trunk.merge.stamp_row(root, rowid, epoch);
+            st.stamp_row(root, rowid, epoch);
         }
     }
 
     /// Mutant 30 only: a table stamp at write time.
     pub(crate) fn trunk_bulk_written(&self, root: i64) {
-        let mut trunk = self.trunk();
-        let epoch = trunk.lineage.epoch;
-        trunk.merge.table_stamps.insert(root, epoch);
+        let epoch = self.trunk().lineage.epoch;
+        self.stamps().table_stamps.insert(root, epoch);
     }
 
     /// The trunk write transaction in progress committed (`Some`) or rolled back (`None`). Its
@@ -1548,24 +1625,27 @@ impl BranchStore {
         if tx.pages.is_empty() && tx.rows.is_empty() && tx.tables.is_empty() {
             return;
         }
-        let mut trunk = self.trunk();
-        let oldest = trunk.lineage.children.keys().next().copied();
-        let epoch = trunk.lineage.epoch;
-        let TrunkInner { merge, work, .. } = &mut *trunk;
-        for (root, rowid) in tx.rows {
-            merge.stamp_row(root, rowid, epoch);
-        }
-        for root in tx.tables {
-            merge.table_stamps.insert(root, epoch);
-        }
-        if !tx.pages.is_empty() {
-            let mut pages: Vec<u32> = tx.pages.into_iter().collect();
-            pages.sort_unstable();
-            merge.trunk_commits += 1;
-            work.trunk_commits += 1;
-            merge.log.push_back((epoch, pages));
-        }
-        merge.prune(oldest);
+        let (epoch, oldest) = {
+            let mut trunk = self.trunk();
+            let oldest = trunk.lineage.children.keys().next().copied();
+            let epoch = trunk.lineage.epoch;
+            let TrunkInner { merge, work, .. } = &mut *trunk;
+            if !tx.pages.is_empty() {
+                let mut pages: Vec<u32> = tx.pages.into_iter().collect();
+                pages.sort_unstable();
+                merge.trunk_commits += 1;
+                work.trunk_commits += 1;
+                merge.log.push_back((epoch, pages));
+            }
+            merge.prune(oldest);
+            (epoch, oldest)
+        };
+        self.stamp_committed(TrunkStamps {
+            epoch,
+            oldest,
+            rows: tx.rows,
+            tables: tx.tables,
+        });
     }
 
     pub(crate) fn set_track_reads(&self, on: bool) {
@@ -1700,21 +1780,6 @@ impl BranchStore {
                 break;
             }
         }
-        // V3: any row this branch wrote that the trunk wrote after the fork, or that an earlier
-        // batch member wrote.
-        let mut key = false;
-        for &((root, rowid), _) in &b.rows {
-            count(Validation::KeyStamp, &mut probes);
-            let row = merge.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
-            let table = merge.table_stamps.get(&root).copied().unwrap_or(0);
-            if row.max(table) + u64::from(mutant(10)) > at + m3
-                || batch.rows.contains(&(root, rowid))
-                || batch.tables.contains(&root)
-            {
-                key = true;
-                break;
-            }
-        }
         let current: HashSet<u32> = b.current.iter().copied().collect();
         // V1, computed only when active: every committed trunk write set since the fork, newest
         // first, checked page by page against this branch's write set.
@@ -1766,6 +1831,30 @@ impl BranchStore {
             false
         });
         drop(trunk);
+        // V3, under the stamps' own lock (A18): any row this branch wrote that the trunk wrote
+        // after the fork, or that an earlier batch member wrote. The caller's WAL write lock keeps
+        // every commit's stamps complete while this reads (asserted by the caller).
+        let mut key = false;
+        {
+            let mut st = self.stamps();
+            st.prune(oldest);
+            let mut key_probes = 0u64;
+            for &((root, rowid), _) in &b.rows {
+                if active == Validation::KeyStamp {
+                    key_probes += 1;
+                }
+                let row = st.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
+                let table = st.table_stamps.get(&root).copied().unwrap_or(0);
+                if row.max(table) + u64::from(mutant(10)) > at + m3
+                    || batch.rows.contains(&(root, rowid))
+                    || batch.tables.contains(&root)
+                {
+                    key = true;
+                    break;
+                }
+            }
+            st.work.merge_probes += key_probes;
+        }
         // The replay applies rows in the branch's last-write order: a UNIQUE value the branch moved
         // from one row to another must leave the first before it reaches the second.
         let mut ordered = b.rows;

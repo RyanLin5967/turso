@@ -503,6 +503,11 @@ impl Merger {
         for branch in branches {
             // The batch's earlier members' writes are pending in this connection's transaction.
             let pager = self.trunk.pager.load().clone();
+            crate::turso_assert!(
+                pager.holds_write_lock(),
+                "a merge validates only inside its trunk write transaction: the WAL write lock is \
+                 what orders it after every commit's post-gate row stamps (PREREG A18)"
+            );
             let prep = pager.with_trunk_pending(|batch| {
                 self.store
                     .merge_prepare(branch.id, policy.validation, physical, batch)
@@ -1318,6 +1323,51 @@ mod tests {
         assert!(!o[1].page_conflict, "premise: the two wrote no page in common: {o:?}");
         assert_eq!(o[1].structural_conflict, Some(true), "{o:?}");
         assert_eq!(o[1].refused, Some(Refusal::Structural), "{o:?}");
+    }
+
+    /// U14 (PREREG A18): a merge commit's trunk-lock hold stamps no row, whatever the merge's row
+    /// count; its rows are all stamped after the commit gate closes. A counter test: the hold's
+    /// row count is 0 at k = 1 and at k = 300, and the post-gate count is k.
+    #[test]
+    fn a_merge_commit_stamps_its_rows_outside_the_trunk_lock_hold() {
+        for k in [1i64, 300] {
+            let (_dir, db) = open_db();
+            let trunk = db.connect().unwrap();
+            trunk
+                .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            trunk.execute("BEGIN").unwrap();
+            for id in 1..=1000 {
+                trunk
+                    .execute(format!("INSERT INTO t VALUES ({id}, 'a')"))
+                    .unwrap();
+            }
+            trunk.execute("COMMIT").unwrap();
+            let b = trunk.fork_branch().unwrap();
+            let bc = b.connect().unwrap();
+            bc.execute("BEGIN").unwrap();
+            for id in 1..=k {
+                bc.execute(format!("UPDATE t SET v = 'b' WHERE id = {id}"))
+                    .unwrap();
+            }
+            bc.execute("COMMIT").unwrap();
+            drop(bc);
+            let before = db.branch_stats().work;
+            let mut merger = Merger::new(trunk.clone()).unwrap();
+            let o = merger.merge(b, key_replay()).unwrap();
+            assert_eq!(o.refused, None, "{o:?}");
+            let after = db.branch_stats().work;
+            assert_eq!(
+                after.trunk_commit_rows_stamped - before.trunk_commit_rows_stamped,
+                0,
+                "k = {k}: rows stamped inside the trunk-lock hold"
+            );
+            assert_eq!(
+                after.merge_rows_stamped_post_gate - before.merge_rows_stamped_post_gate,
+                k as u64,
+                "k = {k}: rows stamped after the gate"
+            );
+        }
     }
 
     /// A foreign key the engine cannot resolve (its parent table does not exist) refuses a member

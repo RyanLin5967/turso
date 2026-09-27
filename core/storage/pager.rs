@@ -3,7 +3,9 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
-use crate::branch::store::{BranchStore, Resolved, TrunkCommitGate, TrunkPageKey, TrunkPending};
+use crate::branch::store::{
+    BranchStore, Resolved, TrunkCommitGate, TrunkPageKey, TrunkPending, TrunkStamps,
+};
 use crate::branch::{BranchBinding, BranchId};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -3997,7 +3999,7 @@ impl Pager {
     /// first child is forked under the WAL write lock this transaction holds). The transaction's
     /// pending merge writes are handed over in the same call, so rows are stamped with the epoch the
     /// page decisions use (PREREG A15 of frontier/round11/r11-merge).
-    fn decide_trunk_commit(&self) -> Option<TrunkCommitGate<'_>> {
+    fn decide_trunk_commit(&self) -> Option<(TrunkCommitGate<'_>, TrunkStamps)> {
         let store = self.branch_store.get()?;
         let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
         let tx = std::mem::take(&mut *self.trunk_pending.lock());
@@ -4934,11 +4936,23 @@ impl Pager {
                     let mut commit_info = self.commit_info.write();
                     // The commit's serialization point for the branch store: its copy decisions
                     // are taken here, and the gate they open closes once the frames are published.
-                    let gate = self.decide_trunk_commit();
+                    let decided = self.decide_trunk_commit();
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
-                    drop(gate);
+                    // The gate closes; the merge record's rows are stamped only now, off the trunk's
+                    // lock, and still under the WAL write lock (PREREG A18 of r11-merge).
+                    if let Some((gate, stamps)) = decided {
+                        drop(gate);
+                        crate::turso_assert!(
+                            wal.holds_write_lock(),
+                            "a trunk commit stamps its merge rows before it releases the WAL write \
+                             lock, which is what keeps every validator from reading them half-done"
+                        );
+                        if let Some(store) = self.branch_store.get() {
+                            store.stamp_committed(stamps);
+                        }
+                    }
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 

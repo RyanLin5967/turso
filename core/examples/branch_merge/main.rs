@@ -451,7 +451,7 @@ fn print_window(run: &Run, index: usize, merged_total: usize, w: &mut Window, a:
     }
     if run.args.lock_timing {
         print!(
-            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             d(|w| w.trunk_commits_decided),
             d(|w| w.trunk_commit_rows_stamped),
             d(|w| w.trunk_commit_pages_decided),
@@ -460,6 +460,8 @@ fn print_window(run: &Run, index: usize, merged_total: usize, w: &mut Window, a:
             d(|w| w.trunk_commit_prune_ns),
             d(|w| w.trunk_lock_acquisitions),
             d(|w| w.trunk_lock_hold_ns),
+            d(|w| w.merge_rows_stamped_post_gate),
+            d(|w| w.trunk_commit_post_gate_ns),
         );
     }
     println!();
@@ -468,7 +470,7 @@ fn print_window(run: &Run, index: usize, merged_total: usize, w: &mut Window, a:
 const HEADER: &str = "window\tmerged_total\tattempts\tcommitted\trefused\ttrue_conflicts\tfalse_refusals\tobs_scalar\tobs_page\tobs_key\tobs_struct\tobs_page_false\tfalse_refusal_rate\tpage_false_rate\tcommits_since_fork\tpages_written\trows_written\tprobes_per_merge\tlog_entries_per_merge\tstruct_probes_per_merge\tinstalled_per_merge\ttrunk_commits\tlog_entries_held\trow_stamps_held\tlive_branches\tarena_in_use\trefused_by\trss_bytes\twal_bytes";
 /// Window deltas of the trunk commit decision's instrument (U14): decisions, rows stamped, pages
 /// decided, the hold's three parts in ns, and the trunk lock's acquisitions and total hold ns.
-const LOCK_HEADER: &str = "\tdecisions\tdecision_rows\tdecision_pages\tdecision_row_ns\tdecision_page_ns\tdecision_prune_ns\ttrunk_lock_acq\ttrunk_lock_hold_ns";
+const LOCK_HEADER: &str = "\tdecisions\tdecision_rows\tdecision_pages\tdecision_row_ns\tdecision_page_ns\tdecision_prune_ns\ttrunk_lock_acq\ttrunk_lock_hold_ns\tpost_gate_rows\tpost_gate_ns";
 const TIMING_HEADER: &str = "\tmerge_p50_us\tmerge_p90_us\tmerge_p99_us\tmerge_max_us\tmerges_per_s_merge_time\tcommits_per_s_merge_time\tattempts_per_s_wall";
 
 fn main() {

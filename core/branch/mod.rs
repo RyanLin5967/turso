@@ -295,6 +295,10 @@ pub struct BranchWork {
     pub trunk_commit_row_ns: u64,
     pub trunk_commit_page_ns: u64,
     pub trunk_commit_prune_ns: u64,
+    /// Rows stamped after the commit gate closed, under the stamps' own lock (PREREG A18).
+    pub merge_rows_stamped_post_gate: u64,
+    /// Nanoseconds those post-gate stampings took, while lock timing is on (0 otherwise).
+    pub trunk_commit_post_gate_ns: u64,
 }
 
 impl BranchWork {
@@ -331,6 +335,8 @@ impl BranchWork {
             trunk_commit_row_ns,
             trunk_commit_page_ns,
             trunk_commit_prune_ns,
+            merge_rows_stamped_post_gate,
+            trunk_commit_post_gate_ns,
             merge_attempts,
             merge_commits,
             merge_refused_scalar,
@@ -377,6 +383,8 @@ impl BranchWork {
         self.trunk_commit_row_ns += trunk_commit_row_ns;
         self.trunk_commit_page_ns += trunk_commit_page_ns;
         self.trunk_commit_prune_ns += trunk_commit_prune_ns;
+        self.merge_rows_stamped_post_gate += merge_rows_stamped_post_gate;
+        self.trunk_commit_post_gate_ns += trunk_commit_post_gate_ns;
         self.merge_attempts += merge_attempts;
         self.merge_commits += merge_commits;
         self.merge_refused_scalar += merge_refused_scalar;
