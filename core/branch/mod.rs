@@ -450,6 +450,22 @@ fn schema_share() -> bool {
     *ON.get_or_init(|| std::env::var_os("R11_SCHEMA_SHARE").is_some())
 }
 
+/// F-S key version (r11-githost-attr PREREG A3.10): `R11_SCHEMA_KEY` unset or `1` keeps the A1 key
+/// (`Connection::branch_schema_source_key` v1); `2` reads the same inputs raw (v2). Any other value
+/// refuses the branch connection rather than run on a guess.
+pub(crate) fn schema_key_version() -> Result<u8> {
+    static V: std::sync::OnceLock<std::result::Result<u8, String>> = std::sync::OnceLock::new();
+    V.get_or_init(|| match std::env::var("R11_SCHEMA_KEY") {
+        Err(std::env::VarError::NotPresent) => Ok(1),
+        Ok(v) if v == "1" => Ok(1),
+        Ok(v) if v == "2" => Ok(2),
+        Ok(v) => Err(format!("R11_SCHEMA_KEY={v:?} is neither 1 nor 2")),
+        Err(e) => Err(format!("R11_SCHEMA_KEY: {e}")),
+    })
+    .clone()
+    .map_err(LimboError::InvalidArgument)
+}
+
 /// F-S: whether a parsed schema may be offered to other connections. Its parse must have read
 /// nothing but the page-1 cookie and `sqlite_schema`'s rows (which the key holds exactly): no
 /// sequence backing table, no custom-types table and no `sqlite_stat1` were read, and it holds no
@@ -863,7 +879,7 @@ impl Database {
             // functions it keeps), and adopt a schema already parsed from the same bytes.
             let key = if schema_share() {
                 let started = std::time::Instant::now();
-                let key = conn.branch_schema_source_key()?;
+                let key = conn.branch_schema_source_key(schema_key_version()?)?;
                 self.branches.note_schema_key(
                     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 );
@@ -996,6 +1012,9 @@ mod durability_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod catalog_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod schema_key_tests;
 
 #[cfg(test)]
 mod tests {

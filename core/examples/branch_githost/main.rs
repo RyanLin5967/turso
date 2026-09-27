@@ -1690,7 +1690,7 @@ fn main() {
     let set = |k: &str| if std::env::var_os(k).is_some() { "set" } else { "unset" };
     println!(
         "# r11-githost-attr: durability={} R11_UBC_PROBE={} R11_CENSUS_OPS={} R11_SCHEMA_SHARE={} \
-         R11_PREWARM={} R11_PREWARM_SLOTS={}",
+         R11_PREWARM={} R11_PREWARM_SLOTS={} R11_SCHEMA_KEY={}",
         match (args.cmd.as_str(), args.eager) {
             ("ubc-selftest", _) => "n/a",
             (_, true) => "eager",
@@ -1700,7 +1700,8 @@ fn main() {
         set("R11_CENSUS_OPS"),
         set("R11_SCHEMA_SHARE"),
         set("R11_PREWARM"),
-        std::env::var("R11_PREWARM_SLOTS").unwrap_or_else(|_| "unset".to_string())
+        std::env::var("R11_PREWARM_SLOTS").unwrap_or_else(|_| "unset".to_string()),
+        std::env::var("R11_SCHEMA_KEY").unwrap_or_else(|_| "unset".to_string())
     );
     match args.cmd.as_str() {
         "grow" => grow(&args),

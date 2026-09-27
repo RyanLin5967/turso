@@ -1343,7 +1343,8 @@ impl Connection {
     /// installed, as `init_reparse_building` does, so the statement does not reprepare. The
     /// placeholder schema goes back before this returns, whatever the outcome, so a reparse after it
     /// still captures the table-valued functions.
-    pub(crate) fn branch_schema_source_key(self: &Arc<Connection>) -> Result<Vec<u8>> {
+    /// `version` 1 is the A1 key; 2 is [`Self::read_branch_schema_source_key_v2`] (PREREG A3.10).
+    pub(crate) fn branch_schema_source_key(self: &Arc<Connection>, version: u8) -> Result<Vec<u8>> {
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
         }
@@ -1357,7 +1358,11 @@ impl Connection {
         pager.begin_read_tx()?;
         self.set_tx_state(TransactionState::Read);
 
-        let key = self.read_branch_schema_source_key(&placeholder);
+        let key = match version {
+            1 => self.read_branch_schema_source_key(&placeholder),
+            2 => self.read_branch_schema_source_key_v2(&placeholder),
+            v => Err(LimboError::InternalError(format!("no F-S source key version {v}"))),
+        };
 
         let previous = self.transaction_state.swap(TransactionState::None);
         turso_assert!(
@@ -1418,6 +1423,88 @@ impl Connection {
                 put(&mut key, format!("{value:?}").as_bytes());
             }
         }
+        Ok(key)
+    }
+
+    /// F-S key v2 (r11-githost-attr PREREG A3.10): v1's inputs read raw. The cookie and the
+    /// text encoding come from the header; the two flags and the table-valued-function names are
+    /// taken as v1 takes them; then every `sqlite_schema` cell, in rowid order, as (rowid, payload
+    /// length, payload with any overflow), through a table cursor on page 1. No schema is built, no
+    /// statement prepared and no value formatted: that fixed cost was v1's price (A3.9: 70-120 us
+    /// of CPU per cold connection). A row's values are its payload decoded under the text
+    /// encoding, so v1's key is a function of this one: equal v2 keys have equal v1 keys, A1.3's
+    /// argument carries over unchanged, and v2 can only share less often than v1, never wrongly.
+    /// Refused on a connection with an MVCC store, whose rows the pager alone does not hold.
+    fn read_branch_schema_source_key_v2(
+        self: &Arc<Connection>,
+        placeholder: &Schema,
+    ) -> Result<Vec<u8>> {
+        use crate::storage::btree::{BTreeCursor, CursorTrait};
+        fn put(key: &mut Vec<u8>, bytes: &[u8]) {
+            key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            key.extend_from_slice(bytes);
+        }
+        if self.mv_store().is_some() {
+            return Err(LimboError::InternalError(
+                "F-S key v2 reads the pager alone; this connection has an MVCC store".to_string(),
+            ));
+        }
+        let pager = self.pager.load().clone();
+        let (cookie, encoding) = pager.io.block(|| {
+            pager.with_header(|header| {
+                // Copied out first: the header is a packed struct.
+                let encoding = header.text_encoding;
+                (header.schema_cookie.get(), format!("{encoding:?}"))
+            })
+        })?;
+        let mut key = Vec::new();
+        put(&mut key, b"r11-githost-attr F-S source v2");
+        key.extend_from_slice(&cookie.to_le_bytes());
+        put(&mut key, encoding.as_bytes());
+        key.push(u8::from(self.experimental_custom_types_enabled()));
+        key.push(u8::from(self.db.experimental_generated_columns_enabled()));
+        let mut tvfs: Vec<&str> = placeholder
+            .tables
+            .values()
+            .filter_map(|table| match table.as_ref() {
+                crate::schema::Table::Virtual(vtab)
+                    if matches!(vtab.kind, turso_ext::VTabKind::TableValuedFunction) =>
+                {
+                    Some(vtab.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        tvfs.sort_unstable();
+        put(&mut key, &(tvfs.len() as u64).to_le_bytes());
+        for name in tvfs {
+            put(&mut key, name.as_bytes());
+        }
+        // sqlite_schema: root page 1, five columns (type, name, tbl_name, rootpage, sql).
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+        pager.io.block(|| cursor.rewind())?;
+        let mut cells: u64 = 0;
+        while cursor.has_record() {
+            let rowid = pager.io.block(|| cursor.rowid())?.ok_or_else(|| {
+                LimboError::InternalError("sqlite_schema cell without a rowid".to_string())
+            })?;
+            let payload = pager.io.block(|| {
+                Ok(match cursor.record()? {
+                    IOResult::Done(record) => {
+                        IOResult::Done(record.map(|r| r.get_payload().to_vec()))
+                    }
+                    IOResult::IO(io) => IOResult::IO(io),
+                })
+            })?;
+            let payload = payload.ok_or_else(|| {
+                LimboError::InternalError("sqlite_schema cell without a record".to_string())
+            })?;
+            key.extend_from_slice(&rowid.to_le_bytes());
+            put(&mut key, &payload);
+            cells += 1;
+            pager.io.block(|| cursor.next())?;
+        }
+        key.extend_from_slice(&cells.to_le_bytes());
         Ok(key)
     }
 
