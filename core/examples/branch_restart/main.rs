@@ -35,6 +35,21 @@
 //! a page keeps a pre-image, since every branch forked before it), then times
 //! `PRAGMA wal_checkpoint(TRUNCATE)` and `Database::branch_compact_now` twice.
 //!
+//! r11-restart-r2 (PREREG A14; UNBUILT when written):
+//!
+//! * `ckpt2` also prints the catalog checkpoint counters and the WAL backfill's reads.
+//! * `ckpt3 --writes M` (F-FZ's stall arm): a second thread commits over the upper half of the
+//!   branches, timing every commit, while this thread's M commits over the lower half cross the
+//!   store's own 1 MiB trigger, so the store checkpoints as it would (`R11_CKPT=fuzzy` for the AFTER
+//!   arm; sharp is the default, the BEFORE arm). One line: both threads' latencies and the counters.
+//! * `fifo --writes K` (K4): release the K oldest trunk children one at a time, each read by a
+//!   fresh `Database::branch`, with the catalog rows each reap read and the versions it freed.
+//! * `grow --lease-ms L` gives every fork a lease of L ms. `leasedown` is a kill -9 VICTIM: open,
+//!   advance the lease clock past every deadline, make the clock durable with one trunk commit (its
+//!   barrier stamps it; nothing expires), READY. `leaseopen` times the open that follows (F-EXP: one
+//!   bounded pass; `R11_EXPIRE=unbounded` for the BEFORE arm), then `expire_branches` for the rest.
+//! * `catonly --n N --writes D --phase build|measure` (A13 amended): the catalog-only fixture.
+//!
 //! Any failed check prints `NOT A RESULT` and exits 1.
 
 use std::io::{BufRead, Write};
@@ -74,6 +89,10 @@ struct Args {
     child_every: usize,
     /// `catalog`: open with `BranchDurability::Catalog` (the published-fix prototype).
     catalog: bool,
+    /// `grow`/`leasedown`/`leaseopen --lease-ms L`: every fork's lease (0: none).
+    lease_ms: u64,
+    /// `catonly --phase build|measure`.
+    phase: String,
 }
 
 fn parse_args() -> Args {
@@ -91,6 +110,8 @@ fn parse_args() -> Args {
         trunk_every: 0,
         child_every: 0,
         catalog: false,
+        lease_ms: 0,
+        phase: String::new(),
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -106,6 +127,8 @@ fn parse_args() -> Args {
             }
             "--child-every" => args.child_every = val().parse().unwrap_or_else(|_| die("bad --child-every")),
             "--trunk-every" => args.trunk_every = val().parse().unwrap_or_else(|_| die("bad --trunk-every")),
+            "--lease-ms" => args.lease_ms = val().parse().unwrap_or_else(|_| die("bad --lease-ms")),
+            "--phase" => args.phase = val(),
             "--mode" => {
                 args.catalog = match val().as_str() {
                     "snapshot" => false,
@@ -212,6 +235,11 @@ impl Files {
 }
 
 fn open_db(path: &Path, sync: bool, catalog: bool) -> Arc<Database> {
+    open_db_leased(path, sync, catalog, 0)
+}
+
+/// `open_db` with every fork given a lease of `lease_ms` (0: none).
+fn open_db_leased(path: &Path, sync: bool, catalog: bool, lease_ms: u64) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let durability = if catalog {
         BranchDurability::Catalog { sync }
@@ -222,7 +250,9 @@ fn open_db(path: &Path, sync: bool, catalog: bool) -> Arc<Database> {
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
-        DatabaseOpts::new().with_branch_durability(durability),
+        DatabaseOpts::new()
+            .with_branch_durability(durability)
+            .with_branch_lease((lease_ms > 0).then(|| Duration::from_millis(lease_ms))),
         None,
         Arc::new(SqliteDialect),
     )
@@ -290,7 +320,7 @@ fn phases_line(s: &BranchOpenStats) -> String {
 }
 
 fn grow(args: &Args) {
-    let db = open_db(&args.db, false, args.catalog);
+    let db = open_db_leased(&args.db, false, args.catalog, args.lease_ms);
     let files = Files::new(&args.db);
     let s = db.branch_open_stats();
     println!("# grow victim pid={} target={} open counters: {}", std::process::id(), args.n, stats_line(&s));
@@ -695,11 +725,15 @@ fn ckpt2(args: &Args) {
     );
     let w0 = db.branch_catalog_rows_written();
     let io0 = turso_core::branch::page_io();
+    let bf0 = turso_core::branch::backfill_io();
+    let ck0 = db.branch_checkpoint_counters();
     let res0 = resident_pages(&files.cat);
     let t = Instant::now();
     db.branch_compact_now().unwrap();
     let t_ck = t.elapsed();
     let io1 = turso_core::branch::page_io();
+    let bf1 = turso_core::branch::backfill_io();
+    let ck1 = db.branch_checkpoint_counters();
     let res1 = resident_pages(&files.cat);
     let rows_written = db.branch_catalog_rows_written() - w0;
     let io = [io1[0] - io0[0], io1[1] - io0[1], io1[2] - io0[2], io1[3] - io0[3]];
@@ -728,7 +762,8 @@ fn ckpt2(args: &Args) {
          ckpt_db_page_reads={}\tckpt_db_page_writes={}\tckpt_wal_frame_reads={}\tckpt_wal_frame_writes={}\t\
          cat_resident_before={}\tcat_resident_after={}\tcat_pages={}\t\
          snap_before={snap0}\tsnap_after={snap1}\tcat_before={cat0}\tcat_after={cat1}\tcat_wal_before={catw0}\t\
-         cat_wal_after={catw1}\tlog_after={log1}\tsettled: {settled}",
+         cat_wal_after={catw1}\tlog_after={log1}\tbackfill_cache_hits={}\tbackfill_wal_reads={}\t\
+         ckpt_counters_delta={:?}\tcat_cache_pages={}\tsettled: {settled}",
         args.n,
         args.writes,
         distinct.len(),
@@ -740,10 +775,255 @@ fn ckpt2(args: &Args) {
         io[3],
         res0.0,
         res1.0,
-        res1.1
+        res1.1,
+        bf1[0] - bf0[0],
+        bf1[1] - bf0[1],
+        counters_delta(&ck0, &ck1),
+        std::env::var("R11_CAT_CACHE_PAGES").unwrap_or_else(|_| "default".to_string())
     );
     drop(trunk);
     drop(db);
+}
+
+/// `after - before` of `Database::branch_checkpoint_counters`, except the max field (index 3) and
+/// the settle max (index 8), which are reported as `after`.
+fn counters_delta(before: &[u64; 9], after: &[u64; 9]) -> [u64; 9] {
+    let mut d = [0; 9];
+    for i in 0..9 {
+        d[i] = if i == 3 || i == 8 { after[i] } else { after[i] - before[i] };
+    }
+    d
+}
+
+/// One committed rewrite of branch `id`'s own row; the commit's wall time in us.
+fn commit_one(db: &Arc<Database>, id: u64, g: u64) -> f64 {
+    let t = Instant::now();
+    let branch = db
+        .branch(BranchId(id))
+        .unwrap_or_else(|e| not_a_result(&format!("attach {id}: {e}")));
+    let conn = branch.connect().unwrap();
+    conn.execute(format!(
+        "UPDATE t SET v = '{}' WHERE id = {}",
+        trunk_write_value(g),
+        row_for(id)
+    ))
+    .unwrap();
+    drop(conn);
+    let _ = branch.into_id();
+    t.elapsed().as_secs_f64() * 1e6
+}
+
+/// (c3) F-FZ's stall arm (PREREG A14 P-FZ2). See the module doc.
+fn ckpt3(args: &Args) {
+    let db = open_db(&args.db, true, args.catalog);
+    let _trunk = db.connect().unwrap();
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n || args.n < 4 {
+        not_a_result(&format!("ckpt3: {st:?}, expected {} branches", args.n));
+    }
+    db.branch_compact_now().unwrap();
+    let half = (args.n / 2) as u64;
+    let ck0 = db.branch_checkpoint_counters();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bg = {
+        let db = db.clone();
+        let stop = stop.clone();
+        let seed = args.seed ^ 0xA5A5_A5A5;
+        let upper = args.n as u64 - half;
+        std::thread::spawn(move || {
+            let mut rng = Rng(seed);
+            let mut lat = Vec::new();
+            let mut g = 1u64 << 40;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                g += 1;
+                lat.push(commit_one(&db, half + 1 + rng.below(upper as usize) as u64, g));
+            }
+            lat
+        })
+    };
+    let mut rng = Rng(args.seed);
+    let mut main_lat = Vec::with_capacity(args.writes);
+    for g in 0..args.writes {
+        main_lat.push(commit_one(&db, 1 + rng.below(half as usize) as u64, g as u64));
+    }
+    // A fuzzy checkpoint still in flight installs before the counters are read.
+    db.branch_checkpoint_wait();
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let mut bg_lat = bg.join().unwrap_or_else(|_| not_a_result("ckpt3: the committer thread panicked"));
+    let ck1 = db.branch_checkpoint_counters();
+    let d = counters_delta(&ck0, &ck1);
+    if d[0] == 0 {
+        not_a_result(&format!("ckpt3: no checkpoint fired in {} + {} commits", args.writes, bg_lat.len()));
+    }
+    bg_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    main_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let stat = |v: &[f64]| {
+        if v.is_empty() {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            (pct(v, 50.0), pct(v, 99.0), pct(v, 99.9), *v.last().unwrap())
+        }
+    };
+    let (b50, b99, b999, bmax) = stat(&bg_lat);
+    let (m50, m99, m999, mmax) = stat(&main_lat);
+    println!(
+        "CKPT3\tn={}\twrites={}\tmode={}\tbg_commits={}\tbg_p50_us={b50:.1}\tbg_p99_us={b99:.1}\tbg_p999_us={b999:.1}\t\
+         bg_max_us={bmax:.1}\tmain_p50_us={m50:.1}\tmain_p99_us={m99:.1}\tmain_p999_us={m999:.1}\tmain_max_us={mmax:.1}\t\
+         ckpts={}\tflights={}\thold_ns={}\thold_max_ns={}\tflight_ns={}\tstmts_locked={}\tsettle_batches={}\t\
+         settle_loads={}\tsettle_max_loads={}",
+        args.n,
+        args.writes,
+        std::env::var("R11_CKPT").unwrap_or_else(|_| "sharp (default)".to_string()),
+        bg_lat.len(),
+        d[0],
+        d[1],
+        d[2],
+        d[3],
+        d[4],
+        d[5],
+        d[6],
+        d[7],
+        d[8]
+    );
+}
+
+/// (K4) The K oldest trunk children released one at a time, oldest first (PREREG A14): what each
+/// reap read from the catalog against what it freed.
+fn fifo(args: &Args) {
+    let db = open_db(&args.db, true, args.catalog);
+    let _trunk = db.connect().unwrap();
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n {
+        not_a_result(&format!("fifo: {st:?}, expected {} branches", args.n));
+    }
+    db.branch_compact_now().unwrap();
+    let retained0 = db.branch_trunk_retained();
+    let k = args.writes.min(args.n);
+    let (mut sum_rows, mut sum_freed, mut worst) = (0u64, 0u64, 0.0f64);
+    for id in 1..=k as u64 {
+        let (_, _, q0, r0) = db.branch_catalog_counters();
+        let w0 = db.branch_stats().unwrap().work;
+        let branch = db
+            .branch(BranchId(id))
+            .unwrap_or_else(|e| not_a_result(&format!("fifo: attach {id}: {e}")));
+        let reaped = branch
+            .reap()
+            .unwrap_or_else(|e| not_a_result(&format!("fifo: reap {id}: {e}")));
+        let (_, _, q1, r1) = db.branch_catalog_counters();
+        let w1 = db.branch_stats().unwrap().work;
+        let rows = r1 - r0;
+        // The branch's own page, plus the trunk versions only it held.
+        let freed = reaped.freed_pages as u64;
+        sum_rows += rows;
+        sum_freed += freed;
+        worst = worst.max(rows as f64 / freed.max(1) as f64);
+        println!(
+            "FIFO\tn={}\tid={id}\tfreed={freed}\tdeferred={}\tcat_rows_read={rows}\tcat_queries={}\t\
+             gc_range_entries={}\tgc_examined={}",
+            args.n,
+            reaped.deferred,
+            q1 - q0,
+            w1.gc_range_entries - w0.gc_range_entries,
+            w1.gc_examined - w0.gc_examined
+        );
+    }
+    println!(
+        "FIFOSUM\tn={}\treaps={k}\ttrunk_retained_before={retained0}\ttrunk_retained_after={}\t\
+         cat_rows_read={sum_rows}\tfreed={sum_freed}\tworst_rows_per_freed={worst:.3}",
+        args.n,
+        db.branch_trunk_retained()
+    );
+}
+
+/// Lease arm VICTIM (PREREG A14): every deadline passed and durable, nothing expired; READY.
+fn leasedown(args: &Args) {
+    if args.lease_ms == 0 {
+        die("leasedown needs --lease-ms");
+    }
+    let db = open_db_leased(&args.db, false, args.catalog, args.lease_ms);
+    let trunk = db.connect().unwrap();
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n {
+        not_a_result(&format!("leasedown: {st:?}, expected {} branches (an expiry ran early?)", args.n));
+    }
+    db.branch_lease_clock_advance(Duration::from_millis(args.lease_ms + 1_000));
+    // A trunk commit's durability barrier stamps the lease clock (a Clock record) and expires
+    // nothing, so the log now says every deadline has passed.
+    trunk
+        .execute(format!("UPDATE t SET v = '{}' WHERE id = 1", trunk_write_value(1 << 50)))
+        .unwrap();
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n {
+        not_a_result(&format!("leasedown: {st:?} after the stamp, expected {}", args.n));
+    }
+    println!(
+        "# leasedown victim pid={} n={} lease_ms={} lease_now_ms={}",
+        std::process::id(),
+        args.n,
+        args.lease_ms,
+        db.branch_lease_now().as_millis()
+    );
+    println!("READY n={} pid={}", args.n, std::process::id());
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+/// The open after `leasedown`'s crash (PREREG A14): what the open reaped, then `expire_branches`.
+fn leaseopen(args: &Args) {
+    let io0 = turso_core::branch::page_io();
+    let t = Instant::now();
+    let db = open_db_leased(&args.db, true, args.catalog, args.lease_ms);
+    let t_open = t.elapsed();
+    let io1 = turso_core::branch::page_io();
+    let s = db.branch_open_stats();
+    let live_after_open = db.branch_stats().unwrap().live_branches;
+    let t = Instant::now();
+    let rest = db
+        .expire_branches()
+        .unwrap_or_else(|e| not_a_result(&format!("leaseopen: expire_branches: {e}")));
+    let t_rest = t.elapsed();
+    let live_end = db.branch_stats().unwrap().live_branches;
+    let reaped_at_open = args.n - live_after_open;
+    if reaped_at_open + rest.reaped.len() != args.n || live_end != 0 {
+        not_a_result(&format!(
+            "leaseopen: {reaped_at_open} reaped at open + {} after != {} (live at the end {live_end})",
+            rest.reaped.len(),
+            args.n
+        ));
+    }
+    println!(
+        "LEASEOPEN\tn={}\texpire={}\topen_us={:.1}\treaped_at_open={reaped_at_open}\texpire_ns_in_open={}\t\
+         open_db_page_reads={}\texpire_rest_us={:.1}\treaped_after={}\tfreed_after={}\t{}",
+        args.n,
+        std::env::var("R11_EXPIRE").unwrap_or_else(|_| "bounded".to_string()),
+        t_open.as_secs_f64() * 1e6,
+        s.expire_ns,
+        io1[0] - io0[0],
+        t_rest.as_secs_f64() * 1e6,
+        rest.reaped.len(),
+        rest.freed_pages,
+        stats_line(&s)
+    );
+}
+
+/// A13 amended: the catalog-only fixture (see `turso_core::branch::catalog_only_fixture`).
+fn catonly(args: &Args) {
+    let measure = match args.phase.as_str() {
+        "build" => false,
+        "measure" => true,
+        other => die(&format!("catonly --phase build|measure, not {other:?}")),
+    };
+    let line = turso_core::branch::catalog_only_fixture(
+        &args.db,
+        args.n as u64,
+        args.writes as u64,
+        measure,
+        args.seed,
+    )
+    .unwrap_or_else(|e| not_a_result(&format!("catonly: {e}")));
+    println!("{line}");
 }
 
 /// `(resident pages, pages)` of a file in the OS page cache, by mmap + mincore; `(0, 0)` if absent.
@@ -848,6 +1128,11 @@ fn main() {
         "compact" => compact(&args),
         "ckpt" => ckpt(&args),
         "ckpt2" => ckpt2(&args),
+        "ckpt3" => ckpt3(&args),
+        "fifo" => fifo(&args),
+        "leasedown" => leasedown(&args),
+        "leaseopen" => leaseopen(&args),
+        "catonly" => catonly(&args),
         "churn" => churn(&args),
         other => die(&format!("unknown command {other}")),
     }

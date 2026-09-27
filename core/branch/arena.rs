@@ -155,9 +155,17 @@ impl<T: Copy + Default> Blocks<T> {
         &mut self.blocks[i / BLOCK][i % BLOCK]
     }
 
-    /// Forget every entry; the blocks stay for reuse.
-    fn clear(&mut self) {
-        self.len = 0;
+    /// Keep the entries `keep` accepts, in order, in place: no block is allocated or moved.
+    fn retain(&mut self, mut keep: impl FnMut(T) -> bool) {
+        let mut kept = 0;
+        for i in 0..self.len {
+            let v = self.get(i);
+            if keep(v) {
+                *self.get_mut(kept) = v;
+                kept += 1;
+            }
+        }
+        self.len = kept;
     }
 
     fn iter(&self) -> impl Iterator<Item = T> + '_ {
@@ -357,18 +365,6 @@ impl Arena {
         self.free.iter().collect()
     }
 
-    /// Empty the in-memory free list (a catalog checkpoint has written it to the catalog).
-    pub(crate) fn drain_free(&mut self) {
-        if trace_slots() {
-            eprintln!("R11SLOT drain_free {:?}", self.free_list());
-        }
-        for i in 0..self.free.len() {
-            let slot = self.free.get(i);
-            self.set_free_bit(slot, false);
-        }
-        self.free.clear();
-    }
-
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
     }
@@ -566,6 +562,42 @@ impl Arena {
             self.free_bits.outer_capacity(),
             chunks,
         ]
+    }
+
+    /// A second handle on the arena file, for a fuzzy checkpoint's writer to sync the slots its
+    /// rows name without the store mutex (r11-restart-r2, F-FZ): an fsync through any descriptor of
+    /// the file makes every write made before it durable. `None` for the memory backing.
+    pub(crate) fn sync_handle(&self) -> Result<Option<File>> {
+        match &self.backing {
+            Backing::File { file, .. } => file
+                .try_clone()
+                .map(Some)
+                .map_err(|e| crate::error::io_error(e, "clone branch arena handle")),
+            Backing::Memory { .. } => Ok(None),
+        }
+    }
+
+    /// Take `slots` off the in-memory free list if they are on it (a fuzzy checkpoint committed
+    /// them to the catalog's free table: the catalog lists them free now). Not an allocation: the
+    /// count in use does not change. Returns the slots that were NOT on the list.
+    pub(crate) fn remove_free(&mut self, slots: &std::collections::HashSet<Slot>) -> Vec<Slot> {
+        let mut absent: std::collections::HashSet<Slot> = slots.clone();
+        let mut removed = Vec::new();
+        self.free.retain(|slot| {
+            if absent.remove(&slot) {
+                removed.push(slot);
+                false
+            } else {
+                true
+            }
+        });
+        for slot in removed {
+            self.set_free_bit(slot, false);
+        }
+        if trace_slots() {
+            eprintln!("R11SLOT remove_free {slots:?} absent={absent:?}");
+        }
+        absent.into_iter().collect()
     }
 
     /// The bytes of a slot in a MEMORY arena.
