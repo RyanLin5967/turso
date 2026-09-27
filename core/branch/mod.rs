@@ -81,10 +81,12 @@ pub(crate) fn count_page_io(which: usize, n: u64) {
     PAGE_IO[which].fetch_add(n, crate::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-wide count of `Pager::read_page` calls, first attempts only (a re-entry after an I/O
-/// yield is not counted again), cache hit or miss, across every database in the process: pages a
-/// B-tree descent fetched (r11-merge PREREG A20c instrument, observing only; one shared atomic on
-/// every page fetch, so no timed run is made with it).
+/// Process-wide count of `Pager::read_page` calls, cache hit or miss, across every database in the
+/// process: pages a B-tree descent fetched (r11-merge PREREG A20c/A20d instrument, observing only;
+/// one shared atomic on every page fetch, so no timed run is made with it). A re-entry through
+/// `pending_reads` is not counted again, but a seek that restarts from its root after an I/O yield,
+/// and a retry of a cached page whose read is still in flight, are: about one extra fetch per cold
+/// root, never on a warm descent.
 #[doc(hidden)]
 pub static PAGE_GETS: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
 
@@ -269,13 +271,11 @@ pub struct Reaped {
     pub deferred: bool,
 }
 
-/// What the last open of the branch store read and rebuilt (r11-restart lane). An observing
-/// instrument only: nothing reads it back. Each phase time is paired with the integer that phase
-/// is proportional to, so the phase table closes against `total_ns`.
 /// V4's base reads since open (r11-merge PREREG A20/A20c instrument, observing only): calls,
 /// those answered from the arena (a retained trunk version), those refused, and retained versions
-/// examined; the catalog's C-P trunk probes and the version rows they returned; and, inside those
-/// probes alone, B-tree seeks, cursor steps (next + prev) and pages fetched.
+/// examined; the catalog's C-P trunk probes and the version rows they returned; and, inside
+/// `Catalog::trunk_pred` alone, its calls, those that found a version, and B-tree seeks, cursor
+/// steps (next + prev) and pages fetched, in total and for the probes that found a version.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct V4Counters {
@@ -285,11 +285,19 @@ pub struct V4Counters {
     pub base_examined: u64,
     pub cp_probes: u64,
     pub cp_rows: u64,
+    pub probe_calls: u64,
+    pub probe_found: u64,
     pub probe_seeks: u64,
     pub probe_steps: u64,
     pub probe_page_gets: u64,
+    pub found_seeks: u64,
+    pub found_steps: u64,
+    pub found_page_gets: u64,
 }
 
+/// What the last open of the branch store read and rebuilt (r11-restart lane). An observing
+/// instrument only: nothing reads it back. Each phase time is paired with the integer that phase
+/// is proportional to, so the phase table closes against `total_ns`.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchOpenStats {

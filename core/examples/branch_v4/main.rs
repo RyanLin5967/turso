@@ -561,20 +561,25 @@ fn reopen(args: &Args) {
         v4_1.base_examined - v4_0.base_examined,
     );
     let (cp_probes, cp_rows) = (v4_1.cp_probes - v4_0.cp_probes, v4_1.cp_rows - v4_0.cp_rows);
-    let (probe_seeks, probe_steps, probe_page_gets) = (
-        v4_1.probe_seeks - v4_0.probe_seeks,
-        v4_1.probe_steps - v4_0.probe_steps,
-        v4_1.probe_page_gets - v4_0.probe_page_gets,
-    );
+    let (probe_calls, probe_found) = (v4_1.probe_calls - v4_0.probe_calls, v4_1.probe_found - v4_0.probe_found);
+    // (s): B-tree seeks + cursor steps; (g): pages fetched; per probe that found a version (index
+    // and table) and per empty probe (index alone). A20d.
+    let s_found = (v4_1.found_seeks + v4_1.found_steps) - (v4_0.found_seeks + v4_0.found_steps);
+    let s_all = (v4_1.probe_seeks + v4_1.probe_steps) - (v4_0.probe_seeks + v4_0.probe_steps);
+    let g_found = v4_1.found_page_gets - v4_0.found_page_gets;
+    let g_all = v4_1.probe_page_gets - v4_0.probe_page_gets;
+    let probe_empty = probe_calls - probe_found;
     println!(
         "V4\tage={}\tforks={}\tversions={}\tn_live={}\trows={}\tkeys={n}\tper={}\tseed={}\t\
          base_reads={base_reads}\tbase_arena={base_arena}\tbase_refused={base_refused}\tbase_examined={base_examined}\t\
-         cp_probes={cp_probes}\tcp_rows={cp_rows}\tprobe_seeks={probe_seeks}\tprobe_steps={probe_steps}\tprobe_page_gets={probe_page_gets}\t\
+         cp_probes={cp_probes}\tcp_rows={cp_rows}\tprobe_calls={probe_calls}\tprobe_found={probe_found}\t\
+         s_total={s_all}\ts_found={s_found}\tg_total={g_all}\tg_found={g_found}\t\
          cat_branch_loads={}\tcat_trunk_page_loads={}\tcat_queries={}\tcat_rows_read={}\t\
          resolve_calls={}\tresolve_arena_reads={}\tarena_by_depth={:?}\tcurrent_by_depth={:?}\tpath_pages_total={}\th_min={h_min}\th_max={h_max}\t\
          expect_arena_leaf={expect_arena_leaf}\tleaves_rewritten={}\tpaths_equal={paths_equal}\tbase_ok={base_ok}\tours_differs={ours_differs}\t\
          M={:.4}\tM1={:.4}\tM2_cp_rows_per_arena={}\tM2_examined_per_arena={}\t\
-         seeks_per_probe={}\tsteps_per_probe={}\tpage_gets_per_probe={}\tpage_io_open={:?}\tpage_io_v4={:?}",
+         s_per_probe={}\ts_per_found={}\ts_per_empty={}\tg_per_probe={}\tg_per_found={}\tg_per_empty={}\t\
+         page_io_open={:?}\tpage_io_v4={:?}",
         args.age,
         args.forks,
         args.versions,
@@ -596,9 +601,12 @@ fn reopen(args: &Args) {
         path_pages.iter().sum::<u64>() as f64 / n as f64,
         ratio(cp_rows, base_arena),
         ratio(base_examined, base_arena),
-        ratio(probe_seeks, cp_probes),
-        ratio(probe_steps, cp_probes),
-        ratio(probe_page_gets, cp_probes),
+        ratio(s_all, probe_calls),
+        ratio(s_found, probe_found),
+        ratio(s_all - s_found, probe_empty),
+        ratio(g_all, probe_calls),
+        ratio(g_found, probe_found),
+        ratio(g_all - g_found, probe_empty),
         delta(io0, io1),
         delta(io1, io2)
     );
@@ -607,6 +615,11 @@ fn reopen(args: &Args) {
         println!("FINDING: {f}");
     }
     let _ = std::io::stdout().flush();
+    if probe_calls != cp_probes {
+        not_a_result(&format!(
+            "the catalog counted {probe_calls} trunk_pred calls and the store {cp_probes} C-P probes: a range read ran in the window"
+        ));
+    }
     if base_arena != arena {
         not_a_result(&format!("the store counted {base_arena} arena base reads, the harness {arena}"));
     }

@@ -158,12 +158,18 @@ pub(crate) struct CatalogCounters {
     pub(crate) queries: u64,
     pub(crate) rows_read: u64,
     pub(crate) rows_written: u64,
-    /// `trunk_pred`'s probes only (r11-merge A20c): B-tree seeks, and cursor steps (next + prev),
-    /// from the statement's own metrics, and pages fetched ([`crate::branch::PAGE_GETS`]), each
-    /// the delta around the one query.
+    /// `trunk_pred`'s probes only (r11-merge A20c/A20d): calls, those that found a version, and
+    /// B-tree seeks, cursor steps (next + prev), from the statement's own metrics, and pages
+    /// fetched ([`crate::branch::PAGE_GETS`]), each the delta around the one query; in total and
+    /// for the probes that found a version (an empty probe descends the index alone).
+    pub(crate) probe_calls: u64,
+    pub(crate) probe_found: u64,
     pub(crate) probe_seeks: u64,
     pub(crate) probe_steps: u64,
     pub(crate) probe_page_gets: u64,
+    pub(crate) found_seeks: u64,
+    pub(crate) found_steps: u64,
+    pub(crate) found_page_gets: u64,
 }
 
 /// An integer as the catalog stores it. Every value the store keeps is below 2^63 except a
@@ -642,10 +648,20 @@ impl Catalog {
             .ret_pred
             .rows(&[int(0), int(page as u64), int(at)], &mut self.counters)?;
         let m1 = self.ret_pred.stmt.metrics();
-        self.counters.probe_page_gets += crate::branch::page_gets() - g0;
-        self.counters.probe_seeks += m1.btree_seeks - m0.btree_seeks;
-        self.counters.probe_steps +=
-            (m1.btree_next + m1.btree_prev) - (m0.btree_next + m0.btree_prev);
+        let gets = crate::branch::page_gets() - g0;
+        let seeks = m1.btree_seeks - m0.btree_seeks;
+        let steps = (m1.btree_next + m1.btree_prev) - (m0.btree_next + m0.btree_prev);
+        let c = &mut self.counters;
+        c.probe_calls += 1;
+        c.probe_page_gets += gets;
+        c.probe_seeks += seeks;
+        c.probe_steps += steps;
+        if !rows.is_empty() {
+            c.probe_found += 1;
+            c.found_page_gets += gets;
+            c.found_seeks += seeks;
+            c.found_steps += steps;
+        }
         rows.first()
             .map(|row| Ok((get(row, 0)?, get(row, 1)?, get(row, 2)? as Slot, get(row, 3)? as u32)))
             .transpose()

@@ -2106,9 +2106,15 @@ impl BranchStore {
         if let Some(c) = inner.cat.as_ref() {
             out.cp_probes = c.trunk_probes;
             out.cp_rows = c.trunk_rows;
-            out.probe_seeks = c.catalog.counters.probe_seeks;
-            out.probe_steps = c.catalog.counters.probe_steps;
-            out.probe_page_gets = c.catalog.counters.probe_page_gets;
+            let k = c.catalog.counters;
+            out.probe_calls = k.probe_calls;
+            out.probe_found = k.probe_found;
+            out.probe_seeks = k.probe_seeks;
+            out.probe_steps = k.probe_steps;
+            out.probe_page_gets = k.probe_page_gets;
+            out.found_seeks = k.found_seeks;
+            out.found_steps = k.found_steps;
+            out.found_page_gets = k.found_page_gets;
         }
         out
     }
