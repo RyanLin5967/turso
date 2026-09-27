@@ -209,7 +209,7 @@ fn trunk_ddl_after_the_fork_leaves_a_branch_cache_and_schema_as_forked() {
     );
     assert_eq!(
         again, 0,
-        "the branch re-resolved {again} pages after trunk DDL: its cache or schema cookie was dropped"
+        "the branch re-resolved {again} pages after trunk DDL: its cache was emptied"
     );
     // The branch's schema is its fork's: the trunk's new table does not exist on it.
     assert_eq!(
@@ -217,9 +217,12 @@ fn trunk_ddl_after_the_fork_leaves_a_branch_cache_and_schema_as_forked() {
         BTreeSet::from(["t".to_string()]),
         "the branch saw the trunk's DDL"
     );
+    let err = bc
+        .execute("SELECT count(*) FROM u")
+        .expect_err("the branch could query a table the trunk created after the fork");
     assert!(
-        bc.execute("SELECT count(*) FROM u").is_err(),
-        "the branch could query a table the trunk created after the fork"
+        err.to_string().contains("no such table"),
+        "the branch's query of the trunk's new table failed for another reason: {err}"
     );
 }
 
@@ -295,71 +298,96 @@ fn rows_retrying(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
 }
 
 /// Under a trunk that commits continuously, a branch connection keeps its cache across every one
-/// of those commits and still reads its fork in every statement: the pages it resolves for the
-/// first time are read at a WAL snapshot that moves under it, the pages it holds stay the fork's,
-/// and its cache is never emptied.
+/// of those commits and still reads its fork in every statement. It first walks the table in id
+/// order, three statements per row, so a new leaf comes into its cache roughly every hundred
+/// statements, most of them rewritten by the trunk by then (a first read of a rewritten page takes
+/// the version the trunk retained; one not rewritten is read at a WAL snapshot that moves under
+/// the branch); then it re-reads random rows, now from its cache. Its cache is never emptied.
 #[test]
 fn a_branch_reads_its_fork_in_every_statement_while_the_trunk_commits_concurrently() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     let (_dir, db) = open_db();
     let trunk = db.connect().unwrap();
     seed(&trunk);
     let b = trunk.fork_branch().unwrap();
     let bc = b.connect().unwrap();
+    let before = db.branch_stats();
 
     let stop = Arc::new(AtomicBool::new(false));
+    let commits = Arc::new(AtomicU64::new(0));
     let writer = {
         let db = db.clone();
-        let stop = stop.clone();
+        let (stop, commits) = (stop.clone(), commits.clone());
         std::thread::spawn(move || {
             let conn = db.connect().unwrap();
             let mut rng = 0x2545_F491_4F6C_DD1Du64;
-            let mut commits = 0u64;
             while !stop.load(Ordering::Acquire) {
                 rng ^= rng << 13;
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
                 let id = (rng % ROWS as u64) as i64 + 1;
-                match conn.execute(format!("UPDATE t SET v = 'w{commits}' WHERE id = {id}")) {
-                    Ok(()) => commits += 1,
+                let n = commits.load(Ordering::Relaxed);
+                match conn.execute(format!("UPDATE t SET v = 'w{n}' WHERE id = {id}")) {
+                    Ok(()) => {
+                        commits.fetch_add(1, Ordering::Release);
+                    }
                     Err(LimboError::Busy | LimboError::BusySnapshot) => std::thread::yield_now(),
                     Err(e) => panic!("trunk writer: {e}"),
                 }
             }
-            commits
         })
     };
+    // The branch's reads begin only once the trunk has committed after the fork.
+    while commits.load(Ordering::Acquire) == 0 {
+        assert!(
+            !writer.is_finished(),
+            "the trunk writer stopped before its first commit"
+        );
+        std::thread::yield_now();
+    }
 
-    let before = db.branch_stats();
-    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-    for read in 0..2_000 {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        let id = (rng % ROWS as u64) as i64 + 1;
+    let read = |statement: usize, id: i64| {
         let r = rows_retrying(&bc, &format!("SELECT v FROM t WHERE id = {id}"));
         assert_eq!(
             r.len(),
             1,
-            "statement {read}: row {id} must exist exactly once"
+            "statement {statement}: row {id} must exist exactly once"
         );
         match &r[0][0] {
             Value::Text(t) => assert_eq!(
                 t.as_str(),
                 original(id),
-                "statement {read}: the branch read row {id} as the trunk rewrote it"
+                "statement {statement}: the branch read row {id} as the trunk rewrote it"
             ),
             other => panic!("row {id}: expected text, got {other:?}"),
         }
+    };
+    let mut statement = 0;
+    for id in 1..=ROWS {
+        for _ in 0..3 {
+            read(statement, id);
+            statement += 1;
+        }
+    }
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..800 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        read(statement, (rng % ROWS as u64) as i64 + 1);
+        statement += 1;
     }
     stop.store(true, Ordering::Release);
-    let commits = writer.join().unwrap();
+    writer.join().unwrap();
     let after = db.branch_stats();
 
+    let commits = commits.load(Ordering::Acquire);
     let kept = after.branch_cache_clears_skipped - before.branch_cache_clears_skipped;
+    let rewritten = after.work.resolve_trunk_rewritten - before.work.resolve_trunk_rewritten;
     assert!(
-        commits > 0 && kept > 0,
-        "nothing was tested: {commits} trunk commits, {kept} WAL changes seen by the branch"
+        commits > 0 && kept > 0 && rewritten > 0,
+        "nothing was tested: {commits} trunk commits, {kept} WAL changes seen by the branch, \
+         {rewritten} first reads of pages the trunk rewrote after the fork"
     );
     assert_eq!(
         after.branch_cache_clears, before.branch_cache_clears,
@@ -374,4 +402,41 @@ fn a_branch_reads_its_fork_in_every_statement_while_the_trunk_commits_concurrent
             other => panic!("row {id}: expected text, got {other:?}"),
         }
     }
+}
+
+/// Another process's trunk commits never pass this process's copy-on-write decision, so a branch
+/// of a database opened for multiprocess WAL would read them: refused at the fork.
+#[cfg(host_shared_wal)]
+#[test]
+fn a_database_opened_with_multiprocess_wal_cannot_be_branched() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("multiprocess.db");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_multiprocess_wal(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let err = match trunk.fork_branch() {
+        Ok(b) => panic!(
+            "branch {} of a multiprocess-WAL database was forked",
+            b.id().0
+        ),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("multiprocess"),
+        "the refusal does not name the mode: {err}"
+    );
+    assert!(
+        err.contains("silently"),
+        "the refusal does not say the failure is silent: {err}"
+    );
+    assert_eq!(value(&trunk, X), original(X));
 }
