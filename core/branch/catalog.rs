@@ -56,7 +56,7 @@ use std::num::NonZero;
 use std::path::Path;
 
 use super::arena::Slot;
-use crate::sync::{Arc, Mutex, MutexGuard};
+use crate::sync::{Arc, Mutex};
 use crate::{
     Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, Result, SqliteDialect,
     Statement, Value, IO,
@@ -253,7 +253,7 @@ impl CatalogCell {
         Self(Arc::new(Mutex::new(catalog)))
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Catalog> {
+    pub(crate) fn lock(&self) -> impl std::ops::DerefMut<Target = Catalog> + '_ {
         self.0.lock()
     }
 }

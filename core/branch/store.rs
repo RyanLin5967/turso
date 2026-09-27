@@ -2550,7 +2550,7 @@ impl StoreInner {
     }
 
     /// The catalog, in a catalog store that has files.
-    fn catalog(&self) -> Option<crate::sync::MutexGuard<'_, Catalog>> {
+    fn catalog(&self) -> Option<impl std::ops::DerefMut<Target = Catalog> + '_> {
         self.cat.as_ref().map(|c| c.catalog.lock())
     }
 
