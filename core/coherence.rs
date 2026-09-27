@@ -352,6 +352,11 @@ pub const FIX_OWNER: u32 = 32768;
 /// through a per-thread keeper, branch connections outside n_connections, the branch schema from a per-thread copy,
 /// and the store's live counter sloppy (amendment 21).
 pub const FIX_UARC: u32 = 16384;
+/// FL (r11-forklock's F-L, ported for r12-phasefair's SOTA arm): trunk forks without the WAL write lock and without
+/// FG's gate. A trunk commit takes its copy decisions at its serialization point, from pre-images captured at each
+/// page's first write, and opens a commit gate that a lock-free fork validates against (Silo, SOSP 2013). Refused with
+/// FK and with F-FB (see `BranchStore::with_shared`). Not part of `all`.
+pub const FIX_FORKOCC: u32 = 65536;
 
 static FIXES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
@@ -383,6 +388,7 @@ pub fn parse_fixes(s: &str) -> Option<u32> {
             "V" => FIX_PRIVATE,
             "Z" => FIX_UARC,
             "O" => FIX_OWNER,
+            "L" => FIX_FORKOCC,
             _ => return None,
         };
     }
@@ -397,7 +403,7 @@ pub fn set_fixes(mask: u32) -> bool {
 /// The fixes this process runs with.
 pub fn fixes() -> u32 {
     *FIXES.get_or_init(|| match std::env::var("TURSO_R11_FIX") {
-        Ok(s) => parse_fixes(&s).unwrap_or_else(|| panic!("TURSO_R11_FIX={s}: expected none, all or letters from W,B,P,S,A,G,K,X,M,Y,U,H,R,V,Z,O")),
+        Ok(s) => parse_fixes(&s).unwrap_or_else(|| panic!("TURSO_R11_FIX={s}: expected none, all or letters from W,B,P,S,A,G,K,X,M,Y,U,H,R,V,Z,O,L")),
         Err(_) => 0,
     })
 }

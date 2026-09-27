@@ -3,7 +3,7 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
-use crate::branch::store::{BranchStore, Resolved, ResolveCause, TrunkPageKey};
+use crate::branch::store::{BranchStore, Resolved, ResolveCause, TrunkCommitGate, TrunkPageKey};
 use crate::branch::{BranchBinding, BranchId};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -1532,6 +1532,10 @@ pub struct Pager {
     /// r12-phasefair F-XI (`TURSO_R12_XI=on`): on another connection's commit, a trunk pager evicts only the pages
     /// that commit rewrote, instead of its whole cache. Branch pagers never use it.
     xi: AtomicBool,
+    /// FL, on a TRUNK pager: the write set's pre-images, each page as it was before this write transaction first
+    /// touched it, captured while the trunk had a live child. The branch store takes the transaction's copy
+    /// decisions from them at its commit (see `BranchStore::begin_trunk_commit`).
+    trunk_pre_images: Mutex<HashMap<u32, Box<[u8]>>>,
 }
 
 /// F-XI's switch, read once per process from `TURSO_R12_XI` (`on` or `off`; unset is off).
@@ -1864,6 +1868,7 @@ impl Pager {
             branch_resolve_log: Mutex::new(rustc_hash::FxHashMap::default()),
             branch_cache_clears: AtomicU64::new(0),
             xi: AtomicBool::new(xi_from_env()),
+            trunk_pre_images: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3289,6 +3294,8 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
+        // FL: a transaction that rolled back left its captures here; this one starts from none.
+        self.trunk_pre_images.lock().clear();
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
@@ -3974,9 +3981,13 @@ impl Pager {
     ///   page space; a page it owns that a live child can still see keeps its old slot for that
     ///   child and gets a fresh one.
     /// * On the trunk: a page a live branch can still see has its pre-image copied into the arena
-    ///   before the write, so neither this commit nor a later checkpoint reaches the branch.
+    ///   before the write, so neither this commit nor a later checkpoint reaches the branch. With FL
+    ///   the page as it is now is CAPTURED instead, and the decision is taken at the commit against
+    ///   the epoch there ([`Pager::decide_trunk_commit`]), so a branch forked while the transaction
+    ///   is open is seen.
     ///
-    /// A page that is already dirty was decided at its first `add_dirty` in this transaction.
+    /// A page that is already dirty was decided at its first `add_dirty` in this transaction; with FL
+    /// a page dirtied again after a spill or a savepoint rollback keeps its first capture.
     fn copy_on_write_decision(&self, page: &Page) -> Result<()> {
         if page.is_dirty() {
             return Ok(());
@@ -3990,11 +4001,41 @@ impl Pager {
             );
         }
         if let Some(store) = self.branch_store.get() {
-            if store.trunk_has_children() || store.stamps_every_trunk_write() {
+            if store.fork_occ() {
+                if store.trunk_has_children() && crate::branch::store::fl_mutant() != 3 {
+                    self.trunk_pre_images
+                        .lock()
+                        .entry(page_no)
+                        .or_insert_with(|| page.get_contents().as_slice().into());
+                }
+            } else if store.trunk_has_children() || store.stamps_every_trunk_write() {
                 store.first_write_trunk(page_no, page.get_contents().as_slice());
             }
         }
         Ok(())
+    }
+
+    /// FL: the branch store's copy decisions for this trunk commit, taken at its serialization point: its frames
+    /// are written and synced, and not yet published. Every trunk commit opens the store's commit gate here, so a
+    /// lock-free fork can tell that a commit landed after its snapshot even when the commit had nothing to decide;
+    /// the caller drops the gate once the frames are published. Pages are handed over (with their pre-images) only
+    /// while the transaction captured any or the trunk has a live child: with neither, no child can appear before
+    /// the commit (the first child is forked excluding trunk writers). `None` without FL.
+    fn decide_trunk_commit(&self) -> Option<TrunkCommitGate<'_>> {
+        let store = self.branch_store.get()?;
+        if !store.fork_occ() {
+            return None;
+        }
+        let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
+        if captured.is_empty() && !store.trunk_has_children() {
+            return Some(store.begin_trunk_commit(std::iter::empty()));
+        }
+        let dirty = self.dirty_pages.read();
+        Some(store.begin_trunk_commit(
+            dirty
+                .iter()
+                .map(|page| (page, captured.get(&page).map(|bytes| &bytes[..]))),
+        ))
     }
 
     pub fn wal_state(&self) -> Result<WalState> {
@@ -4916,9 +4957,13 @@ impl Pager {
                 CommitState::WalCommitDone => {
                     // all I/O complete, NOW it's safe to advance WAL state
                     let mut commit_info = self.commit_info.write();
+                    // FL: the commit's serialization point for the branch store: its copy decisions are taken
+                    // here, and the gate they open closes once the frames are published.
+                    let gate = self.decide_trunk_commit();
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
+                    drop(gate);
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 

@@ -79,6 +79,37 @@
 //! an older generation is never served. The cache is filled by the pager after it reads a page for
 //! a branch ([`BranchStore::fill_trunk_page`]), under the key [`BranchStore::resolve_into`] gave.
 //!
+//! With FL (below) the epoch in the key is the epoch of the page's last COMMIT, stamped at the
+//! commit's serialization point: a commit after the fork at `trunk_at` stamps its pages with a later
+//! epoch before it publishes them, and no fork registers inside a commit's gate, so the key still
+//! names one version (the buffer tag with its LSN, where the LSN is the commit's epoch).
+//!
+//! # Trunk commits and forks without the writer's exclusion (FL, r11-forklock's F-L)
+//!
+//! Without FL a trunk fork excludes every trunk write transaction (the WAL write lock, or FG's gate
+//! as a reader), because a transaction takes its copy decisions at each page's first write, for the
+//! epoch of that moment: a fork in between would see its commit. With FL
+//! (`TURSO_R11_FIX` letter `L`) the decisions are taken where an optimistic transaction takes its own,
+//! at the commit's serialization point against the epoch there (Silo, SOSP 2013):
+//!
+//! * **The writer** only CAPTURES, at a page's first write in the transaction, the page as it was
+//!   (the pager's write set), and only while the trunk has a live child. After the frames are
+//!   written and synced and before they are published, [`BranchStore::begin_trunk_commit`] takes
+//!   every decision in one hold of the trunk's lock and opens the COMMIT GATE (`trunk_commits`
+//!   odd); dropping the [`TrunkCommitGate`] after the publication closes it. A rolled-back
+//!   transaction leaves nothing in the store.
+//! * **A fork** reads `trunk_commits` (waiting out an open gate), begins a WAL read transaction, and
+//!   registers under the trunk's lock only if `trunk_commits` has not moved since and the trunk has
+//!   a live child ([`BranchStore::fork_trunk_occ`]): every commit decided before the registration
+//!   is then in the fork's snapshot, and every commit decided after it sees the child.
+//! * **The first child**, and a fork that lost every lock-free attempt, fork the old way (FG's gate
+//!   or the WAL write lock). `trunk_children` goes from 0 to 1 only there, and with FL its arrive
+//!   runs inside the same trunk-lock hold that lists the child (F6's condition (i)), so outside that
+//!   lock a listed child is always counted.
+//! * FL is volatile-only: the arena does not survive a restart here, so decisions taken after the
+//!   WAL fsync lose nothing on a crash. A durable store would need a WAL position in the fork's
+//!   record (r11-invariant-matrix U1). FL is refused with FK and with F-FB (see `with_shared`).
+//!
 //! # Concurrency — a striped store
 //!
 //! The store was one `Mutex` over every branch. Under threads it was not the first wall — the
@@ -275,6 +306,60 @@ pub(crate) struct BranchStore {
     trunk_chunks: OnceLock<std::sync::Arc<Chunks>>,
     /// F-FB: batched trunk forks (`TURSO_FORK_BATCH=on` at construction); `None` forks one at a time.
     fork_batch: Option<ForkBatcher>,
+    /// FL: trunk commits decide at their serialization point and forks register against the commit gate (see
+    /// "Trunk commits and forks without the writer's exclusion").
+    fl: bool,
+    /// FL's commit gate: trunk commits that have taken their copy decisions, counted twice — odd while a commit
+    /// is between its decisions and its publication. Opened under the trunk's lock by the trunk's one writer.
+    trunk_commits: CachePadded<AtomicU64>,
+    /// Test-only: run by a trunk fork right after its trunk-lock hold, where a trunk writer could read
+    /// `trunk_children` (FL's K10-7).
+    #[cfg(test)]
+    after_fork_hold: std::sync::Mutex<Option<Box<dyn Fn(&BranchStore) + Send>>>,
+}
+
+/// What an FL trunk fork did before it registered (observation only).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ForkAttempts {
+    /// Lock-free attempts abandoned because a trunk commit took its decisions in between, or was taking them.
+    pub(crate) gate_retries: u64,
+}
+
+/// What a trunk fork's registration did.
+pub(crate) enum TrunkFork {
+    Forked(BranchId),
+    /// FL: a trunk commit took its copy decisions after the fork's snapshot, or is taking them: begin a new
+    /// snapshot and try again.
+    Retry,
+    /// FL: the trunk has no live child, so this fork would be the first: fork the old way.
+    NeedsWriterLock,
+}
+
+/// FL: a trunk commit between its copy decisions and its publication. Dropping it closes the commit gate: drop
+/// it once the commit is published (or has failed), never before.
+pub(crate) struct TrunkCommitGate<'a> {
+    store: &'a BranchStore,
+}
+
+impl Drop for TrunkCommitGate<'_> {
+    fn drop(&mut self) {
+        self.store.trunk_commits.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// FL's mutant schemata (r12-phasefair PREREG section "F-L (r11-forklock)", FL.3; test builds only): `FL_MUTANT=n`,
+/// read once. 1 ignores the commit gate; 2 does not restamp at the commit; 3 captures nothing; 4 admits a lock-free
+/// first child; 5 treats a page born in the previous epoch as born in this one; 6 moves the arrive after the hold.
+#[cfg(test)]
+pub(crate) fn fl_mutant() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| std::env::var("FL_MUTANT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn fl_mutant() -> u32 {
+    0
 }
 
 #[cfg(test)]
@@ -1133,6 +1218,19 @@ impl BranchStore {
         if fork_batch && crate::coherence::fix(crate::coherence::FIX_TRUNKIDX) {
             panic!("TURSO_FORK_BATCH=on with r11-coherence's FK: FK forks without the trunk lock; refused");
         }
+        let fl = crate::coherence::fix(crate::coherence::FIX_FORKOCC);
+        if fl && crate::coherence::fix(crate::coherence::FIX_TRUNKIDX) {
+            panic!(
+                "TURSO_R11_FIX with L and K: FL registers forks under the trunk lock against a commit gate, FK \
+                 without that lock; not composed; refused"
+            );
+        }
+        if fl && fork_batch {
+            panic!(
+                "TURSO_FORK_BATCH=on with FL: F-FB's batch epoch assumes every member excludes trunk writers, which \
+                 FL's forks do not; refused"
+            );
+        }
         let k3 = shared.map(std::sync::Arc::new);
         let n_shards = if crate::coherence::fix(crate::coherence::FIX_STRIPES) {
             SHARDS_FINE
@@ -1195,6 +1293,10 @@ impl BranchStore {
             k3_mode: mode,
             trunk_chunks: OnceLock::new(),
             fork_batch: fork_batch.then(ForkBatcher::new),
+            fl,
+            trunk_commits: CachePadded::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            after_fork_hold: std::sync::Mutex::new(None),
         }
     }
 
@@ -1298,7 +1400,7 @@ impl BranchStore {
         let mut ids = vec![first];
         for _ in 1..k {
             let id = self.next_branch_id();
-            self.finish_trunk_fork(id, f, Arc::new(Schema::default()));
+            self.finish_trunk_fork(id, f, Arc::new(Schema::default()), false);
             ids.push(id);
         }
         ids
@@ -1481,6 +1583,38 @@ impl BranchStore {
         page_size: usize,
         reserved_space: u8,
     ) -> Result<BranchId> {
+        match self.fork_trunk_occ(schema, page_size, reserved_space, None, ForkAttempts::default())? {
+            TrunkFork::Forked(id) => Ok(id),
+            _ => unreachable!("a trunk fork that excludes trunk writers always registers"),
+        }
+    }
+
+    /// FL: whether trunk commits decide at their serialization point and forks may register against the gate.
+    pub(crate) fn fork_occ(&self) -> bool {
+        self.fl
+    }
+
+    /// FL: the commit gate's count, for a lock-free trunk fork to hand back to [`Self::fork_trunk_occ`]. Odd while
+    /// a trunk commit is between its copy decisions and its publication.
+    pub(crate) fn trunk_commit_seq(&self) -> u64 {
+        self.trunk_commits.load(Ordering::Acquire)
+    }
+
+    /// Fork a child of the trunk. `seen: None`: the caller excludes trunk writers (the WAL write lock or FG's
+    /// gate), and the fork always registers ([`Self::fork_trunk`]'s contract). `seen: Some(count)` (FL only): the
+    /// caller holds a WAL read snapshot begun after it read `count` from [`Self::trunk_commit_seq`], and the fork
+    /// registers only if no trunk commit has taken its decisions since — so every commit decided before this
+    /// registration is in the caller's snapshot, and every one decided after it retains what the child sees — and
+    /// only if the trunk already has a live child.
+    pub(crate) fn fork_trunk_occ(
+        &self,
+        schema: Arc<Schema>,
+        page_size: usize,
+        reserved_space: u8,
+        seen: Option<u64>,
+        attempts: ForkAttempts,
+    ) -> Result<TrunkFork> {
+        crate::turso_assert!(seen.is_none() || self.fl, "a lock-free trunk fork without FL");
         let format = *self.trunk_format.get_or_init(|| (page_size, reserved_space));
         if format != (page_size, reserved_space) {
             return Err(LimboError::InternalError(format!(
@@ -1501,25 +1635,56 @@ impl BranchStore {
             (id, self.join_fork_batch(fb))
         } else {
             let mut trunk = self.trunk(TrunkSite::Fork);
+            if let Some(seen) = seen {
+                if self.trunk_children_ctr().load(Ordering::Acquire) == 0 && fl_mutant() != 4 {
+                    return Ok(TrunkFork::NeedsWriterLock);
+                }
+                // An odd count was read inside a commit's gate: the snapshot may or may not hold that commit.
+                if (seen % 2 == 1 || self.trunk_commits.load(Ordering::Acquire) != seen) && fl_mutant() != 1 {
+                    return Ok(TrunkFork::Retry);
+                }
+            }
             let id = self.next_branch_id();
             let f = trunk.lineage.epoch;
             trunk.lineage.epoch += 1;
             trunk.lineage.children.insert(f, 1);
+            if self.fl {
+                // F6's condition (i): outside the trunk's lock a listed child is counted, because a trunk writer
+                // reads the count without that lock to decide whether to capture.
+                if fl_mutant() != 6 {
+                    crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
+                    self.trunk_children_ctr().fetch_add(1, Ordering::AcqRel);
+                }
+                let work = &mut trunk.work;
+                if seen.is_some() {
+                    work.trunk_forks_fast += 1;
+                } else {
+                    work.trunk_forks_locked += 1;
+                }
+                work.trunk_fork_gate_retries += attempts.gate_retries;
+            }
             (id, f)
         };
-        self.finish_trunk_fork(id, f, schema);
-        Ok(id)
+        #[cfg(test)]
+        if let Some(hook) = self.after_fork_hold.lock().unwrap().as_ref() {
+            hook(self);
+        }
+        self.finish_trunk_fork(id, f, schema, self.fl && fl_mutant() != 6);
+        Ok(TrunkFork::Forked(id))
     }
 
-    /// A trunk fork's branch, made once its epoch `f` is listed among the trunk's children.
-    fn finish_trunk_fork(&self, id: BranchId, f: u64, schema: Arc<Schema>) {
+    /// A trunk fork's branch, made once its epoch `f` is listed among the trunk's children. `arrived`: FL's fork
+    /// already counted the child in `trunk_children` under the trunk's lock.
+    fn finish_trunk_fork(&self, id: BranchId, f: u64, schema: Arc<Schema>, arrived: bool) {
         self.live_inc();
         self.shard(id).branches.insert(
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
         );
-        crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-        self.trunk_children_ctr().fetch_add(1, Ordering::AcqRel);
+        if !arrived {
+            crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
+            self.trunk_children_ctr().fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// F-FB: join the collecting batch of trunk forks and return its fork epoch, leading the batch
@@ -1822,6 +1987,73 @@ impl BranchStore {
             );
         }
         self.written.get_or_insert(page).store(epoch, Ordering::Release);
+    }
+
+    /// FL: the copy decisions of one trunk commit, taken at its serialization point (after its frames are written
+    /// and synced, before they are published). `pages` is every page the commit writes, each with the pre-image the
+    /// pager captured at the page's first write in the transaction, or `None` if the trunk had no live child then.
+    /// For each page last committed before this epoch: if a live child forked since then can see the version being
+    /// overwritten, keep a copy of it for that child (as [`Self::first_write_trunk`] does), and stamp `written` with
+    /// this epoch — before the commit is published, so a reader whose WAL snapshot holds the new version also sees
+    /// the new epoch.
+    ///
+    /// The decisions are taken against the epoch NOW, so a fork registered at any moment of the transaction is
+    /// seen. The returned gate keeps lock-free forks from registering until it is dropped, once the commit is
+    /// published. A page without a pre-image was first written while the trunk had no live child; the first child
+    /// is forked excluding trunk writers (F-L3), and this writer excludes those, so no live child can see what it
+    /// overwrites — asserted, since the writer tells the store nothing else about that page (the cache's
+    /// generation covers it).
+    pub(crate) fn begin_trunk_commit<'a, 'p>(
+        &'a self,
+        pages: impl IntoIterator<Item = (u32, Option<&'p [u8]>)>,
+    ) -> TrunkCommitGate<'a> {
+        crate::turso_assert!(self.fl, "a commit-time copy decision without FL");
+        let mut trunk = self.trunk(TrunkSite::Write);
+        let opened = self.trunk_commits.fetch_add(1, Ordering::AcqRel);
+        crate::turso_assert!(opened % 2 == 0, "two trunk commits inside the commit gate at once");
+        let gate = TrunkCommitGate { store: self };
+        let TrunkInner {
+            lineage,
+            domain,
+            work,
+        } = &mut *trunk;
+        let epoch = lineage.epoch;
+        work.trunk_commits_decided += 1;
+        for (page, pre_image) in pages {
+            let born = self.written(page);
+            let Some(pre_image) = pre_image else {
+                crate::turso_assert!(
+                    !lineage.has_child_in(born, epoch),
+                    "a trunk commit overwrites a page a live child can see, and no pre-image was captured for it"
+                );
+                continue;
+            };
+            work.trunk_pre_images_captured += 1;
+            if born >= epoch || (fl_mutant() == 5 && born + 1 >= epoch) {
+                continue;
+            }
+            if lineage.has_child_in(born, epoch) {
+                let slot = domain.alloc(self.page_size());
+                domain.page_mut(slot).copy_from_slice(pre_image);
+                if self.k3.is_some() {
+                    // Before the version is published: a reader that finds it reads through these.
+                    self.trunk_chunks.get_or_init(|| domain.arena().chunks());
+                }
+                lineage.retain(
+                    page,
+                    Retained {
+                        born,
+                        died: epoch,
+                        slot,
+                    },
+                );
+                work.trunk_pre_images_retained += 1;
+            }
+            if fl_mutant() != 2 {
+                self.written.get_or_insert(page).store(epoch, Ordering::Release);
+            }
+        }
+        gate
     }
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
@@ -3435,5 +3667,299 @@ mod tests {
             store.release_handle(id);
         }
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {mode:?}: versions leaked");
+    }
+
+    /// FL: a store with FL on (and the other letters off), trunk reads in `mode`.
+    fn fl_store(mode: K3Mode) -> BranchStore {
+        crate::coherence::force_fixes_for_test(crate::coherence::FIX_FORKOCC);
+        let store = BranchStore::with_k3(mode);
+        crate::coherence::force_fixes_for_test(0);
+        assert!(store.fork_occ(), "premise: FL is on in this store");
+        store
+    }
+
+    /// FL: a trunk fork as the pager makes it when it excludes trunk writers (F-L3): it always registers.
+    fn fl_fork_locked(store: &BranchStore) -> BranchId {
+        store
+            .fork_trunk(Arc::new(Schema::default()), PAGE, 0)
+            .unwrap()
+    }
+
+    /// FL: a lock-free trunk fork against `seen`.
+    fn fl_fork_fast(store: &BranchStore, seen: u64) -> TrunkFork {
+        store
+            .fork_trunk_occ(Arc::new(Schema::default()), PAGE, 0, Some(seen), ForkAttempts::default())
+            .unwrap()
+    }
+
+    /// FL K10-4 (r12-phasefair PREREG section "F-L (r11-forklock)", FL.3): a fork without the WAL write lock or FG's
+    /// gate registers only between two commits' gates, against the count it read before its snapshot, and never as
+    /// the trunk's first child. Each refusal is forced to fire, and each admission shown after it, in every K3 mode.
+    #[test]
+    fn fl_a_lock_free_fork_registers_only_between_commit_gates_and_never_as_the_first_child() {
+        for mode in K3Mode::ALL {
+            let store = fl_store(mode);
+            assert!(
+                matches!(fl_fork_fast(&store, store.trunk_commit_seq()), TrunkFork::NeedsWriterLock),
+                "k3 {mode:?}: a lock-free fork registered as the trunk's first child"
+            );
+            let first = fl_fork_locked(&store);
+            let seen = store.trunk_commit_seq();
+            assert_eq!(seen % 2, 0, "k3 {mode:?}: the gate is open with no commit in flight");
+            let TrunkFork::Forked(a) = fl_fork_fast(&store, seen) else {
+                panic!("k3 {mode:?}: a lock-free fork between commits was refused");
+            };
+            let gate = store.begin_trunk_commit([(1, Some(&image(0)[..]))]);
+            let inside = store.trunk_commit_seq();
+            assert_eq!(inside, seen + 1, "k3 {mode:?}: a commit's decisions did not open the gate");
+            assert!(
+                matches!(fl_fork_fast(&store, seen), TrunkFork::Retry),
+                "k3 {mode:?}: a fork registered against a snapshot taken before a commit's decisions"
+            );
+            assert!(
+                matches!(fl_fork_fast(&store, inside), TrunkFork::Retry),
+                "k3 {mode:?}: a fork registered inside a commit's gate"
+            );
+            drop(gate);
+            let after = store.trunk_commit_seq();
+            assert_eq!(after, seen + 2, "k3 {mode:?}: the gate did not close");
+            assert!(
+                matches!(fl_fork_fast(&store, seen), TrunkFork::Retry),
+                "k3 {mode:?}: a fork registered against a snapshot taken before a published commit"
+            );
+            let TrunkFork::Forked(b) = fl_fork_fast(&store, after) else {
+                panic!("k3 {mode:?}: a lock-free fork after the commit was refused");
+            };
+            let work = store.stats().work;
+            assert_eq!(
+                (work.trunk_forks_fast, work.trunk_forks_locked),
+                (2, 1),
+                "k3 {mode:?}: fork counts"
+            );
+            for id in [first, a, b] {
+                store.release_handle(id);
+            }
+        }
+    }
+
+    /// FL K10-1/K10-2 at the store's level: a trunk transaction's copy decisions are taken at its commit, against
+    /// the epoch there. A child forked after the writer captured a page and before its commit reads the pre-image,
+    /// when the page's last commit was in an earlier epoch and when it was in the epoch just before this one; a
+    /// child forked after the commit reads the trunk's new version. In every K3 mode (the retained versions are
+    /// then searched without the trunk's lock).
+    #[test]
+    fn fl_a_trunk_commit_decides_against_the_epoch_at_its_commit_not_at_its_first_write() {
+        for mode in K3Mode::ALL {
+            let store = fl_store(mode);
+            let first = fl_fork_locked(&store);
+            let mut buf = vec![0u8; PAGE];
+            let mut read = |id: BranchId| match store.resolve_into(id, 3, &mut buf).unwrap() {
+                Resolved::Filled => Some(u64::from_le_bytes(buf[..8].try_into().unwrap())),
+                Resolved::Trunk(_) => None,
+            };
+            let fast = || match fl_fork_fast(&store, store.trunk_commit_seq()) {
+                TrunkFork::Forked(id) => id,
+                _ => panic!("k3 {mode:?}: a lock-free fork between commits was refused"),
+            };
+            // C0: page 3 goes from generation 0 to 1 in epoch 1; `first` keeps generation 0.
+            drop(store.begin_trunk_commit([(3, Some(&image(0)[..]))]));
+            // C1: the writer captures generation 1, then a child forks, then C1 commits generation 2.
+            let captured = image(1);
+            let x = fast();
+            drop(store.begin_trunk_commit([(3, Some(&captured[..]))]));
+            // C2: the page's last commit is two epochs back; again children fork mid-transaction.
+            let captured2 = image(2);
+            let y = fast();
+            let z = fast();
+            drop(store.begin_trunk_commit([(3, Some(&captured2[..]))]));
+            let after = fast();
+            assert_eq!(read(first), Some(0), "k3 {mode:?}: the child forked before C0 lost its version");
+            assert_eq!(read(x), Some(1), "k3 {mode:?}: a child forked inside C1 did not get C1's pre-image");
+            assert_eq!(read(y), Some(2), "k3 {mode:?}: a child forked inside C2 did not get C2's pre-image");
+            assert_eq!(read(z), Some(2), "k3 {mode:?}: a child forked inside C2 did not get C2's pre-image");
+            assert_eq!(read(after), None, "k3 {mode:?}: a child forked after C2 does not read the trunk's page");
+            let work = store.stats().work;
+            assert_eq!(work.trunk_commits_decided, 3, "k3 {mode:?}");
+            assert_eq!(work.trunk_pre_images_retained, 3, "k3 {mode:?}: one retained version per commit");
+            for id in [first, x, y, z, after] {
+                store.release_handle(id);
+            }
+            assert_eq!(store.stats().arena_slots_in_use, 0, "k3 {mode:?}: versions leaked");
+        }
+    }
+
+    /// FL K10-7 (F6's condition (i), r11-fi-refute-code's model): outside the trunk's lock a listed trunk child is
+    /// always counted in `trunk_children`, which a trunk writer reads without that lock to decide whether to capture.
+    /// A hook run right after each fork's trunk-lock hold asserts it, for the first child (forked excluding trunk
+    /// writers) and for a lock-free one.
+    #[test]
+    fn fl_a_listed_trunk_child_is_counted_the_moment_the_trunk_lock_is_released() {
+        let store = fl_store(K3Mode::Off);
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let ran = ran.clone();
+            *store.after_fork_hold.lock().unwrap() = Some(Box::new(move |s: &BranchStore| {
+                assert!(
+                    s.trunk_has_children(),
+                    "a trunk child is listed and not counted once the trunk's lock is released"
+                );
+                ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        let first = fl_fork_locked(&store);
+        let TrunkFork::Forked(second) = fl_fork_fast(&store, store.trunk_commit_seq()) else {
+            panic!("a lock-free fork between commits was refused");
+        };
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 2, "the hook did not run");
+        *store.after_fork_hold.lock().unwrap() = None;
+        store.release_handle(first);
+        store.release_handle(second);
+    }
+
+    /// FL K10-5 at the store's level: lock-free forks racing trunk commits under threads, in every K3 mode. A writer
+    /// runs transactions of one to three pages under a stand-in for the WAL write lock (`wal`): it captures each
+    /// page's pre-image at its first write while the trunk has a live child, yields (so forks land inside the
+    /// transaction), takes the commit's decisions, publishes under the stand-in for the WAL snapshot (`committed`),
+    /// yields inside the gate, and closes it. Four fork threads fork without `wal` (under it only when the store
+    /// answers NeedsWriterLock), each taking its snapshot after reading the gate's count as the pager does, and check
+    /// every page of every child they hold — resolving and reading under one snapshot, filling the trunk-page cache
+    /// on a miss — against the snapshot the child was forked from, then reap some. The shapes the protocol exists for
+    /// must occur: forks inside an open transaction, retained pre-images, and lock-free forks.
+    #[test]
+    fn fl_lock_free_forks_racing_trunk_commits_read_every_fork_as_it_was() {
+        for mode in K3Mode::ALL {
+            fl_race(mode);
+        }
+    }
+
+    fn fl_race(mode: K3Mode) {
+        use std::sync::atomic::{AtomicBool as StdBool, AtomicU64 as StdU64};
+        use std::sync::{Mutex as StdMutex, RwLock};
+        const FORKERS: u64 = 4;
+        const FORKS: usize = 300;
+        let store = Arc::new(fl_store(mode));
+        let wal = Arc::new(StdMutex::new(()));
+        let committed = Arc::new(RwLock::new(
+            (0..PAGES).map(|p| (p, 0u64)).collect::<HashMap<u32, u64>>(),
+        ));
+        let done = Arc::new(StdBool::new(false));
+        let mid_txn_forks = Arc::new(StdU64::new(0));
+        let writer = {
+            let (store, wal, committed, done, mid) = (
+                store.clone(),
+                wal.clone(),
+                committed.clone(),
+                done.clone(),
+                mid_txn_forks.clone(),
+            );
+            std::thread::spawn(move || {
+                let mut rng = Rng(0x5851_F42D_4C95_7F2D);
+                let mut generation = 1u64;
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    let _w = wal.lock().unwrap();
+                    let forks_before = store.stats().work.trunk_forks_fast;
+                    let mut captured: HashMap<u32, Vec<u8>> = HashMap::new();
+                    let mut pages = Vec::new();
+                    for _ in 0..=rng.below(3) {
+                        let page = rng.below(u64::from(PAGES)) as u32;
+                        if !pages.contains(&page) {
+                            pages.push(page);
+                            if store.trunk_has_children() {
+                                captured.insert(page, image(committed.read().unwrap()[&page]));
+                            }
+                        }
+                        std::thread::yield_now();
+                    }
+                    let gate = store.begin_trunk_commit(
+                        pages.iter().map(|&p| (p, captured.get(&p).map(|b| &b[..]))),
+                    );
+                    if store.stats().work.trunk_forks_fast > forks_before {
+                        mid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    {
+                        let mut c = committed.write().unwrap();
+                        for &p in &pages {
+                            c.insert(p, generation);
+                            generation += 1;
+                        }
+                    }
+                    std::thread::yield_now();
+                    drop(gate);
+                    drop(_w);
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let forkers: Vec<_> = (0..FORKERS)
+            .map(|w| {
+                let (store, wal, committed) = (store.clone(), wal.clone(), committed.clone());
+                std::thread::spawn(move || {
+                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ (w + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
+                    let mut held: Vec<(BranchId, HashMap<u32, u64>)> = Vec::new();
+                    let mut buf = vec![0u8; PAGE];
+                    let check = |id: BranchId, sees: &HashMap<u32, u64>, buf: &mut Vec<u8>| {
+                        for page in 0..PAGES {
+                            let snap = committed.read().unwrap();
+                            let got = match store.resolve_into(id, page, buf).unwrap() {
+                                Resolved::Filled => u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                                Resolved::Trunk(key) => {
+                                    store.fill_trunk_page(key, &image(snap[&page]));
+                                    snap[&page]
+                                }
+                            };
+                            drop(snap);
+                            assert_eq!(got, sees[&page], "k3 {mode:?}: child {} page {page}", id.0);
+                        }
+                    };
+                    for _ in 0..FORKS {
+                        let (id, sees) = loop {
+                            let seen = store.trunk_commit_seq();
+                            if seen % 2 == 1 {
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            let sees = committed.read().unwrap().clone();
+                            match fl_fork_fast(&store, seen) {
+                                TrunkFork::Forked(id) => break (id, sees),
+                                TrunkFork::Retry => std::thread::yield_now(),
+                                TrunkFork::NeedsWriterLock => {
+                                    let _w = wal.lock().unwrap();
+                                    let sees = committed.read().unwrap().clone();
+                                    break (fl_fork_locked(&store), sees);
+                                }
+                            }
+                        };
+                        check(id, &sees, &mut buf);
+                        held.push((id, sees));
+                        let i = rng.below(held.len() as u64) as usize;
+                        check(held[i].0, &held[i].1, &mut buf);
+                        if held.len() > 6 || rng.below(4) == 0 {
+                            let (id, _) = held.swap_remove(rng.below(held.len() as u64) as usize);
+                            store.release_handle(id);
+                        }
+                    }
+                    for (id, sees) in &held {
+                        check(*id, sees, &mut buf);
+                    }
+                    for (id, _) in held {
+                        store.release_handle(id);
+                    }
+                })
+            })
+            .collect();
+        for f in forkers {
+            f.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+        writer.join().unwrap();
+        let work = store.stats().work;
+        assert!(work.trunk_forks_fast > 0, "k3 {mode:?}: no fork took the lock-free path: {work:?}");
+        assert!(work.trunk_pre_images_retained > 0, "k3 {mode:?}: no commit retained a pre-image: {work:?}");
+        assert!(
+            mid_txn_forks.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "k3 {mode:?}: no fork landed inside an open trunk transaction"
+        );
+        assert_eq!(store.stats().live_branches, 0, "k3 {mode:?}: branches leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "k3 {mode:?}: versions leaked");
     }
 }

@@ -284,6 +284,19 @@ pub struct BranchWork {
     pub resolve_first: u64,
     pub resolve_again_clear: u64,
     pub resolve_again_other: u64,
+    /// FL (r11-forklock's F-L): trunk forks registered against the commit gate, without the WAL write lock or FG's
+    /// gate; and those registered by today's path (the trunk's first child, or a fork that lost every lock-free
+    /// attempt, F-L3). Counted under the trunk's lock. Both 0 without FL.
+    pub trunk_forks_fast: u64,
+    pub trunk_forks_locked: u64,
+    /// FL: lock-free attempts, by the trunk forks that registered, abandoned because a trunk commit took its copy
+    /// decisions in between (or was taking them).
+    pub trunk_fork_gate_retries: u64,
+    /// FL: trunk commits that took their copy decisions at their serialization point (`begin_trunk_commit`), the
+    /// pages they wrote with a captured pre-image, and the captures kept as retained versions.
+    pub trunk_commits_decided: u64,
+    pub trunk_pre_images_captured: u64,
+    pub trunk_pre_images_retained: u64,
 }
 
 /// The sites at which the store takes the trunk's lock, in the order of [`TrunkSites`]' arrays:
@@ -341,6 +354,12 @@ impl BranchWork {
             resolve_first,
             resolve_again_clear,
             resolve_again_other,
+            trunk_forks_fast,
+            trunk_forks_locked,
+            trunk_fork_gate_retries,
+            trunk_commits_decided,
+            trunk_pre_images_captured,
+            trunk_pre_images_retained,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -365,6 +384,12 @@ impl BranchWork {
         self.resolve_first += resolve_first;
         self.resolve_again_clear += resolve_again_clear;
         self.resolve_again_other += resolve_again_other;
+        self.trunk_forks_fast += trunk_forks_fast;
+        self.trunk_forks_locked += trunk_forks_locked;
+        self.trunk_fork_gate_retries += trunk_fork_gate_retries;
+        self.trunk_commits_decided += trunk_commits_decided;
+        self.trunk_pre_images_captured += trunk_pre_images_captured;
+        self.trunk_pre_images_retained += trunk_pre_images_retained;
     }
 }
 
@@ -479,6 +504,33 @@ impl Connection {
     fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
+        let mut attempts = store::ForkAttempts::default();
+        if self.db.branches.fork_occ() {
+            // FL (r11-forklock's F-L): a trunk commit takes its copy decisions at its serialization point, against
+            // the epoch there (see the store's "Trunk commits and forks, FL"), so a fork needs neither the WAL write
+            // lock nor FG's gate: it takes a read snapshot between two commits' decisions and registers under the
+            // trunk's lock if no commit took its decisions since. The trunk's first live child, and a fork that
+            // lost every lock-free attempt to trunk commits, take today's path below (F-L3).
+            const LOCK_FREE_ATTEMPTS: usize = 8;
+            let store = &self.db.branches;
+            for _ in 0..LOCK_FREE_ATTEMPTS {
+                let seen = store.trunk_commit_seq();
+                if seen % 2 == 1 {
+                    // A trunk commit is between its copy decisions and its publication.
+                    attempts.gate_retries += 1;
+                    pager.io.yield_now();
+                    continue;
+                }
+                pager.begin_read_tx()?;
+                let forked = self.fork_trunk_registered(pager, Some(seen), attempts);
+                pager.end_read_tx();
+                match forked? {
+                    store::TrunkFork::Forked(id) => return Ok(id),
+                    store::TrunkFork::Retry => attempts.gate_retries += 1,
+                    store::TrunkFork::NeedsWriterLock => break,
+                }
+            }
+        }
         if pager.fork_gate_on() {
             // r11-coherence FG: a reader of the fork gate. Trunk write transactions hold it exclusively for as long
             // as they hold the WAL write lock, so the guarantee below is the one the write lock gave, and forks no
@@ -497,7 +549,7 @@ impl Connection {
                         return Err(err);
                     }
                 }
-                let forked = self.fork_trunk_locked(pager);
+                let forked = self.fork_trunk_locked(pager, attempts);
                 pager.fork_gate_exit();
                 pager.end_read_tx();
                 return forked;
@@ -520,15 +572,38 @@ impl Connection {
                     return Err(err);
                 }
             }
-            let forked = self.fork_trunk_locked(pager);
+            let forked = self.fork_trunk_locked(pager, attempts);
             pager.end_write_tx();
             pager.end_read_tx();
             return forked;
         }
     }
 
-    fn fork_trunk_locked(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
-        let hdr_at = crate::coherence::ENABLED.then(crate::coherence::wall_ns);
+    /// Register a trunk fork whose caller excludes trunk writers (FG's gate as a reader, or the WAL write lock).
+    fn fork_trunk_locked(
+        self: &Arc<Connection>,
+        pager: &Arc<Pager>,
+        attempts: store::ForkAttempts,
+    ) -> Result<BranchId> {
+        match self.fork_trunk_registered(pager, None, attempts)? {
+            store::TrunkFork::Forked(id) => Ok(id),
+            _ => Err(LimboError::InternalError(
+                "a trunk fork that excludes trunk writers was not registered".to_string(),
+            )),
+        }
+    }
+
+    /// Register a trunk fork against the caller's read snapshot: `seen` is FL's commit-gate count, read before the
+    /// snapshot began, or `None` when the caller excludes trunk writers (see [`store::BranchStore::fork_trunk_occ`]).
+    fn fork_trunk_registered(
+        self: &Arc<Connection>,
+        pager: &Arc<Pager>,
+        seen: Option<u64>,
+        attempts: store::ForkAttempts,
+    ) -> Result<store::TrunkFork> {
+        // Counted only inside the gate or the WAL write lock (`seen` is None): r12-phasefair's # gate reads it as
+        // the reader section's header read, and FL's lock-free fork reads the header outside both.
+        let hdr_at = (crate::coherence::ENABLED && seen.is_none()).then(crate::coherence::wall_ns);
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
@@ -569,7 +644,9 @@ impl Connection {
                 "an initialized database's pager has no reserved-space byte".to_string(),
             )
         })?;
-        self.db.branches.fork_trunk(schema, page_size, reserved_space)
+        self.db
+            .branches
+            .fork_trunk_occ(schema, page_size, reserved_space, seen, attempts)
     }
 
     /// The branch this connection is open on, if any.
@@ -664,6 +741,9 @@ mod isolation_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod mechanism_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod fl_tests;
 
 #[cfg(test)]
 mod tests {

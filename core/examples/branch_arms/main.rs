@@ -2601,6 +2601,23 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
             d(before.trunk_sites.acquisitions[0], after.trunk_sites.acquisitions[0]) as f64 / cycles,
         );
         print_sites(n, t, draw, cycles, &before, &after);
+        // FL (r11-forklock's F-L; r12-phasefair PREREG section "F-L (r11-forklock)"): its counters, all 0 without L.
+        let trunk_forks = d(before.trunk_sites.acquisitions[0], after.trunk_sites.acquisitions[0]);
+        println!(
+            "# fl N={n} T={t} draw={draw} cycles={} fl={} forks_fast={} forks_locked={} gate_retries={} \
+             gate_retries_per_fork={:.4} locked_per_fork={:.5} commits_decided={} pre_images_captured={} \
+             pre_images_retained={} fork_site_acq={trunk_forks}",
+            t * c,
+            u8::from(turso_core::coherence::fixes() & turso_core::coherence::FIX_FORKOCC != 0),
+            d(before.trunk_forks_fast, after.trunk_forks_fast),
+            d(before.trunk_forks_locked, after.trunk_forks_locked),
+            d(before.trunk_fork_gate_retries, after.trunk_fork_gate_retries),
+            d(before.trunk_fork_gate_retries, after.trunk_fork_gate_retries) as f64 / (t * c) as f64,
+            d(before.trunk_forks_locked, after.trunk_forks_locked) as f64 / (t * c) as f64,
+            d(before.trunk_commits_decided, after.trunk_commits_decided),
+            d(before.trunk_pre_images_captured, after.trunk_pre_images_captured),
+            d(before.trunk_pre_images_retained, after.trunk_pre_images_retained),
+        );
         // With no writer the writer's fields read zero and the forks' side is the no-writer control (r12-phasefair
         // amendment 6 (c)): their gate holds, header reads and page-1 misses with no trunk commit.
         let no_writer = WriterOut::default();
