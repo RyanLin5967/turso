@@ -790,7 +790,7 @@ impl BranchStore {
             k_epoch: CachePadded::new(AtomicU64::new(0)),
             k_children: crate::skiplist::SkipMap::new(),
             k_retained: CachePadded::new(AtomicUsize::new(0)),
-            fz: crate::coherence::fix(crate::coherence::FIX_UARC),
+            fz: crate::coherence::fix(crate::coherence::FIX_UARC) && std::env::var_os("R11_MUT_Z_LIVE").is_none(),
             live_spares: (0..crate::bravo::THREADS)
                 .map(|_| CachePadded::new(AtomicUsize::new(0)))
                 .collect(),

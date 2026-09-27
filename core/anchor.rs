@@ -66,7 +66,7 @@ thread_local! {
 
 /// A handle on `db` for a connection or a branch: through this thread's keeper with FZ, else its own `Arc`.
 pub(crate) fn database_handle(db: &Arc<crate::Database>) -> DbRef<crate::Database> {
-    if !crate::coherence::fix(crate::coherence::FIX_UARC) {
+    if !crate::coherence::fix(crate::coherence::FIX_UARC) || std::env::var_os("R11_MUT_Z_DB").is_some() {
         // The Arc<Database> clone and its drop.
         crate::coherence::bump(crate::coherence::Class::DbArc, 2);
         return DbRef::Owned(db.clone());

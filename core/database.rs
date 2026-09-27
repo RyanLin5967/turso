@@ -2474,7 +2474,8 @@ impl Database {
         let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
         // FZ: a branch connection does not count in n_connections (it never checkpoints the trunk on close).
-        let counted = !(crate::coherence::fix(crate::coherence::FIX_UARC) && pager.branch_id().is_some());
+        let counted = !(crate::coherence::fix(crate::coherence::FIX_UARC) && pager.branch_id().is_some())
+            || std::env::var_os("R11_MUT_Z_NCONN").is_some();
         let conn = Arc::new(Connection {
             db: crate::anchor::database_handle(self),
             counted_in_n_connections: counted,
@@ -3035,7 +3036,7 @@ impl Database {
     /// FZ (amendment 21): the schema handle for a branch whose schema is `s`: this thread's own copy when `s` is the
     /// schema the anchor copied (so the clone and its drop write only this thread's count), else a clone of `s`.
     pub(crate) fn branch_schema(&self, s: &Arc<Schema>) -> Arc<Schema> {
-        if crate::coherence::fix(crate::coherence::FIX_UARC) {
+        if crate::coherence::fix(crate::coherence::FIX_UARC) && std::env::var_os("R11_MUT_Z_SCHEMA").is_none() {
             if let Some(a) = self.anchor() {
                 let copy = a.schema.get_or_init(|| {
                     // Copy from the root source: when `s` is already another slot's copy, its source.
