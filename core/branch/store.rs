@@ -1268,7 +1268,10 @@ impl BranchStore {
         let format = super::journal::format_version(inner.splice);
         if let Some(m) = meta.filter(|m| m.format != format) {
             return Err(LimboError::Corrupt(format!(
-                "branch catalog {}: format version {}; this store reads version {format} (4 is the                  F7 splice arm's: open with the same DatabaseOpts::with_branch_splice; 0 predates                  the F7 port)",
+                "branch catalog {}: format version {}; this store reads version {format} (4 is the \
+                 F7 splice arm's: open with the same DatabaseOpts::with_branch_splice; 0 was written \
+                 before the catalog carried the key: before the F7 port, or by this lane's builds \
+                 before fa16116b3)",
                 files.cat.display(),
                 m.format
             )));

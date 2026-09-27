@@ -3096,8 +3096,10 @@ fn a_splice_frees_what_the_base_rule_frees_one_release_earlier() {
 /// its page map; from all of its current versions that build inserts the level's own page plus the
 /// j - 1 moved in, D(D+1)/2 in all over the chain; from the versions born after `inherited_at`, the
 /// one page its level wrote: exactly D. The last level reads every level's page, and so does a child
-/// forked from it, in the store that built the maps and after a reopen, which re-derives them
-/// (`inherited_at` then starts at the fork epoch, and the child's map must still name every page).
+/// forked from it, in the store that built the maps and after a checkpoint and a reopen, which
+/// re-derives them from the checkpoint (a snapshot load's `derive_page_maps`, or a catalog load's
+/// `insert_loaded`: `inherited_at` then starts at the fork epoch, and the child's map must still name
+/// every page). Without the checkpoint the reopen only replays the log (review 3, C2).
 #[test]
 fn a_chain_that_writes_forks_and_releases_builds_each_view_from_its_own_pages() {
     const D: i64 = 48;
@@ -3159,6 +3161,7 @@ fn a_chain_that_writes_forks_and_releases_builds_each_view_from_its_own_pages() 
         }
         assert_eq!(read(&child, D + 1), val("s", D + 1), "a child of the tip misread a trunk page");
         let _ = child.reap().unwrap();
+        db.branch_compact_now().unwrap(); // the reopen loads the maps' state, not only a log
         tip_id = prev.into_id();
     }
     let db = reopen_in(&path, incarnation, spliced());

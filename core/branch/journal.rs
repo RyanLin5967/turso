@@ -506,7 +506,10 @@ impl Journal {
     ///
     /// Refused while another journal holds the log (review N1), and over files that hold state:
     /// the caller found nothing recoverable when it opened, so state here was written since by
-    /// another store instance, and starting it over would destroy that store's branches.
+    /// another store instance, and starting it over would destroy that store's branches. The tests'
+    /// entry point: the store starts its journal through `open_fresh_with` and `start` (see
+    /// `ensure_backing`), so outside the tests this and `open_fresh` have no caller.
+    #[cfg(test)]
     pub(crate) fn create(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
         let mut journal = Self::open_fresh(files, page_size, sync)?;
         journal.start(false)?;
@@ -514,6 +517,7 @@ impl Journal {
     }
 
     /// The first half of `create`: lock the log and check it holds no state. Writes nothing.
+    #[cfg(test)]
     pub(crate) fn open_fresh(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
         Self::open_fresh_with(files, page_size, sync, false)
     }
