@@ -835,6 +835,8 @@ impl Journal {
 
     /// The log's logical end: the bytes in the file plus those still buffered. A fuzzy checkpoint
     /// captures the state as of this position (r11-restart-r2, F-FZ); it is a frame boundary.
+    /// (`len` already counts a flight taken and not yet written, and the buffer is sealed frames
+    /// and then `pending`: merge 1b(ii).)
     pub(crate) fn mark(&self) -> u64 {
         self.len + self.buffered_len() as u64
     }
@@ -850,6 +852,9 @@ impl Journal {
     /// Blind spot: POSIX rename over a file this process holds open. On Windows that rename fails,
     /// so a catalog store there cannot cut its log (nor reopen from crash state S1); catalog mode
     /// is unix-only as written.
+    ///
+    /// The caller keeps group flights out (merge 1b(ii)): every byte below `len` is written (it is
+    /// read back here), and no flight writes through a descriptor of the file this renames away.
     pub(crate) fn rewrite_from(&mut self, from: u64, generation: u64) -> Result<()> {
         self.check_live()?;
         let end = self.mark();

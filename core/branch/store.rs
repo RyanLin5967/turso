@@ -561,7 +561,9 @@ struct StoreInner {
     parked_applied: u64,
     /// Slots freed by an early-released operation whose records are not yet durable, under the log
     /// sequence number that makes them free (see `Group`, rule 2). A catalog checkpoint covers
-    /// every applied operation, so it lists them free in its own transaction (`checkpoint_catalog`).
+    /// every operation applied before its capture, so it takes these out at the capture and lists
+    /// them free in its own transaction (`checkpoint_capture`; they come back here if it does not
+    /// commit).
     pending_free: VecDeque<(u64, Vec<Slot>)>,
     /// The hold in progress (see `Hold`); observation only.
     hold: HoldAcc,
@@ -1367,12 +1369,13 @@ struct Captured {
     /// The deferred frees the capture covers (r11-churn's `pending_free`, every entry there at the
     /// capture), moved out of it: the catalog lists their slots free, so this process returns them
     /// only once it has committed; if it does not, they go back to wait for their records.
-    covered: Vec<(u64, Vec<Slot>)>,
+    covered: VecDeque<(u64, Vec<Slot>)>,
     meta: Meta,
     /// `ChildIndex` keys (children forked, and removal links) as of the capture.
     child_keys: Vec<(u64, u64)>,
     child_removed: Vec<(u64, u64)>,
-    /// A handle on the arena file: synced before the catalog names the slots.
+    /// A handle on the arena file: synced before the catalog names the slots. `None` in the sharp
+    /// form, which synced the arena under the mutex before its capture (merge 1b(ii)).
     arena: Option<std::fs::File>,
     lease_now: u64,
     fail_after_commit: bool,
@@ -1385,17 +1388,19 @@ struct Captured {
 /// told apart from success: the arena fsync (a later fsync of the same file can report success over
 /// the pages this one dropped) or the catalog COMMIT (its frames may be on disk). The install then
 /// fail-stops the journal (r11-bigtxn review 2 F2). Any other failure rolled back and changed
-/// nothing.
+/// nothing. With `group` (the fuzzy form), the arena fsync holds the group's flight slot
+/// (`sync_arena_in_group`).
 fn checkpoint_write(
     catalog: &mut Catalog,
     cap: &Captured,
     hold: Option<&AtomicU8>,
+    group: Option<&Group>,
     in_doubt: &mut bool,
 ) -> Result<()> {
     // Every slot the catalog is about to name must be durable first.
     if let Some(file) = cap.arena.as_ref() {
         *in_doubt = true;
-        super::journal::fsync_file(file)?;
+        sync_arena_in_group(group, file)?;
         *in_doubt = false;
     }
     catalog.begin()?;
@@ -1450,6 +1455,49 @@ fn checkpoint_write(
     Ok(())
 }
 
+/// The fuzzy writer's arena fsync, as the holder of the group's flight slot (merge 1b(ii); adopted
+/// from the quarantined resolution c8552d0d2 when the two were diffed). It waits out a flight in the
+/// air and refuses if one failed (whose fsync may have dropped pages that this fsync would then
+/// report durable); a failure of its own, or a panic, poisons the group as the slot is released. So
+/// no flight syncs the arena between this fsync's failure and the install's fail-stop, and the
+/// catalog never names pages a failed flight's fsync lost. The store mutex is not held here, and
+/// the slot's other holders never wait for the writer. Without a group, a plain fsync.
+fn sync_arena_in_group(group: Option<&Group>, file: &std::fs::File) -> Result<()> {
+    /// Releases the slot on every exit; `ok` still false then poisons the group.
+    struct FlightSlot<'a> {
+        group: &'a Group,
+        ok: bool,
+    }
+    impl Drop for FlightSlot<'_> {
+        fn drop(&mut self) {
+            let mut g = self.group.state.lock().unwrap_or_else(|e| e.into_inner());
+            g.flushing = false;
+            if !self.ok {
+                g.poisoned = true;
+            }
+            self.group.cv.notify_all();
+        }
+    }
+    let Some(group) = group else {
+        return super::journal::fsync_file(file);
+    };
+    {
+        let mut g = group.state.lock().unwrap();
+        while g.flushing {
+            g = group.cv.wait(g).unwrap();
+        }
+        if g.poisoned {
+            return Err(group_poisoned());
+        }
+        g.flushing = true;
+    }
+    let mut slot = FlightSlot { group, ok: false };
+    let synced = super::journal::fsync_file(file);
+    slot.ok = synced.is_ok();
+    drop(slot);
+    synced
+}
+
 /// F-FZ phase 4 (and the sharp path's last step): bound the catalog's WAL (fix v2, PREREG A7). A
 /// PASSIVE backfill first, which waits for no reader, then a TRUNCATE attempt. The checkpoint is
 /// already durable, so a failure costs only WAL length: it is logged, not returned.
@@ -1471,10 +1519,12 @@ fn truncate_catalog_wal(catalog: &mut Catalog) {
 /// mutex, and the sharp path (which takes the store mutex, then the writer) refuses while a capture
 /// is in flight, so the two cannot deadlock.
 ///
-/// With r11-churn's group commit (merge 1b(ii)): the install waits out a group flight in the air
-/// before it rewrites the log (a flight writes the file it was taken from, at an offset reserved in
-/// it), and a committed checkpoint makes every record before its capture durable, so the group's
-/// waiters for them are released however the log cut then goes.
+/// With r11-churn's group commit (merge 1b(ii)): phase 2's arena fsync holds the group's flight
+/// slot (`sync_arena_in_group`); the install waits out a group flight in the air before it rewrites
+/// the log (a flight writes the file it was taken from, at an offset reserved in it), and a
+/// committed checkpoint makes every record before its capture durable, so the group's waiters for
+/// them are released however the log cut then goes; a journal the install leaves fail-stopped
+/// poisons the group after that.
 #[allow(clippy::too_many_arguments)]
 fn run_flight(
     inner: Arc<Mutex<StoreInner>>,
@@ -1493,7 +1543,7 @@ fn run_flight(
     let mut in_doubt = false;
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut w = writer.lock();
-        let written = checkpoint_write(&mut w, &cap, Some(&*hold), &mut in_doubt);
+        let written = checkpoint_write(&mut w, &cap, Some(&*hold), Some(&*group), &mut in_doubt);
         if written.is_err() {
             w.rollback();
         }
@@ -1507,10 +1557,8 @@ fn run_flight(
     });
     let write_ns = ns(t);
     if in_doubt {
-        // Stop every flight not yet started NOW, not only at the install: until the journal is
-        // poisoned there, a flight could sync the arena again and report success over the pages
-        // the failed fsync dropped. Blind spot: a flight already in the air, whose arena fsync ran
-        // beside this one, lands as its own fsync reported.
+        // A COMMIT whose outcome is unknown (a failed arena fsync poisoned the group already, in
+        // `sync_arena_in_group`): stop every flight now, not only at the install.
         group.poison();
     }
     if written.is_ok() {
@@ -1534,8 +1582,12 @@ fn run_flight(
             guard.work.compactions += 1;
             // The catalog is the truth up to the capture: its records are durable, whether the
             // log was then cut or not (a failed cut leaves them in the old log, before the
-            // marker recovery cuts at).
+            // marker recovery cuts at), and whether the journal is fail-stopped now or not.
             group.durable_to(lsn);
+        }
+        if guard.poisoned() {
+            // Nothing after the capture becomes durable in this process.
+            group.poison();
         }
         let hold_ns = ns(t);
         if let Some(cat) = guard.cat.as_mut() {
@@ -2673,7 +2725,6 @@ impl BranchStore {
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         cat.ckpt.flights += 1;
         let writer = cat.writer.clone();
-        let dirty = cap.dirty.clone();
         let shared = self.inner.clone();
         let hold = self.flight_hold.clone();
         let over_hard = self.over_hard.clone();
@@ -2686,13 +2737,18 @@ impl BranchStore {
             // waits for nothing.
             let _ = flights.remove(0).join();
         }
-        // The capture moved the deferred frees it covers out of `pending_free`; if no thread
-        // takes it, they go back (below), in their order.
-        let covered = cap.covered.clone();
+        // The thread takes the capture from a shared slot, so a failed spawn (whose closure is
+        // dropped) still finds it here to undo: it carries the dirty map and the deferred frees it
+        // took (merge 1b(ii); adopted from the quarantined c8552d0d2).
+        let slot = Arc::new(Mutex::new(Some(cap)));
+        let taken = slot.clone();
         let spawned = crate::thread::Builder::new()
             .name("branch-checkpoint".to_string())
             .spawn(move || {
-                run_flight(shared, writer, cap, hold, over_hard, truncating, installs, group)
+                let cap = taken.lock().take();
+                if let Some(cap) = cap {
+                    run_flight(shared, writer, cap, hold, over_hard, truncating, installs, group);
+                }
             });
         match spawned {
             Ok(handle) => {
@@ -2700,17 +2756,19 @@ impl BranchStore {
                 true
             }
             Err(e) => {
-                // Nothing was written: undo the capture (the thread's closure, and the capture
-                // with it, are gone).
+                // Nothing was written: undo the capture exactly as a failed write is undone (the
+                // read snapshot ended, `flight` cleared, the dirty map and the deferred frees put
+                // back).
                 tracing::warn!("branch catalog checkpoint thread not started: {e}");
-                for entry in covered.into_iter().rev() {
-                    inner.pending_free.push_front(entry);
-                }
-                let cat = inner.cat.as_mut().expect("captured above");
-                cat.catalog.end_read_snapshot();
-                cat.flight = false;
-                for (id, what) in dirty {
-                    *cat.dirty.entry(id).or_insert(0) |= what;
+                let unsent = slot.lock().take();
+                if let Some(cap) = unsent {
+                    let _ = inner.checkpoint_install(
+                        cap,
+                        Err(LimboError::InternalError(
+                            "the branch catalog checkpoint's thread did not start".to_string(),
+                        )),
+                        false,
+                    );
                 }
                 false
             }
@@ -2745,11 +2803,16 @@ impl BranchStore {
         g.flushing = true;
         drop(g);
         let lsn = inner.journal.as_ref().map_or(0, Journal::lsn);
-        let generation = inner.journal.as_ref().map_or(0, Journal::generation);
+        let generation = inner.committed_generation();
         let compacted = self.compact_quiesced(inner, fail_after_rename);
-        // The commit point is the journal's move to a new generation: from there the snapshot (or
-        // the catalog) is the truth and holds everything applied.
-        let advanced = inner.journal.as_ref().map_or(0, Journal::generation) != generation;
+        // The commit point is the move to a new committed generation: from there the snapshot (or
+        // the catalog) is the truth and holds everything applied. In snapshot mode that is the
+        // journal's generation (the rename, then the log reset); in catalog mode it is the
+        // catalog's COMMIT, which the log follows only once it is rewritten (r11-restart-r2): a
+        // rewrite that fails before its rename leaves the old log in use, cut by recovery at the
+        // checkpoint's marker, and the checkpoint durable all the same (merge 1b(ii); adopted from
+        // the quarantined c8552d0d2).
+        let advanced = inner.committed_generation() != generation;
         let poisoned = inner.journal.as_ref().is_some_and(Journal::is_poisoned);
         match &compacted {
             // Everything applied is durable: past the commit point a later failure (the catalog's
@@ -2883,10 +2946,13 @@ impl BranchStore {
         // the pass-then-ensure order did (a12-durable-open).
         inner.ensure(parent)?;
         // F-EXP: a parent whose lease ran out that the bounded pass did not reach is reaped on
-        // access (below), so it is refused as reaped, exactly as if the pass had reached it.
-        let parent_due = inner.branches.get(&parent).is_some_and(|st| {
-            !st.handle.is_released() && st.lease.is_some_and(|deadline| deadline <= now)
-        });
+        // access (below), so it is refused as reaped, exactly as if the pass had reached it. A
+        // fail-stopped store reaps nothing: the fork goes on to its own buffering, which refuses
+        // it, as restart-r2's order did (adopted from the quarantined c8552d0d2).
+        let parent_due = !inner.poisoned()
+            && inner.branches.get(&parent).is_some_and(|st| {
+                !st.handle.is_released() && st.lease.is_some_and(|deadline| deadline <= now)
+            });
         let forkable = !parent_due
             && !plan.due.contains(&parent)
             && matches!(inner.branches.get(&parent),
@@ -3801,6 +3867,8 @@ impl BranchStore {
     /// transaction this way; a pager uses `shadow_slot`/`publish` with its `ShadowTxn`): write each
     /// into the slot `first_write_branch` reserved, without the store mutex, then `publish`.
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
+        // Back-pressure and the lease stamp (r11-restart-r2's additions to this function) are in
+        // `publish`, which this rides on (merge 1b(ii)).
         let mut txn = ShadowTxn::default();
         {
             let inner = self.lock();
@@ -4256,6 +4324,17 @@ impl StoreInner {
     /// time since open — the safe direction, leases only lengthen, but the clock stood still.)
     fn leases_exist(&self) -> bool {
         !self.leases.is_empty() || self.cat.as_ref().is_some_and(|c| c.lease_floor.is_some())
+    }
+
+    /// The generation the last compaction COMMITTED, the commit point `BranchStore::compact` lands
+    /// the group by (merge 1b(ii)): the journal's in snapshot mode; the catalog's in catalog mode,
+    /// which the log's own generation follows only once the log is rewritten to the checkpoint's
+    /// suffix (r11-restart-r2).
+    fn committed_generation(&self) -> u64 {
+        match self.cat.as_ref() {
+            Some(cat) => cat.generation,
+            None => self.journal.as_ref().map_or(0, Journal::generation),
+        }
     }
 
     /// Fail-stop after a catalog read failed in the middle of an operation: the in-memory state
@@ -4821,7 +4900,7 @@ impl StoreInner {
         let mut w = writer.lock();
         let w0 = w.counters.queries;
         let mut in_doubt = false;
-        let written = checkpoint_write(&mut w, &cap, None, &mut in_doubt);
+        let written = checkpoint_write(&mut w, &cap, None, None, &mut in_doubt);
         let wrote = w.counters.queries - w0;
         let installed = self.checkpoint_install(cap, written, in_doubt);
         if installed.is_ok() {
@@ -4979,10 +5058,11 @@ impl StoreInner {
             return Err(e);
         }
         cat.flight = true;
-        let covered: Vec<(u64, Vec<Slot>)> = if restart {
-            Vec::new()
+        // Moved whole (O(1) under the mutex; adopted from the quarantined c8552d0d2).
+        let covered = if restart {
+            VecDeque::new()
         } else {
-            std::mem::take(&mut self.pending_free).into()
+            std::mem::take(&mut self.pending_free)
         };
         Ok(Box::new(Captured {
             generation,
@@ -5054,6 +5134,12 @@ impl StoreInner {
         };
         if cap.fail_after_commit {
             journal.poison();
+            // Nothing is installed: the deferred frees stay deferred, as they did when the durable
+            // port's checkpoint (7a4f2db88) stopped here, before it took them (adopted from the
+            // quarantined c8552d0d2).
+            for entry in cap.covered.into_iter().rev() {
+                self.pending_free.push_front(entry);
+            }
             return Err(LimboError::InternalError(
                 "failpoint: branch checkpoint stopped after the catalog commit".to_string(),
             ));
