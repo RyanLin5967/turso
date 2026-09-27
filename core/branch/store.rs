@@ -299,12 +299,9 @@ impl Drop for Publishing<'_> {
         }
         inner.publishing -= 1;
         if inner.publishing == 0 {
-            // The last commit between its holds: a compaction refused meanwhile runs now, and the
-            // commits waiting for it go on (merge 1b(ii) review F6). Not from a panicking hold:
-            // the journal is fail-stopped, and a waiter's own check finds that.
-            if inner.compaction_deferred && !std::thread::panicking() {
-                self.0.maybe_compact(&mut inner);
-            }
+            // The last commit between its holds: the commits waiting before their first hold for a
+            // compaction refused meanwhile go on, and the first of them runs it, unless this
+            // commit's own next hold has (`publish`; merge 1b(ii) review F6).
             let (count, drained) = &self.0.drained;
             *count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
             drained.notify_all();
