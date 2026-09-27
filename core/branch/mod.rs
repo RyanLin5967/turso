@@ -226,6 +226,11 @@ pub struct HoldMax {
     pub zeroed_bytes: u64,
     /// Nanoseconds of one hold, from acquisition to release; 0 unless [`set_hold_timing`] is on.
     pub ns: u64,
+    /// The longest time each step of a trunk first-write hold took, in nanoseconds: the `written`
+    /// lookup, the arena slot allocation, the pre-image copy, the retain (three B-tree inserts) and
+    /// the `written` insert. 0 unless [`set_hold_timing`] is on. Attributes a long trunk hold to a
+    /// step (r11-bigtxn amendment 7).
+    pub trunk_step_ns: [u64; 5],
 }
 
 /// Time every hold of the branch store's mutex into [`HoldMax::ns`]. Observation only; costs two

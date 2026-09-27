@@ -170,6 +170,30 @@ impl Drop for Hold<'_> {
     }
 }
 
+/// The longest time each step of one kind of hold took (observation only; one clock read per step
+/// while hold timing is on, none otherwise).
+struct StepLap<'a> {
+    max: &'a mut [u64; 5],
+    at: Option<std::time::Instant>,
+}
+
+impl<'a> StepLap<'a> {
+    fn new(max: &'a mut [u64; 5]) -> Self {
+        let at = HOLD_TIMING
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(std::time::Instant::now);
+        Self { max, at }
+    }
+
+    fn step(&mut self, i: usize) {
+        if let Some(at) = self.at {
+            let now = std::time::Instant::now();
+            self.max[i] = self.max[i].max(now.duration_since(at).as_nanos() as u64);
+            self.at = Some(now);
+        }
+    }
+}
+
 /// The most pages one hold of the store mutex maps, allocates or frees on behalf of one
 /// transaction's commit or rollback, or of one reap: work proportional to a transaction's size is
 /// split into holds of this many pages, so no other branch ever waits for more than this.
@@ -851,17 +875,25 @@ impl BranchStore {
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
         let mut inner = self.lock();
         let StoreInner {
-            arena, trunk, hold, ..
+            arena,
+            trunk,
+            hold,
+            hold_max,
+            ..
         } = &mut *inner;
+        let mut lap = StepLap::new(&mut hold_max.trunk_step_ns);
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
+        lap.step(0);
         if born >= epoch {
             return;
         }
         if trunk.lineage.has_child_in(born, epoch) {
             let arena = arena.as_mut().expect("the trunk has a child, so the arena exists");
             let slot = arena.alloc();
+            lap.step(1);
             arena.page_mut(slot).copy_from_slice(pre_image);
+            lap.step(2);
             hold.pages += 1;
             hold.copy_bytes += pre_image.len() as u64;
             trunk.lineage.retain(
@@ -872,8 +904,10 @@ impl BranchStore {
                     slot,
                 },
             );
+            lap.step(3);
         }
         trunk.written.insert(page, epoch);
+        lap.step(4);
     }
 
     /// Commit a branch transaction: map each page of `dirty` to the slot the transaction filled for

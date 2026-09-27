@@ -221,7 +221,7 @@ const HEADER: &str = "phase\tD\tN\trep\tus\tlock_holds\tlocked_copy_bytes\tmax_h
 max_hold_realloc_moved\tmax_hold_ns\tresolve_calls\tevict_calls\tevict_examined\tevict_full\t\
 over_capacity_admits\tevictable_scan\tspill_scan\tsubjournal_pages\tarena_in_use\tcache_len\tview_build_pages\t\
 holds_timed\thold_p50_ns\thold_p99_ns\thold_p999_ns\tmax_hold_realloc_bytes\tmax_hold_node_copies\t\
-max_hold_zeroed_bytes\tholds_ge_16us\tminflt\tmajflt\tnivcsw";
+max_hold_zeroed_bytes\tholds_ge_16us\tminflt\tmajflt\tnivcsw\tstep_lookup_ns\tstep_alloc_ns\tstep_copy_ns\tstep_retain_ns\tstep_insert_ns";
 
 /// Process-wide minor and major page faults and involuntary context switches (getrusage), read
 /// outside the timed window: a long hold that does no more counted work than a short one is a
@@ -295,7 +295,7 @@ impl Ctx {
             "-".to_string()
         };
         println!(
-            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}\t{}\t{}\t{}\t{long}\t{}\t{}\t{}",
+            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}\t{}\t{}\t{}\t{long}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             b.w.lock_holds - a.w.lock_holds,
             b.w.locked_copy_bytes - a.w.locked_copy_bytes,
             m.pages,
@@ -321,6 +321,11 @@ impl Ctx {
             rb.0 - ra.0,
             rb.1 - ra.1,
             rb.2 - ra.2,
+            m.trunk_step_ns[0],
+            m.trunk_step_ns[1],
+            m.trunk_step_ns[2],
+            m.trunk_step_ns[3],
+            m.trunk_step_ns[4],
         );
         (out, el)
     }
