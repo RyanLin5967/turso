@@ -2630,6 +2630,8 @@ impl StoreInner {
             }
             // Redone into the arena by `redo_page_images` before the arena is opened.
             Record::PageImage { .. } => Ok(()),
+            // Read by recovery's scan, which never passes one on.
+            Record::FlightEnd { .. } => Ok(()),
             Record::IdFloor { next_id } => {
                 self.next_id = self.next_id.max(*next_id);
                 Ok(())
