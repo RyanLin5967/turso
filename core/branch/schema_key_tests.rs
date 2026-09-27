@@ -1,7 +1,8 @@
 //! F-S source key v2 (r11-githost-attr PREREG A3.10). v2 reads the A1 key's inputs raw, so it must
 //! be a refinement of v1: equal v2 keys only where v1 keys are equal. It must still tell apart what
-//! A1.3 had to tell apart (one schema cookie, different DDL), read overflowing `sqlite_schema` cells
-//! whole, and ignore header bytes that are not a key input (a branch that grew has its own page 1).
+//! A1.3 had to tell apart (one schema cookie, different DDL), keep every input v1 keeps (the
+//! cookie, the flags), read overflowing and multi-page `sqlite_schema` whole, and ignore header
+//! bytes that are not a key input (a branch that grew has its own page 1).
 //! The `R11_SCHEMA_KEY` gate itself is read once per process and is not exercised here.
 //!
 //! ⚠ UNBUILT when written.
@@ -122,4 +123,78 @@ fn branches_share_a_v2_key_by_schema_not_by_page_one() {
     let (g1, g2) = keys(&gc);
     assert_eq!(t1, g1, "premise: v1 shares the grown branch with the trunk");
     assert_eq!(t2, g2, "v2 keyed on something beyond the schema source");
+}
+
+#[test]
+fn v2_keys_differ_on_the_cookie_alone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let a = open(&dir.path().join("a.db"), DatabaseOpts::new()).connect().unwrap();
+    let d = open(&dir.path().join("d.db"), DatabaseOpts::new()).connect().unwrap();
+    a.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    d.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    d.execute("CREATE TABLE scratch(z)").unwrap();
+    d.execute("DROP TABLE scratch").unwrap();
+    // Premise: the same sqlite_schema rows under two cookies. The cookie is what an adopter's
+    // connection is stamped with, so it is a key input on its own.
+    let schema = "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema";
+    assert_eq!(rows(&a, schema), rows(&d, schema));
+    assert_ne!(cookie(&a), cookie(&d));
+    let (a1, a2) = keys(&a);
+    let (d1, d2) = keys(&d);
+    assert_ne!(a1, d1, "premise: v1 tells the cookies apart");
+    assert_ne!(a2, d2, "v2 ignored the cookie");
+}
+
+#[test]
+fn v2_descends_a_multi_page_sqlite_schema() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ddl = |last: &str| -> Vec<String> {
+        let mut v: Vec<String> = (0..150)
+            .map(|i| {
+                format!("CREATE TABLE table_{i:03}(a_rather_long_column_name_{i:03} TEXT, b INTEGER)")
+            })
+            .collect();
+        v.push(format!("CREATE TABLE {last}(x)"));
+        v
+    };
+    let make = |name: &str, last: &str| {
+        let conn = open(&dir.path().join(name), DatabaseOpts::new()).connect().unwrap();
+        for stmt in ddl(last) {
+            conn.execute(stmt).unwrap();
+        }
+        conn
+    };
+    let p = make("p.db", "last_one");
+    let q = make("q.db", "last_one");
+    let r = make("r.db", "last_two");
+    // Premise: the rows cannot fit one page, so page 1 is an interior page and every row sits on
+    // a child: a key that read page 1's own cells alone would see no rows at all.
+    let total: i64 = rows(&p, "SELECT sum(length(sql)) FROM sqlite_schema")[0][0].as_int().unwrap();
+    let page_size = rows(&p, "PRAGMA page_size")[0][0].as_int().unwrap();
+    assert!(total > page_size, "premise: sqlite_schema must span pages ({total} <= {page_size})");
+    assert_eq!(cookie(&p), cookie(&r));
+    let (p1, p2) = keys(&p);
+    let (q1, q2) = keys(&q);
+    let (r1, r2) = keys(&r);
+    assert_eq!(p1, q1, "premise: v1 shares p and q");
+    assert_eq!(p2, q2, "v2 must share p and q");
+    assert_ne!(p1, r1, "premise: v1 tells p from r");
+    assert_ne!(p2, r2, "v2 missed rows on a child page");
+}
+
+#[test]
+fn v2_keys_differ_on_the_custom_types_flag_alone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let plain = open(&dir.path().join("plain.db"), DatabaseOpts::new()).connect().unwrap();
+    let typed = open(&dir.path().join("typed.db"), DatabaseOpts::new().with_custom_types(true))
+        .connect()
+        .unwrap();
+    plain.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    typed.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    assert!(typed.experimental_custom_types_enabled());
+    assert!(!plain.experimental_custom_types_enabled());
+    let (p1, p2) = keys(&plain);
+    let (t1, t2) = keys(&typed);
+    assert_ne!(p1, t1, "premise: v1 keys the flag");
+    assert_ne!(p2, t2, "v2 ignored the custom-types flag");
 }

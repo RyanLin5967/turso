@@ -440,6 +440,9 @@ pub struct BranchIoCounters {
     pub schema_keys: u64,
     pub schema_key_ns: u64,
     pub schema_adoptions: u64,
+    /// PREREG A3.10: the source-key reads that ran key v2 (a subset of `schema_keys`), so a run can
+    /// show which key it used rather than which environment it was given.
+    pub schema_keys_v2: u64,
 }
 
 /// F-S (r11-githost-attr PREREG A1): `R11_SCHEMA_SHARE` set means a branch connection whose state
@@ -878,10 +881,12 @@ impl Database {
             // reparse would read (cookie and `sqlite_schema` rows, plus the flags and table-valued
             // functions it keeps), and adopt a schema already parsed from the same bytes.
             let key = if schema_share() {
+                let version = schema_key_version()?;
                 let started = std::time::Instant::now();
-                let key = conn.branch_schema_source_key(schema_key_version()?)?;
+                let key = conn.branch_schema_source_key(version)?;
                 self.branches.note_schema_key(
                     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    version,
                 );
                 Some(key)
             } else {

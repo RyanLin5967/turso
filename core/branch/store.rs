@@ -207,6 +207,8 @@ pub(crate) struct BranchStore {
     schema_reparse_ns: AtomicU64,
     schema_keys: AtomicU64,
     schema_key_ns: AtomicU64,
+    /// PREREG A3.10: the source-key reads that ran key v2 (a subset of `schema_keys`).
+    schema_keys_v2: AtomicU64,
     schema_adoptions: AtomicU64,
     /// F-S (r11-githost-attr PREREG A1; only while `R11_SCHEMA_SHARE` is set): parsed schemas by
     /// the exact bytes a reparse of them would read (`Connection::branch_schema_source_key`). Its
@@ -970,6 +972,7 @@ impl BranchStore {
             schema_reparse_ns: AtomicU64::new(0),
             schema_keys: AtomicU64::new(0),
             schema_key_ns: AtomicU64::new(0),
+            schema_keys_v2: AtomicU64::new(0),
             schema_adoptions: AtomicU64::new(0),
             shared_schemas: Mutex::new(HashMap::new()),
         }
@@ -1115,6 +1118,7 @@ impl BranchStore {
             schema_reparse_ns: AtomicU64::new(0),
             schema_keys: AtomicU64::new(0),
             schema_key_ns: AtomicU64::new(0),
+            schema_keys_v2: AtomicU64::new(0),
             schema_adoptions: AtomicU64::new(0),
             shared_schemas: Mutex::new(HashMap::new()),
         };
@@ -2309,10 +2313,14 @@ impl BranchStore {
         self.schema_reparse_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
-    /// r11-githost-attr F-S instrument (observing only): one source-key read, and its time.
-    pub(crate) fn note_schema_key(&self, ns: u64) {
+    /// r11-githost-attr F-S instrument (observing only): one source-key read of `version`, and its
+    /// time.
+    pub(crate) fn note_schema_key(&self, ns: u64, version: u8) {
         self.schema_keys.fetch_add(1, Ordering::Relaxed);
         self.schema_key_ns.fetch_add(ns, Ordering::Relaxed);
+        if version == 2 {
+            self.schema_keys_v2.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// r11-githost-attr F-S instrument (observing only): one connection adopted a shared schema.
@@ -2352,6 +2360,7 @@ impl BranchStore {
             schema_reparses: self.schema_reparses.load(Ordering::Relaxed),
             schema_reparse_ns: self.schema_reparse_ns.load(Ordering::Relaxed),
             schema_keys: self.schema_keys.load(Ordering::Relaxed),
+            schema_keys_v2: self.schema_keys_v2.load(Ordering::Relaxed),
             schema_key_ns: self.schema_key_ns.load(Ordering::Relaxed),
             schema_adoptions: self.schema_adoptions.load(Ordering::Relaxed),
             ..Default::default()

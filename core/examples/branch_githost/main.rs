@@ -1663,6 +1663,13 @@ fn probe(args: &Args) {
     if census_on {
         println!("{}", Census::open(&args.db).line(n, label, "before_close"));
     }
+    // PREREG A3.10: which source key this process ran, from the engine's own count (not the
+    // environment): keys_v2 = keys when R11_SCHEMA_KEY=2 took effect, 0 under key v1.
+    let keys = db.branch_io_counters();
+    println!(
+        "SCHEMAKEY\tn={n}\tlabel={label}\tkeys={}\tkeys_v2={}\tadoptions={}\treparses={}",
+        keys.schema_keys, keys.schema_keys_v2, keys.schema_adoptions, keys.schema_reparses
+    );
     // The pair ops rewrote branches outside the schedule: no later process may replay against them.
     write_tainted_steps(&args.db, model.steps);
     let t = Instant::now();

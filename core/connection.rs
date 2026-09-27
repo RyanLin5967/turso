@@ -1339,11 +1339,11 @@ impl Connection {
     /// `sqlite_schema` row in scan order, each value length-prefixed in its `Debug` form (injective
     /// for `Value`). A reparse reads nothing else unless the parse finds sequences, the
     /// custom-types table or `sqlite_stat1`; `schema_shareable` refuses to share such a schema.
-    /// The read runs in its own read transaction with a fresh schema carrying the branch's cookie
-    /// installed, as `init_reparse_building` does, so the statement does not reprepare. The
-    /// placeholder schema goes back before this returns, whatever the outcome, so a reparse after it
-    /// still captures the table-valued functions.
-    /// `version` 1 is the A1 key; 2 is [`Self::read_branch_schema_source_key_v2`] (PREREG A3.10).
+    /// The read runs in its own read transaction. Version 1 (the A1 key) installs a fresh schema
+    /// carrying the branch's cookie, as `init_reparse_building` does, so its statement does not
+    /// reprepare; version 2 ([`Self::read_branch_schema_source_key_v2`], PREREG A3.10) prepares
+    /// nothing. The placeholder schema goes back before this returns, whatever the outcome, so a
+    /// reparse after it still captures the table-valued functions.
     pub(crate) fn branch_schema_source_key(self: &Arc<Connection>, version: u8) -> Result<Vec<u8>> {
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
