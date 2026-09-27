@@ -247,6 +247,27 @@ pub struct BranchResident {
     pub arena_free_bits_words: usize,
     /// Arena chunks allocated (each `SLOTS_PER_CHUNK` pages; never freed).
     pub arena_chunks: usize,
+    /// Bytes held per structure (lane r12-f9-shrink), for peak-then-shrink curves. Arena chunks
+    /// whose memory is mapped (address space, not residency).
+    pub arena_chunks_mapped: usize,
+    /// Arena bytes written and not returned to the OS: every slot below `arena_high_water`, while
+    /// the arena never returns a slot's memory.
+    pub arena_resident_bytes: usize,
+    /// The arena's own bookkeeping: capacity times element size of each of its vectors.
+    pub arena_meta_bytes: usize,
+    /// Cumulative: arena pages handed back to the OS, purged pages taken back into use, chunks
+    /// mapped and unmapped. Zero where the arena never returns memory.
+    pub arena_purges: u64,
+    pub arena_reuses: u64,
+    pub arena_chunk_maps: u64,
+    pub arena_chunk_unmaps: u64,
+    /// The branch table's value storage (allocated chunks times the chunk length times
+    /// `table_entry_bytes`), its index and free-list bytes, the size of one value entry, and the
+    /// value chunks allocated.
+    pub table_value_bytes: usize,
+    pub table_index_bytes: usize,
+    pub table_entry_bytes: usize,
+    pub table_value_chunks: usize,
 }
 
 /// Cumulative counts of the store's per-call work since the database opened. Observation only:

@@ -807,7 +807,21 @@ impl BranchStore {
             r.arena_free_list_capacity = free_capacity;
             r.arena_free_bits_words = free_bits_words;
             r.arena_chunks = chunks;
+            let b = arena.bytes();
+            r.arena_chunks_mapped = b.chunks_mapped;
+            r.arena_resident_bytes = b.resident;
+            r.arena_meta_bytes = b.meta;
+            r.arena_purges = b.purges;
+            r.arena_reuses = b.reuses;
+            r.arena_chunk_maps = b.chunk_maps;
+            r.arena_chunk_unmaps = b.chunk_unmaps;
         }
+        (
+            r.table_value_bytes,
+            r.table_index_bytes,
+            r.table_entry_bytes,
+            r.table_value_chunks,
+        ) = inner.branches.bytes();
         r
     }
 

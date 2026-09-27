@@ -156,6 +156,19 @@ impl<T> BranchTable<T> {
         self.retired
     }
 
+    /// `(value bytes, index bytes, entry bytes, value chunks)`: the chunks' entries (each holds its
+    /// generation and its value inline), the free list and the chunk pointers. Observation only.
+    pub(crate) fn bytes(&self) -> (usize, usize, usize, usize) {
+        let entry = std::mem::size_of::<Entry<T>>();
+        (
+            self.chunks.len() * CHUNK * entry,
+            self.free.capacity() * std::mem::size_of::<u32>()
+                + self.chunks.capacity() * std::mem::size_of::<Box<[Entry<T>]>>(),
+            entry,
+            self.chunks.len(),
+        )
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = (BranchId, &T)> {
         self.chunks.iter().enumerate().flat_map(|(c, chunk)| {
             chunk.iter().enumerate().filter_map(move |(i, e)| {

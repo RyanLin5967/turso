@@ -20,6 +20,18 @@ pub(crate) type Slot = u32;
 /// memory only as its slots are touched; the chunk size bounds the granularity, not the footprint.
 const SLOTS_PER_CHUNK: usize = 256;
 
+/// Bytes the arena holds, by part (see `BranchResident`). Observation only.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ArenaBytes {
+    pub(crate) chunks_mapped: usize,
+    pub(crate) resident: usize,
+    pub(crate) meta: usize,
+    pub(crate) purges: u64,
+    pub(crate) reuses: u64,
+    pub(crate) chunk_maps: u64,
+    pub(crate) chunk_unmaps: u64,
+}
+
 pub(crate) struct Arena {
     page_size: usize,
     chunks: Vec<Box<[u8]>>,
@@ -102,6 +114,20 @@ impl Arena {
             self.free_bits.len(),
             self.chunks.len(),
         )
+    }
+
+    /// Bytes held, by part. Observation only. Every slot below `high_water` was written whole when
+    /// it was handed out, and nothing returns a slot's memory, so all of them count as resident.
+    pub(crate) fn bytes(&self) -> ArenaBytes {
+        ArenaBytes {
+            chunks_mapped: self.chunks.len(),
+            resident: self.high_water as usize * self.page_size,
+            meta: self.chunks.capacity() * std::mem::size_of::<Box<[u8]>>()
+                + self.free.capacity() * std::mem::size_of::<Slot>()
+                + self.free_bits.capacity() * std::mem::size_of::<u64>(),
+            chunk_maps: self.chunks.len() as u64,
+            ..Default::default()
+        }
     }
 
     pub(crate) fn page(&self, slot: Slot) -> &[u8] {
