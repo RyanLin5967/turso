@@ -1141,6 +1141,7 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
+        super::count_fsync();
         // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));

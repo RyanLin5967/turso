@@ -3589,6 +3589,8 @@ impl Pager {
             }
 
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+            // r12-e3: the branch store's prefetch arm refuses (or counts) a miss on this thread.
+            crate::branch::io_miss_gate()?;
             let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
             self.pending_reads.write().insert(
                 page_idx,

@@ -35,6 +35,15 @@
 //! a page keeps a pre-image, since every branch forked before it), then times
 //! `PRAGMA wal_checkpoint(TRUNCATE)` and `Database::branch_compact_now` twice.
 //!
+//! `grow --clean` (r12-e3) closes the database cleanly after READY and exits, instead of blocking.
+//!
+//! `reaprate` (r12-e3, frontier/round12/r12-e3/PREREG.md): opens `Catalog { sync: true }`, then per
+//! cell reaps `--reaps` detached children of the trunk by id (`Database::branch_release_detached`)
+//! from `--threads` reaper threads in rounds of `--round`, the main thread re-forking the same number
+//! between rounds (each writing its own row, a trunk UPDATE after every `--trunk-every` forks), and
+//! prints the store's per-reap samples: `cold` cells run right after a checkpoint and a reopen,
+//! `warm` cells after the victims were made resident (attach + detach, untimed).
+//!
 //! Any failed check prints `NOT A RESULT` and exits 1.
 
 use std::io::{BufRead, Write};
@@ -74,6 +83,16 @@ struct Args {
     child_every: usize,
     /// `catalog`: open with `BranchDurability::Catalog` (the published-fix prototype).
     catalog: bool,
+    /// `grow --clean`: close cleanly after READY.
+    clean: bool,
+    /// `reaprate`: reaper thread counts, cell kinds, reaps per cell, reaps per round, victim
+    /// order, the prefetch arm.
+    threads: Vec<usize>,
+    cells: Vec<String>,
+    reaps: usize,
+    round: usize,
+    oldest: bool,
+    prefetch: bool,
 }
 
 fn parse_args() -> Args {
@@ -91,6 +110,13 @@ fn parse_args() -> Args {
         trunk_every: 0,
         child_every: 0,
         catalog: false,
+        clean: false,
+        threads: vec![1, 4, 8],
+        cells: vec!["cold".to_string(), "warm".to_string()],
+        reaps: 4000,
+        round: 1000,
+        oldest: false,
+        prefetch: false,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -106,6 +132,30 @@ fn parse_args() -> Args {
             }
             "--child-every" => args.child_every = val().parse().unwrap_or_else(|_| die("bad --child-every")),
             "--trunk-every" => args.trunk_every = val().parse().unwrap_or_else(|_| die("bad --trunk-every")),
+            "--clean" => args.clean = true,
+            "--threads" => {
+                args.threads = val()
+                    .split(',')
+                    .map(|t| t.parse().unwrap_or_else(|_| die("bad --threads")))
+                    .collect()
+            }
+            "--cells" => args.cells = val().split(',').map(str::to_string).collect(),
+            "--reaps" => args.reaps = val().parse().unwrap_or_else(|_| die("bad --reaps")),
+            "--round" => args.round = val().parse().unwrap_or_else(|_| die("bad --round")),
+            "--victim" => {
+                args.oldest = match val().as_str() {
+                    "random" => false,
+                    "oldest" => true,
+                    other => die(&format!("unknown --victim {other}")),
+                }
+            }
+            "--prefetch" => {
+                args.prefetch = match val().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => die(&format!("unknown --prefetch {other}")),
+                }
+            }
             "--mode" => {
                 args.catalog = match val().as_str() {
                     "snapshot" => false,
@@ -394,6 +444,12 @@ fn grow(args: &Args) {
     );
     println!("READY n={} pid={}", args.n, std::process::id());
     std::io::stdout().flush().unwrap();
+    if args.clean {
+        drop(trunk);
+        drop(db);
+        println!("# closed cleanly (--clean)");
+        return;
+    }
     // Block until killed. A closed stdin (EOF) also ends here, without a clean close: the victim
     // never closes the database.
     let mut line = String::new();
@@ -849,6 +905,364 @@ fn main() {
         "ckpt" => ckpt(&args),
         "ckpt2" => ckpt2(&args),
         "churn" => churn(&args),
+        "reaprate" => reaprate(&args),
         other => die(&format!("unknown command {other}")),
     }
+}
+
+/// The box's parallelism now, with nothing shared: `t` threads each run the same fixed xorshift
+/// loop (branch_arms' null control, copied). Operations per second over the slowest finish.
+fn null_ops_per_s(t: usize) -> f64 {
+    const ITER: u64 = 50_000_000;
+    let barrier = std::sync::Barrier::new(t + 1);
+    let wall = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..t)
+            .map(|i| {
+                let barrier = &barrier;
+                s.spawn(move || {
+                    let mut r = Rng(0x2545_F491_4F6C_DD1D ^ (i as u64 + 1));
+                    barrier.wait();
+                    let mut acc = 0u64;
+                    for _ in 0..ITER {
+                        acc = acc.wrapping_add(r.next());
+                    }
+                    std::hint::black_box(acc)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let start = Instant::now();
+        for h in handles {
+            h.join().unwrap();
+        }
+        start.elapsed()
+    });
+    (t as u64 * ITER) as f64 / wall.as_secs_f64()
+}
+
+/// User and system CPU time of the process so far, in nanoseconds.
+fn cpu_ns() -> (u64, u64) {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        not_a_result("getrusage failed");
+    }
+    let ns = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000_000 + tv.tv_usec as u64 * 1_000;
+    (ns(ru.ru_utime), ns(ru.ru_stime))
+}
+
+/// Re-fork `k` children of the trunk, each writing its own row, with a trunk UPDATE after every
+/// `every` forks of the run (counted by `forks`); returns their ids.
+fn refill(
+    trunk: &Arc<Connection>,
+    k: usize,
+    every: usize,
+    forks: &mut u64,
+    trunk_writes: &mut u64,
+) -> Vec<u64> {
+    let mut ids = Vec::with_capacity(k);
+    for _ in 0..k {
+        let branch = trunk
+            .fork_branch()
+            .unwrap_or_else(|e| not_a_result(&format!("refill fork: {e}")));
+        let id = branch.id().0;
+        let row = row_for(id);
+        let conn = branch.connect().unwrap();
+        conn.execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", branch_value(row)))
+            .unwrap_or_else(|e| not_a_result(&format!("refill write on {id}: {e}")));
+        drop(conn);
+        let _ = branch.into_id();
+        ids.push(id);
+        *forks += 1;
+        if every > 0 && *forks % every as u64 == 0 {
+            *trunk_writes += 1;
+            trunk
+                .execute(format!(
+                    "UPDATE t SET v = '{}' WHERE id = {}",
+                    trunk_write_value(1_000_000_000 + *trunk_writes),
+                    far_row(row)
+                ))
+                .unwrap_or_else(|e| not_a_result(&format!("refill trunk write: {e}")));
+        }
+    }
+    ids
+}
+
+fn pct_u64(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    sorted[((p / 100.0) * (sorted.len() - 1) as f64).round() as usize]
+}
+
+/// r12-e3: reaps/s per parent on the durable catalog store; see the module doc and the PREREG.
+fn reaprate(args: &Args) {
+    if !args.catalog {
+        die("reaprate needs --mode catalog");
+    }
+    if args.threads.is_empty() || args.threads.contains(&0) || args.round == 0 || args.reaps < args.round {
+        die("reaprate: --threads positive, --round > 0, --reaps >= --round");
+    }
+    let files = Files::new(&args.db);
+    let t = Instant::now();
+    let mut db = open_db(&args.db, true, true);
+    let mut trunk = db.connect().unwrap();
+    println!(
+        "# reaprate n={} open_us={:.0} threads={:?} cells={:?} reaps={} round={} victim={} prefetch={} \
+         trunk_every={} seed={:#x} {} rss_bytes={}",
+        args.n,
+        t.elapsed().as_secs_f64() * 1e6,
+        args.threads,
+        args.cells,
+        args.reaps,
+        args.round,
+        if args.oldest { "oldest" } else { "random" },
+        if args.prefetch { "on" } else { "off" },
+        args.trunk_every,
+        args.seed,
+        files.line(),
+        rss_bytes()
+    );
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n {
+        not_a_result(&format!("reaprate: {st:?}, expected {} live branches", args.n));
+    }
+    // The population, in fork order (ids are fork order: every branch is a child of the trunk).
+    let mut pop: std::collections::VecDeque<u64> = db
+        .branch_ids()
+        .unwrap_or_else(|e| not_a_result(&format!("branch_ids: {e}")))
+        .into_iter()
+        .map(|b| b.0)
+        .collect();
+    if pop.len() != args.n {
+        not_a_result(&format!("branch_ids listed {} branches, expected {}", pop.len(), args.n));
+    }
+    let mut rng = Rng(args.seed | 1);
+    let (mut forks, mut trunk_writes) = (0u64, 0u64);
+    println!(
+        "N\tkind\tT\tdraw\tmetric\tp50\tp90\tp99\tmax\tmean"
+    );
+    let order: Vec<(usize, u64)> = args
+        .threads
+        .iter()
+        .map(|&t| (t, 0u64))
+        .chain(args.threads.iter().rev().map(|&t| (t, 1u64)))
+        .collect();
+    for kind in &args.cells {
+        let cold = match kind.as_str() {
+            "cold" => true,
+            "warm" => false,
+            other => die(&format!("unknown cell kind {other}")),
+        };
+        for &(t, draw) in &order {
+            if cold {
+                // A clean shutdown's checkpoint, then a reopen: nothing is resident, and the
+                // catalog connection's page cache is empty (the OS file cache is not purged).
+                db.branch_compact_now()
+                    .unwrap_or_else(|e| not_a_result(&format!("compact before reopen: {e}")));
+                drop(trunk);
+                drop(db);
+                let t0 = Instant::now();
+                db = open_db(&args.db, true, true);
+                trunk = db.connect().unwrap();
+                println!("# reopen before N={} kind=cold T={t} draw={draw}: open_us={:.0}", args.n, t0.elapsed().as_secs_f64() * 1e6);
+            }
+            let null = null_ops_per_s(t);
+            db.branch_set_prefetch(args.prefetch);
+            db.branch_reap_sampling(true);
+            let _ = db.branch_take_reap_samples();
+            let rounds = args.reaps / args.round;
+            let (mut wall_ns, mut reaps) = (0u128, 0usize);
+            let (mut cpu_user, mut cpu_sys) = (0u64, 0u64);
+            let io0 = turso_core::branch::page_io();
+            let fs0 = turso_core::branch::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..rounds {
+                // This round's victims, dealt to the reapers round-robin.
+                let mut victims = Vec::with_capacity(args.round);
+                for _ in 0..args.round {
+                    let v = if args.oldest {
+                        pop.pop_front().unwrap()
+                    } else {
+                        let at = rng.below(pop.len());
+                        pop.swap_remove_back(at).unwrap()
+                    };
+                    victims.push(v);
+                }
+                if !cold {
+                    // Warm: every victim resident before the timed phase.
+                    for &v in &victims {
+                        let b = db
+                            .branch(BranchId(v))
+                            .unwrap_or_else(|e| not_a_result(&format!("warm attach {v}: {e}")));
+                        let _ = b.into_id();
+                    }
+                    let _ = db.branch_take_reap_samples();
+                }
+                let shares: Vec<Vec<u64>> = (0..t)
+                    .map(|i| victims.iter().skip(i).step_by(t).copied().collect())
+                    .collect();
+                let barrier = std::sync::Barrier::new(t + 1);
+                let c0 = cpu_ns();
+                let wall = std::thread::scope(|s| {
+                    let handles: Vec<_> = shares
+                        .iter()
+                        .map(|share| {
+                            let (db, barrier) = (&db, &barrier);
+                            s.spawn(move || {
+                                barrier.wait();
+                                for &v in share {
+                                    let r = db.branch_release_detached(BranchId(v)).unwrap_or_else(
+                                        |e| not_a_result(&format!("reap {v}: {e}")),
+                                    );
+                                    if r.deferred || r.freed_pages < 1 {
+                                        not_a_result(&format!("reap {v} freed {r:?}"));
+                                    }
+                                }
+                            })
+                        })
+                        .collect();
+                    barrier.wait();
+                    let started = Instant::now();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                    started.elapsed()
+                });
+                let c1 = cpu_ns();
+                cpu_user += c1.0 - c0.0;
+                cpu_sys += c1.1 - c0.1;
+                wall_ns += wall.as_nanos();
+                reaps += victims.len();
+                pop.extend(refill(&trunk, args.round, args.trunk_every, &mut forks, &mut trunk_writes));
+            }
+            let io1 = turso_core::branch::page_io();
+            let fs1 = turso_core::branch::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
+            let samples = db.branch_take_reap_samples();
+            db.branch_reap_sampling(false);
+            if samples.len() != reaps {
+                not_a_result(&format!("{} reap samples for {reaps} reaps", samples.len()));
+            }
+            let x = reaps as f64 / (wall_ns as f64 / 1e9);
+            let sum = |f: &dyn Fn(&turso_core::branch::ReapSample) -> u64| -> u64 {
+                samples.iter().map(f).sum()
+            };
+            let n_ckpt = samples.iter().filter(|s| s.ckpt).count();
+            let plain: Vec<&turso_core::branch::ReapSample> = samples.iter().filter(|s| !s.ckpt).collect();
+            let per = |f: &dyn Fn(&turso_core::branch::ReapSample) -> u64| -> f64 {
+                plain.iter().map(|s| f(s)).sum::<u64>() as f64 / plain.len().max(1) as f64
+            };
+            println!(
+                "# rrcell N={} kind={kind} T={t} draw={draw} prefetch={} victim={} reaps={reaps} wall_ns={wall_ns} \
+                 reaps_per_s={x:.1} lifetime_s={:.3} null_ops_per_s={null:.0} user_ns={cpu_user} sys_ns={cpu_sys} \
+                 ckpt_reaps={n_ckpt} gave_up={} late_total={} plan_reads_total={} \
+                 page_io_delta={:?} fsyncs_global_delta={} rss_bytes={}",
+                args.n,
+                if args.prefetch { "on" } else { "off" },
+                if args.oldest { "oldest" } else { "random" },
+                args.n as f64 / x,
+                samples.iter().filter(|s| s.gave_up).count(),
+                sum(&|s| s.late),
+                sum(&|s| s.plan_reads),
+                [io1[0] - io0[0], io1[1] - io0[1], io1[2] - io0[2], io1[3] - io0[3]],
+                fs1 - fs0,
+                rss_bytes()
+            );
+            println!(
+                "# rrper N={} kind={kind} T={t} draw={draw} (non-checkpoint reaps, per reap) queries={:.3} loads={:.4} \
+                 page_reads={:.4} fsyncs={:.4} late={:.4} reruns={:.3} prefetch_reads={:.3} plan_reads={:.4} \
+                 hold_us={:.2} plan_hold_us={:.2} wait_us={:.2} ensure_us={:.2} log_us={:.2} collect_us={:.2} \
+                 prefetch_us={:.2}",
+                args.n,
+                per(&|s| s.queries),
+                per(&|s| s.loads),
+                per(&|s| s.page_reads),
+                per(&|s| s.fsyncs),
+                per(&|s| s.late),
+                per(&|s| s.reruns),
+                per(&|s| s.prefetch_reads),
+                per(&|s| s.plan_reads),
+                per(&|s| s.hold_ns) / 1e3,
+                per(&|s| s.plan_hold_ns) / 1e3,
+                per(&|s| s.wait_ns) / 1e3,
+                per(&|s| s.ensure_ns) / 1e3,
+                per(&|s| s.log_ns) / 1e3,
+                per(&|s| s.collect_ns) / 1e3,
+                per(&|s| s.prefetch_ns) / 1e3,
+            );
+            if n_ckpt > 0 {
+                let ck: Vec<&turso_core::branch::ReapSample> = samples.iter().filter(|s| s.ckpt).collect();
+                let m = |f: &dyn Fn(&turso_core::branch::ReapSample) -> u64| -> f64 {
+                    ck.iter().map(|s| f(s)).sum::<u64>() as f64 / ck.len() as f64
+                };
+                println!(
+                    "# rrckpt N={} kind={kind} T={t} draw={draw} (checkpoint reaps, per reap) n={n_ckpt} ckpt_us={:.1} \
+                     ckpt_reads={:.1} ckpt_fsyncs={:.2} ckpt_queries={:.1} hold_us={:.1}",
+                    args.n,
+                    m(&|s| s.ckpt_ns) / 1e3,
+                    m(&|s| s.ckpt_reads),
+                    m(&|s| s.ckpt_fsyncs),
+                    m(&|s| s.ckpt_queries),
+                    m(&|s| s.hold_ns) / 1e3,
+                );
+            }
+            type Rs = turso_core::branch::ReapSample;
+            let metrics: [(&str, &dyn Fn(&Rs) -> u64); 4] = [
+                ("hold_us", &|s: &Rs| s.hold_ns),
+                ("lock_total_us", &|s: &Rs| s.hold_ns + s.plan_hold_ns),
+                ("wait_us", &|s: &Rs| s.wait_ns),
+                ("reap_total_us", &|s: &Rs| s.wait_ns + s.hold_ns + s.plan_hold_ns + s.prefetch_ns),
+            ];
+            for (name, f) in metrics {
+                let mut v: Vec<u64> = samples.iter().map(f).collect();
+                v.sort_unstable();
+                let mean = v.iter().sum::<u64>() as f64 / v.len().max(1) as f64;
+                println!(
+                    "{}\t{kind}\t{t}\t{draw}\t{name}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                    args.n,
+                    pct_u64(&v, 50.0) as f64 / 1e3,
+                    pct_u64(&v, 90.0) as f64 / 1e3,
+                    pct_u64(&v, 99.0) as f64 / 1e3,
+                    *v.last().unwrap_or(&0) as f64 / 1e3,
+                    mean / 1e3
+                );
+            }
+            // Checks: the live count, and 50 random live branches read their own row.
+            let st = db.branch_stats().unwrap();
+            if st.live_branches != args.n || pop.len() != args.n {
+                not_a_result(&format!(
+                    "after N={} {kind} T={t} draw={draw}: {st:?}, harness holds {}",
+                    args.n,
+                    pop.len()
+                ));
+            }
+            for _ in 0..50 {
+                let v = pop[rng.below(pop.len())];
+                let b = db
+                    .branch(BranchId(v))
+                    .unwrap_or_else(|e| not_a_result(&format!("check attach {v}: {e}")));
+                let row = row_for(v);
+                let got = read_v(&b.connect().unwrap(), row);
+                if got != branch_value(row) {
+                    not_a_result(&format!("branch {v} reads row {row} as {got}"));
+                }
+                let _ = b.into_id();
+            }
+            println!(
+                "# checked N={} kind={kind} T={t} draw={draw}: live={} arena_slots_in_use={} trunk_retained={} \
+                 50 own rows read right; forks={forks} trunk_writes={trunk_writes} {}",
+                args.n,
+                st.live_branches,
+                st.arena_slots_in_use,
+                db.branch_trunk_retained(),
+                files.line()
+            );
+        }
+    }
+    drop(trunk);
+    drop(db);
+    let db = open_db(&args.db, true, true);
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n {
+        not_a_result(&format!("final reopen: {st:?}, expected {} live", args.n));
+    }
+    println!("# final reopen: live={} arena_slots_in_use={}", st.live_branches, st.arena_slots_in_use);
 }

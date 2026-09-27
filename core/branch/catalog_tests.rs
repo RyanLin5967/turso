@@ -420,3 +420,186 @@ fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
         let _ = b.into_id();
     }
 }
+
+// r12-e3: the prefetch arm (LeanStore's no-I/O-under-a-latch rule) and its page-read gate.
+
+/// Grow `n` branches, each writing its own row, with a trunk UPDATE of another row after every
+/// 8th fork (so the trunk retains versions the reaps free in place); return their ids.
+fn grow_written(db: &Arc<Database>, n: usize) -> Vec<BranchId> {
+    let trunk = db.connect().unwrap();
+    (0..n)
+        .map(|i| {
+            let b = trunk.fork_branch().unwrap();
+            let row = 1 + (i % 400) as i64;
+            b.connect()
+                .unwrap()
+                .execute(format!("UPDATE t SET v = 'b{}' WHERE id = {row}", b.id().0))
+                .unwrap();
+            if i % 8 == 7 {
+                trunk
+                    .execute(format!("UPDATE t SET v = 'tw{i}' WHERE id = {}", 1 + (i + 200) % 400))
+                    .unwrap();
+            }
+            b.into_id()
+        })
+        .collect()
+}
+
+/// A lookup under a refusing gate fails before any read and names itself; re-running the named
+/// statement with the gate off reads its pages; the lookup then succeeds under the refusing gate
+/// with the same answer a fresh connection gives; and the refused statements left no read mark
+/// behind (the catalog's WAL still truncates).
+#[test]
+fn a_refused_page_read_leaves_the_catalog_usable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let ids;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        ids = grow_written(&db, 300);
+        db.branch_compact_now().unwrap();
+    }
+    let cat_path = std::path::PathBuf::from(format!("{}-branch-cat", path.to_str().unwrap()));
+    let want = catalog::Catalog::open(&cat_path, true)
+        .unwrap()
+        .load_branch(ids[150].0)
+        .unwrap();
+    assert!(want.is_some());
+    let mut cat = catalog::Catalog::open(&cat_path, true).unwrap();
+    let mut refused = 0;
+    let got = loop {
+        let gate = set_io_mode(IO_REFUSE);
+        let r = cat.load_branch(ids[150].0);
+        set_io_mode(gate);
+        match r {
+            Ok(b) => break b,
+            Err(_) => {
+                let (stmt, params) = cat.counters.miss.take().expect("a refused read names its statement");
+                cat.rerun(stmt, &params).unwrap();
+                refused += 1;
+                assert!(refused < 20, "the lookup keeps missing after its pages were read");
+            }
+        }
+    };
+    assert!(refused > 0, "a cold connection's lookup never met the gate: the test proves nothing");
+    assert_eq!(got, want);
+    let r = cat.truncate_wal().unwrap();
+    assert_eq!(r.first().copied(), Some(0), "the WAL did not truncate after refusals: {r:?}");
+}
+
+/// Reaps of cold branches with the prefetch arm on and off, in the same order on the same
+/// history: the same state results, the prefetch arm reads no catalog page inside the store
+/// mutex (outside its checkpoints) and meets no late miss, and it did prefetch — while the plain
+/// arm did read pages inside the mutex, so the arm had work to move.
+#[test]
+fn prefetch_reaps_free_what_plain_reaps_free_and_read_nothing_inside_the_lock() {
+    let mut outcomes = Vec::new();
+    for prefetch in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let ids;
+        {
+            let db = open_at(&path, catalog()).unwrap();
+            seed(&db.connect().unwrap());
+            ids = grow_written(&db, 400);
+            db.branch_compact_now().unwrap();
+        }
+        let db = open_at(&path, catalog()).unwrap();
+        db.branch_set_prefetch(prefetch);
+        db.branch_reap_sampling(true);
+        let mut order = ids.clone();
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        for i in (1..order.len()).rev() {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            order.swap(i, (rng % (i as u64 + 1)) as usize);
+        }
+        let (reaped, kept) = order.split_at(200);
+        let mut freed = 0;
+        for &id in reaped {
+            let r = db.branch_release_detached(id).unwrap();
+            assert!(!r.deferred);
+            freed += r.freed_pages;
+        }
+        let samples = db.branch_take_reap_samples();
+        assert_eq!(samples.len(), 200);
+        let plain: Vec<_> = samples.iter().filter(|s| !s.ckpt).collect();
+        let sum = |f: &dyn Fn(&ReapSample) -> u64| plain.iter().map(|s| f(s)).sum::<u64>();
+        if prefetch {
+            assert_eq!(sum(&|s| s.page_reads), 0, "prefetch: a page read inside the lock");
+            assert_eq!(sum(&|s| s.late), 0, "prefetch: a late miss");
+            assert_eq!(sum(&|s| s.plan_reads), 0, "prefetch: the gate let a plan read through");
+            assert!(sum(&|s| s.reruns) > 0, "prefetch: nothing was prefetched");
+            assert!(sum(&|s| s.prefetch_reads) > 0, "prefetch: the prefetches read nothing");
+            assert!(samples.iter().all(|s| !s.gave_up));
+        } else {
+            assert!(sum(&|s| s.page_reads) > 0, "plain: no page read inside the lock to move");
+            assert_eq!(sum(&|s| s.reruns), 0);
+        }
+        assert!(sum(&|s| s.loads) > 0, "no reap loaded a cold branch");
+        assert_eq!(sum(&|s| s.fsyncs), plain.len() as u64, "one fsync per plain reap");
+        let st = db.branch_stats().unwrap();
+        for (i, &id) in kept.iter().enumerate().step_by(9) {
+            let b = db.branch(id).unwrap();
+            let pos = ids.iter().position(|&x| x == id).unwrap();
+            let row = 1 + (pos % 400) as i64;
+            assert_eq!(value(&b.connect().unwrap(), row), format!("b{}", id.0), "kept #{i}");
+            let _ = b.into_id();
+        }
+        outcomes.push((st.live_branches, st.arena_slots_in_use, db.branch_trunk_retained(), freed));
+    }
+    assert_eq!(outcomes[0], outcomes[1], "prefetch changed what the reaps did");
+    assert_eq!(outcomes[0].0, 200);
+}
+
+/// Four threads reap cold branches concurrently with the prefetch arm on; no late miss, and after a
+/// reopen exactly the survivors remain, each reading its own row.
+#[test]
+fn threaded_prefetch_reaps_survive_a_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let ids;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        ids = grow_written(&db, 400);
+        db.branch_compact_now().unwrap();
+    }
+    let (reaped, kept): (Vec<(usize, BranchId)>, Vec<(usize, BranchId)>) =
+        ids.iter().copied().enumerate().partition(|(i, _)| i % 2 == 1);
+    let before;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        db.branch_set_prefetch(true);
+        db.branch_reap_sampling(true);
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let (db, reaped) = (&db, &reaped);
+                s.spawn(move || {
+                    for &(_, id) in reaped.iter().skip(t).step_by(4) {
+                        let r = db.branch_release_detached(id).unwrap();
+                        assert!(!r.deferred);
+                    }
+                });
+            }
+        });
+        let samples = db.branch_take_reap_samples();
+        assert_eq!(samples.len(), reaped.len());
+        assert!(samples.iter().all(|s| s.late == 0 && !s.gave_up), "a late miss under threads");
+        let st = db.branch_stats().unwrap();
+        assert_eq!(st.live_branches, kept.len());
+        before = (st.arena_slots_in_use, db.branch_trunk_retained());
+    }
+    let db = open_at(&path, catalog()).unwrap();
+    let st = db.branch_stats().unwrap();
+    assert_eq!(st.live_branches, kept.len());
+    assert_eq!((st.arena_slots_in_use, db.branch_trunk_retained()), before);
+    for &(pos, id) in &kept {
+        let b = db.branch(id).unwrap();
+        let row = 1 + (pos % 400) as i64;
+        assert_eq!(value(&b.connect().unwrap(), row), format!("b{}", id.0));
+        let _ = b.into_id();
+    }
+}

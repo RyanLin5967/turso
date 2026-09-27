@@ -79,6 +79,122 @@ pub fn page_io() -> [u64; 4] {
 
 pub(crate) fn count_page_io(which: usize, n: u64) {
     PAGE_IO[which].fetch_add(n, crate::sync::atomic::Ordering::Relaxed);
+    if which == 0 || which == 2 {
+        THREAD_READS.with(|c| c.set(c.get() + n));
+    }
+}
+
+// r12-e3 lane instruments and the prefetch arm's page-read gate (observation only unless a
+// thread sets `IO_REFUSE`, which only the branch store's prefetch arm does, on its own thread).
+thread_local! {
+    /// Database-file and WAL page reads made by this thread (PAGE_IO's reads, per thread).
+    static THREAD_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// fsyncs of branch files made by this thread.
+    static THREAD_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Page-cache misses let through in `IO_COUNT` mode (the prefetch arm's LATE misses).
+    static THREAD_LATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// This thread's page-read gate (`IO_OFF`, `IO_REFUSE`, `IO_COUNT`).
+    static IO_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(IO_OFF) };
+    /// Set when the gate refused a read, until taken.
+    static IO_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The gate lets every page-cache miss read.
+pub(crate) const IO_OFF: u8 = 0;
+/// The gate refuses a page-cache miss before any read (an error, recorded for the caller).
+pub(crate) const IO_REFUSE: u8 = 1;
+/// The gate lets a miss read, and counts it as a late miss.
+pub(crate) const IO_COUNT: u8 = 2;
+
+/// Set this thread's page-read gate; returns the mode it replaces.
+pub(crate) fn set_io_mode(mode: u8) -> u8 {
+    IO_MODE.with(|m| m.replace(mode))
+}
+
+/// Called by the pager at a page-cache miss, before it reads.
+pub(crate) fn io_miss_gate() -> Result<()> {
+    match IO_MODE.with(|m| m.get()) {
+        IO_REFUSE => {
+            IO_REFUSED.with(|r| r.set(true));
+            Err(LimboError::InternalError(
+                "branch store: a page read was refused inside the store lock (prefetch arm)"
+                    .to_string(),
+            ))
+        }
+        IO_COUNT => {
+            THREAD_LATE.with(|c| c.set(c.get() + 1));
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Whether the gate refused a read since the last call.
+pub(crate) fn take_io_refused() -> bool {
+    IO_REFUSED.with(|r| r.replace(false))
+}
+
+pub(crate) fn thread_page_reads() -> u64 {
+    THREAD_READS.with(|c| c.get())
+}
+
+pub(crate) fn thread_late_misses() -> u64 {
+    THREAD_LATE.with(|c| c.get())
+}
+
+pub(crate) fn thread_fsyncs() -> u64 {
+    THREAD_FSYNCS.with(|c| c.get())
+}
+
+/// Every fsync of a branch file, process-wide (r12-e3 instrument).
+#[doc(hidden)]
+pub static FSYNCS: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn count_fsync() {
+    FSYNCS.fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+    THREAD_FSYNCS.with(|c| c.set(c.get() + 1));
+}
+
+/// One reap of a branch, as the store saw it (r12-e3 instrument; see
+/// [`Database::branch_reap_sampling`]). Times are nanoseconds; counts are this reap's own.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReapSample {
+    /// Time waiting for the store mutex, summed over every attempt.
+    pub wait_ns: u64,
+    /// The final (successful) attempt's hold of the store mutex.
+    pub hold_ns: u64,
+    /// Holds of the attempts whose plan missed (prefetch arm).
+    pub plan_hold_ns: u64,
+    /// Phases of the final hold: making the branch resident, the release record's flush, the
+    /// release itself (children, garbage, frees), and a checkpoint if one ran.
+    pub ensure_ns: u64,
+    pub log_ns: u64,
+    pub collect_ns: u64,
+    pub ckpt_ns: u64,
+    /// Catalog statements run inside the final hold, the checkpoint's excluded.
+    pub queries: u64,
+    /// Branch states loaded from the catalog inside the final hold.
+    pub loads: u64,
+    /// Catalog page reads inside the final hold, the checkpoint's excluded.
+    pub page_reads: u64,
+    /// fsyncs inside the final hold, the checkpoint's excluded.
+    pub fsyncs: u64,
+    /// A checkpoint ran inside the hold, and its page reads, fsyncs and statements.
+    pub ckpt: bool,
+    pub ckpt_reads: u64,
+    pub ckpt_fsyncs: u64,
+    pub ckpt_queries: u64,
+    /// Prefetch arm: attempts that missed and re-ran, time and page reads spent prefetching
+    /// outside the store mutex, page reads the gate refused inside it, and late misses (a page
+    /// read inside the final hold that the plan did not foresee).
+    pub reruns: u64,
+    pub prefetch_ns: u64,
+    pub prefetch_reads: u64,
+    pub plan_reads: u64,
+    pub late: u64,
+    /// Prefetch arm: the reap stopped re-running after 64 misses and ran its section anyway.
+    pub gave_up: bool,
 }
 pub(crate) mod catalog;
 pub(crate) mod journal;
@@ -580,6 +696,34 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_trunk_retained(&self) -> u64 {
         self.branches.trunk_retained_count()
+    }
+
+    /// Reap a DETACHED branch by id, without attaching it first (r12-e3 instrument: a lease-expiry
+    /// pass reaps this way, so a branch that is not resident is loaded inside the reap's own hold).
+    #[doc(hidden)]
+    pub fn branch_release_detached(&self, id: BranchId) -> Result<Reaped> {
+        self.branches.refuse_if_trunk_only("releasing a branch")?;
+        self.branches.release_handle(id)
+    }
+
+    /// Record a [`ReapSample`] for every reap from now on (r12-e3 instrument); off drops them.
+    #[doc(hidden)]
+    pub fn branch_reap_sampling(&self, on: bool) {
+        self.branches.set_reap_sampling(on);
+    }
+
+    /// The reap samples recorded since the last call.
+    #[doc(hidden)]
+    pub fn branch_take_reap_samples(&self) -> Vec<ReapSample> {
+        self.branches.take_reap_samples()
+    }
+
+    /// r12-e3's prefetch arm (LeanStore's no-I/O-under-a-latch rule): while on, a reap plans its
+    /// catalog reads under the store mutex with page reads refused, and on a miss releases the
+    /// mutex, reads the missed statement's pages under the catalog's own lock, and starts over.
+    #[doc(hidden)]
+    pub fn branch_set_prefetch(&self, on: bool) {
+        self.branches.set_prefetch(on);
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.

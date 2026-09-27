@@ -56,7 +56,7 @@ use std::num::NonZero;
 use std::path::Path;
 
 use super::arena::Slot;
-use crate::sync::Arc;
+use crate::sync::{Arc, Mutex, MutexGuard};
 use crate::{
     Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, Result, SqliteDialect,
     Statement, Value, IO,
@@ -153,11 +153,14 @@ pub(crate) struct CatBranch {
 }
 
 /// Counters, observing only (r11-restart lane instrument).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct CatalogCounters {
     pub(crate) queries: u64,
     pub(crate) rows_read: u64,
     pub(crate) rows_written: u64,
+    /// The statement (its id) and parameters of the last query the page-read gate refused
+    /// (r12-e3 prefetch arm), until the store takes it.
+    pub(crate) miss: Option<(u8, Vec<Value>)>,
 }
 
 /// An integer as the catalog stores it. Every value the store keeps is below 2^63 except a
@@ -196,6 +199,8 @@ fn cur_key(branch: u64, page: u32) -> Result<i64> {
 
 struct Stmt {
     stmt: Statement,
+    /// Which statement this is, so a refused query can be re-run by id (r12-e3).
+    id: u8,
 }
 
 impl Stmt {
@@ -209,7 +214,15 @@ impl Stmt {
         // Reset at once, finished or not: a statement left un-reset must hold no read mark on the
         // catalog's WAL (a held mark keeps the WAL from ever restarting; PREREG A7).
         self.stmt.reset()?;
-        let rows = rows?;
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(e) => {
+                if super::take_io_refused() {
+                    counters.miss = Some((self.id, params.to_vec()));
+                }
+                return Err(e);
+            }
+        };
         counters.queries += 1;
         counters.rows_read += rows.len() as u64;
         Ok(rows)
@@ -227,6 +240,21 @@ impl Stmt {
         counters.queries += 1;
         counters.rows_written += 1;
         Ok(())
+    }
+}
+
+/// The catalog behind its own lock (r12-e3): the store takes it inside the store mutex, and the
+/// prefetch arm takes it alone, so that a page a reap will read is read outside the store mutex.
+#[derive(Clone)]
+pub(crate) struct CatalogCell(Arc<Mutex<Catalog>>);
+
+impl CatalogCell {
+    pub(crate) fn new(catalog: Catalog) -> Self {
+        Self(Arc::new(Mutex::new(catalog)))
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Catalog> {
+        self.0.lock()
     }
 }
 
@@ -295,7 +323,14 @@ impl Catalog {
         for sql in SCHEMA {
             conn.execute(*sql)?;
         }
-        let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: conn.prepare(sql)? }) };
+        let mut next_id = 0u8;
+        let mut p = |sql: &str| -> Result<Stmt> {
+            next_id += 1;
+            Ok(Stmt {
+                stmt: conn.prepare(sql)?,
+                id: next_id,
+            })
+        };
         Ok(Catalog {
             meta_all: p("SELECT k, v FROM meta")?,
             meta_put: p("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)")?,
@@ -365,6 +400,32 @@ impl Catalog {
             conn,
             _db: db,
         })
+    }
+
+    /// Re-run a query the page-read gate refused, reading its pages (r12-e3 prefetch arm: called
+    /// with the gate off, under the catalog's lock and not the store's). Only the statements a
+    /// reap plans are listed.
+    pub(crate) fn rerun(&mut self, id: u8, params: &[Value]) -> Result<()> {
+        let counters = &mut self.counters;
+        for stmt in [
+            &mut self.branch_get,
+            &mut self.cur_range,
+            &mut self.ret_owner,
+            &mut self.ret_pred,
+            &mut self.ret_born_range,
+            &mut self.ret_died_range,
+            &mut self.child_in,
+            &mut self.child_below,
+            &mut self.child_above,
+        ] {
+            if stmt.id == id {
+                stmt.rows(params, counters)?;
+                return Ok(());
+            }
+        }
+        Err(LimboError::InternalError(format!(
+            "branch catalog: statement {id} is not one a reap plans"
+        )))
     }
 
     /// The meta row, or `None` for a catalog no checkpoint has committed yet.

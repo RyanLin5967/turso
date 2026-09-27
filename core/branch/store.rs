@@ -160,12 +160,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::arena::{Arena, Slot};
-use super::catalog::{CatBranch, Catalog, Meta};
+use super::catalog::{CatBranch, Catalog, CatalogCell, Meta};
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::page_map::PageMap;
 use super::{
     BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchStats, BranchWork, Expired,
-    Reaped,
+    ReapSample, Reaped,
 };
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
@@ -199,6 +199,10 @@ pub(crate) struct BranchStore {
     /// `resolve_into` calls and the arena slot reads they made (r11-restart lane instrument).
     resolve_calls: AtomicU64,
     arena_reads: AtomicU64,
+    /// r12-e3: record a `ReapSample` per reap (observing only).
+    sampling: AtomicBool,
+    /// r12-e3's prefetch arm (see `BranchStore::release_handle`).
+    prefetch: AtomicBool,
 }
 
 struct StoreInner {
@@ -245,11 +249,14 @@ struct StoreInner {
     /// Commits parked by recovery, and parked Commits applied since (observing only).
     parked_records: u64,
     parked_applied: u64,
+    /// r12-e3: one sample per reap while sampling is on (observing only).
+    reap_samples: Vec<ReapSample>,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
 struct CatState {
-    catalog: Catalog,
+    /// Behind its own lock (r12-e3): taken inside the store mutex, or alone by a prefetch.
+    catalog: CatalogCell,
     /// Branches whose catalog rows are stale, and which of their rows (`DIRTY_*`): at the next
     /// checkpoint only those are rewritten (fix v3, PREREG A9: a commit rewrites the branch's `cur`
     /// rows and never its `branch` row, so its secondary indexes are not touched).
@@ -287,7 +294,7 @@ struct CatState {
 impl CatState {
     fn new(catalog: Catalog) -> Self {
         Self {
-            catalog,
+            catalog: CatalogCell::new(catalog),
             dirty: HashMap::new(),
             removed: HashSet::new(),
             trunk_known: HashSet::new(),
@@ -623,6 +630,30 @@ impl ChildIndex {
         Ok((listed || fresh, lo, hi))
     }
 
+    /// The nearest live siblings of the child `parent` forked at `f` — exactly the lookups
+    /// `remove` makes in catalog mode, with its removal mark put back afterwards (r12-e3's plan).
+    fn neighbours(
+        &mut self,
+        cat: &mut Catalog,
+        parent: BranchId,
+        f: u64,
+    ) -> Result<(Option<u64>, Option<u64>)> {
+        let key = (parent.0, f);
+        let prior = self.removed.insert(key, (None, None));
+        let found = self
+            .below(Some(&mut *cat), parent, f)
+            .and_then(|lo| Ok((lo, self.above(Some(&mut *cat), parent, f)?)));
+        match prior {
+            Some(links) => {
+                self.removed.insert(key, links);
+            }
+            None => {
+                self.removed.remove(&key);
+            }
+        }
+        found
+    }
+
     /// Follow the removal links from `e` downward (or upward) to a live child.
     fn resolve(&self, p: u64, mut e: Option<u64>, down: bool) -> Option<u64> {
         while let Some(x) = e {
@@ -834,6 +865,55 @@ impl Lineage {
     }
 }
 
+/// The catalog's trunk versions that F2's query for the reap of the child forked at `f` reads in
+/// place (C-P): `ret_died` in `(f, hi]` without an older live sibling, `ret_born` in `(lo, f]`
+/// without a younger one, else both in a loop doubling from 16 rows until one side ends. The
+/// candidates still need `only_f` and `trunk_gone`. Shared by the release and r12-e3's plan, which
+/// must ask exactly the same statements with exactly the same parameters.
+fn trunk_candidates(
+    catalog: &mut Catalog,
+    f: u64,
+    lo: Option<u64>,
+    hi: Option<u64>,
+    probes: &mut u64,
+    rows: &mut u64,
+    range_entries: &mut u64,
+) -> Result<Vec<(u32, u64, u64, Slot, u32)>> {
+    let candidates = match (lo, hi) {
+        (None, _) => {
+            *probes += 1;
+            catalog.trunk_died_range(f, hi, u64::MAX >> 1)?
+        }
+        (Some(_), None) => {
+            *probes += 1;
+            catalog.trunk_born_range(lo, f, u64::MAX >> 1)?
+        }
+        (Some(_), Some(_)) => {
+            let mut batch = 16u64;
+            loop {
+                *probes += 2;
+                let by_born = catalog.trunk_born_range(lo, f, batch)?;
+                let by_died = catalog.trunk_died_range(f, hi, batch)?;
+                let fetched = (by_born.len() + by_died.len()) as u64;
+                *rows += fetched;
+                *range_entries += fetched;
+                if (by_born.len() as u64) < batch {
+                    break by_born;
+                }
+                if (by_died.len() as u64) < batch {
+                    break by_died;
+                }
+                batch *= 2;
+            }
+        }
+    };
+    if lo.is_none() || hi.is_none() {
+        *rows += candidates.len() as u64;
+        *range_entries += candidates.len() as u64;
+    }
+    Ok(candidates)
+}
+
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
@@ -893,6 +973,8 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+            sampling: AtomicBool::new(false),
+            prefetch: AtomicBool::new(false),
         }
     }
 
@@ -1027,6 +1109,8 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+            sampling: AtomicBool::new(false),
+            prefetch: AtomicBool::new(false),
         };
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
@@ -1062,8 +1146,9 @@ impl BranchStore {
                 stats.trunk_page_loads = cat.trunk_page_loads;
                 stats.trunk_probes = cat.trunk_probes;
                 stats.trunk_rows = cat.trunk_rows;
-                stats.cat_queries = cat.catalog.counters.queries;
-                stats.cat_rows_read = cat.catalog.counters.rows_read;
+                let catalog = cat.catalog.lock();
+                stats.cat_queries = catalog.counters.queries;
+                stats.cat_rows_read = catalog.counters.rows_read;
             }
         }
         store.open_stats = stats;
@@ -1105,7 +1190,7 @@ impl BranchStore {
         inner.n_states = meta.states;
         inner.lease.recovered(meta.lease_now_ms);
         let mut cat = CatState::new(catalog);
-        cat.lease_floor = cat.catalog.lease_min()?;
+        cat.lease_floor = cat.catalog.lock().lease_min()?;
         inner.cat = Some(cat);
         // Replay, remembering every slot a record names (in use) and every slot its replay frees,
         // in order: the last word on each slot wins.
@@ -1161,7 +1246,7 @@ impl BranchStore {
         let mut taken = HashSet::new();
         let mut high_water = file_hw.max(meta.arena_hw);
         for (&slot, &used) in &touched {
-            let was_used = slot < meta.arena_hw && !cat.catalog.free_has(slot)?;
+            let was_used = slot < meta.arena_hw && !cat.catalog.lock().free_has(slot)?;
             in_use += used as i64 - was_used as i64;
             if slot < meta.arena_hw && !was_used {
                 // The catalog lists it free; this process owns it now either way.
@@ -1322,12 +1407,12 @@ impl BranchStore {
         // index; the rows due are made resident, which puts their deadlines in `leases`.
         if let Some(cat) = inner.cat.as_mut() {
             if cat.lease_floor.is_some_and(|floor| floor <= now) {
-                let due_rows = cat.catalog.lease_due(now)?;
+                let due_rows = cat.catalog.lock().lease_due(now)?;
                 for id in due_rows {
                     inner.ensure(BranchId(id))?;
                 }
                 let cat = inner.cat.as_mut().expect("still a catalog store");
-                cat.lease_floor = cat.catalog.lease_min_after(now)?;
+                cat.lease_floor = cat.catalog.lock().lease_min_after(now)?;
             }
         }
         let due: Vec<BranchId> = inner
@@ -1583,9 +1668,89 @@ impl BranchStore {
     ///
     /// An error when the release could not be made durable (review N4): the branch is then kept —
     /// nothing is freed in this process — and comes back, detached, at the next open.
+    /// Release a branch's handle (or, for a detached one, the branch).
+    ///
+    /// r12-e3 prefetch arm (LeanStore's rule: no I/O while holding a latch; a miss releases the
+    /// latch, loads, and restarts): while `prefetch` is on, a catalog store first PLANS the reap
+    /// under the store mutex with the page-read gate refusing every page-cache miss — the loads,
+    /// neighbour lookups and trunk ranges the release will make, mutating nothing logical
+    /// (`StoreInner::plan_reap`). On a miss it releases the store mutex, re-runs the missed
+    /// statement with I/O under the catalog's own lock only, and starts over. When the plan passes,
+    /// every page the release will read is in the catalog's page cache, and the release runs with
+    /// the gate COUNTING any miss it did not foresee (a late miss). The checkpoint a release may
+    /// trigger runs with the gate off and is counted apart.
     pub(crate) fn release_handle(&self, id: BranchId) -> Result<Reaped> {
-        let mut inner = self.inner.lock();
+        let prefetch = self.prefetch.load(Ordering::Relaxed);
+        let mut sample = ReapSample::default();
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        loop {
+            let asked = Instant::now();
+            let mut inner = self.inner.lock();
+            let held = Instant::now();
+            sample.wait_ns += ns(held - asked);
+            if prefetch && inner.cat.is_some() && sample.reruns < 64 {
+                let reads = super::thread_page_reads();
+                let gate = super::set_io_mode(super::IO_REFUSE);
+                let planned = inner.plan_reap(id);
+                super::set_io_mode(gate);
+                sample.plan_reads += super::thread_page_reads() - reads;
+                if let Err(e) = planned {
+                    let cat = inner.cat.as_ref().expect("checked above");
+                    let missed = cat.catalog.lock().counters.miss.take();
+                    let Some((stmt, params)) = missed else {
+                        return Err(e);
+                    };
+                    let catalog = cat.catalog.clone();
+                    sample.plan_hold_ns += ns(held.elapsed());
+                    drop(inner);
+                    // The prefetch: outside the store mutex, under the catalog's lock alone.
+                    let started = Instant::now();
+                    let reads = super::thread_page_reads();
+                    catalog.lock().rerun(stmt, &params)?;
+                    sample.prefetch_reads += super::thread_page_reads() - reads;
+                    sample.prefetch_ns += ns(started.elapsed());
+                    sample.reruns += 1;
+                    continue;
+                }
+            } else if prefetch && inner.cat.is_some() {
+                sample.gave_up = true;
+            }
+            let gate = if prefetch {
+                super::set_io_mode(super::IO_COUNT)
+            } else {
+                super::IO_OFF
+            };
+            let released = self.release_section(&mut inner, id, &mut sample, held);
+            if prefetch {
+                super::set_io_mode(gate);
+            }
+            return released;
+        }
+    }
+
+    /// The release itself, under the store mutex (`held`: when it was taken). Fills `sample`'s
+    /// section fields and, while sampling is on, records it.
+    fn release_section(
+        &self,
+        inner: &mut StoreInner,
+        id: BranchId,
+        sample: &mut ReapSample,
+        held: Instant,
+    ) -> Result<Reaped> {
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let queries = |inner: &StoreInner| {
+            inner.cat.as_ref().map_or(0, |c| c.catalog.lock().counters.queries)
+        };
+        let loads = |inner: &StoreInner| inner.cat.as_ref().map_or(0, |c| c.branch_loads);
+        let (queries0, loads0) = (queries(inner), loads(inner));
+        let (reads0, fsyncs0, late0) = (
+            super::thread_page_reads(),
+            super::thread_fsyncs(),
+            super::thread_late_misses(),
+        );
+        let phase = Instant::now();
         inner.ensure(id)?;
+        sample.ensure_ns = ns(phase.elapsed());
         let Some(st) = inner.branches.get(&id) else {
             return Ok(Reaped {
                 freed_pages: 0,
@@ -1604,7 +1769,8 @@ impl BranchStore {
             }
             Handle::Attached | Handle::Detached => {}
         }
-        if let Err(e) = self.log(&mut inner, Record::Release { branch: id.0 }) {
+        let phase = Instant::now();
+        if let Err(e) = self.log(inner, Record::Release { branch: id.0 }) {
             // The release is not durable, so nothing may be freed — now or ever in this process:
             // after a restart the branch comes back (detached), and its slots must still hold
             // what it names. ReleasePending is the state `collect` never frees.
@@ -1618,19 +1784,60 @@ impl BranchStore {
                 id.0
             )));
         }
+        sample.log_ns = ns(phase.elapsed());
+        let phase = Instant::now();
         let mut freed = Vec::new();
         if let Err(e) = inner.apply_release(id, &mut freed) {
             return Err(inner.fatal(e));
         }
         let freed_pages = freed.len();
         inner.release_slots(freed);
-        self.sync_trunk_children(&inner);
-        self.sync_lease_flag(&inner);
-        self.maybe_compact(&mut inner);
+        self.sync_trunk_children(inner);
+        self.sync_lease_flag(inner);
+        sample.collect_ns = ns(phase.elapsed());
+        // A checkpoint, if the log asks for one: its I/O is the checkpoint's, counted apart.
+        sample.ckpt = inner.journal.as_ref().is_some_and(|j| j.wants_compaction());
+        let (ckpt_reads0, ckpt_fsyncs0, ckpt_queries0) =
+            (super::thread_page_reads(), super::thread_fsyncs(), queries(inner));
+        let gate = super::set_io_mode(super::IO_OFF);
+        let phase = Instant::now();
+        self.maybe_compact(inner);
+        sample.ckpt_ns = ns(phase.elapsed());
+        super::set_io_mode(gate);
+        sample.ckpt_reads = super::thread_page_reads() - ckpt_reads0;
+        sample.ckpt_fsyncs = super::thread_fsyncs() - ckpt_fsyncs0;
+        sample.ckpt_queries = queries(inner) - ckpt_queries0;
+        sample.queries = queries(inner) - queries0 - sample.ckpt_queries;
+        sample.loads = loads(inner) - loads0;
+        sample.page_reads = super::thread_page_reads() - reads0 - sample.ckpt_reads;
+        sample.fsyncs = super::thread_fsyncs() - fsyncs0 - sample.ckpt_fsyncs;
+        sample.late = super::thread_late_misses() - late0;
+        let deferred = inner.branches.contains_key(&id);
+        sample.hold_ns = ns(held.elapsed());
+        if self.sampling.load(Ordering::Relaxed) {
+            inner.reap_samples.push(*sample);
+        }
         Ok(Reaped {
             freed_pages,
-            deferred: inner.branches.contains_key(&id),
+            deferred,
         })
+    }
+
+    /// r12-e3: record a `ReapSample` per reap while on.
+    pub(crate) fn set_reap_sampling(&self, on: bool) {
+        self.sampling.store(on, Ordering::Relaxed);
+        if !on {
+            self.inner.lock().reap_samples = Vec::new();
+        }
+    }
+
+    pub(crate) fn take_reap_samples(&self) -> Vec<ReapSample> {
+        std::mem::take(&mut self.inner.lock().reap_samples)
+    }
+
+    /// r12-e3's prefetch arm on or off (see `release_handle`).
+    pub(crate) fn set_prefetch(&self, on: bool) {
+        self.prefetch.store(on, Ordering::Relaxed);
     }
 
     /// Detach a live branch from its handle without releasing it.
@@ -1677,7 +1884,8 @@ impl BranchStore {
         // are listed above; removed ones are gone).
         let StoreInner { cat, branches, .. } = &mut *inner;
         if let Some(cat) = cat.as_mut() {
-            for id in cat.catalog.unreleased_ids()?.into_iter().map(BranchId) {
+            let unreleased = cat.catalog.lock().unreleased_ids()?;
+            for id in unreleased.into_iter().map(BranchId) {
                 if !branches.contains_key(&id) && !cat.removed.contains(&id) {
                     ids.push(id);
                 }
@@ -1796,7 +2004,8 @@ impl BranchStore {
         }
         let keep = {
             let StoreInner { children, cat, .. } = &mut *inner;
-            children.any_in(cat.as_mut().map(|c| &mut c.catalog), BranchId::TRUNK, born, epoch)?
+            let mut catalog = cat.as_ref().map(|c| c.catalog.lock());
+            children.any_in(catalog.as_deref_mut(), BranchId::TRUNK, born, epoch)?
         };
         if keep {
             inner.refill_free()?;
@@ -2055,6 +2264,7 @@ impl BranchStore {
         let others = match cat.as_mut() {
             Some(cat) => cat
                 .catalog
+                .lock()
                 .trunk_count()
                 .unwrap_or_default()
                 .saturating_sub(cat.trunk_gone.len() as u64),
@@ -2069,7 +2279,7 @@ impl BranchStore {
             .lock()
             .cat
             .as_ref()
-            .map_or(0, |c| c.catalog.counters.rows_written)
+            .map_or(0, |c| c.catalog.lock().counters.rows_written)
     }
 
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
@@ -2077,11 +2287,12 @@ impl BranchStore {
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {
         let inner = self.inner.lock();
         inner.cat.as_ref().map_or((0, 0, 0, 0), |c| {
+            let catalog = c.catalog.lock();
             (
                 c.branch_loads,
                 c.trunk_page_loads,
-                c.catalog.counters.queries,
-                c.catalog.counters.rows_read,
+                catalog.counters.queries,
+                catalog.counters.rows_read,
             )
         })
     }
@@ -2144,6 +2355,7 @@ impl BranchStore {
         let cursor = cat.free_cursor;
         let listed: HashSet<Slot> = cat
             .catalog
+            .lock()
             .free_all()
             .unwrap_or_default()
             .into_iter()
@@ -2168,7 +2380,7 @@ impl BranchStore {
         cat.as_mut().is_some_and(|cat| {
             !cat.taken.contains(&slot)
                 && cat.free_cursor.is_none_or(|c| slot > c)
-                && cat.catalog.free_has(slot).unwrap_or(false)
+                && cat.catalog.lock().free_has(slot).unwrap_or(false)
         })
     }
 
@@ -2273,6 +2485,7 @@ impl StoreInner {
             deferred_freed: Vec::new(),
             parked_records: 0,
             parked_applied: 0,
+            reap_samples: Vec::new(),
         }
     }
 
@@ -2337,8 +2550,8 @@ impl StoreInner {
     }
 
     /// The catalog, in a catalog store that has files.
-    fn catalog(&mut self) -> Option<&mut Catalog> {
-        self.cat.as_mut().map(|c| &mut c.catalog)
+    fn catalog(&self) -> Option<crate::sync::MutexGuard<'_, Catalog>> {
+        self.cat.as_ref().map(|c| c.catalog.lock())
     }
 
     /// Make `id`'s state resident. An eager store holds every state; a catalog store reads one
@@ -2359,7 +2572,7 @@ impl StoreInner {
             let loaded = if cat.removed.contains(&next) {
                 None
             } else {
-                cat.catalog.load_branch(next.0)?
+                cat.catalog.lock().load_branch(next.0)?
             };
             let Some(b) = loaded else {
                 if chain.is_empty() {
@@ -2381,6 +2594,34 @@ impl StoreInner {
             self.apply_parked(loaded)?;
         }
         Ok(true)
+    }
+
+    /// r12-e3 prefetch arm: make, first, the catalog reads the release of `id` will make —
+    /// `ensure` (a cache fill, not a logical change), the trunk child's neighbour lookups exactly as
+    /// `ChildIndex::remove` makes them (its removal mark put back), and the trunk ranges exactly as
+    /// `trunk_catalog_garbage` asks them — so that under a refusing page-read gate a miss surfaces
+    /// here, before anything is logged or freed. A branch the release would not free (released,
+    /// open, a parent, or a child of a branch) is planned no further than `ensure`: its release
+    /// then runs with the gate counting whatever it reads.
+    fn plan_reap(&mut self, id: BranchId) -> Result<()> {
+        if !self.ensure(id)? {
+            return Ok(());
+        }
+        let st = &self.branches[&id];
+        if st.handle.is_released() || st.open || st.lineage.n_children > 0 || !st.parent.is_trunk()
+        {
+            return Ok(());
+        }
+        let f = st.fork_epoch;
+        let StoreInner { children, cat, .. } = self;
+        let Some(cat) = cat.as_mut() else {
+            return Ok(());
+        };
+        let mut catalog = cat.catalog.lock();
+        let (lo, hi) = children.neighbours(&mut catalog, BranchId::TRUNK, f)?;
+        let (mut probes, mut rows, mut entries) = (0, 0, 0);
+        trunk_candidates(&mut catalog, f, lo, hi, &mut probes, &mut rows, &mut entries)?;
+        Ok(())
     }
 
     /// C-R: apply `id`'s parked Commits, in log order, now that it is resident. A slot one of them
@@ -2504,7 +2745,8 @@ impl StoreInner {
             return Ok(());
         }
         cat.trunk_probes += 1;
-        if let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, u64::MAX)? {
+        let last = cat.catalog.lock().trunk_pred(page, u64::MAX)?;
+        if let Some((born, died, slot, crc)) = last {
             cat.trunk_rows += 1;
             // A version reaped since the checkpoint still dates the page's last write.
             if !cat.trunk_gone.contains(&(page, born)) {
@@ -2553,7 +2795,8 @@ impl StoreInner {
             }
         }
         cat.trunk_probes += 1;
-        let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, at)? else {
+        let found = cat.catalog.lock().trunk_pred(page, at)?;
+        let Some((born, died, slot, crc)) = found else {
             return Ok(None);
         };
         cat.trunk_rows += 1;
@@ -2589,38 +2832,15 @@ impl StoreInner {
         let only_f = |born: u64, died: u64| {
             lo.is_none_or(|lo| born > lo) && born <= f && f < died && hi.is_none_or(|hi| died <= hi)
         };
-        let mut candidates = match (lo, hi) {
-            (None, _) => {
-                cat.trunk_probes += 1;
-                cat.catalog.trunk_died_range(f, hi, u64::MAX >> 1)?
-            }
-            (Some(_), None) => {
-                cat.trunk_probes += 1;
-                cat.catalog.trunk_born_range(lo, f, u64::MAX >> 1)?
-            }
-            (Some(_), Some(_)) => {
-                let mut batch = 16u64;
-                loop {
-                    cat.trunk_probes += 2;
-                    let by_born = cat.catalog.trunk_born_range(lo, f, batch)?;
-                    let by_died = cat.catalog.trunk_died_range(f, hi, batch)?;
-                    let fetched = (by_born.len() + by_died.len()) as u64;
-                    cat.trunk_rows += fetched;
-                    self.work.gc_range_entries += fetched;
-                    if (by_born.len() as u64) < batch {
-                        break by_born;
-                    }
-                    if (by_died.len() as u64) < batch {
-                        break by_died;
-                    }
-                    batch *= 2;
-                }
-            }
-        };
-        if lo.is_none() || hi.is_none() {
-            cat.trunk_rows += candidates.len() as u64;
-            self.work.gc_range_entries += candidates.len() as u64;
-        }
+        let mut candidates = trunk_candidates(
+            &mut cat.catalog.lock(),
+            f,
+            lo,
+            hi,
+            &mut cat.trunk_probes,
+            &mut cat.trunk_rows,
+            &mut self.work.gc_range_entries,
+        )?;
         candidates.retain(|&(page, born, died, _, _)| {
             only_f(born, died) && !cat.trunk_gone.contains(&(page, born))
         });
@@ -2650,7 +2870,7 @@ impl StoreInner {
             return Ok(());
         };
         while arena.free_count() == 0 && !cat.free_exhausted {
-            let batch = cat.catalog.free_batch(cat.free_cursor, 256)?;
+            let batch = cat.catalog.lock().free_batch(cat.free_cursor, 256)?;
             match batch.last() {
                 None => cat.free_exhausted = true,
                 Some(&last) => cat.free_cursor = Some(last),
@@ -2695,7 +2915,7 @@ impl StoreInner {
             // (VACUUM and journal-mode changes are refused while a branch exists, so only the
             // empty case is reachable.)
             let catalog_retains = match self.catalog() {
-                Some(cat) => cat.any_retained()?,
+                Some(mut cat) => cat.any_retained()?,
                 None => false,
             };
             if self.n_states > 0 || !self.trunk.lineage.retained.is_empty() || catalog_retains {
@@ -2920,7 +3140,8 @@ impl StoreInner {
                 arena.in_use()
             );
         }
-        let catalog = &mut cat.catalog;
+        let mut catalog_guard = cat.catalog.lock();
+        let catalog = &mut *catalog_guard;
         catalog.begin()?;
         let written = (|| -> Result<()> {
             for (b, what) in &rows {
@@ -2963,6 +3184,7 @@ impl StoreInner {
             catalog.rollback();
             return Err(e);
         }
+        drop(catalog_guard);
         // From here the catalog is the truth; the log is stale by generation.
         if fail_after_commit {
             journal.poison();
@@ -2973,7 +3195,8 @@ impl StoreInner {
         journal.restart_at(generation)?;
         // Fix v2 (PREREG A7): bound the catalog's own WAL. The checkpoint above is already durable, so
         // a failure here costs only WAL length, never state: it is logged, not returned.
-        match cat.catalog.truncate_wal() {
+        let truncated = cat.catalog.lock().truncate_wal();
+        match truncated {
             Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
                 tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
             }
@@ -3002,7 +3225,7 @@ impl StoreInner {
         cat.free_cursor = None;
         cat.free_exhausted = false;
         cat.taken = reserved.into_iter().collect();
-        cat.lease_floor = cat.catalog.lease_min()?;
+        cat.lease_floor = cat.catalog.lock().lease_min()?;
         self.lease.queued(now);
         self.lease.flushed();
         Ok(())
@@ -3098,7 +3321,8 @@ impl StoreInner {
             cat,
             ..
         } = self;
-        let mut catalog = cat.as_mut().map(|c| &mut c.catalog);
+        let mut catalog_guard = cat.as_ref().map(|c| c.catalog.lock());
+        let mut catalog = catalog_guard.as_deref_mut();
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         let epoch = st.lineage.epoch;
         let mut what = DIRTY_CUR;
@@ -3128,6 +3352,7 @@ impl StoreInner {
                 }
             }
         }
+        drop(catalog_guard);
         self.mark_dirty(id, what);
         Ok(())
     }
@@ -3182,7 +3407,9 @@ impl StoreInner {
                     ..
                 } = self;
                 let st = branches.get_mut(&id).expect("just looked it up");
-                st.retire_current(id, children, cat.as_mut().map(|c| &mut c.catalog), freed)?;
+                let mut catalog = cat.as_ref().map(|c| c.catalog.lock());
+                st.retire_current(id, children, catalog.as_deref_mut(), freed)?;
+                drop(catalog);
                 self.mark_dirty(id, DIRTY_CUR | DIRTY_RET);
                 return Ok(());
             }
@@ -3205,8 +3432,10 @@ impl StoreInner {
                 )));
             }
             let catalog_mode = self.cat.is_some();
-            let catalog = self.cat.as_mut().map(|c| &mut c.catalog);
-            let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode)?;
+            let (listed, lo, hi) = {
+                let mut catalog = self.cat.as_ref().map(|c| c.catalog.lock());
+                self.children.remove(catalog.as_deref_mut(), parent, f, catalog_mode)?
+            };
             crate::turso_assert!(listed, "detached a child the parent does not list");
             if parent.is_trunk() {
                 // In memory: every version (eager), or those retained since the last checkpoint
@@ -3240,7 +3469,7 @@ impl StoreInner {
             .filter(|(_, st)| st.handle == Handle::Released)
             .map(|(&id, _)| id)
             .collect();
-        if let Some(cat) = self.catalog() {
+        if let Some(mut cat) = self.catalog() {
             released.extend(cat.released_ids()?.into_iter().map(BranchId));
             released.sort_unstable();
             released.dedup();
