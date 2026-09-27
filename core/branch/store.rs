@@ -141,6 +141,10 @@ pub(crate) struct BranchStore {
     /// FS10 (r11-sessions): branch pagers release their private cache entries for pages held by
     /// reference when their connection's last statement ends (see `Pager::release_shared_pages`).
     fs10: AtomicBool,
+    /// FS10 fill by reference (r11-sessions amendment 14): a branch that reads a trunk page from the
+    /// WAL or the file and fills F6 with it then holds F6's bytes, not its own copy
+    /// (`TURSO_R11S_FS10=2`, which also turns FS10 on).
+    fs10_fill: AtomicBool,
     /// FS9B (r11-sessions): serve inherited ancestor-branch versions by reference (`Arena::clones`).
     fs9b: AtomicBool,
 }
@@ -262,19 +266,27 @@ impl TrunkPages {
 
     /// Cache `bytes` as the version `key` names, unless the generation has moved on since `key` was
     /// resolved or a version at least as new is already cached.
-    fn fill(&self, key: TrunkPageKey, bytes: &[u8]) {
+    fn fill(&self, key: TrunkPageKey, bytes: &[u8]) -> Option<Arc<crate::alloc::DynBoxedSlice<u8>>> {
         if key.generation != self.generation.load(Ordering::Acquire) {
-            return;
+            return None;
         }
         let new = std::sync::Arc::new(CachedPage {
             generation: key.generation,
             epoch: key.epoch,
             bytes: Arc::new(bytes.to_vec().into_boxed_slice()),
         });
-        self.pages.get_or_insert(key.page).rcu(|old| match old {
+        let slot = self.pages.get_or_insert(key.page);
+        slot.rcu(|old| match old {
             Some(p) if p.generation == key.generation && p.epoch >= key.epoch => Some(p.clone()),
             _ => Some(new.clone()),
         });
+        // A version cached at the same epoch and generation holds the same bytes, whoever filled
+        // it; a newer epoch is another version and is never handed back.
+        let cur = slot.load();
+        match &*cur {
+            Some(p) if p.generation == key.generation && p.epoch == key.epoch => Some(p.bytes.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -609,7 +621,10 @@ impl BranchStore {
             trunk_format: OnceLock::new(),
             fw3: std::sync::atomic::AtomicBool::new(super::walpin::fw3()),
             fs9: AtomicBool::new(fs9_from_env()),
-            fs10: AtomicBool::new(std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "1")),
+            fs10: AtomicBool::new(
+                std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "1" || v == "2"),
+            ),
+            fs10_fill: AtomicBool::new(std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "2")),
             fs9b: AtomicBool::new(fs9b_from_env()),
         }
     }
@@ -621,14 +636,20 @@ impl BranchStore {
 
     /// Cache a trunk page the pager has read for a branch, under the key [`Self::resolve_into`]
     /// gave for it. `bytes` must be the whole page as the WAL or the database file held it under
-    /// the reading connection's snapshot.
-    pub(crate) fn fill_trunk_page(&self, key: TrunkPageKey, bytes: &[u8]) {
+    /// the reading connection's snapshot. Returns the cache's bytes when the cache now holds
+    /// exactly this version (same page, epoch and generation), so the reader may hold them instead
+    /// of its own copy; `None` when the fill was refused or a newer version is cached.
+    pub(crate) fn fill_trunk_page(
+        &self,
+        key: TrunkPageKey,
+        bytes: &[u8],
+    ) -> Option<Arc<crate::alloc::DynBoxedSlice<u8>>> {
         let page_size = self.trunk_format.get().map(|f| f.0);
         crate::turso_assert!(
             page_size == Some(bytes.len()),
             "a trunk page to cache is not one page long"
         );
-        self.trunk_pages.fill(key, bytes);
+        self.trunk_pages.fill(key, bytes)
     }
 
     pub(crate) fn set_fs9(&self, on: bool) {
@@ -649,6 +670,14 @@ impl BranchStore {
 
     pub(crate) fn fs10(&self) -> bool {
         self.fs10.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_fs10_fill(&self, on: bool) {
+        self.fs10_fill.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn fs10_fill(&self) -> bool {
+        self.fs10_fill.load(Ordering::Relaxed)
     }
 
     /// Trunk pages F6's shared cache holds a version of: the shared pool's size, in pages.

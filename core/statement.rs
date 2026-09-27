@@ -556,13 +556,6 @@ impl Statement {
                 .fetch_sub(1, Ordering::SeqCst);
             if previous == 1 {
                 self.program.connection.clear_interrupt_if_idle();
-                // No statement runs on this connection now: a branch pager lets go of its cache
-                // entries for pages it holds by reference (FS10; a no-op unless enabled).
-                self.program
-                    .connection
-                    .pager
-                    .load()
-                    .release_shared_pages();
             }
             self.counted_as_active_root = false;
         }
@@ -1621,6 +1614,23 @@ impl Statement {
         }
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
+        // This statement's cursors are gone, so it pins no page. If no root statement runs on the
+        // connection, a branch pager lets go of its cache entries for pages it holds by reference
+        // (FS10; a no-op unless enabled). At Done the cursors still pinned their page stacks, which
+        // the release must skip (r11-sessions amendment 14).
+        if self
+            .program
+            .connection
+            .n_active_root_statements
+            .load(Ordering::SeqCst)
+            == 0
+        {
+            self.program
+                .connection
+                .pager
+                .load()
+                .release_shared_pages();
+        }
         self.busy = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;

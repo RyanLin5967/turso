@@ -526,6 +526,14 @@ impl Database {
         self.branches.set_fs10(on);
     }
 
+    /// FS10 fill by reference (r11-sessions amendment 14): a branch that fills the shared
+    /// trunk-page cache holds the cache's bytes instead of its own copy. Normally taken from
+    /// `TURSO_R11S_FS10=2`; tests set it per database.
+    #[doc(hidden)]
+    pub fn set_fs10_fill(&self, on: bool) {
+        self.branches.set_fs10_fill(on);
+    }
+
     /// Trunk pages held in the shared trunk-page cache (the FS10 pool's size). Observation only.
     #[doc(hidden)]
     pub fn trunk_cache_pages(&self) -> usize {

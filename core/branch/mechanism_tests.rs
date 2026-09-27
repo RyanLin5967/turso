@@ -1173,6 +1173,38 @@ fn a_held_idle_session_keeps_no_private_entry_for_a_shared_page() {
     assert_eq!(value(&trunk, 10), Some(original(10)));
 }
 
+/// FS10 fill by reference (r11-sessions amendment 14). The first branch to read a trunk version
+/// reads it from the file and fills the shared cache with it; holding the fill by reference, it
+/// keeps the cache's bytes rather than its own copy, so after its statement it too holds no private
+/// entry (`FS10C_FILL_COPY` keeps the copy). A trunk write after the fill stays invisible to it, and
+/// its own write still copies first.
+#[test]
+fn the_first_reader_holds_the_trunk_page_it_filled_by_reference() {
+    let (_dir, db) = open_db();
+    db.set_fs10(true);
+    db.set_fs10_fill(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let before: BTreeMap<i64, String> = (1..=300).map(|id| (id, original(id))).collect();
+    let b1 = trunk.fork_branch().unwrap();
+    let c1 = b1.connect().unwrap();
+    assert_eq!(table(&c1), before);
+    assert_eq!(
+        c1.pager.load().page_cache_len(),
+        0,
+        "the first reader kept private copies of the pages it filled into the shared cache"
+    );
+    set(&trunk, 10, "trunk-after-fill");
+    assert_eq!(table(&c1), before);
+    set(&c1, 20, "b1-write");
+    assert_eq!(value(&c1, 20), Some("b1-write".to_string()));
+    let b2 = trunk.fork_branch().unwrap();
+    let c2 = b2.connect().unwrap();
+    assert_eq!(value(&c2, 20), Some(original(20)));
+    assert_eq!(value(&c2, 10), Some("trunk-after-fill".to_string()));
+    assert_eq!(value(&trunk, 20), Some(original(20)));
+}
+
 /// FS9B. Branches forked from a chain read a version an interior ANCESTOR branch holds for them
 /// (its retained pre-image, and its current page) by reference, one shared copy per slot; the copy
 /// goes when the slot is released (`FS9B_NO_EVICT` keeps it) or written: once no child can see a

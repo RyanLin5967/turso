@@ -1523,6 +1523,9 @@ pub struct Pager {
     /// Set when this pager serves a branch instead of the trunk: reads resolve through the
     /// branch's page space and commits go to it, never to the WAL.
     branch: OnceLock<BranchBinding>,
+    /// FS10: a page held by reference may be in the private cache (set when one is installed;
+    /// cleared by a release that left none), so a release with nothing to do walks nothing.
+    shared_cached: Arc<AtomicBool>,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1812,6 +1815,7 @@ impl Pager {
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
             branch_store: OnceLock::new(),
             branch: OnceLock::new(),
+            shared_cached: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1855,9 +1859,10 @@ impl Pager {
 
     /// FS10 (r11-sessions): on a branch pager, drop the private cache entries of pages held by
     /// reference (Buffer::Shared: F6's trunk pages, FS9's clones) once no statement runs on the
-    /// connection. Between statements no cursor holds a page, so this is ordinary eviction of clean
-    /// pages; the next statement re-resolves them from the shared pool by reference. A held idle
-    /// session then keeps no per-page state for shared pages. Returns the entries released.
+    /// connection and the finishing statement's cursors are gone. Then no cursor of this
+    /// connection holds a page, so this is ordinary eviction of clean pages; the next statement
+    /// re-resolves them from the shared pool by reference. A held idle session then keeps no
+    /// per-page state for shared pages. Returns the entries released.
     pub(crate) fn release_shared_pages(&self) -> usize {
         if !self.branch.get().is_some_and(|b| b.store.fs10()) {
             return 0;
@@ -1866,13 +1871,22 @@ impl Pager {
         if crate::branch::store::mutants::on("FS10_KEEP_PRIVATE") {
             return 0;
         }
-        self.page_cache.write().delete_clean_shared(|page| {
+        if !self.shared_cached.swap(false, Ordering::AcqRel) {
+            return 0;
+        }
+        let (released, kept) = self.page_cache.write().delete_clean_shared(|page| {
             page.get()
                 .buffer
                 .as_ref()
                 .is_some_and(|b| matches!(**b, Buffer::Shared(_)))
-        })
+        });
+        if kept > 0 {
+            self.shared_cached.store(true, Ordering::Release);
+        }
+        released
     }
+
+
 
     /// This pager's private page-cache capacity, in pages. Observation only.
     pub(crate) fn page_cache_capacity(&self) -> usize {
@@ -3581,9 +3595,13 @@ impl Pager {
         // has, and a failed read reaches it as an error and is not cached.
         let store = branch.store.clone();
         let loaded = page.clone();
+        let shared_cached = self.shared_cached.clone();
         let mut fill = CompletionGroup::new(move |res| {
             if res.is_ok() && loaded.is_loaded() {
-                store.fill_trunk_page(key, loaded.get_contents().as_slice());
+                let cached = store.fill_trunk_page(key, loaded.get_contents().as_slice());
+                if store.fs10_fill() {
+                    hold_filled_by_reference(&loaded, cached, &shared_cached);
+                }
             }
         });
         fill.add(&c);
@@ -3738,7 +3756,10 @@ impl Pager {
             // The trunk's cached version, held by reference: every open session that reads this
             // version shares one copy of its bytes (FS5). `copy_on_write_decision` gives the page
             // a private copy before its first write.
-            Resolved::Shared(bytes) => buf = Arc::new(Buffer::new_shared(bytes)),
+            Resolved::Shared(bytes) => {
+                buf = Arc::new(Buffer::new_shared(bytes));
+                self.shared_cached.store(true, Ordering::Release);
+            }
             Resolved::Filled => {}
         }
         let page = Arc::new(Page::new(page_idx));
@@ -3842,9 +3863,12 @@ impl Pager {
                 // frame of the page after the branch's fork, and the generation held), so F6 may
                 // cache them for the next branch. The read above completed synchronously.
                 if !allow_empty_read && page.is_loaded() {
-                    branch
+                    let cached = branch
                         .store
                         .fill_trunk_page(key, page.get_contents().as_slice());
+                    if branch.store.fs10_fill() {
+                        hold_filled_by_reference(&page, cached, &self.shared_cached);
+                    }
                 }
                 return Ok((page, c));
             }
@@ -7474,5 +7498,24 @@ pub(crate) mod fw3_test_hook {
             2 => (still_trunk, true),
             _ => (still_trunk, same_generation),
         }
+    }
+}
+
+/// FS10 fill by reference (r11-sessions amendment 14): once `page`, read from the WAL or the file
+/// for a branch, is cached in F6 as exactly the version it read (`cached`), the page holds F6's
+/// bytes instead of this read's own buffer, which goes back to the pool. `shared_cached` is the
+/// pager's flag that a page held by reference may be in its cache.
+fn hold_filled_by_reference(
+    page: &Page,
+    cached: Option<Arc<crate::alloc::DynBoxedSlice<u8>>>,
+    shared_cached: &AtomicBool,
+) {
+    #[cfg(test)]
+    if crate::branch::store::mutants::on("FS10C_FILL_COPY") {
+        return;
+    }
+    if let Some(bytes) = cached {
+        page.get().buffer = Some(Arc::new(Buffer::new_shared(bytes)));
+        shared_cached.store(true, Ordering::Release);
     }
 }

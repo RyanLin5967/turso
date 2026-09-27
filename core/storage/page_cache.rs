@@ -386,25 +386,35 @@ impl PageCache {
 
     /// FS10 (r11-sessions): remove every clean, unlocked, unpinned entry whose page `is_shared`
     /// says is held by reference from a shared pool, leaving the page itself loaded (another holder
-    /// keeps a valid page), then give the map's spare capacity back. Returns the entries removed.
-    pub fn delete_clean_shared(&mut self, is_shared: impl Fn(&PageRef) -> bool) -> usize {
+    /// keeps a valid page), then give the map's spare capacity back. Returns the entries removed and
+    /// the shared entries kept (dirty, locked or pinned).
+    pub fn delete_clean_shared(&mut self, is_shared: impl Fn(&PageRef) -> bool) -> (usize, usize) {
+        let mut kept = 0;
         let keys: Vec<PageCacheKey> = self
             .map
             .iter()
             .filter_map(|(key, &entry_ptr)| {
                 let page = unsafe { &(*entry_ptr).page };
-                (!page.is_dirty() && !page.is_locked() && !page.is_pinned() && is_shared(page))
-                    .then_some(*key)
+                if !is_shared(page) {
+                    return None;
+                }
+                if page.is_dirty() || page.is_locked() || page.is_pinned() {
+                    kept += 1;
+                    return None;
+                }
+                Some(*key)
             })
             .collect();
         let mut removed = 0;
         for key in keys {
             if self._delete(key, false).is_ok() {
                 removed += 1;
+            } else {
+                kept += 1;
             }
         }
         self.map.shrink_to_fit();
-        removed
+        (removed, kept)
     }
 
     #[inline]
