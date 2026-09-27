@@ -394,6 +394,9 @@ pub(crate) struct BranchStore {
     /// waits on it, so every waiting operation (not only one that happens to join the thread)
     /// waits for the install, and none waits for the WAL truncation after it.
     installs: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+    /// Test hook (merge 1b(ii) review F6): while it holds `HOLD_BETWEEN_MAP_HOLDS`, a commit that
+    /// maps in more than two holds waits before its third, with no lock held.
+    publish_hold: AtomicU8,
     /// Live children of the trunk. Read without the lock on every trunk first-write so that a
     /// database with no branches pays one atomic load per written page and nothing else.
     ///
@@ -710,6 +713,9 @@ pub(crate) const HOLD_AFTER_COMMIT: u8 = 3;
 
 /// Or-ed into the hook's stage once the flight has arrived there (tests wait for it).
 pub(crate) const HOLD_ARRIVED: u8 = 0x80;
+
+/// The commit hook's stage (`BranchStore::publish_hold`): before a commit's third map hold.
+pub(crate) const HOLD_BETWEEN_MAP_HOLDS: u8 = 4;
 
 /// If the hook is at `stage`, mark the arrival and wait until it is moved (tests and the harness
 /// release it by storing 0).
@@ -1704,6 +1710,7 @@ impl BranchStore {
             over_hard: Arc::new(AtomicBool::new(false)),
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
+            publish_hold: AtomicU8::new(0),
             trunk_children: AtomicUsize::new(0),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
@@ -1847,6 +1854,7 @@ impl BranchStore {
             over_hard: Arc::new(AtomicBool::new(false)),
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
+            publish_hold: AtomicU8::new(0),
             unsynced: AtomicBool::new(false),
             leases_outstanding: AtomicBool::new(false),
             trunk_only: false,
@@ -3494,6 +3502,9 @@ impl BranchStore {
         // 2. The map, in bounded holds.
         let mapped = (|| -> Result<()> {
             for (i, batch) in entries.chunks(HOLD_BATCH).enumerate() {
+                if i == 2 {
+                    pause_at(Some(&self.publish_hold), HOLD_BETWEEN_MAP_HOLDS);
+                }
                 let mut inner = self.lock();
                 if i == 1 {
                     // A crash between two holds of mapping, for the tests (amendment 8b).
@@ -4168,6 +4179,17 @@ impl BranchStore {
     pub(crate) fn checkpoint_held(&self) -> u8 {
         self.flight_hold.load(Ordering::Acquire)
     }
+
+    /// Make a multi-hold commit wait before its third map hold at `stage`
+    /// (`HOLD_BETWEEN_MAP_HOLDS`) until this is called with another value (0 releases it).
+    pub(crate) fn publish_hold(&self, stage: u8) {
+        self.publish_hold.store(stage, Ordering::Release);
+    }
+
+    /// The commit hook's value: a stage, with `HOLD_ARRIVED` once a commit waits there.
+    pub(crate) fn publish_held(&self) -> u8 {
+        self.publish_hold.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for BranchStore {
@@ -4176,6 +4198,7 @@ impl Drop for BranchStore {
     /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files.
     fn drop(&mut self) {
         self.flight_hold.store(0, Ordering::Release);
+        self.publish_hold.store(0, Ordering::Release);
         self.join_flights();
         let mut inner = self.inner.lock();
         let now = inner.lease.now_ms();
@@ -5953,6 +5976,65 @@ mod tests {
             u64::from(arena.high_water()) * 1024 <= file_len,
             "the reopened arena's high-water mark {} (at 1024 B) exceeds its file ({file_len} B)",
             arena.high_water()
+        );
+    }
+
+    /// Review F2 of merge 1b(ii) (PREREG 8f): an empty catalog store's restart whose checkpoint
+    /// committed the new page size, and whose log cut then failed before its rename (here its
+    /// temporary file cannot be created; a crash there leaves the same files). The log still has the
+    /// old generation and page size; recovery replays an older-generation catalog log from its
+    /// checkpoint's marker on, and refused this one outright ("log and snapshot disagree on the page
+    /// size"), so the store could never be opened again.
+    fn restart_whose_log_cut_failed(path: &str) {
+        let store = BranchStore::open(BranchDurability::Catalog { sync: false }, None, path).unwrap();
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(512).unwrap();
+        let s = inner.alloc_slot().unwrap();
+        inner.release_slots(vec![s]);
+        let mut tmp = BranchFiles::for_db(path).log.into_os_string();
+        tmp.push(".tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let generation = inner.cat.as_ref().map_or(0, |c| c.generation);
+        assert!(inner.ensure_backing(1024).is_err(), "premise: the restart's log cut failed");
+        assert!(
+            inner.cat.as_ref().map_or(0, |c| c.generation) > generation,
+            "premise: the restart's checkpoint committed before its log cut failed"
+        );
+        std::fs::remove_dir(&tmp).unwrap();
+    }
+
+    #[test]
+    fn a_restart_whose_log_cut_failed_after_its_checkpoint_committed_reopens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        restart_whose_log_cut_failed(path);
+        let store = BranchStore::open(BranchDurability::Catalog { sync: false }, None, path)
+            .expect("the store cannot be opened after a restart whose log cut failed");
+        let inner = store.inner.lock();
+        let arena = inner.arena.as_ref().expect("the reopened catalog store has its arena");
+        assert_eq!(arena.page_size(), 1024, "the catalog committed the new page size");
+    }
+
+    /// The same restart, in the process that ran it: the catalog now says the new page size and
+    /// the log and arena in memory the old one, so it must fail-stop rather than log on at a page
+    /// size the catalog disagrees with.
+    #[test]
+    fn a_restart_whose_log_cut_failed_after_its_checkpoint_committed_fail_stops() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Catalog { sync: false }, None, path).unwrap();
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(512).unwrap();
+        let mut tmp = BranchFiles::for_db(path).log.into_os_string();
+        tmp.push(".tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(inner.ensure_backing(1024).is_err(), "premise: the restart's log cut failed");
+        std::fs::remove_dir(&tmp).unwrap();
+        assert!(
+            inner.poisoned(),
+            "a store whose catalog committed a page size its log and arena do not have ran on"
         );
     }
 

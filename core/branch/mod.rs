@@ -264,6 +264,9 @@ pub enum BranchFailpoint {
     /// The next compaction's arena sync, before its snapshot is written, fails as an I/O error
     /// would (r11-churn amendment 6a).
     CompactArenaSyncFails,
+    /// The next catalog checkpoint's COMMIT fails as an I/O error would, so whether it took effect
+    /// is unknown (merge 1b(ii) review F4): the store must fail-stop.
+    CheckpointCommitFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -483,6 +486,9 @@ pub struct BranchWork {
     /// Times a holder of the store mutex waited out a flight in the air (its syncs then run while
     /// the mutex is held, by another thread).
     pub locked_flight_waits: u64,
+    /// Commits that waited, before their first hold, for the commits between their holds to drain
+    /// so that a compaction refused meanwhile could run (merge 1b(ii) review F6).
+    pub publish_gate_waits: u64,
 }
 
 /// The largest single hold of the store mutex, per measure, since the previous
@@ -922,6 +928,19 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_checkpoint_hold(&self, stage: u8) {
         self.branches.checkpoint_hold(stage);
+    }
+
+    /// Make the next branch commit that maps in more than two holds wait before its third (4;
+    /// 0 releases it), for tests that act on the store while a commit is between its holds.
+    #[doc(hidden)]
+    pub fn branch_publish_hold(&self, stage: u8) {
+        self.branches.publish_hold(stage);
+    }
+
+    /// The commit hook's value: the stage set, with 0x80 once a commit waits there.
+    #[doc(hidden)]
+    pub fn branch_publish_held(&self) -> u8 {
+        self.branches.publish_held()
     }
 
     /// Wait for every fuzzy checkpoint started so far to install.

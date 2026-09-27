@@ -542,3 +542,256 @@ fn a_compaction_that_fails_before_its_snapshot_leaves_later_commits_working() {
         assert_eq!(v, format!("two-{id}"), "row {id} after the reopen");
     }
 }
+
+// ---- Merge 1b(ii): the fresh-context review of c38fe12b7 (PREREG amendment 8f). Red first. ----
+
+fn in_use(db: &Database) -> std::collections::BTreeSet<u32> {
+    db.branch_slots_in_use().into_iter().collect()
+}
+
+/// Review F1 (catalog recovery; present at d7a2b8f6e): a branch released while its connection is
+/// open is checkpointed as released, then collected at its close with no record, so its slots go
+/// back to the free list and a later commit takes them. The catalog names them as the released
+/// branch's until the next checkpoint. Recovery collected the catalog's released branches AFTER the
+/// log's replay, and those frees overrode the replay's "in use": after a reopen the later commit's
+/// slots were free, and the next writes overwrote its pages. With `retire`, the released branch has
+/// a live child, so the close retires it (frees only what the child cannot read) instead.
+fn a_slot_a_close_freed_and_a_commit_took_survives_a_reopen(retire: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let (b2_id, child_id, reused);
+    {
+        let db = open(&path, CATALOG);
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 2_000);
+        let b1 = trunk.fork_branch().unwrap();
+        let b1c = b1.connect().unwrap();
+        b1c.execute("UPDATE t SET v = 'b1-' || id WHERE id <= 1000").unwrap();
+        let child = retire.then(|| b1.fork().unwrap());
+        let before = in_use(&db);
+        b1c.execute("UPDATE t SET v = 'b1late-' || id WHERE id > 1000").unwrap();
+        // What the close frees: everything b1 owns, or (retired) what its child cannot read.
+        let freed: std::collections::BTreeSet<u32> = if retire {
+            in_use(&db).difference(&before).copied().collect()
+        } else {
+            in_use(&db)
+        };
+        assert!(!freed.is_empty(), "premise: b1 owns slots its close frees");
+        drop(b1);
+        db.branch_compact_now().unwrap();
+        drop(b1c);
+        assert!(
+            freed.iter().all(|&s| db.branch_slot_is_free(s)),
+            "premise: the close freed b1's slots"
+        );
+        let b2 = trunk.fork_branch().unwrap();
+        let b2c = b2.connect().unwrap();
+        b2c.execute("UPDATE t SET v = 'b2-' || id").unwrap();
+        reused = in_use(&db)
+            .intersection(&freed)
+            .copied()
+            .collect::<Vec<u32>>();
+        assert!(!reused.is_empty(), "premise: b2's commit took none of the slots b1's close freed");
+        drop(b2c);
+        b2_id = b2.into_id();
+        child_id = child.map(|c| c.into_id());
+    }
+    // A clean close with no checkpoint after b2's commit: b2 lives in the log's suffix only.
+    let db = open(&path, CATALOG);
+    let taken: Vec<u32> = reused.iter().copied().filter(|&s| db.branch_slot_is_free(s)).collect();
+    assert!(
+        taken.is_empty(),
+        "after a reopen, {} slots b2 committed into are free (first {:?})",
+        taken.len(),
+        taken.first()
+    );
+    let b2c = db.branch(b2_id).unwrap().connect().unwrap();
+    let check = |when: &str| {
+        for (id, v) in table(&b2c) {
+            assert_eq!(v, format!("b2-{id}"), "b2's row {id} {when}");
+        }
+        integrity_ok(&b2c);
+    };
+    check("after the reopen");
+    let b3 = db.connect().unwrap().fork_branch().unwrap();
+    b3.connect().unwrap().execute("UPDATE t SET v = 'b3-' || id").unwrap();
+    check("after another branch's writes");
+    if let Some(child_id) = child_id {
+        // The child's release collects b1 now: none of what it frees may be b2's.
+        db.branch(child_id).unwrap().reap().unwrap();
+        let b4 = db.connect().unwrap().fork_branch().unwrap();
+        b4.connect().unwrap().execute("UPDATE t SET v = 'b4-' || id").unwrap();
+        check("after the child's release and more writes");
+    }
+}
+
+#[test]
+fn a_slot_a_close_freed_and_a_later_commit_took_is_that_commits_after_a_reopen() {
+    a_slot_a_close_freed_and_a_commit_took_survives_a_reopen(false);
+}
+
+#[test]
+fn a_slot_a_retiring_close_freed_and_a_later_commit_took_is_that_commits_after_a_reopen() {
+    a_slot_a_close_freed_and_a_commit_took_survives_a_reopen(true);
+}
+
+/// Review F4: a catalog checkpoint's arena fsync, and its COMMIT, can fail with an outcome that
+/// cannot be known (a later fsync can report success over pages this one dropped; a failed COMMIT
+/// may be on disk): the store must fail-stop. `CompactArenaSyncFails` reached only a snapshot
+/// compaction, and nothing reached the COMMIT, so no test made either fail-stop fire. Sharp
+/// (`compact_now`) and fuzzy (`checkpoint_fuzzy_now`, its fsync on the writer's thread).
+fn a_catalog_checkpoint_in_doubt_fail_stops(fuzzy: bool, failpoint: BranchFailpoint) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let (b_id, image);
+    {
+        let db = open(&path, CATALOG);
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 2_000);
+        let b = trunk.fork_branch().unwrap();
+        b_id = b.id();
+        let bc = b.connect().unwrap();
+        bc.execute("UPDATE t SET v = 'before-' || id").unwrap();
+        db.branch_failpoint(Some(failpoint));
+        if fuzzy {
+            assert!(
+                db.branch_checkpoint_fuzzy_now().unwrap(),
+                "premise: no fuzzy checkpoint started"
+            );
+            db.branch_checkpoint_wait();
+        } else {
+            assert!(
+                db.branch_compact_now().is_err(),
+                "a checkpoint whose outcome is unknown reported success"
+            );
+        }
+        assert_eq!(db.branch_failpoint_pending(), None, "the failpoint never fired");
+        assert!(
+            bc.execute("UPDATE t SET v = 'after-' || id").is_err(),
+            "a commit was acknowledged after a checkpoint whose outcome is unknown"
+        );
+        drop(bc);
+        let _ = b.into_id();
+        image = crash_image(&path, dir.path());
+    }
+    let db = open(&image, CATALOG);
+    let bc = db.branch(b_id).unwrap().connect().unwrap();
+    for (id, v) in table(&bc) {
+        assert_eq!(v, format!("before-{id}"), "row {id} after the reopen");
+    }
+    integrity_ok(&bc);
+}
+
+#[test]
+fn a_sharp_catalog_checkpoint_whose_arena_sync_fails_fail_stops_the_store() {
+    a_catalog_checkpoint_in_doubt_fail_stops(false, BranchFailpoint::CompactArenaSyncFails);
+}
+
+#[test]
+fn a_fuzzy_catalog_checkpoint_whose_arena_sync_fails_fail_stops_the_store() {
+    a_catalog_checkpoint_in_doubt_fail_stops(true, BranchFailpoint::CompactArenaSyncFails);
+}
+
+#[test]
+fn a_sharp_catalog_checkpoint_whose_commit_fails_fail_stops_the_store() {
+    a_catalog_checkpoint_in_doubt_fail_stops(false, BranchFailpoint::CheckpointCommitFails);
+}
+
+#[test]
+fn a_fuzzy_catalog_checkpoint_whose_commit_fails_fail_stops_the_store() {
+    a_catalog_checkpoint_in_doubt_fail_stops(true, BranchFailpoint::CheckpointCommitFails);
+}
+
+/// Review F6 (the port's own guard): a compaction the automatic check asks for while a commit is
+/// between its holds is refused, and must run once no commit is: here when this commit drains.
+/// Before, the refusal was forgotten, and overlapping commits could starve compaction for good.
+fn a_refused_compaction_runs_when_the_commits_drain(mode: BranchDurability) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir.path().join("t.db"), mode);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20_000);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    bc.execute("UPDATE t SET v = 'before-' || id").unwrap();
+    bc.execute("BEGIN").unwrap();
+    bc.execute("UPDATE t SET v = 'after-' || id").unwrap();
+    let w0 = db.branch_stats().unwrap().work;
+    db.branch_failpoint(Some(BranchFailpoint::MaybeCompactBetweenMapHolds));
+    bc.execute("COMMIT").unwrap();
+    assert_eq!(db.branch_failpoint_pending(), None, "premise: the failpoint fired");
+    let w1 = db.branch_stats().unwrap().work;
+    assert!(
+        w1.compactions_refused > w0.compactions_refused,
+        "premise: the compaction between the holds was refused"
+    );
+    assert!(
+        w1.compactions > w0.compactions,
+        "a compaction refused while a commit was between its holds never ran once it drained"
+    );
+}
+
+#[test]
+fn a_refused_compaction_runs_when_the_commits_drain_durable() {
+    a_refused_compaction_runs_when_the_commits_drain(DURABLE);
+}
+
+#[test]
+fn a_refused_catalog_checkpoint_runs_when_the_commits_drain() {
+    a_refused_compaction_runs_when_the_commits_drain(CATALOG);
+}
+
+/// Review F6, the overlap: while a refused compaction waits for the commits between their holds, a
+/// new commit waits before its first hold, so the commits in flight drain and the compaction runs
+/// (otherwise commits that keep overlapping starve it). Commit A pauses before its third map hold
+/// with a compaction refused; commit B must wait at its first hold until A is released.
+#[test]
+fn a_commit_waits_while_a_refused_compaction_waits_for_the_commits_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir.path().join("t.db"), DURABLE);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 20_000);
+    let a = trunk.fork_branch().unwrap();
+    let b = trunk.fork_branch().unwrap();
+    let w0 = db.branch_stats().unwrap().work;
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let t = std::time::Instant::now();
+        while !done() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(20), "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    /// Releases the commit hook however the scope ends, so a failed assertion never leaves commit
+    /// A paused while the scope waits to join it.
+    struct Release<'a>(&'a Database);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            self.0.branch_publish_hold(0);
+        }
+    }
+    std::thread::scope(|s| {
+        let _release = Release(&db);
+        db.branch_publish_hold(store::HOLD_BETWEEN_MAP_HOLDS);
+        db.branch_failpoint(Some(BranchFailpoint::MaybeCompactBetweenMapHolds));
+        let ta = s.spawn(|| a.connect().unwrap().execute("UPDATE t SET v = 'a-' || id"));
+        wait("premise: commit A never paused between its holds", &|| {
+            db.branch_publish_held() == store::HOLD_BETWEEN_MAP_HOLDS | store::HOLD_ARRIVED
+        });
+        assert!(
+            db.branch_stats().unwrap().work.compactions_refused > w0.compactions_refused,
+            "premise: the compaction between A's holds was refused"
+        );
+        let tb = s.spawn(|| b.connect().unwrap().execute("UPDATE t SET v = 'b-' || id WHERE id = 1"));
+        wait(
+            "commit B started its holds while a refused compaction waited for commit A",
+            &|| db.branch_stats().unwrap().work.publish_gate_waits > w0.publish_gate_waits,
+        );
+        assert!(!tb.is_finished(), "commit B finished while commit A was between its holds");
+        db.branch_publish_hold(0);
+        ta.join().unwrap().unwrap();
+        tb.join().unwrap().unwrap();
+    });
+    assert!(
+        db.branch_stats().unwrap().work.compactions > w0.compactions,
+        "the refused compaction never ran"
+    );
+}

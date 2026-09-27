@@ -1644,6 +1644,28 @@ pub(crate) fn fsync_dir_of(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Review F3 of merge 1b(ii) (PREREG 8f): a catalog store's log cut renames a new file over
+    /// the log, so a second opener that opened the path before the rename holds the replaced file;
+    /// its lock then succeeds on a file no store uses, and it would recover a stale log beside the
+    /// live one. The lock must be refused unless the path still names the locked file.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_on_a_log_file_that_was_renamed_away_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db-branch-log");
+        std::fs::write(&path, b"old").unwrap();
+        let stale = open_rw(&path, false).unwrap();
+        let newer = dir.path().join("db-branch-log.tmp");
+        std::fs::write(&newer, b"new").unwrap();
+        std::fs::rename(&newer, &path).unwrap();
+        assert!(
+            lock_exclusive(&stale, &path).is_err(),
+            "a lock on a log file that was renamed away was taken"
+        );
+        let fresh = open_rw(&path, false).unwrap();
+        lock_exclusive(&fresh, &path).expect("the lock on the file the path names");
+    }
+
     #[test]
     fn every_record_round_trips() {
         let records = [
