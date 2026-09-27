@@ -77,6 +77,25 @@ pub fn page_io() -> [u64; 4] {
     ]
 }
 
+/// r12-catload: with `R12_TRACE_READS` set, every database page read as `(page number, bytes)`,
+/// process-wide and in order (observing only; unset, one initialised-flag load per read).
+static READ_TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static READ_TRACE: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn trace_page_read(page: usize, bytes: usize) {
+    if *READ_TRACE_ON.get_or_init(|| std::env::var_os("R12_TRACE_READS").is_some()) {
+        if let Ok(mut t) = READ_TRACE.lock() {
+            t.push((page as u32, bytes as u32));
+        }
+    }
+}
+
+/// Take the page reads [`trace_page_read`] recorded since the last take (r12-catload instrument).
+#[doc(hidden)]
+pub fn take_page_read_trace() -> Vec<(u32, u32)> {
+    READ_TRACE.lock().map(|mut t| std::mem::take(&mut *t)).unwrap_or_default()
+}
+
 pub(crate) fn count_page_io(which: usize, n: u64) {
     PAGE_IO[which].fetch_add(n, crate::sync::atomic::Ordering::Relaxed);
 }

@@ -151,6 +151,7 @@ impl DatabaseStorage for DatabaseFile {
         turso_assert_greater_than_or_equal!(page_idx as i64, 0);
         let r = c.as_read();
         let size = r.buf().len();
+        crate::branch::trace_page_read(page_idx, size);
         // Page numbers are 1-based; a reference to page 0 comes from a
         // corrupted pointer (e.g. a zeroed overflow page number), not from
         // any legitimate caller.

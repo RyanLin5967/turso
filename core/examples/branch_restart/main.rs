@@ -623,6 +623,7 @@ fn open(args: &Args) {
     let reads = db.branch_read_counters();
     // branch_stats applies the parked Commits (C-R) before counting slots: timed apart from the open.
     let (loads0, _, q0, rows0) = db.branch_catalog_counters();
+    trace_line(args, "open");
     let (sio0, sru0) = (turso_core::branch::page_io(), Ru::now());
     let t = Instant::now();
     let st = db.branch_stats().unwrap();
@@ -642,6 +643,7 @@ fn open(args: &Args) {
         sio1[2] - sio0[2],
         sru1.since(&sru0).fields("settle_")
     );
+    trace_line(args, "settle");
     let tr = db.branch_trunk_retained();
     // Every branch owns one page and the arena also holds the trunk's retained versions, unless the
     // victim said otherwise (a churn victim's parents retain the versions their children forked on).
@@ -749,6 +751,7 @@ fn open(args: &Args) {
             let _ = branch.into_id();
         }
         attach_line(args, &attach_t, &attach_x);
+        trace_line(args, "probes");
         let no = vec![(0u64, 0u64); attach_t.len()];
         let nok = vec![(0u64, 0u64, 0u64); attach_t.len()];
         summary("attach", args.n, &args.label, &mut attach_t, &no, &nok);
@@ -772,6 +775,25 @@ fn open(args: &Args) {
         args.label,
         t_close.as_secs_f64() * 1e6,
         files.line()
+    );
+}
+
+/// r12-catload: with `R12_TRACE_READS` set, the database page reads since the last TRACE line: all
+/// of them in order as `page:bytes`, their count and the distinct (page, bytes) pairs among them.
+fn trace_line(args: &Args, phase: &str) {
+    if std::env::var_os("R12_TRACE_READS").is_none() {
+        return;
+    }
+    let t = turso_core::branch::take_page_read_trace();
+    let distinct: std::collections::HashSet<(u32, u32)> = t.iter().copied().collect();
+    let list: Vec<String> = t.iter().map(|(p, b)| format!("{p}:{b}")).collect();
+    println!(
+        "TRACE\tn={}\tlabel={}\tphase={phase}\treads={}\tdistinct={}\tlist={}",
+        args.n,
+        args.label,
+        t.len(),
+        distinct.len(),
+        list.join(",")
     );
 }
 
