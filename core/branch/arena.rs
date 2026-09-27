@@ -32,8 +32,11 @@
 //!   are unmapped. When the top chunks are all unmapped, `high_water` drops to the mapped top and
 //!   the bookkeeping vectors shrink, with hysteresis (capacity above 4x length shrinks to 2x).
 //!
-//! No release path reallocates: a release sets bits and may unmap a chunk, so the free list's
-//! doubling copies under the store mutex (sweep S5) are gone with the list.
+//! The free list's doubling copies under the store mutex (sweep S5) are gone with the list. A
+//! release still does bounded work under the mutex: it may grow the FIFO (at most
+//! `max(units per chunk, active units / 8) + 1` entries of 4 bytes), `madvise` units past the bound,
+//! `munmap` a chunk, and, when a trim shrinks the bookkeeping vectors, copy them (bytes per slot of
+//! the peak / 8, once per shrink, with hysteresis).
 
 use crate::turso_assert;
 use std::collections::VecDeque;
@@ -114,6 +117,13 @@ impl ChunkMem {
         let advice = libc::MADV_FREE_REUSABLE;
         #[cfg(not(target_os = "macos"))]
         let advice = libc::MADV_DONTNEED;
+        // In tests, poison the range first: macOS keeps a purged page's bytes until the kernel
+        // takes it, so without this a purge of the wrong range would go unseen by a content check.
+        #[cfg(test)]
+        // SAFETY: the range lies inside this mapping.
+        unsafe {
+            std::ptr::write_bytes(self.ptr.as_ptr().add(offset), 0xDB, len)
+        };
         // SAFETY: the range lies inside this mapping and no live slot overlaps it (the caller
         // checks every slot of the unit is free).
         let rc = unsafe {
@@ -239,6 +249,8 @@ pub(crate) struct Arena {
     reuses: u64,
     chunk_maps: u64,
     chunk_unmaps: u64,
+    #[cfg(test)]
+    trims: u64,
 }
 
 impl Arena {
@@ -270,6 +282,8 @@ impl Arena {
             reuses: 0,
             chunk_maps: 0,
             chunk_unmaps: 0,
+            #[cfg(test)]
+            trims: 0,
         }
     }
 
@@ -434,7 +448,7 @@ impl Arena {
     fn unmap(&mut self, c: usize) {
         self.chunks[c].mem = None;
         self.chunk_unmaps += 1;
-        if super::mutant::on(8) {
+        if super::mutant::on(11) {
             return;
         }
         let upc = self.units_per_chunk();
@@ -461,6 +475,10 @@ impl Arena {
         }
         if n == self.chunks.len() {
             return;
+        }
+        #[cfg(test)]
+        {
+            self.trims += 1;
         }
         let hw = (self.high_water as usize).min(n * SLOTS_PER_CHUNK);
         self.free_count -= (hw..self.high_water as usize)
@@ -516,8 +534,8 @@ impl Arena {
             let u = self.dirty.pop_front().expect("longer than the bound") as usize;
             set_bit(&mut self.listed_bits, u, false);
             let c = (u * self.unit_slots) / SLOTS_PER_CHUNK;
-            let valid = super::mutant::on(2)
-                || (bit(&self.resident_bits, u) && self.unit_live(u) == 0);
+            let valid = super::mutant::on(8)
+                || (bit(&self.resident_bits, u) && (super::mutant::on(2) || self.unit_live(u) == 0));
             if !valid {
                 continue;
             }
@@ -664,6 +682,18 @@ impl Arena {
         }
         assert_eq!(resident, self.resident_units, "resident_units");
         assert_eq!(active, self.active_units, "active_units");
+        for u in 0..n * upc {
+            if self.purgeable && bit(&self.resident_bits, u) && self.unit_live(u) == 0 {
+                assert!(bit(&self.listed_bits, u), "unit {u} resident and all free but not listed");
+            }
+        }
+        if self.purgeable {
+            assert!(
+                self.resident_units
+                    <= self.active_units + upc.max(self.active_units >> LG_DIRTY_MULT),
+                "resident units past active + the dirty bound"
+            );
+        }
         let mut listed: Vec<u32> = self.dirty.iter().copied().collect();
         let len = listed.len();
         listed.sort_unstable();
@@ -749,30 +779,43 @@ mod tests {
         }
     }
 
-    /// F9 T1: first fit. After any mix of allocations and releases, `alloc` returns the lowest free
-    /// slot, or `high_water` when none is free.
+    /// F9 T1: first fit, against a model that knows nothing of the arena's internals: `alloc` returns
+    /// the lowest slot not in use (below `high_water` that is the lowest free slot; with none free it
+    /// is `high_water`, which a trim may have lowered). Phases of growth and shrink, so the walk
+    /// reaches unmaps and trims, with `check` every 64 steps.
     #[test]
-    fn alloc_returns_the_lowest_free_slot() {
+    fn alloc_returns_the_lowest_slot_not_in_use() {
         let mut arena = Arena::new(4096);
-        let mut free = std::collections::BTreeSet::new();
-        let mut live = Vec::new();
+        let mut live = std::collections::BTreeSet::new();
+        let mut order: Vec<Slot> = Vec::new();
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        for _ in 0..20_000 {
-            if live.is_empty() || rng.below(3) != 0 {
-                let want = free.iter().next().copied().unwrap_or(arena.high_water);
+        for step in 0..40_000usize {
+            // Grow 2:1 for 5,000 steps, then shrink 1:3, alternately.
+            let grow = (step / 5_000) % 2 == 0;
+            let alloc = order.is_empty()
+                || if grow {
+                    rng.below(3) != 0
+                } else {
+                    rng.below(4) == 0
+                };
+            if alloc {
+                let want = (0..).find(|s| !live.contains(s)).expect("some slot is not in use");
                 let got = arena.alloc();
-                assert_eq!(got, want, "alloc must take the lowest free slot");
-                free.remove(&got);
-                live.push(got);
+                assert!(!live.contains(&got), "step {step}: slot {got} handed out twice");
+                assert_eq!(got, want, "step {step}: alloc must take the lowest slot not in use");
+                live.insert(got);
+                order.push(got);
             } else {
-                let s = live.swap_remove(rng.below(live.len()));
+                let s = order.swap_remove(rng.below(order.len()));
                 arena.release(s);
-                free.insert(s);
+                live.remove(&s);
             }
-            // A trim forgets free slots above the new high_water.
-            free.retain(|&s| s < arena.high_water);
+            if step % 64 == 0 {
+                arena.check();
+            }
         }
         arena.check();
+        assert!(arena.chunk_unmaps > 0 && arena.trims > 0, "the walk never unmapped or trimmed");
     }
 
     /// F9 T2: a random walk with peaks and shrinks against a model. Every page in use keeps the
@@ -806,16 +849,23 @@ mod tests {
                 while live.len() > keep {
                     let (s, _) = live.swap_remove(rng.below(live.len()));
                     arena.release(s);
+                    assert!(!arena.slots_in_use().contains(&s), "a released slot still in use");
                     arena.check();
+                    assert_eq!(arena.in_use(), live.len(), "in_use against the model");
                 }
+                let mut want: Vec<Slot> = live.iter().map(|&(s, _)| s).collect();
+                want.sort_unstable();
+                assert_eq!(arena.slots_in_use(), want, "the slots in use against the model");
                 for _ in 0..3 * SLOTS_PER_CHUNK {
                     let (s, _) = live.swap_remove(rng.below(live.len()));
                     arena.release(s);
+                    assert!(!arena.slots_in_use().contains(&s), "a released slot still in use");
                     stamp = stamp.wrapping_add(1);
                     let n = arena.alloc();
                     arena.page_mut(n).fill(stamp);
                     live.push((n, stamp));
                     arena.check();
+                    assert_eq!(arena.in_use(), live.len(), "in_use against the model");
                 }
                 for &(s, v) in &live {
                     assert!(
@@ -832,6 +882,7 @@ mod tests {
                 assert!(arena.mapped_chunks() <= chunks.len() + 1, "more than one spare mapped");
             }
             assert!(arena.chunk_unmaps > 0, "the walk never unmapped a chunk");
+            assert!(arena.trims > 0, "the walk never trimmed");
             if arena.purgeable {
                 assert!(arena.purges > 0, "the walk never purged a unit");
                 assert!(arena.reuses > 0, "the walk never reused a purged unit");
@@ -843,7 +894,8 @@ mod tests {
     #[test]
     fn a_full_release_returns_every_chunk_but_the_spare() {
         let mut arena = Arena::new(4096);
-        let slots: Vec<Slot> = (0..SLOTS_PER_CHUNK * 12).map(|_| arena.alloc()).collect();
+        let slots: Vec<Slot> = (0..SLOTS_PER_CHUNK * 40).map(|_| arena.alloc()).collect();
+        assert!(arena.free_bits.capacity() > 64, "the peak must be big enough to test the shrink");
         for &s in &slots {
             arena.page_mut(s).fill(1);
         }

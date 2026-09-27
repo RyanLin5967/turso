@@ -499,7 +499,8 @@ impl Database {
         self.branches.table_shape()
     }
 
-    /// Whether `slot` is on the arena free list, for membership assertions.
+    /// Whether `slot` has been released and not handed out again, for membership assertions. Since
+    /// F9 a released slot whose chunk the arena has trimmed away reads as never handed out: false.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
         self.branches.slot_is_free(slot)

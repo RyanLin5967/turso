@@ -173,7 +173,11 @@ impl<T> BranchTable<T> {
             last.1
         } else {
             let moved = last.0;
-            let (_, val) = std::mem::replace(&mut self.dense[d / CHUNK][d % CHUNK], last);
+            let (owner, val) = std::mem::replace(&mut self.dense[d / CHUNK][d % CHUNK], last);
+            #[cfg(test)]
+            assert_eq!(owner, slot, "the value at the hole belongs to the removed slot");
+            #[cfg(not(test))]
+            let _ = owner;
             if !super::mutant::on(4) {
                 self.entry_mut(moved).expect("a stored value's slot exists").link =
                     OCCUPIED | d as u32;
@@ -372,7 +376,7 @@ mod f9_tests {
             assert_eq!(listed, want, "iteration is not the live set");
         };
         let mut next = 0u64;
-        for (peak, keep) in [(5_000usize, 7usize), (3_000, 1), (6_000, 1_100)] {
+        for (peak, keep) in [(5_000usize, 7usize), (3_000, 1), (6_000, 1_100), (70_000, 3)] {
             while model.len() < peak {
                 let id = t.vacant_id();
                 t.insert(id, next);
@@ -380,6 +384,7 @@ mod f9_tests {
                 next += 1;
             }
             check(&t, &model, &dead);
+            let peak_cap = t.dense.capacity();
             let mut ids: Vec<BranchId> = model.keys().copied().collect();
             ids.sort();
             while model.len() > keep {
@@ -391,6 +396,9 @@ mod f9_tests {
                 }
             }
             check(&t, &model, &dead);
+            if peak_cap > 64 {
+                assert!(t.dense.capacity() <= 64, "the value-chunk list kept its peak capacity");
+            }
             for _ in 0..2_000 {
                 let id = ids.swap_remove(below(ids.len()));
                 assert_eq!(t.remove(&id), model.remove(&id));
