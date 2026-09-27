@@ -445,6 +445,9 @@ pub(crate) struct Journal {
     pid: u32,
     /// See [`Journal::fail_next_write`].
     fail_next_write: bool,
+    /// Frame bytes ever buffered by this journal: the log sequence number a group flush makes
+    /// durable up to (r11-churn amendment 4). Monotone across compactions, unlike `len`.
+    lsn: u64,
 }
 
 impl Journal {
@@ -501,6 +504,7 @@ impl Journal {
             poisoned: false,
             pid: std::process::id(),
             fail_next_write: false,
+            lsn: 0,
         })
     }
 
@@ -609,6 +613,7 @@ impl Journal {
             poisoned: false,
             pid: std::process::id(),
             fail_next_write: false,
+            lsn: 0,
         };
 
         let mut records = Vec::new();
@@ -783,6 +788,7 @@ impl Journal {
         put_u32(&mut self.pending, payload.len() as u32);
         put_u32(&mut self.pending, crc32c::crc32c(&payload));
         self.pending.extend_from_slice(&payload);
+        self.lsn += (FRAME_HEADER_LEN + payload.len()) as u64;
         match record {
             Record::TrunkRetain { slot, .. } => self.pending_slots.push(*slot),
             Record::Commit { pages, .. } => self.pending_slots.extend(pages.iter().map(|p| p.1)),
@@ -845,6 +851,68 @@ impl Journal {
             fsync_file(&self.file)?;
         }
         Ok(())
+    }
+
+    /// Frame bytes ever buffered (see the `lsn` field).
+    pub(crate) fn lsn(&self) -> u64 {
+        self.lsn
+    }
+
+    /// Take everything buffered as one [`Flight`], for a group flush that writes it with no lock
+    /// held (r11-churn amendment 4). The log region is reserved here, so the next flight goes after
+    /// it; the caller guarantees no other flight is in the air (one leader at a time), which is
+    /// also what makes the on-disk length check below exact. The arena descriptor comes along when
+    /// a commit has written slots since the last sync: those slots are named by frames in this
+    /// flight, and rule 1 wants them durable before the frames are.
+    pub(crate) fn take_flight(&mut self, arena: &mut Arena) -> Result<Flight> {
+        let fail = std::mem::take(&mut self.fail_next_write);
+        self.check_live()?;
+        let end_lsn = self.lsn;
+        if self.pending.is_empty() {
+            return Ok(Flight {
+                log: None,
+                arena: None,
+                bytes: Vec::new(),
+                at: self.len,
+                sync: self.sync,
+                fail: false,
+                end_lsn,
+            });
+        }
+        let on_disk = self
+            .file
+            .metadata()
+            .map_err(|e| io_error(e, "stat branch log"))?
+            .len();
+        if on_disk != self.len {
+            self.poisoned = true;
+            return Err(corrupt(
+                "the branch log changed under this journal; another store instance wrote it",
+            ));
+        }
+        let log = self
+            .file
+            .try_clone()
+            .map_err(|e| io_error(e, "dup branch log"))?;
+        let arena = arena.take_dirty_file()?;
+        let bytes = std::mem::take(&mut self.pending);
+        self.pending_slots.clear();
+        let at = self.len;
+        self.len += bytes.len() as u64;
+        Ok(Flight {
+            log: Some(log),
+            arena,
+            bytes,
+            at,
+            sync: self.sync,
+            fail,
+            end_lsn,
+        })
+    }
+
+    /// The last snapshot's size in bytes (observation only, r11-churn).
+    pub(crate) fn snapshot_len(&self) -> u64 {
+        self.snapshot_len
     }
 
     pub(crate) fn wants_compaction(&self) -> bool {
@@ -966,6 +1034,49 @@ impl Journal {
 ///
 /// Every other error — permission denied, an I/O error, not-a-directory — cannot be told apart
 /// from a file that holds state, so the caller refuses rather than guess.
+/// One group flush (r11-churn amendment 4): frames taken from a journal's buffer, the log offset
+/// they go to, and the arena descriptor to sync first. Written by [`Flight::write`] with no lock
+/// held; the journal already counts the region as written, so a failed write must fail-stop it.
+pub(crate) struct Flight {
+    log: Option<File>,
+    arena: Option<File>,
+    bytes: Vec<u8>,
+    at: u64,
+    sync: bool,
+    fail: bool,
+    /// The journal's `lsn` at the end of these frames: what the flight makes durable.
+    pub(crate) end_lsn: u64,
+}
+
+impl Flight {
+    /// Arena first, then the frames, then the log: the order `Journal::flush` keeps.
+    pub(crate) fn write(self) -> Result<()> {
+        if self.fail {
+            return Err(LimboError::InternalError(
+                "failpoint: a branch log write failed".to_string(),
+            ));
+        }
+        let Some(log) = self.log else {
+            return Ok(());
+        };
+        if self.sync {
+            if let Some(arena) = &self.arena {
+                fsync_file(arena)?;
+            }
+        }
+        write_at(&log, &self.bytes, self.at)?;
+        if self.sync {
+            fsync_file(&log)?;
+        }
+        Ok(())
+    }
+
+    /// Frame bytes in this flight (observation only).
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 pub(crate) fn cannot_exist(e: &std::io::Error) -> bool {
     match e.kind() {
         std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidFilename => true,
@@ -1134,13 +1245,33 @@ pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
     }
 }
 
+/// Observation only (r11-churn instrument; nothing reads it): every `fsync_file` call, process-wide
+/// and on the calling thread. Every branch-file fsync goes through `fsync_file`.
+pub(crate) static FSYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    pub(crate) static THREAD_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// `fsync(2)`, as Turso's own `FileSyncType::Fsync` — deliberately NOT `F_FULLFSYNC`, which std's
 /// `sync_all` uses on Apple platforms: branch state gets the durability class the trunk gets under
 /// default settings, no stronger and no weaker.
 pub(crate) fn fsync_file(file: &File) -> Result<()> {
+    FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_FSYNCS.with(|n| n.set(n.get() + 1));
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
+        // Measurement switch (r11-churn amendment 4, observation of the durability class, not a
+        // mechanism): `TURSO_BRANCH_FULLFSYNC=1` makes every branch-file sync `F_FULLFSYNC` on
+        // Apple platforms, which flushes the drive's cache as plain fsync(2) there does not.
+        #[cfg(target_vendor = "apple")]
+        if full_fsync() {
+            // SAFETY: as below.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+                return Err(io_error(std::io::Error::last_os_error(), "F_FULLFSYNC branch file"));
+            }
+            return Ok(());
+        }
         // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));
@@ -1152,6 +1283,18 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
         file.sync_all()
             .map_err(|e| io_error(e, "fsync branch file"))
     }
+}
+
+/// Whether `TURSO_BRANCH_FULLFSYNC=1` asked for `F_FULLFSYNC` (read once per process).
+#[cfg(target_vendor = "apple")]
+pub(crate) fn full_fsync() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| std::env::var("TURSO_BRANCH_FULLFSYNC").is_ok_and(|v| v == "1"))
+}
+
+#[cfg(not(target_vendor = "apple"))]
+pub(crate) fn full_fsync() -> bool {
+    false
 }
 
 /// Make a file's creation or rename durable: on POSIX that is an fsync of its directory.

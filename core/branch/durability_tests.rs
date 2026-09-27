@@ -2388,3 +2388,188 @@ fn attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused() {
         refused.join(" | ")
     );
 }
+
+/// r11-churn PREREG amendment 2 (group commit for reaps): `Database::reap_branches` makes every
+/// Release in the batch durable with ONE flush — one log fsync on this thread, the arena being
+/// clean — frees exactly what one release per branch would, in order (a chain's root deferred
+/// behind its tip, which then frees both), and a restart comes back with only the branch kept.
+#[test]
+fn a_batch_release_is_one_flush_and_frees_what_single_releases_free() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let mut batch = Vec::new();
+        for i in 0..6 {
+            let b = trunk.fork_branch().unwrap();
+            set(&b.connect().unwrap(), 10 + i, &format!("b{i}"));
+            batch.push(b);
+        }
+        let p = trunk.fork_branch().unwrap();
+        set(&p.connect().unwrap(), 100, "p");
+        let c = p.fork().unwrap();
+        set(&c.connect().unwrap(), 101, "c");
+        batch.push(p);
+        batch.push(c);
+        let keep = trunk.fork_branch().unwrap();
+        set(&keep.connect().unwrap(), 150, "keep");
+        assert_eq!(in_use(&db).len(), 9);
+        let fsyncs = crate::branch::churn_counters().thread_fsyncs;
+        let reaped = db.reap_branches(batch).unwrap();
+        assert_eq!(
+            crate::branch::churn_counters().thread_fsyncs - fsyncs,
+            1,
+            "a batch release is one flush: one log fsync, the arena being clean"
+        );
+        assert!(reaped[..6].iter().all(|r| !r.deferred && r.freed_pages == 1));
+        assert!(reaped[6].deferred && reaped[6].freed_pages == 0, "the chain root: {:?}", reaped[6]);
+        assert!(!reaped[7].deferred && reaped[7].freed_pages == 2, "the chain tip: {:?}", reaped[7]);
+        assert_eq!(db.branch_ids().unwrap(), vec![keep.id()]);
+        assert_eq!(in_use(&db).len(), 1);
+        let _kept = keep.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let ids = db.branch_ids().unwrap();
+    assert_eq!(ids.len(), 1, "the batch's releases did not all survive the restart: {ids:?}");
+    let keep = db.branch(ids[0]).unwrap();
+    assert_eq!(value(&keep.connect().unwrap(), 150).as_deref(), Some("keep"));
+}
+
+/// r11-churn PREREG amendment 2 (group commit for the expiry pass): the pass a fork runs rides on
+/// the fork's own flush, so a fork that reaps an expired lease costs ONE log fsync, not two (the
+/// pass's, then the fork's), and the reap is durable: a restart does not bring the branch back.
+#[test]
+fn an_expiry_pass_rides_on_the_forks_own_flush() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let a = trunk.fork_branch().unwrap();
+        a.lease(Duration::from_secs(5)).unwrap();
+        set(&a.connect().unwrap(), 20, "a");
+        let a = a.into_id();
+        db.branch_lease_clock_advance(Duration::from_secs(6));
+        let fsyncs = crate::branch::churn_counters().thread_fsyncs;
+        let b = trunk.fork_branch().unwrap();
+        assert_eq!(
+            crate::branch::churn_counters().thread_fsyncs - fsyncs,
+            1,
+            "the expiry pass took a flush of its own"
+        );
+        assert_eq!(db.branch_ids().unwrap(), vec![b.id()], "the fork's pass did not reap {a:?}");
+        assert!(in_use(&db).is_empty());
+        let _b = b.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_ids().unwrap().len(), 1, "the reaped branch came back");
+}
+
+/// r11-churn PREREG amendment 4 (group commit, flush outside the store mutex): eight agents fork,
+/// write and release branches concurrently, so their records share flights. Every operation that
+/// returned is durable — a restart brings back exactly the branches kept, each with its own row —
+/// and no released branch comes back.
+#[test]
+fn concurrent_lifecycles_under_group_commit_survive_a_restart() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let kept: std::sync::Mutex<Vec<(BranchId, i64, String)>> = std::sync::Mutex::new(Vec::new());
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        seed(&db.connect().unwrap(), 400);
+        std::thread::scope(|s| {
+            for t in 0..8i64 {
+                let (db, kept) = (&db, &kept);
+                s.spawn(move || {
+                    let trunk = db.connect().unwrap();
+                    let mut release = Vec::new();
+                    for i in 0..20i64 {
+                        let row = 1 + t * 40 + i;
+                        let b = loop {
+                            match trunk.fork_branch() {
+                                Ok(b) => break b,
+                                Err(crate::LimboError::Busy)
+                                | Err(crate::LimboError::BusySnapshot) => {
+                                    std::thread::yield_now()
+                                }
+                                Err(e) => panic!("fork: {e}"),
+                            }
+                        };
+                        let v = format!("t{t}i{i}");
+                        set(&b.connect().unwrap(), row, &v);
+                        if i % 2 == 0 {
+                            kept.lock().unwrap().push((b.into_id(), row, v));
+                        } else {
+                            release.push(b);
+                        }
+                        if release.len() == 5 {
+                            db.reap_branches(std::mem::take(&mut release)).unwrap();
+                        }
+                    }
+                    db.reap_branches(release).unwrap();
+                });
+            }
+        });
+        assert_eq!(db.branch_ids().unwrap().len(), 80);
+    }
+    let db = reopen(&path, incarnation);
+    let kept = kept.into_inner().unwrap();
+    let ids: BTreeSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
+    assert_eq!(ids, kept.iter().map(|k| k.0).collect(), "the restart's branches");
+    for (id, row, v) in kept {
+        let b = db.branch(id).unwrap();
+        let c = b.connect().unwrap();
+        assert_eq!(value(&c, row), Some(v));
+        assert_eq!(value(&c, 399), Some(original(399)));
+        drop(c);
+        let _ = b.into_id();
+    }
+}
+
+/// r11-churn PREREG amendment 4: an early-released batch release whose flight fails reports the
+/// failure, frees none of the slots its durable state still names (rule 2 under early release),
+/// fail-stops the store, and a restart brings the branches back with their pages.
+#[test]
+fn an_early_released_release_whose_flight_fails_frees_nothing_now_or_later() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let (a_id, b_id);
+    let held;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let a = trunk.fork_branch().unwrap();
+        set(&a.connect().unwrap(), 10, "a");
+        let b = trunk.fork_branch().unwrap();
+        set(&b.connect().unwrap(), 20, "b");
+        held = in_use(&db);
+        assert_eq!(held.len(), 2);
+        (a_id, b_id) = (a.id(), b.id());
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(
+            db.reap_branches(vec![a, b]).is_err(),
+            "a batch whose flight failed reported success"
+        );
+        assert_eq!(in_use(&db), held, "the failed batch freed slots its durable state names");
+        assert!(trunk.fork_branch().is_err(), "a fork was accepted after a failed flight");
+        assert_eq!(in_use(&db), held);
+    }
+    let db = reopen(&path, incarnation);
+    let ids: BTreeSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
+    assert_eq!(ids, BTreeSet::from([a_id, b_id]), "a release that never became durable held");
+    let a = db.branch(a_id).unwrap();
+    assert_eq!(value(&a.connect().unwrap(), 10), Some("a".to_string()));
+    let _ = a.into_id();
+}

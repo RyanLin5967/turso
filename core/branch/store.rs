@@ -117,8 +117,10 @@
 //!
 //! # What this does not do
 //!
-//! * One `Mutex` guards every branch, held across the durable store's fsyncs. Correct, and a named
-//!   wall under concurrent writers; the benchmark this lane ships is single-threaded and says so.
+//! * One `Mutex` guards every branch, held across the durable store's fsyncs except a group
+//!   flight's: forks, branch commits and batch releases wait for durability with it released (see
+//!   `Group`, r11-churn amendment 4). Correct, and a named wall under concurrent writers; the
+//!   benchmark this lane ships is single-threaded and says so.
 //! * The persistent page maps are an index over slots the lineages own; they own nothing. A
 //!   branch's `inherited` names only slots its ancestors keep for it, so dropping a map never frees
 //!   a page and keeping one never pins a page.
@@ -154,14 +156,14 @@
 //! version holding a fork epoch, `trunk_written_known` reads a page's last version once, and a trunk
 //! child's reap adds the catalog's garbage (`trunk_catalog_garbage`) to what F2 finds in memory.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::arena::{Arena, Slot};
 use super::catalog::{CatBranch, Catalog, Meta};
-use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
+use super::journal::{BranchFiles, Flight, Journal, Record, SnapBranch, SnapshotState};
 use super::page_map::PageMap;
 use super::{
     BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchStats, BranchWork, Expired,
@@ -199,6 +201,57 @@ pub(crate) struct BranchStore {
     /// `resolve_into` calls and the arena slot reads they made (r11-restart lane instrument).
     resolve_calls: AtomicU64,
     arena_reads: AtomicU64,
+    /// Group commit with the flush outside the store mutex (r11-churn amendment 4); see `Group`.
+    group: Group,
+}
+
+/// Group commit with the flush OUTSIDE the store mutex (r11-churn PREREG amendment 4): early lock
+/// release and flush pipelining, as Aether (Johnson et al., VLDB 2010) and ferrodb's D159 do.
+///
+/// A fork, a branch commit or a batch release decides and applies under the store mutex, buffers
+/// its records, releases the mutex, and only then waits until its records are durable
+/// (`wait_durable`). One waiter at a time LEADS a flush: it takes everything buffered so far, under
+/// the mutex (`Journal::take_flight`), and writes and syncs it holding no lock at all, so whatever
+/// arrives meanwhile buffers behind it and shares the next flush. Every other flush site still
+/// flushes under the mutex (`flush_locked`), but waits out a flight in the air first: frames are
+/// written in log order, and a later region must never be synced ahead of an earlier one.
+///
+/// What early release must not break, and why it does not:
+/// * **Rule 1** (a record is durable only after the slots it names): a commit writes its slots
+///   before it buffers its record, so they are written before the flight that carries the record
+///   is taken, and the flight syncs the arena before the log.
+/// * **Rule 2** (a slot is reused only once the record that freed it is durable): a slot freed by an
+///   early-released operation waits in `pending_free` under that operation's log position, and
+///   returns to the arena only once a flush has covered it (`mature_frees`).
+/// * **Acknowledgement**: no caller learns of an operation before its records are durable. A later
+///   operation that depends on an earlier one (a commit on a branch whose fork is still in flight)
+///   is later in the log, so its own durability implies the earlier one's.
+/// * **Failure**: a failed flight fail-stops the journal, and every waiter gets the error. The
+///   in-memory state is then ahead of the disk — the fail-stop rule already governs that (nothing
+///   more is written; the next open recovers from disk), and the slots such operations freed are
+///   never returned, because no flush will ever cover them.
+struct Group {
+    state: std::sync::Mutex<GroupState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct GroupState {
+    /// A flight is being written.
+    flushing: bool,
+    /// Every journal byte below this log sequence number is durable.
+    durable: u64,
+    /// A flight failed: nothing more becomes durable in this process.
+    poisoned: bool,
+}
+
+impl Group {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(GroupState::default()),
+            cv: std::sync::Condvar::new(),
+        }
+    }
 }
 
 struct StoreInner {
@@ -245,6 +298,10 @@ struct StoreInner {
     /// Commits parked by recovery, and parked Commits applied since (observing only).
     parked_records: u64,
     parked_applied: u64,
+    /// Slots freed by an early-released operation whose records are not yet durable, under the log
+    /// sequence number that makes them free (see `Group`, rule 2). A catalog checkpoint covers
+    /// every applied operation, so it lists them free in its own transaction (`checkpoint_catalog`).
+    pending_free: VecDeque<(u64, Vec<Slot>)>,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -455,6 +512,37 @@ enum Stamp {
     Queue,
     /// Write and flush one now (`Database::expire_branches`).
     Flush,
+}
+
+/// Observation only (r11-churn instrument; nothing reads them): what expiry passes that found
+/// something due did, and what compactions cost. Process-wide; updated under the store mutex.
+pub(crate) mod churn_counters {
+    use std::sync::atomic::AtomicU64;
+    pub(crate) static EXPIRE_PASSES_WITH_DUE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_REAPED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_FREED_PAGES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static EXPIRE_FSYNCS: AtomicU64 = AtomicU64::new(0);
+    /// Passes whose records rode on a fork's own flush (r11-churn amendment 2's fix).
+    pub(crate) static EXPIRE_PIGGYBACKED: AtomicU64 = AtomicU64::new(0);
+    /// Group commit (amendment 4): flights led outside the mutex, flushes taken under it, the
+    /// operations that waited for durability, and those whose records a flight had already made
+    /// durable by the time they looked.
+    pub(crate) static GC_FLIGHTS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static GC_LOCKED_FLUSHES: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static GC_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static GC_ALREADY_DURABLE: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACTIONS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_NS_MAX: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_FSYNCS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static COMPACT_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+}
+
+/// An expiry pass planned but not yet durable (see `BranchStore::expire_plan`).
+struct ExpirePlan {
+    due: Vec<BranchId>,
+    records: Vec<Record>,
+    now: u64,
 }
 
 /// The finest grain at which expiry passes queue a clock stamp.
@@ -893,6 +981,7 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+            group: Group::new(),
         }
     }
 
@@ -1027,6 +1116,7 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+            group: Group::new(),
         };
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
@@ -1237,24 +1327,191 @@ impl BranchStore {
     /// Append `records` and make them durable with ONE flush before the caller acts on any of
     /// them. A no-op when volatile.
     fn log_all(&self, inner: &mut StoreInner, records: Vec<Record>) -> Result<()> {
+        {
+            let StoreInner {
+                journal,
+                arena,
+                failpoint,
+                ..
+            } = &mut *inner;
+            let (Some(journal), Some(_)) = (journal.as_mut(), arena.as_ref()) else {
+                return Ok(());
+            };
+            injected_flush_failure(failpoint, journal)?;
+            for record in &records {
+                journal.buffer(record)?;
+            }
+        }
+        self.flush_locked(inner)?;
+        inner.lease.flushed();
+        self.unsynced.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Buffer `records` for an early-released operation and return the log sequence number the
+    /// caller must wait for (`wait_durable`) before acknowledging it. Nothing is flushed here; 0
+    /// when volatile (always durable).
+    fn buffer_all(&self, inner: &mut StoreInner, records: Vec<Record>) -> Result<u64> {
         let StoreInner {
-            journal,
-            arena,
-            failpoint,
-            lease,
-            ..
+            journal, failpoint, ..
         } = inner;
-        let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
-            return Ok(());
+        let Some(journal) = journal.as_mut() else {
+            return Ok(0);
         };
         injected_flush_failure(failpoint, journal)?;
+        journal.check_live()?;
+        if *failpoint == Some(BranchFailpoint::GroupFlightFails) {
+            *failpoint = None;
+            // Fails inside the flight's write, after this operation is applied (amendment 4).
+            journal.fail_next_write();
+        }
         for record in &records {
             journal.buffer(record)?;
         }
-        journal.flush(arena)?;
-        lease.flushed();
-        self.unsynced.store(false, Ordering::Release);
-        Ok(())
+        Ok(journal.lsn())
+    }
+
+    /// Flush everything buffered, under the store mutex the caller holds. A flight in the air goes
+    /// first (its frames precede these in the log); its leader needs only the group lock to finish,
+    /// never the store mutex, so waiting for it here cannot deadlock.
+    fn flush_locked(&self, inner: &mut StoreInner) -> Result<()> {
+        let mut g = self.group.state.lock().unwrap();
+        while g.flushing {
+            g = self.group.cv.wait(g).unwrap();
+        }
+        if g.poisoned {
+            return Err(group_poisoned());
+        }
+        let flight = match inner.take_flight() {
+            Ok(Some(flight)) => flight,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                g.poisoned = true;
+                self.group.cv.notify_all();
+                return Err(e);
+            }
+        };
+        g.flushing = true;
+        drop(g);
+        churn_counters::GC_LOCKED_FLUSHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let end = flight.end_lsn;
+        let written = flight.write();
+        if written.is_err() {
+            if let Some(journal) = inner.journal.as_mut() {
+                journal.poison();
+            }
+        }
+        self.land(end, written.is_ok());
+        written
+    }
+
+    /// Wait until no flight is in the air (called under the store mutex, so none can start).
+    fn quiesce(&self) {
+        let mut g = self.group.state.lock().unwrap();
+        while g.flushing {
+            g = self.group.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Return the deferred frees a flush has covered (called under the store mutex).
+    fn mature(&self, inner: &mut StoreInner) {
+        if inner.pending_free.is_empty() {
+            return;
+        }
+        let durable = self.group.state.lock().unwrap().durable;
+        inner.mature_frees(durable);
+    }
+
+    /// Record a flight's outcome and wake every waiter.
+    fn land(&self, end: u64, ok: bool) {
+        let mut g = self.group.state.lock().unwrap();
+        g.flushing = false;
+        if ok {
+            g.durable = g.durable.max(end);
+        } else {
+            g.poisoned = true;
+        }
+        self.group.cv.notify_all();
+    }
+
+    /// Wait until the journal's first `lsn` bytes are durable, leading a flight when none is in the
+    /// air. Called WITHOUT the store mutex.
+    pub(crate) fn wait_durable(&self, lsn: u64) -> Result<()> {
+        if lsn == 0 {
+            return Ok(());
+        }
+        churn_counters::GC_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut first = true;
+        loop {
+            {
+                let mut g = self.group.state.lock().unwrap();
+                loop {
+                    if g.durable >= lsn {
+                        if first {
+                            churn_counters::GC_ALREADY_DURABLE
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        return Ok(());
+                    }
+                    if g.poisoned {
+                        return Err(group_poisoned());
+                    }
+                    if !g.flushing {
+                        break;
+                    }
+                    first = false;
+                    g = self.group.cv.wait(g).unwrap();
+                }
+            }
+            first = false;
+            // Lead: take what is buffered under the store mutex, then write it holding nothing.
+            let flight = {
+                let mut inner = self.inner.lock();
+                let mut g = self.group.state.lock().unwrap();
+                if g.durable >= lsn {
+                    return Ok(());
+                }
+                if g.poisoned {
+                    return Err(group_poisoned());
+                }
+                if g.flushing {
+                    continue;
+                }
+                match inner.take_flight() {
+                    Ok(Some(flight)) if flight.len() == 0 => {
+                        // Our frames left the buffer, yet no flush covered them and none is in
+                        // the air: only a failed flush does that, and it poisons the group.
+                        return Err(group_poisoned());
+                    }
+                    Ok(Some(flight)) => {
+                        g.flushing = true;
+                        flight
+                    }
+                    // Nothing buffered, yet not durable: a flush under the mutex took our frames
+                    // and has not landed. It cannot be in the air (flushing is false), so this is
+                    // a flush that failed; the group says so.
+                    Ok(None) => return Err(group_poisoned()),
+                    Err(e) => {
+                        g.poisoned = true;
+                        self.group.cv.notify_all();
+                        return Err(e);
+                    }
+                }
+            };
+            churn_counters::GC_FLIGHTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let end = flight.end_lsn;
+            let written = flight.write();
+            if written.is_err() {
+                // Poison the group first (waking the waiters, some of whom hold the store mutex
+                // while they wait), then the journal under the mutex.
+                self.land(end, false);
+                if let Some(journal) = self.inner.lock().journal.as_mut() {
+                    journal.poison();
+                }
+                return written;
+            }
+            self.land(end, true);
+        }
     }
 
     /// Grant or extend `id`'s lease to `ttl` past the lease clock's now. A deadline only moves
@@ -1312,11 +1569,35 @@ impl BranchStore {
     /// child keeps exactly the versions that child can read. The Release records are made durable
     /// together, before anything is freed.
     fn expire(&self, inner: &mut StoreInner, stamp: Stamp) -> Result<(Expired, u64)> {
+        let plan = self.expire_plan(inner, stamp)?;
+        let now = plan.now;
+        if plan.due.is_empty() {
+            return Ok((Expired::default(), now));
+        }
+        let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
+        self.log_all(inner, plan.records.clone())?;
+        let fsyncs = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0;
+        let expired = self.expire_apply(inner, plan, fsyncs)?;
+        self.maybe_compact(inner);
+        Ok((expired, now))
+    }
+
+    /// The first half of an expiry pass: what is due, and the records that release it (deepest
+    /// first, then a clock stamp), WITHOUT flushing them. A caller that flushes anyway puts them in
+    /// its own flush ahead of its own records (group commit, r11-churn amendment 2), and applies the
+    /// plan only after that flush, so rule 2 holds: nothing is freed before its Release is durable.
+    /// With nothing due, the stamp is handled here exactly as the pass always did.
+    fn expire_plan(&self, inner: &mut StoreInner, stamp: Stamp) -> Result<ExpirePlan> {
         let now = inner.lease.now_ms();
+        let empty = ExpirePlan {
+            due: Vec::new(),
+            records: Vec::new(),
+            now,
+        };
         // A fail-stopped store cannot make a Release durable, so it reaps nothing (and frees
         // nothing); reads stay available and the next open recovers from disk.
         if inner.poisoned() {
-            return Ok((Expired::default(), now));
+            return Ok(empty);
         }
         // Catalog stores: a lease a branch not yet resident carries is in the catalog's lease
         // index; the rows due are made resident, which puts their deadlines in `leases`.
@@ -1357,7 +1638,7 @@ impl BranchStore {
                     }
                 }
             }
-            return Ok((Expired::default(), now));
+            return Ok(empty);
         }
         let mut by_depth = Vec::with_capacity(due.len());
         for id in due {
@@ -1371,7 +1652,33 @@ impl BranchStore {
             .collect();
         records.push(Record::Clock { now_ms: now });
         inner.lease.queued(now);
-        self.log_all(inner, records)?;
+        Ok(ExpirePlan { due, records, now })
+    }
+
+    /// The second half of an expiry pass, once its records are durable: release what was due and
+    /// free what that frees. `fsyncs` is what the flush that carried the records cost the pass (0
+    /// when it rode on another operation's flush); observation only.
+    fn expire_apply(
+        &self,
+        inner: &mut StoreInner,
+        plan: ExpirePlan,
+        fsyncs: u64,
+    ) -> Result<Expired> {
+        self.expire_apply_at(inner, plan, fsyncs, None)
+    }
+
+    /// `expire_apply`, with the frees held until `defer_to` is durable when the pass's records ride
+    /// on an early-released operation's flush (amendment 4). A release that fails part-way (a
+    /// catalog read, a12-durable-open) fail-stops the store, so none of the pass's records is ever
+    /// made durable.
+    fn expire_apply_at(
+        &self,
+        inner: &mut StoreInner,
+        plan: ExpirePlan,
+        fsyncs: u64,
+        defer_to: Option<u64>,
+    ) -> Result<Expired> {
+        let due = plan.due;
         let mut freed = Vec::new();
         for &id in &due {
             if let Err(e) = inner.apply_release(id, &mut freed) {
@@ -1379,17 +1686,31 @@ impl BranchStore {
             }
         }
         let freed_pages = freed.len();
-        inner.release_slots(freed);
+        {
+            use churn_counters::*;
+            EXPIRE_PASSES_WITH_DUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            EXPIRE_REAPED.fetch_add(due.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            EXPIRE_FREED_PAGES.fetch_add(freed_pages as u64, std::sync::atomic::Ordering::Relaxed);
+            EXPIRE_FSYNCS.fetch_add(fsyncs, std::sync::atomic::Ordering::Relaxed);
+        }
+        match defer_to {
+            Some(lsn) => inner.defer_frees(lsn, freed),
+            None => inner.release_slots(freed),
+        }
         self.sync_trunk_children(inner);
         self.sync_lease_flag(inner);
-        self.maybe_compact(inner);
-        Ok((
-            Expired {
-                reaped: due,
-                freed_pages,
-            },
-            now,
-        ))
+        Ok(Expired {
+            reaped: due,
+            freed_pages,
+        })
+    }
+
+    /// Leases outstanding, and how many of them have run out (observation only, r11-churn).
+    pub(crate) fn lease_counts(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        let now = inner.lease.now_ms();
+        let due = inner.leases.range(..=(now, BranchId(u64::MAX))).count();
+        (inner.leases.len(), due)
     }
 
     /// Move the lease clock forward, for tests. It never moves back.
@@ -1409,20 +1730,21 @@ impl BranchStore {
 
     /// Append `record` and make it durable before the caller acts on it. A no-op when volatile.
     fn log(&self, inner: &mut StoreInner, record: Record) -> Result<()> {
-        let StoreInner {
-            journal,
-            arena,
-            failpoint,
-            lease,
-            ..
-        } = inner;
-        let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
-            return Ok(());
-        };
-        injected_flush_failure(failpoint, journal)?;
-        journal.buffer(&record)?;
-        journal.flush(arena)?;
-        lease.flushed();
+        {
+            let StoreInner {
+                journal,
+                arena,
+                failpoint,
+                ..
+            } = &mut *inner;
+            let (Some(journal), Some(_)) = (journal.as_mut(), arena.as_ref()) else {
+                return Ok(());
+            };
+            injected_flush_failure(failpoint, journal)?;
+            journal.buffer(&record)?;
+        }
+        self.flush_locked(inner)?;
+        inner.lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         Ok(())
     }
@@ -1432,14 +1754,49 @@ impl BranchStore {
     /// log intact; a failure after it fail-stops the journal (see `Journal::compact`).
     fn maybe_compact(&self, inner: &mut StoreInner) {
         if inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
+            let t = Instant::now();
+            let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
+            }
+            use churn_counters::*;
+            let ns = t.elapsed().as_nanos() as u64;
+            COMPACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            COMPACT_NS_TOTAL.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+            COMPACT_NS_MAX.fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+            COMPACT_FSYNCS.fetch_add(
+                super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if let Some(j) = inner.journal.as_ref() {
+                COMPACT_BYTES_LAST.store(j.snapshot_len(), std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
 
     fn compact(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
+        // No flight may be writing the log this truncates. The snapshot (in catalog mode, the
+        // checkpoint) carries every applied operation, including the early-released ones still
+        // buffered, so once it is durable so are they.
+        let mut g = self.group.state.lock().unwrap();
+        while g.flushing {
+            g = self.group.cv.wait(g).unwrap();
+        }
+        if g.poisoned {
+            return Err(group_poisoned());
+        }
+        g.flushing = true;
+        drop(g);
+        let lsn = inner.journal.as_ref().map_or(0, Journal::lsn);
+        let compacted = self.compact_quiesced(inner, fail_after_rename);
+        self.land(lsn, compacted.is_ok());
+        compacted
+    }
+
+    fn compact_quiesced(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
         if inner.cat.is_some() {
+            // Catalog mode compacts by checkpointing into the catalog (a12-durable-open); the
+            // checkpoint lists free the deferred frees it covers (see `checkpoint_catalog`).
             inner.checkpoint_catalog(fail_after_rename)?;
             self.unsynced.store(false, Ordering::Release);
             return Ok(());
@@ -1465,16 +1822,51 @@ impl BranchStore {
     /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
-    pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
+    ///
+    /// Early release (amendment 4): the fork is applied and its records buffered; the returned log
+    /// sequence number must be passed to `wait_durable` — after the caller has released the WAL
+    /// write lock — before the branch is handed to anyone.
+    pub(crate) fn fork_trunk(
+        &self,
+        schema: Arc<Schema>,
+        page_size: usize,
+    ) -> Result<(BranchId, u64)> {
         let mut inner = self.inner.lock();
+        let restart = inner.arena.as_ref().is_some_and(|a| a.page_size() != page_size);
+        if restart {
+            // `ensure_backing` may start an empty store over (a compaction that truncates the
+            // log): no flight may be writing it. None can start while this holds the mutex.
+            self.quiesce();
+        }
         inner.ensure_backing(page_size)?;
-        let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
+        if restart {
+            // It did (it refuses otherwise): the empty snapshot supersedes everything buffered.
+            let lsn = inner.journal.as_ref().map_or(0, Journal::lsn);
+            self.land(lsn, true);
+            // Deferred frees name slots of the arena the restart replaced: returned to the new one
+            // they would free slots it never handed out.
+            inner.pending_free.clear();
+        }
+        self.mature(&mut inner);
+        // The expiry pass rides on the fork's own flush (group commit, r11-churn amendment 2): the
+        // same records in the same order as the pass's own flush followed by the fork's, made
+        // durable by one flush, then freed, then the fork applied.
+        let plan = self.expire_plan(&mut inner, Stamp::Queue)?;
+        let now = plan.now;
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now);
+        let (fork_records, lease) = inner.fork_records(id, BranchId::TRUNK, now);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
-        self.log_all(&mut inner, records)?;
+        let mut records = plan.records.clone();
+        records.extend(fork_records);
+        let lsn = self.buffer_all(&mut inner, records)?;
+        if !plan.due.is_empty() {
+            self.expire_apply_at(&mut inner, plan, 0, Some(lsn))?;
+            churn_counters::EXPIRE_PIGGYBACKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // A catalog read failing part-way leaves the fork half-applied: fail-stop, so its buffered
+        // records are never made durable (a12-durable-open).
         if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, Some(schema), Handle::Attached) {
             return Err(inner.fatal(e));
         }
@@ -1482,39 +1874,66 @@ impl BranchStore {
         self.sync_trunk_children(&inner);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
-        Ok(id)
+        Ok((id, lsn))
     }
 
     /// Fork a child of a branch. Refused while the parent has a write transaction in progress, for
     /// the same reason a trunk fork takes the WAL write lock, and refused on a released branch.
-    pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
+    ///
+    /// Early release (amendment 4), as `fork_trunk`: the caller waits on the returned log sequence
+    /// number before handing the branch out.
+    pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<(BranchId, u64)> {
         let mut inner = self.inner.lock();
+        self.mature(&mut inner);
         // Reap what has expired first, so a parent whose lease ran out is refused rather than
         // revived by a child that would pin it (Neon refuses to "create children from expiring
-        // branches").
-        let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
+        // branches"). The pass rides on the fork's own flush (group commit, r11-churn amendment 2);
+        // when the fork is refused, the pass is completed alone, as before.
+        let plan = self.expire_plan(&mut inner, Stamp::Queue)?;
+        let now = plan.now;
+        // Catalog stores: the parent made resident (ancestors first) before its state is read, as
+        // the pass-then-ensure order did (a12-durable-open).
         inner.ensure(parent)?;
-        let st = inner.branches.get(&parent).ok_or_else(|| gone(parent))?;
-        if st.writer {
-            return Err(LimboError::Busy);
-        }
-        if st.handle.is_released() {
+        let forkable = !plan.due.contains(&parent)
+            && matches!(inner.branches.get(&parent),
+                        Some(st) if !st.writer && !st.handle.is_released());
+        if !forkable {
+            // Refused: complete the pass alone, then refuse exactly as the pass-then-check order
+            // always did (gone, Busy, or reaped, in that order).
+            if !plan.due.is_empty() {
+                let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
+                self.log_all(&mut inner, plan.records.clone())?;
+                let fsyncs =
+                    super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0;
+                self.expire_apply(&mut inner, plan, fsyncs)?;
+                self.maybe_compact(&mut inner);
+            }
+            let st = inner.branches.get(&parent).ok_or_else(|| gone(parent))?;
+            if st.writer {
+                return Err(LimboError::Busy);
+            }
             return Err(reaped(parent));
         }
-        let schema = st.schema.clone();
+        let schema = inner.branches.get(&parent).expect("checked above").schema.clone();
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, parent, now);
+        let (fork_records, lease) = inner.fork_records(id, parent, now);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
-        self.log_all(&mut inner, records)?;
+        let mut records = plan.records.clone();
+        records.extend(fork_records);
+        let lsn = self.buffer_all(&mut inner, records)?;
+        if !plan.due.is_empty() {
+            self.expire_apply_at(&mut inner, plan, 0, Some(lsn))?;
+            churn_counters::EXPIRE_PIGGYBACKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Err(e) = inner.apply_fork(parent, id, schema, Handle::Attached) {
             return Err(inner.fatal(e));
         }
         inner.apply_fork_lease(id, lease);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
-        Ok(id)
+        Ok((id, lsn))
     }
 
     /// Mark the branch open for a connection and return its committed schema (`None` after a
@@ -1631,6 +2050,90 @@ impl BranchStore {
             freed_pages,
             deferred: inner.branches.contains_key(&id),
         })
+    }
+
+    /// Release several branches with ONE durable flush: group commit for reaps (r11-churn, PREREG
+    /// amendment 2). Every Release record is buffered and one flush makes them all durable before
+    /// anything is freed — rule 2, per batch instead of per branch, as `expire` already does for
+    /// leases and as ZFS frees a transaction group's destroys at its one sync. The releases are then
+    /// applied in the given order, so a chain released root first defers each interior until its
+    /// tip frees it, exactly as one `release_handle` per branch would. If the flush fails, every
+    /// branch of the batch is kept (`ReleasePending`), as `release_handle` keeps one.
+    pub(crate) fn release_many(&self, ids: &[BranchId]) -> Result<Vec<Reaped>> {
+        let mut inner = self.inner.lock();
+        let mut out = vec![
+            Reaped {
+                freed_pages: 0,
+                deferred: false,
+            };
+            ids.len()
+        ];
+        let mut todo = Vec::with_capacity(ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        for (i, &id) in ids.iter().enumerate() {
+            // Catalog stores: the branch made resident first, as `release_handle` does; a branch
+            // not resident would otherwise be skipped, unreleased.
+            inner.ensure(id)?;
+            let Some(st) = inner.branches.get(&id) else {
+                continue;
+            };
+            match st.handle {
+                Handle::Released => out[i].deferred = true,
+                Handle::ReleasePending => {
+                    return Err(fail_stopped(inner.journal.as_ref(), id, "no release"))
+                }
+                Handle::Attached | Handle::Detached => {
+                    if seen.insert(id) {
+                        todo.push(i);
+                    } else {
+                        out[i].deferred = true;
+                    }
+                }
+            }
+        }
+        if todo.is_empty() {
+            return Ok(out);
+        }
+        let records = todo
+            .iter()
+            .map(|&i| Record::Release { branch: ids[i].0 })
+            .collect();
+        // Early release (amendment 4): buffer the batch, apply it, and wait for the flight with the
+        // mutex released; the slots it frees return to the arena only once it is durable.
+        let lsn = match self.buffer_all(&mut inner, records) {
+            Ok(lsn) => lsn,
+            Err(e) => {
+                tracing::warn!("{} branches released in memory only: {e}", todo.len());
+                for &i in &todo {
+                    if let Some(st) = inner.branches.get_mut(&ids[i]) {
+                        st.handle = Handle::ReleasePending;
+                    }
+                }
+                return Err(LimboError::InternalError(format!(
+                    "{} branches were not released durably ({e}); they are kept, and come back at \
+                     the next open",
+                    todo.len()
+                )));
+            }
+        };
+        let mut freed = Vec::new();
+        for &i in &todo {
+            let before = freed.len();
+            // A catalog read failing part-way leaves the batch half-applied: fail-stop, so none of
+            // its buffered records is ever made durable (a12-durable-open).
+            if let Err(e) = inner.apply_release(ids[i], &mut freed) {
+                return Err(inner.fatal(e));
+            }
+            out[i].freed_pages = freed.len() - before;
+            out[i].deferred = inner.branches.contains_key(&ids[i]);
+        }
+        inner.defer_frees(lsn, freed);
+        self.sync_trunk_children(&inner);
+        self.sync_lease_flag(&inner);
+        self.maybe_compact(&mut inner);
+        drop(inner);
+        self.wait_durable(lsn)?;
+        Ok(out)
     }
 
     /// Detach a live branch from its handle without releasing it.
@@ -1757,6 +2260,7 @@ impl BranchStore {
     /// slot the commit will write the page into. Nothing is published until then.
     pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<()> {
         let mut inner = self.inner.lock();
+        self.mature(&mut inner);
         // A transaction that began before the journal failed may write no further page.
         if inner.poisoned() {
             return Err(fail_stopped(inner.journal.as_ref(), id, "no page write"));
@@ -1787,6 +2291,8 @@ impl BranchStore {
         // write would retain no pre-image for the branches on disk.
         self.refuse_if_trunk_only("a trunk page write")?;
         let mut inner = self.inner.lock();
+        // Deferred frees a flush has covered go back to the arena before it allocates (amendment 4).
+        self.mature(&mut inner);
         // Catalog stores: the page's `written` epoch, from its last catalog version, first.
         inner.trunk_written_known(page)?;
         let epoch = inner.trunk.lineage.epoch;
@@ -1862,40 +2368,46 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         // Re-read under the lock: `first_write_trunk` sets it while holding it.
         let unsynced = self.unsynced.load(Ordering::Acquire);
-        let StoreInner {
-            journal,
-            arena,
-            failpoint,
-            orphans,
-            lease,
-            leases,
-            ..
-        } = &mut *inner;
-        let (Some(journal), Some(arena)) = (journal.as_mut(), arena.as_mut()) else {
+        if inner.journal.is_none() || inner.arena.is_none() {
             return Ok(());
-        };
+        }
         if !unsynced {
             // Only stamps are at stake: the buffer holds nothing else without `unsynced`. A trunk
             // commit that needs no pre-image does not fail because its stamp could not be written;
             // a lost stamp lengthens leases and loses no data. But a failed flush POISONS the
             // journal, as every failed flush does: from then on every branch write and every trunk
             // commit that needs a pre-image is refused until the database is reopened.
-            if journal.is_poisoned() || leases.is_empty() {
-                return Ok(());
-            }
-            let now = lease.now_ms();
-            if now >= lease.queued_ms.saturating_add(STAMP_EVERY_MS) {
-                journal.buffer(&Record::Clock { now_ms: now })?;
-                lease.queued(now);
-            }
-            if lease.queued_ms > lease.durable_ms {
-                if *failpoint == Some(BranchFailpoint::StampFlushFails) {
-                    *failpoint = None;
-                    // Fails inside `flush`, so the poisoning is `flush`'s own (review 4 C7).
-                    journal.fail_next_write();
+            let flush = {
+                let StoreInner {
+                    journal,
+                    failpoint,
+                    lease,
+                    leases,
+                    ..
+                } = &mut *inner;
+                let journal = journal.as_mut().expect("checked above");
+                if journal.is_poisoned() || leases.is_empty() {
+                    return Ok(());
                 }
-                match journal.flush(arena) {
-                    Ok(()) => lease.flushed(),
+                let now = lease.now_ms();
+                if now >= lease.queued_ms.saturating_add(STAMP_EVERY_MS) {
+                    journal.buffer(&Record::Clock { now_ms: now })?;
+                    lease.queued(now);
+                }
+                if lease.queued_ms > lease.durable_ms {
+                    if *failpoint == Some(BranchFailpoint::StampFlushFails) {
+                        *failpoint = None;
+                        // Fails inside the flush, so the poisoning is the flush's own (review 4 C7).
+                        journal.fail_next_write();
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if flush {
+                match self.flush_locked(&mut inner) {
+                    Ok(()) => inner.lease.flushed(),
                     Err(e) => {
                         tracing::warn!("branch lease clock not stamped at a trunk commit: {e}")
                     }
@@ -1903,24 +2415,35 @@ impl BranchStore {
             }
             return Ok(());
         }
-        if *failpoint == Some(BranchFailpoint::BarrierBeforeRecords) {
-            *failpoint = None;
-            *orphans = journal.pending_slots.clone();
-            journal.poison();
-            return Err(LimboError::InternalError(
-                "failpoint: the trunk commit's branch barrier stopped before its records"
-                    .to_string(),
-            ));
-        }
-        if !leases.is_empty() {
-            let now = lease.now_ms();
-            if now >= lease.queued_ms.saturating_add(STAMP_EVERY_MS) {
-                journal.buffer(&Record::Clock { now_ms: now })?;
-                lease.queued(now);
+        {
+            let StoreInner {
+                journal,
+                failpoint,
+                orphans,
+                lease,
+                leases,
+                ..
+            } = &mut *inner;
+            let journal = journal.as_mut().expect("checked above");
+            if *failpoint == Some(BranchFailpoint::BarrierBeforeRecords) {
+                *failpoint = None;
+                *orphans = journal.pending_slots.clone();
+                journal.poison();
+                return Err(LimboError::InternalError(
+                    "failpoint: the trunk commit's branch barrier stopped before its records"
+                        .to_string(),
+                ));
+            }
+            if !leases.is_empty() {
+                let now = lease.now_ms();
+                if now >= lease.queued_ms.saturating_add(STAMP_EVERY_MS) {
+                    journal.buffer(&Record::Clock { now_ms: now })?;
+                    lease.queued(now);
+                }
             }
         }
-        journal.flush(arena)?;
-        lease.flushed();
+        self.flush_locked(&mut inner)?;
+        inner.lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         self.maybe_compact(&mut inner);
         Ok(())
@@ -2001,14 +2524,17 @@ impl BranchStore {
                 inner.lease.queued(now);
             }
         }
-        self.log_all(&mut inner, records)?;
+        // Early release (amendment 4): buffer, apply, and wait for the flight with the mutex
+        // released. The versions this commit supersedes are freed only once it is durable.
+        let lsn = self.buffer_all(&mut inner, records)?;
         let mut freed = Vec::new();
         if let Err(e) = inner.apply_commit(id, &entries, &mut freed) {
             return Err(inner.fatal(e));
         }
-        inner.release_slots(freed);
+        inner.defer_frees(lsn, freed);
         self.maybe_compact(&mut inner);
-        Ok(())
+        drop(inner);
+        self.wait_durable(lsn)
     }
 
     /// Fill `out` with `page` as branch `id` sees it, if that version lives in the arena. `false`
@@ -2096,7 +2622,9 @@ impl BranchStore {
     pub(crate) fn stats(&self) -> Result<BranchStats> {
         self.refuse_if_trunk_only("branch statistics")?;
         let mut inner = self.inner.lock();
-        // The slot counts the log describes: parked Commits applied first (C-R).
+        // The slot counts the log describes: deferred frees a flush has covered returned
+        // (amendment 4), and parked Commits applied (C-R), first.
+        self.mature(&mut inner);
         inner.settle()?;
         Ok(BranchStats {
             live_branches: inner.n_states as usize,
@@ -2111,6 +2639,7 @@ impl BranchStore {
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
         let mut inner = self.inner.lock();
+        self.mature(&mut inner);
         if let Err(e) = inner.settle() {
             tracing::warn!("branch store: parked commits not applied: {e}");
         }
@@ -2127,6 +2656,8 @@ impl BranchStore {
 
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
         let mut inner = self.inner.lock();
+        // Deferred frees a flush has covered are free (amendment 4): return them first.
+        self.mature(&mut inner);
         if let Err(e) = inner.settle() {
             tracing::warn!("branch store: parked commits not applied: {e}");
         }
@@ -2158,6 +2689,7 @@ impl BranchStore {
 
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
         let mut inner = self.inner.lock();
+        self.mature(&mut inner);
         if let Err(e) = inner.settle() {
             tracing::warn!("branch store: parked commits not applied: {e}");
         }
@@ -2230,6 +2762,16 @@ fn injected_flush_failure(failpoint: &mut Option<BranchFailpoint>, journal: &mut
     Ok(())
 }
 
+/// A group flight failed (amendment 4): the journal is fail-stopped, and nothing an operation
+/// buffered after the last durable flush will become durable in this process.
+fn group_poisoned() -> LimboError {
+    LimboError::InternalError(
+        "branch store is fail-stopped after a failed group flush; reopen the database to recover \
+         it from disk"
+            .to_string(),
+    )
+}
+
 fn reaped(id: BranchId) -> LimboError {
     LimboError::InvalidArgument(format!("branch {} has been reaped", id.0))
 }
@@ -2273,6 +2815,7 @@ impl StoreInner {
             deferred_freed: Vec::new(),
             parked_records: 0,
             parked_applied: 0,
+            pending_free: VecDeque::new(),
         }
     }
 
@@ -2888,6 +3431,17 @@ impl StoreInner {
             .values()
             .flat_map(|st| st.pending.values().copied())
             .collect();
+        // Slots freed by early-released operations (r11-churn amendment 4) wait in `pending_free`
+        // until a flush covers their records (rule 2). This checkpoint covers every operation
+        // applied so far, the ones still only buffered included, so it lists their slots free in
+        // the same transaction that stops naming them, and this process takes them back only once
+        // it has committed. Left out, they would stay in use in the catalog for good: a recovery
+        // reads the free table, and no later record frees them again.
+        let covered: Vec<Slot> = self
+            .pending_free
+            .iter()
+            .flat_map(|(_, freed)| freed.iter().copied())
+            .collect();
         let meta = Meta {
             generation,
             page_size: journal.page_size() as u32,
@@ -2896,7 +3450,7 @@ impl StoreInner {
             trunk_children: self.trunk.lineage.n_children,
             lease_now_ms: now,
             arena_hw: arena.high_water(),
-            in_use: (arena.in_use() - reserved.len()) as u64,
+            in_use: (arena.in_use() - reserved.len() - covered.len()) as u64,
             states: self.n_states,
         };
         if super::arena::trace_slots() {
@@ -2953,7 +3507,7 @@ impl StoreInner {
             for &slot in &cat.taken {
                 catalog.free_delete(slot)?;
             }
-            for &slot in arena.free_list().iter().chain(reserved.iter()) {
+            for &slot in arena.free_list().iter().chain(reserved.iter()).chain(covered.iter()) {
                 catalog.free_put(slot)?;
             }
             catalog.put_meta(&meta)
@@ -2997,6 +3551,12 @@ impl StoreInner {
         lineage.by_died.clear();
         self.children.map.clear();
         self.children.removed.clear();
+        // The covered deferred frees are catalog free rows now, like every other free slot: no
+        // longer in use here, and dropped from the in-memory list with the rest just below.
+        self.pending_free.clear();
+        for slot in covered {
+            arena.release(slot);
+        }
         // Every free slot is in the catalog now: the in-memory list is dropped and refetched.
         arena.drain_free();
         cat.free_cursor = None;
@@ -3006,6 +3566,38 @@ impl StoreInner {
         self.lease.queued(now);
         self.lease.flushed();
         Ok(())
+    }
+
+    /// Everything buffered, as one flight (`Journal::take_flight`); `None` when volatile.
+    fn take_flight(&mut self) -> Result<Option<Flight>> {
+        let (Some(journal), Some(arena)) = (self.journal.as_mut(), self.arena.as_mut()) else {
+            return Ok(None);
+        };
+        journal.take_flight(arena).map(Some)
+    }
+
+    /// Hold `freed` until the records that freed them — up to `lsn` — are durable (rule 2 under
+    /// early release; see `Group`). A volatile store frees at once.
+    fn defer_frees(&mut self, lsn: u64, freed: Vec<Slot>) {
+        if self.journal.is_none() || lsn == 0 {
+            self.release_slots(freed);
+            return;
+        }
+        if !freed.is_empty() {
+            self.pending_free.push_back((lsn, freed));
+        }
+    }
+
+    /// Return to the arena every deferred free a flush has covered.
+    fn mature_frees(&mut self, durable: u64) {
+        while self
+            .pending_free
+            .front()
+            .is_some_and(|&(lsn, _)| lsn <= durable)
+        {
+            let (_, freed) = self.pending_free.pop_front().expect("just looked");
+            self.release_slots(freed);
+        }
     }
 
     fn release_slots(&mut self, freed: Vec<Slot>) {
@@ -3898,7 +4490,9 @@ mod sota_index_tests {
         for step in 0..1500 {
             match rng.below(10) {
                 0..=2 if live.len() < 40 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    // Early release (r11-churn amendment 4): a fork is handed out once durable.
+                    let (id, lsn) = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    store.wait_durable(lsn).unwrap();
                     live.push((id, epoch, current.clone()));
                     epoch += 1;
                 }
@@ -4096,7 +4690,9 @@ mod sota_tree_tests {
             let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
             match rng.below(12) {
                 0 if live.len() < 60 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    // Early release (r11-churn amendment 4): a fork is handed out once durable.
+                    let (id, lsn) = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    store.wait_durable(lsn).unwrap();
                     nodes.push(Node {
                         id,
                         sees: trunk.clone(),
@@ -4112,7 +4708,8 @@ mod sota_tree_tests {
                     } else {
                         live[rng.below(live.len() as u64) as usize]
                     };
-                    let id = store.fork_branch(nodes[parent].id).unwrap();
+                    let (id, lsn) = store.fork_branch(nodes[parent].id).unwrap();
+                    store.wait_durable(lsn).unwrap();
                     let (sees, depth) = (nodes[parent].sees.clone(), nodes[parent].depth + 1);
                     nodes[parent].forked = true;
                     max_depth = max_depth.max(depth);
@@ -4277,14 +4874,21 @@ mod sota_tree_tests {
                     let from_trunk = live.is_empty() || rng.below(4) == 0;
                     arm(&store, BranchFailpoint::LogFlushFails);
                     let (forked, sees, depth) = if from_trunk {
-                        (store.fork_trunk(Arc::new(Schema::default()), PAGE), trunk.clone(), 1)
+                        // Early release (r11-churn amendment 4): a fork is handed out once
+                        // durable, and a failed flight is a failed fork.
+                        let r = store
+                            .fork_trunk(Arc::new(Schema::default()), PAGE)
+                            .and_then(|(id, lsn)| store.wait_durable(lsn).map(|()| id));
+                        (r, trunk.clone(), 1)
                     } else {
                         let parent = if rng.below(2) == 0 {
                             *live.last().unwrap()
                         } else {
                             live[rng.below(live.len() as u64) as usize]
                         };
-                        let r = store.fork_branch(nodes[parent].id);
+                        let r = store
+                            .fork_branch(nodes[parent].id)
+                            .and_then(|(id, lsn)| store.wait_durable(lsn).map(|()| id));
                         if r.is_ok() {
                             nodes[parent].forked = true;
                         }

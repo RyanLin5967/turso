@@ -264,6 +264,22 @@ impl Arena {
         Ok(())
     }
 
+    /// For a group flush (r11-churn amendment 4): a duplicate of the arena file's descriptor if
+    /// slots were written since the last sync, clearing the mark; the flight syncs it. `None` for
+    /// the memory backing or a clean arena.
+    pub(crate) fn take_dirty_file(&mut self) -> Result<Option<File>> {
+        if let Backing::File { file, dirty } = &mut self.backing {
+            if *dirty {
+                let dup = file
+                    .try_clone()
+                    .map_err(|e| crate::error::io_error(e, "dup branch arena"))?;
+                *dirty = false;
+                return Ok(Some(dup));
+            }
+        }
+        Ok(None)
+    }
+
     /// Make every slot written so far durable. A no-op for the memory backing.
     pub(crate) fn sync(&mut self) -> Result<()> {
         if let Backing::File { file, dirty } = &mut self.backing {
