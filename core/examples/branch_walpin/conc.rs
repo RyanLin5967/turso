@@ -665,7 +665,11 @@ pub(crate) fn run_conc(bench: &mut Bench, args: &Args) {
     drop(sessions);
     let b = bench.db.branch_stats();
     println!(
-        "# conc teardown live_branches={} arena_in_use={} arena_free={}",
-        b.live_branches, b.arena_slots_in_use, b.arena_slots_free
+        "# conc teardown live_branches={} arena_in_use={} arena_free={} f6_trunk_page_hits={} f6_trunk_page_misses={}",
+        b.live_branches,
+        b.arena_slots_in_use,
+        b.arena_slots_free,
+        b.work.trunk_page_hits,
+        b.work.trunk_page_misses
     );
 }
