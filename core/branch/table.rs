@@ -156,6 +156,11 @@ impl<T> BranchTable<T> {
         self.retired
     }
 
+    /// Reserve the free list for `n` more slots (r11-ever amendment 34, arm R).
+    pub(crate) fn reserve_free(&mut self, n: usize) {
+        self.free.reserve(n);
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = (BranchId, &T)> {
         self.chunks.iter().enumerate().flat_map(|(c, chunk)| {
             chunk.iter().enumerate().filter_map(move |(i, e)| {
