@@ -57,6 +57,7 @@ use std::path::Path;
 
 use super::arena::Slot;
 use crate::sync::Arc;
+use crate::util::IOExt as _;
 use crate::{
     Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, Result, SqliteDialect,
     Statement, Value, IO,
@@ -433,9 +434,19 @@ impl Catalog {
     /// table's rows, and each B-tree's pages per level, walked from its root through the interior
     /// pages' child pointers (SQLite's file format: an interior page, type 2 or 5, lists a left child
     /// in the first four bytes of each cell and its right-most child at header offset 8; page 1's
-    /// header starts at byte 100). Pages are read through `sqlite_dbpage` on this connection, so the
-    /// WAL's latest versions count. Unprepared statements, outside `counters`: an instrument.
+    /// header starts at byte 100). Pages are read through this connection's pager inside one read
+    /// transaction (the snapshot a `BEGIN` and a first read take), so the WAL's latest versions
+    /// count and nothing moves pages mid-walk; `sqlite_dbpage` would do the same but is built only
+    /// with the `cli_only` feature. Unprepared statements, outside `counters`: an instrument. It
+    /// writes nothing: the transaction only reads, and is rolled back.
     pub(crate) fn shape(&self) -> Result<super::CatalogShape> {
+        self.conn.execute("BEGIN")?;
+        let shape = self.shape_in_read_tx();
+        let _ = self.conn.execute("ROLLBACK");
+        shape
+    }
+
+    fn shape_in_read_tx(&self) -> Result<super::CatalogShape> {
         let bad = |what: String| LimboError::Corrupt(format!("branch catalog shape: {what}"));
         let one_int = |sql: &str| -> Result<u64> {
             let rows = self.conn.prepare(sql)?.run_collect_rows()?;
@@ -445,12 +456,13 @@ impl Catalog {
                 .map(|v| v as u64)
                 .ok_or_else(|| bad(format!("{sql} returned no integer")))
         };
-        let page_count = one_int("PRAGMA page_count")?;
-        let freelist_count = one_int("PRAGMA freelist_count")?;
+        // A table read first: it takes the transaction's read snapshot.
         let mut rows = Vec::new();
         for table in ["meta", "branch", "cur", "ret", "free"] {
             rows.push((table.to_string(), one_int(&format!("SELECT count(*) FROM {table}"))?));
         }
+        let page_count = one_int("PRAGMA page_count")?;
+        let freelist_count = one_int("PRAGMA freelist_count")?;
         let mut roots = vec![("sqlite_schema".to_string(), 1u64)];
         for row in self
             .conn
@@ -462,16 +474,13 @@ impl Catalog {
                 _ => return Err(bad("an unreadable sqlite_schema row".to_string())),
             }
         }
+        let pager = self.conn.get_pager();
         let page = |pgno: u64| -> Result<Vec<u8>> {
-            let rows = self
-                .conn
-                .prepare(format!("SELECT data FROM sqlite_dbpage WHERE pgno = {pgno}"))?
-                .run_collect_rows()?;
-            rows.first()
-                .and_then(|r| r.first())
-                .and_then(Value::to_blob)
-                .map(|b| b.to_vec())
-                .ok_or_else(|| bad(format!("page {pgno} unreadable")))
+            let (page_ref, completion) = pager.io.block(|| pager.read_page(pgno as i64))?;
+            if let Some(c) = completion {
+                pager.io.wait_for_completion(c)?;
+            }
+            Ok(page_ref.get_contents().as_slice().to_vec())
         };
         let u16_at = |d: &[u8], at: usize| -> Result<usize> {
             d.get(at..at + 2)
