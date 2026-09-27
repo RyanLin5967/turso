@@ -1968,6 +1968,38 @@ mod tests {
         assert_eq!(std::fs::metadata(&files.log).unwrap().len(), starts[2]);
     }
 
+    /// r12-noforce review 2 (R2-3): the later-flight check covers ANY damage, not only a zeroed frame.
+    /// A garbled frame inside an acknowledged flight, with a whole later flight after it, is Corrupt.
+    #[cfg(unix)]
+    #[test]
+    fn a_garbled_frame_under_a_whole_later_flight_is_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        let mut byte = std::fs::read(&files.log).unwrap()[starts[1] as usize + FRAME_HEADER_LEN];
+        byte ^= 0x5A;
+        {
+            use std::os::unix::fs::FileExt;
+            let f = OpenOptions::new().write(true).open(&files.log).unwrap();
+            f.write_all_at(&[byte], starts[1] + FRAME_HEADER_LEN as u64).unwrap();
+        }
+        assert!(Journal::recover(&files, false).is_err(), "damage under a later flight was cut");
+    }
+
+    /// r12-noforce review 2 (R2-4): the last flight lost its first block AND its end frame while a
+    /// frame in its middle survived. It was never synced, so it is cut back to the flight before it.
+    #[test]
+    fn a_last_flight_that_lost_its_start_and_end_is_cut() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        zero(&files.log, starts[2], FRAME_HEADER_LEN + 4);
+        let len = std::fs::metadata(&files.log).unwrap().len();
+        OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
+        let recovered = Journal::recover(&files, false)
+            .expect("a torn last flight is not corruption")
+            .expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 2]);
+    }
+
     /// Recovery's redo pass puts every image into its slot in log order, so a slot imaged twice
     /// ends with the later image, and a slot past the arena file's end is grown into.
     #[test]
