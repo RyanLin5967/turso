@@ -267,6 +267,10 @@ pub struct BranchWork {
     /// Entries those splices visited: versions freed as invisible, retained versions converted, and
     /// every entry of the smaller `current` map.
     pub splice_entries: u64,
+    /// Entries of `current` that `fork_branch`'s lazy view build inserted (once per branch, at its first
+    /// fork: nothing clears `view` after `BranchState::new`). Observation only (r11-adversarial PREREG
+    /// amendment 11).
+    pub view_build_entries: u64,
 }
 
 impl Branch {
