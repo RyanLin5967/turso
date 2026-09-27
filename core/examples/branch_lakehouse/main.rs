@@ -97,6 +97,9 @@ pub struct Args {
     synchronous: String,
     dir: Option<PathBuf>,
     counters_only: bool,
+    /// Reap every snapshot at the end and require an empty store (default). `none` skips it: the durable
+    /// catalog's WAL grew by 3.6 GB over 43,200 consecutive teardown reaps (PREREG A7).
+    teardown: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -126,6 +129,7 @@ fn parse_args() -> Args {
         synchronous: "NORMAL".to_string(),
         dir: None,
         counters_only: false,
+        teardown: true,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -164,6 +168,13 @@ fn parse_args() -> Args {
             }
             "--dir" => a.dir = Some(PathBuf::from(val())),
             "--counters-only" => a.counters_only = true,
+            "--teardown" => {
+                a.teardown = match val().as_str() {
+                    "full" => true,
+                    "none" => false,
+                    v => die(&format!("--teardown full|none, not {v}")),
+                }
+            }
             f => die(&format!("unknown flag {f}")),
         }
     }
@@ -732,6 +743,14 @@ fn main() {
         s_k2.summary(),
         s_fills as f64 / ((s_fills + s_hits).max(1)) as f64
     );
+    if !run.args.teardown {
+        println!(
+            "# teardown: skipped (--teardown none); {} snapshots live at the end: {}",
+            run.snaps.len(),
+            arm::state(&run.db)
+        );
+        return;
+    }
     // Teardown: every snapshot reaped, oldest first; the store must end empty.
     while let Some(l) = run.snaps.pop_front() {
         let branch = match l.snap {
