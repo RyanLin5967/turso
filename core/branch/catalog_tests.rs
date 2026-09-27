@@ -420,3 +420,295 @@ fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
         let _ = b.into_id();
     }
 }
+
+// ---- r11-restart-r2 (PREREG A14; UNBUILT when written) ----
+
+/// Branch `id`'s own row rewritten to `v` and committed.
+fn write(db: &Arc<Database>, id: BranchId, row: i64, v: &str) {
+    let b = db.branch(id).unwrap();
+    b.connect()
+        .unwrap()
+        .execute(format!("UPDATE t SET v = '{v}' WHERE id = {row}"))
+        .unwrap();
+    let _ = b.into_id();
+}
+
+/// Every branch of `model` reads its own row as the model says, and no other branch is live.
+fn check(db: &Arc<Database>, model: &std::collections::HashMap<BranchId, (i64, String)>) {
+    assert_eq!(db.branch_stats().unwrap().live_branches, model.len(), "live branches");
+    for (&id, (row, want)) in model {
+        let b = db.branch(id).unwrap();
+        assert_eq!(&value(&b.connect().unwrap(), *row), want, "branch {}", id.0);
+        let _ = b.into_id();
+    }
+}
+
+/// Wait, 10 s at most, for a fuzzy checkpoint to arrive at hook `stage`.
+fn wait_held(db: &Arc<Database>, stage: u8) {
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != stage | store::HOLD_ARRIVED {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(10),
+            "the fuzzy checkpoint never reached stage {stage}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// `grow` into a model: each branch's row and value.
+fn grown(db: &Arc<Database>, n: usize) -> std::collections::HashMap<BranchId, (i64, String)> {
+    grow(db, n)
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| (id, (1 + (i % 400) as i64, format!("b{}", id.0))))
+        .collect()
+}
+
+/// F-FZ, P-FZ1: a fuzzy checkpoint holds no store lock while it writes. Held after writing the
+/// captured rows and before committing them, it lets the store commit, fork, read and reap; after
+/// its install every branch reads as the model says, and after a reopen too. It ran at most 4
+/// catalog statements under the store mutex.
+#[test]
+fn a_fuzzy_checkpoint_holds_no_store_lock_while_it_writes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let mut model;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        model = grown(&db, 120);
+        db.branch_compact_now().unwrap();
+        let mut ids: Vec<BranchId> = model.keys().copied().collect();
+        ids.sort();
+        for &id in ids.iter().step_by(3) {
+            let v = format!("c{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+        }
+        let before = db.branch_checkpoint_counters();
+        db.branch_checkpoint_hold(store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no fuzzy checkpoint started");
+        wait_held(&db, store::HOLD_BEFORE_COMMIT);
+        // The writer sits inside its catalog transaction: each of these takes the store mutex.
+        for &id in ids.iter().skip(1).step_by(3) {
+            let v = format!("d{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+        }
+        model.extend(grown(&db, 10));
+        for &id in ids.iter().skip(2).step_by(30) {
+            let _ = db.branch(id).unwrap().reap().unwrap();
+            model.remove(&id);
+        }
+        check(&db, &model);
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        let after = db.branch_checkpoint_counters();
+        assert_eq!(after[0] - before[0], 1, "installed: {before:?} -> {after:?}");
+        assert_eq!(after[1] - before[1], 1, "flights: {before:?} -> {after:?}");
+        assert!(
+            after[5] - before[5] <= 4,
+            "catalog statements under the store mutex: {before:?} -> {after:?}"
+        );
+        check(&db, &model);
+    }
+    let db = open_at(&path, catalog()).unwrap();
+    check(&db, &model);
+}
+
+/// F-FZ crash state S1: the catalog committed, the log not yet cut. The image replays exactly the
+/// records written after the capture, and reads as the store did.
+#[test]
+fn a_crash_between_a_fuzzy_commit_and_its_install_replays_only_the_suffix() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let image;
+    let mut model;
+    let mut after = 0u64;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        model = grown(&db, 80);
+        db.branch_compact_now().unwrap();
+        let mut ids: Vec<BranchId> = model.keys().copied().collect();
+        ids.sort();
+        for &id in ids.iter().step_by(2) {
+            let v = format!("c{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+        }
+        db.branch_checkpoint_hold(store::HOLD_AFTER_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no fuzzy checkpoint started");
+        wait_held(&db, store::HOLD_AFTER_COMMIT);
+        for &id in ids.iter().step_by(5) {
+            let v = format!("s{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+            after += 1;
+        }
+        image = crash_image(&path, dir.path());
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        check(&db, &model);
+    }
+    let db = open_at(&image, catalog()).unwrap();
+    let s = db.branch_open_stats();
+    assert_eq!(s.records, after, "replayed other than the suffix after the capture: {s:?}");
+    check(&db, &model);
+    db.branch_compact_now().unwrap();
+    drop(db);
+    let db = open_at(&image, catalog()).unwrap();
+    check(&db, &model);
+}
+
+/// F-FZ crash state S0: the catalog transaction written, not committed. The image replays every
+/// record since the previous checkpoint: the captured ones and the ones after.
+#[test]
+fn a_crash_before_a_fuzzy_commit_replays_the_whole_log() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let image;
+    let mut model;
+    let mut records = 0u64;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        model = grown(&db, 80);
+        db.branch_compact_now().unwrap();
+        let mut ids: Vec<BranchId> = model.keys().copied().collect();
+        ids.sort();
+        for &id in ids.iter().step_by(2) {
+            let v = format!("c{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+            records += 1;
+        }
+        db.branch_checkpoint_hold(store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no fuzzy checkpoint started");
+        wait_held(&db, store::HOLD_BEFORE_COMMIT);
+        for &id in ids.iter().step_by(5) {
+            let v = format!("s{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+            records += 1;
+        }
+        image = crash_image(&path, dir.path());
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+    }
+    let db = open_at(&image, catalog()).unwrap();
+    let s = db.branch_open_stats();
+    // Plus the checkpoint's own marker (`Record::Checkpoint`), which the first write after the
+    // capture flushed with its own record.
+    assert_eq!(s.records, records + 1, "the uncommitted checkpoint cut the log: {s:?}");
+    check(&db, &model);
+}
+
+/// F-FZ's log bound: with fuzzy checkpoints the log may pass the threshold while one is in flight,
+/// but an operation that finds it past twice the threshold waits for the install, so the log never
+/// exceeds twice the threshold plus one operation's records. (The sharp checkpoint's bound, the
+/// threshold plus one operation, is `the_log_stays_under_the_checkpoint_threshold`, which holds in
+/// the default, sharp mode: PREREG A15 addendum.) Fuzzy mode only, so it is ignored in the default
+/// suite and run by name with `R11_CKPT=fuzzy --ignored` (q7.sh `tests fuzzy`).
+#[test]
+#[ignore = "fuzzy mode only: run with R11_CKPT=fuzzy and --ignored"]
+fn the_log_stays_under_twice_the_threshold_with_fuzzy_checkpoints() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    seed(&db.connect().unwrap());
+    let files = journal::BranchFiles::for_db(path.to_str().unwrap());
+    let trunk = db.connect().unwrap();
+    let mut max_log = 0;
+    for i in 0..60_000u64 {
+        let b = trunk.fork_branch().unwrap();
+        let row = 1 + (i % 400) as i64;
+        b.connect()
+            .unwrap()
+            .execute(format!("UPDATE t SET v = 'b{i}' WHERE id = {row}"))
+            .unwrap();
+        let _ = b.into_id();
+        max_log = max_log.max(std::fs::metadata(&files.log).unwrap().len());
+    }
+    db.branch_checkpoint_wait();
+    let c = db.branch_checkpoint_counters();
+    assert!(c[1] >= 2, "fewer than two fuzzy checkpoints ran: {c:?}");
+    assert!(max_log <= (2 << 20) + 256, "the log grew to {max_log} bytes: {c:?}");
+}
+
+/// C-R's settle in bounded batches (PREREG A14): after a crash whose tail commits to 200 old
+/// branches, a fuzzy checkpoint starts only once they are applied, 64 branches per call at most.
+#[test]
+fn parked_commits_settle_in_bounded_batches_before_a_fuzzy_checkpoint() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let image;
+    let mut model;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        model = grown(&db, 200);
+        db.branch_compact_now().unwrap();
+        let ids: Vec<BranchId> = model.keys().copied().collect();
+        for id in ids {
+            let v = format!("r{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+        }
+        image = crash_image(&path, dir.path());
+    }
+    let db = open_at(&image, catalog()).unwrap();
+    assert_eq!(db.branch_open_stats().parked_records, 200);
+    let before = db.branch_checkpoint_counters();
+    let mut calls = 0;
+    while !db.branch_checkpoint_fuzzy_now().unwrap() {
+        calls += 1;
+        assert!(calls < 10, "no checkpoint after {calls} settle batches");
+    }
+    db.branch_checkpoint_wait();
+    let after = db.branch_checkpoint_counters();
+    assert_eq!(calls, 3, "64 + 64 + 64, then 8 and the checkpoint");
+    assert_eq!(after[6] - before[6], 4, "settle batches: {before:?} -> {after:?}");
+    assert_eq!(after[7] - before[7], 200, "settle loads: {before:?} -> {after:?}");
+    assert_eq!(after[8], 64, "most loads in one batch: {after:?}");
+    check(&db, &model);
+}
+
+/// F-EXP: an open after every lease ran out reaps one bounded batch (256), not every branch; a
+/// due branch the pass did not reach is reaped when an operation names it; `expire_branches`
+/// reaps the rest.
+#[test]
+fn an_open_after_every_lease_ran_out_reaps_one_bounded_batch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let lease = std::time::Duration::from_secs(3600);
+    let opts = || catalog().with_branch_lease(Some(lease));
+    let n = 600;
+    let ids;
+    {
+        let db = open_at(&path, opts()).unwrap();
+        seed(&db.connect().unwrap());
+        ids = grow(&db, n);
+        db.branch_compact_now().unwrap();
+        db.branch_lease_clock_advance(lease + std::time::Duration::from_secs(1));
+        // The close stamps the clock and expires nothing.
+    }
+    let db = open_at(&path, opts()).unwrap();
+    assert_eq!(
+        db.branch_stats().unwrap().live_branches,
+        n - 256,
+        "the open's expiry pass is not bounded: {:?}",
+        db.branch_open_stats()
+    );
+    // The connection's own expiry pass reaps the next batch (the 256 earliest deadlines left), and
+    // the branch it names, due but later than all of those, is reaped on access.
+    let last = *ids.last().unwrap();
+    let b = db.branch(last).unwrap();
+    assert!(b.connect().is_err(), "a branch past its lease opened a connection");
+    drop(b);
+    let live = db.branch_stats().unwrap().live_branches;
+    assert_eq!(live, n - 2 * 256 - 1, "the connection's pass or the reap on access");
+    let rest = db.expire_branches().unwrap();
+    assert_eq!(rest.reaped.len(), live, "expire_branches did not reap the rest");
+    assert_eq!(db.branch_stats().unwrap().live_branches, 0);
+}
