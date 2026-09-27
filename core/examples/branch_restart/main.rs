@@ -1002,6 +1002,9 @@ fn reaprate(args: &Args) {
     if args.threads.is_empty() || args.threads.contains(&0) || args.round == 0 || args.reaps < args.round {
         die("reaprate: --threads positive, --round > 0, --reaps >= --round");
     }
+    if args.reaps > args.n {
+        die("reaprate: --reaps must be <= --n (a cell's victims all come from the population it began with)");
+    }
     let files = Files::new(&args.db);
     let t = Instant::now();
     let mut db = open_db(&args.db, true, true);
@@ -1071,6 +1074,9 @@ fn reaprate(args: &Args) {
             db.branch_reap_sampling(true);
             let _ = db.branch_take_reap_samples();
             let rounds = args.reaps / args.round;
+            // Victims come from the population as the cell began; this cell's refills join it at
+            // the end, so a cold cell's victims are all cold and a warm cell's all pre-touched.
+            let mut fresh: Vec<u64> = Vec::with_capacity(args.reaps);
             let (mut wall_ns, mut reaps) = (0u128, 0usize);
             let (mut cpu_user, mut cpu_sys) = (0u64, 0u64);
             let io0 = turso_core::branch::page_io();
@@ -1095,7 +1101,6 @@ fn reaprate(args: &Args) {
                             .unwrap_or_else(|e| not_a_result(&format!("warm attach {v}: {e}")));
                         let _ = b.into_id();
                     }
-                    let _ = db.branch_take_reap_samples();
                 }
                 let shares: Vec<Vec<u64>> = (0..t)
                     .map(|i| victims.iter().skip(i).step_by(t).copied().collect())
@@ -1132,8 +1137,9 @@ fn reaprate(args: &Args) {
                 cpu_sys += c1.1 - c0.1;
                 wall_ns += wall.as_nanos();
                 reaps += victims.len();
-                pop.extend(refill(&trunk, args.round, args.trunk_every, &mut forks, &mut trunk_writes));
+                fresh.extend(refill(&trunk, args.round, args.trunk_every, &mut forks, &mut trunk_writes));
             }
+            pop.extend(fresh);
             let io1 = turso_core::branch::page_io();
             let fs1 = turso_core::branch::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
             let samples = db.branch_take_reap_samples();

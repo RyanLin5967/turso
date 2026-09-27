@@ -1688,6 +1688,8 @@ impl BranchStore {
             let mut inner = self.inner.lock();
             let held = Instant::now();
             sample.wait_ns += ns(held - asked);
+            // The final hold's counts start here, so its plan (loads, statements) counts too.
+            let base = Self::section_base(&inner);
             if prefetch && inner.cat.is_some() && sample.reruns < 64 {
                 let reads = super::thread_page_reads();
                 let gate = super::set_io_mode(super::IO_REFUSE);
@@ -1720,7 +1722,7 @@ impl BranchStore {
             } else {
                 super::IO_OFF
             };
-            let released = self.release_section(&mut inner, id, &mut sample, held);
+            let released = self.release_section(&mut inner, id, &mut sample, held, base);
             if prefetch {
                 super::set_io_mode(gate);
             }
@@ -1728,26 +1730,35 @@ impl BranchStore {
         }
     }
 
-    /// The release itself, under the store mutex (`held`: when it was taken). Fills `sample`'s
-    /// section fields and, while sampling is on, records it.
+    /// Where a hold's counts start: (catalog statements, branch loads, this thread's page reads,
+    /// fsyncs and late misses).
+    fn section_base(inner: &StoreInner) -> [u64; 5] {
+        [
+            inner.cat.as_ref().map_or(0, |c| c.catalog.lock().counters.queries),
+            inner.cat.as_ref().map_or(0, |c| c.branch_loads),
+            super::thread_page_reads(),
+            super::thread_fsyncs(),
+            super::thread_late_misses(),
+        ]
+    }
+
+    /// The release itself, under the store mutex (`held`: when it was taken; `base`: the hold's
+    /// counts then, before any plan). Fills `sample`'s section fields and, while sampling is on,
+    /// records it.
     fn release_section(
         &self,
         inner: &mut StoreInner,
         id: BranchId,
         sample: &mut ReapSample,
         held: Instant,
+        base: [u64; 5],
     ) -> Result<Reaped> {
         let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         let queries = |inner: &StoreInner| {
             inner.cat.as_ref().map_or(0, |c| c.catalog.lock().counters.queries)
         };
         let loads = |inner: &StoreInner| inner.cat.as_ref().map_or(0, |c| c.branch_loads);
-        let (queries0, loads0) = (queries(inner), loads(inner));
-        let (reads0, fsyncs0, late0) = (
-            super::thread_page_reads(),
-            super::thread_fsyncs(),
-            super::thread_late_misses(),
-        );
+        let [queries0, loads0, reads0, fsyncs0, late0] = base;
         let phase = Instant::now();
         inner.ensure(id)?;
         sample.ensure_ns = ns(phase.elapsed());
