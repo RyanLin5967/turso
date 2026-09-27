@@ -80,6 +80,19 @@ pub fn page_io() -> [u64; 4] {
 pub(crate) fn count_page_io(which: usize, n: u64) {
     PAGE_IO[which].fetch_add(n, crate::sync::atomic::Ordering::Relaxed);
 }
+
+/// Process-wide count of `Pager::read_page` calls, first attempts only (a re-entry after an I/O
+/// yield is not counted again), cache hit or miss, across every database in the process: pages a
+/// B-tree descent fetched (r11-merge PREREG A20c instrument, observing only; one shared atomic on
+/// every page fetch, so no timed run is made with it).
+#[doc(hidden)]
+pub static PAGE_GETS: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
+
+/// A snapshot of [`PAGE_GETS`].
+#[doc(hidden)]
+pub fn page_gets() -> u64 {
+    PAGE_GETS.load(crate::sync::atomic::Ordering::Relaxed)
+}
 pub(crate) mod catalog;
 pub(crate) mod journal;
 pub(crate) mod page_map;
@@ -259,6 +272,24 @@ pub struct Reaped {
 /// What the last open of the branch store read and rebuilt (r11-restart lane). An observing
 /// instrument only: nothing reads it back. Each phase time is paired with the integer that phase
 /// is proportional to, so the phase table closes against `total_ns`.
+/// V4's base reads since open (r11-merge PREREG A20/A20c instrument, observing only): calls,
+/// those answered from the arena (a retained trunk version), those refused, and retained versions
+/// examined; the catalog's C-P trunk probes and the version rows they returned; and, inside those
+/// probes alone, B-tree seeks, cursor steps (next + prev) and pages fetched.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct V4Counters {
+    pub base_reads: u64,
+    pub base_arena: u64,
+    pub base_refused: u64,
+    pub base_examined: u64,
+    pub cp_probes: u64,
+    pub cp_rows: u64,
+    pub probe_seeks: u64,
+    pub probe_steps: u64,
+    pub probe_page_gets: u64,
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchOpenStats {
@@ -584,10 +615,9 @@ impl Database {
         self.branches.base_page_into(id, page, out)
     }
 
-    /// `(base reads, arena-resolved, refused, retained versions examined, C-P trunk probes, C-P
-    /// trunk rows)` since open (r11-merge A20 instrument).
+    /// V4's base-read counters since open (r11-merge A20/A20c instrument).
     #[doc(hidden)]
-    pub fn branch_v4_counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+    pub fn branch_v4_counters(&self) -> V4Counters {
         self.branches.v4_counters()
     }
 

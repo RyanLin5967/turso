@@ -246,13 +246,13 @@ struct StoreInner {
     parked_records: u64,
     parked_applied: u64,
     /// V4 base reads (r11-merge PREREG A20; observing only).
-    v4: V4Counters,
+    v4: V4Work,
 }
 
 /// A V4 merge's base reads since open: `base_page_into` calls, those answered from the arena (a
 /// retained trunk version) and those refused, and the retained versions compared (r11-merge A20).
 #[derive(Debug, Default, Clone, Copy)]
-struct V4Counters {
+struct V4Work {
     base_reads: u64,
     base_arena: u64,
     base_refused: u64,
@@ -2092,16 +2092,25 @@ impl BranchStore {
         read.map(|()| true)
     }
 
-    /// `(base reads, arena-resolved, refused, retained versions examined, C-P trunk probes, C-P
-    /// trunk rows)` since open (r11-merge A20). Does not settle, so reading it moves nothing.
-    pub(crate) fn v4_counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+    /// V4's counters since open (r11-merge A20/A20c). Does not settle, so reading it moves nothing.
+    pub(crate) fn v4_counters(&self) -> super::V4Counters {
         let inner = self.inner.lock();
         let v = inner.v4;
-        let (probes, rows) = inner
-            .cat
-            .as_ref()
-            .map_or((0, 0), |c| (c.trunk_probes, c.trunk_rows));
-        (v.base_reads, v.base_arena, v.base_refused, v.base_examined, probes, rows)
+        let mut out = super::V4Counters {
+            base_reads: v.base_reads,
+            base_arena: v.base_arena,
+            base_refused: v.base_refused,
+            base_examined: v.base_examined,
+            ..Default::default()
+        };
+        if let Some(c) = inner.cat.as_ref() {
+            out.cp_probes = c.trunk_probes;
+            out.cp_rows = c.trunk_rows;
+            out.probe_seeks = c.catalog.counters.probe_seeks;
+            out.probe_steps = c.catalog.counters.probe_steps;
+            out.probe_page_gets = c.catalog.counters.probe_page_gets;
+        }
+        out
     }
 
     pub(crate) fn open_stats(&self) -> BranchOpenStats {
@@ -2335,7 +2344,7 @@ impl StoreInner {
             deferred_freed: Vec::new(),
             parked_records: 0,
             parked_applied: 0,
-            v4: V4Counters::default(),
+            v4: V4Work::default(),
         }
     }
 

@@ -1,7 +1,13 @@
 //! V4 base-diff confirm run (r11-merge lane; PREREG A20 in frontier/round11/r11-merge/PREREG.md).
 //!
-//!   branch_v4 victim --db PATH --age A [--rows R] [--keys K] [--per M] [--seed S]
-//!   branch_v4 reopen --db PATH --age A [--rows R] [--keys K] [--per M] [--seed S]
+//!   branch_v4 victim --db PATH (--age A [--forks F] | --versions V) [--rows R] [--keys K] [--per M] [--seed S]
+//!   branch_v4 reopen (the same arguments)
+//!
+//! A20c's arms: `--forks F` (the N arm) forks F more branches from the trunk, detached and never
+//! written, spread evenly over the A commits (floor(F*g/A) - floor(F*(g-1)/A) before commit g).
+//! `--versions V` (the V arm) replaces the random commits: V rounds of one trunk commit updating
+//! B's K key rows, so rewriting B's leaves, then one observer fork, detached; each of B's leaves
+//! then carries V retained trunk versions and B's base is the oldest.
 //!
 //! `victim` is the kill -9 VICTIM. It opens a fresh catalog-mode store (`Catalog { sync: false }`;
 //! the files are the same bytes as with sync), creates t(id INTEGER PRIMARY KEY, v TEXT) with R
@@ -55,6 +61,8 @@ struct Args {
     keys: usize,
     per: usize,
     seed: u64,
+    forks: u64,
+    versions: u64,
 }
 
 fn parse_args() -> Args {
@@ -68,6 +76,8 @@ fn parse_args() -> Args {
         keys: 64,
         per: 16,
         seed: 0x9E37_79B9_7F4A_7C15,
+        forks: 0,
+        versions: 0,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -78,11 +88,19 @@ fn parse_args() -> Args {
             "--keys" => args.keys = val().parse().unwrap_or_else(|_| die("bad --keys")),
             "--per" => args.per = val().parse().unwrap_or_else(|_| die("bad --per")),
             "--seed" => args.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
+            "--forks" => args.forks = val().parse().unwrap_or_else(|_| die("bad --forks")),
+            "--versions" => args.versions = val().parse().unwrap_or_else(|_| die("bad --versions")),
             other => die(&format!("unknown argument {other}")),
         }
     }
+    if args.versions > 0 {
+        if args.age != 0 || args.forks != 0 {
+            die("--versions sets the commits and the forks; it takes no --age or --forks");
+        }
+        args.age = args.versions;
+    }
     if args.db.as_os_str().is_empty() || args.age == 0 || args.rows < 1 || args.keys == 0 || args.per == 0 {
-        die("--db and --age are required; --rows, --keys and --per must be positive");
+        die("--db and --age (or --versions) are required; --rows, --keys and --per must be positive");
     }
     if args.keys as i64 > args.rows {
         die("--keys exceeds --rows");
@@ -120,10 +138,24 @@ fn draws(args: &Args) -> Draws {
             keys.push(k);
         }
     }
-    let trunk = (0..args.age)
-        .map(|_| (0..args.per).map(|_| rng.row(args.rows)).collect())
-        .collect();
+    let trunk = if args.versions > 0 {
+        vec![keys.clone(); args.versions as usize]
+    } else {
+        (0..args.age)
+            .map(|_| (0..args.per).map(|_| rng.row(args.rows)).collect())
+            .collect()
+    };
     Draws { keys, trunk }
+}
+
+/// The N arm's forks before commit `g` (1-based): F spread evenly over the A commits.
+fn forks_before(args: &Args, g: u64) -> u64 {
+    args.forks * g / args.age - args.forks * (g - 1) / args.age
+}
+
+/// Live branches the run leaves: B, the N arm's forks, the V arm's observers.
+fn n_live(args: &Args) -> usize {
+    (1 + args.forks + args.versions) as usize
 }
 
 fn trunk_value(id: i64) -> String {
@@ -217,9 +249,11 @@ fn victim(args: &Args) {
     trunk.execute("COMMIT").unwrap();
     checkpoint_truncate(&trunk);
     println!(
-        "# victim pid={} age={} rows={} keys={} per={} seed={} page_size={} page_count={}",
+        "# victim pid={} age={} forks={} versions={} rows={} keys={} per={} seed={} page_size={} page_count={}",
         std::process::id(),
         args.age,
+        args.forks,
+        args.versions,
         args.rows,
         args.keys,
         args.per,
@@ -239,17 +273,28 @@ fn victim(args: &Args) {
     conn.execute("COMMIT").unwrap();
     drop(conn);
     let _ = branch.into_id();
+    let fork_one = || {
+        let b = trunk.fork_branch().unwrap();
+        let _ = b.into_id();
+    };
     for (g, rows) in d.trunk.iter().enumerate() {
-        let value = trunk_write_value(g as u64 + 1);
+        let g = g as u64 + 1;
+        for _ in 0..if args.forks > 0 { forks_before(args, g) } else { 0 } {
+            fork_one();
+        }
+        let value = trunk_write_value(g);
         trunk.execute("BEGIN").unwrap();
         for &r in rows {
             trunk.execute(format!("UPDATE t SET v = '{value}' WHERE id = {r}")).unwrap();
         }
         trunk.execute("COMMIT").unwrap();
+        if args.versions > 0 {
+            fork_one();
+        }
     }
     let st = db.branch_stats().unwrap();
-    if st.live_branches != 1 {
-        not_a_result(&format!("after the trunk commits: {st:?}, expected 1 live branch"));
+    if st.live_branches != n_live(args) {
+        not_a_result(&format!("after the trunk commits: {st:?}, expected {} live branches", n_live(args)));
     }
     println!(
         "# victim before checkpoint: trunk_commits={} trunk_retained={} arena_slots_in_use={} {}",
@@ -509,22 +554,34 @@ fn reopen(args: &Args) {
         args.age,
         rewritten_leaves.len()
     );
+    let (base_reads, base_arena, base_refused, base_examined) = (
+        v4_1.base_reads - v4_0.base_reads,
+        v4_1.base_arena - v4_0.base_arena,
+        v4_1.base_refused - v4_0.base_refused,
+        v4_1.base_examined - v4_0.base_examined,
+    );
+    let (cp_probes, cp_rows) = (v4_1.cp_probes - v4_0.cp_probes, v4_1.cp_rows - v4_0.cp_rows);
+    let (probe_seeks, probe_steps, probe_page_gets) = (
+        v4_1.probe_seeks - v4_0.probe_seeks,
+        v4_1.probe_steps - v4_0.probe_steps,
+        v4_1.probe_page_gets - v4_0.probe_page_gets,
+    );
     println!(
-        "V4\tage={}\trows={}\tkeys={n}\tper={}\tseed={}\tbase_reads={}\tbase_arena={}\tbase_refused={}\tbase_examined={}\t\
-         cp_probes={}\tcp_rows={}\tcat_branch_loads={}\tcat_trunk_page_loads={}\tcat_queries={}\tcat_rows_read={}\t\
+        "V4\tage={}\tforks={}\tversions={}\tn_live={}\trows={}\tkeys={n}\tper={}\tseed={}\t\
+         base_reads={base_reads}\tbase_arena={base_arena}\tbase_refused={base_refused}\tbase_examined={base_examined}\t\
+         cp_probes={cp_probes}\tcp_rows={cp_rows}\tprobe_seeks={probe_seeks}\tprobe_steps={probe_steps}\tprobe_page_gets={probe_page_gets}\t\
+         cat_branch_loads={}\tcat_trunk_page_loads={}\tcat_queries={}\tcat_rows_read={}\t\
          resolve_calls={}\tresolve_arena_reads={}\tarena_by_depth={:?}\tcurrent_by_depth={:?}\tpath_pages_total={}\th_min={h_min}\th_max={h_max}\t\
          expect_arena_leaf={expect_arena_leaf}\tleaves_rewritten={}\tpaths_equal={paths_equal}\tbase_ok={base_ok}\tours_differs={ours_differs}\t\
-         M={:.4}\tM1={:.4}\tM2_cp_rows_per_arena={}\tM2_examined_per_arena={}\tpage_io_open={:?}\tpage_io_v4={:?}",
+         M={:.4}\tM1={:.4}\tM2_cp_rows_per_arena={}\tM2_examined_per_arena={}\t\
+         seeks_per_probe={}\tsteps_per_probe={}\tpage_gets_per_probe={}\tpage_io_open={:?}\tpage_io_v4={:?}",
         args.age,
+        args.forks,
+        args.versions,
+        n_live(args),
         args.rows,
         args.per,
         args.seed,
-        v4_1.0 - v4_0.0,
-        v4_1.1 - v4_0.1,
-        v4_1.2 - v4_0.2,
-        v4_1.3 - v4_0.3,
-        v4_1.4 - v4_0.4,
-        v4_1.5 - v4_0.5,
         cat1.0 - cat0.0,
         cat1.1 - cat0.1,
         cat1.2 - cat0.2,
@@ -537,8 +594,11 @@ fn reopen(args: &Args) {
         rewritten_leaves.len(),
         arena as f64 / n as f64,
         path_pages.iter().sum::<u64>() as f64 / n as f64,
-        ratio(v4_1.5 - v4_0.5, v4_1.1 - v4_0.1),
-        ratio(v4_1.3 - v4_0.3, v4_1.1 - v4_0.1),
+        ratio(cp_rows, base_arena),
+        ratio(base_examined, base_arena),
+        ratio(probe_seeks, cp_probes),
+        ratio(probe_steps, cp_probes),
+        ratio(probe_page_gets, cp_probes),
         delta(io0, io1),
         delta(io1, io2)
     );
@@ -547,8 +607,8 @@ fn reopen(args: &Args) {
         println!("FINDING: {f}");
     }
     let _ = std::io::stdout().flush();
-    if v4_1.1 - v4_0.1 != arena {
-        not_a_result(&format!("the store counted {} arena base reads, the harness {arena}", v4_1.1 - v4_0.1));
+    if base_arena != arena {
+        not_a_result(&format!("the store counted {base_arena} arena base reads, the harness {arena}"));
     }
 
     // Theirs, after the counters are taken (these reads go through the ordinary resolve path).
@@ -579,8 +639,8 @@ fn reopen(args: &Args) {
                 db.branch_trunk_retained(),
                 files_line(&args.db)
             );
-            if st.live_branches != 1 {
-                later.push(format!("after the reopen: {st:?}, expected 1 live branch"));
+            if st.live_branches != n_live(args) {
+                later.push(format!("after the reopen: {st:?}, expected {} live branches", n_live(args)));
             }
         }
         Err(e) => later.push(format!("branch_stats after the reopen: {e}")),
@@ -595,7 +655,7 @@ fn reopen(args: &Args) {
     println!("DONE age={}", args.age);
 }
 
-/// `num/den` to four places, or `na` when nothing was arena-resolved.
+/// `num/den` to four places, or `na` when the denominator is 0.
 fn ratio(num: u64, den: u64) -> String {
     if den == 0 {
         "na".to_string()

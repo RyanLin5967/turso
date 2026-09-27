@@ -3559,6 +3559,7 @@ impl Pager {
             // rather than issuing duplicate IO.
             (pending.page, pending.disk_read)
         } else {
+            crate::branch::PAGE_GETS.fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
             // Fast path: cache hit.
             {
                 let mut page_cache = self.page_cache.write();

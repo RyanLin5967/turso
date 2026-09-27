@@ -158,6 +158,12 @@ pub(crate) struct CatalogCounters {
     pub(crate) queries: u64,
     pub(crate) rows_read: u64,
     pub(crate) rows_written: u64,
+    /// `trunk_pred`'s probes only (r11-merge A20c): B-tree seeks, and cursor steps (next + prev),
+    /// from the statement's own metrics, and pages fetched ([`crate::branch::PAGE_GETS`]), each
+    /// the delta around the one query.
+    pub(crate) probe_seeks: u64,
+    pub(crate) probe_steps: u64,
+    pub(crate) probe_page_gets: u64,
 }
 
 /// An integer as the catalog stores it. Every value the store keeps is below 2^63 except a
@@ -630,9 +636,16 @@ impl Catalog {
     /// page's last version (whose `died` is the trunk's last write of the page). One index probe
     /// (`ret_page`, descending): the multiversion B-tree's "version of key k at time t" (C-P).
     pub(crate) fn trunk_pred(&mut self, page: u32, at: u64) -> Result<Option<(u64, u64, Slot, u32)>> {
+        let m0 = self.ret_pred.stmt.metrics();
+        let g0 = crate::branch::page_gets();
         let rows = self
             .ret_pred
             .rows(&[int(0), int(page as u64), int(at)], &mut self.counters)?;
+        let m1 = self.ret_pred.stmt.metrics();
+        self.counters.probe_page_gets += crate::branch::page_gets() - g0;
+        self.counters.probe_seeks += m1.btree_seeks - m0.btree_seeks;
+        self.counters.probe_steps +=
+            (m1.btree_next + m1.btree_prev) - (m0.btree_next + m0.btree_prev);
         rows.first()
             .map(|row| Ok((get(row, 0)?, get(row, 1)?, get(row, 2)? as Slot, get(row, 3)? as u32)))
             .transpose()
