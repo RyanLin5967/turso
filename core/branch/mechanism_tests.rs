@@ -803,7 +803,7 @@ fn exec_retrying_busy(conn: &Arc<Connection>, sql: &str) {
 const RECLAIM_KILL_CHILD: &str = "branch::mechanism_tests::reclaim_kill_child_process";
 const RECLAIM_KILL_ENV: &str = "TURSO_BRANCH_RECLAIM_KILL_DB";
 const RECLAIM_KILL_MARK: &str = "RECLAIM_KILL_CHILD: between two reclamation holds";
-const RECLAIM_KILL_ROWS: i64 = 5000;
+const RECLAIM_KILL_ROWS: i64 = 20_000;
 
 #[test]
 fn reclaim_kill_child_process() {
@@ -837,9 +837,9 @@ fn reclaim_kill_child_process() {
         use std::io::Write as _;
         println!("{RECLAIM_KILL_MARK}");
         std::io::stdout().flush().unwrap();
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-        }
+        // Killed by the parent long before this; bounded so an orphan cannot outlive it for long.
+        std::thread::sleep(std::time::Duration::from_secs(600));
+        std::process::exit(3);
     })));
     drop(branch);
     unreachable!("the reclamation pause never returns");

@@ -65,7 +65,7 @@
 //! branch's page map — and the queue is reclaimed in holds of at most [`RECLAIM_BATCH`] units,
 //! the mutex handed to any waiting thread between them: OpenZFS's asynchronous destroy, which
 //! unlinks a dataset at once and frees its blocks a bounded number per transaction group.
-//! Reclamation examines what it frees plus at most one root per queued heap, and never walks a
+//! Reclamation examines what it frees plus at most one root per queue entry, and never walks a
 //! surviving version. A version waiting in the queue is invisible: no live child and no later fork
 //! lies in its `[born, died)`, and the born-ordered lookup answers as it would without it (see
 //! [`Lineage::retained_at`]).
@@ -297,7 +297,9 @@ fn pop_garbage(
         }
         let mut root = heap.take().expect("checked above");
         *heap = meld(root.left.take(), root.right.take(), &mut work.gc_meld_steps);
-        crate::turso_debug_assert!(
+        // Debug builds only: turso_debug_assert! would still evaluate the range search in release.
+        #[cfg(debug_assertions)]
+        crate::turso_assert!(
             children.range(root.born..root.died).next().is_none(),
             "reclaimed a version a live child can still see"
         );
@@ -1509,11 +1511,14 @@ mod tests {
     /// whichever structure held the pages (r12-async-destroy PREREG §4, T-red): 2^20 versions the
     /// trunk retained for one child alone (the heap side of a reap), and 2^20 pages one branch
     /// wrote itself (the page-map side). A store that frees inside the reap's one hold frees all
-    /// 2^20 in it.
+    /// 2^20 in it. Both sides run before anything is asserted, so a failure reports both, and the
+    /// hold bound is asserted before the totals.
     #[test]
     fn a_reap_of_2_20_pages_holds_the_store_mutex_for_at_most_a_batch_of_frees() {
         const K: u32 = 1 << 20;
         const B: u64 = 64;
+        // (own, held before, freed_pages, held after, branches after, the reap's per-hold maxima)
+        let mut seen = Vec::new();
         for own in [false, true] {
             let store = BranchStore::new();
             let schema = Arc::new(Schema::default());
@@ -1533,24 +1538,33 @@ mod tests {
             // A younger live sibling, so the trunk side's garbage has a neighbour to be filed
             // under.
             let sibling = store.fork_trunk(schema, PAGE).unwrap();
-            assert_eq!(store.stats().arena_slots_in_use, K as usize, "own {own}");
+            let before = store.stats().arena_slots_in_use;
             store.take_hold_max();
             let reaped = store.release_handle(child);
             let h = store.take_hold_max();
-            assert_eq!(reaped.freed_pages, K as usize, "own {own}");
-            assert_eq!(store.stats().arena_slots_in_use, 0, "own {own}");
+            let after = store.stats().arena_slots_in_use;
+            store.release_handle(sibling);
+            seen.push((own, before, reaped.freed_pages, after, store.stats().live_branches, h));
+        }
+        for &(own, _, _, _, _, h) in &seen {
             assert!(
                 h.freed <= B && h.slot_decrefs <= B && h.map_nodes <= B && h.heap_examined <= B,
                 "own {own}: one hold of the reap freed {} slots, dropped {} slot references, visited \
-                 {} map nodes and examined {} heap roots, against at most {B} each ({} holds)",
+                 {} map nodes and examined {} heap roots, against at most {B} each ({} holds); \
+                 both sides: {seen:?}",
                 h.freed,
                 h.slot_decrefs,
                 h.map_nodes,
                 h.heap_examined,
                 h.holds
             );
-            store.release_handle(sibling);
-            assert_eq!(store.stats().live_branches, 0, "own {own}");
+        }
+        for &(own, before, freed, after, branches, _) in &seen {
+            assert_eq!(
+                (before, freed, after, branches),
+                (K as usize, K as usize, 0, 0),
+                "own {own}: slots held before, freed, held after, branches left"
+            );
         }
     }
 
@@ -1890,18 +1904,24 @@ mod tests {
         }
     }
 
-    /// The drainer dies after `cut` units — mid-batch, at the batch edge, past it — other work
-    /// runs while the queue waits (a fork, and a trunk rewrite whose versions are filed under the
-    /// very child whose heap still holds the queued garbage), and a fresh drainer on another
-    /// thread finishes it (r12-async-destroy PREREG §4, T-crash-resume). Against a twin store that
-    /// did the same with whole reaps: the same slots end up held, the frees add up to the twin's
-    /// exactly (a second release of any slot would panic at the arena), and every live branch
-    /// reads its model bytes throughout.
+    /// The drainer dies after `cut` units of work — mid-batch, at a batch edge, past it, inside the
+    /// second queue entry, past both — other work runs while the queue waits (a fork, and a trunk
+    /// rewrite whose versions are filed under the very child whose heap still holds the queued
+    /// garbage), and a fresh drainer on another thread finishes it (r12-async-destroy PREREG §4,
+    /// T-crash-resume). The frees add up to exactly the victims' 450 slots (a second release of any
+    /// slot would panic at the arena), exactly the 750 slots live branches can reach stay held, as
+    /// on a twin store that did the same with whole reaps, and every live branch reads its model
+    /// bytes throughout.
     #[test]
     fn a_reclamation_cut_at_any_point_resumes_without_a_leak_or_a_double_free() {
-        let mut cut_in = [0usize; 2];
+        // w's 150 own slots and the 300 versions v alone held.
+        const GARBAGE: usize = 450;
+        // r's 150 own slots and the 300 versions kept for r; the 300 kept for z and n.
+        const HELD_AFTER: usize = 750;
+        // Cuts that finished the first queue entry and left the second.
+        let mut crossed = [0usize; 2];
         for order in [[0, 1], [1, 0]] {
-            for cut in 0..=130usize {
+            for cut in 0..=520usize {
                 let what = format!("order {order:?} cut {cut}");
                 let (store, twin) = (BranchStore::new(), BranchStore::new());
                 let (mut readers, victims, mut trunk) = victims_and_readers(&store);
@@ -1919,8 +1939,8 @@ mod tests {
                     freed += store.reclaim_step(budget);
                     left -= budget;
                 }
-                if store.reclaim_queued() > 0 {
-                    cut_in[order[0]] += 1;
+                if store.reclaim_queued() == 1 {
+                    crossed[order[0]] += 1;
                 }
                 read_all(&store, &readers, &trunk, &what);
                 // Work while the queue waits, on both stores alike.
@@ -1946,28 +1966,34 @@ mod tests {
                     .unwrap()
                 });
                 read_all(&store, &readers, &trunk, &what);
-                assert_eq!(freed, twin_freed, "{what}: frees");
-                assert!(freed >= 450, "{what}: the victims held {freed} slots only");
+                assert_eq!((freed, twin_freed), (GARBAGE, GARBAGE), "{what}: frees, cut and twin");
                 assert_eq!(
-                    store.stats().arena_slots_in_use,
-                    twin.stats().arena_slots_in_use,
-                    "{what}: slots held"
+                    (
+                        store.stats().arena_slots_in_use,
+                        twin.stats().arena_slots_in_use
+                    ),
+                    (HELD_AFTER, HELD_AFTER),
+                    "{what}: slots held, cut and twin"
                 );
             }
         }
-        // Each order's cuts must have left work queued (they fall inside its first entry).
-        assert!(cut_in[0] > 100 && cut_in[1] > 100, "cuts that left work queued: {cut_in:?}");
+        assert!(
+            crossed[0] > 50 && crossed[1] > 50,
+            "cuts that finished the first queue entry and left the second: {crossed:?}"
+        );
     }
 
-    /// A background thread reclaims while this thread unlinks victims and reads every page of
-    /// every reader over and over (r12-async-destroy PREREG §4, T-concurrent). The victims share
-    /// what they free with the readers — a map whose nodes and slots a reader's map also holds,
-    /// trunk versions next to ones a reader sees — so a reclamation that freed a page a reader
-    /// can see fails a read: at the arena (a freed slot refuses access) or at the bytes.
+    /// A background thread reclaims in small batches while this thread unlinks victims and reads
+    /// every page of every reader over and over (r12-async-destroy PREREG §4, T-concurrent). The
+    /// victims share what they free with the readers — a map whose nodes and slots a reader's map
+    /// also holds, trunk versions next to ones a reader sees — so a reclamation that freed a page a
+    /// reader can see fails a read: at the arena (a freed slot refuses access) or at the bytes.
     #[test]
     fn a_background_reclaimer_never_frees_a_page_a_live_branch_can_read() {
         use std::sync::atomic::AtomicBool;
-        for round in 0..20 {
+        // Reads that began and ended with reclamation still queued.
+        let mut overlapped = 0;
+        for round in 0..20u64 {
             let store = Arc::new(BranchStore::new());
             let (readers, victims, trunk) = victims_and_readers(&store);
             let held = store.stats().arena_slots_in_use;
@@ -1975,32 +2001,38 @@ mod tests {
             let drainer = {
                 let (store, stop) = (store.clone(), stop.clone());
                 std::thread::spawn(move || {
+                    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ round);
                     let mut freed = 0;
                     loop {
-                        let n = store.reclaim_step(RECLAIM_BATCH);
+                        // Small batches with a yield between them, so reclamation stays pending
+                        // across reads.
+                        let n = store.reclaim_step(1 + rng.below(8) as usize);
                         freed += n;
-                        if n == 0 {
-                            if stop.load(Ordering::Acquire) && store.reclaim_queued() == 0 {
-                                return freed;
-                            }
-                            std::thread::yield_now();
+                        if n == 0 && stop.load(Ordering::Acquire) && store.reclaim_queued() == 0 {
+                            return freed;
                         }
+                        std::thread::yield_now();
                     }
                 })
             };
             for (i, &victim) in victims.iter().enumerate() {
                 store.unlink(victim).expect("the victim exists");
                 for _ in 0..4 {
+                    let pending = store.reclaim_queued() > 0;
                     read_all(&store, &readers, &trunk, &format!("round {round} victim {i}"));
+                    if pending && store.reclaim_queued() > 0 {
+                        overlapped += 1;
+                    }
                 }
             }
             stop.store(true, Ordering::Release);
             let freed = drainer.join().unwrap();
             read_all(&store, &readers, &trunk, &format!("round {round} drained"));
             assert_eq!(store.reclaim_queued(), 0);
+            assert_eq!(freed, 450, "round {round}: w's 150 own slots and the 300 v alone held");
             assert_eq!(held - store.stats().arena_slots_in_use, freed, "round {round}");
-            assert!(freed >= 450, "round {round}: the victims held {freed} slots only");
         }
+        assert!(overlapped > 0, "no read began and ended with reclamation pending");
     }
 
     /// One committed write transaction on `id` of `pages`, each holding `image(generation)`.
