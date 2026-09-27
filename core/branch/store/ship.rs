@@ -115,6 +115,10 @@ pub(crate) struct SlotView {
     alloc_seq: u64,
     content_seq: u64,
     data: std::sync::Arc<[u8]>,
+    /// The fork base, resolved when the slot was written (F-S3): for a branch page, the slot its
+    /// branch reads the page from through its ancestry, with that slot's bytes (the branch pins it
+    /// while it lives); `None` means the trunk's page of the same number.
+    base: Option<(Slot, std::sync::Arc<[u8]>)>,
 }
 
 pub(crate) struct TrunkVersion {
@@ -130,6 +134,33 @@ pub(crate) struct WrittenView {
     epoch: Option<u64>,
 }
 
+/// One item's current value in the change index.
+#[derive(Clone)]
+pub(crate) enum ChangeVal {
+    State(std::sync::Arc<StateView>),
+    Hole { born: u64 },
+    Slot(std::sync::Arc<SlotView>),
+    Trunk(std::sync::Arc<TrunkVersion>),
+    Written(std::sync::Arc<WrittenView>),
+}
+
+/// The items of one kind whose latest change was one sequence number, with their current values.
+#[derive(Clone, Default)]
+pub(crate) struct ChangeSet {
+    items: Vec<(u64, ChangeVal)>,
+}
+
+const TAG_STATE: u64 = 0;
+const TAG_SLOT: u64 = 1;
+const TAG_TRUNK: u64 = 2;
+const TAG_WRITTEN: u64 = 3;
+
+/// A change-index key: the sequence number, then the kind.
+fn change_key(seq: u64, tag: u64) -> u64 {
+    crate::turso_assert!(seq < 1 << 62, "shipping sequence numbers ran past 2^62");
+    (seq << 2) | tag
+}
+
 /// The ship view. Cloning it is the O(1) snapshot a send serialises from.
 #[derive(Clone, Default)]
 pub(crate) struct ShipView {
@@ -137,9 +168,74 @@ pub(crate) struct ShipView {
     slots: BirthTree<SlotView>,
     trunk_retained: BirthTree<TrunkVersion>,
     written: BirthTree<WrittenView>,
+    /// F-S3, the birth-ordered change index: every item of the trees above, filed under the
+    /// sequence number of its latest change a receiver must hear about, with its current value. An
+    /// incremental reads the entries after its base and nothing else.
+    changes: BirthTree<ChangeSet>,
     trunk_epoch: u64,
     next_id: u64,
     seq: u64,
+}
+
+impl ShipView {
+    /// Item (`tag`, `key`) now changes at `seq` with value `val`; its entry was at `old` (0: none).
+    fn change_move(&mut self, tag: u64, key: u64, old: u64, seq: u64, val: ChangeVal, w: &mut TreeWork) {
+        if old > 0 {
+            self.change_drop(tag, key, old, w);
+        }
+        let ck = change_key(seq, tag);
+        let pushed = val.clone();
+        let existed = self.changes.update(ck, Some(seq), w, |item, _| {
+            if let Item::Live { val: set, .. } = item {
+                std::sync::Arc::make_mut(set).items.push((key, pushed));
+            }
+        });
+        if !existed {
+            self.changes.put(
+                ck,
+                Item::Live {
+                    birth: seq,
+                    val: std::sync::Arc::new(ChangeSet {
+                        items: vec![(key, val)],
+                    }),
+                },
+                Some(seq),
+                w,
+            );
+        }
+    }
+
+    /// Item (`tag`, `key`) filed at `at` leaves the index.
+    fn change_drop(&mut self, tag: u64, key: u64, at: u64, w: &mut TreeWork) {
+        let ck = change_key(at, tag);
+        let mut empty = false;
+        self.changes.update(ck, None, w, |item, _| {
+            if let Item::Live { val: set, .. } = item {
+                let set = std::sync::Arc::make_mut(set);
+                set.items.retain(|(k, _)| *k != key);
+                empty = set.items.is_empty();
+            }
+        });
+        if empty {
+            self.changes.remove(ck, w);
+        }
+    }
+
+    /// Item (`tag`, `key`) filed at `at` has a new value from a derivable change: the entry keeps
+    /// its place and takes the value, so an incremental never reads a stale one.
+    fn change_refresh(&mut self, tag: u64, key: u64, at: u64, val: ChangeVal, w: &mut TreeWork) {
+        // Mutant S3 (PREREG A5c): a derivable edit leaves the entry's old value in place.
+        if at == 0 || super::super::ship_mutant() == "S3" {
+            return;
+        }
+        self.changes.update(change_key(at, tag), None, w, |item, _| {
+            if let Item::Live { val: set, .. } = item {
+                if let Some(e) = std::sync::Arc::make_mut(set).items.iter_mut().find(|(k, _)| *k == key) {
+                    e.1 = val;
+                }
+            }
+        });
+    }
 }
 
 /// A retained version's key: its page, then its birth epoch.
@@ -159,6 +255,8 @@ pub(crate) struct Track {
     /// Work the view's upkeep did under the mutex, and the operations that did it.
     view_work: TreeWork,
     view_ops: u64,
+    /// Fork-base resolutions done at write time (F-S3), one per branch slot write.
+    base_lookups: u64,
     /// `(birth, id)` of every hole, so that holes every receiver has passed can be dropped.
     holes: BTreeSet<(u64, u64)>,
 }
@@ -214,10 +312,15 @@ impl StoreInner {
             retained,
         };
         let item_birth = bump.unwrap_or(birth);
+        let arc = Arc::new(view);
         let mut w = TreeWork::default();
         t.view
             .states
-            .put(id.0, Item::Live { birth: item_birth, val: Arc::new(view) }, bump, &mut w);
+            .put(id.0, Item::Live { birth: item_birth, val: arc.clone() }, bump, &mut w);
+        match bump {
+            Some(seq) => t.view.change_move(TAG_STATE, id.0, birth, seq, ChangeVal::State(arc), &mut w),
+            None => t.view.change_refresh(TAG_STATE, id.0, birth, ChangeVal::State(arc), &mut w),
+        }
         t.view_work.add(w);
         t.view_ops += 1;
     }
@@ -270,17 +373,26 @@ impl StoreInner {
             return;
         };
         let mut w = TreeWork::default();
+        let mut edited = None;
         t.view.states.update(id.0, bump, &mut w, |item, w| {
             if let Item::Live { birth, val } = item {
                 if Arc::strong_count(val) > 1 {
                     w.nodes_copied += 1;
                 }
                 edit(Arc::make_mut(val), w);
+                let old = *birth;
                 if let Some(seq) = bump {
                     *birth = seq;
                 }
+                edited = Some((old, val.clone()));
             }
         });
+        if let Some((old, arc)) = edited {
+            match bump {
+                Some(seq) => t.view.change_move(TAG_STATE, id.0, old, seq, ChangeVal::State(arc), &mut w),
+                None => t.view.change_refresh(TAG_STATE, id.0, old, ChangeVal::State(arc), &mut w),
+            }
+        }
         t.view_work.add(w);
         t.view_ops += 1;
     }
@@ -291,11 +403,36 @@ impl StoreInner {
             return;
         };
         let (alloc_seq, content_seq, page) = arena.stamps_of(slot).expect("a tracked arena stamps");
-        let view = SlotView { page, owner, alloc_seq, content_seq, data: arena.page_arc(slot).clone() };
+        // The fork base, resolved now so that a send never looks it up: what the owning branch
+        // reads for this page through its ancestry (its `inherited` map, else the trunk's version
+        // as of `trunk_at`), or the trunk's page when neither holds one.
+        let base = match owner {
+            SlotOwner::Branch(o) => {
+                t.base_lookups += 1;
+                self.branches.get(&BranchId(o)).and_then(|st| {
+                    let mut examined = 0;
+                    st.inherited
+                        .get(page)
+                        .or_else(|| self.trunk.lineage.retained_at(page, st.trunk_at, &mut examined))
+                })
+            }
+            SlotOwner::Trunk { .. } => None,
+        }
+        .map(|b| (b, arena.page_arc(b).clone()));
+        let view = Arc::new(SlotView {
+            page,
+            owner,
+            alloc_seq,
+            content_seq,
+            data: arena.page_arc(slot).clone(),
+            base,
+        });
         let mut w = TreeWork::default();
+        let old = t.view.slots.get(u64::from(slot)).map_or(0, Item::birth);
         t.view
             .slots
-            .put(u64::from(slot), Item::Live { birth: seq, val: Arc::new(view) }, Some(seq), &mut w);
+            .put(u64::from(slot), Item::Live { birth: seq, val: view.clone() }, Some(seq), &mut w);
+        t.view.change_move(TAG_SLOT, u64::from(slot), old, seq, ChangeVal::Slot(view), &mut w);
         t.view_work.add(w);
         t.view_ops += 1;
     }
@@ -304,7 +441,9 @@ impl StoreInner {
     pub(super) fn ship_slot_gone(&mut self, slot: Slot) {
         if let Some(t) = self.track.as_mut() {
             let mut w = TreeWork::default();
-            t.view.slots.remove(u64::from(slot), &mut w);
+            if let Some(old) = t.view.slots.remove(u64::from(slot), &mut w) {
+                t.view.change_drop(TAG_SLOT, u64::from(slot), old.birth(), &mut w);
+            }
             t.view_work.add(w);
         }
     }
@@ -313,7 +452,9 @@ impl StoreInner {
     pub(super) fn ship_state_gone(&mut self, id: BranchId, born_seq: u64, seq: u64) {
         if let Some(t) = self.track.as_mut() {
             let mut w = TreeWork::default();
+            let old = t.view.states.get(id.0).map_or(0, Item::birth);
             t.view.states.put(id.0, Item::Hole { birth: seq, born: born_seq }, Some(seq), &mut w);
+            t.view.change_move(TAG_STATE, id.0, old, seq, ChangeVal::Hole { born: born_seq }, &mut w);
             t.holes.insert((seq, id.0));
             t.view_work.add(w);
             t.view_ops += 1;
@@ -333,12 +474,15 @@ impl StoreInner {
         let epoch = self.trunk.written.get(&page).copied();
         if let Some(t) = self.track.as_mut() {
             let mut w = TreeWork::default();
+            let old = t.view.written.get(u64::from(page)).map_or(0, Item::birth);
+            let view = Arc::new(WrittenView { page, epoch });
             t.view.written.put(
                 u64::from(page),
-                Item::Live { birth: seq, val: Arc::new(WrittenView { page, epoch }) },
+                Item::Live { birth: seq, val: view.clone() },
                 Some(seq),
                 &mut w,
             );
+            t.view.change_move(TAG_WRITTEN, u64::from(page), old, seq, ChangeVal::Written(view), &mut w);
             t.log_bytes += 24 + page_size as u64;
             t.view_work.add(w);
             t.view_ops += 1;
@@ -348,15 +492,13 @@ impl StoreInner {
     pub(super) fn ship_trunk_retained(&mut self, page: u32, v: Retained, seq: u64) {
         if let Some(t) = self.track.as_mut() {
             let mut w = TreeWork::default();
-            t.view.trunk_retained.put(
-                ret_key(page, v.born),
-                Item::Live {
-                    birth: seq,
-                    val: Arc::new(TrunkVersion { page, born: v.born, died: v.died, slot: v.slot }),
-                },
-                Some(seq),
-                &mut w,
-            );
+            let key = ret_key(page, v.born);
+            let old = t.view.trunk_retained.get(key).map_or(0, Item::birth);
+            let view = Arc::new(TrunkVersion { page, born: v.born, died: v.died, slot: v.slot });
+            t.view
+                .trunk_retained
+                .put(key, Item::Live { birth: seq, val: view.clone() }, Some(seq), &mut w);
+            t.view.change_move(TAG_TRUNK, key, old, seq, ChangeVal::Trunk(view), &mut w);
             t.view_work.add(w);
             t.view_ops += 1;
         }
@@ -365,7 +507,10 @@ impl StoreInner {
     fn ship_trunk_retained_gone(&mut self, page: u32, born: u64) {
         if let Some(t) = self.track.as_mut() {
             let mut w = TreeWork::default();
-            t.view.trunk_retained.remove(ret_key(page, born), &mut w);
+            let key = ret_key(page, born);
+            if let Some(old) = t.view.trunk_retained.remove(key, &mut w) {
+                t.view.change_drop(TAG_TRUNK, key, old.birth(), &mut w);
+            }
             t.view_work.add(w);
         }
     }
@@ -526,6 +671,9 @@ pub struct SendReport {
     /// is one), and how long it held it.
     pub locked_ops: u64,
     pub locked_ns: u64,
+    /// Fork bases looked up in the snapshot at send time (each O(tree height)); a pruned
+    /// incremental performs none (F-S3).
+    pub base_lookups: u64,
 }
 
 /// Receiver work, counted in the receive code.
@@ -812,10 +960,10 @@ impl BranchStore {
     }
 
     /// The view's upkeep so far: (operations, nodes touched, nodes copied because a snapshot
-    /// shared them).
-    pub(crate) fn view_work(&self) -> (u64, u64, u64) {
-        self.inner.lock().track.as_ref().map_or((0, 0, 0), |t| {
-            (t.view_ops, t.view_work.nodes_touched, t.view_work.nodes_copied)
+    /// shared them, fork-base resolutions at write time).
+    pub(crate) fn view_work(&self) -> (u64, u64, u64, u64) {
+        self.inner.lock().track.as_ref().map_or((0, 0, 0, 0), |t| {
+            (t.view_ops, t.view_work.nodes_touched, t.view_work.nodes_copied, t.base_lookups)
         })
     }
 
@@ -828,8 +976,9 @@ impl BranchStore {
         let keep = t.holes.split_off(&(upto + 1, 0));
         let gone = std::mem::replace(&mut t.holes, keep);
         let mut w = TreeWork::default();
-        for &(_, id) in &gone {
+        for &(birth, id) in &gone {
             t.view.states.remove(id, &mut w);
+            t.view.change_drop(TAG_STATE, id, birth, &mut w);
         }
         t.view_work.add(w);
         gone.len()
@@ -1336,7 +1485,8 @@ impl BranchStore {
     }
 }
 
-/// The fork base of a slot the view holds: the version its owner saw before writing it. A branch
+/// The fork base of a slot, looked up in the snapshot at send time (full sends and the counted
+/// comparators; a pruned incremental uses the base resolved at write time instead): a branch
 /// page's is what the branch reads through its ancestry (`inherited`, else the trunk's version as of
 /// `trunk_at`, else the trunk page); a retained trunk version's is the page's next version, retained
 /// or current. Returns the base as a slot of the view or as a trunk page number.
@@ -1433,18 +1583,37 @@ pub(crate) fn send_snapshot(
     rep.meta_bytes += begin.0.len() as u64;
     sink.put(&begin.0)?;
 
-    // The states to describe, and the holes a receiver at `base` must hear about.
+    // The states to describe, and the holes a receiver at `base` must hear about. A pruned
+    // incremental reads them, and every other changed item, from the change index alone (F-S3):
+    // only its entries filed after the base, and no lookup into the trees.
     let mut states: Vec<(u64, std::sync::Arc<StateView>)> = Vec::new();
     let mut dead: Vec<u64> = Vec::new();
+    let mut changed_slots: Vec<(u64, std::sync::Arc<SlotView>)> = Vec::new();
+    let mut changed_versions: Vec<std::sync::Arc<TrunkVersion>> = Vec::new();
+    let mut changed_written: Vec<std::sync::Arc<WrittenView>> = Vec::new();
     if pruned {
-        v.states.walk_changed(base_seq, &mut tw, |id, item| match item {
-            Item::Live { val, .. } => states.push((id, val.clone())),
-            Item::Hole { born, .. } => {
-                if *born <= base_seq {
-                    dead.push(id);
+        v.changes.walk_changed(base_seq, &mut tw, |_, item| {
+            let Some(set) = item.live() else {
+                return;
+            };
+            for (key, val) in &set.items {
+                match val {
+                    ChangeVal::State(sv) => states.push((*key, sv.clone())),
+                    ChangeVal::Hole { born } => {
+                        if *born <= base_seq {
+                            dead.push(*key);
+                        }
+                    }
+                    ChangeVal::Slot(sv) => changed_slots.push((*key, sv.clone())),
+                    ChangeVal::Trunk(ver) => changed_versions.push(ver.clone()),
+                    ChangeVal::Written(w) => changed_written.push(w.clone()),
                 }
             }
         });
+        rep.entries_visited += (states.len() + dead.len() + changed_slots.len()
+            + changed_versions.len()
+            + changed_written.len()) as u64;
+        states.sort_unstable_by_key(|(id, _)| *id);
     } else {
         v.states.walk_all(&mut tw, |id, item| {
             if let Some(val) = item.live() {
@@ -1544,26 +1713,33 @@ pub(crate) fn send_snapshot(
 
     // 3. The trunk's own metadata.
     let mut written: Vec<std::sync::Arc<WrittenView>> = Vec::new();
-    let mut take_written = |_: u64, it: &Item<WrittenView>| {
-        if let Some(w) = it.live() {
-            written.push(w.clone());
-        }
-    };
-    if incremental {
-        v.written.walk_changed(base_seq, &mut tw, &mut take_written);
-    } else {
-        v.written.walk_all(&mut tw, &mut take_written);
-    }
     let mut versions: Vec<std::sync::Arc<TrunkVersion>> = Vec::new();
-    let mut take_version = |_: u64, it: &Item<TrunkVersion>| {
-        if let Some(ver) = it.live() {
-            versions.push(ver.clone());
-        }
-    };
-    if incremental {
-        v.trunk_retained.walk_changed(base_seq, &mut tw, &mut take_version);
+    if pruned {
+        written = std::mem::take(&mut changed_written);
+        written.sort_unstable_by_key(|w| w.page);
+        versions = std::mem::take(&mut changed_versions);
+        versions.sort_unstable_by_key(|ver| (ver.page, ver.born));
     } else {
-        v.trunk_retained.walk_all(&mut tw, &mut take_version);
+        let mut take_written = |_: u64, it: &Item<WrittenView>| {
+            if let Some(w) = it.live() {
+                written.push(w.clone());
+            }
+        };
+        if incremental {
+            v.written.walk_changed(base_seq, &mut tw, &mut take_written);
+        } else {
+            v.written.walk_all(&mut tw, &mut take_written);
+        }
+        let mut take_version = |_: u64, it: &Item<TrunkVersion>| {
+            if let Some(ver) = it.live() {
+                versions.push(ver.clone());
+            }
+        };
+        if incremental {
+            v.trunk_retained.walk_changed(base_seq, &mut tw, &mut take_version);
+        } else {
+            v.trunk_retained.walk_all(&mut tw, &mut take_version);
+        }
     }
     let meta_written: Vec<(u32, u64)> = if pruned || !incremental {
         written.iter().filter_map(|w| w.epoch.map(|e| (w.page, e))).collect()
@@ -1667,50 +1843,65 @@ pub(crate) fn send_snapshot(
         rep.page_bytes += rec.0.len() as u64;
         sink.put(&rec.0)
     };
-    // The bytes of a fork base: a slot of the snapshot, or a trunk page of the image.
-    let base_bytes = |base: (Option<Slot>, u32)| -> Option<(Option<Slot>, &[u8])> {
-        match base {
+    // A slot's fork base: in a pruned incremental, the one resolved when the slot was written
+    // (another slot with its bytes, or the trunk's page of the same number); otherwise looked up
+    // in the snapshot now, one lookup per slot (`base_lookups`).
+    let lookups = Cell::new(0u64);
+    let base_bytes = |sv: &SlotView| -> Result<Option<(Option<Slot>, &[u8])>> {
+        if pruned {
+            return Ok(match &sv.base {
+                Some((slot, data)) => Some((Some(*slot), &data[..])),
+                None => trunk.page(sv.page).map(|p| (None, p)),
+            });
+        }
+        lookups.set(lookups.get() + 1);
+        Ok(match fork_base(v, sv)? {
             (Some(slot), _) => v
                 .slots
                 .get_live(u64::from(slot))
                 .map(|b| (Some(slot), &b.data[..])),
             (None, pgno) => trunk.page(pgno).map(|p| (None, p)),
-        }
+        })
     };
 
-    // 4. References to trunk pre-images the receiver holds (IncrAlloc ships them as data).
+    // 4. References to trunk pre-images the receiver holds (IncrAlloc ships them as data): a
+    // retained trunk version's slot handed out after the base whose content was born before it.
     if incremental {
-        let changed: Vec<std::sync::Arc<TrunkVersion>> = if pruned {
-            versions.clone()
+        let candidates: Vec<(Slot, std::sync::Arc<SlotView>)> = if pruned {
+            changed_slots
+                .iter()
+                .map(|(k, sv)| (*k as Slot, sv.clone()))
+                .collect()
         } else {
             let mut c = Vec::new();
             v.trunk_retained.walk_changed(base_seq, &mut tw, |_, it| {
                 if let Some(ver) = it.live() {
-                    c.push(ver.clone());
+                    if let Some(sv) = v.slots.get_live(u64::from(ver.slot)) {
+                        c.push((ver.slot, sv.clone()));
+                    }
                 }
             });
             c
         };
-        for ver in changed {
-            let sv = v
-                .slots
-                .get_live(u64::from(ver.slot))
-                .ok_or_else(|| corrupt("a retained trunk version's slot is missing from the view"))?;
-            if sv.content_seq > base_seq || sv.alloc_seq <= base_seq {
-                continue; // new content (a SLOT below), or a slot the receiver holds already
+        for (slot, sv) in candidates {
+            if !matches!(sv.owner, SlotOwner::Trunk { .. })
+                || sv.content_seq > base_seq
+                || sv.alloc_seq <= base_seq
+            {
+                continue; // a branch page, new content (a SLOT below), or a slot the receiver holds
             }
             if mode == SendMode::IncrAlloc {
-                let fb = fork_base(v, sv)?;
-                ship_page(&mut sink, &mut rep, T_SLOT, ver.slot, ver.page, true, &sv.data[..], trunk.page(ver.page), base_bytes(fb))?;
+                ship_page(&mut sink, &mut rep, T_SLOT, slot, sv.page, true, &sv.data[..], trunk.page(sv.page), base_bytes(&sv)?)?;
                 rep.slot_records += 1;
                 continue;
             }
+            let ver_page = sv.page;
             let mut hash = content_hash(&sv.data);
             if plant == Plant::BadRefHash && !planted.get() {
                 planted.set(true);
                 hash ^= 1;
             }
-            let rec = Rec::new(T_REF).u32(ver.slot).u32(ver.page).u64(hash);
+            let rec = Rec::new(T_REF).u32(slot).u32(ver_page).u64(hash);
             rep.ref_records += 1;
             rep.ref_bytes += rec.0.len() as u64;
             sink.put(&rec.0)?;
@@ -1743,20 +1934,28 @@ pub(crate) fn send_snapshot(
 
     // 6. Slots whose content is newer than the base, bases first.
     let mut slots: Vec<(u64, std::sync::Arc<SlotView>)> = Vec::new();
-    let mut take_slot = |key: u64, it: &Item<SlotView>| {
-        if let Some(sv) = it.live() {
-            if !incremental || sv.content_seq > base_seq {
-                slots.push((key, sv.clone()));
-            }
-        }
-    };
-    if incremental {
-        v.slots.walk_changed(base_seq, &mut tw, &mut take_slot);
+    if pruned {
+        slots = changed_slots
+            .into_iter()
+            .filter(|(_, sv)| sv.content_seq > base_seq)
+            .collect();
     } else {
-        v.slots.walk_all(&mut tw, &mut take_slot);
+        let mut take_slot = |key: u64, it: &Item<SlotView>| {
+            if let Some(sv) = it.live() {
+                if !incremental || sv.content_seq > base_seq {
+                    slots.push((key, sv.clone()));
+                }
+            }
+        };
+        if incremental {
+            v.slots.walk_changed(base_seq, &mut tw, &mut take_slot);
+        } else {
+            v.slots.walk_all(&mut tw, &mut take_slot);
+        }
     }
-    // Trunk versions first, newest per page first (each one's base is the next version); then
-    // branch slots by owner id (a base belongs to the trunk or to an ancestor, a smaller id).
+    // Trunk versions first, newest per page first (a looked-up base is the next version; a
+    // pruned incremental's is the trunk page); then branch slots by owner id (a branch slot's base
+    // belongs to the trunk or to an ancestor, a smaller id).
     slots.sort_unstable_by_key(|(slot, sv)| match sv.owner {
         SlotOwner::Trunk { born, .. } => (0u8, u64::from(sv.page), u64::MAX - born, *slot),
         SlotOwner::Branch(owner) => (1u8, owner, 0, *slot),
@@ -1764,7 +1963,6 @@ pub(crate) fn send_snapshot(
     for (slot, sv) in &slots {
         rep.slots_visited += 1;
         let fresh = !incremental || sv.alloc_seq > base_seq;
-        let fb = fork_base(v, sv)?;
         ship_page(
             &mut sink,
             &mut rep,
@@ -1774,7 +1972,7 @@ pub(crate) fn send_snapshot(
             fresh,
             &sv.data[..],
             trunk.page(sv.page),
-            base_bytes(fb),
+            base_bytes(sv)?,
         )?;
         rep.slot_records += 1;
     }
@@ -1787,6 +1985,7 @@ pub(crate) fn send_snapshot(
     rep.nodes_visited = tw.nodes_visited;
     rep.items_checked = tw.items_checked;
     rep.index_visited = tw.nodes_visited;
+    rep.base_lookups = lookups.get();
     Ok(rep)
 }
 

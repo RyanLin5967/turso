@@ -441,9 +441,9 @@ impl Database {
     }
 
     /// The ship view's upkeep so far: (operations, nodes touched, nodes copied because a snapshot
-    /// shared them).
+    /// shared them, fork-base resolutions at write time).
     #[doc(hidden)]
-    pub fn branch_view_work(&self) -> (u64, u64, u64) {
+    pub fn branch_view_work(&self) -> (u64, u64, u64, u64) {
         self.branches.view_work()
     }
 
