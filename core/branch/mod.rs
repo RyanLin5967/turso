@@ -207,6 +207,17 @@ pub enum BranchDurability {
 pub enum BranchFailpoint {
     /// The next branch commit writes and syncs its slots, then fails before appending its record.
     CommitAfterSlotsBeforeRecord,
+    /// The next branch commit large enough to map in several holds stops after its first hold of
+    /// mapping, with its record made durable first, and fail-stops (r11-bigtxn port, amendment 8b):
+    /// a crash there must recover the whole commit.
+    CommitBetweenMapHolds,
+    /// As `CommitBetweenMapHolds`, but its record is never flushed: a crash there must recover
+    /// none of the commit.
+    CommitBetweenMapHoldsUndurable,
+    /// The next multi-hold branch commit asks for a compaction between its first two holds of
+    /// mapping, then goes on: the compaction must not run there (it would snapshot half the commit
+    /// and drop its buffered record), so a crash after the commit recovers all of it.
+    CompactBetweenMapHolds,
     /// The next durability barrier (a trunk commit's) fails before writing its records.
     BarrierBeforeRecords,
     /// The next compaction fails after renaming the new snapshot, before resetting the log.
@@ -426,9 +437,10 @@ pub struct BranchWork {
     /// Page-map entries a branch's first fork inserted into its view outside the store mutex
     /// (r11-bigtxn F-fork1; NOT ported onto the durable store, so 0 here).
     pub view_build_pages: u64,
-    /// Process-wide, from `journal` (r11-bigtxn amendment 8): branch log and arena bytes written
-    /// and synced while the store mutex was held; bytes a flight synced with no lock held; bytes
-    /// copied into the journal's buffer under the mutex; bytes of frames handed in by move.
+    /// Per store (r11-bigtxn amendment 8): branch log and arena bytes written and synced while the
+    /// store mutex was held; bytes a flight synced with no lock held; bytes copied into the
+    /// journal's buffer under the mutex; bytes of frames handed in by move. The journal's own
+    /// counts restart when the store opens.
     pub sync_locked_bytes: u64,
     pub sync_unlocked_bytes: u64,
     pub journal_copied_bytes: u64,
@@ -693,6 +705,13 @@ impl Connection {
     /// The branch this connection is open on, if any.
     pub fn branch_id(&self) -> Option<BranchId> {
         self.pager.load().branch_id()
+    }
+
+    /// Pages currently held in this connection's page cache. Observation only. (Ported from
+    /// r11-bigtxn, `7fcc8db5b`.)
+    #[doc(hidden)]
+    pub fn page_cache_len(&self) -> usize {
+        self.pager.load().page_cache_len()
     }
 }
 
@@ -980,6 +999,9 @@ mod durability_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod catalog_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod composed_tests;
 
 #[cfg(test)]
 mod tests {

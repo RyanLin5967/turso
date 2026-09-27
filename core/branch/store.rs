@@ -359,6 +359,10 @@ pub(crate) struct BranchStore {
     arena_reads: AtomicU64,
     /// Group commit with the flush outside the store mutex (r11-churn amendment 4); see `Group`.
     group: Group,
+    /// Observation only (r11-bigtxn amendment 8): bytes of log and arena a flight wrote and synced
+    /// with the store mutex held (`flush_locked`) and with no lock held (`wait_durable`'s leader).
+    flight_locked_bytes: AtomicU64,
+    flight_unlocked_bytes: AtomicU64,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (r11-churn PREREG amendment 4): early lock
@@ -1148,6 +1152,8 @@ impl BranchStore {
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
             group: Group::new(),
+            flight_locked_bytes: AtomicU64::new(0),
+            flight_unlocked_bytes: AtomicU64::new(0),
         }
     }
 
@@ -1283,6 +1289,8 @@ impl BranchStore {
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
             group: Group::new(),
+            flight_locked_bytes: AtomicU64::new(0),
+            flight_unlocked_bytes: AtomicU64::new(0),
         };
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
@@ -1560,8 +1568,8 @@ impl BranchStore {
         g.flushing = true;
         drop(g);
         churn_counters::GC_LOCKED_FLUSHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        super::journal::SYNC_LOCKED_BYTES
-            .fetch_add(flight.sync_bytes(), std::sync::atomic::Ordering::Relaxed);
+        self.flight_locked_bytes
+            .fetch_add(flight.sync_bytes(), Ordering::Relaxed);
         let end = flight.end_lsn;
         let written = flight.write();
         if written.is_err() {
@@ -1581,13 +1589,48 @@ impl BranchStore {
         }
     }
 
-    /// Return the deferred frees a flush has covered (called under the store mutex).
+    /// Return deferred frees a flush has covered, at most [`HOLD_BATCH`] of them (called under the
+    /// store mutex, by the mechanism). An operation that deferred many drains the rest in bounded
+    /// holds once it is durable (`wait_durable`), so no one hold frees a large operation's garbage.
     fn mature(&self, inner: &mut StoreInner) {
         if inner.pending_free.is_empty() {
             return;
         }
         let durable = self.group.state.lock().unwrap().durable;
         inner.mature_frees(durable);
+    }
+
+    /// Return every deferred free a flush has covered, however many (the observation calls, whose
+    /// counts must describe the log; not the mechanism, so not bounded).
+    fn mature_all(&self, inner: &mut StoreInner) {
+        if inner.pending_free.is_empty() {
+            return;
+        }
+        let durable = self.group.state.lock().unwrap().durable;
+        while inner
+            .pending_free
+            .front()
+            .is_some_and(|&(lsn, _)| lsn <= durable)
+        {
+            inner.mature_frees(durable);
+        }
+    }
+
+    /// Return every deferred free a flush has covered, in holds of at most [`HOLD_BATCH`] (with no
+    /// lock held on entry: each round takes its own hold).
+    fn drain_matured(&self) {
+        loop {
+            let mut inner = self.lock();
+            let durable = self.group.state.lock().unwrap().durable;
+            if !inner
+                .pending_free
+                .front()
+                .is_some_and(|&(lsn, _)| lsn <= durable)
+            {
+                return;
+            }
+            inner.mature_frees(durable);
+        }
     }
 
     /// Record a flight's outcome and wake every waiter.
@@ -1603,8 +1646,16 @@ impl BranchStore {
     }
 
     /// Wait until the journal's first `lsn` bytes are durable, leading a flight when none is in the
-    /// air. Called WITHOUT the store mutex.
+    /// air, then return the deferred frees that flush covered, in bounded holds (amendment 8b: the
+    /// operation that deferred them pays for them, and no one hold frees all of them). Called
+    /// WITHOUT the store mutex.
     pub(crate) fn wait_durable(&self, lsn: u64) -> Result<()> {
+        self.wait_durable_inner(lsn)?;
+        self.drain_matured();
+        Ok(())
+    }
+
+    fn wait_durable_inner(&self, lsn: u64) -> Result<()> {
         if lsn == 0 {
             return Ok(());
         }
@@ -1667,8 +1718,8 @@ impl BranchStore {
                 }
             };
             churn_counters::GC_FLIGHTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            super::journal::SYNC_UNLOCKED_BYTES
-                .fetch_add(flight.sync_bytes(), std::sync::atomic::Ordering::Relaxed);
+            self.flight_unlocked_bytes
+                .fetch_add(flight.sync_bytes(), Ordering::Relaxed);
             let end = flight.end_lsn;
             let written = flight.write();
             if written.is_err() {
@@ -2452,7 +2503,6 @@ impl BranchStore {
             if batch.is_empty() {
                 return;
             }
-            inner.hold.pages += batch.len() as u64;
             inner.release_slots(batch);
         }
     }
@@ -2585,8 +2635,41 @@ impl BranchStore {
         };
         // 2. The map, in bounded holds.
         let mapped = (|| -> Result<()> {
-            for batch in entries.chunks(HOLD_BATCH) {
+            for (i, batch) in entries.chunks(HOLD_BATCH).enumerate() {
                 let mut inner = self.lock();
+                if i == 1 {
+                    // A crash between two holds of mapping, for the tests (amendment 8b).
+                    let stop = inner.failpoint;
+                    if matches!(
+                        stop,
+                        Some(
+                            BranchFailpoint::CommitBetweenMapHolds
+                                | BranchFailpoint::CommitBetweenMapHoldsUndurable
+                        )
+                    ) {
+                        inner.failpoint = None;
+                        if stop == Some(BranchFailpoint::CommitBetweenMapHolds) {
+                            drop(inner);
+                            self.wait_durable(lsn)?;
+                            inner = self.lock();
+                        }
+                        if let Some(journal) = inner.journal.as_mut() {
+                            journal.poison();
+                        }
+                        return Err(LimboError::InternalError(
+                            "failpoint: branch commit stopped between two holds of its map"
+                                .to_string(),
+                        ));
+                    }
+                    if stop == Some(BranchFailpoint::CompactBetweenMapHolds) {
+                        inner.failpoint = None;
+                        drop(inner);
+                        // Refused (Busy) while this commit is between its holds; the commit goes
+                        // on either way, and the test reads what a crash after it recovers.
+                        let _ = self.compact_now();
+                        inner = self.lock();
+                    }
+                }
                 if let Some(st) = inner.branches.get_mut(&id) {
                     for &(page, _, _) in batch {
                         st.pending.remove(&page);
@@ -2623,7 +2706,6 @@ impl BranchStore {
                 return;
             };
             let slots: Vec<Slot> = batch.iter().filter_map(|p| st.pending.remove(p)).collect();
-            inner.hold.pages += slots.len() as u64;
             inner.release_slots(slots);
         }
     }
@@ -3016,7 +3098,7 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         // The slot counts the log describes: deferred frees a flush has covered returned
         // (amendment 4), and parked Commits applied (C-R), first.
-        self.mature(&mut inner);
+        self.mature_all(&mut inner);
         inner.settle()?;
         Ok(BranchStats {
             live_branches: inner.n_states as usize,
@@ -3026,12 +3108,13 @@ impl BranchStore {
                 .as_ref()
                 .map_or(0, |a| a.high_water() as usize - a.in_use()),
             work: {
-                use std::sync::atomic::Ordering::Relaxed;
                 let mut w = inner.work;
-                w.sync_locked_bytes = super::journal::SYNC_LOCKED_BYTES.load(Relaxed);
-                w.sync_unlocked_bytes = super::journal::SYNC_UNLOCKED_BYTES.load(Relaxed);
-                w.journal_copied_bytes = super::journal::BUFFER_COPIED_BYTES.load(Relaxed);
-                w.journal_handed_bytes = super::journal::BUFFER_HANDED_BYTES.load(Relaxed);
+                let j = inner.journal.as_ref();
+                w.sync_locked_bytes = j.map_or(0, |j| j.synced_locked_bytes)
+                    + self.flight_locked_bytes.load(Ordering::Relaxed);
+                w.sync_unlocked_bytes = self.flight_unlocked_bytes.load(Ordering::Relaxed);
+                w.journal_copied_bytes = j.map_or(0, |j| j.copied_bytes);
+                w.journal_handed_bytes = j.map_or(0, |j| j.handed_bytes);
                 w
             },
         })
@@ -3039,7 +3122,7 @@ impl BranchStore {
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
         let mut inner = self.inner.lock();
-        self.mature(&mut inner);
+        self.mature_all(&mut inner);
         if let Err(e) = inner.settle() {
             tracing::warn!("branch store: parked commits not applied: {e}");
         }
@@ -3057,7 +3140,7 @@ impl BranchStore {
     pub(crate) fn slots_in_use(&self) -> Vec<u32> {
         let mut inner = self.inner.lock();
         // Deferred frees a flush has covered are free (amendment 4): return them first.
-        self.mature(&mut inner);
+        self.mature_all(&mut inner);
         if let Err(e) = inner.settle() {
             tracing::warn!("branch store: parked commits not applied: {e}");
         }
@@ -3089,7 +3172,7 @@ impl BranchStore {
 
     pub(crate) fn slot_is_free(&self, slot: u32) -> bool {
         let mut inner = self.inner.lock();
-        self.mature(&mut inner);
+        self.mature_all(&mut inner);
         if let Err(e) = inner.settle() {
             tracing::warn!("branch store: parked commits not applied: {e}");
         }
@@ -3995,15 +4078,24 @@ impl StoreInner {
         }
     }
 
-    /// Return to the arena every deferred free a flush has covered.
+    /// Return to the arena deferred frees a flush has covered: at most [`HOLD_BATCH`] slots, the
+    /// front entry split if it is larger (r11-bigtxn port, amendment 8b).
     fn mature_frees(&mut self, durable: u64) {
-        while self
-            .pending_free
-            .front()
-            .is_some_and(|&(lsn, _)| lsn <= durable)
-        {
-            let (_, freed) = self.pending_free.pop_front().expect("just looked");
-            self.release_slots(freed);
+        let mut budget = HOLD_BATCH;
+        while budget > 0 {
+            let Some((lsn, front)) = self.pending_free.front_mut() else {
+                break;
+            };
+            if *lsn > durable {
+                break;
+            }
+            let take = budget.min(front.len());
+            let batch: Vec<Slot> = front.drain(front.len() - take..).collect();
+            if front.is_empty() {
+                self.pending_free.pop_front();
+            }
+            budget -= take;
+            self.release_slots(batch);
         }
     }
 
@@ -4011,6 +4103,7 @@ impl StoreInner {
         if freed.is_empty() {
             return;
         }
+        self.hold.pages += freed.len() as u64;
         let arena = self.arena.as_mut().expect("slots were freed, so the arena exists");
         for slot in freed {
             arena.release(slot);
@@ -4051,7 +4144,15 @@ impl StoreInner {
             let f = st.lineage.epoch;
             st.lineage.epoch += 1;
             st.lineage.n_children += 1;
+            // A first fork builds the parent's view from all its pages in this hold (r11-bigtxn's
+            // F-fork1 is not ported): counted as the hold's pages.
+            let built = if st.view.is_none() {
+                st.current.len() as u64
+            } else {
+                0
+            };
             let inherited = st.view_now().clone();
+            self.hold.pages += built;
             (f, inherited, st.trunk_at)
         };
         self.children.insert(parent, f, child);

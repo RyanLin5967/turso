@@ -436,6 +436,12 @@ pub(crate) struct Journal {
     /// sealed frames' lists are kept whole, as they were handed in.
     pub(crate) pending_slots: Vec<Slot>,
     sealed_slots: Vec<Vec<Slot>>,
+    /// Observation only (r11-bigtxn amendment 8), per journal: bytes of log and arena written and
+    /// synced by `flush` (always under the store mutex: the journal lives inside it); bytes copied
+    /// into the buffer by `buffer` (under it too); bytes of frames handed in by move.
+    pub(crate) synced_locked_bytes: u64,
+    pub(crate) copied_bytes: u64,
+    pub(crate) handed_bytes: u64,
     snapshot_len: u64,
     sync: bool,
     /// Set by an I/O failure, or a failpoint standing in for a crash. From then on nothing more is
@@ -506,6 +512,9 @@ impl Journal {
             sealed: Vec::new(),
             pending_slots: Vec::new(),
             sealed_slots: Vec::new(),
+            synced_locked_bytes: 0,
+            copied_bytes: 0,
+            handed_bytes: 0,
             snapshot_len: 0,
             sync,
             poisoned: false,
@@ -617,6 +626,9 @@ impl Journal {
             sealed: Vec::new(),
             pending_slots: Vec::new(),
             sealed_slots: Vec::new(),
+            synced_locked_bytes: 0,
+            copied_bytes: 0,
+            handed_bytes: 0,
             snapshot_len,
             sync,
             poisoned: false,
@@ -797,10 +809,7 @@ impl Journal {
         put_u32(&mut self.pending, payload.len() as u32);
         put_u32(&mut self.pending, crc32c::crc32c(&payload));
         self.pending.extend_from_slice(&payload);
-        BUFFER_COPIED_BYTES.fetch_add(
-            (self.pending.len() - before) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.copied_bytes += (self.pending.len() - before) as u64;
         self.lsn += (FRAME_HEADER_LEN + payload.len()) as u64;
         match record {
             Record::TrunkRetain { slot, .. } => self.pending_slots.push(*slot),
@@ -815,7 +824,7 @@ impl Journal {
     /// store's holder O(1) (r11-bigtxn, ported onto the durable store).
     pub(crate) fn buffer_frame(&mut self, frame: Vec<u8>, slots: Vec<Slot>) -> Result<()> {
         self.check_live()?;
-        BUFFER_HANDED_BYTES.fetch_add(frame.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.handed_bytes += frame.len() as u64;
         self.lsn += frame.len() as u64;
         if !self.pending.is_empty() {
             self.sealed.push(std::mem::take(&mut self.pending));
@@ -862,10 +871,10 @@ impl Journal {
             self.write_pending(arena)
         };
         match written {
-            Ok(()) => {
+            Ok(arena_bytes) => {
                 // Always under the store mutex: the journal lives inside it.
                 let bytes = self.buffered_len() as u64;
-                SYNC_LOCKED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                self.synced_locked_bytes += bytes + arena_bytes;
                 self.len += bytes;
                 self.drop_buffered();
                 Ok(())
@@ -877,7 +886,7 @@ impl Journal {
         }
     }
 
-    fn write_pending(&self, arena: &mut Arena) -> Result<()> {
+    fn write_pending(&self, arena: &mut Arena) -> Result<u64> {
         // Append only where this journal believes the log ends. A log that is longer than that was
         // written by someone else: writing at the stale offset would cut their records off at the
         // next recovery, so refuse — reading the file's state, not trusting the in-memory length
@@ -893,10 +902,7 @@ impl Journal {
                 "the branch log changed under this journal; another store instance wrote it",
             ));
         }
-        if self.sync {
-            let arena_bytes = arena.sync()?;
-            SYNC_LOCKED_BYTES.fetch_add(arena_bytes, std::sync::atomic::Ordering::Relaxed);
-        }
+        let arena_bytes = if self.sync { arena.sync()? } else { 0 };
         let mut at = self.len;
         for chunk in self.sealed.iter().chain(std::iter::once(&self.pending)) {
             write_at(&self.file, chunk, at)?;
@@ -905,7 +911,7 @@ impl Journal {
         if self.sync {
             fsync_file(&self.file)?;
         }
-        Ok(())
+        Ok(arena_bytes)
     }
 
     /// Frame bytes ever buffered (see the `lsn` field).
@@ -1320,18 +1326,6 @@ pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
             .map_err(|e| io_error(e, "read branch file"))
     }
 }
-
-/// Observation only (r11-bigtxn amendment 8, process-wide): bytes of branch log and arena written
-/// and synced while the store mutex was held (`Journal::flush`, and a flight flushed under it);
-/// bytes a flight synced with no lock held; bytes copied into the journal's buffer under the store
-/// mutex (`Journal::buffer`); and bytes of frames handed in by move (`Journal::buffer_frame`).
-pub(crate) static SYNC_LOCKED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static SYNC_UNLOCKED_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub(crate) static BUFFER_COPIED_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub(crate) static BUFFER_HANDED_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// A record as one log frame (length, crc32c, payload), for [`Journal::buffer_frame`]: encoded by
 /// the caller without the store mutex.
