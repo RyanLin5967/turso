@@ -186,12 +186,6 @@ pub struct BranchStats {
     pub row_stamps: usize,
 }
 
-/// Cumulative counts of the store's per-call work since the database opened. Observation only:
-/// nothing in the mechanism reads them. Each is updated once per call under the lock the call
-/// already holds, from a loop index the call computes anyway, so counting adds no per-element step.
-/// The `lock_*` counters describe the store's locks themselves, summed over all of them (the trunk's
-/// and every shard's); `trunk_lock_*` is the trunk's alone. Only the `*_hold_ns` pair adds work under
-/// a lock.
 /// Where the trunk's lock is taken, for its per-site accounting (r11-merge PREREG A22): the index
 /// into [`BranchWork::trunk_site_acq`] and [`BranchWork::trunk_site_hold_ns`].
 pub const TRUNK_SITE_COUNT: usize = 9;
@@ -199,6 +193,12 @@ pub const TRUNK_SITES: [&str; TRUNK_SITE_COUNT] = [
     "fork", "decide", "resolve", "preprobe", "tx_end", "prepare", "counted", "release", "other",
 ];
 
+/// Cumulative counts of the store's per-call work since the database opened. Observation only:
+/// nothing in the mechanism reads them. Each is updated once per call under the lock the call
+/// already holds, from a loop index the call computes anyway, so counting adds no per-element step.
+/// The `lock_*` counters describe the store's locks themselves, summed over all of them (the trunk's
+/// and every shard's); `trunk_lock_*` is the trunk's alone. Only the `*_hold_ns` pair adds work under
+/// a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchWork {
     /// Page resolutions against the branch tree (one per branch-pager page read).

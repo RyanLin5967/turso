@@ -1553,9 +1553,18 @@ mod tests {
         assert_eq!(w.trunk_site_acq.iter().sum::<u64>(), w.trunk_lock_acquisitions, "{w:?}");
         assert_eq!(w.trunk_site_hold_ns.iter().sum::<u64>(), w.trunk_lock_hold_ns, "{w:?}");
         let site = |name: &str| crate::branch::TRUNK_SITES.iter().position(|s| *s == name).unwrap();
-        for name in ["fork", "decide", "prepare", "release"] {
-            assert!(w.trunk_site_acq[site(name)] >= 20, "{name}: {:?}", w.trunk_site_acq);
-        }
+        // Each site's count, derived from the merge path's source (not from a run): per committed
+        // merge one pre-probe, one prepare and two counted holds; one release per merged branch
+        // plus `live`'s; no trunk-lock resolution (nothing the trunk rewrote is read by a branch
+        // forked before it). A mis-tagged site moves counts between sites and fails here even
+        // though the sums still close (mutant 40).
+        let acq = |name: &str| w.trunk_site_acq[site(name)];
+        assert_eq!(acq("release"), 21, "{:?}", w.trunk_site_acq);
+        assert_eq!(acq("counted"), 40, "{:?}", w.trunk_site_acq);
+        assert_eq!(acq("prepare"), 20, "{:?}", w.trunk_site_acq);
+        assert_eq!(acq("preprobe"), 20, "{:?}", w.trunk_site_acq);
+        assert_eq!(acq("resolve"), 0, "{:?}", w.trunk_site_acq);
+        assert!(acq("fork") >= 21 && acq("decide") >= 20, "{:?}", w.trunk_site_acq);
         assert!(w.trunk_lock_hold_ns > 0, "lock timing was on");
     }
 

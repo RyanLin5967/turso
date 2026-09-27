@@ -444,9 +444,10 @@ thread_local! {
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-13 and 15-39; 14 is not built, since no SQL path
+/// scope gate and the install's isolation, 11-13 and 15-40, where 39 and 40 break A22's per-site
+/// lock accounting; 14 is not built, since no SQL path
 /// without DDL clears a user table's b-tree), so each test can be shown to fail for it
-/// (frontier/round11/r11-merge PREREG A6, A13, A14, A15). Always false otherwise.
+/// (frontier/round11/r11-merge PREREG A6, A13, A14, A15, A22a). Always false otherwise.
 #[cfg(test)]
 pub(crate) fn mutant(n: u32) -> bool {
     static CHOSEN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -493,7 +494,8 @@ const SITE_RELEASE: usize = 7;
 const SITE_OTHER: usize = 8;
 
 /// A lock of the store, held. Observation only: dropping it adds the time it was held to its
-/// structure's `lock_hold_ns` when lock timing was on at the acquisition, and does nothing else.
+/// structure's `lock_hold_ns` (and, for the trunk's lock, to its call site's `trunk_site_hold_ns`,
+/// A22) when lock timing was on at the acquisition, and does nothing else.
 struct Held<'a, T: Counted> {
     guard: MutexGuard<'a, T>,
     since: Option<Instant>,
@@ -2156,7 +2158,9 @@ impl BranchStore {
             freed += st.lineage.release_all(domain).len();
             drop(shard);
             if st.parent.is_trunk() {
-                let mut trunk = self.trunk_at(SITE_RELEASE);
+                // Mutant 40 (A22a): the release hold tagged as a counted hold.
+                let mut trunk =
+                    self.trunk_at(if mutant(40) { SITE_COUNTED } else { SITE_RELEASE });
                 let TrunkInner {
                     lineage,
                     domain,
