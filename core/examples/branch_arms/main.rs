@@ -80,6 +80,8 @@ struct Args {
     w_list: Vec<usize>,
     no_autocheckpoint: bool,
     synchronous: String,
+    /// r11-adversarial amendment 19: 0 none, 1 the victim's state, 2 state plus child_gone's tree paths.
+    prewarm: u8,
 }
 
 fn parse_list(s: &str, what: &str) -> Vec<usize> {
@@ -101,6 +103,7 @@ fn parse_args() -> Args {
         w_list: vec![1],
         no_autocheckpoint: false,
         synchronous: "OFF".to_string(),
+        prewarm: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -126,6 +129,14 @@ fn parse_args() -> Args {
             "--windows" => args.windows = val().parse().unwrap_or_else(|_| die("bad --windows")),
             "--w" => args.w_list = parse_list(&val(), "--w"),
             "--no-autocheckpoint" => args.no_autocheckpoint = true,
+            "--prewarm" => {
+                args.prewarm = match val().as_str() {
+                    "none" => 0,
+                    "state" => 1,
+                    "all" => 2,
+                    other => die(&format!("unknown --prewarm {other}")),
+                }
+            }
             "--synchronous" => {
                 args.synchronous = match val().as_str() {
                     "off" => "OFF",
@@ -156,6 +167,9 @@ fn parse_args() -> Args {
         && !matches!(args.arm, Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread)
     {
         die("--victim applies to the churn arms only");
+    }
+    if args.prewarm != 0 && !matches!(args.arm, Arm::Churn | Arm::ChurnHot | Arm::ChurnSpread) {
+        die("--prewarm applies to the churn arms only");
     }
     if args.checkpoints.is_empty() || args.checkpoints.windows(2).any(|w| w[0] >= w[1]) {
         die("--checkpoints must be strictly increasing");
@@ -369,6 +383,8 @@ struct WorkSum {
     resolve_retained_examined: u64,
     gc_examined: u64,
     gc_range_entries: u64,
+    tree_ops: u64,
+    tree_entries: u64,
 }
 
 impl WorkSum {
@@ -378,6 +394,8 @@ impl WorkSum {
         self.resolve_retained_examined += b.resolve_retained_examined - a.resolve_retained_examined;
         self.gc_examined += b.gc_examined - a.gc_examined;
         self.gc_range_entries += b.gc_range_entries - a.gc_range_entries;
+        self.tree_ops += b.child_gone_tree_ops - a.child_gone_tree_ops;
+        self.tree_entries += b.child_gone_tree_entries - a.child_gone_tree_entries;
     }
 }
 
@@ -437,10 +455,14 @@ impl Bench {
         let n = us.len() as f64;
         let p50 = percentile(&us, 50.0);
         let per = |v: u64| v as f64 / n;
+        // Trimmed mean, samples <= p90 (amendment 19): the p50 is quantized at the clock tick (41.67 ns).
+        let p90 = percentile(&us, 90.0);
+        let kept: Vec<f64> = us.iter().copied().filter(|&v| v <= p90).collect();
+        let tmean = kept.iter().sum::<f64>() / kept.len() as f64;
         println!(
-            "{x}\t{name}\t{}\t{p50:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+            "{x}\t{name}\t{}\t{p50:.2}\t{:.2}\t{:.2}\t{:.2}\t{tmean:.4}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.1}",
             us.len(),
-            percentile(&us, 90.0),
+            p90,
             percentile(&us, 99.0),
             us[us.len() - 1],
             per(op.work.resolve_calls),
@@ -448,6 +470,8 @@ impl Bench {
             per(op.work.resolve_retained_examined),
             per(op.work.gc_examined),
             per(op.work.gc_range_entries),
+            per(op.work.tree_ops),
+            per(op.work.tree_entries),
         );
         let mut tails = op.tails.clone();
         tails.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
@@ -532,7 +556,7 @@ impl Bench {
     }
 }
 
-const HEADER: &str = "x\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\tresolves_per_op\tlevels_per_op\tret_examined_per_op\tgc_examined_per_op\tgc_range_per_op";
+const HEADER: &str = "x\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\ttmean_le_p90_us\tresolves_per_op\tlevels_per_op\tret_examined_per_op\tgc_examined_per_op\tgc_range_per_op\ttree_ops_per_op\ttree_entries_per_op";
 
 fn main() {
     let args = parse_args();
@@ -580,6 +604,7 @@ fn main() {
     let synchronous = int("PRAGMA synchronous");
 
     println!("# branch_arms — Turso fork, per-branch CoW arena, PREREG amendment 1");
+    println!("# prewarm={}", ["none", "state", "all"][args.prewarm as usize]);
     println!(
         "# arm={:?} victim={:?} checkpoints={:?} samples={} seed={:#x} cycles={} windows={} w={:?} \
          trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} page_size={page_size} \
@@ -943,7 +968,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 "expected {n} branches and {expected_in_use} arena pages before churn: {s:?}"
             ));
         }
-        let mut all: [Op; 8] = Default::default();
+        let mut all: [Op; 9] = Default::default();
         let names = [
             "fork",
             "open",
@@ -953,12 +978,13 @@ fn arm_churn(b: &mut Bench, args: &Args) {
             "read_own",
             "read_hot",
             "read_inh",
+            "prewarm",
         ];
         let mut off_prediction_reaps = 0usize;
         let mut versions_freed = 0usize;
         let rss0 = rss_bytes();
         for wdx in 0..args.windows {
-            let mut win: [Op; 8] = Default::default();
+            let mut win: [Op; 9] = Default::default();
             for c in 0..per_window {
                 let row = row_for(grown);
                 grown += 1;
@@ -995,6 +1021,12 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                     rows: vec![row],
                     trunk_writes_at_fork: at_fork,
                 });
+                // amendment 19: take the victim's misses outside the reap's window, right before it.
+                if args.prewarm != 0 {
+                    let trees = args.prewarm == 2;
+                    let h = b.timed(&mut win[8], || victim.branch.bench_prewarm(trees));
+                    std::hint::black_box(h);
+                }
                 let reaped = b.timed(&mut win[4], || victim.branch.reap().unwrap());
                 if reaped.deferred || reaped.freed_pages < 1 {
                     not_a_result(&format!("a churn reap freed {reaped:?}"));
@@ -1076,6 +1108,8 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 all[i].work.resolve_retained_examined += w.resolve_retained_examined;
                 all[i].work.gc_examined += w.gc_examined;
                 all[i].work.gc_range_entries += w.gc_range_entries;
+                all[i].work.tree_ops += w.tree_ops;
+                all[i].work.tree_entries += w.tree_entries;
             }
             line += &format!(
                 " arena_in_use={} arena_high_water={} rss_bytes={}",
@@ -1126,6 +1160,7 @@ fn arm_churn(b: &mut Bench, args: &Args) {
             "read_own",
             "read_hot",
             "read_inh",
+            "prewarm",
         ],
     );
     drop(live);

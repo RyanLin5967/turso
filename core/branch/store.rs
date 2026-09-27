@@ -209,13 +209,20 @@ impl Lineage {
 
     /// Detach the child forked at `f` and release every retained version that only it could see.
     fn child_gone(&mut self, f: u64, arena: &mut Arena, work: &mut BranchWork) -> usize {
+        // Observation only (r11-adversarial PREREG amendment 19): the trees' sizes, once per call.
+        work.child_gone_tree_entries +=
+            (self.children.len() + self.by_born.len() + self.by_died.len()) as u64;
         let removed = self.children.remove(&f);
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
         let dead = self.garbage(f, lo, hi, work);
+        // children: remove + two ranges; garbage: one range on each index; each dead version: its page's
+        // versions, by_born and by_died, one removal each.
+        work.child_gone_tree_ops += 5 + 3 * dead.len() as u64;
         for &(born, page, died) in &dead {
             let versions = self.retained.get_mut(&page).expect("indexed version is listed");
+            work.child_gone_tree_entries += versions.len() as u64;
             let v = versions.remove(&born).expect("indexed version is listed");
             work.gc_examined += 1;
             if versions.is_empty() {
@@ -434,6 +441,54 @@ impl BranchStore {
     }
 
     /// The `Branch` handle has gone.
+    /// Observation only (r11-adversarial PREREG amendment 19): read, and change nothing, what
+    /// `release_handle(id)` of an unforked branch would touch, so a harness can take those cache misses outside
+    /// its timed window. `trees` false: the branch's own state (its table entry, its `current` map, the arena
+    /// words of its pages). `trees` true: that plus every B-tree path its parent's `child_gone` walks, with the
+    /// same neighbours and the same garbage. Returns a value built from what was read, so no read is elided.
+    #[doc(hidden)]
+    pub(crate) fn bench_prewarm(&self, id: BranchId, trees: bool) -> u64 {
+        let inner = self.inner.lock();
+        let Some(st) = inner.branches.get(&id) else {
+            return 0;
+        };
+        let mut h = st.fork_epoch ^ st.trunk_at ^ u64::from(st.handle) ^ st.lineage.children.len() as u64;
+        for owned in st.current.values() {
+            h = h.wrapping_add(u64::from(owned.slot) ^ owned.born);
+            if let Some(a) = inner.arena.as_ref() {
+                h ^= u64::from(a.is_free(owned.slot));
+            }
+        }
+        if !trees {
+            return h;
+        }
+        let lineage = if st.parent.is_trunk() {
+            &inner.trunk.lineage
+        } else {
+            match inner.branches.get(&st.parent) {
+                Some(p) => &p.lineage,
+                None => return h,
+            }
+        };
+        let f = st.fork_epoch;
+        h ^= u64::from(lineage.children.contains_key(&f));
+        let lo = lineage.children.range(..f).next_back().map(|(&e, _)| e);
+        let hi = lineage
+            .children
+            .range((Bound::Excluded(f), Bound::Unbounded))
+            .next()
+            .map(|(&e, _)| e);
+        let mut scratch = BranchWork::default();
+        for (born, page, died) in lineage.garbage(f, lo, hi, &mut scratch) {
+            if let Some(v) = lineage.retained.get(&page).and_then(|v| v.get(&born)) {
+                h ^= u64::from(v.slot);
+            }
+            h ^= u64::from(lineage.by_born.contains(&(born, page, died)));
+            h ^= u64::from(lineage.by_died.contains(&(died, page, born)));
+        }
+        h ^ lo.unwrap_or(0) ^ hi.unwrap_or(0)
+    }
+
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
         let mut inner = self.inner.lock();
         let Some(st) = inner.branches.get_mut(&id) else {

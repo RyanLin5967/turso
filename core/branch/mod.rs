@@ -199,6 +199,12 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// `retained_by_born` entries visited by `child_gone`'s range query.
     pub gc_range_entries: u64,
+    /// B-tree operations `child_gone` makes on its lineage's ordered maps (children, by_born, by_died and a
+    /// page's versions): each one an O(log n) descent that no other counter counts. Observation only
+    /// (r11-adversarial PREREG amendment 19).
+    pub child_gone_tree_ops: u64,
+    /// Entries of the trees those operations descend, summed per call (their depth is O(log) of this).
+    pub child_gone_tree_entries: u64,
 }
 
 impl Branch {
@@ -230,6 +236,13 @@ impl Branch {
     }
 
     /// Release this branch. Dropping the handle does the same; this form reports what was freed.
+    /// Observation only (r11-adversarial PREREG amendment 19): read what reaping this branch would touch,
+    /// without changing anything; see `BranchStore::bench_prewarm`.
+    #[doc(hidden)]
+    pub fn bench_prewarm(&self, trees: bool) -> u64 {
+        self.db.branches.bench_prewarm(self.id, trees)
+    }
+
     pub fn reap(mut self) -> Result<Reaped> {
         self.released = true;
         Ok(self.db.branches.release_handle(self.id))
