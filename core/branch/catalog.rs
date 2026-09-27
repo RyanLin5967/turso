@@ -69,6 +69,7 @@ use std::num::NonZero;
 use std::path::Path;
 
 use super::arena::Slot;
+use super::prewarm::{warm_files, wal_of, Prewarm, PrewarmStats};
 use crate::storage::pager::{PageRef, Pager};
 use crate::sync::Arc;
 use crate::util::IOExt as _;
@@ -151,70 +152,6 @@ pub(crate) fn cat_cache_pages() -> u64 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(32_768)
     })
-}
-
-/// The catalog prewarm a store's open performs (r12-catload; a measurement arm, `R12_PREWARM`, off
-/// when unset). The published answers to a cold first touch after a restart: PostgreSQL's
-/// pg_prewarm (`read` and `buffer` modes) and InnoDB's buffer pool load, whose hot set a B-tree's
-/// interior pages are.
-/// * `interior`: every interior page of every catalog B-tree into the page cache, level by level
-///   from its root. One leaf per tree is read to find the leaf level (a B-tree's leaves share one
-///   depth), so no other leaf is read.
-/// * `file`: the catalog file and its WAL read sequentially into the OS page cache (pg_prewarm
-///   `read`); the page cache is untouched.
-/// * `buffer`: every page of the catalog into the page cache (pg_prewarm `buffer`), the cache first
-///   resized to hold them all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum Prewarm {
-    #[default]
-    Off,
-    Interior,
-    File,
-    Buffer,
-}
-
-impl Prewarm {
-    /// `R12_PREWARM`. A value this does not know refuses the open: a misspelt arm must not run as
-    /// the control.
-    pub(crate) fn from_env() -> Result<Prewarm> {
-        match std::env::var("R12_PREWARM") {
-            Err(std::env::VarError::NotPresent) => Ok(Prewarm::Off),
-            Ok(v) => match v.as_str() {
-                "" | "off" => Ok(Prewarm::Off),
-                "interior" => Ok(Prewarm::Interior),
-                "file" => Ok(Prewarm::File),
-                "buffer" => Ok(Prewarm::Buffer),
-                other => Err(LimboError::InvalidArgument(format!(
-                    "R12_PREWARM={other:?}: expected off, interior, file or buffer"
-                ))),
-            },
-            Err(e) => Err(LimboError::InvalidArgument(format!("R12_PREWARM: {e}"))),
-        }
-    }
-
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Prewarm::Off => "off",
-            Prewarm::Interior => "interior",
-            Prewarm::File => "file",
-            Prewarm::Buffer => "buffer",
-        }
-    }
-}
-
-/// What an open's prewarm read (r12-catload instrument, observing only).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PrewarmStats {
-    pub(crate) mode: Prewarm,
-    /// Pages requested through the page cache (`interior`, `buffer`).
-    pub(crate) pages: u64,
-    /// Interior pages among them (`interior`).
-    pub(crate) interior: u64,
-    /// Bytes read from the catalog's files (`file`).
-    pub(crate) bytes: u64,
-    /// The page cache's capacity after the prewarm, in pages.
-    pub(crate) cache_pages: u64,
-    pub(crate) ns: u64,
 }
 
 /// Read page `idx` through the page cache and wait until it is loaded.
@@ -495,8 +432,9 @@ impl Catalog {
         })
     }
 
-    /// r12-catload: read what `mode` names into the OS page cache or this connection's page cache
-    /// (see [`Prewarm`]), once, at a store's open. `path` is the catalog file this handle opened.
+    /// r12-catload: warm this catalog as `mode` says (see `super::prewarm`), once, at a store's
+    /// open: its file and WAL in the OS page cache (`read`, `prefetch`), or this connection's page
+    /// cache (`interior`, `buffer`). `path` is the catalog file this handle opened.
     pub(crate) fn prewarm(&mut self, path: &Path, mode: Prewarm) -> Result<()> {
         let t = std::time::Instant::now();
         let mut st = PrewarmStats {
@@ -506,30 +444,8 @@ impl Catalog {
         };
         match mode {
             Prewarm::Off => {}
-            Prewarm::File => {
-                use std::io::Read;
-                let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
-                let mut buf = vec![0u8; 1 << 20];
-                for file in [path, wal.as_path()] {
-                    let fail = |e: std::io::Error| {
-                        LimboError::InternalError(format!(
-                            "branch catalog prewarm: {}: {e}",
-                            file.display()
-                        ))
-                    };
-                    let mut f = match std::fs::File::open(file) {
-                        Ok(f) => f,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(e) => return Err(fail(e)),
-                    };
-                    loop {
-                        let n = f.read(&mut buf).map_err(fail)?;
-                        if n == 0 {
-                            break;
-                        }
-                        st.bytes += n as u64;
-                    }
-                }
+            Prewarm::Read | Prewarm::Prefetch => {
+                warm_files(&[path, wal_of(path).as_path()], mode, &mut st)?;
             }
             Prewarm::Interior | Prewarm::Buffer => {
                 let ints = |conn: &Arc<Connection>, sql: &str| -> Result<Vec<u64>> {
@@ -1102,6 +1018,53 @@ impl Catalog {
 
     pub(crate) fn free_put(&mut self, slot: Slot) -> Result<()> {
         self.free_put.exec(&[int(slot as u64)], &mut self.counters)
+    }
+}
+
+/// r12-catload: a bare catalog handle for the catalog-only load arm (the harness's `catload`, on a
+/// `catalog_only_fixture` or a store's catalog file): open the catalog, read its meta row, prewarm it
+/// as `R12_PREWARM` says (the files part only when `R12_PREWARM_FILES` includes the catalog), then
+/// load branches one at a time, each as a store's first touch does (`Catalog::load_branch`), with no
+/// store around it, so the harness can time and count each load alone.
+#[doc(hidden)]
+pub struct CatalogProbe {
+    cat: Catalog,
+}
+
+impl CatalogProbe {
+    pub fn open(path: &Path) -> Result<CatalogProbe> {
+        let mut cat = Catalog::open(path, false)?;
+        cat.meta()?;
+        let (mode, targets) = super::prewarm::from_env()?;
+        if !mode.warms_files() || targets.catalog {
+            cat.prewarm(path, mode)?;
+        }
+        Ok(CatalogProbe { cat })
+    }
+
+    /// Load branch `id` whole, as a first touch does; `Ok(false)`: the catalog has no such branch.
+    pub fn load(&mut self, id: u64) -> Result<bool> {
+        Ok(self.cat.load_branch(id)?.is_some())
+    }
+
+    /// `(catalog queries, rows read)` since open.
+    pub fn counters(&self) -> (u64, u64) {
+        (self.cat.counters.queries, self.cat.counters.rows_read)
+    }
+
+    /// The open's prewarm, as `Database::branch_prewarm` reports it.
+    pub fn prewarm(&self) -> (&'static str, u64, u64, u64, u64, u64, u64, u64) {
+        let p = self.cat.prewarm;
+        (
+            p.mode.name(),
+            p.files,
+            p.bytes,
+            p.advised,
+            p.pages,
+            p.interior,
+            p.cache_pages,
+            p.ns,
+        )
     }
 }
 

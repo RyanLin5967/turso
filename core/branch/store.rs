@@ -160,7 +160,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::arena::{Arena, Slot};
-use super::catalog::{CatBranch, Catalog, Meta, Prewarm, PrewarmStats};
+use super::catalog::{CatBranch, Catalog, Meta};
+use super::prewarm::{self, Prewarm, PrewarmStats, Targets};
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::page_map::PageMap;
 use super::{
@@ -176,6 +177,9 @@ use crate::{LimboError, Result};
 pub(crate) struct BranchStore {
     /// Shared with a fuzzy checkpoint's thread, which takes it for its install (F-FZ).
     inner: Arc<Mutex<StoreInner>>,
+    /// What this open's prewarm did to files other than the catalog (r12-catload; the catalog's
+    /// own part is on its handle).
+    prewarm: PrewarmStats,
     /// Threads of fuzzy checkpoints started (F-FZ): joined by `compact_now`, by `Drop`, and once
     /// more than `FLIGHTS_KEPT` accumulate (the oldest is long past its install).
     flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
@@ -1243,6 +1247,7 @@ impl BranchStore {
     fn trunk_only() -> Self {
         Self {
             inner: Arc::new(Mutex::new(StoreInner::fresh(None, false, None))),
+            prewarm: PrewarmStats::default(),
             flights: Mutex::new(Vec::new()),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
@@ -1286,6 +1291,20 @@ impl BranchStore {
         let opened = Instant::now();
         let mut stats = BranchOpenStats::default();
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // r12-catload: the prewarm (`R12_PREWARM`, off when unset). The arena is warmed here, before
+        // recovery reads anything; the catalog by `recover_catalog`, on its own handle.
+        let (warm, targets) = if matches!(durability, BranchDurability::Volatile) {
+            (Prewarm::Off, Targets { catalog: false, arena: false })
+        } else {
+            prewarm::from_env()?
+        };
+        let mut warmed = PrewarmStats {
+            mode: warm,
+            ..PrewarmStats::default()
+        };
+        if targets.arena && !memory {
+            prewarm::warm_files(&[BranchFiles::for_db(db_path).arena.as_path()], warm, &mut warmed)?;
+        }
         let inner = match durability {
             BranchDurability::Volatile => {
                 if !memory && BranchFiles::for_db(db_path).exist() {
@@ -1375,7 +1394,7 @@ impl BranchStore {
                 }
                 let mut inner = StoreInner::fresh_mode(Some(files.clone()), sync, default_lease, true);
                 if files.exist() {
-                    Self::recover_catalog(&mut inner, &files, sync, &mut stats)?;
+                    Self::recover_catalog(&mut inner, &files, sync, &mut stats, (warm, targets))?;
                 }
                 inner
             }
@@ -1383,6 +1402,7 @@ impl BranchStore {
         let mut store = Self {
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             inner: Arc::new(Mutex::new(inner)),
+            prewarm: warmed,
             flights: Mutex::new(Vec::new()),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
@@ -1447,14 +1467,18 @@ impl BranchStore {
         files: &BranchFiles,
         sync: bool,
         stats: &mut BranchOpenStats,
+        (warm, targets): (Prewarm, Targets),
     ) -> Result<()> {
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let t = Instant::now();
         let mut catalog = Catalog::open(&files.cat, sync)?;
         let meta = catalog.meta()?;
         stats.catalog_ns = ns(t);
-        // r12-catload: the catalog prewarm (`R12_PREWARM`, off when unset), before the replay reads.
-        catalog.prewarm(&files.cat, Prewarm::from_env()?)?;
+        // r12-catload: the catalog's prewarm, before the replay reads: its pages (`interior`,
+        // `buffer`), or its files unless `R12_PREWARM_FILES` leaves the catalog out.
+        if !warm.warms_files() || targets.catalog {
+            catalog.prewarm(&files.cat, warm)?;
+        }
         let t = Instant::now();
         let recovered =
             Journal::recover_catalog(files, sync, meta.map(|m| (m.page_size, m.generation)))?;
@@ -2633,11 +2657,12 @@ impl BranchStore {
             .map_or(0, |c| c.catalog.counters.rows_written)
     }
 
-    /// What this open's catalog prewarm read (r12-catload instrument); `None` for a store that did
-    /// not recover a catalog.
-    pub(crate) fn catalog_prewarm(&self) -> Option<PrewarmStats> {
+    /// What this open's prewarm did, the arena's part and the catalog's merged (r12-catload
+    /// instrument).
+    pub(crate) fn prewarm_stats(&self) -> PrewarmStats {
         let inner = self.inner.lock();
-        inner.cat.as_ref().map(|c| c.catalog.prewarm)
+        let catalog = inner.cat.as_ref().map(|c| c.catalog.prewarm).unwrap_or_default();
+        self.prewarm.merged(catalog)
     }
 
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows

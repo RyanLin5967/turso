@@ -122,8 +122,10 @@ pub(crate) fn count_backfill_io(which: usize) {
 pub(crate) mod catalog;
 #[doc(hidden)]
 pub use catalog::catalog_only_fixture;
+pub use catalog::CatalogProbe;
 pub(crate) mod journal;
 pub(crate) mod page_map;
+pub(crate) mod prewarm;
 pub(crate) mod store;
 
 use crate::error::LimboError;
@@ -605,14 +607,23 @@ impl Database {
         self.branches.catalog_counters()
     }
 
-    /// What this open's catalog prewarm read (r12-catload instrument): `(mode, pages read through
-    /// the page cache, interior pages among them, bytes read from the files, page cache capacity
-    /// after it, nanoseconds)`; `None` for a store that did not recover a catalog.
+    /// What this open's prewarm did (r12-catload instrument, `R12_PREWARM`): `(mode, files warmed in
+    /// the OS page cache, bytes read, bytes whose read-ahead was requested, catalog pages read
+    /// through its page cache, interior pages among them, catalog page cache capacity after it,
+    /// nanoseconds)`.
     #[doc(hidden)]
-    pub fn branch_catalog_prewarm(&self) -> Option<(&'static str, u64, u64, u64, u64, u64)> {
-        self.branches
-            .catalog_prewarm()
-            .map(|p| (p.mode.name(), p.pages, p.interior, p.bytes, p.cache_pages, p.ns))
+    pub fn branch_prewarm(&self) -> (&'static str, u64, u64, u64, u64, u64, u64, u64) {
+        let p = self.branches.prewarm_stats();
+        (
+            p.mode.name(),
+            p.files,
+            p.bytes,
+            p.advised,
+            p.pages,
+            p.interior,
+            p.cache_pages,
+            p.ns,
+        )
     }
 
     /// Catalog statements that wrote a row since open; 0 for a store that is not a catalog store.

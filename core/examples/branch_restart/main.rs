@@ -600,13 +600,8 @@ fn summary(name: &str, n: usize, label: &str, v: &mut [f64], counters: &[(u64, u
 fn open(args: &Args) {
     let files = Files::new(&args.db);
     let files_before = files.line();
-    // r12-catload: how much of the catalog the OS page cache holds as this open starts.
-    let (cat_res, cat_pages) = resident_pages(&files.cat);
-    let (wal_res, wal_pages) = resident_pages(&files.cat_wal);
-    println!(
-        "RESIDENT\tn={}\tlabel={}\tcat_resident={cat_res}\tcat_vm_pages={cat_pages}\tcat_wal_resident={wal_res}\tcat_wal_vm_pages={wal_pages}",
-        args.n, args.label
-    );
+    // r12-catload: how much of the catalog and the arena the OS page cache holds as this open starts.
+    resident_line(args, &files, "RESIDENT");
     let rss0 = rss_bytes();
     let io0 = turso_core::branch::page_io();
     let oru0 = Ru::now();
@@ -624,6 +619,8 @@ fn open(args: &Args) {
     // branch_stats applies the parked Commits (C-R) before counting slots: timed apart from the open.
     let (loads0, _, q0, rows0) = db.branch_catalog_counters();
     trace_line(args, "open");
+    // r12-catload: and as the settle starts (a `prefetch` prewarm may still be reading).
+    resident_line(args, &files, "RESIDENT2");
     let (sio0, sru0) = (turso_core::branch::page_io(), Ru::now());
     let t = Instant::now();
     let st = db.branch_stats().unwrap();
@@ -675,15 +672,7 @@ fn open(args: &Args) {
         io1[3] - io0[3]
     );
     println!("OPENRU\tn={}\tlabel={}\t{}", args.n, args.label, oru.fields("open_"));
-    if let Some((mode, pages, interior, bytes, cache_pages, ns)) = db.branch_catalog_prewarm() {
-        println!(
-            "PREWARM\tn={}\tlabel={}\tmode={mode}\tpages={pages}\tinterior={interior}\tbytes={bytes}\t\
-             cache_pages={cache_pages}\tprewarm_us={:.1}",
-            args.n,
-            args.label,
-            ns as f64 / 1e3
-        );
-    }
+    prewarm_line(args, db.branch_prewarm());
     if args.probes > 0 {
         let mut rng = Rng(args.seed);
         let mut seen = std::collections::HashSet::new();
@@ -776,6 +765,79 @@ fn open(args: &Args) {
         t_close.as_secs_f64() * 1e6,
         files.line()
     );
+}
+
+/// r12-catload: the OS page-cache residency (mincore, in VM pages) of the catalog, its WAL and the
+/// arena.
+fn resident_line(args: &Args, files: &Files, tag: &str) {
+    let (cr, cp) = resident_pages(&files.cat);
+    let (wr, wp) = resident_pages(&files.cat_wal);
+    let (ar, ap) = resident_pages(&files.arena);
+    println!(
+        "{tag}\tn={}\tlabel={}\tcat_resident={cr}\tcat_vm_pages={cp}\tcat_wal_resident={wr}\tcat_wal_vm_pages={wp}\t\
+         arena_resident={ar}\tarena_vm_pages={ap}",
+        args.n, args.label
+    );
+}
+
+/// r12-catload: what the open's prewarm did (`Database::branch_prewarm`, `CatalogProbe::prewarm`).
+fn prewarm_line(args: &Args, p: (&str, u64, u64, u64, u64, u64, u64, u64)) {
+    let (mode, files, bytes, advised, pages, interior, cache_pages, ns) = p;
+    println!(
+        "PREWARM\tn={}\tlabel={}\tmode={mode}\tfiles={files}\tbytes={bytes}\tadvised={advised}\tpages={pages}\t\
+         interior={interior}\tcache_pages={cache_pages}\tprewarm_us={:.1}",
+        args.n,
+        args.label,
+        ns as f64 / 1e3
+    );
+}
+
+/// r12-catload `catload --db CATALOG --n N --writes K [--window W] [--seed S]`: the catalog-only load
+/// arm. Open a bare catalog (`CatalogProbe`: meta row, then the `R12_PREWARM` prewarm), then load K
+/// distinct random branches one at a time, each timed and counted alone (PAGE_IO page reads, device
+/// bytes, instructions, cycles, thread CPU), as a store's first touch loads one. `--db` is the catalog
+/// file itself (a `catonly` fixture's, or a store's `-branch-cat`).
+fn catload(args: &Args) {
+    let path = args.db.clone();
+    let (r, p) = resident_pages(&path);
+    println!("RESIDENT\tn={}\tlabel={}\tcat_resident={r}\tcat_vm_pages={p}", args.n, args.label);
+    let (io0, ru0, t) = (turso_core::branch::page_io(), Ru::now(), Instant::now());
+    let mut probe = turso_core::branch::CatalogProbe::open(&path)
+        .unwrap_or_else(|e| not_a_result(&format!("catload open: {e}")));
+    let open_us = t.elapsed().as_secs_f64() * 1e6;
+    let (io1, oru) = (turso_core::branch::page_io(), Ru::now().since(&ru0));
+    println!(
+        "CATOPEN\tn={}\tlabel={}\topen_us={open_us:.1}\topen_db_page_reads={}\t{}",
+        args.n,
+        args.label,
+        io1[0] - io0[0],
+        oru.fields("open_")
+    );
+    prewarm_line(args, probe.prewarm());
+    trace_line(args, "open");
+    let mut rng = Rng(args.seed);
+    let mut seen = std::collections::HashSet::new();
+    let k = args.writes.min(if args.window > 0 { args.window } else { args.n });
+    let (mut wall, mut x) = (vec![], vec![]);
+    while seen.len() < k {
+        let id = args.pick(&mut rng);
+        if !seen.insert(id) {
+            continue;
+        }
+        let (a0, r0, t) = (turso_core::branch::page_io(), Ru::now(), Instant::now());
+        let found = probe.load(id).unwrap_or_else(|e| not_a_result(&format!("catload load {id}: {e}")));
+        wall.push(t.elapsed().as_secs_f64() * 1e6);
+        let (a1, r1) = (turso_core::branch::page_io(), Ru::now());
+        if !found {
+            not_a_result(&format!("catload: branch {id} is not in the catalog"));
+        }
+        x.push((a1[0] - a0[0], r1.since(&r0)));
+    }
+    let (q, rows) = probe.counters();
+    // The per-load summary, in the ATTACH line's shape.
+    attach_line(args, &wall, &x);
+    println!("CATLOAD\tn={}\tlabel={}\tk={k}\tqueries={q}\trows={rows}", args.n, args.label);
+    trace_line(args, "loads");
 }
 
 /// r12-catload: with `R12_TRACE_READS` set, the database page reads since the last TRACE line: all
@@ -1351,6 +1413,7 @@ fn main() {
         "leaseopen" => leaseopen(&args),
         "catonly" => catonly(&args),
         "churn" => churn(&args),
+        "catload" => catload(&args),
         other => die(&format!("unknown command {other}")),
     }
 }

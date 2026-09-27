@@ -715,13 +715,15 @@ fn an_open_after_every_lease_ran_out_reaps_one_bounded_batch() {
 
 /// r12-catload: the catalog prewarm reads what its mode names, and changes no answer. A store of
 /// 3,000 branches is grown, checkpointed and closed; fresh handles on its catalog then prewarm in
-/// each mode. `off` reads nothing; `file` reads the catalog file and its WAL whole; `buffer`
-/// requests every page once and sizes the cache to hold them; `interior` requests every interior
-/// page and exactly one leaf per B-tree (the leaf that shows where the leaves start). Every branch
-/// then loads from each prewarmed handle exactly as from one that was not prewarmed.
+/// each mode. `off` reads nothing; `read` reads the catalog file and its WAL whole; `prefetch`
+/// requests read-ahead of exactly those bytes; `buffer` requests every page once and sizes the cache
+/// to hold them; `interior` requests every interior page and exactly one leaf per B-tree (the leaf
+/// that shows where the leaves start). Every branch then loads from each prewarmed handle exactly as
+/// from one that was not prewarmed.
 #[test]
 fn catalog_prewarm_reads_what_its_mode_names() {
-    use super::catalog::{Catalog, Prewarm};
+    use super::catalog::Catalog;
+    use super::prewarm::Prewarm;
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("c.db");
     let db = open_at(&path, catalog()).unwrap();
@@ -741,16 +743,27 @@ fn catalog_prewarm_reads_what_its_mode_names() {
     assert!(want.iter().all(Option::is_some), "a grown branch is missing from the catalog");
     // One handle on the file at a time.
     drop(plain);
-    for mode in [Prewarm::Off, Prewarm::File, Prewarm::Buffer, Prewarm::Interior] {
+    let whole = size(&cat) + size(&wal);
+    for mode in [
+        Prewarm::Off,
+        Prewarm::Read,
+        Prewarm::Prefetch,
+        Prewarm::Buffer,
+        Prewarm::Interior,
+    ] {
         let mut c = Catalog::open(&cat, false).unwrap();
         c.prewarm(&cat, mode).unwrap();
         let st = c.prewarm;
         assert_eq!(st.mode, mode);
         match mode {
-            Prewarm::Off => assert_eq!((st.pages, st.bytes), (0, 0)),
-            Prewarm::File => {
-                assert_eq!(st.pages, 0);
-                assert_eq!(st.bytes, size(&cat) + size(&wal));
+            Prewarm::Off => assert_eq!((st.pages, st.bytes, st.advised), (0, 0, 0)),
+            Prewarm::Read => {
+                assert_eq!((st.pages, st.advised), (0, 0));
+                assert_eq!(st.bytes, whole);
+            }
+            Prewarm::Prefetch => {
+                assert_eq!((st.pages, st.bytes), (0, 0));
+                assert_eq!(st.advised, whole);
             }
             Prewarm::Buffer => {
                 assert_eq!(st.pages, pages);
