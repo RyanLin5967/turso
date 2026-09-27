@@ -164,6 +164,24 @@ impl Drop for Hold<'_> {
         max.zeroed_bytes = max.zeroed_bytes.max(acc.zeroed_bytes);
         if let Some(start) = self.start {
             let ns = start.elapsed().as_nanos() as u64;
+            if ns > max.ns {
+                max.ns_hold_number = inner.work.lock_holds;
+                let t = &inner.trunk;
+                let a = inner.arena.as_ref().map_or([0; 7], |a| a.shape());
+                max.sizes_at_max = [
+                    t.written.len() as u64,
+                    t.lineage.retained.len() as u64,
+                    t.lineage.by_born.len() as u64,
+                    a[0] as u64,
+                    a[1] as u64,
+                    a[2] as u64,
+                    a[3] as u64,
+                    a[4] as u64,
+                    a[5] as u64,
+                    a[6] as u64,
+                    acc.realloc_moved,
+                ];
+            }
             max.ns = max.ns.max(ns);
             inner.hold_hist[hold_bucket(ns)] += 1;
         }

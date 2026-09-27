@@ -115,6 +115,11 @@ impl<T: Copy + Default> Blocks<T> {
     fn outer_capacity(&self) -> usize {
         self.blocks.capacity()
     }
+
+    /// Length of the outer vector of block pointers (blocks allocated so far).
+    fn outer_len(&self) -> usize {
+        self.blocks.len()
+    }
 }
 
 pub(crate) struct Arena {
@@ -224,6 +229,21 @@ impl Arena {
         [
             self.free.outer_capacity(),
             self.free_bits.outer_capacity(),
+            self.chunks.outer_capacity(),
+        ]
+    }
+
+    /// Free-list length and, for the free list, free bits and chunk table, the length and capacity
+    /// of the outer vector of block pointers: the arena's only containers that can double.
+    /// Observation only (r11-bigtxn amendment 7).
+    pub(crate) fn shape(&self) -> [usize; 7] {
+        [
+            self.free.len(),
+            self.free.outer_len(),
+            self.free.outer_capacity(),
+            self.free_bits.outer_len(),
+            self.free_bits.outer_capacity(),
+            self.chunks.outer_len(),
             self.chunks.outer_capacity(),
         ]
     }

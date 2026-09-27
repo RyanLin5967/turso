@@ -231,6 +231,16 @@ pub struct HoldMax {
     /// the `written` insert. 0 unless [`set_hold_timing`] is on. Attributes a long trunk hold to a
     /// step (r11-bigtxn amendment 7).
     pub trunk_step_ns: [u64; 5],
+    /// The store's hold number (its running `lock_holds`) of the longest hold, and the sizes of
+    /// the containers a trunk first-write touches, sampled when that hold ended: `written`,
+    /// `retained` (pages), retained versions, the arena free list, then the length and capacity of
+    /// the free list's, free bits' and chunk table's block-pointer vectors. The B-trees have no
+    /// capacity; the arena vectors are the only ones that can double. 0 unless [`set_hold_timing`]
+    /// is on (r11-bigtxn amendment 7).
+    pub ns_hold_number: u64,
+    /// The container sizes sampled when the longest hold ended, in the order listed above, then
+    /// the entries that hold's own arena-vector growth moved (its realloc counter).
+    pub sizes_at_max: [u64; 11],
 }
 
 /// Time every hold of the branch store's mutex into [`HoldMax::ns`]. Observation only; costs two

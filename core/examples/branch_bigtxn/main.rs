@@ -221,7 +221,7 @@ const HEADER: &str = "phase\tD\tN\trep\tus\tlock_holds\tlocked_copy_bytes\tmax_h
 max_hold_realloc_moved\tmax_hold_ns\tresolve_calls\tevict_calls\tevict_examined\tevict_full\t\
 over_capacity_admits\tevictable_scan\tspill_scan\tsubjournal_pages\tarena_in_use\tcache_len\tview_build_pages\t\
 holds_timed\thold_p50_ns\thold_p99_ns\thold_p999_ns\tmax_hold_realloc_bytes\tmax_hold_node_copies\t\
-max_hold_zeroed_bytes\tholds_ge_16us\tminflt\tmajflt\tnivcsw\tstep_lookup_ns\tstep_alloc_ns\tstep_copy_ns\tstep_retain_ns\tstep_insert_ns";
+max_hold_zeroed_bytes\tholds_ge_16us\tminflt\tmajflt\tnivcsw\tstep_lookup_ns\tstep_alloc_ns\tstep_copy_ns\tstep_retain_ns\tstep_insert_ns\tmax_hold_index\tat_written\tat_retained_pages\tat_versions\tat_free\tat_free_blocks\tat_free_blocks_cap\tat_bits_blocks\tat_bits_blocks_cap\tat_chunk_blocks\tat_chunk_blocks_cap\tat_hold_realloc_moved";
 
 /// Process-wide minor and major page faults and involuntary context switches (getrusage), read
 /// outside the timed window: a long hold that does no more counted work than a short one is a
@@ -294,8 +294,19 @@ impl Ctx {
         } else {
             "-".to_string()
         };
+        // Where in the phase its longest hold fell (0-based hold index) and the container sizes
+        // sampled when it ended: a growth landing in one hold sits at a doubling point.
+        let at_max = if self.timing && m.ns > 0 {
+            let idx = m.ns_hold_number as i64 - a.w.lock_holds as i64 - 1;
+            std::iter::once(idx.to_string())
+                .chain(m.sizes_at_max.iter().map(|v| v.to_string()))
+                .collect::<Vec<_>>()
+                .join("\t")
+        } else {
+            vec!["-"; 12].join("\t")
+        };
         println!(
-            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}\t{}\t{}\t{}\t{long}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}\t{}\t{}\t{}\t{long}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{at_max}",
             b.w.lock_holds - a.w.lock_holds,
             b.w.locked_copy_bytes - a.w.locked_copy_bytes,
             m.pages,
