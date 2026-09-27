@@ -380,6 +380,10 @@ pub struct BranchWork {
     pub splices: u64,
     pub splice_commits: u64,
     pub splice_entries: u64,
+    /// Entries a branch's lazily built page map (`view`) inserted at its first fork: its current
+    /// versions born after its `inherited` map was taken (r11-ever amendment 17; r11-adversarial's
+    /// counter of the same name counted all of `current`).
+    pub view_build_entries: u64,
 }
 
 impl Branch {

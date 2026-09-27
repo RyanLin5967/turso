@@ -3090,3 +3090,88 @@ fn a_splice_frees_what_the_base_rule_frees_one_release_earlier() {
     }
     assert_eq!(totals[0], totals[1], "the two arms freed different totals: {totals:?}");
 }
+
+/// r11-adversarial's chainw (amendment 17), in the splice arm: at each of D levels the newest branch
+/// writes a page no level wrote before, forks, and is released, so it is spliced into the new child,
+/// which inherits every page the dead levels above had moved into it. Each level's first fork builds
+/// its page map; from all of its current versions that build inserts the level's own page plus the
+/// j - 1 moved in, D(D+1)/2 in all over the chain; from the versions born after `inherited_at`, the
+/// one page its level wrote: exactly D. The last level reads every level's page, and so does a child
+/// forked from it, in the store that built the maps and after a reopen, which re-derives them
+/// (`inherited_at` then starts at the fork epoch, and the child's map must still name every page).
+#[test]
+fn a_chain_that_writes_forks_and_releases_builds_each_view_from_its_own_pages() {
+    const D: i64 = 48;
+    // One row per leaf page: ~3 KiB values on 4 KiB pages, rewritten at the same length.
+    let val = |tag: &str, id: i64| format!("{id:010}{}", tag.repeat(2990));
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let tip_id;
+    {
+        let db = open_at(&path, spliced()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE w(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        trunk.execute("BEGIN").unwrap();
+        for id in 1..=D + 1 {
+            trunk.execute(format!("INSERT INTO w VALUES ({id}, '{}')", val("s", id))).unwrap();
+        }
+        trunk.execute("COMMIT").unwrap();
+        let write = |b: &Branch, id: i64| {
+            b.connect()
+                .unwrap()
+                .execute(format!("UPDATE w SET v = '{}' WHERE id = {id}", val("w", id)))
+                .unwrap();
+        };
+        let read = |b: &Branch, id: i64| -> String {
+            match &rows(&b.connect().unwrap(), &format!("SELECT v FROM w WHERE id = {id}"))[0][0] {
+                Value::Text(t) => t.as_str().to_string(),
+                other => panic!("expected text, got {other:?}"),
+            }
+        };
+        let probe = trunk.fork_branch().unwrap();
+        write(&probe, D + 1);
+        assert_eq!(probe.owned_slots().len(), 1, "premise: a row's rewrite takes more than its leaf");
+        assert!(!probe.reap().unwrap().deferred);
+        let before = db.branch_stats().unwrap().work;
+        let mut prev = trunk.fork_branch().unwrap();
+        for j in 1..=D {
+            write(&prev, j);
+            let next = prev.fork().unwrap();
+            let r = prev.reap().unwrap();
+            assert!(r.deferred, "level {j}: the released level was not kept for its child: {r:?}");
+            prev = next;
+        }
+        let w = db.branch_stats().unwrap().work;
+        assert_eq!(w.splices - before.splices, D as u64, "premise: every level was spliced");
+        assert_eq!(
+            w.view_build_entries - before.view_build_entries,
+            D as u64,
+            "each level's first fork built its map from more than its own page"
+        );
+        assert_eq!(db.branch_stats().unwrap().live_branches, 1);
+        for id in 1..=D {
+            assert_eq!(read(&prev, id), val("w", id), "the tip misread level {id}'s page");
+        }
+        let child = prev.fork().unwrap();
+        for id in 1..=D {
+            assert_eq!(read(&child, id), val("w", id), "a child of the tip misread level {id}'s page");
+        }
+        assert_eq!(read(&child, D + 1), val("s", D + 1), "a child of the tip misread a trunk page");
+        let _ = child.reap().unwrap();
+        tip_id = prev.into_id();
+    }
+    let db = reopen_in(&path, incarnation, spliced());
+    let tip = db.branch(tip_id).unwrap();
+    let child = tip.fork().unwrap();
+    for id in 1..=D {
+        let got = match &rows(&child.connect().unwrap(), &format!("SELECT v FROM w WHERE id = {id}"))[0][0] {
+            Value::Text(t) => t.as_str().to_string(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert_eq!(got, val("w", id), "after the reopen a child of the tip misread level {id}'s page");
+    }
+    let _ = child.reap().unwrap();
+    let _ = tip.into_id();
+}

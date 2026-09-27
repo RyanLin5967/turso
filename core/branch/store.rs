@@ -28,7 +28,9 @@
 //! which is its parent's `view` at the fork: the parent's own `inherited` plus the parent's current
 //! pages, kept up to date by the parent's commits once it has forked a child. A fork clones the
 //! parent's `view` in O(1) and a commit path-copies O(log P) trie nodes, so a lookup costs the same
-//! at depth 1000 as at depth 1. A page no branch in the chain wrote is the trunk's, as of
+//! at depth 1000 as at depth 1. The first fork builds the `view`, from the current versions born
+//! after `inherited` was taken only (`inherited_at`): a splice's moved-in versions are already in
+//! `inherited`, and re-inserting them made that build O(every page the dead levels above moved in). A page no branch in the chain wrote is the trunk's, as of
 //! `trunk_at`, the fork epoch at which the branch's ancestry leaves the trunk.
 //!
 //! The maps are derived state, like the retained indexes: replay applies `Fork` and `Commit`
@@ -571,6 +573,14 @@ struct BranchState {
     trunk_at: u64,
     /// Every arena page this branch sees through its ancestors: its parent's `view` at the fork.
     inherited: PageMap,
+    /// The fork epoch at which `inherited` was taken: the fork itself, or, after a snapshot load or a
+    /// catalog load, the fork epoch `inherited` was derived at. A splice changes `fork_epoch` and
+    /// leaves this and `inherited` alone. Every current version born at or below it is one a splice
+    /// moved in from a zombie, which `inherited` already names with the same slot and crc (the
+    /// zombie's view at this epoch held the version the child read through it); every other
+    /// current version is the branch's own, born above it (epoch inheritance). So `view_now` needs
+    /// only the versions born above it.
+    inherited_at: u64,
     /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
     /// branch's first fork and kept current by its commits from then on; `None` until it forks, and
     /// again once it is retired (a released branch takes no child).
@@ -578,16 +588,26 @@ struct BranchState {
 }
 
 impl BranchState {
-    /// The map a child forked now inherits, built from `inherited` and `current` the first time.
-    fn view_now(&mut self) -> &PageMap {
-        let (inherited, current) = (&self.inherited, &self.current);
-        self.view.get_or_insert_with(|| {
+    /// The map a child forked now inherits, built from `inherited` and `current` the first time,
+    /// from the current versions born after `inherited_at` only (see there). Iterating all of
+    /// `current` made the first fork after a splice cost every page the dead levels above had moved
+    /// into it: Theta(d^2) over a chain that writes a new page, forks and releases its parent at
+    /// each of d levels (r11-adversarial's chainw, against the volatile store's F7). Returns the map
+    /// and the entries this call inserted (0 when the map was already built; observation only).
+    fn view_now(&mut self) -> (&PageMap, u64) {
+        let mut built = 0u64;
+        let (inherited, current, by_born, at) =
+            (&self.inherited, &self.current, &self.current_by_born, self.inherited_at);
+        let view = self.view.get_or_insert_with(|| {
             let mut view = inherited.clone();
-            for (&page, owned) in current {
+            for &(_, page) in by_born.range((at.saturating_add(1), 0)..) {
+                let owned = current[&page];
                 view.insert(page, (owned.slot, owned.crc));
+                built += 1;
             }
             view
-        })
+        });
+        (&*view, built)
     }
 
     /// The version of `page` this branch held at its own epoch `f` — what a child forked at `f`
@@ -2670,6 +2690,7 @@ impl StoreInner {
                 lease,
                 trunk_at,
                 inherited,
+                inherited_at: b.fork_epoch,
                 view: None,
             },
         );
@@ -3240,8 +3261,11 @@ impl StoreInner {
             let f = st.lineage.epoch;
             st.lineage.epoch += 1;
             st.lineage.n_children += 1;
-            let inherited = st.view_now().clone();
-            (f, inherited, st.trunk_at)
+            let (view, built) = st.view_now();
+            let inherited = view.clone();
+            let trunk_at = st.trunk_at;
+            self.work.view_build_entries += built;
+            (f, inherited, trunk_at)
         };
         self.children.insert(parent, f, child);
         self.next_id = self.next_id.max(child.0 + 1);
@@ -3266,6 +3290,7 @@ impl StoreInner {
                 lease: None,
                 trunk_at,
                 inherited,
+                inherited_at: f,
                 view: None,
             },
         );
@@ -3457,7 +3482,8 @@ impl StoreInner {
     ///    as a retained version of `c` OLDER than `c`'s others (U5: `Lineage::retain` checks both
     ///    neighbours), or is freed when there are none. Epoch inheritance puts every zombie version
     ///    `c` reads below every epoch of `c`, so no key changes. `c`'s page maps are unchanged:
-    ///    `inherited` (and `view`) already name these same slots for these pages.
+    ///    `inherited` (and `view`) already name these same slots for these pages, and the moved
+    ///    versions are born at or below `inherited_at`, so `view_now` does not re-insert them.
     /// 4. U6: `c` is re-keyed under the zombie's parent at the zombie's fork epoch (`relink`), and a
     ///    catalog store removes the zombie and re-keys `c`'s row at its next checkpoint.
     ///
@@ -3770,6 +3796,7 @@ impl StoreInner {
                 .get_mut(&id)
                 .expect("a lineage lists only branches that exist");
             st.inherited = inherited;
+            st.inherited_at = st.fork_epoch;
             st.trunk_at = trunk_at;
             st.view = None;
             let st = &self.branches[&id];
@@ -4012,9 +4039,10 @@ impl StoreInner {
                     open: b.held_open,
                     writer: false,
                     lease,
-                    // Placeholders: `derive_page_maps` sets both once every lineage is linked.
+                    // Placeholders: `derive_page_maps` sets these once every lineage is linked.
                     trunk_at: 0,
                     inherited: PageMap::default(),
+                    inherited_at: 0,
                     view: None,
                 },
             );
