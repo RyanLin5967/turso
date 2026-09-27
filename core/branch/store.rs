@@ -212,11 +212,14 @@ impl Lineage {
         // Observation only (r11-adversarial PREREG amendment 19): the trees' sizes, once per call.
         work.child_gone_tree_entries +=
             (self.children.len() + self.by_born.len() + self.by_died.len()) as u64;
+        let t0 = std::time::Instant::now();
         let removed = self.children.remove(&f);
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
+        let t1 = std::time::Instant::now();
         let dead = self.garbage(f, lo, hi, work);
+        let t2 = std::time::Instant::now();
         // children: remove + two ranges; garbage: one range on each index; each dead version: its page's
         // versions, by_born and by_died, one removal each.
         work.child_gone_tree_ops += 5 + 3 * dead.len() as u64;
@@ -233,6 +236,9 @@ impl Lineage {
             crate::turso_assert!(indexed, "a released version was missing from an index");
             arena.release(v.slot);
         }
+        work.cg_children_ns += (t1 - t0).as_nanos() as u64;
+        work.cg_garbage_ns += (t2 - t1).as_nanos() as u64;
+        work.cg_remove_ns += t2.elapsed().as_nanos() as u64;
         dead.len()
     }
 

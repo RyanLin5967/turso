@@ -211,6 +211,11 @@ pub struct BranchWork {
     pub child_gone_ns: u64,
     /// Wall nanoseconds `release_handle` held the store lock: acquisition to just before it returns.
     pub reap_hold_ns: u64,
+    /// child_gone's time by segment (Instant marks inside it; observation only, r11-adversarial amendment 21):
+    /// the neighbour search on `children`, the `garbage` range queries, and the removals of dead versions.
+    pub cg_children_ns: u64,
+    pub cg_garbage_ns: u64,
+    pub cg_remove_ns: u64,
 }
 
 impl Branch {
