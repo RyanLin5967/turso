@@ -427,10 +427,15 @@ pub(crate) struct Journal {
     generation: u64,
     /// Bytes of the log that hold whole, durable-or-written records (header included).
     len: u64,
-    /// Encoded frames not yet written: records wait here until a flush has synced the arena.
+    /// Encoded frames not yet written: records wait here until a flush has synced the arena. In
+    /// log order, `sealed` comes first: frames encoded without the store mutex and handed in whole
+    /// (`buffer_frame`), with whatever `pending` held before each; then `pending`.
     pending: Vec<u8>,
-    /// Arena slots named by records still in `pending` (the failpoint reports them as orphans).
+    sealed: Vec<Vec<u8>>,
+    /// Arena slots named by records still buffered (the failpoint reports them as orphans); the
+    /// sealed frames' lists are kept whole, as they were handed in.
     pub(crate) pending_slots: Vec<Slot>,
+    sealed_slots: Vec<Vec<Slot>>,
     snapshot_len: u64,
     sync: bool,
     /// Set by an I/O failure, or a failpoint standing in for a crash. From then on nothing more is
@@ -498,7 +503,9 @@ impl Journal {
             generation: 0,
             len: 0,
             pending: Vec::new(),
+            sealed: Vec::new(),
             pending_slots: Vec::new(),
+            sealed_slots: Vec::new(),
             snapshot_len: 0,
             sync,
             poisoned: false,
@@ -535,7 +542,7 @@ impl Journal {
     /// written for that attempt's page size, and the retry's is the one the arena will use.
     pub(crate) fn restart(&mut self, page_size: usize) -> Result<()> {
         self.check_live()?;
-        if self.len != LOG_HEADER_LEN as u64 || !self.pending.is_empty() {
+        if self.len != LOG_HEADER_LEN as u64 || self.buffered_len() != 0 {
             return Err(LimboError::InternalError(
                 "branch log holds records; it cannot change page size".to_string(),
             ));
@@ -607,7 +614,9 @@ impl Journal {
             generation,
             len: 0,
             pending: Vec::new(),
+            sealed: Vec::new(),
             pending_slots: Vec::new(),
+            sealed_slots: Vec::new(),
             snapshot_len,
             sync,
             poisoned: false,
@@ -742,8 +751,7 @@ impl Journal {
     /// generation. A failure poisons the journal, as a failed compaction does after its rename.
     pub(crate) fn restart_at(&mut self, generation: u64) -> Result<()> {
         self.check_live()?;
-        self.pending.clear();
-        self.pending_slots.clear();
+        self.drop_buffered();
         self.snapshot_len = 0;
         if let Err(e) = self.reset_log(generation) {
             self.poisoned = true;
@@ -785,9 +793,14 @@ impl Journal {
         self.check_live()?;
         let mut payload = Vec::with_capacity(32);
         record.encode(&mut payload);
+        let before = self.pending.len();
         put_u32(&mut self.pending, payload.len() as u32);
         put_u32(&mut self.pending, crc32c::crc32c(&payload));
         self.pending.extend_from_slice(&payload);
+        BUFFER_COPIED_BYTES.fetch_add(
+            (self.pending.len() - before) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.lsn += (FRAME_HEADER_LEN + payload.len()) as u64;
         match record {
             Record::TrunkRetain { slot, .. } => self.pending_slots.push(*slot),
@@ -797,13 +810,48 @@ impl Journal {
         Ok(())
     }
 
+    /// Queue one frame encoded by [`encode_frame`] without the store mutex, and the arena slots
+    /// its record names, by move: no byte of it is copied here, so a D-page `Commit` costs the
+    /// store's holder O(1) (r11-bigtxn, ported onto the durable store).
+    pub(crate) fn buffer_frame(&mut self, frame: Vec<u8>, slots: Vec<Slot>) -> Result<()> {
+        self.check_live()?;
+        BUFFER_HANDED_BYTES.fetch_add(frame.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.lsn += frame.len() as u64;
+        if !self.pending.is_empty() {
+            self.sealed.push(std::mem::take(&mut self.pending));
+            self.sealed_slots.push(std::mem::take(&mut self.pending_slots));
+        }
+        self.sealed.push(frame);
+        self.sealed_slots.push(slots);
+        Ok(())
+    }
+
+    /// Frame bytes buffered and not yet written.
+    fn buffered_len(&self) -> usize {
+        self.sealed.iter().map(Vec::len).sum::<usize>() + self.pending.len()
+    }
+
+    /// Every arena slot a buffered record names (for the failpoint's orphan report).
+    pub(crate) fn pending_slot_list(&self) -> Vec<Slot> {
+        let mut all: Vec<Slot> = self.sealed_slots.iter().flatten().copied().collect();
+        all.extend_from_slice(&self.pending_slots);
+        all
+    }
+
+    fn drop_buffered(&mut self) {
+        self.pending.clear();
+        self.pending_slots.clear();
+        self.sealed.clear();
+        self.sealed_slots.clear();
+    }
+
     /// Make every buffered record durable: arena first, then the records, then the log.
     pub(crate) fn flush(&mut self, arena: &mut Arena) -> Result<()> {
         // Taken first, so the failpoint is spent by exactly this call whatever it returns — it
         // cannot outlive the barrier that armed it (review 5 T-1).
         let fail_next_write = std::mem::take(&mut self.fail_next_write);
         self.check_live()?;
-        if self.pending.is_empty() {
+        if self.buffered_len() == 0 {
             return Ok(());
         }
         let written = if fail_next_write {
@@ -815,9 +863,11 @@ impl Journal {
         };
         match written {
             Ok(()) => {
-                self.len += self.pending.len() as u64;
-                self.pending.clear();
-                self.pending_slots.clear();
+                // Always under the store mutex: the journal lives inside it.
+                let bytes = self.buffered_len() as u64;
+                SYNC_LOCKED_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+                self.len += bytes;
+                self.drop_buffered();
                 Ok(())
             }
             Err(e) => {
@@ -844,9 +894,14 @@ impl Journal {
             ));
         }
         if self.sync {
-            arena.sync()?;
+            let arena_bytes = arena.sync()?;
+            SYNC_LOCKED_BYTES.fetch_add(arena_bytes, std::sync::atomic::Ordering::Relaxed);
         }
-        write_at(&self.file, &self.pending, self.len)?;
+        let mut at = self.len;
+        for chunk in self.sealed.iter().chain(std::iter::once(&self.pending)) {
+            write_at(&self.file, chunk, at)?;
+            at += chunk.len() as u64;
+        }
         if self.sync {
             fsync_file(&self.file)?;
         }
@@ -868,10 +923,11 @@ impl Journal {
         let fail = std::mem::take(&mut self.fail_next_write);
         self.check_live()?;
         let end_lsn = self.lsn;
-        if self.pending.is_empty() {
+        if self.buffered_len() == 0 {
             return Ok(Flight {
                 log: None,
                 arena: None,
+                arena_bytes: 0,
                 bytes: Vec::new(),
                 at: self.len,
                 sync: self.sync,
@@ -894,14 +950,23 @@ impl Journal {
             .file
             .try_clone()
             .map_err(|e| io_error(e, "dup branch log"))?;
-        let arena = arena.take_dirty_file()?;
-        let bytes = std::mem::take(&mut self.pending);
+        let (arena, arena_bytes) = match arena.take_dirty_file()? {
+            Some((file, bytes)) => (Some(file), bytes),
+            None => (None, 0),
+        };
+        // Moved, not concatenated: the store mutex is held here.
+        let mut bytes = std::mem::take(&mut self.sealed);
+        if !self.pending.is_empty() {
+            bytes.push(std::mem::take(&mut self.pending));
+        }
         self.pending_slots.clear();
+        self.sealed_slots.clear();
         let at = self.len;
-        self.len += bytes.len() as u64;
+        self.len += bytes.iter().map(Vec::len).sum::<usize>() as u64;
         Ok(Flight {
             log: Some(log),
             arena,
+            arena_bytes,
             bytes,
             at,
             sync: self.sync,
@@ -967,8 +1032,7 @@ impl Journal {
                 "failpoint: branch compaction stopped after the snapshot rename".to_string(),
             ));
         }
-        self.pending.clear();
-        self.pending_slots.clear();
+        self.drop_buffered();
         self.snapshot_len = out.len() as u64;
         if let Err(e) = self.reset_log(generation) {
             self.poisoned = true;
@@ -1040,7 +1104,10 @@ impl Journal {
 pub(crate) struct Flight {
     log: Option<File>,
     arena: Option<File>,
-    bytes: Vec<u8>,
+    /// Arena bytes written since the last sync, which this flight syncs (observation only).
+    arena_bytes: u64,
+    /// The frames, in log order, as the journal buffered them (see `Journal::sealed`).
+    bytes: Vec<Vec<u8>>,
     at: u64,
     sync: bool,
     fail: bool,
@@ -1064,7 +1131,11 @@ impl Flight {
                 fsync_file(arena)?;
             }
         }
-        write_at(&log, &self.bytes, self.at)?;
+        let mut at = self.at;
+        for chunk in &self.bytes {
+            write_at(&log, chunk, at)?;
+            at += chunk.len() as u64;
+        }
         if self.sync {
             fsync_file(&log)?;
         }
@@ -1073,7 +1144,12 @@ impl Flight {
 
     /// Frame bytes in this flight (observation only).
     pub(crate) fn len(&self) -> usize {
-        self.bytes.len()
+        self.bytes.iter().map(Vec::len).sum()
+    }
+
+    /// Bytes this flight writes and syncs, log and arena (observation only).
+    pub(crate) fn sync_bytes(&self) -> u64 {
+        self.len() as u64 + self.arena_bytes
     }
 }
 
@@ -1243,6 +1319,30 @@ pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
         f.read_exact(out)
             .map_err(|e| io_error(e, "read branch file"))
     }
+}
+
+/// Observation only (r11-bigtxn amendment 8, process-wide): bytes of branch log and arena written
+/// and synced while the store mutex was held (`Journal::flush`, and a flight flushed under it);
+/// bytes a flight synced with no lock held; bytes copied into the journal's buffer under the store
+/// mutex (`Journal::buffer`); and bytes of frames handed in by move (`Journal::buffer_frame`).
+pub(crate) static SYNC_LOCKED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SYNC_UNLOCKED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BUFFER_COPIED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BUFFER_HANDED_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A record as one log frame (length, crc32c, payload), for [`Journal::buffer_frame`]: encoded by
+/// the caller without the store mutex.
+pub(crate) fn encode_frame(record: &Record) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(64);
+    record.encode(&mut payload);
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    put_u32(&mut frame, payload.len() as u32);
+    put_u32(&mut frame, crc32c::crc32c(&payload));
+    frame.extend_from_slice(&payload);
+    frame
 }
 
 /// Observation only (r11-churn instrument; nothing reads it): every `fsync_file` call, process-wide
