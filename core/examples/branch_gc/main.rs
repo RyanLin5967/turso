@@ -1,7 +1,7 @@
 //! Branch lifecycles per second against concurrent agents on the DURABLE branch store: what a
 //! group commit with the flush outside the store mutex buys (r11-churn lane; the specification is
 //! `frontier/round11/r11-churn/PREREG.md` amendment 4 in artie-research, and this file is its
-//! implementation).
+//! implementation). r12-noforce appends five columns (see below); the first fourteen are unchanged.
 //!
 //!   TURSO_BRANCH_FULLFSYNC=0|1 cargo run -p turso_core --release --example branch_gc -- \
 //!       --threads 1,2,4,8,16 [--warm-ms 3000] [--window-ms 15000] [--lease-ms 1000] [--w 1] \
@@ -23,6 +23,10 @@
 //!   fsyncs_per_arrival branch-file fsyncs (the r11-churn instrument) per arrival
 //!   flights, waits     group-commit flights led outside the mutex, and operations that waited for
 //!                      durability (both 0 on a store without group commit)
+//!   fork_/commit_fsyncs_per_arrival  branch-file fsyncs on the AGENT thread inside its fork, and
+//!                      inside its write-and-commit (r12-noforce: which step pays which sync)
+//!   compactions_per_arrival, compact_fsyncs_per_arrival, log_bytes_per_arrival  the checkpoint's
+//!                      share, and the bytes flights wrote to the log (page images under no-force)
 //!
 //! Which sync the store issues is printed from the instrument: plain fsync(2), or `F_FULLFSYNC`
 //! with `TURSO_BRANCH_FULLFSYNC=1`.
@@ -155,6 +159,8 @@ struct Shared {
     arrivals: AtomicU64,
     reaped: AtomicU64,
     busy_retries: AtomicU64,
+    fork_fsyncs: AtomicU64,
+    commit_fsyncs: AtomicU64,
     cycles: Mutex<Vec<u64>>,
     stop_agents: AtomicBool,
     stop_reaper: AtomicBool,
@@ -164,6 +170,7 @@ fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize) {
     let trunk = db.connect().unwrap();
     while !shared.stop_agents.load(Ordering::Acquire) {
         let start = Instant::now();
+        let fsyncs0 = churn_counters().thread_fsyncs;
         let branch = loop {
             match trunk.fork_branch() {
                 Ok(b) => break b,
@@ -175,6 +182,7 @@ fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize) {
                 Err(e) => not_a_result(&format!("fork failed: {e}")),
             }
         };
+        let fsyncs1 = churn_counters().thread_fsyncs;
         let n = shared.next_n.fetch_add(1, Ordering::Relaxed);
         let rows = rows_of(n, w);
         let conn = branch.connect().unwrap();
@@ -193,6 +201,7 @@ fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize) {
             }
             conn.execute("COMMIT").unwrap();
         }
+        let fsyncs2 = churn_counters().thread_fsyncs;
         if n % 64 == 0 {
             let other = rows[0] % TRUNK_ROWS + 1;
             if read_v(&conn, rows[0]) != branch_value(rows[0])
@@ -208,6 +217,12 @@ fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize) {
             .lock()
             .unwrap()
             .push_back((Instant::now() + lease, branch));
+        shared
+            .fork_fsyncs
+            .fetch_add(fsyncs1 - fsyncs0, Ordering::Relaxed);
+        shared
+            .commit_fsyncs
+            .fetch_add(fsyncs2 - fsyncs1, Ordering::Relaxed);
         shared.arrivals.fetch_add(1, Ordering::Release);
         shared.cycles.lock().unwrap().push(cycle);
     }
@@ -265,7 +280,7 @@ fn main() {
     trunk.execute("COMMIT").unwrap();
     trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     let c0 = churn_counters();
-    println!("# branch_gc — Turso fork, DURABLE branch store, concurrent agent lifecycles, r11-churn amendment 4");
+    println!("# branch_gc — Turso fork, DURABLE branch store, concurrent agent lifecycles, r11-churn amendment 4 + r12-noforce columns");
     println!(
         "# threads={:?} warm_ms={} window_ms={} lease_ms={} w={} durability={:?} reap_every_ms={} \
          sync_call={} build={}",
@@ -290,7 +305,9 @@ fn main() {
     println!(
         "# gc columns: T lifecycles_per_s arrivals_per_s fsyncs_per_arrival fsyncs_per_s \
          flights_per_s locked_flushes_per_s waits_per_s already_durable_per_s \
-         busy_retries_per_arrival cycle_p50_us cycle_p90_us cycle_p99_us cycle_max_us"
+         busy_retries_per_arrival cycle_p50_us cycle_p90_us cycle_p99_us cycle_max_us \
+         fork_fsyncs_per_arrival commit_fsyncs_per_arrival compactions_per_arrival \
+         compact_fsyncs_per_arrival log_bytes_per_arrival"
     );
     let shared = Arc::new(Shared {
         queue: Mutex::new(VecDeque::new()),
@@ -298,6 +315,8 @@ fn main() {
         arrivals: AtomicU64::new(0),
         reaped: AtomicU64::new(0),
         busy_retries: AtomicU64::new(0),
+        fork_fsyncs: AtomicU64::new(0),
+        commit_fsyncs: AtomicU64::new(0),
         cycles: Mutex::new(Vec::new()),
         stop_agents: AtomicBool::new(false),
         stop_reaper: AtomicBool::new(false),
@@ -322,12 +341,14 @@ fn main() {
                 s.reaped.load(Ordering::Acquire),
                 s.busy_retries.load(Ordering::Acquire),
                 churn_counters(),
+                s.fork_fsyncs.load(Ordering::Acquire),
+                s.commit_fsyncs.load(Ordering::Acquire),
             )
         };
         shared.cycles.lock().unwrap().clear();
-        let (t0, a0, r0, b0, k0) = snap(&shared);
+        let (t0, a0, r0, b0, k0, f0, m0) = snap(&shared);
         std::thread::sleep(args.window);
-        let (t1, a1, r1, b1, k1) = snap(&shared);
+        let (t1, a1, r1, b1, k1, f1, m1) = snap(&shared);
         let mut cyc: Vec<f64> = std::mem::take(&mut *shared.cycles.lock().unwrap())
             .iter()
             .map(|&n| n as f64 / 1e3)
@@ -340,8 +361,10 @@ fn main() {
         let secs = (t1 - t0).as_secs_f64();
         let arrivals = (a1 - a0) as f64;
         let per_s = |x: u64| x as f64 / secs;
+        let per_arrival = |x: u64| x as f64 / arrivals.max(1.0);
         println!(
-            "# gc {t} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1}",
+            "# gc {t} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1} \
+             {:.4} {:.4} {:.5} {:.4} {:.1}",
             per_s(r1 - r0),
             arrivals / secs,
             (k1.fsyncs - k0.fsyncs) as f64 / arrivals.max(1.0),
@@ -355,6 +378,11 @@ fn main() {
             percentile(&cyc, 90.0),
             percentile(&cyc, 99.0),
             cyc.last().copied().unwrap_or(0.0),
+            per_arrival(f1 - f0),
+            per_arrival(m1 - m0),
+            per_arrival(k1.compactions - k0.compactions),
+            per_arrival(k1.compact_fsyncs - k0.compact_fsyncs),
+            per_arrival(k1.log_bytes - k0.log_bytes),
         );
         // Quiescent between thread counts: agents stopped, and the reaper releases only what is
         // due, so the engine holds exactly the branches still in the table.

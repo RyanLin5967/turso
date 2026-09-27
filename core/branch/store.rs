@@ -71,8 +71,13 @@
 //! replaying them through the same `apply_*` functions the live store runs, so epochs, children and
 //! every branch-side retain/free decision are re-derived rather than stored. Two rules:
 //!
-//! 1. A record is written only after every slot it names is durable (the journal's flush order),
-//!    and an operation that returns to its caller has had its record flushed.
+//! 1. A record that names a slot follows that slot's `PageImage` in the log, so the slot is
+//!    recoverable whenever the record is durable (the journal's redo rule: ARIES no-force, the
+//!    arena is synced only at a checkpoint), and an operation that returns to its caller has had
+//!    its record flushed — except a FORK, which is not forced (ARIES does not force a transaction's
+//!    begin): everything that depends on a fork is later in the log, so it is made durable by the
+//!    first of them, and a fork with nothing durable after it is lost in a crash together with
+//!    every handle to it. Its id is never reissued: see `ID_RESERVE`.
 //! 2. A slot is freed only after the record that frees it is durable: an older durable state that
 //!    still names it can never see it reused.
 //!
@@ -147,15 +152,15 @@ pub(crate) struct BranchStore {
 /// written in log order, and a later region must never be synced ahead of an earlier one.
 ///
 /// What early release must not break, and why it does not:
-/// * **Rule 1** (a record is durable only after the slots it names): a commit writes its slots
-///   before it buffers its record, so they are written before the flight that carries the record
-///   is taken, and the flight syncs the arena before the log.
+/// * **Rule 1** (a durable record's slots are recoverable): a commit buffers its slots' images
+///   before its record, so the flight that carries the record carries them too, ahead of it.
 /// * **Rule 2** (a slot is reused only once the record that freed it is durable): a slot freed by an
 ///   early-released operation waits in `pending_free` under that operation's log position, and
 ///   returns to the arena only once a flush has covered it (`mature_frees`).
-/// * **Acknowledgement**: no caller learns of an operation before its records are durable. A later
-///   operation that depends on an earlier one (a commit on a branch whose fork is still in flight)
-///   is later in the log, so its own durability implies the earlier one's.
+/// * **Acknowledgement**: no caller learns of a commit or a release before its records are durable.
+///   A fork is handed out before (rule 1's one exception). A later operation that depends on an
+///   earlier one (a commit on a branch whose fork is still buffered) is later in the log, so its own
+///   durability implies the earlier one's.
 /// * **Failure**: a failed flight fail-stops the journal, and every waiter gets the error. The
 ///   in-memory state is then ahead of the disk — the fail-stop rule already governs that (nothing
 ///   more is written; the next open recovers from disk), and the slots such operations freed are
@@ -207,6 +212,68 @@ struct StoreInner {
     /// expiry pass riding on a fork's flight); 0 if none. A branch such a release kept alive — open
     /// at the time — is freed at its close, and those frees wait for this (review r12-merge1 R2).
     early_released: u64,
+    /// Fork ids below this are reserved by a DURABLE `IdFloor` (or by the state recovered at open):
+    /// a fork below it may be handed out before its own record is durable (see `ID_RESERVE`).
+    id_floor_durable: u64,
+    /// The highest floor buffered so far; `id_floor_durable` catches up as flushes land.
+    id_floor: u64,
+    /// Buffered floors, under the log sequence number that makes each durable.
+    id_floor_pending: VecDeque<(u64, u64)>,
+}
+
+/// Fork ids reserved ahead of the counter by an `IdFloor` record (r12-noforce), the way PostgreSQL
+/// logs sequence values ahead of use. A fork is not forced, so a crash can lose it after its id was
+/// handed out; recovery resumes the counter at the highest durable floor, so that id is never
+/// handed out again. A new floor is buffered once fewer than half of these are left, and rides on
+/// a flush that happens anyway; a fork waits for its own record only when its id is not yet under
+/// a durable floor — the first fork after an open, or one that outran every flush by half of these.
+const ID_RESERVE: u64 = 1 << 16;
+
+/// Crash points and mutants for the no-force crash test (r12-noforce). A test arms a point by name;
+/// the process then SIGKILLs itself when it reaches it, after writing a note to the file named by
+/// `TURSO_BRANCH_CRASH_NOTE`. `TURSO_NF_MUTANT` names one mutant to switch on. Nothing here exists
+/// outside tests.
+#[cfg(test)]
+pub(crate) mod crash {
+    static ARMED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    pub(crate) fn arm(point: &str) {
+        *ARMED.lock().unwrap() = Some(point.to_string());
+    }
+
+    pub(crate) fn point(name: &str, note: impl FnOnce() -> String) {
+        if ARMED.lock().unwrap().as_deref() == Some(name) {
+            kill_now(&format!("{name} {}", note()));
+        }
+    }
+
+    /// SIGKILL this process now, as a crash would: no destructor, no flush, no exit handler.
+    pub(crate) fn kill_now(note: &str) -> ! {
+        if let Some(path) = std::env::var_os("TURSO_BRANCH_CRASH_NOTE") {
+            std::fs::write(path, note).expect("write the crash note");
+        }
+        #[cfg(unix)]
+        // SAFETY: signals this process; nothing is borrowed across it.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        std::process::abort()
+    }
+
+    pub(crate) fn mutant(name: &str) -> bool {
+        std::env::var("TURSO_NF_MUTANT").is_ok_and(|m| m == name)
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) mod crash {
+    #[inline(always)]
+    pub(crate) fn point(_name: &str, _note: impl FnOnce() -> String) {}
+
+    #[inline(always)]
+    pub(crate) fn mutant(_name: &str) -> bool {
+        false
+    }
 }
 
 /// The lease clock: milliseconds of time the database has been OPEN, summed across every open.
@@ -658,6 +725,14 @@ impl BranchStore {
                         // A snapshot can hold a released branch that was kept only by an open
                         // connection; after a restart nothing is open.
                         inner.collect_released(&mut ignored);
+                        // The redo rule: the recovered records' slots are put back from their
+                        // images before the arena counts what its file holds.
+                        super::journal::redo_page_images(
+                            &files,
+                            recovered.page_size,
+                            &recovered.records,
+                            sync,
+                        )?;
                         let referenced = inner.referenced_slots();
                         inner.arena = Some(Arena::open_file(
                             &files.arena,
@@ -666,6 +741,10 @@ impl BranchStore {
                             &referenced,
                         )?);
                         inner.journal = Some(recovered.journal);
+                        // Every id handed out before the crash is below the recovered counter:
+                        // that is what the durable floors were for. Nothing above it is reserved.
+                        inner.id_floor_durable = inner.next_id;
+                        inner.id_floor = inner.next_id;
                     }
                 }
                 inner
@@ -805,13 +884,15 @@ impl BranchStore {
         }
     }
 
-    /// Return the deferred frees a flush has covered (called under the store mutex).
+    /// Return the deferred frees a flush has covered, and raise the durable id floor to the floors
+    /// it covered (called under the store mutex).
     fn mature(&self, inner: &mut StoreInner) {
-        if inner.pending_free.is_empty() {
+        if inner.pending_free.is_empty() && inner.id_floor_pending.is_empty() {
             return;
         }
         let durable = self.group.state.lock().unwrap().durable;
         inner.mature_frees(durable);
+        inner.mature_id_floors(durable);
     }
 
     /// Record a flight's outcome and wake every waiter.
@@ -893,6 +974,9 @@ impl BranchStore {
             churn_counters::GC_FLIGHTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let end = flight.end_lsn;
             let written = flight.write();
+            if written.is_ok() {
+                crash::point("flight-after-sync", || format!("end_lsn={end}"));
+            }
             if written.is_err() {
                 // Poison the group first (waking the waiters, some of whom hold the store mutex
                 // while they wait), then the journal under the mutex.
@@ -1201,14 +1285,15 @@ impl BranchStore {
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
     ///
-    /// Early release (amendment 4): the fork is applied and its records buffered; the returned log
-    /// sequence number must be passed to `wait_durable` — after the caller has released the WAL
-    /// write lock — before the branch is handed to anyone.
+    /// No force (r12-noforce, rule 1's exception): the fork is applied and its records buffered,
+    /// and it returns the log sequence number that makes them durable, plus whether the caller must
+    /// wait for it (`wait_durable`, after releasing the WAL write lock) before handing the branch
+    /// out — only when the branch's id is not yet under a durable floor (`ID_RESERVE`).
     pub(crate) fn fork_trunk(
         &self,
         schema: Arc<Schema>,
         page_size: usize,
-    ) -> Result<(BranchId, u64)> {
+    ) -> Result<(BranchId, u64, bool)> {
         let mut inner = self.inner.lock();
         let restart = inner.arena.as_ref().is_some_and(|a| a.page_size() != page_size);
         if restart {
@@ -1233,9 +1318,18 @@ impl BranchStore {
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
-        let mut records = plan.records.clone();
+        let floor = inner.id_reservation(id.0);
+        let mut records: Vec<Record> = floor
+            .map(|f| Record::IdFloor { next_id: f })
+            .into_iter()
+            .collect();
+        records.extend(plan.records.iter().cloned());
         records.extend(fork_records);
         let lsn = self.buffer_all(&mut inner, records)?;
+        if let Some(f) = floor {
+            inner.id_reserved(f, lsn);
+        }
+        let wait = !inner.id_durably_reserved(id.0);
         if !plan.due.is_empty() {
             self.expire_apply_at(&mut inner, plan, 0, Some(lsn));
             churn_counters::EXPIRE_PIGGYBACKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1245,15 +1339,15 @@ impl BranchStore {
         self.sync_trunk_children(&inner);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
-        Ok((id, lsn))
+        Ok((id, lsn, wait))
     }
 
     /// Fork a child of a branch. Refused while the parent has a write transaction in progress, for
     /// the same reason a trunk fork takes the WAL write lock, and refused on a released branch.
     ///
-    /// Early release (amendment 4), as `fork_trunk`: the caller waits on the returned log sequence
-    /// number before handing the branch out.
-    pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<(BranchId, u64)> {
+    /// No force, as `fork_trunk`: the caller waits on the returned log sequence number only when
+    /// the returned flag says so.
+    pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<(BranchId, u64, bool)> {
         let mut inner = self.inner.lock();
         self.mature(&mut inner);
         // Reap what has expired first, so a parent whose lease ran out is refused rather than
@@ -1288,9 +1382,18 @@ impl BranchStore {
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
-        let mut records = plan.records.clone();
+        let floor = inner.id_reservation(id.0);
+        let mut records: Vec<Record> = floor
+            .map(|f| Record::IdFloor { next_id: f })
+            .into_iter()
+            .collect();
+        records.extend(plan.records.iter().cloned());
         records.extend(fork_records);
         let lsn = self.buffer_all(&mut inner, records)?;
+        if let Some(f) = floor {
+            inner.id_reserved(f, lsn);
+        }
+        let wait = !inner.id_durably_reserved(id.0);
         if !plan.due.is_empty() {
             self.expire_apply_at(&mut inner, plan, 0, Some(lsn));
             churn_counters::EXPIRE_PIGGYBACKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1299,7 +1402,7 @@ impl BranchStore {
         inner.apply_fork_lease(id, lease);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
-        Ok((id, lsn))
+        Ok((id, lsn, wait))
     }
 
     /// Mark the branch open for a connection and return its committed schema (`None` after a
@@ -1497,6 +1600,7 @@ impl BranchStore {
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
         drop(inner);
+        crash::point("release-after-buffer", || format!("lsn={lsn}"));
         self.wait_durable(lsn)?;
         Ok(out)
     }
@@ -1671,6 +1775,13 @@ impl BranchStore {
             };
             trunk.lineage.retain(page, retained);
             if let Some(journal) = journal.as_mut() {
+                // The redo rule: the image goes first, so the barrier's flush syncs the log alone.
+                if !crash::mutant("no_redo") {
+                    journal.buffer(&Record::PageImage {
+                        slot,
+                        bytes: pre_image.to_vec(),
+                    })?;
+                }
                 journal.buffer(&Record::TrunkRetain {
                     page,
                     born,
@@ -1780,8 +1891,9 @@ impl BranchStore {
         Ok(())
     }
 
-    /// Commit a branch's dirty pages: write each into the slot its copy decision reserved, make
-    /// that durable with the `Commit` record, and only then move the branch's map.
+    /// Commit a branch's dirty pages: write each into the slot its copy decision reserved, log each
+    /// page's image and then the `Commit` record, and move the branch's map; return once the log
+    /// holding them is durable. The arena itself is synced at the next checkpoint (the redo rule).
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
         let mut inner = self.inner.lock();
         // Refuse BEFORE any slot is written: after the journal failed, this commit's record can
@@ -1789,6 +1901,8 @@ impl BranchStore {
         if inner.poisoned() {
             return Err(fail_stopped(inner.journal.as_ref(), id, "no commit"));
         }
+        // One `PageImage` per written slot, logged ahead of the `Commit` (the redo rule).
+        let mut images = Vec::with_capacity(pages.len());
         let entries = {
             let StoreInner {
                 arena,
@@ -1815,6 +1929,12 @@ impl BranchStore {
                 let bytes = page.get_contents().as_slice();
                 arena.write_slot(slot, bytes)?;
                 entries.push((no, slot, crc32c::crc32c(bytes)));
+                if journal.is_some() && !crash::mutant("no_redo") {
+                    images.push(Record::PageImage {
+                        slot,
+                        bytes: bytes.to_vec(),
+                    });
+                }
             }
             // A reservation whose page is not dirty at commit was never written: free it.
             for (_, slot) in st.pending.drain() {
@@ -1840,12 +1960,14 @@ impl BranchStore {
         if entries.is_empty() {
             return Ok(());
         }
+        crash::point("commit-after-slots", || format!("slots={entries:?}"));
         // On failure the written slots are NOT freed: the record may have reached the disk, and
         // recovery, not this process, decides whether they are live.
-        let mut records = vec![Record::Commit {
+        let mut records = images;
+        records.push(Record::Commit {
             branch: id.0,
             pages: entries.clone(),
-        }];
+        });
         // The commit pays for a flush anyway: while a lease is outstanding, stamp the clock in it,
         // so a crash cannot lose the open time an agent spent committing (review R2).
         if !inner.leases.is_empty() {
@@ -1863,6 +1985,10 @@ impl BranchStore {
         inner.defer_frees(lsn, freed);
         self.maybe_compact(&mut inner);
         drop(inner);
+        crash::point("commit-after-buffer", || format!("lsn={lsn}"));
+        if crash::mutant("ack_early") {
+            return Ok(());
+        }
         self.wait_durable(lsn)
     }
 
@@ -1977,6 +2103,14 @@ impl Drop for BranchStore {
             if let Err(e) = self.log(&mut inner, Record::Clock { now_ms: now }) {
                 tracing::debug!("branch lease clock not stamped at close: {e}");
             }
+            return;
+        }
+        // Forks and id floors are buffered without a flush of their own (rule 1's exception): a
+        // clean close makes whatever is still buffered durable, as a crash would not.
+        if inner.journal.as_ref().is_some_and(Journal::has_pending) {
+            if let Err(e) = self.flush_locked(&mut inner) {
+                tracing::debug!("branch records not flushed at close: {e}");
+            }
         }
     }
 }
@@ -2028,6 +2162,10 @@ impl StoreInner {
             default_lease,
             pending_free: VecDeque::new(),
             early_released: 0,
+            // Nothing is reserved yet: the first fork waits for the floor it buffers.
+            id_floor_durable: 1,
+            id_floor: 1,
+            id_floor_pending: VecDeque::new(),
         }
     }
 
@@ -2194,10 +2332,42 @@ impl StoreInner {
 
     /// Everything buffered, as one flight (`Journal::take_flight`); `None` when volatile.
     fn take_flight(&mut self) -> Result<Option<Flight>> {
-        let (Some(journal), Some(arena)) = (self.journal.as_mut(), self.arena.as_mut()) else {
+        let (Some(journal), Some(_)) = (self.journal.as_mut(), self.arena.as_ref()) else {
             return Ok(None);
         };
-        journal.take_flight(arena).map(Some)
+        journal.take_flight().map(Some)
+    }
+
+    /// The floor a fork of `id` must buffer ahead of its own records, when fewer than half of the
+    /// reserved ids are left (see `ID_RESERVE`). `None` for a volatile store, whose ids die with it.
+    fn id_reservation(&self, id: u64) -> Option<u64> {
+        if self.journal.is_none() || crash::mutant("no_id_floor") {
+            return None;
+        }
+        (id.saturating_add(ID_RESERVE / 2) >= self.id_floor).then(|| id.saturating_add(ID_RESERVE))
+    }
+
+    /// A floor was buffered; it is durable once `lsn` is.
+    fn id_reserved(&mut self, floor: u64, lsn: u64) {
+        self.id_floor = floor;
+        self.id_floor_pending.push_back((lsn, floor));
+    }
+
+    /// Whether a fork of `id` may be handed out before its record is durable: only if a durable
+    /// floor already covers `id`, so no crash can hand `id` out again.
+    fn id_durably_reserved(&self, id: u64) -> bool {
+        crash::mutant("no_id_floor") || id < self.id_floor_durable
+    }
+
+    /// Raise the durable floor to every buffered floor a flush has covered.
+    fn mature_id_floors(&mut self, durable: u64) {
+        while let Some(&(lsn, floor)) = self.id_floor_pending.front() {
+            if lsn > durable {
+                break;
+            }
+            self.id_floor_durable = self.id_floor_durable.max(floor);
+            self.id_floor_pending.pop_front();
+        }
     }
 
     /// Hold `freed` until the records that freed them — up to `lsn` — are durable (rule 2 under
@@ -2468,6 +2638,12 @@ impl StoreInner {
                 self.lease.recovered(*now_ms);
                 Ok(())
             }
+            // Redone into the arena by `redo_page_images` before the arena is opened.
+            Record::PageImage { .. } => Ok(()),
+            Record::IdFloor { next_id } => {
+                self.next_id = self.next_id.max(*next_id);
+                Ok(())
+            }
         }
     }
 
@@ -2519,7 +2695,8 @@ impl StoreInner {
             .collect();
         branches.sort_unstable_by_key(|b| b.id);
         SnapshotState {
-            next_id: self.next_id,
+            // The reserved floor too: ids below it may have been handed out (see `ID_RESERVE`).
+            next_id: self.next_id.max(self.id_floor),
             trunk_epoch: self.trunk.lineage.epoch,
             lease_now_ms: self.lease.now_ms(),
             trunk_retained: self.trunk.lineage.retained_list(),

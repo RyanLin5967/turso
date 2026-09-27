@@ -21,11 +21,16 @@
 //! log is O(change) per operation — the opposite of the whole-map rewrite ferrodb's D79 measured as
 //! its persistence wall.
 //!
-//! # The ordering rule
+//! # The redo rule (ARIES no-force, r12-noforce)
 //!
-//! [`Journal::flush`] syncs the arena BEFORE it writes and syncs the buffered records, and records
-//! are only ever written by a flush. A record on disk therefore never names a slot whose bytes are
-//! not already durable, even if the OS writes the log page early.
+//! Every record that names a slot is preceded in the log by a [`Record::PageImage`] holding that
+//! slot's bytes, and records are only ever written by a flush, which syncs the LOG alone. The arena
+//! is written when the slot is filled but synced lazily: by [`Journal::compact`] (the checkpoint,
+//! before the snapshot that drops those images) and by recovery, which redoes every image in the
+//! durable log into its slot ([`redo_page_images`]) before the arena is opened. A record on disk
+//! therefore never names a slot whose bytes cannot be recovered, whatever the OS wrote early or
+//! late. (It used to be ordered instead: the arena synced before the log, one more sync per
+//! commit.)
 //!
 //! # One store per set of files
 //!
@@ -58,7 +63,11 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// Version 1 stored the deadline itself and could not tell a deadline of 0 from none, so a version
 /// 1 snapshot read by this code would come back with every deadline 1 ms early. Another version is
 /// refused, never reinterpreted.
-const FORMAT_VERSION: u32 = 2;
+/// 3: the redo rule (r12-noforce): a slot a record names is recoverable from a `PageImage`, not
+/// durable in the arena, and `SnapshotState::next_id` includes the reserved id floor. A version 2
+/// log replayed by this code would trust arena slots its writer had synced; this code never syncs
+/// them before the log, so the two are refused, never mixed.
+const FORMAT_VERSION: u32 = 3;
 const LOG_HEADER_LEN: usize = 32;
 const FRAME_HEADER_LEN: usize = 8;
 /// Compact once the log is larger than this and larger than twice the last snapshot, so the log is
@@ -141,6 +150,17 @@ pub(crate) enum Record {
     Clock {
         now_ms: u64,
     },
+    /// The bytes of `slot`, logged before the `Commit` or `TrunkRetain` that names it: recovery
+    /// redoes it into the arena (the redo rule, r12-noforce), so no flush has to sync the arena.
+    PageImage {
+        slot: Slot,
+        bytes: Vec<u8>,
+    },
+    /// Fork ids below `next_id` are reserved: recovery resumes the id counter at or above it, so
+    /// an id handed out before its fork was durable is never handed out again (r12-noforce).
+    IdFloor {
+        next_id: u64,
+    },
 }
 
 const TAG_FORK: u8 = 1;
@@ -149,6 +169,8 @@ const TAG_TRUNK_RETAIN: u8 = 3;
 const TAG_RELEASE: u8 = 4;
 const TAG_LEASE: u8 = 5;
 const TAG_CLOCK: u8 = 6;
+const TAG_PAGE_IMAGE: u8 = 7;
+const TAG_ID_FLOOR: u8 = 8;
 
 impl Record {
     fn encode(&self, out: &mut Vec<u8>) {
@@ -200,6 +222,16 @@ impl Record {
                 out.push(TAG_CLOCK);
                 put_u64(out, *now_ms);
             }
+            Record::PageImage { slot, bytes } => {
+                out.push(TAG_PAGE_IMAGE);
+                put_u32(out, *slot);
+                put_u32(out, bytes.len() as u32);
+                out.extend_from_slice(bytes);
+            }
+            Record::IdFloor { next_id } => {
+                out.push(TAG_ID_FLOOR);
+                put_u64(out, *next_id);
+            }
         }
     }
 
@@ -233,6 +265,15 @@ impl Record {
                 now_ms: r.u64()?,
             },
             TAG_CLOCK => Record::Clock { now_ms: r.u64()? },
+            TAG_PAGE_IMAGE => {
+                let slot = r.u32()?;
+                let n = r.u32()? as usize;
+                Record::PageImage {
+                    slot,
+                    bytes: r.take(n)?.to_vec(),
+                }
+            }
+            TAG_ID_FLOOR => Record::IdFloor { next_id: r.u64()? },
             _ => return None,
         };
         // Trailing bytes inside a frame whose CRC matched are a format error, not a torn tail.
@@ -741,7 +782,7 @@ impl Journal {
         Ok(())
     }
 
-    /// Queue a record. It reaches the file only through [`Journal::flush`].
+    /// Queue a record. It reaches the file only through a flush or a flight.
     pub(crate) fn buffer(&mut self, record: &Record) -> Result<()> {
         self.check_live()?;
         let mut payload = Vec::with_capacity(32);
@@ -758,7 +799,8 @@ impl Journal {
         Ok(())
     }
 
-    /// Make every buffered record durable: arena first, then the records, then the log.
+    /// Make every buffered record durable: write them, then sync the log. The arena is not synced
+    /// (the redo rule); the parameter stays so every caller keeps the shape it had.
     pub(crate) fn flush(&mut self, arena: &mut Arena) -> Result<()> {
         // Taken first, so the failpoint is spent by exactly this call whatever it returns — it
         // cannot outlive the barrier that armed it (review 5 T-1).
@@ -788,7 +830,7 @@ impl Journal {
         }
     }
 
-    fn write_pending(&self, arena: &mut Arena) -> Result<()> {
+    fn write_pending(&self, _arena: &mut Arena) -> Result<()> {
         // Append only where this journal believes the log ends. A log that is longer than that was
         // written by someone else: writing at the stale offset would cut their records off at the
         // next recovery, so refuse — reading the file's state, not trusting the in-memory length
@@ -804,9 +846,6 @@ impl Journal {
                 "the branch log changed under this journal; another store instance wrote it",
             ));
         }
-        if self.sync {
-            arena.sync()?;
-        }
         write_at(&self.file, &self.pending, self.len)?;
         if self.sync {
             fsync_file(&self.file)?;
@@ -819,20 +858,23 @@ impl Journal {
         self.lsn
     }
 
+    /// Whether any record is buffered and not yet written.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Take everything buffered as one [`Flight`], for a group flush that writes it with no lock
     /// held (r11-churn amendment 4). The log region is reserved here, so the next flight goes after
     /// it; the caller guarantees no other flight is in the air (one leader at a time), which is
-    /// also what makes the on-disk length check below exact. The arena descriptor comes along when
-    /// a commit has written slots since the last sync: those slots are named by frames in this
-    /// flight, and rule 1 wants them durable before the frames are.
-    pub(crate) fn take_flight(&mut self, arena: &mut Arena) -> Result<Flight> {
+    /// also what makes the on-disk length check below exact. No arena descriptor comes along: the
+    /// slots these frames name are carried by their `PageImage` frames (the redo rule).
+    pub(crate) fn take_flight(&mut self) -> Result<Flight> {
         let fail = std::mem::take(&mut self.fail_next_write);
         self.check_live()?;
         let end_lsn = self.lsn;
         if self.pending.is_empty() {
             return Ok(Flight {
                 log: None,
-                arena: None,
                 bytes: Vec::new(),
                 at: self.len,
                 sync: self.sync,
@@ -855,14 +897,12 @@ impl Journal {
             .file
             .try_clone()
             .map_err(|e| io_error(e, "dup branch log"))?;
-        let arena = arena.take_dirty_file()?;
         let bytes = std::mem::take(&mut self.pending);
         self.pending_slots.clear();
         let at = self.len;
         self.len += bytes.len() as u64;
         Ok(Flight {
             log: Some(log),
-            arena,
             bytes,
             at,
             sync: self.sync,
@@ -1011,12 +1051,11 @@ impl Journal {
 ///
 /// Every other error — permission denied, an I/O error, not-a-directory — cannot be told apart
 /// from a file that holds state, so the caller refuses rather than guess.
-/// One group flush (r11-churn amendment 4): frames taken from a journal's buffer, the log offset
-/// they go to, and the arena descriptor to sync first. Written by [`Flight::write`] with no lock
-/// held; the journal already counts the region as written, so a failed write must fail-stop it.
+/// One group flush (r11-churn amendment 4): frames taken from a journal's buffer and the log offset
+/// they go to. Written by [`Flight::write`] with no lock held; the journal already counts the
+/// region as written, so a failed write must fail-stop it.
 pub(crate) struct Flight {
     log: Option<File>,
-    arena: Option<File>,
     bytes: Vec<u8>,
     at: u64,
     sync: bool,
@@ -1026,7 +1065,7 @@ pub(crate) struct Flight {
 }
 
 impl Flight {
-    /// Arena first, then the frames, then the log: the order `Journal::flush` keeps.
+    /// The frames, then the log's sync: one sync, whatever the frames name (the redo rule).
     pub(crate) fn write(self) -> Result<()> {
         if self.fail {
             return Err(LimboError::InternalError(
@@ -1036,12 +1075,9 @@ impl Flight {
         let Some(log) = self.log else {
             return Ok(());
         };
-        if self.sync {
-            if let Some(arena) = &self.arena {
-                fsync_file(arena)?;
-            }
-        }
         write_at(&log, &self.bytes, self.at)?;
+        LOG_BYTES.fetch_add(self.bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        super::store::crash::point("flight-after-write", || format!("at={}", self.at));
         if self.sync {
             fsync_file(&log)?;
         }
@@ -1166,6 +1202,40 @@ fn read_snapshot(path: &Path) -> Result<(u32, u64, SnapshotState, u64)> {
     Ok((page_size, generation, state, bytes.len() as u64))
 }
 
+/// Recovery's redo pass (the redo rule): write every `PageImage` of the recovered records into its
+/// arena slot, in log order, then sync the arena once. Idempotent, so a crash inside it is repaired
+/// by the next recovery: the images stay in the log until a compaction has synced the arena. Runs
+/// before the arena is opened, so a slot the arena file never grew to is there when it is counted.
+/// An image of the wrong size is corruption: a frame whose CRC matched cannot be torn.
+pub(crate) fn redo_page_images(
+    files: &BranchFiles,
+    page_size: usize,
+    records: &[Record],
+    sync: bool,
+) -> Result<()> {
+    let mut images = records.iter().filter_map(|r| match r {
+        Record::PageImage { slot, bytes } => Some((*slot, bytes)),
+        _ => None,
+    });
+    let Some(first) = images.next() else {
+        return Ok(());
+    };
+    let arena = open_rw(&files.arena, false)?;
+    for (slot, bytes) in std::iter::once(first).chain(images) {
+        if bytes.len() != page_size {
+            return Err(corrupt(&format!(
+                "a page image of slot {slot} holds {} bytes, not the {page_size}-byte page",
+                bytes.len()
+            )));
+        }
+        write_at(&arena, bytes, slot as u64 * page_size as u64)?;
+    }
+    if sync {
+        fsync_file(&arena)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn open_rw(path: &Path, truncate: bool) -> Result<File> {
     OpenOptions::new()
         .read(true)
@@ -1225,6 +1295,8 @@ pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
 /// Observation only (r11-churn instrument; nothing reads it): every `fsync_file` call, process-wide
 /// and on the calling thread. Every branch-file fsync goes through `fsync_file`.
 pub(crate) static FSYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Observation only (r12-noforce instrument): frame bytes group flights wrote to the log.
+pub(crate) static LOG_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 thread_local! {
     pub(crate) static THREAD_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -1738,5 +1810,51 @@ mod tests {
         state.encode(&mut body);
         assert_eq!(SnapshotState::decode(&body), Some(state));
         assert_eq!(SnapshotState::decode(&body[..body.len() - 1]), None);
+    }
+
+    /// r12-noforce's two records round-trip, a short or long payload is refused, and neither
+    /// encodes to an empty payload (the premise that makes a zero length torn).
+    #[test]
+    fn page_image_and_id_floor_records_round_trip() {
+        for record in [
+            Record::PageImage {
+                slot: 41,
+                bytes: (0..512u32).map(|i| (i % 251) as u8).collect(),
+            },
+            Record::IdFloor { next_id: 1 << 16 },
+        ] {
+            let mut payload = Vec::new();
+            record.encode(&mut payload);
+            assert!(!payload.is_empty());
+            assert_eq!(Record::decode(&payload), Some(record.clone()));
+            assert_eq!(Record::decode(&payload[..payload.len() - 1]), None);
+            payload.push(0);
+            assert_eq!(Record::decode(&payload), None);
+        }
+    }
+
+    /// Recovery's redo pass puts every image into its slot in log order, so a slot imaged twice
+    /// ends with the later image, and a slot past the arena file's end is grown into.
+    #[test]
+    fn redo_writes_each_image_in_log_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let page = |b: u8| vec![b; 512];
+        let records = vec![
+            Record::PageImage { slot: 3, bytes: page(1) },
+            Record::Fork { child: 1, parent: 0 },
+            Record::PageImage { slot: 0, bytes: page(2) },
+            Record::PageImage { slot: 3, bytes: page(3) },
+        ];
+        redo_page_images(&files, 512, &records, false).unwrap();
+        let arena = std::fs::read(&files.arena).unwrap();
+        assert_eq!(arena.len(), 4 * 512, "the arena did not grow to the highest imaged slot");
+        assert_eq!(&arena[..512], page(2).as_slice());
+        assert_eq!(&arena[3 * 512..], page(3).as_slice(), "the later image of slot 3 lost");
+        let wrong = vec![Record::PageImage { slot: 1, bytes: vec![0; 100] }];
+        assert!(
+            redo_page_images(&files, 512, &wrong, false).is_err(),
+            "a wrong-sized image was redone"
+        );
     }
 }

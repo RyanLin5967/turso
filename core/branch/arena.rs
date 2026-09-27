@@ -41,7 +41,18 @@ pub(crate) struct Arena {
     /// cannot answer "is this slot free" without a scan, and releasing an already-free slot must be
     /// caught AT the release — found later, it is two owners of one page and nothing says which.
     free_bits: Vec<u64>,
+    /// Test only: file writes since the last `sync`, held here while [`LOSE_UNSYNCED_WRITES`] is set.
+    #[cfg(test)]
+    unsynced: std::collections::HashMap<Slot, Vec<u8>>,
 }
+
+/// Test only (r12-noforce crash test): while set, a FILE arena keeps every slot write since its last
+/// `sync` in memory and puts it in the file only at that sync, so a process killed before the sync
+/// loses it. That is the arena's worst case under power loss (nothing unsynced reached the disk); a
+/// plain kill would leave the writes in the page cache and prove nothing about the redo rule.
+#[cfg(test)]
+pub(crate) static LOSE_UNSYNCED_WRITES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl Arena {
     pub(crate) fn new(page_size: usize) -> Self {
@@ -51,6 +62,8 @@ impl Arena {
             high_water: 0,
             free: Vec::new(),
             free_bits: Vec::new(),
+            #[cfg(test)]
+            unsynced: std::collections::HashMap::new(),
         }
     }
 
@@ -103,6 +116,8 @@ impl Arena {
             high_water,
             free,
             free_bits,
+            #[cfg(test)]
+            unsynced: std::collections::HashMap::new(),
         })
     }
 
@@ -166,6 +181,12 @@ impl Arena {
         turso_assert!(bytes.len() == self.page_size, "arena write of a wrong-sized page");
         let offset = self.check(slot) as u64 * self.page_size as u64;
         if let Backing::File { file, dirty } = &mut self.backing {
+            #[cfg(test)]
+            if LOSE_UNSYNCED_WRITES.load(std::sync::atomic::Ordering::Relaxed) {
+                self.unsynced.insert(slot, bytes.to_vec());
+                *dirty = true;
+                return Ok(());
+            }
             write_at(file, bytes, offset)?;
             *dirty = true;
             return Ok(());
@@ -178,31 +199,25 @@ impl Arena {
         turso_assert!(out.len() == self.page_size, "arena read into a wrong-sized buffer");
         let offset = self.check(slot) as u64 * self.page_size as u64;
         if let Backing::File { file, .. } = &self.backing {
+            #[cfg(test)]
+            if let Some(bytes) = self.unsynced.get(&slot) {
+                out.copy_from_slice(bytes);
+                return Ok(());
+            }
             return read_at(file, out, offset);
         }
         out.copy_from_slice(self.page(slot));
         Ok(())
     }
 
-    /// For a group flush (r11-churn amendment 4): a duplicate of the arena file's descriptor if
-    /// slots were written since the last sync, clearing the mark; the flight syncs it. `None` for
-    /// the memory backing or a clean arena.
-    pub(crate) fn take_dirty_file(&mut self) -> Result<Option<File>> {
-        if let Backing::File { file, dirty } = &mut self.backing {
-            if *dirty {
-                let dup = file
-                    .try_clone()
-                    .map_err(|e| crate::error::io_error(e, "dup branch arena"))?;
-                *dirty = false;
-                return Ok(Some(dup));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Make every slot written so far durable. A no-op for the memory backing.
+    /// Make every slot written so far durable. A no-op for the memory backing. Under the redo rule
+    /// only a compaction (the checkpoint) and recovery need this; no commit waits for it.
     pub(crate) fn sync(&mut self) -> Result<()> {
         if let Backing::File { file, dirty } = &mut self.backing {
+            #[cfg(test)]
+            for (slot, bytes) in self.unsynced.drain() {
+                write_at(file, &bytes, slot as u64 * self.page_size as u64)?;
+            }
             if *dirty {
                 fsync_file(file)?;
                 *dirty = false;
