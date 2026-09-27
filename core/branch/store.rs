@@ -772,12 +772,19 @@ impl BranchStore {
                 return freed;
             }
             hold.release_fair();
-            #[cfg(test)]
-            if let Some(pause) = self.reclaim_pause.lock().as_ref() {
-                pause();
-            }
+            self.after_reclaim_hold();
         }
     }
+
+    #[cfg(test)]
+    fn after_reclaim_hold(&self) {
+        if let Some(pause) = self.reclaim_pause.lock().as_ref() {
+            pause();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn after_reclaim_hold(&self) {}
 
     /// One hold of reclamation from the front of the queue, spending at most `budget` units (and
     /// never more than [`RECLAIM_BATCH`]). Returns the slots freed. For a background drainer, and
