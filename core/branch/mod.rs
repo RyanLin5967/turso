@@ -598,6 +598,9 @@ mod isolation_tests;
 #[cfg(all(test, feature = "fs"))]
 mod mechanism_tests;
 
+#[cfg(all(test, feature = "fs"))]
+mod noclear_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
