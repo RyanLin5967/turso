@@ -1463,7 +1463,9 @@ mod tests {
     /// lock both free. Each prune calls the thread-local probe, which reads the real lock state at
     /// that moment: the shared WAL write lock (tried, and released at once if it was free) and the
     /// trunk lock (`try_lock`). Mutant 37 prunes at the pre-A19 site, under the committer's WAL
-    /// write lock; T-A19b, which checks only that the stamps stay bounded, passes on it.
+    /// write lock; T-A19b, which checks only that the stamps stay bounded, passes on it. Mutant 38
+    /// prunes inside the trunk-lock hold. The trunk assert comes first, so each mutant's panic
+    /// names its own lock.
     #[test]
     fn the_stamps_prune_runs_with_the_wal_write_lock_free() {
         let (_dir, db) = open_db();
@@ -1513,9 +1515,10 @@ mod tests {
         }
         crate::branch::store::PRUNE_PROBE.with(|p| *p.borrow_mut() = None);
         let (n, wal_held, trunk_held) = seen.get();
-        assert!(n > 0, "no stamps prune ran");
-        assert_eq!(wal_held, 0, "{wal_held} of {n} stamps prunes ran under the WAL write lock");
+        // One prune after the lock release per commit that stamped rows: every merge stamps.
+        assert!(n >= 200, "{n} stamps prunes ran for 200 merges");
         assert_eq!(trunk_held, 0, "{trunk_held} of {n} stamps prunes ran under the trunk lock");
+        assert_eq!(wal_held, 0, "{wal_held} of {n} stamps prunes ran under the WAL write lock");
     }
 
     /// A19a (mutant 36): the prune after the WAL lock keeps a stamp one epoch above the oldest live

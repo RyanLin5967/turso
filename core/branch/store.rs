@@ -444,7 +444,7 @@ thread_local! {
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-13 and 15-36; 14 is not built, since no SQL path
+/// scope gate and the install's isolation, 11-13 and 15-38; 14 is not built, since no SQL path
 /// without DDL clears a user table's b-tree), so each test can be shown to fail for it
 /// (frontier/round11/r11-merge PREREG A6, A13, A14, A15). Always false otherwise.
 #[cfg(test)]
@@ -1410,6 +1410,10 @@ impl BranchStore {
         // Pruned here, in the hold the commit already takes, not in a second one after it.
         let oldest = lineage.children.keys().next().copied();
         merge.prune(oldest);
+        // Mutant 38 (A21): the stamps pruned inside the trunk-lock hold.
+        if mutant(38) {
+            self.stamps().prune(oldest);
+        }
         if let (Some(r), Some(p), Some(q)) = (t_rows, t_pages, t_prune) {
             work.trunk_commit_row_ns += p.duration_since(r).as_nanos() as u64;
             work.trunk_commit_page_ns += q.duration_since(p).as_nanos() as u64;
