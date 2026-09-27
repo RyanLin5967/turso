@@ -245,6 +245,18 @@ struct StoreInner {
     /// Commits parked by recovery, and parked Commits applied since (observing only).
     parked_records: u64,
     parked_applied: u64,
+    /// V4 base reads (r11-merge PREREG A20; observing only).
+    v4: V4Counters,
+}
+
+/// A V4 merge's base reads since open: `base_page_into` calls, those answered from the arena (a
+/// retained trunk version) and those refused, and the retained versions compared (r11-merge A20).
+#[derive(Debug, Default, Clone, Copy)]
+struct V4Counters {
+    base_reads: u64,
+    base_arena: u64,
+    base_refused: u64,
+    base_examined: u64,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -2042,6 +2054,49 @@ impl BranchStore {
         Ok(true)
     }
 
+    /// Fill `out` with `page` as the trunk held it when branch `id` forked, if that version lives
+    /// in the arena (a retained trunk version). `false` means the trunk's current version is the
+    /// base, which the caller reads through the ordinary path; an error means the base is gone
+    /// (r11-merge A20: V4's base read; observing only, nothing else calls it).
+    pub(crate) fn base_page_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        let mut examined = 0;
+        let resolved = inner.base_resolve(id, page, &mut examined);
+        inner.v4.base_reads += 1;
+        inner.v4.base_examined += examined;
+        if resolved.is_err() {
+            inner.v4.base_refused += 1;
+        }
+        let Some((slot, crc)) = resolved? else {
+            return Ok(false);
+        };
+        inner.v4.base_arena += 1;
+        let arena = inner
+            .arena
+            .as_ref()
+            .expect("a slot resolved, so the arena exists");
+        arena.read_slot(slot, out)?;
+        if arena.is_file_backed() && crc32c::crc32c(out) != crc {
+            return Err(LimboError::Corrupt(format!(
+                "branch {}'s base page {page} (arena slot {slot}) failed its checksum",
+                id.0
+            )));
+        }
+        Ok(true)
+    }
+
+    /// `(base reads, arena-resolved, refused, retained versions examined, C-P trunk probes, C-P
+    /// trunk rows)` since open (r11-merge A20). Does not settle, so reading it moves nothing.
+    pub(crate) fn v4_counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let inner = self.inner.lock();
+        let v = inner.v4;
+        let (probes, rows) = inner
+            .cat
+            .as_ref()
+            .map_or((0, 0), |c| (c.trunk_probes, c.trunk_rows));
+        (v.base_reads, v.base_arena, v.base_refused, v.base_examined, probes, rows)
+    }
+
     pub(crate) fn open_stats(&self) -> BranchOpenStats {
         self.open_stats
     }
@@ -2273,6 +2328,7 @@ impl StoreInner {
             deferred_freed: Vec::new(),
             parked_records: 0,
             parked_applied: 0,
+            v4: V4Counters::default(),
         }
     }
 
@@ -3287,6 +3343,34 @@ impl StoreInner {
             return Err(LimboError::Corrupt(format!(
                 "branch {} would read trunk page {page} written after its fork; the pre-image was \
                  not retained",
+                id.0
+            )));
+        }
+        Ok(None)
+    }
+
+    /// The version of `page` the trunk held when branch `id` forked: `resolve`'s trunk tail at the
+    /// branch's `trunk_at`, ignoring the branch's own and inherited pages (the base a V4 merge
+    /// diffs against, r11-merge A20). `None`: the trunk has not rewritten the page since, so its
+    /// current version is the base.
+    fn base_resolve(
+        &mut self,
+        id: BranchId,
+        page: u32,
+        examined: &mut u64,
+    ) -> Result<Option<(Slot, u32)>> {
+        if !self.ensure(id)? {
+            return Err(gone(id));
+        }
+        let at = self.branches.get(&id).ok_or_else(|| gone(id))?.trunk_at;
+        self.trunk_written_known(page)?;
+        if let Some(found) = self.trunk_version_at(page, at, examined)? {
+            return Ok(Some(found));
+        }
+        let born = self.trunk.written.get(&page).copied().unwrap_or(0);
+        if born > at {
+            return Err(LimboError::Corrupt(format!(
+                "branch {}'s base page {page} was written after its fork and not retained",
                 id.0
             )));
         }

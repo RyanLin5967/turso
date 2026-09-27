@@ -576,6 +576,21 @@ impl Database {
         self.branches.read_counters()
     }
 
+    /// V4's base read (r11-merge PREREG A20): fill `out` with `page` as the trunk held it when
+    /// branch `id` forked. `Ok(true)`: read from the arena (a retained trunk version); `Ok(false)`:
+    /// the trunk's current version is the base, and `out` is untouched.
+    #[doc(hidden)]
+    pub fn branch_base_page(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
+        self.branches.base_page_into(id, page, out)
+    }
+
+    /// `(base reads, arena-resolved, refused, retained versions examined, C-P trunk probes, C-P
+    /// trunk rows)` since open (r11-merge A20 instrument).
+    #[doc(hidden)]
+    pub fn branch_v4_counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+        self.branches.v4_counters()
+    }
+
     /// Trunk pre-images the store holds now (r11-restart lane instrument).
     #[doc(hidden)]
     pub fn branch_trunk_retained(&self) -> u64 {
