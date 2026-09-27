@@ -133,6 +133,9 @@ pub(crate) struct BranchStore {
     /// change while a branch exists (both need VACUUM, which is refused), so a branch connection
     /// takes its page format from here instead of reading the trunk's file header.
     trunk_format: OnceLock<(usize, u8)>,
+    /// r11-walpin FW3 for this database's branches (ported onto F6 for r11-walpin-conc row G): taken
+    /// from the process switch when the store is created, or set per database by a test.
+    fw3: AtomicBool,
 }
 
 /// Where the page a branch asked for comes from.
@@ -506,7 +509,24 @@ impl BranchStore {
                 pages: Radix::new(),
             },
             trunk_format: OnceLock::new(),
+            fw3: AtomicBool::new(super::walpin::fw3()),
         }
+    }
+
+    pub(crate) fn fw3(&self) -> bool {
+        self.fw3.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_fw3(&self, on: bool) {
+        self.fw3.store(on, Ordering::Relaxed);
+    }
+
+    /// r11-walpin FW3: whether branch `id` still reads `page` from the trunk (the store holds no
+    /// version of it for this branch). Not counted in the work counters.
+    pub(crate) fn sees_trunk(&self, id: BranchId, page: u32) -> Result<bool> {
+        let inner = self.lock();
+        let (mut levels, mut examined) = (0, 0);
+        Ok(inner.resolve(id, page, &mut levels, &mut examined)?.is_none())
     }
 
     /// The trunk's page size and reserved bytes per page, once a branch has been forked.

@@ -55,6 +55,7 @@
 pub(crate) mod arena;
 pub(crate) mod page_map;
 pub(crate) mod store;
+pub mod walpin;
 
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};
@@ -389,6 +390,50 @@ impl Database {
         self.branches.set_lock_timing(on);
     }
 
+    /// The trunk WAL's state, for the r11-walpin instrument (observation only).
+    #[doc(hidden)]
+    pub fn walpin_stats(&self) -> walpin::WalPinStats {
+        self.shared_wal.read().walpin_stats()
+    }
+
+    /// Turn FW3 on or off for this database's branches (tests; the harness uses the process
+    /// switch). Call before any branch connection is opened.
+    #[doc(hidden)]
+    pub fn walpin_set_fw3(&self, on: bool) {
+        self.branches.set_fw3(on);
+    }
+
+    /// r11-walpin-conc amendment 5: restart the trunk log under SQLite's rule (read mark 0 stays
+    /// shared) or turso's (mark 0 upgraded). In-process WAL only.
+    #[doc(hidden)]
+    pub fn walpin_set_sqlite_restart(&self, on: bool) {
+        self.shared_wal
+            .read()
+            .runtime
+            .sqlite_restart
+            .store(on, crate::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// FW2: open the second WAL file (`<wal>2`). Call once, right after open, before any write.
+    #[doc(hidden)]
+    pub fn walpin_open_wal2(&self) -> Result<()> {
+        let file = self
+            .io
+            .open_file(&format!("{}2", self.walpin_wal_path()), crate::OpenFlags::Create, false)?;
+        self.shared_wal.read().walpin_set_wal2_file(file);
+        Ok(())
+    }
+
+    /// The trunk WAL's max_frame alone: one atomic load under the shared WAL lock.
+    #[doc(hidden)]
+    pub fn walpin_max_frame(&self) -> u64 {
+        self.shared_wal
+            .read()
+            .metadata
+            .max_frame
+            .load(crate::sync::atomic::Ordering::Acquire)
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
@@ -436,6 +481,9 @@ mod isolation_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod mechanism_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod walpin_tests;
 
 #[cfg(test)]
 mod tests {
