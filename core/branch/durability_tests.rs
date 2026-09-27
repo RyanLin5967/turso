@@ -3047,3 +3047,46 @@ fn a_registry_hit_of_the_other_splice_arm_is_refused() {
         }
     }
 }
+
+/// The lead's ruling on r11-churn's batch test (amendment 15), on this base. The composed base has
+/// no batch release (`reap_branches` is on the pre-F1 line only, r11-ever-durable 0905219cd), so
+/// this is that test's splice-mode twin, one release at a time, run in both arms. P writes row 100
+/// and forks C, which writes row 101 on the same leaf (the premise, asserted by a probe branch that
+/// writes both rows into one slot). Off (the base's rule): P's reap is deferred and frees nothing,
+/// and C's frees both pages. On: P's reap splices P into C and frees P's page, which C's own copy
+/// shadows (deferred, 1), and C's frees C's (1). The totals match: a splice moves a free to an
+/// earlier release and never adds or loses one.
+#[test]
+fn a_splice_frees_what_the_base_rule_frees_one_release_earlier() {
+    let mut totals = Vec::new();
+    for (splice, p_want, c_want) in [(false, (true, 0), (false, 2)), (true, (true, 1), (false, 1))] {
+        let what = format!("splice={splice}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("durable.db");
+        let db = open_at(&path, durable().with_branch_splice(splice)).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let probe = trunk.fork_branch().unwrap();
+        {
+            let q = probe.connect().unwrap();
+            set(&q, 100, "q");
+            set(&q, 101, "q");
+        }
+        assert_eq!(probe.owned_slots().len(), 1, "{what}: premise: rows 100 and 101 are on two leaves");
+        let r = probe.reap().unwrap();
+        assert!(!r.deferred && r.freed_pages == 1, "{what}: the probe's reap: {r:?}");
+        let p = trunk.fork_branch().unwrap();
+        set(&p.connect().unwrap(), 100, "p");
+        let c = p.fork().unwrap();
+        set(&c.connect().unwrap(), 101, "c");
+        assert_eq!(in_use(&db).len(), 2, "{what}: premise: p and c own one page each");
+        let rp = p.reap().unwrap();
+        assert_eq!((rp.deferred, rp.freed_pages), p_want, "{what}: p's reap: {rp:?}");
+        assert_eq!(value(&c.connect().unwrap(), 100).as_deref(), Some("p"), "{what}: c lost p's row");
+        let rc = c.reap().unwrap();
+        assert_eq!((rc.deferred, rc.freed_pages), c_want, "{what}: c's reap: {rc:?}");
+        assert!(in_use(&db).is_empty(), "{what}: pages left in use: {:?}", in_use(&db));
+        totals.push(rp.freed_pages + rc.freed_pages);
+    }
+    assert_eq!(totals[0], totals[1], "the two arms freed different totals: {totals:?}");
+}
