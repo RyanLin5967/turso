@@ -564,6 +564,13 @@ impl Database {
         self.branches.catalog_counters()
     }
 
+    /// `(trunk-version probes, trunk-version rows read)` by the catalog since open; zeros for a
+    /// store that is not a catalog store (r12-lakehouse instrument).
+    #[doc(hidden)]
+    pub fn branch_catalog_trunk_counters(&self) -> (u64, u64) {
+        self.branches.catalog_trunk_counters()
+    }
+
     /// Catalog statements that wrote a row since open; 0 for a store that is not a catalog store.
     #[doc(hidden)]
     pub fn branch_catalog_rows_written(&self) -> u64 {

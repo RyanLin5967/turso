@@ -2086,6 +2086,17 @@ impl BranchStore {
         })
     }
 
+    /// `(trunk-version probes, trunk-version rows returned)` by the catalog since open: C-P's
+    /// cumulative counters (`trunk_written_known`, `trunk_version_at`, `trunk_catalog_garbage`);
+    /// zeros for a store that is not a catalog store. Observation only (r12-lakehouse instrument).
+    pub(crate) fn catalog_trunk_counters(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        inner
+            .cat
+            .as_ref()
+            .map_or((0, 0), |c| (c.trunk_probes, c.trunk_rows))
+    }
+
     pub(crate) fn read_counters(&self) -> (u64, u64) {
         (
             self.resolve_calls.load(Ordering::Relaxed),
