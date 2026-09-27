@@ -262,6 +262,17 @@ pub(crate) struct BranchStore {
     fo: bool,
     /// r11-coherence FX: copy trunk-cache hits outside the shard lock.
     copy_out: bool,
+    /// Spin-then-park for the trunk's lock (see [`take`]); from `TURSO_K3_TRUNKSPIN` (ns) at construction.
+    trunk_spin_ns: AtomicU64,
+    /// Observation only (amendment 8.2): branch pagers' page caches emptied by a WAL change.
+    branch_cache_clears: CachePadded<AtomicU64>,
+    /// F-K3: the trunk's retained versions, searchable without the trunk's lock (the same `Arc` as
+    /// the trunk lineage's `shared`). `None` is F5's locked lookup.
+    k3: Option<std::sync::Arc<SharedVersions>>,
+    k3_mode: K3Mode,
+    /// F-K3: the trunk arena's pages, for reading a retained version without the trunk's lock. Set
+    /// under the trunk lock by the first retain, before that version is published.
+    trunk_chunks: OnceLock<std::sync::Arc<Chunks>>,
 }
 
 #[cfg(test)]
@@ -293,17 +304,6 @@ static STORE_UIDS: AtomicU64 = AtomicU64::new(1);
 std::thread_local! {
     /// FS: this thread's id blocks, one per store, keyed by the store's `uid` (never reused, unlike its address).
     static ID_BLOCKS: std::cell::RefCell<Vec<(u64, u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// Spin-then-park for the trunk's lock (see [`take`]); from `TURSO_K3_TRUNKSPIN` (ns) at construction.
-    trunk_spin_ns: AtomicU64,
-    /// Observation only (amendment 8.2): branch pagers' page caches emptied by a WAL change.
-    branch_cache_clears: CachePadded<AtomicU64>,
-    /// F-K3: the trunk's retained versions, searchable without the trunk's lock (the same `Arc` as
-    /// the trunk lineage's `shared`). `None` is F5's locked lookup.
-    k3: Option<std::sync::Arc<SharedVersions>>,
-    k3_mode: K3Mode,
-    /// F-K3: the trunk arena's pages, for reading a retained version without the trunk's lock. Set
-    /// under the trunk lock by the first retain, before that version is published.
-    trunk_chunks: OnceLock<std::sync::Arc<Chunks>>,
 }
 
 /// One stripe of the branch map.
@@ -1725,6 +1725,8 @@ impl BranchStore {
         out: &mut [u8],
         cause: ResolveCause,
     ) -> Result<Resolved> {
+        // FX: a trunk-cache key decided under the shard lock, copied after it is released.
+        let mut copy_after: Option<TrunkPageKey> = None;
         let (at, elsewhere) = {
             let mut shard = self.shard(id);
             shard.work.resolve_calls += 1;
