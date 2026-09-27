@@ -1946,6 +1946,12 @@ impl BranchStore {
         if fail {
             inner.failpoint = None;
         }
+        if inner.failpoint == Some(BranchFailpoint::CompactArenaSyncFails) {
+            inner.failpoint = None;
+            if let Some(journal) = inner.journal.as_mut() {
+                journal.fail_next_compact_arena_sync();
+            }
+        }
         self.compact(&mut inner, fail)
     }
 

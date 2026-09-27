@@ -2706,3 +2706,39 @@ fn a_compaction_that_fails_before_its_rename_does_not_fail_stop_later_writes() {
     drop(cb);
     let _ = b.into_id();
 }
+
+/// The other half of R1, found by a fresh review of its fix (artie-research PREREG amendment 6a). A compaction can also
+/// fail before its rename at its ARENA sync. A failed sync may have dropped the pages it was writing back, and a later
+/// fsync of the same file can then report success without them, so that failure must fail-stop the store as a failed
+/// log flush does: a later branch write is refused, never acknowledged.
+#[test]
+fn a_compaction_whose_arena_sync_fails_fail_stops_the_store() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let b_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        let cb = b.connect().unwrap();
+        set(&cb, 10, "before");
+        db.branch_failpoint(Some(BranchFailpoint::CompactArenaSyncFails));
+        assert!(db.branch_compact_now().is_err(), "the failpoint did not fire");
+        assert!(
+            cb.execute("UPDATE t SET v = 'after' WHERE id = 11").is_err(),
+            "a write was acknowledged after the compaction's arena sync failed"
+        );
+        drop(cb);
+        b_id = b.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let b = db.branch(b_id).unwrap();
+    let cb = b.connect().unwrap();
+    assert_eq!(value(&cb, 10), Some("before".to_string()));
+    assert_eq!(value(&cb, 11), Some(original(11)));
+    drop(cb);
+    let _ = b.into_id();
+}
