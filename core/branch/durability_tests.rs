@@ -2562,3 +2562,433 @@ fn an_early_released_release_whose_flight_fails_frees_nothing_now_or_later() {
     assert_eq!(value(&a.connect().unwrap(), 10), Some("a".to_string()));
     let _ = a.into_id();
 }
+
+// ---- r12-noforce (artie-research frontier/round12/r12-noforce/PREREG.md): ARIES no-force ----
+
+/// PREREG C1-C4, a counter test (control flow fixes every count, so it stands at any load). After
+/// a reopen: the first fork waits for the id floor it buffers (one log sync); a later fork syncs
+/// nothing; a one-row branch commit syncs the log once and never the arena (its page image rides in
+/// the log); its release is one flush. Before no-force (gc2) the fork cost 1 and the commit 2.
+#[test]
+fn a_no_force_lifecycle_syncs_the_log_once() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let warm = trunk.fork_branch().unwrap();
+        set(&warm.connect().unwrap(), 7, "warm");
+        let _ = warm.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let trunk = db.connect().unwrap();
+    let fsyncs = || crate::branch::churn_counters().thread_fsyncs;
+
+    let before = fsyncs();
+    let w = trunk.fork_branch().unwrap();
+    assert_eq!(fsyncs() - before, 1, "C4: the first fork after an open waits for its id floor");
+
+    let before = fsyncs();
+    let b = trunk.fork_branch().unwrap();
+    assert_eq!(fsyncs() - before, 0, "C1: a fork under a durable id floor is not forced");
+
+    let bc = b.connect().unwrap();
+    let before = fsyncs();
+    set(&bc, 150, "b");
+    assert_eq!(fsyncs() - before, 1, "C2: a branch commit syncs the log once, the arena never");
+    drop(bc);
+
+    let before = fsyncs();
+    db.reap_branches(vec![b]).unwrap();
+    assert_eq!(fsyncs() - before, 1, "C3: a batch release is one flush");
+    drop(w);
+}
+
+/// The no-force contract, in process (a crash image is every file copied while the database is
+/// open). A fork that nothing after it made durable is lost by a crash — ARIES does not force a
+/// transaction's begin — and its id is never handed out again; a fork detached with `into_id` is
+/// forced, so it survives. Red before no-force: the unforced fork came back.
+#[test]
+fn an_unforced_fork_is_lost_by_a_crash_and_its_id_is_never_reissued() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let w = trunk.fork_branch().unwrap(); // the first fork: it waits for the id floor
+    let b = trunk.fork_branch().unwrap(); // under the floor: buffered only
+    let d = trunk.fork_branch().unwrap();
+    let d_id = d.into_id(); // detached: forced here
+    let (w_id, b_id) = (w.id(), b.id());
+    let image = crash_image(&path, dir.path());
+
+    let crashed = open_at(&image, durable()).unwrap();
+    let ids: BTreeSet<BranchId> = crashed.branch_ids().unwrap().into_iter().collect();
+    assert!(ids.contains(&w_id), "the forced first fork was lost: {ids:?}");
+    assert!(ids.contains(&d_id), "a detached fork was lost by a crash: {ids:?}");
+    assert!(
+        !ids.contains(&b_id),
+        "the unforced fork survived the crash image: nothing was not forced ({ids:?})"
+    );
+    let next = crashed.connect().unwrap().fork_branch().unwrap();
+    assert!(
+        next.id().0 > b_id.0.max(d_id.0),
+        "fork id {} handed out again after the crash (handed out before: {:?})",
+        next.id().0,
+        [w_id, b_id, d_id]
+    );
+    drop(b);
+    drop(w);
+}
+
+/// Every kill point of the crash test, in lifecycle order. `flight-after-write` is recovered twice:
+/// with the log as the kill left it, and cut back to where that flight began.
+#[cfg(unix)]
+const NO_FORCE_KILL_POINTS: [&str; 11] = [
+    "after-first-fork",
+    "after-fork",
+    "after-connect",
+    "commit-after-slots",
+    "commit-after-buffer",
+    "flight-after-write",
+    "flight-after-sync",
+    "after-commit",
+    "after-close",
+    "release-after-buffer",
+    "after-release",
+];
+
+/// The child of `no_force_crash_recovers_at_every_kill_point`: a process of this test binary that
+/// opens the parent's database, runs one lifecycle, and SIGKILLs itself at the point named by
+/// `TURSO_NF_CRASH_AT`. Every unsynced ARENA write dies with it (`LOSE_UNSYNCED_WRITES`: nothing
+/// unsynced reached the disk, the arena's worst case under power loss). It reports what it was told
+/// was done, as a caller would record it, in `TURSO_NF_CRASH_LOG`.
+#[cfg(unix)]
+#[test]
+#[ignore = "the child process of no_force_crash_recovers_at_every_kill_point; it runs only there"]
+fn no_force_crash_child() {
+    use super::store::crash;
+    let Some(db_path) = std::env::var_os("TURSO_NF_CRASH_CHILD_DB") else {
+        return;
+    };
+    let at = std::env::var("TURSO_NF_CRASH_AT").expect("a kill point");
+    let progress = std::path::PathBuf::from(std::env::var_os("TURSO_NF_CRASH_LOG").expect("a log"));
+    let mut said = String::new();
+    let mut record = |line: String| {
+        said.push_str(&line);
+        said.push('\n');
+        std::fs::write(&progress, &said).unwrap();
+    };
+    let kill_after = |point: &str| {
+        if at == point {
+            crash::kill_now(point);
+        }
+    };
+    super::arena::LOSE_UNSYNCED_WRITES.store(true, std::sync::atomic::Ordering::Relaxed);
+    let db = open_at(Path::new(&db_path), durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    let w = trunk.fork_branch().unwrap();
+    record(format!("w {}", w.id().0));
+    kill_after("after-first-fork");
+    let b = trunk.fork_branch().unwrap();
+    record(format!("b {}", b.id().0));
+    kill_after("after-fork");
+    let bc = b.connect().unwrap();
+    kill_after("after-connect");
+    for point in [
+        "commit-after-slots",
+        "commit-after-buffer",
+        "flight-after-write",
+        "flight-after-sync",
+    ] {
+        if at == point {
+            crash::arm(point);
+        }
+    }
+    set(&bc, 150, "b");
+    record("committed".to_string());
+    record(format!("b_slots {:?}", b.owned_slots()));
+    kill_after("after-commit");
+    drop(bc);
+    kill_after("after-close");
+    if at == "release-after-buffer" {
+        crash::arm(&at);
+    }
+    db.reap_branches(vec![b]).unwrap();
+    record("released".to_string());
+    kill_after("after-release");
+    panic!("kill point {at} was never reached");
+}
+
+/// One crash and one recovery; `Err` names every invariant that failed.
+#[cfg(unix)]
+fn no_force_crash_once(at: &str, cut_log: bool) -> std::result::Result<(), String> {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let p_id;
+    let page_size;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        set(&p.connect().unwrap(), 7, "p");
+        p_id = p.into_id();
+        page_size = rows(&trunk, "PRAGMA page_size")[0][0].as_int().unwrap() as u64;
+    }
+    let note = dir.path().join("note");
+    let progress = dir.path().join("progress");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "branch::durability_tests::no_force_crash_child",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("TURSO_NF_CRASH_CHILD_DB", &path)
+        .env("TURSO_NF_CRASH_AT", at)
+        .env("TURSO_NF_CRASH_LOG", &progress)
+        .env("TURSO_BRANCH_CRASH_NOTE", &note)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{at}: the child did not finish in 120 s"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // The kill point fired, and it was this one: death by SIGKILL, and the child's own note.
+    if status.signal() != Some(libc::SIGKILL) {
+        return Err(format!("{at}: the child was not killed at the point ({status})"));
+    }
+    let noted = std::fs::read_to_string(&note).unwrap_or_default();
+    if noted.split_whitespace().next() != Some(at) {
+        return Err(format!("{at}: the child died at another point: {noted:?}"));
+    }
+    let said = std::fs::read_to_string(&progress).unwrap_or_default();
+    let said_id = |key: &str| {
+        said.lines()
+            .find_map(|l| l.strip_prefix(&format!("{key} ")))
+            .map(|v| v.parse::<u64>().unwrap())
+    };
+    let Some(w) = said_id("w") else {
+        return Err(format!("{at}: the child died before its first fork returned: {said:?}"));
+    };
+    let b = said_id("b");
+    let committed = said.lines().any(|l| l == "committed");
+    let released = said.lines().any(|l| l == "released");
+    let b_slot: Option<u64> = said
+        .lines()
+        .find_map(|l| l.strip_prefix("b_slots "))
+        .map(|v| {
+            let first = v.trim_matches(|c: char| c == '[' || c == ']').split(", ").next();
+            first.unwrap().parse().unwrap()
+        });
+    let arena_path = std::path::PathBuf::from(format!("{}-branch-arena", path.display()));
+    let slot_bytes = |slot: u64| {
+        let bytes = std::fs::read(&arena_path).unwrap_or_default();
+        let off = (slot * page_size) as usize;
+        bytes.get(off..off + page_size as usize).map(<[u8]>::to_vec)
+    };
+    let before_redo = b_slot.map(slot_bytes);
+    if cut_log {
+        let start: u64 = noted
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("at="))
+            .expect("the flight's start offset")
+            .parse()
+            .unwrap();
+        let log = std::path::PathBuf::from(format!("{}-branch-log", path.display()));
+        std::fs::OpenOptions::new().write(true).open(&log).unwrap().set_len(start).unwrap();
+    }
+
+    let db = open_at(&path, durable()).map_err(|e| format!("{at}: R1, the open refused: {e}"))?;
+    let mut failed = Vec::new();
+    // What must hold, by kill point: B is durable once its commit's flight has synced (or, for
+    // flight-after-write left uncut, once its frames reached the file), and gone once released.
+    let b_expected = match at {
+        "after-first-fork" | "after-fork" | "after-connect" | "commit-after-slots"
+        | "commit-after-buffer" | "after-release" => false,
+        "flight-after-write" => !cut_log,
+        _ => true,
+    };
+    let ids: BTreeSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
+    let b_present = b.is_some_and(|b| ids.contains(&BranchId(b)));
+    if !ids.contains(&p_id) {
+        failed.push("R2: P, committed before the child ran, is gone".to_string());
+    }
+    if !ids.contains(&BranchId(w)) {
+        failed.push(format!("R2: W ({w}), whose fork waited for durability, is gone"));
+    }
+    if b_present != b_expected {
+        failed.push(format!(
+            "R2/R3: B present = {b_present}, expected {b_expected} \
+             (committed {committed}, released {released})"
+        ));
+    }
+    let mut owned = BTreeSet::new();
+    for &id in &ids {
+        let branch = match db.branch(id) {
+            Ok(branch) => branch,
+            Err(e) => {
+                failed.push(format!("R1: branch {} cannot be attached: {e}", id.0));
+                continue;
+            }
+        };
+        owned.extend(branch.owned_slots());
+        match branch.connect() {
+            Ok(conn) => {
+                let (v7, v150) = (value(&conn, 7), value(&conn, 150));
+                let ok = rows(&conn, "PRAGMA integrity_check")[0][0] == Value::from_text("ok");
+                if !ok {
+                    failed.push(format!("R1: branch {} fails its integrity check", id.0));
+                }
+                let (want7, want150) = if id == p_id {
+                    ("p".to_string(), original(150))
+                } else if Some(id.0) == b {
+                    (original(7), "b".to_string())
+                } else {
+                    (original(7), original(150))
+                };
+                if v7.as_deref() != Some(want7.as_str())
+                    || v150.as_deref() != Some(want150.as_str())
+                {
+                    failed.push(format!(
+                        "R2/R3: branch {} reads 7 = {v7:?}, 150 = {v150:?}",
+                        id.0
+                    ));
+                }
+            }
+            Err(e) => failed.push(format!("R1: branch {} cannot be read: {e}", id.0)),
+        }
+        let _ = branch.into_id();
+    }
+    if in_use(&db) != owned {
+        failed.push(format!(
+            "R4: slots in use {:?} are not the recovered branches' {:?}",
+            in_use(&db),
+            owned
+        ));
+    }
+    let handed_out = b.unwrap_or(w).max(w);
+    match db.connect().unwrap().fork_branch() {
+        Ok(next) if next.id().0 > handed_out => {}
+        Ok(next) => failed.push(format!(
+            "R5: fork id {} handed out again (the child handed out up to {handed_out})",
+            next.id().0
+        )),
+        Err(e) => failed.push(format!("R5: a fork after recovery failed: {e}")),
+    }
+    // The premise that makes this a test of the redo rule: where B's commit was acknowledged, its
+    // page was NOT in the arena file when the child died; only the log could bring it back.
+    if b_expected && committed && at != "after-release" {
+        let after_redo = b_slot.map(slot_bytes);
+        if after_redo.is_none() || after_redo == before_redo {
+            failed.push(format!(
+                "premise: B's slot {b_slot:?} was already in the arena file before recovery \
+                 (the power-loss switch did nothing)"
+            ));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{at}{}: {}", if cut_log { " (log cut)" } else { "" }, failed.join("; ")))
+    }
+}
+
+/// PREREG §3.4: a real SIGKILL of a child process between each step of a lifecycle, and inside its
+/// commit's flush, then a recovery that must keep every acknowledged effect, show nothing partial,
+/// leak no slot and never reissue an id. With `TURSO_NF_MUTANT` set (M1 `no_redo`, M2 `ack_early`,
+/// M3 `no_id_floor`) the same test is the fire-check and must FAIL.
+#[cfg(unix)]
+#[test]
+fn no_force_crash_recovers_at_every_kill_point() {
+    let mut failures = Vec::new();
+    let mut runs = 0;
+    for at in NO_FORCE_KILL_POINTS {
+        let cuts: &[bool] = if at == "flight-after-write" { &[false, true] } else { &[false] };
+        for &cut in cuts {
+            runs += 1;
+            let verdict = no_force_crash_once(at, cut);
+            println!("no-force crash {at}{}: {verdict:?}", if cut { " (log cut)" } else { "" });
+            if let Err(e) = verdict {
+                failures.push(e);
+            }
+        }
+    }
+    assert_eq!(runs, 12, "the kill-point list changed: 12 recoveries were registered");
+    assert!(
+        failures.is_empty(),
+        "{} of {runs} recoveries failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// The checksum guard of `a_corrupted_arena_slot_is_an_error_not_a_wrong_page`, where the redo rule
+/// leaves it load-bearing: after a CHECKPOINT (a compaction) the log no longer holds the page's
+/// image, the arena is its only copy, and a rotted byte must be a checksum error, not a wrong page.
+/// (Before the checkpoint, recovery redoes the image and repairs the rot.)
+#[test]
+fn a_corrupted_arena_slot_after_a_checkpoint_is_an_error_not_a_wrong_page() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let b_id;
+    let slots;
+    let page_size;
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        page_size = rows(&trunk, "PRAGMA page_size")[0][0].as_int().unwrap() as u64;
+        let b = trunk.fork_branch().unwrap();
+        set(&b.connect().unwrap(), 150, "branch");
+        slots = b.owned_slots();
+        assert_eq!(slots.len(), 1, "one in-place UPDATE should own exactly one page");
+        db.branch_compact_now().unwrap();
+        b_id = b.into_id();
+    }
+    let arena = format!("{}-branch-arena", path.to_str().unwrap());
+    let offset = slots[0] as u64 * page_size + page_size / 2;
+    {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&arena)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        f.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        f.write_all(&byte).unwrap();
+    }
+    let db = reopen(&path, incarnation);
+    let b = db.branch(b_id).unwrap();
+    let bc = b.connect().unwrap();
+    let read = bc
+        .prepare("SELECT v FROM t WHERE id = 150")
+        .and_then(|mut s| s.run_collect_rows());
+    let err = match read {
+        Ok(rows) => panic!("a corrupted branch page was served after a checkpoint: {rows:?}"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("checksum"), "{err}");
+    assert_eq!(value(&bc, 7), Some(original(7)));
+}

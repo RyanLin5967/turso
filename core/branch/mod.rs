@@ -203,6 +203,9 @@ pub struct Branch {
     db: Arc<Database>,
     id: BranchId,
     released: bool,
+    /// The log sequence number that makes this branch's fork durable (0: already durable). A fork
+    /// is not forced (r12-noforce); [`Branch::into_id`] forces it.
+    fork_lsn: u64,
 }
 
 /// Observation-only counters (r11-churn instrument): branch-file fsyncs process-wide and on the
@@ -221,6 +224,8 @@ pub struct ChurnCounters {
     pub gc_locked_flushes: u64,
     pub gc_waits: u64,
     pub gc_already_durable: u64,
+    /// Frame bytes group flights wrote to the branch log (r12-noforce instrument).
+    pub log_bytes: u64,
     pub full_fsync: bool,
     pub compactions: u64,
     pub compact_ns_total: u64,
@@ -245,6 +250,7 @@ pub fn churn_counters() -> ChurnCounters {
         gc_locked_flushes: GC_LOCKED_FLUSHES.load(Relaxed),
         gc_waits: GC_WAITS.load(Relaxed),
         gc_already_durable: GC_ALREADY_DURABLE.load(Relaxed),
+        log_bytes: journal::LOG_BYTES.load(Relaxed),
         full_fsync: journal::full_fsync(),
         compactions: COMPACTIONS.load(Relaxed),
         compact_ns_total: COMPACT_NS_TOTAL.load(Relaxed),
@@ -286,11 +292,12 @@ pub struct BranchStats {
 }
 
 impl Branch {
-    fn new(db: Arc<Database>, id: BranchId) -> Self {
+    fn new(db: Arc<Database>, id: BranchId, fork_lsn: u64) -> Self {
         Self {
             db,
             id,
             released: false,
+            fork_lsn,
         }
     }
 
@@ -309,10 +316,13 @@ impl Branch {
     /// No admissibility check here: this branch passed [`check_forkable`] when its root was forked
     /// from the trunk, and journal-mode changes are refused while any branch exists.
     pub fn fork(&self) -> Result<Branch> {
-        let (id, lsn) = self.db.branches.fork_branch(self.id)?;
-        // Early release (r11-churn amendment 4): the fork is applied; hand it out once durable.
-        self.db.branches.wait_durable(lsn)?;
-        Ok(Branch::new(self.db.clone(), id))
+        let (id, lsn, wait) = self.db.branches.fork_branch(self.id)?;
+        // No force (r12-noforce): the fork is applied and handed out before it is durable, unless
+        // its id is not yet under a durable floor.
+        if wait {
+            self.db.branches.wait_durable(lsn)?;
+        }
+        Ok(Branch::new(self.db.clone(), id, lsn))
     }
 
     /// Release this branch. Dropping the handle does the same; this form reports what was freed,
@@ -333,8 +343,16 @@ impl Branch {
     /// Detach this branch from its handle WITHOUT releasing it — the branch outlives the handle
     /// (and, with durable branches, the process) until [`Database::branch`] re-attaches it and
     /// the new handle is reaped or dropped.
+    ///
+    /// A fork is not forced (r12-noforce), so this is where it is: an id that outlives its handle
+    /// must name a branch that outlives the process. If that flush fails, the store is fail-stopped
+    /// (every later operation refuses, naming it), and the branch does not come back at the next
+    /// open unless something after its fork had already been made durable.
     pub fn into_id(mut self) -> BranchId {
         self.released = true;
+        if let Err(e) = self.db.branches.wait_durable(self.fork_lsn) {
+            tracing::warn!("branch {} detached, but its fork is not durable: {e}", self.id.0);
+        }
         self.db.branches.detach(self.id);
         self.id
     }
@@ -404,21 +422,24 @@ impl Connection {
         }
         let pager = self.pager.load().clone();
         check_forkable(&self.db, &pager)?;
-        let (id, lsn) = match pager.branch_id() {
+        let (id, lsn, wait) = match pager.branch_id() {
             Some(parent) => self.db.branches.fork_branch(parent)?,
             None => self.fork_trunk(&pager)?,
         };
-        // Early release (r11-churn amendment 4): the fork is applied and every lock is released;
-        // the branch is handed out only once its records are durable.
-        self.db.branches.wait_durable(lsn)?;
-        Ok(Branch::new(self.db.clone(), id))
+        // No force (r12-noforce): the fork is applied and every lock is released; the branch is
+        // handed out now, and its records become durable with the next flush — its own first
+        // commit at the latest. Only a fork whose id is not yet under a durable floor waits.
+        if wait {
+            self.db.branches.wait_durable(lsn)?;
+        }
+        Ok(Branch::new(self.db.clone(), id, lsn))
     }
 
     /// Fork the trunk under its WAL write lock. The lock is the point: a trunk write transaction
     /// in flight across the fork took its copy decisions for the previous epoch, so the pages it
     /// commits afterwards would be visible to the new branch. Holding the writer lock means there
     /// is no such transaction, and the read snapshot it forces is the latest commit.
-    fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<(BranchId, u64)> {
+    fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<(BranchId, u64, bool)> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
         loop {
@@ -445,7 +466,10 @@ impl Connection {
         }
     }
 
-    fn fork_trunk_locked(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<(BranchId, u64)> {
+    fn fork_trunk_locked(
+        self: &Arc<Connection>,
+        pager: &Arc<Pager>,
+    ) -> Result<(BranchId, u64, bool)> {
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
@@ -489,7 +513,8 @@ impl Database {
     /// unreleased branch after a reopen.
     pub fn branch(self: &Arc<Database>, id: BranchId) -> Result<Branch> {
         self.branches.attach(id)?;
-        Ok(Branch::new(self.clone(), id))
+        // A detached branch's fork is durable: `into_id` forced it, or a reopen recovered it.
+        Ok(Branch::new(self.clone(), id, 0))
     }
 
     /// Every unreleased branch, attached or not. Refused on a read-only handle of a database with
