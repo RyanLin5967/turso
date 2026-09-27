@@ -2248,11 +2248,41 @@ mod tests {
         assert_eq!(replica.digest(&rtrunk), want, "the replica decoded the deltas wrongly");
     }
 
-    /// R3 (PREREG A5, F-S2 bound; green at the base too, see A5; expectation corrected in A5a):
-    /// after one state changes among K, an incremental send's visits are bounded by a constant, not
-    /// by K, and the replica it feeds equals the source.
+    /// R3 (PREREG A5, F-S2 bound; green at the base too, see A5): after one state changes among
+    /// K, an incremental send's visits are bounded by a constant, not by K.
     #[test]
     fn an_incremental_after_one_change_among_many_states_visits_a_bounded_number_of_things() {
+        for k in [200u64, 2000] {
+            let store = BranchStore::new();
+            store.enable_shipping().unwrap();
+            let trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+            let mut ids = Vec::new();
+            for i in 0..k {
+                let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                write_page(&store, id, 1, &image(0), &image(20_000 + i));
+                ids.push(id);
+            }
+            let img = trunk_image(&trunk);
+            let mut buf = Vec::new();
+            let full = store
+                .send(SendMode::FullFix, None, &img, false, Plant::None, true, Some(&mut buf))
+                .unwrap();
+            write_page(&store, ids[(k / 2) as usize], 1, &image(0), &image(77));
+            let rep = store
+                .send(SendMode::IncrFix, Some(full.to), &img, false, Plant::None, true, None)
+                .unwrap();
+            let visits = rep.states_visited + rep.entries_visited + rep.slots_visited + rep.index_visited;
+            assert!(visits <= 64, "k = {k}: an incremental after one change visited {visits}: {rep:?}");
+            assert_eq!((rep.state_records, rep.slot_records), (1, 1), "k = {k}: {rep:?}");
+        }
+    }
+
+    /// R3′ (PREREG A5c; registered by A5's pre-run prediction "changed states now ship only
+    /// changed entries"): after one metadata-free rewrite among K states, an incremental ships the
+    /// slot's bytes and no STATE record, visits a bounded number of things, and the replica it
+    /// feeds equals the source. R3, above, keeps the base's expectation.
+    #[test]
+    fn an_incremental_after_one_metadata_free_rewrite_ships_only_its_bytes_and_the_replica_matches() {
         for k in [200u64, 2000] {
             let store = BranchStore::new();
             store.enable_shipping().unwrap();
