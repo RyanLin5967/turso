@@ -43,10 +43,48 @@ pub struct Anchor {
     /// U2: this thread slot's own deep copy of the builtin symbol maps, and the builtin generation it copied
     /// ([`crate::database::BuiltinSyms`]); a connect extends from it only while the generation still matches.
     pub(crate) builtins: OnceLock<(u64, crate::connection::SymbolTable)>,
+    /// FZ (amendment 21): the schema this slot copied from (kept, so its address is never reused) and this thread's
+    /// own deep copy of it; a branch whose schema is that source gets the copy.
+    pub(crate) schema: OnceLock<Option<(Arc<crate::schema::Schema>, Arc<crate::schema::Schema>)>>,
     pub(crate) branches: Arc<BranchStore>,
     pub(crate) shared_wal: Arc<BravoRwLock<WalFileShared>>,
     pub(crate) init_lock: Arc<Mutex<()>>,
     pub(crate) init_page_1: Arc<ArcSwapOption<Page>>,
+}
+
+/// FZ (U-ARC, amendment 21): the one strong reference to a database that this thread's handles share. The database
+/// cannot hold it (that would be a cycle), so a thread-local table holds it weakly: the keeper lives while any handle
+/// does, and a handle's clone and drop write only the keeper's count.
+pub(crate) struct DbKeeper {
+    db: Arc<crate::Database>,
+}
+
+thread_local! {
+    static DB_KEEPERS: std::cell::RefCell<Vec<(usize, crate::sync::Weak<DbKeeper>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A handle on `db` for a connection or a branch: through this thread's keeper with FZ, else its own `Arc`.
+pub(crate) fn database_handle(db: &Arc<crate::Database>) -> DbRef<crate::Database> {
+    if !crate::coherence::fix(crate::coherence::FIX_UARC) {
+        // The Arc<Database> clone and its drop.
+        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
+        return DbRef::Owned(db.clone());
+    }
+    let key = Arc::as_ptr(db) as usize;
+    let keeper = DB_KEEPERS.with(|k| {
+        let mut k = k.borrow_mut();
+        k.retain(|(_, w)| w.strong_count() > 0);
+        if let Some(live) = k.iter().find(|(p, _)| *p == key).and_then(|(_, w)| w.upgrade()) {
+            return live;
+        }
+        // The keeper's one Arc<Database> clone, once per keeper.
+        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
+        let keeper = Arc::new(DbKeeper { db: db.clone() });
+        k.push((key, Arc::downgrade(&keeper)));
+        keeper
+    });
+    DbRef::Anchored(NonNull::from(&keeper.db), keeper)
 }
 
 /// The database's anchors, one per thread slot ([`crate::bravo::thread_index`]), or none without FU.
@@ -80,7 +118,8 @@ impl Anchors {
 /// the anchor's `Arc` plus a clone of the anchor.
 pub enum DbRef<T: ?Sized> {
     Owned(Arc<T>),
-    Anchored(NonNull<Arc<T>>, Arc<Anchor>),
+    /// A pointer to an `Arc<T>` that the second field keeps alive: an [`Anchor`], or a [`DbKeeper`].
+    Anchored(NonNull<Arc<T>>, Arc<dyn std::any::Any + Send + Sync>),
 }
 
 // SAFETY: an anchored handle is a shared reference to an `Arc<T>` that its own anchor clone keeps alive; it is
@@ -93,6 +132,11 @@ impl<T: ?Sized> DbRef<T> {
     pub(crate) fn anchored(anchor: &Arc<Anchor>, field: impl FnOnce(&Anchor) -> &Arc<T>) -> Self {
         let ptr = NonNull::from(field(&**anchor));
         DbRef::Anchored(ptr, anchor.clone())
+    }
+
+    /// Whether this handle writes only a per-thread count (the coherence instrument's question).
+    pub(crate) fn is_anchored(&self) -> bool {
+        matches!(self, DbRef::Anchored(..))
     }
 
     /// The object's own `Arc`, for a caller that keeps it beyond this handle (a shared count write).

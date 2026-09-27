@@ -2473,10 +2473,11 @@ impl Database {
     ) -> Result<Arc<Connection>> {
         let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
-        // The Arc<Database> clone and its drop at the connection's close.
-        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
+        // FZ: a branch connection does not count in n_connections (it never checkpoints the trunk on close).
+        let counted = !(crate::coherence::fix(crate::coherence::FIX_UARC) && pager.branch_id().is_some());
         let conn = Arc::new(Connection {
-            db: self.clone(),
+            db: crate::anchor::database_handle(self),
+            counted_in_n_connections: counted,
             pager: crate::connection::PagerSlot::new(pager),
             syms_thread_private: AtomicBool::new(false),
             schema: RwLock::new(schema.unwrap_or_else(|| self.schema.lock().clone())),
@@ -2550,9 +2551,11 @@ impl Database {
             prepare_context_generation: AtomicU64::new(0),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
-        crate::coherence::bump(crate::coherence::Class::DbHot, 1);
-        self.n_connections
-            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+        if counted {
+            crate::coherence::bump(crate::coherence::Class::DbHot, 1);
+            self.n_connections
+                .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+        }
         // add built-in extensions symbols to the connection to prevent having to load each time
         // U2: from this thread's own copy of the builtin maps while the builtins have not changed since it was taken
         // (no shared lock, no shared Arc count); otherwise from the database's.
@@ -3029,6 +3032,28 @@ impl Database {
         }
     }
 
+    /// FZ (amendment 21): the schema handle for a branch whose schema is `s`: this thread's own copy when `s` is the
+    /// schema the anchor copied (so the clone and its drop write only this thread's count), else a clone of `s`.
+    pub(crate) fn branch_schema(&self, s: &Arc<Schema>) -> Arc<Schema> {
+        if crate::coherence::fix(crate::coherence::FIX_UARC) {
+            if let Some(a) = self.anchor() {
+                let copy = a.schema.get_or_init(|| {
+                    crate::alloc::TryClone::try_clone(&**s)
+                        .ok()
+                        .map(|copy| (s.clone(), Arc::new(copy)))
+                });
+                if let Some((src, copy)) = copy {
+                    if Arc::ptr_eq(src, s) {
+                        return copy.clone();
+                    }
+                }
+            }
+        }
+        // The clone and its drop.
+        crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
+        s.clone()
+    }
+
     /// r11-coherence FU: this thread's anchor of the objects a pager reaches, or `None` without FU.
     pub(crate) fn anchor(&self) -> Option<Arc<crate::anchor::Anchor>> {
         self.anchors.get(|| crate::anchor::Anchor {
@@ -3036,6 +3061,7 @@ impl Database {
             db_file: self.db_file.clone(),
             buffer_pool: self.buffer_pool.clone(),
             builtins: OnceLock::new(),
+            schema: OnceLock::new(),
             branches: self.branches.clone(),
             shared_wal: self.shared_wal.clone(),
             init_lock: self.init_lock.clone(),

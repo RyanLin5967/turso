@@ -418,7 +418,11 @@ impl PagerSlot {
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
-    pub(crate) db: Arc<Database>,
+    /// FZ (amendment 21): through this thread's keeper, so the connection's open and close write no shared count.
+    pub(crate) db: crate::anchor::DbRef<Database>,
+    /// FZ: whether this connection counts in `Database::n_connections` (branch connections do not: only trunk
+    /// connections decide the checkpoint on last close).
+    pub(crate) counted_in_n_connections: bool,
     pub(crate) pager: PagerSlot,
     /// r11-coherence U2: the builtin maps came from this thread's own copy (the instrument counts their drops as
     /// private).
@@ -657,10 +661,12 @@ impl Drop for Connection {
             });
 
             // if connection wasn't properly closed, decrement the connection counter
-            crate::coherence::bump(crate::coherence::Class::DbHot, 1);
-            self.db
-                .n_connections
-                .fetch_sub(1, crate::sync::atomic::Ordering::SeqCst);
+            if self.counted_in_n_connections {
+                crate::coherence::bump(crate::coherence::Class::DbHot, 1);
+                self.db
+                    .n_connections
+                    .fetch_sub(1, crate::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
 }
@@ -2525,7 +2531,8 @@ impl Connection {
             .wal
             .as_ref()
             .is_none_or(|wal| wal.should_checkpoint_on_close());
-        if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
+        if self.counted_in_n_connections
+            && self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1)
             && !self.db.is_readonly()
             && !is_memory_db
             && should_checkpoint_on_close
@@ -3334,14 +3341,14 @@ impl Connection {
     /// Get the Database object for a given database id.
     pub(crate) fn get_source_database(&self, database_id: usize) -> Arc<Database> {
         match database_id {
-            MAIN_DB_ID => self.db.clone(),
+            MAIN_DB_ID => self.db.to_arc(),
             TEMP_DB_ID => self
                 .temp
                 .database
                 .read()
                 .as_ref()
                 .map(|temp_db| temp_db.db.clone())
-                .unwrap_or_else(|| self.db.clone()),
+                .unwrap_or_else(|| self.db.to_arc()),
             _ => self
                 .attached_databases
                 .read()
@@ -4696,7 +4703,7 @@ impl Connection {
     }
 
     pub(crate) fn database_ptr(&self) -> usize {
-        Arc::as_ptr(&self.db) as usize
+        self.db.as_ptr() as usize
     }
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {

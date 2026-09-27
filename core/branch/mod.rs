@@ -150,7 +150,8 @@ pub fn check_branchable(mvcc_enabled: bool) -> Result<()> {
 /// an open connection on the branch, or a live child forked from it. Then the branch is kept until
 /// the last of those goes, and freed at that moment.
 pub struct Branch {
-    db: Arc<Database>,
+    /// FZ (amendment 21): through this thread's keeper.
+    db: crate::anchor::DbRef<Database>,
     id: BranchId,
     released: bool,
 }
@@ -302,9 +303,9 @@ impl BranchWork {
 }
 
 impl Branch {
-    fn new(db: Arc<Database>, id: BranchId) -> Self {
+    fn new(db: &Arc<Database>, id: BranchId) -> Self {
         Self {
-            db,
+            db: crate::anchor::database_handle(db),
             id,
             released: false,
         }
@@ -317,7 +318,7 @@ impl Branch {
     /// Open a connection whose reads and writes see only this branch. One at a time: a second
     /// connection on the same branch is refused (see [`store::BranchStore::open`]).
     pub fn connect(&self) -> Result<Arc<Connection>> {
-        self.db.connect_branch(self.id)
+        self.db.as_arc().connect_branch(self.id)
     }
 
     /// Fork a child of this branch. Refused with `Busy` while a write transaction is open on it.
@@ -325,9 +326,12 @@ impl Branch {
     /// No admissibility check here: this branch passed [`check_forkable`] when its root was forked
     /// from the trunk, and journal-mode changes are refused while any branch exists.
     pub fn fork(&self) -> Result<Branch> {
-        let id = self.db.branches.fork_branch(self.id)?;
-        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
-        Ok(Branch::new(self.db.clone(), id))
+        // FZ: the child's schema from this thread's copy when it is the anchor's source schema.
+        let db = self.db.as_arc();
+        let id = db
+            .branches
+            .fork_branch_with(self.id, |s| db.branch_schema(s))?;
+        Ok(Branch::new(db, id))
     }
 
     /// Release this branch. Dropping the handle does the same; this form reports what was freed.
@@ -399,9 +403,7 @@ impl Connection {
             Some(parent) => self.db.branches.fork_branch(parent)?,
             None => self.fork_trunk(&pager)?,
         };
-        // The branch handle's Arc<Database> clone and its drop at the reap.
-        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
-        Ok(Branch::new(self.db.clone(), id))
+        Ok(Branch::new(self.db.as_arc(), id))
     }
 
     /// Fork the trunk under its WAL write lock. The lock is the point: a trunk write transaction
@@ -534,7 +536,7 @@ impl Database {
     /// The pager is built by `_init_branch`, bound before it reads anything, so page 1 — like every
     /// page after it — is read as the BRANCH sees it, and nothing of the trunk's can be left in it.
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
-        let schema = self.branches.open(id)?;
+        let schema = self.branches.open_with(id, |s| self.branch_schema(s))?;
         // Built before anything fallible below, so an error there still closes the branch.
         // FU: the store through this thread's anchor.
         let binding = BranchBinding {

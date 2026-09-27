@@ -211,6 +211,11 @@ pub(crate) struct BranchStore {
     k_epoch: CachePadded<AtomicU64>,
     k_children: crate::skiplist::SkipMap<u64, BranchId>,
     k_retained: CachePadded<AtomicUsize>,
+    /// FZ (amendment 21): the live counter is sloppy (Boyd-Wickizer et al., OSDI 2010): each thread slot holds spare
+    /// credits, the global count moves [`LIVE_BATCH`] at a time and equals the live branches plus every slot's
+    /// spares, so it never under-reports. [`BranchStore::has_branches`] reclaims the spares before it answers.
+    fz: bool,
+    live_spares: Box<[CachePadded<AtomicUsize>]>,
     /// r11-coherence FX: copy trunk-cache hits outside the shard lock.
     copy_out: bool,
 }
@@ -233,6 +238,9 @@ fn run_k_depart_hook() {
         f();
     }
 }
+
+/// FZ: live-count credits a thread slot takes per trip to the store's counter.
+const LIVE_BATCH: usize = 64;
 
 /// FS: ids a thread takes per trip to the store's counter.
 const ID_BLOCK: u64 = 64;
@@ -782,6 +790,10 @@ impl BranchStore {
             k_epoch: CachePadded::new(AtomicU64::new(0)),
             k_children: crate::skiplist::SkipMap::new(),
             k_retained: CachePadded::new(AtomicUsize::new(0)),
+            fz: crate::coherence::fix(crate::coherence::FIX_UARC),
+            live_spares: (0..crate::bravo::THREADS)
+                .map(|_| CachePadded::new(AtomicUsize::new(0)))
+                .collect(),
             copy_out: crate::coherence::fix(crate::coherence::FIX_COPYOUT),
         }
     }
@@ -916,7 +928,56 @@ impl BranchStore {
     /// Whether any branch state exists at all, including one kept alive only by a live child.
     /// Paths that rewrite the trunk without passing through `add_dirty` refuse while this holds.
     pub(crate) fn has_branches(&self) -> bool {
+        if self.fz && self.live_ctr().load(Ordering::Acquire) > 0 {
+            // Take every slot's spares back first, so the count is exact unless a fork or reap races this call
+            // (then it can only over-report: spares are never negative).
+            for slot in self.live_spares.iter() {
+                let spare = slot.swap(0, Ordering::AcqRel);
+                if spare > 0 {
+                    self.live_ctr().fetch_sub(spare, Ordering::AcqRel);
+                }
+            }
+        }
         self.live_ctr().load(Ordering::Acquire) > 0
+    }
+
+    /// One more live branch (FZ: from this thread slot's spares when it has one).
+    fn live_inc(&self) {
+        if self.fz {
+            let slot = &self.live_spares[crate::bravo::thread_index() % self.live_spares.len()];
+            if slot
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1))
+                .is_ok()
+            {
+                return;
+            }
+            crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
+            self.live_ctr().fetch_add(LIVE_BATCH, Ordering::AcqRel);
+            slot.fetch_add(LIVE_BATCH - 1, Ordering::AcqRel);
+            return;
+        }
+        crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
+        self.live_ctr().fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// One live branch fewer (FZ: into this thread slot's spares, returned to the count a batch at a time).
+    fn live_dec(&self) {
+        if self.fz {
+            let slot = &self.live_spares[crate::bravo::thread_index() % self.live_spares.len()];
+            slot.fetch_add(1, Ordering::AcqRel);
+            if slot
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                    (v > 2 * LIVE_BATCH).then(|| v - LIVE_BATCH)
+                })
+                .is_ok()
+            {
+                crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
+                self.live_ctr().fetch_sub(LIVE_BATCH, Ordering::AcqRel);
+            }
+            return;
+        }
+        crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
+        self.live_ctr().fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
@@ -955,8 +1016,7 @@ impl BranchStore {
             trunk.lineage.children.insert(f, id);
             (id, f)
         };
-        crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-        self.live_ctr().fetch_add(1, Ordering::AcqRel);
+        self.live_inc();
         self.shard(id).branches.insert(
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
@@ -971,6 +1031,21 @@ impl BranchStore {
     /// locked one after the other, never together (see [`BranchStore::fork_trunk`] for why the
     /// window between them is harmless).
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
+        self.fork_branch_with(parent, |s| {
+            // The child's schema clone and its drop at the reap.
+            crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
+            s.clone()
+        })
+    }
+
+    /// [`BranchStore::fork_branch`], with `schema` choosing the child's schema handle from the parent's (FZ: this
+    /// thread's copy of it).
+    pub(crate) fn fork_branch_with(
+        &self,
+        parent: BranchId,
+        schema: impl FnOnce(&Arc<Schema>) -> Arc<Schema>,
+    ) -> Result<BranchId> {
+        let pick = schema;
         let (id, child) = {
             let mut shard = self.shard(parent);
             let st = shard.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
@@ -981,7 +1056,7 @@ impl BranchStore {
             let f = st.lineage.epoch;
             st.lineage.epoch += 1;
             st.lineage.children.insert(f, id);
-            let schema = st.schema.clone();
+            let schema = pick(&st.schema);
             let (current, inherited) = (&st.current, &st.inherited);
             let view = st
                 .view
@@ -995,8 +1070,7 @@ impl BranchStore {
                 .clone();
             (id, BranchState::new(parent, f, schema, st.trunk_at, view))
         };
-        crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-        self.live_ctr().fetch_add(1, Ordering::AcqRel);
+        self.live_inc();
         self.shard(id).branches.insert(id, child);
         Ok(id)
     }
@@ -1005,6 +1079,20 @@ impl BranchStore {
     /// branch: two would each hold a private page cache of the same page space, and nothing would
     /// tell one that the other had committed — a silently stale read, so it is refused.
     pub(crate) fn open(&self, id: BranchId) -> Result<Arc<Schema>> {
+        self.open_with(id, |s| {
+            // The clone and its drop at the connection's close.
+            crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
+            s.clone()
+        })
+    }
+
+    /// [`BranchStore::open`], with `schema` choosing the connection's schema handle from the branch's (FZ: this
+    /// thread's copy of it).
+    pub(crate) fn open_with(
+        &self,
+        id: BranchId,
+        schema: impl FnOnce(&Arc<Schema>) -> Arc<Schema>,
+    ) -> Result<Arc<Schema>> {
         let mut shard = self.shard(id);
         let st = shard.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.open {
@@ -1016,9 +1104,7 @@ impl BranchStore {
             )));
         }
         st.open = true;
-        // The clone and its drop at the connection's close.
-        crate::coherence::bump(crate::coherence::Class::SchemaArc, 2);
-        Ok(st.schema.clone())
+        Ok(schema(&st.schema))
     }
 
     /// The connection on `id` has gone. Releases its write lock if a transaction was abandoned.
@@ -1390,8 +1476,7 @@ impl BranchStore {
                 return (freed, at != id);
             }
             let st = shard.branches.remove(&at).expect("just looked it up");
-            crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
-            self.live_ctr().fetch_sub(1, Ordering::AcqRel);
+            self.live_dec();
             let domain = &mut shard.domain;
             for owned in st.current.values() {
                 domain.release(owned.slot);

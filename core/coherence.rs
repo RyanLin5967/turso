@@ -149,6 +149,10 @@ pub const FIX_HEAP: u32 = 2048;
 pub const FIX_REPLICA: u32 = 4096;
 /// V: the harness gives each thread private databases (the engine ignores it) (amendment 15).
 pub const FIX_PRIVATE: u32 = 8192;
+/// FZ (U-ARC): the last shared reference counts off the conc path: the connection's and branch handles' database
+/// through a per-thread keeper, branch connections outside n_connections, the branch schema from a per-thread copy,
+/// and the store's live counter sloppy (amendment 21).
+pub const FIX_UARC: u32 = 16384;
 
 static FIXES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
@@ -178,6 +182,7 @@ pub fn parse_fixes(s: &str) -> Option<u32> {
             "H" => FIX_HEAP,
             "R" => FIX_REPLICA,
             "V" => FIX_PRIVATE,
+            "Z" => FIX_UARC,
             _ => return None,
         };
     }
@@ -192,7 +197,7 @@ pub fn set_fixes(mask: u32) -> bool {
 /// The fixes this process runs with.
 pub fn fixes() -> u32 {
     *FIXES.get_or_init(|| match std::env::var("TURSO_R11_FIX") {
-        Ok(s) => parse_fixes(&s).unwrap_or_else(|| panic!("TURSO_R11_FIX={s}: expected none, all or letters from W,B,P,S,A,G,K,X,M,Y,U,H,R,V")),
+        Ok(s) => parse_fixes(&s).unwrap_or_else(|| panic!("TURSO_R11_FIX={s}: expected none, all or letters from W,B,P,S,A,G,K,X,M,Y,U,H,R,V,Z")),
         Err(_) => 0,
     })
 }
