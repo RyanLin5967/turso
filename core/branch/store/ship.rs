@@ -2247,8 +2247,9 @@ mod tests {
         assert_eq!(replica.digest(&rtrunk), want, "the replica decoded the deltas wrongly");
     }
 
-    /// R3 (PREREG A5, F-S2 bound; green at the base too, see A5): after one state changes among
-    /// K, an incremental send's visits are bounded by a constant, not by K.
+    /// R3 (PREREG A5, F-S2 bound; green at the base too, see A5; expectation corrected in A5a):
+    /// after one state changes among K, an incremental send's visits are bounded by a constant, not
+    /// by K, and the replica it feeds equals the source.
     #[test]
     fn an_incremental_after_one_change_among_many_states_visits_a_bounded_number_of_things() {
         for k in [200u64, 2000] {
@@ -2266,13 +2267,21 @@ mod tests {
             let full = store
                 .send(SendMode::FullFix, None, &img, false, Plant::None, true, Some(&mut buf))
                 .unwrap();
+            let replica = BranchStore::new();
+            let (mut rtrunk, mut at) = (TrunkImage::empty(PAGE), None);
+            replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false).unwrap();
             write_page(&store, ids[(k / 2) as usize], 1, &image(0), &image(77));
+            let mut buf = Vec::new();
             let rep = store
-                .send(SendMode::IncrFix, Some(full.to), &img, false, Plant::None, true, None)
+                .send(SendMode::IncrFix, Some(full.to), &img, false, Plant::None, true, Some(&mut buf))
                 .unwrap();
             let visits = rep.states_visited + rep.entries_visited + rep.slots_visited + rep.index_visited;
             assert!(visits <= 64, "k = {k}: an incremental after one change visited {visits}: {rep:?}");
-            assert_eq!((rep.state_records, rep.slot_records), (1, 1), "k = {k}: {rep:?}");
+            // An in-place rewrite in the same epoch changes no metadata entry, so the only record is
+            // the slot's new bytes (PREREG A5a: the base shipped a STATE record here as well).
+            assert_eq!((rep.state_records, rep.slot_records), (0, 1), "k = {k}: {rep:?}");
+            replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false).unwrap();
+            assert_eq!(replica.digest(&rtrunk), store.digest(&img), "k = {k}: the replica differs");
         }
     }
 }
