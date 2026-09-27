@@ -3519,6 +3519,8 @@ impl StoreInner {
     /// every other in-memory set stays as it is until the install, so between now and then the
     /// store reads exactly as it does between checkpoints.
     fn checkpoint_capture(&mut self, fail_after_commit: bool, restart: bool) -> Result<Box<Captured>> {
+        // MUTANT M-NORESTART (PREREG A19; never merge): with R11_MUTANT=norestart the restart flag is ignored.
+        let restart = restart && std::env::var("R11_MUTANT").as_deref() != Ok("norestart");
         let now = self.lease.now_ms();
         let (Some(journal), Some(arena), Some(cat)) =
             (self.journal.as_mut(), self.arena.as_mut(), self.cat.as_mut())
