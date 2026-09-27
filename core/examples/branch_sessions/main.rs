@@ -569,13 +569,14 @@ impl Bench {
 
     fn trunk_commit(&mut self) {
         let row = spread_row(self.model.writes);
-        let g = self.model.record(row);
-        self.trunk
-            .execute(format!(
-                "UPDATE t SET v = '{}' WHERE id = {row}",
-                trunk_gen_value(g)
-            ))
-            .unwrap();
+        let sql = format!(
+            "UPDATE t SET v = '{}' WHERE id = {row}",
+            trunk_gen_value(self.model.writes)
+        );
+        // With concurrent trunk writers (--trunk-writers) the WAL write lock can be held: retry Busy,
+        // counted. The model records the write only once it has committed.
+        retry_busy(|| self.trunk.execute(&sql));
+        self.model.record(row);
     }
 
     fn checkpoint_passive(&self) -> (i64, i64, i64) {
@@ -1141,6 +1142,25 @@ fn start_writers(db: &Arc<Database>, n: usize) -> Writers {
     Writers { stop, handles }
 }
 
+/// Busy results retried by `retry_busy`, reported per active arm.
+static BUSY_RETRIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Run `f`, retrying `Busy`/`BusySnapshot` (yielding between tries, at most 100,000 times) and
+/// counting each retry in BUSY_RETRIES; any other error is not a result.
+fn retry_busy<T>(mut f: impl FnMut() -> turso_core::Result<T>) -> T {
+    for _ in 0..100_000 {
+        match f() {
+            Ok(v) => return v,
+            Err(turso_core::LimboError::Busy | turso_core::LimboError::BusySnapshot) => {
+                BUSY_RETRIES.fetch_add(1, Ordering::Relaxed);
+                std::thread::yield_now();
+            }
+            Err(e) => not_a_result(&format!("trunk op failed: {e}")),
+        }
+    }
+    not_a_result("trunk op still Busy after 100,000 retries")
+}
+
 /// The active ops, K cycles, with every held session still open.
 fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
     let k = b.args.active;
@@ -1200,7 +1220,9 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
         let at_fork = b.model.writes;
         let (r0, m0, l0, t0) = (b.resolves(), mem(), b.lock_takes(), tl_bytes());
         let t = Instant::now();
-        let br = b.trunk.fork_branch().unwrap();
+        // A trunk fork takes the trunk's WAL write lock; with concurrent trunk writers it can find it
+        // held (v2_mux_fw3_w2 aborted on exactly this Busy): retry, counted.
+        let br = retry_busy(|| b.trunk.fork_branch());
         let conn = br.connect().unwrap();
         let got = read_v(&conn, row);
         drop(conn);
@@ -1284,10 +1306,11 @@ fn active_arm(b: &mut Bench, sessions: &mut [Session], x: usize) {
         }
     }
     println!(
-        "# active x={x} trunk_writers={} writer_commits={commits} writer_busy={busy} \
+        "# active x={x} trunk_writers={} writer_commits={commits} writer_busy={busy} main_busy_retries={} \
          main_thread_buffer_cache page_before={} page_after={} walframe_before={} walframe_after={} \
          wal_bytes_end={}",
         b.args.trunk_writers,
+        BUSY_RETRIES.swap(0, Ordering::Relaxed),
         bufs0.0,
         bufs1.0,
         bufs0.1,
