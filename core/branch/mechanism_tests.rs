@@ -797,3 +797,97 @@ fn exec_retrying_busy(conn: &Arc<Connection>, sql: &str) {
     }
     panic!("{sql}: still Busy after 10,000 attempts");
 }
+
+/// The trunk's image as a sender must pass it: checkpointed, so it holds every committed write.
+fn checkpointed_image(conn: &Arc<Connection>, path: &std::path::Path) -> TrunkImage {
+    let r = rows(conn, "PRAGMA wal_checkpoint(TRUNCATE)");
+    assert_eq!(r[0][0].as_int(), Some(0), "the trunk checkpoint did not complete: {r:?}");
+    let page_size = rows(conn, "PRAGMA page_size")[0][0].as_int().unwrap() as usize;
+    TrunkImage::new(page_size, std::fs::read(path).unwrap())
+}
+
+/// Send `snap` (a full stream without `base`, an incremental from it with one) into `replica`;
+/// returns the position the replica is now at.
+fn ship_into(snap: &ShipSnap, base: Option<u64>, img: &TrunkImage, replica: &mut Replica) -> u64 {
+    let mode = if base.is_some() { SendMode::IncrFix } else { SendMode::FullFix };
+    let mut buf = Vec::new();
+    let rep = Database::branch_send_snapshot(snap, mode, base, img, false, Plant::None, false, Some(&mut buf))
+        .unwrap();
+    replica.receive(&mut &buf[..]).unwrap();
+    rep.to
+}
+
+/// Shipping tracked, a branch alive, a replica seeded by a full stream: (dir, db, trunk, branch,
+/// db path, image, replica, its position).
+#[allow(clippy::type_complexity)]
+fn shipped_db() -> (tempfile::TempDir, Arc<Database>, Arc<Connection>, Branch, std::path::PathBuf, TrunkImage, Replica, u64) {
+    let (dir, db) = open_db();
+    db.branch_enable_shipping().unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let b = trunk.fork_branch().unwrap();
+    set(&b.connect().unwrap(), 3, "branch");
+    let path = dir.path().join("branching.db");
+    let img = checkpointed_image(&trunk, &path);
+    let (snap, _) = db.branch_snapshot().unwrap();
+    let mut replica = Replica::new(img.page_size());
+    let at = ship_into(&snap, None, &img, &mut replica);
+    (dir, db, trunk, b, path, img, replica, at)
+}
+
+/// T1a (r11-ship PREREG A6.1): a snapshot taken while a trunk write transaction is open must not
+/// hide that transaction's commit from every later incremental. The transaction's first write to a
+/// page marks the page changed; the image can only hold the page's committed bytes. Either the
+/// snapshot is refused, or the incremental after the commit must still carry the committed bytes.
+#[test]
+fn a_trunk_commit_after_a_snapshot_inside_its_transaction_reaches_the_next_incremental() {
+    let (_dir, db, trunk, _b, path, img0, mut replica, mut at) = shipped_db();
+
+    trunk.execute("BEGIN").unwrap();
+    set(&trunk, 150, "in-flight");
+    match db.branch_snapshot() {
+        Err(LimboError::Busy) => {}
+        Err(other) => panic!("unexpected error: {other}"),
+        // The transaction is uncommitted, so the trunk's committed image is still `img0`.
+        Ok((snap, _)) => at = ship_into(&snap, Some(at), &img0, &mut replica),
+    }
+    trunk.execute("COMMIT").unwrap();
+
+    let img = checkpointed_image(&trunk, &path);
+    let (snap, _) = db.branch_snapshot().unwrap();
+    ship_into(&snap, Some(at), &img, &mut replica);
+    assert_eq!(
+        replica.digest(),
+        db.branch_digest(&img),
+        "the replica misses the trunk commit whose transaction was open at a snapshot"
+    );
+}
+
+/// T1b (r11-ship PREREG A6.1): the same through the locked send, which snapshots inside.
+#[test]
+fn a_trunk_commit_after_a_send_inside_its_transaction_reaches_the_next_incremental() {
+    let (_dir, db, trunk, _b, path, img0, mut replica, mut at) = shipped_db();
+    let incremental = |replica: &mut Replica, at: u64, img: &TrunkImage| -> Result<u64> {
+        let mut buf = Vec::new();
+        let rep = db.branch_send(SendMode::IncrFix, Some(at), img, false, Plant::None, false, Some(&mut buf))?;
+        replica.receive(&mut &buf[..]).unwrap();
+        Ok(rep.to)
+    };
+
+    trunk.execute("BEGIN").unwrap();
+    set(&trunk, 150, "in-flight");
+    match incremental(&mut replica, at, &img0) {
+        Err(LimboError::Busy) => {}
+        Err(other) => panic!("unexpected error: {other}"),
+        Ok(to) => at = to,
+    }
+    trunk.execute("COMMIT").unwrap();
+
+    let img = checkpointed_image(&trunk, &path);
+    incremental(&mut replica, at, &img).unwrap();
+    assert_eq!(
+        replica.digest(),
+        db.branch_digest(&img),
+        "the replica misses the trunk commit whose transaction was open at a send"
+    );
+}
