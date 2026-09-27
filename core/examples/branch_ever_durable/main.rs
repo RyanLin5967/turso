@@ -650,7 +650,7 @@ fn main() {
                 not_a_result(&format!("after the reopen branch {} misread its own row", id.0));
             }
             if let Some((prow, pval)) = parent_row {
-                let want = if prow == own_row { own.clone() } else { pval };
+                let want = if prow == own_row { own } else { pval };
                 if read_v(&conn, prow) != want {
                     not_a_result(&format!("after the reopen branch {} misread row {prow}", id.0));
                 }

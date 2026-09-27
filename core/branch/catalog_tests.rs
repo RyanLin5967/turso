@@ -618,3 +618,136 @@ fn closed_branch_not_held_again(opts: DatabaseOpts, live: usize) {
     let _ = d.into_id();
     let _ = db.branch(c1_id).unwrap().into_id();
 }
+
+/// Review 3 (of 9ae27b4b2..3f3036b18), finding A1: the red test above ends the hold in the live
+/// store only (`close`), so the two other places a hold ends, a replayed `Close` and the end of
+/// recovery (`close_held`), each marking the row DIRTY_ROW, had no killer. Session 1: P, with
+/// children C1 and C2, writes page x between the two forks and is released under its open
+/// connection; a checkpoint writes `released = 2`; then either the connection closes (the `Close`
+/// is in the log's tail) or not (P is still held), and the process crashes. Session 2 recovers,
+/// which ends the hold (by replaying the `Close`, or at the end of recovery), checkpoints (the row
+/// must say 1 now), reaps C2 (x is freed) and lets D reuse x; crash. Session 3's recovery must
+/// not hold P again and free x under D's page. Both arms, both ways the hold ends.
+#[test]
+fn a_held_row_is_cleared_when_a_recovery_ends_the_hold() {
+    for (splice, live) in [(false, 3), (true, 2)] {
+        for closed_before_crash in [true, false] {
+            held_row_cleared_by_recovery(catalog().with_branch_splice(splice), live, closed_before_crash);
+        }
+    }
+}
+
+fn held_row_cleared_by_recovery(opts: DatabaseOpts, live: usize, closed_before_crash: bool) {
+    let what = format!("splice={} closed_before_crash={closed_before_crash}", opts.branch_splice);
+    let dir = tempfile::TempDir::new().unwrap();
+    let (one, two) = (dir.path().join("one"), dir.path().join("two"));
+    std::fs::create_dir(&one).unwrap();
+    std::fs::create_dir(&two).unwrap();
+    let path = dir.path().join("c.db");
+    let (image1, x, c1_id, c2_id);
+    {
+        let db = open_at(&path, opts).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let p = trunk.fork_branch().unwrap();
+        let c1 = p.fork().unwrap();
+        let pc = p.connect().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&pc, 7, "p-between");
+        let fresh: Vec<u32> = db.branch_slots_in_use().into_iter().filter(|s| !s0.contains(s)).collect();
+        assert_eq!(fresh.len(), 1, "{what}: premise: p's write took one slot");
+        x = fresh[0];
+        let c2 = p.fork().unwrap();
+        drop(p); // released under pc: held
+        db.branch_compact_now().unwrap(); // the row says released = 2
+        if closed_before_crash {
+            drop(pc); // the Close is in the log's tail
+        }
+        image1 = crash_image(&path, &one);
+        c1_id = c1.into_id();
+        c2_id = c2.into_id();
+    }
+    let (image2, d_id, d_slots, in_use_live);
+    {
+        let db = open_at(&image1, opts).unwrap(); // the recovery ends P's hold
+        db.branch_compact_now().unwrap(); // the row must say 1 now
+        let reaped = db.branch(c2_id).unwrap().reap().unwrap(); // P retired again: x is freed
+        assert!(!reaped.deferred, "{what}: {reaped:?}");
+        assert!(db.branch_slot_is_free(x), "{what}: premise: C2's reap did not free p's page");
+        let trunk = db.connect().unwrap();
+        let d = trunk.fork_branch().unwrap();
+        set(&d.connect().unwrap(), 150, "d");
+        d_slots = d.owned_slots();
+        assert!(d_slots.contains(&x), "{what}: premise: d did not reuse the freed slot: {d_slots:?}");
+        in_use_live = db.branch_slots_in_use();
+        image2 = crash_image(&image1, &two);
+        d_id = d.into_id();
+    }
+    let db = open_at(&image2, opts).unwrap();
+    for slot in &d_slots {
+        assert!(!db.branch_slot_is_free(*slot), "{what}: slot {slot}: d's page, freed by the recovery");
+    }
+    let mut got = db.branch_slots_in_use();
+    got.sort_unstable();
+    let mut want = in_use_live;
+    want.sort_unstable();
+    assert_eq!(got, want, "{what}: the recovery's slot set is not the crashed store's");
+    assert_eq!(db.branch_stats().unwrap().live_branches, live, "{what}: c1 and d (and P if off)");
+    let d = db.branch(d_id).unwrap();
+    assert_eq!(value(&d.connect().unwrap(), 150), "d", "{what}");
+    let _ = d.into_id();
+    let _ = db.branch(c1_id).unwrap().into_id();
+}
+
+/// Review 3, finding A2: in the U6 test above Q1's reap cannot tell whether the lookup found C at
+/// Z's key, because Q, forked later, keeps P's first version either way. Here Q1 is P's NEWEST
+/// child and C, at Z's key, the only other child P forked inside that version's life, so the
+/// version survives Q1's reap only if the lookup finds C (the in-memory index says C; the catalog,
+/// until the next checkpoint, still says Z). Then a checkpoint and a reopen, and C still reads it;
+/// C's reap frees it.
+#[test]
+fn a_spliced_childs_key_keeps_its_parents_version_when_the_newest_sibling_goes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let (p_id, c_id, p7);
+    {
+        let db = open_at(&path, spliced()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let p = trunk.fork_branch().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&p.connect().unwrap(), 7, "p-first");
+        p7 = db
+            .branch_slots_in_use()
+            .into_iter()
+            .filter(|s| !s0.contains(s))
+            .collect::<Vec<u32>>();
+        assert!(!p7.is_empty(), "p's write took no slot of its own");
+        let z = p.fork().unwrap();
+        let q1 = p.fork().unwrap(); // the newest child
+        set(&p.connect().unwrap(), 7, "p-second"); // P retains its first version for Z and Q1
+        let c = z.fork().unwrap();
+        db.branch_compact_now().unwrap(); // P, Z, Q1 and C are catalog rows
+        let reaped = z.reap().unwrap(); // one live child: C takes Z's key under P
+        assert!(reaped.deferred, "{reaped:?}");
+        let reaped = q1.reap().unwrap(); // lo = C at Z's key, hi = none
+        assert!(!reaped.deferred, "{reaped:?}");
+        for slot in &p7 {
+            assert!(!db.branch_slot_is_free(*slot), "slot {slot}: C still reads it, freed by Q1's reap");
+        }
+        assert_eq!(value(&c.connect().unwrap(), 7), "p-first");
+        db.branch_compact_now().unwrap();
+        p_id = p.into_id();
+        c_id = c.into_id();
+    }
+    let db = open_at(&path, spliced()).unwrap();
+    let c = db.branch(c_id).expect("the spliced child names a missing parent");
+    assert_eq!(value(&c.connect().unwrap(), 7), "p-first", "C lost P's first version");
+    let reaped = c.reap().unwrap();
+    assert!(!reaped.deferred, "{reaped:?}");
+    for slot in &p7 {
+        assert!(db.branch_slot_is_free(*slot), "slot {slot}: no reader is left, still held");
+    }
+    assert_eq!(db.branch_stats().unwrap().live_branches, 1, "P alone should be left");
+    let _ = db.branch(p_id).unwrap().into_id();
+}
