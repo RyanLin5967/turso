@@ -248,8 +248,9 @@ pub(crate) static WAL2_RECOVERY: AtomicU64 = AtomicU64::new(0);
 /// r11-walpin-conc amendment 21: the wal2 crash test's crash points and recovery mutants (test builds only). A child
 /// process of the lib test binary sets `TURSO_WALPIN_CRASH=<point>:<k>`; the point kills its own process with SIGKILL
 /// (no destructors, no close) at its first hit while the process has made exactly `k` FW2 switches.
-/// `TURSO_WALPIN_WAL2_MUTANT` selects a recovery mutant: `newer_only` (M1: where both files would be recovered, keep
-/// only the newer) or `wal0_only` (M0: the base, which recovers `-wal` alone).
+/// `TURSO_WALPIN_WAL2_MUTANT` selects a mutant: `newer_only` (M1: where both files would be recovered, keep only the
+/// newer), `wal0_only` (M0: the base, which recovers `-wal` alone), `wal2_first` (M2: a restart empties `-wal2`
+/// before `-wal`) or `no_salt_check` (M3: a follower with a commit is always chained).
 #[cfg(test)]
 pub(crate) mod crash {
     use super::FW2_SWITCHES;
@@ -291,5 +292,13 @@ pub(crate) mod crash {
 
     pub(crate) fn mutant() -> Option<String> {
         std::env::var("TURSO_WALPIN_WAL2_MUTANT").ok()
+    }
+
+    /// Amendment 21a mutant M2 (`wal2_first`): a restart generation empties `-wal2` before `-wal`.
+    pub(crate) fn restart_order<T>(mut order: [T; 2]) -> [T; 2] {
+        if mutant().as_deref() == Some("wal2_first") {
+            order.swap(0, 1);
+        }
+        order
     }
 }

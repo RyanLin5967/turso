@@ -2153,15 +2153,32 @@ impl Database {
                     // r11-walpin-conc amendment 21 (A2): under FW2 the log is two files, recovered
                     // together here, before any pager sees the WAL, so the schema below is read
                     // from the recovered state.
-                    if crate::branch::walpin::fw2()
-                        && shared_wal.read().metadata.enabled.load(Ordering::Acquire)
+                    // Amendment 21a: like SQLite, where only a wal2 build can open a wal2
+                    // database (SQLITE_NOTADB, wal2.md), an open with FW2 off refuses a `<wal>2`
+                    // that holds anything, which it would otherwise ignore (losing its commits)
+                    // and let a later FW2 open misorder; and FW2 does not recover through the
+                    // multiprocess WAL's shared snapshot.
+                    if crate::branch::walpin::fw2() {
+                        if self.opts.enable_multiprocess_wal {
+                            return Err(LimboError::InvalidArgument(
+                                "FW2 (wal2) does not support the multiprocess WAL".to_string(),
+                            ));
+                        }
+                        if shared_wal.read().metadata.enabled.load(Ordering::Acquire) {
+                            WalFileShared::walpin_recover_wal2(
+                                &shared_wal,
+                                &self.io,
+                                &self.wal_path,
+                                self.open_flags,
+                            )?;
+                        }
+                    } else if std::fs::metadata(format!("{}2", self.wal_path))
+                        .is_ok_and(|m| m.len() > 0)
                     {
-                        WalFileShared::walpin_recover_wal2(
-                            &shared_wal,
-                            &self.io,
-                            &self.wal_path,
-                            self.open_flags,
-                        )?;
+                        return Err(LimboError::InvalidArgument(format!(
+                            "'{}2' holds a wal2 log: open this database with FW2 on",
+                            self.wal_path
+                        )));
                     }
                     self.shared_wal = shared_wal;
                     let last_checksum_and_max_frame =
@@ -2214,6 +2231,13 @@ impl Database {
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+        if crate::branch::walpin::fw2() {
+            // r11-walpin-conc amendment 21a: this rebuilds the WAL from `-wal` alone.
+            return Err(LimboError::InvalidArgument(
+                "reloading a WAL after external restore is not supported under FW2 (wal2)"
+                    .to_string(),
+            ));
+        }
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"

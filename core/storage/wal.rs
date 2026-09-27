@@ -3283,6 +3283,27 @@ impl Wal2Recovered {
     }
 }
 
+/// r11-walpin-conc amendment 21 mutants M1 (`newer_only`: where both files would be recovered, keep
+/// the newer alone) and M0 (`wal0_only`: the base, `-wal` alone), from `TURSO_WALPIN_WAL2_MUTANT`.
+#[cfg(test)]
+fn walpin_recovery_mutant(decided: Wal2Recovered) -> Wal2Recovered {
+    match (walpin::crash::mutant().as_deref(), decided) {
+        (Some("newer_only"), Wal2Recovered::Both { older }) => Wal2Recovered::Only(1 - older),
+        (Some("wal0_only"), _) => Wal2Recovered::Only(0),
+        _ => decided,
+    }
+}
+
+/// r11-walpin-conc amendment 21a mutant M3 (`no_salt_check`): each file's salts read as the other's
+/// last commit checksum, so a follower with a commit is always chained.
+#[cfg(test)]
+fn walpin_salt_mutant(mut f0: Wal2FileScan, mut f1: Wal2FileScan) -> (Wal2FileScan, Wal2FileScan) {
+    if walpin::crash::mutant().as_deref() == Some("no_salt_check") {
+        (f0.salts, f1.salts) = (f1.last_checksum, f0.last_checksum);
+    }
+    (f0, f1)
+}
+
 /// Process-local coordination and caches layered around the shared WAL metadata.
 pub struct WalSharedRuntime {
     // Frame cache maps a Page to all the frames it has stored in WAL in ascending order.
@@ -4821,14 +4842,17 @@ impl Wal for WalFile {
                 // 1 (-wal <= 32 B empties -wal2) every crash state in between recovers to the
                 // database file alone; emptying -wal2 first could replay an older -wal over newer
                 // database pages.
-                walpin_empty_wal_file(self.io.as_ref(), file.as_ref())?;
+                let order = [Some(file.clone()), self.coordination.wal2_other_file()];
+                // Mutant M2 (amendment 21a, test builds only): -wal2 first.
                 #[cfg(test)]
-                walpin::crash::point("restart_wal0");
-                if let Some(other) = self.coordination.wal2_other_file() {
-                    walpin_empty_wal_file(self.io.as_ref(), other.as_ref())?;
+                let order = walpin::crash::restart_order(order);
+                for (_i, f) in order.iter().enumerate() {
+                    if let Some(f) = f {
+                        walpin_empty_wal_file(self.io.as_ref(), f.as_ref())?;
+                    }
+                    #[cfg(test)]
+                    walpin::crash::point(["restart_first", "restart_second"][_i]);
                 }
-                #[cfg(test)]
-                walpin::crash::point("restart_wal1");
             }
             // A switch generation is written over the reused file's old frames, which fail the
             // new salts (SQLite's wal2 truncates nothing at a switch, wal.c 4948; amendment 21,
@@ -6260,19 +6284,17 @@ impl WalFileShared {
             }
             Wal2Recovered::Only(0)
         } else {
+            let size1 = file1.size()?;
             let scan1 = sqlite3_ondisk::build_shared_wal(&file1, io)?;
-            let f0 = this.read().walpin_scan();
-            let f1 = scan1.read().walpin_scan();
-            #[allow(unused_mut)]
-            let mut decided = Wal2Recovered::decide(&f0, &f1);
+            let f0 = this.read().walpin_scan(size0);
+            let f1 = scan1.read().walpin_scan(size1);
+            // Mutant M3 (amendment 21a, test builds only): every follower's salts match.
             #[cfg(test)]
-            match (walpin::crash::mutant().as_deref(), decided) {
-                (Some("newer_only"), Wal2Recovered::Both { older }) => {
-                    decided = Wal2Recovered::Only(1 - older)
-                }
-                (Some("wal0_only"), _) => decided = Wal2Recovered::Only(0),
-                _ => {}
-            }
+            let (f0, f1) = walpin_salt_mutant(f0, f1);
+            let decided = Wal2Recovered::decide(&f0, &f1);
+            // Mutants M1 and M0 (amendment 21, test builds only).
+            #[cfg(test)]
+            let decided = walpin_recovery_mutant(decided);
             let scan1 = scan1.read();
             this.write()
                 .walpin_install_recovered(decided, &f0, &f1, &scan1);
@@ -6283,11 +6305,13 @@ impl WalFileShared {
         Ok(decided)
     }
 
-    /// r11-walpin-conc amendment 21: this WAL file as its recovery left it (`Wal2FileScan`).
-    fn walpin_scan(&self) -> Wal2FileScan {
+    /// r11-walpin-conc amendment 21: this WAL file as its recovery left it (`Wal2FileScan`). A file
+    /// of `size` <= a header is not valid, as in SQLite's walIndexRecoverOne (`nSize>WAL_HDRSIZE`).
+    fn walpin_scan(&self, size: u64) -> Wal2FileScan {
         let hdr = *self.metadata.wal_header.lock();
         Wal2FileScan {
-            valid: self.metadata.initialized.load(Ordering::Acquire),
+            valid: size > WAL_HEADER_SIZE as u64
+                && self.metadata.initialized.load(Ordering::Acquire),
             seq: hdr.checkpoint_seq,
             salts: (hdr.salt_1, hdr.salt_2),
             max_frame: self.metadata.max_frame.load(Ordering::Acquire),

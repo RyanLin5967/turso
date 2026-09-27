@@ -1,17 +1,22 @@
-//! r11-walpin-conc amendment 21: durable wal2 (FW2). Each configuration runs a workload in a child
-//! process of this test binary, with FW2 on, and kills that child at one crash point. Further
-//! children then reopen the directory. The recovered database must hold every acknowledged
+//! r11-walpin-conc amendments 21 and 21a: durable wal2 (FW2). Each configuration runs a workload in
+//! a child process of this test binary, with FW2 on, and kills that child at one crash point.
+//! Further children then reopen the directory. The recovered database must hold every acknowledged
 //! transaction, the in-flight one exactly as registered, and nothing else, and must keep working
-//! across another switch. Mutant M1 (keep only the newer file where both would be recovered) must
-//! fail the same check wherever the older file still holds commits that the database file lacks.
+//! across another switch. Mutants must fail the same check where they are registered to: M1 (keep
+//! only the newer file where both would be recovered) where the older file still holds commits the
+//! database file lacks, M2 (a restart empties -wal2 before -wal) at the restart's first step, M3
+//! (no salt check) where the older file lost its last commit.
 //!
 //! Children are driven by `WAL2_CRASH_MODE` and are no-ops without it, so `wal2_crash_child` passes
-//! trivially in an ordinary run. The engine's crash points are `walpin::crash` (test builds only).
+//! trivially in an ordinary run. A child writes its results to the file named by `WAL2_CRASH_OUT`,
+//! not to stdout, where libtest's own "test ... " line shares the first line. The engine's crash
+//! points and mutants are `walpin::crash` (test builds only).
 
 use super::walpin;
+use crate::storage::wal::{Wal2FileScan, Wal2Recovered};
 use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
@@ -20,6 +25,7 @@ const ROWS_PER_TXN: i64 = 8;
 const MAX_TXNS: i64 = 6_000;
 const CONTINUE_TXNS: i64 = 400;
 const CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+const VERIFY_MUTANTS: [&str; 3] = ["newer_only", "wal0_only", "no_salt_check"];
 
 fn open(dir: &str) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
@@ -57,20 +63,30 @@ fn txn(conn: &Arc<crate::Connection>, i: i64) {
     conn.execute("COMMIT").unwrap();
 }
 
+/// Append one result line to `WAL2_CRASH_OUT`. A write(2) reaches the kernel before the next line
+/// of the workload runs, so it survives this process's SIGKILL.
 fn say(line: &str) {
-    let mut out = std::io::stdout();
-    writeln!(out, "{line}").unwrap();
-    out.flush().unwrap();
+    let path = std::env::var("WAL2_CRASH_OUT").unwrap();
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(format!("{line}\n").as_bytes())
+        .unwrap();
 }
 
 /// `WAL2_CRASH_ACK=<k>:<m>`: kill this child after the m-th COMMIT made while the switch count is
-/// k has returned, before its ack. `restart:<m>` counts COMMITs after the restart arm's TRUNCATE.
+/// k has returned, before its ack. `restart:<m>` counts COMMITs after the arm's checkpoint.
 fn ack_point() -> Option<(String, u64)> {
     let v = std::env::var("WAL2_CRASH_ACK").ok()?;
     let (k, m) = v.rsplit_once(':')?;
     Some((k.to_string(), m.parse().ok()?))
 }
 
+/// The workload. Arms: `plain`; `pinned` (a reader holds a snapshot from before switch 1, so the
+/// old file's checkpoint is refused); `restart` (a RESTART checkpoint 10 commits after switch 1,
+/// while -wal2 is the current file); `truncate` (a TRUNCATE checkpoint 10 commits after switch 2).
 fn work(dir: &str) {
     let arm = std::env::var("WAL2_CRASH_ARM").unwrap_or_else(|_| "plain".into());
     let ack = ack_point();
@@ -85,14 +101,13 @@ fn work(dir: &str) {
     let pin = db.connect().unwrap();
     let mut pinned = false;
     let (mut last_sw, mut since_switch) = (0u64, 0u64);
-    let (mut truncated, mut since_truncate) = (false, 0u64);
+    let (mut checkpointed, mut since_checkpoint) = (false, 0u64);
     for i in 1..=MAX_TXNS {
         if arm == "pinned"
             && !pinned
             && walpin::counters().fw2_switches == 0
             && db.walpin_max_frame() >= 900
         {
-            // A reader whose snapshot ends in file 0: after switch 1 it refuses file 0's checkpoint.
             pin.execute("BEGIN").unwrap();
             int(&pin, "SELECT count(*) FROM t");
             pinned = true;
@@ -104,11 +119,11 @@ fn work(dir: &str) {
             (last_sw, since_switch) = (sw, 0);
         }
         since_switch += 1;
-        if truncated {
-            since_truncate += 1;
+        if checkpointed {
+            since_checkpoint += 1;
         }
         match &ack {
-            Some((k, m)) if k == "restart" && truncated && since_truncate == *m => {
+            Some((k, m)) if k == "restart" && checkpointed && since_checkpoint == *m => {
                 walpin::crash::kill_self(&format!("acked restart:{m} (txn {i})"))
             }
             Some((k, m)) if k.parse::<u64>().ok() == Some(sw) && since_switch == *m => {
@@ -117,17 +132,25 @@ fn work(dir: &str) {
             _ => {}
         }
         say(&format!("ack {i}"));
-        if arm == "restart" && !truncated && sw == 2 && since_switch == 10 {
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-            assert_eq!(db.walpin_max_frame(), 0, "the TRUNCATE restarted the log");
-            truncated = true;
-            say(&format!("truncated after {i}"));
+        let mode = match arm.as_str() {
+            "restart" if sw == 1 => Some("RESTART"),
+            "truncate" if sw == 2 => Some("TRUNCATE"),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            if !checkpointed && since_switch == 10 {
+                conn.execute(format!("PRAGMA wal_checkpoint({mode})"))
+                    .unwrap();
+                assert_eq!(db.walpin_max_frame(), 0, "{mode} restarted the log");
+                checkpointed = true;
+                say(&format!("{mode} after {i}"));
+            }
         }
     }
     say("no crash point fired");
 }
 
-/// Print what the recovered database holds: the decision, the present transactions (they must be
+/// Record what the recovered database holds: the decision, the present transactions (they must be
 /// exactly 1..=P, each with all its rows), and meta.last.
 fn verify(dir: &str) {
     let db = open(dir);
@@ -189,22 +212,62 @@ fn wal2_crash_child() {
     }
 }
 
-fn child(mode: &str, dir: &Path, env: &[(&str, &str)]) -> Output {
+/// A child's exit and its result lines.
+struct Ran {
+    out: Output,
+    results: String,
+}
+
+impl Ran {
+    fn text(&self) -> String {
+        format!(
+            "status {:?}\n--- results\n{}--- stdout\n{}--- stderr\n{}",
+            self.out.status,
+            self.results,
+            String::from_utf8_lossy(&self.out.stdout),
+            String::from_utf8_lossy(&self.out.stderr)
+        )
+    }
+
+    /// The last result line starting with `key`, split on whitespace.
+    fn line(&self, key: &str) -> Option<Vec<&str>> {
+        self.results
+            .lines()
+            .rev()
+            .find(|l| l.starts_with(key))
+            .map(|l| l.split_whitespace().collect())
+    }
+
+    /// (present, complete, meta) from a verify child, None if it did not finish.
+    fn verified(&self) -> Option<(i64, bool, i64)> {
+        if !self.out.status.success() {
+            return None;
+        }
+        let f = self.line("present ")?;
+        Some((f[1].parse().ok()?, f[3] == "true", f[5].parse().ok()?))
+    }
+}
+
+/// Run one child on `dir`, its outputs in files beside it named `<dir>.<tag>.*`. The child is
+/// killed after CHILD_LIMIT, so a child that hangs (a mutant reading an inconsistent tree) fails its
+/// configuration instead of the whole test.
+fn child(mode: &str, dir: &Path, tag: &str, env: &[(&str, &str)]) -> Ran {
+    let beside = |ext: &str| PathBuf::from(format!("{}.{tag}.{ext}", dir.display()));
+    let (res, out_path, err_path) = (beside("res"), beside("out"), beside("err"));
+    let _ = std::fs::remove_file(&res);
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args([CHILD, "--exact", "--nocapture", "--test-threads=1"])
         .env("TURSO_WALPIN_FIX", "fw2")
         .env("WAL2_CRASH_MODE", mode)
         .env("WAL2_CRASH_DIR", dir)
+        .env("WAL2_CRASH_OUT", &res)
         .env_remove("TURSO_WALPIN_CRASH")
         .env_remove("TURSO_WALPIN_WAL2_MUTANT")
-        .env_remove("WAL2_CRASH_ACK");
+        .env_remove("WAL2_CRASH_ACK")
+        .env_remove("WAL2_CRASH_ARM");
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // Output goes to files beside the directory, and the child is killed after CHILD_LIMIT, so a
-    // child that hangs (a mutant reading an inconsistent tree) fails its configuration instead of
-    // the whole test.
-    let (out_path, err_path) = (dir.with_extension("out"), dir.with_extension("err"));
     cmd.stdout(std::fs::File::create(&out_path).unwrap())
         .stderr(std::fs::File::create(&err_path).unwrap());
     let mut proc = cmd.spawn().unwrap();
@@ -226,38 +289,14 @@ fn child(mode: &str, dir: &Path, env: &[(&str, &str)]) -> Output {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    Output {
-        status,
-        stdout: std::fs::read(&out_path).unwrap(),
-        stderr: std::fs::read(&err_path).unwrap(),
+    Ran {
+        out: Output {
+            status,
+            stdout: std::fs::read(&out_path).unwrap(),
+            stderr: std::fs::read(&err_path).unwrap(),
+        },
+        results: std::fs::read_to_string(&res).unwrap_or_default(),
     }
-}
-
-fn text(out: &Output) -> String {
-    format!(
-        "status {:?}\n--- stdout\n{}--- stderr\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
-}
-
-/// The last `<key> ...` line's fields after the key.
-fn line<'a>(out: &'a str, key: &str) -> Option<Vec<&'a str>> {
-    out.lines()
-        .rev()
-        .find(|l| l.starts_with(key))
-        .map(|l| l.split_whitespace().collect())
-}
-
-/// (present, complete, meta) from a verify child's stdout, None if it did not finish.
-fn verified(out: &Output) -> Option<(i64, bool, i64)> {
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let f = line(&stdout, "present ")?;
-    Some((f[1].parse().ok()?, f[3] == "true", f[5].parse().ok()?))
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -268,78 +307,159 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+/// Cut a WAL file after its second-to-last commit frame: the file loses its last commit, as an
+/// unsynced tail would at a power loss. Returns the frames removed.
+fn cut_last_commit(wal: &Path) -> u64 {
+    let bytes = std::fs::read(wal).unwrap();
+    let page_size = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let frame = 24 + page_size;
+    let (salt1, salt2) = (&bytes[16..20], &bytes[20..24]);
+    let mut commits = Vec::new();
+    let mut off = 32;
+    while off + frame <= bytes.len() {
+        let h = &bytes[off..off + 24];
+        if &h[8..12] != salt1 || &h[12..16] != salt2 {
+            break;
+        }
+        if h[4..8] != [0, 0, 0, 0] {
+            commits.push(off + frame);
+        }
+        off += frame;
+    }
+    assert!(
+        commits.len() >= 2,
+        "the file holds two commits to cut between"
+    );
+    let keep = commits[commits.len() - 2];
+    let f = std::fs::OpenOptions::new().write(true).open(wal).unwrap();
+    f.set_len(keep as u64).unwrap();
+    ((commits[commits.len() - 1] - keep) / frame) as u64
+}
+
 struct Config {
     name: String,
     arm: &'static str,
     engine: Option<String>,
     ack: Option<String>,
-    inflight_present: bool,
-    m1_must_kill: bool,
+    /// P - A: +1 the in-flight transaction is present, 0 absent, -1 the last ack was cut away.
+    offset: i64,
+    /// A mutant in the WORK child (M2); the correct recovery must then FAIL the check.
+    work_mutant: Option<&'static str>,
+    cut_tail: bool,
+    /// Verify mutants that must fail the check here.
+    must_kill: &'static [&'static str],
 }
 
-/// The 22 registered configurations (PREREG amendment 21).
+fn config(
+    name: String,
+    arm: &'static str,
+    engine: Option<String>,
+    ack: Option<String>,
+    offset: i64,
+) -> Config {
+    Config {
+        name,
+        arm,
+        engine,
+        ack,
+        offset,
+        work_mutant: None,
+        cut_tail: false,
+        must_kill: &[],
+    }
+}
+
+/// The 25 registered configurations (PREREG amendments 21 and 21a).
 fn configs() -> Vec<Config> {
     let mut v = Vec::new();
     for k in 1..=3u64 {
-        for (point, present) in [
-            ("switched", false),
-            ("header", false),
-            ("commit_written", true),
-            ("ckpt_copied", true),
-            ("ckpt_done", true),
+        for (point, offset) in [
+            ("switched", 0),
+            ("header", 0),
+            ("commit_written", 1),
+            ("ckpt_copied", 1),
+            ("ckpt_done", 1),
         ] {
-            v.push(Config {
-                name: format!("{point}:{k}"),
-                arm: "plain",
-                engine: Some(format!("{point}:{k}")),
-                ack: None,
-                inflight_present: present,
-                m1_must_kill: point == "commit_written",
-            });
+            let mut c = config(
+                format!("{point}:{k}"),
+                "plain",
+                Some(format!("{point}:{k}")),
+                None,
+                offset,
+            );
+            if point == "commit_written" {
+                c.must_kill = &["newer_only"];
+            }
+            v.push(c);
         }
-        v.push(Config {
-            name: format!("acked:{k}"),
-            arm: "plain",
-            engine: None,
-            ack: Some(format!("{k}:1")),
-            inflight_present: true,
-            m1_must_kill: false,
-        });
+        v.push(config(
+            format!("acked:{k}"),
+            "plain",
+            None,
+            Some(format!("{k}:1")),
+            1,
+        ));
     }
-    v.push(Config {
-        name: "pinned acked:1:20".into(),
-        arm: "pinned",
-        engine: None,
-        ack: Some("1:20".into()),
-        inflight_present: true,
-        m1_must_kill: true,
-    });
-    for (point, present) in [("restart_wal0", false), ("restart_wal1", false)] {
-        v.push(Config {
-            name: format!("restart {point}:2"),
-            arm: "restart",
-            engine: Some(format!("{point}:2")),
-            ack: None,
-            inflight_present: present,
-            m1_must_kill: false,
-        });
+    let mut pinned = config(
+        "pinned acked:1:20".into(),
+        "pinned",
+        None,
+        Some("1:20".into()),
+        1,
+    );
+    pinned.must_kill = &["newer_only"];
+    v.push(pinned);
+    for point in ["restart_first", "restart_second"] {
+        v.push(config(
+            format!("restart {point}:1"),
+            "restart",
+            Some(format!("{point}:1")),
+            None,
+            0,
+        ));
     }
-    v.push(Config {
-        name: "restart acked:5".into(),
-        arm: "restart",
-        engine: None,
-        ack: Some("restart:5".into()),
-        inflight_present: true,
-        m1_must_kill: false,
-    });
+    v.push(config(
+        "restart acked:5".into(),
+        "restart",
+        None,
+        Some("restart:5".into()),
+        1,
+    ));
+    v.push(config(
+        "truncate acked:5".into(),
+        "truncate",
+        None,
+        Some("restart:5".into()),
+        1,
+    ));
+    let mut tail = config(
+        "tail_lost commit_written:1".into(),
+        "plain",
+        Some("commit_written:1".into()),
+        None,
+        -1,
+    );
+    tail.cut_tail = true;
+    tail.must_kill = &["no_salt_check"];
+    v.push(tail);
+    let mut m2 = config(
+        "M2 restart_first:1".into(),
+        "restart",
+        Some("restart_first:1".into()),
+        None,
+        0,
+    );
+    m2.work_mutant = Some("wal2_first");
+    v.push(m2);
     v
 }
 
-/// PREREG amendment 21: at every registered crash point, recovery keeps every acknowledged
-/// transaction and the in-flight one as registered, nothing else, complete, and the database keeps
-/// working across another switch and a reopen; M1 is killed wherever it is predicted to be.
+/// PREREG amendments 21 and 21a: at every registered crash point, recovery keeps every
+/// acknowledged transaction and the in-flight one as registered, nothing else, complete, and the
+/// database keeps working across another switch and a reopen; each mutant is killed where it is
+/// registered to be.
 #[test]
-#[ignore = "spawns ~110 child processes of this binary (FW2 on in each); run explicitly"]
+#[ignore = "spawns ~150 child processes of this binary (FW2 on in each); run explicitly"]
 fn wal2_recovers_every_committed_txn_at_every_switch_point() {
     let mut failures = Vec::new();
     let mut table = Vec::new();
@@ -354,79 +474,95 @@ fn wal2_recovers_every_committed_txn_at_every_switch_point() {
         if let Some(a) = &c.ack {
             env.push(("WAL2_CRASH_ACK", a.as_str()));
         }
-        let w = child("work", &dir, &env);
-        let werr = String::from_utf8_lossy(&w.stderr).into_owned();
-        let wout = String::from_utf8_lossy(&w.stdout).into_owned();
+        if let Some(m) = c.work_mutant {
+            env.push(("TURSO_WALPIN_WAL2_MUTANT", m));
+        }
+        let w = child("work", &dir, "work", &env);
         #[cfg(unix)]
-        let killed = std::os::unix::process::ExitStatusExt::signal(&w.status) == Some(9);
+        let killed = std::os::unix::process::ExitStatusExt::signal(&w.out.status) == Some(9);
         #[cfg(not(unix))]
-        let killed = !w.status.success();
-        if !(killed && werr.contains("walpin crash point")) {
-            failures.push(format!("{}: point never fired\n{}", c.name, text(&w)));
+        let killed = !w.out.status.success();
+        let fired = String::from_utf8_lossy(&w.out.stderr).contains("walpin crash point");
+        if !(killed && fired) {
+            failures.push(format!("{}: point never fired\n{}", c.name, w.text()));
             continue;
         }
-        let acked = line(&wout, "ack ").map_or(0, |f| f[1].parse::<i64>().unwrap());
-        let want = acked + i64::from(c.inflight_present);
-        // Mutants first, on copies of the crashed directory.
-        let mut mutant_killed = [false; 2];
-        for (m, name) in ["newer_only", "wal0_only"].iter().enumerate() {
+        let acked = w.line("ack ").map_or(0, |f| f[1].parse::<i64>().unwrap());
+        let cut = if c.cut_tail {
+            cut_last_commit(&dir.join("crash.db-wal"))
+        } else {
+            0
+        };
+        let want = acked + c.offset;
+        let good = Some((want, true, want));
+        // Verify mutants first, each on its own copy of the crashed directory.
+        let mut mutants = Vec::new();
+        for name in VERIFY_MUTANTS {
             let copy = tmp.path().join(name);
             copy_dir(&dir, &copy);
-            let out = child("verify", &copy, &[("TURSO_WALPIN_WAL2_MUTANT", *name)]);
-            mutant_killed[m] = verified(&out) != Some((want, true, want));
-        }
-        let v = child("verify", &dir, &[]);
-        let vout = String::from_utf8_lossy(&v.stdout).into_owned();
-        let decision = line(&vout, "decision ").map_or("?".to_string(), |f| f[1].to_string());
-        let got = verified(&v);
-        if got != Some((want, true, want)) {
-            failures.push(format!(
-                "{}: acked {acked}, want exactly 1..={want} complete with meta {want}, got {got:?}\n{}",
-                c.name,
-                text(&v)
+            let out = child(
+                "verify",
+                &copy,
+                "verify",
+                &[("TURSO_WALPIN_WAL2_MUTANT", name)],
+            );
+            let dead = out.verified() != good;
+            if c.must_kill.contains(&name) && !dead {
+                failures.push(format!(
+                    "{}: {name} SURVIVED where it must be killed",
+                    c.name
+                ));
+            }
+            mutants.push(format!(
+                "{name} {}",
+                if dead { "killed" } else { "survived" }
             ));
         }
-        let cont = child("continue", &dir, &[]);
-        let cout = String::from_utf8_lossy(&cont.stdout).into_owned();
-        let switches = line(&cout, "continued ").and_then(|f| f[4].parse::<u64>().ok());
-        if !cont.status.success() || switches.unwrap_or(0) < 1 {
-            failures.push(format!(
-                "{}: continuation failed or made no switch\n{}",
-                c.name,
-                text(&cont)
-            ));
-        }
-        let after = verified(&child("verify", &dir, &[]));
-        let want_after = want + CONTINUE_TXNS;
-        if after != Some((want_after, true, want_after)) {
-            failures.push(format!(
-                "{}: after continuing, want 1..={want_after}, got {after:?}",
-                c.name
-            ));
-        }
-        if c.m1_must_kill && !mutant_killed[0] {
-            failures.push(format!(
-                "{}: M1 (newer_only) SURVIVED where it must be killed",
-                c.name
-            ));
+        let v = child("verify", &dir, "verify", &[]);
+        let decision = v
+            .line("decision ")
+            .map_or("?".to_string(), |f| f[1].to_string());
+        let got = v.verified();
+        let mut continued = None;
+        if c.work_mutant.is_some() {
+            // M2: the correct recovery over the mutant's crash state must fail the check.
+            if got == good {
+                failures.push(format!("{}: M2 SURVIVED where it must be killed", c.name));
+            }
+        } else {
+            if got != good {
+                failures.push(format!(
+                    "{}: acked {acked}, want exactly 1..={want} complete with meta {want}, got {got:?}\n{}",
+                    c.name,
+                    v.text()
+                ));
+            }
+            let cont = child("continue", &dir, "continue", &[]);
+            continued = cont
+                .line("continued ")
+                .and_then(|f| f[4].parse::<u64>().ok());
+            if !cont.out.status.success() || continued.unwrap_or(0) < 1 {
+                failures.push(format!(
+                    "{}: continuation failed or made no switch\n{}",
+                    c.name,
+                    cont.text()
+                ));
+            }
+            let after = child("verify", &dir, "after", &[]).verified();
+            let want_after = want + CONTINUE_TXNS;
+            if after != Some((want_after, true, want_after)) {
+                failures.push(format!(
+                    "{}: after continuing, want 1..={want_after}, got {after:?}",
+                    c.name
+                ));
+            }
         }
         table.push(format!(
-            "{:<24} acked {:>5} want {:>5} decision {} M1 {} M0 {} continued {:?}",
+            "{:<28} acked {:>5} cut {cut} want {:>5} got {got:?} decision {decision} {} continued-switches {continued:?}",
             c.name,
             acked,
             want,
-            decision,
-            if mutant_killed[0] {
-                "killed"
-            } else {
-                "survived"
-            },
-            if mutant_killed[1] {
-                "killed"
-            } else {
-                "survived"
-            },
-            switches
+            mutants.join(" ")
         ));
     }
     eprintln!("wal2 crash table ({} configurations):", table.len());
@@ -439,5 +575,101 @@ fn wal2_recovers_every_committed_txn_at_every_switch_point() {
         failures.len(),
         failures.join("\n")
     );
-    assert_eq!(table.len(), 22, "every registered configuration ran");
+    assert_eq!(table.len(), 25, "every registered configuration ran");
+}
+
+/// Amendment 21a: `Wal2Recovered::decide` against SQLite's walIndexRecover rules (wal.c 2001-2035),
+/// one case per branch. The expected values are read off those rules, not computed by `decide`.
+#[test]
+fn wal2_recovery_decision_follows_sqlites_rules() {
+    let f =
+        |valid: bool, seq: u32, salts: (u32, u32), max_frame: u64, last: (u32, u32)| Wal2FileScan {
+            valid,
+            seq,
+            salts,
+            max_frame,
+            last_checksum: last,
+        };
+    let (ck0, ck1) = ((11, 12), (21, 22));
+    let cases = [
+        // -wal2 follows -wal: both iff -wal2 has a commit and its salts are -wal's last checksum.
+        (
+            "wal2 follows, chained",
+            f(true, 5, (1, 2), 10, ck0),
+            f(true, 6, ck0, 3, ck1),
+            Wal2Recovered::Both { older: 0 },
+        ),
+        (
+            "wal2 follows, salts differ",
+            f(true, 5, (1, 2), 10, ck0),
+            f(true, 6, (9, 9), 3, ck1),
+            Wal2Recovered::Only(0),
+        ),
+        (
+            "wal2 follows, no commit",
+            f(true, 5, (1, 2), 10, ck0),
+            f(true, 6, ck0, 0, ck1),
+            Wal2Recovered::Only(0),
+        ),
+        // -wal follows -wal2: the same the other way round; otherwise -wal2 alone.
+        (
+            "wal follows, chained",
+            f(true, 6, ck1, 3, ck0),
+            f(true, 5, (1, 2), 10, ck1),
+            Wal2Recovered::Both { older: 1 },
+        ),
+        (
+            "wal follows, salts differ",
+            f(true, 6, (9, 9), 3, ck0),
+            f(true, 5, (1, 2), 10, ck1),
+            Wal2Recovered::Only(1),
+        ),
+        (
+            "wal follows, no commit",
+            f(true, 6, ck1, 0, ck0),
+            f(true, 5, (1, 2), 10, ck1),
+            Wal2Recovered::Only(1),
+        ),
+        // Fallback: counters not adjacent, the lower counter's file alone; invalid is highest.
+        (
+            "not adjacent, wal lower",
+            f(true, 3, (1, 2), 10, ck0),
+            f(true, 9, ck0, 3, ck1),
+            Wal2Recovered::Only(0),
+        ),
+        (
+            "not adjacent, wal2 lower",
+            f(true, 9, ck1, 3, ck0),
+            f(true, 3, (1, 2), 10, ck1),
+            Wal2Recovered::Only(1),
+        ),
+        (
+            "wal invalid",
+            f(false, 0, (0, 0), 0, (0, 0)),
+            f(true, 3, (1, 2), 10, ck1),
+            Wal2Recovered::Only(1),
+        ),
+        (
+            "wal2 invalid",
+            f(true, 3, (1, 2), 10, ck0),
+            f(false, 0, (0, 0), 0, (0, 0)),
+            Wal2Recovered::Only(0),
+        ),
+        (
+            "both invalid",
+            f(false, 0, (0, 0), 0, (0, 0)),
+            f(false, 0, (0, 0), 0, (0, 0)),
+            Wal2Recovered::Only(0),
+        ),
+        // turso's u32 counter wraps where SQLite's 4-bit one does.
+        (
+            "wal2 follows across the wrap",
+            f(true, u32::MAX, (1, 2), 10, ck0),
+            f(true, 0, ck0, 3, ck1),
+            Wal2Recovered::Both { older: 0 },
+        ),
+    ];
+    for (what, f0, f1, want) in cases {
+        assert_eq!(Wal2Recovered::decide(&f0, &f1), want, "{what}");
+    }
 }
