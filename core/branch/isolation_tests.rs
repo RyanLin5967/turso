@@ -615,3 +615,129 @@ fn with_z_an_open_branch_reads_an_untouched_table_through_the_backfilled_file() 
     }
     crate::coherence::force_fixes_for_test(0);
 }
+
+/// r11-coherence round 12, VACUUM item: runs `stmt` on the trunk with the refusal-gap hook set to fork a branch from
+/// a second trunk connection, and returns (the fork's result, the statement's result, whether the hook ran).
+fn fork_in_the_refusal_gap(
+    db: &Arc<Database>,
+    trunk: &Arc<Connection>,
+    stmt: &str,
+) -> (Option<Result<Branch>>, Result<()>, bool) {
+    let forker = db.connect().unwrap();
+    let forked = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+    {
+        let (forked, ran) = (forked.clone(), ran.clone());
+        crate::storage::pager::set_branch_refusal_gap_hook_for_test(Box::new(move || {
+            ran.set(true);
+            *forked.borrow_mut() = Some(forker.fork_branch());
+        }));
+    }
+    let result = trunk.execute(stmt);
+    crate::storage::pager::clear_branch_refusal_gap_hook_for_test();
+    let fork = forked.borrow_mut().take();
+    (fork, result, ran.get())
+}
+
+/// r11-coherence round 12, VACUUM item (red first): VACUUM refuses while branches exist, but at 1050cc120 it asks
+/// (`Pager::begin_vacuum_blocking_tx`'s `refuse_if_branching`) BEFORE it takes its exclusive WAL access. A fork that
+/// lands in between leaves a live branch whose pages VACUUM then rewrites with no copy decision. The hook forks exactly
+/// there. The invariant: the fork and the VACUUM never both succeed, and a branch that exists reads its fork's rows.
+/// Freed pages (every other row deleted) make a VACUUM that ran move pages. Both fork-gate masks.
+#[test]
+fn a_fork_in_vacuums_refusal_gap_and_the_vacuum_never_both_succeed() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
+        let expected: Vec<(i64, String)> =
+            (1..=ROWS).filter(|id| id % 2 == 1).map(|id| (id, original(id))).collect();
+        let (fork, vacuum, ran) = fork_in_the_refusal_gap(&db, &trunk, "VACUUM");
+        assert!(ran, "mask {mask}: premise: VACUUM passed its branch check and reached the gap");
+        match (fork.expect("the hook ran"), vacuum) {
+            (Ok(_), Ok(())) => panic!(
+                "mask {mask}: a fork landed between VACUUM's branch check and its exclusive WAL access, and VACUUM still ran"
+            ),
+            (Ok(b), Err(e)) => {
+                assert!(
+                    e.to_string().contains("while branches of this database exist"),
+                    "mask {mask}: VACUUM refused for another reason: {e}"
+                );
+                let bc = b.connect().unwrap();
+                assert_eq!(all_rows(&bc, &format!("mask {mask}: branch after the refused VACUUM")), expected);
+            }
+            (Err(fe), Ok(())) => assert!(
+                matches!(fe, LimboError::Busy),
+                "mask {mask}: the fork in the gap failed with {fe}, not Busy"
+            ),
+            (Err(fe), Err(ve)) => panic!("mask {mask}: both refused: fork {fe}, VACUUM {ve}"),
+        }
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// r11-coherence round 12, VACUUM item (red first): the same gap in `PRAGMA journal_mode`, which runs with no
+/// transaction: its branch check (vdbe/execute.rs) and its page-1 header rewrite are separated by a TRUNCATE
+/// checkpoint and nothing a fork respects. A WAL -> MVCC switch with a live branch is what the check exists to
+/// refuse (a branch of an MVCC database is silently wrong; see `crate::branch`). Invariant as above.
+#[test]
+fn a_fork_in_journal_modes_refusal_gap_and_the_switch_never_both_succeed() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let expected: Vec<(i64, String)> = (1..=ROWS).map(|id| (id, original(id))).collect();
+        let (fork, switch, ran) = fork_in_the_refusal_gap(&db, &trunk, "PRAGMA journal_mode = 'mvcc'");
+        assert!(ran, "mask {mask}: premise: the switch passed its branch check and reached the gap");
+        let mode = trunk
+            .prepare("PRAGMA journal_mode")
+            .unwrap()
+            .run_collect_rows()
+            .map(|r| format!("{:?}", r[0][0]));
+        match (fork.expect("the hook ran"), switch) {
+            (Ok(_), Ok(())) => panic!(
+                "mask {mask}: a fork landed between journal_mode's branch check and its header write, and the switch \
+                 still ran (mode now {mode:?})"
+            ),
+            (Ok(b), Err(e)) => {
+                assert!(
+                    e.to_string().contains("while branches of this database exist"),
+                    "mask {mask}: the switch refused for another reason: {e}"
+                );
+                let bc = b.connect().unwrap();
+                assert_eq!(all_rows(&bc, &format!("mask {mask}: branch after the refused switch")), expected);
+            }
+            (Err(fe), Ok(())) => assert!(
+                matches!(fe, LimboError::Busy),
+                "mask {mask}: the fork in the gap failed with {fe}, not Busy"
+            ),
+            (Err(fe), Err(ve)) => panic!("mask {mask}: both refused: fork {fe}, switch {ve}"),
+        }
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// r11-coherence round 12, VACUUM item: the control. With no branch and no fork, VACUUM and the journal-mode switch still
+/// run, so the fix refuses only when a branch exists.
+#[test]
+fn with_no_branch_vacuum_and_the_journal_mode_switch_still_run() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
+        trunk.execute("VACUUM").unwrap_or_else(|e| panic!("mask {mask}: VACUUM with no branch failed: {e}"));
+        assert_eq!(count(&trunk), ROWS / 2, "mask {mask}: VACUUM lost rows");
+        let rows = trunk
+            .prepare("PRAGMA journal_mode = 'mvcc'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap_or_else(|e| panic!("mask {mask}: the journal-mode switch with no branch failed: {e}"));
+        assert_eq!(format!("{:?}", rows[0][0]).to_lowercase().contains("mvcc"), true, "mask {mask}: the switch did not take: {rows:?}");
+    }
+    crate::coherence::force_fixes_for_test(0);
+}

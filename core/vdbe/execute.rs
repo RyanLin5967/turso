@@ -18152,6 +18152,8 @@ fn op_journal_mode_inner(
                             .to_string(),
                     ));
                 }
+                #[cfg(test)]
+                crate::storage::pager::run_branch_refusal_gap_hook();
 
                 // Check if database is readonly - cannot change journal mode on readonly databases
                 if program.connection.is_readonly(*db) {

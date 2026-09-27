@@ -73,6 +73,32 @@ const PENDING_BYTE: u32 = 0x40000000;
 #[cfg(feature = "autovacuum")]
 use ptrmap::*;
 
+#[cfg(test)]
+thread_local! {
+    static BRANCH_REFUSAL_GAP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Tests (r11-coherence round 12, VACUUM item): run `f` once, on this thread, right after a page-rewriting operation's
+/// branch refusal passed and before the operation holds anything a fork respects: VACUUM between `refuse_if_branching`
+/// and its exclusive WAL access, `PRAGMA journal_mode` between its branch check and the rest of the switch.
+#[cfg(test)]
+pub(crate) fn set_branch_refusal_gap_hook_for_test(f: Box<dyn FnOnce()>) {
+    BRANCH_REFUSAL_GAP_HOOK.with(|h| *h.borrow_mut() = Some(f));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_branch_refusal_gap_hook_for_test() {
+    BRANCH_REFUSAL_GAP_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
+#[cfg(test)]
+pub(crate) fn run_branch_refusal_gap_hook() {
+    if let Some(f) = BRANCH_REFUSAL_GAP_HOOK.with(|h| h.borrow_mut().take()) {
+        f();
+    }
+}
+
 /// What a branch pager's read of a page found in the branch store.
 enum BranchRead {
     /// The page, loaded: from the branch's page space or the shared trunk-page cache.
@@ -3241,6 +3267,8 @@ impl Pager {
     /// and a WAL must be present.
     pub fn begin_vacuum_blocking_tx(&self) -> Result<IOResult<()>> {
         self.refuse_if_branching("VACUUM")?;
+        #[cfg(test)]
+        run_branch_refusal_gap_hook();
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
                 "begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
