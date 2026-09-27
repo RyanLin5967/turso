@@ -192,6 +192,13 @@ struct Args {
     chain: Option<usize>,
     /// Concurrent trunk writer threads during the active arm (amendment 9).
     trunk_writers: usize,
+    /// Interleaved pre-image arm (amendment 14): one trunk rewrite of a leaf every session reads
+    /// between consecutive forks, so the sessions see many retained versions.
+    interleave: bool,
+    /// Cap-engaged scan arm (amendment 14): a table of this many rows, larger than the session
+    /// cache, scanned once by every held session under `PRAGMA cache_size = cache_size`.
+    capscan: Option<i64>,
+    cache_size: Option<i64>,
 }
 
 fn die(msg: &str) -> ! {
@@ -221,6 +228,9 @@ fn parse_args() -> Args {
         preimage: None,
         chain: None,
         trunk_writers: 0,
+        interleave: false,
+        capscan: None,
+        cache_size: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -263,6 +273,13 @@ fn parse_args() -> Args {
             }
             "--trunk-writers" => {
                 args.trunk_writers = val().parse().unwrap_or_else(|_| die("bad --trunk-writers"))
+            }
+            "--interleave" => args.interleave = true,
+            "--capscan" => {
+                args.capscan = Some(val().parse().unwrap_or_else(|_| die("bad --capscan")))
+            }
+            "--cache-size" => {
+                args.cache_size = Some(val().parse().unwrap_or_else(|_| die("bad --cache-size")))
             }
             "--level-floor" => {
                 args.level_floor = val().parse().unwrap_or_else(|_| die("bad --level-floor"))
@@ -872,6 +889,21 @@ fn main() {
         "#\tx\tphase\tsessions\tbytes_mean\tbytes_min\tbytes_max\tallocs_mean\tallocs_min\tallocs_max"
     );
 
+    if b.args.interleave || b.args.capscan.is_some() {
+        let n = *b.args.checkpoints.last().unwrap();
+        if b.args.interleave {
+            interleave_arm(&mut b, n);
+        } else {
+            let cache = b.args.cache_size.unwrap_or_else(|| die("--capscan needs --cache-size"));
+            capscan_arm(&mut b, b.args.capscan.unwrap(), cache, n);
+        }
+        let end = db.branch_stats();
+        if end.live_branches != 0 || end.arena_slots_in_use != 0 {
+            not_a_result(&format!("arm teardown leaked: {end:?}"));
+        }
+        println!("# teardown: every branch freed, arena empty");
+        return;
+    }
     if let Some(d) = b.args.chain {
         let (r, n) = (b.args.preimage.unwrap_or(0), *b.args.checkpoints.last().unwrap());
         chain_arm(&mut b, d, r, n);
@@ -1241,6 +1273,212 @@ fn chain_arm(b: &mut Bench, d: usize, r: usize, n: usize) {
         b.db.slot_clone_count(),
         b.db.retained_clone_count()
     );
+}
+
+/// The interleaved pre-image arm (amendment 14; r11-sessions-refute via the lead). Sessions fork from
+/// the trunk one at a time, and between consecutive forks the trunk rewrites one row on one of the
+/// W = 4 leaves every session reads, round robin. Session i then sees, for each leaf, the version
+/// current at its fork: about n distinct retained versions over the arm, each seen by about W
+/// sessions. Per session: the read's bytes and the store's counters. Per arm: distinct versions
+/// seen, retained versions seen, FS9's clones, and reads per version and per clone.
+fn interleave_arm(b: &mut Bench, n: usize) {
+    const ROWS: [i64; 4] = [1, 602, 1203, 1804];
+    let fs9 = std::env::var("TURSO_R11S_FS9").unwrap_or_default();
+    let fs10 = std::env::var("TURSO_R11S_FS10").unwrap_or_default();
+    let m0 = mem();
+    let arena0 = b.db.branch_stats().arena_slots_in_use;
+    let mut held = Vec::with_capacity(n);
+    for i in 0..n {
+        let at_fork = b.model.writes;
+        let br = b.trunk.fork_branch().unwrap();
+        let conn = br.connect().unwrap();
+        held.push((br, conn, at_fork));
+        let row = ROWS[i % ROWS.len()];
+        let g = b.model.record(row);
+        b.trunk
+            .execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_gen_value(g)))
+            .unwrap();
+    }
+    let m1 = mem();
+    let arena1 = b.db.branch_stats().arena_slots_in_use;
+    let names = [
+        "read_bytes",
+        "resolves",
+        "trunk_page_hits",
+        "trunk_page_misses",
+        "retained_copies",
+        "retained_shared_hits",
+        "retained_clone_fills",
+        "cached_pages_idle",
+    ];
+    let mut accs: [Acc; 8] = Default::default();
+    let mut first = None;
+    let mut versions = std::collections::HashSet::new();
+    let mut retained = std::collections::HashSet::new();
+    let (mut retained_reads, mut shared_hits) = (0i64, 0i64);
+    for (i, (_, conn, at_fork)) in held.iter().enumerate() {
+        let (ma, w0) = (mem(), b.db.branch_stats().work);
+        for &row in &ROWS {
+            let got = read_v(conn, row);
+            let want = b.model.value_at(row, *at_fork);
+            if got != want {
+                not_a_result(&format!("interleave arm: session {i} read {got} for row {row}, want {want}"));
+            }
+            let (v, len) = b.model.history.get(&row).map_or((0, 0), |h| {
+                (h.partition_point(|&(seq, _)| seq < *at_fork), h.len())
+            });
+            versions.insert((row, v));
+            if v < len {
+                retained.insert((row, v));
+            }
+        }
+        let (mb, w1) = (mem(), b.db.branch_stats().work);
+        let d = |f: fn(&turso_core::branch::BranchWork) -> u64| (f(&w1) - f(&w0)) as i64;
+        let row = [
+            mb.bytes - ma.bytes,
+            d(|w| w.resolve_calls),
+            d(|w| w.trunk_page_hits),
+            d(|w| w.trunk_page_misses),
+            d(|w| w.retained_copies),
+            d(|w| w.retained_shared_hits),
+            d(|w| w.retained_clone_fills),
+            conn.session_footprint().cached_pages as i64,
+        ];
+        retained_reads += row[4] + row[5] + row[6];
+        shared_hits += row[5] + row[6];
+        if i == 0 {
+            first = Some(row);
+            continue;
+        }
+        for (a, v) in accs.iter_mut().zip(row) {
+            a.add(v);
+        }
+    }
+    let m2 = mem();
+    let clones = b.db.retained_clone_count();
+    println!(
+        "# interleave n={n} w=4 fs9={fs9:?} fs10={fs10:?} first_session={first:?} ({})",
+        names.join(", ")
+    );
+    for (name, a) in names.iter().zip(&accs) {
+        println!("interleave\t{n}\t{name}\t{}\t{:.2}\t{}\t{}", a.n, a.mean(), a.min, a.max);
+    }
+    println!(
+        "# interleave n={n} distinct_versions={} retained_versions={} retained_reads={retained_reads} \
+         retained_clones={clones} reads_per_retained_version={:.3} shared_reads_per_clone={:.3} \
+         arena_before={arena0} arena_after_forks={arena1}",
+        versions.len(),
+        retained.len(),
+        retained_reads as f64 / retained.len().max(1) as f64,
+        shared_hits as f64 / clones.max(1) as f64,
+    );
+    println!(
+        "# interleave n={n} bytes_per_session: forks_and_rewrites={:.2} reads={:.2} total={:.2}",
+        (m1.bytes - m0.bytes) as f64 / n as f64,
+        (m2.bytes - m1.bytes) as f64 / n as f64,
+        (m2.bytes - m0.bytes) as f64 / n as f64,
+    );
+    for (br, conn, _) in held {
+        drop(conn);
+        br.reap().unwrap();
+    }
+    println!(
+        "# interleave n={n} after teardown retained_clones={} slot_clones={}",
+        b.db.retained_clone_count(),
+        b.db.slot_clone_count()
+    );
+}
+
+/// The cap-engaged scan arm (amendment 14; r11-sessions-refute via the lead). A table `big` of
+/// `rows` rows, many more pages than a session's cache holds. Every held session sets
+/// `PRAGMA cache_size = cache` (above the 2,000-page default, below the table) and scans `big` once,
+/// so the cache's cap engages and evicts during the scan. Per session: the bytes the idle session
+/// keeps after its scan, its cached pages and capacity, and the store's counters for the scan.
+fn capscan_arm(b: &mut Bench, rows: i64, cache: i64, n: usize) {
+    let fs10 = std::env::var("TURSO_R11S_FS10").unwrap_or_default();
+    b.trunk
+        .execute("CREATE TABLE big(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    b.trunk.execute("BEGIN").unwrap();
+    for id in 1..=rows {
+        b.trunk
+            .execute(format!("INSERT INTO big VALUES ({id}, '{}')", trunk_value(id)))
+            .unwrap();
+    }
+    b.trunk.execute("COMMIT").unwrap();
+    let int = |sql: &str| -> i64 {
+        b.trunk.prepare(sql).unwrap().run_collect_rows().unwrap()[0][0]
+            .as_int()
+            .unwrap()
+    };
+    let page_count = int("PRAGMA page_count");
+    println!(
+        "# capscan rows={rows} db_pages={page_count} cache_size={cache} n={n} fs10={fs10:?}"
+    );
+    let names = [
+        "idle_bytes",
+        "cached_pages_idle",
+        "cache_capacity",
+        "resolves",
+        "trunk_page_hits",
+        "trunk_page_misses",
+    ];
+    let mut accs: [Acc; 6] = Default::default();
+    let mut first = None;
+    let mut held = Vec::with_capacity(n);
+    let want = (rows, rows * VALUE_LEN as i64);
+    let m0 = mem();
+    for i in 0..n {
+        let (ma, w0) = (mem(), b.db.branch_stats().work);
+        let br = b.trunk.fork_branch().unwrap();
+        let conn = br.connect().unwrap();
+        conn.execute(format!("PRAGMA cache_size = {cache}")).unwrap();
+        let got = conn
+            .prepare("SELECT count(*), sum(length(v)) FROM big")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        if (got[0][0].as_int(), got[0][1].as_int()) != (Some(want.0), Some(want.1)) {
+            not_a_result(&format!("capscan: session {i} scanned {:?}", got[0]));
+        }
+        let (mb, w1) = (mem(), b.db.branch_stats().work);
+        let f = conn.session_footprint();
+        let d = |f: fn(&turso_core::branch::BranchWork) -> u64| (f(&w1) - f(&w0)) as i64;
+        let row = [
+            mb.bytes - ma.bytes,
+            f.cached_pages as i64,
+            f.cache_capacity as i64,
+            d(|w| w.resolve_calls),
+            d(|w| w.trunk_page_hits),
+            d(|w| w.trunk_page_misses),
+        ];
+        held.push((br, conn));
+        if i == 0 {
+            first = Some(row);
+            continue;
+        }
+        for (a, v) in accs.iter_mut().zip(row) {
+            a.add(v);
+        }
+    }
+    let m1 = mem();
+    println!(
+        "# capscan n={n} first_session={first:?} ({})",
+        names.join(", ")
+    );
+    for (name, a) in names.iter().zip(&accs) {
+        println!("capscan\t{n}\t{name}\t{}\t{:.2}\t{}\t{}", a.n, a.mean(), a.min, a.max);
+    }
+    println!(
+        "# capscan n={n} bytes_per_session={:.2} trunk_cache_pages={} rss_bytes={}",
+        (m1.bytes - m0.bytes) as f64 / n as f64,
+        b.db.trunk_cache_pages(),
+        rss_bytes()
+    );
+    for (br, conn) in held {
+        drop(conn);
+        br.reap().unwrap();
+    }
 }
 
 /// Concurrent trunk writers for the active arm (amendment 9): each thread has its own trunk
