@@ -3159,8 +3159,9 @@ impl Pager {
         };
         let changed = wal.begin_read_tx()?;
         if changed {
-            if let Some(branch) = self.branch.get() {
-                // Observation only (amendment 8.2): a branch's cache emptied by a trunk commit.
+            if let Some(branch) = self.branch.get().filter(|_| crate::coherence::ENABLED) {
+                // Observation only (amendment 8.2): a branch's cache emptied by a trunk commit. Counting
+                // builds only (r12 E1): the store's count is a shared line, kept out of timed builds.
                 self.branch_cache_clears.fetch_add(1, Ordering::Relaxed);
                 branch.store.note_branch_cache_clear();
             }
@@ -3720,7 +3721,10 @@ impl Pager {
             ));
         }
         let buf = Arc::new(self.buffer_pool.get_page());
-        let cause = {
+        let cause = if !crate::coherence::ENABLED {
+            // Timed builds do not class resolves (r12 E1): the log is a map insert per resolve.
+            ResolveCause::Untracked
+        } else {
             // Observation only (amendment 8.2): class this resolve against this connection's past.
             let clears = self.branch_cache_clears.load(Ordering::Relaxed);
             match self
