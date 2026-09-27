@@ -3432,7 +3432,7 @@ impl Pager {
             }
             pages
         };
-        branch.store.commit_pages(branch.id, &dirty)?;
+        let committed = branch.store.commit_pages(branch.id, &dirty)?;
         // Publish the connection's schema when DDL changed it, and also when the connection holds a
         // private copy for any other reason (an ANALYZE on this branch refreshed its stats): branch
         // connections share the store's schema instead of reloading stats at connect (FS3), so the
@@ -3448,6 +3448,10 @@ impl Pager {
         }
         for page in &dirty {
             page.clear_dirty();
+        }
+        // FS11: each committed page now holds its slot's bytes by reference, not its own copy.
+        for (page, bytes) in dirty.iter().zip(committed) {
+            hold_committed_by_reference(page, bytes, &self.shared_cached);
         }
         self.dirty_pages.write().clear();
         branch.store.end_write(branch.id);
@@ -7518,4 +7522,20 @@ fn hold_filled_by_reference(
         page.get().buffer = Some(Arc::new(Buffer::new_shared(bytes)));
         shared_cached.store(true, Ordering::Release);
     }
+}
+
+/// FS11 (r11-sessions amendment 15): a branch page just committed into its arena slot holds the
+/// slot's bytes (`bytes`, the same content) by reference instead of its own buffer, which goes back
+/// to the pool; its next write copies first, as for any page held by reference.
+fn hold_committed_by_reference(
+    page: &Page,
+    bytes: Arc<crate::alloc::DynBoxedSlice<u8>>,
+    shared_cached: &AtomicBool,
+) {
+    #[cfg(test)]
+    if crate::branch::store::mutants::on("FS11_COMMIT_COPY") {
+        return;
+    }
+    page.get().buffer = Some(Arc::new(Buffer::new_shared(bytes)));
+    shared_cached.store(true, Ordering::Release);
 }

@@ -145,6 +145,11 @@ pub(crate) struct BranchStore {
     /// WAL or the file and fills F6 with it then holds F6's bytes, not its own copy
     /// (`TURSO_R11S_FS10=2`, which also turns FS10 on).
     fs10_fill: AtomicBool,
+    /// FS11 (r11-sessions amendment 15): every version the arena holds for a branch (its own current
+    /// page, an ancestor branch's version, a trunk pre-image) is served by reference from its slot,
+    /// and a committed page is held by reference from the slot it was committed into
+    /// (`TURSO_R11S_FS11=1`). Supersedes FS9's and FS9B's clone caches while on.
+    fs11: AtomicBool,
     /// FS9B (r11-sessions): serve inherited ancestor-branch versions by reference (`Arena::clones`).
     fs9b: AtomicBool,
 }
@@ -625,6 +630,7 @@ impl BranchStore {
                 std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "1" || v == "2"),
             ),
             fs10_fill: AtomicBool::new(std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "2")),
+            fs11: AtomicBool::new(std::env::var("TURSO_R11S_FS11").is_ok_and(|v| v == "1")),
             fs9b: AtomicBool::new(fs9b_from_env()),
         }
     }
@@ -670,6 +676,10 @@ impl BranchStore {
 
     pub(crate) fn fs10(&self) -> bool {
         self.fs10.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_fs11(&self, on: bool) {
+        self.fs11.store(on, Ordering::Relaxed);
     }
 
     pub(crate) fn set_fs10_fill(&self, on: bool) {
@@ -968,17 +978,25 @@ impl BranchStore {
         trunk.written.insert(page, epoch);
     }
 
-    /// Commit a branch's dirty pages into the slots their copy decisions allocated.
-    pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
+    /// Commit a branch's dirty pages into the slots their copy decisions allocated. Under FS11 it
+    /// returns each committed slot's bytes, in `pages` order, for the pager to hold by reference
+    /// instead of its own copy; otherwise nothing.
+    pub(crate) fn commit_pages(
+        &self,
+        id: BranchId,
+        pages: &[PageRef],
+    ) -> Result<Vec<Arc<crate::alloc::DynBoxedSlice<u8>>>> {
+        let fs11 = self.fs11.load(Ordering::Relaxed);
         let mut inner = self.lock();
         let StoreInner {
             arena, branches, ..
         } = &mut *inner;
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if pages.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
+        let mut refs = Vec::with_capacity(if fs11 { pages.len() } else { 0 });
         for page in pages {
             let no = page.get().id as u32;
             let owned = st.current.get(&no).copied().ok_or_else(|| {
@@ -994,8 +1012,11 @@ impl BranchStore {
             arena
                 .page_mut(owned.slot)
                 .copy_from_slice(page.get_contents().as_slice());
+            if fs11 {
+                refs.push(arena.shared_ref(owned.slot));
+            }
         }
-        Ok(())
+        Ok(refs)
     }
 
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
@@ -1033,8 +1054,29 @@ impl BranchStore {
         inner.work.resolve_calls += 1;
         inner.work.resolve_levels += levels;
         inner.work.resolve_retained_examined += examined;
-        let slot = match resolved? {
-            // The branch's own current page stays a private copy: it is the page the branch writes.
+        let resolved = resolved?;
+        if let Origin::Arena(slot) | Origin::Inherited(slot) | Origin::TrunkRetained { slot, .. } =
+            resolved
+        {
+            #[cfg(test)]
+            let fs11 = self.fs11.load(Ordering::Relaxed) && !mutants::on("FS11_READ_COPY");
+            #[cfg(not(test))]
+            let fs11 = self.fs11.load(Ordering::Relaxed);
+            if share && fs11 {
+                // FS11: the slot's own bytes, by reference. The pager copies before its first write.
+                let StoreInner { arena, work, .. } = &mut *inner;
+                work.slot_ref_hits += 1;
+                return Ok(Resolved::Shared(
+                    arena
+                        .as_ref()
+                        .expect("a slot resolved, so the arena exists")
+                        .shared_ref(slot),
+                ));
+            }
+        }
+        let slot = match resolved {
+            // Without FS11 the branch's own current page is a private copy: it is the page the
+            // branch writes.
             Origin::Arena(slot) => slot,
             Origin::Inherited(slot) => {
                 if share && self.fs9b.load(Ordering::Relaxed) {
@@ -1127,7 +1169,10 @@ impl BranchStore {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
-            work: inner.work,
+            work: BranchWork {
+                slot_unshared_writes: inner.arena.as_ref().map_or(0, |a| a.unshared_writes()),
+                ..inner.work
+            },
         }
     }
 

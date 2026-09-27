@@ -1205,6 +1205,62 @@ fn the_first_reader_holds_the_trunk_page_it_filled_by_reference() {
     assert_eq!(value(&trunk, 20), Some(original(20)));
 }
 
+/// FS11 (r11-sessions amendment 15). Every version the arena holds is read by reference from its
+/// slot: the branch's own page, a version an ancestor branch holds for a child, and a trunk
+/// pre-image. A page a session committed is held by reference from the slot it went into, so an
+/// idle writer keeps no private copy of it (`FS11_COMMIT_COPY` keeps the copy; `FS11_READ_COPY`
+/// copies on read). Writes still copy first: the child, the trunk and the other connection keep
+/// their versions.
+#[test]
+fn arena_versions_are_read_by_reference_and_an_idle_writer_keeps_no_copy() {
+    let (_dir, db) = open_db();
+    db.set_fs10(true);
+    db.set_fs10_fill(true);
+    db.set_fs11(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let start = db.branch_stats().work;
+    let b = trunk.fork_branch().unwrap();
+    let c = b.connect().unwrap();
+    set(&c, 10, "b-v1");
+    assert_eq!(
+        c.pager.load().page_cache_len(),
+        0,
+        "the writer kept a private copy of the page it committed"
+    );
+    // A second connection on the branch reads the branch's own page by reference.
+    let c2 = b.connect().unwrap();
+    let before = db.branch_stats().work;
+    assert_eq!(value(&c2, 10), Some("b-v1".to_string()));
+    assert!(
+        db.branch_stats().work.slot_ref_hits > before.slot_ref_hits,
+        "the branch's own page was not read by reference"
+    );
+    // A child reads b's version through its inherited map; b rewrites; each keeps its version.
+    let child = b.fork().unwrap();
+    let cc = child.connect().unwrap();
+    assert_eq!(value(&cc, 10), Some("b-v1".to_string()));
+    set(&c, 10, "b-v2");
+    assert_eq!(value(&cc, 10), Some("b-v1".to_string()));
+    assert_eq!(value(&c, 10), Some("b-v2".to_string()));
+    assert_eq!(value(&trunk, 10), Some(original(10)));
+    // A trunk pre-image is read by reference too.
+    let b3 = trunk.fork_branch().unwrap();
+    let c3 = b3.connect().unwrap();
+    set(&trunk, 20, "trunk-v1");
+    assert_eq!(value(&c3, 20), Some(original(20)));
+    assert_eq!(value(&trunk, 20), Some("trunk-v1".to_string()));
+    let end = db.branch_stats().work;
+    assert_eq!(end.inherited_copies - start.inherited_copies, 0, "an ancestor's version was copied");
+    assert_eq!(end.retained_copies - start.retained_copies, 0, "a trunk pre-image was copied");
+    assert_eq!(
+        (end.retained_clone_fills - start.retained_clone_fills)
+            + (end.inherited_clone_fills - start.inherited_clone_fills),
+        0,
+        "a clone was built for a version the slot already holds"
+    );
+}
+
 /// FS9B. Branches forked from a chain read a version an interior ANCESTOR branch holds for them
 /// (its retained pre-image, and its current page) by reference, one shared copy per slot; the copy
 /// goes when the slot is released (`FS9B_NO_EVICT` keeps it) or written: once no child can see a

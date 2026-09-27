@@ -297,6 +297,12 @@ pub struct BranchWork {
     pub inherited_shared_hits: u64,
     /// FS9B: slot clones built, one copy per inherited slot, on its first resolution.
     pub inherited_clone_fills: u64,
+    /// FS11: resolutions answered with an arena slot's own bytes by reference (the branch's own
+    /// page, an ancestor branch's version, or a trunk pre-image).
+    pub slot_ref_hits: u64,
+    /// FS11: writes to a slot whose bytes a reader held, which gave the slot a fresh copy (read
+    /// from the arena at `stats`, not counted in `work` itself).
+    pub slot_unshared_writes: u64,
 }
 
 impl Branch {
@@ -532,6 +538,14 @@ impl Database {
     #[doc(hidden)]
     pub fn set_fs10_fill(&self, on: bool) {
         self.branches.set_fs10_fill(on);
+    }
+
+    /// FS11 (r11-sessions amendment 15): arena versions are served by reference from their slots,
+    /// and a branch's committed page is held by reference from its slot. Normally taken from
+    /// `TURSO_R11S_FS11=1`; tests set it per database.
+    #[doc(hidden)]
+    pub fn set_fs11(&self, on: bool) {
+        self.branches.set_fs11(on);
     }
 
     /// Trunk pages held in the shared trunk-page cache (the FS10 pool's size). Observation only.

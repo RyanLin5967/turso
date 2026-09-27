@@ -16,13 +16,23 @@ use crate::turso_assert;
 /// Index of a page-sized slot in the arena.
 pub(crate) type Slot = u32;
 
-/// Slots per allocation. Chunks are zero-filled through the allocator, so the OS backs a chunk with
-/// memory only as its slots are touched; the chunk size bounds the granularity, not the footprint.
+/// Slots the slot table grows by at a time.
 const SLOTS_PER_CHUNK: usize = 256;
+
+/// One slot's page: its own shared allocation, so a reader can hold a version's bytes by reference
+/// (FS11) instead of copying them.
+type SlotBytes = crate::sync::Arc<crate::alloc::DynBoxedSlice<u8>>;
 
 pub(crate) struct Arena {
     page_size: usize,
-    chunks: Vec<Box<[u8]>>,
+    /// Each slot's page (r11-sessions FS11; before it, 256-slot chunks). `None` only for a free slot
+    /// whose bytes a reader still held when it was released: it gets a fresh page when reused.
+    /// A slot's bytes are written only while the arena holds the sole reference: a write to bytes
+    /// a reader holds first gives the slot a fresh copy (`page_mut`), so a reader's version never
+    /// changes under it.
+    slots: Vec<Option<SlotBytes>>,
+    /// FS11: writes that found a reader holding the slot's bytes and gave the slot a fresh copy.
+    unshared_writes: u64,
     /// Slots below this have been handed out at least once.
     high_water: u32,
     free: Vec<Slot>,
@@ -42,7 +52,8 @@ impl Arena {
     pub(crate) fn new(page_size: usize) -> Self {
         Self {
             page_size,
-            chunks: Vec::new(),
+            slots: Vec::new(),
+            unshared_writes: 0,
             high_water: 0,
             free: Vec::new(),
             free_bits: Vec::new(),
@@ -68,6 +79,26 @@ impl Arena {
         self.clones.len()
     }
 
+    /// FS11: `slot`'s bytes by reference. The holder keeps this version: a later write to the slot
+    /// goes to a fresh copy (`page_mut`), and a release leaves the bytes to the holder.
+    pub(crate) fn shared_ref(&self, slot: Slot) -> SlotBytes {
+        turso_assert!(slot < self.high_water, "arena slot out of range");
+        turso_assert!(!self.is_free(slot), "access to a free arena slot");
+        self.slots[slot as usize]
+            .as_ref()
+            .expect("a slot in use has its page")
+            .clone()
+    }
+
+    /// FS11: writes that gave a slot a fresh copy because a reader held its bytes.
+    pub(crate) fn unshared_writes(&self) -> u64 {
+        self.unshared_writes
+    }
+
+    fn fresh_page(&self) -> SlotBytes {
+        crate::sync::Arc::new(vec![0u8; self.page_size].into_boxed_slice())
+    }
+
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
     }
@@ -75,14 +106,16 @@ impl Arena {
     pub(crate) fn alloc(&mut self) -> Slot {
         if let Some(slot) = self.free.pop() {
             self.set_free_bit(slot, false);
+            if self.slots[slot as usize].is_none() {
+                self.slots[slot as usize] = Some(self.fresh_page());
+            }
             return slot;
         }
         let slot = self.high_water;
-        let chunk = slot as usize / SLOTS_PER_CHUNK;
-        if chunk == self.chunks.len() {
-            self.chunks
-                .push(vec![0u8; SLOTS_PER_CHUNK * self.page_size].into_boxed_slice());
+        if self.slots.len() == self.slots.capacity() {
+            self.slots.reserve(SLOTS_PER_CHUNK);
         }
+        self.slots.push(Some(self.fresh_page()));
         self.high_water += 1;
         let words = (self.high_water as usize).div_ceil(64);
         if self.free_bits.len() < words {
@@ -100,6 +133,14 @@ impl Arena {
         let evict = true;
         if evict {
             self.clones.remove(&slot);
+        }
+        // A reader holding this version keeps it; the slot's next owner gets a fresh page.
+        let bytes = &mut self.slots[slot as usize];
+        if bytes
+            .as_mut()
+            .is_some_and(|b| crate::sync::Arc::get_mut(b).is_none())
+        {
+            *bytes = None;
         }
         self.set_free_bit(slot, true);
         self.free.push(slot);
@@ -126,8 +167,10 @@ impl Arena {
     }
 
     pub(crate) fn page(&self, slot: Slot) -> &[u8] {
-        let (chunk, offset) = self.locate(slot);
-        &self.chunks[chunk][offset..offset + self.page_size]
+        self.locate(slot);
+        self.slots[slot as usize]
+            .as_ref()
+            .expect("a slot in use has its page")
     }
 
     pub(crate) fn page_mut(&mut self, slot: Slot) -> &mut [u8] {
@@ -141,19 +184,28 @@ impl Arena {
         if evict {
             self.clones.remove(&slot);
         }
-        let (chunk, offset) = self.locate(slot);
-        let page_size = self.page_size;
-        &mut self.chunks[chunk][offset..offset + page_size]
+        self.locate(slot);
+        let bytes = self.slots[slot as usize]
+            .as_mut()
+            .expect("a slot in use has its page");
+        if crate::sync::Arc::get_mut(bytes).is_none() {
+            // FS11: a reader holds this version's bytes. It keeps them; the slot takes a copy.
+            #[cfg(test)]
+            if super::store::mutants::on("FS11_WRITE_SHARED") {
+                let shared = crate::sync::Arc::as_ptr(bytes) as *mut crate::alloc::DynBoxedSlice<u8>;
+                // SAFETY: none. The mutant writes through bytes a reader holds, which is the defect
+                // the arena test exists to catch.
+                return unsafe { &mut (*shared)[..] };
+            }
+            *bytes = crate::sync::Arc::new(bytes.to_vec().into_boxed_slice());
+            self.unshared_writes += 1;
+        }
+        &mut crate::sync::Arc::get_mut(bytes).expect("the slot's bytes were just made unique")[..]
     }
 
-    fn locate(&self, slot: Slot) -> (usize, usize) {
+    fn locate(&self, slot: Slot) {
         turso_assert!(slot < self.high_water, "arena slot out of range");
         turso_assert!(!self.is_free(slot), "access to a free arena slot");
-        let slot = slot as usize;
-        (
-            slot / SLOTS_PER_CHUNK,
-            (slot % SLOTS_PER_CHUNK) * self.page_size,
-        )
     }
 
     fn set_free_bit(&mut self, slot: Slot, free: bool) {
@@ -201,6 +253,28 @@ mod tests {
         let a = arena.alloc();
         arena.release(a);
         arena.release(a);
+    }
+
+    /// FS11: a reader holding a slot's bytes keeps its version through a write to the slot, the
+    /// slot's release, and the slot's reuse (`FS11_WRITE_SHARED` writes through them).
+    #[test]
+    fn a_slot_written_while_a_reader_holds_it_leaves_the_reader_its_version() {
+        let mut arena = Arena::new(64);
+        let s = arena.alloc();
+        arena.page_mut(s).fill(1);
+        let held = arena.shared_ref(s);
+        arena.page_mut(s).fill(2);
+        assert!(held.iter().all(|&x| x == 1), "a write reached bytes a reader holds");
+        assert!(arena.page(s).iter().all(|&x| x == 2), "the slot lost its own write");
+        assert_eq!(arena.unshared_writes(), 1);
+        let held2 = arena.shared_ref(s);
+        arena.release(s);
+        let t = arena.alloc();
+        assert_eq!(t, s, "the free list must be drained before the arena grows");
+        arena.page_mut(t).fill(3);
+        assert!(held2.iter().all(|&x| x == 2), "a reused slot wrote into bytes a reader holds");
+        assert!(held.iter().all(|&x| x == 1));
+        assert!(arena.page(t).iter().all(|&x| x == 3));
     }
 
     #[test]
