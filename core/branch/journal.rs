@@ -69,6 +69,8 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// them before the log, so the two are refused, never mixed.
 const FORMAT_VERSION: u32 = 3;
 const LOG_HEADER_LEN: usize = 32;
+/// An empty flight's end frame: the frame header and a `FlightEnd` payload (tag, u64, u32).
+const EMPTY_FLIGHT_LEN: u64 = (FRAME_HEADER_LEN + 1 + 8 + 4) as u64;
 const FRAME_HEADER_LEN: usize = 8;
 /// Compact once the log is larger than this and larger than twice the last snapshot, so the log is
 /// never more than a constant factor of the live state and compaction work is amortised O(1).
@@ -501,6 +503,10 @@ pub(crate) struct Journal {
     /// Frame bytes ever buffered by this journal: the log sequence number a group flush makes
     /// durable up to (r11-churn amendment 4). Monotone across compactions, unlike `len`.
     lsn: u64,
+    /// This log is written in flights from its first byte: every header this journal writes is
+    /// followed by an empty flight's end frame, so recovery reads it by the flight rule even before
+    /// its first flight (`Journal::mark_flights`, r12-noforce).
+    marked: bool,
 }
 
 impl Journal {
@@ -557,7 +563,20 @@ impl Journal {
             pid: std::process::id(),
             fail_next_write: false,
             lsn: 0,
+            marked: false,
         })
+    }
+
+    /// Write every later header with an empty flight's end frame after it, so the log is read by the
+    /// flight rule from its first byte (the store's journals; `Journal::flush`'s tests keep the old
+    /// rule). A header already written stays as it is until the next reset.
+    pub(crate) fn mark_flights(&mut self) {
+        self.marked = true;
+    }
+
+    /// The length of a log that holds no record: its header, and its empty flight when marked.
+    fn empty_len(&self) -> u64 {
+        LOG_HEADER_LEN as u64 + if self.marked { EMPTY_FLIGHT_LEN } else { 0 }
     }
 
     /// The second half of `create`: write the generation-0 header and make its directory entry
@@ -587,7 +606,7 @@ impl Journal {
     /// written for that attempt's page size, and the retry's is the one the arena will use.
     pub(crate) fn restart(&mut self, page_size: usize) -> Result<()> {
         self.check_live()?;
-        if self.len != LOG_HEADER_LEN as u64 || !self.pending.is_empty() {
+        if self.len != self.empty_len() || !self.pending.is_empty() {
             return Err(LimboError::InternalError(
                 "branch log holds records; it cannot change page size".to_string(),
             ));
@@ -645,6 +664,7 @@ impl Journal {
             pid: std::process::id(),
             fail_next_write: false,
             lsn: 0,
+            marked: false,
         };
 
         let mut records = Vec::new();
@@ -656,8 +676,13 @@ impl Journal {
                 let mut pos = LOG_HEADER_LEN;
                 // Where the last whole flight ends, and how many records precede it (`FlightEnd`).
                 let mut flight_end: Option<(usize, usize)> = None;
+                // How the scan stopped: `None` at the clean end of the file, else what it met.
+                let mut damage: Option<&str> = None;
                 loop {
                     let Some(frame) = bytes.get(pos..pos + FRAME_HEADER_LEN) else {
+                        if pos < bytes.len() {
+                            damage = Some("a short frame");
+                        }
                         break;
                     };
                     let len = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
@@ -666,50 +691,17 @@ impl Journal {
                     // byte. It needs its own test, because crc32c of nothing is 0 — a zero-filled
                     // header (a file size made durable before its data) passes the CRC below and
                     // would be reported as corruption (review 4 O1).
-                    //
-                    // Torn ONLY if nothing valid follows (review 5 O1-1, the lead's decision): a
-                    // zeroed hole with a whole frame after it means a later write survived and an
-                    // earlier one did not — under macOS plain fsync, possibly an acknowledged one.
-                    // That is Corrupt, loudly, and the log is left as it is.
                     if len == 0 {
-                        // Unless the hole lies inside the LAST flight, whose end frame reached the
-                        // disk before its first block did: a flight written and never synced, so
-                        // never acknowledged (r12-noforce: every commit flight now carries a page
-                        // image, so it spans blocks). Cut it there like any torn tail.
-                        if in_the_last_flight(&bytes, pos) {
-                            break;
-                        }
-                        if let Some(at) = first_whole_frame_after(&bytes, pos + 1) {
-                            // No truncation is offered (review 7 item 1, the lead's decision): it
-                            // is safe only if the records past the hole were never acknowledged.
-                            // Flights now end in `FlightEnd` frames, and a hole inside the LAST
-                            // flight was cut above; a whole frame beyond it means an earlier write
-                            // was lost under a later one, which may have been acknowledged.
-                            return Err(corrupt(&format!(
-                                "branch log {log}: a zeroed region at byte {pos} is followed by a \
-                                 whole record at byte {at}, so this is not a torn tail. The records \
-                                 after the hole may have been acknowledged, and nothing in the log \
-                                 tells acknowledged records from unacknowledged ones, so cutting \
-                                 the log at the hole is not safe: it would drop trunk pre-image \
-                                 records whose trunk commits are durable, and branches forked \
-                                 before them would then read newer trunk pages without any error. \
-                                 The safe remedy: keep a copy of all three branch files ({log}, \
-                                 {arena}, {snap}) — a restore needs all three, and is safe only \
-                                 while the trunk has not been written since they were moved aside \
-                                 — then move all three aside. Every branch is lost; the trunk is \
-                                 intact, because it never depends on branch files",
-                                log = files.log.display(),
-                                arena = files.arena.display(),
-                                snap = files.snap.display()
-                            )));
-                        }
+                        damage = Some("a zeroed region");
                         break;
                     }
                     let start = pos + FRAME_HEADER_LEN;
                     let Some(payload) = bytes.get(start..start + len) else {
+                        damage = Some("a short frame");
                         break;
                     };
                     if crc32c::crc32c(payload) != crc {
+                        damage = Some("a damaged frame");
                         break;
                     }
                     let record =
@@ -720,11 +712,12 @@ impl Journal {
                     } = record
                     {
                         // An end frame whose checksum does not cover the frames before it ends no
-                        // whole flight: stop here, as at any torn frame.
+                        // whole flight: damage, as at any torn frame.
                         let whole = bytes
                             .get(from as usize..pos)
                             .is_some_and(|flight| crc32c::crc32c(flight) == flight_crc);
                         if !whole {
+                            damage = Some("a flight whose checksum fails");
                             break;
                         }
                         pos = start + len;
@@ -733,6 +726,49 @@ impl Journal {
                     }
                     records.push(record);
                     pos = start + len;
+                }
+                if let Some(what) = damage {
+                    // Is the damage a torn tail — nothing acknowledged lost — or an earlier write
+                    // lost under a later one that may have been acknowledged (under macOS plain
+                    // fsync)? That is Corrupt, loudly, and the log is left as it is (review 5
+                    // O1-1, the lead's decision).
+                    //
+                    // A log written in flights (r12-noforce; the store marks its logs from their
+                    // first byte, `Journal::mark_flights`) answers it for ANY damage: a flight is
+                    // synced whole before the next one is written, so the damage is a torn tail
+                    // unless a WHOLE later flight follows it — a whole end frame naming a start past
+                    // the damage. The flight the damage lies in was never acknowledged, whatever
+                    // survived of it, and is cut below.
+                    //
+                    // A log with no end frame at all (only `Journal::flush` writes one, in tests)
+                    // keeps the rule it always had: a zeroed frame with any whole frame after it is
+                    // Corrupt; other damage is a torn tail.
+                    let later = if flight_end.is_some() || first_flight_end_after(&bytes, pos).is_some() {
+                        later_whole_flight(&bytes, pos)
+                    } else if what == "a zeroed region" {
+                        first_whole_frame_after(&bytes, pos + 1)
+                    } else {
+                        None
+                    };
+                    if let Some(at) = later {
+                        // No truncation is offered (review 7 item 1, the lead's decision): the
+                        // records past the damage may have been acknowledged.
+                        return Err(corrupt(&format!(
+                            "branch log {log}: {what} at byte {pos} is followed by a whole record \
+                             at byte {at}, so this is not a torn tail. The records after it may \
+                             have been acknowledged, and cutting the log there is not safe: it \
+                             would drop trunk pre-image records whose trunk commits are durable, \
+                             and branches forked before them would then read newer trunk pages \
+                             without any error. The safe remedy: keep a copy of all three branch \
+                             files ({log}, {arena}, {snap}) — a restore needs all three, and is \
+                             safe only while the trunk has not been written since they were moved \
+                             aside — then move all three aside. Every branch is lost; the trunk is \
+                             intact, because it never depends on branch files",
+                            log = files.log.display(),
+                            arena = files.arena.display(),
+                            snap = files.snap.display()
+                        )));
+                    }
                 }
                 // A log written in flights keeps only whole flights: a flight is synced only after
                 // all of it is written, so one cut short, torn or garbled anywhere was never
@@ -944,14 +980,7 @@ impl Journal {
         let mut bytes = std::mem::take(&mut self.pending);
         self.pending_slots.clear();
         let at = self.len;
-        let mut end = Vec::with_capacity(16);
-        Record::FlightEnd {
-            start: at,
-            crc: crc32c::crc32c(&bytes),
-        }
-        .encode(&mut end);
-        put_u32(&mut bytes, end.len() as u32);
-        put_u32(&mut bytes, crc32c::crc32c(&end));
+        let end = flight_end_frame(at, &bytes);
         bytes.extend_from_slice(&end);
         self.len += bytes.len() as u64;
         Ok(Flight {
@@ -1042,6 +1071,9 @@ impl Journal {
         put_u32(&mut header, crc);
         put_u32(&mut header, 0);
         debug_assert_eq!(header.len(), LOG_HEADER_LEN);
+        if self.marked {
+            header.extend_from_slice(&flight_end_frame(LOG_HEADER_LEN as u64, &[]));
+        }
         self.file
             .set_len(0)
             .map_err(|e| io_error(e, "truncate branch log"))?;
@@ -1050,7 +1082,7 @@ impl Journal {
             fsync_file(&self.file)?;
         }
         self.generation = generation;
-        self.len = LOG_HEADER_LEN as u64;
+        self.len = header.len() as u64;
         Ok(())
     }
 
@@ -1151,21 +1183,57 @@ fn first_whole_frame_after(bytes: &[u8], from: usize) -> Option<usize> {
     })
 }
 
-/// Whether the zeroed frame at `hole` lies inside the last flight of `bytes`: every whole frame
-/// after it belongs to one flight that began at or before the hole, and that flight's end frame is
-/// the last whole frame in the file. Such a flight was written and never synced — a later flight
-/// starts only after an earlier one is synced — so nothing in it was acknowledged. A log with no
-/// end frames (written by `Journal::flush`) never qualifies, and keeps the Corrupt refusal.
-fn in_the_last_flight(bytes: &[u8], hole: usize) -> bool {
-    let mut last = None;
-    let mut from = hole + 1;
-    while let Some(at) = first_whole_frame_after(bytes, from) {
-        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-        let payload = &bytes[at + FRAME_HEADER_LEN..at + FRAME_HEADER_LEN + len];
-        last = Record::decode(payload);
-        from = at + FRAME_HEADER_LEN + len;
+/// The end frame of a flight that began at `start` and holds the frames `flight`.
+fn flight_end_frame(start: u64, flight: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(16);
+    Record::FlightEnd {
+        start,
+        crc: crc32c::crc32c(flight),
     }
-    matches!(last, Some(Record::FlightEnd { start, .. }) if start <= hole as u64)
+    .encode(&mut payload);
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    put_u32(&mut frame, payload.len() as u32);
+    put_u32(&mut frame, crc32c::crc32c(&payload));
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+/// Every whole, decodable frame at or after `from`, in order: `(offset, record)`. After a whole frame
+/// the next is looked for at its end, so a run of frames costs one pass.
+fn whole_frames_after(bytes: &[u8], from: usize) -> Vec<(usize, Record)> {
+    let mut out = Vec::new();
+    let mut at = from;
+    while let Some(found) = first_whole_frame_after(bytes, at) {
+        let len = u32::from_le_bytes(bytes[found..found + 4].try_into().unwrap()) as usize;
+        let payload = &bytes[found + FRAME_HEADER_LEN..found + FRAME_HEADER_LEN + len];
+        if let Some(record) = Record::decode(payload) {
+            out.push((found, record));
+        }
+        at = found + FRAME_HEADER_LEN + len;
+    }
+    out
+}
+
+/// Whether any whole end frame follows `from`: the log was written in flights.
+fn first_flight_end_after(bytes: &[u8], from: usize) -> Option<usize> {
+    whole_frames_after(bytes, from + 1)
+        .into_iter()
+        .find_map(|(at, r)| matches!(r, Record::FlightEnd { .. }).then_some(at))
+}
+
+/// The start of a WHOLE flight that began after the damage at `damage`: a whole end frame naming a
+/// start past it. A flight is written only after the one before it is synced, so such a flight
+/// means the damaged one had been acknowledged. The damaged flight's own end frame, if it survived,
+/// names a start at or before the damage and does not count.
+fn later_whole_flight(bytes: &[u8], damage: usize) -> Option<usize> {
+    whole_frames_after(bytes, damage + 1)
+        .into_iter()
+        .find_map(|(at, r)| match r {
+            Record::FlightEnd { start, .. } if start as usize > damage && (start as usize) < at => {
+                Some(start as usize)
+            }
+            _ => None,
+        })
 }
 
 /// `Some((page_size, generation))` if the header is whole and valid, `None` if it is torn (a crash
@@ -1966,6 +2034,38 @@ mod tests {
         assert_eq!(forks(&recovered.records), vec![1, 2]);
         drop(recovered);
         assert_eq!(std::fs::metadata(&files.log).unwrap().len(), starts[2]);
+    }
+
+    /// r12-noforce review 2 (R2-3): the later-flight check covers ANY damage, not only a zeroed frame.
+    /// A garbled frame inside an acknowledged flight, with a whole later flight after it, is Corrupt.
+    #[cfg(unix)]
+    #[test]
+    fn a_garbled_frame_under_a_whole_later_flight_is_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        let mut byte = std::fs::read(&files.log).unwrap()[starts[1] as usize + FRAME_HEADER_LEN];
+        byte ^= 0x5A;
+        {
+            use std::os::unix::fs::FileExt;
+            let f = OpenOptions::new().write(true).open(&files.log).unwrap();
+            f.write_all_at(&[byte], starts[1] + FRAME_HEADER_LEN as u64).unwrap();
+        }
+        assert!(Journal::recover(&files, false).is_err(), "damage under a later flight was cut");
+    }
+
+    /// r12-noforce review 2 (R2-4): the last flight lost its first block AND its end frame while a
+    /// frame in its middle survived. It was never synced, so it is cut back to the flight before it.
+    #[test]
+    fn a_last_flight_that_lost_its_start_and_end_is_cut() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        zero(&files.log, starts[2], FRAME_HEADER_LEN + 4);
+        let len = std::fs::metadata(&files.log).unwrap().len();
+        OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
+        let recovered = Journal::recover(&files, false)
+            .expect("a torn last flight is not corruption")
+            .expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 2]);
     }
 
     /// Recovery's redo pass puts every image into its slot in log order, so a slot imaged twice
