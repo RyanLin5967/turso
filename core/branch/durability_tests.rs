@@ -2620,28 +2620,89 @@ fn an_unforced_fork_is_lost_by_a_crash_and_its_id_is_never_reissued() {
     seed(&trunk, 200);
     let w = trunk.fork_branch().unwrap(); // the first fork: it waits for the id floor
     let b = trunk.fork_branch().unwrap(); // under the floor: buffered only
-    let d = trunk.fork_branch().unwrap();
-    let d_id = d.into_id(); // detached: forced here
     let (w_id, b_id) = (w.id(), b.id());
-    let image = crash_image(&path, dir.path());
-
+    let first = tempfile::TempDir::new().unwrap();
+    let image = crash_image(&path, first.path());
+    {
+        let crashed = open_at(&image, durable()).unwrap();
+        let ids: BTreeSet<BranchId> = crashed.branch_ids().unwrap().into_iter().collect();
+        assert!(ids.contains(&w_id), "the forced first fork was lost: {ids:?}");
+        assert!(
+            !ids.contains(&b_id),
+            "the unforced fork survived the crash image: nothing was left unforced ({ids:?})"
+        );
+        let next = crashed.connect().unwrap().fork_branch().unwrap();
+        assert!(
+            next.id().0 > b_id.0,
+            "fork id {} handed out again after the crash (handed out before: {:?})",
+            next.id().0,
+            [w_id, b_id]
+        );
+    }
+    // A detached fork is forced — and with it everything buffered before it, B's fork included.
+    let d = trunk.fork_branch().unwrap();
+    let d_id = d.into_id();
+    let second = tempfile::TempDir::new().unwrap();
+    let image = crash_image(&path, second.path());
     let crashed = open_at(&image, durable()).unwrap();
     let ids: BTreeSet<BranchId> = crashed.branch_ids().unwrap().into_iter().collect();
-    assert!(ids.contains(&w_id), "the forced first fork was lost: {ids:?}");
     assert!(ids.contains(&d_id), "a detached fork was lost by a crash: {ids:?}");
-    assert!(
-        !ids.contains(&b_id),
-        "the unforced fork survived the crash image: nothing was not forced ({ids:?})"
-    );
-    let next = crashed.connect().unwrap().fork_branch().unwrap();
-    assert!(
-        next.id().0 > b_id.0.max(d_id.0),
-        "fork id {} handed out again after the crash (handed out before: {:?})",
-        next.id().0,
-        [w_id, b_id, d_id]
-    );
+    assert!(ids.contains(&b_id), "a fork buffered before a forced one was lost: {ids:?}");
     drop(b);
     drop(w);
+}
+
+/// r12-noforce adversary, finding 2: a connection's close frees what a release made free, and
+/// under no-force that release can still be only buffered — an expiry pass riding on a fork that is
+/// not forced. Freed at once, the slot is reused by the next commit, and a crash before the release
+/// is durable brings the released branch back reading another branch's bytes. The close must wait
+/// for the release (rule 2), like the release's own frees.
+#[test]
+fn a_close_does_not_free_what_a_buffered_release_frees() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let x_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let x = trunk.fork_branch().unwrap();
+        x.lease(Duration::from_secs(10)).unwrap();
+        let xc = x.connect().unwrap();
+        set(&xc, 150, "x");
+        let x_slots = x.owned_slots();
+        assert_eq!(x_slots.len(), 1, "one in-place UPDATE should own exactly one page");
+        // A checkpoint: x's page image leaves the log, so the arena holds its only copy.
+        db.branch_compact_now().unwrap();
+        db.branch_lease_clock_advance(Duration::from_secs(11));
+        // Not forced: its expiry pass reaps x, and x's Release waits in the buffer.
+        let y = trunk.fork_branch().unwrap();
+        drop(xc); // x's close: what x's release frees must wait for that release
+        for slot in &x_slots {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "slot {slot} was freed by a close before the release that frees it was durable"
+            );
+        }
+        // y's commit writes its page into a fresh slot (and syncs the arena), then dies before its
+        // record: nothing buffered since the checkpoint ever reaches the log.
+        let yc = y.connect().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::CommitAfterSlotsBeforeRecord));
+        assert!(yc.execute("UPDATE t SET v = 'y' WHERE id = 150").is_err());
+        x_id = x.id();
+    }
+    // x's release and the clock stamp past its deadline were never durable: x comes back.
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_ids().unwrap(), vec![x_id], "only x's durable state survives");
+    let x = db.branch(x_id).unwrap();
+    assert_eq!(
+        value(&x.connect().unwrap(), 150),
+        Some("x".to_string()),
+        "x came back reading another branch's page"
+    );
+    let _ = x.into_id();
 }
 
 /// Every kill point of the crash test, in lifecycle order. `flight-after-write` is recovered twice:
@@ -2725,11 +2786,23 @@ fn no_force_crash_child() {
 
 /// One crash and one recovery; `Err` names every invariant that failed.
 #[cfg(unix)]
-fn no_force_crash_once(at: &str, cut_log: bool) -> std::result::Result<(), String> {
+/// How a kill's log is recovered: as the kill left it, cut back to where the in-air flight began,
+/// or TORN — the flight's first 4 KiB lost and its end kept, as power lost mid-flight can leave it.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum LogAfterKill {
+    AsLeft,
+    Cut,
+    Torn,
+}
+
+#[cfg(unix)]
+fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result<(), String> {
     use std::os::unix::process::ExitStatusExt;
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("durable.db");
     let p_id;
+    let q_id;
     let page_size;
     {
         let db = open_at(&path, durable()).unwrap();
@@ -2738,6 +2811,12 @@ fn no_force_crash_once(at: &str, cut_log: bool) -> std::result::Result<(), Strin
         let p = trunk.fork_branch().unwrap();
         set(&p.connect().unwrap(), 7, "p");
         p_id = p.into_id();
+        // Q commits a page and is released: its slot is free and INSIDE the arena file, holding
+        // Q's bytes, so B's commit reuses it and a redo that skipped in-file slots would be seen.
+        let q = trunk.fork_branch().unwrap();
+        set(&q.connect().unwrap(), 30, "q");
+        q_id = q.id();
+        db.reap_branches(vec![q]).unwrap();
         page_size = rows(&trunk, "PRAGMA page_size")[0][0].as_int().unwrap() as u64;
     }
     let note = dir.path().join("note");
@@ -2803,7 +2882,7 @@ fn no_force_crash_once(at: &str, cut_log: bool) -> std::result::Result<(), Strin
         bytes.get(off..off + page_size as usize).map(<[u8]>::to_vec)
     };
     let before_redo = b_slot.map(slot_bytes);
-    if cut_log {
+    if log_after != LogAfterKill::AsLeft {
         let start: u64 = noted
             .split_whitespace()
             .find_map(|w| w.strip_prefix("at="))
@@ -2811,8 +2890,19 @@ fn no_force_crash_once(at: &str, cut_log: bool) -> std::result::Result<(), Strin
             .parse()
             .unwrap();
         let log = std::path::PathBuf::from(format!("{}-branch-log", path.display()));
-        std::fs::OpenOptions::new().write(true).open(&log).unwrap().set_len(start).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+        if log_after == LogAfterKill::Cut {
+            file.set_len(start).unwrap();
+        } else {
+            let len = file.metadata().unwrap().len();
+            if len < start + 4096 + 16 {
+                return Err(format!("{at}: the flight is too short to tear ({len} <= {start} + 4 KiB)"));
+            }
+            use std::os::unix::fs::FileExt;
+            file.write_all_at(&[0u8; 4096], start).unwrap();
+        }
     }
+    let cut_log = log_after != LogAfterKill::AsLeft;
 
     let db = open_at(&path, durable()).map_err(|e| format!("{at}: R1, the open refused: {e}"))?;
     let mut failed = Vec::new();
@@ -2828,6 +2918,9 @@ fn no_force_crash_once(at: &str, cut_log: bool) -> std::result::Result<(), Strin
     let b_present = b.is_some_and(|b| ids.contains(&BranchId(b)));
     if !ids.contains(&p_id) {
         failed.push("R2: P, committed before the child ran, is gone".to_string());
+    }
+    if ids.contains(&q_id) {
+        failed.push("R2: Q, released before the child ran, came back".to_string());
     }
     if !ids.contains(&BranchId(w)) {
         failed.push(format!("R2: W ({w}), whose fork waited for durability, is gone"));
@@ -2905,7 +2998,7 @@ fn no_force_crash_once(at: &str, cut_log: bool) -> std::result::Result<(), Strin
     if failed.is_empty() {
         Ok(())
     } else {
-        Err(format!("{at}{}: {}", if cut_log { " (log cut)" } else { "" }, failed.join("; ")))
+        Err(format!("{at} ({log_after:?}): {}", failed.join("; ")))
     }
 }
 
@@ -2916,20 +3009,25 @@ fn no_force_crash_once(at: &str, cut_log: bool) -> std::result::Result<(), Strin
 #[cfg(unix)]
 #[test]
 fn no_force_crash_recovers_at_every_kill_point() {
+    use LogAfterKill::*;
     let mut failures = Vec::new();
     let mut runs = 0;
     for at in NO_FORCE_KILL_POINTS {
-        let cuts: &[bool] = if at == "flight-after-write" { &[false, true] } else { &[false] };
-        for &cut in cuts {
+        let logs: &[LogAfterKill] = if at == "flight-after-write" {
+            &[AsLeft, Cut, Torn]
+        } else {
+            &[AsLeft]
+        };
+        for &log_after in logs {
             runs += 1;
-            let verdict = no_force_crash_once(at, cut);
-            println!("no-force crash {at}{}: {verdict:?}", if cut { " (log cut)" } else { "" });
+            let verdict = no_force_crash_once(at, log_after);
+            println!("no-force crash {at} ({log_after:?}): {verdict:?}");
             if let Err(e) = verdict {
                 failures.push(e);
             }
         }
     }
-    assert_eq!(runs, 12, "the kill-point list changed: 12 recoveries were registered");
+    assert_eq!(runs, 13, "the kill-point list changed: 13 recoveries were registered");
     assert!(
         failures.is_empty(),
         "{} of {runs} recoveries failed:\n{}",
