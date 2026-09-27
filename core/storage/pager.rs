@@ -3278,6 +3278,15 @@ impl Pager {
             LimboError::InternalError("begin_vacuum_blocking_tx requires WAL mode".into())
         })?;
         wal.begin_vacuum_blocking_tx()?;
+        // r11-coherence round 12: the branch refusal at the top ran before any lock, so a fork could land between it and
+        // the line above. Every trunk fork begins with a WAL read transaction, which this exclusive access now excludes,
+        // and a branch's own fork needs a branch to exist already; so the answer asked again here cannot change until
+        // VACUUM releases the access. Refused: release what the line above took, in its documented order.
+        if let Err(refused) = self.refuse_if_branching("VACUUM") {
+            wal.end_write_tx();
+            wal.release_vacuum_lock();
+            return Err(refused);
+        }
         // let's be conservative and clear all cache for vacuum
         // todo: clear cache only if we detect that new writes have occurred like `begin_read_tx`
         self.clear_page_cache(false);

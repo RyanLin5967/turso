@@ -17995,6 +17995,37 @@ pub struct OpJournalModeState {
     /// successful bootstrap. If the statement is reset/dropped while parked at a
     /// bootstrap yield, dropping this guard restores in-memory state.
     pub bootstrap_guard: Option<MvccBootstrapGuard>,
+    /// r11-coherence round 12: the trunk write transaction held from the branch re-check to the header write.
+    pub branch_exclusion: Option<TrunkWriteExclusion>,
+}
+
+/// r11-coherence round 12: a trunk write transaction held across `PRAGMA journal_mode`'s header rewrite. The pragma runs
+/// with no transaction, so its branch check in `Start` held nothing a fork respects: a fork could land before the header
+/// is rewritten. Non-G forks need the WAL write lock, and G forks need the fork gate, which a write transaction holds
+/// exclusively; so under this guard the branch question, asked again, cannot change. Released when dropped: at
+/// `Finalize`, or with the op state when the statement errors or is reset.
+pub struct TrunkWriteExclusion {
+    pager: Arc<Pager>,
+}
+
+impl TrunkWriteExclusion {
+    fn take(pager: &Arc<Pager>) -> Result<Self> {
+        pager.begin_read_tx()?;
+        if let Err(e) = pager.io.block(|| pager.begin_write_tx(WalAutoActions::empty())) {
+            pager.end_read_tx();
+            return Err(e);
+        }
+        Ok(Self {
+            pager: pager.clone(),
+        })
+    }
+}
+
+impl Drop for TrunkWriteExclusion {
+    fn drop(&mut self) {
+        self.pager.end_write_tx();
+        self.pager.end_read_tx();
+    }
 }
 
 impl OpJournalModeState {
@@ -18253,6 +18284,19 @@ fn op_journal_mode_inner(
             }
 
             OpJournalModeSubState::UpdateHeader => {
+                if state.active_op_state.journal_mode().branch_exclusion.is_none() {
+                    let exclusion = TrunkWriteExclusion::take(pager)?;
+                    if program.connection.branch_id().is_some()
+                        || program.connection.db.branches.has_branches()
+                    {
+                        drop(exclusion);
+                        return Err(LimboError::InvalidArgument(
+                            "cannot change journal_mode while branches of this database exist"
+                                .to_string(),
+                        ));
+                    }
+                    state.active_op_state.journal_mode().branch_exclusion = Some(exclusion);
+                }
                 let new_mode = state
                     .active_op_state
                     .journal_mode()
@@ -18295,6 +18339,8 @@ fn op_journal_mode_inner(
             }
 
             OpJournalModeSubState::Finalize => {
+                // The header is written: release the trunk write transaction before the new mode is set up.
+                state.active_op_state.journal_mode().branch_exclusion = None;
                 let new_mode = state
                     .active_op_state
                     .journal_mode()
