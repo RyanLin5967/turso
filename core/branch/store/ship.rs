@@ -1516,6 +1516,31 @@ fn fork_base(v: &ShipView, sv: &SlotView) -> Result<(Option<Slot>, u32)> {
     }
 }
 
+/// A slot's fork base as the stream encodes it: the base resolved at write time when `stored`
+/// (a pruned incremental), else looked up in the snapshot (counted in `lookups`).
+fn base_of<'a>(
+    stored: bool,
+    v: &'a ShipView,
+    trunk: &'a TrunkImage,
+    sv: &'a SlotView,
+    lookups: &Cell<u64>,
+) -> Result<Option<(Option<Slot>, &'a [u8])>> {
+    if stored {
+        return Ok(match &sv.base {
+            Some((slot, data)) => Some((Some(*slot), &data[..])),
+            None => trunk.page(sv.page).map(|p| (None, p)),
+        });
+    }
+    lookups.set(lookups.get() + 1);
+    Ok(match fork_base(v, sv)? {
+        (Some(slot), _) => v
+            .slots
+            .get_live(u64::from(slot))
+            .map(|b| (Some(slot), &b.data[..])),
+        (None, pgno) => trunk.page(pgno).map(|p| (None, p)),
+    })
+}
+
 /// Serialise `snap` with no lock held (F-S1): everything below reads only the snapshot's trees and
 /// the bytes they share. Incremental modes walk the trees from `base` (F-S2).
 #[allow(clippy::too_many_arguments)]
@@ -1847,22 +1872,6 @@ pub(crate) fn send_snapshot(
     // (another slot with its bytes, or the trunk's page of the same number); otherwise looked up
     // in the snapshot now, one lookup per slot (`base_lookups`).
     let lookups = Cell::new(0u64);
-    let base_bytes = |sv: &SlotView| -> Result<Option<(Option<Slot>, &[u8])>> {
-        if pruned {
-            return Ok(match &sv.base {
-                Some((slot, data)) => Some((Some(*slot), &data[..])),
-                None => trunk.page(sv.page).map(|p| (None, p)),
-            });
-        }
-        lookups.set(lookups.get() + 1);
-        Ok(match fork_base(v, sv)? {
-            (Some(slot), _) => v
-                .slots
-                .get_live(u64::from(slot))
-                .map(|b| (Some(slot), &b.data[..])),
-            (None, pgno) => trunk.page(pgno).map(|p| (None, p)),
-        })
-    };
 
     // 4. References to trunk pre-images the receiver holds (IncrAlloc ships them as data): a
     // retained trunk version's slot handed out after the base whose content was born before it.
@@ -1891,7 +1900,7 @@ pub(crate) fn send_snapshot(
                 continue; // a branch page, new content (a SLOT below), or a slot the receiver holds
             }
             if mode == SendMode::IncrAlloc {
-                ship_page(&mut sink, &mut rep, T_SLOT, slot, sv.page, true, &sv.data[..], trunk.page(sv.page), base_bytes(&sv)?)?;
+                ship_page(&mut sink, &mut rep, T_SLOT, slot, sv.page, true, &sv.data[..], trunk.page(sv.page), base_of(pruned, v, trunk, &sv, &lookups)?)?;
                 rep.slot_records += 1;
                 continue;
             }
@@ -1972,7 +1981,7 @@ pub(crate) fn send_snapshot(
             fresh,
             &sv.data[..],
             trunk.page(sv.page),
-            base_bytes(sv)?,
+            base_of(pruned, v, trunk, sv, &lookups)?,
         )?;
         rep.slot_records += 1;
     }
