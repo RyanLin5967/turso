@@ -186,6 +186,10 @@ struct Args {
     /// Pre-image arm (amendment 9): R of the W=4 leaves each session reads are rewritten by the
     /// trunk after every session forked.
     preimage: Option<usize>,
+    /// Ancestor-chain arm (amendment 13): sessions are forked from the tip of a chain of D branches;
+    /// the chain's first branch wrote, and after the sessions forked rewrote, R of the rows each
+    /// session reads (so the session reads that ancestor BRANCH's retained version).
+    chain: Option<usize>,
     /// Concurrent trunk writer threads during the active arm (amendment 9).
     trunk_writers: usize,
 }
@@ -215,6 +219,7 @@ fn parse_args() -> Args {
         level_floor: 20,
         mux: false,
         preimage: None,
+        chain: None,
         trunk_writers: 0,
     };
     let mut it = std::env::args().skip(1);
@@ -250,6 +255,9 @@ fn parse_args() -> Args {
                     val().parse().unwrap_or_else(|_| die("bad --swap-growth-mib"))
             }
             "--mux" => args.mux = true,
+            "--chain" => {
+                args.chain = Some(val().parse().unwrap_or_else(|_| die("bad --chain")))
+            }
             "--preimage" => {
                 args.preimage = Some(val().parse().unwrap_or_else(|_| die("bad --preimage")))
             }
@@ -864,6 +872,16 @@ fn main() {
         "#\tx\tphase\tsessions\tbytes_mean\tbytes_min\tbytes_max\tallocs_mean\tallocs_min\tallocs_max"
     );
 
+    if let Some(d) = b.args.chain {
+        let (r, n) = (b.args.preimage.unwrap_or(0), *b.args.checkpoints.last().unwrap());
+        chain_arm(&mut b, d, r, n);
+        let end = db.branch_stats();
+        if end.live_branches != 0 || end.arena_slots_in_use != 0 {
+            not_a_result(&format!("chain arm teardown leaked: {end:?}"));
+        }
+        println!("# teardown: every branch freed, arena empty");
+        return;
+    }
     let mut sessions: Vec<Session> = Vec::new();
     let mut limit: Option<String> = None;
     let checkpoints = b.args.checkpoints.clone();
@@ -954,6 +972,12 @@ fn main() {
             swap_used_mib(),
             memory_level(),
             b.wal_bytes(),
+        );
+        println!(
+            "# pool x={x} trunk_cache_pages={} slot_clones={} retained_clones={}",
+            b.db.trunk_cache_pages(),
+            b.db.slot_clone_count(),
+            b.db.retained_clone_count()
         );
         println!(
             "# growth_cost x={x} store_lock_takes_per_session={:.3}",
@@ -1102,6 +1126,120 @@ fn preimage_arm(b: &mut Bench, sessions: &mut [Session], x: usize, r: usize) {
         "# preimage x={x} retained_clones={} arena_in_use={}",
         b.db.retained_clone_count(),
         b.db.branch_stats().arena_slots_in_use
+    );
+}
+
+/// The ancestor-chain arm (amendment 13). A chain trunk -> a1 -> ... -> ad; a1 writes one row on
+/// each of `r` of the 4 leaves every session reads, then the rest of the chain and `n` held sessions
+/// fork from ad and connect, then a1 rewrites those rows. A session's read of such a row resolves
+/// through its inherited page map to a1's RETAINED version (an ancestor branch's pre-image), which
+/// FS9 does not share and FS9B does. Per session: the read's bytes and the store's counters.
+fn chain_arm(b: &mut Bench, d: usize, r: usize, n: usize) {
+    const ROWS: [i64; 4] = [1, 602, 1203, 1804];
+    if d == 0 || r > ROWS.len() {
+        die("--chain D needs D >= 1 and --preimage R <= 4");
+    }
+    let a1 = b.trunk.fork_branch().unwrap();
+    let a1c = a1.connect().unwrap();
+    let v1 = |row: i64| format!("a{:0>width$}", row, width = VALUE_LEN - 1);
+    let v2 = |row: i64| format!("z{:0>width$}", row, width = VALUE_LEN - 1);
+    for &row in &ROWS[..r] {
+        a1c.execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", v1(row)))
+            .unwrap();
+    }
+    let mut chain = vec![a1];
+    while chain.len() < d {
+        let next = chain.last().unwrap().fork().unwrap();
+        chain.push(next);
+    }
+    let tip = chain.last().unwrap();
+    let mut held = Vec::with_capacity(n);
+    for _ in 0..n {
+        let br = tip.fork().unwrap();
+        let conn = br.connect().unwrap();
+        held.push((br, conn));
+    }
+    for &row in &ROWS[..r] {
+        a1c.execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", v2(row)))
+            .unwrap();
+    }
+    let want = |row: i64| {
+        if ROWS[..r].contains(&row) {
+            v1(row)
+        } else {
+            trunk_value(row)
+        }
+    };
+    let fs9 = std::env::var("TURSO_R11S_FS9").unwrap_or_default();
+    let names = [
+        "read_bytes",
+        "resolves",
+        "trunk_page_hits",
+        "inherited_copies",
+        "inherited_shared_hits",
+        "inherited_clone_fills",
+        "retained_copies",
+    ];
+    let mut accs: [Acc; 7] = Default::default();
+    let mut first = None;
+    for (i, (_, conn)) in held.iter().enumerate() {
+        let (m0, w0) = (mem(), b.db.branch_stats().work);
+        for &row in &ROWS {
+            let got = read_v(conn, row);
+            if got != want(row) {
+                not_a_result(&format!("chain arm: session {i} read {got} for row {row}"));
+            }
+        }
+        let (m1, w1) = (mem(), b.db.branch_stats().work);
+        let d_ = |f: fn(&turso_core::branch::BranchWork) -> u64| (f(&w1) - f(&w0)) as i64;
+        let row = [
+            m1.bytes - m0.bytes,
+            d_(|w| w.resolve_calls),
+            d_(|w| w.trunk_page_hits),
+            d_(|w| w.inherited_copies),
+            d_(|w| w.inherited_shared_hits),
+            d_(|w| w.inherited_clone_fills),
+            d_(|w| w.retained_copies),
+        ];
+        if i == 0 {
+            first = Some(row);
+            continue;
+        }
+        for (a, v) in accs.iter_mut().zip(row) {
+            a.add(v);
+        }
+    }
+    println!(
+        "# chain d={d} r={r} n={n} fs9={fs9:?} first_session={first:?} ({})",
+        names.join(", ")
+    );
+    for (name, a) in names.iter().zip(&accs) {
+        println!("chain\t{d}\t{r}\t{name}\t{}\t{:.2}\t{}\t{}", a.n, a.mean(), a.min, a.max);
+    }
+    println!(
+        "# chain d={d} r={r} slot_clones={} retained_clones={} arena_in_use={}",
+        b.db.slot_clone_count(),
+        b.db.retained_clone_count(),
+        b.db.branch_stats().arena_slots_in_use
+    );
+    // a1 still reads its own newest versions.
+    for &row in &ROWS[..r] {
+        if read_v(&a1c, row) != v2(row) {
+            not_a_result("chain arm: a1 lost its own rewrite");
+        }
+    }
+    for (br, conn) in held {
+        drop(conn);
+        br.reap().unwrap();
+    }
+    drop(a1c);
+    while let Some(br) = chain.pop() {
+        br.reap().unwrap();
+    }
+    println!(
+        "# chain d={d} r={r} after teardown slot_clones={} retained_clones={}",
+        b.db.slot_clone_count(),
+        b.db.retained_clone_count()
     );
 }
 
