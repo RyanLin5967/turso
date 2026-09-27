@@ -168,4 +168,34 @@ mod tests {
         assert_eq!(map.get(4), None);
         assert_eq!(map.get(1 << 20), None, "a page beyond the root's reach");
     }
+
+    /// r11-coherence amendment 30 (T30c): store-wide slots carry their domain in the high 32 bits; a map returns them
+    /// whole, in every version.
+    #[test]
+    fn slots_with_high_bits_round_trip_in_every_version() {
+        let slots: [Slot; 3] = [(1024 << 32) | Slot::from(u32::MAX - 1), (5 << 32) | 7, 0];
+        let pages = [0u32, 1, u32::MAX - 1];
+        let mut map = PageMap::default();
+        for (&page, slot) in pages.iter().zip(slots) {
+            map.insert(page, slot);
+        }
+        let before = map.clone();
+        map.insert(1, (6 << 32) | 9);
+        for (&page, slot) in pages.iter().zip(slots) {
+            assert_eq!(before.get(page), Some(slot), "page {page} in the earlier version");
+        }
+        assert_eq!(map.get(1), Some((6 << 32) | 9), "page 1 in the later version");
+        assert_eq!(map.get(0), Some(slots[0]), "page 0 in the later version");
+    }
+
+    /// r11-coherence amendment 30 (T30d): the node sizes, printed. A leaf array no larger than an inner node's is why
+    /// widening a slot from 4 to 8 bytes leaves every node allocation the same size.
+    #[test]
+    fn a_leaf_array_is_no_larger_than_an_inner_array() {
+        let node = std::mem::size_of::<Node>();
+        let leaf = std::mem::size_of::<[Slot; WIDTH]>();
+        let inner = std::mem::size_of::<[Option<Arc<Node>>; WIDTH]>();
+        println!("r11-coherence T30d: size_of Node {node}, leaf array {leaf}, inner array {inner}");
+        assert!(leaf <= inner, "a leaf array ({leaf} B) is larger than an inner node's ({inner} B)");
+    }
 }

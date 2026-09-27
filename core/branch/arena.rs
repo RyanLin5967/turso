@@ -43,6 +43,14 @@ impl Arena {
         }
     }
 
+    /// Tests only: continue handing out slots from `high_water`, as if every slot below it had been handed out and
+    /// kept. Nothing below it is backed, so only `alloc` may follow (r11-coherence amendment 30).
+    #[cfg(test)]
+    pub(crate) fn skip_to(&mut self, high_water: Slot) {
+        self.high_water = high_water;
+        self.free_bits.resize((high_water as usize).div_ceil(64), 0);
+    }
+
     pub(crate) fn page_size(&self) -> usize {
         self.page_size
     }
@@ -172,5 +180,17 @@ mod tests {
         for &s in &slots {
             assert!(arena.page(s).iter().all(|&x| x == (s % 251) as u8), "slot {s} aliased");
         }
+    }
+
+    /// r11-coherence amendment 30 (T30a): the arena's index reaches its last slot, u32::MAX - 1, and refuses the next
+    /// one instead of wrapping to slot 0. The first allocation must succeed, so a lower cap cannot pass this test by
+    /// panicking with the same message.
+    #[test]
+    fn the_arena_hands_out_its_last_slot_and_refuses_the_next() {
+        let mut arena = Arena::new(1);
+        arena.skip_to(u32::MAX - 1);
+        assert_eq!(arena.alloc(), u32::MAX - 1, "the arena's last slot");
+        let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| arena.alloc()));
+        assert!(next.is_err(), "the arena handed out slot u32::MAX");
     }
 }

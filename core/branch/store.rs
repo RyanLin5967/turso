@@ -2325,4 +2325,20 @@ mod tests {
         store.release_handle(id);
         assert_eq!(store.stats().arena_slots_in_use, 0, "the reap must free every page the branch owned");
     }
+
+    /// r11-coherence amendment 30 (T30b): a trunk-domain slot at the top of its arena's index. Its store-wide slot
+    /// names domain 1024 and local slot u32::MAX - 1, and a page map returns it unchanged.
+    #[test]
+    fn a_trunk_domain_slot_at_the_top_of_its_index_round_trips() {
+        let mut domain = Domain::new(TRUNK_DOMAIN);
+        let mut arena = Arena::new(8);
+        arena.skip_to(u32::MAX - 1);
+        domain.arena = Some(arena);
+        let slot = domain.alloc(8);
+        assert_eq!(domain_of(slot), TRUNK_DOMAIN, "the slot's domain");
+        assert_eq!(domain.local(slot), u32::MAX - 1, "the slot's local index");
+        let mut map = PageMap::default();
+        map.insert(u32::MAX - 1, slot);
+        assert_eq!(map.get(u32::MAX - 1), Some(slot), "the page map changed the slot");
+    }
 }
