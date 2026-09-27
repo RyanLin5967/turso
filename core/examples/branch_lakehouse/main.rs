@@ -451,8 +451,14 @@ fn reopen(run: Run) -> Run {
             tick: l.tick,
         })
         .collect();
+    // The process-wide registry holds the database weakly: unless this was the last handle, the
+    // "reopen" below would hand back the same instance, and nothing would have been reopened.
+    let weak = Arc::downgrade(&db);
     drop(trunk);
     drop(db);
+    if weak.upgrade().is_some() {
+        not_a_result(&format!("tick {tick}: the database outlived its close, so a reopen would share it"));
+    }
     let db = arm::open(&path, args.sync, args.fs9);
     let trunk = db.connect().unwrap();
     let run = Run {
@@ -470,6 +476,56 @@ fn reopen(run: Run) -> Run {
     run.exec("PRAGMA synchronous = OFF");
     println!("OPEN n={} tick={} {}", run.opens, run.tick, arm::open_stats(&run.db));
     run
+}
+
+/// The checker must be able to fire. A snapshot forked before the trunk rewrites rows `1..=scan`
+/// must read every old value, checked as `read` checks, and none of the new ones; then it is reaped
+/// and the model takes the new values (a second write at tick 0).
+fn self_check(run: &mut Run) {
+    let n = run.args.scan;
+    let branch = run.trunk.fork_branch().unwrap();
+    let mut new = Vec::new();
+    run.exec("BEGIN");
+    for id in 1..=n {
+        let seed = run.rng.next();
+        run.exec(&format!("UPDATE t SET v = '{}' WHERE id = {id}", value(seed, 0)));
+        new.push(seed);
+    }
+    run.exec("COMMIT");
+    let conn = branch.connect().unwrap();
+    let got = conn
+        .prepare(format!("SELECT id, v FROM t WHERE id BETWEEN 1 AND {n} ORDER BY id"))
+        .and_then(|mut st| st.run_collect_rows())
+        .unwrap_or_else(|e| not_a_result(&format!("self-check scan: {e}")));
+    drop(conn);
+    let (mut old, mut fresh) = (0, 0);
+    for (j, row) in got.iter().enumerate() {
+        let id = 1 + j as i64;
+        let (seed, rot) = run.model.at(id, 0).expect("the model holds every initial row");
+        let text = match &row[1] {
+            Value::Text(t) => t.as_str().to_string(),
+            _ => String::new(),
+        };
+        old += (row[0].as_int() == Some(id) && text == value(seed, rot)) as i64;
+        fresh += (text == value(new[j], 0)) as i64;
+    }
+    if got.len() as i64 != n || old != n || fresh != 0 {
+        not_a_result(&format!(
+            "self-check: a snapshot forked before a trunk rewrite of rows 1..={n} read {} rows, {old} \
+             old values and {fresh} new ones",
+            got.len()
+        ));
+    }
+    if let Err(e) = branch.reap() {
+        not_a_result(&format!("self-check reap failed: {e}"));
+    }
+    for (j, seed) in new.into_iter().enumerate() {
+        run.model.put(1 + j as i64, 0, seed, 0, None);
+    }
+    println!(
+        "# self-check: a snapshot forked before a trunk rewrite of rows 1..={n} read {old}/{n} old \
+         values and {fresh} new ones, so the row check can fire"
+    );
 }
 
 fn dir_bytes(dir: &Path) -> u64 {
@@ -515,6 +571,7 @@ fn main() {
     }
     run.exec("COMMIT");
     run.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    self_check(&mut run);
     let a = &run.args;
     println!("# branch_lakehouse — r12-lakehouse PREREG; arm {}", arm::NAME);
     println!(
