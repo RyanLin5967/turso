@@ -2220,17 +2220,30 @@ fn arm_conc(b: &mut Bench, args: &Args) {
             // `branch_stats` takes the trunk lock once itself, counted in the second snapshot.
             const CAL: u64 = 200;
             let before = b.db.branch_stats().work;
+            // The same writes timed as the cell writer times its own (r12-phasefair PREREG amendment 1): with no fork
+            // running, they are the writer's solo cost, the capacity that r(T) is bounded by (counting builds only).
+            let mut solo = WriterOut { writes: CAL, ..Default::default() };
+            let (gate0, coh0) = (coherence::gate_snapshot(), coherence::snapshot());
             for _ in 0..CAL {
                 let g = writer.started.load(Ordering::Relaxed);
                 writer.started.store(g + 1, Ordering::Release);
+                let at = coherence::ENABLED.then(|| (Instant::now(), coherence::thread_cpu_ns()));
                 conn.execute(format!(
                     "UPDATE t SET v = '{}' WHERE id = {}",
                     trunk_gen_value(g),
                     spread_row(g)
                 ))
                 .unwrap();
+                if let Some((t0, c0)) = at {
+                    solo.exec_wall_ns += t0.elapsed().as_nanos() as u64;
+                    solo.exec_cpu_ns += coherence::thread_cpu_ns().saturating_sub(c0);
+                }
                 writer.committed.store(g + 1, Ordering::Release);
             }
+            let (gate1, coh1) = (coherence::gate_snapshot(), coherence::snapshot());
+            solo.gate = std::array::from_fn(|i| gate1[i] - gate0[i]);
+            solo.coh = std::array::from_fn(|i| coh1[i] - coh0[i]);
+            print_gate(&format!("solo N={n}"), &solo, &[0; coherence::GATE_FIELDS], 1.0);
             let after = b.db.branch_stats();
             let acq = after.work.trunk_lock_acquisitions - before.trunk_lock_acquisitions - 1;
             println!(
