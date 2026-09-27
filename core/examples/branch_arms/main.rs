@@ -19,9 +19,10 @@
 //! `--synchronous off|normal|full` sets the trunk's sync mode (default off, as amendments 1-2).
 //! Ported verbatim from the turso_curve lane's amendment 3 (`48a2b97a3`); this lane's amendment 5.
 //!
-//! `--victim oldest|random` (churn arms only; default random) picks each cycle's reap victim: a
+//! `--victim oldest|random|window:W` (churn arms only; default random) picks each cycle's reap victim: a
 //! uniformly random live branch, or the oldest one, which is the order uniform-TTL lease expiry
-//! reaps in (amendment 3).
+//! reaps in (amendment 3), or a uniformly random one of the W most recently forked (r11-adversarial
+//! R2 arm: the other N - W stay resident and are never touched by a reap).
 //!
 //! Every read a sample makes is checked against a model the harness keeps itself (never against
 //! the engine), and the engine's own counts are checked against the workload before a number is
@@ -64,6 +65,8 @@ enum Arm {
 enum Victim {
     Random,
     Oldest,
+    /// Uniformly among the W most recently forked live branches (r11-adversarial R2 arm).
+    Window(usize),
 }
 
 struct Args {
@@ -136,6 +139,12 @@ fn parse_args() -> Args {
                 args.victim = match val().as_str() {
                     "random" => Victim::Random,
                     "oldest" => Victim::Oldest,
+                    w if w.starts_with("window:") => {
+                        match w["window:".len()..].parse() {
+                            Ok(w) if w > 0 => Victim::Window(w),
+                            _ => die("bad --victim window:W (W a positive integer)"),
+                        }
+                    }
                     other => die(&format!("unknown victim policy {other}")),
                 }
             }
@@ -970,6 +979,16 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 let victim = match args.victim {
                     Victim::Random => live.swap_remove_back(b.rng.below(live.len())).unwrap(),
                     Victim::Oldest => live.pop_front().unwrap(),
+                    // The window is the back W of `live`: the new branch is pushed at the back below,
+                    // and `swap_remove_back` moves the back element into the victim's place, which is
+                    // inside the window, so the front N - W are never moved or reaped.
+                    Victim::Window(w) => {
+                        if w > live.len() {
+                            die(&format!("--victim window:{w} exceeds the {} live branches", live.len()));
+                        }
+                        let at = live.len() - w + b.rng.below(w);
+                        live.swap_remove_back(at).unwrap()
+                    }
                 };
                 live.push_back(Live {
                     branch,
