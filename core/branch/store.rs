@@ -268,7 +268,16 @@ struct Publishing<'a>(&'a BranchStore);
 
 impl Drop for Publishing<'_> {
     fn drop(&mut self) {
-        self.0.lock().publishing -= 1;
+        let mut inner = self.0.lock();
+        if std::thread::panicking() {
+            // A mapping hold panicked: the commit is half-mapped and its record only buffered.
+            // Letting a compaction snapshot that would make half a commit durable, so fail-stop
+            // first (review 2 F3).
+            if let Some(journal) = inner.journal.as_mut() {
+                journal.poison();
+            }
+        }
+        inner.publishing -= 1;
     }
 }
 
@@ -2054,19 +2063,26 @@ impl BranchStore {
         g.flushing = true;
         drop(g);
         let lsn = inner.journal.as_ref().map_or(0, Journal::lsn);
+        let generation = inner.journal.as_ref().map_or(0, Journal::generation);
         let compacted = self.compact_quiesced(inner, fail_after_rename);
+        // The commit point is the journal's move to a new generation: from there the snapshot (or
+        // the catalog) is the truth and holds everything applied.
+        let advanced = inner.journal.as_ref().map_or(0, Journal::generation) != generation;
+        let poisoned = inner.journal.as_ref().is_some_and(Journal::is_poisoned);
         match &compacted {
-            Ok(()) => {
+            // Everything applied is durable: past the commit point a later failure (the catalog's
+            // lease floor, say) loses nothing (review 2 F1).
+            Ok(()) | Err(_) if advanced && !poisoned => {
                 inner.work.compactions += 1;
                 self.land(lsn, true);
             }
-            // The journal is still live: the compaction failed before its snapshot became the
-            // truth, so nothing was lost and nothing more is durable. Only the flight slot is
-            // released; poisoning the group here would take commits in memory and fail every one
-            // of them at its wait (review H4).
-            Err(_) if !inner.journal.as_ref().is_some_and(Journal::is_poisoned) => {
-                self.land_unchanged()
-            }
+            // Nothing was compacted (no catalog or arena yet): nothing more is durable.
+            Ok(()) => self.land_unchanged(),
+            // Failed before its commit point with the journal live (no I/O whose outcome is in
+            // doubt: those poison it): nothing was lost and nothing more is durable. Only the
+            // flight slot is released; poisoning the group here would take commits in memory and
+            // fail every one at its wait (review H4).
+            Err(_) if !poisoned => self.land_unchanged(),
             Err(_) => self.land(lsn, false),
         }
         compacted
@@ -3990,7 +4006,14 @@ impl StoreInner {
         journal.check_live()?;
         // Every slot the catalog is about to name must be durable first.
         if self.sync {
-            self.work.compact_locked_bytes += arena.sync()?;
+            match arena.sync() {
+                Ok(bytes) => self.work.compact_locked_bytes += bytes,
+                // A failed fsync may have dropped the pages (review 2 F2): fail-stop.
+                Err(e) => {
+                    journal.poison();
+                    return Err(e);
+                }
+            }
         }
         let generation = journal.generation() + 1;
         let rows: Vec<(CatBranch, u8)> = cat
@@ -4105,7 +4128,10 @@ impl StoreInner {
             }
             catalog.put_meta(&meta)
         })()
-        .and_then(|()| catalog.commit());
+        // A failed COMMIT is ambiguous (its frames may be on disk, and then the catalog is the
+        // truth at the new generation while this process would go on logging to the old one):
+        // fail-stop (review 2 F2). A failed put before it rolls back and changes nothing.
+        .and_then(|()| catalog.commit().inspect_err(|_| journal.poison()));
         if let Err(e) = written {
             catalog.rollback();
             return Err(e);
@@ -4147,6 +4173,7 @@ impl StoreInner {
         // The covered deferred frees are catalog free rows now, like every other free slot: no
         // longer in use here, and dropped from the in-memory list with the rest just below.
         self.pending_free.clear();
+        self.hold.pages += covered.len() as u64;
         for slot in covered {
             arena.release(slot);
         }

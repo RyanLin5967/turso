@@ -108,6 +108,11 @@ fn commit_is_bounded(durability: BranchDurability) {
     assert_eq!(w1.locked_copy_bytes, w0.locked_copy_bytes, "pages copied under the mutex");
     if durability != VOLATILE {
         assert_eq!(
+            (w1.compactions - w0.compactions, w1.compact_locked_bytes - w0.compact_locked_bytes),
+            (0, 0),
+            "premise: no compaction ran inside the commit (its syncs are counted apart)"
+        );
+        assert_eq!(
             w1.sync_locked_bytes - w0.sync_locked_bytes,
             0,
             "the commit synced bytes under the store mutex"
@@ -480,4 +485,60 @@ fn a_catalog_checkpoint_between_map_holds_is_refused_and_the_commit_recovers_who
 #[test]
 fn an_automatic_catalog_checkpoint_between_map_holds_is_refused_and_the_commit_recovers_whole() {
     compaction_between_map_holds_waits(CATALOG, BranchFailpoint::MaybeCompactBetweenMapHolds);
+}
+
+/// Review H3: a branch released while its connection is open, whose Release record never became
+/// durable (its flight failed), must keep every slot when that connection closes: a slot freed
+/// then could be reused while recovery still names it.
+#[test]
+fn a_close_after_a_release_whose_flight_failed_frees_none_of_the_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir.path().join("t.db"), DURABLE);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 2_000);
+    let b = trunk.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    bc.execute("UPDATE t SET v = 'mine-' || id").unwrap();
+    let owned: Vec<u32> = db.branch_slots_in_use();
+    assert!(!owned.is_empty(), "premise: the branch owns slots");
+    db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+    assert!(
+        db.reap_branches(vec![b]).is_err(),
+        "premise: the release's flight failed"
+    );
+    drop(bc);
+    let freed: Vec<u32> = owned.iter().copied().filter(|&s| db.branch_slot_is_free(s)).collect();
+    assert!(
+        freed.is_empty(),
+        "closing a branch whose Release is not durable freed {} of its slots (first {:?})",
+        freed.len(),
+        freed.first()
+    );
+}
+
+/// Review H4: a compaction that fails before its snapshot is the truth (here its temporary file
+/// cannot be created) loses nothing and makes nothing durable: later commits must go on working.
+#[test]
+fn a_compaction_that_fails_before_its_snapshot_leaves_later_commits_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.db");
+    let db = open(&path, DURABLE);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 2_000);
+    let b = trunk.fork_branch().unwrap();
+    let b_id = b.id();
+    let bc = b.connect().unwrap();
+    bc.execute("UPDATE t SET v = 'one-' || id").unwrap();
+    let tmp = format!("{}-branch-snap.tmp", path.display());
+    std::fs::create_dir(&tmp).unwrap();
+    assert!(db.branch_compact_now().is_err(), "premise: the compaction failed");
+    std::fs::remove_dir(&tmp).unwrap();
+    bc.execute("UPDATE t SET v = 'two-' || id")
+        .expect("a commit after a compaction that failed before its snapshot");
+    let image = crash_image(&path, dir.path());
+    let db = open(&image, DURABLE);
+    let bc = db.branch(b_id).unwrap().connect().unwrap();
+    for (id, v) in table(&bc) {
+        assert_eq!(v, format!("two-{id}"), "row {id} after the reopen");
+    }
 }

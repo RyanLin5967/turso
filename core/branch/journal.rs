@@ -1004,7 +1004,19 @@ impl Journal {
         self.check_live()?;
         // The snapshot names slots that buffered-but-unwritten records also name; they must be
         // durable before the snapshot is.
-        let arena_bytes = if self.sync { arena.sync()? } else { 0 };
+        let arena_bytes = if self.sync {
+            match arena.sync() {
+                Ok(bytes) => bytes,
+                // As the same error in `flush`: a failed fsync may have dropped the pages, and a
+                // retry on the same file can report success (review 2 F2).
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(e);
+                }
+            }
+        } else {
+            0
+        };
         let generation = self.generation + 1;
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(SNAP_MAGIC);

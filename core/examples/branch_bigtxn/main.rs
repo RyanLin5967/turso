@@ -236,7 +236,7 @@ const HEADER: &str = "phase\tD\tN\trep\tus\tlock_holds\tlocked_copy_bytes\tmax_h
 max_hold_realloc_moved\tmax_hold_ns\tresolve_calls\tevict_calls\tevict_examined\tevict_full\t\
 over_capacity_admits\tevictable_scan\tspill_scan\tsubjournal_pages\tarena_in_use\tcache_len\tview_build_pages\t\
 holds_timed\thold_p50_ns\thold_p99_ns\thold_p999_ns\tmax_hold_realloc_bytes\tmax_hold_node_copies\t\
-max_hold_zeroed_bytes\tholds_ge_16us\tsync_locked_bytes\tsync_unlocked_bytes\tjournal_copied_bytes\tjournal_handed_bytes";
+max_hold_zeroed_bytes\tholds_ge_16us\tsync_locked_bytes\tsync_unlocked_bytes\tjournal_copied_bytes\tjournal_handed_bytes\tcompact_locked_bytes\tcompactions\tcompactions_refused\tlocked_flight_waits";
 
 struct Ctx {
     db: Arc<Database>,
@@ -298,7 +298,7 @@ impl Ctx {
             "-".to_string()
         };
         println!(
-            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}\t{}\t{}\t{}\t{long}\t{}\t{}\t{}\t{}",
+            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}\t{}\t{}\t{}\t{long}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             b.w.lock_holds - a.w.lock_holds,
             b.w.locked_copy_bytes - a.w.locked_copy_bytes,
             m.pages,
@@ -325,6 +325,10 @@ impl Ctx {
             b.w.sync_unlocked_bytes - a.w.sync_unlocked_bytes,
             b.w.journal_copied_bytes - a.w.journal_copied_bytes,
             b.w.journal_handed_bytes - a.w.journal_handed_bytes,
+            b.w.compact_locked_bytes - a.w.compact_locked_bytes,
+            b.w.compactions - a.w.compactions,
+            b.w.compactions_refused - a.w.compactions_refused,
+            b.w.locked_flight_waits - a.w.locked_flight_waits,
         );
         (out, el)
     }
