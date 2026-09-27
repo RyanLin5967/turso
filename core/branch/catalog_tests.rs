@@ -7,7 +7,10 @@ use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value,
 use std::path::Path;
 
 fn catalog() -> DatabaseOpts {
-    DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: true })
+    // r11-ever amendment 15: R11_SPLICE=1 runs this file in the F7 splice arm (off by default).
+    DatabaseOpts::new()
+        .with_branch_durability(BranchDurability::Catalog { sync: true })
+        .with_branch_splice(std::env::var_os("R11_SPLICE").is_some())
 }
 
 fn open_at(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
@@ -423,6 +426,12 @@ fn a_crash_after_commits_to_old_branches_reads_no_branch_at_recovery() {
 
 // ---- r11-ever: the F7 durable port on the composed base (UNBUILT; r11-ever amendment 14) ----
 
+/// `catalog()` in the F7 splice arm, whatever R11_SPLICE says: the tests that assert a splice
+/// (r11-ever amendment 15).
+fn spliced() -> DatabaseOpts {
+    catalog().with_branch_splice(true)
+}
+
 fn set(conn: &Arc<Connection>, id: i64, v: &str) {
     conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {id}")).unwrap();
 }
@@ -442,7 +451,7 @@ fn a_spliced_child_is_listed_under_its_new_parent_after_a_checkpoint_and_a_reope
     let path = dir.path().join("c.db");
     let (p_id, q_id, c_id, p7);
     {
-        let db = open_at(&path, catalog()).unwrap();
+        let db = open_at(&path, spliced()).unwrap();
         let trunk = db.connect().unwrap();
         seed(&trunk);
         let p = trunk.fork_branch().unwrap();
@@ -474,7 +483,7 @@ fn a_spliced_child_is_listed_under_its_new_parent_after_a_checkpoint_and_a_reope
         q_id = q.into_id();
         c_id = c.into_id();
     }
-    let db = open_at(&path, catalog()).unwrap();
+    let db = open_at(&path, spliced()).unwrap();
     let c = db.branch(c_id).expect("the spliced child names a missing parent");
     assert_eq!(value(&c.connect().unwrap(), 7), "p-first");
     let _ = c.into_id();
@@ -507,7 +516,7 @@ fn a_splice_after_recovery_applies_the_childs_parked_commit_first() {
     let path = dir.path().join("c.db");
     let (z_id, c_id, z7, image);
     {
-        let db = open_at(&path, catalog()).unwrap();
+        let db = open_at(&path, spliced()).unwrap();
         let trunk = db.connect().unwrap();
         seed(&trunk);
         let z = trunk.fork_branch().unwrap();
@@ -526,7 +535,7 @@ fn a_splice_after_recovery_applies_the_childs_parked_commit_first() {
         z_id = z.into_id();
         c_id = c.into_id();
     }
-    let db = open_at(&image, catalog()).unwrap();
+    let db = open_at(&image, spliced()).unwrap();
     let s = db.branch_open_stats();
     assert_eq!(s.parked_records, 1, "premise: C's Commit was not parked: {s:?}");
     assert_eq!(s.branch_loads, 0, "premise: recovery read a branch: {s:?}");
@@ -545,17 +554,25 @@ fn a_splice_after_recovery_applies_the_childs_parked_commit_first() {
 /// connection closes. Otherwise a checkpoint after the close leaves `released = 2` with the `Close`
 /// gone from the log, a restart holds the branch again, and replay skips the collects the live store
 /// made since: here C2's reap, which retires P a second time (freeing P's page written between
-/// C1's fork and C2's) and splices it into C1. D then reuses that slot, and at the end of that
-/// recovery the late collect would free it under D's page. P, released while its connection is
-/// open, has two children; the close retires it; checkpoint; C2's reap; D's commit; crash. The image
-/// must keep D's slot in use and read D's page.
+/// C1's fork and C2's) and, in the splice arm, splices it into C1. D then reuses that slot, and at
+/// the end of that recovery the late collect would free it under D's page. P, released while its
+/// connection is open, has two children; the close retires it; checkpoint; C2's reap; D's commit;
+/// crash. The image must keep D's slot in use and read D's page. The hold and its end are in both
+/// arms, so the test runs in both (amendment 15): off, P stays, retired, beside C1 and D.
 #[test]
 fn a_closed_branch_is_not_held_again_after_a_checkpoint_and_a_crash() {
+    for (splice, live) in [(false, 3), (true, 2)] {
+        closed_branch_not_held_again(catalog().with_branch_splice(splice), live);
+    }
+}
+
+fn closed_branch_not_held_again(opts: DatabaseOpts, live: usize) {
+    let what = format!("splice={}", opts.branch_splice);
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("c.db");
     let (image, d_id, d_slots, c1_id, in_use_live);
     {
-        let db = open_at(&path, catalog()).unwrap();
+        let db = open_at(&path, opts).unwrap();
         let trunk = db.connect().unwrap();
         seed(&trunk);
         let p = trunk.fork_branch().unwrap();
@@ -568,36 +585,36 @@ fn a_closed_branch_is_not_held_again_after_a_checkpoint_and_a_crash() {
             .into_iter()
             .filter(|s| !s0.contains(s))
             .collect();
-        assert_eq!(x.len(), 1, "premise: p's write took one slot");
+        assert_eq!(x.len(), 1, "{what}: premise: p's write took one slot");
         let c2 = p.fork().unwrap();
         drop(p); // released under pc: held
         db.branch_compact_now().unwrap(); // the row says released = 2
         drop(pc); // Close: P retired, two children kept
         db.branch_compact_now().unwrap(); // the row must say 1 now; the Close leaves the log
-        let reaped = c2.reap().unwrap(); // P retired again (x is freed) and spliced into C1
-        assert!(!reaped.deferred, "{reaped:?}");
-        assert!(db.branch_slot_is_free(x[0]), "premise: C2's reap did not free p's page");
+        let reaped = c2.reap().unwrap(); // P retired again (x is freed), spliced into C1 if on
+        assert!(!reaped.deferred, "{what}: {reaped:?}");
+        assert!(db.branch_slot_is_free(x[0]), "{what}: premise: C2's reap did not free p's page");
         let d = trunk.fork_branch().unwrap();
         set(&d.connect().unwrap(), 150, "d");
         d_slots = d.owned_slots();
-        assert!(d_slots.contains(&x[0]), "premise: d did not reuse the freed slot: {d_slots:?}");
+        assert!(d_slots.contains(&x[0]), "{what}: premise: d did not reuse the freed slot: {d_slots:?}");
         in_use_live = db.branch_slots_in_use();
         image = crash_image(&path, dir.path());
         d_id = d.into_id();
         c1_id = c1.into_id();
     }
-    let db = open_at(&image, catalog()).unwrap();
+    let db = open_at(&image, opts).unwrap();
     for slot in &d_slots {
-        assert!(!db.branch_slot_is_free(*slot), "slot {slot}: d's page, freed by the recovery");
+        assert!(!db.branch_slot_is_free(*slot), "{what}: slot {slot}: d's page, freed by the recovery");
     }
     let mut got = db.branch_slots_in_use();
     got.sort_unstable();
     let mut want = in_use_live;
     want.sort_unstable();
-    assert_eq!(got, want, "the recovery's slot set is not the crashed store's");
-    assert_eq!(db.branch_stats().unwrap().live_branches, 2, "c1 and d should be left");
+    assert_eq!(got, want, "{what}: the recovery's slot set is not the crashed store's");
+    assert_eq!(db.branch_stats().unwrap().live_branches, live, "{what}: c1 and d (and P if off)");
     let d = db.branch(d_id).unwrap();
-    assert_eq!(value(&d.connect().unwrap(), 150), "d");
+    assert_eq!(value(&d.connect().unwrap(), 150), "d", "{what}");
     let _ = d.into_id();
     let _ = db.branch(c1_id).unwrap().into_id();
 }

@@ -63,7 +63,23 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// inheritance), so the epochs replay derives for a version-2 log would differ from the ones it was
 /// written under; the log gains `ReleaseOpen` and `Close`, and a snapshot's `released` byte gains 2
 /// (released while a connection holds it open). A version-2 file is refused like any other.
+///
+/// 4: the same format, written by a store in the F7 SPLICE arm (`DatabaseOpts::with_branch_splice`,
+/// r11-ever amendment 15). Replay repeats every splice, so a log written with splices replayed
+/// without them (or the reverse) would rebuild another tree: each arm writes its own version and
+/// reads only its own, which makes opening a store in the other arm an error, not a wrong state.
 const FORMAT_VERSION: u32 = 3;
+const SPLICE_FORMAT_VERSION: u32 = 4;
+
+/// The format version a store in the splice arm (`true`) or not writes, and reads.
+pub(crate) fn format_version(splice: bool) -> u32 {
+    if splice {
+        SPLICE_FORMAT_VERSION
+    } else {
+        FORMAT_VERSION
+    }
+}
+
 const LOG_HEADER_LEN: usize = 32;
 const FRAME_HEADER_LEN: usize = 8;
 /// Compact once the log is larger than this and larger than twice the last snapshot, so the log is
@@ -481,6 +497,8 @@ pub(crate) struct Journal {
     pid: u32,
     /// See [`Journal::fail_next_write`].
     fail_next_write: bool,
+    /// The format version this journal writes and was read at (`format_version`).
+    format: u32,
 }
 
 impl Journal {
@@ -516,7 +534,10 @@ impl Journal {
         }
         lock_exclusive(&file, &files.log)?;
         let existing = read_all(&mut file)?;
-        if files.snap.exists() || files.cat.exists() || !matches!(parse_log_header(&existing), Ok(None))
+        // A header of either arm's version is state (`parse_log_header` errs on the other one).
+        if files.snap.exists()
+            || files.cat.exists()
+            || !matches!(parse_log_header(&existing, FORMAT_VERSION), Ok(None))
         {
             return Err(LimboError::LockingError(format!(
                 "branch files next to {} gained state after this branch store opened: another \
@@ -537,7 +558,13 @@ impl Journal {
             poisoned: false,
             pid: std::process::id(),
             fail_next_write: false,
+            format: FORMAT_VERSION,
         })
+    }
+
+    /// The format version this journal writes: set by a store in the splice arm before `start`.
+    pub(crate) fn set_format(&mut self, format: u32) {
+        self.format = format;
     }
 
     /// The second half of `create`: write the generation-0 header and make its directory entry
@@ -583,7 +610,16 @@ impl Journal {
     /// Reopen an existing store. `Ok(None)` means the files hold no state at all (a crash while
     /// the log was being created, before its header was durable): the store starts empty.
     pub(crate) fn recover(files: &BranchFiles, sync: bool) -> Result<Option<Recovered>> {
-        Self::recover_base(files, sync, None)
+        Self::recover_base(files, sync, None, FORMAT_VERSION)
+    }
+
+    /// `recover`, reading (and refusing anything but) the given format version.
+    pub(crate) fn recover_as(
+        files: &BranchFiles,
+        sync: bool,
+        format: u32,
+    ) -> Result<Option<Recovered>> {
+        Self::recover_base(files, sync, None, format)
     }
 
     /// `recover` for a catalog store: the catalog's meta row, `(page_size, generation)`, stands
@@ -594,20 +630,31 @@ impl Journal {
         sync: bool,
         base: Option<(u32, u64)>,
     ) -> Result<Option<Recovered>> {
-        Self::recover_base(files, sync, Some(base))
+        Self::recover_base(files, sync, Some(base), FORMAT_VERSION)
+    }
+
+    /// `recover_catalog`, reading (and refusing anything but) the given format version.
+    pub(crate) fn recover_catalog_as(
+        files: &BranchFiles,
+        sync: bool,
+        base: Option<(u32, u64)>,
+        format: u32,
+    ) -> Result<Option<Recovered>> {
+        Self::recover_base(files, sync, Some(base), format)
     }
 
     fn recover_base(
         files: &BranchFiles,
         sync: bool,
         catalog: Option<Option<(u32, u64)>>,
+        format: u32,
     ) -> Result<Option<Recovered>> {
         // Lock before reading or discarding anything (review N1): the temp snapshot removed below
         // could be a live store's compaction in flight.
         let mut file = open_rw(&files.log, false)?;
         lock_exclusive(&file, &files.log)?;
         let snapshot = match catalog {
-            None if files.snap.exists() => Some(read_snapshot(&files.snap)?),
+            None if files.snap.exists() => Some(read_snapshot(&files.snap, format)?),
             None => None,
             Some(base) => base.map(|(ps, g)| (ps, g, SnapshotState::default(), 0)),
         };
@@ -617,7 +664,7 @@ impl Journal {
             std::fs::remove_file(&tmp).map_err(|e| io_error(e, "remove stale branch snapshot"))?;
         }
         let bytes = read_all(&mut file)?;
-        let header = parse_log_header(&bytes)?;
+        let header = parse_log_header(&bytes, format)?;
 
         let (page_size, generation, snapshot_state, snapshot_len) = match (snapshot, header) {
             (None, None) => return Ok(None),
@@ -645,6 +692,7 @@ impl Journal {
             poisoned: false,
             pid: std::process::id(),
             fail_next_write: false,
+            format,
         };
 
         let mut records = Vec::new();
@@ -903,7 +951,7 @@ impl Journal {
         let generation = self.generation + 1;
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(SNAP_MAGIC);
-        put_u32(&mut out, FORMAT_VERSION);
+        put_u32(&mut out, self.format);
         put_u32(&mut out, self.page_size);
         put_u64(&mut out, generation);
         state.encode(&mut out);
@@ -949,7 +997,7 @@ impl Journal {
     fn reset_log(&mut self, generation: u64) -> Result<()> {
         let mut header = Vec::with_capacity(LOG_HEADER_LEN);
         header.extend_from_slice(LOG_MAGIC);
-        put_u32(&mut header, FORMAT_VERSION);
+        put_u32(&mut header, self.format);
         put_u32(&mut header, self.page_size);
         put_u64(&mut header, generation);
         let crc = crc32c::crc32c(&header);
@@ -1029,7 +1077,7 @@ fn first_whole_frame_after(bytes: &[u8], from: usize) -> Option<usize> {
 /// `Some((page_size, generation))` if the header is whole and valid, `None` if it is torn (a crash
 /// before it was durable). A whole header of ANOTHER format version is an error, not a torn one:
 /// taking it for torn would start an empty store over it, or reset its log.
-fn parse_log_header(bytes: &[u8]) -> Result<Option<(u32, u64)>> {
+fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64)>> {
     let Some(h) = bytes.get(..LOG_HEADER_LEN) else {
         return Ok(None);
     };
@@ -1041,9 +1089,10 @@ fn parse_log_header(bytes: &[u8]) -> Result<Option<(u32, u64)>> {
         return Ok(None);
     }
     let version = field(8);
-    if version != FORMAT_VERSION {
+    if version != format {
         return Err(corrupt(&format!(
-            "log format version {version}; this build reads version {FORMAT_VERSION}"
+            "log format version {version}; this store reads version {format} (4 is the F7 \
+             splice arm's: open with the same DatabaseOpts::with_branch_splice)"
         )));
     }
     let generation = u64::from_le_bytes(h[16..24].try_into().unwrap());
@@ -1094,7 +1143,7 @@ fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
 
 /// `(page_size, generation, state, file_len)`. A snapshot is only ever put in place by a rename
 /// of a complete, synced file, so any defect in one is corruption, not a torn write.
-fn read_snapshot(path: &Path) -> Result<(u32, u64, SnapshotState, u64)> {
+fn read_snapshot(path: &Path, format: u32) -> Result<(u32, u64, SnapshotState, u64)> {
     let mut file = File::open(path).map_err(|e| io_error(e, "open branch snapshot"))?;
     let bytes = read_all(&mut file)?;
     const HEAD: usize = 8 + 4 + 4 + 8;
@@ -1105,8 +1154,8 @@ fn read_snapshot(path: &Path) -> Result<(u32, u64, SnapshotState, u64)> {
     if crc32c::crc32c(body) != u32::from_le_bytes(trailer.try_into().unwrap()) {
         return Err(corrupt("snapshot checksum"));
     }
-    if u32::from_le_bytes(body[8..12].try_into().unwrap()) != FORMAT_VERSION {
-        return Err(corrupt("snapshot format version"));
+    if u32::from_le_bytes(body[8..12].try_into().unwrap()) != format {
+        return Err(corrupt("snapshot format version (4 is the F7 splice arm's)"));
     }
     let page_size = u32::from_le_bytes(body[12..16].try_into().unwrap());
     let generation = u64::from_le_bytes(body[16..24].try_into().unwrap());
@@ -1605,6 +1654,64 @@ mod tests {
         put_u32(&mut snap, crc);
         std::fs::write(&files.snap, &snap).unwrap();
         assert!(Journal::recover(&files, false).is_err(), "a snapshot of another version was accepted");
+    }
+
+    /// r11-ever amendment 15: the F7 splice arm writes version 4 and the default arm 3, and each
+    /// reads only its own, because replay repeats every splice (a log written with splices and
+    /// replayed without them would rebuild another tree). The log's check and the snapshot's are
+    /// each made to fire alone: in the second half the log is of the READING arm's version.
+    #[test]
+    fn each_splice_arm_reads_only_its_own_format_version() {
+        fn header(format: u32, generation: u64) -> Vec<u8> {
+            let mut header = Vec::new();
+            header.extend_from_slice(LOG_MAGIC);
+            put_u32(&mut header, format);
+            put_u32(&mut header, 512);
+            put_u64(&mut header, generation);
+            let crc = crc32c::crc32c(&header);
+            put_u32(&mut header, crc);
+            put_u32(&mut header, 0);
+            header
+        }
+        fn snapshot(format: u32, generation: u64) -> Vec<u8> {
+            let mut snap = Vec::new();
+            snap.extend_from_slice(SNAP_MAGIC);
+            put_u32(&mut snap, format);
+            put_u32(&mut snap, 512);
+            put_u64(&mut snap, generation);
+            SnapshotState::default().encode(&mut snap);
+            let crc = crc32c::crc32c(&snap);
+            put_u32(&mut snap, crc);
+            snap
+        }
+        assert_ne!(format_version(false), format_version(true));
+        for written in [false, true] {
+            let (own, other) = (format_version(written), format_version(!written));
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+
+            std::fs::write(&files.log, header(own, 0)).unwrap();
+            assert!(
+                Journal::recover_as(&files, false, other).is_err(),
+                "splice={written}: the other arm read this arm's log"
+            );
+            let got = Journal::recover_as(&files, false, own).unwrap();
+            assert!(got.is_some(), "splice={written}: its own arm found no state in its log");
+            drop(got);
+
+            std::fs::write(&files.snap, snapshot(own, 1)).unwrap();
+            std::fs::write(&files.log, header(other, 1)).unwrap();
+            assert!(
+                Journal::recover_as(&files, false, other).is_err(),
+                "splice={written}: the other arm read this arm's snapshot"
+            );
+            std::fs::write(&files.log, header(own, 1)).unwrap();
+            let got = Journal::recover_as(&files, false, own).unwrap();
+            assert!(
+                got.is_some_and(|r| r.snapshot.is_some()),
+                "splice={written}: its own arm did not read its snapshot"
+            );
+        }
     }
 
     #[test]

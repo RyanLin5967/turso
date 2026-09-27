@@ -81,7 +81,15 @@
 //!
 //! # Splicing a zombie out (F7 durable port, r11-ever; UNBUILT)
 //!
-//! A released branch no connection holds, left with exactly ONE live child, is spliced out: the
+//! An ARM, off by default (`DatabaseOpts::with_branch_splice`; the lane's suites and harnesses turn
+//! it on with `R11_SPLICE=1` and name it). Off, a released branch with a live child is only
+//! retired, as above, and kept until its last child goes: the base's rule. Its frees are the base's
+//! at the same calls (argued from source, not run: a kept current version is read by the children
+//! forked at or after its birth, so it is garbage exactly when the newest child's fork is below its
+//! birth, which is the base's interval rule for a version retained until the release epoch, since
+//! every child forked below that epoch), so the per-release attribution the base's tests assert
+//! holds unedited. In the arm, a released branch no connection holds, left with exactly ONE live
+//! child, is spliced out: the
 //! child takes its place under its parent at the same fork epoch and inherits the versions it read
 //! through it (`StoreInner::splice`; the volatile store's F7, turso r11-ever fad7db24d / a85f41ab2 /
 //! d9be3f03a; prior art: ZFS `zfs promote`, QEMU `block-stream` / `block-commit`, Neon
@@ -89,7 +97,9 @@
 //! oldest keeps every branch it ever created: as catalog rows, children-index entries and snapshot
 //! entries. With it a kept released branch no connection holds has two or more live children, so
 //! kept states number under twice the live ones. Composed with this file's other fixes, the splice
-//! carries four obligations (r11-invariant-matrix U5-U7; U8 does not arise: no deferred frees here):
+//! carries three obligations (r11-invariant-matrix U5-U7). U8 does not arise on this base: F-reclaim
+//! (turso e7d0fd4a7) is not in it, and with it a splice would first have to drain or filter the
+//! zombie's queued ranges, which name slots the splice moves to the child:
 //!
 //! * U5, F1's per-page order: a splice can retain a version OLDER than the child's own, so
 //!   `Lineage::retain` checks both neighbours, not only the last (fad7db24d's check).
@@ -104,7 +114,12 @@
 //! repeats every splice where the live store made it and needs no record of its own: a release
 //! (`Release`, or `ReleaseOpen` when a connection holds the branch), the close of a held branch
 //! (`Close`), and the end of recovery, which logs a `Close` for every branch a crash left held. A
-//! snapshot records the hold (`held_open`), a catalog row as `released = 2`. The log format is 3.
+//! snapshot records the hold (`held_open`), a catalog row as `released = 2`. The log format is 3, and
+//! 4 in the splice arm (both arms have epoch inheritance and the hold records): each arm reads only
+//! its own, since replay without the splices that were made, or with ones that were not, would
+//! rebuild another tree. A catalog store whose log header is torn opens from its meta row with no
+//! version check; that is safe for the arm, since no record is replayed and a checkpointed state is
+//! a valid tree in either arm.
 //!
 //! # Leases (F5, UNBUILT)
 //!
@@ -258,6 +273,12 @@ struct StoreInner {
     n_states: u64,
     /// `BranchDurability::Catalog`: checkpoint into the catalog, read state on demand.
     catalog_mode: bool,
+    /// The F7 SPLICE arm (`DatabaseOpts::with_branch_splice`, r11-ever amendment 15): a released
+    /// branch left with one live child is spliced into it. Off, the store keeps the base's rule
+    /// (a released branch with a live child is retired and kept), so the base's per-release
+    /// attribution holds unedited. A durable store writes and reads only its arm's format version
+    /// (`journal::format_version`), so its files cannot be reopened in the other arm.
+    splice: bool,
     /// The catalog and what this process holds beside it; `Some` once a catalog store has files.
     cat: Option<CatState>,
     /// Observation only; see [`BranchWork`].
@@ -973,6 +994,7 @@ impl BranchStore {
     pub(crate) fn open_with_flags(
         durability: BranchDurability,
         default_lease: Option<Duration>,
+        splice: bool,
         db_path: &str,
         read_only: bool,
     ) -> Result<Self> {
@@ -990,7 +1012,7 @@ impl BranchStore {
                 )));
             }
         }
-        Self::open(durability, default_lease, db_path)
+        Self::open_mode(durability, default_lease, splice, db_path)
     }
 
     fn trunk_only() -> Self {
@@ -1030,6 +1052,17 @@ impl BranchStore {
         default_lease: Option<Duration>,
         db_path: &str,
     ) -> Result<Self> {
+        Self::open_mode(durability, default_lease, false, db_path)
+    }
+
+    /// `open` in the F7 splice arm (`splice`) or not.
+    pub(crate) fn open_mode(
+        durability: BranchDurability,
+        default_lease: Option<Duration>,
+        splice: bool,
+        db_path: &str,
+    ) -> Result<Self> {
+        let format = super::journal::format_version(splice);
         let memory = crate::is_memory_like(db_path);
         let opened = Instant::now();
         let mut stats = BranchOpenStats::default();
@@ -1043,7 +1076,9 @@ impl BranchStore {
                          silently change what those branches read"
                     )));
                 }
-                StoreInner::fresh(None, false, default_lease)
+                let mut inner = StoreInner::fresh(None, false, default_lease);
+                inner.splice = splice;
+                inner
             }
             BranchDurability::Durable { sync } => {
                 if memory {
@@ -1060,9 +1095,10 @@ impl BranchStore {
                     )));
                 }
                 let mut inner = StoreInner::fresh(Some(files.clone()), sync, default_lease);
+                inner.splice = splice;
                 if files.exist() {
                     let t = Instant::now();
-                    let recovered = Journal::recover(&files, sync)?;
+                    let recovered = Journal::recover_as(&files, sync, format)?;
                     stats.recover_ns = ns(t);
                     if let Some(mut recovered) = recovered {
                         stats.snap_bytes = recovered.snap_bytes;
@@ -1129,6 +1165,7 @@ impl BranchStore {
                     )));
                 }
                 let mut inner = StoreInner::fresh_mode(Some(files.clone()), sync, default_lease, true);
+                inner.splice = splice;
                 if files.exist() {
                     Self::recover_catalog(&mut inner, &files, sync, &mut stats)?;
                 }
@@ -1205,7 +1242,12 @@ impl BranchStore {
         stats.catalog_ns = ns(t);
         let t = Instant::now();
         let recovered =
-            Journal::recover_catalog(files, sync, meta.map(|m| (m.page_size, m.generation)))?;
+            Journal::recover_catalog_as(
+                files,
+                sync,
+                meta.map(|m| (m.page_size, m.generation)),
+                super::journal::format_version(inner.splice),
+            )?;
         stats.recover_ns = ns(t);
         let Some(mut recovered) = recovered else {
             return Ok(());
@@ -2400,6 +2442,7 @@ impl StoreInner {
             children: ChildIndex::default(),
             n_states: 0,
             catalog_mode,
+            splice: false,
             cat: None,
             work: BranchWork::default(),
             derived_inserts: 0,
@@ -2864,6 +2907,8 @@ impl StoreInner {
                     }
                     let mut journal =
                         Journal::open_fresh_with(files, page_size, self.sync, fail_lock)?;
+                    // The arm's format version, in the header `start` writes (amendment 15).
+                    journal.set_format(super::journal::format_version(self.splice));
                     let started = journal.start(fail);
                     self.journal = Some(journal);
                     started?;
@@ -3339,8 +3384,9 @@ impl StoreInner {
                 st.retire_current(id, children, cat.as_mut().map(|c| &mut c.catalog), freed)?;
                 let one = st.lineage.n_children == 1;
                 self.mark_dirty(id, DIRTY_CUR | DIRTY_RET);
-                // F7 durable port: with exactly one live child left, it is spliced out.
-                if one {
+                // F7 durable port, in the splice arm: with exactly one live child left, it is
+                // spliced out. Off, it stays retired, as on the base.
+                if one && self.splice {
                     self.splice(id, freed)?;
                     return Ok(id == first);
                 }
@@ -4019,7 +4065,7 @@ mod tests {
             let first = BranchStore::open(durable, None, path).unwrap();
             first.inner.lock().ensure_backing(512).unwrap();
         }
-        let ro = BranchStore::open_with_flags(BranchDurability::Volatile, None, path, true)
+        let ro = BranchStore::open_with_flags(BranchDurability::Volatile, None, false, path, true)
             .expect("a read-only open over branch files must open trunk-only");
         assert!(ro.has_branches(), "VACUUM and journal-mode changes must stay refused");
         assert!(ro.trunk_has_children(), "every trunk write must reach the refusal below");
@@ -4218,6 +4264,12 @@ mod sota_helpers {
         }
     }
 
+    /// The F7 splice arm, from `R11_SPLICE` (r11-ever amendment 15): these model tests check every
+    /// read against a model, so the lane runs them in both arms.
+    pub(super) fn splice_arm() -> bool {
+        std::env::var_os("R11_SPLICE").is_some()
+    }
+
     /// A store of the given mode over `dir` (unused when volatile).
     pub(super) fn open_store(mode: Mode, dir: &std::path::Path, name: &str) -> BranchStore {
         let path = if mode.durable() {
@@ -4225,7 +4277,7 @@ mod sota_helpers {
         } else {
             ":memory:".to_string()
         };
-        BranchStore::open(mode.durability(), None, &path).unwrap()
+        BranchStore::open_mode(mode.durability(), None, splice_arm(), &path).unwrap()
     }
 
     /// Copy every branch file of the store at `dir/name` to `dir/<image>` while it is open, and
@@ -4247,7 +4299,7 @@ mod sota_helpers {
                 std::fs::copy(&src, &dst).unwrap();
             }
         }
-        BranchStore::open(mode.durability(), None, to_str(&dir.join(image))).unwrap()
+        BranchStore::open_mode(mode.durability(), None, splice_arm(), to_str(&dir.join(image))).unwrap()
     }
 
     fn to_str(p: &std::path::Path) -> &str {

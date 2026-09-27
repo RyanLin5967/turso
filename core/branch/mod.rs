@@ -339,9 +339,10 @@ pub struct BranchOpenStats {
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
-    /// Branch states that exist, including reaped branches kept alive by an open connection or by
-    /// two or more live children (one with exactly one is spliced into it and is not counted, while
-    /// its pages are: they now belong to that child).
+    /// Branch states that exist, including reaped branches kept alive by an open connection or by a
+    /// live child. In the F7 splice arm (`DatabaseOpts::with_branch_splice`) only by two or more: one
+    /// with exactly one is spliced into it and is not counted, while its pages are (they now belong
+    /// to that child).
     pub live_branches: usize,
     /// Arena pages owned by some branch (or retained for one).
     pub arena_slots_in_use: usize,

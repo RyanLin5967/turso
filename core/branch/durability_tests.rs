@@ -20,7 +20,10 @@ fn durable() -> DatabaseOpts {
     } else {
         BranchDurability::Durable { sync: true }
     };
-    DatabaseOpts::new().with_branch_durability(durability)
+    // r11-ever amendment 15: R11_SPLICE=1 runs it in the F7 splice arm (off by default).
+    DatabaseOpts::new()
+        .with_branch_durability(durability)
+        .with_branch_splice(std::env::var_os("R11_SPLICE").is_some())
 }
 
 fn open_read_only(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
@@ -2394,33 +2397,61 @@ fn attach_of_a_database_held_open_with_a_lease_or_durable_is_not_refused() {
 // workload that forks from its newest branch and releases its oldest (r11-restart's E5) kept every
 // branch it ever created: as snapshot entries, catalog rows and children-index entries. The port
 // splices a released branch with exactly one live child out of the tree. Every test here runs in
-// snapshot mode, and in catalog mode under R11_BRANCH_CATALOG, like the rest of this file.
+// snapshot mode, and in catalog mode under R11_BRANCH_CATALOG, like the rest of this file. The
+// splice is an ARM, off by default (the lead's ruling, amendment 15): the tests that assert a splice
+// open in it explicitly (`spliced()`), whatever R11_SPLICE says; the last three test the switch.
 
 fn catalog_run() -> bool {
     std::env::var_os("R11_BRANCH_CATALOG").is_some()
 }
 
-/// The log records a recovery of the (closed) store at `path` would replay, in either mode.
+/// `durable()` in the F7 splice arm, whatever R11_SPLICE says.
+fn spliced() -> DatabaseOpts {
+    durable().with_branch_splice(true)
+}
+
+/// `reopen`, in the arm `opts` names: a store opens only in the arm its files were written in.
+fn reopen_in(path: &Path, previous_incarnation: u64, opts: DatabaseOpts) -> Arc<Database> {
+    let db = open_at(path, opts).expect("reopen");
+    assert_ne!(
+        db.incarnation, previous_incarnation,
+        "the registry returned the old Database: this is not a reopen"
+    );
+    db
+}
+
+/// The log records a recovery of the (closed) store at `path`, written in the splice arm, would
+/// replay, in either mode.
 fn log_records(path: &Path) -> Vec<journal::Record> {
     let files = journal::BranchFiles::for_db(path.to_str().unwrap());
+    let format = journal::format_version(true);
     let recovered = if catalog_run() {
         let meta = catalog::Catalog::open(&files.cat, false).unwrap().meta().unwrap();
-        journal::Journal::recover_catalog(&files, false, meta.map(|m| (m.page_size, m.generation)))
+        journal::Journal::recover_catalog_as(
+            &files,
+            false,
+            meta.map(|m| (m.page_size, m.generation)),
+            format,
+        )
     } else {
-        journal::Journal::recover(&files, false)
+        journal::Journal::recover_as(&files, false, format)
     };
     recovered.unwrap().expect("the store has files").records
 }
 
-/// What the last snapshot or catalog checkpoint of the (closed) store at `path` holds for `id`:
-/// `Some(held)`, held meaning released while a connection held it open, or `None` without it.
+/// What the last snapshot or catalog checkpoint of the (closed) store at `path`, written in the
+/// splice arm, holds for `id`: `Some(held)`, held meaning released while a connection held it open,
+/// or `None` without it.
 fn checkpointed_hold(path: &Path, id: BranchId) -> Option<bool> {
     let files = journal::BranchFiles::for_db(path.to_str().unwrap());
     if catalog_run() {
         let b = catalog::Catalog::open(&files.cat, false).unwrap().load_branch(id.0).unwrap();
         return b.map(|b| b.released && b.held_open);
     }
-    let snapshot = journal::Journal::recover(&files, false).unwrap().unwrap().snapshot?;
+    let snapshot = journal::Journal::recover_as(&files, false, journal::format_version(true))
+        .unwrap()
+        .unwrap()
+        .snapshot?;
     snapshot
         .branches
         .into_iter()
@@ -2459,7 +2490,7 @@ fn a_chain_that_releases_its_oldest_keeps_only_its_live_branches() {
     let slots;
     let mut expect: BTreeMap<BranchId, BTreeMap<i64, String>> = BTreeMap::new();
     {
-        let db = open_at(&path, durable()).unwrap();
+        let db = open_at(&path, spliced()).unwrap();
         incarnation = db.incarnation;
         let trunk = db.connect().unwrap();
         seed(&trunk, 200);
@@ -2526,7 +2557,7 @@ fn a_chain_that_releases_its_oldest_keeps_only_its_live_branches() {
 
     // Replay only (the log is far below the compaction threshold): the same splices at the same
     // points, so the same slots.
-    let db = reopen(&path, incarnation);
+    let db = reopen_in(&path, incarnation, spliced());
     let ids: Vec<BranchId> = expect.keys().copied().collect();
     assert_eq!(db.branch_ids().unwrap(), ids, "replay kept or lost a branch");
     assert_eq!(db.branch_stats().unwrap().live_branches, LIVE, "replay kept a spliced branch");
@@ -2537,7 +2568,7 @@ fn a_chain_that_releases_its_oldest_keeps_only_its_live_branches() {
     db.branch_compact_now().unwrap();
     let incarnation = db.incarnation;
     drop(db);
-    let db = reopen(&path, incarnation);
+    let db = reopen_in(&path, incarnation, spliced());
     assert_eq!(db.branch_stats().unwrap().live_branches, LIVE, "the snapshot kept a spliced branch");
     assert_eq!(in_use(&db), slots, "the snapshot restart landed on other slots");
     check_views(&db, &expect, "after the snapshot");
@@ -2567,7 +2598,7 @@ fn a_branch_released_under_its_open_connection_is_spliced_at_the_close() {
         std::fs::create_dir(dir.path().join(sub)).unwrap();
     }
     {
-        let db = open_at(&path, durable()).unwrap();
+        let db = open_at(&path, spliced()).unwrap();
         incarnation = db.incarnation;
         let trunk = db.connect().unwrap();
         seed(&trunk, 200);
@@ -2650,14 +2681,14 @@ fn a_branch_released_under_its_open_connection_is_spliced_at_the_close() {
             (110, original(110)),
         ]),
     )]);
-    let db = reopen(&path, incarnation);
+    let db = reopen_in(&path, incarnation, spliced());
     assert_eq!(db.branch_ids().unwrap(), vec![c_id]);
     assert_eq!(db.branch_stats().unwrap().live_branches, 1, "replay kept the spliced branch");
     assert_eq!(in_use(&db), slots, "replay of the Close landed on other slots");
     check_views(&db, &expect, "after the snapshot and the Close");
     drop(db);
     for image in [&image_before, &image_after] {
-        let crashed = open_at(image, durable()).unwrap();
+        let crashed = open_at(image, spliced()).unwrap();
         assert_eq!(
             crashed.branch_stats().unwrap().live_branches,
             1,
@@ -2681,7 +2712,7 @@ fn a_grandchild_reads_a_spliced_parents_write() {
     let incarnation;
     let expect;
     {
-        let db = open_at(&path, durable()).unwrap();
+        let db = open_at(&path, spliced()).unwrap();
         incarnation = db.incarnation;
         let trunk = db.connect().unwrap();
         seed(&trunk, 200);
@@ -2700,7 +2731,7 @@ fn a_grandchild_reads_a_spliced_parents_write() {
         let row = BTreeMap::from([(7, "p-after-three-forks".to_string())]);
         expect = BTreeMap::from([(c.into_id(), row.clone()), (g.into_id(), row)]);
     }
-    let db = reopen(&path, incarnation);
+    let db = reopen_in(&path, incarnation, spliced());
     assert_eq!(db.branch_stats().unwrap().live_branches, 2);
     check_views(&db, &expect, "after replay");
     // The page maps a replay builds come from each fork, as live; a snapshot or catalog checkpoint
@@ -2710,7 +2741,7 @@ fn a_grandchild_reads_a_spliced_parents_write() {
     db.branch_compact_now().unwrap();
     let incarnation = db.incarnation;
     drop(db);
-    let db = reopen(&path, incarnation);
+    let db = reopen_in(&path, incarnation, spliced());
     assert_eq!(db.branch_stats().unwrap().live_branches, 2);
     check_views(&db, &expect, "after a checkpoint and a reopen");
 }
@@ -2730,7 +2761,7 @@ fn a_splice_frees_a_version_the_child_shadowed_before_its_own_child_forked() {
     let slots;
     let expect;
     {
-        let db = open_at(&path, durable()).unwrap();
+        let db = open_at(&path, spliced()).unwrap();
         incarnation = db.incarnation;
         let trunk = db.connect().unwrap();
         seed(&trunk, 200);
@@ -2761,7 +2792,7 @@ fn a_splice_frees_a_version_the_child_shadowed_before_its_own_child_forked() {
             (d.into_id(), BTreeMap::from([(7, "c-first".to_string())])),
         ]);
     }
-    let db = reopen(&path, incarnation);
+    let db = reopen_in(&path, incarnation, spliced());
     assert_eq!(db.branch_stats().unwrap().live_branches, 2);
     assert_eq!(in_use(&db), slots, "replay of the splice landed on other slots");
     check_views(&db, &expect, "after replay");
@@ -2782,7 +2813,7 @@ fn a_recovery_logs_the_close_of_a_branch_a_crash_left_held() {
     let image;
     let p_id;
     {
-        let db = open_at(&path, durable()).unwrap();
+        let db = open_at(&path, spliced()).unwrap();
         let trunk = db.connect().unwrap();
         seed(&trunk, 200);
         let p = trunk.fork_branch().unwrap();
@@ -2800,7 +2831,7 @@ fn a_recovery_logs_the_close_of_a_branch_a_crash_left_held() {
     let slots;
     let incarnation;
     {
-        let db = open_at(&image, durable()).unwrap(); // session 2: recovery splices p into c
+        let db = open_at(&image, spliced()).unwrap(); // session 2: recovery splices p into c
         incarnation = db.incarnation;
         assert_eq!(db.branch_stats().unwrap().live_branches, 1, "recovery kept the held branch");
         let ids = db.branch_ids().unwrap();
@@ -2841,7 +2872,7 @@ fn a_recovery_logs_the_close_of_a_branch_a_crash_left_held() {
         // Session 3's state checks below cannot tell a missing Close from a present one on this
         // schedule (the splice commutes with session 2's operations here); this order check can.
     }
-    let db = reopen(&image, incarnation); // session 3
+    let db = reopen_in(&image, incarnation, spliced()); // session 3
     assert_eq!(db.branch_ids().unwrap(), vec![d_id]);
     assert_eq!(db.branch_stats().unwrap().live_branches, 1, "replay kept a spliced branch");
     assert_eq!(in_use(&db), slots, "session 3 replayed session 2 onto another tree");
@@ -2873,7 +2904,7 @@ fn a_splice_keeps_the_zombies_version_below_the_childs_own() {
     let expect;
     let d1_id;
     {
-        let db = open_at(&path, durable()).unwrap();
+        let db = open_at(&path, spliced()).unwrap();
         incarnation = db.incarnation;
         let trunk = db.connect().unwrap();
         seed(&trunk, 200);
@@ -2904,7 +2935,7 @@ fn a_splice_keeps_the_zombies_version_below_the_childs_own() {
             (d2.into_id(), BTreeMap::from([(7, "c1".to_string())])),
         ]);
     }
-    let db = reopen(&path, incarnation); // replay repeats the splice
+    let db = reopen_in(&path, incarnation, spliced()); // replay repeats the splice
     assert_eq!(db.branch_stats().unwrap().live_branches, 3);
     assert_eq!(in_use(&db), slots, "replay of the splice landed on other slots");
     check_views(&db, &expect, "after replay");
@@ -2912,5 +2943,107 @@ fn a_splice_keeps_the_zombies_version_below_the_childs_own() {
     assert!(!reaped.deferred, "{reaped:?}");
     for slot in &z7 {
         assert!(db.branch_slot_is_free(*slot), "slot {slot}: its only reader is gone, still held");
+    }
+}
+
+/// r11-ever amendment 15 (the lead's ruling): the splice is an ARM, off by default. P writes row 7
+/// and forks C, and P is released: off, P is kept (retired) as on the base, with no splice, and a
+/// reopen keeps it; on, P is spliced into C. Either way the reap is deferred and C reads P's write.
+/// The on arm is the control that the off arm's counts can tell the two apart.
+#[test]
+fn the_splice_arm_is_off_by_default_and_splices_only_when_on() {
+    assert!(!DatabaseOpts::new().branch_splice, "the splice arm is on by default");
+    for (splice, live, splices) in [(false, 2, 0), (true, 1, 1)] {
+        let opts = durable().with_branch_splice(splice);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("durable.db");
+        let (incarnation, c_id);
+        {
+            let db = open_at(&path, opts).unwrap();
+            incarnation = db.incarnation;
+            let trunk = db.connect().unwrap();
+            seed(&trunk, 200);
+            let p = trunk.fork_branch().unwrap();
+            set(&p.connect().unwrap(), 7, "p");
+            let c = p.fork().unwrap();
+            let reaped = p.reap().unwrap();
+            assert!(reaped.deferred, "splice={splice}: {reaped:?}");
+            let s = db.branch_stats().unwrap();
+            assert_eq!(s.live_branches, live, "splice={splice}: {s:?}");
+            assert_eq!(s.work.splices, splices, "splice={splice}: {s:?}");
+            assert_eq!(value(&c.connect().unwrap(), 7).as_deref(), Some("p"), "splice={splice}");
+            c_id = c.into_id();
+        }
+        let db = reopen_in(&path, incarnation, opts);
+        assert_eq!(db.branch_stats().unwrap().live_branches, live, "splice={splice}: after the reopen");
+        let c = db.branch(c_id).unwrap();
+        assert_eq!(value(&c.connect().unwrap(), 7).as_deref(), Some("p"), "splice={splice}: reopened");
+        let _ = c.into_id();
+    }
+}
+
+/// r11-ever amendment 15: replay repeats every splice, so a store's files open only in the arm they
+/// were written in (the log's and snapshot's format version: 3 off, 4 on). The other arm is an error
+/// that names the splice arm, never a replay under the other rule: both directions, from the log
+/// alone and after a checkpoint (a snapshot, or a catalog checkpoint whose new log header carries
+/// the version). The refused open changes nothing: the store's own arm then opens it.
+#[test]
+fn a_store_opens_only_in_the_splice_arm_its_files_were_written_in() {
+    for splice in [false, true] {
+        for checkpoint in [false, true] {
+            let what = format!("splice={splice} checkpoint={checkpoint}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("durable.db");
+            let written = durable().with_branch_splice(splice);
+            let b_id;
+            {
+                let db = open_at(&path, written).unwrap();
+                let trunk = db.connect().unwrap();
+                seed(&trunk, 50);
+                let b = trunk.fork_branch().unwrap();
+                set(&b.connect().unwrap(), 7, "b");
+                b_id = b.into_id();
+                if checkpoint {
+                    db.branch_compact_now().unwrap();
+                }
+            }
+            let err = match open_at(&path, durable().with_branch_splice(!splice)) {
+                Ok(_) => panic!("{what}: the other arm opened the store"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains("splice"), "{what}: refused for another reason: {err}");
+            let db = open_at(&path, written).expect("its own arm opens it");
+            assert_eq!(db.branch_ids().unwrap(), vec![b_id], "{what}");
+            let b = db.branch(b_id).unwrap();
+            assert_eq!(value(&b.connect().unwrap(), 7).as_deref(), Some("b"), "{what}");
+            let _ = b.into_id();
+        }
+    }
+}
+
+/// r11-ever amendment 15: a registry hit must not hand an open the instance of the other splice arm,
+/// whose releases would be collected by the other rule (review 7 item 2's rule for the lease, applied
+/// to the new option). Volatile too: a volatile store collects in process.
+#[test]
+fn a_registry_hit_of_the_other_splice_arm_is_refused() {
+    for durable_store in [false, true] {
+        for splice in [false, true] {
+            let what = format!("durable={durable_store} splice={splice}");
+            let base = if durable_store { durable() } else { DatabaseOpts::new() };
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("held.db");
+            let held = open_at(&path, base.with_branch_splice(splice)).unwrap();
+            seed(&held.connect().unwrap(), 3);
+            let err = match open_at(&path, base.with_branch_splice(!splice)) {
+                Ok(_) => panic!("{what}: an open in the other arm received the held instance"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains("is open in this process with the branch splice arm"),
+                "{what}: refused for another reason: {err}"
+            );
+            open_at(&path, base.with_branch_splice(splice)).expect("the same arm receives it");
+            drop(held);
+        }
     }
 }
