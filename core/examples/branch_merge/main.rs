@@ -12,6 +12,8 @@
 //!   upd   agent j UPDATEs rows perm[(j*k+i) mod R] to same-length values (disjoint while L*k <= R)
 //!   ins   agent j INSERTs k fresh ids into random gaps of the table (disjoint; splits leaves)
 //!   rand  agent j UPDATEs k uniformly random rows (true conflicts exist; a correctness arm)
+//!   clu   agent j UPDATEs the k CONTIGUOUS rows (j*k+i) mod R, so they share leaves: about 36 rows per
+//!         leaf page (U14's clustered arm, PREREG A17a; disjoint while L*k <= R)
 //!
 //! The harness keeps its own model of which committed merge wrote each row last. A merge truly
 //! conflicts iff a row it wrote was written by a merge committed after its fork. Every merge's
@@ -40,6 +42,7 @@ enum Workload {
     Upd,
     Ins,
     Rand,
+    Clu,
 }
 
 #[derive(Debug)]
@@ -117,6 +120,7 @@ fn parse_args() -> Args {
                     "upd" => Workload::Upd,
                     "ins" => Workload::Ins,
                     "rand" => Workload::Rand,
+                    "clu" => Workload::Clu,
                     other => die(&format!("unknown workload {other}")),
                 }
             }
@@ -283,6 +287,7 @@ impl Run {
                     Workload::Upd => (i64::from(self.perm[x % r]) + 1) << 20,
                     Workload::Ins => ((i64::from(self.perm[x % r]) + 1) << 20) + 1 + (x / r) as i64,
                     Workload::Rand => ((self.rng.below(r) as i64) + 1) << 20,
+                    Workload::Clu => ((x % r) as i64 + 1) << 20,
                 };
                 (id, i)
             })
@@ -299,7 +304,9 @@ impl Run {
         for &(id, i) in &ids {
             let v = agent_value(j, i);
             let sql = match self.args.workload {
-                Workload::Upd | Workload::Rand => format!("UPDATE t SET v = '{v}' WHERE id = {id}"),
+                Workload::Upd | Workload::Rand | Workload::Clu => {
+                    format!("UPDATE t SET v = '{v}' WHERE id = {id}")
+                }
                 Workload::Ins => format!("INSERT INTO t VALUES ({id}, '{v}')"),
             };
             conn.execute(sql).unwrap();
