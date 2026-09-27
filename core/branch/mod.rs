@@ -57,6 +57,29 @@ pub(crate) mod page_map;
 pub(crate) mod store;
 pub(crate) mod table;
 
+/// Fire-check switches for lane r12-f9-shrink's registered mutants (PREREG section 7): in a test
+/// build `R12_MUTANT=k` turns mutant k on; outside tests every switch is the constant `false`.
+#[cfg(test)]
+pub(crate) mod mutant {
+    pub(crate) fn on(k: u32) -> bool {
+        static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *M.get_or_init(|| {
+            std::env::var("R12_MUTANT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        }) == k
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) mod mutant {
+    #[inline(always)]
+    pub(crate) fn on(_: u32) -> bool {
+        false
+    }
+}
+
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};
 use crate::storage::wal::WalAutoActions;
@@ -239,19 +262,22 @@ pub struct BranchResident {
     pub waste_live_retained: usize,
     pub waste_trunk_retained: usize,
     pub waste_live_current: usize,
-    /// Arena slots ever handed out (the arena never shrinks below this).
+    /// Arena slots handed out at least once. Since F9 it falls when the top chunks empty (trim).
     pub arena_high_water: usize,
     pub arena_in_use: usize,
+    /// Free arena slots below `arena_high_water` (the free list's length before F9).
     pub arena_free_list_len: usize,
+    /// The free list's capacity; 0 since F9, which has no free list.
     pub arena_free_list_capacity: usize,
     pub arena_free_bits_words: usize,
-    /// Arena chunks allocated (each `SLOTS_PER_CHUNK` pages; never freed).
+    /// Arena chunks indexed below `arena_high_water`, mapped or not (before F9 each was allocated
+    /// and never freed).
     pub arena_chunks: usize,
     /// Bytes held per structure (lane r12-f9-shrink), for peak-then-shrink curves. Arena chunks
     /// whose memory is mapped (address space, not residency).
     pub arena_chunks_mapped: usize,
-    /// Arena bytes written and not returned to the OS: every slot below `arena_high_water`, while
-    /// the arena never returns a slot's memory.
+    /// Arena bytes written and not returned to the OS: before F9 every slot below
+    /// `arena_high_water`; since F9 the OS-page units written and not purged or unmapped.
     pub arena_resident_bytes: usize,
     /// The arena's own bookkeeping: capacity times element size of each of its vectors.
     pub arena_meta_bytes: usize,
