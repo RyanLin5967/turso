@@ -4387,6 +4387,41 @@ mod tests {
         assert_eq!(recovered.records, vec![Record::Release { branch: 9 }]);
     }
 
+    /// R3 (r11-bigtxn merge-1 review 4/6, artie-research f167c44b; PREREG A19): the catalog twin of the test above.
+    /// An emptied catalog store that follows a new page size must leave its catalog agreeing with the truncated
+    /// arena: no free row naming an old slot, and a high-water mark of 0. At d7a2b8f6e the next allocation panicked
+    /// ("a free slot past the high-water mark"): the restart's checkpoint wrote the OLD arena's free rows and
+    /// high-water mark; and a reopen restored the old high-water mark at the new page size.
+    #[test]
+    fn an_empty_catalog_store_follows_the_database_to_a_new_page_size() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        {
+            let store =
+                BranchStore::open(BranchDurability::Catalog { sync: false }, None, path).unwrap();
+            let mut inner = store.inner.lock();
+            inner.ensure_backing(512).unwrap();
+            let s = inner.alloc_slot().unwrap();
+            inner.release_slots(vec![s]);
+            inner
+                .ensure_backing(1024)
+                .expect("an empty catalog store refused the database's new page size");
+            let s = inner.alloc_slot().unwrap();
+            inner.release_slots(vec![s]);
+        }
+        let store = BranchStore::open(BranchDurability::Catalog { sync: false }, None, path).unwrap();
+        let inner = store.inner.lock();
+        let arena = inner.arena.as_ref().expect("the reopened catalog store has its arena");
+        assert_eq!(arena.page_size(), 1024, "the store kept the old page size");
+        let file_len = std::fs::metadata(&BranchFiles::for_db(path).arena).map_or(0, |m| m.len());
+        assert!(
+            u64::from(arena.high_water()) * 1024 <= file_len,
+            "the reopened arena's high-water mark {} (at 1024 B) exceeds its file ({file_len} B)",
+            arena.high_water()
+        );
+    }
+
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
     /// a page-size change, and must keep refusing it.
     #[test]
