@@ -175,6 +175,7 @@ trait Counted {
 struct Held<'a, T: Counted> {
     guard: MutexGuard<'a, T>,
     since: Option<Instant>,
+    site: usize,
 }
 
 impl<T: Counted> Deref for Held<'_, T> {
@@ -193,7 +194,11 @@ impl<T: Counted> DerefMut for Held<'_, T> {
 impl<T: Counted> Drop for Held<'_, T> {
     fn drop(&mut self) {
         if let Some(since) = self.since {
-            self.guard.work().lock.hold_ns += since.elapsed().as_nanos() as u64;
+            let held = since.elapsed().as_nanos() as u64;
+            let site = self.site;
+            let lock = &mut self.guard.work().lock;
+            lock.hold_ns += held;
+            lock.hold_site_ns[site] += held;
         }
     }
 }
@@ -217,9 +222,14 @@ fn take<T: Counted>(lock: &Mutex<T>, site: Site, timed: bool) -> Held<'_, T> {
     if let Some(waited) = waited {
         counts.contended[site as usize] += 1;
         counts.wait_ns += waited.as_nanos() as u64;
+        counts.wait_site_ns[site as usize] += waited.as_nanos() as u64;
     }
     let since = timed.then(Instant::now);
-    Held { guard, since }
+    Held {
+        guard,
+        since,
+        site: site as usize,
+    }
 }
 
 pub(crate) struct BranchStore {

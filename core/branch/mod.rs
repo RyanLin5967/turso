@@ -233,6 +233,8 @@ impl BranchWork {
         for i in 0..LOCK_SITES.len() {
             self.lock.acquisitions[i] += o.lock.acquisitions[i];
             self.lock.contended[i] += o.lock.contended[i];
+            self.lock.wait_site_ns[i] += o.lock.wait_site_ns[i];
+            self.lock.hold_site_ns[i] += o.lock.hold_site_ns[i];
         }
         self.lock.wait_ns += o.lock.wait_ns;
         self.lock.hold_ns += o.lock.hold_ns;
@@ -275,6 +277,10 @@ pub struct LockCounts {
     /// Nanoseconds the lock was held, all sites; counted only while lock timing is on
     /// ([`Database::set_branch_lock_timing`]), since timing a hold adds work inside it.
     pub hold_ns: u64,
+    /// `wait_ns` split by site (E7 attribution, r11-bushy-conc amendment 11).
+    pub wait_site_ns: [u64; 19],
+    /// `hold_ns` split by site (with lock timing on only).
+    pub hold_site_ns: [u64; 19],
 }
 
 impl Branch {

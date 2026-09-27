@@ -139,6 +139,11 @@ impl Interval {
     /// Print the interval (`--timing` only): its wall and CPU time, the lock's waits and holds and
     /// its per-site counts over the interval, and every op's latency percentiles.
     fn print(&self, db: &Database, args: &Args, x: u64, steps: u64, times: &mut OpTimes) {
+        self.print_with(db, args, x, steps, times, None);
+    }
+
+    /// As `print`, plus (cat) the workers' summed barrier time and the main thread's serial time over the interval.
+    fn print_with(&self, db: &Database, args: &Args, x: u64, steps: u64, times: &mut OpTimes, harness: Option<(u64, u64)>) {
         let wall = self.start.elapsed().as_nanos() as u64;
         let cpu = cpu_ns() - self.cpu;
         if !args.timing {
@@ -153,6 +158,14 @@ impl Interval {
             lock.wait_ns - self.lock.wait_ns,
             lock.hold_ns - self.lock.hold_ns,
         );
+        println!(
+            "# interval_sites x={x} lock_wait_site={} lock_hold_site={}",
+            sites(&lock.wait_site_ns, &self.lock.wait_site_ns),
+            sites(&lock.hold_site_ns, &self.lock.hold_site_ns),
+        );
+        if let Some((barrier_ns, serial_ns)) = harness {
+            println!("# interval_harness x={x} barrier_wait_ns={barrier_ns} main_serial_ns={serial_ns} workers={}", args.threads.unwrap_or(1));
+        }
         for (op, samples) in OPS.iter().zip(times.iter_mut()) {
             if samples.is_empty() {
                 continue;
@@ -416,6 +429,8 @@ struct CatOut {
     reads_checked: u64,
     times: OpTimes,
     teardown: Vec<(u32, Branch)>,
+    /// Time this worker spent in the level barriers since the last checkpoint (timing only).
+    barrier_ns: u64,
 }
 
 fn lap(times: &mut OpTimes, op: usize, since: Option<Instant>) {
@@ -427,8 +442,13 @@ fn lap(times: &mut OpTimes, op: usize, since: Option<Instant>) {
 fn cat_worker(k: usize, t: usize, timing: bool, shared: &RwLock<CatShared>, barrier: &Barrier, out: &Mutex<CatOut>) {
     let clock = || timing.then(Instant::now);
     let mut times = new_times();
+    let mut barrier_ns = 0u64;
     loop {
+        let a = clock();
         barrier.wait();
+        if let Some(a) = a {
+            barrier_ns += ns(a.elapsed()) as u64;
+        }
         let sh = shared.read().unwrap();
         let mut kept = Vec::new();
         let mut pruned = Vec::new();
@@ -496,8 +516,13 @@ fn cat_worker(k: usize, t: usize, timing: bool, shared: &RwLock<CatShared>, barr
         o.pruned.append(&mut pruned);
         o.reads_checked += reads;
         drain_times(&mut times, &mut o.times);
+        o.barrier_ns += std::mem::take(&mut barrier_ns);
         drop(o);
+        let a = clock();
         barrier.wait();
+        if let Some(a) = a {
+            barrier_ns += ns(a.elapsed()) as u64;
+        }
     }
 }
 
@@ -530,8 +555,10 @@ fn cat(args: &Args, db: &Arc<Database>, trunk: Arc<Connection>, t: usize) {
         let mut iv = Interval::start(db);
         let mut steps = 1u64;
         let mut level = 0u64;
+        let mut serial_ns = 0u64;
         for &target in &args.checkpoints {
             while level < target {
+                let prep = args.timing.then(Instant::now);
                 let choice = b.rng.below(fanout as u64) as usize;
                 {
                     let mut sh = shared.write().unwrap();
@@ -570,8 +597,12 @@ fn cat(args: &Args, db: &Arc<Database>, trunk: Arc<Connection>, t: usize) {
                     b.states += fanout as u64;
                     sh.plan = plan;
                 }
+                if let Some(p) = prep {
+                    serial_ns += ns(p.elapsed()) as u64;
+                }
                 barrier.wait();
                 barrier.wait();
+                let apply = args.timing.then(Instant::now);
                 let mut sh = shared.write().unwrap();
                 for out in &outs {
                     let mut o = out.lock().unwrap();
@@ -606,6 +637,10 @@ fn cat(args: &Args, db: &Arc<Database>, trunk: Arc<Connection>, t: usize) {
                     b.reaps += 1;
                     b.max_cascade = b.max_cascade.max(1);
                 }
+                drop(sh);
+                if let Some(a) = apply {
+                    serial_ns += ns(a.elapsed()) as u64;
+                }
                 level += 1;
             }
             let sh = shared.read().unwrap();
@@ -613,8 +648,11 @@ fn cat(args: &Args, db: &Arc<Database>, trunk: Arc<Connection>, t: usize) {
             if let Some(own) = b.times.as_mut() {
                 drain_times(own, &mut times);
             }
+            let mut barrier_ns = 0u64;
             for out in &outs {
-                drain_times(&mut out.lock().unwrap().times, &mut times);
+                let mut o = out.lock().unwrap();
+                drain_times(&mut o.times, &mut times);
+                barrier_ns += std::mem::take(&mut o.barrier_ns);
             }
             let h = Harness {
                 handles: b.handles,
@@ -629,7 +667,7 @@ fn cat(args: &Args, db: &Arc<Database>, trunk: Arc<Connection>, t: usize) {
                 steps,
             };
             let x = h.nodes;
-            iv.print(db, args, x, steps, &mut times);
+            iv.print_with(db, args, x, steps, &mut times, Some((barrier_ns, std::mem::take(&mut serial_ns))));
             checkpoint(db, args, t, x, Some(level), &w0, &m0, &h, "");
             drop(sh);
             steps = 0;
