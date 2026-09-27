@@ -1920,7 +1920,7 @@ impl BranchStore {
         }
         let t = Instant::now();
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
-        let cap = match inner.checkpoint_capture(false) {
+        let cap = match inner.checkpoint_capture(false, false) {
             Ok(cap) => cap,
             Err(e) => {
                 tracing::warn!("branch catalog checkpoint not started: {e}");
@@ -1980,7 +1980,7 @@ impl BranchStore {
 
     fn compact(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
         if inner.cat.is_some() {
-            inner.checkpoint_catalog(fail_after_rename)?;
+            inner.checkpoint_catalog(fail_after_rename, false)?;
             self.unsynced.store(false, Ordering::Release);
             return Ok(());
         }
@@ -3416,7 +3416,7 @@ impl StoreInner {
             if let Some(journal) = self.journal.as_mut() {
                 journal.set_page_size(page_size);
             }
-            if let Err(e) = self.checkpoint_catalog(false) {
+            if let Err(e) = self.checkpoint_catalog(false, true) {
                 if let (Some(journal), Some(old)) = (self.journal.as_mut(), old) {
                     journal.set_page_size(old);
                 }
@@ -3474,7 +3474,11 @@ impl StoreInner {
     /// purpose): capture, write and install back to back under the store mutex. `maybe_compact`
     /// runs the same three steps as a fuzzy checkpoint instead, with the write on its own thread
     /// and no store mutex held across it (F-FZ).
-    fn checkpoint_catalog(&mut self, fail_after_commit: bool) -> Result<()> {
+    ///
+    /// `restart` (R3, PREREG A19): `restart_empty` is about to truncate the arena to a new page size, so the
+    /// checkpoint records the arena the store will have, not the one it has: no free row at all (every old one is
+    /// deleted), high-water mark 0, nothing in use. The truncation still follows the commit.
+    fn checkpoint_catalog(&mut self, fail_after_commit: bool, restart: bool) -> Result<()> {
         // The catalog must hold the state the log describes: parked Commits first (C-R).
         self.settle()?;
         if self.journal.is_none() || self.arena.is_none() {
@@ -3490,7 +3494,7 @@ impl StoreInner {
         let t = Instant::now();
         let writer = cat.writer.clone();
         let q0 = cat.catalog.counters.queries;
-        let cap = self.checkpoint_capture(fail_after_commit)?;
+        let cap = self.checkpoint_capture(fail_after_commit, restart)?;
         let mut w = writer.lock();
         let w0 = w.counters.queries;
         let written = checkpoint_write(&mut w, &cap, None);
@@ -3514,7 +3518,7 @@ impl StoreInner {
     /// be in flight. The dirty map is swapped out (a branch changed after this is dirty again);
     /// every other in-memory set stays as it is until the install, so between now and then the
     /// store reads exactly as it does between checkpoints.
-    fn checkpoint_capture(&mut self, fail_after_commit: bool) -> Result<Box<Captured>> {
+    fn checkpoint_capture(&mut self, fail_after_commit: bool, restart: bool) -> Result<Box<Captured>> {
         let now = self.lease.now_ms();
         let (Some(journal), Some(arena), Some(cat)) =
             (self.journal.as_mut(), self.arena.as_mut(), self.cat.as_mut())
@@ -3558,11 +3562,14 @@ impl StoreInner {
         let trunk_gone: Vec<(u32, u64)> = cat.trunk_gone.iter().copied().collect();
         // Slots reserved by open write transactions are named by no durable state: the catalog
         // lists them free (a crash frees them), and this process keeps them as taken.
-        let reserved: Vec<Slot> = self
-            .branches
-            .values()
-            .flat_map(|st| st.pending.values().copied())
-            .collect();
+        let reserved: Vec<Slot> = if restart {
+            Vec::new()
+        } else {
+            self.branches
+                .values()
+                .flat_map(|st| st.pending.values().copied())
+                .collect()
+        };
         // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
         if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
             cat.dirty = dirty;
@@ -3576,8 +3583,9 @@ impl StoreInner {
             trunk_epoch: self.trunk.lineage.epoch,
             trunk_children: self.trunk.lineage.n_children,
             lease_now_ms: now,
-            arena_hw: arena.high_water(),
-            in_use: (arena.in_use() - reserved.len()) as u64,
+            // R3: a restart records the truncated arena the store is about to have.
+            arena_hw: if restart { 0 } else { arena.high_water() },
+            in_use: if restart { 0 } else { (arena.in_use() - reserved.len()) as u64 },
             states: self.n_states,
         };
         if super::arena::trace_slots() {
@@ -3625,9 +3633,10 @@ impl StoreInner {
             removed: cat.removed.iter().copied().collect(),
             trunk_new,
             trunk_gone,
-            free_cursor: cat.free_cursor,
-            taken: cat.taken.iter().copied().collect(),
-            free_list: arena.free_list().to_vec(),
+            // R3: a restart deletes every free row (a cursor past every slot) and writes none.
+            free_cursor: if restart { Some(Slot::MAX) } else { cat.free_cursor },
+            taken: if restart { Vec::new() } else { cat.taken.iter().copied().collect() },
+            free_list: if restart { Vec::new() } else { arena.free_list().to_vec() },
             reserved,
             meta,
             child_keys: self.children.map.keys().copied().collect(),
