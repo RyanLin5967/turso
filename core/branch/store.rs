@@ -243,10 +243,18 @@ pub(crate) mod crash {
             std::fs::write(path, note).expect("write the crash note");
         }
         #[cfg(unix)]
-        // SAFETY: signals this process; nothing is borrowed across it.
-        unsafe {
-            libc::kill(libc::getpid(), libc::SIGKILL);
+        {
+            // SAFETY: signals this process; nothing is borrowed across it.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+            // In a multi-threaded process `kill` can return before the process is torn down; the
+            // kill ends it here. (An `abort()` here raced it and the child died of SIGABRT.)
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
         }
+        #[cfg(not(unix))]
         std::process::abort()
     }
 

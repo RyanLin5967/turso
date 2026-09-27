@@ -2914,7 +2914,10 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
         "flight-after-write" => !cut_log,
         _ => true,
     };
-    let ids: BTreeSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
+    let ids: BTreeSet<BranchId> = match db.branch_ids() {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(e) => return Err(format!("{at}: R1, the branch list refused: {e}")),
+    };
     let b_present = b.is_some_and(|b| ids.contains(&BranchId(b)));
     if !ids.contains(&p_id) {
         failed.push("R2: P, committed before the child ran, is gone".to_string());
@@ -2941,12 +2944,37 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
             }
         };
         owned.extend(branch.owned_slots());
+        // Reads that fail are R1 failures, recorded, not panics: a checksum error is how a lost
+        // page shows itself, and every kill point must get its verdict.
+        let query = |conn: &Arc<Connection>, sql: &str| {
+            conn.prepare(sql)
+                .and_then(|mut s| s.run_collect_rows())
+                .map_err(|e| e.to_string())
+        };
+        let text = |conn: &Arc<Connection>, row: i64| {
+            query(conn, &format!("SELECT v FROM t WHERE id = {row}")).map(|r| {
+                r.first().and_then(|r| match &r[0] {
+                    Value::Text(t) => Some(t.as_str().to_string()),
+                    _ => None,
+                })
+            })
+        };
         match branch.connect() {
             Ok(conn) => {
-                let (v7, v150) = (value(&conn, 7), value(&conn, 150));
-                let ok = rows(&conn, "PRAGMA integrity_check")[0][0] == Value::from_text("ok");
-                if !ok {
-                    failed.push(format!("R1: branch {} fails its integrity check", id.0));
+                let (v7, v150) = match (text(&conn, 7), text(&conn, 150)) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    (Err(e), _) | (_, Err(e)) => {
+                        failed.push(format!("R1: branch {} cannot be read: {e}", id.0));
+                        let _ = branch.into_id();
+                        continue;
+                    }
+                };
+                match query(&conn, "PRAGMA integrity_check") {
+                    Ok(r) if r.first().is_some_and(|r| r[0] == Value::from_text("ok")) => {}
+                    other => failed.push(format!(
+                        "R1: branch {} fails its integrity check: {other:?}",
+                        id.0
+                    )),
                 }
                 let (want7, want150) = if id == p_id {
                     ("p".to_string(), original(150))
