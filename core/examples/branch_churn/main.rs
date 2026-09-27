@@ -72,7 +72,7 @@ struct Args {
     expire_every: Duration,
     batch_max: usize,
     reap_every: Duration,
-    /// Amendment 5: one trunk UPDATE per arrival, of the next row of the `spread` walk.
+    /// Amendments 5/5c: one trunk UPDATE per arrival, rotating over 312 known-distinct leaves.
     trunk_writes: bool,
     synchronous: &'static str,
     verify_every: usize,
@@ -144,7 +144,7 @@ fn parse_args() -> Args {
             "--reap-every-ms" => args.reap_every = ms(val(), "--reap-every-ms"),
             "--trunk-writes" => {
                 args.trunk_writes = match val().as_str() {
-                    "spread" => true,
+                    "rotate" => true,
                     "none" => false,
                     other => die(&format!("unknown --trunk-writes {other}")),
                 }
@@ -222,10 +222,17 @@ fn trunk_gen_value(g: u64) -> String {
     format!("t{:0>width$}", g, width = VALUE_LEN - 1)
 }
 
-/// The `spread` walk (branch_arms): the row of the trunk's `g`-th write. 37 is coprime with the
-/// row count, so the walk visits every row, one leaf further each time.
-fn spread_row(g: u64) -> i64 {
-    ((g * 37) % TRUNK_ROWS as u64) as i64 + 1
+/// Trunk pages the trunk writes rotate over (amendment 5c). Rows `1 + 64 j` for j < 312 lie on
+/// 312 DISTINCT leaves whatever the B-tree's split points: a table leaf holds a contiguous rowid
+/// range, and at most (4096 - 8) / 106 = 38 rows of this table fit on one (each cell is at least a
+/// 100-byte text, a record header, a rowid and a 2-byte pointer), so rows 64 apart never share one.
+/// Knowing the page of every trunk write is what lets the harness predict each reap exactly.
+const TRUNK_PAGES: u64 = 312;
+const TRUNK_ROW_STRIDE: u64 = 64;
+
+/// The row of the trunk's `g`-th write: page `g mod 312`, in rotation.
+fn trunk_row(g: u64) -> i64 {
+    ((g % TRUNK_PAGES) * TRUNK_ROW_STRIDE) as i64 + 1
 }
 
 /// The trunk's write history, kept by the harness (never read from the engine): what a branch
@@ -317,6 +324,8 @@ struct Entry {
 struct ReapWindow {
     latency_ns: Vec<u64>,
     pages: u64,
+    /// Trunk pre-images freed by reaps (freed pages beyond the branches' own w), amendment 5c.
+    trunk_preimages: u64,
     deferred: u64,
     cascades: u64,
     max_pages: u64,
@@ -488,10 +497,20 @@ fn main() {
         } else {
             (1, Duration::ZERO)
         };
+        let trunk_written = args.trunk_writes;
         std::thread::spawn(move || match mode {
-            Mode::Serial | Mode::Batch => {
-                reaper_loop(&shared, &db, t0, w, chain, pause, steady_batch, batch_max, round)
-            }
+            Mode::Serial | Mode::Batch => reaper_loop(
+                &shared,
+                &db,
+                t0,
+                w,
+                chain,
+                pause,
+                steady_batch,
+                batch_max,
+                round,
+                trunk_written,
+            ),
             Mode::Lease => expirer_loop(&shared, &db, every),
         })
     };
@@ -655,7 +674,7 @@ fn forker_loop(
         if args.trunk_writes {
             // One trunk write per arrival, after the fork: the branch just forked can see the page
             // it rewrites, so the trunk keeps a pre-image for it (a TrunkRetain record).
-            let row = spread_row(model.writes);
+            let row = trunk_row(model.writes);
             let g = model.record(row);
             trunk
                 .execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_gen_value(g)))
@@ -729,7 +748,7 @@ fn verify_one(
     // With trunk writes: the row of the trunk's first write after this fork, which the branch must
     // read as its pre-image (a retained version) — or the trunk's value if no write came after.
     let rewritten = if model.writes > e.trunk_at {
-        spread_row(e.trunk_at)
+        trunk_row(e.trunk_at)
     } else {
         other
     };
@@ -777,6 +796,7 @@ fn reaper_loop(
     steady_batch: u64,
     batch_max: usize,
     round: Duration,
+    trunk_written: bool,
 ) {
     let mut resumed: Option<(Duration, u64)> = None;
     loop {
@@ -840,7 +860,19 @@ fn reaper_loop(
             let pos = n % chain;
             let tip = pos == chain - 1;
             let expect_pages = if tip { chain * w } else { 0 };
-            if r.deferred == tip || r.freed_pages as u64 != expect_pages {
+            // With the trunk written (chain 1 only; amendment 5c), the harness's own model gives
+            // the reap's outcome EXACTLY. Arrival k forks child c_k and then rewrites trunk page
+            // k mod 312, which keeps the pre-image V_k = [epoch of that page's previous write, k + 1).
+            // Only c_{k-311} .. c_k were forked inside it, and every one but c_k is older. So when
+            // FIFO lease order reaps c_k, V_k has no other live reader and is freed, while every
+            // other version holding k also holds the live c_{k+1}. Each reap therefore frees its w
+            // pages plus exactly ONE trunk pre-image, and is never deferred.
+            let wrong = if trunk_written {
+                r.deferred || r.freed_pages as u64 != w + 1
+            } else {
+                r.deferred == tip || r.freed_pages as u64 != expect_pages
+            };
+            if wrong {
                 not_a_result(&format!(
                     "arrival {n} (chain position {pos}) reaped {r:?}, expected {} and {expect_pages} pages",
                     if tip { "freed" } else { "deferred" }
@@ -854,6 +886,9 @@ fn reaper_loop(
             {
                 let mut win = shared.window.lock().unwrap();
                 win.pages += r.freed_pages as u64;
+                if trunk_written {
+                    win.trunk_preimages += r.freed_pages as u64 - w;
+                }
                 win.deferred += r.deferred as u64;
                 win.cascades += (tip && chain > 1) as u64;
                 win.max_pages = win.max_pages.max(r.freed_pages as u64);
@@ -912,6 +947,7 @@ struct Win {
     pop_max: u64,
     gc_range: u64,
     gc_examined: u64,
+    trunk_preimages: u64,
 }
 
 fn sampler_loop(
@@ -1030,6 +1066,7 @@ fn sampler_loop(
             pop_max,
             gc_range,
             gc_examined,
+            trunk_preimages: win.trunk_preimages,
         });
         if done {
             return out;
@@ -1098,13 +1135,15 @@ fn summarize(args: &Args, wins: &[Win], shared: &Shared) {
         let reaped_n = (last.reaped - first.reaped).max(1) as f64;
         let gc_range: u64 = steady.iter().skip(1).map(|w| w.gc_range).sum();
         let gc_examined: u64 = steady.iter().skip(1).map(|w| w.gc_examined).sum();
+        let preimages: u64 = steady.iter().skip(1).map(|w| w.trunk_preimages).sum();
         println!(
             "# summary pop steady: pop_max={} at_t_ms={} gc_range_per_reaped={:.3} \
-             gc_examined_per_reaped={:.3}",
+             gc_examined_per_reaped={:.3} trunk_preimages_freed_per_reaped={:.4}",
             peak.pop_max,
             peak.t.as_millis(),
             gc_range as f64 / reaped_n,
             gc_examined as f64 / reaped_n,
+            preimages as f64 / reaped_n,
         );
     }
     // Over the whole run, including the ramp, the pause and the drain.
