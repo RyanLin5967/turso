@@ -1,14 +1,14 @@
 //! Branches EVER created against branches LIVE on the DURABLE branch store (lane r11-ever, PREREG
 //! amendments 13-14: r11-ever-refute's item 5). A port of the volatile store's `branch_ever` (turso
 //! branch r11-ever @ 9e206a60b): the same cycle, shapes, victims and seed streams, the same model of
-//! the kept states (the F7 splice rule) and the same read checks, run against the F7 port on the
+//! the kept states (the F7 splice rule, or the base's) and the same read checks, run against the F7 port on the
 //! COMPOSED durable store (branch r11-ever-durable-cat, from a12's d7a2b8f6e: F1/F2/F4 + catalog
 //! v3/v4 + C-P + C-R), in snapshot mode or catalog mode. (First written for the port on the pre-F1
 //! store, r11-ever-durable ae3309970, whose counters this base does not have.)
 //!
 //!   cargo run -p turso_core --release --example branch_ever_durable -- \
 //!       --shape flat|moran|refine --victim random|oldest --live N --checkpoints a,b,... \
-//!       [--durability durable|durable-nosync|catalog|catalog-nosync] [--seed S] \
+//!       --splice on|off [--durability durable|durable-nosync|catalog|catalog-nosync] [--seed S] \
 //!       [--read-every K] [--window W] [--untimed] [--reopen]
 //!
 //! ⚠ UNBUILT when committed: written under quiet mode (no local compute); never compiled or run.
@@ -28,6 +28,10 @@
 //! RESULT` (rc 1) unless the kept states equal the harness's model of the rule, every reap's
 //! `deferred` equals the model's (kept, or spliced into its child), and every sampled read (own
 //! row, parent's row, one of up to 4 deeper ancestors' rows, one trunk-only row) matches.
+//!
+//! `--splice on|off` is REQUIRED (r11-ever amendment 15: the splice is an arm of the store, off by
+//! default there): it opens the store in the F7 splice arm or not, and the kept-state model follows
+//! the same rule (the volatile harness's `--expect splice` or `--expect keep`). The header names it.
 //!
 //! With `--reopen`, after the last checkpoint every live branch is detached, every holder of the
 //! database is dropped, and the database is reopened (recovery loads the snapshot and replays the
@@ -75,6 +79,7 @@ struct Args {
     untimed: bool,
     seed: u64,
     durability: BranchDurability,
+    splice: bool,
     reopen: bool,
 }
 
@@ -89,9 +94,11 @@ fn parse_args() -> Args {
         untimed: false,
         seed: 0x9E37_79B9_7F4A_7C15,
         durability: BranchDurability::Durable { sync: true },
+        splice: false,
         reopen: false,
     };
     let mut shape = None;
+    let mut splice = None;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -122,6 +129,13 @@ fn parse_args() -> Args {
                     )),
                 }
             }
+            "--splice" => {
+                splice = Some(match val().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    o => die(&format!("--splice must be on or off, not {o}")),
+                })
+            }
             "--live" => a.live = val().parse().unwrap_or_else(|_| die("bad --live")),
             "--checkpoints" => {
                 a.checkpoints = val()
@@ -140,6 +154,7 @@ fn parse_args() -> Args {
         }
     }
     a.shape = shape.unwrap_or_else(|| die("--shape is required"));
+    a.splice = splice.unwrap_or_else(|| die("--splice on|off is required: the arm is named, never defaulted"));
     if a.live < 2 || a.checkpoints.is_empty() {
         die("--live must be >= 2 and --checkpoints non-empty");
     }
@@ -226,13 +241,15 @@ fn size_of(path: &Path, suffix: &str) -> u64 {
     std::fs::metadata(format!("{}{suffix}", path.display())).map_or(0, |m| m.len())
 }
 
-fn open_db(path: &Path, durability: BranchDurability) -> Arc<Database> {
+fn open_db(path: &Path, args: &Args) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     Database::open_file_with_flags(
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
-        DatabaseOpts::new().with_branch_durability(durability),
+        DatabaseOpts::new()
+            .with_branch_durability(args.durability)
+            .with_branch_splice(args.splice),
         None,
         Arc::new(SqliteDialect),
     )
@@ -262,11 +279,12 @@ impl Live {
 }
 
 /// The harness's model of which branch states the store keeps, from the reclamation rule alone:
-/// a state is kept while it has a handle or a kept child, and a released one left with exactly one
-/// kept child is spliced out, the child taking its place (the volatile harness's model under
-/// `--expect splice`).
+/// a state is kept while it has a handle or a kept child, and, in the splice arm, a released one
+/// left with exactly one kept child is spliced out, the child taking its place (the volatile
+/// harness's model under `--expect splice`; off, `--expect keep`).
 #[derive(Default)]
 struct KeptModel {
+    splice: bool,
     /// id -> (parent id, 0 for the trunk; kept children; handle alive)
     nodes: HashMap<u64, (u64, Vec<u64>, bool)>,
 }
@@ -300,7 +318,7 @@ impl KeptModel {
                 return (freed, false);
             }
             if kids > 0 {
-                if kids == 1 {
+                if kids == 1 && self.splice {
                     let child = self.nodes[&at].1[0];
                     self.nodes.remove(&at);
                     self.nodes.get_mut(&child).unwrap().0 = parent;
@@ -457,7 +475,7 @@ fn main() {
     let args = parse_args();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("branch_ever_durable.db");
-    let mut db = open_db(&path, args.durability);
+    let mut db = open_db(&path, &args);
     let mut trunk = db.connect().unwrap();
     // The trunk is written only at setup; its sync mode is not on any measured path.
     trunk.execute("PRAGMA synchronous = OFF").unwrap();
@@ -475,7 +493,7 @@ fn main() {
     println!("# branch_ever_durable — Turso fork, DURABLE branch store with the F7 port (r11-ever)");
     println!(
         "# shape={:?} victim={:?} live={} checkpoints={:?} window={} read_every={} untimed={} \
-         durability={:?} reopen={} seed={:#x} trunk_rows={TRUNK_ROWS} branch_rows={BRANCH_ROWS}",
+         durability={:?} splice={} reopen={} seed={:#x} trunk_rows={TRUNK_ROWS} branch_rows={BRANCH_ROWS}",
         args.shape,
         args.victim,
         args.live,
@@ -484,6 +502,7 @@ fn main() {
         args.read_every,
         args.untimed,
         args.durability,
+        if args.splice { "on" } else { "off" },
         args.reopen,
         args.seed
     );
@@ -492,7 +511,10 @@ fn main() {
     let mut rng = Rng::stream(args.seed, 0);
     let mut rrng = Rng::stream(args.seed, 0xE703_7ED1_A0B4_28DB);
     let mut live: VecDeque<Live> = VecDeque::new();
-    let mut kept = KeptModel::default();
+    let mut kept = KeptModel {
+        splice: args.splice,
+        ..KeptModel::default()
+    };
     let mut win = Window::default();
     let mut created = 0usize;
     let mut reads_checked = 0u64;
@@ -600,7 +622,7 @@ fn main() {
         drop(trunk);
         drop(db);
         let t = Instant::now();
-        db = open_db(&path, args.durability);
+        db = open_db(&path, &args);
         trunk = db.connect().unwrap();
         let reopen_ns = t.elapsed().as_nanos();
         let o = db.branch_open_stats();
