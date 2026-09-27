@@ -1823,7 +1823,8 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                  busy_writer={writer_busy} rewritten={rewritten} locked={locked} \
                  rewritten_per_cycle={:.4} locked_per_cycle={:.4} trunk_acq_per_cycle={:.4} \
                  trunk_wait_frac={:.5} trunk_wait_ns_per_cycle={:.1} retained_examined={} gc_freed={gc_freed} \
-                 trunk_slots_in_use={} wal_bytes={} trunk_blocking_per_cycle={:.4}",
+                 trunk_slots_in_use={} wal_bytes={} trunk_blocking_per_cycle={:.4} \
+                 gc_range_entries={} gc_examined={} gc_range_per_cycle={:.4}",
                 t * c,
                 args.reads,
                 writes as f64 / cycles,
@@ -1836,6 +1837,11 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 s.trunk_slots_in_use,
                 std::fs::metadata(&b.wal_path).map_or(0, |m| m.len()),
                 d(before.trunk_lock_blocking, after.trunk_lock_blocking) as f64 / cycles,
+                // The reap's range-walk entries (both indexes) and removals: what its hold's growth
+                // with N is made of (PREREG amendment 6, item 6).
+                d(before.gc_range_entries, after.gc_range_entries),
+                d(before.gc_examined, after.gc_examined),
+                d(before.gc_range_entries, after.gc_range_entries) as f64 / cycles,
             );
             print_sites(n, t, draw, cycles, &before, &after);
             if !b.db.branch_trunk_reads_lockfree() {
