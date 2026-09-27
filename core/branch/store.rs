@@ -157,23 +157,179 @@
 //! child's reap adds the catalog's garbage (`trunk_catalog_garbage`) to what F2 finds in memory.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::ops::Bound;
+use std::ops::{Bound, Deref, DerefMut};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use super::arena::{Arena, Slot};
+use super::arena::{Arena, Slot, SlotPtr};
 use super::catalog::{CatBranch, Catalog, Meta};
 use super::journal::{BranchFiles, Flight, Journal, Record, SnapBranch, SnapshotState};
 use super::page_map::PageMap;
 use super::{
     BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchStats, BranchWork, Expired,
-    Reaped,
+    HoldMax, Reaped,
 };
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
 use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::{Arc, Mutex, MutexGuard};
 use crate::{LimboError, Result};
+
+/// Time every store-mutex hold (observation only; off unless a harness turns it on). Ported from
+/// r11-bigtxn (turso `7fcc8db5b`), as the rest of this block.
+static HOLD_TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_hold_timing(on: bool) {
+    HOLD_TIMING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What one store-mutex hold did, folded into [`BranchWork`] and [`HoldMax`] when it ends.
+/// Observation only.
+#[derive(Default)]
+struct HoldAcc {
+    pages: u64,
+    copy_bytes: u64,
+    realloc_moved: u64,
+    /// Bytes those growths moved.
+    realloc_bytes: u64,
+    /// Page-map nodes path-copied (an `Arc::make_mut` on a shared node).
+    node_copies: u64,
+    /// Arena chunk bytes newly allocated, zero-filled, inside the hold.
+    zeroed_bytes: u64,
+}
+
+/// A hold of the store mutex that accounts for itself when it is released.
+struct Hold<'a> {
+    guard: MutexGuard<'a, StoreInner>,
+    start: Option<std::time::Instant>,
+    /// The arena's vector capacities at acquisition: a growth inside the hold moved the old
+    /// contents, which the realloc counter charges to it.
+    arena_caps: [usize; 3],
+    /// The arena's chunk bytes at acquisition, for `zeroed_bytes`.
+    arena_chunk_bytes: usize,
+}
+
+impl Deref for Hold<'_> {
+    type Target = StoreInner;
+    fn deref(&self) -> &StoreInner {
+        &self.guard
+    }
+}
+
+impl DerefMut for Hold<'_> {
+    fn deref_mut(&mut self) -> &mut StoreInner {
+        &mut self.guard
+    }
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        let inner = &mut *self.guard;
+        let mut acc = std::mem::take(&mut inner.hold);
+        let caps = inner.arena.as_ref().map_or([0; 3], |a| a.capacities());
+        for (old, new) in self.arena_caps.iter().zip(caps) {
+            if new != *old {
+                // Each of the arena's growable vectors holds one block pointer per entry.
+                acc.realloc_moved += *old as u64;
+                acc.realloc_bytes += (*old * std::mem::size_of::<usize>()) as u64;
+            }
+        }
+        let chunk_bytes = inner.arena.as_ref().map_or(0, |a| a.chunk_bytes());
+        acc.zeroed_bytes += chunk_bytes.saturating_sub(self.arena_chunk_bytes) as u64;
+        inner.work.lock_holds += 1;
+        inner.work.locked_copy_bytes += acc.copy_bytes;
+        let max = &mut inner.hold_max;
+        max.pages = max.pages.max(acc.pages);
+        max.copy_bytes = max.copy_bytes.max(acc.copy_bytes);
+        max.realloc_moved = max.realloc_moved.max(acc.realloc_moved);
+        max.realloc_bytes = max.realloc_bytes.max(acc.realloc_bytes);
+        max.node_copies = max.node_copies.max(acc.node_copies);
+        max.zeroed_bytes = max.zeroed_bytes.max(acc.zeroed_bytes);
+        if let Some(start) = self.start {
+            let ns = start.elapsed().as_nanos() as u64;
+            max.ns = max.ns.max(ns);
+            inner.hold_hist[hold_bucket(ns)] += 1;
+        }
+    }
+}
+
+/// The most pages one hold of the store mutex maps, allocates or frees on behalf of one
+/// transaction's commit or rollback: work proportional to a transaction's size is split into holds
+/// of this many pages, so no other branch ever waits for more than this.
+const HOLD_BATCH: usize = 64;
+
+/// Hold-duration histogram: 8 buckets per octave of nanoseconds.
+const HOLD_HIST_BUCKETS: usize = 8 * 40;
+
+fn hold_bucket(ns: u64) -> usize {
+    (((ns.max(1) as f64).log2() * 8.0) as usize).min(HOLD_HIST_BUCKETS - 1)
+}
+
+/// A branch write transaction's own slots (r11-bigtxn F-shadow with STEAL, ported onto the durable
+/// store): every page it first writes gets a slot reserved under the store mutex (the durable
+/// store's copy decision, `pending`), which the transaction fills WITHOUT the mutex, at a spill
+/// and at commit, through the slot's [`SlotPtr`]. The committed slots are never written, so a
+/// rollback is returning these; and no durable record names them before the commit's own.
+#[derive(Default)]
+pub(crate) struct ShadowTxn {
+    pages: HashMap<u32, Shadow>,
+}
+
+#[derive(Clone)]
+struct Shadow {
+    slot: Slot,
+    ptr: SlotPtr,
+    /// The slot holds the page's latest spilled or committed image.
+    filled: bool,
+    /// crc32c of that image, computed as it is filled (the `Commit` record carries it).
+    crc: u32,
+}
+
+impl ShadowTxn {
+    /// Record the slot `BranchStore::shadow_slot` reserved for `page`.
+    pub(crate) fn insert(&mut self, page: u32, slot: Slot, ptr: SlotPtr) {
+        self.pages.insert(
+            page,
+            Shadow {
+                slot,
+                ptr,
+                filled: false,
+                crc: 0,
+            },
+        );
+    }
+
+    /// Copy `image` into `page`'s slot.
+    pub(crate) fn fill(&mut self, page: u32, image: &[u8]) -> Result<()> {
+        let s = self.pages.get_mut(&page).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "branch page {page} was dirtied with no shadow slot behind it"
+            ))
+        })?;
+        // SAFETY: this transaction reserved the slot and has not published it (`SlotPtr`).
+        unsafe { s.ptr.write(image)? };
+        s.crc = crc32c::crc32c(image);
+        s.filled = true;
+        Ok(())
+    }
+
+    /// The page's image as this transaction last filled it, if it did.
+    pub(crate) fn read(&self, page: u32, out: &mut [u8]) -> Result<bool> {
+        let Some(s) = self.pages.get(&page) else {
+            return Ok(false);
+        };
+        if !s.filled {
+            return Ok(false);
+        }
+        // SAFETY: as `fill`.
+        unsafe { s.ptr.read(out)? };
+        Ok(true)
+    }
+
+    pub(crate) fn is_filled(&self, page: u32) -> bool {
+        self.pages.get(&page).is_some_and(|s| s.filled)
+    }
+}
 
 pub(crate) struct BranchStore {
     inner: Mutex<StoreInner>,
@@ -302,6 +458,16 @@ struct StoreInner {
     /// sequence number that makes them free (see `Group`, rule 2). A catalog checkpoint covers
     /// every applied operation, so it lists them free in its own transaction (`checkpoint_catalog`).
     pending_free: VecDeque<(u64, Vec<Slot>)>,
+    /// The hold in progress (see `Hold`); observation only.
+    hold: HoldAcc,
+    /// Per-hold maxima since the last `take_hold_max`; observation only.
+    hold_max: HoldMax,
+    /// Hold durations since the last `take_hold_hist` (only while hold timing is on).
+    hold_hist: [u64; HOLD_HIST_BUCKETS],
+    /// Commits between their first and last hold (r11-bigtxn ported): their record is buffered and
+    /// only part of their pages is mapped, so no compaction or catalog checkpoint may snapshot the
+    /// state until this is 0 (a snapshot drops the buffered records whose effects it carries).
+    publishing: u32,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -579,9 +745,9 @@ struct BranchState {
     fork_epoch: u64,
     lineage: Lineage,
     /// The branch's current version of every page it has committed.
-    current: HashMap<u32, Owned>,
+    current: BTreeMap<u32, Owned>,
     /// Slots reserved by the open write transaction's copy decisions, not yet published.
-    pending: HashMap<u32, Slot>,
+    pending: BTreeMap<u32, Slot>,
     /// The branch's committed schema: shared with the parent at fork, replaced by a committed
     /// DDL. `None` after a reopen until the first connection reparses it from the branch's pages.
     schema: Option<Arc<Schema>>,
@@ -644,7 +810,7 @@ impl BranchState {
         // Its children keep their own `inherited`; a released branch forks no new one.
         self.view = None;
         let epoch = self.lineage.epoch;
-        let current: Vec<(u32, Owned)> = self.current.drain().collect();
+        let current: Vec<(u32, Owned)> = std::mem::take(&mut self.current).into_iter().collect();
         for (page, owned) in current {
             if children.any_in(cat.as_deref_mut(), id, owned.born, epoch)? {
                 self.lineage.retain(
@@ -1394,6 +1560,8 @@ impl BranchStore {
         g.flushing = true;
         drop(g);
         churn_counters::GC_LOCKED_FLUSHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::journal::SYNC_LOCKED_BYTES
+            .fetch_add(flight.sync_bytes(), std::sync::atomic::Ordering::Relaxed);
         let end = flight.end_lsn;
         let written = flight.write();
         if written.is_err() {
@@ -1466,7 +1634,7 @@ impl BranchStore {
             first = false;
             // Lead: take what is buffered under the store mutex, then write it holding nothing.
             let flight = {
-                let mut inner = self.inner.lock();
+                let mut inner = self.lock();
                 let mut g = self.group.state.lock().unwrap();
                 if g.durable >= lsn {
                     return Ok(());
@@ -1499,13 +1667,15 @@ impl BranchStore {
                 }
             };
             churn_counters::GC_FLIGHTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::journal::SYNC_UNLOCKED_BYTES
+                .fetch_add(flight.sync_bytes(), std::sync::atomic::Ordering::Relaxed);
             let end = flight.end_lsn;
             let written = flight.write();
             if written.is_err() {
                 // Poison the group first (waking the waiters, some of whom hold the store mutex
                 // while they wait), then the journal under the mutex.
                 self.land(end, false);
-                if let Some(journal) = self.inner.lock().journal.as_mut() {
+                if let Some(journal) = self.lock().journal.as_mut() {
                     journal.poison();
                 }
                 return written;
@@ -1518,7 +1688,7 @@ impl BranchStore {
     /// forward (Chubby §2.8: the master "is free to advance this timeout further into the future,
     /// but may not move it backwards in time").
     pub(crate) fn set_lease(&self, id: BranchId, ttl: Duration) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         // A lease that has run out is not renewable: reap first, so a late renewal is refused
         // rather than reviving the branch.
         // One `now` for the whole operation (review R5): the renewal is decided at the instant
@@ -1550,7 +1720,7 @@ impl BranchStore {
     /// spent open survives a restart even if nothing expired.
     pub(crate) fn expire_now(&self) -> Result<Expired> {
         self.refuse_if_trunk_only("the expiry pass")?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         // A fail-stopped pass reaps nothing and stamps nothing: an empty `Expired` would say
         // "nothing was due" when the truth is "could not run" (review N4).
         if inner.poisoned() {
@@ -1753,6 +1923,12 @@ impl BranchStore {
     /// operation that triggered it is already durable, and a failure before the rename leaves the
     /// log intact; a failure after it fail-stops the journal (see `Journal::compact`).
     fn maybe_compact(&self, inner: &mut StoreInner) {
+        // A commit between its holds has its record buffered and half its pages mapped: a
+        // snapshot now would drop the record and keep half the commit. The last hold of that
+        // commit tries again.
+        if inner.publishing > 0 {
+            return;
+        }
         if inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
             let t = Instant::now();
             let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
@@ -1831,7 +2007,7 @@ impl BranchStore {
         schema: Arc<Schema>,
         page_size: usize,
     ) -> Result<(BranchId, u64)> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let restart = inner.arena.as_ref().is_some_and(|a| a.page_size() != page_size);
         if restart {
             // `ensure_backing` may start an empty store over (a compaction that truncates the
@@ -1883,7 +2059,7 @@ impl BranchStore {
     /// Early release (amendment 4), as `fork_trunk`: the caller waits on the returned log sequence
     /// number before handing the branch out.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<(BranchId, u64)> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         self.mature(&mut inner);
         // Reap what has expired first, so a parent whose lease ran out is refused rather than
         // revived by a child that would pin it (Neon refuses to "create children from expiring
@@ -1941,7 +2117,7 @@ impl BranchStore {
     /// page cache of the same page space, and nothing would tell one that the other had committed
     /// — a silently stale read, so it is refused.
     pub(crate) fn open_conn(&self, id: BranchId) -> Result<Option<Arc<Schema>>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         // Nor is an expired branch openable: the same pass, the same refusal.
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
         let poisoned = inner.poisoned().then(|| fail_stop_cause(inner.journal.as_ref()));
@@ -1982,12 +2158,12 @@ impl BranchStore {
     /// The connection on `id` has gone. Releases its write lock and reservations if a transaction
     /// was abandoned, and frees the branch if it was released meanwhile.
     pub(crate) fn close(&self, id: BranchId) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let mut freed = Vec::new();
         if let Some(st) = inner.branches.get_mut(&id) {
             st.open = false;
             st.writer = false;
-            freed.extend(st.pending.drain().map(|(_, slot)| slot));
+            freed.extend(std::mem::take(&mut st.pending).into_values());
         }
         if let Err(e) = inner.collect(id, &mut freed) {
             tracing::warn!("branch {} not collected at close: {e}", id.0);
@@ -2003,7 +2179,7 @@ impl BranchStore {
     /// An error when the release could not be made durable (review N4): the branch is then kept —
     /// nothing is freed in this process — and comes back, detached, at the next open.
     pub(crate) fn release_handle(&self, id: BranchId) -> Result<Reaped> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         inner.ensure(id)?;
         let Some(st) = inner.branches.get(&id) else {
             return Ok(Reaped {
@@ -2060,7 +2236,7 @@ impl BranchStore {
     /// tip frees it, exactly as one `release_handle` per branch would. If the flush fails, every
     /// branch of the batch is kept (`ReleasePending`), as `release_handle` keeps one.
     pub(crate) fn release_many(&self, ids: &[BranchId]) -> Result<Vec<Reaped>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let mut out = vec![
             Reaped {
                 freed_pages: 0,
@@ -2138,7 +2314,7 @@ impl BranchStore {
 
     /// Detach a live branch from its handle without releasing it.
     pub(crate) fn detach(&self, id: BranchId) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         let _ = inner.ensure(id);
         if let Some(st) = inner.branches.get_mut(&id) {
             if st.handle == Handle::Attached {
@@ -2150,7 +2326,7 @@ impl BranchStore {
     /// Give a detached branch a handle again. One handle per branch.
     pub(crate) fn attach(&self, id: BranchId) -> Result<()> {
         self.refuse_if_trunk_only("attaching a branch")?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         inner.ensure(id)?;
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         match st.handle {
@@ -2191,8 +2367,41 @@ impl BranchStore {
         Ok(ids)
     }
 
-    pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
+    /// Take the store mutex for the mechanism. Every hold it returns is counted in
+    /// [`BranchWork::lock_holds`] and folded into [`HoldMax`]; the observation calls (`stats`, the
+    /// membership diagnostics, the counters) lock directly so they do not count themselves.
+    fn lock(&self) -> Hold<'_> {
+        let guard = self.inner.lock();
+        // Started once the lock is ours, so a contended acquire's wait is not counted as hold.
+        let start = HOLD_TIMING
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(std::time::Instant::now);
+        let arena_caps = guard.arena.as_ref().map_or([0; 3], |a| a.capacities());
+        let arena_chunk_bytes = guard.arena.as_ref().map_or(0, |a| a.chunk_bytes());
+        Hold {
+            guard,
+            start,
+            arena_caps,
+            arena_chunk_bytes,
+        }
+    }
+
+    /// The per-hold maxima since the previous call, which this call resets.
+    pub(crate) fn take_hold_max(&self) -> HoldMax {
+        std::mem::take(&mut self.inner.lock().hold_max)
+    }
+
+    /// The hold-duration histogram since the previous call (bucket b holds durations in
+    /// [2^(b/8), 2^((b+1)/8)) ns), which this call resets. Empty unless hold timing is on.
+    pub(crate) fn take_hold_hist(&self) -> Vec<u64> {
         let mut inner = self.inner.lock();
+        let hist = inner.hold_hist.to_vec();
+        inner.hold_hist = [0; HOLD_HIST_BUCKETS];
+        hist
+    }
+
+    pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
+        let mut inner = self.lock();
         // A fail-stopped store takes no write: a commit would write its pages into the arena
         // before its record failed, possibly into a slot durable state still names (review R1).
         if inner.poisoned() {
@@ -2213,19 +2422,239 @@ impl BranchStore {
     }
 
     pub(crate) fn end_write(&self, id: BranchId) {
-        if let Some(st) = self.inner.lock().branches.get_mut(&id) {
+        if let Some(st) = self.lock().branches.get_mut(&id) {
             st.writer = false;
         }
     }
 
     /// A branch transaction rolled back: its reservations were never published, so they are free.
     pub(crate) fn abort_write(&self, id: BranchId) {
-        let mut inner = self.inner.lock();
-        let mut freed = Vec::new();
-        if let Some(st) = inner.branches.get_mut(&id) {
-            freed.extend(st.pending.drain().map(|(_, slot)| slot));
+        self.discard(id, &mut ShadowTxn::default());
+    }
+
+    /// Roll back branch `id`'s transaction: return every slot it reserved, in holds of at most
+    /// [`HOLD_BATCH`]. No durable record names them (only a commit's own does, and it is taken out
+    /// of `pending` as it maps), so they are free at once.
+    pub(crate) fn discard(&self, id: BranchId, txn: &mut ShadowTxn) {
+        txn.pages.clear();
+        loop {
+            let mut inner = self.lock();
+            let Some(st) = inner.branches.get_mut(&id) else {
+                return;
+            };
+            let mut batch = Vec::with_capacity(HOLD_BATCH);
+            while batch.len() < HOLD_BATCH {
+                match st.pending.pop_first() {
+                    Some((_, slot)) => batch.push(slot),
+                    None => break,
+                }
+            }
+            if batch.is_empty() {
+                return;
+            }
+            inner.hold.pages += batch.len() as u64;
+            inner.release_slots(batch);
         }
-        inner.release_slots(freed);
+    }
+
+    /// The first write of `page` in a transaction on branch `id`: reserve its slot (the copy
+    /// decision `first_write_branch` makes) and return the transaction's writer for it, or `None`
+    /// if the transaction has it already. The transaction records it after this returns, so the
+    /// growth of its own map is never inside a hold.
+    pub(crate) fn shadow_slot(
+        &self,
+        id: BranchId,
+        page: u32,
+        txn: &ShadowTxn,
+    ) -> Result<Option<(Slot, SlotPtr)>> {
+        if txn.pages.contains_key(&page) {
+            return Ok(None);
+        }
+        self.reserve_slot(id, page).map(Some)
+    }
+
+    /// Commit branch `id`'s transaction (r11-bigtxn F-shadow, ported onto the durable store with
+    /// r11-churn's group commit). Every page of `dirty` is in its slot already, filled WITHOUT the
+    /// store mutex (at a spill, or by the caller just before this); the `Commit` record is encoded
+    /// here, without it too. Then:
+    /// 1. one hold checks fail-stop, notes the arena's unsynced writes (rule 1: a record is durable
+    ///    only after the slots it names) and hands the journal the record by move;
+    /// 2. holds of at most [`HOLD_BATCH`] pages map the pages, each page's copy decision taken in
+    ///    the hold that maps it (the version it supersedes is retained for a live child that can
+    ///    still see it, else freed), and every freed slot waits in `pending_free` under the
+    ///    record's log position (rule 2);
+    /// 3. holds of at most [`HOLD_BATCH`] return the reservations of pages that are not dirty (a
+    ///    statement rollback dropped them; no record names them);
+    /// 4. with no lock held, the caller waits for the record to be durable (the group's flight).
+    ///
+    /// Nothing observes the branch between the holds: its one connection is the committer,
+    /// `fork_branch` refuses while the writer flag is set, and no compaction or catalog checkpoint
+    /// runs while `publishing` counts this commit. A crash replays the record whole or not at all.
+    pub(crate) fn publish(&self, id: BranchId, txn: &mut ShadowTxn, dirty: &[u32]) -> Result<()> {
+        let mut shadows = std::mem::take(&mut txn.pages);
+        let mut entries = Vec::with_capacity(dirty.len());
+        for &page in dirty {
+            let s = shadows.remove(&page).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "branch {} committed page {page} with no copy decision behind it",
+                    id.0
+                ))
+            })?;
+            if !s.filled {
+                return Err(LimboError::InternalError(format!(
+                    "branch {} committed page {page} whose slot was never filled",
+                    id.0
+                )));
+            }
+            entries.push((page, s.slot, s.crc));
+        }
+        let leftover: Vec<u32> = shadows.into_keys().collect();
+        if entries.is_empty() {
+            self.return_reserved(id, &leftover);
+            return Ok(());
+        }
+        let record = Record::Commit {
+            branch: id.0,
+            pages: entries,
+        };
+        let frame = super::journal::encode_frame(&record);
+        let Record::Commit { pages: entries, .. } = record else {
+            unreachable!("built as a Commit just above")
+        };
+        let named: Vec<Slot> = entries.iter().map(|&(_, slot, _)| slot).collect();
+
+        // 1. The record.
+        let lsn = {
+            let mut inner = self.lock();
+            self.mature(&mut inner);
+            // Refuse BEFORE the record: after the journal failed, it can never be durable. The
+            // slots stay reserved; the rollback that follows returns them.
+            if inner.poisoned() {
+                return Err(fail_stopped(inner.journal.as_ref(), id, "no commit"));
+            }
+            let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
+            if st.handle.is_released() {
+                return Err(reaped(id));
+            }
+            // Bytes the transaction wrote into these slots through their `SlotPtr`s.
+            let bytes = named.len() as u64
+                * inner.arena.as_ref().map_or(0, |a| a.page_size()) as u64;
+            if inner.failpoint == Some(BranchFailpoint::CommitAfterSlotsBeforeRecord) {
+                inner.failpoint = None;
+                let StoreInner {
+                    arena,
+                    branches,
+                    journal,
+                    orphans,
+                    ..
+                } = &mut *inner;
+                let arena = arena.as_mut().expect("a branch exists, so the arena does");
+                arena.note_unsynced_writes(bytes);
+                arena.sync()?;
+                *orphans = named.clone();
+                let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
+                for (_, slot) in std::mem::take(&mut st.pending) {
+                    arena.release(slot);
+                }
+                if let Some(journal) = journal.as_mut() {
+                    journal.poison();
+                }
+                return Err(LimboError::InternalError(
+                    "failpoint: branch commit stopped after its slots, before its record"
+                        .to_string(),
+                ));
+            }
+            inner
+                .arena
+                .as_mut()
+                .expect("a branch exists, so the arena does")
+                .note_unsynced_writes(bytes);
+            // The commit pays for a flush anyway: while a lease is outstanding, stamp the clock in
+            // it, so a crash cannot lose the open time an agent spent committing (review R2).
+            let mut after = Vec::new();
+            if !inner.leases.is_empty() {
+                let now = inner.lease.now_ms();
+                if now > inner.lease.queued_ms {
+                    after.push(Record::Clock { now_ms: now });
+                    inner.lease.queued(now);
+                }
+            }
+            let lsn = self.buffer_frame_then(&mut inner, frame, named, after)?;
+            inner.publishing += 1;
+            lsn
+        };
+        // 2. The map, in bounded holds.
+        let mapped = (|| -> Result<()> {
+            for batch in entries.chunks(HOLD_BATCH) {
+                let mut inner = self.lock();
+                if let Some(st) = inner.branches.get_mut(&id) {
+                    for &(page, _, _) in batch {
+                        st.pending.remove(&page);
+                    }
+                }
+                let mut freed = Vec::new();
+                if let Err(e) = inner.apply_commit(id, batch, &mut freed) {
+                    return Err(inner.fatal(e));
+                }
+                inner.hold.pages += batch.len() as u64;
+                inner.defer_frees(lsn, freed);
+            }
+            Ok(())
+        })();
+        {
+            let mut inner = self.lock();
+            inner.publishing -= 1;
+            if mapped.is_ok() {
+                self.maybe_compact(&mut inner);
+            }
+        }
+        mapped?;
+        // 3. The reservations no page used.
+        self.return_reserved(id, &leftover);
+        // 4. Durability, with no lock held.
+        self.wait_durable(lsn)
+    }
+
+    /// Return the reservations of `pages` (not dirty at commit) to the arena, in bounded holds.
+    fn return_reserved(&self, id: BranchId, pages: &[u32]) {
+        for batch in pages.chunks(HOLD_BATCH) {
+            let mut inner = self.lock();
+            let Some(st) = inner.branches.get_mut(&id) else {
+                return;
+            };
+            let slots: Vec<Slot> = batch.iter().filter_map(|p| st.pending.remove(p)).collect();
+            inner.hold.pages += slots.len() as u64;
+            inner.release_slots(slots);
+        }
+    }
+
+    /// `buffer_all` for a commit whose record was encoded without the mutex: the frame goes in by
+    /// move, then `after` (small records) behind it.
+    fn buffer_frame_then(
+        &self,
+        inner: &mut StoreInner,
+        frame: Vec<u8>,
+        named: Vec<Slot>,
+        after: Vec<Record>,
+    ) -> Result<u64> {
+        let StoreInner {
+            journal, failpoint, ..
+        } = inner;
+        let Some(journal) = journal.as_mut() else {
+            return Ok(0);
+        };
+        injected_flush_failure(failpoint, journal)?;
+        journal.check_live()?;
+        if *failpoint == Some(BranchFailpoint::GroupFlightFails) {
+            *failpoint = None;
+            // Fails inside the flight's write, after this operation is applied (amendment 4).
+            journal.fail_next_write();
+        }
+        journal.buffer_frame(frame, named)?;
+        for record in &after {
+            journal.buffer(record)?;
+        }
+        Ok(journal.lsn())
     }
 
     pub(crate) fn holds_writer(&self, id: BranchId) -> bool {
@@ -2237,7 +2666,7 @@ impl BranchStore {
     }
 
     pub(crate) fn schema(&self, id: BranchId) -> Result<Arc<Schema>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         inner.ensure(id)?;
         inner
             .branches
@@ -2251,7 +2680,7 @@ impl BranchStore {
     }
 
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         inner.branches.get_mut(&id).ok_or_else(|| gone(id))?.schema = Some(schema);
         Ok(())
     }
@@ -2259,7 +2688,12 @@ impl BranchStore {
     /// The copy decision for a branch's first write to `page` in a transaction: reserve the fresh
     /// slot the commit will write the page into. Nothing is published until then.
     pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<()> {
-        let mut inner = self.inner.lock();
+        self.reserve_slot(id, page).map(|_| ())
+    }
+
+    /// `first_write_branch`, returning the page's reserved slot and its writer from the same hold.
+    fn reserve_slot(&self, id: BranchId, page: u32) -> Result<(Slot, SlotPtr)> {
+        let mut inner = self.lock();
         self.mature(&mut inner);
         // A transaction that began before the journal failed may write no further page.
         if inner.poisoned() {
@@ -2267,7 +2701,10 @@ impl BranchStore {
         }
         inner.refill_free()?;
         let StoreInner {
-            arena, branches, ..
+            arena,
+            branches,
+            hold,
+            ..
         } = &mut *inner;
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
@@ -2277,10 +2714,14 @@ impl BranchStore {
                 id.0
             )));
         }
-        if let std::collections::hash_map::Entry::Vacant(e) = st.pending.entry(page) {
-            e.insert(arena.alloc());
-        }
-        Ok(())
+        let slot = match st.pending.entry(page) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                hold.pages += 1;
+                *e.insert(arena.alloc())
+            }
+            std::collections::btree_map::Entry::Occupied(e) => *e.get(),
+        };
+        Ok((slot, arena.slot_ptr(slot)))
     }
 
     /// The copy decision for the trunk's first write to `page` in a transaction: if a live child
@@ -2290,7 +2731,7 @@ impl BranchStore {
         // The second fence of a trunk-only store, behind the connection's read-only check: this
         // write would retain no pre-image for the branches on disk.
         self.refuse_if_trunk_only("a trunk page write")?;
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         // Deferred frees a flush has covered go back to the arena before it allocates (amendment 4).
         self.mature(&mut inner);
         // Catalog stores: the page's `written` epoch, from its last catalog version, first.
@@ -2311,6 +2752,7 @@ impl BranchStore {
             arena,
             trunk,
             journal,
+            hold,
             ..
         } = &mut *inner;
         if keep {
@@ -2331,6 +2773,8 @@ impl BranchStore {
             }
             let slot = arena.alloc();
             arena.write_slot(slot, pre_image)?;
+            hold.pages += 1;
+            hold.copy_bytes += pre_image.len() as u64;
             let crc = crc32c::crc32c(pre_image);
             let retained = Retained {
                 born,
@@ -2365,7 +2809,7 @@ impl BranchStore {
         {
             return Ok(());
         }
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         // Re-read under the lock: `first_write_trunk` sets it while holding it.
         let unsynced = self.unsynced.load(Ordering::Acquire);
         if inner.journal.is_none() || inner.arena.is_none() {
@@ -2427,7 +2871,7 @@ impl BranchStore {
             let journal = journal.as_mut().expect("checked above");
             if *failpoint == Some(BranchFailpoint::BarrierBeforeRecords) {
                 *failpoint = None;
-                *orphans = journal.pending_slots.clone();
+                *orphans = journal.pending_slot_list();
                 journal.poison();
                 return Err(LimboError::InternalError(
                     "failpoint: the trunk commit's branch barrier stopped before its records"
@@ -2449,99 +2893,47 @@ impl BranchStore {
         Ok(())
     }
 
-    /// Commit a branch's dirty pages: write each into the slot its copy decision reserved, make
-    /// that durable with the `Commit` record, and only then move the branch's map.
+    /// Commit a branch's dirty pages given as resident pages (the store's own tests drive a
+    /// transaction this way; a pager uses `shadow_slot`/`publish` with its `ShadowTxn`): write each
+    /// into the slot `first_write_branch` reserved, without the store mutex, then `publish`.
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
-        let mut inner = self.inner.lock();
-        // Refuse BEFORE any slot is written: after the journal failed, this commit's record can
-        // never be durable, so its pages have no business in the arena.
-        if inner.poisoned() {
-            return Err(fail_stopped(inner.journal.as_ref(), id, "no commit"));
-        }
-        let entries = {
-            let StoreInner {
-                arena,
-                branches,
-                journal,
-                failpoint,
-                orphans,
-                ..
-            } = &mut *inner;
-            let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        let mut txn = ShadowTxn::default();
+        {
+            let inner = self.lock();
+            // Refuse BEFORE any slot is written: after the journal failed, this commit's record
+            // can never be durable, so its pages have no business in the arena.
+            if inner.poisoned() {
+                return Err(fail_stopped(inner.journal.as_ref(), id, "no commit"));
+            }
+            let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
             if st.handle.is_released() {
                 return Err(reaped(id));
             }
-            let arena = arena.as_mut().expect("a branch exists, so the arena does");
-            let mut entries = Vec::with_capacity(pages.len());
-            for page in pages {
-                let no = page.get().id as u32;
-                let slot = st.pending.remove(&no).ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "branch {} committed page {no} with no copy decision behind it",
-                        id.0
-                    ))
-                })?;
-                let bytes = page.get_contents().as_slice();
-                arena.write_slot(slot, bytes)?;
-                entries.push((no, slot, crc32c::crc32c(bytes)));
-            }
-            // A reservation whose page is not dirty at commit was never written: free it.
-            for (_, slot) in st.pending.drain() {
-                arena.release(slot);
-            }
-            if *failpoint == Some(BranchFailpoint::CommitAfterSlotsBeforeRecord) {
-                *failpoint = None;
-                arena.sync()?;
-                *orphans = entries.iter().map(|&(_, slot, _)| slot).collect();
-                for &(_, slot, _) in &entries {
-                    arena.release(slot);
-                }
-                if let Some(journal) = journal.as_mut() {
-                    journal.poison();
-                }
-                return Err(LimboError::InternalError(
-                    "failpoint: branch commit stopped after its slots, before its record"
-                        .to_string(),
-                ));
-            }
-            entries
-        };
-        if entries.is_empty() {
-            return Ok(());
-        }
-        // On failure the written slots are NOT freed: the record may have reached the disk, and
-        // recovery, not this process, decides whether they are live.
-        let mut records = vec![Record::Commit {
-            branch: id.0,
-            pages: entries.clone(),
-        }];
-        // The commit pays for a flush anyway: while a lease is outstanding, stamp the clock in it,
-        // so a crash cannot lose the open time an agent spent committing (review R2).
-        if !inner.leases.is_empty() {
-            let now = inner.lease.now_ms();
-            if now > inner.lease.queued_ms {
-                records.push(Record::Clock { now_ms: now });
-                inner.lease.queued(now);
+            let arena = inner.arena.as_ref().expect("a branch exists, so the arena does");
+            for (&page, &slot) in &st.pending {
+                txn.insert(page, slot, arena.slot_ptr(slot));
             }
         }
-        // Early release (amendment 4): buffer, apply, and wait for the flight with the mutex
-        // released. The versions this commit supersedes are freed only once it is durable.
-        let lsn = self.buffer_all(&mut inner, records)?;
-        let mut freed = Vec::new();
-        if let Err(e) = inner.apply_commit(id, &entries, &mut freed) {
-            return Err(inner.fatal(e));
+        let mut dirty = Vec::with_capacity(pages.len());
+        for page in pages {
+            let no = page.get().id as u32;
+            if !txn.pages.contains_key(&no) {
+                return Err(LimboError::InternalError(format!(
+                    "branch {} committed page {no} with no copy decision behind it",
+                    id.0
+                )));
+            }
+            txn.fill(no, page.get_contents().as_slice())?;
+            dirty.push(no);
         }
-        inner.defer_frees(lsn, freed);
-        self.maybe_compact(&mut inner);
-        drop(inner);
-        self.wait_durable(lsn)
+        self.publish(id, &mut txn, &dirty)
     }
 
     /// Fill `out` with `page` as branch `id` sees it, if that version lives in the arena. `false`
     /// means the branch sees the trunk's current version, which the caller reads through the
     /// ordinary WAL / database-file path.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock();
         self.resolve_calls.fetch_add(1, Ordering::Relaxed);
         let (mut levels, mut examined) = (0, 0);
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
@@ -2633,7 +3025,15 @@ impl BranchStore {
                 .arena
                 .as_ref()
                 .map_or(0, |a| a.high_water() as usize - a.in_use()),
-            work: inner.work,
+            work: {
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut w = inner.work;
+                w.sync_locked_bytes = super::journal::SYNC_LOCKED_BYTES.load(Relaxed);
+                w.sync_unlocked_bytes = super::journal::SYNC_UNLOCKED_BYTES.load(Relaxed);
+                w.journal_copied_bytes = super::journal::BUFFER_COPIED_BYTES.load(Relaxed);
+                w.journal_handed_bytes = super::journal::BUFFER_HANDED_BYTES.load(Relaxed);
+                w
+            },
         })
     }
 
@@ -2716,6 +3116,9 @@ impl BranchStore {
 
     pub(crate) fn compact_now(&self) -> Result<()> {
         let mut inner = self.inner.lock();
+        if inner.publishing > 0 {
+            return Err(LimboError::Busy);
+        }
         let fail = inner.failpoint == Some(BranchFailpoint::CompactAfterRenameBeforeLogReset);
         if fail {
             inner.failpoint = None;
@@ -2816,6 +3219,10 @@ impl StoreInner {
             parked_records: 0,
             parked_applied: 0,
             pending_free: VecDeque::new(),
+            hold: HoldAcc::default(),
+            hold_max: HoldMax::default(),
+            hold_hist: [0; HOLD_HIST_BUCKETS],
+            publishing: 0,
         }
     }
 
@@ -3019,7 +3426,7 @@ impl StoreInner {
                 fork_epoch: b.fork_epoch,
                 lineage,
                 current,
-                pending: HashMap::new(),
+                pending: BTreeMap::new(),
                 schema: None,
                 handle: if b.released {
                     Handle::Released
@@ -3655,8 +4062,8 @@ impl StoreInner {
                 parent,
                 fork_epoch: f,
                 lineage: Lineage::default(),
-                current: HashMap::new(),
-                pending: HashMap::new(),
+                current: BTreeMap::new(),
+                pending: BTreeMap::new(),
                 schema,
                 handle,
                 open: false,
@@ -4114,7 +4521,7 @@ impl StoreInner {
                     fork_epoch: b.fork_epoch,
                     lineage,
                     current,
-                    pending: HashMap::new(),
+                    pending: BTreeMap::new(),
                     schema: None,
                     handle: if b.released {
                         Handle::Released

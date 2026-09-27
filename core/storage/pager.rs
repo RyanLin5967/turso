@@ -3173,8 +3173,11 @@ impl Pager {
         if let Some(branch) = self.branch.get() {
             // A branch's writes go to its own page space, never to the WAL, so it takes the
             // branch's write lock and leaves the WAL's alone: branches write concurrently with the
-            // trunk and with each other.
+            // trunk and with each other. Once this pager holds the branch's write lock no earlier
+            // transaction of it is live, so any slots one ended without commit or rollback still
+            // holds are returned.
             branch.store.begin_write(branch.id)?;
+            branch.discard();
             return Ok(IOResult::Done(()));
         }
         let Some(wal) = self.wal.as_ref() else {
@@ -3344,33 +3347,43 @@ impl Pager {
                 schema_did_change: true
             }
         );
-        let dirty: Vec<PageRef> = {
+        let (ids, resident): (Vec<u32>, Vec<PageRef>) = {
             let dirty_pages = self.dirty_pages.read();
             let mut cache = self.page_cache.write();
-            let mut pages = Vec::with_capacity(dirty_pages.len() as usize);
+            let mut resident = Vec::new();
             for page_id in dirty_pages.iter() {
-                // Spilling is off on a branch pager, so a dirty page cannot have been evicted.
-                let page = cache
-                    .peek(&PageCacheKey::new(page_id as usize), false)
-                    .ok_or_else(|| {
-                        LimboError::InternalError(format!(
-                            "dirty branch page {page_id} is not in the page cache"
-                        ))
-                    })?;
-                pages.push(page);
+                match cache.peek(&PageCacheKey::new(page_id as usize), false) {
+                    Some(page) => resident.push(page),
+                    // Only a spilled page may have left the cache: its image is in its slot.
+                    None if branch.is_filled(page_id) => {}
+                    None => {
+                        return Err(LimboError::InternalError(format!(
+                            "dirty branch page {page_id} is not in the page cache and was never \
+                             spilled"
+                        )))
+                    }
+                }
             }
-            pages
+            (dirty_pages.iter().collect(), resident)
         };
-        branch.store.commit_pages(branch.id, &dirty)?;
+        // Outside the store mutex: each slot is this transaction's alone until it is published.
+        for page in &resident {
+            if !page.is_spilled() {
+                branch.fill(page.get().id as u32, page.get_contents().as_slice())?;
+            }
+        }
+        branch.publish(&ids)?;
         if schema_did_change {
             branch
                 .store
                 .set_schema(branch.id, connection.schema.read().clone())?;
         }
-        for page in &dirty {
+        for page in &resident {
             page.clear_dirty();
+            page.clear_spilled();
         }
         self.dirty_pages.write().clear();
+        self.page_cache.write().unpark_all();
         branch.store.end_write(branch.id);
         if let Some(wal) = self.wal.as_ref() {
             wal.end_read_tx();
@@ -3630,9 +3643,12 @@ impl Pager {
             ));
         }
         let buf = Arc::new(self.buffer_pool.get_page());
-        if !branch
-            .store
-            .resolve_into(branch.id, page_idx as u32, buf.as_mut_slice())?
+        // A page this transaction spilled is read back from its own slot; otherwise the branch's
+        // committed page space answers.
+        if !branch.read_spilled(page_idx as u32, buf.as_mut_slice())?
+            && !branch
+                .store
+                .resolve_into(branch.id, page_idx as u32, buf.as_mut_slice())?
         {
             return Ok(None);
         }
@@ -3806,7 +3822,9 @@ impl Pager {
         }
         let page_no = page.get().id as u32;
         if let Some(branch) = self.branch.get() {
-            return branch.store.first_write_branch(branch.id, page_no);
+            // The version this write supersedes stays in its committed slot, untouched until the
+            // transaction publishes (shadow paging), so no pre-image is copied here.
+            return branch.first_write(page_no);
         }
         if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() {
@@ -4118,11 +4136,22 @@ impl Pager {
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn try_spill_dirty_pages(&self) -> Result<IOResult<()>> {
-        if self.branch.get().is_some() {
-            // Spilling writes uncommitted pages to the WAL. A branch's pages never go there, and
-            // writing them into the branch's own slots before commit would make a rollback
-            // unrecoverable, so they stay resident: the capacity is a soft limit (see
-            // `cache_insert`) and the cache admits them over it.
+        if let Some(branch) = self.branch.get() {
+            // A branch spills into the transaction's own slots, never the WAL and never the
+            // committed slots, so a rollback stays a matter of returning those slots (see
+            // `ShadowTxn`). The copy is a memcpy, or a positional write into the arena file (not
+            // synced: the commit's flight syncs the arena before its record).
+            let pages = match self.page_cache.read().check_spill(IOV_MAX) {
+                SpillResult::PagesToSpill(pages) => pages,
+                _ => return Ok(IOResult::Done(())),
+            };
+            let mut cache = self.page_cache.write();
+            for page in &pages {
+                let id = page.get().id;
+                branch.fill(id as u32, page.get_contents().as_slice())?;
+                cache.notify_page_spilled(PageCacheKey::new(id));
+                page.set_spilled();
+            }
             return Ok(IOResult::Done(()));
         }
         loop {
@@ -6089,7 +6118,9 @@ impl Pager {
             self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
             if let Some(branch) = self.branch.get() {
-                branch.store.abort_write(branch.id);
+                // The committed slots were never written: returning the transaction's own is the
+                // whole rollback.
+                branch.discard();
             }
         } else {
             turso_assert!(

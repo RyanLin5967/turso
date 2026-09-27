@@ -418,7 +418,53 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// Index entries (`by_born` and `by_died`) visited by `child_gone`'s garbage query.
     pub gc_range_entries: u64,
+    /// Acquisitions of the store mutex by the mechanism (the observation calls are not counted).
+    /// (Ported from r11-bigtxn, turso `7fcc8db5b`.)
+    pub lock_holds: u64,
+    /// Arena page bytes memcpy'd while the store mutex was held.
+    pub locked_copy_bytes: u64,
+    /// Page-map entries a branch's first fork inserted into its view outside the store mutex
+    /// (r11-bigtxn F-fork1; NOT ported onto the durable store, so 0 here).
+    pub view_build_pages: u64,
+    /// Process-wide, from `journal` (r11-bigtxn amendment 8): branch log and arena bytes written
+    /// and synced while the store mutex was held; bytes a flight synced with no lock held; bytes
+    /// copied into the journal's buffer under the mutex; bytes of frames handed in by move.
+    pub sync_locked_bytes: u64,
+    pub sync_unlocked_bytes: u64,
+    pub journal_copied_bytes: u64,
+    pub journal_handed_bytes: u64,
 }
+
+/// The largest single hold of the store mutex, per measure, since the previous
+/// [`Database::branch_take_hold_max`]. Observation only. (Ported from r11-bigtxn, `7fcc8db5b`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HoldMax {
+    /// Arena pages allocated, copied, mapped or released inside one hold.
+    pub pages: u64,
+    /// Arena page bytes memcpy'd inside one hold.
+    pub copy_bytes: u64,
+    /// Entries moved by container growth inside one hold: a std `HashMap` reserve (growth or
+    /// in-place rehash) or an arena vector.
+    pub realloc_moved: u64,
+    /// Bytes moved by that growth inside one hold.
+    pub realloc_bytes: u64,
+    /// Page-map nodes path-copied inside one hold (each `size_of::<Node>()` bytes).
+    pub node_copies: u64,
+    /// Arena chunk bytes allocated and zero-filled inside one hold.
+    pub zeroed_bytes: u64,
+    /// Nanoseconds of one hold, from acquisition to release; 0 unless [`set_hold_timing`] is on.
+    pub ns: u64,
+}
+
+/// Time every hold of the branch store's mutex into [`HoldMax::ns`]. Observation only; costs two
+/// clock reads per hold while on.
+#[doc(hidden)]
+pub fn set_hold_timing(on: bool) {
+    store::set_hold_timing(on);
+}
+
+#[doc(hidden)]
+pub use crate::storage::page_cache::{cache_work, CacheWork};
 
 impl Branch {
     fn new(db: Arc<Database>, id: BranchId) -> Self {
@@ -497,10 +543,58 @@ impl Drop for Branch {
 pub(crate) struct BranchBinding {
     pub(crate) store: Arc<BranchStore>,
     pub(crate) id: BranchId,
+    /// The write transaction's own slots (see [`store::ShadowTxn`]); empty between transactions.
+    pub(crate) txn: crate::sync::Mutex<store::ShadowTxn>,
+}
+
+impl BranchBinding {
+    pub(crate) fn new(store: Arc<BranchStore>, id: BranchId) -> Self {
+        Self {
+            store,
+            id,
+            txn: crate::sync::Mutex::new(store::ShadowTxn::default()),
+        }
+    }
+
+    /// The first write of `page` in this transaction: reserve a slot of the transaction's own.
+    pub(crate) fn first_write(&self, page: u32) -> Result<()> {
+        let mut txn = self.txn.lock();
+        if let Some((slot, ptr)) = self.store.shadow_slot(self.id, page, &txn)? {
+            // Recorded after the store mutex is released: this map's growth is not in a hold.
+            txn.insert(page, slot, ptr);
+        }
+        Ok(())
+    }
+
+    /// Copy a dirty page's image into its slot: at a spill, and at commit.
+    pub(crate) fn fill(&self, page: u32, image: &[u8]) -> Result<()> {
+        self.txn.lock().fill(page, image)
+    }
+
+    /// The page as this transaction spilled it, if it did.
+    pub(crate) fn read_spilled(&self, page: u32, out: &mut [u8]) -> Result<bool> {
+        self.txn.lock().read(page, out)
+    }
+
+    pub(crate) fn is_filled(&self, page: u32) -> bool {
+        self.txn.lock().is_filled(page)
+    }
+
+    /// Commit: map the pages of `dirty` to their filled slots.
+    pub(crate) fn publish(&self, dirty: &[u32]) -> Result<()> {
+        self.store.publish(self.id, &mut self.txn.lock(), dirty)
+    }
+
+    /// Roll back: return the transaction's slots. The committed ones were never written.
+    pub(crate) fn discard(&self) {
+        self.store.discard(self.id, &mut self.txn.lock());
+    }
 }
 
 impl Drop for BranchBinding {
     fn drop(&mut self) {
+        // A transaction abandoned with its connection returns its slots before the branch closes.
+        self.discard();
         self.store.close(self.id);
     }
 }
@@ -606,6 +700,19 @@ impl Database {
     /// Refused on a read-only handle of a database with branches, whose branch store is not open.
     pub fn branch_stats(&self) -> Result<BranchStats> {
         self.branches.stats()
+    }
+
+    /// The per-hold maxima of the branch store's mutex since the previous call; resets them.
+    #[doc(hidden)]
+    pub fn branch_take_hold_max(&self) -> HoldMax {
+        self.branches.take_hold_max()
+    }
+
+    /// Store-mutex holds by duration since the previous call, bucket b = [2^(b/8), 2^((b+1)/8)) ns;
+    /// resets it. Filled only while [`set_hold_timing`] is on.
+    #[doc(hidden)]
+    pub fn branch_take_hold_hist(&self) -> Vec<u64> {
+        self.branches.take_hold_hist()
     }
 
     /// What the branch store's open read and rebuilt (r11-restart lane instrument).
@@ -736,10 +843,7 @@ impl Database {
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
         let schema = self.branches.open_conn(id)?;
         // Built before anything fallible below, so an error there still closes the branch.
-        let binding = BranchBinding {
-            store: self.branches.clone(),
-            id,
-        };
+        let binding = BranchBinding::new(self.branches.clone(), id);
         let pager = self._init(None, None)?;
         // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may
         // survive into the branch's view.
