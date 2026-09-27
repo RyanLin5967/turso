@@ -162,7 +162,9 @@ pub struct Branch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaped {
     /// Arena pages returned to the free list by this call: the branch's own, plus any version an
-    /// ancestor was retaining only for it.
+    /// ancestor was retaining only for it. The call frees them in batches after unlinking the
+    /// branch; while other reaps reclaim concurrently the count can include some of theirs and miss
+    /// some of its own.
     pub freed_pages: usize,
     /// True when something still reads through the branch (an open connection or a live child), so
     /// its pages outlive this call: they are freed when the last map naming them goes. The branch's

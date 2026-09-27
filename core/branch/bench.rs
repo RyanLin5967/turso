@@ -71,6 +71,23 @@ impl StoreBench {
         self.store.release_handle(id)
     }
 
+    /// The first half of `reap`: unlink in one hold and queue the space; returns whether the branch
+    /// is still read through. [`StoreBench::reclaim_step`] frees the queue.
+    pub fn unlink(&self, id: BranchId) -> Option<bool> {
+        self.store.unlink(id).map(|(deferred, _, _)| deferred)
+    }
+
+    /// One hold of reclamation, at most `budget` units (capped at the store's batch); returns the
+    /// slots freed.
+    pub fn reclaim_step(&self, budget: usize) -> usize {
+        self.store.reclaim_step(budget)
+    }
+
+    /// Entries waiting on the reclamation queue.
+    pub fn reclaim_queued(&self) -> usize {
+        self.store.reclaim_queued()
+    }
+
     pub fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
         self.store.resolve_into(id, page, out)
     }

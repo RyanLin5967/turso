@@ -49,15 +49,26 @@
 //!
 //! The live children a version holds are a contiguous run of the node's live children (those
 //! forked in `[born, died)`), and the run only ever loses members. So each version is filed under
-//! its FIRST live holder, in a min-heap ordered by `died`: priority queues on the nodes of a
-//! union–find over the live list (Mendelson, Tarjan, Thorup and Zwick, SWAT 2004). When the child
-//! at `f` goes, the versions filed under it are exactly those with `born` in `(lo, f]`; of those,
-//! the garbage is the prefix of its heap with `died <= hi` (all of it, if there is no younger live
-//! sibling), and the rest now start at `hi`, so the heap is melded into `hi`'s. A reap therefore
-//! visits what it frees plus one heap root, and melds two heaps — leftist heaps (Crane 1972), so
-//! O(log V) worst case — and never walks a surviving version. (The two range walks this replaces,
-//! ZFS-deadlist indexes by `born` and by `died`, cost twice the smaller range whatever it freed:
-//! a reap could walk every version and free none.)
+//! a live child `c` such that no live child forked in `[born, c)` — its first live holder, or,
+//! once it is garbage, the live child after the run it had — in a min-heap ordered by `died`:
+//! priority queues on the nodes of a union–find over the live list (Mendelson, Tarjan, Thorup and
+//! Zwick, SWAT 2004). A version filed under `c` is garbage exactly when `died <= c`, so a heap's
+//! garbage is its min-prefix. When the child at `f` goes, its heap is melded into that of `hi`, the
+//! next live sibling — leftist heaps (Crane 1972), so one meld is O(log V) worst case — which keeps
+//! the rule: the versions filed under `f` have `born` in `(lo, f]`, and no live child now lies
+//! between `lo` and `hi`. With no younger live sibling, every version filed under `f` is garbage.
+//! (The two range walks this replaces, ZFS-deadlist indexes by `born` and by `died`, cost twice
+//! the smaller range whatever it freed: a reap could walk every version and free none.)
+//!
+//! A reap frees nothing itself. In one hold of the mutex it unlinks what it made unreachable and
+//! queues it — a garbage prefix now at the top of `hi`'s heap, a heap that is all garbage, a dead
+//! branch's page map — and the queue is reclaimed in holds of at most [`RECLAIM_BATCH`] units,
+//! the mutex handed to any waiting thread between them: OpenZFS's asynchronous destroy, which
+//! unlinks a dataset at once and frees its blocks a bounded number per transaction group.
+//! Reclamation examines what it frees plus at most one root per queued heap, and never walks a
+//! surviving version. A version waiting in the queue is invisible: no live child and no later fork
+//! lies in its `[born, died)`, and the born-ordered lookup answers as it would without it (see
+//! [`Lineage::retained_at`]).
 //!
 //! That is the TRUNK's reclamation. A branch's versions are reclaimed by reference counts instead
 //! (Rodeh, "B-trees, Shadowing, and Clones", ACM TOS 2008): every branch page lives in a slot that
@@ -68,10 +79,11 @@
 //! a dead ancestor named, is freed when the last map naming it goes, which interval retention
 //! cannot see (the interval predicate ignores descendants' writes).
 //!
-//! A branch whose handle has been dropped and that has no open connection releases its map at once
-//! (its children hold their own). If it still has two or more live children its state is kept as
-//! their fork point; with one it is spliced out, the child taking its place in its parent; with
-//! none it is freed, and freeing it may in turn free or splice its parent.
+//! A branch whose handle has been dropped and that has no open connection releases its map (its
+//! children hold their own): the map goes on the reclamation queue, and its nodes and slot
+//! references are dropped a bounded number per hold. If it still has two or more live children
+//! its state is kept as their fork point; with one it is spliced out, the child taking its place
+//! in its parent; with none it is freed, and freeing it may in turn free or splice its parent.
 //!
 //! # What this does not do
 //!
@@ -92,12 +104,12 @@
 //! Tarjan's fat node (JCSS 1989) with a search tree over its version stamps. [`Lineage::retain`]
 //! refuses a version that would break the disjointness the search relies on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 
 use super::arena::{Arena, Slot};
 use super::linear_map::LinearMap;
-use super::page_map::{MapWork, PageMap};
+use super::page_map::{MapWork, PageMap, Release};
 use super::{BranchId, BranchStats, BranchWork, HoldMax, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
@@ -158,6 +170,28 @@ impl Hold<'_> {
     }
 }
 
+impl Hold<'_> {
+    /// Release the mutex, handing it to a thread waiting for it if there is one: a reclamation loop
+    /// that took it straight back could keep a waiter out for many batches.
+    fn release_fair(mut self) {
+        if let Some(mut guard) = self.guard.take() {
+            Self::account(&mut guard, self.start, self.at);
+            unlock_fair(guard);
+        }
+    }
+}
+
+#[cfg(not(shuttle))]
+fn unlock_fair(guard: MutexGuard<'_, StoreInner>) {
+    MutexGuard::unlock_fair(guard);
+}
+
+/// The model checker's mutex has no fair unlock; its scheduler decides who runs next anyway.
+#[cfg(shuttle)]
+fn unlock_fair(guard: MutexGuard<'_, StoreInner>) {
+    drop(guard);
+}
+
 impl Deref for Hold<'_> {
     type Target = StoreInner;
     fn deref(&self) -> &StoreInner {
@@ -189,6 +223,10 @@ pub(crate) struct BranchStore {
     /// same lock. A 1-to-0 transition (a reap) racing the read only makes the writer take the lock
     /// and find nothing to do.
     trunk_children: AtomicUsize,
+    /// Test-only: runs after each reclamation hold a reap makes, so a test can act, or die, between
+    /// two holds deterministically.
+    #[cfg(test)]
+    reclaim_pause: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 struct StoreInner {
@@ -202,6 +240,80 @@ struct StoreInner {
     branch_table_peak: usize,
     /// Observation only; see [`HoldMax`].
     hold_max: HoldMax,
+    /// Space reaps have unlinked and not yet reclaimed, oldest first (see [`Doomed`]).
+    doomed: VecDeque<Doomed>,
+    /// The sequence number of `doomed`'s front entry: entry `i` is number `doomed_head + i`.
+    doomed_head: u64,
+}
+
+/// The most units one hold of the store mutex spends reclaiming (see [`StoreInner::reclaim`]): a
+/// unit is one heap root examined, one page-map node visited, one slot reference dropped, or one
+/// queue entry found to have nothing left. So no hold frees more than this many slots, whatever a
+/// reap unlinked. r11-bigtxn's batch for the same purpose on the range-walk store.
+pub(crate) const RECLAIM_BATCH: usize = 64;
+
+/// What a reap unlinked and left to reclaim (OpenZFS's asynchronous destroy: the destroy unlinks
+/// the dataset, and the sync thread frees its blocks a bounded number per transaction group).
+enum Doomed {
+    /// The live child of `node` forked at `child` may have garbage at the top of its heap: the
+    /// versions filed under it with `died <= child` (see "Reclamation"). If the child has gone
+    /// since, its heap moved on with its reap, which queued its own entry.
+    Filed { node: BranchId, child: u64 },
+    /// A heap of versions of `node`'s lineage that are all garbage: the child they were filed
+    /// under had no younger live sibling.
+    Heap { node: BranchId, heap: Heap },
+    /// A dead branch's page map: the nodes it may alone hold and the slot references it still owes.
+    Map(Release),
+}
+
+/// What a reap unlinked that holds no arena slot: dropped after the mutex is released.
+#[derive(Default)]
+struct Graveyard {
+    states: Vec<BranchState>,
+    tables: Vec<LinearMap<u32, Owned>>,
+}
+
+/// Pop and free the versions at the top of `heap` with `died <= bound` (every version, with no
+/// bound), examining at most `budget` roots; the root that stops it is examined too. Returns the
+/// roots examined, the versions freed, and whether no garbage is left in `heap`.
+fn pop_garbage(
+    heap: &mut Heap,
+    bound: Option<u64>,
+    children: &BTreeMap<u64, Child>,
+    retained: &mut LinearMap<u32, BTreeMap<u64, Retained>>,
+    budget: usize,
+    arena: &mut Arena,
+    work: &mut BranchWork,
+) -> (usize, usize, bool) {
+    let (mut examined, mut freed) = (0, 0);
+    while examined < budget {
+        let Some(root) = heap.as_ref() else {
+            return (examined, freed, true);
+        };
+        examined += 1;
+        work.gc_heap_examined += 1;
+        if bound.is_some_and(|bound| root.died > bound) {
+            return (examined, freed, true);
+        }
+        let mut root = heap.take().expect("checked above");
+        *heap = meld(root.left.take(), root.right.take(), &mut work.gc_meld_steps);
+        crate::turso_debug_assert!(
+            children.range(root.born..root.died).next().is_none(),
+            "reclaimed a version a live child can still see"
+        );
+        let versions = retained
+            .get_mut(&root.page)
+            .expect("a filed version is listed");
+        let v = versions.remove(&root.born).expect("a filed version is listed");
+        crate::turso_assert!(v.died == root.died, "a filed version disagrees with its listing");
+        work.gc_examined += 1;
+        if versions.is_empty() {
+            retained.remove(&root.page, &mut work.page_table_moved);
+        }
+        arena.release(v.slot);
+        freed += 1;
+    }
+    (examined, freed, false)
 }
 
 #[derive(Default)]
@@ -376,46 +488,24 @@ impl Lineage {
         (f < v.died).then_some(v.slot)
     }
 
-    /// Detach the child forked at `f` and release every retained version that only it could see:
-    /// the versions filed under `f` (it was their first live holder) whose `died` is at most the
-    /// next live sibling's fork epoch. The rest move to that sibling's heap.
-    fn child_gone(&mut self, f: u64, arena: &mut Arena, work: &mut BranchWork) -> usize {
+    /// Detach the child forked at `f` of `node` (this lineage's owner). The versions filed under
+    /// it move to the next live sibling's heap, where those only `f` could see — `died` at most
+    /// that sibling's fork epoch — are now its garbage prefix; with no younger live sibling they
+    /// are all garbage. Frees nothing: returns where the garbage is, for the reclamation queue.
+    fn child_gone(&mut self, node: BranchId, f: u64, work: &mut BranchWork) -> Option<Doomed> {
         let child = self.children.remove(&f);
         crate::turso_assert!(child.is_some(), "detached a child the parent does not list");
-        let mut heap = child.expect("checked above").first_of;
-        let hi = self.children.range(f..).next().map(|(&e, _)| e);
-        let mut freed = 0;
-        while let Some(root) = heap.as_ref() {
-            work.gc_heap_examined += 1;
-            if hi.is_some_and(|hi| root.died > hi) {
-                break;
-            }
-            let mut root = heap.take().expect("checked above");
-            heap = meld(root.left.take(), root.right.take(), &mut work.gc_meld_steps);
-            let versions = self
-                .retained
-                .get_mut(&root.page)
-                .expect("a filed version is listed");
-            let v = versions.remove(&root.born).expect("a filed version is listed");
-            crate::turso_assert!(v.died == root.died, "a filed version disagrees with its listing");
-            work.gc_examined += 1;
-            if versions.is_empty() {
-                self.retained.remove(&root.page, &mut work.page_table_moved);
-            }
-            arena.release(v.slot);
-            freed += 1;
+        let heap = child.expect("checked above").first_of;
+        if heap.is_none() {
+            return None;
         }
-        match hi {
-            Some(hi) => {
-                let next = self.children.get_mut(&hi).expect("hi is a live child");
+        match self.children.range_mut(f..).next() {
+            Some((&hi, next)) => {
                 next.first_of = meld(next.first_of.take(), heap, &mut work.gc_meld_steps);
+                Some(Doomed::Filed { node, child: hi })
             }
-            None => crate::turso_assert!(
-                heap.is_none(),
-                "the youngest child left a version no live child holds"
-            ),
+            None => Some(Doomed::Heap { node, heap }),
         }
-        freed
     }
 }
 
@@ -463,8 +553,12 @@ impl BranchStore {
                 work: BranchWork::default(),
                 branch_table_peak: 0,
                 hold_max: HoldMax::default(),
+                doomed: VecDeque::new(),
+                doomed_head: 0,
             }),
             trunk_children: AtomicUsize::new(0),
+            #[cfg(test)]
+            reclaim_pause: Mutex::new(None),
         }
     }
 
@@ -599,36 +693,107 @@ impl BranchStore {
 
     /// The connection on `id` has gone. Releases its write lock if a transaction was abandoned.
     pub(crate) fn close(&self, id: BranchId) {
-        let mut inner = self.lock();
-        if let Some(st) = inner.branches.get_mut(&id) {
-            st.open = false;
-            st.writer = false;
+        let mut dead = Graveyard::default();
+        let (start, end) = {
+            let mut inner = self.lock();
+            if let Some(st) = inner.branches.get_mut(&id) {
+                st.open = false;
+                st.writer = false;
+            }
+            let start = inner.doomed_end();
+            self.collect(&mut inner, id, &mut dead);
+            (start, inner.doomed_end())
+        };
+        drop(dead);
+        if end > start {
+            self.reclaim_through(end);
         }
-        self.collect(&mut inner, id);
     }
 
-    /// The `Branch` handle has gone.
+    /// The `Branch` handle has gone. Unlinks what that made unreachable in one hold, then reclaims
+    /// it in holds of at most [`RECLAIM_BATCH`] units before returning.
     pub(crate) fn release_handle(&self, id: BranchId) -> Reaped {
-        let mut inner = self.lock();
-        let Some(st) = inner.branches.get_mut(&id) else {
+        let Some((deferred, start, end)) = self.unlink(id) else {
             return Reaped {
                 freed_pages: 0,
                 deferred: false,
             };
         };
-        st.handle = false;
-        // Deferred means something still reads through the branch, so its pages outlive this call:
-        // kept with the branch, or, when it is spliced out, with the child that took them over.
-        let deferred = st.open || !st.lineage.children.is_empty();
-        let freed_pages = self.collect(&mut inner, id);
-        crate::turso_assert!(
-            deferred || !inner.branches.contains_key(&id),
-            "a branch nothing reads through was kept"
-        );
+        let freed_pages = if end > start {
+            self.reclaim_through(end)
+        } else {
+            0
+        };
         Reaped {
             freed_pages,
             deferred,
         }
+    }
+
+    /// The first half of [`BranchStore::release_handle`], in one hold: drop the handle and unlink
+    /// whatever that made unreachable, queueing its space. Returns whether something still reads
+    /// through the branch (see [`Reaped::deferred`]) and the queue numbers before and after this
+    /// call's entries; `None` if there is no such branch. The space is freed by whoever reclaims
+    /// the queue that far — this call's caller, or a background drainer.
+    pub(crate) fn unlink(&self, id: BranchId) -> Option<(bool, u64, u64)> {
+        let mut dead = Graveyard::default();
+        let out = {
+            let mut inner = self.lock();
+            let st = inner.branches.get_mut(&id)?;
+            st.handle = false;
+            // Deferred means something still reads through the branch, so its pages outlive this
+            // call: kept with the branch, or, when it is spliced out, with the child that took them
+            // over.
+            let deferred = st.open || !st.lineage.children.is_empty();
+            let start = inner.doomed_end();
+            self.collect(&mut inner, id, &mut dead);
+            crate::turso_assert!(
+                deferred || !inner.branches.contains_key(&id),
+                "a branch nothing reads through was kept"
+            );
+            (deferred, start, inner.doomed_end())
+        };
+        drop(dead);
+        Some(out)
+    }
+
+    /// Reclaim, in holds of at most [`RECLAIM_BATCH`] units and oldest entry first, until every
+    /// queue entry numbered below `end` is finished. Returns the slots this call freed (which, when
+    /// several threads reclaim at once, may include another reap's and miss some of its own).
+    fn reclaim_through(&self, end: u64) -> usize {
+        let mut freed = 0;
+        loop {
+            let mut hold = self.lock();
+            if hold.doomed_head >= end {
+                return freed;
+            }
+            freed += hold.reclaim(RECLAIM_BATCH);
+            if hold.doomed_head >= end {
+                return freed;
+            }
+            hold.release_fair();
+            #[cfg(test)]
+            if let Some(pause) = self.reclaim_pause.lock().as_ref() {
+                pause();
+            }
+        }
+    }
+
+    /// One hold of reclamation from the front of the queue, spending at most `budget` units (and
+    /// never more than [`RECLAIM_BATCH`]). Returns the slots freed. For a background drainer, and
+    /// for a test that cuts a reclamation short at a chosen point.
+    pub(crate) fn reclaim_step(&self, budget: usize) -> usize {
+        self.lock().reclaim(budget.min(RECLAIM_BATCH))
+    }
+
+    /// Entries on the reclamation queue (observation only).
+    pub(crate) fn reclaim_queued(&self) -> usize {
+        self.inner.lock().doomed.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reclaim_pause(&self, pause: Option<Box<dyn Fn() + Send + Sync>>) {
+        *self.reclaim_pause.lock() = pause;
     }
 
     pub(crate) fn begin_write(&self, id: BranchId) -> Result<()> {
@@ -863,87 +1028,87 @@ impl BranchStore {
             .is_some_and(|a| a.is_free(slot))
     }
 
-    /// Free `id` if nothing can reach it any more, then its parent if that freed the parent's last
-    /// reason to exist. Returns the number of arena pages released.
-    fn collect(&self, inner: &mut StoreInner, mut id: BranchId) -> usize {
-        let mut freed = 0;
+    /// Unlink `id` if nothing can reach it any more, then its parent if that removed the parent's
+    /// last reason to exist. Frees nothing: the space this made unreachable goes on the
+    /// reclamation queue (see [`Doomed`]), and the unlinked states to `dead`.
+    fn collect(&self, inner: &mut StoreInner, mut id: BranchId, dead: &mut Graveyard) {
         loop {
             let Some(st) = inner.branches.get(&id) else {
-                return freed;
+                return;
             };
             if st.handle || st.open {
-                return freed;
+                return;
             }
             if st.view.is_some() {
-                freed += self.retire(inner, id);
+                self.retire(inner, id, dead);
             }
             let st = inner.branches.get(&id).expect("looked up above");
             if st.lineage.children.len() == 1 {
-                self.splice(inner, id);
-                return freed;
+                self.splice(inner, id, dead);
+                return;
             }
             if !st.lineage.children.is_empty() {
-                return freed;
+                return;
             }
             let st = inner
                 .branches
                 .remove(&id, &mut inner.work.branch_table_moved)
                 .expect("just looked it up");
             let StoreInner {
-                arena,
                 trunk,
                 branches,
                 work,
+                doomed,
                 ..
             } = &mut *inner;
-            let arena = arena.as_mut().expect("a branch existed, so the arena does");
             crate::turso_assert!(
                 st.lineage.retained.is_empty(),
                 "a branch lineage retained a version; branch versions live by reference count"
             );
-            if st.parent.is_trunk() {
-                freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
+            let (parent, fork_epoch) = (st.parent, st.fork_epoch);
+            dead.states.push(st);
+            if parent.is_trunk() {
+                doomed.extend(trunk.lineage.child_gone(parent, fork_epoch, work));
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
-                return freed;
+                return;
             }
-            let parent = branches
-                .get_mut(&st.parent)
-                .expect("a live branch's parent is kept while the branch lives");
-            freed += parent.lineage.child_gone(st.fork_epoch, arena, work);
-            id = st.parent;
+            let lineage = &mut branches
+                .get_mut(&parent)
+                .expect("a live branch's parent is kept while the branch lives")
+                .lineage;
+            doomed.extend(lineage.child_gone(parent, fork_epoch, work));
+            id = parent;
         }
     }
 }
 
 impl BranchStore {
     /// `id` has no handle and no connection, so it will never be written, read or forked again:
-    /// release its map. A slot only this map named is freed; one a child's map (or anyone's) still
-    /// names lives on there. Returns the pages freed.
-    fn retire(&self, inner: &mut StoreInner, id: BranchId) -> usize {
+    /// release its map, onto the reclamation queue. A slot only this map named is freed there; one
+    /// a child's map (or anyone's) still names lives on in it. Its `current` table goes to `dead`.
+    fn retire(&self, inner: &mut StoreInner, id: BranchId, dead: &mut Graveyard) {
         let StoreInner {
-            arena,
             branches,
             work,
+            doomed,
             ..
         } = &mut *inner;
-        let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).expect("the caller looked it up");
-        let mut w = MapWork::default();
-        if let Some(mut view) = st.view.take() {
-            view.release(arena, &mut w);
+        if let Some(view) = st.view.take() {
+            let release = view.into_release();
+            if !release.is_done() {
+                doomed.push_back(Doomed::Map(release));
+            }
         }
-        work.reclaim_map_nodes += w.nodes_released;
-        work.reclaim_slot_decrefs += w.decrefs;
         work.retired += st.current.len() as u64;
-        st.current = LinearMap::default();
-        w.freed as usize
+        dead.tables.push(std::mem::take(&mut st.current));
     }
 
     /// Remove `id` — dead, map released, exactly one live child — from the tree and give the child
     /// its place: the child becomes its parent's child at `id`'s fork epoch, which is what it saw
     /// of that parent. Nothing moves: every slot the child reads is named, and counted, by its own
     /// map. So a chain of dead ancestors costs one state, not one each.
-    fn splice(&self, inner: &mut StoreInner, id: BranchId) {
+    fn splice(&self, inner: &mut StoreInner, id: BranchId, dead: &mut Graveyard) {
         let st = inner
             .branches
             .remove(&id, &mut inner.work.branch_table_moved)
@@ -984,10 +1149,108 @@ impl BranchStore {
             .get_mut(&st.fork_epoch)
             .expect("the parent lists the spliced branch")
             .id = child_id;
+        dead.states.push(st);
     }
 }
 
 impl StoreInner {
+    /// One past the number of the newest entry on the reclamation queue.
+    fn doomed_end(&self) -> u64 {
+        self.doomed_head + self.doomed.len() as u64
+    }
+
+    /// Reclaim from the front of the queue, spending at most `budget` units (see
+    /// [`RECLAIM_BATCH`]); every entry visited costs at least one. Returns the arena slots freed.
+    /// An entry is popped only once it is finished, and every free updates the entry it came from
+    /// in the same step, so a reclamation cut at any point leaves the queue naming exactly what is
+    /// still to free.
+    fn reclaim(&mut self, budget: usize) -> usize {
+        let StoreInner {
+            arena,
+            trunk,
+            branches,
+            work,
+            doomed,
+            doomed_head,
+            ..
+        } = self;
+        let (mut spent, mut freed) = (0, 0);
+        if !doomed.is_empty() {
+            work.reclaim_holds += 1;
+        }
+        while spent < budget {
+            let Some(entry) = doomed.front_mut() else {
+                break;
+            };
+            let arena = arena.as_mut().expect("space was queued, so the arena exists");
+            let (units, n, finished) = match entry {
+                Doomed::Filed { node, child } => {
+                    let (node, child) = (*node, *child);
+                    let lineage = if node.is_trunk() {
+                        Some(&mut trunk.lineage)
+                    } else {
+                        branches.get_mut(&node).map(|st| &mut st.lineage)
+                    };
+                    match lineage {
+                        Some(lineage) if lineage.children.contains_key(&child) => {
+                            let Lineage {
+                                children, retained, ..
+                            } = lineage;
+                            let c = children.get_mut(&child).expect("checked above");
+                            let mut heap = c.first_of.take();
+                            let out = pop_garbage(
+                                &mut heap,
+                                Some(child),
+                                children,
+                                retained,
+                                budget - spent,
+                                arena,
+                                work,
+                            );
+                            children.get_mut(&child).expect("checked above").first_of = heap;
+                            out
+                        }
+                        _ => (0, 0, true),
+                    }
+                }
+                Doomed::Heap { node, heap } => {
+                    let node = *node;
+                    let lineage = if node.is_trunk() {
+                        &mut trunk.lineage
+                    } else {
+                        &mut branches
+                            .get_mut(&node)
+                            .expect("a lineage with garbage outlives it (only the trunk retains)")
+                            .lineage
+                    };
+                    pop_garbage(
+                        heap,
+                        None,
+                        &lineage.children,
+                        &mut lineage.retained,
+                        budget - spent,
+                        arena,
+                        work,
+                    )
+                }
+                Doomed::Map(release) => {
+                    let mut w = MapWork::default();
+                    let units = release.step(arena, &mut w, budget - spent);
+                    work.reclaim_map_nodes += w.nodes_released;
+                    work.reclaim_slot_decrefs += w.decrefs;
+                    (units, w.freed as usize, release.is_done())
+                }
+            };
+            spent += units.max(1);
+            freed += n;
+            if finished {
+                doomed.pop_front();
+                *doomed_head += 1;
+            }
+        }
+        freed
+    }
+
     /// `levels` counts the nodes consulted — the branch (its map), then the trunk if the map does
     /// not hold the page — and `examined` the retained versions compared.
     fn resolve(
@@ -1073,9 +1336,11 @@ mod tests {
     /// The trunk's retained-version index against a brute-force model, through the store's own
     /// entry points (`fork_trunk`, `first_write_trunk`, `release_handle`, `resolve_into`), and the
     /// garbage query's cost against its contract: a reap examines exactly the versions it frees,
-    /// plus one heap root when some version filed under the reaped child survives it — a version
-    /// with `born` in `(lo, f]` and `died > hi` — and never any other version; and no reap's melds
-    /// walk more than 2·(log2(V + 1) + 1) right-spine nodes.
+    /// plus one heap root when the reaped child had versions filed under it and `hi` still has one
+    /// after them — a survivor of the child's, or one of `hi`'s own, the root that stops the
+    /// reclamation of `hi`'s garbage prefix (r12-async-destroy PREREG §4; before the reclamation
+    /// queue it was a survivor only) — and never any other version; and no reap's melds walk more
+    /// than 2·(log2(V + 1) + 1) right-spine nodes.
     ///
     /// The trunk rewrites a handful of pages, several per epoch, so versions share `born` and `died`
     /// across pages; children are reaped oldest-first, newest-first and at random, so the garbage
@@ -1144,6 +1409,14 @@ mod tests {
                         .filter(filed)
                         .filter(|&&(_, _, died)| hi.is_some_and(|hi| died > hi))
                         .count() as u64;
+                    // After the reap, the versions filed under `hi`: nothing live lies in
+                    // `[born, hi)` once `f` is gone, so `born` is in `(lo, hi]`, and `hi < died`.
+                    let hi_keeps = hi.is_some_and(|hi| {
+                        history.iter().any(|&(_, born, died)| {
+                            lo.is_none_or(|lo| born > lo) && born <= hi && hi < died
+                        })
+                    });
+                    let stop = history.iter().any(|v| filed(&v)) && hi_keeps;
                     let versions = history.len() as f64;
                     let before = store.stats();
                     let reaped = store.release_handle(id);
@@ -1155,11 +1428,12 @@ mod tests {
                         "seed {seed:#x} step {step}: the reap's report disagrees with the arena"
                     );
                     let examined = after.work.gc_heap_examined - before.work.gc_heap_examined;
-                    let contract = reaped.freed_pages as u64 + u64::from(survivors > 0);
+                    let contract = reaped.freed_pages as u64 + u64::from(stop);
                     assert_eq!(
                         examined, contract,
                         "seed {seed:#x} step {step}: reaping the child forked at {f} (lo {lo:?}, \
-                         hi {hi:?}, {survivors} filed survivors) examined {examined} heap roots"
+                         hi {hi:?}, {survivors} filed survivors, hi keeps a version: {hi_keeps}) \
+                         examined {examined} heap roots"
                     );
                     let steps = after.work.gc_meld_steps - before.work.gc_meld_steps;
                     let bound = 2.0 * ((versions + 1.0).log2() + 1.0) * (1.0 + examined as f64);
@@ -1226,9 +1500,9 @@ mod tests {
 
     /// A reap of 2^20 pages holds the store mutex for at most a batch of 64 frees at a time,
     /// whichever structure held the pages (r12-async-destroy PREREG §4, T-red): 2^20 versions the
-    /// trunk retained for one child alone (the heap side of a reap), and 2^20 pages one branch wrote
-    /// itself (the page-map side). A store that frees inside the reap's one hold frees all 2^20 in
-    /// it.
+    /// trunk retained for one child alone (the heap side of a reap), and 2^20 pages one branch
+    /// wrote itself (the page-map side). A store that frees inside the reap's one hold frees all
+    /// 2^20 in it.
     #[test]
     fn a_reap_of_2_20_pages_holds_the_store_mutex_for_at_most_a_batch_of_frees() {
         const K: u32 = 1 << 20;
@@ -1249,7 +1523,8 @@ mod tests {
                     store.first_write_trunk(page, &pre);
                 }
             }
-            // A younger live sibling, so the trunk side's garbage has a neighbour to be filed under.
+            // A younger live sibling, so the trunk side's garbage has a neighbour to be filed
+            // under.
             let sibling = store.fork_trunk(schema, PAGE).unwrap();
             assert_eq!(store.stats().arena_slots_in_use, K as usize, "own {own}");
             store.take_hold_max();
@@ -1269,6 +1544,455 @@ mod tests {
             );
             store.release_handle(sibling);
             assert_eq!(store.stats().live_branches, 0, "own {own}");
+        }
+    }
+
+    /// The trunk model test with every reap split into its unlink and reclamation holds of random
+    /// budgets, and forks, trunk rewrites and further unlinks run between any two holds
+    /// (r12-async-destroy PREREG §4, T-interleave). After every step every live child reads its
+    /// fork-time bytes, and the arena holds exactly the versions a live child can see plus the
+    /// garbage unlinked and not yet reclaimed; drained, exactly the live ones.
+    #[test]
+    fn retained_versions_match_a_model_with_reclamation_cut_between_any_two_holds() {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            run_cut(seed);
+        }
+    }
+
+    fn run_cut(seed: u64) {
+        let store = BranchStore::new();
+        let mut rng = Rng(seed);
+        let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut live: Vec<(BranchId, u64, HashMap<u32, u64>)> = Vec::new();
+        // The versions some live child can see: (page, born, died).
+        let mut history: Vec<(u32, u64, u64)> = Vec::new();
+        let mut written: HashMap<u32, u64> = HashMap::new();
+        let (mut epoch, mut generation) = (0u64, 0u64);
+        // Garbage unlinked and not yet reclaimed; steps that ran with some of it still queued.
+        let (mut owed, mut waited) = (0usize, 0usize);
+        for step in 0..3000 {
+            match rng.below(12) {
+                0..=2 if live.len() < 40 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    live.push((id, epoch, current.clone()));
+                    epoch += 1;
+                }
+                0..=5 => {
+                    for _ in 0..=rng.below(3) {
+                        let page = rng.below(PAGES as u64) as u32;
+                        if store.trunk_has_children() {
+                            let born = written.get(&page).copied().unwrap_or(0);
+                            if born < epoch {
+                                if live.iter().any(|&(_, f, _)| born <= f && f < epoch) {
+                                    history.push((page, born, epoch));
+                                }
+                                written.insert(page, epoch);
+                            }
+                            store.first_write_trunk(page, &image(current[&page]));
+                        }
+                        generation += 1;
+                        current.insert(page, generation);
+                    }
+                }
+                6..=7 if !live.is_empty() => {
+                    let (id, _, _) = live.remove(rng.below(live.len() as u64) as usize);
+                    let (deferred, _, _) = store.unlink(id).expect("a live child exists");
+                    assert!(!deferred, "seed {seed:#x} step {step}");
+                    let before = history.len();
+                    history.retain(|&(_, born, died)| {
+                        live.iter().any(|&(_, f, _)| born <= f && f < died)
+                    });
+                    owed += before - history.len();
+                }
+                _ => {
+                    let budget = 1 + rng.below(RECLAIM_BATCH as u64) as usize;
+                    let freed = store.reclaim_step(budget);
+                    assert!(
+                        freed <= budget && freed <= owed,
+                        "seed {seed:#x} step {step}: a hold of budget {budget} freed {freed} with \
+                         {owed} owed"
+                    );
+                    owed -= freed;
+                }
+            }
+            if owed > 0 {
+                waited += 1;
+            }
+            assert_eq!(
+                store.stats().arena_slots_in_use,
+                history.len() + owed,
+                "seed {seed:#x} step {step}: the arena holds a version no live child can see and \
+                 nothing owes, or lost one"
+            );
+            let mut buf = vec![0u8; PAGE];
+            for (id, f, view) in &live {
+                for page in 0..PAGES {
+                    let got = if store.resolve_into(*id, page, &mut buf).unwrap() {
+                        u64::from_le_bytes(buf[..8].try_into().unwrap())
+                    } else {
+                        current[&page]
+                    };
+                    assert_eq!(
+                        got, view[&page],
+                        "seed {seed:#x} step {step}: child forked at {f} read the wrong page {page}"
+                    );
+                }
+            }
+        }
+        // The interleavings this test exists for must have happened: work ran while garbage waited.
+        assert!(waited > 100, "seed {seed:#x}: only {waited} steps ran with garbage queued");
+        while store.reclaim_queued() > 0 {
+            owed -= store.reclaim_step(RECLAIM_BATCH);
+        }
+        assert_eq!(owed, 0, "seed {seed:#x}: the queue emptied with garbage unfreed");
+        assert_eq!(store.stats().arena_slots_in_use, history.len(), "seed {seed:#x}");
+        for (id, _, _) in live {
+            store.release_handle(id);
+        }
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
+        assert_eq!(store.reclaim_queued(), 0, "seed {seed:#x}");
+    }
+
+    /// The branch-tree model test with every release split into its unlink and reclamation holds
+    /// of random budgets, run between any other two operations (r12-async-destroy PREREG §4,
+    /// T-interleave): a dead branch's page map waits on the queue while its children and its
+    /// parent write through nodes it still holds. Every live branch reads its model bytes after
+    /// every step; the arena never holds less than what live branches can reach, and, drained,
+    /// exactly that.
+    #[test]
+    fn every_branch_of_a_random_tree_reads_right_with_reclamation_cut_between_any_two_holds() {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            run_tree_cut(seed);
+        }
+    }
+
+    /// Slots held by the arena, and slots reachable from a live branch's map or kept for a trunk
+    /// child (the trunk's retained versions, pending garbage included).
+    fn held_and_reachable(store: &BranchStore, nodes: &[Node]) -> (usize, usize) {
+        let inner = store.inner.lock();
+        let mut reach: HashSet<Slot> = HashSet::new();
+        for n in nodes.iter().filter(|n| n.handle) {
+            let st = inner.branches.get(&n.id).expect("a live branch has state");
+            if let Some(view) = st.view.as_ref() {
+                reach.extend(view.slots());
+            }
+        }
+        let trunk_versions: usize = inner
+            .trunk
+            .lineage
+            .retained
+            .values()
+            .map(|versions| versions.len())
+            .sum();
+        (
+            inner.arena.as_ref().map_or(0, |a| a.in_use()),
+            reach.len() + trunk_versions,
+        )
+    }
+
+    fn run_tree_cut(seed: u64) {
+        let store = BranchStore::new();
+        let mut rng = Rng(seed);
+        let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut generation = 0u64;
+        let (mut waited, mut drains) = (0, 0);
+        for step in 0..2500 {
+            let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
+            match rng.below(14) {
+                0 if live.len() < 60 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    nodes.push(Node {
+                        id,
+                        sees: trunk.clone(),
+                        handle: true,
+                        depth: 1,
+                        forked: false,
+                    });
+                }
+                1..=3 if !live.is_empty() && live.len() < 60 => {
+                    let parent = if rng.below(2) == 0 {
+                        *live.last().unwrap()
+                    } else {
+                        live[rng.below(live.len() as u64) as usize]
+                    };
+                    let id = store.fork_branch(nodes[parent].id).unwrap();
+                    let (sees, depth) = (nodes[parent].sees.clone(), nodes[parent].depth + 1);
+                    nodes[parent].forked = true;
+                    nodes.push(Node {
+                        id,
+                        sees,
+                        handle: true,
+                        depth,
+                        forked: false,
+                    });
+                }
+                4..=5 => {
+                    let page = rng.below(u64::from(PAGES)) as u32;
+                    if store.trunk_has_children() {
+                        store.first_write_trunk(page, &image(trunk[&page]));
+                    }
+                    generation += 1;
+                    trunk.insert(page, generation);
+                }
+                6..=9 if !live.is_empty() => {
+                    let v = live[rng.below(live.len() as u64) as usize];
+                    let id = nodes[v].id;
+                    store.begin_write(id).unwrap();
+                    let mut committed = Vec::new();
+                    for _ in 0..=rng.below(2) {
+                        let page = rng.below(u64::from(PAGES)) as u32;
+                        if committed.iter().any(|p: &PageRef| p.get().id == page as usize) {
+                            continue;
+                        }
+                        store
+                            .first_write_branch(id, page, &image(nodes[v].sees[&page]))
+                            .unwrap();
+                        generation += 1;
+                        committed.push(page_with(page, generation));
+                        nodes[v].sees.insert(page, generation);
+                    }
+                    store.commit_pages(id, &committed).unwrap();
+                    store.end_write(id);
+                }
+                10 if !live.is_empty() => {
+                    let v = live[rng.below(live.len() as u64) as usize];
+                    nodes[v].handle = false;
+                    store.unlink(nodes[v].id).expect("a live branch exists");
+                }
+                11 if store.reclaim_queued() > 0 && rng.below(2) == 0 => {
+                    while store.reclaim_queued() > 0 {
+                        store.reclaim_step(RECLAIM_BATCH);
+                    }
+                    drains += 1;
+                    let (held, reachable) = held_and_reachable(&store, &nodes);
+                    assert_eq!(
+                        held, reachable,
+                        "seed {seed:#x} step {step}: drained, the arena holds {held} slots but only \
+                         {reachable} are reachable"
+                    );
+                }
+                _ => {
+                    store.reclaim_step(1 + rng.below(RECLAIM_BATCH as u64) as usize);
+                }
+            }
+            if store.reclaim_queued() > 0 {
+                waited += 1;
+            }
+            let mut buf = vec![0u8; PAGE];
+            for n in nodes.iter().filter(|n| n.handle) {
+                for page in 0..PAGES {
+                    let got = if store.resolve_into(n.id, page, &mut buf).unwrap() {
+                        u64::from_le_bytes(buf[..8].try_into().unwrap())
+                    } else {
+                        trunk[&page]
+                    };
+                    assert_eq!(
+                        got,
+                        n.sees[&page],
+                        "seed {seed:#x} step {step}: branch {} at depth {} read the wrong page {page}",
+                        n.id.0,
+                        n.depth
+                    );
+                }
+            }
+            let (held, reachable) = held_and_reachable(&store, &nodes);
+            assert!(
+                held >= reachable,
+                "seed {seed:#x} step {step}: the arena holds {held} slots but {reachable} are \
+                 reachable: a reclamation freed a reachable slot"
+            );
+        }
+        assert!(
+            waited > 100 && drains > 5,
+            "seed {seed:#x}: {waited} steps ran with space queued, {drains} full drains"
+        );
+        for n in nodes.iter().filter(|n| n.handle) {
+            store.release_handle(n.id);
+        }
+        while store.reclaim_queued() > 0 {
+            store.reclaim_step(RECLAIM_BATCH);
+        }
+        assert_eq!(store.stats().live_branches, 0, "seed {seed:#x}: branches leaked");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
+    }
+
+    /// Readers, victims and the trunk model for the reclamation tests below. Reader `r` (a trunk
+    /// child) wrote pages `0..150` of its own; victim `w`, forked from `r`, overwrote `0..75` and
+    /// wrote `150..225`, so its map shares nodes and slots with `r`'s; the trunk then rewrote
+    /// `0..300`, keeping versions for `r`; victim `v` forked, and the trunk rewrote `0..300`
+    /// again, keeping versions for `v` alone; reader `z` forked last. Returns the readers with
+    /// what each sees, the victims `[w, v]`, and the trunk's current generation per page.
+    fn victims_and_readers(
+        store: &BranchStore,
+    ) -> (Vec<(BranchId, HashMap<u32, u64>)>, [BranchId; 2], HashMap<u32, u64>) {
+        const TRUNK_PAGES: u32 = 300;
+        let schema = Arc::new(Schema::default());
+        let mut trunk: HashMap<u32, u64> = (0..TRUNK_PAGES).map(|p| (p, 0)).collect();
+        let mut generation = 0u64;
+        let mut write = |store: &BranchStore, id, pages: &[u32], sees: &mut HashMap<u32, u64>| {
+            store.begin_write(id).unwrap();
+            let mut committed = Vec::new();
+            for &page in pages {
+                store.first_write_branch(id, page, &image(sees[&page])).unwrap();
+                generation += 1;
+                committed.push(page_with(page, generation));
+                sees.insert(page, generation);
+            }
+            store.commit_pages(id, &committed).unwrap();
+            store.end_write(id);
+        };
+        let r = store.fork_trunk(schema.clone(), PAGE).unwrap();
+        let mut r_sees = trunk.clone();
+        write(store, r, &(0..150u32).collect::<Vec<_>>(), &mut r_sees);
+        let w = store.fork_branch(r).unwrap();
+        let mut w_sees = r_sees.clone();
+        let w_pages: Vec<u32> = (0..75).chain(150..225).collect();
+        write(store, w, &w_pages, &mut w_sees);
+        let mut gen = 1_000_000u64;
+        let mut rewrite = |trunk: &mut HashMap<u32, u64>| {
+            for page in 0..TRUNK_PAGES {
+                store.first_write_trunk(page, &image(trunk[&page]));
+                gen += 1;
+                trunk.insert(page, gen);
+            }
+        };
+        rewrite(&mut trunk);
+        let v = store.fork_trunk(schema.clone(), PAGE).unwrap();
+        rewrite(&mut trunk);
+        let z = store.fork_trunk(schema, PAGE).unwrap();
+        (vec![(r, r_sees), (z, trunk.clone())], [w, v], trunk)
+    }
+
+    fn read_all(
+        store: &BranchStore,
+        readers: &[(BranchId, HashMap<u32, u64>)],
+        trunk: &HashMap<u32, u64>,
+        what: &str,
+    ) {
+        let mut buf = vec![0u8; PAGE];
+        for (id, sees) in readers {
+            for (&page, &want) in sees {
+                let got = if store.resolve_into(*id, page, &mut buf).unwrap() {
+                    u64::from_le_bytes(buf[..8].try_into().unwrap())
+                } else {
+                    trunk[&page]
+                };
+                assert_eq!(got, want, "{what}: branch {} read the wrong page {page}", id.0);
+            }
+        }
+    }
+
+    /// The drainer dies after `cut` units — mid-batch, at the batch edge, past it — other work
+    /// runs while the queue waits (a fork, and a trunk rewrite whose versions are filed under the
+    /// very child whose heap still holds the queued garbage), and a fresh drainer on another
+    /// thread finishes it (r12-async-destroy PREREG §4, T-crash-resume). Against a twin store that
+    /// did the same with whole reaps: the same slots end up held, the frees add up to the twin's
+    /// exactly (a second release of any slot would panic at the arena), and every live branch
+    /// reads its model bytes throughout.
+    #[test]
+    fn a_reclamation_cut_at_any_point_resumes_without_a_leak_or_a_double_free() {
+        let mut cut_in = [0usize; 2];
+        for order in [[0, 1], [1, 0]] {
+            for cut in 0..=130usize {
+                let what = format!("order {order:?} cut {cut}");
+                let (store, twin) = (BranchStore::new(), BranchStore::new());
+                let (mut readers, victims, mut trunk) = victims_and_readers(&store);
+                let (_, twin_victims, _) = victims_and_readers(&twin);
+                assert_eq!(victims, twin_victims);
+                let mut twin_freed = 0;
+                for i in order {
+                    store.unlink(victims[i]).expect("the victim exists");
+                    twin_freed += twin.release_handle(victims[i]).freed_pages;
+                }
+                let mut freed = 0;
+                let mut left = cut;
+                while left > 0 {
+                    let budget = left.min(RECLAIM_BATCH);
+                    freed += store.reclaim_step(budget);
+                    left -= budget;
+                }
+                if store.reclaim_queued() > 0 {
+                    cut_in[order[0]] += 1;
+                }
+                read_all(&store, &readers, &trunk, &what);
+                // Work while the queue waits, on both stores alike.
+                let schema = Arc::new(Schema::default());
+                let n = store.fork_trunk(schema.clone(), PAGE).unwrap();
+                assert_eq!(n, twin.fork_trunk(schema, PAGE).unwrap());
+                readers.push((n, trunk.clone()));
+                for page in 0..300u32 {
+                    store.first_write_trunk(page, &image(trunk[&page]));
+                    twin.first_write_trunk(page, &image(trunk[&page]));
+                    trunk.insert(page, 2_000_000 + u64::from(page));
+                }
+                read_all(&store, &readers, &trunk, &what);
+                freed += std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let mut freed = 0;
+                        while store.reclaim_queued() > 0 {
+                            freed += store.reclaim_step(RECLAIM_BATCH);
+                        }
+                        freed
+                    })
+                    .join()
+                    .unwrap()
+                });
+                read_all(&store, &readers, &trunk, &what);
+                assert_eq!(freed, twin_freed, "{what}: frees");
+                assert!(freed >= 450, "{what}: the victims held {freed} slots only");
+                assert_eq!(
+                    store.stats().arena_slots_in_use,
+                    twin.stats().arena_slots_in_use,
+                    "{what}: slots held"
+                );
+            }
+        }
+        // Each order's cuts must have left work queued (they fall inside its first entry).
+        assert!(cut_in[0] > 100 && cut_in[1] > 100, "cuts that left work queued: {cut_in:?}");
+    }
+
+    /// A background thread reclaims while this thread unlinks victims and reads every page of
+    /// every reader over and over (r12-async-destroy PREREG §4, T-concurrent). The victims share
+    /// what they free with the readers — a map whose nodes and slots a reader's map also holds,
+    /// trunk versions next to ones a reader sees — so a reclamation that freed a page a reader
+    /// can see fails a read: at the arena (a freed slot refuses access) or at the bytes.
+    #[test]
+    fn a_background_reclaimer_never_frees_a_page_a_live_branch_can_read() {
+        use std::sync::atomic::AtomicBool;
+        for round in 0..20 {
+            let store = Arc::new(BranchStore::new());
+            let (readers, victims, trunk) = victims_and_readers(&store);
+            let held = store.stats().arena_slots_in_use;
+            let stop = Arc::new(AtomicBool::new(false));
+            let drainer = {
+                let (store, stop) = (store.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut freed = 0;
+                    loop {
+                        let n = store.reclaim_step(RECLAIM_BATCH);
+                        freed += n;
+                        if n == 0 {
+                            if stop.load(Ordering::Acquire) && store.reclaim_queued() == 0 {
+                                return freed;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            };
+            for (i, &victim) in victims.iter().enumerate() {
+                store.unlink(victim).expect("the victim exists");
+                for _ in 0..4 {
+                    read_all(&store, &readers, &trunk, &format!("round {round} victim {i}"));
+                }
+            }
+            stop.store(true, Ordering::Release);
+            let freed = drainer.join().unwrap();
+            read_all(&store, &readers, &trunk, &format!("round {round} drained"));
+            assert_eq!(store.reclaim_queued(), 0);
+            assert_eq!(held - store.stats().arena_slots_in_use, freed, "round {round}");
+            assert!(freed >= 450, "round {round}: the victims held {freed} slots only");
         }
     }
 

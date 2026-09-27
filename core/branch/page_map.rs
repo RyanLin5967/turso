@@ -9,7 +9,7 @@
 //! they descend from one another.
 //!
 //! The maps OWN the branch slots they name, by count: each slot counts the leaf nodes that name it
-//! (see [`PageMap::set`] and [`PageMap::release`]), and it is freed when the last one goes. So a
+//! (see [`PageMap::set`] and [`Release`]), and it is freed when the last one goes. So a
 //! branch slot lives exactly as long as some map can reach it. Trunk-retained slots never appear in
 //! a map; the trunk's interval reclamation keeps those (see `store`).
 //!
@@ -169,8 +169,8 @@ impl PageMap {
     /// Reference counts (Rodeh, "B-trees, Shadowing, and Clones", ACM TOS 2008, as btrfs counts
     /// shadowed tree blocks): each slot is counted once per LEAF NODE that names it, not per map,
     /// so a clone of a whole map costs nothing. Copying a shared leaf takes a reference to each of
-    /// its slots; replacing an entry moves one; [`PageMap::release`] drops the references of the
-    /// nodes only this map held. Setting an entry to the slot it already holds changes no count and
+    /// its slots; replacing an entry moves one; a [`Release`] drops the references of the nodes
+    /// only this map held. Setting an entry to the slot it already holds changes no count and
     /// only makes the path to it this map's own.
     pub(crate) fn set(&mut self, page: u32, slot: Slot, refs: &mut impl SlotRefs, w: &mut MapWork) {
         crate::turso_assert!(slot != EMPTY, "arena slot u32::MAX is the page map's empty marker");
@@ -209,25 +209,58 @@ impl PageMap {
         }
     }
 
-    /// Drop this map, and the references of every node it alone held; a node another map still
-    /// holds is left to that map. Visits only this map's own nodes, iteratively.
-    pub(crate) fn release(&mut self, refs: &mut impl SlotRefs, w: &mut MapWork) {
-        let mut stack: Vec<Arc<Node>> = self.root.take().into_iter().collect();
-        while let Some(node) = stack.pop() {
+    /// Give this map up, to be dropped in bounded steps by [`Release::step`]. O(1): until a step
+    /// drops them, the map's nodes and every slot reference they hold stay where they are.
+    pub(crate) fn into_release(mut self) -> Release {
+        Release {
+            nodes: self.root.take().into_iter().collect(),
+            slots: Vec::new(),
+        }
+    }
+}
+
+/// A map given up by [`PageMap::into_release`], dropped a bounded amount at a time: the nodes it
+/// may still alone hold, and the slot references owed by the leaves it did alone hold.
+pub(crate) struct Release {
+    nodes: Vec<Arc<Node>>,
+    /// In the order the leaf named them, last first, so they are dropped in the leaf's order.
+    slots: Vec<Slot>,
+}
+
+impl Release {
+    pub(crate) fn is_done(&self) -> bool {
+        self.nodes.is_empty() && self.slots.is_empty()
+    }
+
+    /// Drop nodes and slot references, spending at most `budget` units — one per node visited, one
+    /// per reference dropped — and return the units spent. Visits only the map's own nodes: a node
+    /// another map still holds is left to that map (dropping this map's handle on it is the visit).
+    /// Run to the end, it drops in the order a whole-map release walking the same stack would.
+    pub(crate) fn step(&mut self, refs: &mut impl SlotRefs, w: &mut MapWork, budget: usize) -> usize {
+        let mut spent = 0;
+        while spent < budget {
+            if let Some(slot) = self.slots.pop() {
+                spent += 1;
+                w.decrefs += 1;
+                if refs.decref(slot) {
+                    w.freed += 1;
+                }
+                continue;
+            }
+            let Some(node) = self.nodes.pop() else {
+                break;
+            };
+            spent += 1;
             w.nodes_released += 1;
             match Arc::try_unwrap(node) {
-                Ok(Node::Inner(kids)) => stack.extend(kids.into_iter().flatten()),
-                Ok(Node::Leaf(slots)) => {
-                    for slot in slots.into_iter().filter(|&s| s != EMPTY) {
-                        w.decrefs += 1;
-                        if refs.decref(slot) {
-                            w.freed += 1;
-                        }
-                    }
-                }
+                Ok(Node::Inner(kids)) => self.nodes.extend(kids.into_iter().flatten()),
+                Ok(Node::Leaf(slots)) => self
+                    .slots
+                    .extend(slots.into_iter().rev().filter(|&s| s != EMPTY)),
                 Err(_shared) => {}
             }
         }
+        spent
     }
 }
 

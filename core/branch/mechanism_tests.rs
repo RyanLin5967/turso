@@ -797,3 +797,108 @@ fn exec_retrying_busy(conn: &Arc<Connection>, sql: &str) {
     }
     panic!("{sql}: still Busy after 10,000 attempts");
 }
+
+/// The child half of [`a_reclamation_killed_midway_leaves_the_database_whole_on_reopen`], re-exec'd
+/// by it; a no-op in an ordinary run.
+const RECLAIM_KILL_CHILD: &str = "branch::mechanism_tests::reclaim_kill_child_process";
+const RECLAIM_KILL_ENV: &str = "TURSO_BRANCH_RECLAIM_KILL_DB";
+const RECLAIM_KILL_MARK: &str = "RECLAIM_KILL_CHILD: between two reclamation holds";
+const RECLAIM_KILL_ROWS: i64 = 5000;
+
+#[test]
+fn reclaim_kill_child_process() {
+    let Ok(path) = std::env::var(RECLAIM_KILL_ENV) else {
+        return;
+    };
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        &path,
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, RECLAIM_KILL_ROWS);
+    let branch = trunk.fork_branch().unwrap();
+    // Every page the UPDATE writes is one the branch still sees, so the trunk retains its
+    // pre-image; reaping the branch then leaves them all to reclaim.
+    trunk
+        .execute("UPDATE t SET v = 'rewritten-' || id")
+        .unwrap();
+    let retained = db.branch_stats().arena_slots_in_use;
+    assert!(
+        retained > 2 * super::store::RECLAIM_BATCH,
+        "only {retained} retained pages: too few for the reap to need several holds"
+    );
+    db.branches.set_reclaim_pause(Some(Box::new(|| {
+        use std::io::Write as _;
+        println!("{RECLAIM_KILL_MARK}");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    })));
+    drop(branch);
+    unreachable!("the reclamation pause never returns");
+}
+
+/// A process killed (SIGKILL) between two holds of a reap's reclamation leaves a database that
+/// reopens whole: integrity_check is ok, every trunk row reads as committed, and no branch state
+/// or slot survives (r12-async-destroy PREREG §4, T-crash-process). The branch arena and its
+/// reclamation queue are volatile on this store (see `arena`), so "no leak" after a kill holds by
+/// construction; what this shows is that reclamation leaves no durable trace.
+#[cfg(unix)]
+#[test]
+fn a_reclamation_killed_midway_leaves_the_database_whole_on_reopen() {
+    use std::io::{BufRead as _, BufReader};
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{Command, Stdio};
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("reclaim-kill.db");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg(RECLAIM_KILL_CHILD)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(RECLAIM_KILL_ENV, &path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if line.contains(RECLAIM_KILL_MARK) {
+                let _ = tx.send(());
+            }
+        }
+    });
+    let reached = rx.recv_timeout(std::time::Duration::from_secs(300));
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    reached.expect("the child never reached the middle of its reclamation");
+    assert_eq!(status.signal(), Some(9), "the child was not killed by SIGKILL: {status:?}");
+
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    assert_eq!(rows(&conn, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
+    let t = table(&conn);
+    assert_eq!(t.len(), RECLAIM_KILL_ROWS as usize);
+    for (id, v) in t {
+        assert_eq!(v, format!("rewritten-{id}"), "row {id}");
+    }
+    let st = db.branch_stats();
+    assert_eq!((st.live_branches, st.arena_slots_in_use), (0, 0));
+}
