@@ -291,6 +291,8 @@ impl Database {
         #[cfg(feature = "percentile")]
         crate::percentile::register_extension(&mut ext_api);
         crate::regexp::register_extension(&mut ext_api);
+        // U2: the registrations above wrote the builtin table through its data pointer.
+        self.builtin_syms.bump_generation();
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;
@@ -299,6 +301,7 @@ impl Database {
             }
         }
         let _ = unsafe { Box::from_raw(ctx) };
+        self.builtin_syms.bump_generation();
         Ok(())
     }
 }

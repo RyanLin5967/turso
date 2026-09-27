@@ -16,12 +16,14 @@
 //! no cycle: a database dropped while pagers live leaves their anchors, and so the objects, alive until the last of
 //! them goes, as the `Arc`s did.
 //!
-//! Not covered: the buffer pool (a concrete `Arc<BufferPool>` the pager and WAL pass on by value to many readers),
-//! and the connection's and branch handles' `Arc<Database>` (a database cannot hold its own anchor without a cycle).
+//! U2 (amendment 20) adds the buffer pool (the pager's and the WAL's handles; `to_arc()` where a page read keeps an
+//! Arc) and a per-thread copy of the builtin symbol maps. Not covered: the connection's and branch handles'
+//! `Arc<Database>` (a database cannot hold its own anchor without a cycle).
 
 use crate::bravo::BravoRwLock;
 use crate::branch::store::BranchStore;
 use crate::io::IO;
+use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Page;
 use crate::storage::wal::WalFileShared;
@@ -36,6 +38,11 @@ use std::ptr::NonNull;
 pub struct Anchor {
     pub(crate) io: Arc<dyn IO>,
     pub(crate) db_file: Arc<dyn DatabaseStorage>,
+    /// U2 (amendment 20): the buffer pool, for the pager's and the WAL's handles.
+    pub(crate) buffer_pool: Arc<BufferPool>,
+    /// U2: this thread slot's own deep copy of the builtin symbol maps, and the builtin generation it copied
+    /// ([`crate::database::BuiltinSyms`]); a connect extends from it only while the generation still matches.
+    pub(crate) builtins: OnceLock<(u64, crate::connection::SymbolTable)>,
     pub(crate) branches: Arc<BranchStore>,
     pub(crate) shared_wal: Arc<BravoRwLock<WalFileShared>>,
     pub(crate) init_lock: Arc<Mutex<()>>,
@@ -94,6 +101,15 @@ impl<T: ?Sized> DbRef<T> {
             DbRef::Owned(a) => a.clone(),
             // SAFETY: the anchor clone held by this handle keeps the anchor, and so the `Arc` it points into, alive.
             DbRef::Anchored(p, _) => unsafe { p.as_ref() }.clone(),
+        }
+    }
+
+    /// The object's own `Arc`, borrowed (no count written): the handle's own, or the anchor's.
+    pub fn as_arc(&self) -> &Arc<T> {
+        match self {
+            DbRef::Owned(a) => a,
+            // SAFETY: as in `to_arc`.
+            DbRef::Anchored(p, _) => unsafe { p.as_ref() },
         }
     }
 

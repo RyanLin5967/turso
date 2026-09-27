@@ -2855,7 +2855,7 @@ impl fmt::Debug for OngoingCheckpoint {
 
 pub struct WalFile {
     io: Arc<dyn IO>,
-    buffer_pool: Arc<BufferPool>,
+    buffer_pool: crate::anchor::DbRef<BufferPool>,
     /// Manages locks needed for VACUUM. This is very much similar to `checkpoint_guard`
     /// This lock is to be held by all readers before they can begin. And VACUUM holds it
     /// exclusively. See `install_vacuum_lock_guard` for its lifecycle.
@@ -4106,7 +4106,7 @@ impl Wal for WalFile {
             None
         });
         let file = self.coordination.wal_file()?;
-        let c = begin_read_wal_frame_raw(&self.buffer_pool, file.as_ref(), offset, complete)?;
+        let c = begin_read_wal_frame_raw(self.buffer_pool.as_arc(), file.as_ref(), offset, complete)?;
         Ok(c)
     }
 
@@ -4712,7 +4712,7 @@ impl Wal for WalFile {
             };
             let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
             let (checksum, frame_buf) = Self::prepare_transformed_frame(
-                &self.buffer_pool,
+                self.buffer_pool.as_arc(),
                 &header,
                 rolling_checksum,
                 page_number,
@@ -4814,7 +4814,7 @@ impl Wal for WalFile {
             let frame_db_size = 0; // this method is not used for the commit path
             let page_number = u32::try_from(page_id).map_err(|_| LimboError::IntegerOverflow)?;
             let (new_checksum, frame_bytes) = Self::prepare_transformed_frame(
-                &self.buffer_pool,
+                self.buffer_pool.as_arc(),
                 &header,
                 rolling_checksum,
                 page_number,
@@ -4925,8 +4925,9 @@ impl WalFile {
         shared: Arc<crate::bravo::BravoRwLock<WalFileShared>>,
         authority: Arc<MappedSharedWalCoordination>,
         _last_checksum_and_max_frame: ((u32, u32), u64),
-        buffer_pool: Arc<BufferPool>,
+        buffer_pool: impl Into<crate::anchor::DbRef<BufferPool>>,
     ) -> Self {
+        let buffer_pool: crate::anchor::DbRef<BufferPool> = buffer_pool.into();
         let coordination: Arc<dyn WalCoordination> =
             Arc::new(ShmWalCoordination::new(shared, authority));
         let snapshot = coordination.load_snapshot();
@@ -4953,8 +4954,9 @@ impl WalFile {
         io: Arc<dyn IO>,
         shared: crate::anchor::DbRef<crate::bravo::BravoRwLock<WalFileShared>>,
         (last_checksum, max_frame): ((u32, u32), u64),
-        buffer_pool: Arc<BufferPool>,
+        buffer_pool: impl Into<crate::anchor::DbRef<BufferPool>>,
     ) -> Self {
+        let buffer_pool: crate::anchor::DbRef<BufferPool> = buffer_pool.into();
         let coordination: Arc<dyn WalCoordination> =
             Arc::new(InProcessWalCoordination::new(shared));
         Self::new_with_coordination(io, coordination, (last_checksum, max_frame), buffer_pool)
@@ -4965,8 +4967,9 @@ impl WalFile {
         io: Arc<dyn IO>,
         coordination: Arc<dyn WalCoordination>,
         (last_checksum, max_frame): ((u32, u32), u64),
-        buffer_pool: Arc<BufferPool>,
+        buffer_pool: impl Into<crate::anchor::DbRef<BufferPool>>,
     ) -> Self {
+        let buffer_pool: crate::anchor::DbRef<BufferPool> = buffer_pool.into();
         let now = io.current_time_monotonic();
         Self {
             io,
@@ -5607,7 +5610,7 @@ impl WalFile {
         let c = begin_read_wal_frame(
             file.as_ref(),
             offset + WAL_FRAME_HEADER_SIZE as u64,
-            self.buffer_pool.clone(),
+            self.buffer_pool.as_arc().clone(),
             complete,
             page_id,
             &self.io_ctx.read(),

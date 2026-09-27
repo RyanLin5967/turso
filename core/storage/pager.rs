@@ -1458,7 +1458,7 @@ pub struct Pager {
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
     /// Buffer pool for temporary data storage.
-    pub buffer_pool: Arc<BufferPool>,
+    pub buffer_pool: crate::anchor::DbRef<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
     /// Reads that have begun (disk IO issued, page allocated) but whose
@@ -1763,7 +1763,7 @@ impl Pager {
             wal,
             io,
             page_cache,
-            buffer_pool,
+            buffer_pool.into(),
             init_lock.into(),
             init_page_1.into(),
         )
@@ -1776,7 +1776,7 @@ impl Pager {
         wal: Option<Arc<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: PageCache,
-        buffer_pool: Arc<BufferPool>,
+        buffer_pool: crate::anchor::DbRef<BufferPool>,
         init_lock: crate::anchor::DbRef<Mutex<()>>,
         init_page_1: crate::anchor::DbRef<ArcSwapOption<Page>>,
     ) -> Result<Self> {
@@ -3593,7 +3593,7 @@ impl Pager {
         };
 
         if let Some(frame_id) = wal.find_frame(page_idx as u64, frame_watermark)? {
-            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.as_arc().clone())?;
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
             return Ok((page, c));
@@ -3741,7 +3741,7 @@ impl Pager {
     ) -> Result<Completion> {
         sqlite3_ondisk::begin_read_page(
             self.db_file.as_ref(),
-            self.buffer_pool.clone(),
+            self.buffer_pool.as_arc().clone(),
             page,
             page_idx,
             allow_empty_read,
@@ -4898,7 +4898,7 @@ impl Pager {
         let (header, raw_page) = parse_wal_frame_header(frame);
 
         wal.write_frame_raw(
-            self.buffer_pool.clone(),
+            self.buffer_pool.as_arc().clone(),
             frame_no,
             header.page_number as u64,
             header.db_size as u64,
@@ -5749,7 +5749,7 @@ impl Pager {
 
                 self.buffer_pool
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
-                let page = allocate_new_page(1, &self.buffer_pool);
+                let page = allocate_new_page(1, self.buffer_pool.as_arc());
 
                 // Page 1 was just constructed here and is not in the page cache yet: no other
                 // reference exists and its previous bytes are uninitialised, so there is no
@@ -5885,7 +5885,7 @@ impl Pager {
                                 cache.contains_key(&page_key)
                             };
                             if !already_present {
-                                let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                                let page = allocate_new_page(new_db_size as i64, self.buffer_pool.as_arc());
                                 self.add_dirty(&page)?;
                                 self.page_cache.write().force_insert_page(page_key, page)?;
                             }
@@ -6048,7 +6048,7 @@ impl Pager {
                     // if new_db_size reaches the pending page, we need to allocate a new one
                     if Some(new_db_size) == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
-                            allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                            allocate_new_page(new_db_size as i64, self.buffer_pool.as_arc());
                         self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
                         self.page_cache
@@ -6067,7 +6067,7 @@ impl Pager {
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                    let page = allocate_new_page(new_db_size as i64, self.buffer_pool.as_arc());
                     {
                         // setup page and add to cache
                         let wt = self.add_dirty(&page)?;

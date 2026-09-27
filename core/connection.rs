@@ -420,6 +420,9 @@ impl PagerSlot {
 pub struct Connection {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: PagerSlot,
+    /// r11-coherence U2: the builtin maps came from this thread's own copy (the instrument counts their drops as
+    /// private).
+    pub(crate) syms_thread_private: AtomicBool,
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
@@ -600,7 +603,9 @@ crate::assert::assert_send_sync!(Connection);
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        crate::coherence::bump(crate::coherence::Class::Builtin, self.syms.read().drop_rmws());
+        if !self.syms_thread_private.load(Ordering::Relaxed) {
+            crate::coherence::bump(crate::coherence::Class::Builtin, self.syms.read().drop_rmws());
+        }
         if !self.is_closed() {
             // A handle dropped mid-transaction rolls that transaction back
             // below, so parked index-method cursors must receive the same
@@ -5487,28 +5492,54 @@ impl SymbolTable {
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
+        self.extend_from(other, true)
+    }
+
+    /// r11-coherence U2: a copy of every map, each its own allocation, so the Arcs taken from it are counted on lines
+    /// only the copier's thread writes. The maps' values are Arc clones.
+    pub(crate) fn deep_copy(&self) -> SymbolTable {
+        fn copy<K: Clone, V: Clone>(m: &CowMap<K, V>) -> CowMap<K, V> {
+            CowMap(Arc::new((*m.0).clone()))
+        }
+        SymbolTable {
+            functions: copy(&self.functions),
+            collations: copy(&self.collations),
+            vtabs: copy(&self.vtabs),
+            vtab_modules: copy(&self.vtab_modules),
+            index_methods: copy(&self.index_methods),
+        }
+    }
+
+    /// [`SymbolTable::extend`], with `shared_lines` saying whether `other`'s Arcs are ones other threads' connections
+    /// also take (the coherence instrument counts only those).
+    pub(crate) fn extend_from(&mut self, other: &SymbolTable, shared_lines: bool) {
         // r11-coherence FB: an empty map takes `other`'s whole map, one Arc, instead of a copy of each entry.
         fn merge<K: Clone + std::hash::Hash + Eq, V: Clone>(
             mine: &mut CowMap<K, V>,
             theirs: &CowMap<K, V>,
             share: bool,
+            counted: bool,
         ) {
             if share && mine.is_empty() {
-                crate::coherence::bump(crate::coherence::Class::Builtin, 1);
+                if counted {
+                    crate::coherence::bump(crate::coherence::Class::Builtin, 1);
+                }
                 *mine = theirs.clone();
                 return;
             }
-            crate::coherence::bump(crate::coherence::Class::Builtin, theirs.len() as u64);
+            if counted {
+                crate::coherence::bump(crate::coherence::Class::Builtin, theirs.len() as u64);
+            }
             for (k, v) in theirs {
                 mine.insert(k.clone(), v.clone());
             }
         }
         let share = crate::coherence::fix(crate::coherence::FIX_BUILTIN);
-        merge(&mut self.functions, &other.functions, share);
-        merge(&mut self.collations, &other.collations, share);
-        merge(&mut self.vtabs, &other.vtabs, share);
-        merge(&mut self.vtab_modules, &other.vtab_modules, share);
-        merge(&mut self.index_methods, &other.index_methods, share);
+        merge(&mut self.functions, &other.functions, share, shared_lines);
+        merge(&mut self.collations, &other.collations, share, shared_lines);
+        merge(&mut self.vtabs, &other.vtabs, share, shared_lines);
+        merge(&mut self.vtab_modules, &other.vtab_modules, share, shared_lines);
+        merge(&mut self.index_methods, &other.index_methods, share, shared_lines);
     }
 
     /// Coherence instrument: the shared-line writes dropping this table makes (see `CowMap::drop_rmws`).

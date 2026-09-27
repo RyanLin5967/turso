@@ -511,6 +511,73 @@ pub fn clear_database_registry() {
     DATABASE_MANAGER.lock().clear();
 }
 
+/// r11-coherence U2 (amendment 20): the database's builtin symbol table and a generation every write moves. A write
+/// guard bumps the generation when it drops, and so does the end of builtin-extension registration (which writes
+/// through `data_ptr`), so a per-thread copy tagged with an older generation is never used.
+pub(crate) struct BuiltinSyms {
+    lock: parking_lot::RwLock<SymbolTable>,
+    generation: crate::sync::atomic::AtomicU64,
+}
+
+pub(crate) struct BuiltinSymsWrite<'a> {
+    guard: parking_lot::RwLockWriteGuard<'a, SymbolTable>,
+    generation: &'a crate::sync::atomic::AtomicU64,
+}
+
+impl std::ops::Deref for BuiltinSymsWrite<'_> {
+    type Target = SymbolTable;
+    fn deref(&self) -> &SymbolTable {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for BuiltinSymsWrite<'_> {
+    fn deref_mut(&mut self) -> &mut SymbolTable {
+        &mut self.guard
+    }
+}
+
+impl Drop for BuiltinSymsWrite<'_> {
+    fn drop(&mut self) {
+        self.generation
+            .fetch_add(1, crate::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl BuiltinSyms {
+    fn new(syms: SymbolTable) -> Self {
+        Self {
+            lock: parking_lot::RwLock::new(syms),
+            generation: crate::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, SymbolTable> {
+        self.lock.read()
+    }
+
+    pub(crate) fn write(&self) -> BuiltinSymsWrite<'_> {
+        BuiltinSymsWrite {
+            guard: self.lock.write(),
+            generation: &self.generation,
+        }
+    }
+
+    pub(crate) fn data_ptr(&self) -> *mut SymbolTable {
+        self.lock.data_ptr()
+    }
+
+    /// Mark a change made through [`Self::data_ptr`].
+    pub(crate) fn bump_generation(&self) {
+        self.generation
+            .fetch_add(1, crate::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(crate::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
 ///
@@ -543,7 +610,7 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     pub(crate) open_flags: OpenFlags,
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
-    pub(crate) builtin_syms: parking_lot::RwLock<SymbolTable>,
+    pub(crate) builtin_syms: BuiltinSyms,
     /// SQL dialect this database runs under, interpreting `sqlite_schema`
     /// SQL rows. Passed explicitly by every open path, fixed at open time,
     /// and shared by all connections because the parsed [`Schema`] is
@@ -690,7 +757,7 @@ impl Database {
             #[cfg(host_shared_wal)]
             shared_wal_coordination: OnceLock::new(),
             db_file,
-            builtin_syms: parking_lot::RwLock::new(syms),
+            builtin_syms: BuiltinSyms::new(syms),
             dialect,
             io: io.clone(),
             open_flags: flags,
@@ -2411,6 +2478,7 @@ impl Database {
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: crate::connection::PagerSlot::new(pager),
+            syms_thread_private: AtomicBool::new(false),
             schema: RwLock::new(schema.unwrap_or_else(|| self.schema.lock().clone())),
             database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
@@ -2485,10 +2553,29 @@ impl Database {
         crate::coherence::bump(crate::coherence::Class::DbHot, 1);
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
-        crate::coherence::bump(crate::coherence::Class::Builtin, 2);
-        let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
-        conn.syms.write().extend(&builtin_syms);
+        // U2: from this thread's own copy of the builtin maps while the builtins have not changed since it was taken
+        // (no shared lock, no shared Arc count); otherwise from the database's.
+        let generation = self.builtin_syms.generation();
+        let copy = self.anchor().filter(|a| {
+            let (g, _) = a
+                .builtins
+                .get_or_init(|| (generation, self.builtin_syms.read().deep_copy()));
+            *g == generation
+        });
+        match copy {
+            Some(a) => {
+                let (_, syms) = a.builtins.get().expect("initialised just above");
+                conn.syms.write().extend_from(syms, false);
+                conn.syms_thread_private
+                    .store(true, crate::sync::atomic::Ordering::Relaxed);
+            }
+            None => {
+                crate::coherence::bump(crate::coherence::Class::Builtin, 2);
+                let builtin_syms = self.builtin_syms.read();
+                conn.syms.write().extend(&builtin_syms);
+            }
+        }
         refresh_analyze_stats(&conn);
         Ok(conn)
     }
@@ -2947,6 +3034,8 @@ impl Database {
         self.anchors.get(|| crate::anchor::Anchor {
             io: Arc::new(crate::io::IoFwd(self.io.clone())),
             db_file: self.db_file.clone(),
+            buffer_pool: self.buffer_pool.clone(),
+            builtins: OnceLock::new(),
             branches: self.branches.clone(),
             shared_wal: self.shared_wal.clone(),
             init_lock: self.init_lock.clone(),
@@ -2957,8 +3046,9 @@ impl Database {
     pub(crate) fn build_wal(
         &self,
         last_checksum_and_max_frame: ((u32, u32), u64),
-        buffer_pool: Arc<BufferPool>,
+        buffer_pool: impl Into<crate::anchor::DbRef<BufferPool>>,
     ) -> Result<Arc<dyn Wal>> {
+        let buffer_pool = buffer_pool.into();
         #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
             return Ok(Arc::new(WalFile::new_with_shared_coordination(
@@ -3073,8 +3163,13 @@ impl Database {
         // FU: the database-owned objects through this thread's anchor (see `crate::anchor`); the buffer pool is not
         // covered (its handle is a concrete `Arc<BufferPool>` that the pager and the WAL pass on by value).
         let anchor = self.anchor();
-        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
-        let buffer_pool = self.buffer_pool.clone();
+        let buffer_pool: crate::anchor::DbRef<BufferPool> = match &anchor {
+            Some(a) => crate::anchor::DbRef::anchored(a, |a| &a.buffer_pool),
+            None => {
+                crate::coherence::bump(crate::coherence::Class::DbArc, 2);
+                self.buffer_pool.clone().into()
+            }
+        };
         if self.initialized() {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
         }
@@ -3083,8 +3178,10 @@ impl Database {
         let last_checksum_and_max_frame = shared_wal.last_checksum_and_max_frame();
         drop(shared_wal);
         let pager_wal: Option<Arc<dyn Wal>> = if wal_enabled {
-            // The WAL's own buffer-pool Arc clone and its drop.
-            crate::coherence::bump(crate::coherence::Class::DbArc, 2);
+            if anchor.is_none() {
+                // The WAL's own buffer-pool Arc clone and its drop.
+                crate::coherence::bump(crate::coherence::Class::DbArc, 2);
+            }
             Some(self.build_wal(last_checksum_and_max_frame, buffer_pool.clone())?)
         } else {
             None

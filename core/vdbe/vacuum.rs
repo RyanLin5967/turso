@@ -1563,7 +1563,7 @@ fn start_temp_batch_reads(
         let c = wal.read_frames_batch(
             *start_frame,
             run_pages,
-            temp_pager.buffer_pool.clone(),
+            temp_pager.buffer_pool.as_arc().clone(),
             run_scratch,
         )?;
         group.add(&c);
