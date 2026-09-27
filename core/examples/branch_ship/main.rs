@@ -492,7 +492,10 @@ fn pipe(
         Ok(w) => w,
         Err(e) => not_a_result(&format!("{point}: the replica refused the stream: {e}")),
     };
-    let sent = sent.unwrap_or_else(|e| not_a_result(&format!("{point}: send failed: {e}")));
+    let mut sent = sent.unwrap_or_else(|e| not_a_result(&format!("{point}: send failed: {e}")));
+    // The send's whole time under the store mutex was the snapshot (F-S1).
+    sent.locked_ops = 1;
+    sent.locked_ns = snap_ns;
     println!(
         "recv\t{point}\trecords={}\tslots_written={}\tslots_claimed={}\trefs={}\ttrunk_pages={}\tdeaths={}\tgc_freed={}\tstates_new={}\tstates_updated={}\tentries={}\tretained_inserted={}\ttrie_inserts={}\tslots_released={}\tfork_deltas={}\tmid_cycles={}\tmid_cycles_while_sending={during}(interleaving-decided)\tsend_s={send_s:.3}\twall_s={secs:.3}(unlocked)",
         work.records,
@@ -769,7 +772,7 @@ fn main() {
     let w2 = args.w2.unwrap_or(args.n / 10);
     println!("# branch_ship — r11-ship PREREG; Turso fork F1+F2+F4 + shipping");
     println!(
-        "# arm={:?} n={} w1={} w2={w2} trunk_every={} seed={:#x} plant={:?} delta={} exports={} samples={} timing={} page_size={page_size} build={}",
+        "# arm={:?} n={} w1={} w2={w2} trunk_every={} seed={:#x} plant={:?} delta={} exports={} samples={} timing={} mid_cycles={} page_size={page_size} build={}",
         args.arm,
         args.n,
         args.w1,
@@ -780,6 +783,7 @@ fn main() {
         args.exports,
         args.samples,
         args.timing,
+        args.mid_cycles,
         if cfg!(debug_assertions) { "DEBUG" } else { "release" }
     );
     println!("{STREAM_HEADER}");

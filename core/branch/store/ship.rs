@@ -262,24 +262,25 @@ impl StoreInner {
         });
     }
 
-    /// Edit state `id`'s view in place of the stored one: `bump` raises its birth, None keeps it.
+    /// Edit state `id`'s view in place: `bump` raises its birth, None keeps it. The view is copied
+    /// only if a snapshot shares it, and so are its trees' nodes, so `view_work.nodes_copied`
+    /// counts exactly what snapshots cost.
     fn ship_edit(&mut self, id: BranchId, bump: Option<u64>, edit: impl FnOnce(&mut StateView, &mut TreeWork)) {
         let Some(t) = self.track.as_mut() else {
             return;
         };
-        let Some((old, birth)) = t.view.states.get(id.0).and_then(|i| i.live().cloned().map(|v| (v, i.birth())))
-        else {
-            return;
-        };
-        let mut view = (*old).clone();
         let mut w = TreeWork::default();
-        edit(&mut view, &mut w);
-        t.view.states.put(
-            id.0,
-            Item::Live { birth: bump.unwrap_or(birth), val: Arc::new(view) },
-            bump,
-            &mut w,
-        );
+        t.view.states.update(id.0, bump, &mut w, |item, w| {
+            if let Item::Live { birth, val } = item {
+                if Arc::strong_count(val) > 1 {
+                    w.nodes_copied += 1;
+                }
+                edit(Arc::make_mut(val), w);
+                if let Some(seq) = bump {
+                    *birth = seq;
+                }
+            }
+        });
         t.view_work.add(w);
         t.view_ops += 1;
     }

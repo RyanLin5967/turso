@@ -267,6 +267,49 @@ impl<V> BirthTree<V> {
         }
     }
 
+    /// Change the item at `key` in place through `f`, path-copying only nodes a snapshot still
+    /// shares. With `bump` the path's births rise to it (and `f` should raise the item's). Returns
+    /// false, calling nothing, when `key` is absent.
+    pub(crate) fn update(
+        &mut self,
+        key: u64,
+        bump: Option<u64>,
+        work: &mut TreeWork,
+        f: impl FnOnce(&mut Item<V>, &mut TreeWork),
+    ) -> bool {
+        if self.get(key).is_none() {
+            return false;
+        }
+        let keep_inner_births = super::ship_mutant() == "S2";
+        let mut level = self.height;
+        let mut node = cow(self.root.as_mut().expect("the key is present"), work);
+        loop {
+            if let Some(seq) = bump {
+                if level == 0 || !keep_inner_births {
+                    node.raise(seq);
+                }
+            }
+            match node {
+                Node::Inner { kids, .. } => {
+                    let i = index(key, level);
+                    let pos = kids
+                        .binary_search_by_key(&i, |(k, _)| *k)
+                        .expect("the key is present");
+                    level -= 1;
+                    node = cow(&mut kids[pos].1, work);
+                }
+                Node::Leaf { items, .. } => {
+                    let i = index(key, 0);
+                    let pos = items
+                        .binary_search_by_key(&i, |(k, _)| *k)
+                        .expect("the key is present");
+                    f(&mut items[pos].1, work);
+                    return true;
+                }
+            }
+        }
+    }
+
     /// Remove `key` outright (no hole, no birth change), pruning nodes it leaves empty. Returns
     /// the item that was there.
     pub(crate) fn remove(&mut self, key: u64, work: &mut TreeWork) -> Option<Item<V>> {
@@ -432,9 +475,16 @@ mod tests {
                         model.insert(key, (seq, None));
                     }
                     4 => {
-                        // A quiet replacement keeps the item's birth.
+                        // A quiet replacement keeps the item's birth; half of them in place.
                         if let Some(&(birth, Some(_))) = model.get(&key) {
-                            tree.put(key, Item::Live { birth, val: Arc::new(seq) }, None, &mut work);
+                            if seq % 2 == 0 {
+                                tree.put(key, Item::Live { birth, val: Arc::new(seq) }, None, &mut work);
+                            } else {
+                                let updated = tree.update(key, None, &mut work, |item, _| {
+                                    *item = Item::Live { birth, val: Arc::new(seq) };
+                                });
+                                assert!(updated);
+                            }
                             model.insert(key, (birth, Some(seq)));
                         }
                     }
