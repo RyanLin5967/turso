@@ -660,6 +660,12 @@ trait WalCoordination: Debug + Send + Sync {
     /// Enumerate the latest visible frame per page in the requested frame range.
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)>;
 
+    /// r12-phasefair F-XI: of `pages`, those with a frame in `min_frame..=max_frame`, read under one lock of the frame
+    /// index. `None` where this backend cannot say exactly; the caller then empties its whole page cache.
+    fn pages_with_frames_in(&self, _pages: &[u64], _min_frame: u64, _max_frame: u64) -> Option<Vec<u64>> {
+        None
+    }
+
     /// Read the current checkpoint epoch used to tag cached WAL pages.
     fn checkpoint_epoch(&self) -> u32;
 
@@ -809,6 +815,18 @@ pub trait Wal: Debug + Send + Sync {
     /// optional frame_watermark parameter can be passed to force WAL to find frame not larger than watermark value
     /// caller must guarantee, that frame_watermark must be greater than last checkpointed frame, otherwise method will panic
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>>;
+
+    /// r12-phasefair F-XI: this connection's (max_frame, checkpoint_seq) as of its last read transaction.
+    fn last_read_snapshot(&self) -> Option<(u64, u32)> {
+        None
+    }
+
+    /// r12-phasefair F-XI: of `pages`, those a commit rewrote after `prev` (a [`Wal::last_read_snapshot`]) up to this
+    /// connection's current read snapshot. `None` if that cannot be told exactly: another WAL generation, or a backend
+    /// without an exact frame index.
+    fn pages_rewritten_since(&self, _prev: (u64, u32), _pages: &[u64]) -> Option<Vec<u64>> {
+        None
+    }
 
     /// Read a frame from the WAL.
     fn read_frame(
@@ -1147,6 +1165,25 @@ impl WalCoordination for InProcessWalCoordination {
                 .copied()
         });
         result
+    }
+
+    // Exact within one WAL generation: the index drops a committed frame only when the log restarts (cache_frame pops
+    // only rewound, uncommitted slots; rollback_cache only frames above the committed max_frame).
+    fn pages_with_frames_in(&self, pages: &[u64], min_frame: u64, max_frame: u64) -> Option<Vec<u64>> {
+        let shared = self.rd();
+        let frame_cache = shared.runtime.frame_cache.lock_class(crate::coherence::Class::WalFc, None);
+        let range = min_frame..=max_frame;
+        Some(
+            pages
+                .iter()
+                .copied()
+                .filter(|page_id| {
+                    frame_cache
+                        .get(page_id)
+                        .is_some_and(|frames| frames.iter().rfind(|&&frame| range.contains(&frame)).is_some())
+                })
+                .collect(),
+        )
     }
 
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
@@ -3576,6 +3613,36 @@ impl Wal for WalFile {
             let shared = unsafe { self.coordination.shared_wal_ptr().as_ref() }.read();
             unsafe { shared.runtime.fork_gate.unlock_read_raw(token) };
         }
+    }
+
+    fn last_read_snapshot(&self) -> Option<(u64, u32)> {
+        let snapshot = self.connection_state().snapshot;
+        Some((snapshot.max_frame, snapshot.checkpoint_seq))
+    }
+
+    fn pages_rewritten_since(&self, prev: (u64, u32), pages: &[u64]) -> Option<Vec<u64>> {
+        let (prev_max, prev_seq) = prev;
+        let cur = self.connection_state().snapshot;
+        // A restart starts a new generation (restart_wal_header bumps checkpoint_seq) whose frame numbers say nothing
+        // about the old one's pages.
+        let same_generation = cur.checkpoint_seq == prev_seq;
+        #[cfg(test)]
+        let same_generation = same_generation || crate::storage::pager::xi_mutant() == 2;
+        if !same_generation || cur.max_frame < prev_max {
+            return None;
+        }
+        #[cfg(test)]
+        match crate::storage::pager::xi_mutant() {
+            1 => return Some(Vec::new()),
+            3 => return self.coordination.pages_with_frames_in(pages, prev_max + 2, cur.max_frame),
+            _ => {}
+        }
+        if cur.max_frame == prev_max {
+            // A backfill alone moved the snapshot: no page's latest version changed.
+            return Some(Vec::new());
+        }
+        self.coordination
+            .pages_with_frames_in(pages, prev_max + 1, cur.max_frame)
     }
 
     fn begin_read_tx(&self) -> Result<bool> {

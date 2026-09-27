@@ -1915,7 +1915,8 @@ fn print_gate(label: &str, w: &WriterOut, forks: &[u64; coherence::GATE_FIELDS],
          held_cpu_pw={:.1} outside_wall_pw={:.1} outside_cpu_pw={:.1} waited_pw={:.4} revokes_pw={:.4} \
          acq_wall_max_ns={} held_wall_max_ns={} writer_shared_rmw_pw={:.2} fork_holds_pc={:.4} \
          fork_hold_wall_ph={:.1} fork_refused_pc={:.4} fork_hdr_reads_pc={:.4} fork_hdr_read_wall_pr={:.1} \
-         trunk_cache_clears_pc={:.4} trunk_page1_misses_pc={:.4}",
+         trunk_cache_clears_pc={:.4} trunk_page1_misses_pc={:.4} xi_kept_pc={:.4} xi_evicted_pc={:.4} \
+         xi_fallbacks_pc={:.4}",
         w.writes,
         g(Gate::WAcq),
         w.idle_yields,
@@ -1945,6 +1946,9 @@ fn print_gate(label: &str, w: &WriterOut, forks: &[u64; coherence::GATE_FIELDS],
         },
         forks[Gate::TrunkCacheClears as usize] as f64 / cycles,
         forks[Gate::TrunkPage1Misses as usize] as f64 / cycles,
+        forks[Gate::XiKept as usize] as f64 / cycles,
+        forks[Gate::XiEvicted as usize] as f64 / cycles,
+        forks[Gate::XiFallbacks as usize] as f64 / cycles,
     );
 }
 
@@ -2156,7 +2160,8 @@ fn arm_conc(b: &mut Bench, args: &Args) {
     };
     println!(
         "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={} mode={mode:?} sources={} \
-         trunk_writer={} reads={} k3_lockfree={} k3_mode={} fork_batch={} pin={} trunk_spin_ns={} resolve_split={}",
+         trunk_writer={} reads={} k3_lockfree={} k3_mode={} fork_batch={} pin={} trunk_spin_ns={} resolve_split={} \
+         r12_xi={}",
         args.threads,
         args.cycles,
         args.lock_timing,
@@ -2169,6 +2174,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
         args.pin,
         std::env::var("TURSO_K3_TRUNKSPIN").unwrap_or_else(|_| "0".to_string()),
         if coherence::ENABLED { "on" } else { "off" },
+        std::env::var("TURSO_R12_XI").unwrap_or_else(|_| "unset".to_string()),
     );
     println!("{CONC_HEADER}");
     let mut live: Vec<Live> = Vec::new();

@@ -1529,6 +1529,27 @@ pub struct Pager {
     branch_resolve_log: Mutex<rustc_hash::FxHashMap<u32, u64>>,
     /// WAL-change cache clears of this pager (counted for branch pagers only).
     branch_cache_clears: AtomicU64,
+    /// r12-phasefair F-XI (`TURSO_R12_XI=on`): on another connection's commit, a trunk pager evicts only the pages
+    /// that commit rewrote, instead of its whole cache. Branch pagers never use it.
+    xi: AtomicBool,
+}
+
+/// F-XI's switch, read once per process from `TURSO_R12_XI` (`on` or `off`; unset is off).
+fn xi_from_env() -> bool {
+    static XI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *XI.get_or_init(|| match std::env::var("TURSO_R12_XI") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(v) if v.is_empty() || v == "off" => false,
+        Ok(v) if v == "on" => true,
+        other => panic!("TURSO_R12_XI={other:?}: expected `on` or `off`"),
+    })
+}
+
+/// F-XI's mutant schemata (r12-phasefair amendment 5; test builds only): `XI_MUTANT=1` evicts nothing, `2` skips the
+/// generation check, `3` starts the frame range one past the first new frame, `4` always empties the whole cache.
+#[cfg(test)]
+pub(crate) fn xi_mutant() -> u8 {
+    std::env::var("XI_MUTANT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1842,6 +1863,7 @@ impl Pager {
             branch: OnceLock::new(),
             branch_resolve_log: Mutex::new(rustc_hash::FxHashMap::default()),
             branch_cache_clears: AtomicU64::new(0),
+            xi: AtomicBool::new(xi_from_env()),
         })
     }
 
@@ -3157,8 +3179,17 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
+        let prev = (self.xi.load(Ordering::Relaxed) && self.branch.get().is_none())
+            .then(|| wal.last_read_snapshot())
+            .flatten();
         let changed = wal.begin_read_tx()?;
         if changed {
+            if prev.is_some_and(|prev| self.evict_rewritten_pages(wal.as_ref(), prev)) {
+                return Ok(());
+            }
+            if prev.is_some() {
+                crate::coherence::gate_add(crate::coherence::Gate::XiFallbacks, 1);
+            }
             if let Some(branch) = self.branch.get().filter(|_| crate::coherence::ENABLED) {
                 // Observation only (amendment 8.2): a branch's cache emptied by a trunk commit. Counting
                 // builds only (r12 E1): the store's count is a shared line, kept out of timed builds.
@@ -3175,6 +3206,40 @@ impl Pager {
             self.set_schema_cookie(None);
         }
         Ok(())
+    }
+
+    /// F-XI: another connection committed since this trunk pager's last read tx (`prev`); evict exactly the cached pages
+    /// those commits rewrote and keep the rest, the per-page cross-invalidation of DB2 data sharing's local buffer pools
+    /// in place of SQLite's whole-cache reset. False when that cannot be done exactly (another WAL generation, a backend
+    /// without an exact frame index, a dirty cached page, or a stale page that is pinned or locked): the caller then
+    /// empties the whole cache, as without F-XI.
+    fn evict_rewritten_pages(&self, wal: &dyn Wal, prev: (u64, u32)) -> bool {
+        #[cfg(test)]
+        if xi_mutant() == 4 {
+            return false;
+        }
+        let Some(pages) = self.page_cache.read().clean_page_numbers() else {
+            return false;
+        };
+        let Some(stale) = wal.pages_rewritten_since(prev, &pages) else {
+            return false;
+        };
+        if !stale.is_empty() {
+            self.invalidate_all_cursors();
+            let mut cache = self.page_cache.write();
+            for &page in &stale {
+                if cache.delete(PageCacheKey::new(page as usize)).is_err() {
+                    return false;
+                }
+            }
+            drop(cache);
+            if stale.contains(&(DatabaseHeader::PAGE_ID as u64)) {
+                self.set_schema_cookie(None);
+            }
+        }
+        crate::coherence::gate_add(crate::coherence::Gate::XiKept, 1);
+        crate::coherence::gate_add(crate::coherence::Gate::XiEvicted, stale.len() as u64);
+        true
     }
 
     /// MVCC-only: refresh connection-private WAL change counters without starting a read tx and invalidate cache if needed.
@@ -7344,3 +7409,8 @@ mod checkpoint_phase_tests {
         );
     }
 }
+
+/// F-XI tests (r12-phasefair PREREG amendment 5).
+#[cfg(test)]
+#[path = "pager_xi_tests.rs"]
+mod xi_tests;

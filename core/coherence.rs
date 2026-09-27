@@ -157,9 +157,14 @@ pub enum Gate {
     /// (pager.rs `begin_read_tx`), and page 1 read from the file on a trunk connection's cache miss.
     TrunkCacheClears,
     TrunkPage1Misses,
+    /// F-XI (r12-phasefair amendment 5): a trunk connection's read tx after another's commit that kept its cache, the
+    /// pages it evicted instead, and the times it fell back to emptying the whole cache.
+    XiKept,
+    XiEvicted,
+    XiFallbacks,
 }
 
-pub const GATE_FIELDS: usize = 18;
+pub const GATE_FIELDS: usize = 21;
 
 pub const GATE_NAMES: [&str; GATE_FIELDS] = [
     "w_acq",
@@ -180,6 +185,9 @@ pub const GATE_NAMES: [&str; GATE_FIELDS] = [
     "r_hdr_read_wall_ns",
     "trunk_cache_clears",
     "trunk_page1_misses",
+    "xi_kept",
+    "xi_evicted",
+    "xi_fallbacks",
 ];
 
 #[cfg(feature = "coherence")]

@@ -730,6 +730,19 @@ impl PageCache {
         Ok(())
     }
 
+    /// r12-phasefair F-XI: the cached page numbers, or `None` if any cached page is dirty.
+    pub fn clean_page_numbers(&self) -> Option<Vec<u64>> {
+        let mut pages = Vec::with_capacity(self.map.len());
+        for (key, &entry_ptr) in self.map.iter() {
+            let entry = unsafe { &*entry_ptr };
+            if entry.page.is_dirty() {
+                return None;
+            }
+            pages.push(key.0 as u64);
+        }
+        Some(pages)
+    }
+
     /// Removes all pages from the cache with pgno greater than max_page_num
     pub fn truncate(&mut self, max_page_num: usize) -> Result<(), CacheError> {
         for key in self
