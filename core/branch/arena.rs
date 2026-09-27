@@ -210,6 +210,26 @@ impl Arena {
         Ok(())
     }
 
+    /// For a flight under `ablate().no_redo` (r12-noforce amendment 6): a duplicate of the arena
+    /// file's descriptor if slots were written since the last sync, clearing the mark; the flight
+    /// syncs it before the log. `None` for the memory backing or a clean arena.
+    pub(crate) fn take_dirty_file(&mut self) -> Result<Option<File>> {
+        if let Backing::File { file, dirty } = &mut self.backing {
+            #[cfg(test)]
+            for (slot, bytes) in self.unsynced.drain() {
+                write_at(file, &bytes, slot as u64 * self.page_size as u64)?;
+            }
+            if *dirty {
+                let dup = file
+                    .try_clone()
+                    .map_err(|e| crate::error::io_error(e, "dup branch arena"))?;
+                *dirty = false;
+                return Ok(Some(dup));
+            }
+        }
+        Ok(None)
+    }
+
     /// Make every slot written so far durable. A no-op for the memory backing. Under the redo rule
     /// only a compaction (the checkpoint) and recovery need this; no commit waits for it.
     pub(crate) fn sync(&mut self) -> Result<()> {

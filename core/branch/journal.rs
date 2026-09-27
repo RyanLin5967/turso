@@ -947,14 +947,16 @@ impl Journal {
     /// held (r11-churn amendment 4). The log region is reserved here, so the next flight goes after
     /// it; the caller guarantees no other flight is in the air (one leader at a time), which is
     /// also what makes the on-disk length check below exact. No arena descriptor comes along: the
-    /// slots these frames name are carried by their `PageImage` frames (the redo rule).
-    pub(crate) fn take_flight(&mut self) -> Result<Flight> {
+    /// slots these frames name are carried by their `PageImage` frames (the redo rule) -- except
+    /// under the measurement switch's `no_redo`, where `arena` is the dirty arena to sync first.
+    pub(crate) fn take_flight(&mut self, arena: Option<File>) -> Result<Flight> {
         let fail = std::mem::take(&mut self.fail_next_write);
         self.check_live()?;
         let end_lsn = self.lsn;
         if self.pending.is_empty() {
             return Ok(Flight {
                 log: None,
+                arena: None,
                 bytes: Vec::new(),
                 at: self.len,
                 sync: self.sync,
@@ -985,6 +987,7 @@ impl Journal {
         self.len += bytes.len() as u64;
         Ok(Flight {
             log: Some(log),
+            arena,
             bytes,
             at,
             sync: self.sync,
@@ -1125,6 +1128,8 @@ impl Journal {
 /// region as written, so a failed write must fail-stop it.
 pub(crate) struct Flight {
     log: Option<File>,
+    /// Only under `ablate().no_redo`: the arena to sync before the frames (gc2's rule-1 order).
+    arena: Option<File>,
     bytes: Vec<u8>,
     at: u64,
     sync: bool,
@@ -1144,6 +1149,11 @@ impl Flight {
         let Some(log) = self.log else {
             return Ok(());
         };
+        if self.sync {
+            if let Some(arena) = &self.arena {
+                fsync_file(arena)?;
+            }
+        }
         write_at(&log, &self.bytes, self.at)?;
         LOG_BYTES.fetch_add(self.bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         super::store::crash::point("flight-after-write", || format!("at={}", self.at));
@@ -1454,6 +1464,29 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
         file.sync_all()
             .map_err(|e| io_error(e, "fsync branch file"))
     }
+}
+
+/// Measurement switch (r12-noforce PREREG amendment 6, sub-question ABL; observation of which sync
+/// each removal carries, not a mechanism): `TURSO_BRANCH_ABLATE` lists `force_fork` (every fork
+/// waits for its own records, restoring sync #1) and/or `no_redo` (no `PageImage` is logged and a
+/// flight syncs the arena before the log, restoring sync #2 in gc2's order). Unset: no-force as
+/// built. Read once per process.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Ablate {
+    pub(crate) force_fork: bool,
+    pub(crate) no_redo: bool,
+}
+
+pub(crate) fn ablate() -> Ablate {
+    static ABLATE: std::sync::OnceLock<Ablate> = std::sync::OnceLock::new();
+    *ABLATE.get_or_init(|| {
+        let v = std::env::var("TURSO_BRANCH_ABLATE").unwrap_or_default();
+        let has = |w: &str| v.split(',').any(|x| x.trim() == w);
+        Ablate {
+            force_fork: has("force_fork"),
+            no_redo: has("no_redo"),
+        }
+    })
 }
 
 /// Whether `TURSO_BRANCH_FULLFSYNC=1` asked for `F_FULLFSYNC` (read once per process).
@@ -1974,7 +2007,7 @@ mod tests {
                 .unwrap();
             journal.buffer(&Record::Clock { now_ms: 7 }).unwrap();
             *start = journal.len;
-            journal.take_flight().unwrap().write().unwrap();
+            journal.take_flight(None).unwrap().write().unwrap();
         }
         (files, starts)
     }

@@ -1326,7 +1326,7 @@ impl BranchStore {
         if let Some(f) = floor {
             inner.id_reserved(f, lsn);
         }
-        let wait = !inner.id_durably_reserved(id.0);
+        let wait = !inner.id_durably_reserved(id.0) || super::journal::ablate().force_fork;
         if !plan.due.is_empty() {
             self.expire_apply_at(&mut inner, plan, 0, Some(lsn));
             churn_counters::EXPIRE_PIGGYBACKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1390,7 +1390,7 @@ impl BranchStore {
         if let Some(f) = floor {
             inner.id_reserved(f, lsn);
         }
-        let wait = !inner.id_durably_reserved(id.0);
+        let wait = !inner.id_durably_reserved(id.0) || super::journal::ablate().force_fork;
         if !plan.due.is_empty() {
             self.expire_apply_at(&mut inner, plan, 0, Some(lsn));
             churn_counters::EXPIRE_PIGGYBACKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1773,7 +1773,7 @@ impl BranchStore {
             trunk.lineage.retain(page, retained);
             if let Some(journal) = journal.as_mut() {
                 // The redo rule: the image goes first, so the barrier's flush syncs the log alone.
-                if !crash::mutant("no_redo") {
+                if !crash::mutant("no_redo") && !super::journal::ablate().no_redo {
                     journal.buffer(&Record::PageImage {
                         slot,
                         bytes: pre_image.to_vec(),
@@ -1928,7 +1928,10 @@ impl BranchStore {
                 let bytes = page.get_contents().as_slice();
                 arena.write_slot(slot, bytes)?;
                 entries.push((no, slot, crc32c::crc32c(bytes)));
-                if journal.is_some() && !crash::mutant("no_redo") {
+                if journal.is_some()
+                    && !crash::mutant("no_redo")
+                    && !super::journal::ablate().no_redo
+                {
                     images.push(Record::PageImage {
                         slot,
                         bytes: bytes.to_vec(),
@@ -2325,10 +2328,16 @@ impl StoreInner {
 
     /// Everything buffered, as one flight (`Journal::take_flight`); `None` when volatile.
     fn take_flight(&mut self) -> Result<Option<Flight>> {
-        let (Some(journal), Some(_)) = (self.journal.as_mut(), self.arena.as_ref()) else {
+        let (Some(journal), Some(arena)) = (self.journal.as_mut(), self.arena.as_mut()) else {
             return Ok(None);
         };
-        journal.take_flight().map(Some)
+        // Measurement switch `no_redo` (amendment 6): the flight syncs the arena first, as gc2 did.
+        let dirty = if super::journal::ablate().no_redo && journal.has_pending() {
+            arena.take_dirty_file()?
+        } else {
+            None
+        };
+        journal.take_flight(dirty).map(Some)
     }
 
     /// The floor a fork of `id` must buffer ahead of its own records, when fewer than half of the

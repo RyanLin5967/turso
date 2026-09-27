@@ -58,6 +58,8 @@ struct Args {
     w: usize,
     durability: BranchDurability,
     reap_every: Duration,
+    /// r12-noforce amendment 6: trunk UPDATEs per lifecycle, after its branch commit (0 = none).
+    trunk_writes: usize,
 }
 
 fn die(msg: &str) -> ! {
@@ -79,6 +81,7 @@ fn parse_args() -> Args {
         w: 1,
         durability: BranchDurability::Durable { sync: true },
         reap_every: Duration::from_millis(100),
+        trunk_writes: 0,
     };
     let ms = |s: String, what: &str| -> Duration {
         Duration::from_millis(s.parse().unwrap_or_else(|_| die(&format!("bad {what}"))))
@@ -98,6 +101,9 @@ fn parse_args() -> Args {
             "--lease-ms" => args.lease = ms(val(), "--lease-ms"),
             "--w" => args.w = val().parse().unwrap_or_else(|_| die("bad --w")),
             "--reap-every-ms" => args.reap_every = ms(val(), "--reap-every-ms"),
+            "--trunk-writes" => {
+                args.trunk_writes = val().parse().unwrap_or_else(|_| die("bad --trunk-writes"))
+            }
             "--durability" => {
                 args.durability = match val().as_str() {
                     "durable" => BranchDurability::Durable { sync: true },
@@ -166,8 +172,18 @@ struct Shared {
     stop_reaper: AtomicBool,
 }
 
-fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize) {
+/// A trunk value no row holds yet, so every trunk UPDATE dirties its page (an UPDATE to an equal
+/// value is skipped: turso-benchmark-pitfalls).
+fn trunk_value_at(n: u64, k: usize) -> String {
+    format!("t{:0>width$}", n * 1000 + k as u64, width = VALUE_LEN - 1)
+}
+
+fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize, trunk_writes: usize) {
     let trunk = db.connect().unwrap();
+    if trunk_writes > 0 {
+        // Never OFF with trunk writes: OFF re-checkpoints the whole WAL on every commit.
+        trunk.execute("PRAGMA synchronous = NORMAL").unwrap();
+    }
     while !shared.stop_agents.load(Ordering::Acquire) {
         let start = Instant::now();
         let fsyncs0 = churn_counters().thread_fsyncs;
@@ -204,13 +220,34 @@ fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize) {
         let fsyncs2 = churn_counters().thread_fsyncs;
         if n % 64 == 0 {
             let other = rows[0] % TRUNK_ROWS + 1;
+            // With trunk writes the branch sees the trunk as of its fork, which no longer holds
+            // `trunk_value`: only its own row is checked then.
             if read_v(&conn, rows[0]) != branch_value(rows[0])
-                || (!rows.contains(&other) && read_v(&conn, other) != trunk_value(other))
+                || (trunk_writes == 0
+                    && !rows.contains(&other)
+                    && read_v(&conn, other) != trunk_value(other))
             {
                 not_a_result(&format!("lifecycle {n} read a wrong version"));
             }
         }
         drop(conn);
+        for k in 0..trunk_writes {
+            // Rotate rows so each write lands on a page some live child forked since its last write.
+            let row = ((n * trunk_writes as u64 + k as u64).wrapping_mul(7919) % TRUNK_ROWS as u64)
+                as i64
+                + 1;
+            let sql = format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_value_at(n, k));
+            loop {
+                match trunk.execute(&sql) {
+                    Ok(_) => break,
+                    Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => {
+                        shared.busy_retries.fetch_add(1, Ordering::Relaxed);
+                        std::thread::yield_now();
+                    }
+                    Err(e) => not_a_result(&format!("trunk write failed: {e}")),
+                }
+            }
+        }
         let cycle = start.elapsed().as_nanos() as u64;
         shared
             .queue
@@ -283,7 +320,7 @@ fn main() {
     println!("# branch_gc — Turso fork, DURABLE branch store, concurrent agent lifecycles, r11-churn amendment 4 + r12-noforce columns");
     println!(
         "# threads={:?} warm_ms={} window_ms={} lease_ms={} w={} durability={:?} reap_every_ms={} \
-         sync_call={} build={}",
+         sync_call={} build={} trunk_writes={} ablate={:?}",
         args.threads,
         args.warm.as_millis(),
         args.window.as_millis(),
@@ -301,6 +338,8 @@ fn main() {
         } else {
             "release"
         },
+        args.trunk_writes,
+        std::env::var("TURSO_BRANCH_ABLATE").unwrap_or_default(),
     );
     println!(
         "# gc columns: T lifecycles_per_s arrivals_per_s fsyncs_per_arrival fsyncs_per_s \
@@ -329,8 +368,9 @@ fn main() {
         shared.stop_agents.store(false, Ordering::Release);
         let agents: Vec<_> = (0..t)
             .map(|_| {
-                let (shared, db, lease, w) = (shared.clone(), db.clone(), args.lease, args.w);
-                std::thread::spawn(move || agent(&shared, &db, lease, w))
+                let (shared, db, lease, w, tw) =
+                    (shared.clone(), db.clone(), args.lease, args.w, args.trunk_writes);
+                std::thread::spawn(move || agent(&shared, &db, lease, w, tw))
             })
             .collect();
         std::thread::sleep(args.warm);
