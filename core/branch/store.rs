@@ -614,6 +614,10 @@ struct Lineage {
     shared: Option<std::sync::Arc<SharedVersions>>,
 }
 
+fn e1_mutant(n: u32) -> bool {
+    std::env::var("E1_MUTANT").ok().and_then(|v| v.parse::<u32>().ok()) == Some(n)
+}
+
 /// No page has this number (SQLite's largest is `u32::MAX - 1`; [`Lineage::retain`] refuses it), so
 /// `(e, NO_PAGE, u64::MAX)` sorts after every index entry whose first field is `e`.
 const NO_PAGE: u32 = u32::MAX;
@@ -952,7 +956,7 @@ impl Lineage {
     fn child_gone(&mut self, f: u64, arena: &mut Domain, work: &mut BranchWork) -> usize {
         let live = self.children.get(&f).copied().unwrap_or(0);
         crate::turso_assert!(live > 0, "detached a child the parent does not list");
-        if live > 1 {
+        if live > 1 && !e1_mutant(1) {
             self.children.insert(f, live - 1);
             return 0;
         }
@@ -1543,16 +1547,31 @@ impl BranchStore {
                     fb.leader.store(false, Ordering::Release);
                     return b;
                 }
+                let early = e1_mutant(2).then(|| {
+                    let mut cur = fb.seq.load(Ordering::Acquire);
+                    while let Err(now) = fb.seq.compare_exchange_weak(
+                        cur,
+                        ((cur >> 32) + 1) << 32,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        cur = now;
+                    }
+                    cur
+                });
                 let mut trunk = self.trunk(TrunkSite::Fork);
                 // Close the collecting batch (the next one starts empty) with the lock held.
-                let mut cur = fb.seq.load(Ordering::Acquire);
-                while let Err(now) = fb.seq.compare_exchange_weak(
-                    cur,
-                    ((cur >> 32) + 1) << 32,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    cur = now;
+                let mut cur = early.unwrap_or_else(|| fb.seq.load(Ordering::Acquire));
+                while early.is_none() {
+                    match fb.seq.compare_exchange_weak(
+                        cur,
+                        ((cur >> 32) + 1) << 32,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(now) => cur = now,
+                    }
                 }
                 let (batch, members) = (cur >> 32, (cur & u64::from(u32::MAX)) as u32);
                 // With the leader's flag held no other batch is being served, and every batch
@@ -1564,7 +1583,7 @@ impl BranchStore {
                 let f = trunk.lineage.epoch;
                 crate::turso_assert!(f == b, "a batched store's trunk epoch is its batch number");
                 trunk.lineage.epoch += 1;
-                let listed = trunk.lineage.children.insert(f, members);
+                let listed = trunk.lineage.children.insert(f, if e1_mutant(3) { 1 } else { members });
                 crate::turso_assert!(listed.is_none(), "a fork batch's epoch was already listed");
                 drop(trunk);
                 fb.done.store(b + 1, Ordering::Release);
