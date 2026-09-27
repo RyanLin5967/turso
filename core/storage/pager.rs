@@ -3165,6 +3165,10 @@ impl Pager {
                 self.branch_cache_clears.fetch_add(1, Ordering::Relaxed);
                 branch.store.note_branch_cache_clear();
             }
+            if self.branch.get().is_none() {
+                // Observation only (r12-phasefair amendment 4; empty without the `coherence` feature).
+                crate::coherence::gate_add(crate::coherence::Gate::TrunkCacheClears, 1);
+            }
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
             // Invalidate cached schema cookie to force re-read on next access
@@ -3679,6 +3683,10 @@ impl Pager {
             }
 
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+            if page_idx == DatabaseHeader::PAGE_ID as i64 && self.branch.get().is_none() {
+                // Observation only (r12-phasefair amendment 4; empty without the `coherence` feature).
+                crate::coherence::gate_add(crate::coherence::Gate::TrunkPage1Misses, 1);
+            }
             let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
             self.pending_reads.write().insert(
                 page_idx,

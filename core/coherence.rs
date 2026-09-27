@@ -149,9 +149,17 @@ pub enum Gate {
     RHoldWallNs,
     /// Shared `try_read` refusals (a writer holds or awaits the gate).
     RRefused,
+    /// Inside the gate, a trunk fork's header read (the schema cookie, branch/mod.rs `fork_trunk_locked`): reads
+    /// and their wall ns (r12-phasefair amendment 4, after the pre-look found page 1 read from the file there).
+    RHdrReads,
+    RHdrReadWallNs,
+    /// A trunk (not branch) connection's page cache emptied at a read tx because another connection committed
+    /// (pager.rs `begin_read_tx`), and page 1 read from the file on a trunk connection's cache miss.
+    TrunkCacheClears,
+    TrunkPage1Misses,
 }
 
-pub const GATE_FIELDS: usize = 14;
+pub const GATE_FIELDS: usize = 18;
 
 pub const GATE_NAMES: [&str; GATE_FIELDS] = [
     "w_acq",
@@ -168,6 +176,10 @@ pub const GATE_NAMES: [&str; GATE_FIELDS] = [
     "r_holds",
     "r_hold_wall_ns",
     "r_refused",
+    "r_hdr_reads",
+    "r_hdr_read_wall_ns",
+    "trunk_cache_clears",
+    "trunk_page1_misses",
 ];
 
 #[cfg(feature = "coherence")]

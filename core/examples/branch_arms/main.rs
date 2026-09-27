@@ -1914,7 +1914,8 @@ fn print_gate(label: &str, w: &WriterOut, forks: &[u64; coherence::GATE_FIELDS],
          acq_wall_pw={:.1} acq_cpu_pw={:.1} revoke_wall_pw={:.1} revoke_cpu_pw={:.1} held_wall_pw={:.1} \
          held_cpu_pw={:.1} outside_wall_pw={:.1} outside_cpu_pw={:.1} waited_pw={:.4} revokes_pw={:.4} \
          acq_wall_max_ns={} held_wall_max_ns={} writer_shared_rmw_pw={:.2} fork_holds_pc={:.4} \
-         fork_hold_wall_ph={:.1} fork_refused_pc={:.4}",
+         fork_hold_wall_ph={:.1} fork_refused_pc={:.4} fork_hdr_reads_pc={:.4} fork_hdr_read_wall_pr={:.1} \
+         trunk_cache_clears_pc={:.4} trunk_page1_misses_pc={:.4}",
         w.writes,
         g(Gate::WAcq),
         w.idle_yields,
@@ -1936,6 +1937,14 @@ fn print_gate(label: &str, w: &WriterOut, forks: &[u64; coherence::GATE_FIELDS],
         r_holds as f64 / cycles,
         if r_holds == 0 { 0.0 } else { forks[Gate::RHoldWallNs as usize] as f64 / r_holds as f64 },
         forks[Gate::RRefused as usize] as f64 / cycles,
+        forks[Gate::RHdrReads as usize] as f64 / cycles,
+        if forks[Gate::RHdrReads as usize] == 0 {
+            0.0
+        } else {
+            forks[Gate::RHdrReadWallNs as usize] as f64 / forks[Gate::RHdrReads as usize] as f64
+        },
+        forks[Gate::TrunkCacheClears as usize] as f64 / cycles,
+        forks[Gate::TrunkPage1Misses as usize] as f64 / cycles,
     );
 }
 

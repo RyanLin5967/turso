@@ -528,9 +528,15 @@ impl Connection {
     }
 
     fn fork_trunk_locked(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
+        let hdr_at = crate::coherence::ENABLED.then(crate::coherence::wall_ns);
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+        if let Some(t0) = hdr_at {
+            // r12-phasefair amendment 4: the header read's share of a fork's time inside the gate.
+            crate::coherence::gate_add(crate::coherence::Gate::RHdrReads, 1);
+            crate::coherence::gate_add(crate::coherence::Gate::RHdrReadWallNs, crate::coherence::wall_ns() - t0);
+        }
         // The branch starts with the schema that matches the committed pages it will read. The
         // connection's own snapshot or the shared one is that schema whenever the cookie agrees;
         // if neither does, a DDL commit is between publishing its pages and its schema, and the
