@@ -62,12 +62,18 @@ impl PageMap {
     }
 
     pub(crate) fn get(&self, page: u32) -> Option<Slot> {
+        self.get_counted(page, &mut 0)
+    }
+
+    /// [`PageMap::get`], adding the nodes it enters to `nodes` (observation, r11-ship A6.3).
+    pub(crate) fn get_counted(&self, page: u32, nodes: &mut u64) -> Option<Slot> {
         let mut node = self.root.as_deref()?;
         if !self.covers(page) {
             return None;
         }
         let mut level = self.height;
         loop {
+            *nodes += 1;
             match node {
                 Node::Inner(kids) => {
                     node = kids[Self::index(page, level)].as_deref()?;

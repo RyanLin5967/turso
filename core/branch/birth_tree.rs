@@ -122,12 +122,14 @@ impl<V> Node<V> {
     }
 }
 
-/// Work a tree operation did: nodes entered by a walk, items looked at, nodes a write went
+/// Work a tree operation did: nodes entered by a walk, items looked at, child births a pruned walk
+/// compared inside the inner nodes it entered (observation, PREREG A6.3), nodes a write went
 /// through, and nodes a write had to COPY because a snapshot still shared them.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TreeWork {
     pub(crate) nodes_visited: u64,
     pub(crate) items_checked: u64,
+    pub(crate) kids_checked: u64,
     pub(crate) nodes_touched: u64,
     pub(crate) nodes_copied: u64,
 }
@@ -136,6 +138,7 @@ impl TreeWork {
     pub(crate) fn add(&mut self, o: TreeWork) {
         self.nodes_visited += o.nodes_visited;
         self.items_checked += o.items_checked;
+        self.kids_checked += o.kids_checked;
         self.nodes_touched += o.nodes_touched;
         self.nodes_copied += o.nodes_copied;
     }
@@ -183,18 +186,23 @@ impl<V> BirthTree<V> {
         self.height >= MAX_HEIGHT || key < 1u64 << (BITS * (self.height + 1))
     }
 
-    #[cfg(test)]
     pub(crate) fn height(&self) -> u32 {
         self.height
     }
 
     pub(crate) fn get(&self, key: u64) -> Option<&Item<V>> {
+        self.get_counted(key, &mut 0)
+    }
+
+    /// [`BirthTree::get`], adding the nodes it enters to `nodes`.
+    pub(crate) fn get_counted(&self, key: u64, nodes: &mut u64) -> Option<&Item<V>> {
         if !self.covers(key) {
             return None;
         }
         let mut node = self.root.as_deref()?;
         let mut level = self.height;
         loop {
+            *nodes += 1;
             match node {
                 Node::Inner { kids, .. } => {
                     let i = index(key, level);
@@ -374,6 +382,10 @@ impl<V> BirthTree<V> {
         work.nodes_visited += 1;
         match node {
             Node::Inner { kids, .. } => {
+                if base.is_some() {
+                    // Each kid's birth is compared on entry to it, below.
+                    work.kids_checked += kids.len() as u64;
+                }
                 for (i, kid) in kids {
                     let prefix = prefix | (u64::from(*i) << (BITS * level));
                     Self::walk_in(kid, level - 1, prefix, base, work, f);
@@ -392,6 +404,11 @@ impl<V> BirthTree<V> {
 
     /// The live item with the greatest key in `[lo, hi]`.
     pub(crate) fn pred(&self, lo: u64, hi: u64) -> Option<(u64, &Arc<V>)> {
+        self.pred_counted(lo, hi, &mut 0)
+    }
+
+    /// [`BirthTree::pred`], adding the nodes it enters (backtracking included) to `nodes`.
+    pub(crate) fn pred_counted(&self, lo: u64, hi: u64, nodes: &mut u64) -> Option<(u64, &Arc<V>)> {
         let root = self.root.as_deref()?;
         let hi = if self.covers(hi) {
             hi
@@ -401,10 +418,11 @@ impl<V> BirthTree<V> {
         if lo > hi {
             return None;
         }
-        Self::pred_in(root, self.height, 0, lo, hi)
+        Self::pred_in(root, self.height, 0, lo, hi, nodes)
     }
 
-    fn pred_in(node: &Node<V>, level: u32, prefix: u64, lo: u64, hi: u64) -> Option<(u64, &Arc<V>)> {
+    fn pred_in(node: &Node<V>, level: u32, prefix: u64, lo: u64, hi: u64, nodes: &mut u64) -> Option<(u64, &Arc<V>)> {
+        *nodes += 1;
         match node {
             Node::Inner { kids, .. } => {
                 let span = 1u64 << (BITS * level);
@@ -414,7 +432,7 @@ impl<V> BirthTree<V> {
                     if start > hi || end < lo {
                         continue;
                     }
-                    if let Some(found) = Self::pred_in(kid, level - 1, start, lo, hi) {
+                    if let Some(found) = Self::pred_in(kid, level - 1, start, lo, hi, nodes) {
                         return Some(found);
                     }
                 }

@@ -183,6 +183,13 @@ impl ShipSnap {
     pub fn seq(&self) -> u64 {
         self.view.seq
     }
+
+    /// Observation (PREREG A6.3): the heights of the states, slots, trunk_retained and written
+    /// trees; a root-to-leaf lookup enters height + 1 nodes.
+    pub fn heights(&self) -> (u32, u32, u32, u32) {
+        let v = &self.view;
+        (v.states.height(), v.slots.height(), v.trunk_retained.height(), v.written.height())
+    }
 }
 
 /// Upkeep of the ship view, called under the mutex after each mutation (no-ops when untracked).
@@ -522,10 +529,24 @@ pub struct SendReport {
     /// the items it looked at inside them.
     pub nodes_visited: u64,
     pub items_checked: u64,
-    /// F-S1: operations the send performed while holding the store mutex (cloning the view's roots
-    /// is one), and how long it held it.
+    /// Observation (PREREG A6.3): child births a walk compared inside the inner nodes it entered,
+    /// fork-base lookups (one per slot record), and the tree nodes those lookups entered.
+    pub kids_checked: u64,
+    pub base_lookups: u64,
+    pub base_lookup_nodes: u64,
+    /// F-S1: operations performed while holding the store mutex, counted by
+    /// [`BranchStore::send`]: the snapshot, plus every record serialised while its guard was
+    /// still held (PREREG A6.2). [`send_snapshot`] takes no store, so it reports 0. And how long
+    /// the mutex was held.
     pub locked_ops: u64,
     pub locked_ns: u64,
+}
+
+impl SendReport {
+    /// Records of every kind this stream carried.
+    pub fn records(&self) -> u64 {
+        self.slot_records + self.trunk_page_records + self.ref_records + self.state_records + self.dead_records
+    }
 }
 
 /// Receiver work, counted in the receive code.
@@ -841,7 +862,9 @@ impl BranchStore {
 
     /// F-S1: the O(1) snapshot a send serialises from — the view's roots, cloned under the mutex.
     /// Refused while a branch write transaction is open: its copy decisions are taken but its pages
-    /// not yet committed (a snapshot is taken at a transaction boundary, like a ZFS txg).
+    /// not yet committed (a snapshot is taken at a transaction boundary, like a ZFS txg). A TRUNK
+    /// write transaction has the same hazard and is invisible here: the database holds the trunk's
+    /// WAL write lock around this call (`Database::branch_snapshot`, PREREG A6.1).
     pub(crate) fn snapshot(&self) -> Result<(ShipSnap, u64)> {
         let t0 = Instant::now();
         let inner = self.inner.lock();
@@ -867,6 +890,7 @@ impl BranchStore {
     /// then [`send_snapshot`] with no lock. `base` is the receiver's position for an incremental
     /// mode and `None` for a full one; `trunk` is the trunk's image at the same moment, which the
     /// caller must have checkpointed so that it holds every committed trunk write.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn send(
         &self,
         mode: SendMode,
@@ -877,9 +901,29 @@ impl BranchStore {
         count: bool,
         out: Option<&mut dyn Write>,
     ) -> Result<SendReport> {
+        self.send_excluding(|| Ok(()), mode, base, trunk, use_delta, plant, count, out)
+    }
+
+    /// [`BranchStore::send`], holding what `exclude` returns across the snapshot only: the
+    /// database passes the trunk's WAL write lock, so no trunk write transaction is open while
+    /// the view is copied, and none is blocked while it is serialised (PREREG A6.1).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_excluding<G>(
+        &self,
+        exclude: impl FnOnce() -> Result<G>,
+        mode: SendMode,
+        base: Option<u64>,
+        trunk: &TrunkImage,
+        use_delta: bool,
+        plant: Plant,
+        count: bool,
+        out: Option<&mut dyn Write>,
+    ) -> Result<SendReport> {
+        let excluded = exclude()?;
         let t0 = Instant::now();
         let inner = self.inner.lock();
         let snap = Self::snapshot_locked(&inner)?;
+        drop(excluded);
         // Mutant S1 (PREREG A5): the send keeps the mutex through serialisation.
         let held = if super::super::ship_mutant() == "S1" {
             Some(inner)
@@ -889,7 +933,10 @@ impl BranchStore {
         };
         let locked_ns = t0.elapsed().as_nanos() as u64;
         let mut rep = send_snapshot(&snap, mode, base, trunk, use_delta, plant, count, out)?;
-        rep.locked_ops = 1;
+        // Operations under the store mutex (PREREG A6.2): the snapshot, and every record that was
+        // serialised while the guard was still held.
+        let serialised_under_guard = if held.is_some() { rep.records() } else { 0 };
+        rep.locked_ops = 1 + serialised_under_guard;
         rep.locked_ns = match held {
             Some(guard) => {
                 drop(guard);
@@ -1340,25 +1387,32 @@ impl BranchStore {
 /// page's is what the branch reads through its ancestry (`inherited`, else the trunk's version as of
 /// `trunk_at`, else the trunk page); a retained trunk version's is the page's next version, retained
 /// or current. Returns the base as a slot of the view or as a trunk page number.
-fn fork_base(v: &ShipView, sv: &SlotView) -> Result<(Option<Slot>, u32)> {
+fn fork_base(v: &ShipView, sv: &SlotView, rep: &mut SendReport) -> Result<(Option<Slot>, u32)> {
     let page = sv.page;
+    // Observation (PREREG A6.3): the lookups' own work, which `nodes_visited` does not see.
+    rep.base_lookups += 1;
+    let nodes = &mut rep.base_lookup_nodes;
     match sv.owner {
         SlotOwner::Trunk { died, .. } => Ok((
-            v.trunk_retained.get_live(ret_key(page, died)).map(|n| n.slot),
+            v.trunk_retained
+                .get_counted(ret_key(page, died), nodes)
+                .and_then(Item::live)
+                .map(|n| n.slot),
             page,
         )),
         SlotOwner::Branch(owner) => {
             let st = v
                 .states
-                .get_live(owner)
+                .get_counted(owner, nodes)
+                .and_then(Item::live)
                 .ok_or_else(|| corrupt(format!("slot of page {page} owned by state {owner}, which the view lacks")))?;
-            if let Some(slot) = st.inherited.get(page) {
+            if let Some(slot) = st.inherited.get_counted(page, nodes) {
                 return Ok((Some(slot), page));
             }
             let at = st.trunk_at;
             let covering = v
                 .trunk_retained
-                .pred(ret_key(page, 0), ret_key(page, at))
+                .pred_counted(ret_key(page, 0), ret_key(page, at), nodes)
                 .filter(|(_, ver)| at < ver.died)
                 .map(|(_, ver)| ver.slot);
             Ok((covering, page))
@@ -1700,7 +1754,7 @@ pub(crate) fn send_snapshot(
                 continue; // new content (a SLOT below), or a slot the receiver holds already
             }
             if mode == SendMode::IncrAlloc {
-                let fb = fork_base(v, sv)?;
+                let fb = fork_base(v, sv, &mut rep)?;
                 ship_page(&mut sink, &mut rep, T_SLOT, ver.slot, ver.page, true, &sv.data[..], trunk.page(ver.page), base_bytes(fb))?;
                 rep.slot_records += 1;
                 continue;
@@ -1764,7 +1818,7 @@ pub(crate) fn send_snapshot(
     for (slot, sv) in &slots {
         rep.slots_visited += 1;
         let fresh = !incremental || sv.alloc_seq > base_seq;
-        let fb = fork_base(v, sv)?;
+        let fb = fork_base(v, sv, &mut rep)?;
         ship_page(
             &mut sink,
             &mut rep,
@@ -1786,6 +1840,7 @@ pub(crate) fn send_snapshot(
     rep.total_bytes = sink.bytes;
     rep.nodes_visited = tw.nodes_visited;
     rep.items_checked = tw.items_checked;
+    rep.kids_checked = tw.kids_checked;
     rep.index_visited = tw.nodes_visited;
     Ok(rep)
 }
@@ -2314,5 +2369,25 @@ mod tests {
             replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false).unwrap();
             assert_eq!(replica.digest(&rtrunk), store.digest(&img), "k = {k}: the replica differs");
         }
+    }
+
+    /// L1 (PREREG A6.2): a send's locked_ops counts what it did under the store mutex: the
+    /// snapshot alone, however many records the stream carries. A send that serialises under the
+    /// mutex (mutant S1) counts every record as well.
+    #[test]
+    fn a_sends_locked_ops_is_the_snapshot_alone() {
+        let store = BranchStore::new();
+        store.enable_shipping().unwrap();
+        let trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        for k in 0..10u64 {
+            let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+            write_page(&store, id, 1, &image(0), &image(30_000 + k));
+        }
+        let img = trunk_image(&trunk);
+        let rep = store
+            .send(SendMode::FullFix, None, &img, false, Plant::None, false, None)
+            .unwrap();
+        assert!(rep.records() >= 10, "{rep:?}");
+        assert_eq!(rep.locked_ops, 1, "{rep:?}");
     }
 }

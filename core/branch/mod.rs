@@ -277,6 +277,56 @@ impl Drop for BranchBinding {
     }
 }
 
+/// The trunk's WAL write lock, held: no trunk write transaction is open while this lives. A trunk
+/// transaction takes its copy decisions, and marks its pages changed for a sender, at each page's
+/// first write, before the bytes commit. So a fork and a ship-view snapshot (PREREG A6.1) are
+/// taken under this, and refused (`Busy`) while such a transaction is open.
+pub(crate) struct TrunkWritesExcluded {
+    pager: Arc<Pager>,
+}
+
+impl TrunkWritesExcluded {
+    pub(crate) fn acquire(pager: &Arc<Pager>) -> Result<Self> {
+        const SNAPSHOT_RETRIES: usize = 8;
+        let mut attempt = 0;
+        loop {
+            pager.begin_read_tx()?;
+            let begun = pager
+                .io
+                .block(|| pager.begin_write_tx(WalAutoActions::empty()));
+            match begun {
+                Ok(()) => {
+                    return Ok(Self {
+                        pager: pager.clone(),
+                    })
+                }
+                Err(LimboError::BusySnapshot) if attempt < SNAPSHOT_RETRIES => {
+                    pager.end_read_tx();
+                    attempt += 1;
+                }
+                Err(err) => {
+                    pager.end_read_tx();
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for TrunkWritesExcluded {
+    fn drop(&mut self) {
+        self.pager.end_write_tx();
+        self.pager.end_read_tx();
+    }
+}
+
+/// [`TrunkWritesExcluded`] on a connection of its own, for callers that hold none. Fields drop in
+/// order: the lock is released before the connection goes.
+struct ShipExclusion {
+    _excluded: TrunkWritesExcluded,
+    _conn: Arc<Connection>,
+}
+
 /// Every condition under which a fork is refused, in one place. MVCC is the pre-registered one
 /// (see the module doc); the rest are paths this fork has not made branch-aware.
 fn check_forkable(db: &Database, pager: &Pager) -> Result<()> {
@@ -318,30 +368,8 @@ impl Connection {
     /// commits afterwards would be visible to the new branch. Holding the writer lock means there
     /// is no such transaction, and the read snapshot it forces is the latest commit.
     fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
-        const SNAPSHOT_RETRIES: usize = 8;
-        let mut attempt = 0;
-        loop {
-            pager.begin_read_tx()?;
-            let begun = pager
-                .io
-                .block(|| pager.begin_write_tx(WalAutoActions::empty()));
-            match begun {
-                Ok(()) => {}
-                Err(LimboError::BusySnapshot) if attempt < SNAPSHOT_RETRIES => {
-                    pager.end_read_tx();
-                    attempt += 1;
-                    continue;
-                }
-                Err(err) => {
-                    pager.end_read_tx();
-                    return Err(err);
-                }
-            }
-            let forked = self.fork_trunk_locked(pager);
-            pager.end_write_tx();
-            pager.end_read_tx();
-            return forked;
-        }
+        let _excluded = TrunkWritesExcluded::acquire(pager)?;
+        self.fork_trunk_locked(pager)
     }
 
     fn fork_trunk_locked(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
@@ -401,11 +429,14 @@ impl Database {
         self.branches.tombstone_count()
     }
 
-    /// Send the branch store (see `store::ship`). `trunk` must be the trunk's checkpointed image.
-    /// `count` also computes the counted-only alternatives (delta and fork-delta sizes, dedup).
+    /// Send the branch store (see `store::ship`). `trunk` must be the trunk's checkpointed image,
+    /// taken with trunk writes excluded. `count` also computes the counted-only alternatives (delta
+    /// and fork-delta sizes, dedup). Refused (`Busy`) while a branch or trunk write transaction is
+    /// open; the trunk's WAL write lock is held across the snapshot only, never the serialisation.
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn branch_send(
-        &self,
+        self: &Arc<Self>,
         mode: SendMode,
         base: Option<u64>,
         trunk: &TrunkImage,
@@ -414,14 +445,44 @@ impl Database {
         count: bool,
         out: Option<&mut dyn std::io::Write>,
     ) -> Result<SendReport> {
-        self.branches.send(mode, base, trunk, delta, plant, count, out)
+        self.branches.send_excluding(
+            || self.exclude_trunk_writes(),
+            mode,
+            base,
+            trunk,
+            delta,
+            plant,
+            count,
+            out,
+        )
     }
 
     /// F-S1's O(1) snapshot of the ship view, and how long the store mutex was held for it (ns).
-    /// Refused (`Busy`) while a branch write transaction is open.
+    /// Refused (`Busy`) while a branch or trunk write transaction is open (PREREG A6.1).
     #[doc(hidden)]
-    pub fn branch_snapshot(&self) -> Result<(ShipSnap, u64)> {
+    pub fn branch_snapshot(self: &Arc<Self>) -> Result<(ShipSnap, u64)> {
+        let _excluded = self.exclude_trunk_writes()?;
         self.branches.snapshot()
+    }
+
+    /// Hold the trunk's WAL write lock for a ship-view snapshot (PREREG A6.1). A trunk write
+    /// transaction marks a page changed at the page's first write, and nothing marks it again at
+    /// COMMIT, so a snapshot taken inside it would ship the page's pre-commit bytes and hide the
+    /// commit from every later incremental. The fork's lock, for the fork's reason.
+    /// BLIND SPOT: this covers the snapshot, not the caller's `TrunkImage`; an image taken outside
+    /// the same trunk-quiet window still ships stale bytes, and nothing here can see its age.
+    fn exclude_trunk_writes(self: &Arc<Self>) -> Result<Option<ShipExclusion>> {
+        // Mutant T (PREREG A6.1): no exclusion, as before the fix.
+        if ship_mutant() == "T" {
+            return Ok(None);
+        }
+        let conn = self.connect()?;
+        let pager = conn.pager.load().clone();
+        let excluded = TrunkWritesExcluded::acquire(&pager)?;
+        Ok(Some(ShipExclusion {
+            _excluded: excluded,
+            _conn: conn,
+        }))
     }
 
     /// Send a snapshot taken by [`Database::branch_snapshot`]; holds no lock of this database.

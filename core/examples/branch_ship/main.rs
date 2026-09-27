@@ -368,12 +368,12 @@ impl Read for PipeReader {
     }
 }
 
-const STREAM_HEADER: &str = "stream\tpoint\tlive\tmode\ttotal\ttotal_raw\ttotal_delta\ttotal_delta_fork\ttotal_dedup\tpage_bytes\tref_bytes\tmeta_bytes\tslot_rec\ttrunk_rec\tref_rec\tstate_rec\tdead_rec\tcur_ent\tret_ent\ttret_ent\twritten_ent\tlive_list\tmaps\tdup\tstates_visited\tentries_visited\tslots_visited\tindex_visited\tnodes_visited\titems_checked\tlocked_ops\tlocked_ns";
+const STREAM_HEADER: &str = "stream\tpoint\tlive\tmode\ttotal\ttotal_raw\ttotal_delta\ttotal_delta_fork\ttotal_dedup\tpage_bytes\tref_bytes\tmeta_bytes\tslot_rec\ttrunk_rec\tref_rec\tstate_rec\tdead_rec\tcur_ent\tret_ent\ttret_ent\twritten_ent\tlive_list\tmaps\tdup\tstates_visited\tentries_visited\tslots_visited\tindex_visited\tnodes_visited\titems_checked\tlocked_ops\tlocked_ns\tkids_checked\tbase_lookups\tbase_lookup_nodes";
 
 fn print_stream(point: &str, live: usize, mode: &str, r: &SendReport) {
     let non_payload = r.total_bytes - r.payload_shipped;
     println!(
-        "stream\t{point}\t{live}\t{mode}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "stream\t{point}\t{live}\t{mode}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         r.total_bytes,
         non_payload + r.payload_raw,
         non_payload + r.payload_delta,
@@ -402,6 +402,9 @@ fn print_stream(point: &str, live: usize, mode: &str, r: &SendReport) {
         r.items_checked,
         r.locked_ops,
         r.locked_ns,
+        r.kids_checked,
+        r.base_lookups,
+        r.base_lookup_nodes,
     );
 }
 
@@ -434,8 +437,9 @@ fn pipe(
         .branch_snapshot()
         .unwrap_or_else(|e| not_a_result(&format!("{point}: snapshot refused: {e}")));
     let (view_ops, touched, copied) = b.db.branch_view_work();
+    let (h_states, h_slots, h_tret, h_written) = snap.heights();
     println!(
-        "snap\t{point}\tseq={}\tsnapshot_locked_ns={snap_ns}\tview_ops={view_ops}\tview_nodes_touched={touched}\tview_nodes_copied={copied}",
+        "snap\t{point}\tseq={}\tsnapshot_locked_ns={snap_ns}\tview_ops={view_ops}\tview_nodes_touched={touched}\tview_nodes_copied={copied}\theight_states={h_states}\theight_slots={h_slots}\theight_trunk_retained={h_tret}\theight_written={h_written}",
         snap.seq()
     );
     if args.timing {
@@ -493,8 +497,9 @@ fn pipe(
         Err(e) => not_a_result(&format!("{point}: the replica refused the stream: {e}")),
     };
     let mut sent = sent.unwrap_or_else(|e| not_a_result(&format!("{point}: send failed: {e}")));
-    // The send's whole time under the store mutex was the snapshot (F-S1).
-    sent.locked_ops = 1;
+    // The send's time under the store mutex was the snapshot's (F-S1): `branch_send_snapshot` takes
+    // no store, so its report's locked_ops is 0 and stays so (PREREG A6.2); only its locked_ns is
+    // the snapshot's measured hold.
     sent.locked_ns = snap_ns;
     println!(
         "recv\t{point}\trecords={}\tslots_written={}\tslots_claimed={}\trefs={}\ttrunk_pages={}\tdeaths={}\tgc_freed={}\tstates_new={}\tstates_updated={}\tentries={}\tretained_inserted={}\ttrie_inserts={}\tslots_released={}\tfork_deltas={}\tmid_cycles={}\tmid_cycles_while_sending={during}(interleaving-decided)\tsend_s={send_s:.3}\twall_s={secs:.3}(unlocked)",
