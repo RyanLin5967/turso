@@ -3217,3 +3217,188 @@ fn a_close_waits_for_a_removed_childs_release() {
     );
     let _ = d.into_id();
 }
+
+// ---- r11-churn's T-N1a, T-N1b, T-R2, verbatim from turso 915f8040c (cross-run, r12-noforce PREREG amendment 5) ----
+
+/// Review r12-merge1 N1 (artie-research frontier/round11/r11-bigtxn/merge1_review.md, part 6). An early-released
+/// batch release applies Release(c) and drops the trunk's child count before its flight lands, so a trunk write that
+/// follows retains no pre-image for c. That trunk commit must not become durable ahead of Release(c): when the flight
+/// fails, c comes back at the reopen and must still read the page as of its fork.
+#[test]
+fn a_trunk_commit_after_a_failed_batch_release_does_not_reach_the_branch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let c_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        // The trunk's only child: it reads original(7).
+        let c = trunk.fork_branch().unwrap();
+        c_id = c.id();
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(db.reap_branches(vec![c]).is_err(), "a batch whose flight failed reported success");
+        // Refused or not, it must not reach c.
+        let _ = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+    }
+    let db = reopen(&path, incarnation);
+    let c = db.branch(c_id).expect("its Release never became durable, so the branch is back");
+    assert_eq!(
+        value(&c.connect().unwrap(), 7),
+        Some(original(7)),
+        "the branch reads a trunk write made after its fork"
+    );
+    let _ = c.into_id();
+}
+
+/// N1 through the other early release: the expiry pass that rides on a BRANCH fork. `p`, an older trunk child, keeps
+/// the trunk's child count above zero, so the trunk's copy decision still runs, but it asks only for children forked
+/// since the page's last write: `c` alone, which the failed fork's pass has already released in memory.
+#[test]
+fn a_trunk_commit_after_a_failed_fork_that_reaped_a_trunk_child_does_not_reach_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let c_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        // Retained for p; the page's last trunk write is now after p's fork.
+        set(&trunk, 7, "t1");
+        let c = trunk.fork_branch().unwrap();
+        assert_eq!(value(&c.connect().unwrap(), 7), Some("t1".to_string()), "premise: c forked after 't1'");
+        c.lease(Duration::from_secs(10)).unwrap();
+        c_id = c.into_id();
+        db.branch_lease_clock_advance(Duration::from_secs(11));
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        // Its expiry pass reaps c, riding on this fork's flight, which fails.
+        assert!(p.fork().is_err(), "a fork whose flight failed reported success");
+        let _ = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+        let _ = p.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let c = db.branch(c_id).expect("its Release never became durable, so the branch is back");
+    assert_eq!(
+        value(&c.connect().unwrap(), 7),
+        Some("t1".to_string()),
+        "the branch reads a trunk write made after its fork"
+    );
+    let _ = c.into_id();
+}
+
+/// Review r12-merge1 R2 (part 3). An expiry pass riding on a fork releases an OPEN branch early; its slots must not go
+/// back to the arena at the connection's close before that Release is durable (rule 2). Here the fork's flight fails,
+/// so the Release never becomes durable, and the close must free nothing.
+#[test]
+fn a_close_frees_nothing_of_a_branch_whose_early_release_is_not_durable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let b_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        let cb = b.connect().unwrap();
+        set(&cb, 10, "b");
+        b.lease(Duration::from_secs(10)).unwrap();
+        let held = in_use(&db);
+        let own: BTreeSet<u32> = b.owned_slots().into_iter().collect();
+        assert!(!own.is_empty() && own.is_subset(&held), "premise: b owns slots in use");
+        db.branch_lease_clock_advance(Duration::from_secs(11));
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        // Its expiry pass releases b, which is open and so kept, riding on this fork's flight, which fails.
+        assert!(trunk.fork_branch().is_err(), "a fork whose flight failed reported success");
+        drop(cb);
+        assert_eq!(in_use(&db), held, "the close freed slots whose Release never became durable");
+        b_id = b.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let b = db.branch(b_id).expect("its Release never became durable, so the branch is back");
+    assert_eq!(value(&b.connect().unwrap(), 10), Some("b".to_string()));
+    let _ = b.into_id();
+}
+
+
+// ---- r12-noforce cross-run twins (PREREG amendment 5): r11-churn's T-N1b and T-R2 under no-force ----
+// Under no-force a fork returns before its flight, so "a fork whose flight failed" cannot report the failure: the
+// armed flight fails at the NEXT flush instead. These twins keep each schedule and its property, and meet the
+// failure there (the trunk commit's barrier; a handle's release).
+
+/// Twin of `a_trunk_commit_after_a_failed_fork_that_reaped_a_trunk_child_does_not_reach_it`.
+#[test]
+fn nf_twin_a_trunk_commit_after_an_unforced_fork_that_reaped_a_trunk_child_does_not_reach_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let c_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let p = trunk.fork_branch().unwrap();
+        set(&trunk, 7, "t1");
+        let c = trunk.fork_branch().unwrap();
+        assert_eq!(value(&c.connect().unwrap(), 7), Some("t1".to_string()), "premise: c forked after 't1'");
+        c.lease(Duration::from_secs(10)).unwrap();
+        c_id = c.into_id();
+        db.branch_lease_clock_advance(Duration::from_secs(11));
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        // Not forced: its pass reaps c in memory, and the flight that would carry Release(c) is armed to fail.
+        let e = p.fork().unwrap();
+        // The next flush is this commit's barrier: it must not let the commit reach c.
+        let _ = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+        let _ = e.into_id();
+        let _ = p.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    let c = db.branch(c_id).expect("its Release never became durable, so the branch is back");
+    assert_eq!(
+        value(&c.connect().unwrap(), 7),
+        Some("t1".to_string()),
+        "the branch reads a trunk write made after its fork"
+    );
+    let _ = c.into_id();
+}
+
+/// Twin of `a_close_frees_nothing_of_a_branch_whose_early_release_is_not_durable`.
+#[test]
+fn nf_twin_a_close_frees_nothing_of_a_branch_whose_early_release_rides_an_unforced_fork() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let b_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        let cb = b.connect().unwrap();
+        set(&cb, 10, "b");
+        b.lease(Duration::from_secs(10)).unwrap();
+        let held = in_use(&db);
+        let own: BTreeSet<u32> = b.owned_slots().into_iter().collect();
+        assert!(!own.is_empty() && own.is_subset(&held), "premise: b owns slots in use");
+        db.branch_lease_clock_advance(Duration::from_secs(11));
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        // Not forced: its pass releases b (open, so kept), and the flight that would carry Release(b) is armed to fail.
+        let e = trunk.fork_branch().unwrap();
+        drop(cb);
+        assert_eq!(in_use(&db), held, "the close freed slots whose Release never became durable");
+        b_id = b.into_id();
+        drop(e); // its Release is the next flush: the armed flight fails there
+    }
+    let db = reopen(&path, incarnation);
+    let b = db.branch(b_id).expect("its Release never became durable, so the branch is back");
+    assert_eq!(value(&b.connect().unwrap(), 10), Some("b".to_string()));
+    let _ = b.into_id();
+}
