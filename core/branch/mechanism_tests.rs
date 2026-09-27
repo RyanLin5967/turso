@@ -1322,6 +1322,61 @@ fn a_rolled_back_branch_write_leaves_no_arena_page() {
     assert_eq!(value(&trunk, 10), Some(original(10)));
 }
 
+/// The law FS5's test reaches for, checked directly under FS10 + FS11 (lead ruling 11:05Z; r11-sessions
+/// amendment 18): a branch's write never changes a version another reader still sees — the shared
+/// trunk-page cache and so every other branch, the trunk, or a child. Under FS11 a committed page
+/// is held by reference from its own slot, so FS5's instrument (Shared entries fall after the
+/// writes) no longer measures this; the law is checked by values, and by the nonzero the store
+/// computes: every page the branch rewrites while a child sees it is retained, so the arena grows
+/// by exactly the pages the branch owned (`LAW_NO_RETAIN` rewrites them in place).
+#[test]
+fn a_branch_write_never_changes_a_version_another_reader_sees() {
+    let (_dir, db) = open_db();
+    db.set_fs10(true);
+    db.set_fs10_fill(true);
+    db.set_fs11(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let v = |tag: &str, id: i64| format!("{tag}-{id:04}-{}", "y".repeat(100 - tag.len() - 6));
+    let before: BTreeMap<i64, String> = (1..=300).map(|id| (id, original(id))).collect();
+    let b = trunk.fork_branch().unwrap();
+    let c = b.connect().unwrap();
+    assert_eq!(table(&c), before);
+    c.execute("BEGIN").unwrap();
+    for id in 1..=300 {
+        set(&c, id, &v("b1", id));
+    }
+    c.execute("COMMIT").unwrap();
+    let after_b1: BTreeMap<i64, String> = (1..=300).map(|id| (id, v("b1", id))).collect();
+    // Every other branch of the trunk, and the trunk, still read the originals: the shared cache's
+    // bytes were never written.
+    let o = trunk.fork_branch().unwrap();
+    let oc = o.connect().unwrap();
+    assert_eq!(table(&oc), before, "another branch saw b's write");
+    assert_eq!(table(&trunk), before, "the trunk saw b's write");
+    // A child sees b's version; b rewrites every row again; the child keeps its version.
+    let child = b.fork().unwrap();
+    let cc = child.connect().unwrap();
+    assert_eq!(table(&cc), after_b1);
+    let owned = b.owned_slots().len();
+    let slots = db.branch_stats().arena_slots_in_use;
+    c.execute("BEGIN").unwrap();
+    for id in 1..=300 {
+        set(&c, id, &v("b2", id));
+    }
+    c.execute("COMMIT").unwrap();
+    assert!(owned > 0, "b owned no page before its rewrite");
+    assert_eq!(
+        db.branch_stats().arena_slots_in_use - slots,
+        owned,
+        "b's rewrite did not retain each page its child sees"
+    );
+    assert_eq!(table(&cc), after_b1, "the child saw its parent's later write");
+    assert_eq!(table(&c), (1..=300).map(|id| (id, v("b2", id))).collect::<BTreeMap<_, _>>());
+    assert_eq!(table(&oc), before);
+    assert_eq!(table(&trunk), before);
+}
+
 /// FS9B. Branches forked from a chain read a version an interior ANCESTOR branch holds for them
 /// (its retained pre-image, and its current page) by reference, one shared copy per slot; the copy
 /// goes when the slot is released (`FS9B_NO_EVICT` keeps it) or written: once no child can see a

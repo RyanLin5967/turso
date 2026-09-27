@@ -106,6 +106,7 @@ use std::time::Instant;
 
 use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
+use super::table::BranchTable;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
@@ -332,9 +333,10 @@ struct StoreInner {
     arena: Option<Arena>,
     next_id: u64,
     trunk: TrunkState,
-    /// Boxed (r11-sessions FS12): the table holds a pointer per bucket, not the ~257-byte state, so
-    /// its empty buckets cost 8 bytes each and a resize moves pointers.
-    branches: HashMap<BranchId, Box<BranchState>>,
+    /// Branch states by id: a slot map, so churn leaves no tombstones and the table never rehashes
+    /// (r11-ever's F8, composed here by r11-sessions amendment 18, see [`super::table`]; it
+    /// supersedes this lane's FS12 boxing, whose resizes still moved every pointer).
+    branches: BranchTable<BranchState>,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
     /// FS9 (r11-sessions): clones of retained trunk versions, keyed by (page, born). A version the
@@ -649,7 +651,7 @@ impl BranchStore {
                     lineage: Lineage::default(),
                     written: HashMap::new(),
                 },
-                branches: HashMap::new(),
+                branches: BranchTable::new(),
                 work: BranchWork::default(),
                 retained_clones: HashMap::new(),
             }),
@@ -816,14 +818,14 @@ impl BranchStore {
             }
             Some(_) => {}
         }
-        let id = BranchId(inner.next_id);
+        let id = inner.branches.vacant_id();
         inner.next_id += 1;
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
         inner.trunk.lineage.children.insert(f, id);
         inner.branches.insert(
             id,
-            Box::new(BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default())),
+            BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
         );
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
@@ -833,7 +835,7 @@ impl BranchStore {
     /// the same reason a trunk fork takes the WAL write lock.
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         let mut inner = self.lock();
-        let id = BranchId(inner.next_id);
+        let id = inner.branches.vacant_id();
         let st = inner.branches.get_mut(&parent).ok_or_else(|| gone(parent))?;
         if st.writer {
             return Err(LimboError::Busy);
@@ -857,7 +859,7 @@ impl BranchStore {
         inner.next_id += 1;
         inner
             .branches
-            .insert(id, Box::new(BranchState::new(parent, f, schema, trunk_at, view)));
+            .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
         Ok(id)
     }
 
@@ -997,7 +999,11 @@ impl BranchStore {
             }
             Some(owned) if owned.born == epoch => {}
             Some(owned) => {
-                if st.lineage.has_child_in(owned.born, epoch) {
+                #[cfg(test)]
+                let retain = st.lineage.has_child_in(owned.born, epoch) && !mutants::on("LAW_NO_RETAIN");
+                #[cfg(not(test))]
+                let retain = st.lineage.has_child_in(owned.born, epoch);
+                if retain {
                     let slot = arena.alloc();
                     arena.page_mut(slot).copy_from_slice(pre_image);
                     st.lineage.retain(
@@ -1343,7 +1349,7 @@ impl BranchStore {
             if st.handle || st.open || !st.lineage.children.is_empty() {
                 return freed;
             }
-            let st = *inner.branches.remove(&id).expect("just looked it up");
+            let st = inner.branches.remove(&id).expect("just looked it up");
             let StoreInner {
                 arena,
                 trunk,

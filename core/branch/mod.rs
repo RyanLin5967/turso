@@ -55,6 +55,7 @@
 pub(crate) mod arena;
 pub(crate) mod page_map;
 pub(crate) mod store;
+pub(crate) mod table;
 pub mod walpin;
 
 use std::cell::Cell;
