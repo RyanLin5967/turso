@@ -32,6 +32,8 @@ fn open_db() -> (tempfile::TempDir, Arc<Database>, Arc<Connection>) {
             .unwrap();
     }
     trunk.execute("COMMIT").unwrap();
+    // As branch_peak does before its first fork.
+    trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     (dir, db, trunk)
 }
 
@@ -126,6 +128,11 @@ fn the_free_list_reserve_and_the_touch_read_nothing_they_should_not() {
     let (_dir, db, trunk) = open_db();
     let b = writer(&trunk, 0);
     assert_ne!(db.branch_touch(&b), 0);
+    let gone = writer(&trunk, 2);
+    let probe = Branch::new(db.clone(), gone.id);
+    gone.reap().unwrap();
+    assert_eq!(db.branch_touch(&probe), 0, "a reaped branch's entry still reads as present");
+    std::mem::forget(probe);
     db.branch_reserve_free(10_000);
     assert!(db.branch_resident().arena_free_list_capacity >= 10_000);
     let kept = writer(&trunk, 1);
