@@ -167,6 +167,8 @@ enum Mode {
     /// A full scan of t (count and total length of v): every leaf, ~550 pages, held in the private
     /// cache afterwards (r11-walpin-conc's K × min(capacity, pages touched) term, amendment 11).
     Scan,
+    /// A write rolled back: BEGIN, an UPDATE of the session's row, ROLLBACK (amendment 17).
+    Rollback,
 }
 
 struct Args {
@@ -199,6 +201,9 @@ struct Args {
     /// cache, scanned once by every held session under `PRAGMA cache_size = cache_size`.
     capscan: Option<i64>,
     cache_size: Option<i64>,
+    /// Pinning arm (amendment 17): sessions fork in groups of G; after each group the trunk
+    /// rewrites R rows on R distinct leaves. Every group pins one version of each of those pages.
+    pin: Option<(usize, usize)>,
 }
 
 fn die(msg: &str) -> ! {
@@ -231,6 +236,7 @@ fn parse_args() -> Args {
         interleave: false,
         capscan: None,
         cache_size: None,
+        pin: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -243,6 +249,7 @@ fn parse_args() -> Args {
                     "write" => Mode::Write,
                     "intx" => Mode::Intx,
                     "scan" => Mode::Scan,
+                    "rollback" => Mode::Rollback,
                     other => die(&format!("unknown mode {other}")),
                 })
             }
@@ -275,6 +282,14 @@ fn parse_args() -> Args {
                 args.trunk_writers = val().parse().unwrap_or_else(|_| die("bad --trunk-writers"))
             }
             "--interleave" => args.interleave = true,
+            "--pin" => {
+                let v = val();
+                let (g, r) = v.split_once(',').unwrap_or_else(|| die("--pin needs G,R"));
+                args.pin = Some((
+                    g.parse().unwrap_or_else(|_| die("bad --pin G")),
+                    r.parse().unwrap_or_else(|_| die("bad --pin R")),
+                ));
+            }
             "--capscan" => {
                 args.capscan = Some(val().parse().unwrap_or_else(|_| die("bad --capscan")))
             }
@@ -674,6 +689,19 @@ impl Bench {
                     not_a_result(&format!("session {i} scanned {:?}", rows[0]));
                 }
             }
+            Mode::Rollback => {
+                conn.execute("BEGIN").unwrap();
+                conn.execute(format!(
+                    "UPDATE t SET v = '{}' WHERE id = {row}",
+                    branch_value(row)
+                ))
+                .unwrap();
+                conn.execute("ROLLBACK").unwrap();
+                let got = read_v(&conn, row);
+                if got != self.model.value_at(row, at_fork) {
+                    not_a_result(&format!("session {i} read {got} after its rollback"));
+                }
+            }
             Mode::Intx => {
                 conn.execute("BEGIN").unwrap();
                 let got = read_v(&conn, row);
@@ -889,9 +917,11 @@ fn main() {
         "#\tx\tphase\tsessions\tbytes_mean\tbytes_min\tbytes_max\tallocs_mean\tallocs_min\tallocs_max"
     );
 
-    if b.args.interleave || b.args.capscan.is_some() {
+    if b.args.interleave || b.args.capscan.is_some() || b.args.pin.is_some() {
         let n = *b.args.checkpoints.last().unwrap();
-        if b.args.interleave {
+        if let Some((g, r)) = b.args.pin {
+            pin_arm(&mut b, g, r, n);
+        } else if b.args.interleave {
             interleave_arm(&mut b, n);
         } else {
             let cache = b.args.cache_size.unwrap_or_else(|| die("--capscan needs --cache-size"));
@@ -1395,6 +1425,81 @@ fn interleave_arm(b: &mut Bench, n: usize) {
         "# interleave n={n} after teardown retained_clones={} slot_clones={}",
         b.db.retained_clone_count(),
         b.db.slot_clone_count()
+    );
+}
+
+/// The pinning arm (amendment 17; the fresh-context adversary's claim 3). `n` sessions fork from the
+/// trunk in groups of `g`, each connected and held; after each group the trunk rewrites `r` rows on
+/// `r` distinct leaves (rows 1, 41, 81, …). A trunk write retains the version it supersedes while a
+/// child that forked since that version was written lives, so every group pins one version of each
+/// of those pages whether or not its sessions read them: `n / g × r` retained pages, one page per
+/// (group, page). Per arm: arena pages before and after, bytes per session, and a read check of
+/// every pinned row in every session.
+fn pin_arm(b: &mut Bench, g: usize, r: usize, n: usize) {
+    if g == 0 || r == 0 || n % g != 0 || 1 + 40 * (r as i64 - 1) > TRUNK_ROWS {
+        die("--pin G,R needs G, R >= 1, G dividing n, and R <= 500");
+    }
+    let rows: Vec<i64> = (0..r as i64).map(|k| 1 + 40 * k).collect();
+    let fs = |k: &str| std::env::var(k).unwrap_or_default();
+    let m0 = mem();
+    let arena0 = b.db.branch_stats().arena_slots_in_use;
+    let mut held = Vec::with_capacity(n);
+    for i in 0..n {
+        let at_fork = b.model.writes;
+        let br = b.trunk.fork_branch().unwrap();
+        let conn = br.connect().unwrap();
+        held.push((br, conn, at_fork));
+        if (i + 1) % g == 0 {
+            b.trunk.execute("BEGIN").unwrap();
+            for &row in &rows {
+                let v = b.model.record(row);
+                b.trunk
+                    .execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_gen_value(v)))
+                    .unwrap();
+            }
+            b.trunk.execute("COMMIT").unwrap();
+        }
+    }
+    let m1 = mem();
+    let arena1 = b.db.branch_stats().arena_slots_in_use;
+    for (i, (_, conn, at_fork)) in held.iter().enumerate() {
+        for &row in &rows {
+            let got = read_v(conn, row);
+            let want = b.model.value_at(row, *at_fork);
+            if got != want {
+                not_a_result(&format!("pin arm: session {i} read {got} for row {row}, want {want}"));
+            }
+        }
+    }
+    let m2 = mem();
+    println!(
+        "# pin n={n} g={g} r={r} fs9={:?} fs10={:?} fs11={:?} groups={} arena_before={arena0} \
+         arena_after_forks={arena1} pinned_pages={} pinned_per_session={:.4} \
+         bytes_per_session_forks_and_rewrites={:.2} bytes_per_session_reads={:.2} \
+         bytes_per_pinned_page={:.2} retained_clones={} slot_clones={}",
+        fs("TURSO_R11S_FS9"),
+        fs("TURSO_R11S_FS10"),
+        fs("TURSO_R11S_FS11"),
+        n / g,
+        arena1 - arena0,
+        (arena1 - arena0) as f64 / n as f64,
+        (m1.bytes - m0.bytes) as f64 / n as f64,
+        (m2.bytes - m1.bytes) as f64 / n as f64,
+        if arena1 > arena0 {
+            (m1.bytes - m0.bytes) as f64 / (arena1 - arena0) as f64
+        } else {
+            0.0
+        },
+        b.db.retained_clone_count(),
+        b.db.slot_clone_count(),
+    );
+    for (br, conn, _) in held {
+        drop(conn);
+        br.reap().unwrap();
+    }
+    println!(
+        "# pin n={n} after teardown arena_in_use={}",
+        b.db.branch_stats().arena_slots_in_use
     );
 }
 
