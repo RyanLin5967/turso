@@ -401,6 +401,14 @@ impl Database {
         self.branches.table_capacity()
     }
 
+    /// Rebuilds the branch table into a fresh allocation sized for `capacity` entries; returns `(items, capacity before,
+    /// capacity after)`. Observation arm (r11-bushy amendment 12); HashMap builds only.
+    #[doc(hidden)]
+    #[cfg(not(feature = "branch-slab"))]
+    pub fn branch_table_rebuild(&self, capacity: usize) -> (usize, usize, usize) {
+        self.branches.rebuild_table(capacity)
+    }
+
     /// Branch states with no handle and no open connection. O(branches). Always 0: such a state is
     /// freed the moment it arises.
     #[doc(hidden)]

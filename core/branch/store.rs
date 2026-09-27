@@ -672,6 +672,20 @@ impl BranchStore {
         self.inner.lock().branches.capacity()
     }
 
+    /// Rebuilds the branch table into a fresh allocation sized for `capacity` entries and returns `(items, capacity before,
+    /// capacity after)`. Observation arm (r11-bushy amendment 12): it drops hashbrown's tombstones and sets its bucket count,
+    /// to separate the table's size from its load factor and tombstones. The entries move unchanged.
+    #[cfg(not(feature = "branch-slab"))]
+    pub(crate) fn rebuild_table(&self, capacity: usize) -> (usize, usize, usize) {
+        let mut inner = self.inner.lock();
+        let before = inner.branches.capacity();
+        let old = std::mem::take(&mut inner.branches);
+        let mut fresh = BranchTable::with_capacity(capacity.max(old.len()));
+        fresh.extend(old);
+        inner.branches = fresh;
+        (inner.branches.len(), before, inner.branches.capacity())
+    }
+
     /// Branch states with no handle and no open connection. Observation only; O(branches). Such a
     /// state is freed the moment it arises, so this is 0 whenever the lock is free.
     pub(crate) fn zombies(&self) -> usize {

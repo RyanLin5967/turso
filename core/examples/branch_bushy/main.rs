@@ -118,6 +118,14 @@ enum Interior {
     Release,
 }
 
+/// `--table-rebuild` (amendment 12): at every checkpoint, rebuild the branch table into a fresh allocation. `Same` keeps its
+/// bucket count (drops tombstones only); `Lf50` sizes it to a load factor in (25%, 50%].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rebuild {
+    Same,
+    Lf50,
+}
+
 struct Args {
     shape: Shape,
     rows: Rows,
@@ -139,6 +147,7 @@ struct Args {
     pre: bool,
     refcounted: bool,
     probe: usize,
+    rebuild: Option<Rebuild>,
 }
 
 fn die(msg: &str) -> ! {
@@ -173,6 +182,7 @@ fn parse_args() -> Args {
         pre: false,
         refcounted: false,
         probe: 0,
+        rebuild: None,
     };
     let mut shape = None;
     let mut it = std::env::args().skip(1);
@@ -223,6 +233,16 @@ fn parse_args() -> Args {
             "--pre" => args.pre = true,
             "--probe-forks" => args.probe = num(val(), "--probe-forks") as usize,
             "--refcounted" => args.refcounted = true,
+            "--table-rebuild" => {
+                if cfg!(feature = "branch-slab") {
+                    die("--table-rebuild needs the HashMap branch table (a build without branch-slab)");
+                }
+                args.rebuild = Some(match val().as_str() {
+                    "same" => Rebuild::Same,
+                    "lf50" => Rebuild::Lf50,
+                    other => die(&format!("unknown table rebuild {other}")),
+                })
+            }
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -588,7 +608,24 @@ impl Bench {
             s.map_work.nodes_released - m0.nodes_released,
             s.map_work.refs_released - m0.refs_released,
         );
+        self.rebuild_table(args, x, s.live_branches);
     }
+
+    /// `--table-rebuild` (amendment 12), after the checkpoint's counters and before its probe forks and timed samples.
+    #[cfg(not(feature = "branch-slab"))]
+    fn rebuild_table(&self, args: &Args, x: u64, live: usize) {
+        if let Some(mode) = args.rebuild {
+            let capacity = match mode {
+                Rebuild::Same => self.db.branch_table_capacity(),
+                Rebuild::Lf50 => (live * 7).div_ceil(4),
+            };
+            let (items, before, after) = self.db.branch_table_rebuild(capacity);
+            println!("# table_rebuild x={x} items={items} cap_before={before} cap_after={after} mode={mode:?}");
+        }
+    }
+
+    #[cfg(feature = "branch-slab")]
+    fn rebuild_table(&self, _: &Args, _: u64, _: usize) {}
 
     /// `--probe-forks K` (amendment 10): K forks from `parents`, off the workload's stream, each child pruned at once, with
     /// the work each fork does counted: allocations and bytes, page-map work, page-map nodes, the branch table's capacity.
@@ -1017,7 +1054,7 @@ fn main() {
     println!(
         "# shape={:?} rows={:?} interior={:?} continue={} fr={} fi={} depth={} gamma_milli={} \
          fanout={} beam={} expand={} checkpoints={:?} seed={:#x} timing={} samples={} \
-         refcounted={} observe={OBSERVE} table={} probe_forks={} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
+         refcounted={} observe={OBSERVE} table={} table_rebuild={:?} probe_forks={} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
          trunk_pages={page_count} build={}",
         args.shape,
         args.rows,
@@ -1036,6 +1073,7 @@ fn main() {
         args.samples,
         args.refcounted,
         if cfg!(feature = "branch-slab") { "slab" } else { "hash" },
+        args.rebuild,
         args.probe,
         if cfg!(debug_assertions) { "DEBUG" } else { "release" },
     );
