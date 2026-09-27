@@ -133,8 +133,8 @@ fn a_retained_version_lives_exactly_as_long_as_a_child_that_can_see_it() {
     let b = trunk.fork_branch().unwrap(); // sees v1
     set(&trunk, 7, "v2");
     let after_second = in_use(&db);
-    let v0_slots: BTreeSet<u32> = after_first.difference(&before).copied().collect();
-    let v1_slots: BTreeSet<u32> = after_second.difference(&after_first).copied().collect();
+    let v0_slots: BTreeSet<u64> = after_first.difference(&before).copied().collect();
+    let v1_slots: BTreeSet<u64> = after_second.difference(&after_first).copied().collect();
     assert!(!v0_slots.is_empty() && !v1_slots.is_empty());
 
     assert_eq!(value(&a.connect().unwrap(), 7), Some(original(7)));
