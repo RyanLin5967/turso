@@ -8,7 +8,9 @@
 //!
 //!   cargo run -p turso_core --release --example branch_adv -- --arm binrev --levels 7,10,13
 //!
-//! Arms: grow, churn, binrev, fifo, arena, bigwrite, view, pathcopy, chain (see the PREREG).
+//! Arms: grow, churn, binrev, fifo, arena, bigwrite, view, pathcopy, chain (see the PREREG), and
+//! bigreap (r12-async-destroy's PREREG). Reap events carry the per-hold maxima of the store mutex
+//! over the reap's holds (`hold_*`); `--time` also times every hold.
 //! Every arm checks the store's own accounting against what its input implies and prints
 //! `NOT A RESULT` and exits non-zero on a mismatch.
 
@@ -20,7 +22,7 @@ use std::time::Instant;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use turso_core::branch::bench::StoreBench;
-use turso_core::branch::{BranchId, BranchStats, BranchWork};
+use turso_core::branch::{BranchId, BranchStats, BranchWork, HoldMax};
 
 struct Args {
     arm: String,
@@ -79,7 +81,7 @@ fn parse_args() -> Args {
     a
 }
 
-const NF: usize = 24;
+const NF: usize = 28;
 
 const FIELDS: [&str; NF] = [
     "resolve_calls",
@@ -106,6 +108,10 @@ const FIELDS: [&str; NF] = [
     "writes_in_place",
     "branch_table_seg_alloc_bytes",
     "branch_table_seg_freed_bytes",
+    "lock_holds",
+    "reclaim_holds",
+    "reclaim_map_nodes",
+    "reclaim_slot_decrefs",
 ];
 
 fn fields(w: &BranchWork) -> [u64; NF] {
@@ -134,7 +140,39 @@ fn fields(w: &BranchWork) -> [u64; NF] {
         w.writes_in_place,
         w.branch_table_seg_alloc_bytes,
         w.branch_table_seg_freed_bytes,
+        w.lock_holds,
+        w.reclaim_holds,
+        w.reclaim_map_nodes,
+        w.reclaim_slot_decrefs,
     ]
+}
+
+/// The per-hold maxima over one reap's holds (reset before it, read after it).
+fn hold_cols(h: &HoldMax) -> String {
+    format!(
+        " holds={} hold_freed_max={} hold_heap_examined_max={} hold_meld_steps_max={} \
+         hold_map_nodes_max={} hold_slot_decrefs_max={} hold_frames_copied_max={} hold_ns_max={}",
+        h.holds,
+        h.freed,
+        h.heap_examined,
+        h.meld_steps,
+        h.map_nodes,
+        h.slot_decrefs,
+        h.frames_copied,
+        h.ns
+    )
+}
+
+/// Elementwise maximum of per-reap hold maxima (`holds` too: the most holds one reap took).
+fn fold_hold(acc: &mut HoldMax, h: &HoldMax) {
+    acc.holds = acc.holds.max(h.holds);
+    acc.freed = acc.freed.max(h.freed);
+    acc.heap_examined = acc.heap_examined.max(h.heap_examined);
+    acc.meld_steps = acc.meld_steps.max(h.meld_steps);
+    acc.map_nodes = acc.map_nodes.max(h.map_nodes);
+    acc.slot_decrefs = acc.slot_decrefs.max(h.slot_decrefs);
+    acc.frames_copied = acc.frames_copied.max(h.frames_copied);
+    acc.ns = acc.ns.max(h.ns);
 }
 
 fn idx(name: &str) -> usize {
@@ -405,9 +443,12 @@ fn arm_binrev(a: &Args, fifo: bool) {
         check(order.len() == half as usize - 1, "every interior child is reaped once");
         let mut levels_sum: Vec<Summary> = (0..levels).map(|_| Summary::default()).collect();
         let mut interior = Summary::default();
+        let mut interior_hold = HoldMax::default();
         let last = *order.last().unwrap();
         for &x in &order {
+            s.take_hold_max();
             let op = m.op(|| s.reap(child[x as usize]));
+            fold_hold(&mut interior_hold, &s.take_hold_max());
             if op.out.deferred {
                 die("an interior reap was deferred");
             }
@@ -430,12 +471,16 @@ fn arm_binrev(a: &Args, fifo: bool) {
             }
         }
         interior.print(&format!("L={levels} interior"), a.time);
+        println!("holdmax L={levels} interior{}", hold_cols(&interior_hold));
         for (name, id) in [("A", anchor_a), ("Z", anchor_z)] {
+            s.take_hold_max();
             let op = m.op(|| s.reap(id));
+            let h = s.take_hold_max();
             println!(
-                "event reap L={levels} anchor={name} freed_pages={}{}{}",
+                "event reap L={levels} anchor={name} freed_pages={}{}{}{}",
                 op.out.freed_pages,
                 nonzero(&op.d),
+                hold_cols(&h),
                 timing(&op, a.time)
             );
         }
@@ -681,8 +726,59 @@ fn arm_deadfork(a: &Args, pre: bool) {
     }
 }
 
+/// r12-async-destroy: one reap of k pages, of each kind. `trunk`: a trunk child pinned while the
+/// trunk first-writes pages 1..=k, then a younger sibling forked, then the child reaped: it alone
+/// held the k retained versions. `own`: a trunk child that wrote pages 1..=k itself, reaped: its
+/// page map alone named the k slots.
+fn arm_bigreap(a: &Args) {
+    for &k in &a.list {
+        for kind in ["trunk", "own"] {
+            let s = StoreBench::new(a.page_size);
+            let m = Meter { s: &s, time: a.time };
+            let c = fork_trunk(&s);
+            let pages: Vec<u32> = (1..=k as u32).collect();
+            let sibling = if kind == "trunk" {
+                for &p in &pages {
+                    s.trunk_write(p);
+                }
+                Some(fork_trunk(&s))
+            } else {
+                s.branch_write(c, &pages)
+                    .unwrap_or_else(|e| die(&format!("write: {e}")));
+                None
+            };
+            check(
+                s.stats().arena_slots_in_use == k,
+                "the reaped child alone holds k slots",
+            );
+            s.take_hold_max();
+            let op = m.op(|| s.reap(c));
+            let h = s.take_hold_max();
+            println!(
+                "event reap k={k} kind={kind} freed_pages={}{}{}{}",
+                op.out.freed_pages,
+                nonzero(&op.d),
+                hold_cols(&h),
+                timing(&op, a.time)
+            );
+            check(
+                op.out.freed_pages == k && !op.out.deferred,
+                "the reap freed all k slots",
+            );
+            check(s.stats().arena_slots_in_use == 0, "no slot is left");
+            if let Some(z) = sibling {
+                s.reap(z);
+            }
+            check(s.stats().live_branches == 0, "no branch is left");
+        }
+    }
+}
+
 fn main() {
     let a = parse_args();
+    if a.time {
+        turso_core::branch::set_hold_timing(true);
+    }
     let head = std::process::Command::new("git")
         .args(["rev-parse", "--short=9", "HEAD"])
         .output()
@@ -716,6 +812,7 @@ fn main() {
         "chainow" => arm_chain(&a, true, true),
         "deadfork" => arm_deadfork(&a, false),
         "deadfork_pre" => arm_deadfork(&a, true),
+        "bigreap" => arm_bigreap(&a),
         other => die(&format!("unknown arm {other}")),
     }
     println!("# done");

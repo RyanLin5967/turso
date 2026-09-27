@@ -9,7 +9,7 @@
 //! into a slot the copy decision already chose and touches no index.
 
 use super::store::BranchStore;
-use super::{BranchId, BranchStats, Reaped};
+use super::{BranchId, BranchStats, HoldMax, Reaped};
 use crate::schema::Schema;
 use crate::sync::Arc;
 use crate::Result;
@@ -77,6 +77,11 @@ impl StoreBench {
 
     pub fn stats(&self) -> BranchStats {
         self.store.stats()
+    }
+
+    /// The per-hold maxima since the previous call, which this call resets.
+    pub fn take_hold_max(&self) -> HoldMax {
+        self.store.take_hold_max()
     }
 
     /// Bytes of one entry of the `branches` table (key plus `BranchState`), for a space estimate.

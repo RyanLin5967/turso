@@ -115,6 +115,8 @@ pub(crate) struct Arena {
     /// Observation only: page copies made by evacuation, and chunks freed.
     copied: u64,
     chunks_freed: u64,
+    /// Observation only: slots released.
+    released: u64,
 }
 
 impl Arena {
@@ -135,6 +137,7 @@ impl Arena {
             held_chunks: 0,
             copied: 0,
             chunks_freed: 0,
+            released: 0,
         }
     }
 
@@ -151,6 +154,11 @@ impl Arena {
     /// Page copies made by evacuating chunks, and chunks freed.
     pub(crate) fn compaction(&self) -> (u64, u64) {
         (self.copied, self.chunks_freed)
+    }
+
+    /// Slots released since the arena was created (observation only).
+    pub(crate) fn released(&self) -> u64 {
+        self.released
     }
 
     fn chunk_slot(&mut self, c: u32) -> &mut ChunkSlot {
@@ -426,6 +434,7 @@ impl Arena {
         let frame = self.entry(slot) as u32;
         self.free_handle(slot);
         self.live -= 1;
+        self.released += 1;
         self.free_frame(frame);
         let free = self.held_chunks * CHUNK - self.live;
         if free > self.live + CHUNK {

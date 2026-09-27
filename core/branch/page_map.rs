@@ -59,6 +59,10 @@ pub(crate) struct MapWork {
     pub(crate) slot_increfs: u64,
     /// Slots whose last reference this operation dropped (freed).
     pub(crate) freed: u64,
+    /// Nodes a release visited: the ones it popped, shared or not.
+    pub(crate) nodes_released: u64,
+    /// Slot references a release dropped.
+    pub(crate) decrefs: u64,
 }
 
 /// `Arc::make_mut` that counts: a leaf cloned because another map shares it is one more node naming
@@ -210,10 +214,12 @@ impl PageMap {
     pub(crate) fn release(&mut self, refs: &mut impl SlotRefs, w: &mut MapWork) {
         let mut stack: Vec<Arc<Node>> = self.root.take().into_iter().collect();
         while let Some(node) = stack.pop() {
+            w.nodes_released += 1;
             match Arc::try_unwrap(node) {
                 Ok(Node::Inner(kids)) => stack.extend(kids.into_iter().flatten()),
                 Ok(Node::Leaf(slots)) => {
                     for slot in slots.into_iter().filter(|&s| s != EMPTY) {
+                        w.decrefs += 1;
                         if refs.decref(slot) {
                             w.freed += 1;
                         }

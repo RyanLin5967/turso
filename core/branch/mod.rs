@@ -254,6 +254,44 @@ pub struct BranchWork {
     pub branch_table_seg_alloc_bytes: u64,
     /// Bytes of bucket segments the `branches` table freed (observation only).
     pub branch_table_seg_freed_bytes: u64,
+    /// Holds of the store mutex taken by the mechanism (the observation calls are not counted).
+    pub lock_holds: u64,
+    /// Of those, the holds that reclaimed a reaped branch's space after its unlink (0 on a store
+    /// that frees inside the reap's one hold).
+    pub reclaim_holds: u64,
+    /// Page-map nodes visited by the release of a dead branch's map.
+    pub reclaim_map_nodes: u64,
+    /// Slot references dropped by the release of a dead branch's map.
+    pub reclaim_slot_decrefs: u64,
+}
+
+/// The largest single hold of the branch store's mutex, per measure, since the previous
+/// [`Database::branch_take_hold_max`]. Observation only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HoldMax {
+    /// Holds taken by the mechanism.
+    pub holds: u64,
+    /// Arena slots released inside one hold.
+    pub freed: u64,
+    /// Heap roots compared inside one hold ([`BranchWork::gc_heap_examined`]).
+    pub heap_examined: u64,
+    /// Right-spine nodes walked by heap melds inside one hold ([`BranchWork::gc_meld_steps`]).
+    pub meld_steps: u64,
+    /// Page-map nodes a map release visited inside one hold.
+    pub map_nodes: u64,
+    /// Slot references a map release dropped inside one hold.
+    pub slot_decrefs: u64,
+    /// Pages the arena copied to evacuate a chunk inside one hold.
+    pub frames_copied: u64,
+    /// Nanoseconds of one hold, from acquisition to release; 0 unless [`set_hold_timing`] is on.
+    pub ns: u64,
+}
+
+/// Time every hold of the branch store's mutex into [`HoldMax::ns`]. Observation only; costs two
+/// clock reads per hold while on.
+#[doc(hidden)]
+pub fn set_hold_timing(on: bool) {
+    store::set_hold_timing(on);
 }
 
 impl Branch {
@@ -412,6 +450,13 @@ impl Connection {
 impl Database {
     pub fn branch_stats(&self) -> BranchStats {
         self.branches.stats()
+    }
+
+    /// The per-hold maxima of the branch store's mutex since the previous call, which this call
+    /// resets. Observation only.
+    #[doc(hidden)]
+    pub fn branch_take_hold_max(&self) -> HoldMax {
+        self.branches.take_hold_max()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.
