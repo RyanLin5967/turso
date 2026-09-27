@@ -200,6 +200,9 @@ pub(crate) struct Arena {
     /// Slots handed out and not released. Equal to `high_water - free.len()` except in a catalog
     /// store, whose free slots are mostly in the catalog's free table, not in `free`.
     in_use: usize,
+    /// Bytes written through `write_slot` (always under the store mutex; a `SlotPtr` write is
+    /// not counted), for the store's per-hold copy counter. Observation only.
+    written_bytes: u64,
 }
 
 // SAFETY: the memory chunks are plain memory owned by the arena; access to them is governed by the
@@ -230,6 +233,7 @@ impl Arena {
             free: Blocks::new(),
             free_bits: Blocks::new(),
             in_use: 0,
+            written_bytes: 0,
         }
     }
 
@@ -293,6 +297,7 @@ impl Arena {
             in_use: high_water as usize - free.len(),
             free,
             free_bits,
+            written_bytes: 0,
         })
     }
 
@@ -323,6 +328,7 @@ impl Arena {
             free: Blocks::new(),
             free_bits,
             in_use: in_use as usize,
+            written_bytes: 0,
         };
         for slot in free {
             arena.add_free(slot);
@@ -438,6 +444,7 @@ impl Arena {
     pub(crate) fn write_slot(&mut self, slot: Slot, bytes: &[u8]) -> Result<()> {
         turso_assert!(bytes.len() == self.page_size, "arena write of a wrong-sized page");
         let offset = self.check(slot) as u64 * self.page_size as u64;
+        self.written_bytes += bytes.len() as u64;
         if let Backing::File {
             file,
             dirty,
@@ -531,6 +538,11 @@ impl Arena {
             }
         }
         Ok(0)
+    }
+
+    /// Bytes written through `write_slot` so far (observation only).
+    pub(crate) fn written_bytes(&self) -> u64 {
+        self.written_bytes
     }
 
     /// Bytes of page memory a memory arena has allocated (whole chunks); 0 for a file arena.

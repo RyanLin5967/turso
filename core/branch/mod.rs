@@ -214,6 +214,9 @@ pub enum BranchFailpoint {
     /// As `CommitBetweenMapHolds`, but its record is never flushed: a crash there must recover
     /// none of the commit.
     CommitBetweenMapHoldsUndurable,
+    /// The next multi-hold branch commit, in its second hold of mapping, runs the automatic
+    /// compaction check as if the log wanted compacting: it must be refused there.
+    MaybeCompactBetweenMapHolds,
     /// The next multi-hold branch commit asks for a compaction between its first two holds of
     /// mapping, then goes on: the compaction must not run there (it would snapshot half the commit
     /// and drop its buffered record), so a crash after the commit recovers all of it.
@@ -445,6 +448,16 @@ pub struct BranchWork {
     pub sync_unlocked_bytes: u64,
     pub journal_copied_bytes: u64,
     pub journal_handed_bytes: u64,
+    /// Bytes a compaction wrote and synced under the store mutex (arena, snapshot, log header;
+    /// in catalog mode the arena sync only), counted apart from the per-operation syncs above.
+    pub compact_locked_bytes: u64,
+    /// Compactions and catalog checkpoints that ran (under the store mutex, as every one does).
+    pub compactions: u64,
+    /// Compactions asked for while a commit was between its holds, and refused (amendment 8b).
+    pub compactions_refused: u64,
+    /// Times a holder of the store mutex waited out a flight in the air (its syncs then run while
+    /// the mutex is held, by another thread).
+    pub locked_flight_waits: u64,
 }
 
 /// The largest single hold of the store mutex, per measure, since the previous
@@ -719,6 +732,18 @@ impl Database {
     /// Refused on a read-only handle of a database with branches, whose branch store is not open.
     pub fn branch_stats(&self) -> Result<BranchStats> {
         self.branches.stats()
+    }
+
+    /// Slots whose free waits for a record to be durable (observation only; nothing is matured).
+    #[doc(hidden)]
+    pub fn branch_pending_frees(&self) -> usize {
+        self.branches.pending_free_slots()
+    }
+
+    /// The failpoint armed and not yet spent, if any.
+    #[doc(hidden)]
+    pub fn branch_failpoint_pending(&self) -> Option<BranchFailpoint> {
+        self.branches.failpoint_pending()
     }
 
     /// The per-hold maxima of the branch store's mutex since the previous call; resets them.

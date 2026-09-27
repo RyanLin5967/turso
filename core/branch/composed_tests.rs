@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 const DURABLE: BranchDurability = BranchDurability::Durable { sync: true };
+const CATALOG: BranchDurability = BranchDurability::Catalog { sync: true };
 const VOLATILE: BranchDurability = BranchDurability::Volatile;
 
 fn open(path: &Path, durability: BranchDurability) -> Arc<Database> {
@@ -134,12 +135,19 @@ fn commit_is_bounded(durability: BranchDurability) {
     bc.execute("UPDATE t SET v = 'big2-' || id").unwrap();
     let _ = db.branch_take_hold_max();
     bc.execute("COMMIT").unwrap();
+    // Read before any observation call that returns matured frees itself (`branch_stats`).
+    assert_eq!(
+        db.branch_pending_frees(),
+        0,
+        "the rewriting commit left its frees for a later hold to return all at once"
+    );
     let rewrite = db.branch_take_hold_max();
     assert!(
         rewrite.pages <= 64,
         "one hold of the rewriting commit (map, or the drain of its frees) touched {} pages",
         rewrite.pages
     );
+    assert_eq!(rewrite.copy_bytes, 0, "the rewriting commit copied pages under the store mutex");
     assert_eq!(
         db.branch_stats().unwrap().arena_slots_in_use as u64,
         owned,
@@ -154,6 +162,11 @@ fn commit_is_bounded(durability: BranchDurability) {
 #[test]
 fn a_large_durable_branch_commit_is_bounded_and_syncs_nothing_under_the_mutex() {
     commit_is_bounded(DURABLE);
+}
+
+#[test]
+fn a_large_catalog_branch_commit_is_bounded_and_syncs_nothing_under_the_mutex() {
+    commit_is_bounded(CATALOG);
 }
 
 #[test]
@@ -255,6 +268,11 @@ fn a_spilling_durable_branch_transaction_commits_rolls_back_forks_and_reopens_in
 }
 
 #[test]
+fn a_spilling_catalog_branch_transaction_commits_rolls_back_forks_and_reopens_intact() {
+    spilling_transaction(CATALOG);
+}
+
+#[test]
 fn a_spilling_volatile_branch_transaction_on_the_composed_store_is_intact() {
     spilling_transaction(VOLATILE);
 }
@@ -330,12 +348,17 @@ fn a_spilled_durable_same_length_rewrite_rolls_back_every_owned_and_not_owned_ro
     spilled_rollback_restores(DURABLE, true);
 }
 
+#[test]
+fn a_spilled_catalog_branch_transaction_rolls_back_to_every_pre_transaction_row() {
+    spilled_rollback_restores(CATALOG, false);
+}
+
 /// A crash between two holds of a commit's map (amendment 8b): the record is either durable, and
 /// recovery replays the whole commit, or it is not, and recovery shows none of it. Never half.
-fn crash_between_map_holds(durable_record: bool) {
+fn crash_between_map_holds(mode: BranchDurability, durable_record: bool) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    let db = open(&path, DURABLE);
+    let db = open(&path, mode);
     let trunk = db.connect().unwrap();
     seed(&trunk, 20_000);
     let b = trunk.fork_branch().unwrap();
@@ -351,7 +374,7 @@ fn crash_between_map_holds(durable_record: bool) {
     }));
     assert!(bc.execute("COMMIT").is_err(), "the failpoint did not stop the commit");
     let image = crash_image(&path, dir.path());
-    let db = open(&image, DURABLE);
+    let db = open(&image, mode);
     let bc = db.branch(b_id).unwrap().connect().unwrap();
     let want = if durable_record { "after" } else { "before" };
     let t = table(&bc);
@@ -372,22 +395,34 @@ fn crash_between_map_holds(durable_record: bool) {
 
 #[test]
 fn a_crash_between_map_holds_after_the_record_is_durable_recovers_the_whole_commit() {
-    crash_between_map_holds(true);
+    crash_between_map_holds(DURABLE, true);
 }
 
 #[test]
 fn a_crash_between_map_holds_before_the_record_is_durable_recovers_none_of_it() {
-    crash_between_map_holds(false);
+    crash_between_map_holds(DURABLE, false);
 }
 
-/// The compaction guard (amendment 8a, hazard 4): a compaction asked for between two holds of a
-/// commit's map must not run there. A snapshot taken then would carry the commit's first batch,
-/// drop its buffered record, and a crash after the commit would recover half of it.
 #[test]
-fn a_compaction_between_map_holds_waits_so_a_crash_after_the_commit_recovers_all_of_it() {
+fn a_catalog_crash_between_map_holds_after_the_record_is_durable_recovers_the_whole_commit() {
+    crash_between_map_holds(CATALOG, true);
+}
+
+#[test]
+fn a_catalog_crash_between_map_holds_before_the_record_is_durable_recovers_none_of_it() {
+    crash_between_map_holds(CATALOG, false);
+}
+
+/// The compaction guards (amendment 8a, hazard 4): a compaction asked for between two holds of a
+/// commit's map must not run there - neither an explicit one (`compact_now`) nor the automatic
+/// check (`maybe_compact`, which another thread's operation runs). A snapshot then would carry the
+/// commit's first batch and drop its buffered record, and a crash after the commit would recover
+/// half of it. Premises asserted: the failpoint fired (the commit took more than one map hold)
+/// and the guard refused.
+fn compaction_between_map_holds_waits(mode: BranchDurability, failpoint: BranchFailpoint) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    let db = open(&path, DURABLE);
+    let db = open(&path, mode);
     let trunk = db.connect().unwrap();
     seed(&trunk, 20_000);
     let b = trunk.fork_branch().unwrap();
@@ -396,10 +431,20 @@ fn a_compaction_between_map_holds_waits_so_a_crash_after_the_commit_recovers_all
     bc.execute("UPDATE t SET v = 'before-' || id").unwrap();
     bc.execute("BEGIN").unwrap();
     bc.execute("UPDATE t SET v = 'after-' || id").unwrap();
-    db.branch_failpoint(Some(BranchFailpoint::CompactBetweenMapHolds));
+    let refused = db.branch_stats().unwrap().work.compactions_refused;
+    db.branch_failpoint(Some(failpoint));
     bc.execute("COMMIT").unwrap();
+    assert_eq!(
+        db.branch_failpoint_pending(),
+        None,
+        "the failpoint never fired: the commit did not take a second map hold"
+    );
+    assert!(
+        db.branch_stats().unwrap().work.compactions_refused > refused,
+        "the compaction asked for between map holds was not refused"
+    );
     let image = crash_image(&path, dir.path());
-    let db = open(&image, DURABLE);
+    let db = open(&image, mode);
     let bc = db.branch(b_id).unwrap().connect().unwrap();
     let t = table(&bc);
     assert_eq!(t.len(), 20_000);
@@ -415,4 +460,24 @@ fn a_compaction_between_map_holds_waits_so_a_crash_after_the_commit_recovers_all
         wrong.first()
     );
     integrity_ok(&bc);
+}
+
+#[test]
+fn an_explicit_compaction_between_map_holds_is_refused_and_the_commit_recovers_whole() {
+    compaction_between_map_holds_waits(DURABLE, BranchFailpoint::CompactBetweenMapHolds);
+}
+
+#[test]
+fn an_automatic_compaction_between_map_holds_is_refused_and_the_commit_recovers_whole() {
+    compaction_between_map_holds_waits(DURABLE, BranchFailpoint::MaybeCompactBetweenMapHolds);
+}
+
+#[test]
+fn a_catalog_checkpoint_between_map_holds_is_refused_and_the_commit_recovers_whole() {
+    compaction_between_map_holds_waits(CATALOG, BranchFailpoint::CompactBetweenMapHolds);
+}
+
+#[test]
+fn an_automatic_catalog_checkpoint_between_map_holds_is_refused_and_the_commit_recovers_whole() {
+    compaction_between_map_holds_waits(CATALOG, BranchFailpoint::MaybeCompactBetweenMapHolds);
 }

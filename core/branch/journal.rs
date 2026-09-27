@@ -442,6 +442,8 @@ pub(crate) struct Journal {
     pub(crate) synced_locked_bytes: u64,
     pub(crate) copied_bytes: u64,
     pub(crate) handed_bytes: u64,
+    /// Bytes a compaction wrote and synced (arena, snapshot, log header), under the store mutex.
+    pub(crate) compact_synced_bytes: u64,
     snapshot_len: u64,
     sync: bool,
     /// Set by an I/O failure, or a failpoint standing in for a crash. From then on nothing more is
@@ -515,6 +517,7 @@ impl Journal {
             synced_locked_bytes: 0,
             copied_bytes: 0,
             handed_bytes: 0,
+            compact_synced_bytes: 0,
             snapshot_len: 0,
             sync,
             poisoned: false,
@@ -629,6 +632,7 @@ impl Journal {
             synced_locked_bytes: 0,
             copied_bytes: 0,
             handed_bytes: 0,
+            compact_synced_bytes: 0,
             snapshot_len,
             sync,
             poisoned: false,
@@ -1000,9 +1004,7 @@ impl Journal {
         self.check_live()?;
         // The snapshot names slots that buffered-but-unwritten records also name; they must be
         // durable before the snapshot is.
-        if self.sync {
-            arena.sync()?;
-        }
+        let arena_bytes = if self.sync { arena.sync()? } else { 0 };
         let generation = self.generation + 1;
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(SNAP_MAGIC);
@@ -1043,6 +1045,9 @@ impl Journal {
         if let Err(e) = self.reset_log(generation) {
             self.poisoned = true;
             return Err(e);
+        }
+        if self.sync {
+            self.compact_synced_bytes += arena_bytes + out.len() as u64 + LOG_HEADER_LEN as u64;
         }
         Ok(())
     }
@@ -1153,9 +1158,14 @@ impl Flight {
         self.bytes.iter().map(Vec::len).sum()
     }
 
-    /// Bytes this flight writes and syncs, log and arena (observation only).
+    /// Bytes this flight writes and syncs, log and arena; 0 when the store does not sync
+    /// (observation only).
     pub(crate) fn sync_bytes(&self) -> u64 {
-        self.len() as u64 + self.arena_bytes
+        if self.sync {
+            self.len() as u64 + self.arena_bytes
+        } else {
+            0
+        }
     }
 }
 

@@ -207,6 +207,8 @@ struct Hold<'a> {
     arena_caps: [usize; 3],
     /// The arena's chunk bytes at acquisition, for `zeroed_bytes`.
     arena_chunk_bytes: usize,
+    /// Bytes written into the arena under the mutex so far, at acquisition, for `copy_bytes`.
+    arena_written: u64,
 }
 
 impl Deref for Hold<'_> {
@@ -236,6 +238,8 @@ impl Drop for Hold<'_> {
         }
         let chunk_bytes = inner.arena.as_ref().map_or(0, |a| a.chunk_bytes());
         acc.zeroed_bytes += chunk_bytes.saturating_sub(self.arena_chunk_bytes) as u64;
+        let written = inner.arena.as_ref().map_or(0, |a| a.written_bytes());
+        acc.copy_bytes += written.saturating_sub(self.arena_written);
         inner.work.lock_holds += 1;
         inner.work.locked_copy_bytes += acc.copy_bytes;
         let max = &mut inner.hold_max;
@@ -257,6 +261,16 @@ impl Drop for Hold<'_> {
 /// transaction's commit or rollback: work proportional to a transaction's size is split into holds
 /// of this many pages, so no other branch ever waits for more than this.
 const HOLD_BATCH: usize = 64;
+
+/// A commit counted in `publishing` from its first hold to its last: released on every exit from
+/// `publish`, a panic in a mapping hold included, so compaction is never disabled for good.
+struct Publishing<'a>(&'a BranchStore);
+
+impl Drop for Publishing<'_> {
+    fn drop(&mut self) {
+        self.0.lock().publishing -= 1;
+    }
+}
 
 /// Hold-duration histogram: 8 buckets per octave of nanoseconds.
 const HOLD_HIST_BUCKETS: usize = 8 * 40;
@@ -363,6 +377,8 @@ pub(crate) struct BranchStore {
     /// with the store mutex held (`flush_locked`) and with no lock held (`wait_durable`'s leader).
     flight_locked_bytes: AtomicU64,
     flight_unlocked_bytes: AtomicU64,
+    /// Observation only: times a holder of the store mutex waited out a flight in the air.
+    locked_flight_waits: AtomicU64,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (r11-churn PREREG amendment 4): early lock
@@ -472,6 +488,8 @@ struct StoreInner {
     /// only part of their pages is mapped, so no compaction or catalog checkpoint may snapshot the
     /// state until this is 0 (a snapshot drops the buffered records whose effects it carries).
     publishing: u32,
+    /// `MaybeCompactBetweenMapHolds`: the automatic check runs as if the log wanted compacting.
+    force_compaction: bool,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -1154,6 +1172,7 @@ impl BranchStore {
             group: Group::new(),
             flight_locked_bytes: AtomicU64::new(0),
             flight_unlocked_bytes: AtomicU64::new(0),
+            locked_flight_waits: AtomicU64::new(0),
         }
     }
 
@@ -1291,6 +1310,7 @@ impl BranchStore {
             group: Group::new(),
             flight_locked_bytes: AtomicU64::new(0),
             flight_unlocked_bytes: AtomicU64::new(0),
+            locked_flight_waits: AtomicU64::new(0),
         };
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
@@ -1550,6 +1570,9 @@ impl BranchStore {
     /// never the store mutex, so waiting for it here cannot deadlock.
     fn flush_locked(&self, inner: &mut StoreInner) -> Result<()> {
         let mut g = self.group.state.lock().unwrap();
+        if g.flushing {
+            self.locked_flight_waits.fetch_add(1, Ordering::Relaxed);
+        }
         while g.flushing {
             g = self.group.cv.wait(g).unwrap();
         }
@@ -1568,10 +1591,12 @@ impl BranchStore {
         g.flushing = true;
         drop(g);
         churn_counters::GC_LOCKED_FLUSHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.flight_locked_bytes
-            .fetch_add(flight.sync_bytes(), Ordering::Relaxed);
+        let bytes = flight.sync_bytes();
         let end = flight.end_lsn;
         let written = flight.write();
+        if written.is_ok() {
+            self.flight_locked_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
         if written.is_err() {
             if let Some(journal) = inner.journal.as_mut() {
                 journal.poison();
@@ -1584,6 +1609,9 @@ impl BranchStore {
     /// Wait until no flight is in the air (called under the store mutex, so none can start).
     fn quiesce(&self) {
         let mut g = self.group.state.lock().unwrap();
+        if g.flushing {
+            self.locked_flight_waits.fetch_add(1, Ordering::Relaxed);
+        }
         while g.flushing {
             g = self.group.cv.wait(g).unwrap();
         }
@@ -1597,7 +1625,7 @@ impl BranchStore {
             return;
         }
         let durable = self.group.state.lock().unwrap().durable;
-        inner.mature_frees(durable);
+        inner.mature_frees(durable, HOLD_BATCH - 1);
     }
 
     /// Return every deferred free a flush has covered, however many (the observation calls, whose
@@ -1612,8 +1640,11 @@ impl BranchStore {
             .front()
             .is_some_and(|&(lsn, _)| lsn <= durable)
         {
-            inner.mature_frees(durable);
+            inner.mature_frees(durable, HOLD_BATCH);
         }
+        // An observation call is not a counted hold: what it freed must not be charged to the
+        // next one.
+        inner.hold = HoldAcc::default();
     }
 
     /// Return every deferred free a flush has covered, in holds of at most [`HOLD_BATCH`] (with no
@@ -1629,7 +1660,7 @@ impl BranchStore {
             {
                 return;
             }
-            inner.mature_frees(durable);
+            inner.mature_frees(durable, HOLD_BATCH);
         }
     }
 
@@ -1718,10 +1749,12 @@ impl BranchStore {
                 }
             };
             churn_counters::GC_FLIGHTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.flight_unlocked_bytes
-                .fetch_add(flight.sync_bytes(), Ordering::Relaxed);
+            let bytes = flight.sync_bytes();
             let end = flight.end_lsn;
             let written = flight.write();
+            if written.is_ok() {
+                self.flight_unlocked_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
             if written.is_err() {
                 // Poison the group first (waking the waiters, some of whom hold the store mutex
                 // while they wait), then the journal under the mutex.
@@ -1974,13 +2007,16 @@ impl BranchStore {
     /// operation that triggered it is already durable, and a failure before the rename leaves the
     /// log intact; a failure after it fail-stops the journal (see `Journal::compact`).
     fn maybe_compact(&self, inner: &mut StoreInner) {
+        let wants =
+            inner.force_compaction || inner.journal.as_ref().is_some_and(|j| j.wants_compaction());
         // A commit between its holds has its record buffered and half its pages mapped: a
         // snapshot now would drop the record and keep half the commit. The last hold of that
         // commit tries again.
-        if inner.publishing > 0 {
+        if wants && inner.publishing > 0 {
+            inner.work.compactions_refused += 1;
             return;
         }
-        if inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
+        if wants {
             let t = Instant::now();
             let fsyncs0 = super::journal::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
             if let Err(e) = self.compact(inner, false) {
@@ -2006,6 +2042,9 @@ impl BranchStore {
         // checkpoint) carries every applied operation, including the early-released ones still
         // buffered, so once it is durable so are they.
         let mut g = self.group.state.lock().unwrap();
+        if g.flushing {
+            self.locked_flight_waits.fetch_add(1, Ordering::Relaxed);
+        }
         while g.flushing {
             g = self.group.cv.wait(g).unwrap();
         }
@@ -2016,8 +2055,28 @@ impl BranchStore {
         drop(g);
         let lsn = inner.journal.as_ref().map_or(0, Journal::lsn);
         let compacted = self.compact_quiesced(inner, fail_after_rename);
-        self.land(lsn, compacted.is_ok());
+        match &compacted {
+            Ok(()) => {
+                inner.work.compactions += 1;
+                self.land(lsn, true);
+            }
+            // The journal is still live: the compaction failed before its snapshot became the
+            // truth, so nothing was lost and nothing more is durable. Only the flight slot is
+            // released; poisoning the group here would take commits in memory and fail every one
+            // of them at its wait (review H4).
+            Err(_) if !inner.journal.as_ref().is_some_and(Journal::is_poisoned) => {
+                self.land_unchanged()
+            }
+            Err(_) => self.land(lsn, false),
+        }
         compacted
+    }
+
+    /// End a compaction that made nothing durable and lost nothing: no flight is in the air now.
+    fn land_unchanged(&self) {
+        let mut g = self.group.state.lock().unwrap();
+        g.flushing = false;
+        self.group.cv.notify_all();
     }
 
     fn compact_quiesced(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
@@ -2221,7 +2280,11 @@ impl BranchStore {
             let _ = inner.fatal(e);
             return;
         }
-        inner.release_slots(freed);
+        // A branch released while its connection was open (release_many, or expiry riding on a
+        // fork) may have its Release record only buffered: its slots wait for everything buffered
+        // so far (review H3; rule 2). Reservations wait with them, which only delays them.
+        let now = inner.journal.as_ref().map_or(0, Journal::lsn);
+        inner.defer_frees(now, freed);
         self.sync_trunk_children(&inner);
     }
 
@@ -2429,11 +2492,13 @@ impl BranchStore {
             .then(std::time::Instant::now);
         let arena_caps = guard.arena.as_ref().map_or([0; 3], |a| a.capacities());
         let arena_chunk_bytes = guard.arena.as_ref().map_or(0, |a| a.chunk_bytes());
+        let arena_written = guard.arena.as_ref().map_or(0, |a| a.written_bytes());
         Hold {
             guard,
             start,
             arena_caps,
             arena_chunk_bytes,
+            arena_written,
         }
     }
 
@@ -2633,6 +2698,11 @@ impl BranchStore {
             inner.publishing += 1;
             lsn
         };
+        // Held from here to the last hold, and released on every exit (a panic included).
+        let publishing = Publishing(self);
+        // A volatile store frees at once; its superseded versions are freed after the map, in
+        // their own holds, so no hold maps a batch AND frees one.
+        let mut to_free: Vec<Slot> = Vec::new();
         // 2. The map, in bounded holds.
         let mapped = (|| -> Result<()> {
             for (i, batch) in entries.chunks(HOLD_BATCH).enumerate() {
@@ -2669,6 +2739,12 @@ impl BranchStore {
                         let _ = self.compact_now();
                         inner = self.lock();
                     }
+                    if stop == Some(BranchFailpoint::MaybeCompactBetweenMapHolds) {
+                        inner.failpoint = None;
+                        inner.force_compaction = true;
+                        self.maybe_compact(&mut inner);
+                        inner.force_compaction = false;
+                    }
                 }
                 if let Some(st) = inner.branches.get_mut(&id) {
                     for &(page, _, _) in batch {
@@ -2680,22 +2756,46 @@ impl BranchStore {
                     return Err(inner.fatal(e));
                 }
                 inner.hold.pages += batch.len() as u64;
-                inner.defer_frees(lsn, freed);
+                if lsn == 0 {
+                    to_free.extend(freed);
+                } else {
+                    // This hold decided retain-or-free against the children as they are NOW, so
+                    // its frees wait for everything buffered so far (a child's Release buffered
+                    // after this commit's record included), not only for the record (review H2).
+                    let now = inner.journal.as_ref().map_or(lsn, Journal::lsn);
+                    inner.defer_frees(now, freed);
+                }
             }
             Ok(())
         })();
-        {
+        for batch in to_free.chunks(HOLD_BATCH) {
+            self.lock().release_slots(batch.to_vec());
+        }
+        drop(publishing);
+        if mapped.is_ok() {
             let mut inner = self.lock();
-            inner.publishing -= 1;
-            if mapped.is_ok() {
-                self.maybe_compact(&mut inner);
-            }
+            self.maybe_compact(&mut inner);
         }
         mapped?;
         // 3. The reservations no page used.
         self.return_reserved(id, &leftover);
         // 4. Durability, with no lock held.
         self.wait_durable(lsn)
+    }
+
+    /// Pending slots whose free waits for durability (observation only).
+    pub(crate) fn pending_free_slots(&self) -> usize {
+        self.inner
+            .lock()
+            .pending_free
+            .iter()
+            .map(|(_, freed)| freed.len())
+            .sum()
+    }
+
+    /// The failpoint armed and not yet spent (observation only).
+    pub(crate) fn failpoint_pending(&self) -> Option<BranchFailpoint> {
+        self.inner.lock().failpoint
     }
 
     /// Return the reservations of `pages` (not dirty at commit) to the arena, in bounded holds.
@@ -2856,7 +2956,6 @@ impl BranchStore {
             let slot = arena.alloc();
             arena.write_slot(slot, pre_image)?;
             hold.pages += 1;
-            hold.copy_bytes += pre_image.len() as u64;
             let crc = crc32c::crc32c(pre_image);
             let retained = Retained {
                 born,
@@ -3115,6 +3214,8 @@ impl BranchStore {
                 w.sync_unlocked_bytes = self.flight_unlocked_bytes.load(Ordering::Relaxed);
                 w.journal_copied_bytes = j.map_or(0, |j| j.copied_bytes);
                 w.journal_handed_bytes = j.map_or(0, |j| j.handed_bytes);
+                w.compact_locked_bytes += j.map_or(0, |j| j.compact_synced_bytes);
+                w.locked_flight_waits = self.locked_flight_waits.load(Ordering::Relaxed);
                 w
             },
         })
@@ -3200,6 +3301,7 @@ impl BranchStore {
     pub(crate) fn compact_now(&self) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.publishing > 0 {
+            inner.work.compactions_refused += 1;
             return Err(LimboError::Busy);
         }
         let fail = inner.failpoint == Some(BranchFailpoint::CompactAfterRenameBeforeLogReset);
@@ -3306,6 +3408,7 @@ impl StoreInner {
             hold_max: HoldMax::default(),
             hold_hist: [0; HOLD_HIST_BUCKETS],
             publishing: 0,
+            force_compaction: false,
         }
     }
 
@@ -3887,7 +3990,7 @@ impl StoreInner {
         journal.check_live()?;
         // Every slot the catalog is about to name must be durable first.
         if self.sync {
-            arena.sync()?;
+            self.work.compact_locked_bytes += arena.sync()?;
         }
         let generation = journal.generation() + 1;
         let rows: Vec<(CatBranch, u8)> = cat
@@ -4078,10 +4181,10 @@ impl StoreInner {
         }
     }
 
-    /// Return to the arena deferred frees a flush has covered: at most [`HOLD_BATCH`] slots, the
-    /// front entry split if it is larger (r11-bigtxn port, amendment 8b).
-    fn mature_frees(&mut self, durable: u64) {
-        let mut budget = HOLD_BATCH;
+    /// Return to the arena deferred frees a flush has covered: at most `budget` slots, the front
+    /// entry split if it is larger (r11-bigtxn port, amendment 8b).
+    fn mature_frees(&mut self, durable: u64, budget: usize) {
+        let mut budget = budget;
         while budget > 0 {
             let Some((lsn, front)) = self.pending_free.front_mut() else {
                 break;
