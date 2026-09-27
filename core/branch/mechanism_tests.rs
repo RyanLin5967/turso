@@ -1380,3 +1380,144 @@ fn inherited_ancestor_versions_are_shared_by_slot_and_released_with_it() {
     assert_eq!(value(&a1c, 10), Some("a1-v2".to_string()));
     assert_eq!(value(&trunk, 10), Some(original(10)));
 }
+
+/// Lane r12-composition arm F11-L (artie-research frontier/round12/r12-composition/PREREG.md
+/// amendment 6): FS5's law in the composed system FS5 + FS11. FS5 relies on no write ever reaching
+/// bytes another holder reads (a `Buffer::Shared` is immutable, and a page held by reference is
+/// copied before its first write); FS11 adds holders — arena slots read by reference, and every
+/// committed page held by reference from its slot. `n` writer branches each run FS5's two-phase
+/// rewrite: one transaction over the rows with `id % 3 == 1`, then row by row over `id % 3 == 2`,
+/// which rewrites leaves the first phase committed (under FS11 those leaves are held by reference to
+/// their slots between the phases). After phase 1 every even writer forks a child whose connection
+/// reads its whole table, so it holds the writer's slots by reference while the writer runs phase 2.
+/// Every read is compared with a model; the result is the number of mismatches (the law's counter)
+/// beside the store's counters, so a scale run prints them before any assertion.
+struct Fs5Law {
+    mismatches: u64,
+    unshared_writes: u64,
+    ref_hits: u64,
+    shared_before: u64,
+    shared_after: u64,
+    arena_in_use: usize,
+}
+
+fn fs5_law(n: usize, fs11: bool, pool: bool) -> Fs5Law {
+    let (_dir, db) = open_db();
+    db.set_fs11(fs11);
+    if pool {
+        // r11-sessions' run configuration (v3d): FS10 fill by reference, FS9 and FS9B.
+        db.set_fs10(true);
+        db.set_fs10_fill(true);
+        db.set_fs9(true);
+        db.set_fs9b(true);
+    }
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let before: BTreeMap<i64, String> = (1..=300).map(|id| (id, original(id))).collect();
+    let pages = rows(&trunk, "PRAGMA page_count")[0][0].as_int().unwrap() as usize;
+    let w0 = db.branch_stats().work;
+    let mut mismatches = 0u64;
+    let mut check = |got: BTreeMap<i64, String>, want: &BTreeMap<i64, String>| {
+        mismatches += got.iter().filter(|(id, v)| want.get(id) != Some(v)).count() as u64;
+        mismatches += want.keys().filter(|id| !got.contains_key(id)).count() as u64;
+    };
+    let mut writers = Vec::with_capacity(n);
+    for _ in 0..n {
+        let b = trunk.fork_branch().unwrap();
+        let c = b.connect().unwrap();
+        check(table(&c), &before);
+        writers.push((b, c, before.clone()));
+    }
+    let shared_before: u64 = writers
+        .iter()
+        .map(|(_, c, _)| c.pager.load().shared_cached_pages(pages) as u64)
+        .sum();
+    let mut children = Vec::new();
+    for (i, (b, c, model)) in writers.iter_mut().enumerate() {
+        c.execute("BEGIN").unwrap();
+        for id in (1..=300).step_by(3) {
+            let v = format!("w{i}-p1-{id}");
+            set(c, id, &v);
+            model.insert(id, v);
+        }
+        c.execute("COMMIT").unwrap();
+        if i % 2 == 0 {
+            let child = b.fork().unwrap();
+            let cc = child.connect().unwrap();
+            check(table(&cc), model);
+            children.push((child, cc, model.clone()));
+        }
+        for id in (2..=300).step_by(3) {
+            let v = format!("w{i}-p2-{id}");
+            set(c, id, &v);
+            model.insert(id, v);
+        }
+    }
+    let shared_after: u64 = writers
+        .iter()
+        .map(|(_, c, _)| c.pager.load().shared_cached_pages(pages) as u64)
+        .sum();
+    for (_, c, model) in &writers {
+        check(table(c), model);
+    }
+    for (_, cc, model) in &children {
+        check(table(cc), model);
+    }
+    check(table(&trunk), &before);
+    let fresh = trunk.fork_branch().unwrap();
+    check(table(&fresh.connect().unwrap()), &before);
+    // The writer keeps its writes across a reconnect (FS5's last check), for the first writer.
+    if let Some((b, c, model)) = writers.first_mut() {
+        let (b, model) = (&*b, model.clone());
+        let _ = std::mem::replace(c, trunk.clone());
+        check(table(&b.connect().unwrap()), &model);
+    }
+    let w1 = db.branch_stats().work;
+    Fs5Law {
+        mismatches,
+        unshared_writes: w1.slot_unshared_writes - w0.slot_unshared_writes,
+        ref_hits: w1.slot_ref_hits - w0.slot_ref_hits,
+        shared_before,
+        shared_after,
+        arena_in_use: db.branch_stats().arena_slots_in_use,
+    }
+}
+
+#[test]
+fn fs5_law_holds_with_fs11_on_and_off() {
+    for (fs11, pool) in [(false, false), (true, false), (true, true)] {
+        let r = fs5_law(8, fs11, pool);
+        assert_eq!(r.mismatches, 0, "fs11={fs11} pool={pool}: a read saw bytes it should not");
+        assert!(r.arena_in_use > 0, "fs11={fs11} pool={pool}: nothing was written");
+        if fs11 {
+            assert!(r.ref_hits > 0, "fs11={fs11} pool={pool}: no slot was read by reference");
+        }
+    }
+}
+
+/// F11-L's measured arm; run alone: `F11_N=<writers> F11_CONFIG=off|fs11|pool
+/// <lib test binary> branch::mechanism_tests::fs5_law_scale --ignored --exact --nocapture`.
+#[test]
+#[ignore]
+fn fs5_law_scale() {
+    let n: usize = std::env::var("F11_N").map_or(100, |v| v.parse().expect("F11_N"));
+    let (fs11, pool) = match std::env::var("F11_CONFIG").as_deref() {
+        Ok("off") => (false, false),
+        Ok("fs11") => (true, false),
+        Ok("pool") => (true, true),
+        other => panic!("F11_CONFIG={other:?}: expected off, fs11 or pool"),
+    };
+    let r = fs5_law(n, fs11, pool);
+    println!(
+        "F11L\tn={n}\tfs11={fs11}\tpool={pool}\tmutant={}\tmismatches={}\tunshared_writes={}\tref_hits={}\t\
+         shared_before={}\tshared_after={}\tarena_in_use={}",
+        std::env::var("TURSO_R11S_MUTANT").unwrap_or_default(),
+        r.mismatches,
+        r.unshared_writes,
+        r.ref_hits,
+        r.shared_before,
+        r.shared_after,
+        r.arena_in_use
+    );
+    assert_eq!(r.mismatches, 0, "a read saw bytes it should not");
+}
