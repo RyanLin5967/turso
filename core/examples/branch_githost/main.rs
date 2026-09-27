@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use turso_core::branch::{BranchCatShape, BranchDurability, BranchId, BranchOpenStats};
+use turso_core::branch::{id_set_census, BranchCatShape, BranchDurability, BranchId, BranchOpenStats};
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO};
 
 const ROWS: u64 = 20_000;
@@ -344,6 +344,30 @@ fn files_line(db: &Path) -> String {
         size_of(&with("-branch-log")),
         size_of(&with("-branch-snap")),
         size_of(&with("-branch-arena"))
+    )
+}
+
+/// githost-shape r3 (lead 2026-09-27, the round-12 scout's scale lens; observation only): F-W1's live-id trie
+/// measured. `model`: the set F-W1's first listing would build for the model's live ids (built here, off the
+/// store); `store`: the store's own set, once a listing of this process has built it. Bytes are node
+/// allocations (the node plus two reference counts); the allocator's rounding is not counted. PREREG G7 registers
+/// bytes per live id flat in N.
+fn idset_line(db: &Arc<Database>, model: &Model, n: u64, label: &str, at: &str) -> String {
+    let (len, nodes, bytes) = id_set_census(model.live_ids().into_iter().map(|id| {
+        u32::try_from(id).unwrap_or_else(|_| not_a_result(&format!("branch id {id} past u32")))
+    }));
+    let per = |b: u64, l: u64| b as f64 / l.max(1) as f64;
+    let own = match db.branch_live_id_census() {
+        Some((l, nd, b)) => format!(
+            "idset_store_len={l}\tidset_store_nodes={nd}\tidset_store_bytes={b}\tidset_store_bytes_per_id={:.3}",
+            per(b, l)
+        ),
+        None => "idset_store_len=none".to_string(),
+    };
+    format!(
+        "IDSET\tn={n}\tlabel={label}\tat={at}\tidset_model_len={len}\tidset_model_nodes={nodes}\t\
+         idset_model_bytes={bytes}\tidset_model_bytes_per_id={:.3}\t{own}",
+        per(bytes, len)
     )
 }
 
@@ -797,6 +821,7 @@ fn grow(args: &Args) {
                 size_of(&wal_path),
                 shape_line(&sh)
             );
+            println!("{}", idset_line(&db, &model, model.live, &args.label, "grow"));
             let _ = std::io::stdout().flush();
             next_report *= 2;
         }
@@ -829,6 +854,7 @@ fn grow(args: &Args) {
         sh.ckpt_states_walked - s0.ckpt_states_walked,
         sh.ckpt_rows_written - s0.ckpt_rows_written
     );
+    println!("{}", idset_line(&db, &model, model.live, &args.label, "grow_end"));
     write_steps(&args.db, model.steps);
     let t = Instant::now();
     drop(trunk);
@@ -885,6 +911,7 @@ fn probe(args: &Args) {
         open_line(&os).replace(' ', "\t"),
         shape_line(&db.branch_cat_shape()).replace(' ', "\t")
     );
+    println!("{}", idset_line(&db, &model, n, label, "open"));
     let _ = std::io::stdout().flush();
 
     // Steady state: the schedule continues.
@@ -976,6 +1003,7 @@ fn probe(args: &Args) {
         model.deaths_skipped,
         shape_line(&sh).replace(' ', "\t")
     );
+    println!("{}", idset_line(&db, &model, n, label, "shape"));
     write_steps(&args.db, model.steps);
     let t = Instant::now();
     drop(trunk);

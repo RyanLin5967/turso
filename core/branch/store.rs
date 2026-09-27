@@ -2190,6 +2190,17 @@ impl BranchStore {
         })
     }
 
+    /// githost-shape r3 instrument (observation only): `(len, nodes, bytes)` of F-W1's live-id set as the store
+    /// holds it, or `None` before this process's first listing builds it. A walk under the store mutex,
+    /// O(nodes): called only outside measured operations.
+    pub(crate) fn live_id_census(&self) -> Option<(u64, u64, u64)> {
+        let inner = self.inner.lock();
+        inner.live_ids.as_ref().map(|set| {
+            let (nodes, bytes) = set.census();
+            (set.len(), nodes, bytes)
+        })
+    }
+
     pub(crate) fn read_counters(&self) -> (u64, u64) {
         (
             self.resolve_calls.load(Ordering::Relaxed),

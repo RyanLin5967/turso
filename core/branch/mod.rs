@@ -82,6 +82,9 @@ pub(crate) fn count_page_io(which: usize, n: u64) {
 }
 pub(crate) mod catalog;
 pub(crate) mod id_set;
+
+#[doc(hidden)]
+pub use id_set::id_set_census;
 pub(crate) mod journal;
 pub(crate) mod page_map;
 pub(crate) mod store;
@@ -640,6 +643,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_read_counters(&self) -> (u64, u64) {
         self.branches.read_counters()
+    }
+
+    /// `(len, nodes, bytes)` of F-W1's live-id set as the store holds it, `None` before the first listing of
+    /// this process (githost-shape r3 instrument; a walk, O(nodes)).
+    #[doc(hidden)]
+    pub fn branch_live_id_census(&self) -> Option<(u64, u64, u64)> {
+        self.branches.live_id_census()
     }
 
     /// Trunk pre-images the store holds now (r11-restart lane instrument).

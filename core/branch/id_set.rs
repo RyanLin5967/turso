@@ -36,6 +36,22 @@ impl Node {
     }
 }
 
+/// Bytes of one stored node: the `ArcInner` holding it, two reference counts and the node (githost-shape r3).
+pub(crate) const NODE_BYTES: u64 = (std::mem::size_of::<Node>() + 2 * std::mem::size_of::<usize>()) as u64;
+
+/// `(len, nodes, bytes)` of the set F-W1's first listing would build for exactly these ids (a fresh set, the
+/// ids inserted in order): the census of `IdSet::census` without a store (githost-shape r3 instrument,
+/// observation only).
+#[doc(hidden)]
+pub fn id_set_census(ids: impl IntoIterator<Item = u32>) -> (u64, u64, u64) {
+    let mut set = IdSet::default();
+    for id in ids {
+        set.insert(id);
+    }
+    let (nodes, bytes) = set.census();
+    (set.len(), nodes, bytes)
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct IdSet {
     root: Option<Arc<Node>>,
@@ -139,6 +155,16 @@ impl IdSet {
         self.len -= 1;
     }
 
+    /// githost-shape r3 instrument (observation only; lead 2026-09-27, the round-12 scout's scale lens): the
+    /// set's stored nodes, and their bytes as node allocations. Every node is one `ArcInner<Node>`, sized to the
+    /// larger variant (`Inner`'s 32 kid pointers), so bytes = nodes x `NODE_BYTES`; the allocator's rounding is
+    /// not counted. A walk, O(nodes): call it outside measured operations.
+    pub(crate) fn census(&self) -> (u64, u64) {
+        let mut work = IdSetWork::default();
+        self.for_each(&mut work, &mut |_| {});
+        (work.nodes, work.nodes * NODE_BYTES)
+    }
+
     /// Call `f` on every key, ascending.
     pub(crate) fn for_each(&self, work: &mut IdSetWork, f: &mut impl FnMut(u32)) {
         if let Some(root) = &self.root {
@@ -189,6 +215,23 @@ fn walk(node: &Node, level: u32, base: u32, work: &mut IdSetWork, f: &mut impl F
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The census counts what is stored. 1,000 consecutive ids from 0: the first key makes a leaf root; key 32
+    /// grows it to one inner root (height 1, covering keys below 32^2 = 1,024); so 32 leaves (31 full, one with
+    /// 8 ids) under 1 inner node, 33 nodes, whatever the order. Removing ids 0..32 prunes the first leaf: 32.
+    #[test]
+    fn a_census_counts_leaves_and_inner_nodes() {
+        let mut set = IdSet::default();
+        for k in 0..1_000u32 {
+            set.insert(k);
+        }
+        assert_eq!(set.census(), (33, 33 * NODE_BYTES));
+        assert_eq!(id_set_census((0..1_000u32).rev()), (1_000, 33, 33 * NODE_BYTES));
+        for k in 0..32u32 {
+            set.remove(k);
+        }
+        assert_eq!(set.census(), (32, 32 * NODE_BYTES));
+    }
 
     /// Against a BTreeSet model under random inserts and removes, with clones taken along the way that
     /// must keep their own contents (path copying), and a walk whose node count stays within the
