@@ -2964,8 +2964,6 @@ fn no_force_crash_child() {
     panic!("kill point {at} was never reached");
 }
 
-/// One crash and one recovery; `Err` names every invariant that failed.
-#[cfg(unix)]
 /// How a kill's log is recovered: as the kill left it, cut back to where the in-air flight began,
 /// or TORN — the flight's first 4 KiB lost and its end kept, as power lost mid-flight can leave it.
 #[cfg(unix)]
@@ -2976,6 +2974,7 @@ enum LogAfterKill {
     Torn,
 }
 
+/// One crash and one recovery; `Err` names every invariant that failed.
 #[cfg(unix)]
 fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result<(), String> {
     use std::os::unix::process::ExitStatusExt;
@@ -3075,7 +3074,8 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
             file.set_len(start).unwrap();
         } else {
             let len = file.metadata().unwrap().len();
-            if len < start + 4096 + 16 {
+            // Room for the zeroed 4 KiB and, whole after it, at least the flight's end frame.
+            if len < start + 4096 + 64 {
                 return Err(format!("{at}: the flight is too short to tear ({len} <= {start} + 4 KiB)"));
             }
             use std::os::unix::fs::FileExt;
@@ -3195,6 +3195,11 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
     // The premise that makes this a test of the redo rule: where B's commit was acknowledged, its
     // page was NOT in the arena file when the child died; only the log could bring it back.
     if b_expected && committed && at != "after-release" {
+        if before_redo.is_none() {
+            failed.push(format!(
+                "premise: B's slot {b_slot:?} lay past the end of the arena file, not in Q's freed slot"
+            ));
+        }
         let after_redo = b_slot.map(slot_bytes);
         if after_redo.is_none() || after_redo == before_redo {
             failed.push(format!(
@@ -3297,4 +3302,98 @@ fn a_corrupted_arena_slot_after_a_checkpoint_is_an_error_not_a_wrong_page() {
     };
     assert!(err.contains("checksum"), "{err}");
     assert_eq!(value(&bc, 7), Some(original(7)));
+}
+
+/// r12-noforce review 2, finding 2: a release applied before it is durable (here an expiry pass
+/// riding on a fork that is not forced) removes the child from its parent at once, so a trunk write
+/// after it keeps no pre-image for that child. If the trunk commit then became durable before the
+/// release, a crash would bring the child back SILENTLY reading the new trunk page. The trunk's
+/// barrier must make the release durable first.
+#[test]
+fn a_trunk_commit_does_not_overtake_a_buffered_release() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let db = open_at(&path, durable()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 200);
+    let p = trunk.fork_branch().unwrap(); // the trunk's oldest child, forked before either write
+    set(&trunk, 7, "t1"); // written after p's fork: its pre-image is kept for p
+    let d = trunk.fork_branch().unwrap(); // sees "t1"
+    d.lease(Duration::from_secs(5)).unwrap();
+    let d_id = d.into_id();
+    db.branch_lease_clock_advance(Duration::from_secs(6));
+    // A fork of p (not a trunk child, and not forced): its pass reaps d, whose Release waits in
+    // the buffer.
+    let e = p.fork().unwrap();
+    assert!(!db.branch_ids().unwrap().contains(&d_id), "the pass did not reap d");
+    let before = in_use(&db);
+    set(&trunk, 7, "t2");
+    assert_eq!(
+        in_use(&db),
+        before,
+        "premise: the trunk write kept a pre-image, so the hazard was not reached"
+    );
+    let image = crash_image(&path, dir.path());
+    let crashed = open_at(&image, durable()).unwrap();
+    if crashed.branch_ids().unwrap().contains(&d_id) {
+        let d = crashed.branch(d_id).unwrap();
+        assert_eq!(
+            value(&d.connect().unwrap(), 7),
+            Some("t1".to_string()),
+            "a child came back after a crash reading a trunk page written after its fork"
+        );
+        let _ = d.into_id();
+    }
+    drop(e);
+    drop(p);
+}
+
+/// r12-noforce review 2, finding 1: a child removed by a release that is not yet durable leaves
+/// its parent's later frees depending on that release too. Here the parent A is released durably
+/// while its connection is open; its child D is then reaped by an expiry pass riding on an unforced
+/// fork; A's close frees A's page, which D reads through A. Freed at once, the slot is reused, and a
+/// crash before D's release is durable brings D back reading another branch's bytes.
+#[test]
+fn a_close_waits_for_a_removed_childs_release() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    let d_id;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let a = trunk.fork_branch().unwrap();
+        set(&a.connect().unwrap(), 150, "a");
+        let a_slots = a.owned_slots();
+        assert_eq!(a_slots.len(), 1, "one in-place UPDATE should own exactly one page");
+        let d = a.fork().unwrap(); // reads A's page through A
+        d.lease(Duration::from_secs(5)).unwrap();
+        d_id = d.into_id();
+        db.branch_compact_now().unwrap(); // A's page image leaves the log
+        let ac = a.connect().unwrap();
+        drop(a); // A's release is durable (forced), but its open connection defers the free
+        db.branch_lease_clock_advance(Duration::from_secs(6));
+        let e = trunk.fork_branch().unwrap(); // not forced: its pass reaps D, Release(D) buffered
+        drop(ac); // A's close: A's page may go only once D's release is durable
+        for slot in &a_slots {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "slot {slot}: freed by a close before the child release it depends on was durable"
+            );
+        }
+        let ec = e.connect().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::CommitAfterSlotsBeforeRecord));
+        assert!(ec.execute("UPDATE t SET v = 'e' WHERE id = 150").is_err());
+    }
+    let db = reopen(&path, incarnation);
+    assert!(db.branch_ids().unwrap().contains(&d_id), "premise: D's release was durable");
+    let d = db.branch(d_id).unwrap();
+    assert_eq!(
+        value(&d.connect().unwrap(), 150),
+        Some("a".to_string()),
+        "D came back reading another branch's page through its released parent"
+    );
+    let _ = d.into_id();
 }

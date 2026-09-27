@@ -752,7 +752,9 @@ impl BranchStore {
                             false,
                             &referenced,
                         )?);
-                        inner.journal = Some(recovered.journal);
+                        let mut journal = recovered.journal;
+                        journal.mark_flights();
+                        inner.journal = Some(journal);
                         // Every id handed out before the crash is below the recovered counter:
                         // that is what the durable floors were for. Nothing above it is reserved.
                         inner.id_floor_durable = inner.next_id;
@@ -1152,10 +1154,14 @@ impl BranchStore {
         let due = plan.due;
         let mut freed = Vec::new();
         for &id in &due {
-            inner.apply_release(id, &mut freed);
             if let Some(lsn) = defer_to {
                 inner.releasing_at(id, lsn);
             }
+            inner.apply_release(id, &mut freed);
+        }
+        if defer_to.is_some() {
+            // Applied before durable: a trunk commit must not overtake these releases.
+            self.unsynced.store(true, Ordering::Release);
         }
         let freed_pages = freed.len();
         {
@@ -1612,12 +1618,14 @@ impl BranchStore {
         let mut freed = Vec::new();
         for &i in &todo {
             let before = freed.len();
+            inner.releasing_at(ids[i], lsn);
             inner.apply_release(ids[i], &mut freed);
             out[i].freed_pages = freed.len() - before;
             out[i].deferred = inner.branches.contains_key(&ids[i]);
-            inner.releasing_at(ids[i], lsn);
         }
         inner.defer_frees(lsn, freed);
+        // Applied before durable: a trunk commit must not overtake these releases (see `unsynced`).
+        self.unsynced.store(true, Ordering::Release);
         self.sync_trunk_children(&inner);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
@@ -2291,6 +2299,7 @@ impl StoreInner {
                     }
                     let mut journal =
                         Journal::open_fresh_with(files, page_size, self.sync, fail_lock)?;
+                    journal.mark_flights();
                     let started = journal.start(fail);
                     self.journal = Some(journal);
                     started?;
@@ -2574,6 +2583,10 @@ impl StoreInner {
                 .get_mut(&st.parent)
                 .expect("a live branch's parent is kept while the branch lives");
             parent.lineage.child_gone(st.fork_epoch, freed);
+            // The parent no longer lists this child, so whatever it frees later (its own close, a
+            // retire) was made free by this child's release too: it inherits that release's lsn
+            // (r12-noforce review 2, finding 1).
+            parent.release_lsn = parent.release_lsn.max(st.release_lsn);
             id = st.parent;
         }
     }
