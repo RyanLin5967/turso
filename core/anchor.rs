@@ -104,6 +104,31 @@ impl Anchors {
         }
     }
 
+    /// FZ: whether `s` is some thread slot's deep copy of the schema `src` (read-only walk of the slots).
+    pub(crate) fn is_copy_of(
+        &self,
+        src: &Arc<crate::schema::Schema>,
+        s: &Arc<crate::schema::Schema>,
+    ) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.get()
+                .and_then(|a| a.schema.get())
+                .and_then(|entry| entry.as_ref())
+                .is_some_and(|(src2, copy2)| Arc::ptr_eq(src2, src) && Arc::ptr_eq(copy2, s))
+        })
+    }
+
+    /// FZ: the source schema of which `s` is some thread slot's copy, if any.
+    pub(crate) fn source_of(&self, s: &Arc<crate::schema::Schema>) -> Option<Arc<crate::schema::Schema>> {
+        self.slots.iter().find_map(|slot| {
+            slot.get()
+                .and_then(|a| a.schema.get())
+                .and_then(|entry| entry.as_ref())
+                .filter(|(_, copy)| Arc::ptr_eq(copy, s))
+                .map(|(src, _)| src.clone())
+        })
+    }
+
     /// This thread's anchor, built from `make` on the slot's first use; `None` without FU.
     pub(crate) fn get(&self, make: impl FnOnce() -> Anchor) -> Option<Arc<Anchor>> {
         if self.slots.is_empty() {
@@ -134,10 +159,7 @@ impl<T: ?Sized> DbRef<T> {
         DbRef::Anchored(ptr, anchor.clone())
     }
 
-    /// Whether this handle writes only a per-thread count (the coherence instrument's question).
-    pub(crate) fn is_anchored(&self) -> bool {
-        matches!(self, DbRef::Anchored(..))
-    }
+
 
     /// The object's own `Arc`, for a caller that keeps it beyond this handle (a shared count write).
     pub fn to_arc(&self) -> Arc<T> {

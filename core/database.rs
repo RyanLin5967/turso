@@ -3038,12 +3038,20 @@ impl Database {
         if crate::coherence::fix(crate::coherence::FIX_UARC) {
             if let Some(a) = self.anchor() {
                 let copy = a.schema.get_or_init(|| {
-                    crate::alloc::TryClone::try_clone(&**s)
+                    // Copy from the root source: when `s` is already another slot's copy, its source.
+                    let root = self.anchors.source_of(s).unwrap_or_else(|| s.clone());
+                    crate::alloc::TryClone::try_clone(&*root)
                         .ok()
-                        .map(|copy| (s.clone(), Arc::new(copy)))
+                        .map(|copy| (root, Arc::new(copy)))
                 });
                 if let Some((src, copy)) = copy {
-                    if Arc::ptr_eq(src, s) {
+                    // This thread's own copy (a branch it forked or opened before): a private line.
+                    if Arc::ptr_eq(copy, s) {
+                        return s.clone();
+                    }
+                    // The source, or another thread slot's copy of the same source (a branch forked on another
+                    // thread): this thread's copy, which has the same content.
+                    if Arc::ptr_eq(src, s) || self.anchors.is_copy_of(src, s) {
                         return copy.clone();
                     }
                 }
