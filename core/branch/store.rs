@@ -159,8 +159,14 @@ fn domain_of(slot: Slot) -> usize {
     (slot >> LOCAL_BITS) as usize
 }
 
-fn shard_of(id: BranchId, shards: usize) -> usize {
-    (id.0 & (shards as u64 - 1)) as usize
+fn shard_of(id: BranchId, shards: usize, owner: bool) -> usize {
+    // FO (amendment 22): a thread's id block (FS hands out ID_BLOCK consecutive ids) maps to one stripe.
+    let key = if owner {
+        id.0 >> ID_BLOCK.trailing_zeros()
+    } else {
+        id.0
+    };
+    (key & (shards as u64 - 1)) as usize
 }
 
 pub(crate) struct BranchStore {
@@ -216,6 +222,8 @@ pub(crate) struct BranchStore {
     /// spares, so it never under-reports. [`BranchStore::has_branches`] reclaims the spares before it answers.
     fz: bool,
     live_spares: Box<[CachePadded<AtomicUsize>]>,
+    /// FO (amendment 22): owner-affine stripes (see [`shard_of`]).
+    fo: bool,
     /// r11-coherence FX: copy trunk-cache hits outside the shard lock.
     copy_out: bool,
 }
@@ -255,6 +263,8 @@ std::thread_local! {
 struct Shard {
     branches: HashMap<BranchId, BranchState>,
     domain: Domain,
+    /// The thread slot that last took this shard's lock (the coherence instrument's shard_xfer; counting builds only).
+    last_slot: usize,
     /// Observation only; see [`BranchWork`]. This shard's lock is counted into its `lock_*` fields.
     work: BranchWork,
 }
@@ -761,6 +771,7 @@ impl BranchStore {
                 .map(|i| {
                     CachePadded::new(Mutex::new(Shard {
                         branches: HashMap::new(),
+                        last_slot: usize::MAX,
                         domain: Domain::new(i),
                         work: BranchWork::default(),
                     }))
@@ -791,6 +802,7 @@ impl BranchStore {
             k_children: crate::skiplist::SkipMap::new(),
             k_retained: CachePadded::new(AtomicUsize::new(0)),
             fz: crate::coherence::fix(crate::coherence::FIX_UARC),
+            fo: crate::coherence::fix(crate::coherence::FIX_OWNER),
             live_spares: (0..crate::bravo::THREADS)
                 .map(|_| CachePadded::new(AtomicUsize::new(0)))
                 .collect(),
@@ -873,7 +885,20 @@ impl BranchStore {
     }
 
     fn shard(&self, id: BranchId) -> Held<'_, Shard> {
-        take(&self.shards[shard_of(id, self.shards.len())], self.timed(), None)
+        let mut held = take(&self.shards[self.shard_ix(id)], self.timed(), None);
+        if crate::coherence::ENABLED {
+            let me = crate::bravo::thread_index();
+            if held.last_slot != me {
+                crate::coherence::bump(crate::coherence::Class::ShardXfer, 1);
+                held.last_slot = me;
+            }
+        }
+        held
+    }
+
+    /// The stripe of branch `id` (FO: owner-affine).
+    fn shard_ix(&self, id: BranchId) -> usize {
+        shard_of(id, self.shards.len(), self.fo)
     }
 
     fn trunk(&self, site: TrunkSite) -> Held<'_, TrunkInner> {
@@ -1332,7 +1357,7 @@ impl BranchStore {
                 .or_else(|| st.inherited.get(page));
             let at = st.trunk_at;
             match found {
-                Some(slot) if domain_of(slot) == shard_of(id, self.shards.len()) => {
+                Some(slot) if domain_of(slot) == self.shard_ix(id) => {
                     out.copy_from_slice(shard.domain.page(slot));
                     return Ok(Resolved::Filled);
                 }
@@ -1541,6 +1566,7 @@ impl BranchStore {
                 branches,
                 domain,
                 work,
+                ..
             } = &mut *shard;
             let parent = branches
                 .get_mut(&st.parent)
@@ -2071,7 +2097,7 @@ mod tests {
                             2..=3 if !live.is_empty() && live.len() < 16 => {
                                 let p = live[rng.below(live.len() as u64) as usize];
                                 let id = store.fork_branch(nodes[p].id).unwrap();
-                                if shard_of(id, store.shards.len()) != shard_of(nodes[p].id, store.shards.len()) {
+                                if store.shard_ix(id) != store.shard_ix(nodes[p].id) {
                                     cross_shard += 1;
                                 }
                                 let (sees, depth) = (nodes[p].sees.clone(), nodes[p].depth + 1);

@@ -47,13 +47,16 @@ pub enum Class {
     StoreGlobal,
     /// The pager's init-lock and page-1-slot Arc clones and drops, per connection (amendment 16).
     DbArcInit,
+    /// Store shard-lock acquisitions whose previous acquirer was another thread slot (a handoff of the stripe's
+    /// lines between cores; amendment 22). Not a shared RMW count: `shared_rmw` excludes it.
+    ShardXfer,
     /// Heap allocations (counted by a harness allocator through [`bump`]).
     Malloc,
     /// Heap frees.
     Free,
 }
 
-pub const CLASSES: usize = 17;
+pub const CLASSES: usize = 18;
 
 pub const NAMES: [&str; CLASSES] = [
     "wal_rw_read",
@@ -71,6 +74,7 @@ pub const NAMES: [&str; CLASSES] = [
     "db_hot",
     "store_global",
     "db_arc_init",
+    "shard_xfer",
     "malloc",
     "free",
 ];
@@ -149,6 +153,8 @@ pub const FIX_HEAP: u32 = 2048;
 pub const FIX_REPLICA: u32 = 4096;
 /// V: the harness gives each thread private databases (the engine ignores it) (amendment 15).
 pub const FIX_PRIVATE: u32 = 8192;
+/// FO: owner-affine store stripes: a thread's id block maps to one stripe (amendment 22).
+pub const FIX_OWNER: u32 = 32768;
 /// FZ (U-ARC): the last shared reference counts off the conc path: the connection's and branch handles' database
 /// through a per-thread keeper, branch connections outside n_connections, the branch schema from a per-thread copy,
 /// and the store's live counter sloppy (amendment 21).
@@ -183,6 +189,7 @@ pub fn parse_fixes(s: &str) -> Option<u32> {
             "R" => FIX_REPLICA,
             "V" => FIX_PRIVATE,
             "Z" => FIX_UARC,
+            "O" => FIX_OWNER,
             _ => return None,
         };
     }
@@ -197,7 +204,7 @@ pub fn set_fixes(mask: u32) -> bool {
 /// The fixes this process runs with.
 pub fn fixes() -> u32 {
     *FIXES.get_or_init(|| match std::env::var("TURSO_R11_FIX") {
-        Ok(s) => parse_fixes(&s).unwrap_or_else(|| panic!("TURSO_R11_FIX={s}: expected none, all or letters from W,B,P,S,A,G,K,X,M,Y,U,H,R,V,Z")),
+        Ok(s) => parse_fixes(&s).unwrap_or_else(|| panic!("TURSO_R11_FIX={s}: expected none, all or letters from W,B,P,S,A,G,K,X,M,Y,U,H,R,V,Z,O")),
         Err(_) => 0,
     })
 }

@@ -1692,7 +1692,7 @@ fn print_coh(label: &str, coh: &[u64; coherence::CLASSES], cycles: f64) {
     let mut shared = 0u64;
     for (i, name) in coherence::NAMES.iter().enumerate() {
         line.push_str(&format!(" {name}={:.3}", coh[i] as f64 / cycles));
-        if !name.ends_with("_fail") && *name != "malloc" && *name != "free" {
+        if !name.ends_with("_fail") && *name != "malloc" && *name != "free" && *name != "shard_xfer" {
             shared += coh[i];
         }
     }
