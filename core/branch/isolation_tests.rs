@@ -325,3 +325,171 @@ fn with_fk_a_fork_between_the_last_depart_and_the_bump_reads_the_new_trunk_page(
     }
     crate::coherence::force_fixes_for_test(0);
 }
+
+/// Every row of `t` as the connection sees it, through SQL. A Busy anywhere is named, not unwrapped.
+fn all_rows(conn: &Arc<Connection>, who: &str) -> Vec<(i64, String)> {
+    let rows = match conn
+        .prepare("SELECT id, v FROM t ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+    {
+        Ok(rows) => rows,
+        Err(LimboError::Busy) => panic!("{who}: the read returned Busy"),
+        Err(e) => panic!("{who}: the read failed with {e}"),
+    };
+    rows.iter()
+        .map(|r| match (&r[0], &r[1]) {
+            (Value::Integer(id), Value::Text(v)) => (*id, v.as_str().to_string()),
+            other => panic!("{who}: unexpected row {other:?}"),
+        })
+        .collect()
+}
+
+/// The bytes of every page of the connection's database as its pager reads them (for a branch: its own page space,
+/// the store's shared trunk-page cache, or the WAL / database file under its WAL read snapshot), bypassing the
+/// connection's page cache, inside one read transaction.
+fn page_bytes(conn: &Arc<Connection>, who: &str) -> Vec<Vec<u8>> {
+    let n = conn
+        .prepare("PRAGMA page_count")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap_or_else(|e| panic!("{who}: page_count failed with {e}"))[0][0]
+        .as_int()
+        .unwrap();
+    let pager = conn.get_pager();
+    pager
+        .begin_read_tx()
+        .unwrap_or_else(|e| panic!("{who}: begin_read_tx failed with {e}"));
+    let mut out = Vec::new();
+    for i in 1..=n {
+        let (page, c) = pager.read_page_no_cache(i, None, false).unwrap();
+        pager.io.wait_for_completion(c).unwrap();
+        out.push(page.get_contents().as_slice().to_vec());
+    }
+    pager.end_read_tx();
+    out
+}
+
+fn wal_len(dir: &tempfile::TempDir) -> u64 {
+    std::fs::metadata(dir.path().join("branching.db-wal")).map_or(0, |m| m.len())
+}
+
+/// r11-coherence Z (amendment 25): Z leaves branch connections out of `n_connections`, so the LAST TRUNK close runs
+/// the shutdown checkpoint (TRUNCATE) while a branch connection is still open. Without Z the open branch connection
+/// counts and the trunk's close does not checkpoint. Premise: the WAL file is truncated with Z, and not without.
+/// Then the branch re-reads every row and every page, byte for byte, with no Busy; then a new trunk connection
+/// rewrites every row into the restarted WAL (its frames start again at the WAL's beginning), and the open branch
+/// connection and a fresh one still read the bytes of the fork. What keeps them: the checkpoint copies bytes without
+/// changing them, and every trunk page a live branch sees is copied into the arena at the trunk's first write
+/// (`Pager::copy_on_write_decision`).
+#[test]
+fn with_z_the_last_trunk_close_checkpoints_under_an_open_branch_and_the_branch_reads_the_same_bytes() {
+    for mask in [0, crate::coherence::FIX_UARC] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        let rows = all_rows(&bc, "branch before the close");
+        assert_eq!(rows.len() as i64, ROWS);
+        let pages = page_bytes(&bc, "branch before the close");
+        assert!(pages.len() > 2, "mask {mask}: premise: the table spans several pages");
+        assert!(wal_len(&dir) > 0, "mask {mask}: premise: the seed is in the WAL before the close");
+
+        trunk.close().unwrap();
+        drop(trunk);
+        let truncated = wal_len(&dir) == 0;
+        assert_eq!(
+            truncated,
+            mask != 0,
+            "mask {mask}: premise: the last trunk close truncates the WAL with Z (the branch does not count) and not \
+             without Z (the open branch connection counts)"
+        );
+
+        assert_eq!(all_rows(&bc, "branch after the close"), rows, "mask {mask}: rows moved under the branch");
+        assert!(
+            page_bytes(&bc, "branch after the close") == pages,
+            "mask {mask}: a page's bytes moved under the branch across the last trunk close"
+        );
+
+        let t2 = db.connect().unwrap();
+        t2.execute("BEGIN").unwrap();
+        for id in 1..=ROWS {
+            set(&t2, id, "after-the-close");
+        }
+        t2.execute("COMMIT").unwrap();
+        assert_eq!(value(&t2, 7), "after-the-close", "mask {mask}: premise: the trunk rewrote the rows");
+        assert!(wal_len(&dir) > 0, "mask {mask}: premise: the rewrite is in the WAL");
+
+        assert_eq!(all_rows(&bc, "open branch after the rewrite"), rows, "mask {mask}: the open branch saw the rewrite");
+        assert!(
+            page_bytes(&bc, "open branch after the rewrite") == pages,
+            "mask {mask}: a page's bytes moved under the open branch after the trunk rewrote the restarted WAL"
+        );
+        let bc2 = b.connect().unwrap();
+        assert_eq!(all_rows(&bc2, "fresh branch after the rewrite"), rows, "mask {mask}: a fresh branch connection saw the rewrite");
+        assert!(
+            page_bytes(&bc2, "fresh branch after the rewrite") == pages,
+            "mask {mask}: a fresh branch connection read different bytes"
+        );
+        drop((bc, bc2, t2));
+        drop(b);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// r11-coherence Z (amendment 25): the last trunk close while a branch statement is part-way through its rows. The
+/// branch's WAL read lock is what keeps the frames it reads: with Z the close's TRUNCATE checkpoint must find the
+/// lock and leave the WAL (it retries three times on Busy and gives up without an error), so the WAL is not
+/// truncated while the statement is open, and the statement finishes with the fork's rows. Red with Z if a branch
+/// statement reads without holding the WAL read lock.
+#[test]
+fn with_z_the_last_trunk_close_leaves_the_wal_a_branch_statement_is_reading() {
+    for mask in [0, crate::coherence::FIX_UARC] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        let rows = all_rows(&bc, "branch before the close");
+        let mut st = bc.prepare("SELECT id, v FROM t ORDER BY id").unwrap();
+        let mut got = Vec::new();
+        let take = |st: &mut crate::Statement, got: &mut Vec<(i64, String)>, limit: Option<usize>| loop {
+            if limit.is_some_and(|l| got.len() >= l) {
+                return;
+            }
+            match st.step() {
+                Ok(crate::StepResult::Row) => {
+                    let r: Vec<Value> = st.row().unwrap().get_values().cloned().collect();
+                    match (&r[0], &r[1]) {
+                        (Value::Integer(id), Value::Text(v)) => got.push((*id, v.as_str().to_string())),
+                        other => panic!("mask {mask}: unexpected row {other:?}"),
+                    }
+                }
+                Ok(crate::StepResult::Done) => return,
+                Ok(crate::StepResult::IO | crate::StepResult::Yield | crate::StepResult::Sleep { .. }) => db.io.step().unwrap(),
+                Ok(crate::StepResult::Busy | crate::StepResult::Interrupt) => panic!("mask {mask}: the branch statement returned Busy"),
+                Err(e) => panic!("mask {mask}: the branch statement failed with {e}"),
+            }
+        };
+        take(&mut st, &mut got, Some(1));
+        assert_eq!(got.len(), 1, "mask {mask}: premise: the statement is part-way through");
+        assert!(wal_len(&dir) > 0, "mask {mask}: premise: the seed is in the WAL");
+
+        trunk.close().unwrap();
+        drop(trunk);
+        assert!(
+            wal_len(&dir) > 0,
+            "mask {mask}: the last trunk close truncated the WAL while a branch statement was reading it"
+        );
+        take(&mut st, &mut got, None);
+        assert_eq!(got, rows, "mask {mask}: the branch statement's rows moved across the last trunk close");
+        drop(st);
+        assert_eq!(all_rows(&bc, "branch after its statement"), rows);
+        drop(bc);
+        drop(b);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
