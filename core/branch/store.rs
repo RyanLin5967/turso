@@ -2133,7 +2133,7 @@ mod tests {
         for step in 0..2000 {
             match rng.below(10) {
                 0..=2 if live.len() < 40 => {
-                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
                     live.push((id, epoch, current.clone()));
                     epoch += 1;
                 }
