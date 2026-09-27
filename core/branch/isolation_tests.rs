@@ -404,9 +404,9 @@ fn with_z_the_last_trunk_close_checkpoints_under_an_open_branch_and_the_branch_r
         seed(&trunk);
         let b = trunk.fork_branch().unwrap();
         let bc = b.connect().unwrap();
-        let rows = all_rows(&bc, "branch before the close");
+        let rows = all_rows(&bc, &format!("mask {mask}: branch before the close"));
         assert_eq!(rows.len() as i64, ROWS);
-        let pages = page_bytes(&bc, "branch before the close");
+        let pages = page_bytes(&bc, &format!("mask {mask}: branch before the close"));
         assert!(pages.len() > 2, "mask {mask}: premise: the table spans several pages");
         assert!(wal_len(&dir) > 0, "mask {mask}: premise: the seed is in the WAL before the close");
 
@@ -420,9 +420,9 @@ fn with_z_the_last_trunk_close_checkpoints_under_an_open_branch_and_the_branch_r
              without Z (the open branch connection counts)"
         );
 
-        assert_eq!(all_rows(&bc, "branch after the close"), rows, "mask {mask}: rows moved under the branch");
+        assert_eq!(all_rows(&bc, &format!("mask {mask}: branch after the close")), rows, "mask {mask}: rows moved under the branch");
         assert!(
-            page_bytes(&bc, "branch after the close") == pages,
+            page_bytes(&bc, &format!("mask {mask}: branch after the close")) == pages,
             "mask {mask}: a page's bytes moved under the branch across the last trunk close"
         );
 
@@ -435,18 +435,18 @@ fn with_z_the_last_trunk_close_checkpoints_under_an_open_branch_and_the_branch_r
         assert_eq!(value(&t2, 7), "after-the-close", "mask {mask}: premise: the trunk rewrote the rows");
         assert!(wal_len(&dir) > 0, "mask {mask}: premise: the rewrite is in the WAL");
 
-        assert_eq!(all_rows(&bc, "open branch after the rewrite"), rows, "mask {mask}: the open branch saw the rewrite");
+        assert_eq!(all_rows(&bc, &format!("mask {mask}: open branch after the rewrite")), rows, "mask {mask}: the open branch saw the rewrite");
         assert!(
-            page_bytes(&bc, "open branch after the rewrite") == pages,
+            page_bytes(&bc, &format!("mask {mask}: open branch after the rewrite")) == pages,
             "mask {mask}: a page's bytes moved under the open branch after the trunk rewrote the restarted WAL"
         );
         // A branch serves one connection at a time: the fresh one opens after the open one closes.
         bc.close().unwrap();
         drop(bc);
         let bc2 = b.connect().unwrap();
-        assert_eq!(all_rows(&bc2, "fresh branch after the rewrite"), rows, "mask {mask}: a fresh branch connection saw the rewrite");
+        assert_eq!(all_rows(&bc2, &format!("mask {mask}: fresh branch after the rewrite")), rows, "mask {mask}: a fresh branch connection saw the rewrite");
         assert!(
-            page_bytes(&bc2, "fresh branch after the rewrite") == pages,
+            page_bytes(&bc2, &format!("mask {mask}: fresh branch after the rewrite")) == pages,
             "mask {mask}: a fresh branch connection read different bytes"
         );
         drop((bc2, t2));
@@ -469,7 +469,7 @@ fn with_z_the_last_trunk_close_leaves_the_wal_a_branch_statement_is_reading() {
         seed(&trunk);
         let b = trunk.fork_branch().unwrap();
         let bc = b.connect().unwrap();
-        let rows = all_rows(&bc, "branch before the close");
+        let rows = all_rows(&bc, &format!("mask {mask}: branch before the close"));
         let mut st = bc.prepare("SELECT id, v FROM t ORDER BY id").unwrap();
         let mut got = Vec::new();
         let take = |st: &mut crate::Statement, got: &mut Vec<(i64, String)>, limit: Option<usize>| loop {
@@ -503,7 +503,7 @@ fn with_z_the_last_trunk_close_leaves_the_wal_a_branch_statement_is_reading() {
         take(&mut st, &mut got, None);
         assert_eq!(got, rows, "mask {mask}: the branch statement's rows moved across the last trunk close");
         drop(st);
-        assert_eq!(all_rows(&bc, "branch after its statement"), rows);
+        assert_eq!(all_rows(&bc, &format!("mask {mask}: branch after its statement")), rows);
         drop(bc);
         drop(b);
     }
@@ -538,11 +538,11 @@ fn with_z_a_branch_that_read_nothing_reads_its_fork_after_the_last_trunk_close_a
         }
         t2.execute("COMMIT").unwrap();
         assert_eq!(value(&t2, 7), "after-the-close", "mask {mask}: premise: the trunk rewrote the rows");
-        assert_eq!(all_rows(&bc, "open branch after the rewrite"), expected, "mask {mask}: the branch saw the rewrite");
+        assert_eq!(all_rows(&bc, &format!("mask {mask}: open branch after the rewrite")), expected, "mask {mask}: the branch saw the rewrite");
         bc.close().unwrap();
         drop(bc);
         let bc2 = b.connect().unwrap();
-        assert_eq!(all_rows(&bc2, "fresh branch after the rewrite"), expected, "mask {mask}: a fresh branch connection saw the rewrite");
+        assert_eq!(all_rows(&bc2, &format!("mask {mask}: fresh branch after the rewrite")), expected, "mask {mask}: a fresh branch connection saw the rewrite");
         drop((bc2, t2));
         drop(b);
     }
@@ -596,7 +596,7 @@ fn with_z_an_open_branch_reads_an_untouched_table_through_the_backfilled_file() 
             "mask {mask}: premise: the last trunk close truncates the WAL with Z and not without"
         );
         let misses = db.branch_stats().work.trunk_page_misses;
-        assert_eq!(u_rows(&bc, "open branch, u after the close"), expected, "mask {mask}: u's rows moved across the close");
+        assert_eq!(u_rows(&bc, &format!("mask {mask}: open branch, u after the close")), expected, "mask {mask}: u's rows moved across the close");
         assert!(
             db.branch_stats().work.trunk_page_misses > misses,
             "mask {mask}: premise: u's pages were read through the WAL or the database file, not a cache"
@@ -608,7 +608,7 @@ fn with_z_an_open_branch_reads_an_untouched_table_through_the_backfilled_file() 
         }
         t2.execute("COMMIT").unwrap();
         assert_eq!(value(&t2, 7), "after-the-close", "mask {mask}: premise: the trunk rewrote t");
-        assert_eq!(u_rows(&bc, "open branch, u after the rewrite"), expected, "mask {mask}: u's rows moved after the rewrite");
+        assert_eq!(u_rows(&bc, &format!("mask {mask}: open branch, u after the rewrite")), expected, "mask {mask}: u's rows moved after the rewrite");
         assert_eq!(value(&bc, 7), original(7), "mask {mask}: the branch saw the trunk's rewrite of t");
         drop((bc, t2));
         drop(b);
