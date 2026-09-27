@@ -129,10 +129,14 @@ fn the_free_list_reserve_and_the_touch_read_nothing_they_should_not() {
     let b = writer(&trunk, 0);
     assert_ne!(db.branch_touch(&b), 0);
     let gone = writer(&trunk, 2);
-    let probe = Branch::new(db.clone(), gone.id);
+    // A second handle naming the same id, already released so that its drop does nothing.
+    let probe = Branch {
+        db: db.clone(),
+        id: gone.id,
+        released: true,
+    };
     gone.reap().unwrap();
     assert_eq!(db.branch_touch(&probe), 0, "a reaped branch's entry still reads as present");
-    std::mem::forget(probe);
     db.branch_reserve_free(10_000);
     assert!(db.branch_resident().arena_free_list_capacity >= 10_000);
     let kept = writer(&trunk, 1);
