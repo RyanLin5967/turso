@@ -427,13 +427,16 @@ fn with_z_the_last_trunk_close_checkpoints_under_an_open_branch_and_the_branch_r
             page_bytes(&bc, "open branch after the rewrite") == pages,
             "mask {mask}: a page's bytes moved under the open branch after the trunk rewrote the restarted WAL"
         );
+        // A branch serves one connection at a time: the fresh one opens after the open one closes.
+        bc.close().unwrap();
+        drop(bc);
         let bc2 = b.connect().unwrap();
         assert_eq!(all_rows(&bc2, "fresh branch after the rewrite"), rows, "mask {mask}: a fresh branch connection saw the rewrite");
         assert!(
             page_bytes(&bc2, "fresh branch after the rewrite") == pages,
             "mask {mask}: a fresh branch connection read different bytes"
         );
-        drop((bc, bc2, t2));
+        drop((bc2, t2));
         drop(b);
     }
     crate::coherence::force_fixes_for_test(0);
