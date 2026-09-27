@@ -37,6 +37,11 @@
 //! descheduled inside a lock-free lookup would, and samples the garbage it holds back before letting
 //! go.
 //!
+//! `--gate-fire-check` (counting builds only; r12-phasefair PREREG §4) runs the fork gate split's planted
+//! cases (F1-F4) on this binary's own lock and exits 0 only if every one fires as registered. With the
+//! `coherence` feature a `conc --trunk-writer` cell also prints `# gate`: where the writer's time goes
+//! around the fork gate, per write, in wall and thread-CPU nanoseconds.
+//!
 //! Every read a sample makes is checked against a model the harness keeps itself (never against
 //! the engine), and the engine's own counts are checked against the workload before a number is
 //! printed; a mismatch prints `NOT A RESULT` and exits 1. Beside each latency the harness prints
@@ -316,6 +321,7 @@ fn parse_args() -> Args {
                 }
             }
             "--trunk-writer" => args.trunk_writer = true,
+            "--gate-fire-check" => gate_fire_check(),
             "--pin" => args.pin = true,
             "--reads" => args.reads = val().parse().unwrap_or_else(|_| die("bad --reads")),
             "--victim" => {
@@ -1531,6 +1537,8 @@ struct ConcOut {
     elapsed: Duration,
     /// This thread's coherence counts over its cycles (all zero without the `coherence` feature).
     coh: [u64; coherence::CLASSES],
+    /// This thread's fork-gate table over its cycles (all zero without the `coherence` feature).
+    gate: [u64; coherence::GATE_FIELDS],
 }
 
 /// Where a conc thread forks from (amendment 15): a trunk connection (the shared arms, and each private database's
@@ -1668,6 +1676,7 @@ fn conc_thread(
     let mut gc_freed = 0u64;
     barrier.wait();
     let coh0 = coherence::snapshot();
+    let gate0 = coherence::gate_snapshot();
     let start = Instant::now();
     for c in 0..cycles {
         let row = row_for(base + c);
@@ -1744,6 +1753,7 @@ fn conc_thread(
     }
     let elapsed = start.elapsed();
     let coh1 = coherence::snapshot();
+    let gate1 = coherence::gate_snapshot();
     ConcOut {
         share,
         ops,
@@ -1751,30 +1761,72 @@ fn conc_thread(
         gc_freed,
         elapsed,
         coh: std::array::from_fn(|i| coh1[i] - coh0[i]),
+        gate: std::array::from_fn(|i| gate1[i] - gate0[i]),
     }
 }
 
+/// The trunk writer's account of one cell. Beyond its Busy answers, counting builds fill the rest (r12-phasefair
+/// PREREG §4): its writes' summed wall and thread-CPU ns (the `execute` call, retries included), its own fork-gate and
+/// coherence tables over the cell, and how often it idled because it was ahead of the forks.
+#[derive(Default)]
+struct WriterOut {
+    busy: u64,
+    writes: u64,
+    exec_wall_ns: u64,
+    exec_cpu_ns: u64,
+    idle_yields: u64,
+    gate: [u64; coherence::GATE_FIELDS],
+    coh: [u64; coherence::CLASSES],
+}
+
 /// The `conc` trunk writer for one cell: rewrites the trunk on the spread walk, one write per fork
-/// the workers have completed in this cell, until told to stop. Returns its Busy answers.
-fn trunk_writer_thread(conn: &Arc<Connection>, w: &TrunkWriter, barrier: &Barrier) -> u64 {
-    let mut busy = 0u64;
+/// the workers have completed in this cell, until told to stop.
+fn trunk_writer_thread(conn: &Arc<Connection>, w: &TrunkWriter, barrier: &Barrier) -> WriterOut {
+    let mut out = WriterOut::default();
     let mut in_cell = 0u64;
     barrier.wait();
+    let (gate0, coh0) = (coherence::gate_snapshot(), coherence::snapshot());
     while !w.stop.load(Ordering::Acquire) {
         if in_cell >= w.forks.load(Ordering::Acquire) {
+            out.idle_yields += 1;
             std::thread::yield_now();
             continue;
         }
         let g = w.started.load(Ordering::Relaxed);
         w.started.store(g + 1, Ordering::Release);
         let row = spread_row(g);
-        busy_retry(&mut busy, "trunk_write", || {
+        let at = coherence::ENABLED.then(|| (Instant::now(), coherence::thread_cpu_ns()));
+        busy_retry(&mut out.busy, "trunk_write", || {
             conn.execute(format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_gen_value(g)))
         });
+        if let Some((t0, c0)) = at {
+            out.exec_wall_ns += t0.elapsed().as_nanos() as u64;
+            out.exec_cpu_ns += coherence::thread_cpu_ns().saturating_sub(c0);
+        }
         w.committed.store(g + 1, Ordering::Release);
         in_cell += 1;
     }
-    busy
+    out.writes = in_cell;
+    let (gate1, coh1) = (coherence::gate_snapshot(), coherence::snapshot());
+    out.gate = std::array::from_fn(|i| gate1[i] - gate0[i]);
+    out.coh = std::array::from_fn(|i| coh1[i] - coh0[i]);
+    out
+}
+
+/// `--gate-fire-check`: the fork gate split's planted cases (r12-phasefair PREREG §4). Exits 0 only if every case
+/// fires as registered; a build without the instrument has no cases, and that is a refusal, not a pass.
+fn gate_fire_check() -> ! {
+    let lines = coherence::gate_fire_check();
+    if lines.is_empty() {
+        println!("# gate_fire_check: NO CASES RAN (not a counting build); refused");
+        std::process::exit(3);
+    }
+    for l in &lines {
+        println!("# gate_fire_check {l}");
+    }
+    let failed = lines.iter().filter(|l| !l.starts_with("PASS ")).count();
+    println!("# gate_fire_check cases={} failed={failed}", lines.len());
+    std::process::exit(if failed == 0 { 0 } else { 1 })
 }
 
 /// The box's parallelism at this moment, with nothing shared: `t` threads each run the same fixed
@@ -1833,6 +1885,58 @@ fn print_coh(label: &str, coh: &[u64; coherence::CLASSES], cycles: f64) {
     }
     line.push_str(&format!(" shared_rmw={:.3}", shared as f64 / cycles));
     println!("{line}");
+}
+
+/// Where the trunk writer's time went around the fork gate in one cell, as one `# gate` line (r12-phasefair PREREG §4;
+/// counting builds only). Per write, wall and thread-CPU ns: `exec` (the whole `execute`), `acq` (the parking_lot
+/// acquisition), `revoke` (BRAVO's revocation), `held` (acquired to released) and `outside` = exec - acq - revoke - held
+/// (prepare, the read tx, the WAL write lock, what follows the release). Then the counts: waits per write (the
+/// acquisition found the gate busy), the longest acquisition and hold, the writer's shared-line writes per write, and
+/// the forks' side per cycle: gate holds, their mean wall, refusals.
+fn print_gate(label: &str, w: &WriterOut, forks: &[u64; coherence::GATE_FIELDS], cycles: f64) {
+    use coherence::Gate;
+    if !coherence::ENABLED {
+        return;
+    }
+    let g = |f: Gate| w.gate[f as usize];
+    let per = |x: u64| if w.writes == 0 { 0.0 } else { x as f64 / w.writes as f64 };
+    let inside_wall = g(Gate::WAcqWallNs) + g(Gate::WRevokeWallNs) + g(Gate::WHeldWallNs);
+    let inside_cpu = g(Gate::WAcqCpuNs) + g(Gate::WRevokeCpuNs) + g(Gate::WHeldCpuNs);
+    let mut shared = 0u64;
+    for (i, name) in coherence::NAMES.iter().enumerate() {
+        if !name.ends_with("_fail") && *name != "malloc" && *name != "free" && *name != "shard_xfer" {
+            shared += w.coh[i];
+        }
+    }
+    let r_holds = forks[Gate::RHolds as usize];
+    println!(
+        "# gate {label} writes={} gate_writes={} idle_yields={} exec_wall_pw={:.1} exec_cpu_pw={:.1} \
+         acq_wall_pw={:.1} acq_cpu_pw={:.1} revoke_wall_pw={:.1} revoke_cpu_pw={:.1} held_wall_pw={:.1} \
+         held_cpu_pw={:.1} outside_wall_pw={:.1} outside_cpu_pw={:.1} waited_pw={:.4} revokes_pw={:.4} \
+         acq_wall_max_ns={} held_wall_max_ns={} writer_shared_rmw_pw={:.2} fork_holds_pc={:.4} \
+         fork_hold_wall_ph={:.1} fork_refused_pc={:.4}",
+        w.writes,
+        g(Gate::WAcq),
+        w.idle_yields,
+        per(w.exec_wall_ns),
+        per(w.exec_cpu_ns),
+        per(g(Gate::WAcqWallNs)),
+        per(g(Gate::WAcqCpuNs)),
+        per(g(Gate::WRevokeWallNs)),
+        per(g(Gate::WRevokeCpuNs)),
+        per(g(Gate::WHeldWallNs)),
+        per(g(Gate::WHeldCpuNs)),
+        per(w.exec_wall_ns.saturating_sub(inside_wall)),
+        per(w.exec_cpu_ns.saturating_sub(inside_cpu)),
+        per(g(Gate::WWaited)),
+        per(g(Gate::WRevokes)),
+        g(Gate::WAcqWallMaxNs),
+        g(Gate::WHeldWallMaxNs),
+        per(shared),
+        r_holds as f64 / cycles,
+        if r_holds == 0 { 0.0 } else { forks[Gate::RHoldWallNs as usize] as f64 / r_holds as f64 },
+        forks[Gate::RRefused as usize] as f64 / cycles,
+    );
 }
 
 /// Every hot address the lane counts (PREREG §0 (b)), by name: the engine's table plus the trunk connection's schema.
@@ -2277,7 +2381,7 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
         let cpu0 = cpu_ns();
         let flt0 = faults();
         let db = &b.db;
-        let (wall, outs, writer_busy, pinned) = std::thread::scope(|s| {
+        let (wall, outs, writer_out, pinned) = std::thread::scope(|s| {
             // Amendment 3: an epoch guard held from before the first cycle until the garbage
             // has been sampled, as a reader descheduled inside a lock-free lookup would hold it.
             let pinner = args.pin.then(|| {
@@ -2321,14 +2425,14 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
             let outs: Vec<ConcOut> = handles.into_iter().map(|h| h.join().unwrap()).collect();
             let wall = start.elapsed();
             writer.stop.store(true, Ordering::Release);
-            let writer_busy = wh.map_or(0, |h| h.join().unwrap());
+            let writer_out = wh.map(|h| h.join().unwrap());
             let pinned = pinner.map(|h| {
                 let held = db.branch_stats();
                 unpin.store(true, Ordering::Release);
                 h.join().unwrap();
                 held
             });
-            (wall, outs, writer_busy, pinned)
+            (wall, outs, writer_out, pinned)
         });
         let cpu1 = cpu_ns();
         let flt1 = faults();
@@ -2340,9 +2444,13 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
         let mut busy = [0u64; 8];
         let mut gc_freed = 0u64;
         let mut coh = [0u64; coherence::CLASSES];
+        let mut fork_gate = [0u64; coherence::GATE_FIELDS];
         let (mut th_min, mut th_max) = (Duration::MAX, Duration::ZERO);
         for out in outs {
             for (sum, x) in coh.iter_mut().zip(out.coh) {
+                *sum += x;
+            }
+            for (sum, x) in fork_gate.iter_mut().zip(out.gate) {
                 *sum += x;
             }
             live.extend(out.share);
@@ -2427,7 +2535,7 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
         );
         println!(
             "# k3 N={n} T={t} draw={draw} cycles={} reads={} trunk_writes={writes} r={:.4} \
-             busy_writer={writer_busy} rewritten={rewritten} locked={locked} \
+             busy_writer={} rewritten={rewritten} locked={locked} \
              rewritten_per_cycle={:.4} locked_per_cycle={:.4} trunk_acq_per_cycle={:.4} \
              trunk_wait_frac={:.5} trunk_wait_ns_per_cycle={:.1} retained_examined={} gc_freed={gc_freed} \
              trunk_slots_in_use={} wal_bytes={} trunk_blocking_per_cycle={:.4} \
@@ -2437,6 +2545,7 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
             t * c,
             args.reads,
             writes as f64 / cycles,
+            writer_out.as_ref().map_or(0, |w| w.busy),
             rewritten as f64 / cycles,
             locked as f64 / cycles,
             trunk_acq as f64 / cycles,
@@ -2464,6 +2573,9 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
             d(before.trunk_sites.acquisitions[0], after.trunk_sites.acquisitions[0]) as f64 / cycles,
         );
         print_sites(n, t, draw, cycles, &before, &after);
+        if let Some(w) = &writer_out {
+            print_gate(&format!("N={n} T={t} draw={draw}"), w, &fork_gate, cycles);
+        }
         if mode != ConcMode::Shared || !b.db.branch_trunk_reads_lockfree() {
             continue;
         }

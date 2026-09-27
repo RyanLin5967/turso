@@ -116,6 +116,179 @@ pub fn snapshot() -> [u64; CLASSES] {
 /// Whether this build carries the instrument.
 pub const ENABLED: bool = cfg!(feature = "coherence");
 
+// --- The fork gate's time split (r12-phasefair PREREG §4) ----------------------------------------------------------
+// Where a trunk writer's time goes around G's fork gate, on the thread that holds it: the parking_lot acquisition, the
+// BRAVO revocation, and the hold, each in wall and thread-CPU nanoseconds, so time off CPU (parked, or preempted) is
+// told apart from time on it. Readers (trunk forks) add their holds and refusals. The gate is the only user of
+// BravoRwLock's raw entry points, which is where these are taken. Counting builds only: without the feature every
+// call below is empty and every table reads zero. Blind spot: time is attributed to the thread that holds the gate.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Gate {
+    /// Exclusive acquisitions (trunk write transactions).
+    WAcq,
+    /// Acquisitions whose parking_lot `try_write` failed first (readers inside, or a writer), so `write()` waited.
+    WWaited,
+    /// Wall and thread-CPU ns spent in the parking_lot acquisition.
+    WAcqWallNs,
+    WAcqCpuNs,
+    /// The longest single acquisition, wall ns.
+    WAcqWallMaxNs,
+    /// BRAVO bias revocations, and the wall and CPU ns of each scan and its wait for fast readers.
+    WRevokes,
+    WRevokeWallNs,
+    WRevokeCpuNs,
+    /// From acquired (after any revocation) to release: wall and CPU ns.
+    WHeldWallNs,
+    WHeldCpuNs,
+    /// The longest single hold, wall ns.
+    WHeldWallMaxNs,
+    /// Shared holds (forks inside the gate) and their wall ns.
+    RHolds,
+    RHoldWallNs,
+    /// Shared `try_read` refusals (a writer holds or awaits the gate).
+    RRefused,
+}
+
+pub const GATE_FIELDS: usize = 14;
+
+pub const GATE_NAMES: [&str; GATE_FIELDS] = [
+    "w_acq",
+    "w_waited",
+    "w_acq_wall_ns",
+    "w_acq_cpu_ns",
+    "w_acq_wall_max_ns",
+    "w_revokes",
+    "w_revoke_wall_ns",
+    "w_revoke_cpu_ns",
+    "w_held_wall_ns",
+    "w_held_cpu_ns",
+    "w_held_wall_max_ns",
+    "r_holds",
+    "r_hold_wall_ns",
+    "r_refused",
+];
+
+#[cfg(feature = "coherence")]
+mod gate_imp {
+    use super::GATE_FIELDS;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static GATE: [Cell<u64>; GATE_FIELDS] = const { [const { Cell::new(0) }; GATE_FIELDS] };
+        /// When this thread's current hold began: (wall ns, thread-CPU ns) for a write hold, wall ns for a read hold.
+        pub(super) static HELD_AT: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+        pub(super) static READ_AT: Cell<u64> = const { Cell::new(0) };
+    }
+}
+
+/// Add `n` to this thread's gate field `f`.
+#[inline(always)]
+pub fn gate_add(f: Gate, n: u64) {
+    #[cfg(feature = "coherence")]
+    gate_imp::GATE.with(|g| g[f as usize].set(g[f as usize].get() + n));
+    #[cfg(not(feature = "coherence"))]
+    let _ = (f, n);
+}
+
+/// Raise this thread's gate field `f` to `v` if it is below.
+#[inline(always)]
+pub fn gate_max(f: Gate, v: u64) {
+    #[cfg(feature = "coherence")]
+    gate_imp::GATE.with(|g| g[f as usize].set(g[f as usize].get().max(v)));
+    #[cfg(not(feature = "coherence"))]
+    let _ = (f, v);
+}
+
+/// A write hold of the gate begins on this thread at (`wall`, `cpu`).
+#[inline(always)]
+pub fn gate_write_held_from(wall: u64, cpu: u64) {
+    #[cfg(feature = "coherence")]
+    gate_imp::HELD_AT.with(|c| c.set((wall, cpu)));
+    #[cfg(not(feature = "coherence"))]
+    let _ = (wall, cpu);
+}
+
+/// This thread's write hold of the gate ends now.
+#[inline(always)]
+pub fn gate_write_released() {
+    #[cfg(feature = "coherence")]
+    {
+        let (w0, c0) = gate_imp::HELD_AT.with(|c| c.get());
+        let (w, c) = (wall_ns().saturating_sub(w0), thread_cpu_ns().saturating_sub(c0));
+        gate_add(Gate::WHeldWallNs, w);
+        gate_add(Gate::WHeldCpuNs, c);
+        gate_max(Gate::WHeldWallMaxNs, w);
+    }
+}
+
+/// A read hold of the gate begins on this thread now.
+#[inline(always)]
+pub fn gate_read_held() {
+    #[cfg(feature = "coherence")]
+    gate_imp::READ_AT.with(|c| c.set(wall_ns()));
+}
+
+/// This thread's read hold of the gate ends now.
+#[inline(always)]
+pub fn gate_read_released() {
+    #[cfg(feature = "coherence")]
+    {
+        let w0 = gate_imp::READ_AT.with(|c| c.get());
+        gate_add(Gate::RHolds, 1);
+        gate_add(Gate::RHoldWallNs, wall_ns().saturating_sub(w0));
+    }
+}
+
+/// This thread's gate totals so far, in [`GATE_NAMES`] order. All zeros without the `coherence` feature.
+pub fn gate_snapshot() -> [u64; GATE_FIELDS] {
+    #[cfg(feature = "coherence")]
+    {
+        gate_imp::GATE.with(|g| std::array::from_fn(|i| g[i].get()))
+    }
+    #[cfg(not(feature = "coherence"))]
+    {
+        [0; GATE_FIELDS]
+    }
+}
+
+/// Monotonic wall nanoseconds since the first call in this process.
+pub fn wall_ns() -> u64 {
+    static E: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    E.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+/// This thread's CPU time, ns (CLOCK_THREAD_CPUTIME_ID: it does not advance while the thread is parked or preempted).
+/// Zero where the clock is not available.
+pub fn thread_cpu_ns() -> u64 {
+    #[cfg(target_family = "unix")]
+    {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+            return 0;
+        }
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        0
+    }
+}
+
+/// The split's fire-check (PREREG §4 F1-F3), run on this build's own gate type: each planted case must show in the
+/// counts it is meant to move. Returns one line per check with PASS or FAIL. Counting builds only (else empty).
+pub fn gate_fire_check() -> Vec<String> {
+    #[cfg(feature = "coherence")]
+    {
+        crate::bravo::split_fire_check()
+    }
+    #[cfg(not(feature = "coherence"))]
+    {
+        Vec::new()
+    }
+}
+
 // --- The published fixes, selected at run time (r11-coherence amendment 2) -----------------------------------------
 // Every fix is compiled into every build, instrumented or not, and chosen once per process from TURSO_R11_FIX (or
 // `set_fixes` before first use), so one binary measures each arm under the same code generation. A structure that

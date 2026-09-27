@@ -167,22 +167,29 @@ impl<T: ?Sized> BravoRwLock<T> {
         crate::coherence::bump(crate::coherence::Class::WalRwWrite, 2);
         let g = self.inner.write();
         if self.enabled && self.rbias.load(Ordering::Acquire) {
-            let start = Instant::now();
-            self.rbias.store(false, Ordering::Release);
-            fence(Ordering::SeqCst);
-            let id = self.id();
-            for line in VISIBLE.iter() {
-                for slot in line.0.iter() {
-                    while slot.load(Ordering::Acquire) == id {
-                        std::hint::spin_loop();
-                    }
-                }
-            }
-            let cost = start.elapsed().as_nanos() as u64;
-            self.inhibit_until
-                .store(now_ns() + cost * INHIBIT_MULTIPLIER as u64, Ordering::Relaxed);
+            self.revoke();
         }
         BravoWriteGuard(g)
+    }
+
+    /// Revoke the reader bias: clear it, wait until no visible reader names this lock, and inhibit re-biasing for
+    /// INHIBIT_MULTIPLIER times the revocation's cost. The caller holds `inner` exclusively.
+    #[inline(always)]
+    fn revoke(&self) {
+        let start = Instant::now();
+        self.rbias.store(false, Ordering::Release);
+        fence(Ordering::SeqCst);
+        let id = self.id();
+        for line in VISIBLE.iter() {
+            for slot in line.0.iter() {
+                while slot.load(Ordering::Acquire) == id {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        let cost = start.elapsed().as_nanos() as u64;
+        self.inhibit_until
+            .store(now_ns() + cost * INHIBIT_MULTIPLIER as u64, Ordering::Relaxed);
     }
 
     /// Shared access without the fast path, for code that needs parking_lot's guard.
@@ -201,7 +208,11 @@ pub enum RawRead {
 impl<T: ?Sized> BravoRwLock<T> {
     /// `try_read`, holding the lock past the call: the token says how to release it.
     pub fn try_read_raw(&self) -> Option<RawRead> {
-        let g = self.try_read()?;
+        let Some(g) = self.try_read() else {
+            crate::coherence::gate_add(crate::coherence::Gate::RRefused, 1);
+            return None;
+        };
+        crate::coherence::gate_read_held();
         let token = match &g {
             BravoReadGuard::Fast { slot, .. } => RawRead::Fast(*slot),
             BravoReadGuard::Slow(_) => RawRead::Slow,
@@ -217,15 +228,44 @@ impl<T: ?Sized> BravoRwLock<T> {
     /// # Safety
     /// `token` came from this lock's `try_read_raw` and was not released before.
     pub unsafe fn unlock_read_raw(&self, token: RawRead) {
+        crate::coherence::gate_read_released();
         match token {
             RawRead::Fast(slot) => slot.store(std::ptr::null_mut(), Ordering::Release),
             RawRead::Slow => self.inner.force_unlock_read(),
         }
     }
 
-    /// `write`, holding the lock past the call.
+    /// `write`, holding the lock past the call. Counting builds take the same two steps timed on this thread, wall
+    /// and CPU (r12-phasefair's gate split, [`crate::coherence::Gate`]): the parking_lot acquisition, entered through
+    /// `try_write` so a wait is counted, then any revocation.
     pub fn write_raw(&self) {
+        #[cfg(not(feature = "coherence"))]
         std::mem::forget(self.write());
+        #[cfg(feature = "coherence")]
+        {
+            use crate::coherence::{gate_add, gate_max, thread_cpu_ns, wall_ns, Gate};
+            crate::coherence::bump(crate::coherence::Class::WalRwWrite, 2);
+            let (w0, c0) = (wall_ns(), thread_cpu_ns());
+            let g = self.inner.try_write().unwrap_or_else(|| {
+                gate_add(Gate::WWaited, 1);
+                self.inner.write()
+            });
+            let (w1, c1) = (wall_ns(), thread_cpu_ns());
+            gate_add(Gate::WAcq, 1);
+            gate_add(Gate::WAcqWallNs, w1 - w0);
+            gate_add(Gate::WAcqCpuNs, c1.saturating_sub(c0));
+            gate_max(Gate::WAcqWallMaxNs, w1 - w0);
+            let (mut w2, mut c2) = (w1, c1);
+            if self.enabled && self.rbias.load(Ordering::Acquire) {
+                self.revoke();
+                (w2, c2) = (wall_ns(), thread_cpu_ns());
+                gate_add(Gate::WRevokes, 1);
+                gate_add(Gate::WRevokeWallNs, w2 - w1);
+                gate_add(Gate::WRevokeCpuNs, c2.saturating_sub(c1));
+            }
+            crate::coherence::gate_write_held_from(w2, c2);
+            std::mem::forget(g);
+        }
     }
 
     /// Release a hold `write_raw` took.
@@ -233,8 +273,135 @@ impl<T: ?Sized> BravoRwLock<T> {
     /// # Safety
     /// The caller holds this lock through `write_raw`.
     pub unsafe fn unlock_write_raw(&self) {
+        crate::coherence::gate_write_released();
         self.inner.force_unlock_write();
     }
+}
+
+/// The gate split's fire-check (r12-phasefair PREREG §4 F1-F4): planted waits and holds on this build's own lock,
+/// each read back from the gate table of the thread that took it. One line per check, PASS or FAIL.
+#[cfg(feature = "coherence")]
+pub(crate) fn split_fire_check() -> Vec<String> {
+    use crate::coherence::{gate_snapshot, wall_ns, Gate, GATE_FIELDS};
+    use std::sync::Arc;
+    use std::time::Duration;
+    const HOLD: Duration = Duration::from_millis(20);
+    const HOLD_NS: u64 = 20_000_000;
+    fn delta(a: [u64; GATE_FIELDS], b: [u64; GATE_FIELDS]) -> [u64; GATE_FIELDS] {
+        std::array::from_fn(|i| b[i] - a[i])
+    }
+    let f = |d: &[u64; GATE_FIELDS], g: Gate| d[g as usize];
+    let mut out = Vec::new();
+    let mut check = |name: &str, ok: bool, d: &[u64; GATE_FIELDS]| {
+        let fields: Vec<String> = crate::coherence::GATE_NAMES
+            .iter()
+            .zip(d)
+            .filter(|(_, v)| **v != 0)
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect();
+        out.push(format!("{} {name}: {}", if ok { "PASS" } else { "FAIL" }, fields.join(" ")));
+    };
+
+    // F1 (unbiased): a slow reader holds the gate for HOLD while a writer takes it; the writer waits in parking_lot
+    // and parks, so the wait is counted, lasts about HOLD, and is mostly off CPU.
+    // F1b (biased): the reader is a fast reader; parking_lot admits the writer at once and the revocation waits,
+    // spinning, so the wait is on CPU and in the revoke fields.
+    for biased in [false, true] {
+        let lock = Arc::new(BravoRwLock::with_bias((), biased));
+        let token = lock.try_read_raw().expect("an idle lock admits a reader");
+        let arrived = Arc::new(AtomicBool::new(false));
+        let (l2, a2) = (lock.clone(), arrived.clone());
+        let writer = std::thread::spawn(move || {
+            let s0 = gate_snapshot();
+            a2.store(true, Ordering::Release);
+            l2.write_raw();
+            unsafe { l2.unlock_write_raw() };
+            delta(s0, gate_snapshot())
+        });
+        while !arrived.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        std::thread::sleep(HOLD);
+        unsafe { lock.unlock_read_raw(token) };
+        let d = writer.join().unwrap();
+        if biased {
+            check(
+                "F1b fast reader: the revocation waits on CPU",
+                f(&d, Gate::WAcq) == 1
+                    && f(&d, Gate::WWaited) == 0
+                    && f(&d, Gate::WRevokes) == 1
+                    && f(&d, Gate::WRevokeWallNs) >= HOLD_NS * 3 / 4
+                    && f(&d, Gate::WRevokeCpuNs) * 2 >= f(&d, Gate::WRevokeWallNs),
+                &d,
+            );
+        } else {
+            check(
+                "F1 slow reader: the writer waits in parking_lot, off CPU",
+                f(&d, Gate::WAcq) == 1
+                    && f(&d, Gate::WWaited) == 1
+                    && f(&d, Gate::WRevokes) == 0
+                    && f(&d, Gate::WAcqWallNs) >= HOLD_NS * 3 / 4
+                    && f(&d, Gate::WAcqCpuNs) * 2 <= f(&d, Gate::WAcqWallNs),
+                &d,
+            );
+        }
+    }
+
+    // F2: no reader: the acquisition is not counted as a wait.
+    let lock = BravoRwLock::with_bias((), false);
+    let s0 = gate_snapshot();
+    lock.write_raw();
+    unsafe { lock.unlock_write_raw() };
+    let d = delta(s0, gate_snapshot());
+    check(
+        "F2 idle gate: no wait",
+        f(&d, Gate::WAcq) == 1 && f(&d, Gate::WWaited) == 0 && f(&d, Gate::WAcqWallNs) < 1_000_000,
+        &d,
+    );
+
+    // F3: a hold spent asleep is off CPU; a hold spent spinning is on it.
+    let s0 = gate_snapshot();
+    lock.write_raw();
+    std::thread::sleep(HOLD);
+    unsafe { lock.unlock_write_raw() };
+    let d = delta(s0, gate_snapshot());
+    check(
+        "F3a hold asleep: off CPU",
+        f(&d, Gate::WHeldWallNs) >= HOLD_NS * 3 / 4 && f(&d, Gate::WHeldCpuNs) * 5 <= f(&d, Gate::WHeldWallNs),
+        &d,
+    );
+    let s0 = gate_snapshot();
+    lock.write_raw();
+    let t0 = wall_ns();
+    while wall_ns() - t0 < HOLD_NS {
+        std::hint::spin_loop();
+    }
+    unsafe { lock.unlock_write_raw() };
+    let d = delta(s0, gate_snapshot());
+    check(
+        "F3b hold spinning: on CPU",
+        f(&d, Gate::WHeldWallNs) >= HOLD_NS && f(&d, Gate::WHeldCpuNs) * 5 >= f(&d, Gate::WHeldWallNs) * 4,
+        &d,
+    );
+
+    // F4: a reader's hold is counted with its length; a reader refused by a held gate is counted as refused.
+    let s0 = gate_snapshot();
+    let token = lock.try_read_raw().expect("an idle lock admits a reader");
+    std::thread::sleep(HOLD / 4);
+    unsafe { lock.unlock_read_raw(token) };
+    lock.write_raw();
+    let refused = lock.try_read_raw().is_none();
+    unsafe { lock.unlock_write_raw() };
+    let d = delta(s0, gate_snapshot());
+    check(
+        "F4 reader hold and refusal",
+        refused
+            && f(&d, Gate::RHolds) == 1
+            && f(&d, Gate::RHoldWallNs) >= HOLD_NS / 4
+            && f(&d, Gate::RRefused) == 1,
+        &d,
+    );
+    out
 }
 
 impl<T: ?Sized> Deref for BravoReadGuard<'_, T> {
