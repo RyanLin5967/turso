@@ -622,13 +622,14 @@ fn fork_in_the_refusal_gap(
     db: &Arc<Database>,
     trunk: &Arc<Connection>,
     stmt: &str,
+    at: crate::storage::pager::RefusalGap,
 ) -> (Option<Result<Branch>>, Result<()>, bool) {
     let forker = db.connect().unwrap();
     let forked = std::rc::Rc::new(std::cell::RefCell::new(None));
     let ran = std::rc::Rc::new(std::cell::Cell::new(false));
     {
         let (forked, ran) = (forked.clone(), ran.clone());
-        crate::storage::pager::set_branch_refusal_gap_hook_for_test(Box::new(move || {
+        crate::storage::pager::set_branch_refusal_gap_hook_for_test(at, Box::new(move || {
             ran.set(true);
             *forked.borrow_mut() = Some(forker.fork_branch());
         }));
@@ -654,7 +655,7 @@ fn a_fork_in_vacuums_refusal_gap_and_the_vacuum_never_both_succeed() {
         trunk.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
         let expected: Vec<(i64, String)> =
             (1..=ROWS).filter(|id| id % 2 == 1).map(|id| (id, original(id))).collect();
-        let (fork, vacuum, ran) = fork_in_the_refusal_gap(&db, &trunk, "VACUUM");
+        let (fork, vacuum, ran) = fork_in_the_refusal_gap(&db, &trunk, "VACUUM", crate::storage::pager::RefusalGap::AfterCheck);
         assert!(ran, "mask {mask}: premise: VACUUM passed its branch check and reached the gap");
         match (fork.expect("the hook ran"), vacuum) {
             (Ok(_), Ok(())) => panic!(
@@ -690,7 +691,12 @@ fn a_fork_in_journal_modes_refusal_gap_and_the_switch_never_both_succeed() {
         let trunk = db.connect().unwrap();
         seed(&trunk);
         let expected: Vec<(i64, String)> = (1..=ROWS).map(|id| (id, original(id))).collect();
-        let (fork, switch, ran) = fork_in_the_refusal_gap(&db, &trunk, "PRAGMA journal_mode = 'mvcc'");
+        let (fork, switch, ran) = fork_in_the_refusal_gap(
+            &db,
+            &trunk,
+            "PRAGMA journal_mode = 'mvcc'",
+            crate::storage::pager::RefusalGap::AfterCheck,
+        );
         assert!(ran, "mask {mask}: premise: the switch passed its branch check and reached the gap");
         let mode = trunk
             .prepare("PRAGMA journal_mode")
@@ -816,5 +822,80 @@ fn with_z_branch_read_begins_racing_the_last_trunk_close_never_return_busy() {
     );
     assert!(truncated > 0, "premise: no round's last trunk close truncated the WAL, so the race never ran");
     assert_eq!(busy, 0, "a branch read begin returned Busy while the last trunk close truncated the WAL");
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// The invariant both refusal tests share: the fork in the gap and the page-rewriting operation never both succeed; a
+/// fork refused must be refused as Busy; and a branch that exists reads its fork's rows.
+fn judge_refusal_gap(
+    mask: u32,
+    what: &str,
+    fork: Option<Result<Branch>>,
+    result: Result<()>,
+    expected: &[(i64, String)],
+) {
+    match (fork.expect("the hook ran"), result) {
+        (Ok(_), Ok(())) => panic!("mask {mask}: a fork landed in {what}'s gap, and {what} still ran"),
+        (Ok(b), Err(e)) => {
+            assert!(
+                e.to_string().contains("while branches of this database exist"),
+                "mask {mask}: {what} refused for another reason: {e}"
+            );
+            let bc = b.connect().unwrap();
+            assert_eq!(all_rows(&bc, &format!("mask {mask}: branch after the refused {what}")), expected);
+        }
+        (Err(fe), Ok(())) => assert!(
+            matches!(fe, LimboError::Busy),
+            "mask {mask}: the fork in {what}'s gap failed with {fe}, not Busy"
+        ),
+        (Err(fe), Err(ve)) => panic!("mask {mask}: both refused: fork {fe}, {what} {ve}"),
+    }
+}
+
+/// r11-coherence round 12, VACUUM item (fix side): the second window. A fork attempted after VACUUM's branch question
+/// was asked again under its exclusive WAL access must not succeed alongside the VACUUM: the access excludes the fork's
+/// read transaction. At the red commit this hook site does not exist, so this test's premise (the hook ran) fails there.
+#[test]
+fn a_fork_inside_vacuums_exclusion_and_the_vacuum_never_both_succeed() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
+        let expected: Vec<(i64, String)> =
+            (1..=ROWS).filter(|id| id % 2 == 1).map(|id| (id, original(id))).collect();
+        let (fork, vacuum, ran) = fork_in_the_refusal_gap(
+            &db,
+            &trunk,
+            "VACUUM",
+            crate::storage::pager::RefusalGap::AfterRecheck,
+        );
+        assert!(ran, "mask {mask}: premise: VACUUM asked the branch question again and reached the hook");
+        judge_refusal_gap(mask, "VACUUM", fork, vacuum, &expected);
+    }
+    crate::coherence::force_fixes_for_test(0);
+}
+
+/// r11-coherence round 12, VACUUM item (fix side): the same second window for the journal-mode switch. A fork attempted
+/// under its trunk write transaction must not succeed alongside the switch. Red under a mutant that re-asks the branch
+/// question WITHOUT taking the exclusion.
+#[test]
+fn a_fork_inside_journal_modes_exclusion_and_the_switch_never_both_succeed() {
+    for mask in [0, crate::coherence::FIX_GATE] {
+        crate::coherence::force_fixes_for_test(mask);
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let expected: Vec<(i64, String)> = (1..=ROWS).map(|id| (id, original(id))).collect();
+        let (fork, switch, ran) = fork_in_the_refusal_gap(
+            &db,
+            &trunk,
+            "PRAGMA journal_mode = 'mvcc'",
+            crate::storage::pager::RefusalGap::AfterRecheck,
+        );
+        assert!(ran, "mask {mask}: premise: the switch asked the branch question again and reached the hook");
+        judge_refusal_gap(mask, "the journal-mode switch", fork, switch, &expected);
+    }
     crate::coherence::force_fixes_for_test(0);
 }

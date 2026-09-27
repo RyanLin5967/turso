@@ -18184,7 +18184,9 @@ fn op_journal_mode_inner(
                     ));
                 }
                 #[cfg(test)]
-                crate::storage::pager::run_branch_refusal_gap_hook();
+                crate::storage::pager::run_branch_refusal_gap_hook(
+                    crate::storage::pager::RefusalGap::AfterCheck,
+                );
 
                 // Check if database is readonly - cannot change journal mode on readonly databases
                 if program.connection.is_readonly(*db) {
@@ -18296,6 +18298,10 @@ fn op_journal_mode_inner(
                         ));
                     }
                     state.active_op_state.journal_mode().branch_exclusion = Some(exclusion);
+                    #[cfg(test)]
+                    crate::storage::pager::run_branch_refusal_gap_hook(
+                        crate::storage::pager::RefusalGap::AfterRecheck,
+                    );
                 }
                 let new_mode = state
                     .active_op_state

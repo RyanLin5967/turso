@@ -75,16 +75,26 @@ use ptrmap::*;
 
 #[cfg(test)]
 thread_local! {
-    static BRANCH_REFUSAL_GAP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    static BRANCH_REFUSAL_GAP_HOOK: std::cell::RefCell<Option<(RefusalGap, Box<dyn FnOnce()>)>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: where the refusal-gap hook fires.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RefusalGap {
+    /// Right after the operation's first branch check, before it holds anything.
+    AfterCheck,
+    /// Right after the operation's branch check asked again under its exclusion (r11-coherence round 12's fix).
+    AfterRecheck,
 }
 
 /// Tests (r11-coherence round 12, VACUUM item): run `f` once, on this thread, right after a page-rewriting operation's
 /// branch refusal passed and before the operation holds anything a fork respects: VACUUM between `refuse_if_branching`
 /// and its exclusive WAL access, `PRAGMA journal_mode` between its branch check and the rest of the switch.
 #[cfg(test)]
-pub(crate) fn set_branch_refusal_gap_hook_for_test(f: Box<dyn FnOnce()>) {
-    BRANCH_REFUSAL_GAP_HOOK.with(|h| *h.borrow_mut() = Some(f));
+pub(crate) fn set_branch_refusal_gap_hook_for_test(at: RefusalGap, f: Box<dyn FnOnce()>) {
+    BRANCH_REFUSAL_GAP_HOOK.with(|h| *h.borrow_mut() = Some((at, f)));
 }
 
 #[cfg(test)]
@@ -93,8 +103,16 @@ pub(crate) fn clear_branch_refusal_gap_hook_for_test() {
 }
 
 #[cfg(test)]
-pub(crate) fn run_branch_refusal_gap_hook() {
-    if let Some(f) = BRANCH_REFUSAL_GAP_HOOK.with(|h| h.borrow_mut().take()) {
+pub(crate) fn run_branch_refusal_gap_hook(here: RefusalGap) {
+    let armed = BRANCH_REFUSAL_GAP_HOOK.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.as_ref().is_some_and(|(at, _)| *at == here) {
+            h.take()
+        } else {
+            None
+        }
+    });
+    if let Some((_, f)) = armed {
         f();
     }
 }
@@ -3268,7 +3286,7 @@ impl Pager {
     pub fn begin_vacuum_blocking_tx(&self) -> Result<IOResult<()>> {
         self.refuse_if_branching("VACUUM")?;
         #[cfg(test)]
-        run_branch_refusal_gap_hook();
+        run_branch_refusal_gap_hook(RefusalGap::AfterCheck);
         if !self.db_initialized() {
             return Err(LimboError::InternalError(
                 "begin_vacuum_blocking_tx can be done on an initialized database (page 1 must already be allocated)".into(),
@@ -3287,6 +3305,8 @@ impl Pager {
             wal.release_vacuum_lock();
             return Err(refused);
         }
+        #[cfg(test)]
+        run_branch_refusal_gap_hook(RefusalGap::AfterRecheck);
         // let's be conservative and clear all cache for vacuum
         // todo: clear cache only if we detect that new writes have occurred like `begin_read_tx`
         self.clear_page_cache(false);
