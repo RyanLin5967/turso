@@ -116,8 +116,13 @@ struct StoreInner {
 struct Lineage {
     /// Advanced by each fork of this node; the pre-increment value is the child's fork epoch.
     epoch: u64,
-    /// Live children by fork epoch. Fork epochs are unique within a parent.
-    children: BTreeMap<u64, BranchId>,
+    /// Live children in fork-epoch order, as an intrusive doubly-linked list (r11-adversarial amendment 21; the
+    /// HyPer / Steam transaction-list shape, Böttcher et al., PVLDB 13(2) 2019, section 4.1). Fork epochs are
+    /// handed out in increasing order, so appending keeps the list sorted, and a child's neighbours are its own
+    /// `sib_prev` / `sib_next`, found with no search. `first` and `last` are the oldest and newest live child.
+    first: Option<(u64, BranchId)>,
+    last: Option<(u64, BranchId)>,
+    nchildren: usize,
     /// Superseded versions kept because a live child forked while they were current, per page and
     /// ordered by `born` (see "Per-page version order" above).
     retained: HashMap<u32, BTreeMap<u64, Retained>>,
@@ -169,6 +174,9 @@ struct BranchState {
     /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
     /// branch's first fork and kept current by its writes from then on; `None` until it forks.
     view: Option<PageMap>,
+    /// This branch's neighbours in its parent's child list (see `Lineage::first`), with their fork epochs.
+    sib_prev: Option<(u64, BranchId)>,
+    sib_next: Option<(u64, BranchId)>,
 }
 
 #[derive(Clone, Copy)]
@@ -180,7 +188,10 @@ struct Owned {
 impl Lineage {
     /// True if a live child forked in `[from, to)` can see a version current over that range.
     fn has_child_in(&self, from: u64, to: u64) -> bool {
-        from < to && self.children.range(from..to).next().is_some()
+        // Every caller passes the lineage's current epoch as `to`, and every live child forked below it, so a
+        // child forked in [from, to) exists iff the newest live child forked at or after `from`.
+        crate::turso_assert!(to == self.epoch, "has_child_in's O(1) form needs `to` = the lineage's epoch");
+        from < to && self.last.is_some_and(|(e, _)| e >= from)
     }
 
     fn retain(&mut self, page: u32, v: Retained) {
@@ -207,22 +218,24 @@ impl Lineage {
         (f < v.died).then_some(v.slot)
     }
 
-    /// Detach the child forked at `f` and release every retained version that only it could see.
-    fn child_gone(&mut self, f: u64, arena: &mut Arena, work: &mut BranchWork) -> usize {
+    /// Release every retained version that only the child forked at `f` could see. The caller has unlinked the
+    /// child from the list (amendment 21); `lo` and `hi` are its former neighbours' fork epochs.
+    fn child_gone(
+        &mut self,
+        f: u64,
+        lo: Option<u64>,
+        hi: Option<u64>,
+        arena: &mut Arena,
+        work: &mut BranchWork,
+    ) -> usize {
         // Observation only (r11-adversarial PREREG amendment 19): the trees' sizes, once per call.
-        work.child_gone_tree_entries +=
-            (self.children.len() + self.by_born.len() + self.by_died.len()) as u64;
-        let t0 = std::time::Instant::now();
-        let removed = self.children.remove(&f);
-        crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
-        let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
-        let hi = self.children.range(f..).next().map(|(&e, _)| e);
+        work.child_gone_tree_entries += (self.by_born.len() + self.by_died.len()) as u64;
         let t1 = std::time::Instant::now();
         let dead = self.garbage(f, lo, hi, work);
         let t2 = std::time::Instant::now();
-        // children: remove + two ranges; garbage: one range on each index; each dead version: its page's
-        // versions, by_born and by_died, one removal each.
-        work.child_gone_tree_ops += 5 + 3 * dead.len() as u64;
+        // garbage: one range on each index; each dead version: its page's versions, by_born and by_died, one
+        // removal each. The neighbour search is gone (amendment 21).
+        work.child_gone_tree_ops += 2 + 3 * dead.len() as u64;
         for &(born, page, died) in &dead {
             let versions = self.retained.get_mut(&page).expect("indexed version is listed");
             work.child_gone_tree_entries += versions.len() as u64;
@@ -236,7 +249,6 @@ impl Lineage {
             crate::turso_assert!(indexed, "a released version was missing from an index");
             arena.release(v.slot);
         }
-        work.cg_children_ns += (t1 - t0).as_nanos() as u64;
         work.cg_garbage_ns += (t2 - t1).as_nanos() as u64;
         work.cg_remove_ns += t2.elapsed().as_nanos() as u64;
         dead.len()
@@ -377,11 +389,17 @@ impl BranchStore {
         inner.next_id += 1;
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
-        inner.trunk.lineage.children.insert(f, id);
-        inner.branches.insert(
-            id,
-            BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
-        );
+        let prev = inner.trunk.lineage.last.replace((f, id));
+        if inner.trunk.lineage.first.is_none() {
+            inner.trunk.lineage.first = Some((f, id));
+        }
+        inner.trunk.lineage.nchildren += 1;
+        if let Some((_, p)) = prev {
+            inner.branches.get_mut(&p).expect("a listed child is kept").sib_next = Some((f, id));
+        }
+        let mut child = BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default());
+        child.sib_prev = prev;
+        inner.branches.insert(id, child);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
@@ -397,7 +415,11 @@ impl BranchStore {
         }
         let f = st.lineage.epoch;
         st.lineage.epoch += 1;
-        st.lineage.children.insert(f, id);
+        let prev = st.lineage.last.replace((f, id));
+        if st.lineage.first.is_none() {
+            st.lineage.first = Some((f, id));
+        }
+        st.lineage.nchildren += 1;
         let schema = st.schema.clone();
         let (current, inherited) = (&st.current, &st.inherited);
         let view = st
@@ -412,9 +434,12 @@ impl BranchStore {
             .clone();
         let trunk_at = st.trunk_at;
         inner.next_id += 1;
-        inner
-            .branches
-            .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
+        if let Some((_, p)) = prev {
+            inner.branches.get_mut(&p).expect("a listed child is kept").sib_next = Some((f, id));
+        }
+        let mut child = BranchState::new(parent, f, schema, trunk_at, view);
+        child.sib_prev = prev;
+        inner.branches.insert(id, child);
         Ok(id)
     }
 
@@ -458,7 +483,7 @@ impl BranchStore {
         let Some(st) = inner.branches.get(&id) else {
             return 0;
         };
-        let mut h = st.fork_epoch ^ st.trunk_at ^ u64::from(st.handle) ^ st.lineage.children.len() as u64;
+        let mut h = st.fork_epoch ^ st.trunk_at ^ u64::from(st.handle) ^ st.lineage.nchildren as u64;
         for owned in st.current.values() {
             h = h.wrapping_add(u64::from(owned.slot) ^ owned.born);
             if let Some(a) = inner.arena.as_ref() {
@@ -477,13 +502,15 @@ impl BranchStore {
             }
         };
         let f = st.fork_epoch;
-        h ^= u64::from(lineage.children.contains_key(&f));
-        let lo = lineage.children.range(..f).next_back().map(|(&e, _)| e);
-        let hi = lineage
-            .children
-            .range((Bound::Excluded(f), Bound::Unbounded))
-            .next()
-            .map(|(&e, _)| e);
+        // The unlink touches both neighbours' states (amendment 21).
+        for (_, sib) in st.sib_prev.iter().chain(st.sib_next.iter()) {
+            if let Some(s) = inner.branches.get(sib) {
+                h ^= s.fork_epoch ^ u64::from(s.handle);
+            }
+        }
+        h ^= lineage.nchildren as u64;
+        let lo = st.sib_prev.map(|(e, _)| e);
+        let hi = st.sib_next.map(|(e, _)| e);
         let mut scratch = BranchWork::default();
         for (born, page, died) in lineage.garbage(f, lo, hi, &mut scratch) {
             if let Some(v) = lineage.retained.get(&page).and_then(|v| v.get(&born)) {
@@ -732,7 +759,7 @@ impl BranchStore {
             let Some(st) = inner.branches.get(&id) else {
                 return freed;
             };
-            if st.handle || st.open || !st.lineage.children.is_empty() {
+            if st.handle || st.open || st.lineage.nchildren != 0 {
                 return freed;
             }
             let st = inner.branches.remove(&id).expect("just looked it up");
@@ -749,21 +776,43 @@ impl BranchStore {
                 freed += 1;
             }
             freed += st.lineage.release_all(arena).len();
+            // Unlink `st` from its parent's child list in O(1): its neighbours are in hand (amendment 21).
+            let t = std::time::Instant::now();
+            if let Some((_, p)) = st.sib_prev {
+                branches.get_mut(&p).expect("a listed sibling is kept").sib_next = st.sib_next;
+            }
+            if let Some((_, n)) = st.sib_next {
+                branches.get_mut(&n).expect("a listed sibling is kept").sib_prev = st.sib_prev;
+            }
+            let lineage = if st.parent.is_trunk() {
+                &mut trunk.lineage
+            } else {
+                &mut branches
+                    .get_mut(&st.parent)
+                    .expect("a live branch's parent is kept while the branch lives")
+                    .lineage
+            };
+            crate::turso_assert!(
+                (st.sib_prev.is_some() || lineage.first == Some((st.fork_epoch, id)))
+                    && (st.sib_next.is_some() || lineage.last == Some((st.fork_epoch, id))),
+                "a child at an end of its parent's list is not that end"
+            );
+            if st.sib_prev.is_none() {
+                lineage.first = st.sib_next;
+            }
+            if st.sib_next.is_none() {
+                lineage.last = st.sib_prev;
+            }
+            lineage.nchildren -= 1;
+            work.cg_children_ns += t.elapsed().as_nanos() as u64;
+            let (lo, hi) = (st.sib_prev.map(|(e, _)| e), st.sib_next.map(|(e, _)| e));
+            freed += lineage.child_gone(st.fork_epoch, lo, hi, arena, work);
+            work.child_gone_ns += t.elapsed().as_nanos() as u64;
+            work.child_gone_calls += 1;
             if st.parent.is_trunk() {
-                let t = std::time::Instant::now();
-                freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
-                work.child_gone_ns += t.elapsed().as_nanos() as u64;
-                work.child_gone_calls += 1;
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
                 return freed;
             }
-            let parent = branches
-                .get_mut(&st.parent)
-                .expect("a live branch's parent is kept while the branch lives");
-            let t = std::time::Instant::now();
-            freed += parent.lineage.child_gone(st.fork_epoch, arena, work);
-            work.child_gone_ns += t.elapsed().as_nanos() as u64;
-            work.child_gone_calls += 1;
             id = st.parent;
         }
     }
@@ -828,6 +877,8 @@ impl BranchState {
             trunk_at,
             inherited,
             view: None,
+            sib_prev: None,
+            sib_next: None,
         }
     }
 }
