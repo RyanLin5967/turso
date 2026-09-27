@@ -398,8 +398,9 @@ impl RowStamps {
     }
 
     /// [`MergeState::prune`]'s rule for the stamps. A stale `oldest` (a smaller one) only keeps more.
+    /// Mutant 36 (A19a) prunes one epoch above the oldest live child, which is unsound.
     fn prune(&mut self, oldest: Option<u64>) {
-        let slack = u64::from(mutant(8));
+        let slack = u64::from(mutant(8) || mutant(36));
         let keep = |e: u64| oldest.is_some_and(|o| e > o + slack);
         while let Some(&(e, root, rowid)) = self.stamp_order.front() {
             if keep(e) {
@@ -429,7 +430,7 @@ impl MergeState {
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-13 and 15-35; 14 is not built, since no SQL path
+/// scope gate and the install's isolation, 11-13 and 15-36; 14 is not built, since no SQL path
 /// without DDL clears a user table's b-tree), so each test can be shown to fail for it
 /// (frontier/round11/r11-merge PREREG A6, A13, A14, A15). Always false otherwise.
 #[cfg(test)]

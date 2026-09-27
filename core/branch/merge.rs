@@ -1459,6 +1459,43 @@ mod tests {
         assert_eq!(s.work.merge_preprobe_hits, 200, "{:?}", s.work);
     }
 
+    /// A19a (mutant 36): the prune after the WAL lock keeps a stamp one epoch above the oldest live
+    /// child. The sole child c forks at f; the trunk's update of row 5 is decided at f + 1 and
+    /// pruned after with oldest f; c's update of row 5 must be refused. Mutant 36 prunes the stamp.
+    #[test]
+    fn a_stamp_just_above_the_oldest_live_child_is_kept() {
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for id in 1..=10 {
+            trunk
+                .execute(format!("INSERT INTO t VALUES ({id}, 'a')"))
+                .unwrap();
+        }
+        let c = trunk.fork_branch().unwrap();
+        trunk
+            .execute("UPDATE t SET v = 'trunk' WHERE id = 5")
+            .unwrap();
+        assert_eq!(
+            db.branch_stats().row_stamps,
+            1,
+            "the prune after the WAL lock removed a stamp a live child needs"
+        );
+        c.connect()
+            .unwrap()
+            .execute("UPDATE t SET v = 'c' WHERE id = 5")
+            .unwrap();
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let o = merger.merge(c, key_replay()).unwrap();
+        assert_eq!(o.refused, Some(Refusal::Key), "{o:?}");
+        assert_eq!(
+            int(&trunk, "SELECT count(*) FROM t WHERE id = 5 AND v = 'trunk'"),
+            1
+        );
+    }
+
     /// R3's survivor (mutant 6): a physical merge's rows join the commit's stamps too, so a later
     /// row-granular merge of the same row, by a branch forked before it, is refused.
     #[test]
