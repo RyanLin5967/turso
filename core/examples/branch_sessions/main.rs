@@ -1584,6 +1584,17 @@ fn pin_arm(b: &mut Bench, g: usize, r: usize, n: usize) {
         b.db.retained_clone_count(),
         b.db.slot_clone_count(),
     );
+    let st = b.db.branch_stats();
+    println!(
+        "# pin n={n} subpage trunk_versions={} trunk_version_bytes={} trunk_pending_pages={} \
+         chunk_slots_in_use={} chunk_size={} arena_in_use={}",
+        st.trunk_versions,
+        st.trunk_version_bytes,
+        st.trunk_pending_pages,
+        st.chunk_slots_in_use,
+        st.chunk_size,
+        st.arena_slots_in_use,
+    );
     for (br, conn, _) in held {
         drop(conn);
         br.reap().unwrap();
