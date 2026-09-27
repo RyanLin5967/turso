@@ -53,6 +53,7 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+pub(crate) mod birth_tree;
 pub(crate) mod page_map;
 pub(crate) mod store;
 
@@ -64,9 +65,16 @@ use crate::util::IOExt as _;
 use crate::{Connection, Database, Result, TransactionState};
 use store::BranchStore;
 pub use store::{
-    content_hash, Digest, Plant, RecvWork, SendMode, SendReport, ShipDump, TrunkImage,
+    content_hash, Digest, Plant, RecvWork, SendMode, SendReport, ShipDump, ShipSnap, TrunkImage,
     CURRENT_ENTRY_BYTES, RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
 };
+
+/// The mutant schema a shipping fire-check selects (PREREG A5, r11-ship): `R11_SHIP_MUTANT` read
+/// once. Empty in every ordinary run.
+pub(crate) fn ship_mutant() -> &'static str {
+    static MUTANT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MUTANT.get_or_init(|| std::env::var("R11_SHIP_MUTANT").unwrap_or_default())
+}
 
 /// The identity of a branch. Distinct from any page or transaction id on purpose: a branch
 /// outlives the transactions that write into it, which is the whole point of the mechanism.
@@ -407,6 +415,36 @@ impl Database {
         out: Option<&mut dyn std::io::Write>,
     ) -> Result<SendReport> {
         self.branches.send(mode, base, trunk, delta, plant, count, out)
+    }
+
+    /// F-S1's O(1) snapshot of the ship view, and how long the store mutex was held for it (ns).
+    /// Refused (`Busy`) while a branch write transaction is open.
+    #[doc(hidden)]
+    pub fn branch_snapshot(&self) -> Result<(ShipSnap, u64)> {
+        self.branches.snapshot()
+    }
+
+    /// Send a snapshot taken by [`Database::branch_snapshot`]; holds no lock of this database.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn branch_send_snapshot(
+        snap: &ShipSnap,
+        mode: SendMode,
+        base: Option<u64>,
+        trunk: &TrunkImage,
+        delta: bool,
+        plant: Plant,
+        count: bool,
+        out: Option<&mut dyn std::io::Write>,
+    ) -> Result<SendReport> {
+        store::send_snapshot(snap, mode, base, trunk, delta, plant, count, out)
+    }
+
+    /// The ship view's upkeep so far: (operations, nodes touched, nodes copied because a snapshot
+    /// shared them).
+    #[doc(hidden)]
+    pub fn branch_view_work(&self) -> (u64, u64, u64) {
+        self.branches.view_work()
     }
 
     #[doc(hidden)]

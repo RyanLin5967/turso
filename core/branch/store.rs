@@ -92,8 +92,10 @@ use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
 
 mod ship;
+pub(crate) use ship::send_snapshot;
+use ship::SlotOwner;
 pub use ship::{
-    content_hash, Digest, Plant, RecvWork, SendMode, SendReport, ShipDump, TrunkImage,
+    content_hash, Digest, Plant, RecvWork, SendMode, SendReport, ShipDump, ShipSnap, TrunkImage,
     CURRENT_ENTRY_BYTES, RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
 };
 pub(crate) use ship::Track;
@@ -122,6 +124,8 @@ struct StoreInner {
     work: BranchWork,
     /// Shipping state, once [`BranchStore::enable_shipping`] ran.
     track: Option<Track>,
+    /// Branch write transactions in progress; a shipping snapshot waits for none.
+    writers: usize,
 }
 
 #[derive(Default)]
@@ -148,8 +152,6 @@ struct Retained {
     born: u64,
     died: u64,
     slot: Slot,
-    /// The shipping sequence number at which it was retained (0 when shipping is not tracked).
-    seq: u64,
 }
 
 struct TrunkState {
@@ -183,10 +185,8 @@ struct BranchState {
     /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
     /// branch's first fork and kept current by its writes from then on; `None` until it forks.
     view: Option<PageMap>,
-    /// Shipping sequence numbers: when the state was forked, and when a field a receiver needs last
-    /// changed (0 when shipping is not tracked).
+    /// The shipping sequence number the state was forked at (0 when shipping is not tracked).
     born_seq: u64,
-    dirty_seq: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -357,6 +357,7 @@ impl BranchStore {
                 branches: HashMap::new(),
                 work: BranchWork::default(),
                 track: None,
+                writers: 0,
             }),
             trunk_children: AtomicUsize::new(0),
             tracking: AtomicBool::new(false),
@@ -411,7 +412,7 @@ impl BranchStore {
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default(), seq),
         );
-        inner.born(id, seq);
+        inner.ship_forked(id, seq);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
@@ -446,8 +447,8 @@ impl BranchStore {
         inner
             .branches
             .insert(id, BranchState::new(parent, f, schema, trunk_at, view, seq));
-        inner.touch(parent, seq);
-        inner.born(id, seq);
+        inner.ship_state(parent, Some(seq));
+        inner.ship_forked(id, seq);
         Ok(id)
     }
 
@@ -475,7 +476,9 @@ impl BranchStore {
         inner.tick();
         if let Some(st) = inner.branches.get_mut(&id) {
             st.open = false;
-            st.writer = false;
+            if std::mem::take(&mut st.writer) {
+                inner.writers -= 1;
+            }
         }
         self.collect(&mut inner, id);
     }
@@ -494,7 +497,7 @@ impl BranchStore {
         let freed_pages = self.collect(&mut inner, id);
         let deferred = inner.branches.contains_key(&id);
         if deferred {
-            inner.touch(id, seq);
+            inner.ship_state(id, Some(seq));
         }
         if let Some(t) = inner.track.as_mut() {
             t.log_bytes += 9;
@@ -512,12 +515,16 @@ impl BranchStore {
             return Err(LimboError::Busy);
         }
         st.writer = true;
+        inner.writers += 1;
         Ok(())
     }
 
     pub(crate) fn end_write(&self, id: BranchId) {
-        if let Some(st) = self.inner.lock().branches.get_mut(&id) {
-            st.writer = false;
+        let mut inner = self.inner.lock();
+        if let Some(st) = inner.branches.get_mut(&id) {
+            if std::mem::take(&mut st.writer) {
+                inner.writers -= 1;
+            }
         }
     }
 
@@ -551,35 +558,37 @@ impl BranchStore {
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         crate::turso_assert!(st.writer, "branch page written outside a write transaction");
         let epoch = st.lineage.epoch;
+        // What the ship view must hear: a new slot, a version retained, and whether `current` moved.
+        let (mut new_slot, mut kept, mut moved) = (None, None, true);
         match st.current.get(&page).copied() {
             None => {
                 let slot = arena.alloc();
                 arena.stamp(slot, seq, seq, page);
-                arena.page_mut(slot).copy_from_slice(pre_image);
+                arena.set_page(slot, pre_image);
                 st.current.insert(page, Owned { slot, born: epoch });
                 if let Some(view) = st.view.as_mut() {
                     view.insert(page, slot);
                 }
+                new_slot = Some(slot);
             }
-            Some(owned) if owned.born == epoch => {}
+            Some(owned) if owned.born == epoch => moved = false,
             Some(owned) => {
                 if st.lineage.has_child_in(owned.born, epoch) {
                     let slot = arena.alloc();
                     arena.stamp(slot, seq, seq, page);
-                    arena.page_mut(slot).copy_from_slice(pre_image);
-                    st.lineage.retain(
-                        page,
-                        Retained {
-                            born: owned.born,
-                            died: epoch,
-                            slot: owned.slot,
-                            seq,
-                        },
-                    );
+                    arena.set_page(slot, pre_image);
+                    let v = Retained {
+                        born: owned.born,
+                        died: epoch,
+                        slot: owned.slot,
+                    };
+                    st.lineage.retain(page, v);
                     st.current.insert(page, Owned { slot, born: epoch });
                     if let Some(view) = st.view.as_mut() {
                         view.insert(page, slot);
                     }
+                    new_slot = Some(slot);
+                    kept = Some(v);
                 } else {
                     // No live child can see the current version: it is rewritten in its own slot,
                     // which is already the one `view` names.
@@ -593,7 +602,15 @@ impl BranchStore {
                 }
             }
         }
-        inner.touch(id, seq);
+        if let Some(v) = kept {
+            inner.ship_retained(id, page, v, seq);
+        }
+        if let Some(slot) = new_slot {
+            inner.ship_slot(slot, SlotOwner::Branch(id.0), seq);
+        }
+        if moved {
+            inner.ship_current(id, page, seq);
+        }
         Ok(())
     }
 
@@ -602,39 +619,34 @@ impl BranchStore {
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
         let mut inner = self.inner.lock();
         let seq = inner.tick();
-        let StoreInner {
-            arena,
-            trunk,
-            track,
-            ..
-        } = &mut *inner;
         // The page's previous content was born at its previous write; that is the content birth of
         // a pre-image retained below, though its slot is handed out now.
-        let content_born = track.as_mut().map_or(0, |t| t.trunk_written(page, seq, pre_image.len()));
+        let content_born = inner.ship_trunk_prev(page);
+        let StoreInner { arena, trunk, .. } = &mut *inner;
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
-        if born >= epoch {
-            return;
-        }
-        if trunk.lineage.has_child_in(born, epoch) {
-            let arena = arena.as_mut().expect("the trunk has a child, so the arena exists");
-            let slot = arena.alloc();
-            arena.stamp(slot, seq, content_born, page);
-            arena.page_mut(slot).copy_from_slice(pre_image);
-            trunk.lineage.retain(
-                page,
-                Retained {
+        let mut kept = None;
+        if born < epoch {
+            if trunk.lineage.has_child_in(born, epoch) {
+                let arena = arena.as_mut().expect("the trunk has a child, so the arena exists");
+                let slot = arena.alloc();
+                arena.stamp(slot, seq, content_born, page);
+                arena.set_page(slot, pre_image);
+                let v = Retained {
                     born,
                     died: epoch,
                     slot,
-                    seq,
-                },
-            );
-            if let Some(t) = track.as_mut() {
-                t.trunk_retained.insert((seq, page, born));
+                };
+                trunk.lineage.retain(page, v);
+                kept = Some(v);
             }
+            trunk.written.insert(page, epoch);
         }
-        trunk.written.insert(page, epoch);
+        if let Some(v) = kept {
+            inner.ship_slot(v.slot, SlotOwner::Trunk { born: v.born, died: v.died }, seq);
+            inner.ship_trunk_retained(page, v, seq);
+        }
+        inner.ship_written(page, seq, pre_image.len());
     }
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated.
@@ -652,6 +664,7 @@ impl BranchStore {
             return Ok(());
         }
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
+        let mut written = Vec::with_capacity(pages.len());
         for page in pages {
             let no = page.get().id as u32;
             let owned = st.current.get(&no).copied().ok_or_else(|| {
@@ -664,13 +677,15 @@ impl BranchStore {
                 owned.born == st.lineage.epoch,
                 "a committed branch page was decided in an earlier epoch"
             );
-            arena
-                .page_mut(owned.slot)
-                .copy_from_slice(page.get_contents().as_slice());
+            arena.set_page(owned.slot, page.get_contents().as_slice());
             arena.stamp_content(owned.slot, seq);
             if let Some(t) = track.as_mut() {
                 t.log_bytes += 8 + arena.page_size() as u64;
             }
+            written.push(owned.slot);
+        }
+        for slot in written {
+            inner.ship_slot(slot, SlotOwner::Branch(id.0), seq);
         }
         Ok(())
     }
@@ -679,7 +694,7 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         let seq = inner.tick();
         inner.branches.get_mut(&id).ok_or_else(|| gone(id))?.schema = schema;
-        inner.touch(id, seq);
+        inner.ship_state(id, Some(seq));
         Ok(())
     }
 
@@ -756,39 +771,43 @@ impl BranchStore {
                 return freed;
             }
             let st = inner.branches.remove(&id).expect("just looked it up");
+            let seq = inner.track.as_ref().map_or(0, |t| t.seq);
+            inner.ship_state_gone(id, st.born_seq, seq);
             let StoreInner {
                 arena,
                 trunk,
                 branches,
                 work,
-                track,
                 ..
             } = &mut *inner;
-            if let Some(t) = track.as_mut() {
-                t.state_gone(id, st.born_seq, st.dirty_seq);
-            }
             let arena = arena.as_mut().expect("a branch existed, so the arena does");
-            for owned in st.current.values() {
-                arena.release(owned.slot);
+            let mut own: Vec<Slot> = st.current.values().map(|o| o.slot).collect();
+            for &slot in &own {
+                arena.release(slot);
                 freed += 1;
             }
-            freed += st.lineage.release_all(arena).len();
-            if st.parent.is_trunk() {
-                let released = trunk.lineage.child_gone(st.fork_epoch, arena, work);
-                freed += released.len();
-                if let Some(t) = track.as_mut() {
-                    for (page, v) in &released {
-                        t.trunk_retained.remove(&(v.seq, *page, v.born));
-                    }
-                }
+            let (parent, fork_epoch) = (st.parent, st.fork_epoch);
+            own.extend(st.lineage.release_all(arena));
+            freed += own.len() - st.current.len();
+            let released = if parent.is_trunk() {
+                trunk.lineage.child_gone(fork_epoch, arena, work)
+            } else {
+                branches
+                    .get_mut(&parent)
+                    .expect("a live branch's parent is kept while the branch lives")
+                    .lineage
+                    .child_gone(fork_epoch, arena, work)
+            };
+            freed += released.len();
+            for slot in own {
+                inner.ship_slot_gone(slot);
+            }
+            inner.ship_released(parent, &released);
+            if parent.is_trunk() {
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
                 return freed;
             }
-            let parent = branches
-                .get_mut(&st.parent)
-                .expect("a live branch's parent is kept while the branch lives");
-            freed += parent.lineage.child_gone(st.fork_epoch, arena, work).len();
-            id = st.parent;
+            id = parent;
         }
     }
 }
@@ -796,26 +815,14 @@ impl BranchStore {
 impl StoreInner {
     /// Advance the shipping sequence for one store operation and return it (0 when untracked).
     fn tick(&mut self) -> u64 {
-        self.track.as_mut().map_or(0, |t| {
-            t.seq += 1;
-            t.seq
-        })
+        self.track.as_mut().map_or(0, |t| t.advance())
     }
 
-    /// A field of state `id` that a receiver needs changed at `seq`.
-    fn touch(&mut self, id: BranchId, seq: u64) {
-        let (Some(t), Some(st)) = (self.track.as_mut(), self.branches.get_mut(&id)) else {
-            return;
-        };
-        t.dirty.remove(&(st.dirty_seq, id));
-        st.dirty_seq = seq;
-        t.dirty.insert((seq, id));
-    }
-
-    /// State `id` was forked at `seq`.
-    fn born(&mut self, id: BranchId, seq: u64) {
+    /// State `id` was forked at `seq`: its view, and the trunk's epoch and next id.
+    fn ship_forked(&mut self, id: BranchId, seq: u64) {
+        self.ship_state(id, Some(seq));
+        self.ship_trunk_scalars();
         if let Some(t) = self.track.as_mut() {
-            t.dirty.insert((seq, id));
             t.log_bytes += 33;
         }
     }
@@ -880,7 +887,6 @@ impl BranchState {
             inherited,
             view: None,
             born_seq: seq,
-            dirty_seq: seq,
         }
     }
 }

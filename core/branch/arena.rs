@@ -5,27 +5,27 @@
 //! arena does not know which; [`super::store`] owns that bookkeeping and the arena only answers
 //! "give me a page" and "take this page back".
 //!
+//! A slot's bytes are an immutable `Arc<[u8]>`: writing a slot REPLACES its Arc rather than writing
+//! into it. So anything that took a clone of a slot's bytes — a shipping snapshot — keeps exactly the
+//! bytes it took, whatever the store writes afterwards, and a send can read them with no lock.
+//!
 //! ⚠ **The arena is volatile.** Slots live in memory and there is no persisted map from branch to
 //! slot, so branches do not survive a restart. That is a scope line, not an oversight: the question
 //! this fork exists to answer is how branch management behaves at 10^6 live branches on a real
 //! engine's pager, and ferrodb's own D79 showed that making the branch map durable is a separate
 //! wall with its own curve. Mixing the two would hide which one a slope belongs to.
 
-use std::collections::BTreeSet;
-use std::ops::Bound;
+use std::sync::Arc;
 
 use crate::turso_assert;
 
 /// Index of a page-sized slot in the arena.
 pub(crate) type Slot = u32;
 
-/// Slots per allocation. Chunks are zero-filled through the allocator, so the OS backs a chunk with
-/// memory only as its slots are touched; the chunk size bounds the granularity, not the footprint.
-const SLOTS_PER_CHUNK: usize = 256;
-
 pub(crate) struct Arena {
     page_size: usize,
-    chunks: Vec<Box<[u8]>>,
+    /// Each handed-out slot's bytes; `None` while the slot is free.
+    pages: Vec<Option<Arc<[u8]>>>,
     /// Slots below this have been handed out at least once.
     high_water: u32,
     free: Vec<Slot>,
@@ -43,21 +43,18 @@ pub(crate) struct Arena {
 /// Per-slot shipping stamps: when the slot was handed out, when its CONTENT was born, and which
 /// page it is a version of. They differ for a retained trunk pre-image, whose slot is handed out
 /// when the trunk overwrites the page but whose content was born at the page's previous write.
-/// `by_content` indexes the live slots by content birth, so "every slot whose content is newer than
-/// the receiver's" is a range, not a scan (ZFS's block birth txg).
 #[derive(Default)]
 pub(crate) struct Stamps {
     alloc_seq: Vec<u64>,
     content_seq: Vec<u64>,
     page: Vec<u32>,
-    by_content: BTreeSet<(u64, Slot)>,
 }
 
 impl Arena {
     pub(crate) fn new(page_size: usize) -> Self {
         Self {
             page_size,
-            chunks: Vec::new(),
+            pages: Vec::new(),
             high_water: 0,
             free: Vec::new(),
             free_bits: Vec::new(),
@@ -72,10 +69,6 @@ impl Arena {
             stamps: Some(Stamps::default()),
             ..Self::new(page_size)
         }
-    }
-
-    pub(crate) fn has_stamps(&self) -> bool {
-        self.stamps.is_some()
     }
 
     pub(crate) fn page_size(&self) -> usize {
@@ -97,12 +90,9 @@ impl Arena {
         slot
     }
 
-    /// Extend the handed-out range to `high_water`, adding chunks and bitmap words as needed.
+    /// Extend the handed-out range to `high_water`, adding page entries and bitmap words.
     fn grow_to(&mut self, high_water: u32) {
-        while (high_water as usize).div_ceil(SLOTS_PER_CHUNK) > self.chunks.len() {
-            self.chunks
-                .push(vec![0u8; SLOTS_PER_CHUNK * self.page_size].into_boxed_slice());
-        }
+        self.pages.resize(high_water as usize, None);
         self.high_water = high_water;
         let words = (self.high_water as usize).div_ceil(64);
         if self.free_bits.len() < words {
@@ -139,30 +129,23 @@ impl Arena {
         turso_assert!(!self.is_free(slot), "released an arena slot that was already free");
         self.set_free_bit(slot, true);
         self.free.push(slot);
-        if let Some(st) = self.stamps.as_mut() {
-            st.by_content.remove(&(st.content_seq[slot as usize], slot));
-        }
+        self.pages[slot as usize] = None;
     }
 
     /// Stamp a slot just handed out: its allocation, its content's birth and its page number.
     pub(crate) fn stamp(&mut self, slot: Slot, alloc_seq: u64, content_seq: u64, page: u32) {
         if let Some(st) = self.stamps.as_mut() {
             let i = slot as usize;
-            st.by_content.remove(&(st.content_seq[i], slot));
             st.alloc_seq[i] = alloc_seq;
             st.content_seq[i] = content_seq;
             st.page[i] = page;
-            st.by_content.insert((content_seq, slot));
         }
     }
 
     /// The slot's content was rewritten at `seq`.
     pub(crate) fn stamp_content(&mut self, slot: Slot, seq: u64) {
         if let Some(st) = self.stamps.as_mut() {
-            let i = slot as usize;
-            st.by_content.remove(&(st.content_seq[i], slot));
-            st.content_seq[i] = seq;
-            st.by_content.insert((seq, slot));
+            st.content_seq[slot as usize] = seq;
         }
     }
 
@@ -171,17 +154,6 @@ impl Arena {
         let st = self.stamps.as_ref()?;
         let i = slot as usize;
         Some((st.alloc_seq[i], st.content_seq[i], st.page[i]))
-    }
-
-    /// Live slots whose content was born after `seq`, in birth order.
-    pub(crate) fn content_newer_than(&self, seq: u64) -> Vec<Slot> {
-        let Some(st) = self.stamps.as_ref() else {
-            return Vec::new();
-        };
-        st.by_content
-            .range((Bound::Excluded((seq, Slot::MAX)), Bound::Unbounded))
-            .map(|&(_, slot)| slot)
-            .collect()
     }
 
     /// The slot is handed out (below the high-water mark and not free).
@@ -210,24 +182,24 @@ impl Arena {
     }
 
     pub(crate) fn page(&self, slot: Slot) -> &[u8] {
-        let (chunk, offset) = self.locate(slot);
-        &self.chunks[chunk][offset..offset + self.page_size]
+        self.page_arc(slot)
     }
 
-    pub(crate) fn page_mut(&mut self, slot: Slot) -> &mut [u8] {
-        let (chunk, offset) = self.locate(slot);
-        let page_size = self.page_size;
-        &mut self.chunks[chunk][offset..offset + page_size]
-    }
-
-    fn locate(&self, slot: Slot) -> (usize, usize) {
+    /// The slot's bytes, shared: a clone stays exactly these bytes whatever the slot holds later.
+    pub(crate) fn page_arc(&self, slot: Slot) -> &Arc<[u8]> {
         turso_assert!(slot < self.high_water, "arena slot out of range");
         turso_assert!(!self.is_free(slot), "access to a free arena slot");
-        let slot = slot as usize;
-        (
-            slot / SLOTS_PER_CHUNK,
-            (slot % SLOTS_PER_CHUNK) * self.page_size,
-        )
+        self.pages[slot as usize]
+            .as_ref()
+            .expect("a handed-out slot has bytes once its owner wrote them")
+    }
+
+    /// Give the slot new bytes. The old bytes are not written: whoever holds them keeps them.
+    pub(crate) fn set_page(&mut self, slot: Slot, bytes: &[u8]) {
+        turso_assert!(slot < self.high_water, "arena slot out of range");
+        turso_assert!(!self.is_free(slot), "write to a free arena slot");
+        turso_assert!(bytes.len() == self.page_size, "a slot holds exactly one page");
+        self.pages[slot as usize] = Some(Arc::from(bytes));
     }
 
     fn set_free_bit(&mut self, slot: Slot, free: bool) {
@@ -251,8 +223,8 @@ mod tests {
         let a = arena.alloc();
         let b = arena.alloc();
         assert_ne!(a, b);
-        arena.page_mut(a).fill(0xAA);
-        arena.page_mut(b).fill(0xBB);
+        arena.set_page(a, &[0xAA; 512]);
+        arena.set_page(b, &[0xBB; 512]);
         assert!(arena.page(a).iter().all(|&x| x == 0xAA));
         assert!(arena.page(b).iter().all(|&x| x == 0xBB));
         assert_eq!(arena.in_use(), 2);
@@ -268,6 +240,23 @@ mod tests {
         assert_eq!(arena.in_use(), 2);
     }
 
+    /// A clone of a slot's bytes is a snapshot of them: writing the slot afterwards replaces its
+    /// bytes and leaves the clone as it was.
+    #[test]
+    fn a_clone_of_a_slots_bytes_survives_every_later_write_and_the_release() {
+        let mut arena = Arena::new(64);
+        let a = arena.alloc();
+        arena.set_page(a, &[1; 64]);
+        let kept = arena.page_arc(a).clone();
+        arena.set_page(a, &[2; 64]);
+        assert!(kept.iter().all(|&x| x == 1) && arena.page(a).iter().all(|&x| x == 2));
+        arena.release(a);
+        let b = arena.alloc();
+        assert_eq!(a, b);
+        arena.set_page(b, &[3; 64]);
+        assert!(kept.iter().all(|&x| x == 1), "a reused slot wrote into a kept snapshot");
+    }
+
     #[test]
     #[should_panic(expected = "already free")]
     fn a_double_release_is_caught_at_the_release() {
@@ -280,9 +269,9 @@ mod tests {
     #[test]
     fn slots_span_chunks_without_aliasing() {
         let mut arena = Arena::new(64);
-        let slots: Vec<Slot> = (0..(SLOTS_PER_CHUNK * 2 + 3)).map(|_| arena.alloc()).collect();
+        let slots: Vec<Slot> = (0..(256 * 2 + 3)).map(|_| arena.alloc()).collect();
         for &s in &slots {
-            arena.page_mut(s).fill((s % 251) as u8);
+            arena.set_page(s, &[(s % 251) as u8; 64]);
         }
         for &s in &slots {
             assert!(arena.page(s).iter().all(|&x| x == (s % 251) as u8), "slot {s} aliased");

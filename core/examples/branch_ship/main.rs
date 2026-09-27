@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use turso_core::branch::{
-    Branch, Plant, Replica, SendMode, SendReport, ShipDump, TrunkImage, CURRENT_ENTRY_BYTES,
-    RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
+    Branch, Digest, Plant, Replica, SendMode, SendReport, ShipDump, ShipSnap, TrunkImage,
+    CURRENT_ENTRY_BYTES, RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
 };
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
 
@@ -52,6 +52,7 @@ enum PlantArg {
     Inherit,
 }
 
+#[derive(Clone)]
 struct Args {
     arm: Arm,
     n: usize,
@@ -67,6 +68,8 @@ struct Args {
     /// Time the fixed sends (under lockrun): no counted-only modes, no counted alternatives, no
     /// minimum dumps; the digests still run, outside the timed calls.
     timing: bool,
+    /// Cycles the main thread runs WHILE each piped send streams from its snapshot (F-S1).
+    mid_cycles: usize,
 }
 
 fn die(msg: &str) -> ! {
@@ -93,6 +96,7 @@ fn parse_args() -> Args {
         delta: true,
         out_dir: None,
         timing: false,
+        mid_cycles: 200,
     };
     let mut arm = None;
     let mut it = std::env::args().skip(1);
@@ -117,6 +121,7 @@ fn parse_args() -> Args {
             "--samples" => a.samples = num(val()),
             "--no-delta" => a.delta = false,
             "--timing" => a.timing = true,
+            "--mid-cycles" => a.mid_cycles = num(val()),
             "--out-dir" => a.out_dir = Some(PathBuf::from(val())),
             "--plant" => {
                 a.plant = match val().as_str() {
@@ -363,12 +368,12 @@ impl Read for PipeReader {
     }
 }
 
-const STREAM_HEADER: &str = "stream\tpoint\tlive\tmode\ttotal\ttotal_raw\ttotal_delta\ttotal_delta_fork\ttotal_dedup\tpage_bytes\tref_bytes\tmeta_bytes\tslot_rec\ttrunk_rec\tref_rec\tstate_rec\tdead_rec\tcur_ent\tret_ent\ttret_ent\twritten_ent\tlive_list\tmaps\tdup\tstates_visited\tentries_visited\tslots_visited\tindex_visited";
+const STREAM_HEADER: &str = "stream\tpoint\tlive\tmode\ttotal\ttotal_raw\ttotal_delta\ttotal_delta_fork\ttotal_dedup\tpage_bytes\tref_bytes\tmeta_bytes\tslot_rec\ttrunk_rec\tref_rec\tstate_rec\tdead_rec\tcur_ent\tret_ent\ttret_ent\twritten_ent\tlive_list\tmaps\tdup\tstates_visited\tentries_visited\tslots_visited\tindex_visited\tnodes_visited\titems_checked\tlocked_ops\tlocked_ns";
 
 fn print_stream(point: &str, live: usize, mode: &str, r: &SendReport) {
     let non_payload = r.total_bytes - r.payload_shipped;
     println!(
-        "stream\t{point}\t{live}\t{mode}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "stream\t{point}\t{live}\t{mode}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         r.total_bytes,
         non_payload + r.payload_raw,
         non_payload + r.payload_delta,
@@ -393,6 +398,10 @@ fn print_stream(point: &str, live: usize, mode: &str, r: &SendReport) {
         r.entries_visited,
         r.slots_visited,
         r.index_visited,
+        r.nodes_visited,
+        r.items_checked,
+        r.locked_ops,
+        r.locked_ns,
     );
 }
 
@@ -405,32 +414,42 @@ fn plant_of(p: PlantArg) -> Plant {
     }
 }
 
-/// Send `mode` from `db` into `replica` through a bounded pipe; returns the sender's report and
-/// prints the receiver's work.
+/// Take F-S1's snapshot, then send it into `replica` through a bounded pipe from a second thread
+/// while this thread runs `b`'s workload for `args.mid_cycles` cycles: the send holds no store lock,
+/// so the store keeps working, and the replica must still equal the store AT the snapshot.
+#[allow(clippy::too_many_arguments)]
 fn pipe(
-    db: &Arc<Database>,
+    b: &mut Bench,
     replica: &mut Replica,
+    args: &Args,
     mode: SendMode,
     base: Option<u64>,
     image: &TrunkImage,
-    delta: bool,
     plant: Plant,
     point: &str,
-    count: bool,
-) -> SendReport {
-    if !count {
-        // Serialization alone, into a sink that discards: how long the store mutex is held when
-        // nothing downstream is slower than the send.
+) -> (SendReport, u64) {
+    let count = !args.timing;
+    let (snap, snap_ns): (ShipSnap, u64) = b
+        .db
+        .branch_snapshot()
+        .unwrap_or_else(|e| not_a_result(&format!("{point}: snapshot refused: {e}")));
+    let (view_ops, touched, copied) = b.db.branch_view_work();
+    println!(
+        "snap\t{point}\tseq={}\tsnapshot_locked_ns={snap_ns}\tview_ops={view_ops}\tview_nodes_touched={touched}\tview_nodes_copied={copied}",
+        snap.seq()
+    );
+    if args.timing {
+        // Serialisation alone, into a sink that discards.
         let t = Instant::now();
-        db.branch_send(mode, base, image, delta, plant, false, Some(&mut std::io::sink()))
+        Database::branch_send_snapshot(&snap, mode, base, image, args.delta, plant, false, Some(&mut std::io::sink()))
             .unwrap();
         println!("time\t{point}\t{mode:?}\tnull_sink_send_s={:.4}", t.elapsed().as_secs_f64());
     }
     let (tx, rx) = sync_channel::<Vec<u8>>(16);
     let t = Instant::now();
-    let mut send_s = 0.0;
-    let (sent, received) = std::thread::scope(|s| {
-        let h = s.spawn(|| {
+    let arm = args.arm;
+    let (sent, received, during, send_s) = std::thread::scope(|s| {
+        let hr = s.spawn(|| {
             let mut reader = PipeReader {
                 rx,
                 cur: Vec::new(),
@@ -438,24 +457,44 @@ fn pipe(
             };
             replica.receive(&mut reader)
         });
-        let mut writer = PipeWriter(tx);
-        let ts = Instant::now();
-        let sent = db.branch_send(mode, base, image, delta, plant, count, Some(&mut writer));
-        send_s = ts.elapsed().as_secs_f64();
-        drop(writer);
-        (sent, h.join().unwrap())
+        let snap = &snap;
+        let hs = s.spawn(move || {
+            let mut writer = PipeWriter(tx);
+            let ts = Instant::now();
+            let sent = Database::branch_send_snapshot(
+                snap,
+                mode,
+                base,
+                image,
+                args.delta,
+                plant,
+                count,
+                Some(&mut writer),
+            );
+            drop(writer);
+            (sent, ts.elapsed().as_secs_f64())
+        });
+        // The store keeps working while the send streams.
+        let mut during = 0u64;
+        if arm != Arm::Chain {
+            for _ in 0..args.mid_cycles {
+                if !hs.is_finished() {
+                    during += 1;
+                }
+                b.cycle(arm);
+            }
+        }
+        let (sent, send_s) = hs.join().unwrap();
+        (sent, hr.join().unwrap(), during, send_s)
     });
     let secs = t.elapsed().as_secs_f64();
-    if !count {
-        println!("time\t{point}\t{mode:?}\tpipe_send_s={send_s:.4}\tpipe_total_s={secs:.4}");
-    }
     let work = match received {
         Ok(w) => w,
         Err(e) => not_a_result(&format!("{point}: the replica refused the stream: {e}")),
     };
     let sent = sent.unwrap_or_else(|e| not_a_result(&format!("{point}: send failed: {e}")));
     println!(
-        "recv\t{point}\trecords={}\tslots_written={}\tslots_claimed={}\trefs={}\ttrunk_pages={}\tdeaths={}\tgc_freed={}\tstates_new={}\tstates_updated={}\tentries={}\tretained_inserted={}\ttrie_inserts={}\tslots_released={}\twall_s={secs:.3}(unlocked)",
+        "recv\t{point}\trecords={}\tslots_written={}\tslots_claimed={}\trefs={}\ttrunk_pages={}\tdeaths={}\tgc_freed={}\tstates_new={}\tstates_updated={}\tentries={}\tretained_inserted={}\ttrie_inserts={}\tslots_released={}\tfork_deltas={}\tmid_cycles={}\tmid_cycles_while_sending={during}(interleaving-decided)\tsend_s={send_s:.3}\twall_s={secs:.3}(unlocked)",
         work.records,
         work.slots_written,
         work.slots_claimed,
@@ -469,29 +508,31 @@ fn pipe(
         work.retained_inserted,
         work.trie_inserts,
         work.slots_released,
+        work.fork_deltas,
+        if arm == Arm::Chain { 0 } else { args.mid_cycles },
     );
-    sent
+    (sent, snap.seq())
 }
 
-fn check_digest(b: &Bench, replica: &Replica, image: &TrunkImage, point: &str) {
-    let src = b.db.branch_digest(image);
+/// The replica against the store's digest taken at the snapshot it received.
+fn check_digest(want: &Digest, replica: &Replica, point: &str) {
     let rep = replica.digest();
     println!(
         "digest\t{point}\tsource={:016x}{:016x}/{}/{}/{}\treplica={:016x}{:016x}/{}/{}/{}\tequal={}",
-        src.hash.0,
-        src.hash.1,
-        src.states,
-        src.slots,
-        src.entries,
+        want.hash.0,
+        want.hash.1,
+        want.states,
+        want.slots,
+        want.entries,
         rep.hash.0,
         rep.hash.1,
         rep.states,
         rep.slots,
         rep.entries,
-        src == rep
+        *want == rep
     );
-    if src != rep {
-        not_a_result(&format!("{point}: replica digest differs from the source's"));
+    if *want != rep {
+        not_a_result(&format!("{point}: replica digest differs from the source's at the snapshot"));
     }
 }
 
@@ -648,6 +689,9 @@ fn state_line(b: &Bench, point: &str) {
 
 /// The incremental point: counted modes, the fixed stream into the replica, the minimum.
 #[allow(clippy::too_many_arguments)]
+/// The incremental point: the minimum's dump and the digest at this moment, the counted modes, then
+/// F-S1's snapshot piped into the replica while the workload continues.
+#[allow(clippy::too_many_arguments)]
 fn incremental(
     b: &mut Bench,
     replica: &mut Replica,
@@ -658,9 +702,15 @@ fn incremental(
     log0: u64,
 ) -> (u64, ShipDump, u64) {
     let image = b.checkpoint_image();
-    let seq = b.db.branch_ship_seq();
     state_line(b, point);
     let live = b.db.branch_stats().live_branches;
+    let want = b.db.branch_digest(&image);
+    let log1 = b.db.branch_log_bytes();
+    let dump1 = if args.timing {
+        ShipDump::default()
+    } else {
+        b.db.branch_dump(&image)
+    };
     for (mode, name) in [(SendMode::IncrRoot, "incr_root"), (SendMode::IncrAlloc, "incr_alloc")] {
         if args.timing {
             break;
@@ -671,32 +721,16 @@ fn incremental(
             .unwrap();
         print_stream(point, live, name, &r);
     }
-    let r = pipe(
-        &b.db,
-        replica,
-        SendMode::IncrFix,
-        Some(base),
-        &image,
-        args.delta,
-        plant_of(args.plant),
-        point,
-        !args.timing,
-    );
+    let (r, seq) = pipe(b, replica, args, SendMode::IncrFix, Some(base), &image, plant_of(args.plant), point);
     print_stream(point, live, "incr_fix", &r);
-    let log1 = b.db.branch_log_bytes();
     println!("log\t{point}\tlog_bytes={}", log1 - log0);
-    let dump1 = if args.timing {
-        ShipDump::default()
-    } else {
-        b.db.branch_dump(&image)
-    };
     if !args.timing {
         print_minimum(point, dump0, &dump1, b.page_size);
     }
-    check_digest(b, replica, &image, point);
-    // The replica acknowledged `seq`: its tombstones can go.
+    check_digest(&want, replica, point);
+    // The replica acknowledged `seq`: holes at or before it can go.
     let dropped = b.db.branch_forget_tombstones(seq);
-    println!("# {point}: tombstones dropped after the replica's ack: {dropped}");
+    println!("# {point}: holes dropped after the replica's ack: {dropped}");
     (seq, dump1, log1)
 }
 
@@ -804,9 +838,18 @@ fn main() {
 
     // T0: full sends.
     let image0 = b.checkpoint_image();
-    let seq0 = b.db.branch_ship_seq();
     state_line(&b, "T0");
     let live0 = b.db.branch_stats().live_branches;
+    let want0 = b.db.branch_digest(&image0);
+    let log0 = b.db.branch_log_bytes();
+    let dump0 = if args.timing {
+        ShipDump::default()
+    } else {
+        b.db.branch_dump(&image0)
+    };
+    if !args.timing {
+        full_minimum("T0", &dump0, &b, &image0);
+    }
     if !args.timing {
         let r = b
             .db
@@ -817,28 +860,9 @@ fn main() {
     let mut replica = Replica::new(page_size);
     replica.skip_inherit = args.plant == PlantArg::Inherit;
     let full_plant = if args.plant == PlantArg::Flip { Plant::FlipPayload } else { Plant::None };
-    let r = pipe(
-        &b.db,
-        &mut replica,
-        SendMode::FullFix,
-        None,
-        &image0,
-        args.delta,
-        full_plant,
-        "T0",
-        !args.timing,
-    );
+    let (r, seq0) = pipe(&mut b, &mut replica, &args, SendMode::FullFix, None, &image0, full_plant, "T0");
     print_stream("T0", live0, "full_fix", &r);
-    let dump0 = if args.timing {
-        ShipDump::default()
-    } else {
-        b.db.branch_dump(&image0)
-    };
-    if !args.timing {
-        full_minimum("T0", &dump0, &b, &image0);
-    }
-    check_digest(&b, &replica, &image0, "T0");
-    let log0 = b.db.branch_log_bytes();
+    check_digest(&want0, &replica, "T0");
 
     let out_dir = args
         .out_dir
@@ -858,18 +882,25 @@ fn main() {
             b.cycle(args.arm);
         }
         println!("# w2_s={:.1}(unlocked)", t.elapsed().as_secs_f64());
-        let (_seq2, dump2, _log2) = incremental(&mut b, &mut replica, &args, "T2", seq1, &dump1, log1);
-        let image2 = b.checkpoint_image();
-        let live2 = b.db.branch_stats().live_branches;
+        let (seq2, dump2, log2) = incremental(&mut b, &mut replica, &args, "T2", seq1, &dump1, log1);
+        // T3: catch the replica up on T2's mid-send cycles with nothing running, so that the source
+        // and the replica hold the same state for the full-send count and the exports.
+        let quiet = Args {
+            mid_cycles: 0,
+            ..args.clone()
+        };
+        let (_seq3, dump3, _log3) = incremental(&mut b, &mut replica, &quiet, "T3", seq2, &dump2, log2);
+        let image3 = b.checkpoint_image();
+        let live3 = b.db.branch_stats().live_branches;
         if !args.timing {
             let r = b
                 .db
-                .branch_send(SendMode::FullFix, None, &image2, false, Plant::None, true, None)
+                .branch_send(SendMode::FullFix, None, &image3, false, Plant::None, true, None)
                 .unwrap();
-            print_stream("T2", live2, "full_fix", &r);
-            full_minimum("T2", &dump2, &b, &image2);
+            print_stream("T3", live3, "full_fix", &r);
+            full_minimum("T3", &dump3, &b, &image3);
         }
-        exports(&mut b, &replica, &image2, args.samples, args.exports, &out_dir);
+        exports(&mut b, &replica, &image3, args.samples, args.exports, &out_dir);
     } else {
         exports(&mut b, &replica, &image0, args.samples, args.exports, &out_dir);
     }
