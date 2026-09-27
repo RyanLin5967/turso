@@ -5,7 +5,7 @@
 //!
 //!   TURSO_BRANCH_FULLFSYNC=0|1 cargo run -p turso_core --release --example branch_gc -- \
 //!       --threads 1,2,4,8,16 [--warm-ms 3000] [--window-ms 15000] [--lease-ms 1000] [--w 1] \
-//!       [--durability durable|durable-nosync] [--reap-every-ms 100]
+//!       [--durability durable|durable-nosync] [--reap-every-ms 100] [--trunk-every 0]
 //!
 //! One lifecycle is one agent's branch: fork from the trunk, connect, write `--w` rows on w distinct
 //! leaves in one transaction, close; `--lease-ms` later the reaper releases it. For each T in
@@ -27,6 +27,12 @@
 //! Which sync the store issues is printed from the instrument: plain fsync(2), or `F_FULLFSYNC`
 //! with `TURSO_BRANCH_FULLFSYNC=1`.
 //!
+//! With `--trunk-every k` (k > 0; r11-churn amendment 6b) the trunk is written too: the agent whose lifecycle
+//! number n has n mod k = k - 1 then commits one trunk UPDATE on its own trunk connection, to a separate table `tw`
+//! that no branch reads (so the checks below stay exact), rotating over its rows. Every `tw` page is visible to every
+//! live child, so each trunk write takes the copy decision a real trunk write takes. Three columns are appended:
+//! trunk commits per second, Busy retries per trunk commit, and flushes under the store mutex per trunk commit.
+//!
 //! Checks (`NOT A RESULT`, exit 1): every 64th lifecycle reads its own row back before closing;
 //! after each T the engine's branch count equals the branches still leased; after the last T,
 //! every branch is released and the arena is empty.
@@ -45,6 +51,7 @@ use turso_core::{
 const TRUNK_ROWS: i64 = 20_000;
 const VALUE_LEN: usize = 100;
 const PAGE_STRIDE: i64 = 312;
+const TW_ROWS: u64 = 1_000;
 
 struct Args {
     threads: Vec<usize>,
@@ -54,6 +61,7 @@ struct Args {
     w: usize,
     durability: BranchDurability,
     reap_every: Duration,
+    trunk_every: u64,
 }
 
 fn die(msg: &str) -> ! {
@@ -75,6 +83,7 @@ fn parse_args() -> Args {
         w: 1,
         durability: BranchDurability::Durable { sync: true },
         reap_every: Duration::from_millis(100),
+        trunk_every: 0,
     };
     let ms = |s: String, what: &str| -> Duration {
         Duration::from_millis(s.parse().unwrap_or_else(|_| die(&format!("bad {what}"))))
@@ -94,6 +103,9 @@ fn parse_args() -> Args {
             "--lease-ms" => args.lease = ms(val(), "--lease-ms"),
             "--w" => args.w = val().parse().unwrap_or_else(|_| die("bad --w")),
             "--reap-every-ms" => args.reap_every = ms(val(), "--reap-every-ms"),
+            "--trunk-every" => {
+                args.trunk_every = val().parse().unwrap_or_else(|_| die("bad --trunk-every"))
+            }
             "--durability" => {
                 args.durability = match val().as_str() {
                     "durable" => BranchDurability::Durable { sync: true },
@@ -155,12 +167,18 @@ struct Shared {
     arrivals: AtomicU64,
     reaped: AtomicU64,
     busy_retries: AtomicU64,
+    trunk_commits: AtomicU64,
+    trunk_busy: AtomicU64,
     cycles: Mutex<Vec<u64>>,
     stop_agents: AtomicBool,
     stop_reaper: AtomicBool,
 }
 
-fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize) {
+fn tw_value(m: u64) -> String {
+    format!("w{:0>width$}", m, width = VALUE_LEN - 1)
+}
+
+fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize, trunk_every: u64) {
     let trunk = db.connect().unwrap();
     while !shared.stop_agents.load(Ordering::Acquire) {
         let start = Instant::now();
@@ -210,6 +228,26 @@ fn agent(shared: &Shared, db: &Arc<Database>, lease: Duration, w: usize) {
             .push_back((Instant::now() + lease, branch));
         shared.arrivals.fetch_add(1, Ordering::Release);
         shared.cycles.lock().unwrap().push(cycle);
+        if trunk_every > 0 && n % trunk_every == trunk_every - 1 {
+            let m = n / trunk_every;
+            let sql = format!(
+                "UPDATE tw SET v = '{}' WHERE id = {}",
+                tw_value(m),
+                m % TW_ROWS + 1
+            );
+            loop {
+                match trunk.execute(&sql) {
+                    Ok(_) => break,
+                    // A fork holds the trunk's WAL write lock.
+                    Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => {
+                        shared.trunk_busy.fetch_add(1, Ordering::Relaxed);
+                        std::thread::yield_now();
+                    }
+                    Err(e) => not_a_result(&format!("trunk write failed: {e}")),
+                }
+            }
+            shared.trunk_commits.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -263,12 +301,24 @@ fn main() {
             .unwrap();
     }
     trunk.execute("COMMIT").unwrap();
+    if args.trunk_every > 0 {
+        trunk
+            .execute("CREATE TABLE tw(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        trunk.execute("BEGIN").unwrap();
+        for id in 1..=TW_ROWS {
+            trunk
+                .execute(format!("INSERT INTO tw VALUES ({id}, '{}')", tw_value(0)))
+                .unwrap();
+        }
+        trunk.execute("COMMIT").unwrap();
+    }
     trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     let c0 = churn_counters();
     println!("# branch_gc — Turso fork, DURABLE branch store, concurrent agent lifecycles, r11-churn amendment 4");
     println!(
         "# threads={:?} warm_ms={} window_ms={} lease_ms={} w={} durability={:?} reap_every_ms={} \
-         sync_call={} build={}",
+         trunk_every={} sync_call={} build={}",
         args.threads,
         args.warm.as_millis(),
         args.window.as_millis(),
@@ -276,6 +326,7 @@ fn main() {
         args.w,
         args.durability,
         args.reap_every.as_millis(),
+        args.trunk_every,
         if c0.full_fsync {
             "F_FULLFSYNC"
         } else {
@@ -290,7 +341,12 @@ fn main() {
     println!(
         "# gc columns: T lifecycles_per_s arrivals_per_s fsyncs_per_arrival fsyncs_per_s \
          flights_per_s locked_flushes_per_s waits_per_s already_durable_per_s \
-         busy_retries_per_arrival cycle_p50_us cycle_p90_us cycle_p99_us cycle_max_us"
+         busy_retries_per_arrival cycle_p50_us cycle_p90_us cycle_p99_us cycle_max_us{}",
+        if args.trunk_every > 0 {
+            " trunk_commits_per_s trunk_busy_per_commit locked_flushes_per_trunk_commit"
+        } else {
+            ""
+        }
     );
     let shared = Arc::new(Shared {
         queue: Mutex::new(VecDeque::new()),
@@ -298,6 +354,8 @@ fn main() {
         arrivals: AtomicU64::new(0),
         reaped: AtomicU64::new(0),
         busy_retries: AtomicU64::new(0),
+        trunk_commits: AtomicU64::new(0),
+        trunk_busy: AtomicU64::new(0),
         cycles: Mutex::new(Vec::new()),
         stop_agents: AtomicBool::new(false),
         stop_reaper: AtomicBool::new(false),
@@ -310,8 +368,9 @@ fn main() {
         shared.stop_agents.store(false, Ordering::Release);
         let agents: Vec<_> = (0..t)
             .map(|_| {
-                let (shared, db, lease, w) = (shared.clone(), db.clone(), args.lease, args.w);
-                std::thread::spawn(move || agent(&shared, &db, lease, w))
+                let (shared, db, lease, w, k) =
+                    (shared.clone(), db.clone(), args.lease, args.w, args.trunk_every);
+                std::thread::spawn(move || agent(&shared, &db, lease, w, k))
             })
             .collect();
         std::thread::sleep(args.warm);
@@ -322,12 +381,14 @@ fn main() {
                 s.reaped.load(Ordering::Acquire),
                 s.busy_retries.load(Ordering::Acquire),
                 churn_counters(),
+                s.trunk_commits.load(Ordering::Acquire),
+                s.trunk_busy.load(Ordering::Acquire),
             )
         };
         shared.cycles.lock().unwrap().clear();
-        let (t0, a0, r0, b0, k0) = snap(&shared);
+        let (t0, a0, r0, b0, k0, tc0, tb0) = snap(&shared);
         std::thread::sleep(args.window);
-        let (t1, a1, r1, b1, k1) = snap(&shared);
+        let (t1, a1, r1, b1, k1, tc1, tb1) = snap(&shared);
         let mut cyc: Vec<f64> = std::mem::take(&mut *shared.cycles.lock().unwrap())
             .iter()
             .map(|&n| n as f64 / 1e3)
@@ -340,8 +401,19 @@ fn main() {
         let secs = (t1 - t0).as_secs_f64();
         let arrivals = (a1 - a0) as f64;
         let per_s = |x: u64| x as f64 / secs;
+        let trunk_cols = if args.trunk_every > 0 {
+            let commits = (tc1 - tc0) as f64;
+            format!(
+                " {:.1} {:.4} {:.4}",
+                commits / secs,
+                (tb1 - tb0) as f64 / commits.max(1.0),
+                (k1.gc_locked_flushes - k0.gc_locked_flushes) as f64 / commits.max(1.0)
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "# gc {t} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1}",
+            "# gc {t} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1}{trunk_cols}",
             per_s(r1 - r0),
             arrivals / secs,
             (k1.fsyncs - k0.fsyncs) as f64 / arrivals.max(1.0),
