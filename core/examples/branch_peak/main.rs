@@ -3,6 +3,21 @@
 
 mod run;
 
+/// libmalloc's purge on demand over every zone (`malloc_zone_pressure_relief`, goal 0: as much as
+/// it can). Off macOS there is nothing to call.
+fn relieve() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone means every zone; the call only returns free memory to the OS.
+        return unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    }
+    #[allow(unreachable_code)]
+    0
+}
+
 fn main() {
-    run::main("system");
+    run::main("system", relieve);
 }

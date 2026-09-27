@@ -7,6 +7,17 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[path = "../branch_peak/run.rs"]
 mod run;
 
+extern "C" {
+    /// mimalloc's own purge on demand; linked through the `mimalloc` crate above.
+    fn mi_collect(force: bool);
+}
+
+fn relieve() -> usize {
+    // SAFETY: mi_collect only frees memory mimalloc holds and no object uses.
+    unsafe { mi_collect(true) };
+    0
+}
+
 fn main() {
-    run::main("mimalloc");
+    run::main("mimalloc", relieve);
 }

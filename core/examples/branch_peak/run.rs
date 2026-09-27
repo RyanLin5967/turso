@@ -40,6 +40,9 @@ struct Args {
     window: usize,
     stall_us: f64,
     seed: u64,
+    /// After each post-peak checkpoint, ask the allocator to return its free memory and read again
+    /// (r12-f9-shrink amendment 3, D2).
+    relief: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -59,6 +62,7 @@ fn parse_args() -> Args {
         checkpoints: vec![],
         reap_oldest: false,
         untimed: false,
+        relief: false,
         window: 5000,
         stall_us: 100.0,
         seed: 0x9E37_79B9_7F4A_7C15,
@@ -86,6 +90,7 @@ fn parse_args() -> Args {
             "--stall-us" => a.stall_us = val().parse().unwrap_or_else(|_| die("bad --stall-us")),
             "--seed" => a.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
             "--untimed" => a.untimed = true,
+            "--relief" => a.relief = true,
             o => die(&format!("unknown argument {o}")),
         }
     }
@@ -296,7 +301,9 @@ fn resident_line(label: &str, n_ever: usize, live: usize, r: &BranchResident) ->
     )
 }
 
-pub fn main(allocator: &str) {
+/// `relieve` asks the global allocator to hand its free memory back to the OS and returns what it
+/// reports (bytes, where it reports any).
+pub fn main(allocator: &str, relieve: fn() -> usize) {
     let args = parse_args();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("branch_peak.db");
@@ -431,6 +438,11 @@ pub fn main(allocator: &str) {
         not_a_result(&format!("after the reap-down: {r:?}"));
     }
     println!("{}", resident_line("reaped", created, live.len(), &r));
+    if args.relief {
+        let returned = relieve();
+        let r = db.branch_resident();
+        println!("{} relief_returned={returned}", resident_line("reaped_relief", created, live.len(), &r));
+    }
     println!(
         "# phase grow seconds={grow_s:.1} {grow_summary} (fork+connect+write per branch) stalls_ge={} \
          listed={:?}",
@@ -521,6 +533,11 @@ pub fn main(allocator: &str) {
             not_a_result(&format!("churn checkpoint {ckpt}: {r:?}"));
         }
         println!("{}", resident_line("churn", created, live.len(), &r));
+        if args.relief {
+            let returned = relieve();
+            let r = db.branch_resident();
+            println!("{} relief_returned={returned}", resident_line("churn_relief", created, live.len(), &r));
+        }
         if !args.untimed {
             for (i, v) in ops.iter_mut().enumerate() {
                 if v.is_empty() {
