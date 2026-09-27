@@ -556,6 +556,13 @@ impl Statement {
                 .fetch_sub(1, Ordering::SeqCst);
             if previous == 1 {
                 self.program.connection.clear_interrupt_if_idle();
+                // No statement runs on this connection now: a branch pager lets go of its cache
+                // entries for pages it holds by reference (FS10; a no-op unless enabled).
+                self.program
+                    .connection
+                    .pager
+                    .load()
+                    .release_shared_pages();
             }
             self.counted_as_active_root = false;
         }

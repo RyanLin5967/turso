@@ -138,6 +138,9 @@ pub(crate) struct BranchStore {
     fw3: std::sync::atomic::AtomicBool,
     /// FS9 (r11-sessions): serve retained trunk versions by reference (see `retained_clones`).
     fs9: AtomicBool,
+    /// FS10 (r11-sessions): branch pagers release their private cache entries for pages held by
+    /// reference when their connection's last statement ends (see `Pager::release_shared_pages`).
+    fs10: AtomicBool,
 }
 
 /// Where the page a branch asked for comes from.
@@ -191,6 +194,18 @@ impl<T: Default> Radix<T> {
         let (t, m, l) = Self::split(page);
         let leaf = self.top.get()?[t].get()?[m].get()?;
         Some(&leaf[l])
+    }
+
+    /// Entries of the installed leaves for which `present` holds.
+    fn count(&self, present: impl Fn(&T) -> bool) -> usize {
+        let Some(top) = self.top.get() else {
+            return 0;
+        };
+        top.iter()
+            .filter_map(|mid| mid.get())
+            .flat_map(|mid| mid.iter().filter_map(|leaf| leaf.get()))
+            .map(|leaf| leaf.iter().filter(|t| present(t)).count())
+            .sum()
     }
 
     fn get_or_insert(&self, page: u32) -> &T {
@@ -583,6 +598,7 @@ impl BranchStore {
             trunk_format: OnceLock::new(),
             fw3: std::sync::atomic::AtomicBool::new(super::walpin::fw3()),
             fs9: AtomicBool::new(fs9_from_env()),
+            fs10: AtomicBool::new(std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "1")),
         }
     }
 
@@ -605,6 +621,20 @@ impl BranchStore {
 
     pub(crate) fn set_fs9(&self, on: bool) {
         self.fs9.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_fs10(&self, on: bool) {
+        self.fs10.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn fs10(&self) -> bool {
+        self.fs10.load(Ordering::Relaxed)
+    }
+
+    /// Trunk pages F6's shared cache holds a version of: the shared pool's size, in pages.
+    /// Observation only (a walk of the installed radix leaves).
+    pub(crate) fn trunk_cache_pages(&self) -> usize {
+        self.trunk_pages.pages.count(|slot| slot.load().is_some())
     }
 
     pub(crate) fn retained_clone_count(&self) -> usize {

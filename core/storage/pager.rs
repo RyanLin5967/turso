@@ -1853,6 +1853,27 @@ impl Pager {
         self.page_cache.read().len()
     }
 
+    /// FS10 (r11-sessions): on a branch pager, drop the private cache entries of pages held by
+    /// reference (Buffer::Shared: F6's trunk pages, FS9's clones) once no statement runs on the
+    /// connection. Between statements no cursor holds a page, so this is ordinary eviction of clean
+    /// pages; the next statement re-resolves them from the shared pool by reference. A held idle
+    /// session then keeps no per-page state for shared pages. Returns the entries released.
+    pub(crate) fn release_shared_pages(&self) -> usize {
+        if !self.branch.get().is_some_and(|b| b.store.fs10()) {
+            return 0;
+        }
+        #[cfg(test)]
+        if crate::branch::store::mutants::on("FS10_KEEP_PRIVATE") {
+            return 0;
+        }
+        self.page_cache.write().delete_clean_shared(|page| {
+            page.get()
+                .buffer
+                .as_ref()
+                .is_some_and(|b| matches!(**b, Buffer::Shared(_)))
+        })
+    }
+
     /// This pager's private page-cache capacity, in pages. Observation only.
     pub(crate) fn page_cache_capacity(&self) -> usize {
         self.page_cache.read().capacity()

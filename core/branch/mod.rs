@@ -516,7 +516,13 @@ impl Database {
     /// ends. Normally taken from `TURSO_R11S_FS10=1`; tests set it per database.
     #[doc(hidden)]
     pub fn set_fs10(&self, on: bool) {
-        let _ = on; // red commit: the switch exists, the release does not
+        self.branches.set_fs10(on);
+    }
+
+    /// Trunk pages held in the shared trunk-page cache (the FS10 pool's size). Observation only.
+    #[doc(hidden)]
+    pub fn trunk_cache_pages(&self) -> usize {
+        self.branches.trunk_cache_pages()
     }
 
     /// FS9: retained trunk versions currently cloned for sharing. Observation only.
