@@ -273,6 +273,8 @@ pub(crate) struct BranchStore {
     /// F-K3: the trunk arena's pages, for reading a retained version without the trunk's lock. Set
     /// under the trunk lock by the first retain, before that version is published.
     trunk_chunks: OnceLock<std::sync::Arc<Chunks>>,
+    /// F-FB: batched trunk forks (`TURSO_FORK_BATCH=on` at construction); `None` forks one at a time.
+    fork_batch: Option<ForkBatcher>,
 }
 
 #[cfg(test)]
@@ -596,8 +598,10 @@ impl TrunkPages {
 struct Lineage {
     /// Advanced by each fork of this node; the pre-increment value is the child's fork epoch.
     epoch: u64,
-    /// Live children by fork epoch. Fork epochs are unique within a parent.
-    children: BTreeMap<u64, BranchId>,
+    /// Live children by fork epoch, counted. Fork epochs are unique within a parent, except that
+    /// trunk forks batched under F-FB share their batch's epoch (r12-e1 amendment 2), so an epoch
+    /// counts every live child forked in it.
+    children: BTreeMap<u64, u32>,
     /// Superseded versions kept because a live child forked while they were current, per page and
     /// ordered by `born` (see "Per-page version order" above).
     retained: HashMap<u32, BTreeMap<u64, Retained>>,
@@ -619,6 +623,32 @@ struct Retained {
     born: u64,
     died: u64,
     slot: Slot,
+}
+
+/// F-FB (r12-e1 amendment 2): trunk forks batched as FoundationDB batches read-version requests
+/// (forks that arrive together share one read version) and as flat combining serves a queue
+/// (Hendler et al., SPAA 2010). A fork joins the collecting batch; the first fork to find no leader
+/// takes the trunk lock, closes the batch, gives it one fork epoch and lists its forks under that
+/// epoch as a count; the others wait for their batch to be done. Every trunk fork of a store in this
+/// mode goes through it, so batch `b`'s epoch is `b`.
+struct ForkBatcher {
+    /// The collecting batch's number (high 32 bits) and the forks that have joined it (low 32).
+    seq: CachePadded<AtomicU64>,
+    /// Batches done: a fork of batch `b` has its epoch once this exceeds `b`.
+    done: CachePadded<AtomicU64>,
+    /// Held by the fork serving the collecting batch, from before it takes the trunk lock until
+    /// its batch is done.
+    leader: CachePadded<AtomicBool>,
+}
+
+impl ForkBatcher {
+    fn new() -> Self {
+        Self {
+            seq: CachePadded::new(AtomicU64::new(0)),
+            done: CachePadded::new(AtomicU64::new(0)),
+            leader: CachePadded::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// Which read path the store takes for a page the trunk rewrote after the reader's fork.
@@ -917,9 +947,16 @@ impl Lineage {
     }
 
     /// Detach the child forked at `f` and release every retained version that only it could see.
+    /// A child that shares its epoch with a live sibling (F-FB) sees nothing the sibling does not,
+    /// so its reap frees nothing; the epoch's last child frees what the epoch alone held.
     fn child_gone(&mut self, f: u64, arena: &mut Domain, work: &mut BranchWork) -> usize {
-        let removed = self.children.remove(&f);
-        crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
+        let live = self.children.get(&f).copied().unwrap_or(0);
+        crate::turso_assert!(live > 0, "detached a child the parent does not list");
+        if live > 1 {
+            self.children.insert(f, live - 1);
+            return 0;
+        }
+        self.children.remove(&f);
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
         self.release_garbage(f, lo, hi, arena, work)
@@ -1087,6 +1124,15 @@ impl BranchStore {
         if !matches!(mode, K3Mode::Off) && crate::coherence::fix(crate::coherence::FIX_TRUNKIDX) {
             panic!("TURSO_K3={} with r11-coherence's FK: not composed; refused", mode.name());
         }
+        let fork_batch = match std::env::var("TURSO_FORK_BATCH") {
+            Err(std::env::VarError::NotPresent) => false,
+            Ok(v) if v.is_empty() || v == "off" => false,
+            Ok(v) if v == "on" => true,
+            other => panic!("TURSO_FORK_BATCH={other:?}: expected `on` or `off`"),
+        };
+        if fork_batch && crate::coherence::fix(crate::coherence::FIX_TRUNKIDX) {
+            panic!("TURSO_FORK_BATCH=on with r11-coherence's FK: FK forks without the trunk lock; refused");
+        }
         let k3 = shared.map(std::sync::Arc::new);
         let n_shards = if crate::coherence::fix(crate::coherence::FIX_STRIPES) {
             SHARDS_FINE
@@ -1148,6 +1194,7 @@ impl BranchStore {
             k3,
             k3_mode: mode,
             trunk_chunks: OnceLock::new(),
+            fork_batch: fork_batch.then(ForkBatcher::new),
         }
     }
 
@@ -1206,6 +1253,55 @@ impl BranchStore {
     /// The trunk-read mode's name: `off`, `lockfree` or `olc`.
     pub(crate) fn k3_mode(&self) -> &'static str {
         self.k3_mode.name()
+    }
+
+    /// Whether trunk forks are batched (F-FB).
+    pub(crate) fn fork_batched(&self) -> bool {
+        self.fork_batch.is_some()
+    }
+
+    /// Tests: this store with F-FB, before its first fork.
+    #[cfg(test)]
+    fn batched(mut self) -> Self {
+        crate::turso_assert!(self.trunk(TrunkSite::Observe).lineage.epoch == 0, "batched after a fork");
+        self.fork_batch = Some(ForkBatcher::new());
+        self
+    }
+
+    /// Tests: the forks that have joined the collecting batch.
+    #[cfg(test)]
+    fn fork_batch_joined(&self) -> u64 {
+        let fb = self.fork_batch.as_ref().expect("a batched store");
+        fb.seq.load(Ordering::Acquire) & u64::from(u32::MAX)
+    }
+
+    /// Tests: the trunk's live children per fork epoch.
+    #[cfg(test)]
+    fn trunk_children_by_epoch(&self) -> Vec<(u64, u32)> {
+        self.trunk(TrunkSite::Observe)
+            .lineage
+            .children
+            .iter()
+            .map(|(&f, &n)| (f, n))
+            .collect()
+    }
+
+    /// Tests: `k` trunk forks served as one batch, from this thread: `k - 1` forks join the
+    /// collecting batch as other threads would, this one joins and leads it, and the other `k - 1`
+    /// branches are then made with the batch's epoch, as their threads would make them.
+    #[cfg(test)]
+    fn fork_trunk_batch_for_test(&self, k: u32, page_size: usize) -> Vec<BranchId> {
+        let fb = self.fork_batch.as_ref().expect("a batched store");
+        fb.seq.fetch_add(u64::from(k - 1), Ordering::AcqRel);
+        let first = self.fork_trunk(Arc::new(Schema::default()), page_size, 0).unwrap();
+        let f = self.shard(first).branches[&first].fork_epoch;
+        let mut ids = vec![first];
+        for _ in 1..k {
+            let id = self.next_branch_id();
+            self.finish_trunk_fork(id, f, Arc::new(Schema::default()));
+            ids.push(id);
+        }
+        ids
     }
 
     fn timed(&self) -> bool {
@@ -1400,14 +1496,23 @@ impl BranchStore {
             let f = self.k_epoch.fetch_add(1, Ordering::AcqRel);
             self.k_children.insert(f, id);
             (id, f)
+        } else if let Some(fb) = &self.fork_batch {
+            let id = self.next_branch_id();
+            (id, self.join_fork_batch(fb))
         } else {
             let mut trunk = self.trunk(TrunkSite::Fork);
             let id = self.next_branch_id();
             let f = trunk.lineage.epoch;
             trunk.lineage.epoch += 1;
-            trunk.lineage.children.insert(f, id);
+            trunk.lineage.children.insert(f, 1);
             (id, f)
         };
+        self.finish_trunk_fork(id, f, schema);
+        Ok(id)
+    }
+
+    /// A trunk fork's branch, made once its epoch `f` is listed among the trunk's children.
+    fn finish_trunk_fork(&self, id: BranchId, f: u64, schema: Arc<Schema>) {
         self.live_inc();
         self.shard(id).branches.insert(
             id,
@@ -1415,7 +1520,64 @@ impl BranchStore {
         );
         crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
         self.trunk_children_ctr().fetch_add(1, Ordering::AcqRel);
-        Ok(id)
+    }
+
+    /// F-FB: join the collecting batch of trunk forks and return its fork epoch, leading the batch
+    /// if no fork is. The leader takes the trunk lock BEFORE it closes the batch, so every fork that
+    /// joined while it waited for the lock is in the batch. Sound because each fork's caller holds
+    /// the fork gate (FG) or the WAL write lock across the call: no trunk commit lands between a
+    /// member's entry and its batch's epoch, so every member sees the trunk as of that epoch.
+    fn join_fork_batch(&self, fb: &ForkBatcher) -> u64 {
+        let b = fb.seq.fetch_add(1, Ordering::AcqRel) >> 32;
+        let mut spins = 0u32;
+        loop {
+            if fb.done.load(Ordering::Acquire) > b {
+                return b;
+            }
+            if fb
+                .leader
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                if fb.done.load(Ordering::Acquire) > b {
+                    fb.leader.store(false, Ordering::Release);
+                    return b;
+                }
+                let mut trunk = self.trunk(TrunkSite::Fork);
+                // Close the collecting batch (the next one starts empty) with the lock held.
+                let mut cur = fb.seq.load(Ordering::Acquire);
+                while let Err(now) = fb.seq.compare_exchange_weak(
+                    cur,
+                    ((cur >> 32) + 1) << 32,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    cur = now;
+                }
+                let (batch, members) = (cur >> 32, (cur & u64::from(u32::MAX)) as u32);
+                // With the leader's flag held no other batch is being served, and every batch
+                // closed before was done before its leader let the flag go.
+                crate::turso_assert!(
+                    batch == b && fb.done.load(Ordering::Relaxed) == b && members > 0,
+                    "a fork batch's leader closes its own batch, the oldest one open"
+                );
+                let f = trunk.lineage.epoch;
+                crate::turso_assert!(f == b, "a batched store's trunk epoch is its batch number");
+                trunk.lineage.epoch += 1;
+                let listed = trunk.lineage.children.insert(f, members);
+                crate::turso_assert!(listed.is_none(), "a fork batch's epoch was already listed");
+                drop(trunk);
+                fb.done.store(b + 1, Ordering::Release);
+                fb.leader.store(false, Ordering::Release);
+                return b;
+            }
+            spins += 1;
+            if spins < 1 << 10 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
     }
 
     /// Fork a child of a branch. Refused while the parent has a write transaction in progress, for
@@ -1447,7 +1609,7 @@ impl BranchStore {
             let id = self.next_branch_id();
             let f = st.lineage.epoch;
             st.lineage.epoch += 1;
-            st.lineage.children.insert(f, id);
+            st.lineage.children.insert(f, 1);
             let schema = pick(&st.schema);
             let (current, inherited) = (&st.current, &st.inherited);
             let view = st
@@ -3076,6 +3238,200 @@ mod tests {
             work.trunk_page_hits
         );
         for (id, _) in live {
+            store.release_handle(id);
+        }
+        assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {mode:?}: versions leaked");
+    }
+
+    /// F-FB (r12-e1 amendment 2, T1): trunk forks that queue while the trunk lock is held form ONE
+    /// batch. A holder keeps the lock while 8 threads fork; once all 8 have joined the collecting
+    /// batch it lets go, and the 8 must take the lock once between them, share one epoch, and be
+    /// listed under it as 8.
+    #[test]
+    fn batched_forks_queued_behind_the_trunk_lock_share_one_epoch_and_one_acquisition() {
+        const K: u32 = 8;
+        let store = Arc::new(BranchStore::with_k3(K3Mode::Off).batched());
+        let first = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        let fork = TrunkSite::Fork as usize;
+        let before = store.stats().work.trunk_sites.acquisitions[fork];
+        let held = store.trunk(TrunkSite::Observe);
+        let forks: Vec<_> = (0..K)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap())
+            })
+            .collect();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        while store.fork_batch_joined() < u64::from(K) {
+            assert!(Instant::now() < deadline, "the forks never all joined the batch");
+            std::thread::yield_now();
+        }
+        drop(held);
+        let ids: Vec<BranchId> = forks.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            store.stats().work.trunk_sites.acquisitions[fork] - before,
+            1,
+            "{K} forks queued behind the lock took it more than once"
+        );
+        assert_eq!(store.trunk_children_by_epoch(), vec![(0, 1), (1, K)]);
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), K as usize, "two forks got one id");
+        for id in ids.into_iter().chain([first]) {
+            assert!(!store.release_handle(id).deferred);
+        }
+        assert!(store.trunk_children_by_epoch().is_empty());
+        assert!(!store.trunk_has_children());
+    }
+
+    /// F-FB (T2): two children forked in one batch share epoch 0; the trunk then rewrites page 0,
+    /// which retains its pre-image for epoch 0. Reaping one child frees nothing, since its sibling
+    /// still sees the version; the sibling reads the pre-image; reaping it frees the version.
+    #[test]
+    fn a_shared_fork_epoch_keeps_its_versions_until_its_last_child_goes() {
+        for mode in K3Mode::ALL {
+            let store = BranchStore::with_k3(mode).batched();
+            let ids = store.fork_trunk_batch_for_test(2, PAGE);
+            assert_eq!(store.trunk_children_by_epoch(), vec![(0, 2)], "k3 {mode:?}: premise: one batch of two");
+            // The trunk rewrites page 0, whose content until now was `image(0)`.
+            store.first_write_trunk(0, &image(0));
+            assert_eq!(
+                store.stats().arena_slots_in_use,
+                1,
+                "k3 {mode:?}: premise: the write retained the pre-image for epoch 0"
+            );
+            assert_eq!(
+                store.release_handle(ids[0]).freed_pages,
+                0,
+                "k3 {mode:?}: the first of two epoch-0 children freed a version its sibling sees"
+            );
+            assert_eq!(store.stats().arena_slots_in_use, 1, "k3 {mode:?}: the version went");
+            let mut buf = vec![0u8; PAGE];
+            assert!(matches!(store.resolve_into(ids[1], 0, &mut buf).unwrap(), Resolved::Filled));
+            assert_eq!(buf, image(0), "k3 {mode:?}: the sibling must read the pre-image");
+            assert_eq!(
+                store.release_handle(ids[1]).freed_pages,
+                1,
+                "k3 {mode:?}: the epoch's last child must free the version"
+            );
+            assert_eq!(store.stats().arena_slots_in_use, 0, "k3 {mode:?}: a version leaked");
+        }
+    }
+
+    /// F-FB (T3): the model walk of `retained_versions_match_a_model_...` with trunk forks in
+    /// batches of 1-4 that share an epoch, and children reaped at random. After every step every
+    /// live child reads every page as of its fork, and the arena holds exactly the versions whose
+    /// `[born, died)` contains a live child's epoch; a reap that leaves a batch sibling frees
+    /// nothing. The walk must reap a non-last member of an epoch that still has versions, and a
+    /// last member that frees some, or it says nothing about the shared case.
+    #[test]
+    fn retained_versions_match_a_model_when_trunk_forks_share_epochs() {
+        for mode in K3Mode::ALL {
+            for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+                run_batched(seed, mode);
+            }
+        }
+    }
+
+    fn run_batched(seed: u64, mode: K3Mode) {
+        let store = BranchStore::with_k3(mode).batched();
+        let mut rng = Rng(seed);
+        let mut current: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut live: Vec<(BranchId, u64, HashMap<u32, u64>)> = Vec::new();
+        let mut history: Vec<(u32, u64, u64)> = Vec::new();
+        let mut written: HashMap<u32, u64> = HashMap::new();
+        let mut epoch = 0u64;
+        let mut generation = 0u64;
+        let (mut kept_for_sibling, mut freed_by_last) = (0, 0);
+        for step in 0..1500 {
+            match rng.below(10) {
+                0..=2 if live.len() < 40 => {
+                    let k = 1 + rng.below(4) as u32;
+                    for id in store.fork_trunk_batch_for_test(k, PAGE) {
+                        live.push((id, epoch, current.clone()));
+                    }
+                    epoch += 1;
+                }
+                0..=5 => {
+                    for _ in 0..=rng.below(3) {
+                        let page = rng.below(PAGES as u64) as u32;
+                        if store.trunk_has_children() {
+                            let born = written.get(&page).copied().unwrap_or(0);
+                            if born < epoch {
+                                if live.iter().any(|&(_, f, _)| born <= f && f < epoch) {
+                                    history.push((page, born, epoch));
+                                }
+                                written.insert(page, epoch);
+                            }
+                            store.first_write_trunk(page, &image(current[&page]));
+                        }
+                        generation += 1;
+                        current.insert(page, generation);
+                    }
+                }
+                _ if !live.is_empty() => {
+                    let at = rng.below(live.len() as u64) as usize;
+                    let (id, f, _) = live.remove(at);
+                    let siblings = live.iter().filter(|c| c.1 == f).count();
+                    let seen = history.iter().filter(|&&(_, born, died)| born <= f && f < died).count();
+                    let before = store.stats();
+                    let reaped = store.release_handle(id);
+                    let after = store.stats();
+                    assert!(!reaped.deferred, "seed {seed:#x} k3 {mode:?} step {step}");
+                    assert_eq!(
+                        before.arena_slots_in_use - after.arena_slots_in_use,
+                        reaped.freed_pages,
+                        "seed {seed:#x} k3 {mode:?} step {step}: the reap's report disagrees with the arena"
+                    );
+                    if siblings > 0 {
+                        assert_eq!(
+                            reaped.freed_pages, 0,
+                            "seed {seed:#x} k3 {mode:?} step {step}: a child with a live batch sibling freed a version"
+                        );
+                        if seen > 0 {
+                            kept_for_sibling += 1;
+                        }
+                    } else if reaped.freed_pages > 0 {
+                        freed_by_last += 1;
+                    }
+                }
+                _ => {}
+            }
+            let alive: HashSet<(u32, u64, u64)> = history
+                .iter()
+                .copied()
+                .filter(|&(_, born, died)| live.iter().any(|&(_, f, _)| born <= f && f < died))
+                .collect();
+            assert_eq!(
+                store.stats().arena_slots_in_use,
+                alive.len(),
+                "seed {seed:#x} k3 {mode:?} step {step}: the arena holds a version no live child can see, or \
+                 lost one a live child can"
+            );
+            history.retain(|v| alive.contains(v));
+            let mut buf = vec![0u8; PAGE];
+            for (id, f, view) in &live {
+                for page in 0..PAGES {
+                    let in_arena = matches!(
+                        store.resolve_into(*id, page, &mut buf).unwrap(),
+                        Resolved::Filled
+                    );
+                    let got = if in_arena {
+                        u64::from_le_bytes(buf[..8].try_into().unwrap())
+                    } else {
+                        current[&page]
+                    };
+                    assert_eq!(
+                        got, view[&page],
+                        "seed {seed:#x} k3 {mode:?} step {step}: child forked at {f} read the wrong page {page}"
+                    );
+                }
+            }
+        }
+        assert!(
+            kept_for_sibling > 0 && freed_by_last > 0,
+            "seed {seed:#x} k3 {mode:?}: reaps of a member whose sibling still sees versions {kept_for_sibling}, \
+             of a last member that freed some {freed_by_last}"
+        );
+        for (id, _, _) in live {
             store.release_handle(id);
         }
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x} k3 {mode:?}: versions leaked");

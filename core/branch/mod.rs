@@ -597,6 +597,13 @@ impl Database {
         self.branches.k3_mode()
     }
 
+    /// Whether the branch store batches trunk forks (F-FB, `TURSO_FORK_BATCH=on` when the database
+    /// opened). Observation only.
+    #[doc(hidden)]
+    pub fn branch_fork_batched(&self) -> bool {
+        self.branches.fork_batched()
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {

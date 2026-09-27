@@ -2043,7 +2043,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
     };
     println!(
         "# conc: threads={:?} (forward, then reversed) cycles_per_thread={} lock_timing={} mode={mode:?} sources={} \
-         trunk_writer={} reads={} k3_lockfree={} k3_mode={} pin={} trunk_spin_ns={} resolve_split={}",
+         trunk_writer={} reads={} k3_lockfree={} k3_mode={} fork_batch={} pin={} trunk_spin_ns={} resolve_split={}",
         args.threads,
         args.cycles,
         args.lock_timing,
@@ -2052,6 +2052,7 @@ fn arm_conc(b: &mut Bench, args: &Args) {
         args.reads,
         b.db.branch_trunk_reads_lockfree(),
         b.db.branch_k3_mode(),
+        if b.db.branch_fork_batched() { "on" } else { "off" },
         args.pin,
         std::env::var("TURSO_K3_TRUNKSPIN").unwrap_or_else(|_| "0".to_string()),
         if coherence::ENABLED { "on" } else { "off" },
@@ -2432,7 +2433,7 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
              trunk_slots_in_use={} wal_bytes={} trunk_blocking_per_cycle={:.4} \
              gc_range_entries={} gc_examined={} gc_range_per_cycle={:.4} \
              resolves_per_cycle={:.4} res_first_pc={:.4} res_again_clear_pc={:.4} res_again_other_pc={:.4} \
-             branch_cache_clears_pc={:.4} olc_restarts={} olc_fallbacks={}",
+             branch_cache_clears_pc={:.4} olc_restarts={} olc_fallbacks={} fork_acq_per_fork={:.4}",
             t * c,
             args.reads,
             writes as f64 / cycles,
@@ -2458,6 +2459,9 @@ fn run_cells(cx: &CellCtx<'_>, live: &mut Vec<Live>, grown: &mut usize) {
             d(start_stats.branch_cache_clears, s.branch_cache_clears) as f64 / cycles,
             d(start_stats.k3_olc_restarts, s.k3_olc_restarts),
             d(start_stats.k3_olc_fallbacks, s.k3_olc_fallbacks),
+            // Trunk-lock acquisitions at the fork site per fork: 1 unbatched, 1 / (mean batch size)
+            // under F-FB (r12-e1 amendment 2).
+            d(before.trunk_sites.acquisitions[0], after.trunk_sites.acquisitions[0]) as f64 / cycles,
         );
         print_sites(n, t, draw, cycles, &before, &after);
         if mode != ConcMode::Shared || !b.db.branch_trunk_reads_lockfree() {
