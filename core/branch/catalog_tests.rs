@@ -751,3 +751,54 @@ fn a_spliced_childs_key_keeps_its_parents_version_when_the_newest_sibling_goes()
     assert_eq!(db.branch_stats().unwrap().live_branches, 1, "P alone should be left");
     let _ = db.branch(p_id).unwrap().into_id();
 }
+
+/// Amendment 17 (the lead's decision on the catalog format key): a catalog store refuses the other
+/// splice arm, and a catalog written before the F7 port, from its meta row alone, which carries the
+/// format version in the page-size key's high bits. Here the log is cut to nothing after a
+/// checkpoint, a torn header with no version to check (a crash while the log was being reset leaves
+/// one), so only the catalog can refuse. The store's own arm then opens it and reads its branch;
+/// last, the meta's key is set to 0, as the base wrote it, and even the own arm is refused. The open
+/// reads the same nine meta rows as before: the key rides in a value, not a row.
+#[test]
+fn a_catalog_with_a_torn_log_header_opens_only_in_its_own_arm() {
+    for splice in [false, true] {
+        let what = format!("splice={splice}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let own = catalog().with_branch_splice(splice);
+        let b_id;
+        {
+            let db = open_at(&path, own).unwrap();
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            set(&b.connect().unwrap(), 7, "b");
+            b_id = b.into_id();
+            db.branch_compact_now().unwrap();
+        }
+        let files = journal::BranchFiles::for_db(path.to_str().unwrap());
+        std::fs::write(&files.log, b"").unwrap();
+        let err = match open_at(&path, own.with_branch_splice(!splice)) {
+            Ok(_) => panic!("{what}: the other arm opened a catalog whose log header is torn"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("splice"), "{what}: refused for another reason: {err}");
+        {
+            let db = open_at(&path, own).expect("its own arm opens it");
+            let b = db.branch(b_id).unwrap();
+            assert_eq!(value(&b.connect().unwrap(), 7), "b", "{what}");
+            let _ = b.into_id();
+        }
+        {
+            let mut cat = catalog::Catalog::open(&files.cat, false).unwrap();
+            let mut m = cat.meta().unwrap().expect("a checkpointed catalog has a meta row");
+            assert_eq!(m.format, journal::format_version(splice), "{what}: the key was not written");
+            m.format = 0;
+            cat.begin().unwrap();
+            cat.put_meta(&m).unwrap();
+            cat.commit().unwrap();
+        }
+        std::fs::write(&files.log, b"").unwrap();
+        assert!(open_at(&path, own).is_err(), "{what}: a catalog written before the port opened");
+    }
+}

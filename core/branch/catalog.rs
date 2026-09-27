@@ -138,6 +138,13 @@ pub(crate) struct Meta {
     pub(crate) arena_hw: u32,
     pub(crate) in_use: u64,
     pub(crate) states: u64,
+    /// The branch log and snapshot format version the store wrote this catalog under (3, or 4 in
+    /// the F7 splice arm; `journal::format_version`), so that a catalog opened with a torn log
+    /// header, which has no version to check, is still refused by an open in the other arm or by
+    /// this build when it predates the F7 port (0: children's epochs from 0). Carried in the high
+    /// 32 bits of the page-size key's value, so the meta row keeps its nine keys and an open reads
+    /// no row more than it did (r11-ever amendment 17, the lead's decision: no new catalog row).
+    pub(crate) format: u32,
 }
 
 /// One branch as the catalog holds it.
@@ -399,7 +406,10 @@ impl Catalog {
             let (k, v) = (get(&row, 0)? as i64, get(&row, 1)?);
             match k {
                 META_GENERATION => m.generation = v,
-                META_PAGE_SIZE => m.page_size = v as u32,
+                META_PAGE_SIZE => {
+                    m.page_size = (v & 0xFFFF_FFFF) as u32;
+                    m.format = (v >> 32) as u32;
+                }
                 META_NEXT_ID => m.next_id = v,
                 META_TRUNK_EPOCH => m.trunk_epoch = v,
                 META_TRUNK_CHILDREN => m.trunk_children = v,
@@ -470,7 +480,7 @@ impl Catalog {
     pub(crate) fn put_meta(&mut self, m: &Meta) -> Result<()> {
         for (k, v) in [
             (META_GENERATION, m.generation),
-            (META_PAGE_SIZE, m.page_size as u64),
+            (META_PAGE_SIZE, (u64::from(m.format) << 32) | u64::from(m.page_size)),
             (META_NEXT_ID, m.next_id),
             (META_TRUNK_EPOCH, m.trunk_epoch),
             (META_TRUNK_CHILDREN, m.trunk_children),

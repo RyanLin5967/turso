@@ -119,9 +119,8 @@
 //! snapshot records the hold (`held_open`), a catalog row as `released = 2`. The log format is 3, and
 //! 4 in the splice arm (both arms have epoch inheritance and the hold records): each arm reads only
 //! its own, since replay without the splices that were made, or with ones that were not, would
-//! rebuild another tree. A catalog store whose log header is torn opens from its meta row with no
-//! version check; that is safe for the arm, since no record is replayed and a checkpointed state is
-//! a valid tree in either arm.
+//! rebuild another tree. A catalog store also carries the version in its meta row (`Meta::format`),
+//! checked at open, so a torn log header does not let the other arm, or a pre-port catalog, in.
 //!
 //! # Leases (F5, UNBUILT)
 //!
@@ -173,9 +172,9 @@
 //!   a page and keeping one never pins a page.
 //! * Snapshot mode (`BranchDurability::Durable`) recovers eagerly: every branch map is materialised
 //!   at open, O(live branch state). Catalog mode reads state on demand (see `catalog.rs`).
-//! * A catalog written before the F7 durable port (children's epochs from 0) is refused only through
-//!   its log's format version: a catalog store whose log header is torn opens from its meta row
-//!   alone, and would take the old epochs. Not guarded.
+//! * A catalog written before the F7 durable port (children's epochs from 0), or in the other splice
+//!   arm, is refused by its meta row's format key (`Meta::format`, in the page-size key's high bits),
+//!   as well as by its log header's version, so a torn header does not let it open.
 //!
 //! # Per-page version order (the fat node; round 10's F1, ported from turso `0de3aa904`)
 //!
@@ -1260,14 +1259,24 @@ impl BranchStore {
         let mut catalog = Catalog::open(&files.cat, sync)?;
         let meta = catalog.meta()?;
         stats.catalog_ns = ns(t);
+        // The catalog's own format key (in the meta row this open reads anyway): the log header's
+        // version is checked too, but a torn header has none, and the catalog alone would then open
+        // in the other splice arm, or, written before the F7 port, with children's epochs from 0.
+        let format = super::journal::format_version(inner.splice);
+        if let Some(m) = meta.filter(|m| m.format != format) {
+            return Err(LimboError::Corrupt(format!(
+                "branch catalog {}: format version {}; this store reads version {format} (4 is the                  F7 splice arm's: open with the same DatabaseOpts::with_branch_splice; 0 predates                  the F7 port)",
+                files.cat.display(),
+                m.format
+            )));
+        }
         let t = Instant::now();
-        let recovered =
-            Journal::recover_catalog_as(
-                files,
-                sync,
-                meta.map(|m| (m.page_size, m.generation)),
-                super::journal::format_version(inner.splice),
-            )?;
+        let recovered = Journal::recover_catalog_as(
+            files,
+            sync,
+            meta.map(|m| (m.page_size, m.generation)),
+            format,
+        )?;
         stats.recover_ns = ns(t);
         let Some(mut recovered) = recovered else {
             return Ok(());
@@ -2958,6 +2967,7 @@ impl StoreInner {
                         generation: 0,
                         page_size: page_size as u32,
                         next_id: self.next_id,
+                        format: super::journal::format_version(self.splice),
                         ..Meta::default()
                     };
                     if let Err(e) = catalog.put_meta(&meta).and_then(|()| catalog.commit()) {
@@ -3104,6 +3114,7 @@ impl StoreInner {
             arena_hw: arena.high_water(),
             in_use: (arena.in_use() - reserved.len()) as u64,
             states: self.n_states,
+            format: super::journal::format_version(self.splice),
         };
         if super::arena::trace_slots() {
             let named: Vec<(u64, Vec<Slot>)> = rows
