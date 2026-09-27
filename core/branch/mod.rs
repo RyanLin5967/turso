@@ -393,6 +393,11 @@ impl Database {
         if self.shared_wal.read().walpin_wal2_installed() {
             return Ok(());
         }
+        if self.opts.enable_multiprocess_wal {
+            return Err(crate::LimboError::InvalidArgument(
+                "FW2 (wal2) does not support the multiprocess WAL".into(),
+            ));
+        }
         let file = self
             .io
             .open_file(&format!("{}2", self.walpin_wal_path()), crate::OpenFlags::Create, false)?;

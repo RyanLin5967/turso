@@ -627,6 +627,12 @@ trait WalCoordination: Debug + Send + Sync {
         None
     }
 
+    /// r11-walpin-conc amendment 21c: `-wal` and `-wal2` by name, whichever is current, for a
+    /// restart generation, which must empty `-wal` first (`prepare_wal_start`).
+    fn wal2_files(&self) -> [Option<Arc<dyn File>>; 2] {
+        [None, None]
+    }
+
     /// Clone the shared WAL state backing this coordination backend.
     fn shared_wal_state(&self) -> Arc<RwLock<WalFileShared>>;
 
@@ -1563,6 +1569,12 @@ impl WalCoordination for InProcessWalCoordination {
         } else {
             shared.runtime.file.clone()
         }
+    }
+
+    fn wal2_files(&self) -> [Option<Arc<dyn File>>; 2] {
+        let shared = self.shared.read();
+        let file1 = shared.runtime.wal2.lock().file1.clone();
+        [shared.runtime.file.clone(), file1]
     }
 
     fn wal_is_initialized(&self) -> bool {
@@ -4842,16 +4854,16 @@ impl Wal for WalFile {
                 // 1 (-wal <= 32 B empties -wal2) every crash state in between recovers to the
                 // database file alone; emptying -wal2 first could replay an older -wal over newer
                 // database pages.
-                let order = [Some(file.clone()), self.coordination.wal2_other_file()];
+                let order = self.coordination.wal2_files();
                 // Mutant M2 (amendment 21a, test builds only): -wal2 first.
                 #[cfg(test)]
                 let order = walpin::crash::restart_order(order);
-                for (_i, f) in order.iter().enumerate() {
+                for (f, _point) in order.iter().zip(["restart_first", "restart_second"]) {
                     if let Some(f) = f {
                         walpin_empty_wal_file(self.io.as_ref(), f.as_ref())?;
                     }
                     #[cfg(test)]
-                    walpin::crash::point(["restart_first", "restart_second"][_i]);
+                    walpin::crash::point(_point);
                 }
             }
             // A switch generation is written over the reused file's old frames, which fail the
