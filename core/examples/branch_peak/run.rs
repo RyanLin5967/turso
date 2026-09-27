@@ -17,10 +17,12 @@
 //! Lane r12-f9-shrink (PREREG section 3) added: the per-structure byte fields of `BranchResident`
 //! (so this source now needs a store that has them), the process's phys_footprint and resident size
 //! (`proc_pid_rusage`) and the malloc zones' bytes in use and allocated at every checkpoint, a
-//! fire-check of the footprint instrument at start, and `shrink_to_fit` on the harness's own list
-//! of live branches after the reap-down, so its peak capacity is not counted as the store's. The
-//! body lives here so that `branch_peak` (system allocator) and `branch_peak_mi` (mimalloc) run the
-//! same code.
+//! fire-check of the footprint instrument at start, and the harness's own list of live branches
+//! kept out of the allocator during the grow and the reap-down (`PeakList`, an anonymous mapping
+//! unmapped after the reap-down; amendment 7: the earlier `shrink_to_fit` handed a 40 MiB buffer to
+//! the allocator, which kept it dirty), so its peak size is not counted as the store's. The body
+//! lives here so that `branch_peak` (system allocator) and `branch_peak_mi` (mimalloc) run the same
+//! code.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -249,6 +251,134 @@ struct Live {
     tag: u64,
 }
 
+/// The harness's list of live branches during the grow and the reap-down: an anonymous mapping
+/// sized for the peak, unmapped when the reap-down ends, so the harness's own peak-sized buffer
+/// never passes through the allocator. As a `VecDeque` its freed 40 MiB buffer (2^20 x 40 B)
+/// stayed dirty in the allocator and read as the store's (Rule One on r12-f9-shrink D3, item 1).
+/// A control run takes the same path with a mapping sized for L.
+#[cfg(unix)]
+struct PeakList<T> {
+    ptr: *mut T,
+    bytes: usize,
+    head: usize,
+    len: usize,
+    cap: usize,
+}
+
+#[cfg(unix)]
+impl<T> PeakList<T> {
+    fn new(cap: usize) -> Self {
+        let bytes = (cap.max(1) * std::mem::size_of::<T>()).max(1);
+        // SAFETY: an anonymous private mapping, unmapped by `Drop`; nothing else refers to it.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            die("mmap of the harness's peak list failed");
+        }
+        Self {
+            ptr: p as *mut T,
+            bytes,
+            head: 0,
+            len: 0,
+            cap,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push_back(&mut self, x: T) {
+        assert!(self.head + self.len < self.cap, "peak list full");
+        // SAFETY: the index is inside the mapping and holds no live value.
+        unsafe { self.ptr.add(self.head + self.len).write(x) };
+        self.len += 1;
+    }
+
+    fn pop_front(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        // SAFETY: `head` holds a live value, which leaves the list here.
+        let x = unsafe { self.ptr.add(self.head).read() };
+        self.head += 1;
+        self.len -= 1;
+        Some(x)
+    }
+
+    /// `VecDeque::swap_remove_back`: take the `k`-th value and move the last one into its place.
+    fn swap_remove_back(&mut self, k: usize) -> Option<T> {
+        if k >= self.len {
+            return None;
+        }
+        let (at, last) = (self.head + k, self.head + self.len - 1);
+        // SAFETY: both indexes hold live values; the last one moves into the hole.
+        let x = unsafe {
+            let x = self.ptr.add(at).read();
+            if at != last {
+                self.ptr.add(at).write(self.ptr.add(last).read());
+            }
+            x
+        };
+        self.len -= 1;
+        Some(x)
+    }
+
+    /// The live values, in order, in a `VecDeque` of exactly their number; the mapping goes back to
+    /// the OS when `self` drops. Returns the mapping's size too.
+    fn into_deque(mut self) -> (usize, std::collections::VecDeque<T>) {
+        let mut d = std::collections::VecDeque::with_capacity(self.len);
+        while let Some(x) = self.pop_front() {
+            d.push_back(x);
+        }
+        (self.bytes, d)
+    }
+}
+
+#[cfg(unix)]
+impl<T> Drop for PeakList<T> {
+    fn drop(&mut self) {
+        while self.pop_front().is_some() {}
+        // SAFETY: unmaps exactly the mapping `new` made; no value is left in it.
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.bytes) };
+    }
+}
+
+/// Off unix the list is an ordinary `VecDeque` (no harness buffer is excluded there).
+#[cfg(not(unix))]
+struct PeakList<T>(std::collections::VecDeque<T>);
+
+#[cfg(not(unix))]
+impl<T> PeakList<T> {
+    fn new(cap: usize) -> Self {
+        Self(std::collections::VecDeque::with_capacity(cap))
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn push_back(&mut self, x: T) {
+        self.0.push_back(x)
+    }
+    fn pop_front(&mut self) -> Option<T> {
+        self.0.pop_front()
+    }
+    fn swap_remove_back(&mut self, k: usize) -> Option<T> {
+        self.0.swap_remove_back(k)
+    }
+    fn into_deque(mut self) -> (usize, std::collections::VecDeque<T>) {
+        self.0.shrink_to_fit();
+        (0, self.0)
+    }
+}
+
 fn pct(sorted: &[f64], p: f64) -> f64 {
     sorted[((p / 100.0) * (sorted.len() - 1) as f64).round() as usize]
 }
@@ -374,11 +504,11 @@ pub fn main(allocator: &str, relieve: fn() -> usize) {
     };
 
     // 1. grow to the peak, timing every fork.
-    let mut live: std::collections::VecDeque<Live> = std::collections::VecDeque::new();
+    let mut peak_list: PeakList<Live> = PeakList::new(args.peak);
     let mut grow_fork = Vec::new();
     let mut grow_stalls = Vec::new();
     let t0 = Instant::now();
-    while live.len() < args.peak {
+    while peak_list.len() < args.peak {
         let mut l = None;
         let n = created;
         timed(args.untimed, &mut grow_fork, &mut || l = Some(fork_one(n)));
@@ -388,14 +518,14 @@ pub fn main(allocator: &str, relieve: fn() -> usize) {
                 grow_stalls.push((created, us));
             }
         }
-        live.push_back(l.unwrap());
+        peak_list.push_back(l.unwrap());
     }
     let grow_s = t0.elapsed().as_secs_f64();
     let r = db.branch_resident();
     if r.states != args.peak || r.zombies != 0 {
         not_a_result(&format!("after growth the engine holds {} states, {} zombies", r.states, r.zombies));
     }
-    println!("{}", resident_line("grown", created, live.len(), &r));
+    println!("{}", resident_line("grown", created, peak_list.len(), &r));
 
     // 2. reap down to L, timing every reap. The i-th reap (1-based) pushes the free list to length
     //    i + (free slots before): a Vec doubling copies it at every power of two.
@@ -403,12 +533,12 @@ pub fn main(allocator: &str, relieve: fn() -> usize) {
     let mut reap_stalls = Vec::new();
     let t1 = Instant::now();
     let mut reaped = 0usize;
-    while live.len() > args.live {
+    while peak_list.len() > args.live {
         let victim = if args.reap_oldest {
-            live.pop_front().unwrap()
+            peak_list.pop_front().unwrap()
         } else {
-            let k = rng.below(live.len());
-            live.swap_remove_back(k).unwrap()
+            let k = rng.below(peak_list.len());
+            peak_list.swap_remove_back(k).unwrap()
         };
         let mut res = None;
         let mut vb = Some(victim.branch);
@@ -428,7 +558,16 @@ pub fn main(allocator: &str, relieve: fn() -> usize) {
     }
     let reap_s = t1.elapsed().as_secs_f64();
     // The harness's own peak-sized buffers are not the store's: give them back before measuring.
-    live.shrink_to_fit();
+    // The list of live branches goes back to the OS with its mapping; the footprint delta at the
+    // unmap is printed as the exclusion's own fire-check.
+    let fp_before_unmap = footprint().map_or(0, |f| f.0);
+    let (list_bytes, mut live) = peak_list.into_deque();
+    let fp_after_unmap = footprint().map_or(0, |f| f.0);
+    println!(
+        "# harness peak list: mapped_bytes={list_bytes} live_entry_bytes={} footprint_delta_at_unmap={}",
+        std::mem::size_of::<Live>(),
+        fp_after_unmap as i64 - fp_before_unmap as i64
+    );
     let grow_summary = summary("grow_branch", &mut grow_fork);
     drop(grow_fork);
     let reap_summary = summary("reap", &mut reap_down);
