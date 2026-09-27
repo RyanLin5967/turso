@@ -2,6 +2,20 @@
 //!
 //!   branch_v4 victim --db PATH --age A [--rows R] [--keys K] [--per M] [--seed S]
 //!   branch_v4 reopen --db PATH --age A [--rows R] [--keys K] [--per M] [--seed S]
+//!   branch_v4 nvictim --db PATH --live N [--every C] [--sample S] [--skeys K] [--rows R] [--seed S] [--tail]
+//!   branch_v4 nreopen --db PATH --live N [--every C] [--sample S] [--skeys K] [--rows R] [--seed S] [--plant]
+//!
+//! `nvictim`/`nreopen` are lane r12-composition's arm K8-N (frontier/round12/r12-composition/PREREG.md §3):
+//! V4's base read on the N axis. N branches are forked from the trunk and detached (live); S of them,
+//! evenly spaced, update K keys each (the sampled writers); after every C forks the trunk commits ONE
+//! row update, so each commit's pre-image is retained and V ~ N/C. The first key of each sampled writer
+//! is the row the trunk's next commit after that writer's fork updates (a true conflict per writer);
+//! every other commit's row is random. Then `PRAGMA wal_checkpoint(TRUNCATE)`, and unless `--tail` the
+//! branch log is compacted, READY, and the driver SIGKILLs it. `nreopen` performs V4's base read of
+//! every sampled key through `Database::branch_base_page`, compares the base cell with the model's
+//! value at that writer's fork and V4's verdict (base != the trunk's current row) with the model's
+//! truth (the trunk wrote the key after the fork). `--plant` expects the wrong base for the first
+//! sampled key (a fire-check: it must print FINDING and exit 3). `victim`/`reopen` are unchanged.
 //!
 //! `victim` is the kill -9 VICTIM. It opens a fresh catalog-mode store (`Catalog { sync: false }`;
 //! the files are the same bytes as with sync), creates t(id INTEGER PRIMARY KEY, v TEXT) with R
@@ -55,6 +69,13 @@ struct Args {
     keys: usize,
     per: usize,
     seed: u64,
+    /// K8-N (r12-composition): live forks, forks per trunk commit, sampled writers, keys each.
+    live: u64,
+    every: u64,
+    sample: u64,
+    skeys: usize,
+    tail: bool,
+    plant: bool,
 }
 
 fn parse_args() -> Args {
@@ -68,6 +89,12 @@ fn parse_args() -> Args {
         keys: 64,
         per: 16,
         seed: 0x9E37_79B9_7F4A_7C15,
+        live: 0,
+        every: 10,
+        sample: 64,
+        skeys: 4,
+        tail: false,
+        plant: false,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -78,8 +105,26 @@ fn parse_args() -> Args {
             "--keys" => args.keys = val().parse().unwrap_or_else(|_| die("bad --keys")),
             "--per" => args.per = val().parse().unwrap_or_else(|_| die("bad --per")),
             "--seed" => args.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
+            "--live" => args.live = val().parse().unwrap_or_else(|_| die("bad --live")),
+            "--every" => args.every = val().parse().unwrap_or_else(|_| die("bad --every")),
+            "--sample" => args.sample = val().parse().unwrap_or_else(|_| die("bad --sample")),
+            "--skeys" => args.skeys = val().parse().unwrap_or_else(|_| die("bad --skeys")),
+            "--tail" => args.tail = true,
+            "--plant" => args.plant = true,
             other => die(&format!("unknown argument {other}")),
         }
+    }
+    if args.cmd.starts_with('n') {
+        if args.db.as_os_str().is_empty() || args.live == 0 || args.every == 0 || args.sample == 0 || args.skeys == 0 {
+            die("--db and --live are required; --every, --sample and --skeys must be positive");
+        }
+        if args.live % args.every != 0 || args.live / args.sample < args.every + 1 {
+            die("--live must be a multiple of --every, and the writers must be more than --every forks apart");
+        }
+        if args.skeys as i64 > args.rows || args.rows < 1 {
+            die("--skeys exceeds --rows");
+        }
+        return args;
     }
     if args.db.as_os_str().is_empty() || args.age == 0 || args.rows < 1 || args.keys == 0 || args.per == 0 {
         die("--db and --age are required; --rows, --keys and --per must be positive");
@@ -595,6 +640,387 @@ fn reopen(args: &Args) {
     println!("DONE age={}", args.age);
 }
 
+/// K8-N's plan (r12-composition PREREG §3), drawn in one order by both processes.
+struct NPlan {
+    /// Fork index (0-based; branch id = index + 1) of each sampled writer, ascending.
+    writers: Vec<u64>,
+    /// Each sampled writer's keys, distinct within the writer. `keys[j][0]` is the row the trunk's
+    /// next commit after writer j's fork updates, so every writer has a true conflict.
+    keys: Vec<Vec<i64>>,
+    /// The row trunk commit g (1-based) updates, at index g - 1.
+    commits: Vec<i64>,
+}
+
+fn nplan(args: &Args) -> NPlan {
+    let mut rng = Rng(args.seed);
+    let gap = args.live / args.sample;
+    let writers: Vec<u64> = (0..args.sample).map(|j| j * gap + gap / 2).collect();
+    let mut keys = Vec::with_capacity(writers.len());
+    for _ in &writers {
+        let mut seen = HashSet::new();
+        let mut ks = Vec::with_capacity(args.skeys);
+        while ks.len() < args.skeys {
+            let k = rng.row(args.rows);
+            if seen.insert(k) {
+                ks.push(k);
+            }
+        }
+        keys.push(ks);
+    }
+    let mut commits: Vec<i64> = (0..args.live / args.every).map(|_| rng.row(args.rows)).collect();
+    for (j, &i) in writers.iter().enumerate() {
+        // Fork i sees commits 1..=i/every; the next commit is i/every + 1, at index i/every. The
+        // writers are more than `every` forks apart, so no two claim the same commit.
+        commits[(i / args.every) as usize] = keys[j][0];
+    }
+    NPlan {
+        writers,
+        keys,
+        commits,
+    }
+}
+
+/// Commits a fork at index `i` sees: 1..=`i / every`.
+fn seen_commits(args: &Args, i: u64) -> u64 {
+    i / args.every
+}
+
+fn nvictim(args: &Args) {
+    if size_of(&args.db) != 0 {
+        not_a_result(&format!("{} exists: every N needs a fresh store", args.db.display()));
+    }
+    let p = nplan(args);
+    let db = open_db(&args.db, false);
+    let trunk = db.connect().unwrap();
+    trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    trunk.execute("BEGIN").unwrap();
+    for id in 1..=args.rows {
+        trunk.execute(format!("INSERT INTO t VALUES ({id}, '{}')", trunk_value(id))).unwrap();
+    }
+    trunk.execute("COMMIT").unwrap();
+    checkpoint_truncate(&trunk);
+    println!(
+        "# nvictim pid={} live={} every={} sample={} skeys={} rows={} seed={} tail={} page_size={} page_count={}",
+        std::process::id(),
+        args.live,
+        args.every,
+        p.writers.len(),
+        args.skeys,
+        args.rows,
+        args.seed,
+        args.tail,
+        int(&trunk, "PRAGMA page_size"),
+        int(&trunk, "PRAGMA page_count")
+    );
+    let (mut next_writer, mut g) = (0usize, 0u64);
+    for i in 0..args.live {
+        let branch = trunk
+            .fork_branch()
+            .unwrap_or_else(|e| not_a_result(&format!("fork {i}: {e}")));
+        if branch.id() != BranchId(i + 1) {
+            not_a_result(&format!("fork {i} returned {:?}, expected id {}", branch.id(), i + 1));
+        }
+        if p.writers.get(next_writer) == Some(&i) {
+            let conn = branch.connect().unwrap();
+            conn.execute("BEGIN").unwrap();
+            for &k in &p.keys[next_writer] {
+                conn.execute(format!("UPDATE t SET v = '{}' WHERE id = {k}", branch_value(k))).unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+            drop(conn);
+            next_writer += 1;
+        }
+        let _ = branch.into_id();
+        if (i + 1) % args.every == 0 {
+            g += 1;
+            let r = p.commits[(g - 1) as usize];
+            trunk
+                .execute(format!("UPDATE t SET v = '{}' WHERE id = {r}", trunk_write_value(g)))
+                .unwrap_or_else(|e| not_a_result(&format!("trunk commit {g}: {e}")));
+        }
+        if (i + 1) % 100_000 == 0 {
+            println!("# grown {} forks, {g} trunk commits", i + 1);
+            let _ = std::io::stdout().flush();
+        }
+    }
+    if next_writer != p.writers.len() || g as usize != p.commits.len() {
+        not_a_result(&format!("wrote {next_writer} writers and {g} commits, planned {} and {}", p.writers.len(), p.commits.len()));
+    }
+    let st = db.branch_stats().unwrap();
+    if st.live_branches as u64 != args.live {
+        not_a_result(&format!("after the growth: {st:?}, expected {} live branches", args.live));
+    }
+    println!(
+        "# nvictim before checkpoint: trunk_commits={g} arena_slots_in_use={} {}",
+        st.arena_slots_in_use,
+        files_line(&args.db)
+    );
+    checkpoint_truncate(&trunk);
+    if !args.tail {
+        db.branch_compact_now().unwrap();
+    }
+    println!(
+        "# nvictim after checkpoint: compacted={} catalog_rows_written={} page_io={:?} {}",
+        !args.tail,
+        db.branch_catalog_rows_written(),
+        turso_core::branch::page_io(),
+        files_line(&args.db)
+    );
+    println!("READY live={} pid={}", args.live, std::process::id());
+    std::io::stdout().flush().unwrap();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match std::io::stdin().lock().read_line(&mut line) {
+            Ok(0) | Err(_) => std::thread::sleep(Duration::from_secs(3600)),
+            Ok(_) => {}
+        }
+    }
+}
+
+fn nreopen(args: &Args) {
+    let p = nplan(args);
+    let files_at_open = files_line(&args.db);
+    if size_of(&with_suffix(&args.db, "-wal")) != 0 {
+        not_a_result("the crash image's WAL is not empty: the database file is not the trunk's current version");
+    }
+    let io0 = turso_core::branch::page_io();
+    let db = open_db(&args.db, true);
+    let open_stats = db.branch_open_stats();
+    let cat_open = db.branch_catalog_counters();
+    let io_open = turso_core::branch::page_io();
+    let trunk = db.connect().unwrap();
+    let page_size = int(&trunk, "PRAGMA page_size") as usize;
+    let root = int(&trunk, "SELECT rootpage FROM sqlite_schema WHERE name = 't'") as u32;
+    let mut file = DbFile {
+        f: std::fs::File::open(&args.db).unwrap(),
+        page_size,
+    };
+    let mut hdr = vec![0u8; page_size];
+    file.read(1, &mut hdr);
+    let usable = page_size - hdr[20] as usize;
+
+    // The model, from the plan alone: each row's commits in order, and each leaf's last rewrite
+    // (same-size UPDATEs move no row, so a row's current leaf was its leaf at every commit).
+    let mut row_commits: HashMap<i64, Vec<u64>> = HashMap::new();
+    for (g0, &r) in p.commits.iter().enumerate() {
+        row_commits.entry(r).or_default().push(g0 as u64 + 1);
+    }
+    let mut leaf_of: HashMap<i64, u32> = HashMap::new();
+    let mut leaf_last: HashMap<u32, u64> = HashMap::new();
+    for (&r, gs) in &row_commits {
+        let (path, v) = current_path(&mut file, root, usable, r);
+        if v.as_deref() != Some(trunk_write_value(*gs.last().unwrap()).as_str()) {
+            not_a_result(&format!("trunk row {r} reads {v:?}, expected commit {}'s value", gs.last().unwrap()));
+        }
+        let leaf = *path.last().unwrap();
+        leaf_of.insert(r, leaf);
+        let last = leaf_last.entry(leaf).or_insert(0);
+        *last = (*last).max(*gs.last().unwrap());
+    }
+    let value_at = |r: i64, seen: u64| -> String {
+        match row_commits.get(&r).and_then(|gs| gs.iter().rev().find(|&&g| g <= seen)) {
+            Some(&g) => trunk_write_value(g),
+            None => trunk_value(r),
+        }
+    };
+
+    let v4_0 = db.branch_v4_counters();
+    let cat0 = db.branch_catalog_counters();
+    let reads0 = db.branch_read_counters();
+    let io1 = turso_core::branch::page_io();
+    let mut buf = vec![0u8; page_size];
+    let mut arena_by_depth = [0u64; 8];
+    let mut current_by_depth = [0u64; 8];
+    let mut path_pages = Vec::new();
+    let (mut base_ok, mut paths_equal, mut expect_arena_leaf) = (0u64, 0u64, 0u64);
+    let (mut truth_conflicts, mut v4_conflicts, mut false_refusals, mut missed) = (0u64, 0u64, 0u64, 0u64);
+    let (mut loads_max, mut loads_min) = (0u64, u64::MAX);
+    let mut findings = Vec::new();
+    for (j, &i) in p.writers.iter().enumerate() {
+        let id = BranchId(i + 1);
+        let seen = seen_commits(args, i);
+        let loads_before = db.branch_catalog_counters().0;
+        for (ki, &k) in p.keys[j].iter().enumerate() {
+            let (cur_path, ours) = current_path(&mut file, root, usable, k);
+            let ours_want = value_at(k, u64::MAX);
+            if ours.as_deref() != Some(ours_want.as_str()) {
+                not_a_result(&format!("key {k}: the trunk's current row is {ours:?}, expected {ours_want}"));
+            }
+            let mut base_want = value_at(k, seen);
+            if args.plant && j == 0 && ki == 0 {
+                base_want = trunk_write_value(seen + 1);
+            }
+            let truth = row_commits.get(&k).is_some_and(|gs| gs.iter().any(|&g| g > seen));
+            let (mut page, mut path) = (root, Vec::new());
+            let base = loop {
+                let depth = path.len();
+                path.push(page);
+                let arena = match db.branch_base_page(id, page, &mut buf) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        findings.push(format!("writer {}: key {k}: base page {page} at depth {depth} refused: {e}", id.0));
+                        break None;
+                    }
+                };
+                if arena {
+                    arena_by_depth[depth.min(7)] += 1;
+                } else {
+                    current_by_depth[depth.min(7)] += 1;
+                    file.read(page, &mut buf);
+                }
+                match step(page, &buf, usable, k) {
+                    Ok(Step::Child(c)) => page = c,
+                    Ok(Step::Leaf(v)) => break Some(v),
+                    Err(e) if arena => {
+                        findings.push(format!("writer {}: key {k}: base page {page} at depth {depth}, from the arena: {e}", id.0));
+                        break None;
+                    }
+                    Err(e) => not_a_result(&format!("database file page {page}: {e}")),
+                }
+                if path.len() > 64 {
+                    findings.push(format!("writer {}: key {k}: no base leaf after 64 levels", id.0));
+                    break None;
+                }
+            };
+            path_pages.push(path.len() as u64);
+            paths_equal += u64::from(path == cur_path);
+            let leaf = *cur_path.last().unwrap();
+            expect_arena_leaf += u64::from(leaf_last.get(&leaf).is_some_and(|&g| g > seen));
+            truth_conflicts += u64::from(truth);
+            match base {
+                Some(Some(v)) if v == base_want => {
+                    base_ok += 1;
+                    let verdict = v != ours_want;
+                    v4_conflicts += u64::from(verdict);
+                    false_refusals += u64::from(verdict && !truth);
+                    missed += u64::from(!verdict && truth);
+                }
+                Some(other) => findings.push(format!(
+                    "writer {} (fork {i}, sees {seen} commits): key {k}: base cell {other:?}, expected {base_want}",
+                    id.0
+                )),
+                None => {}
+            }
+        }
+        let loads = db.branch_catalog_counters().0 - loads_before;
+        loads_max = loads_max.max(loads);
+        loads_min = loads_min.min(loads);
+    }
+    let v4_1 = db.branch_v4_counters();
+    let cat1 = db.branch_catalog_counters();
+    let reads1 = db.branch_read_counters();
+    let io2 = turso_core::branch::page_io();
+
+    let n = path_pages.len() as u64;
+    let arena: u64 = arena_by_depth.iter().sum();
+    let h_min = *path_pages.iter().min().unwrap();
+    let h_max = *path_pages.iter().max().unwrap();
+    let delta = |a: [u64; 4], b: [u64; 4]| [b[0] - a[0], b[1] - a[1], b[2] - a[2], b[3] - a[3]];
+    let io_v4 = delta(io1, io2);
+    let probes = v4_1.4 - v4_0.4;
+    println!("# nreopen open_stats {open_stats:?}");
+    println!(
+        "# nreopen at open: files {files_at_open}; catalog (branch_loads, trunk_page_loads, queries, rows_read) {cat_open:?}; page_io {:?}",
+        delta(io0, io_open)
+    );
+    println!(
+        "# model: trunk commits {}; rows committed {}; leaves rewritten {}; keys whose leaf was rewritten after their writer's fork {expect_arena_leaf}/{n}; \
+         base path = current path {paths_equal}/{n}; H min {h_min} max {h_max}",
+        p.commits.len(),
+        row_commits.len(),
+        leaf_last.len()
+    );
+    println!(
+        "V4N\tlive={}\tevery={}\tsample={}\tskeys={}\trows={}\tseed={}\ttail={}\tplant={}\tkeys={n}\tbase_reads={}\tbase_arena={}\tbase_refused={}\t\
+         base_examined={}\tcp_probes={probes}\tcp_rows={}\tcat_branch_loads={}\tcat_trunk_page_loads={}\tcat_queries={}\tcat_rows_read={}\t\
+         resolve_calls={}\tresolve_arena_reads={}\tarena_by_depth={:?}\tcurrent_by_depth={:?}\tpath_pages_total={}\th_min={h_min}\th_max={h_max}\t\
+         expect_arena_leaf={expect_arena_leaf}\tpaths_equal={paths_equal}\tbase_ok={base_ok}\ttruth_conflicts={truth_conflicts}\tv4_conflicts={v4_conflicts}\t\
+         false_refusals={false_refusals}\tmissed_conflicts={missed}\tloads_per_writer_min={loads_min}\tloads_per_writer_max={loads_max}\t\
+         cp_probes_per_base_read={}\tcp_rows_per_probe={}\tdb_reads_per_probe={}\tpage_io_open={:?}\tpage_io_v4={io_v4:?}",
+        args.live,
+        args.every,
+        p.writers.len(),
+        args.skeys,
+        args.rows,
+        args.seed,
+        args.tail,
+        args.plant,
+        v4_1.0 - v4_0.0,
+        v4_1.1 - v4_0.1,
+        v4_1.2 - v4_0.2,
+        v4_1.3 - v4_0.3,
+        v4_1.5 - v4_0.5,
+        cat1.0 - cat0.0,
+        cat1.1 - cat0.1,
+        cat1.2 - cat0.2,
+        cat1.3 - cat0.3,
+        reads1.0 - reads0.0,
+        reads1.1 - reads0.1,
+        &arena_by_depth[..(h_max as usize).min(8)],
+        &current_by_depth[..(h_max as usize).min(8)],
+        path_pages.iter().sum::<u64>(),
+        ratio(probes, v4_1.0 - v4_0.0),
+        ratio(v4_1.5 - v4_0.5, probes),
+        ratio(io_v4[0], probes),
+        delta(io0, io_open),
+    );
+    for f in &findings {
+        println!("FINDING: {f}");
+    }
+    let _ = std::io::stdout().flush();
+    if v4_1.1 - v4_0.1 != arena {
+        not_a_result(&format!("the store counted {} arena base reads, the harness {arena}", v4_1.1 - v4_0.1));
+    }
+
+    // Theirs and the live count, after the counters are taken (these settle and read through the
+    // ordinary paths).
+    let mut later = Vec::new();
+    for (j, &i) in p.writers.iter().enumerate() {
+        let id = BranchId(i + 1);
+        match db.branch(id) {
+            Ok(branch) => {
+                match branch.connect() {
+                    Ok(conn) => {
+                        for &k in &p.keys[j] {
+                            match try_read_v(&conn, k) {
+                                Ok(theirs) if theirs == branch_value(k) => {}
+                                Ok(theirs) => later.push(format!("writer {}: key {k}: reads {theirs}, expected {}", id.0, branch_value(k))),
+                                Err(e) => later.push(format!("writer {}: key {k}: read failed: {e}", id.0)),
+                            }
+                        }
+                    }
+                    Err(e) => later.push(format!("connect to {id:?}: {e}")),
+                }
+                let _ = branch.into_id();
+            }
+            Err(e) => later.push(format!("attach {id:?}: {e}")),
+        }
+    }
+    match db.branch_stats() {
+        Ok(st) => {
+            println!(
+                "# nreopen after: theirs checked {n} keys; live_branches={} trunk_retained={} {}",
+                st.live_branches,
+                db.branch_trunk_retained(),
+                files_line(&args.db)
+            );
+            if st.live_branches as u64 != args.live {
+                later.push(format!("after the reopen: {st:?}, expected {} live branches", args.live));
+            }
+        }
+        Err(e) => later.push(format!("branch_stats after the reopen: {e}")),
+    }
+    for f in &later {
+        println!("FINDING: {f}");
+    }
+    if !findings.is_empty() || !later.is_empty() {
+        let _ = std::io::stdout().flush();
+        std::process::exit(3);
+    }
+    println!("DONE live={}", args.live);
+}
+
 /// `num/den` to four places, or `na` when nothing was arena-resolved.
 fn ratio(num: u64, den: u64) -> String {
     if den == 0 {
@@ -612,6 +1038,8 @@ fn main() {
     match args.cmd.as_str() {
         "victim" => victim(&args),
         "reopen" => reopen(&args),
+        "nvictim" => nvictim(&args),
+        "nreopen" => nreopen(&args),
         other => die(&format!("unknown command {other}")),
     }
 }
