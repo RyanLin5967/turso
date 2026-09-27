@@ -208,6 +208,8 @@ pub struct BranchStats {
     pub k3_olc_pool_in_use: u64,
     /// F-K3v: the most chunks (of 1,024 nodes) any one height's pool holds.
     pub k3_olc_max_class_chunks: u64,
+    /// Branch pagers' page caches emptied because the WAL changed (amendment 8.2).
+    pub branch_cache_clears: u64,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -275,6 +277,12 @@ pub struct BranchWork {
     pub resolve_trunk_locked: u64,
     /// The trunk's lock per site (lane r11-k3-trunklock amendment 3).
     pub trunk_sites: TrunkSites,
+    /// Resolutions by cause, as the pager classes them per connection (amendment 8.2): the
+    /// connection's first read of the page, a re-read after a WAL change emptied its cache, and any
+    /// other re-read. Resolutions from callers that do not class them (tests) are in none.
+    pub resolve_first: u64,
+    pub resolve_again_clear: u64,
+    pub resolve_again_other: u64,
 }
 
 /// The sites at which the store takes the trunk's lock, in the order of [`TrunkSites`]' arrays:
@@ -329,6 +337,9 @@ impl BranchWork {
             resolve_trunk_rewritten,
             resolve_trunk_locked,
             trunk_sites,
+            resolve_first,
+            resolve_again_clear,
+            resolve_again_other,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -350,6 +361,9 @@ impl BranchWork {
         self.resolve_trunk_rewritten += resolve_trunk_rewritten;
         self.resolve_trunk_locked += resolve_trunk_locked;
         self.trunk_sites.add(&trunk_sites);
+        self.resolve_first += resolve_first;
+        self.resolve_again_clear += resolve_again_clear;
+        self.resolve_again_other += resolve_again_other;
     }
 }
 

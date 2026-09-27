@@ -1824,7 +1824,9 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                  rewritten_per_cycle={:.4} locked_per_cycle={:.4} trunk_acq_per_cycle={:.4} \
                  trunk_wait_frac={:.5} trunk_wait_ns_per_cycle={:.1} retained_examined={} gc_freed={gc_freed} \
                  trunk_slots_in_use={} wal_bytes={} trunk_blocking_per_cycle={:.4} \
-                 gc_range_entries={} gc_examined={} gc_range_per_cycle={:.4}",
+                 gc_range_entries={} gc_examined={} gc_range_per_cycle={:.4} \
+                 resolves_per_cycle={:.4} res_first_pc={:.4} res_again_clear_pc={:.4} res_again_other_pc={:.4} \
+                 branch_cache_clears_pc={:.4} olc_restarts={} olc_fallbacks={}",
                 t * c,
                 args.reads,
                 writes as f64 / cycles,
@@ -1842,6 +1844,14 @@ fn arm_conc(b: &mut Bench, args: &Args) {
                 d(before.gc_range_entries, after.gc_range_entries),
                 d(before.gc_examined, after.gc_examined),
                 d(before.gc_range_entries, after.gc_range_entries) as f64 / cycles,
+                // Resolutions by cause and the caches emptied by trunk commits (amendment 8.2).
+                d(before.resolve_calls, after.resolve_calls) as f64 / cycles,
+                d(before.resolve_first, after.resolve_first) as f64 / cycles,
+                d(before.resolve_again_clear, after.resolve_again_clear) as f64 / cycles,
+                d(before.resolve_again_other, after.resolve_again_other) as f64 / cycles,
+                d(start_stats.branch_cache_clears, s.branch_cache_clears) as f64 / cycles,
+                d(start_stats.k3_olc_restarts, s.k3_olc_restarts),
+                d(start_stats.k3_olc_fallbacks, s.k3_olc_fallbacks),
             );
             print_sites(n, t, draw, cycles, &before, &after);
             if !b.db.branch_trunk_reads_lockfree() {

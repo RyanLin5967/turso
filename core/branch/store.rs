@@ -228,6 +228,8 @@ pub(crate) struct BranchStore {
     lock_timing: AtomicBool,
     /// Spin-then-park for the trunk's lock (see [`take`]); from `TURSO_K3_TRUNKSPIN` (ns) at construction.
     trunk_spin_ns: AtomicU64,
+    /// Observation only (amendment 8.2): branch pagers' page caches emptied by a WAL change.
+    branch_cache_clears: CachePadded<AtomicU64>,
     /// F-K3: the trunk's retained versions, searchable without the trunk's lock (the same `Arc` as
     /// the trunk lineage's `shared`). `None` is F5's locked lookup.
     k3: Option<std::sync::Arc<SharedVersions>>,
@@ -441,6 +443,17 @@ impl Domain {
             .as_ref()
             .is_some_and(|a| a.is_free(self.local(slot)))
     }
+}
+
+/// Why the pager asks for a page (observation only; lane r11-k3-trunklock amendment 8.2): this
+/// connection's first read of it, a re-read after a WAL change emptied its page cache, another
+/// re-read, or a caller that does not say (the store's own tests).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolveCause {
+    First,
+    AgainAfterClear,
+    AgainOther,
+    Untracked,
 }
 
 /// Where the page a branch asked for comes from.
@@ -1016,6 +1029,7 @@ impl BranchStore {
             live: AtomicUsize::new(0),
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
+            branch_cache_clears: CachePadded::new(AtomicU64::new(0)),
             trunk_spin_ns: AtomicU64::new(match std::env::var("TURSO_K3_TRUNKSPIN") {
                 Err(std::env::VarError::NotPresent) => 0,
                 Ok(v) => v
@@ -1055,6 +1069,11 @@ impl BranchStore {
             Some(site as usize),
             self.trunk_spin_ns.load(Ordering::Relaxed),
         )
+    }
+
+    /// A branch pager's page cache was emptied because the WAL changed (observation only).
+    pub(crate) fn note_branch_cache_clear(&self) {
+        self.branch_cache_clears.fetch_add(1, Ordering::Relaxed);
     }
 
     /// How long a waiter for the trunk's lock spins before it blocks (PREREG amendment 5); 0: it
@@ -1399,9 +1418,26 @@ impl BranchStore {
     /// it holds it — and no trunk lock is taken. The cache is consulted, and its hit or miss
     /// counted, under this branch's shard lock.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<Resolved> {
+        self.resolve_into_as(id, page, out, ResolveCause::Untracked)
+    }
+
+    /// [`Self::resolve_into`], counting the resolve under `cause` (observation only).
+    pub(crate) fn resolve_into_as(
+        &self,
+        id: BranchId,
+        page: u32,
+        out: &mut [u8],
+        cause: ResolveCause,
+    ) -> Result<Resolved> {
         let (at, elsewhere) = {
             let mut shard = self.shard(id);
             shard.work.resolve_calls += 1;
+            match cause {
+                ResolveCause::First => shard.work.resolve_first += 1,
+                ResolveCause::AgainAfterClear => shard.work.resolve_again_clear += 1,
+                ResolveCause::AgainOther => shard.work.resolve_again_other += 1,
+                ResolveCause::Untracked => {}
+            }
             shard.work.resolve_levels += 1;
             let st = shard.branches.get(&id).ok_or_else(|| gone(id))?;
             let found = st
@@ -1523,6 +1559,7 @@ impl BranchStore {
             stats.work.trunk_lock_wait_ns = trunk.work.lock_wait_ns;
             stats.work.trunk_lock_hold_ns = trunk.work.lock_hold_ns;
             stats.work.trunk_lock_blocking = trunk.work.lock_blocking;
+            stats.branch_cache_clears = self.branch_cache_clears.load(Ordering::Relaxed);
         }
         for lock in self.shards.iter() {
             let shard = take(lock, self.timed(), None, 0);
