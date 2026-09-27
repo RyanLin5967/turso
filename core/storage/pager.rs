@@ -3451,7 +3451,9 @@ impl Pager {
         }
         // FS11: each committed page now holds its slot's bytes by reference, not its own copy.
         for (page, bytes) in dirty.iter().zip(committed) {
-            hold_committed_by_reference(page, bytes, &self.shared_cached);
+            if let Some(bytes) = bytes {
+                hold_committed_by_reference(page, bytes, &self.shared_cached);
+            }
         }
         self.dirty_pages.write().clear();
         branch.store.end_write(branch.id);
@@ -6300,6 +6302,10 @@ impl Pager {
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
         if is_write {
+            // FS13: the branch store takes back this transaction's copy decisions.
+            if let Some(branch) = self.branch.get() {
+                branch.store.rollback_writes(branch.id);
+            }
             let clear_dirty = true;
             // The page cache only needs to be cleared if we are rolling back a write transaction.
             // If a read transaction rolls back, and the next read transaction detects that the

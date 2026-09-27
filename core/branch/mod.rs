@@ -548,6 +548,14 @@ impl Database {
         self.branches.set_fs11(on);
     }
 
+    /// FS13 (r11-sessions amendment 17): a branch transaction's copy decisions are taken back when
+    /// it rolls back, and at commit for pages it did not really change. Normally taken from
+    /// `TURSO_R11S_FS13=1`; tests set it per database.
+    #[doc(hidden)]
+    pub fn set_fs13(&self, on: bool) {
+        self.branches.set_fs13(on);
+    }
+
     /// Trunk pages held in the shared trunk-page cache (the FS10 pool's size). Observation only.
     #[doc(hidden)]
     pub fn trunk_cache_pages(&self) -> usize {

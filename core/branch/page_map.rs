@@ -79,6 +79,31 @@ impl PageMap {
         }
     }
 
+    /// Unmap `page` (r11-sessions FS13, undoing a copy decision). Every other version of this map
+    /// keeps the mapping it had.
+    pub(crate) fn remove(&mut self, page: u32) {
+        if self.get(page).is_none() {
+            return;
+        }
+        let mut level = self.height;
+        let mut node = Arc::make_mut(self.root.as_mut().expect("get found the page"));
+        loop {
+            node = match node {
+                Node::Inner(kids) => {
+                    let kid = kids[Self::index(page, level)]
+                        .as_mut()
+                        .expect("get found the page");
+                    level -= 1;
+                    Arc::make_mut(kid)
+                }
+                Node::Leaf(slots) => {
+                    slots[Self::index(page, 0)] = EMPTY;
+                    return;
+                }
+            };
+        }
+    }
+
     /// Map `page` to `slot`, replacing any previous mapping. Every other version of this map —
     /// every clone taken before this call — keeps the mapping it had.
     pub(crate) fn insert(&mut self, page: u32, slot: Slot) {

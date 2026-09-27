@@ -1262,6 +1262,66 @@ fn arena_versions_are_read_by_reference_and_an_idle_writer_keeps_no_copy() {
     );
 }
 
+/// FS13 (r11-sessions amendment 17). A rolled-back branch transaction leaves no arena page behind:
+/// each copy decision it made is taken back (`FS13_NO_ROLLBACK_UNDO` keeps them) — a first write's
+/// page released, a rewrite's retained version made current again — and a commit takes back a
+/// decision whose write a savepoint rolled back (`FS13_NO_COMMIT_UNDO` keeps it). Every reader keeps
+/// its version, and the branch writes and commits normally afterwards.
+#[test]
+fn a_rolled_back_branch_write_leaves_no_arena_page() {
+    let (_dir, db) = open_db();
+    db.set_fs13(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let b = trunk.fork_branch().unwrap();
+    let c = b.connect().unwrap();
+    let slots0 = db.branch_stats().arena_slots_in_use;
+    c.execute("BEGIN").unwrap();
+    set(&c, 10, "rolled-back");
+    c.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        db.branch_stats().arena_slots_in_use,
+        slots0,
+        "a rolled-back first write kept its page"
+    );
+    assert_eq!(value(&c, 10), Some(original(10)));
+    // A committed version a child sees, then a rolled-back rewrite of it.
+    set(&c, 10, "b-v1");
+    let child = b.fork().unwrap();
+    let cc = child.connect().unwrap();
+    assert_eq!(value(&cc, 10), Some("b-v1".to_string()));
+    let slots1 = db.branch_stats().arena_slots_in_use;
+    c.execute("BEGIN").unwrap();
+    set(&c, 10, "b-v2-rolled-back");
+    c.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        db.branch_stats().arena_slots_in_use,
+        slots1,
+        "a rolled-back rewrite kept its page"
+    );
+    assert_eq!(value(&c, 10), Some("b-v1".to_string()));
+    assert_eq!(value(&cc, 10), Some("b-v1".to_string()));
+    set(&c, 10, "b-v2");
+    assert_eq!(value(&c, 10), Some("b-v2".to_string()));
+    assert_eq!(value(&cc, 10), Some("b-v1".to_string()));
+    // A savepoint rolled back inside a committed transaction.
+    let slots2 = db.branch_stats().arena_slots_in_use;
+    c.execute("BEGIN").unwrap();
+    c.execute("SAVEPOINT sp").unwrap();
+    set(&c, 250, "savepoint-rolled-back");
+    c.execute("ROLLBACK TO sp").unwrap();
+    c.execute("RELEASE sp").unwrap();
+    c.execute("COMMIT").unwrap();
+    assert_eq!(
+        db.branch_stats().arena_slots_in_use,
+        slots2,
+        "a savepoint's rolled-back write kept its page"
+    );
+    assert_eq!(value(&c, 250), Some(original(250)));
+    assert_eq!(value(&cc, 250), Some(original(250)));
+    assert_eq!(value(&trunk, 10), Some(original(10)));
+}
+
 /// FS9B. Branches forked from a chain read a version an interior ANCESTOR branch holds for them
 /// (its retained pre-image, and its current page) by reference, one shared copy per slot; the copy
 /// goes when the slot is released (`FS9B_NO_EVICT` keeps it) or written: once no child can see a

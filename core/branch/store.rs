@@ -150,6 +150,11 @@ pub(crate) struct BranchStore {
     /// and a committed page is held by reference from the slot it was committed into
     /// (`TURSO_R11S_FS11=1`). Supersedes FS9's and FS9B's clone caches while on.
     fs11: AtomicBool,
+    /// FS13 (r11-sessions amendment 17): a branch transaction's copy decisions are undone when it
+    /// rolls back, and at commit for every page whose committed bytes are the version it
+    /// superseded (a savepoint rolled the write back, or it changed nothing), so no byte-identical
+    /// arena page outlives the transaction (`TURSO_R11S_FS13=1`).
+    fs13: AtomicBool,
     /// FS9B (r11-sessions): serve inherited ancestor-branch versions by reference (`Arena::clones`).
     fs9b: AtomicBool,
 }
@@ -327,7 +332,9 @@ struct StoreInner {
     arena: Option<Arena>,
     next_id: u64,
     trunk: TrunkState,
-    branches: HashMap<BranchId, BranchState>,
+    /// Boxed (r11-sessions FS12): the table holds a pointer per bucket, not the ~257-byte state, so
+    /// its empty buckets cost 8 bytes each and a resize moves pointers.
+    branches: HashMap<BranchId, Box<BranchState>>,
     /// Observation only; see [`BranchWork`].
     work: BranchWork,
     /// FS9 (r11-sessions): clones of retained trunk versions, keyed by (page, born). A version the
@@ -410,6 +417,21 @@ struct BranchState {
     /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
     /// branch's first fork and kept current by its writes from then on; `None` until it forks.
     view: Option<PageMap>,
+    /// FS13: the copy decisions of the write transaction in progress, in order, so a rollback (or
+    /// a commit that finds a write undone) can take them back. Empty outside a transaction.
+    tx: Vec<TxDecision>,
+}
+
+/// FS13: one copy decision of a branch write transaction.
+#[derive(Clone, Copy)]
+struct TxDecision {
+    page: u32,
+    /// The branch's current version of the page before the decision, if it had one.
+    prev: Option<Owned>,
+    /// The slot the decision allocated (holding the pre-image until commit), if any.
+    new_slot: Option<Slot>,
+    /// The decision retained `prev` for a child.
+    retained: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -422,6 +444,20 @@ impl Lineage {
     /// True if a live child forked in `[from, to)` can see a version current over that range.
     fn has_child_in(&self, from: u64, to: u64) -> bool {
         from < to && self.children.range(from..to).next().is_some()
+    }
+
+    /// FS13: remove the version of `page` born at `born` from every index and hand it back (its
+    /// slot is the owner's current page again).
+    fn unretain(&mut self, page: u32, born: u64) -> Retained {
+        let versions = self.retained.get_mut(&page).expect("an undone retention is listed");
+        let v = versions.remove(&born).expect("an undone retention is listed");
+        if versions.is_empty() {
+            self.retained.remove(&page);
+        }
+        let indexed =
+            self.by_born.remove(&(v.born, page, v.died)) && self.by_died.remove(&(v.died, page, v.born));
+        crate::turso_assert!(indexed, "an undone retention was missing from an index");
+        v
     }
 
     fn retain(&mut self, page: u32, v: Retained) {
@@ -631,6 +667,7 @@ impl BranchStore {
             ),
             fs10_fill: AtomicBool::new(std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "2")),
             fs11: AtomicBool::new(std::env::var("TURSO_R11S_FS11").is_ok_and(|v| v == "1")),
+            fs13: AtomicBool::new(std::env::var("TURSO_R11S_FS13").is_ok_and(|v| v == "1")),
             fs9b: AtomicBool::new(fs9b_from_env()),
         }
     }
@@ -676,6 +713,10 @@ impl BranchStore {
 
     pub(crate) fn fs10(&self) -> bool {
         self.fs10.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_fs13(&self, on: bool) {
+        self.fs13.store(on, Ordering::Relaxed);
     }
 
     pub(crate) fn set_fs11(&self, on: bool) {
@@ -782,7 +823,7 @@ impl BranchStore {
         inner.trunk.lineage.children.insert(f, id);
         inner.branches.insert(
             id,
-            BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
+            Box::new(BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default())),
         );
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
@@ -816,7 +857,7 @@ impl BranchStore {
         inner.next_id += 1;
         inner
             .branches
-            .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
+            .insert(id, Box::new(BranchState::new(parent, f, schema, trunk_at, view)));
         Ok(id)
     }
 
@@ -872,7 +913,33 @@ impl BranchStore {
             return Err(LimboError::Busy);
         }
         st.writer = true;
+        st.tx.clear();
         Ok(())
+    }
+
+    /// FS13: a branch write transaction rolled back: take back its copy decisions, newest first.
+    pub(crate) fn rollback_writes(&self, id: BranchId) {
+        if !self.fs13.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut inner = self.lock();
+        let StoreInner {
+            arena, branches, ..
+        } = &mut *inner;
+        let Some(st) = branches.get_mut(&id) else {
+            return;
+        };
+        let decisions = std::mem::take(&mut st.tx);
+        #[cfg(test)]
+        if mutants::on("FS13_NO_ROLLBACK_UNDO") {
+            return;
+        }
+        let Some(arena) = arena.as_mut() else {
+            return;
+        };
+        for d in decisions.into_iter().rev() {
+            st.undo(d, arena);
+        }
     }
 
     pub(crate) fn end_write(&self, id: BranchId) {
@@ -910,6 +977,7 @@ impl BranchStore {
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         crate::turso_assert!(st.writer, "branch page written outside a write transaction");
         let epoch = st.lineage.epoch;
+        let log = self.fs13.load(Ordering::Relaxed);
         match st.current.get(&page).copied() {
             None => {
                 let slot = arena.alloc();
@@ -917,6 +985,14 @@ impl BranchStore {
                 st.current.insert(page, Owned { slot, born: epoch });
                 if let Some(view) = st.view.as_mut() {
                     view.insert(page, slot);
+                }
+                if log {
+                    st.tx.push(TxDecision {
+                        page,
+                        prev: None,
+                        new_slot: Some(slot),
+                        retained: false,
+                    });
                 }
             }
             Some(owned) if owned.born == epoch => {}
@@ -936,6 +1012,14 @@ impl BranchStore {
                     if let Some(view) = st.view.as_mut() {
                         view.insert(page, slot);
                     }
+                    if log {
+                        st.tx.push(TxDecision {
+                            page,
+                            prev: Some(owned),
+                            new_slot: Some(slot),
+                            retained: true,
+                        });
+                    }
                 } else {
                     // No live child can see the current version: it is rewritten in its own slot,
                     // which is already the one `view` names.
@@ -946,6 +1030,14 @@ impl BranchStore {
                             born: epoch,
                         },
                     );
+                    if log {
+                        st.tx.push(TxDecision {
+                            page,
+                            prev: Some(owned),
+                            new_slot: None,
+                            retained: false,
+                        });
+                    }
                 }
             }
         }
@@ -985,19 +1077,55 @@ impl BranchStore {
         &self,
         id: BranchId,
         pages: &[PageRef],
-    ) -> Result<Vec<Arc<crate::alloc::DynBoxedSlice<u8>>>> {
+    ) -> Result<Vec<Option<Arc<crate::alloc::DynBoxedSlice<u8>>>>> {
         let fs11 = self.fs11.load(Ordering::Relaxed);
         let mut inner = self.lock();
         let StoreInner {
             arena, branches, ..
         } = &mut *inner;
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
-        if pages.is_empty() {
+        let decisions = std::mem::take(&mut st.tx);
+        if pages.is_empty() && decisions.is_empty() {
             return Ok(Vec::new());
         }
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
+        // FS13: a decision whose page is not committed (a savepoint rollback discarded it), or whose
+        // committed bytes are the pre-image its slot holds (a savepoint rolled the write back, or it
+        // changed nothing), is taken back instead of committed.
+        let mut undone = std::collections::HashSet::new();
+        #[cfg(test)]
+        let commit_undo = !mutants::on("FS13_NO_COMMIT_UNDO");
+        #[cfg(not(test))]
+        let commit_undo = true;
+        if commit_undo {
+            let committed: HashMap<u32, &PageRef> =
+                pages.iter().map(|p| (p.get().id as u32, p)).collect();
+            for d in decisions.into_iter().rev() {
+                let unchanged = match (committed.get(&d.page), d.new_slot) {
+                    (None, _) => true,
+                    (Some(page), Some(slot)) => {
+                        page.get_contents().as_slice() == arena.page(slot)
+                    }
+                    (Some(_), None) => false,
+                };
+                if unchanged {
+                    st.undo(d, arena);
+                    undone.insert(d.page);
+                }
+            }
+        }
         let mut refs = Vec::with_capacity(if fs11 { pages.len() } else { 0 });
         for page in pages {
+            if undone.contains(&(page.get().id as u32)) {
+                if fs11 {
+                    // The branch sees its earlier version again: hold that by reference if the
+                    // arena has it; a trunk version stays this page's own bytes.
+                    let no = page.get().id as u32;
+                    let slot = st.current.get(&no).map(|o| o.slot).or_else(|| st.inherited.get(no));
+                    refs.push(slot.map(|s| arena.shared_ref(s)));
+                }
+                continue;
+            }
             let no = page.get().id as u32;
             let owned = st.current.get(&no).copied().ok_or_else(|| {
                 LimboError::InternalError(format!(
@@ -1013,7 +1141,7 @@ impl BranchStore {
                 .page_mut(owned.slot)
                 .copy_from_slice(page.get_contents().as_slice());
             if fs11 {
-                refs.push(arena.shared_ref(owned.slot));
+                refs.push(Some(arena.shared_ref(owned.slot)));
             }
         }
         Ok(refs)
@@ -1215,7 +1343,7 @@ impl BranchStore {
             if st.handle || st.open || !st.lineage.children.is_empty() {
                 return freed;
             }
-            let st = inner.branches.remove(&id).expect("just looked it up");
+            let st = *inner.branches.remove(&id).expect("just looked it up");
             let StoreInner {
                 arena,
                 trunk,
@@ -1333,6 +1461,36 @@ impl BranchState {
             trunk_at,
             inherited,
             view: None,
+            tx: Vec::new(),
+        }
+    }
+
+    /// FS13: take back one copy decision: release the slot it allocated, make the version it
+    /// retained current again, and restore the page's mapping in `current` and `view`.
+    fn undo(&mut self, d: TxDecision, arena: &mut Arena) {
+        if d.retained {
+            let prev = d.prev.expect("a retaining decision superseded a current page");
+            let v = self.lineage.unretain(d.page, prev.born);
+            crate::turso_assert!(v.slot == prev.slot, "an undone retention named another slot");
+        }
+        if let Some(slot) = d.new_slot {
+            arena.release(slot);
+        }
+        match d.prev {
+            Some(owned) => {
+                self.current.insert(d.page, owned);
+            }
+            None => {
+                self.current.remove(&d.page);
+            }
+        }
+        if d.new_slot.is_some() {
+            if let Some(view) = self.view.as_mut() {
+                match d.prev.map(|o| o.slot).or_else(|| self.inherited.get(d.page)) {
+                    Some(slot) => view.insert(d.page, slot),
+                    None => view.remove(d.page),
+                }
+            }
         }
     }
 }
