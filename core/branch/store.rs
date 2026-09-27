@@ -28,7 +28,9 @@
 //! ancestors, which is its parent's `view` at the fork: the parent's own `inherited` plus the
 //! parent's current pages, kept up to date by the parent's writes once it has forked a child. A
 //! fork clones the parent's `view` in O(1) and a write path-copies O(log P) trie nodes, so a
-//! lookup costs the same at depth 1000 as at depth 1. A page no branch in the chain wrote is the
+//! lookup costs the same at depth 1000 as at depth 1. The first fork builds the `view` from the
+//! current versions born after `inherited` was taken only (`inherited_at`): a splice's moved-in
+//! versions are already in `inherited`. A page no branch in the chain wrote is the
 //! trunk's, as of `trunk_at`, the fork epoch at which the branch's ancestry leaves the trunk.
 //!
 //! # Where the copies come from — the write ticket
@@ -208,6 +210,12 @@ struct BranchState {
     trunk_at: u64,
     /// Every arena page this branch sees through its ancestors: its parent's `view` at the fork.
     inherited: PageMap,
+    /// The fork epoch at which `inherited` was taken. A splice changes `fork_epoch` and leaves this
+    /// and `inherited` alone. Every current version born at or below it is one a splice moved in
+    /// from a zombie, which `inherited` already names with the same slot (the zombie's view at this
+    /// epoch held the version the child read through it); every other current version is the
+    /// branch's own, born above it (epoch inheritance). So the view build needs only those above.
+    inherited_at: u64,
     /// `inherited` plus this branch's current pages, for its children to inherit. Built at the
     /// branch's first fork and kept current by its writes from then on; `None` until it forks.
     view: Option<PageMap>,
@@ -436,18 +444,27 @@ impl BranchStore {
         st.lineage.epoch += 1;
         st.lineage.children.insert(f, id);
         let schema = st.schema.clone();
-        let (current, inherited) = (&st.current, &st.inherited);
+        // Only the current versions born after `inherited` was taken (see `inherited_at`): a
+        // splice's moved-in versions are in `inherited` already, and re-inserting them made the
+        // first fork after each splice cost every page the dead levels above had moved in, which is
+        // Theta(d^2) over a chain that writes a new page, forks and releases its parent at each of
+        // d levels (r11-adversarial's chainw; r11-ever amendment 17).
+        let (current, by_born, inherited, at) =
+            (&st.current, &st.current_by_born, &st.inherited, st.inherited_at);
+        let mut built = 0u64;
         let view = st
             .view
             .get_or_insert_with(|| {
                 let mut view = inherited.clone();
-                for (&page, owned) in current {
-                    view.insert(page, owned.slot);
+                for &(_, page) in by_born.range((at.saturating_add(1), 0)..) {
+                    view.insert(page, current[&page].slot);
+                    built += 1;
                 }
                 view
             })
             .clone();
         let trunk_at = st.trunk_at;
+        inner.work.view_build_entries += built;
         inner.next_id += 1;
         inner
             .branches
@@ -1092,6 +1109,7 @@ impl BranchState {
             writer: false,
             trunk_at,
             inherited,
+            inherited_at: fork_epoch,
             view: None,
         }
     }
@@ -1643,6 +1661,51 @@ mod tests {
         assert_eq!(read(c, 0), Some(300));
         store.release_handle(c);
         store.release_handle(d);
+        assert_eq!(store.stats().live_branches, 0);
+        assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
+    }
+
+    /// r11-adversarial's chainw (r11-ever amendment 17): at each of D levels the newest branch
+    /// writes a page no level wrote before, forks, and is released, so it is spliced into the new
+    /// child, which inherits every page the dead levels above had moved into it. Each level's first
+    /// fork builds its view: from all of `current`, j entries at level j and D(D+1)/2 in all; from
+    /// the versions born after `inherited_at`, the level's own page, D in all. The tip and a child
+    /// forked from it read every level's page, and teardown frees everything.
+    #[test]
+    fn a_chain_that_writes_forks_and_releases_builds_each_view_from_its_own_pages() {
+        const D: u32 = 64;
+        let store = BranchStore::new();
+        let mut prev = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        let before = store.stats().work;
+        for j in 0..D {
+            store.begin_write(prev).unwrap();
+            store.first_write_branch(prev, j, &image(0)).unwrap();
+            store.commit_pages(prev, &[page_with(j, 1000 + u64::from(j))]).unwrap();
+            store.end_write(prev);
+            let next = store.fork_branch(prev).unwrap();
+            let reaped = store.release_handle(prev);
+            assert!(reaped.deferred, "level {j}: the released level was not kept for its child");
+            prev = next;
+        }
+        check_invariants(&store, "after the chain");
+        let work = store.stats().work;
+        assert_eq!(work.splices - before.splices, u64::from(D), "premise: every level was spliced");
+        assert_eq!(
+            work.view_build_entries - before.view_build_entries,
+            u64::from(D),
+            "a level's first fork built its view from more than its own page"
+        );
+        let child = store.fork_branch(prev).unwrap();
+        let mut buf = vec![0u8; PAGE];
+        for j in 0..D {
+            for id in [prev, child] {
+                assert!(store.resolve_into(id, j, &mut buf).unwrap(), "branch {} lost page {j}", id.0);
+                let got = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                assert_eq!(got, 1000 + u64::from(j), "branch {} misread page {j}", id.0);
+            }
+        }
+        store.release_handle(child);
+        store.release_handle(prev);
         assert_eq!(store.stats().live_branches, 0);
         assert_eq!(store.stats().arena_slots_in_use, 0, "slots leaked");
     }

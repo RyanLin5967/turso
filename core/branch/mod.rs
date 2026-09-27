@@ -276,6 +276,10 @@ pub struct BranchWork {
     /// Entries those splices visited: versions freed as invisible, retained versions converted, and
     /// every entry of the smaller `current` map.
     pub splice_entries: u64,
+    /// Entries a branch's lazily built `view` inserted at its first fork: its current versions born
+    /// after its `inherited` map was taken (r11-ever amendment 17; r11-adversarial's counter of the
+    /// same name, 6f8e93947, counted all of `current`).
+    pub view_build_entries: u64,
 }
 
 impl Branch {
