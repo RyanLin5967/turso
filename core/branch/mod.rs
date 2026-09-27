@@ -226,8 +226,11 @@ pub struct Branch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaped {
     /// Arena pages returned to the free list by this call: the branch's own, plus any version an
-    /// ancestor was retaining only for it.
+    /// ancestor was retaining only for it, plus any trunk pending image no live child needs now.
     pub freed_pages: usize,
+    /// Trunk chunk versions released by this call. A store that keeps the trunk's versions as
+    /// whole pages counts them in `freed_pages` and reports 0 here.
+    pub freed_chunks: usize,
     /// True when the branch could not be freed yet (an open connection or a live child still reads
     /// through it); its pages are freed when the last of those goes away.
     pub deferred: bool,
@@ -242,6 +245,17 @@ pub struct BranchStats {
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
+    /// Superseded versions the trunk keeps for its live children: whole pages in a page-granular
+    /// store, chunks in a sub-page one.
+    pub trunk_versions: usize,
+    /// The bytes of page data those versions hold.
+    pub trunk_version_bytes: usize,
+    /// Sub-page store: trunk pages whose latest write's whole pre-image is kept (0 otherwise).
+    pub trunk_pending_pages: usize,
+    /// Sub-page store: chunk slots in use (0 otherwise).
+    pub chunk_slots_in_use: usize,
+    /// Sub-page store: bytes per chunk (0 otherwise).
+    pub chunk_size: usize,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -258,8 +272,9 @@ pub struct BranchWork {
     /// then the trunk when neither holds the page — at most 2. (Before the persistent page map this
     /// counted the branch, each ancestor walked, and the trunk.)
     pub resolve_levels: u64,
-    /// Retained versions compared against the fork epoch while resolving (`Lineage::retained_at`):
-    /// at most one per lineage consulted, the page's born-predecessor. The O(log V) descent that
+    /// Retained versions compared against the fork epoch while resolving (`TrunkState::overlay`):
+    /// at most one per chunk of the page, each chunk's born-predecessor (the trunk keeps chunk
+    /// versions; see `store`, "The trunk keeps sub-page versions"). The O(log V) descent that
     /// finds it is not counted; time is the only instrument for it.
     pub resolve_retained_examined: u64,
     /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
@@ -284,13 +299,16 @@ pub struct BranchWork {
     /// Resolutions of a trunk page it did not hold, which the pager then read through the WAL or
     /// the database file.
     pub trunk_page_misses: u64,
-    /// Resolutions answered with a version the TRUNK retained for this branch (a pre-image of a page
-    /// the trunk rewrote after the fork), copied into the caller's private buffer (FS9 off).
+    /// Resolutions of a trunk page as of the branch's fork that the trunk has rewritten since (its
+    /// pending image with the chunk versions containing the fork laid over it), assembled in the
+    /// caller's private buffer (FS9 off).
     pub retained_copies: u64,
-    /// FS9: such resolutions answered by reference from the retained-version clone cache.
+    /// FS9: such resolutions answered by reference from the clone cache (U11's f-interval key).
     pub retained_shared_hits: u64,
-    /// FS9: clones built, one copy per retained trunk version, on its first resolution.
+    /// FS9: clones built, one per `(page, lo, hi)` key, on the key's first resolution.
     pub retained_clone_fills: u64,
+    /// FS9: clones dropped because the oldest live fork reached their interval's end.
+    pub retained_clone_evictions: u64,
     /// Resolutions answered with a version an ANCESTOR BRANCH holds for this branch (through the
     /// inherited page map), copied into the caller's private buffer (FS9B off).
     pub inherited_copies: u64,
@@ -304,6 +322,13 @@ pub struct BranchWork {
     /// FS11: writes to a slot whose bytes a reader held, which gave the slot a fresh copy (read
     /// from the arena at `stats`, not counted in `work` itself).
     pub slot_unshared_writes: u64,
+    /// Sub-page store: chunks a trunk write was found to have changed, counted at its page's next
+    /// trunk write (0 otherwise).
+    pub trunk_chunks_changed: u64,
+    /// Sub-page store: those of them kept as chunk versions, because a live child can see them.
+    pub trunk_chunks_retained: u64,
+    /// Sub-page store: chunks laid over a pending image by resolutions.
+    pub resolve_chunks_overlaid: u64,
 }
 
 impl Branch {

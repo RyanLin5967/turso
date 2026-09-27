@@ -129,13 +129,17 @@ fn a_retained_version_lives_exactly_as_long_as_a_child_that_can_see_it() {
 
     let a = trunk.fork_branch().unwrap(); // sees v0
     set(&trunk, 7, "v1");
-    let after_first = in_use(&db);
     let b = trunk.fork_branch().unwrap(); // sees v1
     set(&trunk, 7, "v2");
-    let after_second = in_use(&db);
-    let v0_slots: BTreeSet<u32> = after_first.difference(&before).copied().collect();
-    let v1_slots: BTreeSet<u32> = after_second.difference(&after_first).copied().collect();
-    assert!(!v0_slots.is_empty() && !v1_slots.is_empty());
+    // The trunk keeps sub-page versions (store.rs, "The trunk keeps sub-page versions"): v0 lives
+    // on as the chunks the v1 write changed, and v1 as the page's pending image (the pre-image of
+    // the v2 write), which both children read through.
+    let s = db.branch_stats();
+    assert!(
+        s.trunk_versions > 0 && s.chunk_slots_in_use == s.trunk_versions,
+        "v0's changed chunks were not kept: {s:?}"
+    );
+    assert!(s.trunk_pending_pages >= 1, "v1 was not kept: {s:?}");
 
     assert_eq!(value(&a.connect().unwrap(), 7), Some(original(7)));
     assert_eq!(value(&b.connect().unwrap(), 7), Some("v1".to_string()));
@@ -143,16 +147,18 @@ fn a_retained_version_lives_exactly_as_long_as_a_child_that_can_see_it() {
 
     // Only `a` could see v0. v1 is still `b`'s.
     drop(a);
-    for slot in &v0_slots {
-        assert!(db.branch_slot_is_free(*slot), "v0 outlived its only reader");
-    }
-    for slot in &v1_slots {
-        assert!(!db.branch_slot_is_free(*slot), "v1 freed while b can still see it");
-    }
+    let s = db.branch_stats();
+    assert_eq!(
+        (s.trunk_versions, s.chunk_slots_in_use),
+        (0, 0),
+        "v0 outlived its only reader: {s:?}"
+    );
+    assert!(s.trunk_pending_pages >= 1, "v1 freed while b can still see it: {s:?}");
     assert_eq!(value(&b.connect().unwrap(), 7), Some("v1".to_string()));
 
     drop(b);
     assert_eq!(in_use(&db), before);
+    assert_eq!(db.branch_stats().trunk_pending_pages, 0);
 }
 
 #[test]
@@ -589,6 +595,7 @@ fn run_model(seed: u64) {
     drop(handles);
     assert_eq!(db.branch_stats().live_branches, 0, "seed {seed:#x}: branches leaked");
     assert_eq!(db.branch_stats().arena_slots_in_use, 0, "seed {seed:#x}: slots leaked");
+    assert_eq!(db.branch_stats().chunk_slots_in_use, 0, "seed {seed:#x}: chunks leaked");
     assert_eq!(rows(&trunk, "PRAGMA integrity_check")[0][0], Value::from_text("ok"));
 }
 
