@@ -1006,11 +1006,15 @@ fn main() {
             memory_level(),
             b.wal_bytes(),
         );
+        let work = b.db.branch_stats().work;
         println!(
-            "# pool x={x} trunk_cache_pages={} slot_clones={} retained_clones={}",
+            "# pool x={x} trunk_cache_pages={} slot_clones={} retained_clones={} slot_ref_hits={} \
+             slot_unshared_writes={}",
             b.db.trunk_cache_pages(),
             b.db.slot_clone_count(),
-            b.db.retained_clone_count()
+            b.db.retained_clone_count(),
+            work.slot_ref_hits,
+            work.slot_unshared_writes
         );
         println!(
             "# growth_cost x={x} store_lock_takes_per_session={:.3}",
@@ -1212,8 +1216,9 @@ fn chain_arm(b: &mut Bench, d: usize, r: usize, n: usize) {
         "inherited_shared_hits",
         "inherited_clone_fills",
         "retained_copies",
+        "slot_ref_hits",
     ];
-    let mut accs: [Acc; 7] = Default::default();
+    let mut accs: [Acc; 8] = Default::default();
     let mut first = None;
     for (i, (_, conn)) in held.iter().enumerate() {
         let (m0, w0) = (mem(), b.db.branch_stats().work);
@@ -1233,6 +1238,7 @@ fn chain_arm(b: &mut Bench, d: usize, r: usize, n: usize) {
             d_(|w| w.inherited_shared_hits),
             d_(|w| w.inherited_clone_fills),
             d_(|w| w.retained_copies),
+            d_(|w| w.slot_ref_hits),
         ];
         if i == 0 {
             first = Some(row);
@@ -1311,8 +1317,9 @@ fn interleave_arm(b: &mut Bench, n: usize) {
         "retained_shared_hits",
         "retained_clone_fills",
         "cached_pages_idle",
+        "slot_ref_hits",
     ];
-    let mut accs: [Acc; 8] = Default::default();
+    let mut accs: [Acc; 9] = Default::default();
     let mut first = None;
     let mut versions = std::collections::HashSet::new();
     let mut retained = std::collections::HashSet::new();
@@ -1344,9 +1351,10 @@ fn interleave_arm(b: &mut Bench, n: usize) {
             d(|w| w.retained_shared_hits),
             d(|w| w.retained_clone_fills),
             conn.session_footprint().cached_pages as i64,
+            d(|w| w.slot_ref_hits),
         ];
-        retained_reads += row[4] + row[5] + row[6];
-        shared_hits += row[5] + row[6];
+        retained_reads += row[4] + row[5] + row[6] + row[8];
+        shared_hits += row[5] + row[6] + row[8];
         if i == 0 {
             first = Some(row);
             continue;
