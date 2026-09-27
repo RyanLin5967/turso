@@ -3070,6 +3070,7 @@ impl Database {
             buffer_pool: self.buffer_pool.clone(),
             builtins: OnceLock::new(),
             schema: OnceLock::new(),
+            dialect: Arc::new(crate::dialect::DialectFwd(self.dialect.clone())),
             branches: self.branches.clone(),
             shared_wal: self.shared_wal.clone(),
             init_lock: self.init_lock.clone(),
@@ -3368,6 +3369,14 @@ impl Database {
 
     /// The SQL dialect this database was opened with.
     pub fn dialect(&self) -> Arc<dyn Dialect> {
+        // FZ (amendment 23): this thread's forwarder, whose count only this thread's statements write.
+        if crate::coherence::fix(crate::coherence::FIX_UARC) {
+            if let Some(a) = self.anchor() {
+                return a.dialect.clone();
+            }
+        }
+        // The Arc<dyn Dialect> clone and its drop.
+        crate::coherence::bump(crate::coherence::Class::DbArc, 2);
         self.dialect.clone()
     }
 

@@ -159,6 +159,75 @@ pub trait Dialect: Send + Sync + 'static {
     }
 }
 
+/// r11-coherence FZ (amendment 23): a per-thread forwarder to a database's dialect. Every method, the defaulted ones
+/// included, calls the wrapped dialect's, so overrides are kept; a connection's statements clone this thread's
+/// forwarder instead of the database's one `Arc<dyn Dialect>`, whose count every thread's statements would write.
+pub struct DialectFwd(pub std::sync::Arc<dyn Dialect>);
+
+impl Dialect for DialectFwd {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        self.0.parse(sql)
+    }
+
+    fn parse_table_sql(
+        &self,
+        sql: &str,
+        root_page: i64,
+    ) -> crate::Result<crate::schema::BTreeTable> {
+        self.0.parse_table_sql(sql, root_page)
+    }
+
+    fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+        self.0.parse_table_sql_ast(sql)
+    }
+
+    fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+        self.0.table_sql_for_replay(sql)
+    }
+
+    fn format_table_sql(
+        &self,
+        input: &str,
+        tbl_name: &turso_parser::ast::QualifiedName,
+        body: &turso_parser::ast::CreateTableBody,
+    ) -> crate::Result<String> {
+        self.0.format_table_sql(input, tbl_name, body)
+    }
+
+    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> crate::Result<String> {
+        self.0.format_rewritten_table_sql(stmt)
+    }
+
+    fn register_catalog(
+        &self,
+        schema: &mut crate::schema::Schema,
+        enable_custom_types: bool,
+    ) -> crate::Result<()> {
+        self.0.register_catalog(schema, enable_custom_types)
+    }
+
+    fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::Func>> {
+        self.0.resolve_function(name, arg_count)
+    }
+
+    fn exec_scalar_function(
+        &self,
+        conn: &crate::Connection,
+        name: &str,
+        args: &[crate::Value],
+    ) -> crate::Result<crate::Value> {
+        self.0.exec_scalar_function(conn, name, args)
+    }
+
+    fn requires_custom_types(&self) -> bool {
+        self.0.requires_custom_types()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

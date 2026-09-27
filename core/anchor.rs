@@ -46,6 +46,8 @@ pub struct Anchor {
     /// FZ (amendment 21): the schema this slot copied from (kept, so its address is never reused) and this thread's
     /// own deep copy of it; a branch whose schema is that source gets the copy.
     pub(crate) schema: OnceLock<Option<(Arc<crate::schema::Schema>, Arc<crate::schema::Schema>)>>,
+    /// FZ (amendment 23): this slot's own forwarder to the database's dialect.
+    pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
     pub(crate) branches: Arc<BranchStore>,
     pub(crate) shared_wal: Arc<BravoRwLock<WalFileShared>>,
     pub(crate) init_lock: Arc<Mutex<()>>,
