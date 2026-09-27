@@ -92,6 +92,9 @@ pub struct Args {
     fs9: bool,
     reopen_every: u64,
     sync: bool,
+    /// The trunk's `PRAGMA synchronous`. NORMAL by default: under OFF the trunk's WAL never restarted
+    /// and grew by every frame written (raw/v_r7200.txt, `files_bytes` +63 KB per tick).
+    synchronous: String,
     dir: Option<PathBuf>,
     counters_only: bool,
 }
@@ -120,6 +123,7 @@ fn parse_args() -> Args {
         fs9: true,
         reopen_every: 0,
         sync: false,
+        synchronous: "NORMAL".to_string(),
         dir: None,
         counters_only: false,
     };
@@ -150,6 +154,12 @@ fn parse_args() -> Args {
                     "on" => true,
                     "off" => false,
                     v => die(&format!("--sync on|off, not {v}")),
+                }
+            }
+            "--synchronous" => {
+                a.synchronous = match val().to_uppercase().as_str() {
+                    s @ ("OFF" | "NORMAL" | "FULL") => s.to_string(),
+                    v => die(&format!("--synchronous OFF|NORMAL|FULL, not {v}")),
                 }
             }
             "--dir" => a.dir = Some(PathBuf::from(val())),
@@ -473,7 +483,7 @@ fn reopen(run: Run) -> Run {
         opens: opens + 1,
         first_reap_after_open: true,
     };
-    run.exec("PRAGMA synchronous = OFF");
+    run.exec(&format!("PRAGMA synchronous = {}", run.args.synchronous));
     println!("OPEN n={} tick={} {}", run.opens, run.tick, arm::open_stats(&run.db));
     run
 }
@@ -561,7 +571,7 @@ fn main() {
         opens: 1,
         first_reap_after_open: false,
     };
-    run.exec("PRAGMA synchronous = OFF");
+    run.exec(&format!("PRAGMA synchronous = {}", run.args.synchronous));
     run.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
     run.exec("BEGIN");
     for id in 1..=run.args.rows {
@@ -576,7 +586,8 @@ fn main() {
     println!("# branch_lakehouse — r12-lakehouse PREREG; arm {}", arm::NAME);
     println!(
         "# r={} ticks={} windows={} rows={} k={} rewrite_every={} readers={} scan={} seed={:#x} \
-         fs9={} reopen_every={} sync={} value_len={VALUE_LEN} page_size={} pages={} build={}",
+         fs9={} reopen_every={} sync={} synchronous={} (reads back {}) value_len={VALUE_LEN} page_size={} \
+         pages={} build={}",
         a.r,
         a.ticks,
         a.windows,
@@ -589,6 +600,8 @@ fn main() {
         a.fs9,
         a.reopen_every,
         a.sync,
+        a.synchronous,
+        run.int("PRAGMA synchronous"),
         run.int("PRAGMA page_size"),
         run.int("PRAGMA page_count"),
         if cfg!(debug_assertions) { "DEBUG" } else { "release" }
