@@ -203,6 +203,10 @@ struct StoreInner {
     /// Slots freed by an early-released operation whose records are not yet durable, under the log
     /// sequence number that makes them free (see `Group`, rule 2).
     pending_free: VecDeque<(u64, Vec<Slot>)>,
+    /// The highest log sequence number of any early-released Release (a batch release, or an
+    /// expiry pass riding on a fork's flight); 0 if none. A branch such a release kept alive — open
+    /// at the time — is freed at its close, and those frees wait for this (review r12-merge1 R2).
+    early_released: u64,
 }
 
 /// The lease clock: milliseconds of time the database has been OPEN, summed across every open.
@@ -1046,6 +1050,9 @@ impl BranchStore {
         if defer_to.is_some_and(|lsn| lsn > 0) {
             self.unsynced.store(true, Ordering::Release);
         }
+        if let Some(lsn) = defer_to {
+            inner.early_released = inner.early_released.max(lsn);
+        }
         let due = plan.due;
         let mut freed = Vec::new();
         for &id in &due {
@@ -1336,7 +1343,12 @@ impl BranchStore {
             freed.extend(st.pending.drain().map(|(_, slot)| slot));
         }
         inner.collect(id, &mut freed);
-        inner.release_slots(freed);
+        // Rule 2 (review r12-merge1 R2): a branch an early release kept alive because it was open is
+        // freed here, and its Release may still be only buffered. Hold the frees until every early
+        // Release so far is durable; `mature` returns them at once when it already is.
+        let lsn = inner.early_released;
+        inner.defer_frees(lsn, freed);
+        self.mature(&mut inner);
         self.sync_trunk_children(&inner);
     }
 
@@ -1460,6 +1472,7 @@ impl BranchStore {
         if lsn > 0 {
             self.unsynced.store(true, Ordering::Release);
         }
+        inner.early_released = inner.early_released.max(lsn);
         let mut freed = Vec::new();
         for &i in &todo {
             let before = freed.len();
@@ -1996,6 +2009,7 @@ impl StoreInner {
             leases: BTreeSet::new(),
             default_lease,
             pending_free: VecDeque::new(),
+            early_released: 0,
         }
     }
 
