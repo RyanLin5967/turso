@@ -3,7 +3,7 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
-use crate::branch::store::{BranchStore, Resolved, TrunkPageKey};
+use crate::branch::store::{BranchStore, Resolved, ResolveCause, TrunkPageKey};
 use crate::branch::{BranchBinding, BranchId};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -1523,6 +1523,12 @@ pub struct Pager {
     /// Set when this pager serves a branch instead of the trunk: reads resolve through the
     /// branch's page space and commits go to it, never to the WAL.
     branch: OnceLock<BranchBinding>,
+    /// Observation only (lane r11-k3-trunklock amendment 8.2): for a branch pager, the pages it has
+    /// resolved, each with the count of WAL-change cache clears at its last resolve, so each resolve
+    /// can be classed as a first read, a re-read after a clear, or another re-read.
+    branch_resolve_log: Mutex<rustc_hash::FxHashMap<u32, u64>>,
+    /// WAL-change cache clears of this pager (counted for branch pagers only).
+    branch_cache_clears: AtomicU64,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1834,6 +1840,8 @@ impl Pager {
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
             branch_store: OnceLock::new(),
             branch: OnceLock::new(),
+            branch_resolve_log: Mutex::new(rustc_hash::FxHashMap::default()),
+            branch_cache_clears: AtomicU64::new(0),
         })
     }
 
@@ -3151,6 +3159,11 @@ impl Pager {
         };
         let changed = wal.begin_read_tx()?;
         if changed {
+            if let Some(branch) = self.branch.get() {
+                // Observation only (amendment 8.2): a branch's cache emptied by a trunk commit.
+                self.branch_cache_clears.fetch_add(1, Ordering::Relaxed);
+                branch.store.note_branch_cache_clear();
+            }
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
             // Invalidate cached schema cookie to force re-read on next access
@@ -3707,11 +3720,25 @@ impl Pager {
             ));
         }
         let buf = Arc::new(self.buffer_pool.get_page());
-        if let Resolved::Trunk(key) =
-            branch
-                .store
-                .resolve_into(branch.id, page_idx as u32, buf.as_mut_slice())?
-        {
+        let cause = {
+            // Observation only (amendment 8.2): class this resolve against this connection's past.
+            let clears = self.branch_cache_clears.load(Ordering::Relaxed);
+            match self
+                .branch_resolve_log
+                .lock()
+                .insert(page_idx as u32, clears)
+            {
+                None => ResolveCause::First,
+                Some(at) if at < clears => ResolveCause::AgainAfterClear,
+                Some(_) => ResolveCause::AgainOther,
+            }
+        };
+        if let Resolved::Trunk(key) = branch.store.resolve_into_as(
+            branch.id,
+            page_idx as u32,
+            buf.as_mut_slice(),
+            cause,
+        )? {
             return Ok(BranchRead::Trunk(key));
         }
         let page = Arc::new(Page::new(page_idx));

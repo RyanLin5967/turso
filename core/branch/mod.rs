@@ -53,7 +53,9 @@
 //! the pager seam, so it is recorded as the open question it is rather than promised.
 
 pub(crate) mod arena;
+pub(crate) mod olc;
 pub(crate) mod page_map;
+pub(crate) mod radix;
 pub(crate) mod store;
 
 use crate::error::LimboError;
@@ -176,6 +178,39 @@ pub struct BranchStats {
     pub arena_slots_in_use: usize,
     /// Arena pages on the free list.
     pub arena_slots_free: usize,
+    /// Of `arena_slots_in_use`, the trunk's retained versions (its own arena domain).
+    pub trunk_slots_in_use: usize,
+    /// F-K3: skip-list nodes of the trunk's version lists allocated and not yet freed, and their
+    /// bytes. A removed node is freed only when epoch reclamation says no reader can reach it, so
+    /// `k3_nodes_live - trunk_slots_in_use` is the garbage reclamation still holds. Both counts are 0
+    /// without F-K3, which keeps no lists; the difference means nothing there.
+    /// Under F-K3v (`TURSO_K3=olc`) removed nodes return to their height's pool at once, so
+    /// `k3_nodes_live` is exactly the live versions (garbage 0 by construction; the free pools,
+    /// high-water minus live, are held for the store's life), and `k3_node_bytes_live` is the
+    /// pools' bytes, in use or free.
+    pub k3_nodes_live: u64,
+    pub k3_node_bytes_live: u64,
+    /// F-K3v readers' failed attempts: validations that failed because the writer changed a node
+    /// under them (`restarts`), laps that found a list's head mid-change (`head_spins`), and
+    /// searches that gave up after 64 failed attempts and were answered under the trunk's lock
+    /// (`fallbacks`). F-K3v readers take no lock unless they fall back, but they are not lock-free:
+    /// a writer stopped mid-change blocks the readers whose path crosses the node it is changing.
+    pub k3_olc_restarts: u64,
+    pub k3_olc_head_spins: u64,
+    pub k3_olc_fallbacks: u64,
+    /// F-K3v: the most nodes in lists at once, and the pool bytes that peak allows (whole chunks per
+    /// height for that height's peak). `k3_node_bytes_live` above this bound is a pool that grew
+    /// while it had free nodes.
+    pub k3_olc_peak_in_use: u64,
+    pub k3_olc_pool_bound_bytes: u64,
+    /// F-K3v: the pools' own count of nodes handed out and not given back. It equals
+    /// `k3_nodes_live` unless the pools lost track of a removed node (never freed, or held back),
+    /// which the pool bound above cannot see (PREREG amendment 3f, N2).
+    pub k3_olc_pool_in_use: u64,
+    /// F-K3v: the most chunks (of 1,024 nodes) any one height's pool holds.
+    pub k3_olc_max_class_chunks: u64,
+    /// Branch pagers' page caches emptied because the WAL changed (amendment 8.2).
+    pub branch_cache_clears: u64,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -199,6 +234,7 @@ pub struct BranchWork {
     /// finds it is not counted; time is the only instrument for it. Since the striped store, the
     /// trunk's retained versions are consulted only for a page the trunk rewrote after the reader's
     /// fork, so a version the unlocked check proves irrelevant is no longer compared or counted.
+    /// F-K3's lock-free lookup is not counted here (it would need a shared write per read).
     pub resolve_retained_examined: u64,
     /// Retained versions released by `child_gone`: one per removal by key. (Before the born-ordered
     /// index this counted a position scan's comparisons.)
@@ -229,15 +265,31 @@ pub struct BranchWork {
     pub trunk_lock_contended: u64,
     pub trunk_lock_wait_ns: u64,
     pub trunk_lock_hold_ns: u64,
-    /// The trunk's lock per site (r11-k3-trunklock amendment 3, a328c4d05; ported unchanged in meaning so both
-    /// lanes measure one quantity, r11-coherence amendment 16).
+    /// Acquisitions that reached a lock's blocking `lock()` (all locks), and the trunk's alone: with the
+    /// trunk's spin-then-park (PREREG amendment 5) a waiter that got the lock while spinning is not one.
+    pub lock_blocking: u64,
+    pub trunk_lock_blocking: u64,
+    /// Resolutions that fell through to the trunk for a page the trunk rewrote after the reader's
+    /// `trunk_at`, so that only a retained version can answer them (lane r11-k3-trunklock, K3).
+    /// Counted under the reader's shard lock.
+    pub resolve_trunk_rewritten: u64,
+    /// Of those, the ones answered under the trunk's lock. Counted under it. Always 0 under F-K3,
+    /// which answers them without the lock (`Database::branch_trunk_reads_lockfree`).
+    pub resolve_trunk_locked: u64,
+    /// The trunk's lock per site (lane r11-k3-trunklock amendment 3).
     pub trunk_sites: TrunkSites,
+    /// Resolutions by cause, as the pager classes them per connection (amendment 8.2): the
+    /// connection's first read of the page, a re-read after a WAL change emptied its cache, and any
+    /// other re-read. Resolutions from callers that do not class them (tests) are in none.
+    pub resolve_first: u64,
+    pub resolve_again_clear: u64,
+    pub resolve_again_other: u64,
 }
 
 /// The sites at which the store takes the trunk's lock, in the order of [`TrunkSites`]' arrays:
 /// a trunk fork, the reap of a trunk child (`child_gone`, or FK's garbage pass), a resolution of a
-/// page the trunk rewrote, a trunk copy decision (`first_write_trunk`), and accounting and
-/// membership queries.
+/// page the trunk rewrote (F5 only), a trunk copy decision (`first_write_trunk`), and accounting and membership
+/// queries.
 pub const TRUNK_LOCK_SITES: [&str; 5] = ["fork_trunk", "reap", "resolve", "trunk_write", "observe"];
 
 /// The trunk lock's accounting per site ([`TRUNK_LOCK_SITES`]), counted under the lock itself.
@@ -281,7 +333,14 @@ impl BranchWork {
             trunk_lock_contended,
             trunk_lock_wait_ns,
             trunk_lock_hold_ns,
+            lock_blocking,
+            trunk_lock_blocking,
+            resolve_trunk_rewritten,
+            resolve_trunk_locked,
             trunk_sites,
+            resolve_first,
+            resolve_again_clear,
+            resolve_again_other,
         } = *other;
         self.resolve_calls += resolve_calls;
         self.resolve_levels += resolve_levels;
@@ -298,7 +357,14 @@ impl BranchWork {
         self.trunk_lock_contended += trunk_lock_contended;
         self.trunk_lock_wait_ns += trunk_lock_wait_ns;
         self.trunk_lock_hold_ns += trunk_lock_hold_ns;
+        self.lock_blocking += lock_blocking;
+        self.trunk_lock_blocking += trunk_lock_blocking;
+        self.resolve_trunk_rewritten += resolve_trunk_rewritten;
+        self.resolve_trunk_locked += resolve_trunk_locked;
         self.trunk_sites.add(&trunk_sites);
+        self.resolve_first += resolve_first;
+        self.resolve_again_clear += resolve_again_clear;
+        self.resolve_again_other += resolve_again_other;
     }
 }
 
@@ -516,6 +582,19 @@ impl Database {
     #[doc(hidden)]
     pub fn set_branch_lock_timing(&self, on: bool) {
         self.branches.set_lock_timing(on);
+    }
+
+    /// Whether the branch store reads pages the trunk rewrote after a branch's fork without the
+    /// trunk's lock (F-K3, `TURSO_K3=lockfree` when the database opened). Observation only.
+    #[doc(hidden)]
+    pub fn branch_trunk_reads_lockfree(&self) -> bool {
+        self.branches.lockfree_trunk_reads()
+    }
+
+    /// The branch store's trunk-read mode: `off` (F5), `lockfree` (F-K3) or `olc` (F-K3v).
+    #[doc(hidden)]
+    pub fn branch_k3_mode(&self) -> &'static str {
+        self.branches.k3_mode()
     }
 
     /// Whether `slot` is on the arena free list, for membership assertions.
