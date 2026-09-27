@@ -204,6 +204,9 @@ struct Args {
     /// Pinning arm (amendment 17): sessions fork in groups of G; after each group the trunk
     /// rewrites R rows on R distinct leaves. Every group pins one version of each of those pages.
     pin: Option<(usize, usize)>,
+    /// Contention arm (amendment 18): T threads, each with n/T held sessions, each doing OPS warm
+    /// point reads; per read, the store's resolves, lock takes and contended acquisitions.
+    contend: Option<(usize, usize)>,
 }
 
 fn die(msg: &str) -> ! {
@@ -237,6 +240,7 @@ fn parse_args() -> Args {
         capscan: None,
         cache_size: None,
         pin: None,
+        contend: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -282,6 +286,14 @@ fn parse_args() -> Args {
                 args.trunk_writers = val().parse().unwrap_or_else(|_| die("bad --trunk-writers"))
             }
             "--interleave" => args.interleave = true,
+            "--contend" => {
+                let v = val();
+                let (t, ops) = v.split_once(',').unwrap_or_else(|| die("--contend needs T,OPS"));
+                args.contend = Some((
+                    t.parse().unwrap_or_else(|_| die("bad --contend T")),
+                    ops.parse().unwrap_or_else(|_| die("bad --contend OPS")),
+                ));
+            }
             "--pin" => {
                 let v = val();
                 let (g, r) = v.split_once(',').unwrap_or_else(|| die("--pin needs G,R"));
@@ -917,9 +929,11 @@ fn main() {
         "#\tx\tphase\tsessions\tbytes_mean\tbytes_min\tbytes_max\tallocs_mean\tallocs_min\tallocs_max"
     );
 
-    if b.args.interleave || b.args.capscan.is_some() || b.args.pin.is_some() {
+    if b.args.interleave || b.args.capscan.is_some() || b.args.pin.is_some() || b.args.contend.is_some() {
         let n = *b.args.checkpoints.last().unwrap();
-        if let Some((g, r)) = b.args.pin {
+        if let Some((t, ops)) = b.args.contend {
+            contend_arm(&mut b, t, ops, n);
+        } else if let Some((g, r)) = b.args.pin {
             pin_arm(&mut b, g, r, n);
         } else if b.args.interleave {
             interleave_arm(&mut b, n);
@@ -1425,6 +1439,83 @@ fn interleave_arm(b: &mut Bench, n: usize) {
         "# interleave n={n} after teardown retained_clones={} slot_clones={}",
         b.db.retained_clone_count(),
         b.db.slot_clone_count()
+    );
+}
+
+/// The contention arm (amendment 18; the lead's FS11 composition check). `n` sessions are forked
+/// and split over `t` threads; each thread connects its sessions, reads each session's row once
+/// (warm), and after a barrier does `ops` more warm point reads round robin. The store's counters
+/// are read around that phase, so per read: resolves, store-lock acquisitions, contended
+/// acquisitions and their wait. The per-read take count is control flow and stands at any load;
+/// the contended count is decided by interleaving and needs the load gates.
+fn contend_arm(b: &mut Bench, t: usize, ops: usize, n: usize) {
+    if t == 0 || ops == 0 || n % t != 0 {
+        die("--contend T,OPS needs T, OPS >= 1 and T dividing n");
+    }
+    let per = n / t;
+    let fs = |k: &str| std::env::var(k).unwrap_or_default();
+    let mut groups: Vec<Vec<(Branch, i64)>> = (0..t).map(|_| Vec::with_capacity(per)).collect();
+    for i in 0..n {
+        groups[i / per].push((b.trunk.fork_branch().unwrap(), row_for(i)));
+    }
+    let barrier = Arc::new(std::sync::Barrier::new(t + 1));
+    let handles: Vec<_> = groups
+        .into_iter()
+        .map(|group| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let sessions: Vec<(Branch, Arc<Connection>, i64)> = group
+                    .into_iter()
+                    .map(|(br, row)| {
+                        let conn = br.connect().unwrap();
+                        (br, conn, row)
+                    })
+                    .collect();
+                for (_, conn, row) in &sessions {
+                    if read_v(conn, *row) != trunk_value(*row) {
+                        not_a_result("contend arm: a warm-up read saw another version");
+                    }
+                }
+                barrier.wait();
+                barrier.wait();
+                for k in 0..ops {
+                    let (_, conn, row) = &sessions[k % sessions.len()];
+                    if read_v(conn, *row) != trunk_value(*row) {
+                        not_a_result("contend arm: a read saw another version");
+                    }
+                }
+                barrier.wait();
+                for (br, conn, _) in sessions {
+                    drop(conn);
+                    br.reap().unwrap();
+                }
+            })
+        })
+        .collect();
+    barrier.wait();
+    let w0 = b.db.branch_stats().work;
+    let t0 = Instant::now();
+    barrier.wait();
+    barrier.wait();
+    let elapsed = t0.elapsed();
+    let w1 = b.db.branch_stats().work;
+    for h in handles {
+        h.join().unwrap();
+    }
+    let reads = (t * ops) as f64;
+    println!(
+        "# contend t={t} ops={ops} n={n} fs10={:?} fs11={:?} reads={} resolves_per_read={:.4} \
+         lock_takes_per_read={:.4} contended_per_read={:.6} contended_total={} lock_wait_ns_per_read={:.2} \
+         elapsed_s={:.3}",
+        fs("TURSO_R11S_FS10"),
+        fs("TURSO_R11S_FS11"),
+        t * ops,
+        (w1.resolve_calls - w0.resolve_calls) as f64 / reads,
+        (w1.lock_acquisitions - w0.lock_acquisitions) as f64 / reads,
+        (w1.lock_contended - w0.lock_contended) as f64 / reads,
+        w1.lock_contended - w0.lock_contended,
+        (w1.lock_wait_ns - w0.lock_wait_ns) as f64 / reads,
+        elapsed.as_secs_f64(),
     );
 }
 
