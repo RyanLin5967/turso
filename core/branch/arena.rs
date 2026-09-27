@@ -170,6 +170,11 @@ impl HotSet {
         }
     }
 
+    /// A released slot holds nothing hot; forgetting it also keeps it from using up the cap.
+    fn forget(&mut self, slot: Slot) {
+        self.last.remove(&slot);
+    }
+
     fn touch(&mut self, slot: Slot) {
         self.seq += 1;
         self.last.insert(slot, self.seq);
@@ -537,6 +542,11 @@ impl Arena {
         self.set_free_bit(slot, true);
         self.free.push(slot);
         self.in_use -= 1;
+        // F-PW: a catalog arena later drains its free list into the catalog, after which `is_free`
+        // no longer knows the slot is free; forget it here, where it is known.
+        if let Some(hot) = &self.hot {
+            hot.lock().forget(slot);
+        }
     }
 
     pub(crate) fn is_free(&self, slot: Slot) -> bool {
@@ -629,6 +639,7 @@ impl Arena {
     /// F-PW: start remembering the slots this arena reads and writes, whatever `R11_PREWARM` says
     /// (tests; the store's arenas take theirs from the environment at creation). A memory arena has
     /// no file to warm and ignores it.
+    #[cfg(test)]
     pub(crate) fn remember_hot(&mut self, cap: usize) {
         if self.is_file_backed() {
             self.hot = Some(Mutex::new(HotSet::new(cap)));
@@ -660,6 +671,11 @@ impl Arena {
     /// reused since costs one wasted read. The file arena's I/O counters are not moved (they count
     /// the operations').
     pub(crate) fn prewarm(&self, slots: &[Slot]) -> Result<Prewarm> {
+        self.prewarm_into(slots, |_, _| {})
+    }
+
+    /// [`Arena::prewarm`], handing each run's file offset and bytes to `sink` (tests read them).
+    fn prewarm_into(&self, slots: &[Slot], mut sink: impl FnMut(u64, &[u8])) -> Result<Prewarm> {
         let Backing::File { file, .. } = &self.backing else {
             return Ok(Prewarm::default());
         };
@@ -679,6 +695,7 @@ impl Arena {
         for (first, n) in hot_runs(&keep, PREWARM_BRIDGE_SLOTS, max_run) {
             let bytes = (n * page) as usize;
             read_at(file, &mut buf[..bytes], first * page)?;
+            sink(first * page, &buf[..bytes]);
             out.bytes += bytes as u64;
             out.ranges += 1;
         }
@@ -836,6 +853,13 @@ mod tests {
         assert_eq!(hot_runs(&[0, 1, 2, 10, 50, 51], 32, 256), vec![(0, 11), (50, 2)]);
         assert_eq!(hot_runs(&[0, 1, 2, 3], 32, 2), vec![(0, 2), (2, 2)]);
         assert_eq!(hot_runs(&[0, 40], 32, 256), vec![(0, 1), (40, 1)]);
+        // A gap of exactly `bridge` slots joins; one more does not.
+        assert_eq!(hot_runs(&[0, 33], 32, 256), vec![(0, 34)]);
+        assert_eq!(hot_runs(&[0, 34], 32, 256), vec![(0, 1), (34, 1)]);
+        // The gap is measured from the run's end, not its first slot.
+        assert_eq!(hot_runs(&[0, 1, 34], 32, 256), vec![(0, 35)]);
+        let contiguous: Vec<Slot> = (0..40).collect();
+        assert_eq!(hot_runs(&contiguous, 32, 256), vec![(0, 40)]);
         let top = u64::from(u32::MAX);
         assert_eq!(hot_runs(&[u32::MAX - 1, u32::MAX], 32, 256), vec![(top - 1, 2)]);
         assert_eq!(hot_runs(&[], 32, 256), Vec::<(u64, u64)>::new());
@@ -845,32 +869,55 @@ mod tests {
     fn prewarm_reads_named_slots_once_and_skips_slots_past_the_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut arena = Arena::open_file(&dir.path().join("a"), 512, true, &[]).unwrap();
-        for _ in 0..4 {
+        for _ in 0..6 {
             let s = arena.alloc();
             arena.write_slot(s, &[s as u8; 512]).unwrap();
         }
         // Handed out, never written: past the file's end.
         let unwritten = arena.alloc();
         let reads = ArenaIo::get(&arena.io.reads);
-        let got = arena.prewarm(&[0, 2, 3, unwritten, 99]).unwrap();
+        let mut seen: Vec<(u64, Vec<u8>)> = Vec::new();
+        let got = arena
+            .prewarm_into(&[1, 3, 4, unwritten, 99], |at, bytes| seen.push((at, bytes.to_vec())))
+            .unwrap();
         assert_eq!(got, Prewarm { read_slots: 3, bytes: 4 * 512, ranges: 1 });
+        // One run, slots 1..=4 (slot 2 bridged), each slot's own bytes.
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, 512);
+        for (k, chunk) in seen[0].1.chunks(512).enumerate() {
+            let slot = 1 + k;
+            assert!(chunk.iter().all(|&b| b == slot as u8), "run slot {slot} read wrong bytes");
+        }
         assert_eq!(ArenaIo::get(&arena.io.reads), reads, "prewarm moved the operations' counters");
         assert_eq!(Arena::new(512).prewarm(&[0]).unwrap(), Prewarm::default());
     }
 
     #[test]
-    fn hot_slots_name_only_slots_still_handed_out() {
+    fn hot_slots_name_the_slots_this_process_read_or_wrote_and_still_holds() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut arena = Arena::open_file(&dir.path().join("a"), 512, true, &[]).unwrap();
-        arena.remember_hot(8);
-        let slots: Vec<Slot> = (0..3).map(|_| arena.alloc()).collect();
-        for &s in &slots {
-            arena.write_slot(s, &[1; 512]).unwrap();
+        let path = dir.path().join("a");
+        {
+            let mut arena = Arena::open_file(&path, 512, true, &[]).unwrap();
+            for _ in 0..3 {
+                let s = arena.alloc();
+                arena.write_slot(s, &[1; 512]).unwrap();
+            }
         }
+        // A later process: its hot list starts empty and names only what IT touches.
+        let mut arena = Arena::open_file(&path, 512, false, &[0, 1, 2]).unwrap();
+        arena.remember_hot(8);
+        assert_eq!(arena.hot_slots(), Some(vec![]));
         let mut out = [0u8; 512];
-        arena.read_slot(slots[0], &mut out).unwrap();
-        arena.release(slots[1]);
-        assert_eq!(arena.hot_slots(), Some(vec![slots[0], slots[2]]));
+        arena.read_slot(1, &mut out).unwrap();
+        assert_eq!(arena.hot_slots(), Some(vec![1]), "a read is remembered");
+        arena.write_slot(2, &[2; 512]).unwrap();
+        assert_eq!(arena.hot_slots(), Some(vec![1, 2]), "a write is remembered");
+        arena.release(1);
+        // As a catalog checkpoint does: after the drain `is_free` no longer knows slot 1 is free,
+        // so only the release's own forgetting keeps it out of the list.
+        arena.drain_free();
+        assert!(!arena.is_free(1));
+        assert_eq!(arena.hot_slots(), Some(vec![2]), "a released slot is forgotten");
         let mut memory = Arena::new(512);
         memory.remember_hot(8);
         assert_eq!(memory.hot_slots(), None);
