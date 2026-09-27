@@ -2257,4 +2257,70 @@ mod tests {
         }
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
     }
+
+    /// r11-coherence amendment 29 (round 12, from SCOUT.md @ 0c36deaf; fix-interactions K5's capacity half, premise
+    /// A17): the trunk domain holds every trunk pre-image a live child can still see. More than 2^21 of them must fit
+    /// (FM set 21 local bits in every arm; 25 before). One child forks at epoch 0, then the trunk writes 2^21 + 1
+    /// distinct pages once each: every write retains the page's version for the child. 8-byte pages keep the arena at
+    /// 16 MiB. Expected pre-images are written out (the page number), not read from the subject.
+    #[test]
+    fn the_trunk_domain_holds_more_than_2_pow_21_retained_versions() {
+        const TINY: usize = 8;
+        const N: u32 = 1 << 21;
+        let store = BranchStore::new();
+        let child = store.fork_trunk(Arc::new(Schema::default()), TINY, 0).unwrap();
+        for page in 0..N {
+            store.first_write_trunk(page, &u64::from(page).to_le_bytes());
+        }
+        assert_eq!(
+            store.stats().arena_slots_in_use,
+            N as usize,
+            "premise: each of the 2^21 trunk writes retained a version for the live child"
+        );
+        store.first_write_trunk(N, &u64::from(N).to_le_bytes());
+        assert_eq!(store.stats().arena_slots_in_use, N as usize + 1, "the 2^21+1-th version was not retained");
+        let mut buf = [0u8; TINY];
+        for page in [0, N - 1, N] {
+            assert!(
+                matches!(store.resolve_into(child, page, &mut buf).unwrap(), Resolved::Filled),
+                "the child must read page {page} from its retained version"
+            );
+            assert_eq!(u64::from_le_bytes(buf), u64::from(page), "the child read the wrong bytes for page {page}");
+        }
+        store.release_handle(child);
+        assert_eq!(store.stats().arena_slots_in_use, 0, "the child's reap must free every retained version");
+    }
+
+    /// r11-coherence amendment 29: a shard domain holds one shard's branch-owned pages, and one branch writing more
+    /// than 2^21 distinct pages must fit. One branch writes 2^21 + 1 pages in one write transaction; each first write
+    /// takes a slot of the branch's shard domain.
+    #[test]
+    fn a_shard_domain_holds_more_than_2_pow_21_branch_pages() {
+        const TINY: usize = 8;
+        const N: u32 = 1 << 21;
+        let store = BranchStore::new();
+        let id = store.fork_trunk(Arc::new(Schema::default()), TINY, 0).unwrap();
+        store.begin_write(id).unwrap();
+        for page in 0..N {
+            store.first_write_branch(id, page, &u64::from(page).to_le_bytes()).unwrap();
+        }
+        assert_eq!(
+            store.stats().arena_slots_in_use,
+            N as usize,
+            "premise: each of the branch's 2^21 first writes took a slot"
+        );
+        store.first_write_branch(id, N, &u64::from(N).to_le_bytes()).unwrap();
+        assert_eq!(store.stats().arena_slots_in_use, N as usize + 1, "the 2^21+1-th page took no slot");
+        store.end_write(id);
+        let mut buf = [0u8; TINY];
+        for page in [0, N - 1, N] {
+            assert!(
+                matches!(store.resolve_into(id, page, &mut buf).unwrap(), Resolved::Filled),
+                "the branch must read page {page} from its own slot"
+            );
+            assert_eq!(u64::from_le_bytes(buf), u64::from(page), "the branch read the wrong bytes for page {page}");
+        }
+        store.release_handle(id);
+        assert_eq!(store.stats().arena_slots_in_use, 0, "the reap must free every page the branch owned");
+    }
 }
