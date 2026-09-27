@@ -92,6 +92,8 @@ pub enum Unbranchable {
     Encrypted,
     /// The database uses auto-vacuum.
     AutoVacuum,
+    /// The database was opened for experimental multiprocess WAL.
+    MultiProcessWal,
 }
 
 impl Unbranchable {
@@ -121,6 +123,14 @@ impl Unbranchable {
                 "cannot branch an auto-vacuum database: auto-vacuum relocates pages and \
                  truncates the database file at commit, and a truncation rewrites what a branch \
                  reads without passing through the copy-on-write decision."
+            }
+            // A branch pager keeps its page cache across trunk commits (lane r12-branch-noclear),
+            // which is sound only because every trunk write passes this process's copy decision.
+            Unbranchable::MultiProcessWal => {
+                "cannot branch a database opened for experimental multiprocess WAL: another \
+                 process's trunk commits never pass this process's copy-on-write decision, so a \
+                 branch would silently read pages the trunk rewrote after its fork. Open the \
+                 database without multiprocess WAL to branch it."
             }
         }
     }
@@ -209,8 +219,12 @@ pub struct BranchStats {
     pub k3_olc_pool_in_use: u64,
     /// F-K3v: the most chunks (of 1,024 nodes) any one height's pool holds.
     pub k3_olc_max_class_chunks: u64,
-    /// Branch pagers' page caches emptied because the WAL changed (amendment 8.2).
+    /// Branch pagers' page caches emptied, for any cause (amendment 8.2; counting builds only). A WAL
+    /// change no longer empties one (lane r12-branch-noclear); a branch's own write rollback still does.
     pub branch_cache_clears: u64,
+    /// WAL changes a branch pager saw and kept its page cache across (lane r12-branch-noclear;
+    /// counting builds only).
+    pub branch_cache_clears_skipped: u64,
     /// Cumulative work counters, for attributing a latency curve to the loop that paid for it.
     pub work: BranchWork,
 }
@@ -449,6 +463,9 @@ fn check_forkable(db: &Database, pager: &Pager) -> Result<()> {
     if pager.get_auto_vacuum_mode() != AutoVacuumMode::None {
         return Err(Unbranchable::AutoVacuum.into());
     }
+    if db.experimental_multiprocess_wal_enabled() {
+        return Err(Unbranchable::MultiProcessWal.into());
+    }
     Ok(())
 }
 
@@ -658,6 +675,9 @@ mod isolation_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod mechanism_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod noclear_tests;
 
 #[cfg(test)]
 mod tests {
