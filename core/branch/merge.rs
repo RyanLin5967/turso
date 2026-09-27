@@ -222,6 +222,9 @@ pub struct Merger {
     stmts: HashMap<(i64, u32), TableStmts>,
     /// The foreign-key checks, compiled for one schema version when foreign keys are enforced.
     fks: Option<FkChecks>,
+    /// Test-only: run between the pre-probes and BEGIN IMMEDIATE (A19's re-check test).
+    #[cfg(test)]
+    after_preprobe: Option<Box<dyn FnMut()>>,
 }
 
 impl Drop for Merger {
@@ -341,6 +344,8 @@ impl Merger {
             store,
             stmts: HashMap::new(),
             fks: None,
+            #[cfg(test)]
+            after_preprobe: None,
         })
     }
 
@@ -476,11 +481,22 @@ impl Merger {
         policy: MergePolicy,
         fk_on: bool,
     ) -> Result<Vec<MergeOutcome>> {
+        // A19 (1): V3's probes before the WAL write lock (Silo/OCC backward validation); each is
+        // re-checked in O(1) under it and replaced by an in-lock probe if anything committed or
+        // stamped since. A branch the store no longer has gets no pre-probe (merge_prepare reports).
+        let pres: Vec<Option<super::store::PreProbe>> = branches
+            .iter()
+            .map(|b| self.store.v3_preprobe(b.id).ok())
+            .collect();
+        #[cfg(test)]
+        if let Some(hook) = self.after_preprobe.as_mut() {
+            hook();
+        }
         // BEGIN IMMEDIATE checks the schema cookie once it holds the write lock and prepares again
         // on a mismatch, so from here to COMMIT the merger's schema is the trunk's: a schema change
         // the caller committed is seen by the scope gate and by the statement cache's key.
         self.trunk.execute("BEGIN IMMEDIATE")?;
-        let result = self.validate_and_install(branches, policy, fk_on);
+        let result = self.validate_and_install(branches, policy, fk_on, &pres);
         match &result {
             Ok(outcomes) if outcomes.iter().any(|o| o.refused.is_none()) => {
                 if let Err(err) = self.trunk.execute("COMMIT") {
@@ -498,10 +514,11 @@ impl Merger {
         branches: &[Branch],
         policy: MergePolicy,
         fk_on: bool,
+        pres: &[Option<super::store::PreProbe>],
     ) -> Result<Vec<MergeOutcome>> {
         let physical = policy.install == Install::Physical;
         let mut outcomes = Vec::with_capacity(branches.len());
-        for branch in branches {
+        for (branch, &pre) in branches.iter().zip(pres) {
             // The batch's earlier members' writes are pending in this connection's transaction.
             let pager = self.trunk.pager.load().clone();
             crate::turso_assert!(
@@ -511,7 +528,7 @@ impl Merger {
             );
             let prep = pager.with_trunk_pending(|batch| {
                 self.store
-                    .merge_prepare(branch.id, policy.validation, physical, batch)
+                    .merge_prepare(branch.id, policy.validation, physical, batch, pre)
             })?;
             let trunk_schema = self.trunk.schema.read().schema_version;
             let scope = prep
@@ -1369,6 +1386,113 @@ mod tests {
                 "k = {k}: rows stamped after the gate"
             );
         }
+    }
+
+    /// A19 (1): a trunk commit between the merger's pre-probe and its WAL write lock is caught by
+    /// the O(1) re-check, which falls back to probing under the lock. Mutant 34 accepts the stale
+    /// pre-probe, installs over the trunk's update and fails here.
+    #[test]
+    fn a_commit_between_the_pre_probe_and_the_lock_is_not_missed() {
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for id in 1..=10 {
+            trunk
+                .execute(format!("INSERT INTO t VALUES ({id}, 'a')"))
+                .unwrap();
+        }
+        let b = trunk.fork_branch().unwrap();
+        b.connect()
+            .unwrap()
+            .execute("UPDATE t SET v = 'b' WHERE id = 5")
+            .unwrap();
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let writer = trunk.clone();
+        merger.after_preprobe = Some(Box::new(move || {
+            writer
+                .execute("UPDATE t SET v = 'trunk' WHERE id = 5")
+                .unwrap();
+        }));
+        let o = merger.merge(b, key_replay()).unwrap();
+        assert_eq!(o.refused, Some(Refusal::Key), "{o:?}");
+        assert_eq!(
+            int(&trunk, "SELECT count(*) FROM t WHERE id = 5 AND v = 'trunk'"),
+            1
+        );
+        let w = db.branch_stats().work;
+        assert_eq!(
+            (w.merge_preprobe_hits, w.merge_preprobe_misses),
+            (0, 1),
+            "the re-check did not reject the stale pre-probe"
+        );
+    }
+
+    /// A19 (2): the stamps are still pruned, by the committing connection after it releases the
+    /// WAL write lock: 200 single-row merges leave one merge's worth. Mutant 35 skips the prune
+    /// and keeps all 200. Every pre-probe here is current (the merger is the only writer).
+    #[test]
+    fn stamps_are_pruned_after_the_wal_lock_is_released() {
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for id in 1..=300 {
+            trunk
+                .execute(format!("INSERT INTO t VALUES ({id}, 'a')"))
+                .unwrap();
+        }
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        for id in 1..=200 {
+            let b = trunk.fork_branch().unwrap();
+            b.connect()
+                .unwrap()
+                .execute(format!("UPDATE t SET v = 'b' WHERE id = {id}"))
+                .unwrap();
+            let o = merger.merge(b, key_replay()).unwrap();
+            assert_eq!(o.refused, None, "{o:?}");
+        }
+        let s = db.branch_stats();
+        assert!(s.row_stamps <= 2, "{} stamps held after 200 merges", s.row_stamps);
+        assert_eq!(s.work.merge_preprobe_hits, 200, "{:?}", s.work);
+    }
+
+    /// R3's survivor (mutant 6): a physical merge's rows join the commit's stamps too, so a later
+    /// row-granular merge of the same row, by a branch forked before it, is refused.
+    #[test]
+    fn a_physical_merge_stamps_the_rows_it_installs() {
+        let (_dir, db) = open_db();
+        db.set_branch_read_tracking(true);
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for id in 1..=10 {
+            trunk
+                .execute(format!("INSERT INTO t VALUES ({id}, 'a')"))
+                .unwrap();
+        }
+        let (b1, b2) = (trunk.fork_branch().unwrap(), trunk.fork_branch().unwrap());
+        b1.connect()
+            .unwrap()
+            .execute("UPDATE t SET v = 'p' WHERE id = 5")
+            .unwrap();
+        b2.connect()
+            .unwrap()
+            .execute("UPDATE t SET v = 'k' WHERE id = 5")
+            .unwrap();
+        let physical = MergePolicy {
+            validation: Validation::PageStamp,
+            install: Install::Physical,
+        };
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let o = merger.merge(b1, physical).unwrap();
+        assert_eq!(o.refused, None, "{o:?}");
+        let o = merger.merge(b2, key_replay()).unwrap();
+        assert_eq!(o.refused, Some(Refusal::Key), "{o:?}");
+        assert_eq!(int(&trunk, "SELECT count(*) FROM t WHERE id = 5 AND v = 'p'"), 1);
     }
 
     /// A foreign key the engine cannot resolve (its parent table does not exist) refuses a member

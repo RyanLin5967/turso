@@ -312,6 +312,13 @@ pub struct BranchWork {
     pub prepare_v2_ns: u64,
     pub prepare_stamp_prune_ns: u64,
     pub prepare_v3_ns: u64,
+    /// A19: pre-probes accepted and rejected by the O(1) re-check under the WAL write lock, the
+    /// time spent pre-probing (outside that lock), and the stamps prune after it is released (ns,
+    /// read only while lock timing is on).
+    pub merge_preprobe_hits: u64,
+    pub merge_preprobe_misses: u64,
+    pub merge_preprobe_ns: u64,
+    pub post_release_prune_ns: u64,
 }
 
 impl BranchWork {
@@ -356,6 +363,10 @@ impl BranchWork {
             prepare_v2_ns,
             prepare_stamp_prune_ns,
             prepare_v3_ns,
+            merge_preprobe_hits,
+            merge_preprobe_misses,
+            merge_preprobe_ns,
+            post_release_prune_ns,
             merge_attempts,
             merge_commits,
             merge_refused_scalar,
@@ -410,6 +421,10 @@ impl BranchWork {
         self.prepare_v2_ns += prepare_v2_ns;
         self.prepare_stamp_prune_ns += prepare_stamp_prune_ns;
         self.prepare_v3_ns += prepare_v3_ns;
+        self.merge_preprobe_hits += merge_preprobe_hits;
+        self.merge_preprobe_misses += merge_preprobe_misses;
+        self.merge_preprobe_ns += merge_preprobe_ns;
+        self.post_release_prune_ns += post_release_prune_ns;
         self.merge_attempts += merge_attempts;
         self.merge_commits += merge_commits;
         self.merge_refused_scalar += merge_refused_scalar;

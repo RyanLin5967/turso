@@ -220,6 +220,12 @@ pub(crate) struct BranchStore {
     /// V3's stamps, behind their own lock (see [`RowStamps`]), and its counts, readable without it.
     stamps: CachePadded<Mutex<RowStamps>>,
     stamps_lock_acquisitions: AtomicU64,
+    /// A19's counts: pre-probes accepted and rejected under the lock, and the time spent
+    /// pre-probing and pruning after the WAL write lock (ns; read only while lock timing is on).
+    preprobe_hits: AtomicU64,
+    preprobe_misses: AtomicU64,
+    preprobe_ns: AtomicU64,
+    post_release_prune_ns: AtomicU64,
     /// Observation arm only (PREREG A18a): stamp the rows inside the decision's hold, as before
     /// A18, so one binary measures A18 on and off. Off by default.
     stamp_in_gate: AtomicBool,
@@ -357,6 +363,22 @@ struct RowStamps {
     stamp_order: VecDeque<(u64, i64, i64)>,
     /// Tables the trunk wrote without naming the rows: root -> epoch.
     table_stamps: HashMap<i64, u64>,
+    /// Advanced by every stamping, in the same hold as its writes (A19): a pre-probe that read it
+    /// is still current iff it has not moved.
+    seq: u64,
+    /// The oldest live child the last stamping's decision saw, for the prune the committing
+    /// connection runs after it has released the WAL write lock (A19).
+    prune_oldest: Option<Option<u64>>,
+}
+
+/// V3's verdict for one branch, taken before the merger's WAL write lock (A19, Silo/OCC backward
+/// validation), with what it was taken against: V0's commit count, read before the probe, and the
+/// stamps' `seq`, read in the probe's own hold.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PreProbe {
+    commits: u64,
+    seq: u64,
+    key: bool,
 }
 
 /// A committed trunk transaction's rows and tables, with the epoch and oldest live child its commit
@@ -407,7 +429,7 @@ impl MergeState {
 
 /// Fire-check only: `R11_MERGE_MUTANT=n` in a TEST build breaks merge mechanism n (validators,
 /// pruning and the guard, 1-10; the write-set and stamp hooks, the replay, the statement cache, the
-/// scope gate and the install's isolation, 11-13 and 15-33; 14 is not built, since no SQL path
+/// scope gate and the install's isolation, 11-13 and 15-35; 14 is not built, since no SQL path
 /// without DDL clears a user table's b-tree), so each test can be shown to fail for it
 /// (frontier/round11/r11-merge PREREG A6, A13, A14, A15). Always false otherwise.
 #[cfg(test)]
@@ -921,6 +943,10 @@ impl BranchStore {
             trunk_children: AtomicUsize::new(0),
             stamps: CachePadded::new(Mutex::new(RowStamps::default())),
             stamps_lock_acquisitions: AtomicU64::new(0),
+            preprobe_hits: AtomicU64::new(0),
+            preprobe_misses: AtomicU64::new(0),
+            preprobe_ns: AtomicU64::new(0),
+            post_release_prune_ns: AtomicU64::new(0),
             stamp_in_gate: AtomicBool::new(false),
             prepare_stamp_prune_ns: AtomicU64::new(0),
             prepare_v3_ns: AtomicU64::new(0),
@@ -1383,6 +1409,8 @@ impl BranchStore {
             for root in std::mem::take(&mut stamps.tables) {
                 st.table_stamps.insert(root, epoch);
             }
+            st.seq += 1;
+            st.prune_oldest = Some(oldest);
             self.stamps_held.store(st.row_stamps.len(), Ordering::Relaxed);
         }
         (gate, stamps)
@@ -1409,8 +1437,11 @@ impl BranchStore {
             for root in s.tables {
                 st.table_stamps.insert(root, s.epoch);
             }
+            st.seq += 1;
         }
-        st.prune(s.oldest);
+        // A19 (2): no prune here, under the WAL write lock; the connection prunes after releasing
+        // it ([`Self::prune_stamps`]), with this decision's oldest live child.
+        st.prune_oldest = Some(s.oldest);
         self.stamps_held.store(st.row_stamps.len(), Ordering::Relaxed);
         drop(st);
         if let Some(t) = t {
@@ -1573,6 +1604,10 @@ impl BranchStore {
         stats.work.merge_probes += self.v3_probes.load(Ordering::Relaxed);
         stats.work.prepare_stamp_prune_ns = self.prepare_stamp_prune_ns.load(Ordering::Relaxed);
         stats.work.prepare_v3_ns = self.prepare_v3_ns.load(Ordering::Relaxed);
+        stats.work.merge_preprobe_hits = self.preprobe_hits.load(Ordering::Relaxed);
+        stats.work.merge_preprobe_misses = self.preprobe_misses.load(Ordering::Relaxed);
+        stats.work.merge_preprobe_ns = self.preprobe_ns.load(Ordering::Relaxed);
+        stats.work.post_release_prune_ns = self.post_release_prune_ns.load(Ordering::Relaxed);
         stats.work.trunk_fork_wal_hold_ns = self.fork_wal_hold_ns.load(Ordering::Relaxed);
         for lock in self.shards.iter() {
             let shard = take(lock, self.timed());
@@ -1646,13 +1681,67 @@ impl BranchStore {
         for &(root, rowid) in rows {
             st.stamp_row(root, rowid, epoch);
         }
+        st.seq += 1;
         self.stamps_held.store(st.row_stamps.len(), Ordering::Relaxed);
     }
 
     /// Mutant 30 only: a table stamp at write time.
     pub(crate) fn trunk_bulk_written(&self, root: i64) {
         let epoch = self.trunk().lineage.epoch;
-        self.stamps().table_stamps.insert(root, epoch);
+        let mut st = self.stamps();
+        st.table_stamps.insert(root, epoch);
+        st.seq += 1;
+    }
+
+    /// A19 (2): prune the stamps after the committing connection has released the WAL write lock,
+    /// with the oldest live child its last stamping's decision saw. A prune removes only stamps at
+    /// or below the oldest live child's epoch, which refuse no live or future child, so it may run
+    /// beside any validator (each takes the stamps lock for its whole probe). An `oldest` that has
+    /// since risen only keeps more. Mutant 35 skips it.
+    pub(crate) fn prune_stamps(&self) {
+        if mutant(35) {
+            return;
+        }
+        let t = self.timed().then(Instant::now);
+        let mut st = self.stamps();
+        let Some(oldest) = st.prune_oldest.take() else {
+            return;
+        };
+        st.prune(oldest);
+        self.stamps_held.store(st.row_stamps.len(), Ordering::Relaxed);
+        drop(st);
+        if let Some(t) = t {
+            self.post_release_prune_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// A19 (1): V3's verdict for branch `id`, taken before the merger's WAL write lock: V0's
+    /// commit count is read first, then the branch's rows are probed against the stamps with the
+    /// stamps' `seq` read in the same hold. `merge_prepare` accepts it under the lock iff neither
+    /// has moved (see [`PreProbe`]).
+    pub(super) fn v3_preprobe(&self, id: BranchId) -> Result<PreProbe> {
+        let (rows, at): (Vec<(i64, i64)>, u64) = {
+            let shard = self.shard(id);
+            let st = shard.branches.get(&id).ok_or_else(|| gone(id))?;
+            (st.rows.keys().copied().collect(), st.trunk_at)
+        };
+        let commits = self.trunk().merge.trunk_commits;
+        let t = self.timed().then(Instant::now);
+        let st = self.stamps();
+        let (m3, m10) = (u64::from(mutant(3)), u64::from(mutant(10)));
+        let key = rows.iter().any(|&(root, rowid)| {
+            let row = st.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
+            let table = st.table_stamps.get(&root).copied().unwrap_or(0);
+            row.max(table) + m10 > at + m3
+        });
+        let seq = st.seq;
+        drop(st);
+        if let Some(t) = t {
+            self.preprobe_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        Ok(PreProbe { commits, seq, key })
     }
 
     /// The trunk write transaction in progress committed (`Some`) or rolled back (`None`). Its
@@ -1721,6 +1810,7 @@ impl BranchStore {
         active: super::merge::Validation,
         physical: bool,
         batch: &TrunkPending,
+        pre: Option<PreProbe>,
     ) -> Result<super::merge::Prepared> {
         use super::merge::{Prepared, Validation};
         struct Copied {
@@ -1818,6 +1908,7 @@ impl BranchStore {
         };
         // V0: any trunk commit since the fork, or any page the transaction in progress wrote (an
         // earlier member of the same batch).
+        let commits_now = merge.trunk_commits;
         let commits_since_fork = merge.trunk_commits - b.commits_at_fork;
         count(Validation::Scalar, &mut probes);
         let scalar = commits_since_fork > u64::from(mutant(1))
@@ -1895,24 +1986,44 @@ impl BranchStore {
         // every commit's stamps complete while this reads (asserted by the caller).
         let mut key = false;
         {
-            let mut st = self.stamps();
+            let st = self.stamps();
             let t_s = timed.then(Instant::now);
-            st.prune(oldest);
-            self.stamps_held.store(st.row_stamps.len(), Ordering::Relaxed);
+            // A19 (2): the stamps are pruned after the WAL lock by the committing connection, not
+            // here (`oldest` stays for the log's prune above).
+            let _ = oldest;
             let t_v3 = timed.then(Instant::now);
             let mut key_probes = 0u64;
-            for &((root, rowid), _) in &b.rows {
-                if active == Validation::KeyStamp {
-                    key_probes += 1;
-                }
-                let row = st.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
-                let table = st.table_stamps.get(&root).copied().unwrap_or(0);
-                if row.max(table) + u64::from(mutant(10)) > at + m3
-                    || batch.rows.contains(&(root, rowid))
-                    || batch.tables.contains(&root)
-                {
-                    key = true;
-                    break;
+            // A19 (1): the pre-probe stands iff no commit was decided (V0's count) and none
+            // stamped (the stamps' seq) since it was taken. Mutant 34 skips the re-check.
+            let stale = |p: &PreProbe| p.commits != commits_now || p.seq != st.seq;
+            let accepted = pre.filter(|p| mutant(34) || !stale(p));
+            match (pre, accepted) {
+                (Some(_), Some(_)) => self.preprobe_hits.fetch_add(1, Ordering::Relaxed),
+                (Some(_), None) => self.preprobe_misses.fetch_add(1, Ordering::Relaxed),
+                _ => 0,
+            };
+            if let Some(p) = accepted {
+                // Only the batch's own uncommitted writes are left to check (O(1) for a batch's
+                // first member, whose pending set is empty).
+                key = p.key
+                    || (!batch.rows.is_empty() || !batch.tables.is_empty())
+                        && b.rows.iter().any(|&((root, rowid), _)| {
+                            batch.rows.contains(&(root, rowid)) || batch.tables.contains(&root)
+                        });
+            } else {
+                for &((root, rowid), _) in &b.rows {
+                    if active == Validation::KeyStamp {
+                        key_probes += 1;
+                    }
+                    let row = st.row_stamps.get(&(root, rowid)).copied().unwrap_or(0);
+                    let table = st.table_stamps.get(&root).copied().unwrap_or(0);
+                    if row.max(table) + u64::from(mutant(10)) > at + m3
+                        || batch.rows.contains(&(root, rowid))
+                        || batch.tables.contains(&root)
+                    {
+                        key = true;
+                        break;
+                    }
                 }
             }
             self.v3_probes.fetch_add(key_probes, Ordering::Relaxed);

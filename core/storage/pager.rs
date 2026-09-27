@@ -3332,6 +3332,12 @@ impl Pager {
 
                     wal.end_write_tx();
                     wal.end_read_tx();
+                    // A19 (2): the merge record's stamps are pruned now, off the WAL write lock.
+                    if self.branch.get().is_none() {
+                        if let Some(store) = self.branch_store.get() {
+                            store.prune_stamps();
+                        }
+                    }
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
