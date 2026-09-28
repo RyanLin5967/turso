@@ -803,6 +803,11 @@ impl Journal {
         Ok(())
     }
 
+    /// `(log bytes, last snapshot bytes)`, for the githost-shape lane's observing counters.
+    pub(crate) fn lens(&self) -> (u64, u64) {
+        (self.len, self.snapshot_len)
+    }
+
     pub(crate) fn wants_compaction(&self) -> bool {
         self.len > COMPACT_MIN_LOG_BYTES.max(2 * self.snapshot_len)
     }

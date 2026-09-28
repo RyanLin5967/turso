@@ -125,6 +125,42 @@ impl PageMap {
     }
 }
 
+impl PageMap {
+    /// Call `f` with every mapped page, ascending; returns (nodes visited, pages mapped). Used by the
+    /// githost-shape lane's DIFF instrument (read-only).
+    pub(crate) fn for_each_page(&self, mut f: impl FnMut(u32)) -> (u64, u64) {
+        fn walk(node: &Node, level: u32, base: u32, f: &mut impl FnMut(u32)) -> (u64, u64) {
+            match node {
+                Node::Inner(kids) => {
+                    let mut acc = (1, 0);
+                    for (i, kid) in kids.iter().enumerate() {
+                        if let Some(kid) = kid {
+                            let child_base = base | ((i as u32) << (BITS * level));
+                            let (n, e) = walk(kid, level - 1, child_base, f);
+                            acc = (acc.0 + n, acc.1 + e);
+                        }
+                    }
+                    acc
+                }
+                Node::Leaf(slots) => {
+                    let mut e = 0;
+                    for (i, m) in slots.iter().enumerate() {
+                        if m.0 != EMPTY {
+                            e += 1;
+                            f(base | i as u32);
+                        }
+                    }
+                    (1, e)
+                }
+            }
+        }
+        match self.root.as_deref() {
+            Some(root) => walk(root, self.height, 0, &mut f),
+            None => (0, 0),
+        }
+    }
+}
+
 #[cfg(test)]
 impl PageMap {
     /// (nodes reachable from the root, pages mapped).

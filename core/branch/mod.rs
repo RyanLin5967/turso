@@ -274,6 +274,56 @@ pub struct BranchOpenStats {
     pub total_ns: u64,
 }
 
+/// Observing counters for the git-hosting shape (githost-shape lane, round 11): nothing in the
+/// mechanism reads them. The first group is cumulative since open; the second is read at the call.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchShapeCounters {
+    /// Log compactions into a snapshot (`maybe_compact` and `compact_now`).
+    pub compactions: u64,
+    /// Snapshot bytes those compactions wrote.
+    pub compact_bytes: u64,
+    /// Nanoseconds inside those compactions (the store mutex is held throughout), total and max.
+    pub compact_ns: u64,
+    pub compact_max_ns: u64,
+    /// Resizes of the `branches` table (a capacity change across one insert), and the entries they
+    /// moved (the table's length at each resize).
+    pub table_resizes: u64,
+    pub table_moved: u64,
+    /// `ids()` calls, the branch states they visited, and nanoseconds they held the store mutex.
+    pub ids_calls: u64,
+    pub ids_visited: u64,
+    pub ids_lock_ns: u64,
+    /// Gauges: branch states, the table's capacity, trunk pages with a recorded write epoch, the
+    /// trunk's retained versions, its live children, and the log and last snapshot lengths.
+    pub branches_len: u64,
+    pub branches_capacity: u64,
+    pub trunk_written: u64,
+    pub trunk_retained: u64,
+    pub trunk_children: u64,
+    pub log_bytes: u64,
+    pub snapshot_bytes: u64,
+}
+
+/// DIFF(branch, TRUNK) as r11-diff-list's D-written arm (githost-shape lane instrument): the pages
+/// whose identity differs between the branch's view and the trunk's current state: the branch's
+/// own current pages, every page of its inherited map, and every trunk page written after the
+/// branch's ancestry left the trunk. Read-only.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchDiff {
+    /// The differing pages, ascending.
+    pub pages: Vec<u32>,
+    /// Current entries of the branch visited.
+    pub own_entries: u64,
+    /// Page-map nodes and mapped entries visited in the inherited map.
+    pub inherited_nodes: u64,
+    pub inherited_entries: u64,
+    /// Trunk `written` entries visited, and those written after the branch's `trunk_at`.
+    pub written_visited: u64,
+    pub written_hits: u64,
+}
+
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
@@ -529,6 +579,18 @@ impl Database {
     /// branches, whose branch store is not open: "none" would be a lie there.
     pub fn branch_ids(&self) -> Result<Vec<BranchId>> {
         self.branches.ids()
+    }
+
+    /// The git-hosting shape's observing counters (githost-shape lane).
+    #[doc(hidden)]
+    pub fn branch_shape_counters(&self) -> BranchShapeCounters {
+        self.branches.shape_counters()
+    }
+
+    /// DIFF(branch `id`, TRUNK), D-written (githost-shape lane instrument). Read-only.
+    #[doc(hidden)]
+    pub fn branch_diff_trunk(&self, id: BranchId) -> Result<BranchDiff> {
+        self.branches.diff_trunk(id)
     }
 
     /// Reap every branch whose lease has run out, deepest first. The same pass also runs at every
