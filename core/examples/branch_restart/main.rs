@@ -11,6 +11,11 @@
 //! pre-image for the children forked since that page's last write: retained trunk versions for the
 //! open to rebuild. Its `open` must then run without --probes (the trunk rows have moved).
 //!
+//! `grow --child-every K` (sota-durable lane, PREREG D3.11): every K-th fork is a child of the branch forked just
+//! before it (attached by id, forked, detached again) instead of a fork of the trunk, so the store holds parents
+//! with live children, whose page maps an open after a snapshot load must derive.
+//! (Both flags composed into r11-restart's harness by the a12-durable-open lane.)
+//!
 //! `grow` is the kill -9 VICTIM: it opens the database `Durable { sync: false }` (the files are the
 //! same bytes as with sync; only fsyncs differ), grows it to N live branches — each forked from the
 //! trunk, each updating one row (one leaf page), each detached so it outlives the process — prints
@@ -59,7 +64,10 @@ struct Args {
     writes: usize,
     seed: u64,
     label: String,
+    /// `catalog`: open with `BranchDurability::Catalog` (the published-fix prototype).
+    catalog: bool,
     trunk_every: usize,
+    child_every: usize,
 }
 
 fn parse_args() -> Args {
@@ -73,7 +81,9 @@ fn parse_args() -> Args {
         writes: 200,
         seed: 0x9E37_79B9_7F4A_7C15,
         label: String::new(),
+        catalog: false,
         trunk_every: 0,
+        child_every: 0,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -84,7 +94,15 @@ fn parse_args() -> Args {
             "--writes" => args.writes = val().parse().unwrap_or_else(|_| die("bad --writes")),
             "--seed" => args.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
             "--label" => args.label = val(),
+            "--child-every" => args.child_every = val().parse().unwrap_or_else(|_| die("bad --child-every")),
             "--trunk-every" => args.trunk_every = val().parse().unwrap_or_else(|_| die("bad --trunk-every")),
+            "--mode" => {
+                args.catalog = match val().as_str() {
+                    "snapshot" => false,
+                    "catalog" => true,
+                    other => die(&format!("unknown --mode {other}")),
+                }
+            }
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -154,6 +172,8 @@ struct Files {
     arena: PathBuf,
     snap: PathBuf,
     wal: PathBuf,
+    cat: PathBuf,
+    cat_wal: PathBuf,
 }
 
 impl Files {
@@ -164,26 +184,35 @@ impl Files {
             arena: with("-branch-arena"),
             snap: with("-branch-snap"),
             wal: with("-wal"),
+            cat: with("-branch-cat"),
+            cat_wal: with("-branch-cat-wal"),
         }
     }
     fn line(&self) -> String {
         format!(
-            "log_bytes={} snap_bytes={} arena_bytes={} wal_bytes={}",
+            "log_bytes={} snap_bytes={} arena_bytes={} wal_bytes={} cat_bytes={} cat_wal_bytes={}",
             size_of(&self.log),
             size_of(&self.snap),
             size_of(&self.arena),
-            size_of(&self.wal)
+            size_of(&self.wal),
+            size_of(&self.cat),
+            size_of(&self.cat_wal)
         )
     }
 }
 
-fn open_db(path: &Path, sync: bool) -> Arc<Database> {
+fn open_db(path: &Path, sync: bool, catalog: bool) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let durability = if catalog {
+        BranchDurability::Catalog { sync }
+    } else {
+        BranchDurability::Durable { sync }
+    };
     Database::open_file_with_flags(
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
-        DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync }),
+        DatabaseOpts::new().with_branch_durability(durability),
         None,
         Arc::new(SqliteDialect),
     )
@@ -194,7 +223,8 @@ fn stats_line(s: &BranchOpenStats) -> String {
     format!(
         "snap_bytes={} log_bytes={} records={} snap_branches={} branches={} current_entries={} \
          retained_entries={} trunk_retained={} trunk_children={} referenced_slots={} \
-         arena_high_water={} arena_free={} derived_map_inserts={}",
+         arena_high_water={} arena_free={} states={} released_scanned={} branch_loads={} \
+         trunk_page_loads={} cat_queries={} cat_rows_read={} touched_slots={} derived_map_inserts={}",
         s.snap_bytes,
         s.log_bytes,
         s.records,
@@ -207,13 +237,21 @@ fn stats_line(s: &BranchOpenStats) -> String {
         s.referenced_slots,
         s.arena_high_water,
         s.arena_free,
+        s.states,
+        s.released_scanned,
+        s.branch_loads,
+        s.trunk_page_loads,
+        s.cat_queries,
+        s.cat_rows_read,
+        s.touched_slots,
         s.derived_map_inserts
     )
 }
 
 fn phases_line(s: &BranchOpenStats) -> String {
     let us = |ns: u64| ns as f64 / 1e3;
-    let sum = s.recover_ns
+    let sum = s.catalog_ns
+        + s.recover_ns
         + s.load_ns
         + s.replay_ns
         + s.collect_ns
@@ -221,8 +259,9 @@ fn phases_line(s: &BranchOpenStats) -> String {
         + s.arena_ns
         + s.expire_ns;
     format!(
-        "recover_us={:.1} load_us={:.1} replay_us={:.1} collect_us={:.1} referenced_us={:.1} \
-         arena_us={:.1} expire_us={:.1} phases_sum_us={:.1} store_total_us={:.1}",
+        "catalog_us={:.1} recover_us={:.1} load_us={:.1} replay_us={:.1} collect_us={:.1} \
+         referenced_us={:.1} arena_us={:.1} expire_us={:.1} phases_sum_us={:.1} store_total_us={:.1}",
+        us(s.catalog_ns),
         us(s.recover_ns),
         us(s.load_ns),
         us(s.replay_ns),
@@ -236,7 +275,7 @@ fn phases_line(s: &BranchOpenStats) -> String {
 }
 
 fn grow(args: &Args) {
-    let db = open_db(&args.db, false);
+    let db = open_db(&args.db, false, args.catalog);
     let files = Files::new(&args.db);
     let s = db.branch_open_stats();
     println!("# grow victim pid={} target={} open counters: {}", std::process::id(), args.n, stats_line(&s));
@@ -270,11 +309,24 @@ fn grow(args: &Args) {
     }
     let start = live;
     let mut trunk_writes = 0u64;
+    let mut children = 0u64;
     let mut snap_changes = 0u64;
     let mut last_snap = size_of(&files.snap);
     while live < args.n {
         let expect = live as u64 + 1;
-        let branch = trunk.fork_branch().unwrap();
+        let branch = if args.child_every > 0 && expect > 1 && expect % args.child_every as u64 == 0 {
+            // A child of the branch forked just before: attach it by id, fork, detach it again
+            // (dropping the handle would release it).
+            let parent = db
+                .branch(BranchId(expect - 1))
+                .unwrap_or_else(|e| not_a_result(&format!("attach {}: {e}", expect - 1)));
+            let child = parent.fork().unwrap();
+            let _ = parent.into_id();
+            children += 1;
+            child
+        } else {
+            trunk.fork_branch().unwrap()
+        };
         if branch.id() != BranchId(expect) {
             not_a_result(&format!("fork returned {:?}, expected id {expect}", branch.id()));
         }
@@ -303,16 +355,20 @@ fn grow(args: &Args) {
         }
     }
     let st = db.branch_stats().unwrap();
-    // Each branch owns one page; with --trunk-every the arena also holds the retained trunk versions.
-    if st.live_branches != args.n
-        || (args.trunk_every == 0 && st.arena_slots_in_use != args.n)
-        || st.arena_slots_in_use < args.n
-    {
-        not_a_result(&format!("after growth: {st:?}, expected {} branches and pages", args.n));
+    let tr = db.branch_trunk_retained();
+    if st.live_branches != args.n || st.arena_slots_in_use as u64 != args.n as u64 + tr {
+        not_a_result(&format!(
+            "after growth: {st:?} with {tr} trunk pre-images, expected {} branches and {} pages",
+            args.n,
+            args.n as u64 + tr
+        ));
     }
-    println!("# trunk writes this growth: {trunk_writes} (--trunk-every {})", args.trunk_every);
     println!(
-        "# grown {start} -> {} branches; snapshot size changes observed: {snap_changes}; {}; rss_bytes={}",
+        "# trunk writes this growth: {trunk_writes} (--trunk-every {}); forks of a branch: {children} (--child-every {})",
+        args.trunk_every, args.child_every
+    );
+    println!(
+        "# grown {start} -> {} branches; snapshot size changes observed: {snap_changes}; trunk_retained={tr}; {}; rss_bytes={}",
         args.n,
         files.line(),
         rss_bytes()
@@ -336,7 +392,7 @@ fn pct(sorted: &[f64], p: f64) -> f64 {
     sorted[rank]
 }
 
-fn summary(name: &str, n: usize, label: &str, v: &mut [f64], counters: &[(u64, u64)]) {
+fn summary(name: &str, n: usize, label: &str, v: &mut [f64], counters: &[(u64, u64)], cat: &[(u64, u64, u64)]) {
     if v.is_empty() {
         return;
     }
@@ -348,16 +404,23 @@ fn summary(name: &str, n: usize, label: &str, v: &mut [f64], counters: &[(u64, u
     let rc_max = counters.iter().map(|c| c.0).max().unwrap();
     let ar_min = counters.iter().map(|c| c.1).min().unwrap();
     let ar_max = counters.iter().map(|c| c.1).max().unwrap();
+    let loads: u64 = cat.iter().map(|c| c.0).sum();
+    let tpages: u64 = cat.iter().map(|c| c.1).sum();
+    let crows: u64 = cat.iter().map(|c| c.2).sum();
     println!(
         "PROBE\tn={n}\tlabel={label}\top={name}\tk={}\tp50_us={:.2}\tp90_us={:.2}\tp99_us={:.2}\tmax_us={:.2}\t\
-         resolve_per={:.3}\tresolve_min={rc_min}\tresolve_max={rc_max}\tarena_reads_per={:.3}\tarena_min={ar_min}\tarena_max={ar_max}",
+         resolve_per={:.3}\tresolve_min={rc_min}\tresolve_max={rc_max}\tarena_reads_per={:.3}\tarena_min={ar_min}\tarena_max={ar_max}\t\
+         branch_loads_per={:.3}\ttrunk_page_loads_per={:.3}\tcat_rows_per={:.3}",
         v.len(),
         pct(v, 50.0),
         pct(v, 90.0),
         pct(v, 99.0),
         v[v.len() - 1],
         rc as f64 / k,
-        ar as f64 / k
+        ar as f64 / k,
+        loads as f64 / k,
+        tpages as f64 / k,
+        crows as f64 / k
     );
 }
 
@@ -366,19 +429,26 @@ fn open(args: &Args) {
     let files_before = files.line();
     let rss0 = rss_bytes();
     let t = Instant::now();
-    let db = open_db(&args.db, true);
+    let db = open_db(&args.db, true, args.catalog);
     let t_db = t.elapsed();
     let t = Instant::now();
     let trunk = db.connect().unwrap();
     let t_connect = t.elapsed();
     let rss1 = rss_bytes();
     let s = db.branch_open_stats();
+    let reads = db.branch_read_counters();
     let st = db.branch_stats().unwrap();
-    if st.live_branches != args.n || st.arena_slots_in_use < args.n {
-        not_a_result(&format!("after open: {st:?}, expected {} branches", args.n));
+    let tr = db.branch_trunk_retained();
+    if st.live_branches != args.n || st.arena_slots_in_use as u64 != args.n as u64 + tr {
+        not_a_result(&format!(
+            "after open: {st:?} with {tr} trunk pre-images, expected {} branches and {} pages",
+            args.n,
+            args.n as u64 + tr
+        ));
     }
     println!(
-        "OPEN\tn={}\tlabel={}\tdb_open_us={:.1}\ttrunk_connect_us={:.1}\t{}\t{}\tlive={}\tarena_in_use={}\t\
+        "OPEN\tn={}\tlabel={}\tdb_open_us={:.1}\ttrunk_connect_us={:.1}\t{}\t{}\tlive={}\tarena_in_use={}\ttrunk_retained_now={tr}\t\
+         resolve_calls_since_open={}\tarena_reads_since_open={}\t\
          rss_before={rss0}\trss_after_open={rss1}\tfiles_before: {files_before}",
         args.n,
         args.label,
@@ -387,13 +457,21 @@ fn open(args: &Args) {
         stats_line(&s).replace(' ', "\t"),
         phases_line(&s).replace(' ', "\t"),
         st.live_branches,
-        st.arena_slots_in_use
+        st.arena_slots_in_use,
+        reads.0,
+        reads.1
     );
     if args.probes > 0 {
         let mut rng = Rng(args.seed);
         let mut seen = std::collections::HashSet::new();
         let (mut c_t, mut own_t, mut trunk_t, mut own2_t) = (vec![], vec![], vec![], vec![]);
+        let mut attach_t = vec![];
         let (mut c_c, mut own_c, mut trunk_c, mut own2_c) = (vec![], vec![], vec![], vec![]);
+        let (mut c_k, mut own_k, mut trunk_k, mut own2_k) = (vec![], vec![], vec![], vec![]);
+        let cc = |db: &Arc<Database>| {
+            let (l, t, _, r) = db.branch_catalog_counters();
+            (l, t, r)
+        };
         let k = args.probes.min(args.n);
         while seen.len() < k {
             let id = 1 + rng.below(args.n) as u64;
@@ -402,24 +480,27 @@ fn open(args: &Args) {
             }
             let row = row_for(id);
             let other = far_row(row);
+            let ka = cc(&db);
+            let t_attach = Instant::now();
             let branch = db.branch(BranchId(id)).unwrap_or_else(|e| not_a_result(&format!("attach {id}: {e}")));
-            let c0 = db.branch_read_counters();
+            attach_t.push(t_attach.elapsed().as_secs_f64() * 1e6);
+            let (c0, k0) = (db.branch_read_counters(), cc(&db));
             let t = Instant::now();
             let conn = branch.connect().unwrap();
             c_t.push(t.elapsed().as_secs_f64() * 1e6);
-            let c1 = db.branch_read_counters();
+            let (c1, k1) = (db.branch_read_counters(), cc(&db));
             let t = Instant::now();
             let v_own = read_v(&conn, row);
             own_t.push(t.elapsed().as_secs_f64() * 1e6);
-            let c2 = db.branch_read_counters();
+            let (c2, k2) = (db.branch_read_counters(), cc(&db));
             let t = Instant::now();
             let v_trunk = read_v(&conn, other);
             trunk_t.push(t.elapsed().as_secs_f64() * 1e6);
-            let c3 = db.branch_read_counters();
+            let (c3, k3) = (db.branch_read_counters(), cc(&db));
             let t = Instant::now();
             let v_own2 = read_v(&conn, row);
             own2_t.push(t.elapsed().as_secs_f64() * 1e6);
-            let c4 = db.branch_read_counters();
+            let (c4, k4) = (db.branch_read_counters(), cc(&db));
             if v_own != branch_value(row) || v_own2 != branch_value(row) {
                 not_a_result(&format!("branch {id} read its own row {row} as {v_own:.12}"));
             }
@@ -431,13 +512,23 @@ fn open(args: &Args) {
             own_c.push(d(c1, c2));
             trunk_c.push(d(c2, c3));
             own2_c.push(d(c3, c4));
+            let d3 = |a: (u64, u64, u64), b: (u64, u64, u64)| (b.0 - a.0, b.1 - a.1, b.2 - a.2);
+            // The attach happened before k0: count it with the connect.
+            c_k.push(d3(ka, k1));
+            own_k.push(d3(k1, k2));
+            trunk_k.push(d3(k2, k3));
+            own2_k.push(d3(k3, k4));
+            let _ = k0;
             drop(conn);
             let _ = branch.into_id();
         }
-        summary("connect", args.n, &args.label, &mut c_t, &c_c);
-        summary("own_first", args.n, &args.label, &mut own_t, &own_c);
-        summary("trunk_first", args.n, &args.label, &mut trunk_t, &trunk_c);
-        summary("own_second", args.n, &args.label, &mut own2_t, &own2_c);
+        let no = vec![(0u64, 0u64); attach_t.len()];
+        let nok = vec![(0u64, 0u64, 0u64); attach_t.len()];
+        summary("attach", args.n, &args.label, &mut attach_t, &no, &nok);
+        summary("connect", args.n, &args.label, &mut c_t, &c_c, &c_k);
+        summary("own_first", args.n, &args.label, &mut own_t, &own_c, &own_k);
+        summary("trunk_first", args.n, &args.label, &mut trunk_t, &trunk_c, &trunk_k);
+        summary("own_second", args.n, &args.label, &mut own2_t, &own2_c, &own2_k);
         let st = db.branch_stats().unwrap();
         if st.live_branches != args.n {
             not_a_result(&format!("probing changed the branch count: {st:?}"));
@@ -459,7 +550,7 @@ fn open(args: &Args) {
 
 fn compact(args: &Args) {
     let files = Files::new(&args.db);
-    let db = open_db(&args.db, true);
+    let db = open_db(&args.db, true, args.catalog);
     let st = db.branch_stats().unwrap();
     if st.live_branches != args.n {
         not_a_result(&format!("compact: {st:?}, expected {} branches", args.n));
@@ -471,7 +562,7 @@ fn compact(args: &Args) {
 
 fn ckpt(args: &Args) {
     let files = Files::new(&args.db);
-    let db = open_db(&args.db, true);
+    let db = open_db(&args.db, true, args.catalog);
     let trunk = db.connect().unwrap();
     let int = |sql: &str| trunk.prepare(sql).unwrap().run_collect_rows().unwrap()[0][0].as_int().unwrap();
     let before = db.branch_stats().unwrap();
@@ -521,6 +612,132 @@ fn ckpt(args: &Args) {
     drop(db);
 }
 
+/// (c2): the store's checkpoint after `--writes` branch commits spread over random live branches
+/// (each: attach, connect, rewrite the branch's own row in place, close, detach). A checkpoint is
+/// taken first, so the timed one covers only these commits: in snapshot mode a compaction (all live
+/// state), in catalog mode the catalog checkpoint (the dirty branches' rows).
+fn ckpt2(args: &Args) {
+    let files = Files::new(&args.db);
+    let db = open_db(&args.db, true, args.catalog);
+    let trunk = db.connect().unwrap();
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n {
+        not_a_result(&format!("ckpt2: {st:?}, expected {} branches", args.n));
+    }
+    db.branch_compact_now().unwrap();
+    let settled = files.line();
+    let mut rng = Rng(args.seed);
+    let mut distinct = std::collections::HashSet::new();
+    let t = Instant::now();
+    for g in 0..args.writes {
+        let id = 1 + rng.below(args.n) as u64;
+        distinct.insert(id);
+        let branch = db
+            .branch(BranchId(id))
+            .unwrap_or_else(|e| not_a_result(&format!("attach {id}: {e}")));
+        let conn = branch.connect().unwrap();
+        conn.execute(format!(
+            "UPDATE t SET v = '{}' WHERE id = {}",
+            trunk_write_value(g as u64),
+            row_for(id)
+        ))
+        .unwrap();
+        drop(conn);
+        let _ = branch.into_id();
+    }
+    let t_commits = t.elapsed();
+    let (log0, cat0, catw0, snap0) = (
+        size_of(&files.log),
+        size_of(&files.cat),
+        size_of(&files.cat_wal),
+        size_of(&files.snap),
+    );
+    let w0 = db.branch_catalog_rows_written();
+    let t = Instant::now();
+    db.branch_compact_now().unwrap();
+    let t_ck = t.elapsed();
+    let rows_written = db.branch_catalog_rows_written() - w0;
+    let (log1, cat1, catw1, snap1) = (
+        size_of(&files.log),
+        size_of(&files.cat),
+        size_of(&files.cat_wal),
+        size_of(&files.snap),
+    );
+    // A sample of the rewritten branches reads its new row.
+    let mut rng = Rng(args.seed);
+    for g in 0..args.writes.min(20) {
+        let id = 1 + rng.below(args.n) as u64;
+        let _ = g;
+        let branch = db.branch(BranchId(id)).unwrap();
+        let conn = branch.connect().unwrap();
+        let v = read_v(&conn, row_for(id));
+        if !v.starts_with('t') {
+            not_a_result(&format!("ckpt2: branch {id} lost its rewrite: {v:.12}"));
+        }
+        drop(conn);
+        let _ = branch.into_id();
+    }
+    println!(
+        "CKPT2\tn={}\twrites={}\tdistinct={}\tcommits_total_us={:.1}\tlog_before_ckpt={log0}\tckpt_us={:.1}\tcat_rows_written={rows_written}\t\
+         snap_before={snap0}\tsnap_after={snap1}\tcat_before={cat0}\tcat_after={cat1}\tcat_wal_before={catw0}\t\
+         cat_wal_after={catw1}\tlog_after={log1}\tsettled: {settled}",
+        args.n,
+        args.writes,
+        distinct.len(),
+        t_commits.as_secs_f64() * 1e6,
+        t_ck.as_secs_f64() * 1e6
+    );
+    drop(trunk);
+    drop(db);
+}
+
+/// (b2) victim: open, checkpoint once (so the log holds only what follows), then `--writes` branch
+/// commits over random live branches (each: attach, connect, rewrite the branch's own row, close,
+/// detach), print READY and block until killed. The log tail it leaves names old branches, which a
+/// recovery must bring back: the steady-state crash, where the growth chain's tails only name
+/// branches forked in the same tail (PREREG A11).
+fn churn(args: &Args) {
+    let files = Files::new(&args.db);
+    let db = open_db(&args.db, false, args.catalog);
+    let _trunk = db.connect().unwrap();
+    let st = db.branch_stats().unwrap();
+    if st.live_branches != args.n {
+        not_a_result(&format!("churn: {st:?}, expected {} branches", args.n));
+    }
+    db.branch_compact_now().unwrap();
+    let mut rng = Rng(args.seed);
+    let mut distinct = std::collections::HashSet::new();
+    for g in 0..args.writes {
+        let id = 1 + rng.below(args.n) as u64;
+        distinct.insert(id);
+        let branch = db
+            .branch(BranchId(id))
+            .unwrap_or_else(|e| not_a_result(&format!("attach {id}: {e}")));
+        let conn = branch.connect().unwrap();
+        conn.execute(format!(
+            "UPDATE t SET v = '{}' WHERE id = {}",
+            trunk_write_value(g as u64),
+            row_for(id)
+        ))
+        .unwrap();
+        drop(conn);
+        let _ = branch.into_id();
+    }
+    println!(
+        "# churn victim pid={} n={} writes={} distinct={} {}",
+        std::process::id(),
+        args.n,
+        args.writes,
+        distinct.len(),
+        files.line()
+    );
+    println!("READY n={} pid={}", args.n, std::process::id());
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 fn main() {
     let args = parse_args();
     if cfg!(debug_assertions) {
@@ -531,6 +748,8 @@ fn main() {
         "open" => open(&args),
         "compact" => compact(&args),
         "ckpt" => ckpt(&args),
+        "ckpt2" => ckpt2(&args),
+        "churn" => churn(&args),
         other => die(&format!("unknown command {other}")),
     }
 }

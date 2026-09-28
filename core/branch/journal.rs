@@ -71,6 +71,8 @@ pub(crate) struct BranchFiles {
     pub(crate) arena: PathBuf,
     pub(crate) log: PathBuf,
     pub(crate) snap: PathBuf,
+    /// The catalog of a catalog-mode store (`catalog.rs`), in place of `snap`.
+    pub(crate) cat: PathBuf,
 }
 
 impl BranchFiles {
@@ -84,6 +86,7 @@ impl BranchFiles {
             arena: named("-branch-arena"),
             log: named("-branch-log"),
             snap: named("-branch-snap"),
+            cat: named("-branch-cat"),
         }
     }
 
@@ -98,7 +101,7 @@ impl BranchFiles {
             Ok(meta) => holds_nothing_up_to.is_none_or(|n| meta.len() > n),
             Err(e) => !cannot_exist(&e),
         };
-        holds(&self.snap, None) || holds(&self.log, Some(0))
+        holds(&self.snap, None) || holds(&self.cat, None) || holds(&self.log, Some(0))
     }
 
     fn snap_tmp(&self) -> PathBuf {
@@ -477,7 +480,8 @@ impl Journal {
         }
         lock_exclusive(&file, &files.log)?;
         let existing = read_all(&mut file)?;
-        if files.snap.exists() || !matches!(parse_log_header(&existing), Ok(None)) {
+        if files.snap.exists() || files.cat.exists() || !matches!(parse_log_header(&existing), Ok(None))
+        {
             return Err(LimboError::LockingError(format!(
                 "branch files next to {} gained state after this branch store opened: another \
                  store instance wrote them",
@@ -543,14 +547,33 @@ impl Journal {
     /// Reopen an existing store. `Ok(None)` means the files hold no state at all (a crash while
     /// the log was being created, before its header was durable): the store starts empty.
     pub(crate) fn recover(files: &BranchFiles, sync: bool) -> Result<Option<Recovered>> {
+        Self::recover_base(files, sync, None)
+    }
+
+    /// `recover` for a catalog store: the catalog's meta row, `(page_size, generation)`, stands
+    /// where the snapshot's header does, and no snapshot is read. `None`: the catalog has no meta
+    /// row (a crash while the store was being created).
+    pub(crate) fn recover_catalog(
+        files: &BranchFiles,
+        sync: bool,
+        base: Option<(u32, u64)>,
+    ) -> Result<Option<Recovered>> {
+        Self::recover_base(files, sync, Some(base))
+    }
+
+    fn recover_base(
+        files: &BranchFiles,
+        sync: bool,
+        catalog: Option<Option<(u32, u64)>>,
+    ) -> Result<Option<Recovered>> {
         // Lock before reading or discarding anything (review N1): the temp snapshot removed below
         // could be a live store's compaction in flight.
         let mut file = open_rw(&files.log, false)?;
         lock_exclusive(&file, &files.log)?;
-        let snapshot = if files.snap.exists() {
-            Some(read_snapshot(&files.snap)?)
-        } else {
-            None
+        let snapshot = match catalog {
+            None if files.snap.exists() => Some(read_snapshot(&files.snap)?),
+            None => None,
+            Some(base) => base.map(|(ps, g)| (ps, g, SnapshotState::default(), 0)),
         };
         // A stale temp snapshot is a compaction that never reached its rename: discard it.
         let tmp = files.snap_tmp();
@@ -562,7 +585,9 @@ impl Journal {
 
         let (page_size, generation, snapshot_state, snapshot_len) = match (snapshot, header) {
             (None, None) => return Ok(None),
-            (Some((ps, g, state, len)), _) => (ps, g, Some(state), len),
+            (Some((ps, g, state, len)), _) => {
+                (ps, g, catalog.is_none().then_some(state), len)
+            }
             (None, Some((ps, g))) => {
                 if g != 0 {
                     return Err(corrupt("log generation is past 0 but there is no snapshot"));
@@ -701,6 +726,25 @@ impl Journal {
 
     pub(crate) fn page_size(&self) -> usize {
         self.page_size as usize
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// A catalog checkpoint at `generation` has committed: drop the records it covers (buffered
+    /// ones included — their effects are in the catalog) and start the log over at that
+    /// generation. A failure poisons the journal, as a failed compaction does after its rename.
+    pub(crate) fn restart_at(&mut self, generation: u64) -> Result<()> {
+        self.check_live()?;
+        self.pending.clear();
+        self.pending_slots.clear();
+        self.snapshot_len = 0;
+        if let Err(e) = self.reset_log(generation) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// The page size the next header or snapshot is written with. Only `restart_empty` changes it,

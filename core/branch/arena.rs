@@ -17,6 +17,12 @@ use std::fs::File;
 use std::path::Path;
 
 use super::journal::{fsync_file, open_rw, read_at, write_at};
+
+/// r11-restart lane instrument: `R11_TRACE_SLOTS` prints every slot transition (observing only).
+pub(crate) fn trace_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("R11_TRACE_SLOTS").is_some())
+}
 use crate::{turso_assert, LimboError, Result};
 
 /// Index of a page-sized slot in the arena.
@@ -41,6 +47,9 @@ pub(crate) struct Arena {
     /// cannot answer "is this slot free" without a scan, and releasing an already-free slot must be
     /// caught AT the release — found later, it is two owners of one page and nothing says which.
     free_bits: Vec<u64>,
+    /// Slots handed out and not released. Equal to `high_water - free.len()` except in a catalog
+    /// store, whose free slots are mostly in the catalog's free table, not in `free`.
+    in_use: usize,
 }
 
 impl Arena {
@@ -51,6 +60,7 @@ impl Arena {
             high_water: 0,
             free: Vec::new(),
             free_bits: Vec::new(),
+            in_use: 0,
         }
     }
 
@@ -93,7 +103,7 @@ impl Arena {
             }
             *word &= !bit;
         }
-        let free = (0..high_water)
+        let free: Vec<Slot> = (0..high_water)
             .rev()
             .filter(|&s| free_bits[s as usize / 64] & (1u64 << (s % 64)) != 0)
             .collect();
@@ -101,9 +111,68 @@ impl Arena {
             page_size,
             backing: Backing::File { file, dirty: false },
             high_water,
+            in_use: high_water as usize - free.len(),
             free,
             free_bits,
         })
+    }
+
+    /// A file-backed arena for a catalog store (r11-restart lane): no reachability sweep. The
+    /// caller supplies the high-water mark, the count in use and the slots known free now; the
+    /// catalog's free table holds the rest, which `add_free` moves in as they are needed. The free
+    /// bitmap starts zeroed ("not known free"), and a zeroed allocation costs no page until
+    /// touched.
+    pub(crate) fn open_file_catalog(
+        path: &Path,
+        page_size: usize,
+        high_water: u32,
+        in_use: u64,
+        free: Vec<Slot>,
+    ) -> Result<Self> {
+        let file = open_rw(path, false)?;
+        let mut arena = Self {
+            page_size,
+            backing: Backing::File { file, dirty: false },
+            high_water,
+            free: Vec::with_capacity(free.len()),
+            free_bits: vec![0; (high_water as usize).div_ceil(64)],
+            in_use: in_use as usize,
+        };
+        for slot in free {
+            arena.add_free(slot);
+        }
+        Ok(arena)
+    }
+
+    pub(crate) fn high_water(&self) -> u32 {
+        self.high_water
+    }
+
+    /// Put a slot that is free but not on the in-memory list (a catalog free row) on it. Not a
+    /// release: the count in use does not change.
+    pub(crate) fn add_free(&mut self, slot: Slot) {
+        if trace_slots() {
+            eprintln!("R11SLOT add_free {slot}");
+        }
+        turso_assert!(slot < self.high_water, "a free slot past the high-water mark");
+        turso_assert!(!self.is_free(slot), "a slot added to the free list twice");
+        self.set_free_bit(slot, true);
+        self.free.push(slot);
+    }
+
+    /// The in-memory free list.
+    pub(crate) fn free_list(&self) -> &[Slot] {
+        &self.free
+    }
+
+    /// Empty the in-memory free list (a catalog checkpoint has written it to the catalog).
+    pub(crate) fn drain_free(&mut self) {
+        if trace_slots() {
+            eprintln!("R11SLOT drain_free {:?}", self.free);
+        }
+        for slot in std::mem::take(&mut self.free) {
+            self.set_free_bit(slot, false);
+        }
     }
 
     pub(crate) fn page_size(&self) -> usize {
@@ -115,9 +184,16 @@ impl Arena {
     }
 
     pub(crate) fn alloc(&mut self) -> Slot {
+        self.in_use += 1;
         if let Some(slot) = self.free.pop() {
             self.set_free_bit(slot, false);
+            if trace_slots() {
+                eprintln!("R11SLOT alloc {slot} (free list)");
+            }
             return slot;
+        }
+        if trace_slots() {
+            eprintln!("R11SLOT alloc {} (high water)", self.high_water);
         }
         let slot = self.high_water;
         if let Backing::Memory { chunks } = &mut self.backing {
@@ -138,8 +214,12 @@ impl Arena {
     pub(crate) fn release(&mut self, slot: Slot) {
         turso_assert!(slot < self.high_water, "released a slot the arena never handed out");
         turso_assert!(!self.is_free(slot), "released an arena slot that was already free");
+        if trace_slots() {
+            eprintln!("R11SLOT release {slot}");
+        }
         self.set_free_bit(slot, true);
         self.free.push(slot);
+        self.in_use -= 1;
     }
 
     pub(crate) fn is_free(&self, slot: Slot) -> bool {
@@ -150,7 +230,7 @@ impl Arena {
     }
 
     pub(crate) fn in_use(&self) -> usize {
-        self.high_water as usize - self.free.len()
+        self.in_use
     }
 
     /// Every slot currently handed out, for membership checks.
