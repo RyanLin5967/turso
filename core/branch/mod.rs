@@ -289,8 +289,8 @@ pub struct BranchResident {
     pub arena_chunk_maps: u64,
     pub arena_chunk_unmaps: u64,
     /// The branch table's value storage (allocated chunks times the chunk length times
-    /// `table_entry_bytes`), its index and free-list bytes, the size of one value entry, and the
-    /// value chunks allocated.
+    /// `table_entry_bytes`), its index bytes (slots, bitmaps, chunk lists; before F9 the free list),
+    /// the size of one value entry, and the value chunks allocated.
     pub table_value_bytes: usize,
     pub table_index_bytes: usize,
     pub table_entry_bytes: usize,

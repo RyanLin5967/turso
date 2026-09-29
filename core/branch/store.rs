@@ -700,9 +700,10 @@ impl BranchStore {
         }
     }
 
-    /// `(states, capacity)` of the branch table: capacity is the slots allocated, which changes only
-    /// when a chunk is appended (F8, [`super::table`]; before F8 it was `HashMap::capacity`, which
-    /// fell by one per tombstone and jumped back at a rehash). O(1).
+    /// `(states, capacity)` of the branch table: capacity is the slots allocated, which grows by a
+    /// chunk at a time (F8, [`super::table`]; before F8 it was `HashMap::capacity`, which fell by one
+    /// per tombstone and jumped back at a rehash) and, since r12-f9-shrink amendment 5, falls when
+    /// the top chunks of slots are freed. O(1).
     pub(crate) fn table_shape(&self) -> (usize, usize) {
         let inner = self.inner.lock();
         (inner.branches.len(), inner.branches.capacity())

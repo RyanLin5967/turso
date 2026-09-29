@@ -481,9 +481,17 @@ impl Arena {
             self.trims += 1;
         }
         let hw = (self.high_water as usize).min(n * SLOTS_PER_CHUNK);
-        self.free_count -= (hw..self.high_water as usize)
-            .filter(|&s| bit(&self.free_bits, s))
-            .count();
+        // The chunks dropped are unmapped, so every slot of them below `high_water` is free: the
+        // count is arithmetic, and a trim costs O(chunks dropped), not O(slots).
+        #[cfg(test)]
+        assert_eq!(
+            (hw..self.high_water as usize)
+                .filter(|&s| bit(&self.free_bits, s))
+                .count(),
+            self.high_water as usize - hw,
+            "a trimmed chunk held a slot in use"
+        );
+        self.free_count -= self.high_water as usize - hw;
         self.high_water = hw as u32;
         self.chunks.truncate(n);
         self.free_bits.truncate(n * WORDS_PER_CHUNK);

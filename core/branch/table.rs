@@ -1,8 +1,8 @@
 //! The branch table: branch states by id, in a slot map.
 //!
 //! An id is a slot index and that slot's generation: `id = generation << 32 | slot`. A lookup indexes
-//! the slot and compares the generation; freeing a slot bumps its generation and puts the slot on a
-//! free list, so ids are recycled without ever naming two branches. Generational indices (the
+//! the slot and compares the generation; freeing a slot bumps its generation and leaves the slot
+//! vacant for reuse, so ids are recycled without ever naming two branches. Generational indices (the
 //! slot-map pattern of ECS entity ids and the `slotmap` crate).
 //!
 //! Why not a hash map: `std::collections::HashMap` deletes by leaving a tombstone wherever the probe
@@ -35,11 +35,13 @@
 //! arena), which gathers the occupied slots at the bottom, and chunks of slots at the top that hold
 //! no occupied or retired slot are freed, keeping one vacant chunk above the highest used one (the
 //! spare rule again), with the chunk list shrunk under hysteresis. A freed chunk's generations must
-//! not be forgotten, or a stale id could name the next occupant: the table keeps one generation
-//! floor, the largest generation any freed slot had reached, and every slot re-created above it
-//! starts there. Every id ever issued for a freed slot carries a generation below its slot's
-//! (each removal bumps it), so below the floor, and every id issued after carries the floor or
-//! more: no stale id can match.
+//! not be forgotten, or a stale id could name the next occupant: for every chunk index it has ever
+//! created the table keeps the largest generation any of its slots reached (4 bytes per 1,024
+//! slots of the peak), and when that chunk is created again all its slots start there. Every id
+//! ever issued for a freed slot carries a generation below its slot's (each removal bumps it), so
+//! below its chunk's top, and every id issued after carries the top or more: no stale id can
+//! match. The top is per chunk so that one slot reused 2^32 times retires only its own chunk's
+//! slots, not every slot re-created anywhere (review of 72d66ae16, finding 1).
 
 use super::BranchId;
 
@@ -74,9 +76,12 @@ pub(crate) struct BranchTable<T> {
     first_vacant_chunk: usize,
     /// Per chunk, its occupied and retired slots: a chunk is freed only at 0.
     chunk_pinned: Vec<u16>,
-    /// The generation a re-created slot starts at: 1, then the largest generation any freed slot
-    /// had reached.
-    gen_floor: u32,
+    /// Per chunk index ever created, the largest generation any of its slots has reached. Never
+    /// shortened: a re-created chunk's slots start at its entry.
+    chunk_gen_top: Vec<u32>,
+    /// Chunks re-created with their slots above generation 1. Test only.
+    #[cfg(test)]
+    floors_applied: u64,
     /// Values with the slot that owns each, packed: every chunk but the last holds exactly
     /// `CHUNK`, the last holds at least one. Each chunk is allocated with capacity `CHUNK` and never
     /// pushed past it, so it never reallocates.
@@ -98,7 +103,9 @@ impl<T> BranchTable<T> {
             chunk_has_vacant: Vec::new(),
             first_vacant_chunk: 0,
             chunk_pinned: Vec::new(),
-            gen_floor: 1,
+            chunk_gen_top: Vec::new(),
+            #[cfg(test)]
+            floors_applied: 0,
             dense: Vec::new(),
             spare: None,
             len: 0,
@@ -179,7 +186,15 @@ impl<T> BranchTable<T> {
                 let slot = self.high_water;
                 crate::turso_assert!(slot < NO_SLOT, "the branch table has no slot left");
                 if slot as usize / CHUNK == self.chunks.len() {
-                    let generation = if super::mutant::on(12) { 1 } else { self.gen_floor };
+                    let c = self.chunks.len();
+                    if c == self.chunk_gen_top.len() {
+                        self.chunk_gen_top.push(1);
+                    }
+                    let generation = if super::mutant::on(12) { 1 } else { self.chunk_gen_top[c] };
+                    #[cfg(test)]
+                    {
+                        self.floors_applied += u64::from(generation > 1);
+                    }
                     let chunk: Vec<Entry> = (0..CHUNK)
                         .map(|_| Entry {
                             generation,
@@ -204,6 +219,8 @@ impl<T> BranchTable<T> {
         let (slot, _) = Self::split(id);
         if slot < self.high_water {
             self.set_vacant(slot, false);
+            // `slot` was the lowest vacant slot, so no chunk below its own has one.
+            self.first_vacant_chunk = slot as usize / CHUNK;
         } else {
             self.high_water += 1;
         }
@@ -278,10 +295,15 @@ impl<T> BranchTable<T> {
             }
             _ => {
                 e.generation = u32::MAX;
-                self.retired += 1;
                 false
             }
         };
+        let generation = e.generation;
+        let c = slot as usize / CHUNK;
+        self.chunk_gen_top[c] = self.chunk_gen_top[c].max(generation);
+        if !vacant {
+            self.retired += 1;
+        }
         if vacant {
             self.set_vacant(slot, true);
             self.chunk_pinned[slot as usize / CHUNK] -= 1;
@@ -291,8 +313,9 @@ impl<T> BranchTable<T> {
         Some(val)
     }
 
-    /// Free the chunks of slots at the top while the two highest hold no occupied or retired slot,
-    /// raising the generation floor to the largest generation each freed chunk had reached.
+    /// Free the chunks of slots at the top while the two highest hold no occupied or retired slot.
+    /// Each freed chunk costs O(1) here (its generations' top is kept up to date by `remove`), so
+    /// a remove that frees k chunks costs O(k), paid for by the inserts that created them.
     fn trim(&mut self) {
         let before = self.chunks.len();
         loop {
@@ -306,14 +329,20 @@ impl<T> BranchTable<T> {
             if !droppable {
                 break;
             }
-            let chunk = self.chunks.pop().expect("n >= 2");
-            let top = chunk.iter().map(|e| e.generation).max().expect("a chunk has slots");
-            self.gen_floor = self.gen_floor.max(top);
+            self.chunks.pop().expect("n >= 2");
             let base = (n - 1) * CHUNK;
             let hw = (self.high_water as usize).min(base);
-            self.vacant_count -= (hw..self.high_water as usize)
-                .filter(|&s| self.vacant_bits[s / 64] & (1u64 << (s % 64)) != 0)
-                .count();
+            // An unpinned chunk holds no occupied or retired slot, so every slot of it below
+            // `high_water` is vacant.
+            #[cfg(test)]
+            assert_eq!(
+                (hw..self.high_water as usize)
+                    .filter(|&s| self.vacant_bits[s / 64] & (1u64 << (s % 64)) != 0)
+                    .count(),
+                self.high_water as usize - hw,
+                "a freed chunk held a slot that was not vacant"
+            );
+            self.vacant_count -= self.high_water as usize - hw;
             self.high_water = hw as u32;
             self.vacant_bits.truncate((n - 1) * WORDS);
             self.chunk_pinned.truncate(n - 1);
@@ -369,6 +398,7 @@ impl<T> BranchTable<T> {
                 + (self.vacant_bits.capacity() + self.chunk_has_vacant.capacity())
                     * std::mem::size_of::<u64>()
                 + self.chunk_pinned.capacity() * std::mem::size_of::<u16>()
+                + self.chunk_gen_top.capacity() * std::mem::size_of::<u32>()
                 + self.dense.capacity() * std::mem::size_of::<Vec<(u32, T)>>(),
             entry,
             chunks,
@@ -422,6 +452,8 @@ impl<T> BranchTable<T> {
                 }
             }
             assert_eq!(self.chunk_pinned[c] as usize, pinned, "chunk {c}: pinned count");
+            let top = self.chunks[c].iter().map(|e| e.generation).max().expect("slots");
+            assert!(top <= self.chunk_gen_top[c], "chunk {c}: a generation above the kept top");
             let bit = self.chunk_has_vacant[c / 64] & (1u64 << (c % 64)) != 0;
             assert_eq!(bit, has_vacant, "chunk {c}: has-vacant bit");
             if has_vacant && lowest.is_none() {
@@ -596,8 +628,8 @@ mod f9_tests {
     /// F9 T5 (amendment 5): the slots shrink. After a peak and a shrink to scattered survivors,
     /// churn and then retire the survivors: the slot chunks fall to at most the chunk of the
     /// highest occupied slot plus one vacant chunk; and no id issued at any time, before or after
-    /// a trim, is ever issued again or resolves after its removal. The trims must raise the
-    /// generation floor, or the walk proves nothing.
+    /// a trim, is ever issued again or resolves after its removal. Some chunk must be re-created
+    /// above generation 1 (its kept top), or the walk proves nothing.
     #[test]
     fn slots_shrink_after_a_peak_and_no_id_is_ever_reissued() {
         let mut t: BranchTable<u64> = BranchTable::new();
@@ -663,6 +695,6 @@ mod f9_tests {
                 assert!(t.get(id).is_none(), "round {round}: a removed id resolves");
             }
         }
-        assert!(t.gen_floor > 1, "no trim raised the generation floor");
+        assert!(t.floors_applied > 0, "no chunk was re-created above generation 1");
     }
 }
