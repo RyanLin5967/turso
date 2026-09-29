@@ -387,7 +387,7 @@ impl Bench {
              scan_per_ckpt_max={} sum_max_frame_at_ckpt={} d_find_calls={} d_find_scanned={} \
              d_restarts={} d_fw2_switches={} d_fw2_refused={} d_fw3_trunk_reads={} d_fw3_retries={} \
              d_fw2_refused_init={} d_fw2_refused_fork={} d_fw2_refused_trunk={} \
-             d_fw2_refused_init_only={}",
+             d_fw2_refused_init_only={} d_fw2_origin_underflow={}",
             s.max_frame,
             s.nbackfills,
             s.checkpoint_seq,
@@ -420,6 +420,7 @@ impl Bench {
             d(c.fw2_refused_fork, self.last.fw2_refused_fork),
             d(c.fw2_refused_trunk, self.last.fw2_refused_trunk),
             d(c.fw2_refused_init_only, self.last.fw2_refused_init_only),
+            d(c.fw2_origin_underflow, self.last.fw2_origin_underflow),
         );
         if self.timing && self.win_commits > 0 {
             let n = (self.win_commits as usize).min(1_000);

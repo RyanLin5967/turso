@@ -540,6 +540,17 @@ trait WalCoordination: Debug + Send + Sync {
     /// Try to acquire the reader protection needed for `snapshot`.
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind>;
 
+    /// r11-walpin-conc amendment 28: `try_begin_read_tx` for a read transaction tagged `origin`
+    /// (a `walpin::origin` tag, read once by the caller, which hands the same tag to
+    /// `end_read_tx_origin`). Only the in-process coordination counts readers by origin.
+    fn try_begin_read_tx_origin(
+        &self,
+        snapshot: WalSnapshot,
+        _origin: u8,
+    ) -> Option<ReadGuardKind> {
+        self.try_begin_read_tx(snapshot)
+    }
+
     /// Release a read guard previously returned by `try_begin_read_tx`.
     fn end_read_tx(&self, guard: ReadGuardKind);
 
@@ -1158,6 +1169,15 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn try_begin_read_tx(&self, snapshot: WalSnapshot) -> Option<ReadGuardKind> {
+        // A caller that does not pass its origin begins the read under this thread's tag.
+        self.try_begin_read_tx_origin(snapshot, walpin::origin::current())
+    }
+
+    fn try_begin_read_tx_origin(
+        &self,
+        snapshot: WalSnapshot,
+        origin: u8,
+    ) -> Option<ReadGuardKind> {
         turso_assert!(
             snapshot.max_frame <= u32::MAX as u64,
             "max_frame exceeds u32 read mark range"
@@ -1179,9 +1199,9 @@ impl WalCoordination for InProcessWalCoordination {
             }
             let class = w.class(snapshot.nbackfills, snapshot.max_frame);
             w.readers[class] += 1;
-            // r11-walpin-conc amendment 28: and by origin; the caller's `WalFile` records the same
-            // tag (this call runs on its thread) and hands it back to `end_read_tx_origin`.
-            w.origin_readers[usize::from(walpin::origin::current())][class] += 1;
+            // r11-walpin-conc amendment 28: and by origin; the caller hands the same tag back to
+            // `end_read_tx_origin`.
+            w.origin_readers[usize::from(origin)][class] += 1;
             return Some(ReadGuardKind::ReadMark(
                 NonZeroUsize::new(class + 1).expect("class + 1 is non-zero"),
             ));
@@ -1250,9 +1270,13 @@ impl WalCoordination for InProcessWalCoordination {
                 let class = usize::from(slot) - 1;
                 turso_assert!(w.readers[class] > 0, "wal2 reader class underflow");
                 w.readers[class] -= 1;
+                // Observation only: a mismatch is counted, never asserted.
                 let by_origin = &mut w.origin_readers[usize::from(origin)][class];
-                turso_assert!(*by_origin > 0, "wal2 reader origin underflow");
-                *by_origin -= 1;
+                if *by_origin > 0 {
+                    *by_origin -= 1;
+                } else {
+                    walpin::FW2_ORIGIN_UNDERFLOW.fetch_add(1, Relaxed);
+                }
                 return;
             }
         }
@@ -3865,12 +3889,25 @@ impl WalFile {
             );
         }
 
-        let origin = walpin::origin::current();
-        let Some(read_guard) = self.coordination.try_begin_read_tx(shared_snapshot) else {
+        // r11-walpin-conc amendment 28: the tag is read once, here, and the same value goes to
+        // the coordination's begin and (through `walpin_origin`) to its end. FW2 only.
+        #[cfg(test)]
+        walpin::origin::recorder::record(walpin::origin::current());
+        let fw2 = walpin::fw2();
+        let origin = if fw2 {
+            walpin::origin::current()
+        } else {
+            walpin::origin::TRUNK
+        };
+        let Some(read_guard) = self
+            .coordination
+            .try_begin_read_tx_origin(shared_snapshot, origin)
+        else {
             return TryBeginReadResult::Retry;
         };
-        self.walpin_origin
-            .store(u32::from(origin), Ordering::Release);
+        if fw2 {
+            self.walpin_origin.store(u32::from(origin), Ordering::Release);
+        }
         self.install_vacuum_lock_guard(vacuum_lock_guard);
         self.install_connection_state(WalConnectionState::new(shared_snapshot, read_guard));
         tracing::debug!(
@@ -3932,7 +3969,11 @@ impl Wal for WalFile {
     fn end_read_tx(&self) {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
-            let origin = self.walpin_origin.load(Ordering::Acquire) as u8;
+            let origin = if walpin::fw2() {
+                self.walpin_origin.load(Ordering::Acquire) as u8
+            } else {
+                walpin::origin::TRUNK
+            };
             self.coordination
                 .end_read_tx_origin(ReadGuardKind::from_lock_index(slot), origin);
             self.max_frame_read_lock_index

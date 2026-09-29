@@ -30,6 +30,9 @@ pub(crate) static FW2_REFUSED_INIT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW2_REFUSED_FORK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW2_REFUSED_TRUNK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW2_REFUSED_INIT_ONLY: AtomicU64 = AtomicU64::new(0);
+/// Read transactions that ended under an origin with no reader counted: an instrument failure,
+/// counted instead of asserted so that the attribution can never stop the process.
+pub(crate) static FW2_ORIGIN_UNDERFLOW: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW3_TRUNK_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW3_RETRIES: AtomicU64 = AtomicU64::new(0);
 // r11-walpin-conc: FW3's retries per call, by cause (frontier/round11/r11-walpin-conc/PREREG.md).
@@ -141,6 +144,8 @@ pub struct WalPinCounters {
     pub fw2_refused_fork: u64,
     pub fw2_refused_trunk: u64,
     pub fw2_refused_init_only: u64,
+    /// Read transactions ended under an origin with no reader counted (instrument failures).
+    pub fw2_origin_underflow: u64,
     /// FW3: branch reads of a trunk page (WAL frame or database file).
     pub fw3_trunk_reads: u64,
     /// FW3: those reads that failed validation and were retried.
@@ -184,6 +189,7 @@ pub fn counters() -> WalPinCounters {
         fw2_refused_fork: FW2_REFUSED_FORK.load(Relaxed),
         fw2_refused_trunk: FW2_REFUSED_TRUNK.load(Relaxed),
         fw2_refused_init_only: FW2_REFUSED_INIT_ONLY.load(Relaxed),
+        fw2_origin_underflow: FW2_ORIGIN_UNDERFLOW.load(Relaxed),
         fw3_trunk_reads: FW3_TRUNK_READS.load(Relaxed),
         fw3_retries: FW3_RETRIES.load(Relaxed),
         fw3_calls_trunk: FW3_CALLS_TRUNK.load(Relaxed),
@@ -314,19 +320,54 @@ pub(crate) mod origin {
         f()
     }
 
-    /// The fire-check's mutant: `with` drops the tag, so every read transaction is TRUNK.
+    /// The fire-check's mutant, for the calling thread only: `with` drops the tag, so every read
+    /// transaction the thread begins is TRUNK.
     #[cfg(test)]
     pub(crate) mod mutant {
-        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use std::cell::Cell;
 
-        static UNTAGGED: AtomicBool = AtomicBool::new(false);
-
-        pub(crate) fn untagged() -> bool {
-            UNTAGGED.load(Relaxed)
+        thread_local! {
+            static UNTAGGED: Cell<bool> = const { Cell::new(false) };
         }
 
+        pub(crate) fn untagged() -> bool {
+            UNTAGGED.with(|u| u.get())
+        }
+
+        #[cfg_attr(not(feature = "fs"), allow(dead_code))]
         pub(crate) fn set_untagged(on: bool) {
-            UNTAGGED.store(on, Relaxed);
+            UNTAGGED.with(|u| u.set(on));
+        }
+    }
+
+    /// The tag of every read transaction the calling thread begins while recording is on, taken
+    /// where the WAL begins it: what pins the production tags (INIT, FORK) to their call sites.
+    #[cfg(test)]
+    pub(crate) mod recorder {
+        use std::cell::RefCell;
+
+        thread_local! {
+            static SEEN: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+        }
+
+        pub(crate) fn record(tag: u8) {
+            SEEN.with(|s| {
+                if let Some(seen) = s.borrow_mut().as_mut() {
+                    seen.push(tag);
+                }
+            });
+        }
+
+        /// Start recording on this thread, dropping anything recorded before.
+        #[cfg_attr(not(feature = "fs"), allow(dead_code))]
+        pub(crate) fn start() {
+            SEEN.with(|s| *s.borrow_mut() = Some(Vec::new()));
+        }
+
+        /// Stop recording and return what was recorded.
+        #[cfg_attr(not(feature = "fs"), allow(dead_code))]
+        pub(crate) fn take() -> Vec<u8> {
+            SEEN.with(|s| s.borrow_mut().take().unwrap_or_default())
         }
     }
 }
