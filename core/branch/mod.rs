@@ -158,8 +158,9 @@ pub(crate) fn count_fsync() {
 // r12-e3 amendment 7 (observing): a reap is PENDING from its first prefetch until its section
 // starts. Every page one of its prefetches inserted into the branch catalog's page cache and that
 // leaves that cache while it is pending is counted here, for the reap to take when it settles.
-// A thread that prefetches owns one slot while it lives (a live-slot bitmap; freed at thread
-// exit; an evicting thread only reads its slot, never takes one), so two live threads never share one; a 65th live thread gets no slot and is counted in `PF_OVERFLOW`
+// A thread that prefetches (a reaper) owns one slot while it lives: a live-slot bitmap, freed at
+// thread exit. An evicting thread only reads its slot and never takes one. So two live threads
+// never share a slot; a 65th live prefetching thread gets none and is counted in `PF_OVERFLOW`
 // (the harness refuses a cell with any). A tag is (slot << 48) | the reap's process-wide serial,
 // so a stale page (an earlier reap's) never matches a later reap. A slot's pending serial and its
 // counters change only under that slot's lock, so a count can never land on a later reap.
