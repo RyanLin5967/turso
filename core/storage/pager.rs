@@ -3589,6 +3589,11 @@ impl Pager {
             }
 
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+            // r12-e3 amendment 8: log the miss (inside a reap section, with R12_A8 only).
+            if crate::branch::a8_on() {
+                let catalog = self.page_cache.read().is_catalog();
+                crate::branch::a8_miss(page_idx as usize, catalog);
+            }
             // r12-e3: the branch store's prefetch arm refuses (or counts) a miss on this thread.
             crate::branch::io_miss_gate()?;
             let (page, c) = self.read_page_no_cache(page_idx, None, false)?;

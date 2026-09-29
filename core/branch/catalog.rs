@@ -56,7 +56,9 @@ use std::num::NonZero;
 use std::path::Path;
 
 use super::arena::Slot;
+use crate::storage::sqlite3_ondisk::PageType;
 use crate::sync::{Arc, Mutex};
+use crate::util::IOExt;
 use crate::{
     Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, Result, SqliteDialect,
     Statement, Value, IO,
@@ -210,7 +212,9 @@ impl Stmt {
             self.stmt
                 .bind_at(NonZero::new(i + 1).expect("i + 1 > 0"), p.clone())?;
         }
+        let outer = super::set_cur_stmt(self.id);
         let rows = self.stmt.run_collect_rows();
+        super::set_cur_stmt(outer);
         // Reset at once, finished or not: a statement left un-reset must hold no read mark on the
         // catalog's WAL (a held mark keeps the WAL from ever restarting; PREREG A7).
         self.stmt.reset()?;
@@ -234,7 +238,9 @@ impl Stmt {
             self.stmt
                 .bind_at(NonZero::new(i + 1).expect("i + 1 > 0"), p.clone())?;
         }
+        let outer = super::set_cur_stmt(self.id);
         let done = self.stmt.run_ignore_rows();
+        super::set_cur_stmt(outer);
         self.stmt.reset()?;
         done?;
         counters.queries += 1;
@@ -297,6 +303,35 @@ pub(crate) struct Catalog {
     free_put: Stmt,
 }
 
+/// The catalog file's page count (r12-e3 amendment 8).
+fn page_count(conn: &Arc<Connection>) -> Result<u64> {
+    let rows = conn.prepare("PRAGMA page_count")?.run_collect_rows()?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_int())
+        .unwrap_or(0) as u64)
+}
+
+/// r12-e3 amendment 8's RESF prewarm: read pages 1..=page_count through the connection's pager,
+/// inside one read transaction, so every page of the file is in the cache.
+fn read_every_page(conn: &Arc<Connection>) -> Result<()> {
+    conn.execute("BEGIN")?;
+    let read = (|| -> Result<()> {
+        conn.prepare("SELECT count(*) FROM sqlite_schema")?.run_ignore_rows()?;
+        let pager = conn.get_pager();
+        for pgno in 1..=page_count(conn)? {
+            let (_page, c) = pager.io.block(|| pager.read_page(pgno as i64))?;
+            if let Some(c) = c {
+                pager.io.wait_for_completion(c)?;
+            }
+        }
+        Ok(())
+    })();
+    let _ = conn.execute("COMMIT");
+    read
+}
+
 impl Catalog {
     /// Open (creating if absent) the catalog at `path`. `sync` selects `synchronous = FULL`, so a
     /// checkpoint's commit is durable before the log starts over; without it, OFF (a measurement
@@ -315,6 +350,7 @@ impl Catalog {
             Arc::new(SqliteDialect),
         )?;
         let conn = db.connect()?;
+        super::a8_catalog_opened();
         conn.execute(if sync {
             "PRAGMA synchronous = FULL"
         } else {
@@ -340,22 +376,37 @@ impl Catalog {
             .get_pager()
             .set_catalog_cache_policy(std::env::var_os("R12_SIEVE_BEHIND").is_some());
         super::CAT_CACHE_PAGES.store(pages as u64, crate::sync::atomic::Ordering::Relaxed);
-        if std::env::var_os("R12_CAT_PREWARM").is_some() {
-            for sql in [
-                "SELECT sum(parent) FROM branch",
-                "SELECT fork_epoch FROM branch WHERE parent >= 0 ORDER BY parent, fork_epoch",
-                "SELECT sum(slot) FROM cur",
-                "SELECT sum(slot) FROM ret",
-                "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, page, born",
-                "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, born",
-                "SELECT died FROM ret WHERE owner >= 0 ORDER BY owner, died",
-            ] {
-                conn.prepare(sql)?.run_ignore_rows()?;
-            }
+        // r12-e3 amendment 8: `R12_CAT_PREWARM=all` (the RESF arm) reads every page of the catalog
+        // file through this connection's pager instead of the seven statements.
+        let prewarm = std::env::var("R12_CAT_PREWARM").ok();
+        super::a8_prewarming(true);
+        let warmed = match prewarm.as_deref() {
+            Some("all") => read_every_page(&conn),
+            Some(_) => (|| -> Result<()> {
+                for sql in [
+                    "SELECT sum(parent) FROM branch",
+                    "SELECT fork_epoch FROM branch WHERE parent >= 0 ORDER BY parent, fork_epoch",
+                    "SELECT sum(slot) FROM cur",
+                    "SELECT sum(slot) FROM ret",
+                    "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, page, born",
+                    "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, born",
+                    "SELECT died FROM ret WHERE owner >= 0 ORDER BY owner, died",
+                ] {
+                    conn.prepare(sql)?.run_ignore_rows()?;
+                }
+                Ok(())
+            })(),
+            None => Ok(()),
+        };
+        super::a8_prewarming(false);
+        warmed?;
+        if super::a8_on() {
+            super::a8_prewarm_done(page_count(&conn)?);
         }
         let mut next_id = 0u8;
         let mut p = |sql: &str| -> Result<Stmt> {
             next_id += 1;
+            super::a8_register_stmt(next_id, sql);
             Ok(Stmt {
                 stmt: conn.prepare(sql)?,
                 id: next_id,
@@ -430,6 +481,52 @@ impl Catalog {
             conn,
             _db: db,
         })
+    }
+
+    /// r12-e3 amendment 8: every page of every B-tree (page 1's schema and each table and index
+    /// in `sqlite_schema`), as `(page, B-tree, depth from its root, page type byte)`, read through
+    /// this connection's pager inside one read transaction. A page in no B-tree (free, overflow)
+    /// is absent.
+    pub(crate) fn page_map(&mut self) -> Result<Vec<(u32, String, u8, u8)>> {
+        self.conn.execute("BEGIN")?;
+        let mapped = (|| -> Result<Vec<(u32, String, u8, u8)>> {
+            let mut roots = vec![("sqlite_schema".to_string(), 1u32)];
+            for row in self
+                .conn
+                .prepare("SELECT name, rootpage FROM sqlite_schema WHERE rootpage > 0")?
+                .run_collect_rows()?
+            {
+                let root = row.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+                if root > 0 {
+                    roots.push((row.first().map(|v| v.to_string()).unwrap_or_default(), root as u32));
+                }
+            }
+            let pager = self.conn.get_pager();
+            let mut out = Vec::new();
+            for (name, root) in roots {
+                let mut stack = vec![(root, 0u8)];
+                while let Some((pgno, depth)) = stack.pop() {
+                    let (page, c) = pager.io.block(|| pager.read_page(pgno as i64))?;
+                    if let Some(c) = c {
+                        pager.io.wait_for_completion(c)?;
+                    }
+                    let contents = page.get_contents();
+                    let ty = contents.page_type()?;
+                    out.push((pgno, name.clone(), depth, ty as u8));
+                    if matches!(ty, PageType::TableInterior | PageType::IndexInterior) {
+                        for i in 0..contents.cell_count() {
+                            stack.push((contents.cell_interior_read_left_child_page(i)?, depth + 1));
+                        }
+                        if let Some(r) = contents.rightmost_pointer()? {
+                            stack.push((r, depth + 1));
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        })();
+        let _ = self.conn.execute("COMMIT");
+        mapped
     }
 
     /// Re-run a query the page-read gate refused, reading its pages (r12-e3 prefetch arm: called

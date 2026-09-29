@@ -1743,7 +1743,12 @@ impl BranchStore {
             } else {
                 super::IO_OFF
             };
+            // r12-e3 amendment 8: the section's misses are logged (the checkpoint's are not).
+            let a8 = super::a8_on() && !super::a8_section(true);
             let released = self.release_section(&mut inner, id, &mut sample, held, base);
+            if a8 {
+                super::a8_section(false);
+            }
             if prefetch {
                 super::set_io_mode(gate);
             }
@@ -1832,8 +1837,10 @@ impl BranchStore {
         let (ckpt_reads0, ckpt_fsyncs0, ckpt_queries0) =
             (super::thread_page_reads(), super::thread_fsyncs(), queries(inner));
         let gate = super::set_io_mode(super::IO_OFF);
+        let a8 = super::a8_section(false);
         let phase = Instant::now();
         self.maybe_compact(inner);
+        super::a8_section(a8);
         sample.ckpt_ns = ns(phase.elapsed());
         super::set_io_mode(gate);
         sample.ckpt_reads = super::thread_page_reads() - ckpt_reads0;
@@ -1865,6 +1872,15 @@ impl BranchStore {
 
     pub(crate) fn take_reap_samples(&self) -> Vec<ReapSample> {
         std::mem::take(&mut self.inner.lock().reap_samples)
+    }
+
+    /// r12-e3 amendment 8: the catalog's page map (empty without a catalog).
+    pub(crate) fn catalog_page_map(&self) -> Result<Vec<(u32, String, u8, u8)>> {
+        let inner = self.inner.lock();
+        match inner.cat.as_ref() {
+            Some(cat) => cat.catalog.lock().page_map(),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// r12-e3's prefetch arm on or off (see `release_handle`).

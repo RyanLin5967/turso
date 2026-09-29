@@ -174,10 +174,11 @@ static PF_REMOVED: [crate::sync::atomic::AtomicU64; PF_SLOTS * PF_COUNTERS] =
     [const { crate::sync::atomic::AtomicU64::new(0) }; PF_SLOTS * PF_COUNTERS];
 static PF_SERIAL: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(1);
 static PF_NEXT_SLOT: crate::sync::atomic::AtomicUsize = crate::sync::atomic::AtomicUsize::new(0);
-/// The branch catalog's page cache, process-wide: [inserts, evictions] (r12-e3 amendment 7).
+/// The branch catalog's page cache, process-wide: [inserts, evictions] (r12-e3 amendment 7), and
+/// [deletes, pages cleared] (amendment 8).
 #[doc(hidden)]
-pub static CAT_CACHE: [crate::sync::atomic::AtomicU64; 2] =
-    [const { crate::sync::atomic::AtomicU64::new(0) }; 2];
+pub static CAT_CACHE: [crate::sync::atomic::AtomicU64; 4] =
+    [const { crate::sync::atomic::AtomicU64::new(0) }; 4];
 /// The branch catalog's page-cache capacity in pages, as its last open set it.
 #[doc(hidden)]
 pub static CAT_CACHE_PAGES: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
@@ -263,7 +264,7 @@ pub(crate) fn pf_removed(tag: u64, how: PfRemoval) {
     }
 }
 
-/// The catalog cache's inserts (0) and evictions (1).
+/// The catalog cache's inserts (0), evictions (1), deletes (2) and cleared pages (3).
 pub(crate) fn count_cat_cache(which: usize) {
     CAT_CACHE[which].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
 }
@@ -277,6 +278,137 @@ pub(crate) fn pf_rerun_cap() -> u64 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(64)
     })
+}
+
+// r12-e3 amendment 8 (observing; `R12_A8=1`, off by default so amendment 7's runs are unperturbed):
+// every page-cache miss inside a non-checkpoint reap section, classified at the miss against the
+// catalog's current open: which pager, which catalog statement, whether this open's prewarm put the
+// page in the cache, whether it was created after the prewarm, and whether it left the cache since.
+// One catalog open at a time is assumed (the harness's; blind spot beyond that, stated).
+pub(crate) fn a8_on() -> bool {
+    static ON: crate::sync::OnceLock<bool> = crate::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("R12_A8").is_some())
+}
+
+/// One logged miss (amendment 8). `left`: 0 never left the cache since this open, 1 evicted,
+/// 2 deleted, 3 cleared.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct A8Miss {
+    pub page: u32,
+    pub catalog: bool,
+    pub stmt: u8,
+    pub prewarmed: bool,
+    pub created_after: bool,
+    pub left: u8,
+}
+
+#[derive(Default)]
+struct A8State {
+    prewarm: std::collections::HashSet<u32>,
+    left: std::collections::HashMap<u32, u8>,
+    pages_at_prewarm: u64,
+    log: Vec<A8Miss>,
+    stmts: std::collections::BTreeMap<u8, String>,
+    opens: u64,
+}
+
+static A8: crate::sync::LazyLock<crate::sync::Mutex<A8State>> =
+    crate::sync::LazyLock::new(|| crate::sync::Mutex::new(A8State::default()));
+
+thread_local! {
+    /// The catalog statement this thread is running (0: none).
+    static CUR_STMT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// This thread is inside a non-checkpoint reap section.
+    static A8_SECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread is running the catalog's prewarm.
+    static A8_PREWARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_cur_stmt(id: u8) -> u8 {
+    CUR_STMT.with(|c| c.replace(id))
+}
+
+pub(crate) fn a8_section(on: bool) -> bool {
+    A8_SECTION.with(|c| c.replace(on))
+}
+
+pub(crate) fn a8_prewarming(on: bool) {
+    A8_PREWARMING.with(|c| c.set(on));
+}
+
+pub(crate) fn a8_register_stmt(id: u8, sql: &str) {
+    if a8_on() {
+        A8.lock().stmts.insert(id, sql.to_string());
+    }
+}
+
+/// A catalog open starts a new classification epoch.
+pub(crate) fn a8_catalog_opened() {
+    if a8_on() {
+        let mut a = A8.lock();
+        a.prewarm.clear();
+        a.left.clear();
+        a.pages_at_prewarm = u64::MAX;
+        a.opens += 1;
+    }
+}
+
+pub(crate) fn a8_prewarm_done(pages: u64) {
+    if a8_on() {
+        A8.lock().pages_at_prewarm = pages;
+    }
+}
+
+/// The catalog's cache inserted `page`.
+pub(crate) fn a8_inserted(page: usize) {
+    if a8_on() && A8_PREWARMING.with(|c| c.get()) {
+        A8.lock().prewarm.insert(page as u32);
+    }
+}
+
+/// The catalog's cache let `page` go (1 evicted, 2 deleted, 3 cleared).
+pub(crate) fn a8_left(page: usize, how: u8) {
+    if a8_on() {
+        A8.lock().left.insert(page as u32, how);
+    }
+}
+
+/// A pager missed `page` (called before it reads); logged only inside a reap section.
+pub(crate) fn a8_miss(page: usize, catalog: bool) {
+    if !A8_SECTION.with(|c| c.get()) {
+        return;
+    }
+    let mut a = A8.lock();
+    let page = page as u32;
+    let m = A8Miss {
+        page,
+        catalog,
+        stmt: CUR_STMT.with(|c| c.get()),
+        prewarmed: catalog && a.prewarm.contains(&page),
+        created_after: catalog && u64::from(page) > a.pages_at_prewarm,
+        left: if catalog { a.left.get(&page).copied().unwrap_or(0) } else { 0 },
+    };
+    a.log.push(m);
+}
+
+/// The misses logged since the last call.
+#[doc(hidden)]
+pub fn a8_take_log() -> Vec<A8Miss> {
+    std::mem::take(&mut A8.lock().log)
+}
+
+/// Catalog opens so far, and the catalog's page count at the last prewarm.
+#[doc(hidden)]
+pub fn a8_opens() -> (u64, u64) {
+    let a = A8.lock();
+    (a.opens, a.pages_at_prewarm)
+}
+
+/// The catalog's statements by id, as prepared (their SQL).
+#[doc(hidden)]
+pub fn a8_stmt_names() -> Vec<(u8, String)> {
+    A8.lock().stmts.iter().map(|(k, v)| (*k, v.clone())).collect()
 }
 
 /// One reap of a branch, as the store saw it (r12-e3 instrument; see
@@ -844,6 +976,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_take_reap_samples(&self) -> Vec<ReapSample> {
         self.branches.take_reap_samples()
+    }
+
+    /// r12-e3 amendment 8: every page of the branch catalog's B-trees, as `(page, B-tree, depth,
+    /// page type byte)`, read through the catalog's own connection (instrument; reads every page).
+    #[doc(hidden)]
+    pub fn branch_catalog_page_map(&self) -> Result<Vec<(u32, String, u8, u8)>> {
+        self.branches.catalog_page_map()
     }
 
     /// r12-e3's prefetch arm (LeanStore's no-I/O-under-a-latch rule): while on, a reap plans its

@@ -994,6 +994,76 @@ fn pct_u64(sorted: &[u64], p: f64) -> u64 {
     sorted[((p / 100.0) * (sorted.len() - 1) as f64).round() as usize]
 }
 
+/// r12-e3 amendment 8: classify the cell's logged in-lock misses and print them, after the cell
+/// (outside every timer; the page map reads every catalog page, so only cold-only runs use it).
+/// Classes: b_evicted / b_deleted / b_cleared (left the cache since the open), a_created (above the
+/// page count at the prewarm), p_stayed (prewarmed, never left, still missed), c_unwarmed (existed
+/// at the prewarm, never left, not read by it), d_other (a pager other than the catalog's).
+fn a8_cell(db: &Arc<Database>, n: usize, kind: &str, t: usize, draw: u64, page_reads: u64, del_clr: [u64; 2]) {
+    let log = turso_core::branch::a8_take_log();
+    let map: std::collections::HashMap<u32, (String, u8, u8)> = db
+        .branch_catalog_page_map()
+        .unwrap_or_else(|e| not_a_result(&format!("a8 page map: {e}")))
+        .into_iter()
+        .map(|(p, name, depth, ty)| (p, (name, depth, ty)))
+        .collect();
+    let (opens, pages_at_prewarm) = turso_core::branch::a8_opens();
+    let mut classes: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    let mut rows: std::collections::BTreeMap<(String, String, String, u8, u8), u64> = std::collections::BTreeMap::new();
+    let mut other_in_stmt = 0u64;
+    for m in &log {
+        let class = if !m.catalog {
+            if m.stmt != 0 {
+                other_in_stmt += 1;
+            }
+            "d_other"
+        } else if m.left == 1 {
+            "b_evicted"
+        } else if m.left == 2 {
+            "b_deleted"
+        } else if m.left == 3 {
+            "b_cleared"
+        } else if m.created_after {
+            "a_created"
+        } else if m.prewarmed {
+            "p_stayed"
+        } else {
+            "c_unwarmed"
+        };
+        *classes.entry(class).or_default() += 1;
+        let (btree, ty, depth) = match map.get(&m.page) {
+            Some((name, depth, ty)) if m.catalog => (
+                name.clone(),
+                match ty {
+                    2 => "index_interior",
+                    5 => "table_interior",
+                    10 => "index_leaf",
+                    13 => "table_leaf",
+                    _ => "other",
+                }
+                .to_string(),
+                *depth,
+            ),
+            _ if m.catalog => ("NONE".to_string(), "-".to_string(), 0),
+            _ => ("OTHER_PAGER".to_string(), "-".to_string(), 0),
+        };
+        *rows.entry((class.to_string(), btree, ty, depth, m.stmt)).or_default() += 1;
+    }
+    println!(
+        "# a8 N={n} kind={kind} T={t} draw={draw} misses={} page_reads_total={page_reads} complete={} \
+         classes={classes:?} other_in_stmt={other_in_stmt} opens_total={opens} pages_at_prewarm={pages_at_prewarm} \
+         mapped_pages={} cat_deletes={} cat_cleared={}",
+        log.len(),
+        log.len() as u64 == page_reads,
+        map.len(),
+        del_clr[0],
+        del_clr[1],
+    );
+    for ((class, btree, ty, depth, stmt), k) in rows {
+        println!("# a8row N={n} kind={kind} T={t} draw={draw} class={class} btree={btree} type={ty} depth={depth} stmt={stmt} n={k}");
+    }
+}
+
 /// r12-e3: reaps/s per parent on the durable catalog store; see the module doc and the PREREG.
 fn reaprate(args: &Args) {
     if !args.catalog {
@@ -1028,6 +1098,13 @@ fn reaprate(args: &Args) {
         ["R12_CAT_CACHE_KIB", "R12_CAT_PREWARM", "R12_SIEVE_BEHIND", "R12_RERUN_CAP"]
             .map(|k| format!("{k}={}", std::env::var(k).unwrap_or_else(|_| "-".to_string())))
     );
+    // r12-e3 amendment 8: name the catalog's statements once.
+    let a8 = std::env::var_os("R12_A8").is_some();
+    if a8 {
+        for (id, sql) in turso_core::branch::a8_stmt_names() {
+            println!("# a8stmt id={id} sql={sql}");
+        }
+    }
     let st = db.branch_stats().unwrap();
     if st.live_branches != args.n {
         not_a_result(&format!("reaprate: {st:?}, expected {} live branches", args.n));
@@ -1086,6 +1163,9 @@ fn reaprate(args: &Args) {
             let fs0 = turso_core::branch::FSYNCS.load(std::sync::atomic::Ordering::Relaxed);
             let cc = || turso_core::branch::CAT_CACHE.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
             let cc0 = cc();
+            if a8 {
+                let _ = turso_core::branch::a8_take_log();
+            }
             for _ in 0..rounds {
                 // This round's victims, dealt to the reapers round-robin.
                 let mut victims = Vec::with_capacity(args.round);
@@ -1229,6 +1309,9 @@ fn reaprate(args: &Args) {
                 removed[11],
                 removed[12],
             );
+            if a8 {
+                a8_cell(&db, args.n, kind, t, draw, sum(&|s| s.page_reads), [cc1[2] - cc0[2], cc1[3] - cc0[3]]);
+            }
             if n_ckpt > 0 {
                 let ck: Vec<&turso_core::branch::ReapSample> = samples.iter().filter(|s| s.ckpt).collect();
                 let m = |f: &dyn Fn(&turso_core::branch::ReapSample) -> u64| -> f64 {

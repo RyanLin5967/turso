@@ -188,6 +188,11 @@ impl PageCache {
         }
     }
 
+    /// r12-e3 amendment 8: this is the branch catalog's cache.
+    pub fn is_catalog(&self) -> bool {
+        self.instrumented
+    }
+
     /// r12-e3 amendment 7: mark this cache as the branch catalog's and choose where a new page
     /// enters the clock. Returns the capacity in pages.
     pub fn set_catalog_policy(&mut self, insert_behind_hand: bool) -> usize {
@@ -334,6 +339,7 @@ impl PageCache {
         if self.instrumented {
             entry.pf_tag = crate::branch::pf_tag();
             crate::branch::count_cat_cache(0);
+            crate::branch::a8_inserted(key.0);
         }
 
         if self.clock_hand.is_null() {
@@ -401,8 +407,12 @@ impl PageCache {
 
         // Track evictable count before removing
         let was_evictable = Self::counted_as_evictable(page);
-        if self.instrumented && entry.pf_tag != 0 {
-            crate::branch::pf_removed(entry.pf_tag, crate::branch::PfRemoval::Deleted);
+        if self.instrumented {
+            crate::branch::count_cat_cache(2);
+            crate::branch::a8_left(key.0, 2);
+            if entry.pf_tag != 0 {
+                crate::branch::pf_removed(entry.pf_tag, crate::branch::PfRemoval::Deleted);
+            }
         }
 
         if clean_page {
@@ -721,6 +731,7 @@ impl PageCache {
                 );
                 if self.instrumented {
                     crate::branch::count_cat_cache(1);
+                    crate::branch::a8_left(key.0, 1);
                     if entry.pf_tag != 0 {
                         crate::branch::pf_removed(
                             entry.pf_tag,
@@ -783,8 +794,12 @@ impl PageCache {
         // Clean all pages
         for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
-            if self.instrumented && entry.pf_tag != 0 {
-                crate::branch::pf_removed(entry.pf_tag, crate::branch::PfRemoval::Cleared);
+            if self.instrumented {
+                crate::branch::count_cat_cache(3);
+                crate::branch::a8_left(entry.key.0, 3);
+                if entry.pf_tag != 0 {
+                    crate::branch::pf_removed(entry.pf_tag, crate::branch::PfRemoval::Cleared);
+                }
             }
             entry.page.clear_loaded();
             let _ = entry.page.get().buffer.take();
