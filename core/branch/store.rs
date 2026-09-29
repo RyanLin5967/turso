@@ -2515,6 +2515,56 @@ mod tests {
         }
     }
 
+    /// r12-lakehouse A9.2, one straggler case pinned by hand. A tag forks at 0; the trunk writes page
+    /// 0 in epoch 1 (all four chunks); child A forks at 1; the trunk writes page 0 again in epoch 2
+    /// (all four chunks). So the chunk versions [0, 1) hold the tag's bytes, the pending image (died 2)
+    /// holds A's, the tag's clone key is (0, 0, 1) and A's is (0, 1, 2). Reaping A empties A's interval
+    /// while the tag holds the horizon at 0: the interval eviction drops A's clone and keeps the tag's;
+    /// the horizon-only base keeps both, one of them orphaned. The tag reads its bytes after either.
+    #[test]
+    fn fs9_interval_eviction_drops_an_emptied_interval_and_keeps_the_tags() {
+        for interval in [false, true] {
+            let store = BranchStore::with_chunk_size(CHUNK);
+            store.set_fs9(true);
+            store.set_clone_evict_interval(interval);
+            let tag = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+            store.first_write_trunk(0, &chunked(&[0; CPP])); // epoch 1: the tag's bytes are [0; 4]
+            let a = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+            store.first_write_trunk(0, &chunked(&[1; CPP])); // epoch 2: A's bytes are [1; 4]
+            let read = |id: BranchId| {
+                let mut buf = vec![0u8; PAGE];
+                match store.resolve_shared(id, 0, &mut buf).unwrap() {
+                    Resolved::Shared(bytes) => bytes.to_vec(),
+                    other => panic!("page 0 was written after the fork, so FS9 serves a clone, got {}", match other {
+                        Resolved::Filled => "Filled",
+                        Resolved::Trunk(_) => "Trunk",
+                        Resolved::Shared(_) => unreachable!(),
+                    }),
+                }
+            };
+            assert_eq!(read(tag), chunked(&[0; CPP]));
+            assert_eq!(read(a), chunked(&[1; CPP]));
+            assert_eq!(
+                store.clone_keys().0,
+                vec![(0, 0, 1), (0, 1, 2)],
+                "{interval}: the premise (the two keys) does not hold"
+            );
+            store.release_handle(a);
+            let (keys, _) = store.clone_keys();
+            if interval {
+                assert_eq!(keys, vec![(0, 0, 1)], "interval: A's clone must go, the tag's must stay");
+                assert_eq!(store.retained_clone_orphans(), 0);
+                assert_eq!(store.stats().work.retained_clone_interval_evictions, 1);
+            } else {
+                assert_eq!(keys, vec![(0, 0, 1), (0, 1, 2)], "base: the horizon (0) keeps both");
+                assert_eq!(store.retained_clone_orphans(), 1, "base: A's clone is orphaned");
+            }
+            assert_eq!(read(tag), chunked(&[0; CPP]), "{interval}: the tag read the wrong bytes");
+            store.release_handle(tag);
+            assert_eq!(store.clone_index_lens(), (0, 0, 0));
+        }
+    }
+
     /// One tagged run; returns the most orphaned clones seen after any step.
     fn run_tagged(seed: u64, budget: Option<usize>, interval: bool) -> usize {
         let store = BranchStore::with_config(CHUNK, budget);
