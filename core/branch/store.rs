@@ -107,7 +107,7 @@ type BranchTable = HashMap<BranchId, BranchState>;
 
 /// A HashMap table's bucket count, which std does not expose, from the span of its entries' addresses: entries sit in
 /// one array of `(K, V)` buckets, so the span in buckets rounds up to the count unless every entry lies in one half of the
-/// table (probability about 2^(1 - entries)). 0 when empty. Observation only (r11-bushy amendment 13); O(entries).
+/// table (probability (entries + 1) / 2^entries). 0 when empty. Observation only (r11-bushy amendment 13); O(entries).
 #[cfg(not(feature = "branch-slab"))]
 fn buckets_of(table: &BranchTable) -> usize {
     let (lo, hi) = table.values().fold((usize::MAX, 0), |(lo, hi), st| {

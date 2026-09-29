@@ -649,17 +649,6 @@ impl Bench {
     #[cfg(feature = "branch-slab")]
     fn rebuild_table(&self, _: &Args, _: u64, _: usize) {}
 
-    /// Amendment 13: the HashMap table's bucket count (O(branches)); 0 with branch-slab.
-    #[cfg(not(feature = "branch-slab"))]
-    fn table_buckets(&self) -> usize {
-        self.db.branch_table_buckets()
-    }
-
-    #[cfg(feature = "branch-slab")]
-    fn table_buckets(&self) -> usize {
-        0
-    }
-
     /// Amendment 13: the address of the first non-trunk parent's table entry (0 if none, or with branch-slab). A stage
     /// that leaves it unchanged ran without a resize.
     #[cfg(not(feature = "branch-slab"))]
@@ -774,29 +763,30 @@ impl Bench {
                 us[us.len() - 1]
             );
         }
-        // Amendment 13: the table around the timed samples. moved=1 when the anchor entry's address changed (a resize).
+        // Amendment 13: the table around the timed samples. moved=1 when the anchor entry's address changed (a resize). No
+        // O(branches) pass here: one would stream the table's control bytes into cache just before the batched stage.
         println!(
-            "# sampletable x={x} cap_before={cap_before} cap_after={} moved={} buckets_after={}",
+            "# sampletable x={x} cap_before={cap_before} cap_after={} moved={}",
             self.db.branch_table_capacity(),
-            u8::from(self.anchor_addr(parents) != anchor_before),
-            self.table_buckets()
+            u8::from(self.anchor_addr(parents) != anchor_before)
         );
         if let Some((k, n)) = args.fork_batch {
             self.fork_batches(x, parents, rng, k, n);
         }
     }
 
-    /// `--fork-batch K,N` (amendment 13), after the timed samples: 4N batches of K parents, each parent drawn as the samples
-    /// draw them but never the trunk (whose fork is another code path). The batches cycle through four timed cells, a
-    /// factorial over the timed region's random-line accesses (A: the harness's Node record of the parent; B: the store's
-    /// fork_branch; C: Branch::new and the child's Node push):
+    /// `--fork-batch K,N` (amendment 13), after the timed samples: 5N batches of K parents, each parent drawn as the samples
+    /// draw them but never the trunk (whose fork is another code path). The batches run in N rounds of five timed cells, in
+    /// an order shuffled per round by the timing RNG; the cells are a factorial over the timed region's random-line accesses
+    /// (A: the harness's Node record of the parent; B: the store's fork_branch; C: Branch::new and the child's Node push):
     ///   fork_ball      A + B + C: `fork`, as the `fork` row times it;
     ///   fork_bnoa      B + C: the K parents' Node records are read before the timer, then `fork` is timed;
+    ///   fork_bsham     A + B + C after a sham pre-read of K other pool members' Node records (the pre-read's control);
     ///   fork_bharness  A only: the K Node records read as a dependent chain (each index waits on the previous read);
     ///   fork_bnone     none: the same dependent loop without the reads (the timer and loop floor).
-    /// A batch records its elapsed time / K, so one clock tick is 1/K tick per parent. Only ball and bnoa fork; every child
-    /// is pruned after its batch, so at most K extra entries are live and the table sees 2NK inserts and removes; the 2NK
-    /// Nodes are not counted as shape bb's tree (`extra_nodes`).
+    /// A batch records its elapsed time / K, so one clock tick is 1/K tick per parent. ball, bnoa and bsham fork; every
+    /// child is pruned after its batch, so at most K extra entries are live and the table sees 3NK inserts and removes; the
+    /// 3NK Nodes are not counted as shape bb's tree (`extra_nodes`).
     fn fork_batches(&mut self, x: u64, parents: &[u32], rng: &mut Rng, k: usize, n: usize) {
         let pool: Vec<u32> = parents.iter().copied().filter(|&p| p != TRUNK).collect();
         if pool.is_empty() {
@@ -804,57 +794,63 @@ impl Bench {
             return;
         }
         let (cap_before, anchor_before) = (self.db.branch_table_capacity(), self.anchor_addr(&pool));
-        let mut t: [Vec<f64>; 4] = Default::default();
-        for j in 0..4 * n {
-            let ps: Vec<u32> = (0..k).map(|_| pool[rng.below(pool.len() as u64) as usize]).collect();
-            let mut kids = Vec::with_capacity(k);
-            let cell = j % 4;
-            let elapsed = match cell {
-                0 => {
-                    let a = Instant::now();
-                    for &p in &ps {
-                        kids.push(self.fork(p));
-                    }
-                    a.elapsed()
-                }
-                1 => {
-                    for &p in &ps {
+        let mut t: [Vec<f64>; 5] = Default::default();
+        for _ in 0..n {
+            let mut order = [0usize, 1, 2, 3, 4];
+            for i in (1..order.len()).rev() {
+                order.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            for cell in order {
+                let ps: Vec<u32> = (0..k).map(|_| pool[rng.below(pool.len() as u64) as usize]).collect();
+                let mut kids = Vec::with_capacity(k);
+                if cell == 1 || cell == 2 {
+                    let pre: Vec<u32> = if cell == 1 {
+                        ps.clone()
+                    } else {
+                        (0..k).map(|_| pool[rng.below(pool.len() as u64) as usize]).collect()
+                    };
+                    for &p in &pre {
                         std::hint::black_box(self.touch_node(p));
                     }
-                    let a = Instant::now();
-                    for &p in &ps {
-                        kids.push(self.fork(p));
-                    }
-                    a.elapsed()
                 }
-                2 => {
-                    let (mask, mut dep) = (std::hint::black_box(0u32), 0u32);
-                    let a = Instant::now();
-                    for &p in &ps {
-                        dep = self.touch_node(p | (dep & mask)) as u32;
+                let elapsed = match cell {
+                    0..=2 => {
+                        let a = Instant::now();
+                        for &p in &ps {
+                            kids.push(self.fork(p));
+                        }
+                        a.elapsed()
                     }
-                    let e = a.elapsed();
-                    std::hint::black_box(dep);
-                    e
-                }
-                _ => {
-                    let (mask, mut dep) = (std::hint::black_box(0u32), 0u32);
-                    let a = Instant::now();
-                    for &p in &ps {
-                        dep = std::hint::black_box(p | (dep & mask));
+                    3 => {
+                        let (mask, mut dep) = (std::hint::black_box(0u32), 0u32);
+                        let a = Instant::now();
+                        for &p in &ps {
+                            dep = self.touch_node(p | (dep & mask)) as u32;
+                        }
+                        let e = a.elapsed();
+                        std::hint::black_box(dep);
+                        e
                     }
-                    let e = a.elapsed();
-                    std::hint::black_box(dep);
-                    e
+                    _ => {
+                        let (mask, mut dep) = (std::hint::black_box(0u32), 0u32);
+                        let a = Instant::now();
+                        for &p in &ps {
+                            dep = std::hint::black_box(p | (dep & mask));
+                        }
+                        let e = a.elapsed();
+                        std::hint::black_box(dep);
+                        e
+                    }
+                };
+                t[cell].push(elapsed.as_secs_f64() * 1e6 / k as f64);
+                self.extra_nodes += kids.len();
+                for (id, branch) in kids {
+                    self.prune(id, branch);
                 }
-            };
-            t[cell].push(elapsed.as_secs_f64() * 1e6 / k as f64);
-            self.extra_nodes += kids.len();
-            for (id, branch) in kids {
-                self.prune(id, branch);
             }
         }
-        for (name, us) in ["fork_ball", "fork_bnoa", "fork_bharness", "fork_bnone"].iter().zip(t.iter_mut()) {
+        let names = ["fork_ball", "fork_bnoa", "fork_bsham", "fork_bharness", "fork_bnone"];
+        for (name, us) in names.iter().zip(t.iter_mut()) {
             us.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let us: &[f64] = us;
             println!(
@@ -866,11 +862,11 @@ impl Bench {
                 us[us.len() - 1]
             );
         }
+        // No O(branches) pass here either (see the sampletable line); the rebuild line carries the exact bucket counts.
         println!(
-            "# forkbatch x={x} k={k} n={n} cap_before={cap_before} cap_after={} moved={} buckets_after={}",
+            "# forkbatch x={x} k={k} n={n} cap_before={cap_before} cap_after={} moved={}",
             self.db.branch_table_capacity(),
-            u8::from(self.anchor_addr(&pool) != anchor_before),
-            self.table_buckets()
+            u8::from(self.anchor_addr(&pool) != anchor_before)
         );
     }
 
