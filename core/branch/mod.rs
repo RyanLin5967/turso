@@ -158,8 +158,8 @@ pub(crate) fn count_fsync() {
 // r12-e3 amendment 7 (observing): a reap is PENDING from its first prefetch until its section
 // starts. Every page one of its prefetches inserted into the branch catalog's page cache and that
 // leaves that cache while it is pending is counted here, for the reap to take when it settles.
-// A reaper thread owns one slot while it lives (a live-slot bitmap; freed at thread exit), so two
-// live threads never share one; a 65th live thread gets no slot and is counted in `PF_OVERFLOW`
+// A thread that prefetches owns one slot while it lives (a live-slot bitmap; freed at thread
+// exit; an evicting thread only reads its slot, never takes one), so two live threads never share one; a 65th live thread gets no slot and is counted in `PF_OVERFLOW`
 // (the harness refuses a cell with any). A tag is (slot << 48) | the reap's process-wide serial,
 // so a stale page (an earlier reap's) never matches a later reap. A slot's pending serial and its
 // counters change only under that slot's lock, so a count can never land on a later reap.
@@ -212,27 +212,40 @@ thread_local! {
 /// `PF_SLOTS` when all 64 are taken.
 pub(crate) fn pf_slot() -> usize {
     use crate::sync::atomic::Ordering::SeqCst;
-    PF_SLOT.with(|c| {
-        if c.0.get() == usize::MAX {
-            let mut got = PF_SLOTS;
-            let mut live = PF_SLOTS_LIVE.load(SeqCst);
-            while live != u64::MAX {
-                let s = (!live).trailing_zeros() as usize;
-                match PF_SLOTS_LIVE.compare_exchange(live, live | (1u64 << s), SeqCst, SeqCst) {
-                    Ok(_) => {
-                        got = s;
-                        break;
+    // `try_with`: after this thread's slot destructor has run (thread exit), there is no slot.
+    PF_SLOT
+        .try_with(|c| {
+            if c.0.get() == usize::MAX {
+                let mut got = PF_SLOTS;
+                let mut live = PF_SLOTS_LIVE.load(SeqCst);
+                while live != u64::MAX {
+                    let s = (!live).trailing_zeros() as usize;
+                    match PF_SLOTS_LIVE.compare_exchange(live, live | (1u64 << s), SeqCst, SeqCst) {
+                        Ok(_) => {
+                            got = s;
+                            break;
+                        }
+                        Err(now) => live = now,
                     }
-                    Err(now) => live = now,
                 }
+                if got == PF_SLOTS {
+                    PF_OVERFLOW.fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+                }
+                c.0.set(got);
             }
-            if got == PF_SLOTS {
-                PF_OVERFLOW.fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
-            }
-            c.0.set(got);
-        }
-        c.0.get()
-    })
+            c.0.get()
+        })
+        .unwrap_or(PF_SLOTS)
+}
+
+/// This thread's slot if it has taken one, without taking one (`PF_SLOTS` otherwise): an
+/// evicting thread that never prefetched cannot be the owner of a pending page.
+fn pf_slot_held() -> usize {
+    PF_SLOT
+        .try_with(|c| c.0.get())
+        .ok()
+        .filter(|&s| s < PF_SLOTS)
+        .unwrap_or(PF_SLOTS)
 }
 
 /// How a page left the catalog's cache.
@@ -289,7 +302,7 @@ pub(crate) fn pf_removed(tag: u64, how: PfRemoval) {
     use crate::sync::atomic::Ordering::Relaxed;
     let slot = (tag >> PF_SERIAL_BITS) as usize % PF_SLOTS;
     let serial = tag & ((1 << PF_SERIAL_BITS) - 1);
-    let evictor = pf_slot();
+    let evictor = pf_slot_held();
     let _slot_lock = PF_LOCKS[slot].lock();
     if serial == 0 || PF_PENDING[slot].load(Relaxed) != serial {
         return;
