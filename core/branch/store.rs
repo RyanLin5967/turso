@@ -342,6 +342,9 @@ struct CkptCounters {
     settle_batches: u64,
     settle_loads: u64,
     settle_max_loads: u64,
+    /// Entries the capture materialised under the store mutex: each captured row's `current` and
+    /// retained versions (PREREG A27, the F-FZ residual; observing only, not in `as_array`).
+    capture_entries: u64,
 }
 
 impl CkptCounters {
@@ -2783,6 +2786,12 @@ impl BranchStore {
             .map_or([0; 9], |c| c.ckpt.as_array())
     }
 
+    /// Entries every capture so far materialised under the store mutex (PREREG A27; 0 for other
+    /// modes).
+    pub(crate) fn checkpoint_capture_entries(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.ckpt.capture_entries)
+    }
+
     /// Start a fuzzy checkpoint now, whatever the log's length (F-FZ; tests and the harness), as
     /// `maybe_compact` would: while C-R has parked Commits, this settles one bounded batch and
     /// starts nothing. `Ok(false)`: nothing started (parked Commits remain, one is in flight, or
@@ -3556,6 +3565,8 @@ impl StoreInner {
                 retained: st.lineage.retained_list(),
             }, what))
             .collect();
+        cat.ckpt.capture_entries +=
+            rows.iter().map(|(b, _)| (b.current.len() + b.retained.len()) as u64).sum::<u64>();
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
