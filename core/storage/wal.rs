@@ -3593,6 +3593,15 @@ impl Wal for WalFile {
                 TryBeginReadResult::Busy => return Err(LimboError::Busy),
                 TryBeginReadResult::Retry => {
                     cnt += 1;
+                    // k3 amendment 21: immediate retries apart from the ones that yield or sleep.
+                    crate::coherence::bump(
+                        if cnt <= 5 {
+                            crate::coherence::Class::ReadTxRetry
+                        } else {
+                            crate::coherence::Class::ReadTxBackoff
+                        },
+                        1,
+                    );
                     if cnt > 100 {
                         return Err(LimboError::Busy);
                     }

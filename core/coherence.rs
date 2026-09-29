@@ -54,9 +54,22 @@ pub enum Class {
     Malloc,
     /// Heap frees.
     Free,
+    // --- k3 amendment 21 (r12-e1-spin): the WAL's user-space spin paths. Observation only; none is a shared-line
+    // write, so `shared_rmw` excludes all five (the harness skips `*_fail`, `*_ns` and `readtx_*`).
+    /// WAL frame_cache SpinLock swaps that found the lock held (the `*_FAIL` twin of [`Class::WalFc`]).
+    WalFcFail,
+    /// Nanoseconds spent spinning on the WAL header lock: from the first failed swap to the acquisition. The clock is
+    /// read only on that contended path.
+    WalHdrSpinNs,
+    /// The same for the WAL frame_cache SpinLock.
+    WalFcSpinNs,
+    /// begin_read_tx retries taken at once (the first five of a call, no yield or sleep).
+    ReadTxRetry,
+    /// begin_read_tx retries after the fifth (yield, then sleep).
+    ReadTxBackoff,
 }
 
-pub const CLASSES: usize = 18;
+pub const CLASSES: usize = 23;
 
 pub const NAMES: [&str; CLASSES] = [
     "wal_rw_read",
@@ -77,6 +90,11 @@ pub const NAMES: [&str; CLASSES] = [
     "shard_xfer",
     "malloc",
     "free",
+    "wal_fc_fail",
+    "wal_hdr_spin_ns",
+    "wal_fc_spin_ns",
+    "readtx_retry",
+    "readtx_backoff",
 ];
 
 #[cfg(feature = "coherence")]
@@ -115,6 +133,25 @@ pub fn snapshot() -> [u64; CLASSES] {
 
 /// Whether this build carries the instrument.
 pub const ENABLED: bool = cfg!(feature = "coherence");
+
+/// The spin counters' clock (k3 amendment 21): the time now in an instrumented build, `None` in a timed one, so a
+/// timed build reads no clock on any path.
+#[inline(always)]
+pub fn spin_clock() -> Option<std::time::Instant> {
+    if ENABLED {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    }
+}
+
+/// Add the time since `t0` (from [`spin_clock`]) to `class`, in nanoseconds.
+#[inline(always)]
+pub fn spin_done(t0: Option<std::time::Instant>, class: Class) {
+    if let Some(t0) = t0 {
+        bump(class, t0.elapsed().as_nanos() as u64);
+    }
+}
 
 // --- The published fixes, selected at run time (r11-coherence amendment 2) -----------------------------------------
 // Every fix is compiled into every build, instrumented or not, and chosen once per process from TURSO_R11_FIX (or
