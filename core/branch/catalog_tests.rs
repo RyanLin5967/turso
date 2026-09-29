@@ -646,6 +646,10 @@ fn a_fuzzy_checkpoint_after_an_uncommitted_one_never_reuses_its_generation() {
     let second;
     {
         let db = open_at(&first, catalog()).unwrap();
+        // Premise: the S0 image replayed its whole log, the failed attempt's marker included: the
+        // 20 writes before its capture, the 8 after, and the marker (the S0 test's count).
+        let s = db.branch_open_stats();
+        assert_eq!(s.records, 20 + 8 + 1, "premise: the S0 image did not replay its whole log: {s:?}");
         check(&db, &model);
         let mut ids: Vec<BranchId> = model.keys().copied().collect();
         ids.sort();
@@ -654,6 +658,8 @@ fn a_fuzzy_checkpoint_after_an_uncommitted_one_never_reuses_its_generation() {
             write(&db, id, model[&id].0, &v);
             model.get_mut(&id).unwrap().1 = v;
         }
+        let log = std::path::PathBuf::from(format!("{}-branch-log", first.display()));
+        let log_len = std::fs::metadata(&log).unwrap().len();
         db.branch_checkpoint_hold(store::HOLD_AFTER_COMMIT);
         let mut calls = 0;
         while !db.branch_checkpoint_fuzzy_now().unwrap() {
@@ -661,7 +667,12 @@ fn a_fuzzy_checkpoint_after_an_uncommitted_one_never_reuses_its_generation() {
             assert!(calls < 10, "no fuzzy checkpoint after {calls} settle batches");
         }
         wait_held(&db, store::HOLD_AFTER_COMMIT);
-        // Nothing is written after this capture, so its own marker has not reached the log.
+        // Premise: nothing reached the log after this capture, so its own marker is not there.
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            log_len,
+            "premise: the log grew across the second capture"
+        );
         second = crash_image(&first, &second_dir);
         db.branch_checkpoint_hold(0);
         db.branch_checkpoint_wait();
