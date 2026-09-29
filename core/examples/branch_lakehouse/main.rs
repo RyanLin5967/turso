@@ -813,7 +813,11 @@ fn main() {
                 let oldest = run.oldest().expect("r >= 1 snapshots stay live");
                 run.model.prune(oldest);
             }
+            // With `--tag` the first tick's only snapshot is the tag, which is never read.
             for _ in 0..run.args.readers {
+                if run.snaps.is_empty() {
+                    break;
+                }
                 rows_checked += run.read();
                 reads += 1;
             }
