@@ -297,7 +297,8 @@ impl Connection {
         check_forkable(&self.db, &pager)?;
         let id = match pager.branch_id() {
             Some(parent) => self.db.branches.fork_branch(parent)?,
-            None => self.fork_trunk(&pager)?,
+            // r11-walpin-conc amendment 28: the fork's trunk read transaction is tagged FORK.
+            None => walpin::origin::with(walpin::origin::FORK, || self.fork_trunk(&pager))?,
         };
         Ok(Branch::new(self.db.clone(), id))
     }
@@ -444,7 +445,8 @@ impl Database {
             store: self.branches.clone(),
             id,
         };
-        let pager = self._init(None, None)?;
+        // r11-walpin-conc amendment 28: `_init`'s trunk read transaction is tagged INIT.
+        let pager = walpin::origin::with(walpin::origin::INIT, || self._init(None, None))?;
         // `_init` read page 1 as the TRUNK sees it. Nothing the trunk put in this pager may
         // survive into the branch's view.
         pager.clear_page_cache(false);
@@ -477,6 +479,9 @@ mod walpin_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod walpin_crash_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod walpin_attr_tests;
 
 #[cfg(test)]
 mod tests {

@@ -23,6 +23,13 @@ pub(crate) static FIND_SCANNED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RESTARTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW2_SWITCHES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW2_CKPT_REFUSED: AtomicU64 = AtomicU64::new(0);
+// r11-walpin-conc amendment 28: FW2's refused checkpoints by the origin of the readers that
+// blocked them (`origin`): each counts the refusals in which that origin held at least one
+// reader ending in the file to be checkpointed; INIT_ONLY those whose blockers were all INIT.
+pub(crate) static FW2_REFUSED_INIT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW2_REFUSED_FORK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW2_REFUSED_TRUNK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FW2_REFUSED_INIT_ONLY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW3_TRUNK_READS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW3_RETRIES: AtomicU64 = AtomicU64::new(0);
 // r11-walpin-conc: FW3's retries per call, by cause (frontier/round11/r11-walpin-conc/PREREG.md).
@@ -128,6 +135,12 @@ pub struct WalPinCounters {
     pub fw2_switches: u64,
     /// FW2: checkpoints refused because a reader's snapshot ends in the file to be checkpointed.
     pub fw2_ckpt_refused: u64,
+    /// Those refusals in which a reader of each origin (`origin`) was among the blockers:
+    /// INIT, FORK, TRUNK; and those whose blockers were all INIT.
+    pub fw2_refused_init: u64,
+    pub fw2_refused_fork: u64,
+    pub fw2_refused_trunk: u64,
+    pub fw2_refused_init_only: u64,
     /// FW3: branch reads of a trunk page (WAL frame or database file).
     pub fw3_trunk_reads: u64,
     /// FW3: those reads that failed validation and were retried.
@@ -167,6 +180,10 @@ pub fn counters() -> WalPinCounters {
         restarts: RESTARTS.load(Relaxed),
         fw2_switches: FW2_SWITCHES.load(Relaxed),
         fw2_ckpt_refused: FW2_CKPT_REFUSED.load(Relaxed),
+        fw2_refused_init: FW2_REFUSED_INIT.load(Relaxed),
+        fw2_refused_fork: FW2_REFUSED_FORK.load(Relaxed),
+        fw2_refused_trunk: FW2_REFUSED_TRUNK.load(Relaxed),
+        fw2_refused_init_only: FW2_REFUSED_INIT_ONLY.load(Relaxed),
         fw3_trunk_reads: FW3_TRUNK_READS.load(Relaxed),
         fw3_retries: FW3_RETRIES.load(Relaxed),
         fw3_calls_trunk: FW3_CALLS_TRUNK.load(Relaxed),
@@ -256,6 +273,62 @@ pub struct WalPinStats {
     /// FW1's frame -> page log: entries and bytes by capacity.
     pub log_frames: u64,
     pub log_bytes: u64,
+}
+
+/// r11-walpin-conc amendment 28: which kind of trunk reader a read transaction is, for the
+/// attribution of FW2's refused checkpoints. A thread-local tag, set around the one call that
+/// begins the read transaction: INIT around `_init` in `connect_branch` (the trunk read of page 1
+/// that every branch connection makes), FORK around a trunk fork; every other read transaction is
+/// TRUNK. The WAL records the tag a read transaction began under and counts readers by it.
+pub(crate) mod origin {
+    use std::cell::Cell;
+
+    pub(crate) const TRUNK: u8 = 0;
+    pub(crate) const INIT: u8 = 1;
+    pub(crate) const FORK: u8 = 2;
+    pub(crate) const ORIGINS: usize = 3;
+
+    thread_local! {
+        static TAG: Cell<u8> = const { Cell::new(TRUNK) };
+    }
+
+    /// The tag a read transaction begun on this thread now would carry.
+    pub(crate) fn current() -> u8 {
+        TAG.with(|t| t.get())
+    }
+
+    /// Run `f` with this thread's read transactions tagged `tag`; the previous tag is restored
+    /// afterwards, also when `f` unwinds.
+    pub(crate) fn with<R>(tag: u8, f: impl FnOnce() -> R) -> R {
+        #[cfg(test)]
+        if mutant::untagged() {
+            return f();
+        }
+        struct Restore(u8);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TAG.with(|t| t.set(self.0));
+            }
+        }
+        let _restore = Restore(TAG.with(|t| t.replace(tag)));
+        f()
+    }
+
+    /// The fire-check's mutant: `with` drops the tag, so every read transaction is TRUNK.
+    #[cfg(test)]
+    pub(crate) mod mutant {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+        static UNTAGGED: AtomicBool = AtomicBool::new(false);
+
+        pub(crate) fn untagged() -> bool {
+            UNTAGGED.load(Relaxed)
+        }
+
+        pub(crate) fn set_untagged(on: bool) {
+            UNTAGGED.store(on, Relaxed);
+        }
+    }
 }
 
 /// r11-walpin-conc amendment 21: how the last FW2 open recovered the two WAL files (`Wal2Recovered::code`; 0 = none
