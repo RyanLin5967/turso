@@ -100,6 +100,9 @@ pub struct Args {
     /// Reap every snapshot at the end and require an empty store (default). `none` skips it: the durable
     /// catalog's WAL grew by 3.6 GB over 43,200 consecutive teardown reaps (PREREG A7).
     teardown: bool,
+    /// PREREG A9.2 (E2 straggler): the first snapshot is a TAG, kept until teardown and never read;
+    /// FIFO expiry keeps `r` other snapshots live, so the tag pins the oldest live fork.
+    tag: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -130,6 +133,7 @@ fn parse_args() -> Args {
         dir: None,
         counters_only: false,
         teardown: true,
+        tag: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -168,6 +172,7 @@ fn parse_args() -> Args {
             }
             "--dir" => a.dir = Some(PathBuf::from(val())),
             "--counters-only" => a.counters_only = true,
+            "--tag" => a.tag = true,
             "--teardown" => {
                 a.teardown = match val().as_str() {
                     "full" => true,
@@ -322,6 +327,8 @@ struct Run {
     model: Model,
     rng: Rng,
     snaps: VecDeque<Live>,
+    /// `--tag`: the pinned first snapshot.
+    tag: Option<Live>,
     tick: u64,
     opens: u64,
     first_reap_after_open: bool,
@@ -458,10 +465,18 @@ fn reopen(run: Run) -> Run {
         model,
         rng,
         snaps,
+        tag,
         tick,
         opens,
         ..
     } = run;
+    let tag = tag.map(|l| Live {
+        snap: match l.snap {
+            Snap::Handle(b) => Snap::Detached(arm::detach(b)),
+            d => d,
+        },
+        tick: l.tick,
+    });
     let snaps = snaps
         .into_iter()
         .map(|l| Live {
@@ -490,6 +505,7 @@ fn reopen(run: Run) -> Run {
         model,
         rng,
         snaps,
+        tag,
         tick,
         opens: opens + 1,
         first_reap_after_open: true,
@@ -578,6 +594,7 @@ fn main() {
         db,
         trunk,
         snaps: VecDeque::new(),
+        tag: None,
         tick: 0,
         opens: 1,
         first_reap_after_open: false,
@@ -617,6 +634,12 @@ fn main() {
         run.int("PRAGMA page_count"),
         if cfg!(debug_assertions) { "DEBUG" } else { "release" }
     );
+    println!(
+        "# tag={} clone_evict={} teardown={}",
+        run.args.tag,
+        arm::clone_evict(&run.db),
+        if run.args.teardown { "full" } else { "none" }
+    );
     println!("# counters only: nothing is timed");
     let per_window = run.args.ticks / run.args.windows;
     let steady_from = run.args.windows / 2;
@@ -636,10 +659,15 @@ fn main() {
             let branch = run.trunk.fork_branch().unwrap_or_else(|e| {
                 not_a_result(&format!("fork at tick {} failed: {e}", run.tick))
             });
-            run.snaps.push_back(Live {
+            let live = Live {
                 snap: Snap::Handle(branch),
                 tick: run.tick,
-            });
+            };
+            if run.args.tag && run.tag.is_none() {
+                run.tag = Some(live);
+            } else {
+                run.snaps.push_back(live);
+            }
             if run.snaps.len() > run.args.r {
                 let before = arm::work(&run.db);
                 let victim = run.snaps.pop_front().expect("more than r snapshots are live");
@@ -712,8 +740,9 @@ fn main() {
         println!(
             "WINDOW w={window} tick={} live={} reads={reads} rows_checked={rows_checked} \
              k1[{}] k1_ordinary[{}] k1_bursts[{}] k2_cat_rows[{}] fills={fills} hits={hits} \
-             fill_ratio={:.4} copies={} evictions={} overlaid={} gc_examined={} heap_live_bytes={} \
-             rss_bytes={} model_rows={} files_bytes={} {}",
+             fill_ratio={:.4} copies={} evictions={} interval_evictions={} clone_gc_entries={} \
+             orphaned_clones={} overlaid={} gc_examined={} heap_live_bytes={} rss_bytes={} model_rows={} \
+             files_bytes={} {}",
             run.tick,
             run.snaps.len(),
             k1.summary(),
@@ -723,6 +752,9 @@ fn main() {
             fills as f64 / ((fills + hits).max(1)) as f64,
             w.retained_copies - w0.retained_copies,
             w.retained_clone_evictions - w0.retained_clone_evictions,
+            w.retained_clone_interval_evictions - w0.retained_clone_interval_evictions,
+            w.clone_gc_entries - w0.clone_gc_entries,
+            arm::orphaned_clones(&run.db),
             w.chunks_overlaid - w0.chunks_overlaid,
             w.gc_examined - w0.gc_examined,
             heap_live_bytes(),
@@ -761,6 +793,15 @@ fn main() {
             not_a_result(&format!("teardown reap of tick {} failed: {e}", l.tick));
         }
     }
+    if let Some(l) = run.tag.take() {
+        let branch = match l.snap {
+            Snap::Handle(b) => b,
+            Snap::Detached(id) => arm::attach(&run.db, id),
+        };
+        if let Err(e) = branch.reap() {
+            not_a_result(&format!("teardown reap of the tag (tick {}) failed: {e}", l.tick));
+        }
+    }
     if let Some(leak) = arm::leaked(&run.db) {
         not_a_result(&format!("teardown leaked: {leak}"));
     }
@@ -775,6 +816,8 @@ pub struct Work {
     retained_shared_hits: u64,
     retained_copies: u64,
     retained_clone_evictions: u64,
+    retained_clone_interval_evictions: u64,
+    clone_gc_entries: u64,
     chunks_overlaid: u64,
     cat_trunk_probes: u64,
     cat_trunk_rows: u64,
@@ -849,6 +892,8 @@ mod arm {
             retained_shared_hits: 0,
             retained_copies: 0,
             retained_clone_evictions: 0,
+            retained_clone_interval_evictions: 0,
+            clone_gc_entries: 0,
             chunks_overlaid: 0,
             cat_trunk_probes: probes,
             cat_trunk_rows: rows,
@@ -870,6 +915,14 @@ mod arm {
             db.branch_trunk_retained(),
             db.branch_catalog_rows_written()
         )
+    }
+
+    pub fn orphaned_clones(_db: &Arc<Database>) -> usize {
+        0
+    }
+
+    pub fn clone_evict(_db: &Arc<Database>) -> &'static str {
+        "none (no FS9)"
     }
 
     pub fn leaked(db: &Arc<Database>) -> Option<String> {
