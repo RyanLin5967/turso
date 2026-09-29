@@ -437,10 +437,10 @@ fn pipe(
         .db
         .branch_snapshot()
         .unwrap_or_else(|e| not_a_result(&format!("{point}: snapshot refused: {e}")));
-    let (view_ops, touched, copied, write_base_lookups) = b.db.branch_view_work();
+    let (view_ops, touched, copied, write_base_lookups, write_base_work) = b.db.branch_view_work();
     let (h_states, h_slots, h_tret, h_written) = snap.heights();
     println!(
-        "snap\t{point}\tseq={}\tsnapshot_locked_ns={snap_ns}\tview_ops={view_ops}\tview_nodes_touched={touched}\tview_nodes_copied={copied}\theight_states={h_states}\theight_slots={h_slots}\theight_trunk_retained={h_tret}\theight_written={h_written}\twrite_base_lookups={write_base_lookups}\theight_changes={}",
+        "snap\t{point}\tseq={}\tsnapshot_locked_ns={snap_ns}\tview_ops={view_ops}\tview_nodes_touched={touched}\tview_nodes_copied={copied}\theight_states={h_states}\theight_slots={h_slots}\theight_trunk_retained={h_tret}\theight_written={h_written}\twrite_base_lookups={write_base_lookups}\twrite_base_work={write_base_work}\theight_changes={}",
         snap.seq(),
         snap.change_index_height()
     );

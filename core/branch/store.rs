@@ -606,7 +606,8 @@ impl BranchStore {
             inner.ship_retained(id, page, v, seq);
         }
         if let Some(slot) = new_slot {
-            inner.ship_slot(slot, SlotOwner::Branch(id.0), seq);
+            // Its fork base is resolved at commit, the entry a snapshot can see (PREREG A7).
+            inner.ship_slot(slot, SlotOwner::Branch(id.0), seq, false);
         }
         if moved {
             inner.ship_current(id, page, seq);
@@ -643,7 +644,7 @@ impl BranchStore {
             trunk.written.insert(page, epoch);
         }
         if let Some(v) = kept {
-            inner.ship_slot(v.slot, SlotOwner::Trunk { born: v.born, died: v.died }, seq);
+            inner.ship_slot(v.slot, SlotOwner::Trunk { born: v.born, died: v.died }, seq, true);
             inner.ship_trunk_retained(page, v, seq);
         }
         inner.ship_written(page, seq, pre_image.len());
@@ -685,7 +686,7 @@ impl BranchStore {
             written.push(owned.slot);
         }
         for slot in written {
-            inner.ship_slot(slot, SlotOwner::Branch(id.0), seq);
+            inner.ship_slot(slot, SlotOwner::Branch(id.0), seq, true);
         }
         Ok(())
     }

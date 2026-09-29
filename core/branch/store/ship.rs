@@ -255,8 +255,10 @@ pub(crate) struct Track {
     /// Work the view's upkeep did under the mutex, and the operations that did it.
     view_work: TreeWork,
     view_ops: u64,
-    /// Fork-base resolutions done at write time (F-S3), one per branch slot write.
+    /// Fork-base resolutions done at write time (F-S3), one per committed branch slot write, and
+    /// their work: page-map nodes entered plus retained trunk versions examined (PREREG A7).
     base_lookups: u64,
+    base_lookup_work: u64,
     /// `(birth, id)` of every hole, so that holes every receiver has passed can be dropped.
     holes: BTreeSet<(u64, u64)>,
 }
@@ -410,7 +412,11 @@ impl StoreInner {
     }
 
     /// Slot `slot`'s bytes, owner or births changed at `seq` (its item birth is `seq`).
-    pub(super) fn ship_slot(&mut self, slot: Slot, owner: SlotOwner, seq: u64) {
+    ///
+    /// `resolve_base` is false at a branch page's FIRST write in a transaction: that view entry is
+    /// replaced at commit, and no snapshot can see it before then (a snapshot is refused while a
+    /// branch writer is open), so its fork base is resolved once, at commit.
+    pub(super) fn ship_slot(&mut self, slot: Slot, owner: SlotOwner, seq: u64, resolve_base: bool) {
         let (Some(t), Some(arena)) = (self.track.as_mut(), self.arena.as_ref()) else {
             return;
         };
@@ -418,19 +424,24 @@ impl StoreInner {
         // The fork base, resolved now so that a send never looks it up: what the owning branch
         // reads for this page through its ancestry (its `inherited` map, else the trunk's version
         // as of `trunk_at`), or the trunk's page when neither holds one.
+        let mut work = 0u64;
         let base = match owner {
-            SlotOwner::Branch(o) => {
+            SlotOwner::Branch(o) if resolve_base => {
                 t.base_lookups += 1;
                 self.branches.get(&BranchId(o)).and_then(|st| {
                     let mut examined = 0;
-                    st.inherited
-                        .get(page)
-                        .or_else(|| self.trunk.lineage.retained_at(page, st.trunk_at, &mut examined))
+                    let found = st
+                        .inherited
+                        .get_counted(page, &mut work)
+                        .or_else(|| self.trunk.lineage.retained_at(page, st.trunk_at, &mut examined));
+                    work += examined;
+                    found
                 })
             }
-            SlotOwner::Trunk { .. } => None,
+            SlotOwner::Branch(_) | SlotOwner::Trunk { .. } => None,
         }
         .map(|b| (b, arena.page_arc(b).clone()));
+        t.base_lookup_work += work;
         let view = Arc::new(SlotView {
             page,
             owner,
@@ -695,10 +706,14 @@ pub struct SendReport {
     /// Observation (PREREG A7): the nodes of `nodes_visited` that the change-index walk entered
     /// (a pruned incremental's only index walk); the rest are the changed states' own trees.
     pub change_index_nodes: u64,
+    /// Every record the stream carried, as the sink counted them: `records()` plus BEGIN,
+    /// TRUNK_META, END and (IncrRoot) LIVE_LIST.
+    pub records_emitted: u64,
 }
 
 impl SendReport {
-    /// Records of every kind this stream carried.
+    /// Data records: slot, trunk page, reference, state and death records (not BEGIN,
+    /// TRUNK_META, END or LIVE_LIST; `records_emitted` counts those too).
     pub fn records(&self) -> u64 {
         self.slot_records + self.trunk_page_records + self.ref_records + self.state_records + self.dead_records
     }
@@ -851,11 +866,14 @@ struct Sink<'a> {
     out: Option<&'a mut dyn Write>,
     buf: Vec<u8>,
     bytes: u64,
+    /// Records put, of every kind (each `put` is one record).
+    records: u64,
 }
 
 impl Sink<'_> {
     fn put(&mut self, data: &[u8]) -> Result<()> {
         self.bytes += data.len() as u64;
+        self.records += 1;
         if self.out.is_some() {
             self.buf.extend_from_slice(data);
             if self.buf.len() >= 1 << 20 {
@@ -988,10 +1006,16 @@ impl BranchStore {
     }
 
     /// The view's upkeep so far: (operations, nodes touched, nodes copied because a snapshot
-    /// shared them, fork-base resolutions at write time).
-    pub(crate) fn view_work(&self) -> (u64, u64, u64, u64) {
-        self.inner.lock().track.as_ref().map_or((0, 0, 0, 0), |t| {
-            (t.view_ops, t.view_work.nodes_touched, t.view_work.nodes_copied, t.base_lookups)
+    /// shared them, fork-base resolutions at write time, and their work).
+    pub(crate) fn view_work(&self) -> (u64, u64, u64, u64, u64) {
+        self.inner.lock().track.as_ref().map_or((0, 0, 0, 0, 0), |t| {
+            (
+                t.view_ops,
+                t.view_work.nodes_touched,
+                t.view_work.nodes_copied,
+                t.base_lookups,
+                t.base_lookup_work,
+            )
         })
     }
 
@@ -1079,7 +1103,6 @@ impl BranchStore {
         let t0 = Instant::now();
         let inner = self.inner.lock();
         let snap = Self::snapshot_locked(&inner)?;
-        drop(excluded);
         // Mutant S1 (PREREG A5): the send keeps the mutex through serialisation.
         let held = if super::super::ship_mutant() == "S1" {
             Some(inner)
@@ -1088,10 +1111,13 @@ impl BranchStore {
             None
         };
         let locked_ns = t0.elapsed().as_nanos() as u64;
+        // Released after the store mutex (LIFO) and outside `locked_ns`: dropping it ends a WAL
+        // transaction and a connection, which is no part of the store's locked section.
+        drop(excluded);
         let mut rep = send_snapshot(&snap, mode, base, trunk, use_delta, plant, count, out)?;
         // Operations under the store mutex (PREREG A6.2): the snapshot, and every record that was
         // serialised while the guard was still held.
-        let serialised_under_guard = if held.is_some() { rep.records() } else { 0 };
+        let serialised_under_guard = if held.is_some() { rep.records_emitted } else { 0 };
         rep.locked_ops = 1 + serialised_under_guard;
         rep.locked_ns = match held {
             Some(guard) => {
@@ -1650,6 +1676,7 @@ pub(crate) fn send_snapshot(
         out,
         buf: Vec::new(),
         bytes: 0,
+        records: 0,
     };
     let page_size = trunk.page_size();
     if sink.out.is_some() && !matches!(mode, SendMode::FullFix | SendMode::IncrFix) {
@@ -1950,13 +1977,18 @@ pub(crate) fn send_snapshot(
                 .collect()
         } else {
             let mut c = Vec::new();
+            let mut missing = false;
             v.trunk_retained.walk_changed(base_seq, &mut tw, |_, it| {
                 if let Some(ver) = it.live() {
-                    if let Some(sv) = v.slots.get_live(u64::from(ver.slot)) {
-                        c.push((ver.slot, sv.clone()));
+                    match v.slots.get_live(u64::from(ver.slot)) {
+                        Some(sv) => c.push((ver.slot, sv.clone())),
+                        None => missing = true,
                     }
                 }
             });
+            if missing {
+                return Err(corrupt("a retained trunk version's slot is missing from the view"));
+            }
             c
         };
         for (slot, sv) in candidates {
@@ -2058,6 +2090,7 @@ pub(crate) fn send_snapshot(
     sink.put(&end.0)?;
     sink.flush()?;
     rep.total_bytes = sink.bytes;
+    rep.records_emitted = sink.records;
     rep.nodes_visited = tw.nodes_visited;
     rep.items_checked = tw.items_checked;
     rep.kids_checked = tw.kids_checked;
