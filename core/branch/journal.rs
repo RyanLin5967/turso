@@ -730,7 +730,11 @@ impl Journal {
                     // marker. Replay what follows it, and make that the log of the catalog's
                     // generation now, so appends and the next checkpoint see one log.
                     let marker = Record::Checkpoint { generation };
+                    // NEVER MERGE: A15 mutant M-NOMARKER (R11_MUTANT=nomarker): ignore the marker and
+                    // replay the whole older log.
+                    let nomarker = std::env::var("R11_MUTANT").as_deref() == Ok("nomarker");
                     let cut = match records.iter().rposition(|r| *r == marker) {
+                        _ if nomarker => LOG_HEADER_LEN,
                         Some(i) => {
                             let at = ends[i];
                             records.drain(..=i);

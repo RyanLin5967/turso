@@ -1906,7 +1906,13 @@ impl BranchStore {
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if !inner.parked.is_empty() {
             let t = Instant::now();
-            if let Err(e) = inner.settle_batch(SETTLE_BATCH) {
+            // NEVER MERGE: A15 mutant M-SETTLE-ALL (R11_MUTANT=settleall) settles every parked branch at once.
+            let batch = if std::env::var("R11_MUTANT").as_deref() == Ok("settleall") {
+                usize::MAX
+            } else {
+                SETTLE_BATCH
+            };
+            if let Err(e) = inner.settle_batch(batch) {
                 tracing::warn!("branch store: parked commits not applied: {e}");
                 let _ = inner.fatal(e);
                 return false;
@@ -2792,6 +2798,12 @@ impl BranchStore {
         if inner.cat.is_none() || inner.journal.is_none() || inner.arena.is_none() {
             return Ok(false);
         }
+        // NEVER MERGE: A15 mutant M-SHARP-IN-FLIGHT (R11_MUTANT=sharpinflight): the "fuzzy" checkpoint
+        // writes the catalog under the store mutex, as the sharp path does (A26 says why this form).
+        if std::env::var("R11_MUTANT").as_deref() == Ok("sharpinflight") {
+            inner.checkpoint_catalog(false, false)?;
+            return Ok(true);
+        }
         Ok(self.start_flight(&mut inner))
     }
 
@@ -3534,8 +3546,14 @@ impl StoreInner {
                     .to_string(),
             ));
         }
-        let generation = cat.next_generation;
-        cat.next_generation += 1;
+        // NEVER MERGE: A15 mutant M-REUSE-GEN (R11_MUTANT=reusegen): number the checkpoint after the
+        // log's generation, so an uncommitted attempt's number is used again.
+        let generation = if std::env::var("R11_MUTANT").as_deref() == Ok("reusegen") {
+            journal.generation() + 1
+        } else {
+            cat.next_generation
+        };
+        cat.next_generation = generation + 1;
         let dirty = std::mem::take(&mut cat.dirty);
         let rows: Vec<(CatBranch, u8)> = dirty
             .iter()
