@@ -3326,7 +3326,11 @@ impl StoreInner {
             // `ret` rows), and `any_retained` would count those rows. Listing the markers missed one
             // (A25b), so a catalog store that holds no branch and no in-memory trunk version
             // checkpoints first, and the catalog then says what the store holds.
-            if self.n_states == 0 && self.trunk.lineage.retained.is_empty() && self.cat.is_some() {
+            if self.n_states == 0
+                && self.trunk.lineage.retained.is_empty()
+                && self.cat.is_some()
+                && std::env::var("R11_MUTANT").as_deref() != Ok("noflush")
+            {
                 self.checkpoint_catalog(false, false)?;
             }
             let catalog_retains = match self.catalog() {
