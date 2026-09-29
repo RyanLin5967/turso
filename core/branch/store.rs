@@ -46,15 +46,17 @@
 //! A retained version is garbage once no live child of its node forked inside `[born, died)`.
 //! Removing the child forked at `f` can only make versions containing `f` garbage, and a version
 //! containing `f` becomes garbage exactly when it also lies strictly between `f`'s neighbouring
-//! live siblings `lo` and `hi`: `born > lo` and `died <= hi`. The versions are indexed both by
-//! `born` and by `died` — ZFS's deadlists, which key a dead block by the interval that killed it
-//! and split it by birth — so that each side of that query is a range, not a scan:
+//! live siblings `lo` and `hi`: `born > lo` and `died <= hi`.
 //!
-//! * with no older live sibling (the oldest child, which is whom uniform-TTL lease expiry reaps),
-//!   the garbage is exactly the versions with `died` in `(f, hi]`;
-//! * with no younger one (the newest child), exactly those with `born` in `(lo, f]`;
-//! * with both, each range also holds survivors, and the two are walked in lockstep until the
-//!   shorter one ends (see [`Lineage::garbage`]).
+//! r2d (r11-adversarial amendment 22) answers that with no keyed search. The live children a version holds are a
+//! contiguous run of the fork-ordered child list, and the run only loses members, so each version is filed under
+//! its FIRST live holder, in a leftist min-heap by `died` (Mendelson, Tarjan, Thorup and Zwick, SWAT 2004; Crane
+//! 1972). The heaps live on gap nodes, one per fork epoch, in a union-find where a dead child links to the next
+//! epoch, so `retain` finds the first live holder of `[born, now)` as find(born) (round 10's U7). When the child at
+//! `f` goes, its neighbours come from the child list (`sib_prev` / `sib_next`); the heap filed under `f` is popped
+//! while `died <= hi` (all of it, with no younger sibling), and the rest is melded into `hi`'s. Each popped version
+//! is reached by its slab index, so it is freed as a tombstone with no search; a page's map drops its tombstones
+//! when they exceed half of it.
 //!
 //! A branch whose handle has been dropped but that still has a live child or an open connection
 //! is kept (its versions are still read through); it is freed the moment the last of those goes,
@@ -79,8 +81,7 @@
 //! Tarjan's fat node (JCSS 1989) with a search tree over its version stamps. [`Lineage::retain`]
 //! refuses a version that would break the disjointness the search relies on.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::Bound;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
@@ -123,18 +124,90 @@ struct Lineage {
     first: Option<(u64, BranchId)>,
     last: Option<(u64, BranchId)>,
     nchildren: usize,
-    /// Superseded versions kept because a live child forked while they were current, per page and
-    /// ordered by `born` (see "Per-page version order" above).
-    retained: HashMap<u32, BTreeMap<u64, Retained>>,
-    /// The same versions as `(born, page, died)`, for the reclamation range query by birth.
-    by_born: BTreeSet<(u64, u32, u64)>,
-    /// The same versions as `(died, page, born)`, for the reclamation range query by death.
-    by_died: BTreeSet<(u64, u32, u64)>,
+    /// Superseded versions kept because a live child forked while they were current, per page: `born` ->
+    /// index into `recs` (see "Per-page version order" above). Freed versions stay as tombstones until the
+    /// page's map is rebuilt.
+    retained: HashMap<u32, PageVersions>,
+    /// The retained versions' records (a slab), reached by index from the page maps and the heaps.
+    recs: Vec<Rec>,
+    free_recs: Vec<u32>,
+    /// Gap nodes for the fork epochs `gap_base..=epoch` (the last is the open one, for the next fork): a
+    /// union-find where a dead child's node links to the next epoch, each root holding the heap of the
+    /// versions it is the first live holder of.
+    gap: VecDeque<Gap>,
+    gap_base: u64,
 }
 
-/// No page has this number (SQLite's largest is `u32::MAX - 1`; [`Lineage::retain`] refuses it), so
-/// `(e, NO_PAGE, u64::MAX)` sorts after every index entry whose first field is `e`.
-const NO_PAGE: u32 = u32::MAX;
+#[derive(Default)]
+struct PageVersions {
+    map: BTreeMap<u64, u32>,
+    /// Tombstones in `map`.
+    dead: u32,
+}
+
+struct Rec {
+    died: u64,
+    slot: Slot,
+    page: u32,
+    live: bool,
+}
+
+struct Gap {
+    /// This node's own epoch while it is live or open; the next epoch once its child is gone.
+    parent: u64,
+    heap: Heap,
+}
+
+/// A leftist min-heap of retained versions ordered by `died` (Crane 1972): every node's right spine is no longer
+/// than its left one, so a meld walks two right spines of O(log n) nodes each. Ported from turso e5230f575 (F-R5).
+struct HeapNode {
+    died: u64,
+    rec: u32,
+    /// Length of the right spine below and including this node.
+    rank: u32,
+    left: Heap,
+    right: Heap,
+}
+
+type Heap = Option<Box<HeapNode>>;
+
+fn rank(h: &Heap) -> u32 {
+    h.as_ref().map_or(0, |n| n.rank)
+}
+
+/// Meld two heaps; `steps` gains the right-spine nodes visited (observation only).
+fn meld(a: Heap, b: Heap, steps: &mut u64) -> Heap {
+    match (a, b) {
+        (None, h) | (h, None) => h,
+        (Some(mut x), Some(mut y)) => {
+            *steps += 1;
+            if y.died < x.died {
+                std::mem::swap(&mut x, &mut y);
+            }
+            let right = x.right.take();
+            x.right = meld(right, Some(y), steps);
+            if rank(&x.left) < rank(&x.right) {
+                std::mem::swap(&mut x.left, &mut x.right);
+            }
+            x.rank = rank(&x.right) + 1;
+            Some(x)
+        }
+    }
+}
+
+impl Drop for HeapNode {
+    /// Iterative: a leftist heap's LEFT paths can be as long as the heap, and a recursive `Box` drop down one
+    /// would overflow the stack.
+    fn drop(&mut self) {
+        let mut stack: Vec<Box<HeapNode>> = Vec::new();
+        stack.extend(self.left.take());
+        stack.extend(self.right.take());
+        while let Some(mut n) = stack.pop() {
+            stack.extend(n.left.take());
+            stack.extend(n.right.take());
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Retained {
@@ -194,144 +267,167 @@ impl Lineage {
         from < to && self.last.is_some_and(|(e, _)| e >= from)
     }
 
-    fn retain(&mut self, page: u32, v: Retained) {
-        let versions = self.retained.entry(page).or_default();
+    /// A new fork of this node: its epoch, and a new open gap node for the fork after it.
+    fn next_fork(&mut self) -> u64 {
+        if self.gap.is_empty() {
+            self.gap_base = self.epoch;
+            self.gap.push_back(Gap { parent: self.epoch, heap: None });
+        }
+        let f = self.epoch;
+        self.epoch += 1;
+        self.gap.push_back(Gap { parent: self.epoch, heap: None });
+        f
+    }
+
+    /// The first gap node at or after epoch `e` that is a live child or the open node: the union-find root of
+    /// `e`'s set, with path halving. Epochs below `gap_base` were all dead children, so they start at the base.
+    fn find(&mut self, e: u64, steps: &mut u64) -> u64 {
+        let base = self.gap_base;
+        let mut x = e.max(base);
+        loop {
+            let p = self.gap[(x - base) as usize].parent;
+            if p == x {
+                return x;
+            }
+            let gp = self.gap[(p - base) as usize].parent;
+            self.gap[(x - base) as usize].parent = gp;
+            *steps += 1;
+            x = gp;
+        }
+    }
+
+    fn retain(&mut self, page: u32, v: Retained, work: &mut BranchWork) {
+        let rec = Rec {
+            died: v.died,
+            slot: v.slot,
+            page,
+            live: true,
+        };
+        let idx = match self.free_recs.pop() {
+            Some(i) => {
+                self.recs[i as usize] = rec;
+                i
+            }
+            None => {
+                self.recs.push(rec);
+                (self.recs.len() - 1) as u32
+            }
+        };
+        let recs = &self.recs;
+        let pv = self.retained.entry(page).or_default();
         crate::turso_assert!(
-            versions
+            pv.map
                 .last_key_value()
-                .is_none_or(|(_, last)| last.died <= v.born),
+                .is_none_or(|(_, &last)| recs[last as usize].died <= v.born),
             "a retained version overlaps an older one of the same page; the born-ordered lookup \
              would return the wrong one"
         );
-        crate::turso_assert!(page != NO_PAGE, "page number u32::MAX is the index sentinel");
-        versions.insert(v.born, v);
-        self.by_born.insert((v.born, page, v.died));
-        self.by_died.insert((v.died, page, v.born));
+        pv.map.insert(v.born, idx);
+        let s = self.find(v.born, &mut work.uf_find_steps);
+        crate::turso_assert!(
+            s < self.epoch,
+            "a version is retained only while a live child forked inside it"
+        );
+        let node = Some(Box::new(HeapNode {
+            died: v.died,
+            rec: idx,
+            rank: 1,
+            left: None,
+            right: None,
+        }));
+        let g = &mut self.gap[(s - self.gap_base) as usize];
+        g.heap = meld(g.heap.take(), node, &mut work.gc_meld_steps);
     }
 
     /// The retained version of `page` visible to a child forked at `f`: the born-predecessor of
     /// `f`, if it was still current at `f`. `examined` counts the versions compared against `f` —
-    /// at most one; the O(log V) descent that finds it is not counted.
+    /// at most one; the O(log V) descent that finds it is not counted. A tombstone never answers: a
+    /// freed version held no live child, so `f` (live) is past its `died`.
     fn retained_at(&self, page: u32, f: u64, examined: &mut u64) -> Option<Slot> {
-        let (_, v) = self.retained.get(&page)?.range(..=f).next_back()?;
+        let (_, &idx) = self.retained.get(&page)?.map.range(..=f).next_back()?;
         *examined += 1;
-        (f < v.died).then_some(v.slot)
+        let r = &self.recs[idx as usize];
+        (r.live && f < r.died).then_some(r.slot)
     }
 
-    /// Release every retained version that only the child forked at `f` could see. The caller has unlinked the
-    /// child from the list (amendment 21); `lo` and `hi` are its former neighbours' fork epochs.
+    /// Release every retained version that only the child forked at `f` could see. The caller has
+    /// unlinked the child from the list; `hi` is its former younger neighbour's fork epoch. The heap
+    /// filed under `f` is popped while `died <= hi` (all of it with no `hi`), the rest melded into
+    /// `hi`'s, and `f`'s gap node linked to the next epoch. No keyed search (amendment 22).
     fn child_gone(
         &mut self,
         f: u64,
-        lo: Option<u64>,
+        _lo: Option<u64>,
         hi: Option<u64>,
         arena: &mut Arena,
         work: &mut BranchWork,
     ) -> usize {
-        // Observation only (r11-adversarial PREREG amendment 19): the trees' sizes, once per call.
-        work.child_gone_tree_entries += (self.by_born.len() + self.by_died.len()) as u64;
         let t1 = std::time::Instant::now();
-        let dead = self.garbage(f, lo, hi, work);
-        let t2 = std::time::Instant::now();
-        // garbage: one range on each index; each dead version: its page's versions, by_born and by_died, one
-        // removal each. The neighbour search is gone (amendment 21).
-        work.child_gone_tree_ops += 2 + 3 * dead.len() as u64;
-        for &(born, page, died) in &dead {
-            let versions = self.retained.get_mut(&page).expect("indexed version is listed");
-            work.child_gone_tree_entries += versions.len() as u64;
-            let v = versions.remove(&born).expect("indexed version is listed");
+        crate::turso_assert!(f >= self.gap_base, "a live child's gap node was trimmed");
+        let i = (f - self.gap_base) as usize;
+        let mut heap = self.gap[i].heap.take();
+        self.gap[i].parent = f + 1;
+        let mut freed = 0;
+        while let Some(root) = heap.as_ref() {
+            work.gc_heap_examined += 1;
+            if hi.is_some_and(|hi| root.died > hi) {
+                break;
+            }
+            let mut root = heap.take().expect("checked above");
+            heap = meld(root.left.take(), root.right.take(), &mut work.gc_meld_steps);
+            let r = &mut self.recs[root.rec as usize];
+            crate::turso_assert!(r.live, "a filed version was already freed");
+            r.live = false;
+            let (page, slot) = (r.page, r.slot);
+            arena.release(slot);
             work.gc_examined += 1;
-            if versions.is_empty() {
+            freed += 1;
+            let recs = &self.recs;
+            let free = &mut self.free_recs;
+            let pv = self.retained.get_mut(&page).expect("a filed version is listed");
+            pv.dead += 1;
+            let mut now_empty = false;
+            if 2 * pv.dead as usize > pv.map.len() {
+                work.page_rebuild_entries += pv.map.len() as u64;
+                pv.map.retain(|_, idx| {
+                    let live = recs[*idx as usize].live;
+                    if !live {
+                        free.push(*idx);
+                    }
+                    live
+                });
+                pv.dead = 0;
+                now_empty = pv.map.is_empty();
+            }
+            if now_empty {
                 self.retained.remove(&page);
             }
-            let indexed = self.by_born.remove(&(born, page, died))
-                && self.by_died.remove(&(died, page, born));
-            crate::turso_assert!(indexed, "a released version was missing from an index");
-            arena.release(v.slot);
+        }
+        let t2 = std::time::Instant::now();
+        match hi {
+            Some(hi) => {
+                let g = &mut self.gap[(hi - self.gap_base) as usize];
+                g.heap = meld(g.heap.take(), heap, &mut work.gc_meld_steps);
+            }
+            None => crate::turso_assert!(
+                heap.is_none(),
+                "the youngest child left a version no live child holds"
+            ),
+        }
+        // Every epoch below the oldest live child is a dead child with an empty heap.
+        let keep = self.first.map_or(self.epoch, |(e, _)| e);
+        while self.gap_base < keep {
+            let n = self.gap.pop_front().expect("gap covers gap_base..=epoch");
+            crate::turso_assert!(n.heap.is_none(), "a dead child's gap node still held versions");
+            self.gap_base += 1;
         }
         work.cg_garbage_ns += (t2 - t1).as_nanos() as u64;
         work.cg_remove_ns += t2.elapsed().as_nanos() as u64;
-        dead.len()
-    }
-
-    /// The versions that held `f` and no other live child, as `(born, page, died)`, once `f` has
-    /// left `children`; `lo` and `hi` are its former neighbours there.
-    ///
-    /// Every retained version holds at least one live child's fork epoch: it is retained only if
-    /// one forked inside it, and this function hands it back the moment the last one goes. So a
-    /// version with `born > lo` and `died <= hi` held `f` and nothing else, and one holding `f`
-    /// that reaches back to `lo` or on to `hi` is still needed. That makes the garbage
-    /// `{born > lo, died <= hi}`, and each index answers one side of it:
-    ///
-    /// * `lo` absent: `died` in `(f, hi]`. Every such version was born at or before `f` (it holds
-    ///   a live child, and there is none below `f`), so every entry the range yields is garbage.
-    ///   This is the oldest child — the victim of uniform-TTL expiry — and the cost is what it frees.
-    /// * `hi` absent: `born` in `(lo, f]`, every entry garbage by the same argument.
-    /// * both: garbage lies in both ranges, and each also yields survivors (versions reaching past
-    ///   `hi`, or back past `lo`). The ranges are walked in lockstep and the first to end is
-    ///   filtered, so the walk costs twice the SMALLER range, never the larger.
-    ///
-    /// `gc_range_entries` counts every entry either range yields.
-    fn garbage(
-        &self,
-        f: u64,
-        lo: Option<u64>,
-        hi: Option<u64>,
-        work: &mut BranchWork,
-    ) -> Vec<(u64, u32, u64)> {
-        // `born` in (lo, f] and `died` in (f, hi], as bounds on the two indexes' first field.
-        let after = |e: u64| (e, NO_PAGE, u64::MAX);
-        let born_from = lo.map_or(Bound::Unbounded, |lo| Bound::Excluded(after(lo)));
-        let born_to = Bound::Included(after(f));
-        let died_from = Bound::Excluded(after(f));
-        let died_to = hi.map_or(Bound::Unbounded, |hi| Bound::Included(after(hi)));
-        let only_f = |born: u64, died: u64| {
-            lo.is_none_or(|lo| born > lo)
-                && born <= f
-                && f < died
-                && hi.is_none_or(|hi| died <= hi)
-        };
-        let mut by_born = self.by_born.range((born_from, born_to));
-        let mut by_died = self
-            .by_died
-            .range((died_from, died_to))
-            .map(|&(died, page, born)| (born, page, died));
-        let mut seen: [Vec<(u64, u32, u64)>; 2] = Default::default();
-        // Which ranges to walk: the one side's own range when a neighbour is missing, else both.
-        let walk = match (lo, hi) {
-            (None, _) => [false, true],
-            (Some(_), None) => [true, false],
-            (Some(_), Some(_)) => [true, true],
-        };
-        let finished = 'walk: loop {
-            for side in 0..2 {
-                if !walk[side] {
-                    continue;
-                }
-                let next = if side == 0 {
-                    by_born.next().copied()
-                } else {
-                    by_died.next()
-                };
-                match next {
-                    Some(v) => {
-                        work.gc_range_entries += 1;
-                        seen[side].push(v);
-                    }
-                    None => break 'walk side,
-                }
-            }
-        };
-        let mut dead = std::mem::take(&mut seen[finished]);
-        dead.retain(|&(born, _, died)| only_f(born, died));
-        dead
+        freed
     }
 
     fn release_all(self, arena: &mut Arena) -> Vec<Slot> {
-        let mut slots = Vec::new();
-        for (_, versions) in self.retained {
-            slots.extend(versions.into_values().map(|v| v.slot));
-        }
+        let slots: Vec<Slot> = self.recs.iter().filter(|r| r.live).map(|r| r.slot).collect();
         for &slot in &slots {
             arena.release(slot);
         }
@@ -387,8 +483,7 @@ impl BranchStore {
         }
         let id = BranchId(inner.next_id);
         inner.next_id += 1;
-        let f = inner.trunk.lineage.epoch;
-        inner.trunk.lineage.epoch += 1;
+        let f = inner.trunk.lineage.next_fork();
         let prev = inner.trunk.lineage.last.replace((f, id));
         if inner.trunk.lineage.first.is_none() {
             inner.trunk.lineage.first = Some((f, id));
@@ -413,8 +508,7 @@ impl BranchStore {
         if st.writer {
             return Err(LimboError::Busy);
         }
-        let f = st.lineage.epoch;
-        st.lineage.epoch += 1;
+        let f = st.lineage.next_fork();
         let prev = st.lineage.last.replace((f, id));
         if st.lineage.first.is_none() {
             st.lineage.first = Some((f, id));
@@ -511,13 +605,17 @@ impl BranchStore {
         h ^= lineage.nchildren as u64;
         let lo = st.sib_prev.map(|(e, _)| e);
         let hi = st.sib_next.map(|(e, _)| e);
-        let mut scratch = BranchWork::default();
-        for (born, page, died) in lineage.garbage(f, lo, hi, &mut scratch) {
-            if let Some(v) = lineage.retained.get(&page).and_then(|v| v.get(&born)) {
-                h ^= u64::from(v.slot);
+        // r2d: f's gap node, the heap root filed under it and its record, and hi's gap node.
+        if let Some(g) = f.checked_sub(lineage.gap_base).and_then(|i| lineage.gap.get(i as usize)) {
+            if let Some(root) = g.heap.as_ref() {
+                h ^= root.died ^ u64::from(lineage.recs[root.rec as usize].slot);
             }
-            h ^= u64::from(lineage.by_born.contains(&(born, page, died)));
-            h ^= u64::from(lineage.by_died.contains(&(died, page, born)));
+        }
+        if let Some(g) = hi
+            .and_then(|hi| hi.checked_sub(lineage.gap_base))
+            .and_then(|i| lineage.gap.get(i as usize))
+        {
+            h ^= u64::from(g.heap.is_some());
         }
         h ^ lo.unwrap_or(0) ^ hi.unwrap_or(0)
     }
@@ -580,7 +678,10 @@ impl BranchStore {
     ) -> Result<()> {
         let mut inner = self.inner.lock();
         let StoreInner {
-            arena, branches, ..
+            arena,
+            branches,
+            work,
+            ..
         } = &mut *inner;
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
@@ -607,6 +708,7 @@ impl BranchStore {
                             died: epoch,
                             slot: owned.slot,
                         },
+                        work,
                     );
                     st.current.insert(page, Owned { slot, born: epoch });
                     if let Some(view) = st.view.as_mut() {
@@ -632,7 +734,9 @@ impl BranchStore {
     /// can still see the version about to be overwritten, keep a copy of it for that child.
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) {
         let mut inner = self.inner.lock();
-        let StoreInner { arena, trunk, .. } = &mut *inner;
+        let StoreInner {
+            arena, trunk, work, ..
+        } = &mut *inner;
         let epoch = trunk.lineage.epoch;
         let born = trunk.written.get(&page).copied().unwrap_or(0);
         if born >= epoch {
@@ -649,6 +753,7 @@ impl BranchStore {
                     died: epoch,
                     slot,
                 },
+                work,
             );
         }
         trunk.written.insert(page, epoch);
@@ -729,9 +834,7 @@ impl BranchStore {
             return Vec::new();
         };
         let mut slots: Vec<u32> = st.current.values().map(|o| o.slot).collect();
-        for versions in st.lineage.retained.values() {
-            slots.extend(versions.values().map(|v| v.slot));
-        }
+        slots.extend(st.lineage.recs.iter().filter(|r| r.live).map(|r| r.slot));
         slots
     }
 

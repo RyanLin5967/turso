@@ -216,6 +216,12 @@ pub struct BranchWork {
     pub cg_children_ns: u64,
     pub cg_garbage_ns: u64,
     pub cg_remove_ns: u64,
+    /// r2d (r11-adversarial amendment 22), observation only: heap roots a reap looked at, right-spine nodes
+    /// visited by melds, union-find parent hops in retain's find, and entries a page-map rebuild walked.
+    pub gc_heap_examined: u64,
+    pub gc_meld_steps: u64,
+    pub uf_find_steps: u64,
+    pub page_rebuild_entries: u64,
 }
 
 impl Branch {

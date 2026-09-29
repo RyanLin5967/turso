@@ -391,6 +391,10 @@ struct WorkSum {
     seg_children: u64,
     seg_garbage: u64,
     seg_remove: u64,
+    heap_examined: u64,
+    meld_steps: u64,
+    uf_steps: u64,
+    rebuild_entries: u64,
 }
 
 impl WorkSum {
@@ -408,6 +412,10 @@ impl WorkSum {
         self.seg_children += b.cg_children_ns - a.cg_children_ns;
         self.seg_garbage += b.cg_garbage_ns - a.cg_garbage_ns;
         self.seg_remove += b.cg_remove_ns - a.cg_remove_ns;
+        self.heap_examined += b.gc_heap_examined - a.gc_heap_examined;
+        self.meld_steps += b.gc_meld_steps - a.gc_meld_steps;
+        self.uf_steps += b.uf_find_steps - a.uf_find_steps;
+        self.rebuild_entries += b.page_rebuild_entries - a.page_rebuild_entries;
     }
 }
 
@@ -472,7 +480,7 @@ impl Bench {
         let kept: Vec<f64> = us.iter().copied().filter(|&v| v <= p90).collect();
         let tmean = kept.iter().sum::<f64>() / kept.len() as f64;
         println!(
-            "{x}\t{name}\t{}\t{p50:.2}\t{:.2}\t{:.2}\t{:.2}\t{tmean:.4}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.1}\t{:.3}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}",
+            "{x}\t{name}\t{}\t{p50:.2}\t{:.2}\t{:.2}\t{:.2}\t{tmean:.4}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.1}\t{:.3}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
             us.len(),
             p90,
             percentile(&us, 99.0),
@@ -490,6 +498,10 @@ impl Bench {
             per(op.work.seg_children),
             per(op.work.seg_garbage),
             per(op.work.seg_remove),
+            per(op.work.heap_examined),
+            per(op.work.meld_steps),
+            per(op.work.uf_steps),
+            per(op.work.rebuild_entries),
         );
         let mut tails = op.tails.clone();
         tails.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
@@ -574,7 +586,7 @@ impl Bench {
     }
 }
 
-const HEADER: &str = "x\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\ttmean_le_p90_us\tresolves_per_op\tlevels_per_op\tret_examined_per_op\tgc_examined_per_op\tgc_range_per_op\ttree_ops_per_op\ttree_entries_per_op\tchild_gone_calls_per_op\tchild_gone_ns_per_op\treap_hold_ns_per_op\tcg_children_ns_per_op\tcg_garbage_ns_per_op\tcg_remove_ns_per_op";
+const HEADER: &str = "x\top\tsamples\tp50_us\tp90_us\tp99_us\tmax_us\ttmean_le_p90_us\tresolves_per_op\tlevels_per_op\tret_examined_per_op\tgc_examined_per_op\tgc_range_per_op\ttree_ops_per_op\ttree_entries_per_op\tchild_gone_calls_per_op\tchild_gone_ns_per_op\treap_hold_ns_per_op\tcg_children_ns_per_op\tcg_garbage_ns_per_op\tcg_remove_ns_per_op\theap_examined_per_op\tmeld_steps_per_op\tuf_steps_per_op\trebuild_entries_per_op";
 
 fn main() {
     let args = parse_args();
@@ -1134,6 +1146,10 @@ fn arm_churn(b: &mut Bench, args: &Args) {
                 all[i].work.seg_children += w.seg_children;
                 all[i].work.seg_garbage += w.seg_garbage;
                 all[i].work.seg_remove += w.seg_remove;
+                all[i].work.heap_examined += w.heap_examined;
+                all[i].work.meld_steps += w.meld_steps;
+                all[i].work.uf_steps += w.uf_steps;
+                all[i].work.rebuild_entries += w.rebuild_entries;
             }
             line += &format!(
                 " arena_in_use={} arena_high_water={} rss_bytes={}",
