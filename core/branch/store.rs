@@ -859,7 +859,7 @@ impl BranchStore {
             if st.handle || st.open || !st.lineage.children.is_empty() {
                 return freed;
             }
-            let st = inner.branches.remove(&id).expect("just looked it up");
+            let mut st = inner.branches.remove(&id).expect("just looked it up");
             let StoreInner {
                 arena,
                 trunk,
@@ -874,7 +874,8 @@ impl BranchStore {
                 arena.release(owned.slot);
                 freed += 1;
             }
-            freed += st.lineage.release_all(arena).len();
+            // Taken, not moved out of `st`: the state itself goes to the drop phase whole.
+            freed += std::mem::take(&mut st.lineage).release_all(arena).len();
             lap(mark, &mut probe.last[2]);
             if st.parent.is_trunk() {
                 freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
