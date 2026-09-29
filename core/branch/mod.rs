@@ -662,6 +662,10 @@ impl Database {
 #[cfg(all(test, feature = "fs"))]
 mod isolation_tests;
 
+/// r12-branch-noclear's T-K1, copied for r12-phasefair's gate under TURSO_R12_XI=on (r12-phasefair amendment 10).
+#[cfg(all(test, feature = "fs"))]
+mod noclear_tk1_tests;
+
 #[cfg(all(test, feature = "fs"))]
 mod mechanism_tests;
 

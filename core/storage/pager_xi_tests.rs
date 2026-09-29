@@ -111,10 +111,13 @@ fn assert_rows(conn: &Arc<Connection>, model: &BTreeMap<i64, String>, what: &str
 }
 
 /// T1 (red without F-XI): B rewrites a row on another leaf; A's next read transaction keeps page 1 (the same page
-/// object) and every page B did not rewrite, and drops the leaf B rewrote.
+/// object) and every page B did not rewrite, and drops exactly the pages B's commit rewrote. Which pages those are is read
+/// from the WAL FILE (the page number in each frame header B's commit appended), never from the frame index F-XI uses:
+/// an UPDATE may rewrite more than its leaf (amendment 10).
 #[test]
 fn xi_a_commit_that_misses_page_1_keeps_it_cached() {
-    let (_dir, db) = open_db();
+    let (dir, db) = open_db();
+    let wal = dir.path().join("xi.db-wal");
     let b = db.connect().unwrap();
     let mut model = BTreeMap::new();
     seed(&b, &mut model);
@@ -124,8 +127,15 @@ fn xi_a_commit_that_misses_page_1_keeps_it_cached() {
     assert_eq!(value(&a, ROWS), model[&ROWS]);
     let before = cached_pages(&pager);
     let page_1 = cached(&pager, 1).expect("A's reads cache page 1");
-    // Same length as the original, so the rewrite stays on its leaf and rewrites that one page.
+    let wal_before = std::fs::read(&wal).expect("the seeded database has a WAL file");
     set(&b, &mut model, ROWS, format!("rewritten-{}", "y".repeat(89)));
+    let written = pages_in_frames(&std::fs::read(&wal).unwrap(), wal_before.len());
+    eprintln!("T1: A cached {before:?}; B's commit wrote pages {written:?}");
+    assert!(!written.contains(&1), "the fixture must not rewrite page 1: B wrote {written:?}");
+    assert!(
+        !written.is_disjoint(&before),
+        "the fixture must rewrite a page A cached, or eviction is never exercised: {before:?} vs {written:?}"
+    );
     pager.begin_read_tx().unwrap();
     let after = cached_pages(&pager);
     let page_1_after = cached(&pager, 1);
@@ -134,11 +144,24 @@ fn xi_a_commit_that_misses_page_1_keeps_it_cached() {
         page_1_after.is_some_and(|p| Arc::ptr_eq(&p, &page_1)),
         "page 1 must stay cached, the same page, across a commit that did not rewrite it"
     );
-    let dropped: BTreeSet<usize> = before.difference(&after).copied().collect();
-    assert!(after.is_subset(&before), "a read tx adds no page before it reads one: {before:?} -> {after:?}");
-    assert_eq!(dropped.len(), 1, "exactly the rewritten leaf is dropped: {before:?} -> {after:?}");
+    let kept: BTreeSet<usize> = before.difference(&written).copied().collect();
+    assert_eq!(after, kept, "exactly the pages B's commit rewrote are dropped: {before:?} -> {after:?}, B wrote {written:?}");
     assert_eq!(value(&a, ROWS), model[&ROWS], "the dropped leaf is read again, rewritten");
     assert_eq!(value(&a, 1), model[&1]);
+}
+
+/// The page numbers in the WAL frames that start at byte `from` (the file's length before a commit). A WAL file is a
+/// 32-byte header (page size, big-endian, at offset 8) and then frames of a 24-byte header (page number, big-endian, at
+/// offset 0) plus one page.
+fn pages_in_frames(wal: &[u8], from: usize) -> BTreeSet<usize> {
+    let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
+    let frame = 24 + page_size;
+    assert!(from >= 32 && (from - 32) % frame == 0, "{from} is not a frame boundary (frame {frame})");
+    assert!((wal.len() - 32) % frame == 0, "the WAL file ends mid-frame: {} bytes", wal.len());
+    (from..wal.len())
+        .step_by(frame)
+        .map(|off| u32::from_be_bytes(wal[off..off + 4].try_into().unwrap()) as usize)
+        .collect()
 }
 
 /// T2: rounds of B's single-row updates (one frame each), multi-row updates and inserts that split pages and grow the
