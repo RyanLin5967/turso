@@ -39,6 +39,10 @@ pub(crate) struct ConcArgs {
     /// Some(true) makes writer w's j-th commit INSERT row `inserted_row(t, w, j)` past the seed.
     /// Either Some prints page_count on every conc line and ends with PRAGMA integrity_check.
     pub trunk_op: Option<bool>,
+    /// r11-walpin-conc amendment 30 (`--active S`): the readers visit only the first S of the K
+    /// sessions; the other K - S stay live branches, forked at setup and never read. None visits
+    /// all K (every earlier cell). Holds a fork's age at its reads fixed while K varies.
+    pub active: Option<usize>,
 }
 
 impl Default for ConcArgs {
@@ -52,7 +56,18 @@ impl Default for ConcArgs {
             storm: false,
             wbusy_timeout: false,
             trunk_op: None,
+            active: None,
         }
+    }
+}
+
+/// Of the sessions dealt round-robin to reader `tid` of `r` (global index `j * r + tid` for its
+/// `j`-th), how many are among the first `active` globally.
+fn active_in_thread(active: usize, r: usize, tid: usize) -> usize {
+    if tid >= active {
+        0
+    } else {
+        (active - tid).div_ceil(r)
     }
 }
 
@@ -408,7 +423,9 @@ fn reader(
     let mut samples = Vec::new();
     let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ ((tid as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03));
     let mut i = 0;
-    let n = sessions.len();
+    let n = c
+        .active
+        .map_or(sessions.len(), |a| active_in_thread(a, c.r, tid).min(sessions.len()));
     if n == 0 {
         return (samples, sessions);
     }
@@ -599,6 +616,12 @@ pub(crate) fn run_conc(bench: &mut Bench, args: &Args) {
     );
     if let Some(insert) = c.trunk_op {
         println!("# conc trunk_op={}", if insert { "insert" } else { "update" });
+    }
+    if let Some(a) = c.active {
+        if a < c.r || a > k {
+            die("--active must be at least --r and at most --k");
+        }
+        println!("# conc active={a} idle={}", k - a);
     }
     let zeros: Box<[u64]> = vec![0; c.t as usize].into();
     let mut per_thread: Vec<Vec<Sess>> = (0..c.r).map(|_| Vec::with_capacity(k / c.r + 1)).collect();

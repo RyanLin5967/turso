@@ -170,6 +170,9 @@ fn parse_args() -> Args {
                     other => die(&format!("unknown --trunk-op {other}")),
                 })
             }
+            "--active" => {
+                args.conc.active = Some(val().parse().unwrap_or_else(|_| die("bad --active")))
+            }
             "--storm" => {
                 args.conc.storm = match val().as_str() {
                     "none" => false,
