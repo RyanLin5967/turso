@@ -839,6 +839,7 @@ fn nreopen(args: &Args) {
     // K8-B (r12-composition amendment 10): every base read bracketed, so db page reads can be tied to
     // the C-P probes and branch loads of that call.
     let twk0 = db.branch_twk_counters();
+    let split0 = db.branch_probe_split_counters();
     let (mut pure_calls, mut pure_probes, mut pure_reads, mut pure_max) = (0u64, 0u64, 0u64, 0u64);
     let (mut load_calls, mut load_reads, mut probes_max) = (0u64, 0u64, 0u64);
     let mut pure_hist = [0u64; 10];
@@ -995,6 +996,27 @@ fn nreopen(args: &Args) {
     );
     let twk1 = db.branch_twk_counters();
     let (twk_probes, twk_rows) = (twk1.0 - twk0.0, twk1.1 - twk0.1);
+    let split1 = db.branch_probe_split_counters();
+    let (twk_reads, tva_probes, tva_rows, tva_reads) = (
+        split1.0 - split0.0,
+        split1.1 - split0.1,
+        split1.2 - split0.2,
+        split1.3 - split0.3,
+    );
+    println!(
+        "K8B_SPLIT\tlive={}\ttail={}\ttwk_probes={twk_probes}\ttwk_rows={twk_rows}\ttwk_reads={twk_reads}\t\
+         twk_reads_per_probe={}\ttva_probes={tva_probes}\ttva_rows={tva_rows}\ttva_reads={tva_reads}\ttva_reads_per_probe={}",
+        args.live,
+        args.tail,
+        ratio(twk_reads, twk_probes),
+        ratio(tva_reads, tva_probes),
+    );
+    if twk_probes + tva_probes != v4_1.4 - v4_0.4 {
+        not_a_result(&format!(
+            "probes split {twk_probes} + {tva_probes}, the store counted {} C-P probes",
+            v4_1.4 - v4_0.4
+        ));
+    }
     let cp_rows = v4_1.5 - v4_0.5;
     println!(
         "K8B\tlive={}\ttail={}\tkeys={n}\tarena_per_key={:.4}\tcp_rows_per_key={:.4}\ttwk_probes={twk_probes}\ttwk_rows={twk_rows}\t\

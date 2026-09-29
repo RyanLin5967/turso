@@ -597,6 +597,12 @@ impl Database {
         self.branches.twk_counters()
     }
 
+    /// `(twk reads, tva probes, tva rows, tva reads)` since open (r12-composition K8-B amendment 13).
+    #[doc(hidden)]
+    pub fn branch_probe_split_counters(&self) -> (u64, u64, u64, u64) {
+        self.branches.probe_split_counters()
+    }
+
     /// Trunk pre-images the store holds now (r11-restart lane instrument).
     #[doc(hidden)]
     pub fn branch_trunk_retained(&self) -> u64 {

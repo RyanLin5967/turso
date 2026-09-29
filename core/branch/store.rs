@@ -298,6 +298,12 @@ struct CatState {
     /// (r12-composition K8-B instrument; observing only).
     twk_probes: u64,
     twk_rows: u64,
+    /// Database page reads made inside those probes, and the same three for `trunk_version_at`'s
+    /// probe (r12-composition K8-B amendment 13: T2's reads split by probe kind; observing only).
+    twk_reads: u64,
+    tva_probes: u64,
+    tva_rows: u64,
+    tva_reads: u64,
 }
 
 impl CatState {
@@ -319,6 +325,10 @@ impl CatState {
             trunk_rows: 0,
             twk_probes: 0,
             twk_rows: 0,
+            twk_reads: 0,
+            tva_probes: 0,
+            tva_rows: 0,
+            tva_reads: 0,
         }
     }
 }
@@ -2117,6 +2127,17 @@ impl BranchStore {
         inner.cat.as_ref().map_or((0, 0), |c| (c.twk_probes, c.twk_rows))
     }
 
+    /// `(twk reads, tva probes, tva rows, tva reads)`: database page reads inside
+    /// `trunk_written_known`'s probes, and `trunk_version_at`'s probes, rows and reads, since open
+    /// (r12-composition K8-B amendment 13). Does not settle.
+    pub(crate) fn probe_split_counters(&self) -> (u64, u64, u64, u64) {
+        let inner = self.inner.lock();
+        inner
+            .cat
+            .as_ref()
+            .map_or((0, 0, 0, 0), |c| (c.twk_reads, c.tva_probes, c.tva_rows, c.tva_reads))
+    }
+
     pub(crate) fn open_stats(&self) -> BranchOpenStats {
         self.open_stats
     }
@@ -2581,7 +2602,10 @@ impl StoreInner {
         }
         cat.trunk_probes += 1;
         cat.twk_probes += 1;
-        if let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, u64::MAX)? {
+        let reads0 = super::page_io()[0];
+        let pred = cat.catalog.trunk_pred(page, u64::MAX);
+        cat.twk_reads += super::page_io()[0] - reads0;
+        if let Some((born, died, slot, crc)) = pred? {
             cat.trunk_rows += 1;
             cat.twk_rows += 1;
             // A version reaped since the checkpoint still dates the page's last write.
@@ -2631,10 +2655,15 @@ impl StoreInner {
             }
         }
         cat.trunk_probes += 1;
-        let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, at)? else {
+        cat.tva_probes += 1;
+        let reads0 = super::page_io()[0];
+        let pred = cat.catalog.trunk_pred(page, at);
+        cat.tva_reads += super::page_io()[0] - reads0;
+        let Some((born, died, slot, crc)) = pred? else {
             return Ok(None);
         };
         cat.trunk_rows += 1;
+        cat.tva_rows += 1;
         *examined += 1;
         // A reaped version held no live child, so it cannot be the one a live child reads.
         if at >= died || cat.trunk_gone.contains(&(page, born)) {
