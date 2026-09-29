@@ -94,6 +94,24 @@ const VALUE_LEN: usize = 100;
 const HOT_ROW: i64 = 1;
 /// Node 0 is the trunk.
 const TRUNK: u32 = 0;
+/// `--timing` (amendment 13): the buffer streamed before each checkpoint's timed samples, larger than this Mac's 16 MiB
+/// L2 plus its system cache, so every variant starts its samples from the same cache state (the rebuild arms would
+/// otherwise start with their fresh table's control bytes cached, and the control with them evicted).
+const FLUSH_MIB: usize = 64;
+/// The Williams design for five cells (amendment 13's --fork-batch): over 10 rounds each cell takes each position twice
+/// and follows each other cell twice.
+const WILLIAMS5: [[usize; 5]; 10] = [
+    [0, 1, 4, 2, 3],
+    [1, 2, 0, 3, 4],
+    [2, 3, 1, 4, 0],
+    [3, 4, 2, 0, 1],
+    [4, 0, 3, 1, 2],
+    [3, 2, 4, 1, 0],
+    [4, 3, 0, 2, 1],
+    [0, 4, 1, 3, 2],
+    [1, 0, 2, 4, 3],
+    [2, 1, 3, 0, 4],
+];
 /// One node in this many also reads the row its root-level ancestor wrote, through a full model walk.
 const DEEP_READ_EVERY: u32 = 64;
 
@@ -250,8 +268,8 @@ fn parse_args() -> Args {
                 let v = val();
                 let (k, n) = v.split_once(',').unwrap_or_else(|| die("--fork-batch needs K,N"));
                 let (k, n) = (num(k.to_string(), "--fork-batch K") as usize, num(n.to_string(), "--fork-batch N") as usize);
-                if k == 0 || n == 0 {
-                    die("--fork-batch needs K > 0 and N > 0");
+                if k == 0 || n == 0 || n % WILLIAMS5.len() != 0 {
+                    die("--fork-batch needs K > 0 and N a positive multiple of 10 (one Williams cycle per 10 rounds)");
                 }
                 args.fork_batch = Some((k, n));
             }
@@ -372,6 +390,8 @@ struct Bench {
     map0: MapWork,
     /// Nodes pushed by `--fork-batch` (amendment 13): shape bb's node-count checkpoints do not count them.
     extra_nodes: usize,
+    /// `--timing`: the FLUSH_MIB buffer (written once, so its pages are real), empty otherwise.
+    flush: Vec<u8>,
 }
 
 impl Bench {
@@ -713,6 +733,8 @@ impl Bench {
     fn sample(&mut self, args: &Args, x: u64, parents: &[u32], rng: &mut Rng) {
         let names = ["fork", "open", "write", "read_own", "read_other", "reap"];
         let mut t: [Vec<Duration>; 6] = Default::default();
+        // Amendment 13: the same cache state for every variant before the timed samples (see FLUSH_MIB).
+        std::hint::black_box(self.flush.iter().step_by(128).fold(0u64, |a, &b| a.wrapping_add(u64::from(b))));
         let (cap_before, anchor_before) = (self.db.branch_table_capacity(), self.anchor_addr(parents));
         for _ in 0..args.samples {
             let p = parents[rng.below(parents.len() as u64) as usize];
@@ -777,11 +799,13 @@ impl Bench {
 
     /// `--fork-batch K,N` (amendment 13), after the timed samples: 5N batches of K parents, each parent drawn as the samples
     /// draw them but never the trunk (whose fork is another code path). The batches run in N rounds of five timed cells, in
-    /// an order shuffled per round by the timing RNG; the cells are a factorial over the timed region's random-line accesses
-    /// (A: the harness's Node record of the parent; B: the store's fork_branch; C: Branch::new and the child's Node push):
+    /// the order of a Williams design (WILLIAMS5, the same at every checkpoint: each cell takes each position and follows
+    /// each other cell equally often); the cells are a factorial over the timed region's random-line accesses (A: the
+    /// harness's Node record of the parent; B: the store's fork_branch; C: Branch::new and the child's Node push):
     ///   fork_ball      A + B + C: `fork`, as the `fork` row times it;
     ///   fork_bnoa      B + C: the K parents' Node records are read before the timer, then `fork` is timed;
-    ///   fork_bsham     A + B + C after a sham pre-read of K other pool members' Node records (the pre-read's control);
+    ///   fork_bsham     A + B + C after a sham pre-read of K Node records drawn afresh from the pool (the pre-read's control;
+    ///                  in c3 the pool is the tip alone, so there it reads what bnoa reads);
     ///   fork_bharness  A only: the K Node records read as a dependent chain (each index waits on the previous read);
     ///   fork_bnone     none: the same dependent loop without the reads (the timer and loop floor).
     /// A batch records its elapsed time / K, so one clock tick is 1/K tick per parent. ball, bnoa and bsham fork; every
@@ -795,12 +819,8 @@ impl Bench {
         }
         let (cap_before, anchor_before) = (self.db.branch_table_capacity(), self.anchor_addr(&pool));
         let mut t: [Vec<f64>; 5] = Default::default();
-        for _ in 0..n {
-            let mut order = [0usize, 1, 2, 3, 4];
-            for i in (1..order.len()).rev() {
-                order.swap(i, rng.below(i as u64 + 1) as usize);
-            }
-            for cell in order {
+        for round in 0..n {
+            for cell in WILLIAMS5[round % WILLIAMS5.len()] {
                 let ps: Vec<u32> = (0..k).map(|_| pool[rng.below(pool.len() as u64) as usize]).collect();
                 let mut kids = Vec::with_capacity(k);
                 if cell == 1 || cell == 2 {
@@ -1209,8 +1229,8 @@ fn main() {
     println!(
         "# shape={:?} rows={:?} interior={:?} continue={} fr={} fi={} depth={} gamma_milli={} \
          fanout={} beam={} expand={} checkpoints={:?} seed={:#x} timing={} samples={} \
-         refcounted={} observe={OBSERVE} table={} table_rebuild={:?} probe_forks={} fork_batch={} trunk_rows={TRUNK_ROWS} \
-         value_len={VALUE_LEN} trunk_pages={page_count} build={}",
+         refcounted={} observe={OBSERVE} table={} table_rebuild={:?} probe_forks={} fork_batch={} flush_mib={} \
+         trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} trunk_pages={page_count} build={}",
         args.shape,
         args.rows,
         args.interior,
@@ -1231,6 +1251,7 @@ fn main() {
         args.rebuild,
         args.probe,
         args.fork_batch.map_or("none".to_string(), |(k, n)| format!("{k},{n}")),
+        if args.timing { FLUSH_MIB } else { 0 },
         if cfg!(debug_assertions) { "DEBUG" } else { "release" },
     );
     if args.timing {
@@ -1266,6 +1287,7 @@ fn main() {
         reads_checked: 0,
         map0: db.branch_stats().map_work,
         extra_nodes: 0,
+        flush: if args.timing { vec![1u8; FLUSH_MIB << 20] } else { Vec::new() },
     };
     match args.shape {
         Shape::Bb => shape_bb(&mut b, &args),
