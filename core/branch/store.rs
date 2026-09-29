@@ -105,6 +105,22 @@ pub(crate) struct BranchStore {
 #[cfg(not(feature = "branch-slab"))]
 type BranchTable = HashMap<BranchId, BranchState>;
 
+/// A HashMap table's bucket count, which std does not expose, from the span of its entries' addresses: entries sit in
+/// one array of `(K, V)` buckets, so the span in buckets rounds up to the count unless every entry lies in one half of the
+/// table (probability about 2^(1 - entries)). 0 when empty. Observation only (r11-bushy amendment 13); O(entries).
+#[cfg(not(feature = "branch-slab"))]
+fn buckets_of(table: &BranchTable) -> usize {
+    let (lo, hi) = table.values().fold((usize::MAX, 0), |(lo, hi), st| {
+        let a = st as *const BranchState as usize;
+        (lo.min(a), hi.max(a))
+    });
+    if lo > hi {
+        0
+    } else {
+        ((hi - lo) / std::mem::size_of::<(BranchId, BranchState)>() + 1).next_power_of_two()
+    }
+}
+
 #[cfg(feature = "branch-slab")]
 #[derive(Default)]
 struct BranchTable {
@@ -675,15 +691,30 @@ impl BranchStore {
     /// Rebuilds the branch table into a fresh allocation sized for `capacity` entries and returns `(items, capacity before,
     /// capacity after)`. Observation arm (r11-bushy amendment 12): it drops hashbrown's tombstones and sets its bucket count,
     /// to separate the table's size from its load factor and tombstones. The entries move unchanged.
+    /// Also returns the bucket counts before and after (`table_buckets`), so the arm can check what it set (amendment 13).
     #[cfg(not(feature = "branch-slab"))]
-    pub(crate) fn rebuild_table(&self, capacity: usize) -> (usize, usize, usize) {
+    pub(crate) fn rebuild_table(&self, capacity: usize) -> (usize, usize, usize, usize, usize) {
         let mut inner = self.inner.lock();
-        let before = inner.branches.capacity();
+        let (before, buckets_before) = (inner.branches.capacity(), buckets_of(&inner.branches));
         let old = std::mem::take(&mut inner.branches);
         let mut fresh = BranchTable::with_capacity(capacity.max(old.len()));
         fresh.extend(old);
         inner.branches = fresh;
-        (inner.branches.len(), before, inner.branches.capacity())
+        (inner.branches.len(), before, inner.branches.capacity(), buckets_before, buckets_of(&inner.branches))
+    }
+
+    /// The branch table's bucket count (see `buckets_of`). Observation only (r11-bushy amendment 13); O(branches).
+    #[cfg(not(feature = "branch-slab"))]
+    pub(crate) fn table_buckets(&self) -> usize {
+        buckets_of(&self.inner.lock().branches)
+    }
+
+    /// The address of `id`'s entry in the branch table, 0 if absent. A resize moves every entry to a new allocation and
+    /// an insert or a removal moves none, so a changed address around a stage means the table was rebuilt under it.
+    /// Observation only (r11-bushy amendment 13).
+    #[cfg(not(feature = "branch-slab"))]
+    pub(crate) fn table_entry_addr(&self, id: BranchId) -> usize {
+        self.inner.lock().branches.get(&id).map_or(0, |st| st as *const BranchState as usize)
     }
 
     /// Branch states with no handle and no open connection. Observation only; O(branches). Such a

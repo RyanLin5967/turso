@@ -370,6 +370,8 @@ struct Bench {
     reads_checked: u64,
     /// Page-map work before the shape ran (the fixture does none).
     map0: MapWork,
+    /// Nodes pushed by `--fork-batch` (amendment 13): shape bb's node-count checkpoints do not count them.
+    extra_nodes: usize,
 }
 
 impl Bench {
@@ -636,13 +638,43 @@ impl Bench {
                 Rebuild::Same => self.db.branch_table_capacity(),
                 Rebuild::Lf50 => (live * 7).div_ceil(4),
             };
-            let (items, before, after) = self.db.branch_table_rebuild(capacity);
-            println!("# table_rebuild x={x} items={items} cap_before={before} cap_after={after} mode={mode:?}");
+            let (items, before, after, buckets_before, buckets_after) = self.db.branch_table_rebuild(capacity);
+            println!(
+                "# table_rebuild x={x} items={items} cap_before={before} cap_after={after} buckets_before={buckets_before} \
+                 buckets_after={buckets_after} mode={mode:?}"
+            );
         }
     }
 
     #[cfg(feature = "branch-slab")]
     fn rebuild_table(&self, _: &Args, _: u64, _: usize) {}
+
+    /// Amendment 13: the HashMap table's bucket count (O(branches)); 0 with branch-slab.
+    #[cfg(not(feature = "branch-slab"))]
+    fn table_buckets(&self) -> usize {
+        self.db.branch_table_buckets()
+    }
+
+    #[cfg(feature = "branch-slab")]
+    fn table_buckets(&self) -> usize {
+        0
+    }
+
+    /// Amendment 13: the address of the first non-trunk parent's table entry (0 if none, or with branch-slab). A stage
+    /// that leaves it unchanged ran without a resize.
+    #[cfg(not(feature = "branch-slab"))]
+    fn anchor_addr(&self, parents: &[u32]) -> usize {
+        parents
+            .iter()
+            .find(|&&p| p != TRUNK)
+            .and_then(|&p| self.nodes[p as usize].branch.as_ref())
+            .map_or(0, |b| self.db.branch_table_entry_addr(b.id()))
+    }
+
+    #[cfg(feature = "branch-slab")]
+    fn anchor_addr(&self, _: &[u32]) -> usize {
+        0
+    }
 
     /// `--probe-forks K` (amendment 10): K forks from `parents`, off the workload's stream, each child pruned at once, with
     /// the work each fork does counted: allocations and bytes, page-map work, page-map nodes, the branch table's capacity.
@@ -692,7 +724,7 @@ impl Bench {
     fn sample(&mut self, args: &Args, x: u64, parents: &[u32], rng: &mut Rng) {
         let names = ["fork", "open", "write", "read_own", "read_other", "reap"];
         let mut t: [Vec<Duration>; 6] = Default::default();
-        let cap_before = self.db.branch_table_capacity();
+        let (cap_before, anchor_before) = (self.db.branch_table_capacity(), self.anchor_addr(parents));
         for _ in 0..args.samples {
             let p = parents[rng.below(parents.len() as u64) as usize];
             let a = Instant::now();
@@ -742,24 +774,35 @@ impl Bench {
                 us[us.len() - 1]
             );
         }
-        // Amendment 13: the table's capacity around the timed samples, so a bucket-count change during them is counted.
-        println!("# sampletable x={x} cap_before={cap_before} cap_after={}", self.db.branch_table_capacity());
+        // Amendment 13: the table around the timed samples. moved=1 when the anchor entry's address changed (a resize).
+        println!(
+            "# sampletable x={x} cap_before={cap_before} cap_after={} moved={} buckets_after={}",
+            self.db.branch_table_capacity(),
+            u8::from(self.anchor_addr(parents) != anchor_before),
+            self.table_buckets()
+        );
         if let Some((k, n)) = args.fork_batch {
             self.fork_batches(x, parents, rng, k, n);
         }
     }
 
-    /// `--fork-batch K,N` (amendment 13), after the timed samples: 2N batches of K forks, each fork from a parent drawn
-    /// as the samples draw them, alternating the timer's placement batch by batch. `fork_bfull` times what the `fork` row
-    /// times (the parent's Node record, the store's fork, the child's Node push); `fork_bstore` reads the K parents'
-    /// Node records before the timer and times only the store's fork calls, with the Node bookkeeping after it. A batch
-    /// records its elapsed time / K, so one clock tick is 1/K tick per fork. Every child is pruned after its batch: at
-    /// most K extra entries are live, and the table sees 2NK inserts and removes.
+    /// `--fork-batch K,N` (amendment 13), after the timed samples: 2N batches of K forks, each from a parent drawn as the
+    /// samples draw them but never the trunk (whose fork is another code path), alternating the timer's placement batch by
+    /// batch. `fork_bfull` times what the `fork` row times (the parent's Node record, the store's fork, the child's Node
+    /// push); `fork_bstore` reads the K parents' Branch handles (the Node fields `fork` reads) before the timer and times
+    /// only the store's fork calls, with the Node bookkeeping after it. A batch records its elapsed time / K, so one clock
+    /// tick is 1/K tick per fork. Every child is pruned after its batch: at most K extra entries are live, the table sees
+    /// 2NK inserts and removes, and the 2NK Nodes are not counted as shape bb's tree (`extra_nodes`).
     fn fork_batches(&mut self, x: u64, parents: &[u32], rng: &mut Rng, k: usize, n: usize) {
-        let cap_before = self.db.branch_table_capacity();
+        let pool: Vec<u32> = parents.iter().copied().filter(|&p| p != TRUNK).collect();
+        if pool.is_empty() {
+            println!("# forkbatch x={x} k={k} n={n} skipped=no_parent");
+            return;
+        }
+        let (cap_before, anchor_before) = (self.db.branch_table_capacity(), self.anchor_addr(&pool));
         let mut t: [Vec<f64>; 2] = Default::default();
         for j in 0..2 * n {
-            let ps: Vec<u32> = (0..k).map(|_| parents[rng.below(parents.len() as u64) as usize]).collect();
+            let ps: Vec<u32> = (0..k).map(|_| pool[rng.below(pool.len() as u64) as usize]).collect();
             let mut kids = Vec::with_capacity(k);
             if j % 2 == 0 {
                 let a = Instant::now();
@@ -770,22 +813,17 @@ impl Bench {
             } else {
                 let mut branches = Vec::with_capacity(k);
                 {
-                    let handles: Vec<Option<&Branch>> = ps
+                    let handles: Vec<&Branch> = ps
                         .iter()
                         .map(|&p| {
-                            if p == TRUNK {
-                                None
-                            } else {
-                                Some(self.nodes[p as usize].branch.as_ref().expect("forked from a live handle"))
-                            }
+                            let b = self.nodes[p as usize].branch.as_ref().expect("forked from a live handle");
+                            std::hint::black_box(b.id());
+                            b
                         })
                         .collect();
                     let a = Instant::now();
-                    for h in &handles {
-                        branches.push(match h {
-                            None => self.trunk.fork_branch().unwrap(),
-                            Some(b) => b.fork().unwrap(),
-                        });
+                    for b in &handles {
+                        branches.push(b.fork().unwrap());
                     }
                     t[1].push(a.elapsed().as_secs_f64() * 1e6 / k as f64);
                 }
@@ -793,6 +831,7 @@ impl Bench {
                     kids.push(self.record_fork(p, branch));
                 }
             }
+            self.extra_nodes += k;
             for (id, branch) in kids {
                 self.prune(id, branch);
             }
@@ -810,8 +849,10 @@ impl Bench {
             );
         }
         println!(
-            "# forkbatch x={x} k={k} n={n} cap_before={cap_before} cap_after={}",
-            self.db.branch_table_capacity()
+            "# forkbatch x={x} k={k} n={n} cap_before={cap_before} cap_after={} moved={} buckets_after={}",
+            self.db.branch_table_capacity(),
+            u8::from(self.anchor_addr(&pool) != anchor_before),
+            self.table_buckets()
         );
     }
 
@@ -865,9 +906,9 @@ fn shape_bb(b: &mut Bench, args: &Args) {
         pos[id as usize] = u32::MAX;
     };
     for &x in &args.checkpoints {
-        while ((b.nodes.len() - 1) as u64) < x {
+        while ((b.nodes.len() - 1 - b.extra_nodes) as u64) < x {
             if eligible.is_empty() {
-                not_a_result(&format!("the tree saturated at {} nodes", b.nodes.len() - 1));
+                not_a_result(&format!("the tree saturated at {} nodes", b.nodes.len() - 1 - b.extra_nodes));
             }
             let p = eligible[b.rng.below(eligible.len() as u64) as usize];
             let (id, branch) = b.fork(p);
@@ -1199,6 +1240,7 @@ fn main() {
         cascades: 0,
         reads_checked: 0,
         map0: db.branch_stats().map_work,
+        extra_nodes: 0,
     };
     match args.shape {
         Shape::Bb => shape_bb(&mut b, &args),

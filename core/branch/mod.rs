@@ -402,11 +402,27 @@ impl Database {
     }
 
     /// Rebuilds the branch table into a fresh allocation sized for `capacity` entries; returns `(items, capacity before,
-    /// capacity after)`. Observation arm (r11-bushy amendment 12); HashMap builds only.
+    /// capacity after, buckets before, buckets after)`. Observation arm (r11-bushy amendments 12 and 13); HashMap builds only.
     #[doc(hidden)]
     #[cfg(not(feature = "branch-slab"))]
-    pub fn branch_table_rebuild(&self, capacity: usize) -> (usize, usize, usize) {
+    pub fn branch_table_rebuild(&self, capacity: usize) -> (usize, usize, usize, usize, usize) {
         self.branches.rebuild_table(capacity)
+    }
+
+    /// The branch table's bucket count, inferred from its entries' addresses. Observation only (r11-bushy amendment 13);
+    /// O(branches); HashMap builds only.
+    #[doc(hidden)]
+    #[cfg(not(feature = "branch-slab"))]
+    pub fn branch_table_buckets(&self) -> usize {
+        self.branches.table_buckets()
+    }
+
+    /// The address of `id`'s entry in the branch table, 0 if absent; it changes when the table is resized. Observation
+    /// only (r11-bushy amendment 13); HashMap builds only.
+    #[doc(hidden)]
+    #[cfg(not(feature = "branch-slab"))]
+    pub fn branch_table_entry_addr(&self, id: BranchId) -> usize {
+        self.branches.table_entry_addr(id)
     }
 
     /// Branch states with no handle and no open connection. O(branches). Always 0: such a state is
