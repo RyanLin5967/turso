@@ -811,10 +811,10 @@ impl Bench {
             println!("# forkbatch x={x} k={k} n={n} skipped=no_parent");
             return;
         }
-        // Fault in the Node Vec pages the stage's pushes will use, untimed, so no timed batch takes a page fault (a
-        // reallocation, if one is due, also happens here, identically in every variant).
+        // Fault in the Node Vec pages the stage's pushes will use, untimed, so no timed batch takes a page fault. Plain
+        // pushes keep the Vec's own growth sequence: a reallocation the stage would have made happens here instead, and
+        // none is added (identically in every variant).
         let (len, forks) = (self.nodes.len(), 3 * k * n);
-        self.nodes.reserve(forks);
         for _ in 0..forks {
             self.nodes.push(Node {
                 parent: TRUNK,
