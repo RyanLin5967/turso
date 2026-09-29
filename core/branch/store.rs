@@ -217,6 +217,9 @@ pub(crate) struct BranchStore {
     fs10: AtomicBool,
     /// FS9B (r11-sessions): serve inherited ancestor-branch versions by reference (`Arena::clones`).
     fs9b: AtomicBool,
+    /// r12-lakehouse A9.2: also evict an FS9 clone the moment the last live fork in its `[lo, hi)`
+    /// goes, not only when the horizon passes `hi` (`TURSO_R12_CLONE_EVICT=interval`).
+    clone_evict_interval: AtomicBool,
 }
 
 /// Where the page a branch asked for comes from.
@@ -397,6 +400,8 @@ struct StoreInner {
     retained_clones: HashMap<(u32, u64, u64), Arc<crate::alloc::DynBoxedSlice<u8>>>,
     /// The keys of `retained_clones` as `(hi, page, lo)`, for the horizon eviction.
     clones_by_hi: BTreeSet<(u64, u32, u64)>,
+    /// The keys as `(lo, page, hi)`, for the interval eviction's side by `lo` (r12-lakehouse A9.2).
+    clones_by_lo: BTreeSet<(u64, u32, u64)>,
 }
 
 /// Where `StoreInner::resolve_origin` found a page.
@@ -913,6 +918,51 @@ impl TrunkState {
     }
 }
 
+/// FS9-U11 interval eviction (r12-lakehouse PREREG A9.2): the clones that held the departed fork `f`
+/// and no other live fork, once `f` has left the trunk's children; `lo_n` and `hi_n` are its former
+/// live neighbours. A clone `[lo, hi)` holding `f` holds no live fork exactly when `lo_n < lo` and
+/// `hi <= hi_n`, so the garbage is `{lo_n < lo <= f < hi <= hi_n}`: F2's garbage query
+/// (`Lineage::garbage`) applied to clone intervals. Each side of it is a range of one index (`lo` in
+/// `(lo_n, f]`, `hi` in `(f, hi_n]`), and both hold the whole garbage, so the two are walked in
+/// lockstep and the side that ends first is filtered: the walk costs twice the smaller range.
+/// `entries` counts every index entry visited.
+fn clone_garbage(
+    by_lo: &BTreeSet<(u64, u32, u64)>,
+    by_hi: &BTreeSet<(u64, u32, u64)>,
+    f: u64,
+    lo_n: Option<u64>,
+    hi_n: Option<u64>,
+    entries: &mut u64,
+) -> Vec<(u32, u64, u64)> {
+    let after = |e: u64| (e, u32::MAX, u64::MAX);
+    let lo_from = lo_n.map_or(Bound::Unbounded, |l| Bound::Excluded(after(l)));
+    let hi_to = hi_n.map_or(Bound::Unbounded, |h| Bound::Included(after(h)));
+    let mut side_lo = by_lo
+        .range((lo_from, Bound::Included(after(f))))
+        .map(|&(lo, page, hi)| (page, lo, hi));
+    let mut side_hi = by_hi
+        .range((Bound::Excluded(after(f)), hi_to))
+        .map(|&(hi, page, lo)| (page, lo, hi));
+    let mut seen: [Vec<(u32, u64, u64)>; 2] = Default::default();
+    let finished = 'walk: loop {
+        for side in 0..2 {
+            let next = if side == 0 { side_lo.next() } else { side_hi.next() };
+            match next {
+                Some(key) => {
+                    *entries += 1;
+                    seen[side].push(key);
+                }
+                None => break 'walk side,
+            }
+        }
+    };
+    let mut dead = std::mem::take(&mut seen[finished]);
+    dead.retain(|&(_, lo, hi)| {
+        lo_n.is_none_or(|l| lo > l) && lo <= f && f < hi && hi_n.is_none_or(|h| hi <= h)
+    });
+    dead
+}
+
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
@@ -983,6 +1033,7 @@ impl BranchStore {
                 work: BranchWork::default(),
                 retained_clones: HashMap::new(),
                 clones_by_hi: BTreeSet::new(),
+                clones_by_lo: BTreeSet::new(),
             }),
             trunk_children: AtomicUsize::new(0),
             lock_timing: AtomicBool::new(false),
@@ -995,6 +1046,9 @@ impl BranchStore {
             fs9: AtomicBool::new(fs9_from_env()),
             fs10: AtomicBool::new(std::env::var("TURSO_R11S_FS10").is_ok_and(|v| v == "1")),
             fs9b: AtomicBool::new(fs9b_from_env()),
+            clone_evict_interval: AtomicBool::new(
+                std::env::var("TURSO_R12_CLONE_EVICT").is_ok_and(|v| v == "interval"),
+            ),
         }
     }
 
@@ -1039,6 +1093,26 @@ impl BranchStore {
     /// Observation only (a walk of the installed radix leaves).
     pub(crate) fn trunk_cache_pages(&self) -> usize {
         self.trunk_pages.pages.count(|slot| slot.load().is_some())
+    }
+
+    pub(crate) fn set_clone_evict_interval(&self, on: bool) {
+        self.clone_evict_interval.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn clone_evict_interval(&self) -> bool {
+        self.clone_evict_interval.load(Ordering::Relaxed)
+    }
+
+    /// FS9 clones no live child can ever read again: those whose `[lo, hi)` holds no live trunk
+    /// fork (a later fork is at or past `hi`). Observation only, O(clones log children).
+    pub(crate) fn retained_clone_orphans(&self) -> usize {
+        let inner = self.inner.lock();
+        let children = &inner.trunk.lineage.children;
+        inner
+            .retained_clones
+            .keys()
+            .filter(|&&(_, lo, hi)| children.range(lo..hi).next().is_none())
+            .count()
     }
 
     pub(crate) fn retained_clone_count(&self) -> usize {
@@ -1429,6 +1503,7 @@ impl BranchStore {
                     work,
                     retained_clones,
                     clones_by_hi,
+                    clones_by_lo,
                     ..
                 } = &mut *inner;
                 let arena = arena
@@ -1459,6 +1534,7 @@ impl BranchStore {
                             let bytes = Arc::new(image.into_boxed_slice());
                             retained_clones.insert((page, lo, hi), bytes.clone());
                             clones_by_hi.insert((hi, page, lo));
+                            clones_by_lo.insert((lo, page, hi));
                             work.retained_clone_fills += 1;
                             bytes
                         }
@@ -1573,6 +1649,17 @@ impl BranchStore {
         (keys, inner.clones_by_hi.len())
     }
 
+    /// The sizes of FS9's clone map and of its two key indexes, which must agree.
+    #[cfg(test)]
+    fn clone_index_lens(&self) -> (usize, usize, usize) {
+        let inner = self.inner.lock();
+        (
+            inner.retained_clones.len(),
+            inner.clones_by_hi.len(),
+            inner.clones_by_lo.len(),
+        )
+    }
+
     /// The trunk's retained chunk versions as `(page, chunk, died)`, for membership assertions.
     #[cfg(test)]
     fn trunk_version_keys(&self) -> std::collections::BTreeSet<(u32, u16, u64)> {
@@ -1615,6 +1702,7 @@ impl BranchStore {
                 work,
                 retained_clones,
                 clones_by_hi,
+                clones_by_lo,
                 ..
             } = &mut *inner;
             let arena = arena.as_mut().expect("a branch existed, so the arena does");
@@ -1657,8 +1745,35 @@ impl BranchStore {
                     }
                 };
                 // FS9's clones. A live child reads a clone only if its fork lies in the clone's
-                // [lo, hi), and every later fork is at or past `hi`, so a clone whose `hi` is at or
-                // below the oldest live fork can never be read again (U11's horizon eviction).
+                // [lo, hi), and every later fork is at or past `hi`. With interval eviction on, the
+                // clones that held this fork and no other live one go now (r12-lakehouse A9.2):
+                // exact under any expiry order, where the horizon alone lets a straggler pin them.
+                if self.clone_evict_interval.load(Ordering::Relaxed) {
+                    #[cfg(test)]
+                    let evict = !mutants::on("FS9_NO_INTERVAL_EVICT");
+                    #[cfg(not(test))]
+                    let evict = true;
+                    let f = st.fork_epoch;
+                    let children = &trunk.lineage.children;
+                    let lo_n = children.range(..f).next_back().map(|(&e, _)| e);
+                    let hi_n = children.range(f..).next().map(|(&e, _)| e);
+                    let dead = clone_garbage(
+                        clones_by_lo,
+                        clones_by_hi,
+                        f,
+                        lo_n,
+                        hi_n,
+                        &mut work.clone_gc_entries,
+                    );
+                    for (page, lo, hi) in dead.into_iter().filter(|_| evict) {
+                        retained_clones.remove(&(page, lo, hi));
+                        clones_by_hi.remove(&(hi, page, lo));
+                        clones_by_lo.remove(&(lo, page, hi));
+                        work.retained_clone_interval_evictions += 1;
+                    }
+                }
+                // Then the horizon: a clone whose `hi` is at or below the oldest live fork can never
+                // be read again (U11's horizon eviction; exact under FIFO expiry).
                 let oldest = trunk.lineage.children.keys().next().copied();
                 #[cfg(test)]
                 let evict = !mutants::on("FS9_NO_EVICT");
@@ -1672,6 +1787,7 @@ impl BranchStore {
                         break;
                     }
                     clones_by_hi.pop_first();
+                    clones_by_lo.remove(&(lo, page, hi));
                     retained_clones.remove(&(page, lo, hi));
                     work.retained_clone_evictions += 1;
                 }
@@ -1682,6 +1798,7 @@ impl BranchStore {
                     trunk.chunk_born.clear();
                     retained_clones.clear();
                     clones_by_hi.clear();
+                    clones_by_lo.clear();
                     // From here the trunk writes without telling the store, so no cached version
                     // can be trusted once a branch exists again. No branch can read in between:
                     // a fork needs this lock.
@@ -2375,6 +2492,105 @@ mod tests {
             store.release_handle(id);
         }
         assert_eq!(store.clone_keys(), (Vec::new(), 0), "seed {seed:#x}: clones leaked");
+    }
+
+    /// r12-lakehouse A9.2: a TAG, the first child, lives for the whole run while the trunk rewrites
+    /// random chunks and every other child is reaped in random order, so the oldest live fork never
+    /// moves and U11's horizon never evicts. With interval eviction on, no clone ever outlives the
+    /// last live fork in its `[lo, hi)` (0 orphans after every step), every child reads every page
+    /// right, and the clone map and both key indexes agree. With it off, orphans appear: the leak the
+    /// eviction exists for, and the proof that the orphan count can fire. Red mutant:
+    /// `FS9_NO_INTERVAL_EVICT` (the query runs, nothing is dropped).
+    #[test]
+    fn fs9_interval_eviction_leaves_no_orphan_clone_under_a_tag() {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            for budget in [None, Some(2)] {
+                assert!(
+                    run_tagged(seed, budget, false) > 0,
+                    "seed {seed:#x} {budget:?}: horizon-only eviction left no orphan under a tag (the \
+                     test cannot see the leak)"
+                );
+                assert_eq!(run_tagged(seed, budget, true), 0, "seed {seed:#x} {budget:?}");
+            }
+        }
+    }
+
+    /// One tagged run; returns the most orphaned clones seen after any step.
+    fn run_tagged(seed: u64, budget: Option<usize>, interval: bool) -> usize {
+        let store = BranchStore::with_config(CHUNK, budget);
+        store.set_fs9(true);
+        store.set_clone_evict_interval(interval);
+        let mut rng = Rng(seed);
+        let mut current: HashMap<u32, [u64; CPP]> = (0..PAGES).map(|p| (p, [0; CPP])).collect();
+        let tag = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        let tag_view = current.clone();
+        let mut live: Vec<(BranchId, u64, HashMap<u32, [u64; CPP]>)> = Vec::new();
+        let (mut epoch, mut generation) = (1u64, 0u64);
+        let mut most = 0;
+        for step in 0..2000 {
+            match rng.below(10) {
+                0..=2 if live.len() < 40 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+                    live.push((id, epoch, current.clone()));
+                    epoch += 1;
+                }
+                0..=5 => {
+                    for _ in 0..=rng.below(3) {
+                        let page = rng.below(PAGES as u64) as u32;
+                        store.first_write_trunk(page, &chunked(&current[&page]));
+                        let mut gens = current[&page];
+                        for g in gens.iter_mut() {
+                            if rng.below(2) == 0 {
+                                generation += 1;
+                                *g = generation;
+                            }
+                        }
+                        current.insert(page, gens);
+                    }
+                }
+                _ if !live.is_empty() => {
+                    let at = rng.below(live.len() as u64) as usize;
+                    let (id, _, _) = live.remove(at);
+                    store.release_handle(id);
+                }
+                _ => {}
+            }
+            let (held, by_hi, by_lo) = store.clone_index_lens();
+            assert_eq!((by_hi, by_lo), (held, held), "seed {seed:#x} step {step}: the key indexes disagree");
+            let orphans = store.retained_clone_orphans();
+            if interval {
+                assert_eq!(
+                    orphans, 0,
+                    "seed {seed:#x} {budget:?} step {step}: a clone outlived every live fork in its interval"
+                );
+            }
+            most = most.max(orphans);
+            let mut buf = vec![0u8; PAGE];
+            let mut check = |id: BranchId, f: u64, view: &HashMap<u32, [u64; CPP]>| {
+                for page in 0..PAGES {
+                    let got = match store.resolve_shared(id, page, &mut buf).unwrap() {
+                        Resolved::Shared(bytes) => bytes.to_vec(),
+                        Resolved::Filled => buf.clone(),
+                        Resolved::Trunk(_) => chunked(&current[&page]),
+                    };
+                    assert_eq!(
+                        got,
+                        chunked(&view[&page]),
+                        "seed {seed:#x} {budget:?} step {step}: child forked at {f} read the wrong page {page}"
+                    );
+                }
+            };
+            check(tag, 0, &tag_view);
+            for (id, f, view) in &live {
+                check(*id, *f, view);
+            }
+        }
+        for (id, _, _) in live {
+            store.release_handle(id);
+        }
+        store.release_handle(tag);
+        assert_eq!(store.clone_index_lens(), (0, 0, 0), "seed {seed:#x}: clones leaked");
+        most
     }
 
     #[test]

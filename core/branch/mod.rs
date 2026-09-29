@@ -308,6 +308,11 @@ pub struct BranchWork {
     pub retained_clone_fills: u64,
     /// FS9: clones dropped because the oldest live fork reached their interval's end.
     pub retained_clone_evictions: u64,
+    /// FS9 interval eviction (r12-lakehouse A9.2): clones dropped when the last live fork in their
+    /// interval went.
+    pub retained_clone_interval_evictions: u64,
+    /// FS9 interval eviction: clone index entries visited by its garbage query.
+    pub clone_gc_entries: u64,
     /// Resolutions answered with a version an ANCESTOR BRANCH holds for this branch (through the
     /// inherited page map), copied into the caller's private buffer (FS9B off).
     pub inherited_copies: u64,
@@ -574,6 +579,18 @@ impl Database {
     #[doc(hidden)]
     pub fn retained_clone_count(&self) -> usize {
         self.branches.retained_clone_count()
+    }
+
+    /// FS9 clones no live child can read again (r12-lakehouse A9.2 instrument).
+    #[doc(hidden)]
+    pub fn retained_clone_orphans(&self) -> usize {
+        self.branches.retained_clone_orphans()
+    }
+
+    /// Whether FS9 clones are also evicted when their interval's last live fork goes.
+    #[doc(hidden)]
+    pub fn clone_evict_interval(&self) -> bool {
+        self.branches.clone_evict_interval()
     }
 
     /// The trunk WAL's state, for the r11-walpin instrument (observation only).
