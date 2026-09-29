@@ -4037,6 +4037,9 @@ impl Pager {
                 .buffer
                 .as_ref()
                 .is_some_and(|b| matches!(**b, Buffer::Shared(_)));
+            // Rule One BATCH2 item 4 (r11-sessions amendment 18c): LAW_NO_COW_COPY skips the copy.
+            #[cfg(test)]
+            let shared = shared && !crate::branch::store::mutants::on("LAW_NO_COW_COPY");
             if shared {
                 let private = self.buffer_pool.get_page();
                 private
