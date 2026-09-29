@@ -974,14 +974,15 @@ mod tests {
 
     /// r12-e3 amendment 7 (u1): with the base placement (right after the hand) an untouched page
     /// inserted into a full cache is evicted by the second later insert, at any capacity; placed
-    /// just before the hand (the POL arm) it survives at least capacity - 1 later inserts.
+    /// just before the hand (the POL arm) it survives at least capacity - 1 later inserts. Page
+    /// ids start at 2: page 1 (the header page) is never evictable and would hold a slot.
     #[test]
     fn a_fresh_page_lives_two_inserts_after_the_hand_and_a_revolution_behind_it() {
         for cap in [16usize, 2000] {
             for behind in [false, true] {
                 let mut c = PageCache::new_with_spill(cap, true);
                 c.insert_behind_hand = behind;
-                let mut next = 1usize;
+                let mut next = 2usize;
                 for _ in 0..3 * cap {
                     insert_page(&mut c, next);
                     next += 1;
@@ -996,7 +997,7 @@ mod tests {
                     lived += 1;
                 }
                 if behind {
-                    assert!(lived + 1 >= cap, "cap {cap} behind: evicted after {lived} inserts");
+                    assert!(lived >= cap, "cap {cap} behind: evicted after {lived} inserts");
                 } else {
                     assert!(lived <= 2, "cap {cap} after the hand: lived {lived} inserts");
                 }

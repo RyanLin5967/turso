@@ -158,9 +158,11 @@ pub(crate) fn count_fsync() {
 // r12-e3 amendment 7 (observing): a reap is PENDING from its first prefetch until its section
 // starts. Every page one of its prefetches inserted into the branch catalog's page cache and that
 // leaves that cache while it is pending is counted here, for the reap to take when it settles.
-// A reaper thread owns one slot; a tag is (slot << 48) | the reap's process-wide serial, so a
-// stale page (an earlier reap's) never matches a later reap. With at most 64 reaper threads alive,
-// two live threads never share a slot (blind spot beyond that, stated).
+// A reaper thread owns one slot while it lives (a live-slot bitmap; freed at thread exit), so two
+// live threads never share one; a 65th live thread gets no slot and is counted in `PF_OVERFLOW`
+// (the harness refuses a cell with any). A tag is (slot << 48) | the reap's process-wide serial,
+// so a stale page (an earlier reap's) never matches a later reap. A slot's pending serial and its
+// counters change only under that slot's lock, so a count can never land on a later reap.
 const PF_SLOTS: usize = 64;
 const PF_SERIAL_BITS: u32 = 48;
 /// Age buckets (in the cache's inserts after the page's own): <= 2, 3-16, 17-256, 257-4096, more.
@@ -172,8 +174,12 @@ static PF_PENDING: [crate::sync::atomic::AtomicU64; PF_SLOTS] =
     [const { crate::sync::atomic::AtomicU64::new(0) }; PF_SLOTS];
 static PF_REMOVED: [crate::sync::atomic::AtomicU64; PF_SLOTS * PF_COUNTERS] =
     [const { crate::sync::atomic::AtomicU64::new(0) }; PF_SLOTS * PF_COUNTERS];
+static PF_LOCKS: [crate::sync::Mutex<()>; PF_SLOTS] = [const { crate::sync::Mutex::new(()) }; PF_SLOTS];
 static PF_SERIAL: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(1);
-static PF_NEXT_SLOT: crate::sync::atomic::AtomicUsize = crate::sync::atomic::AtomicUsize::new(0);
+static PF_SLOTS_LIVE: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
+/// Threads that found every prefetch slot taken (their prefetches go uncounted).
+#[doc(hidden)]
+pub static PF_OVERFLOW: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
 /// The branch catalog's page cache, process-wide: [inserts, evictions] (r12-e3 amendment 7), and
 /// [deletes, pages cleared] (amendment 8).
 #[doc(hidden)]
@@ -183,18 +189,49 @@ pub static CAT_CACHE: [crate::sync::atomic::AtomicU64; 4] =
 #[doc(hidden)]
 pub static CAT_CACHE_PAGES: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
 
+/// This thread's prefetch slot (`usize::MAX`: not yet taken; `PF_SLOTS`: none free), given back
+/// to the bitmap when the thread exits.
+struct PfSlot(std::cell::Cell<usize>);
+
+impl Drop for PfSlot {
+    fn drop(&mut self) {
+        let s = self.0.get();
+        if s < PF_SLOTS {
+            PF_SLOTS_LIVE.fetch_and(!(1u64 << s), crate::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 thread_local! {
-    static PF_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    static PF_SLOT: PfSlot = PfSlot(std::cell::Cell::new(usize::MAX));
     /// Set while this thread runs a prefetch: the tag its inserts carry.
     static PF_TAG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// This thread's slot, taken on first use: the lowest free bit of the live-slot bitmap, or
+/// `PF_SLOTS` when all 64 are taken.
 pub(crate) fn pf_slot() -> usize {
+    use crate::sync::atomic::Ordering::SeqCst;
     PF_SLOT.with(|c| {
-        if c.get() == usize::MAX {
-            c.set(PF_NEXT_SLOT.fetch_add(1, crate::sync::atomic::Ordering::Relaxed) % PF_SLOTS);
+        if c.0.get() == usize::MAX {
+            let mut got = PF_SLOTS;
+            let mut live = PF_SLOTS_LIVE.load(SeqCst);
+            while live != u64::MAX {
+                let s = (!live).trailing_zeros() as usize;
+                match PF_SLOTS_LIVE.compare_exchange(live, live | (1u64 << s), SeqCst, SeqCst) {
+                    Ok(_) => {
+                        got = s;
+                        break;
+                    }
+                    Err(now) => live = now,
+                }
+            }
+            if got == PF_SLOTS {
+                PF_OVERFLOW.fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+            }
+            c.0.set(got);
         }
-        c.get()
+        c.0.get()
     })
 }
 
@@ -218,7 +255,13 @@ pub(crate) fn pf_new_serial() -> u64 {
 /// Mark reap `serial` pending on this thread and tag this thread's inserts until `pf_end_prefetch`.
 pub(crate) fn pf_begin_prefetch(serial: u64) {
     let slot = pf_slot();
-    PF_PENDING[slot].store(serial, crate::sync::atomic::Ordering::Relaxed);
+    if slot >= PF_SLOTS {
+        return;
+    }
+    {
+        let _slot_lock = PF_LOCKS[slot].lock();
+        PF_PENDING[slot].store(serial, crate::sync::atomic::Ordering::Relaxed);
+    }
     PF_TAG.with(|t| t.set(((slot as u64) << PF_SERIAL_BITS) | serial));
 }
 
@@ -229,8 +272,12 @@ pub(crate) fn pf_end_prefetch() {
 /// End this thread's pending window and take its counts.
 pub(crate) fn pf_settle() -> [u64; PF_COUNTERS] {
     let slot = pf_slot();
-    PF_PENDING[slot].store(0, crate::sync::atomic::Ordering::Relaxed);
     let mut out = [0u64; PF_COUNTERS];
+    if slot >= PF_SLOTS {
+        return out;
+    }
+    let _slot_lock = PF_LOCKS[slot].lock();
+    PF_PENDING[slot].store(0, crate::sync::atomic::Ordering::Relaxed);
     for (i, o) in out.iter_mut().enumerate() {
         *o = PF_REMOVED[slot * PF_COUNTERS + i].swap(0, crate::sync::atomic::Ordering::Relaxed);
     }
@@ -242,6 +289,8 @@ pub(crate) fn pf_removed(tag: u64, how: PfRemoval) {
     use crate::sync::atomic::Ordering::Relaxed;
     let slot = (tag >> PF_SERIAL_BITS) as usize % PF_SLOTS;
     let serial = tag & ((1 << PF_SERIAL_BITS) - 1);
+    let evictor = pf_slot();
+    let _slot_lock = PF_LOCKS[slot].lock();
     if serial == 0 || PF_PENDING[slot].load(Relaxed) != serial {
         return;
     }
@@ -249,7 +298,7 @@ pub(crate) fn pf_removed(tag: u64, how: PfRemoval) {
     match how {
         PfRemoval::Evicted { age, touched } => {
             let bucket = PF_AGE_LIMITS.iter().position(|&l| age <= l).unwrap_or(4);
-            let by_other = if pf_slot() == slot { 0 } else { 5 };
+            let by_other = if evictor == slot { 0 } else { 5 };
             PF_REMOVED[base + by_other + bucket].fetch_add(1, Relaxed);
             if touched {
                 PF_REMOVED[base + 10].fetch_add(1, Relaxed);
@@ -287,7 +336,7 @@ pub(crate) fn pf_rerun_cap() -> u64 {
 // One catalog open at a time is assumed (the harness's; blind spot beyond that, stated).
 pub(crate) fn a8_on() -> bool {
     static ON: crate::sync::OnceLock<bool> = crate::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("R12_A8").is_some())
+    *ON.get_or_init(|| std::env::var("R12_A8").is_ok_and(|v| v == "1"))
 }
 
 /// One logged miss (amendment 8). `left`: 0 never left the cache since this open, 1 evicted,

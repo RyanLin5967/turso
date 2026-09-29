@@ -998,7 +998,8 @@ fn pct_u64(sorted: &[u64], p: f64) -> u64 {
 /// (outside every timer; the page map reads every catalog page, so only cold-only runs use it).
 /// Classes: b_evicted / b_deleted / b_cleared (left the cache since the open), a_created (above the
 /// page count at the prewarm), p_stayed (prewarmed, never left, still missed), c_unwarmed (existed
-/// at the prewarm, never left, not read by it), d_other (a pager other than the catalog's).
+/// at the prewarm, never left, not read by it), d_other (a pager other than the catalog's while a
+/// catalog statement runs), o_otherdb (a pager other than the catalog's outside one).
 fn a8_cell(db: &Arc<Database>, n: usize, kind: &str, t: usize, draw: u64, page_reads: u64, del_clr: [u64; 2]) {
     let log = turso_core::branch::a8_take_log();
     let map: std::collections::HashMap<u32, (String, u8, u8)> = db
@@ -1010,13 +1011,19 @@ fn a8_cell(db: &Arc<Database>, n: usize, kind: &str, t: usize, draw: u64, page_r
     let (opens, pages_at_prewarm) = turso_core::branch::a8_opens();
     let mut classes: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
     let mut rows: std::collections::BTreeMap<(String, String, String, u8, u8), u64> = std::collections::BTreeMap::new();
-    let mut other_in_stmt = 0u64;
+    let mut created_after_left = 0u64;
     for m in &log {
+        if m.catalog && m.created_after && m.left != 0 {
+            created_after_left += 1;
+        }
         let class = if !m.catalog {
+            // (d) is a pager other than the catalog's while a catalog statement runs; outside any
+            // catalog statement it is another database's read (o).
             if m.stmt != 0 {
-                other_in_stmt += 1;
+                "d_other"
+            } else {
+                "o_otherdb"
             }
-            "d_other"
         } else if m.left == 1 {
             "b_evicted"
         } else if m.left == 2 {
@@ -1051,7 +1058,7 @@ fn a8_cell(db: &Arc<Database>, n: usize, kind: &str, t: usize, draw: u64, page_r
     }
     println!(
         "# a8 N={n} kind={kind} T={t} draw={draw} misses={} page_reads_total={page_reads} complete={} \
-         classes={classes:?} other_in_stmt={other_in_stmt} opens_total={opens} pages_at_prewarm={pages_at_prewarm} \
+         classes={classes:?} created_after_left={created_after_left} opens_total={opens} pages_at_prewarm={pages_at_prewarm} \
          mapped_pages={} cat_deletes={} cat_cleared={}",
         log.len(),
         log.len() as u64 == page_reads,
@@ -1099,7 +1106,10 @@ fn reaprate(args: &Args) {
             .map(|k| format!("{k}={}", std::env::var(k).unwrap_or_else(|_| "-".to_string())))
     );
     // r12-e3 amendment 8: name the catalog's statements once.
-    let a8 = std::env::var_os("R12_A8").is_some();
+    let a8 = std::env::var("R12_A8").is_ok_and(|v| v == "1");
+    if a8 && args.cells.iter().any(|c| c != "cold") {
+        die("R12_A8 walks every catalog page after each cell, so it runs cold cells only (each reopens)");
+    }
     if a8 {
         for (id, sql) in turso_core::branch::a8_stmt_names() {
             println!("# a8stmt id={id} sql={sql}");
@@ -1286,6 +1296,9 @@ fn reaprate(args: &Args) {
                 .collect();
             let mut reruns: Vec<u64> = samples.iter().map(|s| s.reruns).collect();
             reruns.sort_unstable();
+            if turso_core::branch::PF_OVERFLOW.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                not_a_result("more than 64 live threads took prefetch slots (their counts were not kept)");
+            }
             if args.prefetch && sum(&|s| s.prefetch_reads) > 0 && cc1[0] == cc0[0] {
                 not_a_result("prefetches read pages but the catalog cache counted no insert (instrument not attached)");
             }
