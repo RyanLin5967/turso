@@ -28,7 +28,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use turso_core::branch::{cache_work, set_hold_timing, Branch, BranchWork, CacheWork, HoldMax};
+use turso_core::branch::{
+    cache_work, set_hold_timing, subjournal_spills, take_subjournal_mem_peak, Branch, BranchWork,
+    CacheWork, HoldMax,
+};
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO};
 
 /// One row per 4 KiB leaf: two 3,000-byte cells cannot share a leaf, and one stays below the
@@ -221,7 +224,7 @@ const HEADER: &str = "phase\tD\tN\trep\tus\tlock_holds\tlocked_copy_bytes\tmax_h
 max_hold_realloc_moved\tmax_hold_ns\tresolve_calls\tevict_calls\tevict_examined\tevict_full\t\
 over_capacity_admits\tevictable_scan\tspill_scan\tsubjournal_pages\tarena_in_use\tcache_len\tview_build_pages\t\
 holds_timed\thold_p50_ns\thold_p99_ns\thold_p999_ns\tmax_hold_realloc_bytes\tmax_hold_node_copies\t\
-max_hold_zeroed_bytes\tholds_ge_16us\tminflt\tmajflt\tnivcsw\tstep_lookup_ns\tstep_alloc_ns\tstep_copy_ns\tstep_retain_ns\tstep_insert_ns\tmax_hold_index\tat_written\tat_retained_pages\tat_versions\tat_free\tat_free_blocks\tat_free_blocks_cap\tat_bits_blocks\tat_bits_blocks_cap\tat_chunk_blocks\tat_chunk_blocks_cap\tat_hold_realloc_moved";
+max_hold_zeroed_bytes\tholds_ge_16us\tminflt\tmajflt\tnivcsw\tstep_lookup_ns\tstep_alloc_ns\tstep_copy_ns\tstep_retain_ns\tstep_insert_ns\tmax_hold_index\tat_written\tat_retained_pages\tat_versions\tat_free\tat_free_blocks\tat_free_blocks_cap\tat_bits_blocks\tat_bits_blocks_cap\tat_chunk_blocks\tat_chunk_blocks_cap\tat_hold_realloc_moved\tsj_mem_peak\tsj_spills";
 
 /// Process-wide minor and major page faults and involuntary context switches (getrusage), read
 /// outside the timed window: a long hold that does no more counted work than a short one is a
@@ -253,11 +256,16 @@ impl Ctx {
         let _ = self.db.branch_take_hold_max();
         let _ = self.db.branch_take_hold_hist();
         let a = snap(&self.db);
+        // The statement journal's in-memory peak and spills over the phase (storage::subjournal_spill).
+        let _ = take_subjournal_mem_peak();
+        let spills_a = subjournal_spills();
         let ra = rusage();
         let t = Instant::now();
         let out = f();
         let el = t.elapsed();
         let rb = rusage();
+        let sj_peak = take_subjournal_mem_peak();
+        let sj_spills = subjournal_spills() - spills_a;
         let b = snap(&self.db);
         let m: HoldMax = self.db.branch_take_hold_max();
         let hist = self.db.branch_take_hold_hist();
@@ -306,7 +314,7 @@ impl Ctx {
             vec!["-"; 12].join("\t")
         };
         println!(
-            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}\t{}\t{}\t{}\t{long}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{at_max}",
+            "{name}\t{d}\t{n}\t{rep}\t{us}\t{}\t{}\t{}\t{}\t{}\t{ns}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{timed}\t{}\t{}\t{}\t{}\t{}\t{}\t{long}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{at_max}\t{sj_peak}\t{sj_spills}",
             b.w.lock_holds - a.w.lock_holds,
             b.w.locked_copy_bytes - a.w.locked_copy_bytes,
             m.pages,

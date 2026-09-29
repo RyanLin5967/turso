@@ -1437,6 +1437,21 @@ impl Savepoint {
     }
 }
 
+/// The statement journal's file when it may spill (see [`Pager::open_subjournal`]); `None` keeps it
+/// in MemoryIO.
+#[cfg(all(feature = "fs", not(target_family = "wasm")))]
+fn spill_journal_file() -> Option<Arc<dyn crate::io::File>> {
+    super::subjournal_spill::spill_threshold().map(|threshold| {
+        Arc::new(super::subjournal_spill::SpillJournal::new(Some(threshold)))
+            as Arc<dyn crate::io::File>
+    })
+}
+
+#[cfg(not(all(feature = "fs", not(target_family = "wasm"))))]
+fn spill_journal_file() -> Option<Arc<dyn crate::io::File>> {
+    None
+}
+
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
@@ -2016,9 +2031,16 @@ impl Pager {
     /// The subjournal is a file that is used to store the "before images" of pages for the
     /// current savepoint. If the savepoint is rolled back, the pages can be restored from the subjournal.
     ///
-    /// Currently uses MemoryIO, but should eventually be backed by temporary on-disk files.
+    /// It is held in memory up to a spill threshold and in an unnamed temporary file past it, as
+    /// SQLite's statement journal (`SQLITE_CONFIG_STMTJRNL_SPILL`, 64 KiB here; see
+    /// storage/subjournal_spill.rs). `TURSO_STMTJRNL_SPILL=-1` keeps it wholly in MemoryIO, as
+    /// before, and so does a build without a file system.
     pub fn open_subjournal(&self) -> Result<()> {
         if self.subjournal.read().is_some() {
+            return Ok(());
+        }
+        if let Some(file) = spill_journal_file() {
+            *self.subjournal.write() = Some(Subjournal::new(file));
             return Ok(());
         }
         use crate::MemoryIO;

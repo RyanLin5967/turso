@@ -86,6 +86,44 @@ pub(crate) fn count_subjournal_page() {
     CACHE_COUNTERS.subjournal_pages.fetch_add(1, Relaxed);
 }
 
+/// The largest size a statement journal held IN MEMORY reached since the last
+/// [`take_subjournal_mem_peak`], in bytes, and the number of statement journals that spilled to a
+/// file (storage::subjournal_spill). Observation only, as the counters above.
+static SUBJOURNAL_MEM_PEAK: AtomicU64 = AtomicU64::new(0);
+static SUBJOURNAL_SPILLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+std::thread_local! {
+    static SUBJOURNAL_SPILLS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn note_subjournal_mem(bytes: u64) {
+    SUBJOURNAL_MEM_PEAK.fetch_max(bytes, Relaxed);
+}
+
+pub(crate) fn count_subjournal_spill() {
+    SUBJOURNAL_SPILLS.fetch_add(1, Relaxed);
+    #[cfg(test)]
+    SUBJOURNAL_SPILLS_HERE.with(|c| c.set(c.get() + 1));
+}
+
+/// The in-memory peak since the previous call, which this call resets.
+pub fn take_subjournal_mem_peak() -> u64 {
+    SUBJOURNAL_MEM_PEAK.swap(0, Relaxed)
+}
+
+/// Statement journals that have spilled to a file in this process.
+pub fn subjournal_spills() -> u64 {
+    SUBJOURNAL_SPILLS.load(Relaxed)
+}
+
+/// Spills made on the calling thread: a test's own statements run on its thread, so this is not
+/// disturbed by tests running in parallel.
+#[cfg(test)]
+pub(crate) fn subjournal_spills_on_this_thread() -> u64 {
+    SUBJOURNAL_SPILLS_HERE.with(|c| c.get())
+}
+
 #[derive(Debug, Copy, Eq, Hash, PartialEq, Clone)]
 #[repr(transparent)]
 pub struct PageCacheKey(usize);

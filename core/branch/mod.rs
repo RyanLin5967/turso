@@ -251,7 +251,9 @@ pub fn set_hold_timing(on: bool) {
 }
 
 #[doc(hidden)]
-pub use crate::storage::page_cache::{cache_work, CacheWork};
+pub use crate::storage::page_cache::{
+    cache_work, subjournal_spills, take_subjournal_mem_peak, CacheWork,
+};
 
 impl Branch {
     fn new(db: Arc<Database>, id: BranchId) -> Self {

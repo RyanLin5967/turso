@@ -28,6 +28,8 @@ pub(super) mod slot_bitmap;
 pub mod sqlite3_ondisk;
 mod state_machines;
 pub(crate) mod subjournal;
+#[cfg(all(feature = "fs", not(target_family = "wasm")))]
+pub(crate) mod subjournal_spill;
 #[allow(clippy::arc_with_non_send_sync)]
 pub(crate) mod wal;
 
