@@ -786,13 +786,17 @@ impl Bench {
         }
     }
 
-    /// `--fork-batch K,N` (amendment 13), after the timed samples: 2N batches of K forks, each from a parent drawn as the
-    /// samples draw them but never the trunk (whose fork is another code path), alternating the timer's placement batch by
-    /// batch. `fork_bfull` times what the `fork` row times (the parent's Node record, the store's fork, the child's Node
-    /// push); `fork_bstore` reads the K parents' Branch handles (the Node fields `fork` reads) before the timer and times
-    /// only the store's fork calls, with the Node bookkeeping after it. A batch records its elapsed time / K, so one clock
-    /// tick is 1/K tick per fork. Every child is pruned after its batch: at most K extra entries are live, the table sees
-    /// 2NK inserts and removes, and the 2NK Nodes are not counted as shape bb's tree (`extra_nodes`).
+    /// `--fork-batch K,N` (amendment 13), after the timed samples: 4N batches of K parents, each parent drawn as the samples
+    /// draw them but never the trunk (whose fork is another code path). The batches cycle through four timed cells, a
+    /// factorial over the timed region's random-line accesses (A: the harness's Node record of the parent; B: the store's
+    /// fork_branch; C: Branch::new and the child's Node push):
+    ///   fork_ball      A + B + C: `fork`, as the `fork` row times it;
+    ///   fork_bnoa      B + C: the K parents' Node records are read before the timer, then `fork` is timed;
+    ///   fork_bharness  A only: the K Node records read as a dependent chain (each index waits on the previous read);
+    ///   fork_bnone     none: the same dependent loop without the reads (the timer and loop floor).
+    /// A batch records its elapsed time / K, so one clock tick is 1/K tick per parent. Only ball and bnoa fork; every child
+    /// is pruned after its batch, so at most K extra entries are live and the table sees 2NK inserts and removes; the 2NK
+    /// Nodes are not counted as shape bb's tree (`extra_nodes`).
     fn fork_batches(&mut self, x: u64, parents: &[u32], rng: &mut Rng, k: usize, n: usize) {
         let pool: Vec<u32> = parents.iter().copied().filter(|&p| p != TRUNK).collect();
         if pool.is_empty() {
@@ -800,43 +804,57 @@ impl Bench {
             return;
         }
         let (cap_before, anchor_before) = (self.db.branch_table_capacity(), self.anchor_addr(&pool));
-        let mut t: [Vec<f64>; 2] = Default::default();
-        for j in 0..2 * n {
+        let mut t: [Vec<f64>; 4] = Default::default();
+        for j in 0..4 * n {
             let ps: Vec<u32> = (0..k).map(|_| pool[rng.below(pool.len() as u64) as usize]).collect();
             let mut kids = Vec::with_capacity(k);
-            if j % 2 == 0 {
-                let a = Instant::now();
-                for &p in &ps {
-                    kids.push(self.fork(p));
-                }
-                t[0].push(a.elapsed().as_secs_f64() * 1e6 / k as f64);
-            } else {
-                let mut branches = Vec::with_capacity(k);
-                {
-                    let handles: Vec<&Branch> = ps
-                        .iter()
-                        .map(|&p| {
-                            let b = self.nodes[p as usize].branch.as_ref().expect("forked from a live handle");
-                            std::hint::black_box(b.id());
-                            b
-                        })
-                        .collect();
+            let cell = j % 4;
+            let elapsed = match cell {
+                0 => {
                     let a = Instant::now();
-                    for b in &handles {
-                        branches.push(b.fork().unwrap());
+                    for &p in &ps {
+                        kids.push(self.fork(p));
                     }
-                    t[1].push(a.elapsed().as_secs_f64() * 1e6 / k as f64);
+                    a.elapsed()
                 }
-                for (&p, branch) in ps.iter().zip(branches) {
-                    kids.push(self.record_fork(p, branch));
+                1 => {
+                    for &p in &ps {
+                        std::hint::black_box(self.touch_node(p));
+                    }
+                    let a = Instant::now();
+                    for &p in &ps {
+                        kids.push(self.fork(p));
+                    }
+                    a.elapsed()
                 }
-            }
-            self.extra_nodes += k;
+                2 => {
+                    let (mask, mut dep) = (std::hint::black_box(0u32), 0u32);
+                    let a = Instant::now();
+                    for &p in &ps {
+                        dep = self.touch_node(p | (dep & mask)) as u32;
+                    }
+                    let e = a.elapsed();
+                    std::hint::black_box(dep);
+                    e
+                }
+                _ => {
+                    let (mask, mut dep) = (std::hint::black_box(0u32), 0u32);
+                    let a = Instant::now();
+                    for &p in &ps {
+                        dep = std::hint::black_box(p | (dep & mask));
+                    }
+                    let e = a.elapsed();
+                    std::hint::black_box(dep);
+                    e
+                }
+            };
+            t[cell].push(elapsed.as_secs_f64() * 1e6 / k as f64);
+            self.extra_nodes += kids.len();
             for (id, branch) in kids {
                 self.prune(id, branch);
             }
         }
-        for (name, us) in ["fork_bfull", "fork_bstore"].iter().zip(t.iter_mut()) {
+        for (name, us) in ["fork_ball", "fork_bnoa", "fork_bharness", "fork_bnone"].iter().zip(t.iter_mut()) {
             us.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let us: &[f64] = us;
             println!(
@@ -854,6 +872,17 @@ impl Bench {
             u8::from(self.anchor_addr(&pool) != anchor_before),
             self.table_buckets()
         );
+    }
+
+    /// The fields of `p`'s Node record that `fork` reads or writes (its Branch handle, epoch, depth and child counts),
+    /// folded into one value (amendment 13's fork_bnoa and fork_bharness cells).
+    fn touch_node(&self, p: u32) -> u64 {
+        let n = &self.nodes[p as usize];
+        n.branch.as_ref().map_or(0, |b| b.id().0)
+            ^ u64::from(n.epoch)
+            ^ u64::from(n.depth)
+            ^ u64::from(n.kept_children)
+            ^ u64::from(n.child_states)
     }
 
     /// Drop every remaining handle, oldest node first, and check the store empties.
