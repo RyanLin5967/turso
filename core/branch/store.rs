@@ -282,6 +282,11 @@ struct CatState {
     /// Trunk-version probes and range reads, and the version rows they returned (C-P).
     trunk_probes: u64,
     trunk_rows: u64,
+    /// r12-lakehouse A8 (observation only): catalog checkpoints since open, free rows they upserted,
+    /// and the row the last checkpoint's `wal_checkpoint(TRUNCATE)` returned (busy, log, checkpointed).
+    checkpoints: u64,
+    free_puts: u64,
+    last_truncate: Vec<i64>,
 }
 
 impl CatState {
@@ -301,6 +306,9 @@ impl CatState {
             trunk_page_loads: 0,
             trunk_probes: 0,
             trunk_rows: 0,
+            checkpoints: 0,
+            free_puts: 0,
+            last_truncate: Vec::new(),
         }
     }
 }
@@ -590,6 +598,10 @@ struct ChildIndex {
     map: BTreeMap<(u64, u64), BranchId>,
     /// (parent, fork epoch) -> (nearest live sibling below, above) when it was removed.
     removed: HashMap<(u64, u64), (Option<u64>, Option<u64>)>,
+    /// r12-lakehouse A9.1 (observation only): `resolve` calls, and removal links they followed. The
+    /// links are never path-compressed, so one lookup can walk every removal since the last checkpoint.
+    resolves: std::cell::Cell<u64>,
+    link_hops: std::cell::Cell<u64>,
 }
 
 impl ChildIndex {
@@ -625,10 +637,14 @@ impl ChildIndex {
 
     /// Follow the removal links from `e` downward (or upward) to a live child.
     fn resolve(&self, p: u64, mut e: Option<u64>, down: bool) -> Option<u64> {
+        self.resolves.set(self.resolves.get() + 1);
         while let Some(x) = e {
             match self.removed.get(&(p, x)) {
                 None => return Some(x),
-                Some(&(lo, hi)) => e = if down { lo } else { hi },
+                Some(&(lo, hi)) => {
+                    self.link_hops.set(self.link_hops.get() + 1);
+                    e = if down { lo } else { hi };
+                }
             }
         }
         None
@@ -2097,6 +2113,22 @@ impl BranchStore {
             .map_or((0, 0), |c| (c.trunk_probes, c.trunk_rows))
     }
 
+    /// r12-lakehouse A8/A9.1 (observation only): `(catalog checkpoints, free rows they upserted,
+    /// the last checkpoint's TRUNCATE row, resolve calls, removal links followed)`.
+    pub(crate) fn mass_expiry_counters(&self) -> (u64, u64, Vec<i64>, u64, u64) {
+        let inner = self.inner.lock();
+        let (checkpoints, free_puts, last) = inner.cat.as_ref().map_or((0, 0, Vec::new()), |c| {
+            (c.checkpoints, c.free_puts, c.last_truncate.clone())
+        });
+        (
+            checkpoints,
+            free_puts,
+            last,
+            inner.children.resolves.get(),
+            inner.children.link_hops.get(),
+        )
+    }
+
     pub(crate) fn read_counters(&self) -> (u64, u64) {
         (
             self.resolve_calls.load(Ordering::Relaxed),
@@ -2967,6 +2999,7 @@ impl StoreInner {
             for &slot in arena.free_list().iter().chain(reserved.iter()) {
                 catalog.free_put(slot)?;
             }
+            // (r12-lakehouse A8 counts these rows below, from the same two lists.)
             catalog.put_meta(&meta)
         })()
         .and_then(|()| catalog.commit());
@@ -2984,12 +3017,18 @@ impl StoreInner {
         journal.restart_at(generation)?;
         // Fix v2 (PREREG A7): bound the catalog's own WAL. The checkpoint above is already durable, so
         // a failure here costs only WAL length, never state: it is logged, not returned.
+        cat.checkpoints += 1;
+        cat.free_puts += (arena.free_list().len() + reserved.len()) as u64;
         match cat.catalog.truncate_wal() {
             Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
-                tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
+                tracing::warn!("branch catalog WAL truncation was busy: {r:?}");
+                cat.last_truncate = r;
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("branch catalog WAL truncation failed: {e}"),
+            Ok(r) => cat.last_truncate = r,
+            Err(e) => {
+                tracing::warn!("branch catalog WAL truncation failed: {e}");
+                cat.last_truncate = vec![-1, -1, -1];
+            }
         }
         cat.dirty.clear();
         cat.removed.clear();

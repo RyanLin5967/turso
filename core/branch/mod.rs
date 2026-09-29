@@ -571,6 +571,13 @@ impl Database {
         self.branches.catalog_trunk_counters()
     }
 
+    /// `(catalog checkpoints, free rows upserted, last TRUNCATE row, child-index resolves, removal
+    /// links followed)` since open (r12-lakehouse A8/A9.1 instrument).
+    #[doc(hidden)]
+    pub fn branch_mass_expiry_counters(&self) -> (u64, u64, Vec<i64>, u64, u64) {
+        self.branches.mass_expiry_counters()
+    }
+
     /// Catalog statements that wrote a row since open; 0 for a store that is not a catalog store.
     #[doc(hidden)]
     pub fn branch_catalog_rows_written(&self) -> u64 {
