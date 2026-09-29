@@ -306,7 +306,9 @@ pub struct BranchWork {
     pub retained_shared_hits: u64,
     /// FS9: clones built, one per `(page, lo, hi)` key, on the key's first resolution.
     pub retained_clone_fills: u64,
-    /// FS9: clones dropped because the oldest live fork reached their interval's end.
+    /// FS9: clones dropped because the oldest live fork reached their interval's end. With interval
+    /// eviction on, a clone whose interval empties goes first and is counted in
+    /// `retained_clone_interval_evictions` instead: compare the sum of the two across modes.
     pub retained_clone_evictions: u64,
     /// FS9 interval eviction (r12-lakehouse A9.2): clones dropped when the last live fork in their
     /// interval went.

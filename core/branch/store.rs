@@ -395,8 +395,9 @@ struct StoreInner {
     /// by `(page, lo, hi)` from [`TrunkState::past_interval`], which shows that two live children
     /// whose reads compute the same key read the same bytes. Each clone is built on its key's first
     /// read and handed out by reference, like FS5's trunk pages; it is dropped once the oldest live
-    /// fork reaches `hi` (see `collect`), and every clone goes with the trunk's last child. Prior
-    /// art: Oracle's consistent-read clones in the buffer cache [RECALLED].
+    /// fork reaches `hi` (see `collect`), or, with interval eviction on, the moment the last live
+    /// fork in its `[lo, hi)` goes; every clone goes with the trunk's last child. Prior art: Oracle's
+    /// consistent-read clones in the buffer cache [RECALLED].
     retained_clones: HashMap<(u32, u64, u64), Arc<crate::alloc::DynBoxedSlice<u8>>>,
     /// The keys of `retained_clones` as `(hi, page, lo)`, for the horizon eviction.
     clones_by_hi: BTreeSet<(u64, u32, u64)>,
@@ -1095,6 +1096,7 @@ impl BranchStore {
         self.trunk_pages.pages.count(|slot| slot.load().is_some())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_clone_evict_interval(&self, on: bool) {
         self.clone_evict_interval.store(on, Ordering::Relaxed);
     }
