@@ -990,3 +990,34 @@ fn wal2_recovery_decision_follows_sqlites_rules() {
         assert_eq!(Wal2Recovered::decide(&f0, &f1), want, "{what}");
     }
 }
+
+/// Amendment 26: the birth gate (FWB) keeps no pre-image of a page past every live child's
+/// fork-time database size, keeps one for a page within some child's size, and changes nothing when
+/// switched off. The expected counts are read off that rule: children fork at sizes 10 and 20; the
+/// trunk first-writes pages 5 and 11 between the forks, then 15 and 25.
+#[test]
+fn fwb_birth_gate_skips_only_pages_past_every_fork_size() {
+    let run = |gate: bool| {
+        walpin::set_birth_gate(gate);
+        let store = super::store::BranchStore::new();
+        let schema = || Arc::new(crate::schema::Schema::default());
+        let page = vec![0u8; 4096];
+        let _a = store.fork_trunk_sized(schema(), 4096, 10).unwrap();
+        store.first_write_trunk(5, &page);
+        store.first_write_trunk(11, &page);
+        let _b = store.fork_trunk_sized(schema(), 4096, 20).unwrap();
+        store.first_write_trunk(15, &page);
+        store.first_write_trunk(25, &page);
+        store.stats().arena_slots_in_use
+    };
+    let (on, off) = (run(true), run(false));
+    walpin::set_birth_gate(false);
+    assert_eq!(
+        off, 4,
+        "ungated: every first write with a live child keeps a copy"
+    );
+    assert_eq!(
+        on, 2,
+        "gated: only pages 5 and 15, within a live child's fork-time size"
+    );
+}

@@ -334,9 +334,11 @@ impl Connection {
     }
 
     fn fork_trunk_locked(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
-        let cookie = pager
-            .io
-            .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+        // The database size is read with the cookie, under the same WAL write lock: the birth gate
+        // (FWB, r11-walpin-conc amendment 26) skips copies of pages past it.
+        let (cookie, db_size) = pager.io.block(|| {
+            pager.with_header(|header| (header.schema_cookie.get(), header.database_size.get()))
+        })?;
         // The branch starts with the schema that matches the committed pages it will read. The
         // connection's own snapshot or the shared one is that schema whenever the cookie agrees;
         // if neither does, a DDL commit is between publishing its pages and its schema, and the
@@ -346,7 +348,7 @@ impl Connection {
             .find(|schema| schema.schema_version == cookie)
             .ok_or(LimboError::SchemaUpdated)?;
         let page_size = pager.get_page_size_unchecked().get() as usize;
-        self.db.branches.fork_trunk(schema, page_size)
+        self.db.branches.fork_trunk_sized(schema, page_size, db_size)
     }
 
     /// The branch this connection is open on, if any.

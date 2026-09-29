@@ -34,6 +34,11 @@ pub(crate) struct ConcArgs {
     pub hot_leaves: Option<u64>,
     pub storm: bool,
     pub wbusy_timeout: bool,
+    /// r11-walpin-conc amendment 26 (`--trunk-op update|insert`): None keeps every earlier cell's
+    /// behaviour (UPDATE, no page_count, no integrity_check); Some(false) is the UPDATE control,
+    /// Some(true) makes writer w's j-th commit INSERT row `inserted_row(t, w, j)` past the seed.
+    /// Either Some prints page_count on every conc line and ends with PRAGMA integrity_check.
+    pub trunk_op: Option<bool>,
 }
 
 impl Default for ConcArgs {
@@ -46,6 +51,7 @@ impl Default for ConcArgs {
             hot_leaves: None,
             storm: false,
             wbusy_timeout: false,
+            trunk_op: None,
         }
     }
 }
@@ -121,6 +127,12 @@ fn gcd(a: u64, b: u64) -> u64 {
 
 fn writer_value(w: u64, j: u64) -> String {
     format!("w{w:02}j{j:0>width$}", width = VALUE_LEN - 4)
+}
+
+/// r11-walpin-conc amendment 26: the row writer `w` INSERTs at its `j`-th commit in the insert arm,
+/// past the seed's rows, unique across writers.
+fn inserted_row(t: u64, w: u64, j: u64) -> i64 {
+    TRUNK_ROWS + 1 + (j * t + w) as i64
 }
 
 fn parse_writer_value(v: &str) -> Option<(u64, u64)> {
@@ -230,12 +242,28 @@ fn select_once(conn: &Arc<Connection>, id: i64) -> turso_core::Result<Option<Str
     })
 }
 
-fn check(lay: &Layout, s: &mut Sess, row: i64, got: Option<String>) {
+/// r11-walpin-conc amendment 26: an inserted row committed before the session's fork must read
+/// back; one whose insert started after the fork must be absent; in between either.
+fn check_inserted(s: &Sess, row: i64, w: u64, j: u64, got: Option<String>) {
+    let (lo, hi) = (s.lo[w as usize], s.hi[w as usize]);
+    let ok = match &got {
+        Some(v) => *v == writer_value(w, j) && j < hi,
+        None => j >= lo,
+    };
+    if !ok {
+        not_a_result(&format!(
+            "branch read of inserted row {row} (writer {w} insert {j}) = {got:?}; fork bracket committed {lo} .. started {hi}"
+        ));
+    }
+}
+
+fn check(lay: &Layout, s: &mut Sess, row: i64, got: Option<String>, insert: bool) {
     let Some(got) = got else {
         not_a_result(&format!("branch read of row {row}: not one text row"));
     };
     let w = lay.owner(row);
-    let base = lay.last_write(row, s.lo[w]);
+    // Insert arm: the seed rows are never written.
+    let base = if insert { None } else { lay.last_write(row, s.lo[w]) };
     let ok = if got == trunk_value(row) {
         base.is_none()
     } else if let Some((gw, gj)) = parse_writer_value(&got) {
@@ -302,6 +330,7 @@ fn writer(
     n: u64,
     wbusy_timeout: bool,
     timing: bool,
+    insert: bool,
 ) -> Vec<(u64, u32, u32)> {
     let conn = db.connect().unwrap();
     conn.execute("PRAGMA synchronous = NORMAL").unwrap();
@@ -311,11 +340,19 @@ fn writer(
     let mut samples = Vec::with_capacity(if timing { n as usize } else { 0 });
     let ns = |d: Duration| d.as_nanos().min(u32::MAX as u128) as u32;
     for j in 0..n {
-        let sql = format!(
-            "UPDATE t SET v = '{}' WHERE id = {}",
-            writer_value(w, j),
-            lay.row(w, j)
-        );
+        let sql = if insert {
+            format!(
+                "INSERT INTO t VALUES ({}, '{}')",
+                inserted_row(lay.t, w, j),
+                writer_value(w, j)
+            )
+        } else {
+            format!(
+                "UPDATE t SET v = '{}' WHERE id = {}",
+                writer_value(w, j),
+                lay.row(w, j)
+            )
+        };
         sh.started[w as usize].store(j + 1, Ordering::Release);
         let t0 = Instant::now();
         let svc = loop {
@@ -372,7 +409,17 @@ fn reader(
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        let row = (x % lay.rows) as i64 + 1;
+        // Insert arm (amendment 26): every other read asks for an inserted row, one the session's fork
+        // committed (it must read back) or one started after it (it must be absent).
+        let ins = (c.trunk_op == Some(true) && x % 2 == 0).then(|| {
+            let w = (x >> 8) % lay.t;
+            let j = (x >> 20) % (s.hi[w as usize] + 8);
+            (w, j)
+        });
+        let row = match ins {
+            Some((w, j)) => inserted_row(lay.t, w, j),
+            None => (x % lay.rows) as i64 + 1,
+        };
         let at = sh.commits_total.load(Ordering::Relaxed);
         let t = Instant::now();
         let conn = match &s.conn {
@@ -397,7 +444,10 @@ fn reader(
         if timing {
             samples.push((at as u32, el.as_nanos().min(u32::MAX as u128) as u32));
         }
-        check(lay, s, row, got);
+        match ins {
+            Some((w, j)) => check_inserted(s, row, w, j, got),
+            None => check(lay, s, row, got, c.trunk_op == Some(true)),
+        }
         s.reads += 1;
         bump(&sh.reads);
     }
@@ -426,6 +476,8 @@ fn storm(db: &Arc<Database>, sh: &Shared) {
 struct Lines {
     last_c: WalPinCounters,
     last_s: SharedSnap,
+    /// r11-walpin-conc amendment 26: print the trunk's page_count on every line (`--trunk-op`).
+    page_count: bool,
 }
 
 impl Lines {
@@ -447,12 +499,22 @@ impl Lines {
             .map(|i| c.ckpt_outcome[i] - self.last_c.ckpt_outcome[i])
             .collect();
         let (lc, ls) = (&self.last_c, &self.last_s);
+        let pc = if self.page_count {
+            let rows = bench
+                .trunk
+                .prepare("PRAGMA page_count")
+                .and_then(|mut st| st.run_collect_rows())
+                .unwrap_or_else(|e| not_a_result(&format!("page_count: {e}")));
+            format!(" page_count={}", rows[0][0].as_int().unwrap_or(-1))
+        } else {
+            String::new()
+        };
         println!(
             "# conc {label} H={h} commits_now={} | d_commits={} d_w_busy={} d_w_busy_snapshot={} d_forks={} \
              d_fork_busy={} d_reaps={} d_reads={} d_read_busy={} d_connects={} d_storm_ok={} d_storm_busy={} | \
              fw3 d_trunk_reads={} d_calls_trunk={} d_retries={} d_store={} d_gen={} d_readerr={} d_busy={} \
              d_multi_store={} max_retries={} d_hist={hist:?} | store d_locks={locks:?} d_contended={contended:?} | \
-             restart d_gates={gates:?} ckpt d_outcomes={ckpt:?} | live_branches={} arena_in_use={} arena_free={}",
+             restart d_gates={gates:?} ckpt d_outcomes={ckpt:?} | live_branches={} arena_in_use={} arena_free={}{pc}",
             s.commits,
             s.commits - ls.commits,
             s.w_busy - ls.w_busy,
@@ -541,16 +603,20 @@ pub(crate) fn run_conc(bench: &mut Bench, args: &Args) {
     let mut lines = Lines {
         last_c: walpin::counters(),
         last_s: sh.snap(),
+        page_count: c.trunk_op.is_some(),
     };
     lines.print(bench, &sh, "opened", 0);
     let db = bench.db.clone();
     let timing = args.timing;
+    let insert = c.trunk_op == Some(true);
     let t_start = Instant::now();
     let (w_samples, r_samples, sessions) = std::thread::scope(|scope| {
         let writers: Vec<_> = (0..c.t)
             .map(|w| {
                 let (db, sh, lay) = (&db, &sh, &lay);
-                scope.spawn(move || writer(db, sh, lay, w, per_writer, c.wbusy_timeout, timing))
+                scope.spawn(move || {
+                    writer(db, sh, lay, w, per_writer, c.wbusy_timeout, timing, insert)
+                })
             })
             .collect();
         let readers: Vec<_> = per_thread
@@ -615,8 +681,8 @@ pub(crate) fn run_conc(bench: &mut Bench, args: &Args) {
         let row = (i * step) as i64 + 1;
         let w = lay.owner(row);
         let want = match lay.last_write(row, per_writer) {
-            Some(j) => writer_value(w as u64, j),
-            None => trunk_value(row),
+            Some(j) if !insert => writer_value(w as u64, j),
+            _ => trunk_value(row),
         };
         let got = super::read_v(&bench.trunk, row);
         if got != want {
@@ -624,6 +690,34 @@ pub(crate) fn run_conc(bench: &mut Bench, args: &Args) {
         }
     }
     println!("# conc trunk_check rows={} ok", lay.rows.min(TRUNK_SAMPLES));
+    if insert {
+        // Amendment 26: sampled inserted rows read back with their writer's value.
+        for i in 0..TRUNK_SAMPLES {
+            let (w, j) = (i % c.t, (i * 37) % per_writer);
+            let row = inserted_row(c.t, w, j);
+            let got = super::read_v(&bench.trunk, row);
+            if got != writer_value(w, j) {
+                not_a_result(&format!("trunk inserted row {row} = {got:?}, want {:?}", writer_value(w, j)));
+            }
+        }
+        println!("# conc trunk_check inserted rows={TRUNK_SAMPLES} ok");
+    }
+    if c.trunk_op.is_some() {
+        // Amendment 26: the trunk passes PRAGMA integrity_check at the end.
+        let rows = bench
+            .trunk
+            .prepare("PRAGMA integrity_check")
+            .and_then(|mut st| st.run_collect_rows())
+            .unwrap_or_else(|e| not_a_result(&format!("integrity_check: {e}")));
+        let first = match rows.first().and_then(|r| r.first()) {
+            Some(Value::Text(t)) => t.as_str().to_string(),
+            other => format!("{other:?}"),
+        };
+        if first != "ok" {
+            not_a_result(&format!("trunk integrity_check: {first}"));
+        }
+        println!("# conc integrity ok");
+    }
 
     if timing {
         println!("# clock tick {:.0} ns (Instant)", clock_tick_ns());

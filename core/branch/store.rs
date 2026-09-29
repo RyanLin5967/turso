@@ -147,6 +147,9 @@ struct TrunkState {
     /// was live at the time", i.e. epoch 0, which is the conservative answer: it can only cause a
     /// retention that was not strictly needed, never skip one that was.
     written: HashMap<u32, u64>,
+    /// r11-walpin-conc amendment 26 (FWB): each live child's database size in pages at its fork, by
+    /// fork epoch. A child resolves from the trunk only pages up to this size.
+    fork_sizes: BTreeMap<u64, u32>,
 }
 
 struct BranchState {
@@ -330,6 +333,7 @@ impl BranchStore {
                 trunk: TrunkState {
                     lineage: Lineage::default(),
                     written: HashMap::new(),
+                    fork_sizes: BTreeMap::new(),
                 },
                 branches: HashMap::new(),
                 work: BranchWork::default(),
@@ -377,6 +381,18 @@ impl BranchStore {
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
+        // No size given: the birth gate never skips a page for this child (conservative).
+        self.fork_trunk_sized(schema, page_size, u32::MAX)
+    }
+
+    /// `fork_trunk`, recording the trunk's database size in pages at the fork, which the birth gate
+    /// (FWB, `first_write_trunk`) reads. The caller reads it under the same WAL write lock.
+    pub(crate) fn fork_trunk_sized(
+        &self,
+        schema: Arc<Schema>,
+        page_size: usize,
+        db_size: u32,
+    ) -> Result<BranchId> {
         let mut inner = self.lock_inner(2);
         match &inner.arena {
             None => inner.arena = Some(Arena::new(page_size)),
@@ -393,6 +409,7 @@ impl BranchStore {
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
         inner.trunk.lineage.children.insert(f, id);
+        inner.trunk.fork_sizes.insert(f, db_size);
         inner.branches.insert(
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
@@ -575,6 +592,20 @@ impl BranchStore {
         if born >= epoch {
             return;
         }
+        // FWB, the birth gate (r11-walpin-conc amendment 26): a page past the fork-time database size of
+        // every child that could see this version did not exist for any of them, and a child resolves
+        // from the trunk only pages up to its fork-time size (its own pages past it are its own), so no
+        // child can ever read this pre-image. SQLite's subjRequiresPage (`pgno <= nOrig`, as this
+        // engine's savepoint subjournal does in pager.rs) and ZFS's hole early return skip the same.
+        if super::walpin::fwb()
+            && trunk
+                .fork_sizes
+                .range(born..epoch)
+                .all(|(_, &size)| page > size)
+        {
+            trunk.written.insert(page, epoch);
+            return;
+        }
         if trunk.lineage.has_child_in(born, epoch) {
             let arena = arena.as_mut().expect("the trunk has a child, so the arena exists");
             let slot = arena.alloc();
@@ -722,6 +753,7 @@ impl BranchStore {
             }
             freed += st.lineage.release_all(arena).len();
             if st.parent.is_trunk() {
+                trunk.fork_sizes.remove(&st.fork_epoch);
                 freed += trunk.lineage.child_gone(st.fork_epoch, arena, work);
                 self.trunk_children.fetch_sub(1, Ordering::AcqRel);
                 return freed;

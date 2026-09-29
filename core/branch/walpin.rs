@@ -11,6 +11,8 @@
 //! * FW2, wal2 (SQLite's wal2 branch): two WAL files; see `storage::wal`. Implies FW1.
 //! * FW3, branch-aware read transactions: a branch pager takes no trunk WAL snapshot and no read
 //!   mark; it reads a trunk page optimistically and validates afterwards (see `Pager`).
+//! * FWB, the birth gate (r11-walpin-conc amendment 26): the trunk keeps no pre-image of a page past
+//!   every live child's database size at its fork (see `BranchStore::first_write_trunk`).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
@@ -86,6 +88,8 @@ pub(crate) fn fw3_record_call(retries: u64, store: u64, busy: bool) {
 static FW1: AtomicBool = AtomicBool::new(false);
 static FW2: AtomicBool = AtomicBool::new(false);
 static FW3: AtomicBool = AtomicBool::new(false);
+/// r11-walpin-conc amendment 26: FWB, the birth gate (see `BranchStore::first_write_trunk`).
+static FWB: AtomicBool = AtomicBool::new(false);
 /// r11-walpin-conc amendment 5: SQLite's restart rule for new databases (see
 /// `WalSharedRuntime::sqlite_restart`).
 static SQLITE_RESTART: AtomicBool = AtomicBool::new(false);
@@ -100,6 +104,7 @@ fn init_from_env() {
             FW1.store(has("fw1") || has("fw2"), Relaxed);
             FW2.store(has("fw2"), Relaxed);
             FW3.store(has("fw3"), Relaxed);
+            FWB.store(has("fwb"), Relaxed);
             SQLITE_RESTART.store(has("sqlrestart"), Relaxed);
         }
     });
@@ -181,6 +186,12 @@ pub fn counters() -> WalPinCounters {
 
 /// Select the fixes. Call before opening the database: FW1 and FW2 change what the WAL indexes as
 /// frames are appended, so switching them on a live WAL is refused by the harness, not handled here.
+/// r11-walpin-conc amendment 26: switch the birth gate (FWB) on or off. Call before opening.
+pub fn set_birth_gate(on: bool) {
+    init_from_env();
+    FWB.store(on, Relaxed);
+}
+
 pub fn set_fixes(fw1: bool, fw2: bool, fw3: bool) {
     init_from_env();
     FW1.store(fw1 || fw2, Relaxed);
@@ -211,6 +222,12 @@ pub(crate) fn fw1() -> bool {
 pub(crate) fn fw2() -> bool {
     init_from_env();
     FW2.load(Relaxed)
+}
+
+#[inline]
+pub(crate) fn fwb() -> bool {
+    init_from_env();
+    FWB.load(Relaxed)
 }
 
 #[inline]

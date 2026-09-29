@@ -54,6 +54,8 @@ struct Args {
     fixes: (bool, bool, bool),
     /// r11-walpin-conc amendment 5: SQLite's restart rule (`--fix sqlrestart`).
     sqlrestart: bool,
+    /// r11-walpin-conc amendment 26: the birth gate (`--fix fwb`).
+    fwb: bool,
     timing: bool,
     dir: Option<PathBuf>,
     conc: conc::ConcArgs,
@@ -94,6 +96,7 @@ fn parse_args() -> Args {
         samples: 200,
         fixes: (false, false, false),
         sqlrestart: false,
+        fwb: false,
         timing: false,
         dir: None,
         conc: conc::ConcArgs::default(),
@@ -132,6 +135,7 @@ fn parse_args() -> Args {
                         "fw2" => args.fixes.1 = true,
                         "fw3" => args.fixes.2 = true,
                         "sqlrestart" => args.sqlrestart = true,
+                        "fwb" => args.fwb = true,
                         other => die(&format!("unknown fix {other}")),
                     }
                 }
@@ -158,6 +162,13 @@ fn parse_args() -> Args {
                             .unwrap_or_else(|| die("--rows is all or hot:<leaves>")),
                     ),
                 }
+            }
+            "--trunk-op" => {
+                args.conc.trunk_op = Some(match val().as_str() {
+                    "update" => false,
+                    "insert" => true,
+                    other => die(&format!("unknown --trunk-op {other}")),
+                })
             }
             "--storm" => {
                 args.conc.storm = match val().as_str() {
@@ -442,6 +453,7 @@ fn main() {
     let (fw1, fw2, fw3) = args.fixes;
     walpin::set_fixes(fw1, fw2, fw3);
     walpin::set_sqlite_restart(args.sqlrestart);
+    walpin::set_birth_gate(args.fwb);
     let base_dir = args.dir.clone().unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&base_dir).unwrap();
     let dir = tempfile::TempDir::new_in(&base_dir).unwrap();
