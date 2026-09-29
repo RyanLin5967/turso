@@ -171,6 +171,22 @@ fn fw2_a_refusal_with_mixed_blockers_is_not_init_only() {
     );
 }
 
+/// (g) The underflow detector fires: a read begun under INIT and ended under TRUNK is one counted
+/// underflow (never an abort), the reader classes still balance, and INIT keeps the leaked count,
+/// which is why an underflow anywhere in a run voids that run's attribution. Ended under the tag it
+/// began under, the same read counts nothing.
+#[test]
+#[ignore = "sets the process-global FW2 switch: run alone with --test-threads=1 --include-ignored"]
+fn fw2_an_origin_mismatch_is_counted_not_asserted() {
+    let (fw1, fw2, fw3) = (walpin::fw1(), walpin::fw2(), walpin::fw3());
+    walpin::set_fixes(true, true, false);
+    let mismatched = crate::storage::wal::walpin_origin_mismatch_probe(origin::INIT, origin::TRUNK);
+    let matched = crate::storage::wal::walpin_origin_mismatch_probe(origin::INIT, origin::INIT);
+    walpin::set_fixes(fw1, fw2, fw3);
+    assert_eq!(mismatched, (1, [0; 4], 1), "begun INIT, ended TRUNK");
+    assert_eq!(matched, (0, [0; 4], 0), "begun and ended INIT");
+}
+
 /// The tags the calling thread's read transactions began under during `f`.
 fn tags_during(f: impl FnOnce()) -> Vec<u8> {
     origin::recorder::start();

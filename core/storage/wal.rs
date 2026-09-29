@@ -3292,6 +3292,27 @@ impl Wal2State {
     }
 }
 
+/// r11-walpin-conc amendment 28b (tests): the origin-underflow detector, forced to fire. On a fresh
+/// in-process coordination (the caller switches FW2 on), a read transaction begins under origin
+/// `begin` and ends under `end`. Returns the underflows counted, the reader classes afterwards and
+/// what is left counted under `begin`.
+#[cfg(test)]
+pub(crate) fn walpin_origin_mismatch_probe(begin: u8, end: u8) -> (u64, [u32; 4], u32) {
+    let shared = WalFileShared::new_noop();
+    let coordination = InProcessWalCoordination::new(shared.clone());
+    let snapshot = coordination.load_snapshot();
+    let before = walpin::counters().fw2_origin_underflow;
+    let guard = coordination
+        .try_begin_read_tx_origin(snapshot, begin)
+        .expect("an FW2 reader begins on an unchanged snapshot");
+    coordination.end_read_tx_origin(guard, end);
+    let underflow = walpin::counters().fw2_origin_underflow - before;
+    let shared = shared.read();
+    let w = shared.runtime.wal2.lock();
+    let left = w.origin_readers[usize::from(begin)].iter().sum();
+    (underflow, w.readers, left)
+}
+
 /// r11-walpin-conc amendment 21: truncate a WAL file to nothing and sync it, blocking (a restart
 /// generation under FW2, and recovery's rule 1). A file already empty is left alone.
 fn walpin_empty_wal_file(io: &dyn IO, file: &dyn File) -> Result<()> {
