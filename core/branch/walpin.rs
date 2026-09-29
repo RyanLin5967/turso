@@ -184,14 +184,14 @@ pub fn counters() -> WalPinCounters {
     }
 }
 
-/// Select the fixes. Call before opening the database: FW1 and FW2 change what the WAL indexes as
-/// frames are appended, so switching them on a live WAL is refused by the harness, not handled here.
 /// r11-walpin-conc amendment 26: switch the birth gate (FWB) on or off. Call before opening.
 pub fn set_birth_gate(on: bool) {
     init_from_env();
     FWB.store(on, Relaxed);
 }
 
+/// Select the fixes. Call before opening the database: FW1 and FW2 change what the WAL indexes as
+/// frames are appended, so switching them on a live WAL is refused by the harness, not handled here.
 pub fn set_fixes(fw1: bool, fw2: bool, fw3: bool) {
     init_from_env();
     FW1.store(fw1 || fw2, Relaxed);

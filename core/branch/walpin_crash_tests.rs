@@ -991,33 +991,41 @@ fn wal2_recovery_decision_follows_sqlites_rules() {
     }
 }
 
-/// Amendment 26: the birth gate (FWB) keeps no pre-image of a page past every live child's
-/// fork-time database size, keeps one for a page within some child's size, and changes nothing when
-/// switched off. The expected counts are read off that rule: children fork at sizes 10 and 20; the
-/// trunk first-writes pages 5 and 11 between the forks, then 15 and 25.
+/// Amendment 26/26c: the birth gate (FWB) keeps no pre-image of a page past every live child's
+/// fork-time database size, keeps one for a page AT or within a child's size, forgets a reaped
+/// child's size, and changes nothing when switched off. The expected counts are read off that rule:
+/// child a forks at size 10, the trunk first-writes 5, 10, 11; child b forks at size 20, the trunk
+/// first-writes 15, 20, 25; b is reaped (its retained versions stay: a's fork epoch still lies in
+/// their range); the trunk first-writes 18. Gated: 5, 10 (a), 15, 20 (b) = 4, and 18 is past a's 10
+/// once b's size is gone. Ungated: every one of the 7 writes keeps a copy.
 #[test]
 fn fwb_birth_gate_skips_only_pages_past_every_fork_size() {
+    let before = walpin::fwb();
     let run = |gate: bool| {
         walpin::set_birth_gate(gate);
         let store = super::store::BranchStore::new();
         let schema = || Arc::new(crate::schema::Schema::default());
         let page = vec![0u8; 4096];
         let _a = store.fork_trunk_sized(schema(), 4096, 10).unwrap();
-        store.first_write_trunk(5, &page);
-        store.first_write_trunk(11, &page);
-        let _b = store.fork_trunk_sized(schema(), 4096, 20).unwrap();
-        store.first_write_trunk(15, &page);
-        store.first_write_trunk(25, &page);
+        for p in [5, 10, 11] {
+            store.first_write_trunk(p, &page);
+        }
+        let b = store.fork_trunk_sized(schema(), 4096, 20).unwrap();
+        for p in [15, 20, 25] {
+            store.first_write_trunk(p, &page);
+        }
+        store.release_handle(b);
+        store.first_write_trunk(18, &page);
         store.stats().arena_slots_in_use
     };
     let (on, off) = (run(true), run(false));
-    walpin::set_birth_gate(false);
+    walpin::set_birth_gate(before);
     assert_eq!(
-        off, 4,
+        off, 7,
         "ungated: every first write with a live child keeps a copy"
     );
     assert_eq!(
-        on, 2,
-        "gated: only pages 5 and 15, within a live child's fork-time size"
+        on, 4,
+        "gated: pages 5, 10, 15 and 20, at or within a live child's fork-time size"
     );
 }

@@ -148,7 +148,9 @@ struct TrunkState {
     /// retention that was not strictly needed, never skip one that was.
     written: HashMap<u32, u64>,
     /// r11-walpin-conc amendment 26 (FWB): each live child's database size in pages at its fork, by
-    /// fork epoch. A child resolves from the trunk only pages up to this size.
+    /// fork epoch, recorded as the running maximum over forks, so the values never decrease with
+    /// the epoch and the latest child in a range bounds them all. A child resolves from the trunk
+    /// only pages up to its own size, which the recorded value never undercuts.
     fork_sizes: BTreeMap<u64, u32>,
 }
 
@@ -380,6 +382,7 @@ impl BranchStore {
     /// Fork a child of the trunk. The caller must hold the trunk's WAL write lock: a trunk write
     /// transaction in flight across the fork would commit pages whose copy decision was taken for
     /// the previous epoch, and the new child would see them.
+    #[cfg(test)]
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
         // No size given: the birth gate never skips a page for this child (conservative).
         self.fork_trunk_sized(schema, page_size, u32::MAX)
@@ -409,7 +412,8 @@ impl BranchStore {
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
         inner.trunk.lineage.children.insert(f, id);
-        inner.trunk.fork_sizes.insert(f, db_size);
+        let floor = inner.trunk.fork_sizes.values().next_back().copied().unwrap_or(0);
+        inner.trunk.fork_sizes.insert(f, db_size.max(floor));
         inner.branches.insert(
             id,
             BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
@@ -597,11 +601,14 @@ impl BranchStore {
         // from the trunk only pages up to its fork-time size (its own pages past it are its own), so no
         // child can ever read this pre-image. SQLite's subjRequiresPage (`pgno <= nOrig`, as this
         // engine's savepoint subjournal does in pager.rs) and ZFS's hole early return skip the same.
+        // The sizes never decrease with the epoch, so the latest child in the range bounds them all:
+        // one lookup, not a walk over every live child.
         if super::walpin::fwb()
             && trunk
                 .fork_sizes
                 .range(born..epoch)
-                .all(|(_, &size)| page > size)
+                .next_back()
+                .is_some_and(|(_, &size)| page > size)
         {
             trunk.written.insert(page, epoch);
             return;

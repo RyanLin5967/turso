@@ -243,8 +243,9 @@ fn select_once(conn: &Arc<Connection>, id: i64) -> turso_core::Result<Option<Str
 }
 
 /// r11-walpin-conc amendment 26: an inserted row committed before the session's fork must read
-/// back; one whose insert started after the fork must be absent; in between either.
-fn check_inserted(s: &Sess, row: i64, w: u64, j: u64, got: Option<String>) {
+/// back; one whose insert started after the fork must be absent; in between either, but the same
+/// answer on every re-read in the session (the memo, as for seed rows; absent is memoized as "").
+fn check_inserted(s: &mut Sess, row: i64, w: u64, j: u64, got: Option<String>) {
     let (lo, hi) = (s.lo[w as usize], s.hi[w as usize]);
     let ok = match &got {
         Some(v) => *v == writer_value(w, j) && j < hi,
@@ -255,6 +256,14 @@ fn check_inserted(s: &Sess, row: i64, w: u64, j: u64, got: Option<String>) {
             "branch read of inserted row {row} (writer {w} insert {j}) = {got:?}; fork bracket committed {lo} .. started {hi}"
         ));
     }
+    let seen = got.unwrap_or_default();
+    if let Some((_, v)) = s.memo.iter().find(|(r, _)| *r == row) {
+        if *v != seen {
+            not_a_result(&format!("branch re-read inserted row {row} = {seen:?}, first read {v:?}"));
+        }
+    } else if s.memo.len() < MEMO {
+        s.memo.push((row, seen));
+    }
 }
 
 fn check(lay: &Layout, s: &mut Sess, row: i64, got: Option<String>, insert: bool) {
@@ -264,7 +273,9 @@ fn check(lay: &Layout, s: &mut Sess, row: i64, got: Option<String>, insert: bool
     let w = lay.owner(row);
     // Insert arm: the seed rows are never written.
     let base = if insert { None } else { lay.last_write(row, s.lo[w]) };
-    let ok = if got == trunk_value(row) {
+    let ok = if insert {
+        got == trunk_value(row)
+    } else if got == trunk_value(row) {
         base.is_none()
     } else if let Some((gw, gj)) = parse_writer_value(&got) {
         gw as usize == w && lay.row(w as u64, gj) == row && gj < s.hi[w] && base.is_none_or(|b| gj >= b)
@@ -322,6 +333,7 @@ fn refork(s: &mut Sess, trunk: &Arc<Connection>, sh: &Shared, held: bool) {
 
 /// Writer `w`: `n` one-row autocommits. Returns (global commit seq, svc ns, e2e ns) per commit when
 /// timing.
+#[allow(clippy::too_many_arguments)]
 fn writer(
     db: &Arc<Database>,
     sh: &Shared,
@@ -411,7 +423,7 @@ fn reader(
         x ^= x << 17;
         // Insert arm (amendment 26): every other read asks for an inserted row, one the session's fork
         // committed (it must read back) or one started after it (it must be absent).
-        let ins = (c.trunk_op == Some(true) && x % 2 == 0).then(|| {
+        let ins = (c.trunk_op == Some(true) && (x >> 1) & 1 == 0).then(|| {
             let w = (x >> 8) % lay.t;
             let j = (x >> 20) % (s.hi[w as usize] + 8);
             (w, j)
@@ -585,6 +597,9 @@ pub(crate) fn run_conc(bench: &mut Bench, args: &Args) {
         c.storm,
         if c.wbusy_timeout { "timeout" } else { "spin" },
     );
+    if let Some(insert) = c.trunk_op {
+        println!("# conc trunk_op={}", if insert { "insert" } else { "update" });
+    }
     let zeros: Box<[u64]> = vec![0; c.t as usize].into();
     let mut per_thread: Vec<Vec<Sess>> = (0..c.r).map(|_| Vec::with_capacity(k / c.r + 1)).collect();
     for i in 0..k {
@@ -693,7 +708,7 @@ pub(crate) fn run_conc(bench: &mut Bench, args: &Args) {
     if insert {
         // Amendment 26: sampled inserted rows read back with their writer's value.
         for i in 0..TRUNK_SAMPLES {
-            let (w, j) = (i % c.t, (i * 37) % per_writer);
+            let (w, j) = (i % c.t, i * per_writer / TRUNK_SAMPLES);
             let row = inserted_row(c.t, w, j);
             let got = super::read_v(&bench.trunk, row);
             if got != writer_value(w, j) {

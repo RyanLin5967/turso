@@ -508,6 +508,10 @@ fn main() {
         args.sqlrestart,
         args.timing
     );
+    if args.fwb {
+        // Amendment 26: the arm is identifiable from the raw, not only from its file name.
+        println!("# fixes fwb:true (the birth gate)");
+    }
     println!(
         "# clock tick {:.0} ns (Instant); build: {}; rss_base_bytes={}",
         clock_tick_ns(),
