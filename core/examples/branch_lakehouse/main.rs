@@ -103,6 +103,11 @@ pub struct Args {
     /// PREREG A9.2 (E2 straggler): the first snapshot is a TAG, kept until teardown and never read;
     /// FIFO expiry keeps `r` other snapshots live, so the tag pins the oldest live fork.
     tag: bool,
+    /// PREREG A8/A10 mass-expiry mode: K (0 = off), catalog checkpoints after the cut, and ticks
+    /// between them.
+    mass_expiry: u64,
+    mass_checkpoints: u64,
+    mass_between: u64,
 }
 
 fn die(msg: &str) -> ! {
@@ -134,6 +139,9 @@ fn parse_args() -> Args {
         counters_only: false,
         teardown: true,
         tag: false,
+        mass_expiry: 0,
+        mass_checkpoints: 5,
+        mass_between: 100,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -173,6 +181,9 @@ fn parse_args() -> Args {
             "--dir" => a.dir = Some(PathBuf::from(val())),
             "--counters-only" => a.counters_only = true,
             "--tag" => a.tag = true,
+            "--mass-expiry" => a.mass_expiry = num(val()),
+            "--mass-checkpoints" => a.mass_checkpoints = num(val()),
+            "--mass-between" => a.mass_between = num(val()),
             "--teardown" => {
                 a.teardown = match val().as_str() {
                     "full" => true,
@@ -390,14 +401,20 @@ impl Run {
             self.model.put(id, t, seed, 0, oldest);
         }
         if t % self.args.rewrite_every == 0 {
-            self.exec(&format!(
-                "UPDATE t SET v = substr(v, {}) || substr(v, 1, {ROTATE})",
-                ROTATE + 1
-            ));
-            for id in lo..=hi {
-                let (seed, rot) = self.model.at(id, t).expect("a live row is modelled");
-                self.model.put(id, t, seed, (rot + 1) % VALUE_LEN as u32, oldest);
-            }
+            self.rewrite(lo, hi, oldest);
+        }
+    }
+
+    /// The whole-table rewrite at the current tick: every live row's value rotated by ROTATE.
+    fn rewrite(&mut self, lo: i64, hi: i64, oldest: Option<u64>) {
+        let t = self.tick;
+        self.exec(&format!(
+            "UPDATE t SET v = substr(v, {}) || substr(v, 1, {ROTATE})",
+            ROTATE + 1
+        ));
+        for id in lo..=hi {
+            let (seed, rot) = self.model.at(id, t).expect("a live row is modelled");
+            self.model.put(id, t, seed, (rot + 1) % VALUE_LEN as u32, oldest);
         }
     }
 
@@ -565,6 +582,85 @@ fn self_check(run: &mut Run) {
     );
 }
 
+/// PREREG A8/A10: the mass-expiry fixture on the durable arm, counters only.
+/// Phase 1: fork `r + K` snapshots, one per tick (the run gives `--k 1` and a rewrite period past the
+/// run, so the ticks write little and pages keep old births). Phase 2: reap the OLDEST K at once,
+/// oldest first (a TTL mass expiry). Phase 3: one whole-table rewrite, whose first writes look up
+/// live children below pages born before or inside the cut range (A9.1's removal links). Then
+/// `mass_checkpoints` catalog checkpoints, each after `mass_between` ticks and a rewrite, with two
+/// model-checked reads after each. One MASS line per phase: catalog checkpoints, free rows
+/// upserted, the last TRUNCATE row, child-index resolves and removal links followed (deltas).
+fn mass_expiry(run: &mut Run) {
+    let k = run.args.mass_expiry as usize;
+    let before = arm::mass_counters(&run.db);
+    let line = |phase: &str, b: &(u64, u64, Vec<i64>, u64, u64), a: &(u64, u64, Vec<i64>, u64, u64)| {
+        let resolves = a.3 - b.3;
+        println!(
+            "MASS phase={phase} k={k} checkpoints={} free_puts={} truncate={:?} resolves={resolves} \
+             link_hops={} hops_per_resolve={:.3}",
+            a.0 - b.0,
+            a.1 - b.1,
+            a.2,
+            a.4 - b.4,
+            (a.4 - b.4) as f64 / resolves.max(1) as f64
+        );
+    };
+    for _ in 0..run.args.r + k {
+        run.tick += 1;
+        run.trunk_tick();
+        let branch = run.trunk.fork_branch().unwrap_or_else(|e| {
+            not_a_result(&format!("fork at tick {} failed: {e}", run.tick))
+        });
+        run.snaps.push_back(Live {
+            snap: Snap::Handle(branch),
+            tick: run.tick,
+        });
+    }
+    let fill = arm::mass_counters(&run.db);
+    line("fill", &before, &fill);
+    for _ in 0..k {
+        let victim = run.snaps.pop_front().expect("r + K snapshots are live");
+        let branch = match victim.snap {
+            Snap::Handle(b) => b,
+            Snap::Detached(id) => arm::attach(&run.db, id),
+        };
+        if let Err(e) = branch.reap() {
+            not_a_result(&format!("mass reap of the snapshot of tick {} failed: {e}", victim.tick));
+        }
+    }
+    let oldest = run.oldest().expect("r snapshots stay live");
+    run.model.prune(oldest);
+    let cut = arm::mass_counters(&run.db);
+    line("cut", &fill, &cut);
+    // A tick of its own: the snapshot forked at the last tick must not see the rewrite.
+    run.tick += 1;
+    run.trunk_tick();
+    let (lo, hi) = (run.model.low(run.tick), run.model.high(run.tick));
+    run.rewrite(lo, hi, Some(oldest));
+    let first = arm::mass_counters(&run.db);
+    line("rewrite_after_cut", &cut, &first);
+    let mut last = first;
+    for c in 1..=run.args.mass_checkpoints {
+        arm::compact(&run.db);
+        let now = arm::mass_counters(&run.db);
+        line(format!("checkpoint{c}").as_str(), &last, &now);
+        for _ in 0..2 {
+            run.read();
+        }
+        for _ in 0..run.args.mass_between.max(1) {
+            run.tick += 1;
+            run.trunk_tick();
+        }
+        let (lo, hi) = (run.model.low(run.tick), run.model.high(run.tick));
+        let oldest = run.oldest();
+        run.rewrite(lo, hi, oldest);
+        let after = arm::mass_counters(&run.db);
+        line(format!("ticks_and_rewrite_after_checkpoint{c}").as_str(), &now, &after);
+        last = after;
+    }
+    println!("# mass-expiry done: live={} {}", run.snaps.len(), arm::state(&run.db));
+}
+
 fn dir_bytes(dir: &Path) -> u64 {
     std::fs::read_dir(dir).map_or(0, |rd| {
         rd.filter_map(|e| e.ok())
@@ -641,6 +737,10 @@ fn main() {
         if run.args.teardown { "full" } else { "none" }
     );
     println!("# counters only: nothing is timed");
+    if run.args.mass_expiry > 0 {
+        mass_expiry(&mut run);
+        return;
+    }
     let per_window = run.args.ticks / run.args.windows;
     let steady_from = run.args.windows / 2;
     // Steady-state (second half) per-reap samples, for the final summary.
@@ -895,6 +995,14 @@ mod arm {
 
     pub fn orphaned_clones(db: &Arc<Database>) -> usize {
         db.retained_clone_orphans()
+    }
+
+    pub fn mass_counters(_db: &Arc<Database>) -> (u64, u64, Vec<i64>, u64, u64) {
+        die("--mass-expiry needs the durable arm (catalog checkpoints)")
+    }
+
+    pub fn compact(_db: &Arc<Database>) {
+        die("--mass-expiry needs the durable arm (catalog checkpoints)")
     }
 
     pub fn clone_evict(db: &Arc<Database>) -> &'static str {
