@@ -1518,6 +1518,15 @@ fn fs5_law(n: usize, fs11: bool, pool: bool) -> Fs5Law {
     for (_, cc, model) in &children {
         check(table(cc), model);
     }
+    // F11-F (r12-composition amendment 10): with F11_RECONNECT=1 each child's connection is dropped and
+    // reopened, so its reads go through its inherited map instead of its page cache.
+    if std::env::var("F11_RECONNECT").is_ok_and(|v| v == "1") {
+        for (child, cc, model) in children.iter_mut() {
+            let _ = std::mem::replace(cc, trunk.clone());
+            let reopened = child.connect().unwrap();
+            check(table(&reopened), model);
+        }
+    }
     check(table(&trunk), &before);
     let fresh = trunk.fork_branch().unwrap();
     check(table(&fresh.connect().unwrap()), &before);
@@ -1564,8 +1573,9 @@ fn fs5_law_scale() {
     };
     let r = fs5_law(n, fs11, pool);
     println!(
-        "F11L\tn={n}\tfs11={fs11}\tpool={pool}\tmutant={}\tmismatches={}\tunshared_writes={}\tref_hits={}\t\
+        "F11L\tn={n}\tfs11={fs11}\tpool={pool}\treconnect={}\tmutant={}\tmismatches={}\tunshared_writes={}\tref_hits={}\t\
          shared_before={}\tshared_after={}\tarena_in_use={}",
+        std::env::var("F11_RECONNECT").unwrap_or_default(),
         std::env::var("TURSO_R11S_MUTANT").unwrap_or_default(),
         r.mismatches,
         r.unshared_writes,
