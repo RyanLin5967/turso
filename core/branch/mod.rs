@@ -229,6 +229,13 @@ impl Branch {
         self.id
     }
 
+    /// Both words `fork` reads from this handle (its Database pointer and its id), folded into one value, so a caller can
+    /// bring the handle into cache without forking. Observation only (r11-bushy amendment 13).
+    #[doc(hidden)]
+    pub fn handle_word(&self) -> u64 {
+        (Arc::as_ptr(&self.db) as usize as u64) ^ self.id.0
+    }
+
     /// Open a connection whose reads and writes see only this branch. One at a time: a second
     /// connection on the same branch is refused (see [`store::BranchStore::open`]).
     pub fn connect(&self) -> Result<Arc<Connection>> {

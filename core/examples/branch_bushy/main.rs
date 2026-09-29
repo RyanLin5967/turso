@@ -94,10 +94,6 @@ const VALUE_LEN: usize = 100;
 const HOT_ROW: i64 = 1;
 /// Node 0 is the trunk.
 const TRUNK: u32 = 0;
-/// `--timing` (amendment 13): the buffer streamed before each checkpoint's timed samples, larger than this Mac's 16 MiB
-/// L2 plus its system cache, so every variant starts its samples from the same cache state (the rebuild arms would
-/// otherwise start with their fresh table's control bytes cached, and the control with them evicted).
-const FLUSH_MIB: usize = 64;
 /// The Williams design for five cells (amendment 13's --fork-batch): over 10 rounds each cell takes each position twice
 /// and follows each other cell twice.
 const WILLIAMS5: [[usize; 5]; 10] = [
@@ -390,8 +386,6 @@ struct Bench {
     map0: MapWork,
     /// Nodes pushed by `--fork-batch` (amendment 13): shape bb's node-count checkpoints do not count them.
     extra_nodes: usize,
-    /// `--timing`: the FLUSH_MIB buffer (written once, so its pages are real), empty otherwise.
-    flush: Vec<u8>,
 }
 
 impl Bench {
@@ -605,6 +599,9 @@ impl Bench {
         if s.live_branches as u64 != self.states {
             not_a_result(&format!("engine has {} branch states, the harness expects {}", s.live_branches, self.states));
         }
+        // Amendment 13: the rebuild runs before this checkpoint's own passes over the table and the Nodes, so every
+        // variant ends its checkpoint on the same passes and starts its timed samples from the same cache state.
+        self.rebuild_table(args, x, s.live_branches);
         let zombies = self.db.branch_zombies() as u64;
         if zombies != self.states - self.handles {
             not_a_result(&format!("engine has {zombies} zombies, the harness expects {}", self.states - self.handles));
@@ -647,7 +644,6 @@ impl Bench {
             s.map_work.nodes_released - m0.nodes_released,
             s.map_work.refs_released - m0.refs_released,
         );
-        self.rebuild_table(args, x, s.live_branches);
     }
 
     /// `--table-rebuild` (amendment 12), after the checkpoint's counters and before its probe forks and timed samples.
@@ -733,8 +729,6 @@ impl Bench {
     fn sample(&mut self, args: &Args, x: u64, parents: &[u32], rng: &mut Rng) {
         let names = ["fork", "open", "write", "read_own", "read_other", "reap"];
         let mut t: [Vec<Duration>; 6] = Default::default();
-        // Amendment 13: the same cache state for every variant before the timed samples (see FLUSH_MIB).
-        std::hint::black_box(self.flush.iter().step_by(128).fold(0u64, |a, &b| a.wrapping_add(u64::from(b))));
         let (cap_before, anchor_before) = (self.db.branch_table_capacity(), self.anchor_addr(parents));
         for _ in 0..args.samples {
             let p = parents[rng.below(parents.len() as u64) as usize];
@@ -894,7 +888,7 @@ impl Bench {
     /// folded into one value (amendment 13's fork_bnoa and fork_bharness cells).
     fn touch_node(&self, p: u32) -> u64 {
         let n = &self.nodes[p as usize];
-        n.branch.as_ref().map_or(0, |b| b.id().0)
+        n.branch.as_ref().map_or(0, |b| b.handle_word())
             ^ u64::from(n.epoch)
             ^ u64::from(n.depth)
             ^ u64::from(n.kept_children)
@@ -1229,7 +1223,7 @@ fn main() {
     println!(
         "# shape={:?} rows={:?} interior={:?} continue={} fr={} fi={} depth={} gamma_milli={} \
          fanout={} beam={} expand={} checkpoints={:?} seed={:#x} timing={} samples={} \
-         refcounted={} observe={OBSERVE} table={} table_rebuild={:?} probe_forks={} fork_batch={} flush_mib={} \
+         refcounted={} observe={OBSERVE} table={} table_rebuild={:?} probe_forks={} fork_batch={} rebuild_at=start \
          trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} trunk_pages={page_count} build={}",
         args.shape,
         args.rows,
@@ -1251,7 +1245,6 @@ fn main() {
         args.rebuild,
         args.probe,
         args.fork_batch.map_or("none".to_string(), |(k, n)| format!("{k},{n}")),
-        if args.timing { FLUSH_MIB } else { 0 },
         if cfg!(debug_assertions) { "DEBUG" } else { "release" },
     );
     if args.timing {
@@ -1287,7 +1280,6 @@ fn main() {
         reads_checked: 0,
         map0: db.branch_stats().map_work,
         extra_nodes: 0,
-        flush: if args.timing { vec![1u8; FLUSH_MIB << 20] } else { Vec::new() },
     };
     match args.shape {
         Shape::Bb => shape_bb(&mut b, &args),
