@@ -811,6 +811,25 @@ impl Bench {
             println!("# forkbatch x={x} k={k} n={n} skipped=no_parent");
             return;
         }
+        // Fault in the Node Vec pages the stage's pushes will use, untimed, so no timed batch takes a page fault (a
+        // reallocation, if one is due, also happens here, identically in every variant).
+        let (len, forks) = (self.nodes.len(), 3 * k * n);
+        self.nodes.reserve(forks);
+        for _ in 0..forks {
+            self.nodes.push(Node {
+                parent: TRUNK,
+                fork_epoch: 0,
+                depth: 0,
+                row: 0,
+                epoch: 0,
+                kept_children: 0,
+                child_states: 0,
+                writes: Vec::new(),
+                branch: None,
+                state: false,
+            });
+        }
+        self.nodes.truncate(len);
         let (cap_before, anchor_before) = (self.db.branch_table_capacity(), self.anchor_addr(&pool));
         let mut t: [Vec<f64>; 5] = Default::default();
         for round in 0..n {
