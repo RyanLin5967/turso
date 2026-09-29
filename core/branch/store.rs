@@ -3328,6 +3328,7 @@ impl StoreInner {
             if self.n_states == 0
                 && self.trunk.lineage.retained.is_empty()
                 && self.cat.as_ref().is_some_and(|c| !c.trunk_gone.is_empty())
+                && std::env::var("R11_MUTANT").as_deref() != Ok("noflush")
             {
                 self.checkpoint_catalog(false, false)?;
             }
