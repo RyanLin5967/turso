@@ -1,5 +1,5 @@
 //! T-K1 of lane r12-branch-noclear, copied VERBATIM with its helpers from turso 6f3555343:core/branch/noclear_tests.rs
-//! (lines 16-72 and 232-251; the two doc-comment lines that followed introduce the next test, not copied), as that lane asked, so r12-phasefair's gate runs it under TURSO_R12_XI=on (PREREG amendment 10).
+//! (lines 16-72 and 232-250; lines 252-253, the next test's doc comment, are not copied), as that lane asked, so r12-phasefair's gate runs it under TURSO_R12_XI=on (PREREG amendment 10).
 //! A trunk connection must read another trunk connection's commit: the correctness guard F-XI (trunk pagers) and noclear
 //! (branch pagers) share. The rest of noclear_tests.rs needs noclear's branch arm, which this tip does not carry.
 
