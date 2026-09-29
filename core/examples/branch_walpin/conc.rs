@@ -43,6 +43,9 @@ pub(crate) struct ConcArgs {
     /// sessions; the other K - S stay live branches, forked at setup and never read. None visits
     /// all K (every earlier cell). Holds a fork's age at its reads fixed while K varies.
     pub active: Option<usize>,
+    /// r11-walpin-conc amendment 28g (`--held-cache N`, with `--conn held`): `PRAGMA cache_size = N` on every held
+    /// session connection, so K held sessions fit in memory. None leaves the default (every earlier cell).
+    pub held_cache: Option<i64>,
 }
 
 impl Default for ConcArgs {
@@ -57,6 +60,7 @@ impl Default for ConcArgs {
             wbusy_timeout: false,
             trunk_op: None,
             active: None,
+            held_cache: None,
         }
     }
 }
@@ -317,7 +321,25 @@ fn is_busy(e: &LimboError) -> bool {
     matches!(e, LimboError::Busy | LimboError::BusySnapshot)
 }
 
-fn refork(s: &mut Sess, trunk: &Arc<Connection>, sh: &Shared, held: bool) {
+/// A held session's connection, with its page cache capped when `--held-cache` is given.
+fn held_connect(branch: &Branch, cache: Option<i64>) -> Arc<Connection> {
+    let conn = branch
+        .connect()
+        .unwrap_or_else(|e| not_a_result(&format!("connect: {e}")));
+    if let Some(n) = cache {
+        conn.execute(format!("PRAGMA cache_size = {n}"))
+            .unwrap_or_else(|e| not_a_result(&format!("cache_size: {e}")));
+    }
+    conn
+}
+
+fn refork(
+    s: &mut Sess,
+    trunk: &Arc<Connection>,
+    sh: &Shared,
+    held: bool,
+    held_cache: Option<i64>,
+) {
     s.conn = None;
     if let Some(b) = s.branch.take() {
         b.reap().unwrap_or_else(|e| not_a_result(&format!("reap: {e}")));
@@ -337,7 +359,7 @@ fn refork(s: &mut Sess, trunk: &Arc<Connection>, sh: &Shared, held: bool) {
     let hi: Box<[u64]> = sh.started.iter().map(|c| c.load(Ordering::Acquire)).collect();
     bump(&sh.forks);
     if held {
-        s.conn = Some(branch.connect().unwrap_or_else(|e| not_a_result(&format!("connect: {e}"))));
+        s.conn = Some(held_connect(&branch, held_cache));
     }
     s.branch = Some(branch);
     s.lo = lo;
@@ -433,7 +455,7 @@ fn reader(
         let s = &mut sessions[i];
         i = (i + 1) % n;
         if c.m > 0 && s.reads >= c.m {
-            refork(s, &trunk, sh, c.held);
+            refork(s, &trunk, sh, c.held, c.held_cache);
         }
         x ^= x << 13;
         x ^= x >> 7;
@@ -623,11 +645,17 @@ pub(crate) fn run_conc(bench: &mut Bench, args: &Args) {
         }
         println!("# conc active={a} idle={}", k - a);
     }
+    if let Some(n) = c.held_cache {
+        if !c.held {
+            die("--held-cache needs --conn held");
+        }
+        println!("# conc held_cache={n}");
+    }
     let zeros: Box<[u64]> = vec![0; c.t as usize].into();
     let mut per_thread: Vec<Vec<Sess>> = (0..c.r).map(|_| Vec::with_capacity(k / c.r + 1)).collect();
     for i in 0..k {
         let branch = bench.trunk.fork_branch().unwrap();
-        let conn = c.held.then(|| branch.connect().unwrap());
+        let conn = c.held.then(|| held_connect(&branch, c.held_cache));
         per_thread[i % c.r].push(Sess {
             branch: Some(branch),
             conn,

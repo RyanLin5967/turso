@@ -170,6 +170,9 @@ fn parse_args() -> Args {
                     other => die(&format!("unknown --trunk-op {other}")),
                 })
             }
+            "--held-cache" => {
+                args.conc.held_cache = Some(val().parse().unwrap_or_else(|_| die("bad --held-cache")))
+            }
             "--active" => {
                 args.conc.active = Some(val().parse().unwrap_or_else(|_| die("bad --active")))
             }
