@@ -148,6 +148,8 @@ struct Args {
     refcounted: bool,
     probe: usize,
     rebuild: Option<Rebuild>,
+    /// `--fork-batch K,N` (amendment 13): after the timed samples, N batches of K forks per timer placement.
+    fork_batch: Option<(usize, usize)>,
 }
 
 fn die(msg: &str) -> ! {
@@ -183,6 +185,7 @@ fn parse_args() -> Args {
         refcounted: false,
         probe: 0,
         rebuild: None,
+        fork_batch: None,
     };
     let mut shape = None;
     let mut it = std::env::args().skip(1);
@@ -242,6 +245,15 @@ fn parse_args() -> Args {
                     "lf50" => Rebuild::Lf50,
                     other => die(&format!("unknown table rebuild {other}")),
                 })
+            }
+            "--fork-batch" => {
+                let v = val();
+                let (k, n) = v.split_once(',').unwrap_or_else(|| die("--fork-batch needs K,N"));
+                let (k, n) = (num(k.to_string(), "--fork-batch K") as usize, num(n.to_string(), "--fork-batch N") as usize);
+                if k == 0 || n == 0 {
+                    die("--fork-batch needs K > 0 and N > 0");
+                }
+                args.fork_batch = Some((k, n));
             }
             other => die(&format!("unknown argument {other}")),
         }
@@ -408,6 +420,11 @@ impl Bench {
         } else {
             self.nodes[parent as usize].branch.as_ref().expect("forked from a live handle").fork().unwrap()
         };
+        self.record_fork(parent, branch)
+    }
+
+    /// The harness's side of a fork: the parent's Node record and the child's Node push.
+    fn record_fork(&mut self, parent: u32, branch: Branch) -> (u32, Branch) {
         let id = self.nodes.len() as u32;
         let p = &mut self.nodes[parent as usize];
         let (fork_epoch, depth) = (p.epoch, p.depth + 1);
@@ -675,6 +692,7 @@ impl Bench {
     fn sample(&mut self, args: &Args, x: u64, parents: &[u32], rng: &mut Rng) {
         let names = ["fork", "open", "write", "read_own", "read_other", "reap"];
         let mut t: [Vec<Duration>; 6] = Default::default();
+        let cap_before = self.db.branch_table_capacity();
         for _ in 0..args.samples {
             let p = parents[rng.below(parents.len() as u64) as usize];
             let a = Instant::now();
@@ -724,6 +742,77 @@ impl Bench {
                 us[us.len() - 1]
             );
         }
+        // Amendment 13: the table's capacity around the timed samples, so a bucket-count change during them is counted.
+        println!("# sampletable x={x} cap_before={cap_before} cap_after={}", self.db.branch_table_capacity());
+        if let Some((k, n)) = args.fork_batch {
+            self.fork_batches(x, parents, rng, k, n);
+        }
+    }
+
+    /// `--fork-batch K,N` (amendment 13), after the timed samples: 2N batches of K forks, each fork from a parent drawn
+    /// as the samples draw them, alternating the timer's placement batch by batch. `fork_bfull` times what the `fork` row
+    /// times (the parent's Node record, the store's fork, the child's Node push); `fork_bstore` reads the K parents'
+    /// Node records before the timer and times only the store's fork calls, with the Node bookkeeping after it. A batch
+    /// records its elapsed time / K, so one clock tick is 1/K tick per fork. Every child is pruned after its batch: at
+    /// most K extra entries are live, and the table sees 2NK inserts and removes.
+    fn fork_batches(&mut self, x: u64, parents: &[u32], rng: &mut Rng, k: usize, n: usize) {
+        let cap_before = self.db.branch_table_capacity();
+        let mut t: [Vec<f64>; 2] = Default::default();
+        for j in 0..2 * n {
+            let ps: Vec<u32> = (0..k).map(|_| parents[rng.below(parents.len() as u64) as usize]).collect();
+            let mut kids = Vec::with_capacity(k);
+            if j % 2 == 0 {
+                let a = Instant::now();
+                for &p in &ps {
+                    kids.push(self.fork(p));
+                }
+                t[0].push(a.elapsed().as_secs_f64() * 1e6 / k as f64);
+            } else {
+                let mut branches = Vec::with_capacity(k);
+                {
+                    let handles: Vec<Option<&Branch>> = ps
+                        .iter()
+                        .map(|&p| {
+                            if p == TRUNK {
+                                None
+                            } else {
+                                Some(self.nodes[p as usize].branch.as_ref().expect("forked from a live handle"))
+                            }
+                        })
+                        .collect();
+                    let a = Instant::now();
+                    for h in &handles {
+                        branches.push(match h {
+                            None => self.trunk.fork_branch().unwrap(),
+                            Some(b) => b.fork().unwrap(),
+                        });
+                    }
+                    t[1].push(a.elapsed().as_secs_f64() * 1e6 / k as f64);
+                }
+                for (&p, branch) in ps.iter().zip(branches) {
+                    kids.push(self.record_fork(p, branch));
+                }
+            }
+            for (id, branch) in kids {
+                self.prune(id, branch);
+            }
+        }
+        for (name, us) in ["fork_bfull", "fork_bstore"].iter().zip(t.iter_mut()) {
+            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let us: &[f64] = us;
+            println!(
+                "{x}\t{name}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}",
+                us.len(),
+                percentile(us, 50.0),
+                percentile(us, 90.0),
+                percentile(us, 99.0),
+                us[us.len() - 1]
+            );
+        }
+        println!(
+            "# forkbatch x={x} k={k} n={n} cap_before={cap_before} cap_after={}",
+            self.db.branch_table_capacity()
+        );
     }
 
     /// Drop every remaining handle, oldest node first, and check the store empties.
@@ -1054,8 +1143,8 @@ fn main() {
     println!(
         "# shape={:?} rows={:?} interior={:?} continue={} fr={} fi={} depth={} gamma_milli={} \
          fanout={} beam={} expand={} checkpoints={:?} seed={:#x} timing={} samples={} \
-         refcounted={} observe={OBSERVE} table={} table_rebuild={:?} probe_forks={} trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} \
-         trunk_pages={page_count} build={}",
+         refcounted={} observe={OBSERVE} table={} table_rebuild={:?} probe_forks={} fork_batch={} trunk_rows={TRUNK_ROWS} \
+         value_len={VALUE_LEN} trunk_pages={page_count} build={}",
         args.shape,
         args.rows,
         args.interior,
@@ -1075,6 +1164,7 @@ fn main() {
         if cfg!(feature = "branch-slab") { "slab" } else { "hash" },
         args.rebuild,
         args.probe,
+        args.fork_batch.map_or("none".to_string(), |(k, n)| format!("{k},{n}")),
         if cfg!(debug_assertions) { "DEBUG" } else { "release" },
     );
     if args.timing {
