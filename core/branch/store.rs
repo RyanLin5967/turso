@@ -422,6 +422,16 @@ fn fuzzy_checkpoints() -> bool {
     *FUZZY.get_or_init(|| std::env::var("R11_CKPT").is_ok_and(|v| v == "fuzzy"))
 }
 
+/// PREREG A27 (the F-FZ capture residual): with `R11_CAPTURE_GATE=on`, a checkpoint's capture copies a
+/// branch's `current` only when a writer of its row needs it (`DIRTY_NEW` or `DIRTY_CUR`), and its
+/// retained versions only for `DIRTY_NEW` or `DIRTY_RET`, as `checkpoint_write` uses them. A branch
+/// that is only `DIRTY_ROW` (a parent that forked) is then one row, not its whole page map. Off by
+/// default until the counter arm is scored: the lane's arm-switch pattern, like `R11_CKPT`.
+fn capture_gate() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("R11_CAPTURE_GATE").is_ok_and(|v| v == "on"))
+}
+
 impl CatState {
     fn new(catalog: Catalog, sync: bool, generation: u64) -> Result<Self> {
         let writer = Arc::new(Mutex::new(catalog.writer(sync)?));
@@ -3549,21 +3559,29 @@ impl StoreInner {
         let rows: Vec<(CatBranch, u8)> = dirty
             .iter()
             .filter_map(|(id, &what)| self.branches.get(id).map(|st| (id, st, what)))
-            .map(|(&id, st, what)| (CatBranch {
-                id: id.0,
-                parent: st.parent.0,
-                fork_epoch: st.fork_epoch,
-                epoch: st.lineage.epoch,
-                released: st.handle == Handle::Released,
-                lease: if st.handle == Handle::Released { None } else { st.lease },
-                n_children: st.lineage.n_children,
-                current: st
-                    .current
-                    .iter()
-                    .map(|(&page, o)| (page, o.slot, o.born, o.crc))
-                    .collect(),
-                retained: st.lineage.retained_list(),
-            }, what))
+            .map(|(&id, st, what)| {
+                let gate = capture_gate();
+                let need_current = !gate || what & (DIRTY_NEW | DIRTY_CUR) != 0;
+                let need_retained = !gate || what & (DIRTY_NEW | DIRTY_RET) != 0;
+                (CatBranch {
+                    id: id.0,
+                    parent: st.parent.0,
+                    fork_epoch: st.fork_epoch,
+                    epoch: st.lineage.epoch,
+                    released: st.handle == Handle::Released,
+                    lease: if st.handle == Handle::Released { None } else { st.lease },
+                    n_children: st.lineage.n_children,
+                    current: if need_current {
+                        st.current
+                            .iter()
+                            .map(|(&page, o)| (page, o.slot, o.born, o.crc))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    retained: if need_retained { st.lineage.retained_list() } else { Vec::new() },
+                }, what)
+            })
             .collect();
         cat.ckpt.capture_entries +=
             rows.iter().map(|(b, _)| (b.current.len() + b.retained.len()) as u64).sum::<u64>();
