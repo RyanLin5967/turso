@@ -3321,6 +3321,14 @@ impl StoreInner {
             // holds a branch or a retained trunk version has pages of the old size and cannot.
             // (VACUUM and journal-mode changes are refused while a branch exists, so only the
             // empty case is reachable.)
+            // PREREG A25/A25b: reaped state is marked only in memory until the next checkpoint
+            // deletes its catalog rows: trunk versions (`trunk_gone`) and whole branches (their
+            // `ret` rows), and `any_retained` would count those rows. Listing the markers missed one
+            // (A25b), so a catalog store that holds no branch and no in-memory trunk version
+            // checkpoints first, and the catalog then says what the store holds.
+            if self.n_states == 0 && self.trunk.lineage.retained.is_empty() && self.cat.is_some() {
+                self.checkpoint_catalog(false, false)?;
+            }
             let catalog_retains = match self.catalog() {
                 Some(cat) => cat.any_retained()?,
                 None => false,
