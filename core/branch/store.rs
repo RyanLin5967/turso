@@ -4431,6 +4431,72 @@ mod tests {
         );
     }
 
+    /// A catalog store that retained trunk versions for one branch, checkpointed them into the
+    /// catalog, then reaped the branch. It is logically empty (no branch, no retained version),
+    /// but the versions' rows are still in the catalog, marked reaped only in memory (`trunk_gone`)
+    /// until the next checkpoint deletes them. Every premise is asserted, so a changed path fails
+    /// loudly instead of passing vacuously.
+    fn catalog_store_emptied_since_its_checkpoint() -> (tempfile::TempDir, Arc<crate::Database>) {
+        use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: false }),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        trunk.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
+        let id = trunk.fork_branch().unwrap().into_id();
+        trunk.execute("UPDATE t SET v = 'after' WHERE id = 1").unwrap();
+        assert!(db.branch_trunk_retained() >= 1, "premise: the trunk write retained no version");
+        db.branch_compact_now().unwrap();
+        db.branch(id).unwrap().reap().unwrap();
+        assert_eq!(db.branch_stats().unwrap().live_branches, 0, "premise: a branch is still live");
+        assert_eq!(db.branch_trunk_retained(), 0, "premise: a trunk version is still retained");
+        assert!(
+            db.branches.trunk_gone_len() >= 1,
+            "premise: the reap did not leave its trunk rows for the next checkpoint"
+        );
+        drop(trunk);
+        (dir, db)
+    }
+
+    /// PREREG A19's owed liveness case (A25). `any_retained` counts the reaped-but-uncheckpointed
+    /// trunk rows, so `ensure_backing` refuses the database's new page size for a store that holds
+    /// nothing. Predicted RED at d6a5fc100: "branch arena holds P-byte pages but the database now
+    /// uses 2P".
+    #[test]
+    fn a_catalog_store_emptied_since_its_checkpoint_follows_a_new_page_size() {
+        let (_dir, db) = catalog_store_emptied_since_its_checkpoint();
+        let mut inner = db.branches.inner.lock();
+        let current = inner.arena.as_ref().expect("the store forked, so its arena exists").page_size();
+        inner
+            .ensure_backing(current * 2)
+            .expect("a logically empty catalog store refused the database's new page size");
+    }
+
+    /// Its control, predicted GREEN at d6a5fc100: the same store after one more checkpoint (which
+    /// deletes the reaped rows) follows the new page size. So the refusal above comes from the
+    /// uncheckpointed rows alone.
+    #[test]
+    fn a_catalog_store_emptied_and_checkpointed_follows_a_new_page_size() {
+        let (_dir, db) = catalog_store_emptied_since_its_checkpoint();
+        db.branch_compact_now().unwrap();
+        assert_eq!(db.branches.trunk_gone_len(), 0, "premise: the checkpoint left reaped rows");
+        let mut inner = db.branches.inner.lock();
+        let current = inner.arena.as_ref().expect("the store forked, so its arena exists").page_size();
+        inner
+            .ensure_backing(current * 2)
+            .expect("an empty, checkpointed catalog store refused the database's new page size");
+    }
+
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
     /// a page-size change, and must keep refusing it.
     #[test]
