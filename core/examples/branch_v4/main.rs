@@ -836,6 +836,12 @@ fn nreopen(args: &Args) {
     let (mut base_ok, mut paths_equal, mut expect_arena_leaf) = (0u64, 0u64, 0u64);
     let (mut truth_conflicts, mut v4_conflicts, mut false_refusals, mut missed) = (0u64, 0u64, 0u64, 0u64);
     let (mut loads_max, mut loads_min) = (0u64, u64::MAX);
+    // K8-B (r12-composition amendment 10): every base read bracketed, so db page reads can be tied to
+    // the C-P probes and branch loads of that call.
+    let twk0 = db.branch_twk_counters();
+    let (mut pure_calls, mut pure_probes, mut pure_reads, mut pure_max) = (0u64, 0u64, 0u64, 0u64);
+    let (mut load_calls, mut load_reads, mut probes_max) = (0u64, 0u64, 0u64);
+    let mut pure_hist = [0u64; 10];
     let mut findings = Vec::new();
     for (j, &i) in p.writers.iter().enumerate() {
         let id = BranchId(i + 1);
@@ -856,7 +862,29 @@ fn nreopen(args: &Args) {
             let base = loop {
                 let depth = path.len();
                 path.push(page);
-                let arena = match db.branch_base_page(id, page, &mut buf) {
+                let (r0, p0, l0) = (
+                    turso_core::branch::page_io()[0],
+                    db.branch_v4_counters().4,
+                    db.branch_catalog_counters().0,
+                );
+                let answer = db.branch_base_page(id, page, &mut buf);
+                let (dr, dp, dl) = (
+                    turso_core::branch::page_io()[0] - r0,
+                    db.branch_v4_counters().4 - p0,
+                    db.branch_catalog_counters().0 - l0,
+                );
+                probes_max = probes_max.max(dp);
+                if dl == 0 {
+                    pure_calls += 1;
+                    pure_probes += dp;
+                    pure_reads += dr;
+                    pure_max = pure_max.max(dr);
+                    pure_hist[(dr as usize).min(9)] += 1;
+                } else {
+                    load_calls += 1;
+                    load_reads += dr;
+                }
+                let arena = match answer {
                     Ok(a) => a,
                     Err(e) => {
                         findings.push(format!("writer {}: key {k}: base page {page} at depth {depth} refused: {e}", id.0));
@@ -965,12 +993,33 @@ fn nreopen(args: &Args) {
         ratio(io_v4[0], probes),
         delta(io0, io_open),
     );
+    let twk1 = db.branch_twk_counters();
+    let (twk_probes, twk_rows) = (twk1.0 - twk0.0, twk1.1 - twk0.1);
+    let cp_rows = v4_1.5 - v4_0.5;
+    println!(
+        "K8B\tlive={}\ttail={}\tkeys={n}\tarena_per_key={:.4}\tcp_rows_per_key={:.4}\ttwk_probes={twk_probes}\ttwk_rows={twk_rows}\t\
+         twk_rows_per_key={:.4}\tother_rows_per_key={:.4}\tpure_calls={pure_calls}\tpure_probes={pure_probes}\tpure_reads={pure_reads}\t\
+         reads_per_pure_probe={}\tpure_max_reads_one_call={pure_max}\tpure_hist={pure_hist:?}\tload_calls={load_calls}\tload_reads={load_reads}\t\
+         probes_max_one_call={probes_max}\topen_log_bytes={}\topen_records={}",
+        args.live,
+        args.tail,
+        arena as f64 / n as f64,
+        cp_rows as f64 / n as f64,
+        twk_rows as f64 / n as f64,
+        (cp_rows - twk_rows) as f64 / n as f64,
+        ratio(pure_reads, pure_probes),
+        open_stats.log_bytes,
+        open_stats.records,
+    );
     for f in &findings {
         println!("FINDING: {f}");
     }
     let _ = std::io::stdout().flush();
     if v4_1.1 - v4_0.1 != arena {
         not_a_result(&format!("the store counted {} arena base reads, the harness {arena}", v4_1.1 - v4_0.1));
+    }
+    if pure_calls + load_calls != v4_1.0 - v4_0.0 {
+        not_a_result(&format!("bracketed {} calls, the store counted {} base reads", pure_calls + load_calls, v4_1.0 - v4_0.0));
     }
 
     // Theirs and the live count, after the counters are taken (these settle and read through the

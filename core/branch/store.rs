@@ -294,6 +294,10 @@ struct CatState {
     /// Trunk-version probes and range reads, and the version rows they returned (C-P).
     trunk_probes: u64,
     trunk_rows: u64,
+    /// The part of `trunk_probes`/`trunk_rows` made by `trunk_written_known`'s once-per-page probe
+    /// (r12-composition K8-B instrument; observing only).
+    twk_probes: u64,
+    twk_rows: u64,
 }
 
 impl CatState {
@@ -313,6 +317,8 @@ impl CatState {
             trunk_page_loads: 0,
             trunk_probes: 0,
             trunk_rows: 0,
+            twk_probes: 0,
+            twk_rows: 0,
         }
     }
 }
@@ -2104,6 +2110,13 @@ impl BranchStore {
         (v.base_reads, v.base_arena, v.base_refused, v.base_examined, probes, rows)
     }
 
+    /// `(probes, rows)` of `trunk_written_known`'s once-per-page catalog probe since open
+    /// (r12-composition K8-B instrument). Does not settle.
+    pub(crate) fn twk_counters(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        inner.cat.as_ref().map_or((0, 0), |c| (c.twk_probes, c.twk_rows))
+    }
+
     pub(crate) fn open_stats(&self) -> BranchOpenStats {
         self.open_stats
     }
@@ -2567,8 +2580,10 @@ impl StoreInner {
             return Ok(());
         }
         cat.trunk_probes += 1;
+        cat.twk_probes += 1;
         if let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, u64::MAX)? {
             cat.trunk_rows += 1;
+            cat.twk_rows += 1;
             // A version reaped since the checkpoint still dates the page's last write.
             if !cat.trunk_gone.contains(&(page, born)) {
                 cat.trunk_cache

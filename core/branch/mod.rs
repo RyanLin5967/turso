@@ -591,6 +591,12 @@ impl Database {
         self.branches.v4_counters()
     }
 
+    /// `(probes, rows)` of the once-per-page `written` probe since open (r12-composition K8-B).
+    #[doc(hidden)]
+    pub fn branch_twk_counters(&self) -> (u64, u64) {
+        self.branches.twk_counters()
+    }
+
     /// Trunk pre-images the store holds now (r11-restart lane instrument).
     #[doc(hidden)]
     pub fn branch_trunk_retained(&self) -> u64 {
