@@ -1880,6 +1880,22 @@ impl StreamingWalReader {
         pos
     }
 
+    /// Mutant M5 (r11-walpin-conc amendment 25b, test builds only): index the frames after the last
+    /// commit too, so that with `finalize_loading`'s max_frame at the last valid frame a torn
+    /// transaction is replayed. Not used by the engine.
+    #[cfg(test)]
+    fn walpin_mutant_index_tail(&self) {
+        if crate::branch::walpin::crash::mutant().as_deref() != Some("uncommitted_tail") {
+            return;
+        }
+        let mut st = self.state.write();
+        let wfs = self.wal_shared.read();
+        let mut frame_cache = wfs.runtime.frame_cache.lock();
+        for (page, frames) in st.pending_frames.drain() {
+            frame_cache.entry(page).or_default().extend(frames);
+        }
+    }
+
     fn flush_pending_frames(&self, state: &mut StreamingState) {
         if state.pending_frames.is_empty() {
             return;
@@ -1906,6 +1922,8 @@ impl StreamingWalReader {
 
     /// Finalizes the loading process
     fn finalize_loading(&self) {
+        #[cfg(test)]
+        self.walpin_mutant_index_tail();
         let mut wfs = self.wal_shared.write();
         let st = self.state.read();
         tracing::debug!(
@@ -1916,6 +1934,16 @@ impl StreamingWalReader {
         );
 
         let max_frame = st.last_valid_frame;
+        let last_checksum = st.last_valid_checksum;
+        // Mutant M5 (r11-walpin-conc amendment 25b, test builds only): recover to the last VALID
+        // frame instead of the last commit, so a torn transaction's frames would be replayed.
+        #[cfg(test)]
+        let (max_frame, last_checksum) =
+            if crate::branch::walpin::crash::mutant().as_deref() == Some("uncommitted_tail") {
+                (st.frame_idx - 1, st.cumulative_checksum)
+            } else {
+                (max_frame, last_checksum)
+            };
         if max_frame > 0 {
             let mut frame_cache = wfs.runtime.frame_cache.lock();
             for frames in frame_cache.values_mut() {
@@ -1935,7 +1963,7 @@ impl StreamingWalReader {
 
         wfs.metadata.max_frame.store(max_frame, Ordering::SeqCst);
         // use checksum of last valid commit frame, not necessarily the last frame
-        wfs.metadata.last_checksum = st.last_valid_checksum;
+        wfs.metadata.last_checksum = last_checksum;
         if st.header_valid {
             wfs.metadata.initialized.store(true, Ordering::SeqCst);
         }

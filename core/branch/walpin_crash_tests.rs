@@ -26,7 +26,13 @@ const ROWS_PER_TXN: i64 = 8;
 const MAX_TXNS: i64 = 6_000;
 const CONTINUE_TXNS: i64 = 400;
 const CHILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
-const VERIFY_MUTANTS: [&str; 4] = ["newer_only", "wal0_only", "no_salt_check", "no_rule1"];
+const VERIFY_MUTANTS: [&str; 5] = [
+    "newer_only",
+    "wal0_only",
+    "no_salt_check",
+    "no_rule1",
+    "uncommitted_tail",
+];
 
 fn open(dir: &str) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
@@ -236,10 +242,19 @@ fn refusals(dir: &str) {
     drop(mp);
     let db = open(dir);
     say("plain opened");
+    // `reload_wal_after_external_restore` exists only with the conn_raw_api feature, which the
+    // registered lib-test build does not enable (amendment 25b): then this guard is UNTESTED, said
+    // so on its own line.
+    #[cfg(feature = "conn_raw_api")]
     say(&match db.reload_wal_after_external_restore() {
         Err(e) => format!("reload refused: {e}"),
         Ok(()) => "reload reloaded".to_string(),
     });
+    #[cfg(not(feature = "conn_raw_api"))]
+    {
+        drop(db);
+        say("reload UNTESTED: conn_raw_api is off in this build");
+    }
 }
 
 #[test]
@@ -385,9 +400,10 @@ enum Cut {
     None,
     /// -wal loses its last commit: cut after its second-to-last commit frame (tail_lost).
     LastCommit,
-    /// -wal's last transaction is torn: cut one frame after its second-to-last commit frame.
+    /// -wal's last transaction is torn: every frame of it except its commit frame survives
+    /// (amendment 25b: the most a torn write can leave, so a replay of it is visible).
     TornOlder,
-    /// -wal2's only transaction is torn: keep its header and first frame (torn_newer).
+    /// -wal2's only transaction is torn the same way: all its frames but the commit frame.
     TornNewer,
 }
 
@@ -434,7 +450,7 @@ fn apply_cut(dir: &Path, cut: Cut) -> u64 {
                     last - prev >= 2,
                     "the last transaction spans two frames or more"
                 );
-                ends[prev + 1]
+                ends[last - 1]
             }
         }
         Cut::TornNewer => {
@@ -442,7 +458,7 @@ fn apply_cut(dir: &Path, cut: Cut) -> u64 {
                 commits.len() == 1 && commits[0] >= 1,
                 "-wal2 holds one transaction of two frames or more: commits at {commits:?}"
             );
-            ends[0]
+            ends[commits[0] - 1]
         }
         Cut::None => unreachable!(),
     };
@@ -616,6 +632,7 @@ fn configs() -> Vec<Config> {
         0,
     );
     torn_newer.cut = Cut::TornNewer;
+    torn_newer.must_kill = &["uncommitted_tail"];
     v.push(torn_newer);
     let mut torn_older = config(
         "torn_older commit_written:1".into(),
@@ -625,6 +642,7 @@ fn configs() -> Vec<Config> {
         -1,
     );
     torn_older.cut = Cut::TornOlder;
+    torn_older.must_kill = &["uncommitted_tail"];
     v.push(torn_older);
     v
 }
@@ -634,7 +652,7 @@ fn configs() -> Vec<Config> {
 /// integrity-clean; the database keeps working across another switch, a second crash and a reopen;
 /// each mutant is killed where it is registered to be.
 #[test]
-#[ignore = "spawns ~220 child processes of this binary (FW2 on in each); run explicitly"]
+#[ignore = "spawns ~300 child processes of this binary (FW2 on in each); run explicitly"]
 fn wal2_recovers_every_committed_txn_at_every_switch_point() {
     let mut failures = Vec::new();
     let mut table = Vec::new();
@@ -837,7 +855,7 @@ fn refusal_walpin_open_wal2_refuses_an_unrecovered_wal2() {
         let wal2 = tmp.path().join("crash.db-wal2");
         std::fs::write(&wal2, vec![7u8; bytes]).unwrap();
         match (db.walpin_open_wal2(), refused) {
-            (Err(e), true) => assert!(e.to_string().contains("wal2"), "{e}"),
+            (Err(e), true) => assert!(e.to_string().contains("not recovered"), "{e}"),
             (Ok(()), false) => {}
             (r, _) => panic!("a {bytes}-B -wal2: want refused={refused}, got {r:?}"),
         }
@@ -863,10 +881,15 @@ fn refusal_fw2_refuses_multiprocess_wal_and_external_restore_reload() {
     );
     assert!(r.line("plain opened").is_some(), "{}", r.text());
     let reload = r.line("reload ").map(|f| f.join(" "));
+    let want_reload = if cfg!(feature = "conn_raw_api") {
+        "refused"
+    } else {
+        "UNTESTED"
+    };
     assert!(
-        reload
-            .as_deref()
-            .is_some_and(|l| l.contains("refused") && l.contains("FW2")),
+        reload.as_deref().is_some_and(
+            |l| l.contains(want_reload) && (want_reload == "UNTESTED" || l.contains("FW2"))
+        ),
         "{}",
         r.text()
     );
