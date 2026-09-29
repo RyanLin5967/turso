@@ -40,16 +40,16 @@ impl<T: Copy> SeqLock<T> {
     /// Exclusive access, as `SpinLock::lock`. The sequence is odd while the guard lives.
     pub fn lock(&self) -> SeqLockGuard<'_, T> {
         // k3 amendment 21: failed swaps and the time spent spinning, outside the WalHdr count (which stays the two
-        // writes of an uncontended acquisition, as before, so `shared_rmw` is unchanged).
-        let mut t0 = None;
+        // writes of an uncontended acquisition, as before, so `shared_rmw` is unchanged). Addendum 21b: the clock is
+        // read only after a failed swap, never while the lock is held.
+        use crate::coherence::{Class, SpinTimer};
+        let mut timer = SpinTimer::new(Class::WalHdrSpinNs, Class::WalHdrContended);
         while self.locked.swap(true, Ordering::Acquire) {
-            crate::coherence::bump(crate::coherence::Class::WalHdrFail, 1);
-            if t0.is_none() {
-                t0 = crate::coherence::spin_clock();
-            }
+            crate::coherence::bump(Class::WalHdrFail, 1);
+            timer.failed();
             std::hint::spin_loop();
         }
-        crate::coherence::spin_done(t0, crate::coherence::Class::WalHdrSpinNs);
+        drop(timer);
         // The swap and the release store, as the SpinLock this replaces.
         crate::coherence::bump(crate::coherence::Class::WalHdr, 2);
         if self.optimistic {

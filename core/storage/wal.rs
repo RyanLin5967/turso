@@ -3585,6 +3585,12 @@ impl Wal for WalFile {
         // up to ~10 seconds before giving up, so we just mirror SQLite's implementation
         // here.
         let mut cnt = 0u32;
+        // k3 addendum 21b: the time between this call's first and last immediate Retry (the clock read only after a
+        // Retry outcome, with nothing held), added when the call returns.
+        let mut timer = crate::coherence::SpinTimer::new(
+            crate::coherence::Class::ReadTxRetryNs,
+            crate::coherence::Class::ReadTxCalls,
+        );
         loop {
             tracing::trace!("begin_read_tx: cnt={cnt}");
             match self.try_begin_read_tx() {
@@ -3594,14 +3600,12 @@ impl Wal for WalFile {
                 TryBeginReadResult::Retry => {
                     cnt += 1;
                     // k3 amendment 21: immediate retries apart from the ones that yield or sleep.
-                    crate::coherence::bump(
-                        if cnt <= 5 {
-                            crate::coherence::Class::ReadTxRetry
-                        } else {
-                            crate::coherence::Class::ReadTxBackoff
-                        },
-                        1,
-                    );
+                    if cnt <= 5 {
+                        crate::coherence::bump(crate::coherence::Class::ReadTxRetry, 1);
+                        timer.failed();
+                    } else {
+                        crate::coherence::bump(crate::coherence::Class::ReadTxBackoff, 1);
+                    }
                     if cnt > 100 {
                         return Err(LimboError::Busy);
                     }

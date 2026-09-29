@@ -67,9 +67,18 @@ pub enum Class {
     ReadTxRetry,
     /// begin_read_tx retries after the fifth (yield, then sleep).
     ReadTxBackoff,
+    // --- k3 addendum 21b: what makes the spin-ns lower bounds usable, and begin_read_tx's time.
+    /// WAL header acquisitions with at least one failed swap.
+    WalHdrContended,
+    /// frame_cache acquisitions with at least one failed swap.
+    WalFcContended,
+    /// Nanoseconds between a begin_read_tx call's first and last immediate Retry (a lower bound on its retry time).
+    ReadTxRetryNs,
+    /// begin_read_tx calls with at least one immediate Retry.
+    ReadTxCalls,
 }
 
-pub const CLASSES: usize = 23;
+pub const CLASSES: usize = 27;
 
 pub const NAMES: [&str; CLASSES] = [
     "wal_rw_read",
@@ -95,6 +104,10 @@ pub const NAMES: [&str; CLASSES] = [
     "wal_fc_spin_ns",
     "readtx_retry",
     "readtx_backoff",
+    "wal_hdr_contended",
+    "wal_fc_contended",
+    "readtx_retry_ns",
+    "readtx_calls",
 ];
 
 #[cfg(feature = "coherence")]
@@ -134,22 +147,47 @@ pub fn snapshot() -> [u64; CLASSES] {
 /// Whether this build carries the instrument.
 pub const ENABLED: bool = cfg!(feature = "coherence");
 
-/// The spin counters' clock (k3 amendment 21): the time now in an instrumented build, `None` in a timed one, so a
-/// timed build reads no clock on any path.
-#[inline(always)]
-pub fn spin_clock() -> Option<std::time::Instant> {
-    if ENABLED {
-        Some(std::time::Instant::now())
-    } else {
-        None
+/// The spin counters' timer (k3 amendment 21, addendum 21b). The clock is read only after a FAILED attempt, never once
+/// the lock is held (or, for begin_read_tx, once a read transaction began), so the time it adds to `ns` when dropped,
+/// first failed attempt to last failed attempt, is a LOWER BOUND on the spin: it misses the first failed attempt and the
+/// one that succeeds. The first failure of an acquisition also counts it in `contended`, so the bound can be scaled.
+/// Without the `coherence` feature it reads no clock and counts nothing.
+pub struct SpinTimer {
+    ns: Class,
+    contended: Class,
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+}
+
+impl SpinTimer {
+    #[inline(always)]
+    pub fn new(ns: Class, contended: Class) -> Self {
+        Self { ns, contended, first: None, last: None }
+    }
+
+    /// Call after each failed attempt, before the next one.
+    #[inline(always)]
+    pub fn failed(&mut self) {
+        if !ENABLED {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.first.is_none() {
+            self.first = Some(now);
+            bump(self.contended, 1);
+        } else {
+            self.last = Some(now);
+        }
     }
 }
 
-/// Add the time since `t0` (from [`spin_clock`]) to `class`, in nanoseconds.
-#[inline(always)]
-pub fn spin_done(t0: Option<std::time::Instant>, class: Class) {
-    if let Some(t0) = t0 {
-        bump(class, t0.elapsed().as_nanos() as u64);
+impl Drop for SpinTimer {
+    /// No clock read here: the interval between the two stored readings.
+    #[inline(always)]
+    fn drop(&mut self) {
+        if let (Some(a), Some(b)) = (self.first, self.last) {
+            bump(self.ns, b.duration_since(a).as_nanos() as u64);
+        }
     }
 }
 

@@ -61,29 +61,27 @@ impl<T> SpinLock<T> {
         class: crate::coherence::Class,
         fail: Option<crate::coherence::Class>,
     ) -> SpinLockGuard<'_, T> {
-        use crate::coherence::Class;
+        use crate::coherence::{Class, SpinTimer};
         // k3 amendment 21: frame_cache's call sites pass no fail twin (they predate it), so it is supplied here; and the
-        // time from the first failed swap to the acquisition goes to the site's spin-ns class.
+        // spin between failed swaps goes to the site's spin-ns class (addendum 21b: the clock is read only after a failed
+        // swap, never while the lock is held).
         let fail = fail.or(if class == Class::WalFc { Some(Class::WalFcFail) } else { None });
-        let spin_ns = match class {
-            Class::WalHdr => Some(Class::WalHdrSpinNs),
-            Class::WalFc => Some(Class::WalFcSpinNs),
+        let mut timer = match class {
+            Class::WalHdr => Some(SpinTimer::new(Class::WalHdrSpinNs, Class::WalHdrContended)),
+            Class::WalFc => Some(SpinTimer::new(Class::WalFcSpinNs, Class::WalFcContended)),
             _ => None,
         };
-        let mut t0 = None;
         while self.locked.swap(true, Ordering::Acquire) {
             crate::coherence::bump(class, 1);
             if let Some(fail) = fail {
                 crate::coherence::bump(fail, 1);
             }
-            if t0.is_none() && spin_ns.is_some() {
-                t0 = crate::coherence::spin_clock();
+            if let Some(t) = timer.as_mut() {
+                t.failed();
             }
             spin_loop();
         }
-        if let Some(c) = spin_ns {
-            crate::coherence::spin_done(t0, c);
-        }
+        drop(timer);
         crate::coherence::bump(class, 2);
         SpinLockGuard { lock: self }
     }
