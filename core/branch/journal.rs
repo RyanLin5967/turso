@@ -743,7 +743,9 @@ impl Journal {
                     // A log with no end frame at all (only `Journal::flush` writes one, in tests)
                     // keeps the rule it always had: a zeroed frame with any whole frame after it is
                     // Corrupt; other damage is a torn tail.
-                    let later = if flight_end.is_some() || first_flight_end_after(&bytes, pos).is_some() {
+                    let flights = !super::store::crash::mutant("legacy_damage_rule")
+                        && (flight_end.is_some() || first_flight_end_after(&bytes, pos).is_some());
+                    let later = if flights {
                         later_whole_flight(&bytes, pos)
                     } else if what == "a zeroed region" {
                         first_whole_frame_after(&bytes, pos + 1)
@@ -1011,8 +1013,9 @@ impl Journal {
     ) -> Result<()> {
         self.check_live()?;
         // The snapshot names slots that buffered-but-unwritten records also name; they must be
-        // durable before the snapshot is.
-        if self.sync {
+        // durable before the snapshot is. Under the redo rule this is the ONLY arena barrier before
+        // the log's page images are dropped (the checkpoint).
+        if self.sync && !super::store::crash::mutant("no_ckpt_sync") {
             arena.sync()?;
         }
         let generation = self.generation + 1;

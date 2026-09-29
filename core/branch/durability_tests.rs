@@ -2773,6 +2773,12 @@ fn no_force_crash_child() {
     record("committed".to_string());
     record(format!("b_slots {:?}", b.owned_slots()));
     kill_after("after-commit");
+    if at == "after-checkpoint" {
+        // The checkpoint: under no-force its arena sync is the only arena barrier before the log's
+        // page images are dropped (PREREG amendment 7, T-CK).
+        db.branch_compact_now().unwrap();
+        crash::kill_now("after-checkpoint");
+    }
     drop(bc);
     kill_after("after-close");
     if at == "release-after-buffer" {
@@ -2881,6 +2887,8 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
         bytes.get(off..off + page_size as usize).map(<[u8]>::to_vec)
     };
     let before_redo = b_slot.map(slot_bytes);
+    let log_path = std::path::PathBuf::from(format!("{}-branch-log", path.display()));
+    let log_len_at_kill = std::fs::metadata(&log_path).map_or(0, |m| m.len());
     if log_after != LogAfterKill::AsLeft {
         let start: u64 = noted
             .split_whitespace()
@@ -3014,7 +3022,14 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
     }
     // The premise that makes this a test of the redo rule: where B's commit was acknowledged, its
     // page was NOT in the arena file when the child died; only the log could bring it back.
-    if b_expected && committed && at != "after-release" {
+    // After a checkpoint the log holds nothing but its 32-byte header and 21-byte empty flight: no
+    // page image can supply B's page, so only the checkpoint's arena sync can have kept it.
+    if at == "after-checkpoint" && log_len_at_kill != 53 {
+        failed.push(format!(
+            "premise: the log held {log_len_at_kill} bytes after the checkpoint, not its bare 53"
+        ));
+    }
+    if b_expected && committed && at != "after-release" && at != "after-checkpoint" {
         if before_redo.is_none() {
             failed.push(format!(
                 "premise: B's slot {b_slot:?} lay past the end of the arena file, not in Q's freed slot"
@@ -3401,4 +3416,128 @@ fn nf_twin_a_close_frees_nothing_of_a_branch_whose_early_release_rides_an_unforc
     let b = db.branch(b_id).expect("its Release never became durable, so the branch is back");
     assert_eq!(value(&b.connect().unwrap(), 10), Some("b".to_string()));
     let _ = b.into_id();
+// ---- r12-noforce PREREG amendment 7: Rule One batch 4's two correctness gaps ----
+
+/// T-CK. Under no-force the checkpoint's arena sync (`Journal::compact`) is the only arena barrier
+/// before the log's page images are dropped. The crash child commits B into an in-file slot, runs
+/// the checkpoint, and is SIGKILLed right after it with every unsynced arena write lost; B must come
+/// back reading its own page. Mutant `no_ckpt_sync` must turn this red.
+#[cfg(unix)]
+#[test]
+fn no_force_crash_after_a_checkpoint_keeps_the_page() {
+    let verdict = no_force_crash_once("after-checkpoint", LogAfterKill::AsLeft);
+    assert!(verdict.is_ok(), "{verdict:?}");
+}
+
+/// Where each flight of a store log begins, from its end frames (tag 9: `FlightEnd{start, crc}`),
+/// in log order. The first is the empty flight a store writes after every header.
+fn flight_starts(log: &Path) -> Vec<u64> {
+    let bytes = std::fs::read(log).unwrap();
+    let mut pos = 32;
+    let mut starts = Vec::new();
+    while pos + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        if len == 0 || pos + 8 + len > bytes.len() {
+            break;
+        }
+        let payload = &bytes[pos + 8..pos + 8 + len];
+        if payload[0] == 9 {
+            starts.push(u64::from_le_bytes(payload[1..9].try_into().unwrap()));
+        }
+        pos += 8 + len;
+    }
+    starts
+}
+
+/// T-E2E-1. The recovery damage rule end to end: the last flight (b's second commit) is damaged,
+/// (i) with only its end frame torn, and (ii) with its first 12 bytes zeroed AND its end frame torn,
+/// so a whole frame survives in its middle. That flight was never acknowledged: the store must open
+/// at b's first commit, and b must keep working. The handle is held, not a temporary.
+#[cfg(unix)]
+#[test]
+fn a_torn_last_flight_is_cut_end_to_end() {
+    for zero_the_start in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("durable.db");
+        let (b_id, after_first, log, incarnation);
+        {
+            let db = open_at(&path, durable()).unwrap();
+            incarnation = db.incarnation;
+            let trunk = db.connect().unwrap();
+            seed(&trunk, 200);
+            let b = trunk.fork_branch().unwrap();
+            let bc = b.connect().unwrap();
+            set(&bc, 7, "first");
+            after_first = in_use(&db);
+            set(&bc, 150, "second");
+            drop(bc);
+            log = db.branch_log_path().expect("a durable store has a log file");
+            b_id = b.into_id();
+        }
+        let last = *flight_starts(&log).last().expect("the log holds flights");
+        let len = std::fs::metadata(&log).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+        if zero_the_start {
+            use std::os::unix::fs::FileExt;
+            f.write_all_at(&[0u8; 12], last).unwrap();
+        }
+        f.set_len(len - 3).unwrap();
+        drop(f);
+
+        let db = open_at(&path, durable())
+            .unwrap_or_else(|e| panic!("zeroed start {zero_the_start}: a torn last flight refused the open: {e}"));
+        assert_ne!(db.incarnation, incarnation, "the registry returned the old Database");
+        assert_eq!(in_use(&db), after_first, "zeroed start {zero_the_start}: the torn commit's slots came back");
+        let b = db.branch(b_id).unwrap();
+        let bc = b.connect().unwrap();
+        assert_eq!(value(&bc, 7), Some("first".to_string()));
+        assert_eq!(value(&bc, 150), Some(original(150)), "zeroed start {zero_the_start}: a torn commit was applied");
+        set(&bc, 150, "after-recovery");
+        assert_eq!(value(&bc, 150), Some("after-recovery".to_string()));
+        drop(bc);
+        let _ = b.into_id();
+    }
+}
+
+/// T-E2E-2. Damage in an EARLIER flight with whole flights after it means an acknowledged flight was
+/// lost under a later one: the open must be refused, naming the remedy, and not silently cut.
+#[cfg(unix)]
+#[test]
+fn damage_under_a_whole_later_flight_refuses_the_open_end_to_end() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let log;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        set(&bc, 7, "one");
+        set(&bc, 8, "two");
+        set(&bc, 9, "three");
+        drop(bc);
+        log = db.branch_log_path().expect("a durable store has a log file");
+        let _ = b.into_id();
+    }
+    // Flights: [0] the empty one after the header, [1] the fork's, [2] "one", [3] "two", [4] "three".
+    let starts = flight_starts(&log);
+    assert!(starts.len() >= 5, "premise: five flights, found {starts:?}");
+    // The SECOND of the three commit flights ("two"), with "three" whole after it: its first frame's
+    // first payload byte.
+    let at = starts[3] + 8;
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&log).unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact_at(&mut byte, at).unwrap();
+        byte[0] ^= 0x5A;
+        f.write_all_at(&byte, at).unwrap();
+    }
+    let err = match open_at(&path, durable()) {
+        Ok(_) => panic!("damage under whole later flights was cut and the store opened"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("aside"), "the refusal names no remedy: {err}");
+    assert!(err.contains(&log.display().to_string()), "the refusal does not name the log: {err}");
 }
