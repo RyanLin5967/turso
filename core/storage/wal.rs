@@ -6289,7 +6289,11 @@ impl WalFileShared {
             Some(file) => file.size()?,
             None => 0,
         };
-        let decided = if size0 <= WAL_HEADER_SIZE as u64 {
+        let rule1 = size0 <= WAL_HEADER_SIZE as u64;
+        // Mutant M4 (amendment 25, test builds only): no rule 1.
+        #[cfg(test)]
+        let rule1 = rule1 && walpin::crash::mutant().as_deref() != Some("no_rule1");
+        let decided = if rule1 {
             // Rule 1 (wal.c 1885-1886, 1978-1980).
             if !read_only {
                 walpin_empty_wal_file(io.as_ref(), file1.as_ref())?;

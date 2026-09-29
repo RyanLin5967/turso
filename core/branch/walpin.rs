@@ -250,7 +250,8 @@ pub(crate) static WAL2_RECOVERY: AtomicU64 = AtomicU64::new(0);
 /// (no destructors, no close) at its first hit while the process has made exactly `k` FW2 switches.
 /// `TURSO_WALPIN_WAL2_MUTANT` selects a mutant: `newer_only` (M1: where both files would be recovered, keep only the
 /// newer), `wal0_only` (M0: the base, which recovers `-wal` alone), `wal2_first` (M2: a restart empties `-wal2`
-/// before `-wal`) or `no_salt_check` (M3: a follower with a commit is always chained).
+/// before `-wal`), `no_salt_check` (M3: a follower with a commit is always chained) or `no_rule1` (M4: recovery skips
+/// rule 1 and scans `-wal2` even after a `-wal` of at most a header).
 #[cfg(test)]
 pub(crate) mod crash {
     use super::FW2_SWITCHES;
