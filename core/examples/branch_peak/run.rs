@@ -397,6 +397,44 @@ fn summary(name: &str, v: &mut Vec<f64>) -> String {
     )
 }
 
+/// Where the live branches sit (r12-f9-shrink amendment 8a; print only): the branches still live
+/// from the grow phase ("survivors", tag <= peak), the branch-table chunks (1,024 slots each) and
+/// arena chunks (256 slots each) they hold, and the highest table and arena chunk any live branch
+/// holds. The table frees chunks only from the top, so its capacity is bounded by
+/// (highest live table chunk + 2) x 1,024; a survivor high in the id space holds every chunk below it.
+fn survivor_line(label: &str, n_ever: usize, peak: usize, live: &std::collections::VecDeque<Live>) -> String {
+    const TABLE_CHUNK: u64 = 1024;
+    const ARENA_CHUNK: u32 = 256;
+    let table_chunk = |l: &Live| (l.branch.id().0 & 0xFFFF_FFFF) / TABLE_CHUNK;
+    let mut t_chunks: Vec<u64> = Vec::new();
+    let mut a_chunks: Vec<u32> = Vec::new();
+    let mut survivors = 0usize;
+    let (mut max_t, mut max_a) = (0u64, 0u32);
+    for l in live {
+        let t = table_chunk(l);
+        let slots = l.branch.owned_slots();
+        max_t = max_t.max(t);
+        for &s in &slots {
+            max_a = max_a.max(s / ARENA_CHUNK);
+        }
+        if l.tag as usize <= peak {
+            survivors += 1;
+            t_chunks.push(t);
+            a_chunks.extend(slots.iter().map(|&s| s / ARENA_CHUNK));
+        }
+    }
+    t_chunks.sort_unstable();
+    t_chunks.dedup();
+    a_chunks.sort_unstable();
+    a_chunks.dedup();
+    format!(
+        "# survivors phase={label} n_ever={n_ever} count={survivors} table_chunks={t_chunks:?} \
+         arena_chunks={a_chunks:?} max_live_table_chunk={max_t} max_live_arena_chunk={max_a} \
+         table_capacity_bound={}",
+        (max_t + 2) * TABLE_CHUNK
+    )
+}
+
 fn resident_line(label: &str, n_ever: usize, live: usize, r: &BranchResident) -> String {
     format!(
         "# ckpt phase={label} n_ever={n_ever} live={live} states={} zombies={} table_capacity={} \
@@ -672,6 +710,7 @@ pub fn main(allocator: &str, relieve: fn() -> usize) {
             not_a_result(&format!("churn checkpoint {ckpt}: {r:?}"));
         }
         println!("{}", resident_line("churn", created, live.len(), &r));
+        println!("{}", survivor_line("churn", created, args.peak, &live));
         if args.relief {
             let returned = relieve();
             let r = db.branch_resident();
