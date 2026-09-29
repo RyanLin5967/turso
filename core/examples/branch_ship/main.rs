@@ -368,12 +368,12 @@ impl Read for PipeReader {
     }
 }
 
-const STREAM_HEADER: &str = "stream\tpoint\tlive\tmode\ttotal\ttotal_raw\ttotal_delta\ttotal_delta_fork\ttotal_dedup\tpage_bytes\tref_bytes\tmeta_bytes\tslot_rec\ttrunk_rec\tref_rec\tstate_rec\tdead_rec\tcur_ent\tret_ent\ttret_ent\twritten_ent\tlive_list\tmaps\tdup\tstates_visited\tentries_visited\tslots_visited\tindex_visited\tnodes_visited\titems_checked\tlocked_ops\tlocked_ns\tkids_checked\tbase_lookups\tbase_lookup_nodes";
+const STREAM_HEADER: &str = "stream\tpoint\tlive\tmode\ttotal\ttotal_raw\ttotal_delta\ttotal_delta_fork\ttotal_dedup\tpage_bytes\tref_bytes\tmeta_bytes\tslot_rec\ttrunk_rec\tref_rec\tstate_rec\tdead_rec\tcur_ent\tret_ent\ttret_ent\twritten_ent\tlive_list\tmaps\tdup\tstates_visited\tentries_visited\tslots_visited\tindex_visited\tnodes_visited\titems_checked\tlocked_ops\tlocked_ns\tkids_checked\tbase_lookups\tbase_lookup_nodes\tchange_index_nodes";
 
 fn print_stream(point: &str, live: usize, mode: &str, r: &SendReport) {
     let non_payload = r.total_bytes - r.payload_shipped;
     println!(
-        "stream\t{point}\t{live}\t{mode}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "stream\t{point}\t{live}\t{mode}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         r.total_bytes,
         non_payload + r.payload_raw,
         non_payload + r.payload_delta,
@@ -405,6 +405,7 @@ fn print_stream(point: &str, live: usize, mode: &str, r: &SendReport) {
         r.kids_checked,
         r.base_lookups,
         r.base_lookup_nodes,
+        r.change_index_nodes,
     );
 }
 
@@ -436,11 +437,12 @@ fn pipe(
         .db
         .branch_snapshot()
         .unwrap_or_else(|e| not_a_result(&format!("{point}: snapshot refused: {e}")));
-    let (view_ops, touched, copied) = b.db.branch_view_work();
+    let (view_ops, touched, copied, write_base_lookups) = b.db.branch_view_work();
     let (h_states, h_slots, h_tret, h_written) = snap.heights();
     println!(
-        "snap\t{point}\tseq={}\tsnapshot_locked_ns={snap_ns}\tview_ops={view_ops}\tview_nodes_touched={touched}\tview_nodes_copied={copied}\theight_states={h_states}\theight_slots={h_slots}\theight_trunk_retained={h_tret}\theight_written={h_written}",
-        snap.seq()
+        "snap\t{point}\tseq={}\tsnapshot_locked_ns={snap_ns}\tview_ops={view_ops}\tview_nodes_touched={touched}\tview_nodes_copied={copied}\theight_states={h_states}\theight_slots={h_slots}\theight_trunk_retained={h_tret}\theight_written={h_written}\twrite_base_lookups={write_base_lookups}\theight_changes={}",
+        snap.seq(),
+        snap.change_index_height()
     );
     if args.timing {
         // Serialisation alone, into a sink that discards.
