@@ -305,7 +305,13 @@ pub(crate) mod crash {
         unsafe {
             libc::kill(libc::getpid(), libc::SIGKILL);
         }
-        std::process::abort()
+        // Amendment 25c: in a multithreaded process a process-directed SIGKILL arrives
+        // asynchronously, and an abort() here could end the child first (by SIGABRT). Wait for it.
+        #[cfg(not(unix))]
+        std::process::abort();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
 
     pub(crate) fn mutant() -> Option<String> {
