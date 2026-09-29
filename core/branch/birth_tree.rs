@@ -402,7 +402,9 @@ impl<V> BirthTree<V> {
         }
     }
 
-    /// The live item with the greatest key in `[lo, hi]`.
+    /// The live item with the greatest key in `[lo, hi]`. Production code calls
+    /// [`BirthTree::pred_counted`]; this uncounted form serves the tests.
+    #[cfg(test)]
     pub(crate) fn pred(&self, lo: u64, hi: u64) -> Option<(u64, &Arc<V>)> {
         self.pred_counted(lo, hi, &mut 0)
     }
@@ -421,7 +423,14 @@ impl<V> BirthTree<V> {
         Self::pred_in(root, self.height, 0, lo, hi, nodes)
     }
 
-    fn pred_in(node: &Node<V>, level: u32, prefix: u64, lo: u64, hi: u64, nodes: &mut u64) -> Option<(u64, &Arc<V>)> {
+    fn pred_in<'a>(
+        node: &'a Node<V>,
+        level: u32,
+        prefix: u64,
+        lo: u64,
+        hi: u64,
+        nodes: &mut u64,
+    ) -> Option<(u64, &'a Arc<V>)> {
         *nodes += 1;
         match node {
             Node::Inner { kids, .. } => {

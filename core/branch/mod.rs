@@ -431,8 +431,9 @@ impl Database {
 
     /// Send the branch store (see `store::ship`). `trunk` must be the trunk's checkpointed image,
     /// taken with trunk writes excluded. `count` also computes the counted-only alternatives (delta
-    /// and fork-delta sizes, dedup). Refused (`Busy`) while a branch or trunk write transaction is
-    /// open; the trunk's WAL write lock is held across the snapshot only, never the serialisation.
+    /// and fork-delta sizes, dedup). Refused (`Busy`; `BusySnapshot` after the fork's 8 stale-snapshot
+    /// retries) while a branch or trunk write transaction is open; the trunk's WAL write lock is held
+    /// across the snapshot only, never the serialisation.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn branch_send(
@@ -458,7 +459,8 @@ impl Database {
     }
 
     /// F-S1's O(1) snapshot of the ship view, and how long the store mutex was held for it (ns).
-    /// Refused (`Busy`) while a branch or trunk write transaction is open (PREREG A6.1).
+    /// Refused (`Busy`; `BusySnapshot` after the fork's 8 stale-snapshot retries) while a branch or
+    /// trunk write transaction is open (PREREG A6.1).
     #[doc(hidden)]
     pub fn branch_snapshot(self: &Arc<Self>) -> Result<(ShipSnap, u64)> {
         let _excluded = self.exclude_trunk_writes()?;
@@ -469,8 +471,10 @@ impl Database {
     /// transaction marks a page changed at the page's first write, and nothing marks it again at
     /// COMMIT, so a snapshot taken inside it would ship the page's pre-commit bytes and hide the
     /// commit from every later incremental. The fork's lock, for the fork's reason.
-    /// BLIND SPOT: this covers the snapshot, not the caller's `TrunkImage`; an image taken outside
-    /// the same trunk-quiet window still ships stale bytes, and nothing here can see its age.
+    /// BLIND SPOTS: this covers the snapshot, not the caller's `TrunkImage`; an image taken outside
+    /// the same trunk-quiet window still ships stale bytes, and nothing here can see its age. And a
+    /// trunk with no WAL has no write lock to take (`begin_write_tx` returns at once), so there the
+    /// exclusion is empty, as the fork's already is.
     fn exclude_trunk_writes(self: &Arc<Self>) -> Result<Option<ShipExclusion>> {
         // Mutant T (PREREG A6.1): no exclusion, as before the fix.
         if ship_mutant() == "T" {

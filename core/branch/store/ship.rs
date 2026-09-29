@@ -540,10 +540,14 @@ pub struct SendReport {
     /// the mutex was held.
     pub locked_ops: u64,
     pub locked_ns: u64,
+    /// Every record the stream carried, as the sink counted them: `records()` plus BEGIN,
+    /// TRUNK_META, END and (IncrRoot) LIVE_LIST.
+    pub records_emitted: u64,
 }
 
 impl SendReport {
-    /// Records of every kind this stream carried.
+    /// Data records: slot, trunk page, reference, state and death records (not BEGIN,
+    /// TRUNK_META, END or LIVE_LIST; `records_emitted` counts those too).
     pub fn records(&self) -> u64 {
         self.slot_records + self.trunk_page_records + self.ref_records + self.state_records + self.dead_records
     }
@@ -696,11 +700,14 @@ struct Sink<'a> {
     out: Option<&'a mut dyn Write>,
     buf: Vec<u8>,
     bytes: u64,
+    /// Records put, of every kind (each `put` is one record).
+    records: u64,
 }
 
 impl Sink<'_> {
     fn put(&mut self, data: &[u8]) -> Result<()> {
         self.bytes += data.len() as u64;
+        self.records += 1;
         if self.out.is_some() {
             self.buf.extend_from_slice(data);
             if self.buf.len() >= 1 << 20 {
@@ -923,7 +930,6 @@ impl BranchStore {
         let t0 = Instant::now();
         let inner = self.inner.lock();
         let snap = Self::snapshot_locked(&inner)?;
-        drop(excluded);
         // Mutant S1 (PREREG A5): the send keeps the mutex through serialisation.
         let held = if super::super::ship_mutant() == "S1" {
             Some(inner)
@@ -932,10 +938,13 @@ impl BranchStore {
             None
         };
         let locked_ns = t0.elapsed().as_nanos() as u64;
+        // Released after the store mutex (LIFO) and outside `locked_ns`: dropping it ends a WAL
+        // transaction and a connection, which is no part of the store's locked section.
+        drop(excluded);
         let mut rep = send_snapshot(&snap, mode, base, trunk, use_delta, plant, count, out)?;
         // Operations under the store mutex (PREREG A6.2): the snapshot, and every record that was
         // serialised while the guard was still held.
-        let serialised_under_guard = if held.is_some() { rep.records() } else { 0 };
+        let serialised_under_guard = if held.is_some() { rep.records_emitted } else { 0 };
         rep.locked_ops = 1 + serialised_under_guard;
         rep.locked_ns = match held {
             Some(guard) => {
@@ -1464,6 +1473,7 @@ pub(crate) fn send_snapshot(
         out,
         buf: Vec::new(),
         bytes: 0,
+        records: 0,
     };
     let page_size = trunk.page_size();
     if sink.out.is_some() && !matches!(mode, SendMode::FullFix | SendMode::IncrFix) {
@@ -1838,6 +1848,7 @@ pub(crate) fn send_snapshot(
     sink.put(&end.0)?;
     sink.flush()?;
     rep.total_bytes = sink.bytes;
+    rep.records_emitted = sink.records;
     rep.nodes_visited = tw.nodes_visited;
     rep.items_checked = tw.items_checked;
     rep.kids_checked = tw.kids_checked;
