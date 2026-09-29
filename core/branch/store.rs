@@ -4477,9 +4477,10 @@ mod tests {
         let (_dir, db) = catalog_store_emptied_since_its_checkpoint();
         let mut inner = db.branches.inner.lock();
         let current = inner.arena.as_ref().expect("the store forked, so its arena exists").page_size();
-        inner
-            .ensure_backing(current * 2)
-            .expect("a logically empty catalog store refused the database's new page size");
+        eprintln!("A25 red: P = {current}, asking for {}", current * 2);
+        if let Err(e) = inner.ensure_backing(current * 2) {
+            panic!("A25: a logically empty catalog store refused the new page size (P = {current}): {e:?}");
+        }
     }
 
     /// Its control, predicted GREEN at d6a5fc100: the same store after one more checkpoint (which
@@ -4492,9 +4493,10 @@ mod tests {
         assert_eq!(db.branches.trunk_gone_len(), 0, "premise: the checkpoint left reaped rows");
         let mut inner = db.branches.inner.lock();
         let current = inner.arena.as_ref().expect("the store forked, so its arena exists").page_size();
-        inner
-            .ensure_backing(current * 2)
-            .expect("an empty, checkpointed catalog store refused the database's new page size");
+        eprintln!("A25 control: P = {current}, asking for {}", current * 2);
+        if let Err(e) = inner.ensure_backing(current * 2) {
+            panic!("A25: an empty, checkpointed catalog store refused the new page size (P = {current}): {e:?}");
+        }
     }
 
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
