@@ -1412,6 +1412,45 @@ fn a_composed_trunk_version_is_dropped_by_an_idle_session() {
     set(&c, 10, "b-write");
     assert_eq!(value(&c, 10), Some("b-write".to_string()));
     assert_eq!(value(&trunk, 10), Some("trunk-v2".to_string()));
+/// FS5's own flow under FS11 with FS10 off (Rule One BATCH2 item 4; r11-sessions amendment 18c): a
+/// reader branch keeps the shared trunk pages cached while another branch rewrites every row, in one
+/// transaction and then row by row. The open reader, a fresh branch and the trunk keep the originals;
+/// the writer reads its writes. Under FS11 the writer's committed pages come back held by reference
+/// (its own slots), so FS5's Shared-count instrument does not apply and the law is checked by values.
+/// `LAW_NO_COW_COPY` skips the copy before a shared page's first write.
+#[test]
+fn a_branch_write_leaves_an_open_readers_version_intact_under_fs11() {
+    let (_dir, db) = open_db();
+    db.set_fs11(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let before: BTreeMap<i64, String> = (1..=300).map(|id| (id, original(id))).collect();
+    let b1 = trunk.fork_branch().unwrap();
+    let c1 = b1.connect().unwrap();
+    assert_eq!(table(&c1), before);
+    let b2 = trunk.fork_branch().unwrap();
+    let c2 = b2.connect().unwrap();
+    assert_eq!(table(&c2), before);
+    c2.execute("BEGIN").unwrap();
+    for id in (1..=300).step_by(3) {
+        set(&c2, id, &format!("b2-{id}"));
+    }
+    c2.execute("COMMIT").unwrap();
+    for id in (2..=300).step_by(3) {
+        set(&c2, id, &format!("b2-{id}"));
+    }
+    let mut want = before.clone();
+    for id in 1..=300 {
+        if id % 3 != 0 {
+            want.insert(id, format!("b2-{id}"));
+        }
+    }
+    assert_eq!(table(&c2), want, "the writer lost a write");
+    assert_eq!(table(&c1), before, "the open reader saw another branch's write");
+    let b3 = trunk.fork_branch().unwrap();
+    let c3 = b3.connect().unwrap();
+    assert_eq!(table(&c3), before, "a fresh branch saw another branch's write");
+    assert_eq!(table(&trunk), before, "the trunk saw a branch's write");
 }
 
 /// FS9B. Branches forked from a chain read a version an interior ANCESTOR branch holds for them

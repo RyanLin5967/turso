@@ -203,10 +203,10 @@ struct Args {
     cache_size: Option<i64>,
     /// Pinning arm (amendment 17): sessions fork in groups of G; after each group the trunk
     /// rewrites R rows on R distinct leaves. Every group pins one version of each of those pages.
-    pin: Option<(usize, usize)>,
+    pin: Option<(usize, usize, usize)>,
     /// Contention arm (amendment 18): T threads, each with n/T held sessions, each doing OPS warm
     /// point reads; per read, the store's resolves, lock takes and contended acquisitions.
-    contend: Option<(usize, usize)>,
+    contend: Option<(usize, usize, bool)>,
 }
 
 fn die(msg: &str) -> ! {
@@ -288,18 +288,26 @@ fn parse_args() -> Args {
             "--interleave" => args.interleave = true,
             "--contend" => {
                 let v = val();
-                let (t, ops) = v.split_once(',').unwrap_or_else(|| die("--contend needs T,OPS"));
+                let f: Vec<&str> = v.split(',').collect();
+                if (f.len() != 2 && f.len() != 3) || f.get(2).is_some_and(|w| *w != "own") {
+                    die("--contend needs T,OPS or T,OPS,own");
+                }
                 args.contend = Some((
-                    t.parse().unwrap_or_else(|_| die("bad --contend T")),
-                    ops.parse().unwrap_or_else(|_| die("bad --contend OPS")),
+                    f[0].parse().unwrap_or_else(|_| die("bad --contend T")),
+                    f[1].parse().unwrap_or_else(|_| die("bad --contend OPS")),
+                    f.len() == 3,
                 ));
             }
             "--pin" => {
                 let v = val();
-                let (g, r) = v.split_once(',').unwrap_or_else(|| die("--pin needs G,R"));
+                let f: Vec<&str> = v.split(',').collect();
+                if f.len() != 2 && f.len() != 3 {
+                    die("--pin needs G,R or G,R,K");
+                }
                 args.pin = Some((
-                    g.parse().unwrap_or_else(|_| die("bad --pin G")),
-                    r.parse().unwrap_or_else(|_| die("bad --pin R")),
+                    f[0].parse().unwrap_or_else(|_| die("bad --pin G")),
+                    f[1].parse().unwrap_or_else(|_| die("bad --pin R")),
+                    f.get(2).map_or(1, |k| k.parse().unwrap_or_else(|_| die("bad --pin K"))),
                 ));
             }
             "--capscan" => {
@@ -931,10 +939,10 @@ fn main() {
 
     if b.args.interleave || b.args.capscan.is_some() || b.args.pin.is_some() || b.args.contend.is_some() {
         let n = *b.args.checkpoints.last().unwrap();
-        if let Some((t, ops)) = b.args.contend {
-            contend_arm(&mut b, t, ops, n);
-        } else if let Some((g, r)) = b.args.pin {
-            pin_arm(&mut b, g, r, n);
+        if let Some((t, ops, own)) = b.args.contend {
+            contend_arm(&mut b, t, ops, own, n);
+        } else if let Some((g, r, k)) = b.args.pin {
+            pin_arm(&mut b, g, r, k, n);
         } else if b.args.interleave {
             interleave_arm(&mut b, n);
         } else {
@@ -1448,7 +1456,7 @@ fn interleave_arm(b: &mut Bench, n: usize) {
 /// are read around that phase, so per read: resolves, store-lock acquisitions, contended
 /// acquisitions and their wait. The per-read take count is control flow and stands at any load;
 /// the contended count is decided by interleaving and needs the load gates.
-fn contend_arm(b: &mut Bench, t: usize, ops: usize, n: usize) {
+fn contend_arm(b: &mut Bench, t: usize, ops: usize, own: bool, n: usize) {
     if t == 0 || ops == 0 || n % t != 0 {
         die("--contend T,OPS needs T, OPS >= 1 and T dividing n");
     }
@@ -1471,8 +1479,18 @@ fn contend_arm(b: &mut Bench, t: usize, ops: usize, n: usize) {
                         (br, conn, row)
                     })
                     .collect();
+                // `own` (amendment 18c): each session first writes its row, so its reads resolve the
+                // branch's own page (FS11's arena path) instead of a trunk page.
+                let want = |row: i64| if own { branch_value(row) } else { trunk_value(row) };
                 for (_, conn, row) in &sessions {
-                    if read_v(conn, *row) != trunk_value(*row) {
+                    if own {
+                        conn.execute(format!(
+                            "UPDATE t SET v = '{}' WHERE id = {row}",
+                            branch_value(*row)
+                        ))
+                        .unwrap();
+                    }
+                    if read_v(conn, *row) != want(*row) {
                         not_a_result("contend arm: a warm-up read saw another version");
                     }
                 }
@@ -1480,7 +1498,7 @@ fn contend_arm(b: &mut Bench, t: usize, ops: usize, n: usize) {
                 barrier.wait();
                 for k in 0..ops {
                     let (_, conn, row) = &sessions[k % sessions.len()];
-                    if read_v(conn, *row) != trunk_value(*row) {
+                    if read_v(conn, *row) != want(*row) {
                         not_a_result("contend arm: a read saw another version");
                     }
                 }
@@ -1504,7 +1522,7 @@ fn contend_arm(b: &mut Bench, t: usize, ops: usize, n: usize) {
     }
     let reads = (t * ops) as f64;
     println!(
-        "# contend t={t} ops={ops} n={n} fs10={:?} fs11={:?} reads={} resolves_per_read={:.4} \
+        "# contend t={t} ops={ops} own={own} n={n} fs10={:?} fs11={:?} reads={} resolves_per_read={:.4} \
          lock_takes_per_read={:.4} contended_per_read={:.6} contended_total={} lock_wait_ns_per_read={:.2} \
          elapsed_s={:.3}",
         fs("TURSO_R11S_FS10"),
@@ -1526,11 +1544,15 @@ fn contend_arm(b: &mut Bench, t: usize, ops: usize, n: usize) {
 /// of those pages whether or not its sessions read them: `n / g × r` retained pages, one page per
 /// (group, page). Per arm: arena pages before and after, bytes per session, and a read check of
 /// every pinned row in every session.
-fn pin_arm(b: &mut Bench, g: usize, r: usize, n: usize) {
-    if g == 0 || r == 0 || n % g != 0 || 1 + 40 * (r as i64 - 1) > TRUNK_ROWS {
-        die("--pin G,R needs G, R >= 1, G dividing n, and R <= 500");
+fn pin_arm(b: &mut Bench, g: usize, r: usize, k_rows: usize, n: usize) {
+    if g == 0 || r == 0 || k_rows == 0 || k_rows > 36 || n % g != 0 || 40 * r as i64 > TRUNK_ROWS {
+        die("--pin G,R[,K] needs G, R >= 1, 1 <= K <= 36, G dividing n, and R <= 500");
     }
-    let rows: Vec<i64> = (0..r as i64).map(|k| 1 + 40 * k).collect();
+    // K consecutive rows from each of R places 40 rows apart (K = 1: one row per leaf; K = 36: about
+    // a whole leaf's rows, the sub-page store's worst case, amendment 18c).
+    let rows: Vec<i64> = (0..r as i64)
+        .flat_map(|p| (0..k_rows as i64).map(move |j| 1 + 40 * p + j))
+        .collect();
     let fs = |k: &str| std::env::var(k).unwrap_or_default();
     let m0 = mem();
     let arena0 = b.db.branch_stats().arena_slots_in_use;
@@ -1564,7 +1586,7 @@ fn pin_arm(b: &mut Bench, g: usize, r: usize, n: usize) {
     }
     let m2 = mem();
     println!(
-        "# pin n={n} g={g} r={r} fs9={:?} fs10={:?} fs11={:?} groups={} arena_before={arena0} \
+        "# pin n={n} g={g} r={r} k={k_rows} fs9={:?} fs10={:?} fs11={:?} groups={} arena_before={arena0} \
          arena_after_forks={arena1} pinned_pages={} pinned_per_session={:.4} \
          bytes_per_session_forks_and_rewrites={:.2} bytes_per_session_reads={:.2} \
          bytes_per_pinned_page={:.2} retained_clones={} slot_clones={}",
