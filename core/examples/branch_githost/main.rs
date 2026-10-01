@@ -116,6 +116,8 @@ struct Args {
     bumps: u64,
     /// R1 (A4.C3): ops of each kind in the P-window.
     pwindow: u64,
+    /// R1's d axis: restart reads only the S1 stack of this depth (0: every stack, round-robin).
+    stack_d: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -183,6 +185,7 @@ fn parse_args() -> Args {
         image: String::new(),
         bumps: 1000,
         pwindow: 1000,
+        stack_d: 0,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -230,6 +233,7 @@ fn parse_args() -> Args {
             "--image" => args.image = val(),
             "--bumps" => args.bumps = val().parse().unwrap_or_else(|_| die("bad --bumps")),
             "--pwindow" => args.pwindow = val().parse().unwrap_or_else(|_| die("bad --pwindow")),
+            "--stack-d" => args.stack_d = val().parse().unwrap_or_else(|_| die("bad --stack-d")),
             other => die(&format!("unknown argument {other}")),
         }
     }
@@ -2383,7 +2387,8 @@ impl Restart {
 
 /// `branch_githost restart`: open a crash image (timed, with its open stats and the settle), then the
 /// post-open sequence, one op each: the oldest-child reap, read_oldest, a merge of the oldest open PR
-/// (pre-horizon: MV4 for both validators, I7), a list, a cold stack-top read (S1 states). Then A4.C3's
+/// (pre-horizon: MV4 for both validators, I7), a list, a cold stack-top read (S1 states; `--stack-d`
+/// picks one depth for R1's d axis). Then A4.C3's
 /// P-window: `--pwindow` ops of each kind, round-robin, with ZERO checkpoints (else NOT A RESULT for
 /// P, printed, not fatal), and then the first checkpoint, forced and timed. P on and off are separate
 /// runs (R12_PREWARM), each on its own clone.
@@ -2391,6 +2396,14 @@ fn restart(args: &Args) {
     let sc = read_sidecar(&args.db);
     if sc.steps == 0 {
         not_a_result("restart of an ungrown database");
+    }
+    // R1's d axis reads one depth's stack; the model still lists every stack's levels.
+    let mut reads = sc.clone();
+    if args.stack_d > 0 {
+        reads.stacks.retain(|st| st.d == args.stack_d);
+        if reads.stacks.is_empty() {
+            not_a_result(&format!("--stack-d {}: this state has no stack of that depth", args.stack_d));
+        }
     }
     let files_before = files_line(&args.db);
     let t = Instant::now();
@@ -2431,14 +2444,14 @@ fn restart(args: &Args) {
     let kinds = ["reap_oldest", "read_oldest", "merge_oldest", "list", "stack_top_read"];
     for (k, name) in kinds.iter().enumerate() {
         let mut s = Series::default();
-        r.op(k, 0, &db, &trunk, &mut model, &sc, &mut s);
+        r.op(k, 0, &db, &trunk, &mut model, &reads, &mut s);
         s.print(&format!("postopen_{name}"), n, label);
     }
     // A4.C3's P-window, round-robin over the kinds.
     let mut ser: Vec<Series> = (0..kinds.len()).map(|_| Series::default()).collect();
     for i in 0..args.pwindow {
         for (k, s) in ser.iter_mut().enumerate() {
-            r.op(k, i + 1, &db, &trunk, &mut model, &sc, s);
+            r.op(k, i + 1, &db, &trunk, &mut model, &reads, s);
         }
     }
     for (s, name) in ser.iter_mut().zip(kinds) {
