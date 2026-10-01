@@ -44,6 +44,8 @@
 //! whole on a mismatch ([`Recovered::last_flight`], `BranchStore::open`); it was never acknowledged.
 //! Every earlier flight's full sync returned, and a slot that fails its crc there is an error, as
 //! before. The check runs for every log: after redo, a log written under the redo rule passes it.
+//! ⚠ UNBUILT when written (r12-optfs, 2026-10-01, quiet mode: no local compute). Reviewed three
+//! times in fresh contexts by reading only; nothing here has been compiled or run.
 //!
 //! # One store per set of files
 //!
@@ -848,7 +850,8 @@ impl Journal {
     }
 
     /// Cut the log back to `start`, where its last whole flight began (the checksum rule): that
-    /// flight was never acknowledged. Recovery calls this before anything is appended.
+    /// flight was never acknowledged. Recovery calls this before anything is appended. Not synced
+    /// here: recovery's next flight (the raised id floor) syncs the cut and its own frames at once.
     pub(crate) fn cut_last_flight(&mut self, start: u64) -> Result<()> {
         self.check_live()?;
         if start < LOG_HEADER_LEN as u64 || start > self.len || !self.pending.is_empty() {
@@ -860,9 +863,6 @@ impl Journal {
         self.file
             .set_len(start)
             .map_err(|e| io_error(e, "truncate branch log"))?;
-        if self.sync {
-            fsync_file(&self.file)?;
-        }
         self.len = start;
         Ok(())
     }

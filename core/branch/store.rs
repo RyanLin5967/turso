@@ -744,14 +744,25 @@ impl BranchStore {
                             None
                         };
                         inner.rebuild(recovered.snapshot.take(), &recovered.records)?;
-                        // Whether the arena file was there before redo, which creates it: a lost
-                        // slot in a recreated arena is a missing file, never a flight to cut
-                        // (r12-optfs review 2, finding 3).
-                        let arena_present = match std::fs::metadata(&files.arena) {
-                            Ok(_) => true,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                        // A missing arena file is refused BEFORE redo, which would create it: the
+                        // arena is created, with a directory sync, before any record can name a
+                        // slot, so state that names one with no arena is damage, never a flight to
+                        // cut — and a refusal that redo had already "repaired" would not survive a
+                        // retry (r12-optfs reviews 2 and 3, G3/H1). Nothing is written first.
+                        match std::fs::metadata(&files.arena) {
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                let named = inner.referenced_slots().len();
+                                if named > 0 {
+                                    return Err(LimboError::Corrupt(format!(
+                                        "branch store: the arena file {} is missing while the \
+                                         branch state names {named} of its slots",
+                                        files.arena.display()
+                                    )));
+                                }
+                            }
                             Err(e) => return Err(crate::error::io_error(e, "stat branch arena")),
-                        };
+                        }
                         // The redo rule: the recovered records' slots are put back from their
                         // images before the arena counts what its file holds.
                         super::journal::redo_page_images(
@@ -770,13 +781,6 @@ impl BranchStore {
                             if let Some(lost) =
                                 inner.lost_slot(&files, recovered.page_size, flight)?
                             {
-                                if !arena_present {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "branch store: the arena file {} is missing while the \
-                                         branch log names {lost}",
-                                        files.arena.display()
-                                    )));
-                                }
                                 tracing::warn!(
                                     "branch log {}: the last flight (byte {}) names {}; it was \
                                      never acknowledged, and it is cut",
@@ -807,12 +811,14 @@ impl BranchStore {
                         )?);
                         let mut journal = recovered.journal;
                         if let Some(start) = cut {
-                            // Made durable only once the rest of the open has been checked, so an
-                            // open that refuses leaves the log as it found it (review, finding 2).
+                            // Only once the rest of the open has been checked, so an open that
+                            // refuses leaves the log as it found it (review, finding 2). The cut
+                            // took the flight's id floor with it, so the raised counter is logged
+                            // in its place, and ONE sync makes the cut and the floor durable
+                            // together (reviews 2 and 3, G2/H2). Blind spot: power lost inside that
+                            // sync can keep the cut and lose the floor, which matters only if the
+                            // cut flight had landed (media damage).
                             journal.cut_last_flight(start)?;
-                            // The cut took the flight's id floor with it: log the raised counter
-                            // now, so a second crash before any fork cannot lower it (review 2,
-                            // finding 2).
                             journal.buffer(&Record::IdFloor {
                                 next_id: inner.next_id,
                             })?;
