@@ -115,6 +115,7 @@ enum Site {
 struct Held<'a> {
     guard: MutexGuard<'a, StoreInner>,
     since: Option<Instant>,
+    site: usize,
 }
 
 impl Deref for Held<'_> {
@@ -133,7 +134,9 @@ impl DerefMut for Held<'_> {
 impl Drop for Held<'_> {
     fn drop(&mut self) {
         if let Some(since) = self.since {
-            self.guard.work.lock.hold_ns += since.elapsed().as_nanos() as u64;
+            let held = since.elapsed().as_nanos() as u64;
+            self.guard.work.lock.hold_ns += held;
+            self.guard.work.lock.hold_site_ns[self.site] += held;
         }
     }
 }
@@ -391,12 +394,17 @@ impl BranchStore {
         if let Some(waited) = waited {
             lock.contended[site as usize] += 1;
             lock.wait_ns += waited.as_nanos() as u64;
+            lock.wait_site_ns[site as usize] += waited.as_nanos() as u64;
         }
         let since = self
             .lock_timing
             .load(Ordering::Relaxed)
             .then(Instant::now);
-        Held { guard, since }
+        Held {
+            guard,
+            since,
+            site: site as usize,
+        }
     }
 
     /// Turn the lock's hold timing on or off (see [`BranchStore::take`]).

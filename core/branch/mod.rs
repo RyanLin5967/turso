@@ -250,6 +250,10 @@ pub struct LockCounts {
     /// Nanoseconds the lock was held, all sites; counted only while lock timing is on
     /// ([`Database::set_branch_lock_timing`]), since timing a hold adds work inside it.
     pub hold_ns: u64,
+    /// `wait_ns` split by site (E7 attribution, r11-bushy-conc amendment 11).
+    pub wait_site_ns: [u64; 15],
+    /// `hold_ns` split by site (with lock timing on only).
+    pub hold_site_ns: [u64; 15],
 }
 
 impl Branch {
