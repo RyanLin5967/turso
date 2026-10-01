@@ -159,8 +159,25 @@ pub(crate) struct Track {
     /// Work the view's upkeep did under the mutex, and the operations that did it.
     view_work: TreeWork,
     view_ops: u64,
+    /// The upkeep calls' own accounting (r13-ship-upkeep PREREG §3): time inside them, calls, calls
+    /// that copied, calls that broke the height bound, and per-call maxima since the last read
+    /// that reset them.
+    upkeep_ns: u64,
+    upkeep_calls: u64,
+    calls_copying: u64,
+    bound_violations: u64,
+    max_call: CallMax,
     /// `(birth, id)` of every hole, so that holes every receiver has passed can be dropped.
     holes: BTreeSet<(u64, u64)>,
+}
+
+/// The largest single upkeep call seen, field by field.
+#[derive(Clone, Copy, Debug, Default)]
+struct CallMax {
+    copied: u64,
+    touched: u64,
+    arc_incs: u64,
+    budget: u64,
 }
 
 impl Track {
@@ -170,6 +187,54 @@ impl Track {
         self.view.seq = self.seq;
         self.seq
     }
+
+    /// Account one leaf upkeep call that started at `t0`: its time, its tree work, and whether it
+    /// kept within its height budget. `op` says whether it counts as a view operation (removals a
+    /// receiver derives do not, as before).
+    fn note(&mut self, w: TreeWork, t0: Instant, op: bool) {
+        self.upkeep_ns += t0.elapsed().as_nanos() as u64;
+        self.upkeep_calls += 1;
+        if w.nodes_copied > 0 {
+            self.calls_copying += 1;
+        }
+        if w.breaks_height_bound() {
+            self.bound_violations += 1;
+        }
+        let m = &mut self.max_call;
+        m.copied = m.copied.max(w.nodes_copied);
+        m.touched = m.touched.max(w.nodes_touched);
+        m.arc_incs = m.arc_incs.max(w.arc_incs);
+        m.budget = m.budget.max(w.height_budget);
+        self.view_work.add(w);
+        if op {
+            self.view_ops += 1;
+        }
+    }
+}
+
+/// The ship view's upkeep counters at one moment (r13-ship-upkeep PREREG §3). Every field is
+/// cumulative since shipping began, except the `max_call_*` fields (since the previous read that
+/// reset them) and `heights` (the four top-level trees now: states, slots, written, trunk
+/// retained).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ViewWorkExt {
+    pub view_ops: u64,
+    pub nodes_touched: u64,
+    pub nodes_copied: u64,
+    pub views_copied: u64,
+    pub make_mut_clones: u64,
+    pub entries_copied: u64,
+    pub arc_incs: u64,
+    pub height_budget: u64,
+    pub upkeep_ns: u64,
+    pub upkeep_calls: u64,
+    pub calls_copying: u64,
+    pub bound_violations: u64,
+    pub max_call_copied: u64,
+    pub max_call_touched: u64,
+    pub max_call_arc_incs: u64,
+    pub max_call_budget: u64,
+    pub heights: [u32; 4],
 }
 
 /// What a snapshot for a send is: the view, and the page size its bytes have.
@@ -190,6 +255,10 @@ impl StoreInner {
     /// Re-put state `id`'s scalars, keeping its current and retained trees; `bump` makes the change
     /// visible to incrementals (None: a derivable change, which keeps the state's birth).
     pub(super) fn ship_state(&mut self, id: BranchId, bump: Option<u64>) {
+        if self.track.is_none() {
+            return;
+        }
+        let t0 = Instant::now();
         let Some(st) = self.branches.get(&id) else {
             return;
         };
@@ -218,8 +287,7 @@ impl StoreInner {
         t.view
             .states
             .put(id.0, Item::Live { birth: item_birth, val: Arc::new(view) }, bump, &mut w);
-        t.view_work.add(w);
-        t.view_ops += 1;
+        t.note(w, t0, true);
     }
 
     /// State `id`'s current version of `page` changed at `seq`.
@@ -269,20 +337,30 @@ impl StoreInner {
         let Some(t) = self.track.as_mut() else {
             return;
         };
+        let t0 = Instant::now();
         let mut w = TreeWork::default();
         t.view.states.update(id.0, bump, &mut w, |item, w| {
             if let Item::Live { birth, val } = item {
                 if Arc::strong_count(val) > 1 {
                     w.nodes_copied += 1;
+                    w.views_copied += 1;
+                    // The clone increments each of its non-empty trees' roots.
+                    w.arc_incs += u64::from(val.inherited.has_root())
+                        + u64::from(val.current.has_root())
+                        + u64::from(val.retained.has_root());
                 }
-                edit(Arc::make_mut(val), w);
+                let before: *const StateView = &**val;
+                let view = Arc::make_mut(val);
+                if !std::ptr::eq(before, &*view) {
+                    w.make_mut_clones += 1;
+                }
+                edit(view, w);
                 if let Some(seq) = bump {
                     *birth = seq;
                 }
             }
         });
-        t.view_work.add(w);
-        t.view_ops += 1;
+        t.note(w, t0, true);
     }
 
     /// Slot `slot`'s bytes, owner or births changed at `seq` (its item birth is `seq`).
@@ -290,33 +368,34 @@ impl StoreInner {
         let (Some(t), Some(arena)) = (self.track.as_mut(), self.arena.as_ref()) else {
             return;
         };
+        let t0 = Instant::now();
         let (alloc_seq, content_seq, page) = arena.stamps_of(slot).expect("a tracked arena stamps");
         let view = SlotView { page, owner, alloc_seq, content_seq, data: arena.page_arc(slot).clone() };
         let mut w = TreeWork::default();
         t.view
             .slots
             .put(u64::from(slot), Item::Live { birth: seq, val: Arc::new(view) }, Some(seq), &mut w);
-        t.view_work.add(w);
-        t.view_ops += 1;
+        t.note(w, t0, true);
     }
 
     /// Slot `slot` was released (derivable by the receiver).
     pub(super) fn ship_slot_gone(&mut self, slot: Slot) {
         if let Some(t) = self.track.as_mut() {
+            let t0 = Instant::now();
             let mut w = TreeWork::default();
             t.view.slots.remove(u64::from(slot), &mut w);
-            t.view_work.add(w);
+            t.note(w, t0, false);
         }
     }
 
     /// State `id` (forked at `born_seq`) was freed at `seq`: a hole.
     pub(super) fn ship_state_gone(&mut self, id: BranchId, born_seq: u64, seq: u64) {
         if let Some(t) = self.track.as_mut() {
+            let t0 = Instant::now();
             let mut w = TreeWork::default();
             t.view.states.put(id.0, Item::Hole { birth: seq, born: born_seq }, Some(seq), &mut w);
             t.holes.insert((seq, id.0));
-            t.view_work.add(w);
-            t.view_ops += 1;
+            t.note(w, t0, true);
         }
     }
 
@@ -332,6 +411,7 @@ impl StoreInner {
     pub(super) fn ship_written(&mut self, page: u32, seq: u64, page_size: usize) {
         let epoch = self.trunk.written.get(&page).copied();
         if let Some(t) = self.track.as_mut() {
+            let t0 = Instant::now();
             let mut w = TreeWork::default();
             t.view.written.put(
                 u64::from(page),
@@ -340,13 +420,13 @@ impl StoreInner {
                 &mut w,
             );
             t.log_bytes += 24 + page_size as u64;
-            t.view_work.add(w);
-            t.view_ops += 1;
+            t.note(w, t0, true);
         }
     }
 
     pub(super) fn ship_trunk_retained(&mut self, page: u32, v: Retained, seq: u64) {
         if let Some(t) = self.track.as_mut() {
+            let t0 = Instant::now();
             let mut w = TreeWork::default();
             t.view.trunk_retained.put(
                 ret_key(page, v.born),
@@ -357,16 +437,16 @@ impl StoreInner {
                 Some(seq),
                 &mut w,
             );
-            t.view_work.add(w);
-            t.view_ops += 1;
+            t.note(w, t0, true);
         }
     }
 
     fn ship_trunk_retained_gone(&mut self, page: u32, born: u64) {
         if let Some(t) = self.track.as_mut() {
+            let t0 = Instant::now();
             let mut w = TreeWork::default();
             t.view.trunk_retained.remove(ret_key(page, born), &mut w);
-            t.view_work.add(w);
+            t.note(w, t0, false);
         }
     }
 
@@ -817,6 +897,43 @@ impl BranchStore {
         self.inner.lock().track.as_ref().map_or((0, 0, 0), |t| {
             (t.view_ops, t.view_work.nodes_touched, t.view_work.nodes_copied)
         })
+    }
+
+    /// The view's upkeep counters now (r13-ship-upkeep PREREG §3); `reset_max` starts a new window
+    /// for the per-call maxima.
+    pub(crate) fn view_work_ext(&self, reset_max: bool) -> ViewWorkExt {
+        let mut inner = self.inner.lock();
+        let Some(t) = inner.track.as_mut() else {
+            return ViewWorkExt::default();
+        };
+        let (w, m) = (t.view_work, t.max_call);
+        if reset_max {
+            t.max_call = CallMax::default();
+        }
+        ViewWorkExt {
+            view_ops: t.view_ops,
+            nodes_touched: w.nodes_touched,
+            nodes_copied: w.nodes_copied,
+            views_copied: w.views_copied,
+            make_mut_clones: w.make_mut_clones,
+            entries_copied: w.entries_copied,
+            arc_incs: w.arc_incs,
+            height_budget: w.height_budget,
+            upkeep_ns: t.upkeep_ns,
+            upkeep_calls: t.upkeep_calls,
+            calls_copying: t.calls_copying,
+            bound_violations: t.bound_violations,
+            max_call_copied: m.copied,
+            max_call_touched: m.touched,
+            max_call_arc_incs: m.arc_incs,
+            max_call_budget: m.budget,
+            heights: [
+                t.view.states.height(),
+                t.view.slots.height(),
+                t.view.written.height(),
+                t.view.trunk_retained.height(),
+            ],
+        }
     }
 
     /// Every receiver has acknowledged `upto`: holes born at or before it can go.
@@ -2246,6 +2363,59 @@ mod tests {
         let (mut rtrunk, mut at) = (TrunkImage::empty(PAGE), None);
         replica.receive(&mut &buf[..], &mut rtrunk, &mut at, false).unwrap();
         assert_eq!(replica.digest(&rtrunk), want, "the replica decoded the deltas wrongly");
+    }
+
+    /// r13-ship-upkeep PREREG §3, by hand: one state A, whose page 1 lives in slot s0. Every tree
+    /// is one leaf (height 0), so each tree call's budget is 1. A snapshot is taken, then:
+    /// - rewriting page 1 in the same epoch only refreshes s0's slot item: the slots leaf is shared,
+    ///   so 1 copy of 1 live item;
+    /// - writing a NEW page 2 allocates s1 (the slots leaf is already copied: no copy), then edits
+    ///   A's view: the states leaf (1 live item), A's StateView (one non-empty tree, `current`) and
+    ///   A's current leaf (1 live item) are copied, so 3 copies, 3 Arc increments, 2 entries,
+    ///   touched 2, budget 2; then the commit refreshes s1 (no copy).
+    /// With the snapshot dropped, writing page 3 copies nothing.
+    #[test]
+    fn upkeep_under_a_snapshot_copies_what_the_hand_count_says() {
+        let store = BranchStore::new();
+        store.enable_shipping().unwrap();
+        let a = store.fork_trunk(Arc::new(Schema::default()), PAGE).unwrap();
+        write_page(&store, a, 1, &image(0), &image(1));
+        let w0 = store.view_work_ext(true);
+        assert_eq!((w0.nodes_copied, w0.make_mut_clones, w0.bound_violations), (0, 0, 0), "{w0:?}");
+        assert_eq!(w0.heights, [0, 0, 0, 0], "{w0:?}");
+        let (snap, _) = store.snapshot().unwrap();
+
+        write_page(&store, a, 1, &image(1), &image(2));
+        let w1 = store.view_work_ext(true);
+        let d = |a: &ViewWorkExt, b: &ViewWorkExt| {
+            (
+                b.view_ops - a.view_ops,
+                b.nodes_touched - a.nodes_touched,
+                b.nodes_copied - a.nodes_copied,
+                b.views_copied - a.views_copied,
+                b.make_mut_clones - a.make_mut_clones,
+                b.arc_incs - a.arc_incs,
+                b.entries_copied - a.entries_copied,
+                b.height_budget - a.height_budget,
+            )
+        };
+        // (ops, touched, copied, views, clones, arc_incs, entries, budget)
+        assert_eq!(d(&w0, &w1), (1, 1, 1, 0, 1, 1, 1, 1), "{w1:?}");
+        assert_eq!((w1.max_call_copied, w1.max_call_touched, w1.bound_violations), (1, 1, 0), "{w1:?}");
+
+        write_page(&store, a, 2, &image(0), &image(3));
+        let w2 = store.view_work_ext(true);
+        assert_eq!(d(&w1, &w2), (3, 4, 3, 1, 3, 3, 2, 4), "{w2:?}");
+        assert_eq!((w2.max_call_copied, w2.max_call_arc_incs, w2.max_call_budget), (3, 3, 2), "{w2:?}");
+        assert_eq!((w2.calls_copying - w1.calls_copying, w2.bound_violations), (1, 0), "{w2:?}");
+
+        drop(snap);
+        write_page(&store, a, 3, &image(0), &image(4));
+        let w3 = store.view_work_ext(true);
+        let (ops, touched, copied, ..) = d(&w2, &w3);
+        assert_eq!((ops, copied, w3.make_mut_clones - w2.make_mut_clones), (3, 0, 0), "{w3:?}");
+        assert_eq!(touched, 4, "{w3:?}");
+        assert!(w3.upkeep_calls >= w3.view_ops && w3.upkeep_ns > 0, "{w3:?}");
     }
 
     /// R3 (PREREG A5, F-S2 bound; green at the base too, see A5; expectation corrected in A5a):

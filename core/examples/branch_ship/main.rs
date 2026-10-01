@@ -16,6 +16,14 @@
 //!   this harness's own model of what that branch sees.
 //! Any mismatch prints `NOT A RESULT` and exits 1.
 //!
+//! `--mid-mode c|h|r|f` (r13-ship-upkeep PREREG §2) sets what each point's mid cycles see: `c` (the
+//! default, r11-ship's harness) runs them while the send streams from its snapshot; `h` lets the
+//! send and the replica finish first and keeps the snapshot while the cycles run; `r` drops it
+//! before the cycles; `f` drops it and takes a fresh snapshot before each cycle. A `vw` line at
+//! every window boundary prints the view's upkeep counters (cumulative), the window's per-call
+//! maxima, and the window's cycles and wall time; a `clock` line prints one empty Instant pair's
+//! cost.
+//!
 //! `--plant flip|tomb|ref|inherit` plants a defect (a flipped payload byte, a dropped tombstone, a
 //! corrupted reference hash, a replica that skips deriving page maps); the run must then print
 //! `NOT A RESULT`. That is the fire-check of the checks above.
@@ -41,6 +49,19 @@ enum Arm {
     Flat,
     Bushy,
     Chain,
+}
+
+/// What a point's mid cycles see (r13-ship-upkeep PREREG §2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MidMode {
+    /// Concurrent with the send, whose snapshot lives until the point ends (r11-ship's harness).
+    C,
+    /// After the send; its snapshot still held.
+    H,
+    /// After the send; its snapshot dropped first.
+    R,
+    /// After the send, its snapshot dropped; a fresh snapshot held across each cycle.
+    F,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,6 +91,7 @@ struct Args {
     timing: bool,
     /// Cycles the main thread runs WHILE each piped send streams from its snapshot (F-S1).
     mid_cycles: usize,
+    mid_mode: MidMode,
 }
 
 fn die(msg: &str) -> ! {
@@ -97,6 +119,7 @@ fn parse_args() -> Args {
         out_dir: None,
         timing: false,
         mid_cycles: 200,
+        mid_mode: MidMode::C,
     };
     let mut arm = None;
     let mut it = std::env::args().skip(1);
@@ -122,6 +145,15 @@ fn parse_args() -> Args {
             "--no-delta" => a.delta = false,
             "--timing" => a.timing = true,
             "--mid-cycles" => a.mid_cycles = num(val()),
+            "--mid-mode" => {
+                a.mid_mode = match val().as_str() {
+                    "c" => MidMode::C,
+                    "h" => MidMode::H,
+                    "r" => MidMode::R,
+                    "f" => MidMode::F,
+                    other => die(&format!("unknown mid mode {other}")),
+                }
+            }
             "--out-dir" => a.out_dir = Some(PathBuf::from(val())),
             "--plant" => {
                 a.plant = match val().as_str() {
@@ -414,6 +446,69 @@ fn plant_of(p: PlantArg) -> Plant {
     }
 }
 
+/// One window boundary: the view's upkeep counters now, the per-call maxima since the previous
+/// boundary (reset here), and the cycles and wall time of the window that ends here.
+fn vw(b: &Bench, label: &str, cycles: u64, wall_ns: u64) {
+    let w = b.db.branch_view_work_ext(true);
+    println!(
+        "vw\t{label}\tview_ops={}\ttouched={}\tcopied={}\tviews_copied={}\tclones={}\tarc_incs={}\tentries={}\tbudget={}\tupkeep_ns={}\tupkeep_calls={}\tcalls_copying={}\tviolations={}\tmax_copied={}\tmax_touched={}\tmax_arc_incs={}\tmax_budget={}\theights={}/{}/{}/{}\tcycles={cycles}\twall_ns={wall_ns}",
+        w.view_ops,
+        w.nodes_touched,
+        w.nodes_copied,
+        w.views_copied,
+        w.make_mut_clones,
+        w.arc_incs,
+        w.entries_copied,
+        w.height_budget,
+        w.upkeep_ns,
+        w.upkeep_calls,
+        w.calls_copying,
+        w.bound_violations,
+        w.max_call_copied,
+        w.max_call_touched,
+        w.max_call_arc_incs,
+        w.max_call_budget,
+        w.heights[0],
+        w.heights[1],
+        w.heights[2],
+        w.heights[3],
+    );
+}
+
+/// The cost of one empty `Instant::now()` / `elapsed()` pair, the pattern every upkeep call is
+/// timed with, as a mean over 10^6 pairs.
+fn clock_line() {
+    const PAIRS: u64 = 1_000_000;
+    let mut acc = 0u64;
+    let t = Instant::now();
+    for _ in 0..PAIRS {
+        let t0 = Instant::now();
+        acc += std::hint::black_box(t0.elapsed().as_nanos() as u64);
+    }
+    let total = t.elapsed().as_nanos() as u64;
+    println!(
+        "clock\tpairs={PAIRS}\tnull_pair_ns={:.2}\tloop_ns_per_pair={:.2}",
+        acc as f64 / PAIRS as f64,
+        total as f64 / PAIRS as f64
+    );
+}
+
+/// Run `args.mid_cycles` cycles of `arm`, taking a fresh snapshot around each one when `fresh`.
+/// Returns the wall time in ns.
+fn cycles(b: &mut Bench, args: &Args, fresh: bool, point: &str) -> u64 {
+    let t = Instant::now();
+    for _ in 0..args.mid_cycles {
+        let held = fresh.then(|| {
+            b.db
+                .branch_snapshot()
+                .unwrap_or_else(|e| not_a_result(&format!("{point}: per-cycle snapshot refused: {e}")))
+        });
+        b.cycle(args.arm);
+        drop(held);
+    }
+    t.elapsed().as_nanos() as u64
+}
+
 /// Take F-S1's snapshot, then send it into `replica` through a bounded pipe from a second thread
 /// while this thread runs `b`'s workload for `args.mid_cycles` cycles: the send holds no store lock,
 /// so the store keeps working, and the replica must still equal the store AT the snapshot.
@@ -438,6 +533,7 @@ fn pipe(
         "snap\t{point}\tseq={}\tsnapshot_locked_ns={snap_ns}\tview_ops={view_ops}\tview_nodes_touched={touched}\tview_nodes_copied={copied}",
         snap.seq()
     );
+    vw(b, &format!("{point}.snap"), 0, 0);
     if args.timing {
         // Serialisation alone, into a sink that discards.
         let t = Instant::now();
@@ -448,6 +544,10 @@ fn pipe(
     let (tx, rx) = sync_channel::<Vec<u8>>(16);
     let t = Instant::now();
     let arm = args.arm;
+    // C: the cycles run while the send streams. H, R, F: the send and the replica finish first.
+    let concurrent = args.mid_mode == MidMode::C;
+    let mid = if arm == Arm::Chain { 0 } else { args.mid_cycles as u64 };
+    let mut mid_wall_ns = 0u64;
     let (sent, received, during, send_s) = std::thread::scope(|s| {
         let hr = s.spawn(|| {
             let mut reader = PipeReader {
@@ -476,18 +576,36 @@ fn pipe(
         });
         // The store keeps working while the send streams.
         let mut during = 0u64;
-        if arm != Arm::Chain {
+        if concurrent && arm != Arm::Chain {
+            let tc = Instant::now();
             for _ in 0..args.mid_cycles {
                 if !hs.is_finished() {
                     during += 1;
                 }
                 b.cycle(arm);
             }
+            mid_wall_ns = tc.elapsed().as_nanos() as u64;
         }
         let (sent, send_s) = hs.join().unwrap();
         (sent, hr.join().unwrap(), during, send_s)
     });
     let secs = t.elapsed().as_secs_f64();
+    let snap_seq = snap.seq();
+    if !concurrent && arm != Arm::Chain {
+        match args.mid_mode {
+            MidMode::H => mid_wall_ns = cycles(b, args, false, point),
+            MidMode::R => {
+                drop(snap);
+                mid_wall_ns = cycles(b, args, false, point);
+            }
+            MidMode::F => {
+                drop(snap);
+                mid_wall_ns = cycles(b, args, true, point);
+            }
+            MidMode::C => unreachable!("handled above"),
+        }
+    }
+    vw(b, &format!("{point}.mid_end"), mid, mid_wall_ns);
     let work = match received {
         Ok(w) => w,
         Err(e) => not_a_result(&format!("{point}: the replica refused the stream: {e}")),
@@ -514,7 +632,7 @@ fn pipe(
         work.fork_deltas,
         if arm == Arm::Chain { 0 } else { args.mid_cycles },
     );
-    (sent, snap.seq())
+    (sent, snap_seq)
 }
 
 /// The replica against the store's digest taken at the snapshot it received.
@@ -734,6 +852,7 @@ fn incremental(
     // The replica acknowledged `seq`: holes at or before it can go.
     let dropped = b.db.branch_forget_tombstones(seq);
     println!("# {point}: holes dropped after the replica's ack: {dropped}");
+    vw(b, &format!("{point}.ack_end"), 0, 0);
     (seq, dump1, log1)
 }
 
@@ -772,7 +891,7 @@ fn main() {
     let w2 = args.w2.unwrap_or(args.n / 10);
     println!("# branch_ship — r11-ship PREREG; Turso fork F1+F2+F4 + shipping");
     println!(
-        "# arm={:?} n={} w1={} w2={w2} trunk_every={} seed={:#x} plant={:?} delta={} exports={} samples={} timing={} mid_cycles={} page_size={page_size} build={}",
+        "# arm={:?} n={} w1={} w2={w2} trunk_every={} seed={:#x} plant={:?} delta={} exports={} samples={} timing={} mid_cycles={} mid_mode={:?} page_size={page_size} build={}",
         args.arm,
         args.n,
         args.w1,
@@ -784,9 +903,11 @@ fn main() {
         args.samples,
         args.timing,
         args.mid_cycles,
+        args.mid_mode,
         if cfg!(debug_assertions) { "DEBUG" } else { "release" }
     );
     println!("{STREAM_HEADER}");
+    clock_line();
 
     let mut b = Bench {
         db: db.clone(),
@@ -839,6 +960,7 @@ fn main() {
         }
     }
     println!("# grow_s={:.1}(unlocked)", t.elapsed().as_secs_f64());
+    vw(&b, "grow.end", 0, 0);
 
     // T0: full sends.
     let image0 = b.checkpoint_image();
@@ -879,12 +1001,14 @@ fn main() {
         for _ in 0..args.w1 {
             b.cycle(args.arm);
         }
+        vw(&b, "W1.end", args.w1 as u64, t.elapsed().as_nanos() as u64);
         println!("# w1_s={:.1}(unlocked)", t.elapsed().as_secs_f64());
         let (seq1, dump1, log1) = incremental(&mut b, &mut replica, &args, "T1", seq0, &dump0, log0);
         let t = Instant::now();
         for _ in 0..w2 {
             b.cycle(args.arm);
         }
+        vw(&b, "W2.end", w2 as u64, t.elapsed().as_nanos() as u64);
         println!("# w2_s={:.1}(unlocked)", t.elapsed().as_secs_f64());
         let (seq2, dump2, log2) = incremental(&mut b, &mut replica, &args, "T2", seq1, &dump1, log1);
         // T3: catch the replica up on T2's mid-send cycles with nothing running, so that the source

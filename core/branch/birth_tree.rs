@@ -120,16 +120,40 @@ impl<V> Node<V> {
             Node::Leaf { items, .. } => items.is_empty(),
         }
     }
+
+    /// What cloning this node copies: (Vec elements, Arc strong-count increments). Every kid holds
+    /// an Arc; of the items only live ones do (a hole holds two integers).
+    fn clone_cost(&self) -> (u64, u64) {
+        match self {
+            Node::Inner { kids, .. } => (kids.len() as u64, kids.len() as u64),
+            Node::Leaf { items, .. } => (
+                items.len() as u64,
+                items.iter().filter(|(_, item)| matches!(item, Item::Live { .. })).count() as u64,
+            ),
+        }
+    }
 }
 
 /// Work a tree operation did: nodes entered by a walk, items looked at, nodes a write went
 /// through, and nodes a write had to COPY because a snapshot still shared them.
+///
+/// The copy's own cost (r13-ship-upkeep PREREG §3): `make_mut_clones` counts the clones
+/// `Arc::make_mut` actually made, by pointer change, which is a second instrument beside
+/// `nodes_copied`'s strong-count read; `entries_copied` and `arc_incs` are the Vec elements and the
+/// child-Arc increments those clones did; `height_budget` adds `height + 1` per tree call, the most
+/// nodes one call can touch. `views_copied` is the part of `nodes_copied` that was a ship view's
+/// per-state value, not a tree node (set by the ship view, not here).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TreeWork {
     pub(crate) nodes_visited: u64,
     pub(crate) items_checked: u64,
     pub(crate) nodes_touched: u64,
     pub(crate) nodes_copied: u64,
+    pub(crate) views_copied: u64,
+    pub(crate) make_mut_clones: u64,
+    pub(crate) entries_copied: u64,
+    pub(crate) arc_incs: u64,
+    pub(crate) height_budget: u64,
 }
 
 impl TreeWork {
@@ -138,6 +162,17 @@ impl TreeWork {
         self.items_checked += o.items_checked;
         self.nodes_touched += o.nodes_touched;
         self.nodes_copied += o.nodes_copied;
+        self.views_copied += o.views_copied;
+        self.make_mut_clones += o.make_mut_clones;
+        self.entries_copied += o.entries_copied;
+        self.arc_incs += o.arc_incs;
+        self.height_budget += o.height_budget;
+    }
+
+    /// One upkeep call broke the height bound: it touched more nodes than its tree calls' paths
+    /// hold, or copied a node it did not touch (a ship view's per-state value aside).
+    pub(crate) fn breaks_height_bound(&self) -> bool {
+        self.nodes_touched > self.height_budget || self.nodes_copied > self.nodes_touched + self.views_copied
     }
 }
 
@@ -174,8 +209,16 @@ fn cow<'a, V>(node: &'a mut Arc<Node<V>>, work: &mut TreeWork) -> &'a mut Node<V
     work.nodes_touched += 1;
     if Arc::strong_count(node) > 1 {
         work.nodes_copied += 1;
+        let (entries, arcs) = node.clone_cost();
+        work.entries_copied += entries;
+        work.arc_incs += arcs;
     }
-    Arc::make_mut(node)
+    let before: *const Node<V> = &**node;
+    let node = Arc::make_mut(node);
+    if !std::ptr::eq(before, &*node) {
+        work.make_mut_clones += 1;
+    }
+    node
 }
 
 impl<V> BirthTree<V> {
@@ -183,9 +226,13 @@ impl<V> BirthTree<V> {
         self.height >= MAX_HEIGHT || key < 1u64 << (BITS * (self.height + 1))
     }
 
-    #[cfg(test)]
     pub(crate) fn height(&self) -> u32 {
         self.height
+    }
+
+    /// Whether the tree has a root, i.e. whether cloning it increments an Arc.
+    pub(crate) fn has_root(&self) -> bool {
+        self.root.is_some()
     }
 
     pub(crate) fn get(&self, key: u64) -> Option<&Item<V>> {
@@ -232,6 +279,7 @@ impl<V> BirthTree<V> {
             }));
             self.height += 1;
         }
+        work.height_budget += u64::from(self.height) + 1;
         // Mutant S2 (PREREG A5): inner nodes keep their births, so a walk prunes changed subtrees.
         let keep_inner_births = super::ship_mutant() == "S2";
         let mut level = self.height;
@@ -280,6 +328,7 @@ impl<V> BirthTree<V> {
         if self.get(key).is_none() {
             return false;
         }
+        work.height_budget += u64::from(self.height) + 1;
         let keep_inner_births = super::ship_mutant() == "S2";
         let mut level = self.height;
         let mut node = cow(self.root.as_mut().expect("the key is present"), work);
@@ -317,6 +366,7 @@ impl<V> BirthTree<V> {
             return None;
         }
         self.get(key)?;
+        work.height_budget += u64::from(self.height) + 1;
         let root = self.root.as_mut()?;
         let removed = Self::remove_in(root, key, self.height, work);
         if self.root.as_ref().is_some_and(|r| r.is_empty()) {
@@ -543,5 +593,77 @@ mod tests {
         tree.walk_changed(1, &mut walk, |k, _| found.push(k));
         assert_eq!(found, vec![54_321]);
         assert_eq!(walk.nodes_visited, u64::from(tree.height()) + 1, "{walk:?}");
+    }
+
+    /// r13-ship-upkeep PREREG §3: the copy counters against counts worked out by hand. Keys
+    /// 0..1024 fill a tree of height 1: a root with 32 kids, each a leaf of 32 live items.
+    #[test]
+    fn a_put_under_a_snapshot_copies_one_path_and_counts_what_the_copy_did() {
+        let mut work = TreeWork::default();
+        let mut tree = BirthTree::default();
+        for key in 0..1024u64 {
+            tree.put(key, Item::Live { birth: 1, val: Arc::new(key) }, Some(1), &mut work);
+        }
+        assert_eq!(tree.height(), 1);
+        assert_eq!((work.nodes_copied, work.make_mut_clones, work.arc_incs), (0, 0, 0), "growth shares nothing");
+        let snap = tree.clone();
+
+        // Root (32 kids) and leaf 0 (32 live items) are shared: both are copied.
+        let mut w = TreeWork::default();
+        tree.put(5, Item::Live { birth: 2, val: Arc::new(0) }, Some(2), &mut w);
+        assert_eq!((w.nodes_touched, w.nodes_copied, w.make_mut_clones), (2, 2, 2), "{w:?}");
+        assert_eq!((w.entries_copied, w.arc_incs, w.height_budget), (64, 64, 2), "{w:?}");
+        assert!(!w.breaks_height_bound());
+
+        // The same path again is no longer shared.
+        let mut w = TreeWork::default();
+        tree.put(6, Item::Live { birth: 3, val: Arc::new(0) }, Some(3), &mut w);
+        assert_eq!((w.nodes_touched, w.nodes_copied, w.make_mut_clones, w.arc_incs), (2, 0, 0, 0), "{w:?}");
+
+        // Leaf 1 is still shared; the new root is not.
+        let mut w = TreeWork::default();
+        let updated = tree.update(40, Some(4), &mut w, |item, _| *item = Item::Live { birth: 4, val: Arc::new(4) });
+        assert!(updated);
+        assert_eq!((w.nodes_touched, w.nodes_copied, w.make_mut_clones), (2, 1, 1), "{w:?}");
+        assert_eq!((w.entries_copied, w.arc_incs, w.height_budget), (32, 32, 2), "{w:?}");
+
+        // A removal from shared leaf 2 copies it before removing.
+        let mut w = TreeWork::default();
+        assert!(tree.remove(70, &mut w).is_some());
+        assert_eq!((w.nodes_touched, w.nodes_copied, w.entries_copied, w.arc_incs), (2, 1, 32, 32), "{w:?}");
+
+        // The snapshot still reads what it had.
+        assert_eq!(snap.get_live(5).map(|v| **v), Some(5));
+        assert_eq!(snap.get_live(70).map(|v| **v), Some(70));
+        drop(snap);
+    }
+
+    /// A hole holds no Arc, so copying a leaf with holes increments fewer Arcs than it copies
+    /// entries: 5 keys in one leaf (height 0), one of them a hole.
+    #[test]
+    fn copying_a_leaf_with_a_hole_increments_only_the_live_items() {
+        let mut work = TreeWork::default();
+        let mut tree = BirthTree::default();
+        for key in 0..5u64 {
+            tree.put(key, Item::Live { birth: 1, val: Arc::new(key) }, Some(1), &mut work);
+        }
+        tree.put(2, Item::Hole { birth: 2, born: 1 }, Some(2), &mut work);
+        let snap = tree.clone();
+        let mut w = TreeWork::default();
+        tree.put(0, Item::Live { birth: 3, val: Arc::new(9) }, Some(3), &mut w);
+        assert_eq!((w.nodes_touched, w.nodes_copied, w.make_mut_clones), (1, 1, 1), "{w:?}");
+        assert_eq!((w.entries_copied, w.arc_incs, w.height_budget), (5, 4, 1), "{w:?}");
+        drop(snap);
+    }
+
+    /// The bound predicate fires on each of its two conditions and not on a call within both.
+    #[test]
+    fn the_height_bound_predicate_fires_on_each_condition() {
+        let ok = TreeWork { nodes_touched: 3, nodes_copied: 4, views_copied: 1, height_budget: 3, ..Default::default() };
+        assert!(!ok.breaks_height_bound());
+        let over_path = TreeWork { nodes_touched: 4, height_budget: 3, ..Default::default() };
+        assert!(over_path.breaks_height_bound());
+        let untouched_copy = TreeWork { nodes_touched: 3, nodes_copied: 4, views_copied: 0, height_budget: 3, ..Default::default() };
+        assert!(untouched_copy.breaks_height_bound());
     }
 }

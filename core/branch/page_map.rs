@@ -53,6 +53,11 @@ pub(crate) struct PageMap {
 }
 
 impl PageMap {
+    /// Whether the map has a root, i.e. whether cloning it increments an Arc.
+    pub(crate) fn has_root(&self) -> bool {
+        self.root.is_some()
+    }
+
     fn covers(&self, page: u32) -> bool {
         u64::from(page) < 1u64 << (BITS * (self.height + 1))
     }

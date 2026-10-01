@@ -96,7 +96,7 @@ pub(crate) use ship::send_snapshot;
 use ship::SlotOwner;
 pub use ship::{
     content_hash, Digest, Plant, RecvWork, SendMode, SendReport, ShipDump, ShipSnap, TrunkImage,
-    CURRENT_ENTRY_BYTES, RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
+    ViewWorkExt, CURRENT_ENTRY_BYTES, RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
 };
 pub(crate) use ship::Track;
 

@@ -66,7 +66,7 @@ use crate::{Connection, Database, Result, TransactionState};
 use store::BranchStore;
 pub use store::{
     content_hash, Digest, Plant, RecvWork, SendMode, SendReport, ShipDump, ShipSnap, TrunkImage,
-    CURRENT_ENTRY_BYTES, RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
+    ViewWorkExt, CURRENT_ENTRY_BYTES, RETAINED_ENTRY_BYTES, STATE_HEADER_BYTES, WRITTEN_ENTRY_BYTES,
 };
 
 /// The mutant schema a shipping fire-check selects (PREREG A5, r11-ship): `R11_SHIP_MUTANT` read
@@ -445,6 +445,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_view_work(&self) -> (u64, u64, u64) {
         self.branches.view_work()
+    }
+
+    /// The ship view's upkeep counters (r13-ship-upkeep PREREG §3); `reset_max` starts a new
+    /// window for the per-call maxima.
+    #[doc(hidden)]
+    pub fn branch_view_work_ext(&self, reset_max: bool) -> ViewWorkExt {
+        self.branches.view_work_ext(reset_max)
     }
 
     #[doc(hidden)]
