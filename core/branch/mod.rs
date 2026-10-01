@@ -343,6 +343,34 @@ pub(crate) fn pf_rerun_cap() -> u64 {
     })
 }
 
+/// r12-e3 amendment 3's RES prewarm (`R12_CAT_PREWARM` set, any value but `all`): the statements
+/// a catalog open runs. One list, so amendment 9's `explain` mode prints the plans of exactly these.
+#[doc(hidden)]
+pub const RES_PREWARM_SQL: [&str; 7] = [
+    "SELECT sum(parent) FROM branch",
+    "SELECT fork_epoch FROM branch WHERE parent >= 0 ORDER BY parent, fork_epoch",
+    "SELECT sum(slot) FROM cur",
+    "SELECT sum(slot) FROM ret",
+    "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, page, born",
+    "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, born",
+    "SELECT died FROM ret WHERE owner >= 0 ORDER BY owner, died",
+];
+
+// r12-e3 amendment 9: a process-wide reap sequence number, stamped on every ReapSample and on every
+// amendment-8 miss, so a harness can split a cell at its first store checkpoint.
+static REAP_SEQ: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static CUR_REAP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A new reap's sequence number (from 1), made current on this thread.
+pub(crate) fn next_reap_seq() -> u64 {
+    let seq = REAP_SEQ.fetch_add(1, crate::sync::atomic::Ordering::Relaxed) + 1;
+    CUR_REAP.with(|c| c.set(seq));
+    seq
+}
+
 // r12-e3 amendment 8 (observing; `R12_A8=1`, off by default so amendment 7's runs are unperturbed):
 // every page-cache miss inside a non-checkpoint reap section, classified at the miss against the
 // catalog's current open: which pager, which catalog statement, whether this open's prewarm put the
@@ -358,6 +386,8 @@ pub(crate) fn a8_on() -> bool {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct A8Miss {
+    /// The reap whose section missed (amendment 9's sequence number).
+    pub reap: u64,
     pub page: u32,
     pub catalog: bool,
     pub stmt: u8,
@@ -445,6 +475,7 @@ pub(crate) fn a8_miss(page: usize, catalog: bool) {
     let mut a = A8.lock();
     let page = page as u32;
     let m = A8Miss {
+        reap: CUR_REAP.with(|c| c.get()),
         page,
         catalog,
         stmt: CUR_STMT.with(|c| c.get()),
@@ -518,6 +549,10 @@ pub struct ReapSample {
     /// Prefetch arm (r12-e3 amendment 7): pages this reap's prefetches inserted into the catalog's
     /// cache that left it while the reap was pending, laid out as `PF_COUNTERS`.
     pub pf_removed: [u64; PF_COUNTERS],
+    /// r12-e3 amendment 9: this reap's sequence number, and the catalog cache's cumulative
+    /// [deletes, cleared pages] when its final hold began (before any checkpoint it runs).
+    pub seq: u64,
+    pub cat_cc0: [u64; 2],
 }
 pub(crate) mod catalog;
 pub(crate) mod journal;
@@ -1039,6 +1074,18 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_take_reap_samples(&self) -> Vec<ReapSample> {
         self.branches.take_reap_samples()
+    }
+
+    /// r12-e3 amendment 9: the SS-RESK knob on this store's catalog (the env var sets it at open).
+    #[doc(hidden)]
+    pub fn branch_set_catalog_ckpt_keep(&self, on: bool) {
+        self.branches.set_catalog_ckpt_keep(on);
+    }
+
+    /// r12-e3 amendment 9: pages in the branch catalog connection's page cache (0 without one).
+    #[doc(hidden)]
+    pub fn branch_catalog_cache_len(&self) -> usize {
+        self.branches.catalog_cache_len()
     }
 
     /// r12-e3 amendment 8: every page of the branch catalog's B-trees, as `(page, B-tree, depth,

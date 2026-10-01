@@ -265,6 +265,9 @@ impl CatalogCell {
 }
 
 pub(crate) struct Catalog {
+    /// r12-e3 amendment 9 (SS-RESK knob, `R12_CAT_CKPT_KEEP=1` at open, off by default): the
+    /// catalog's own TRUNCATE checkpoint keeps its page cache instead of clearing it.
+    pub(crate) ckpt_keep: bool,
     _db: Arc<Database>,
     conn: Arc<Connection>,
     pub(crate) counters: CatalogCounters,
@@ -383,15 +386,7 @@ impl Catalog {
         let warmed = match prewarm.as_deref() {
             Some("all") => read_every_page(&conn),
             Some(_) => (|| -> Result<()> {
-                for sql in [
-                    "SELECT sum(parent) FROM branch",
-                    "SELECT fork_epoch FROM branch WHERE parent >= 0 ORDER BY parent, fork_epoch",
-                    "SELECT sum(slot) FROM cur",
-                    "SELECT sum(slot) FROM ret",
-                    "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, page, born",
-                    "SELECT born FROM ret WHERE owner >= 0 ORDER BY owner, born",
-                    "SELECT died FROM ret WHERE owner >= 0 ORDER BY owner, died",
-                ] {
+                for sql in super::RES_PREWARM_SQL {
                     conn.prepare(sql)?.run_ignore_rows()?;
                 }
                 Ok(())
@@ -478,9 +473,15 @@ impl Catalog {
             free_del: p("DELETE FROM free WHERE slot = ?1")?,
             free_put: p("INSERT OR REPLACE INTO free(slot) VALUES (?1)")?,
             counters: CatalogCounters::default(),
+            ckpt_keep: std::env::var("R12_CAT_CKPT_KEEP").is_ok_and(|v| v == "1"),
             conn,
             _db: db,
         })
+    }
+
+    /// r12-e3 amendment 9: the number of pages in this connection's page cache (test instrument).
+    pub(crate) fn cache_len(&self) -> usize {
+        self.conn.get_pager().page_cache_len()
     }
 
     /// r12-e3 amendment 8: every page of every B-tree (page 1's schema and each table and index
@@ -602,6 +603,26 @@ impl Catalog {
     /// use, which this catalog's pattern never meets, so without this the WAL keeps every frame ever
     /// written and an open recovers all of them. Returns the pragma's row (busy, log, checkpointed).
     pub(crate) fn truncate_wal(&mut self) -> Result<Vec<i64>> {
+        if self.ckpt_keep {
+            // r12-e3 amendment 9: the same TRUNCATE checkpoint through the pager, with
+            // clear_page_cache=false. As the explicit pragma does, a read slot this connection
+            // still holds is given up first, or the WAL restart would be busy.
+            let pager = self.conn.get_pager();
+            if pager.holds_read_lock() {
+                pager.end_read_tx();
+            }
+            let sync = self.conn.get_sync_mode();
+            let r = pager.io.block(|| {
+                pager.checkpoint(
+                    crate::CheckpointMode::Truncate {
+                        upper_bound_inclusive: None,
+                    },
+                    sync,
+                    false,
+                )
+            })?;
+            return Ok(vec![0, r.wal_max_frame as i64, r.wal_total_backfilled as i64]);
+        }
         let rows = self
             .conn
             .prepare("PRAGMA wal_checkpoint(TRUNCATE)")?

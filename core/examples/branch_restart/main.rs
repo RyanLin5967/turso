@@ -93,6 +93,8 @@ struct Args {
     round: usize,
     oldest: bool,
     prefetch: bool,
+    /// r12-e3 amendment 9: split each cell at its first store checkpoint.
+    ss: bool,
 }
 
 fn parse_args() -> Args {
@@ -117,6 +119,7 @@ fn parse_args() -> Args {
         round: 1000,
         oldest: false,
         prefetch: false,
+        ss: false,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -149,6 +152,7 @@ fn parse_args() -> Args {
                     other => die(&format!("unknown --victim {other}")),
                 }
             }
+            "--ss" => args.ss = true,
             "--prefetch" => {
                 args.prefetch = match val().as_str() {
                     "on" => true,
@@ -906,6 +910,7 @@ fn main() {
         "ckpt2" => ckpt2(&args),
         "churn" => churn(&args),
         "reaprate" => reaprate(&args),
+        "explain" => explain(&args),
         other => die(&format!("unknown command {other}")),
     }
 }
@@ -1000,7 +1005,16 @@ fn pct_u64(sorted: &[u64], p: f64) -> u64 {
 /// page count at the prewarm), p_stayed (prewarmed, never left, still missed), c_unwarmed (existed
 /// at the prewarm, never left, not read by it), d_other (a pager other than the catalog's while a
 /// catalog statement runs), o_otherdb (a pager other than the catalog's outside one).
-fn a8_cell(db: &Arc<Database>, n: usize, kind: &str, t: usize, draw: u64, page_reads: u64, del_clr: [u64; 2]) {
+fn a8_cell(
+    db: &Arc<Database>,
+    n: usize,
+    kind: &str,
+    t: usize,
+    draw: u64,
+    page_reads: u64,
+    del_clr: [u64; 2],
+    split: Option<u64>,
+) {
     let log = turso_core::branch::a8_take_log();
     let map: std::collections::HashMap<u32, (String, u8, u8)> = db
         .branch_catalog_page_map()
@@ -1012,6 +1026,10 @@ fn a8_cell(db: &Arc<Database>, n: usize, kind: &str, t: usize, draw: u64, page_r
     let mut classes: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
     let mut rows: std::collections::BTreeMap<(String, String, String, u8, u8), u64> = std::collections::BTreeMap::new();
     let mut created_after_left = 0u64;
+    // r12-e3 amendment 9: with `split` (the cell's first checkpoint reap), misses of later reaps are
+    // also counted apart as post-checkpoint.
+    let mut post: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    let mut post_n = 0u64;
     for m in &log {
         if m.catalog && m.created_after && m.left != 0 {
             created_after_left += 1;
@@ -1038,6 +1056,15 @@ fn a8_cell(db: &Arc<Database>, n: usize, kind: &str, t: usize, draw: u64, page_r
             "c_unwarmed"
         };
         *classes.entry(class).or_default() += 1;
+        let phase = match split {
+            Some(s) if m.reap > s => {
+                post_n += 1;
+                *post.entry(class).or_default() += 1;
+                "post"
+            }
+            Some(_) => "pre",
+            None => "-",
+        };
         let (btree, ty, depth) = match map.get(&m.page) {
             Some((name, depth, ty)) if m.catalog => (
                 name.clone(),
@@ -1054,7 +1081,7 @@ fn a8_cell(db: &Arc<Database>, n: usize, kind: &str, t: usize, draw: u64, page_r
             _ if m.catalog => ("NONE".to_string(), "-".to_string(), 0),
             _ => ("OTHER_PAGER".to_string(), "-".to_string(), 0),
         };
-        *rows.entry((class.to_string(), btree, ty, depth, m.stmt)).or_default() += 1;
+        *rows.entry((format!("{class} phase={phase}"), btree, ty, depth, m.stmt)).or_default() += 1;
     }
     println!(
         "# a8 N={n} kind={kind} T={t} draw={draw} misses={} page_reads_total={page_reads} complete={} \
@@ -1066,8 +1093,94 @@ fn a8_cell(db: &Arc<Database>, n: usize, kind: &str, t: usize, draw: u64, page_r
         del_clr[0],
         del_clr[1],
     );
+    if let Some(s) = split {
+        println!("# a8ss N={n} kind={kind} T={t} draw={draw} first_ckpt_reap={s} post_misses={post_n} post_classes={post:?}");
+    }
     for ((class, btree, ty, depth, stmt), k) in rows {
         println!("# a8row N={n} kind={kind} T={t} draw={draw} class={class} btree={btree} type={ty} depth={depth} stmt={stmt} n={k}");
+    }
+}
+
+/// r12-e3 amendment 9: one cell split at its first store checkpoint (`first`, a reap sequence
+/// number): checkpoints, reaps per checkpoint interval, in-lock page reads, late reads and re-runs per
+/// non-checkpoint reap before and after it, and the catalog cache's deletes and cleared pages from the
+/// start of the first checkpoint reap's hold to the cell's end (`cc_end`: cumulative [deletes, cleared]).
+fn ss_cell(
+    n: usize,
+    kind: &str,
+    t: usize,
+    draw: u64,
+    samples: &[turso_core::branch::ReapSample],
+    first: Option<u64>,
+    cc_end: [u64; 2],
+) {
+    let mut by_seq: Vec<&turso_core::branch::ReapSample> = samples.iter().collect();
+    by_seq.sort_by_key(|s| s.seq);
+    let ckpt_seqs: Vec<u64> = by_seq.iter().filter(|s| s.ckpt).map(|s| s.seq).collect();
+    let k_mean = if ckpt_seqs.len() >= 2 {
+        (ckpt_seqs[ckpt_seqs.len() - 1] - ckpt_seqs[0]) as f64 / (ckpt_seqs.len() - 1) as f64
+    } else {
+        f64::NAN
+    };
+    let f = first.unwrap_or(u64::MAX);
+    let side = |post: bool| -> Vec<&turso_core::branch::ReapSample> {
+        by_seq.iter().copied().filter(|s| !s.ckpt && ((s.seq > f) == post)).collect()
+    };
+    let per = |v: &[&turso_core::branch::ReapSample], g: &dyn Fn(&turso_core::branch::ReapSample) -> u64| -> f64 {
+        v.iter().map(|s| g(s)).sum::<u64>() as f64 / v.len().max(1) as f64
+    };
+    let (post, pre) = (side(true), side(false));
+    let tot = |v: &[&turso_core::branch::ReapSample], g: &dyn Fn(&turso_core::branch::ReapSample) -> u64| -> u64 {
+        v.iter().map(|s| g(s)).sum()
+    };
+    let after = match by_seq.iter().find(|s| s.ckpt) {
+        Some(s) => [cc_end[0] - s.cat_cc0[0], cc_end[1] - s.cat_cc0[1]],
+        None => [0, 0],
+    };
+    println!(
+        "# ss N={n} kind={kind} T={t} draw={draw} ckpts={} first_ckpt_reap={} k_mean={k_mean:.1} post_reaps={} \
+         post_page_reads={:.4} pre_reaps={} pre_page_reads={:.4} post_late_passed={} post_late_giveup={} \
+         post_reruns={:.3} pre_reruns={:.3} post_gave_up={} cat_deletes_after={} cat_cleared_after={}",
+        ckpt_seqs.len(),
+        first.map_or("none".to_string(), |s| s.to_string()),
+        post.len(),
+        per(&post, &|s| s.page_reads),
+        pre.len(),
+        per(&pre, &|s| s.page_reads),
+        tot(&post, &|s| if s.gave_up { 0 } else { s.late }),
+        tot(&post, &|s| if s.gave_up { s.late } else { 0 }),
+        per(&post, &|s| s.reruns),
+        per(&pre, &|s| s.reruns),
+        post.iter().filter(|s| s.gave_up).count(),
+        after[0],
+        after[1],
+    );
+}
+
+/// r12-e3 amendment 9 (A8-P3'): EXPLAIN QUERY PLAN, from this build's own planner, of the RES
+/// prewarm statements, on the catalog database at `--db` (open it on a clone: nothing is written).
+fn explain(args: &Args) {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        args.db.to_str().unwrap(),
+        OpenFlags::None,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap_or_else(|e| die(&format!("open {}: {e}", args.db.display())));
+    let conn = db.connect().unwrap();
+    for sql in turso_core::branch::RES_PREWARM_SQL {
+        println!("# explain sql={sql}");
+        let rows = conn
+            .prepare(format!("EXPLAIN QUERY PLAN {sql}"))
+            .and_then(|mut st| st.run_collect_rows())
+            .unwrap_or_else(|e| die(&format!("explain {sql}: {e}")));
+        for row in rows {
+            let line: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+            println!("#   plan {}", line.join(" | "));
+        }
     }
 }
 
@@ -1322,8 +1435,14 @@ fn reaprate(args: &Args) {
                 removed[11],
                 removed[12],
             );
+            // r12-e3 amendment 9: the cell split at its first store checkpoint.
+            let first_ckpt = samples.iter().filter(|s| s.ckpt).map(|s| s.seq).min();
+            if args.ss {
+                ss_cell(args.n, kind, t, draw, &samples, first_ckpt, [cc1[2], cc1[3]]);
+            }
             if a8 {
-                a8_cell(&db, args.n, kind, t, draw, sum(&|s| s.page_reads), [cc1[2] - cc0[2], cc1[3] - cc0[3]]);
+                let split = if args.ss { Some(first_ckpt.unwrap_or(u64::MAX)) } else { None };
+                a8_cell(&db, args.n, kind, t, draw, sum(&|s| s.page_reads), [cc1[2] - cc0[2], cc1[3] - cc0[3]], split);
             }
             if n_ckpt > 0 {
                 let ck: Vec<&turso_core::branch::ReapSample> = samples.iter().filter(|s| s.ckpt).collect();

@@ -3757,6 +3757,11 @@ impl Pager {
         Ok(page)
     }
 
+    /// r12-e3 amendment 9: pages in this pager's cache (test instrument).
+    pub fn page_cache_len(&self) -> usize {
+        self.page_cache.read().len()
+    }
+
     /// r12-e3 amendment 7: mark this pager's page cache as the branch catalog's (its removals of
     /// prefetched pages are counted) and choose where a new page enters its clock. Returns the
     /// capacity in pages.

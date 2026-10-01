@@ -603,3 +603,89 @@ fn threaded_prefetch_reaps_survive_a_reopen() {
         let _ = b.into_id();
     }
 }
+
+/// r12-e3 amendment 9's gate: the SS-RESK knob (the catalog keeps its page cache across its own
+/// TRUNCATE checkpoint) changes no store state. One seeded fork/write/reap workload crosses four
+/// store checkpoints with the knob off and with it on: live branches, arena slots in use, trunk
+/// versions retained and every survivor's own row are equal after every checkpoint and after a
+/// reopen. And the knob does what it says (fired both ways): off, a checkpoint empties the catalog's
+/// cache; on, the cache keeps its pages across it.
+#[test]
+fn keeping_the_catalog_cache_across_its_checkpoint_changes_no_state() {
+    fn fork_written(db: &Arc<Database>, n: usize, next_row: &mut i64) -> Vec<(BranchId, i64)> {
+        let trunk = db.connect().unwrap();
+        (0..n)
+            .map(|_| {
+                let b = trunk.fork_branch().unwrap();
+                let row = 1 + (*next_row % 400);
+                *next_row += 1;
+                b.connect()
+                    .unwrap()
+                    .execute(format!("UPDATE t SET v = 'b{}' WHERE id = {row}", b.id().0))
+                    .unwrap();
+                if *next_row % 8 == 0 {
+                    trunk
+                        .execute(format!("UPDATE t SET v = 'tw{next_row}' WHERE id = {}", 1 + (*next_row + 200) % 400))
+                        .unwrap();
+                }
+                (b.into_id(), row)
+            })
+            .collect()
+    }
+    fn survivors_read_right(db: &Arc<Database>, live: &[(BranchId, i64)]) {
+        for &(id, row) in live.iter().step_by(7) {
+            let b = db.branch(id).unwrap();
+            assert_eq!(value(&b.connect().unwrap(), row), format!("b{}", id.0), "branch {} row {row}", id.0);
+            let _ = b.into_id();
+        }
+    }
+    let mut runs = Vec::new();
+    for keep in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let mut next_row = 0i64;
+        let mut live;
+        {
+            let db = open_at(&path, catalog()).unwrap();
+            seed(&db.connect().unwrap());
+            live = fork_written(&db, 300, &mut next_row);
+            db.branch_compact_now().unwrap();
+        }
+        let db = open_at(&path, catalog()).unwrap();
+        db.branch_set_catalog_ckpt_keep(keep);
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut states = Vec::new();
+        for round in 0..4 {
+            for _ in 0..40 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let (id, _) = live.swap_remove((rng % live.len() as u64) as usize);
+                let r = db.branch_release_detached(id).unwrap();
+                assert!(!r.deferred, "round {round}: reap of {} deferred", id.0);
+            }
+            live.extend(fork_written(&db, 40, &mut next_row));
+            survivors_read_right(&db, &live);
+            let before = db.branch_catalog_cache_len();
+            db.branch_compact_now().unwrap();
+            let after = db.branch_catalog_cache_len();
+            assert!(before > 4, "round {round}: the catalog cache held only {before} pages before the checkpoint");
+            if keep {
+                assert!(after * 2 >= before, "knob on, round {round}: the checkpoint dropped the cache ({before} -> {after})");
+            } else {
+                assert!(after * 2 < before, "knob off, round {round}: the checkpoint kept the cache ({before} -> {after})");
+            }
+            survivors_read_right(&db, &live);
+            let st = db.branch_stats().unwrap();
+            states.push((st.live_branches, st.arena_slots_in_use, db.branch_trunk_retained()));
+        }
+        drop(db);
+        let db = open_at(&path, catalog()).unwrap();
+        survivors_read_right(&db, &live);
+        let st = db.branch_stats().unwrap();
+        states.push((st.live_branches, st.arena_slots_in_use, db.branch_trunk_retained()));
+        runs.push((states, live.iter().map(|&(id, _)| id.0).collect::<Vec<_>>()));
+    }
+    assert_eq!(runs[0], runs[1], "the knob changed the store's state");
+    assert_eq!(runs[0].0[0].0, 300, "live branches after the first round");
+}

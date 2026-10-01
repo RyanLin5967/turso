@@ -1685,6 +1685,7 @@ impl BranchStore {
         let prefetch = self.prefetch.load(Ordering::Relaxed);
         let cap = super::pf_rerun_cap();
         let mut sample = ReapSample::default();
+        sample.seq = super::next_reap_seq();
         let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         // r12-e3 amendment 7: this reap's serial once it prefetches (0: never), which makes it
         // pending until its section starts.
@@ -1785,6 +1786,10 @@ impl BranchStore {
         };
         let loads = |inner: &StoreInner| inner.cat.as_ref().map_or(0, |c| c.branch_loads);
         let [queries0, loads0, reads0, fsyncs0, late0] = base;
+        {
+            use crate::sync::atomic::Ordering::Relaxed;
+            sample.cat_cc0 = [super::CAT_CACHE[2].load(Relaxed), super::CAT_CACHE[3].load(Relaxed)];
+        }
         let phase = Instant::now();
         inner.ensure(id)?;
         sample.ensure_ns = ns(phase.elapsed());
@@ -1872,6 +1877,18 @@ impl BranchStore {
 
     pub(crate) fn take_reap_samples(&self) -> Vec<ReapSample> {
         std::mem::take(&mut self.inner.lock().reap_samples)
+    }
+
+    /// r12-e3 amendment 9: the SS-RESK knob on the catalog, if there is one.
+    pub(crate) fn set_catalog_ckpt_keep(&self, on: bool) {
+        if let Some(cat) = self.inner.lock().cat.as_ref() {
+            cat.catalog.lock().ckpt_keep = on;
+        }
+    }
+
+    /// r12-e3 amendment 9: pages in the catalog connection's page cache.
+    pub(crate) fn catalog_cache_len(&self) -> usize {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.catalog.lock().cache_len())
     }
 
     /// r12-e3 amendment 8: the catalog's page map (empty without a catalog).
