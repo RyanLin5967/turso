@@ -3416,6 +3416,8 @@ fn nf_twin_a_close_frees_nothing_of_a_branch_whose_early_release_rides_an_unforc
     let b = db.branch(b_id).expect("its Release never became durable, so the branch is back");
     assert_eq!(value(&b.connect().unwrap(), 10), Some("b".to_string()));
     let _ = b.into_id();
+}
+
 // ---- r12-noforce PREREG amendment 7: Rule One batch 4's two correctness gaps ----
 
 /// T-CK. Under no-force the checkpoint's arena sync (`Journal::compact`) is the only arena barrier
