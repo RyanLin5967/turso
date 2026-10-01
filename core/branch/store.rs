@@ -637,6 +637,13 @@ pub(crate) mod mutants {
     }
 }
 
+/// Whether `bytes` hold a B-tree interior page: type byte 2 (index) or 5 (table), read after the
+/// 100-byte database header on page 1.
+fn is_interior_page(page: u32, bytes: &[u8]) -> bool {
+    let at = if page == 1 { 100 } else { 0 };
+    matches!(bytes.get(at), Some(2 | 5))
+}
+
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
@@ -973,11 +980,23 @@ impl BranchStore {
     ) -> Result<()> {
         let mut inner = self.lock();
         let StoreInner {
-            arena, branches, ..
+            arena,
+            branches,
+            work,
+            ..
         } = &mut *inner;
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         crate::turso_assert!(st.writer, "branch page written outside a write transaction");
+        work.branch_page_writes += 1;
+        #[cfg(test)]
+        let interior = (is_interior_page(page, pre_image) && !mutants::on("COUNT_NO_INTERIOR"))
+            || mutants::on("COUNT_ALL_INTERIOR");
+        #[cfg(not(test))]
+        let interior = is_interior_page(page, pre_image);
+        if interior {
+            work.branch_interior_page_writes += 1;
+        }
         let epoch = st.lineage.epoch;
         let log = self.fs13.load(Ordering::Relaxed);
         match st.current.get(&page).copied() {

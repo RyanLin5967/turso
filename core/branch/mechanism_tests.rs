@@ -1377,6 +1377,118 @@ fn a_branch_write_never_changes_a_version_another_reader_sees() {
     assert_eq!(table(&trunk), before);
 }
 
+/// The set-inclusion form of the law above, on its fixture unchanged (lead ruling 03:40Z; r11-sessions
+/// amendment 18e). A page b's second transaction writes while a child sees it keeps its old slot for
+/// the child and takes a fresh one, so no slot b owned is given up and the arena grows by exactly the
+/// pages that transaction wrote, as the store's own first-write decisions count them
+/// (`LAW_NO_RETAIN` rewrites them in place, so none is fresh). The page-write counters also say how
+/// many interior pages each transaction wrote; those counts are printed, not asserted.
+#[test]
+fn a_branch_rewrite_retains_every_page_it_writes_while_a_child_sees_it() {
+    let (_dir, db) = open_db();
+    db.set_fs10(true);
+    db.set_fs10_fill(true);
+    db.set_fs11(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let v = |tag: &str, id: i64| format!("{tag}-{id:04}-{}", "y".repeat(100 - tag.len() - 6));
+    let before: BTreeMap<i64, String> = (1..=300).map(|id| (id, original(id))).collect();
+    let b = trunk.fork_branch().unwrap();
+    let c = b.connect().unwrap();
+    assert_eq!(table(&c), before);
+    let w0 = db.branch_stats().work;
+    c.execute("BEGIN").unwrap();
+    for id in 1..=300 {
+        set(&c, id, &v("b1", id));
+    }
+    c.execute("COMMIT").unwrap();
+    let w1 = db.branch_stats().work;
+    let after_b1: BTreeMap<i64, String> = (1..=300).map(|id| (id, v("b1", id))).collect();
+    let o = trunk.fork_branch().unwrap();
+    let oc = o.connect().unwrap();
+    assert_eq!(table(&oc), before, "another branch saw b's write");
+    assert_eq!(table(&trunk), before, "the trunk saw b's write");
+    let child = b.fork().unwrap();
+    let cc = child.connect().unwrap();
+    assert_eq!(table(&cc), after_b1);
+    let owned_before: BTreeSet<u32> = b.owned_slots().into_iter().collect();
+    let slots = db.branch_stats().arena_slots_in_use;
+    let w2 = db.branch_stats().work;
+    c.execute("BEGIN").unwrap();
+    for id in 1..=300 {
+        set(&c, id, &v("b2", id));
+    }
+    c.execute("COMMIT").unwrap();
+    let w3 = db.branch_stats().work;
+    let owned_after: BTreeSet<u32> = b.owned_slots().into_iter().collect();
+    let fresh = owned_after.difference(&owned_before).count();
+    let grew = db.branch_stats().arena_slots_in_use - slots;
+    let tx1_writes = w1.branch_page_writes - w0.branch_page_writes;
+    let tx2_writes = w3.branch_page_writes - w2.branch_page_writes;
+    eprintln!(
+        "# law3: tx1_writes={tx1_writes} tx1_interior={} tx2_writes={tx2_writes} tx2_interior={} owned_before={} owned_after={} fresh={fresh} arena_grew={grew}",
+        w1.branch_interior_page_writes - w0.branch_interior_page_writes,
+        w3.branch_interior_page_writes - w2.branch_interior_page_writes,
+        owned_before.len(),
+        owned_after.len()
+    );
+    assert_eq!(
+        tx1_writes as usize,
+        owned_before.len(),
+        "the write counter missed a page b's first transaction took"
+    );
+    assert!(
+        owned_before.is_subset(&owned_after),
+        "b's rewrite gave up a version its child sees"
+    );
+    assert_eq!(grew, fresh, "the arena grew by something other than b's new versions");
+    assert!(fresh > 0, "b's rewrite retained no page its child sees");
+    assert_eq!(
+        fresh as u64, tx2_writes,
+        "b's rewrite retained fewer pages than it wrote"
+    );
+    assert_eq!(table(&cc), after_b1, "the child saw its parent's later write");
+    assert_eq!(table(&c), (1..=300).map(|id| (id, v("b2", id))).collect::<BTreeMap<_, _>>());
+    assert_eq!(table(&oc), before);
+    assert_eq!(table(&trunk), before);
+}
+
+/// The page-write counters fire on what they name and on nothing else (r11-sessions amendment 18e).
+/// A same-size rewrite of one row writes a leaf and no interior page; rows appended past the last
+/// leaf add leaves, and that balance writes their parent, an interior page. `COUNT_NO_INTERIOR`
+/// never counts an interior write; `COUNT_ALL_INTERIOR` counts every write as one.
+#[test]
+fn the_page_write_counters_count_a_parent_write_and_nothing_else() {
+    let (_dir, db) = open_db();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    let b = trunk.fork_branch().unwrap();
+    let c = b.connect().unwrap();
+    let w0 = db.branch_stats().work;
+    set(&c, 1, &format!("trunk-0001-{}", "z".repeat(90)));
+    let w1 = db.branch_stats().work;
+    assert!(
+        w1.branch_page_writes > w0.branch_page_writes,
+        "a branch write was not counted"
+    );
+    assert_eq!(
+        w1.branch_interior_page_writes, w0.branch_interior_page_writes,
+        "a leaf write counted as an interior write"
+    );
+    c.execute("BEGIN").unwrap();
+    for id in 301..=400 {
+        c.execute(format!("INSERT INTO t VALUES ({id}, '{}')", original(id)))
+            .unwrap();
+    }
+    c.execute("COMMIT").unwrap();
+    let w2 = db.branch_stats().work;
+    assert!(
+        w2.branch_interior_page_writes > w1.branch_interior_page_writes,
+        "a balance's parent write was not counted"
+    );
+    assert_eq!(table(&c).len(), 400);
+}
+
 /// FS5's own flow under FS11 with FS10 off (Rule One BATCH2 item 4; r11-sessions amendment 18c): a
 /// reader branch keeps the shared trunk pages cached while another branch rewrites every row, in one
 /// transaction and then row by row. The open reader, a fresh branch and the trunk keep the originals;

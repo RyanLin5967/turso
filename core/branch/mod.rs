@@ -304,6 +304,14 @@ pub struct BranchWork {
     /// FS11: writes to a slot whose bytes a reader held, which gave the slot a fresh copy (read
     /// from the arena at `stats`, not counted in `work` itself).
     pub slot_unshared_writes: u64,
+    /// Pages branch transactions wrote: one per page per transaction (the store's first-write
+    /// decision), whatever it decided.
+    pub branch_page_writes: u64,
+    /// Those writes whose superseded version is a B-tree interior page (type byte 2 or 5, after
+    /// page 1's 100-byte database header): the parent writes a balance makes. Blind spot: an
+    /// overflow or freelist page whose first byte happens to be 2 or 5 (a next-page number of
+    /// 2^25 or more) counts too.
+    pub branch_interior_page_writes: u64,
 }
 
 impl Branch {
