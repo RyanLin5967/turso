@@ -8,8 +8,10 @@
 //!   nopin     the same, with the branch's SELECT autocommitted (control)
 //!   nobranch  the same trunk commits with no live child: the branch is reaped after its one autocommitted read
 //!             (r11-walpin-conc amendment 33f, G8)
-//!   overlap   K branch sessions; after each trunk commit one of them ends its read tx and begins a
-//!             new one, so K read transactions are always open, each spanning K trunk commits
+//!   overlap   K branch sessions forked at setup; after each trunk commit one of them ends its read tx and
+//!             begins a new one on the same branch, so K read transactions are always open (without FW3 each
+//!             spans K trunk commits; under FW3 a branch's snapshot is its fork, so each spans all of them:
+//!             r11-walpin-conc amendment 33f)
 //!   refork    as overlap, but each re-begin is on a NEW fork (the session's previous branch is then reaped), so
 //!             the K open snapshots sit at K distinct trunk epochs (r11-walpin-conc amendment 33f, G9)
 //!   u3        `overlap 1` in the background; the trunk rewrites one row k times, then 3,000 rows on
@@ -344,12 +346,17 @@ impl Bench {
     }
 
     fn check(&self, s: &Session, what: &str) {
-        let got = read_v(&s.conn, s.row);
-        let want = self.model.value_at(s.row, s.writes_at_fork);
+        self.check_row(s, s.row, what);
+    }
+
+    /// The model check of `row` (not necessarily the session's own) on session `s`.
+    fn check_row(&self, s: &Session, row: i64, what: &str) {
+        let got = read_v(&s.conn, row);
+        let want = self.model.value_at(row, s.writes_at_fork);
         if got != want {
             not_a_result(&format!(
-                "{what}: branch forked at trunk write {} read row {} = {got:?}, model says {want:?}",
-                s.writes_at_fork, s.row
+                "{what}: branch forked at trunk write {} read row {row} = {got:?}, model says {want:?}",
+                s.writes_at_fork
             ));
         }
     }
@@ -722,6 +729,9 @@ fn run_refork(bench: &mut Bench, args: &Args) {
             let oldest = sessions.iter().min_by_key(|s| s.writes_at_fork).unwrap();
             bench.state("point", h);
             bench.req_line(h, Some(oldest));
+            // Amendment 33g: the row this commit rewrote, read on the oldest open snapshot (forked before it), so a
+            // retained version's content is model-checked at every point. After the point's lines; not timed.
+            bench.check_row(oldest, spread_row(h), "refork_retained");
             next += 1;
         }
     }

@@ -382,7 +382,7 @@ fn fw2_begins_are_counted_by_origin() {
     let (t, w) = (usize::from(origin::TRUNK), usize::from(origin::WRITER));
     assert!(tagged[w] >= 1 && tagged.iter().sum::<u64>() == tagged[w], "tagged: {tagged:?}");
     assert!(untagged[t] >= 1 && untagged.iter().sum::<u64>() == untagged[t], "untagged: {untagged:?}");
-    assert!(mutant[t] >= 1 && mutant[w] == 0, "mutant: {mutant:?}");
+    assert!(mutant[t] >= 1 && mutant.iter().sum::<u64>() == mutant[t], "mutant: {mutant:?}");
 }
 
 /// (m) r11-walpin-conc amendment 33f (F9): `walpin_stats` reports FW2's open readers by class and by origin, and
