@@ -1030,3 +1030,50 @@ fn a_fuzzy_checkpoint_evicts_only_states_clean_at_its_install() {
     let db = open_at(&path, catalog()).unwrap();
     check(&db, &model);
 }
+
+/// r13-compose A2.R6 (S-6 for the build before F7's merge): the catalog carries the store's format
+/// version in its meta row, and an open checks it before the log. With the log header torn (no
+/// version to check there), a catalog of another format -- 0 (before the key), 2 (the base), 3 or 4
+/// (F7-durable's arms, no-force's 3) -- is refused, never reinterpreted, and the store's own opens.
+#[test]
+fn a_catalog_of_another_format_is_refused_even_with_a_torn_log_header() {
+    let own = journal::format_version();
+    for other in [0u32, 2, 3, 4] {
+        assert_ne!(other, own, "the test needs a format this store does not write");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let b_id;
+        {
+            let db = open_at(&path, catalog()).unwrap();
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = db.branch(trunk.fork_branch().unwrap().into_id()).unwrap();
+            b.connect().unwrap().execute("UPDATE t SET v = 'b' WHERE id = 7").unwrap();
+            b_id = b.into_id();
+            db.branch_compact_now().unwrap();
+        }
+        let files = journal::BranchFiles::for_db(path.to_str().unwrap());
+        std::fs::write(&files.log, b"").unwrap();
+        {
+            let db = open_at(&path, catalog()).expect("the store's own format opens");
+            let b = db.branch(b_id).unwrap();
+            assert_eq!(value(&b.connect().unwrap(), 7), "b", "format {other}: own open");
+            let _ = b.into_id();
+        }
+        {
+            let mut cat = catalog::Catalog::open(&files.cat, false).unwrap();
+            let mut m = cat.meta().unwrap().expect("a checkpointed catalog has a meta row");
+            assert_eq!(m.format, own, "the key was not written");
+            m.format = other;
+            cat.begin().unwrap();
+            cat.put_meta(&m).unwrap();
+            cat.commit().unwrap();
+        }
+        std::fs::write(&files.log, b"").unwrap();
+        let err = match open_at(&path, catalog()) {
+            Ok(_) => panic!("a catalog of format {other} opened in a store of format {own}"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("format version"), "format {other}: refused for another reason: {err}");
+    }
+}

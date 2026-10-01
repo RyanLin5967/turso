@@ -1568,6 +1568,19 @@ impl BranchStore {
         let mut catalog = Catalog::open(&files.cat, sync)?;
         let meta = catalog.meta()?;
         stats.catalog_ns = ns(t);
+        // r13-compose A2.R6: the catalog's own format key (in the meta row this open reads anyway),
+        // checked before anything else is read: the log header's version is checked too, but a torn
+        // header has none, and a catalog of another format (or one written before the key, 0) would
+        // then open. A refused open pays no catalog prewarm (the arena's, earlier, is a cost only).
+        let format = super::journal::format_version();
+        if let Some(m) = meta.filter(|m| m.format != format) {
+            return Err(LimboError::Corrupt(format!(
+                "branch catalog {}: format version {}; this store reads version {format} (0 was \
+                 written before the catalog carried the key)",
+                files.cat.display(),
+                m.format
+            )));
+        }
         // r12-catload: the catalog's prewarm, before the replay reads: its pages (`interior`,
         // `buffer`), or its files unless `R12_PREWARM_FILES` leaves the catalog out.
         if !warm.warms_files() || targets.catalog {
@@ -3762,6 +3775,7 @@ impl StoreInner {
                         generation: 0,
                         page_size: page_size as u32,
                         next_id: self.next_id,
+                        format: super::journal::format_version(),
                         ..Meta::default()
                     };
                     if let Err(e) = catalog.put_meta(&meta).and_then(|()| catalog.commit()) {
@@ -3975,6 +3989,7 @@ impl StoreInner {
             arena_hw: arena.high_water(),
             in_use: (arena.in_use() - reserved.len()) as u64,
             states: self.n_states,
+            format: super::journal::format_version(),
         };
         if super::arena::trace_slots() {
             let named: Vec<(u64, Vec<Slot>)> = rows

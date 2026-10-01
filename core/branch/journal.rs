@@ -58,7 +58,18 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// Version 1 stored the deadline itself and could not tell a deadline of 0 from none, so a version
 /// 1 snapshot read by this code would come back with every deadline 1 ms early. Another version is
 /// refused, never reinterpreted.
-const FORMAT_VERSION: u32 = 2;
+///
+/// 7 (r13-compose, PREREG A2.R6 / S-6): the composed store before F7's merge (B_noF7). Base 2 already
+/// gained `Record::Checkpoint` (tag 7, F-FZ) without a new number, and F7-durable and no-force each
+/// claim 3, so the composition takes a number none of its inputs wrote. The catalog's meta row carries
+/// the same number (`Meta::format`), checked at open before the log.
+const FORMAT_VERSION: u32 = 7;
+
+/// The format version this store writes and reads, in its log and snapshot headers and in a catalog's
+/// meta row (r13-compose A2.R6).
+pub(crate) const fn format_version() -> u32 {
+    FORMAT_VERSION
+}
 const LOG_HEADER_LEN: usize = 32;
 const FRAME_HEADER_LEN: usize = 8;
 /// Compact once the log is larger than this and larger than twice the last snapshot, so the log is
@@ -168,6 +179,29 @@ const TAG_RELEASE: u8 = 4;
 const TAG_LEASE: u8 = 5;
 const TAG_CLOCK: u8 = 6;
 const TAG_CHECKPOINT: u8 = 7;
+
+/// Every record tag is distinct (r13-compose S-4): two equal tag constants would compile, with only an
+/// unreachable-pattern warning, and decode one record as the other. Refused at compile time instead.
+const _: () = {
+    let tags = [
+        TAG_FORK,
+        TAG_COMMIT,
+        TAG_TRUNK_RETAIN,
+        TAG_RELEASE,
+        TAG_LEASE,
+        TAG_CLOCK,
+        TAG_CHECKPOINT,
+    ];
+    let mut i = 0;
+    while i < tags.len() {
+        let mut j = i + 1;
+        while j < tags.len() {
+            assert!(tags[i] != tags[j], "two branch log record tags are equal");
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 impl Record {
     fn encode(&self, out: &mut Vec<u8>) {
