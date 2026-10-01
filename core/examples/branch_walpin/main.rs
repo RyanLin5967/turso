@@ -237,18 +237,27 @@ fn half_row(j: u64) -> i64 {
     ((j * 37) % (TRUNK_ROWS / 2) as u64) as i64 + TRUNK_ROWS / 2 + 1
 }
 
-fn read_v(conn: &Arc<Connection>, id: i64) -> String {
+/// One row's value, or why it could not be read: an error from prepare or from the read itself (a branch read the
+/// store refuses, e.g. a pre-image that was not retained), a row count other than 1, or a value that is not text.
+/// r11-walpin-conc amendment 33l (D1, D2): no read failure panics; the caller says what it means.
+fn try_read_v(conn: &Arc<Connection>, id: i64) -> Result<String, String> {
     let mut stmt = conn
         .prepare(format!("SELECT v FROM t WHERE id = {id}"))
-        .unwrap();
-    let rows = stmt.run_collect_rows().unwrap();
+        .map_err(|e| format!("prepare failed: {e}"))?;
+    let rows = stmt
+        .run_collect_rows()
+        .map_err(|e| format!("read failed: {e}"))?;
     match rows.as_slice() {
         [row] => match &row[0] {
-            Value::Text(t) => t.as_str().to_string(),
-            other => not_a_result(&format!("row {id}: expected text, got {other:?}")),
+            Value::Text(t) => Ok(t.as_str().to_string()),
+            other => Err(format!("expected text, got {other:?}")),
         },
-        _ => not_a_result(&format!("row {id}: {} rows", rows.len())),
+        _ => Err(format!("{} rows", rows.len())),
     }
+}
+
+fn read_v(conn: &Arc<Connection>, id: i64) -> String {
+    try_read_v(conn, id).unwrap_or_else(|e| not_a_result(&format!("row {id}: {e}")))
 }
 
 fn rss_bytes() -> u64 {
@@ -352,14 +361,21 @@ impl Bench {
     }
 
     /// The model check of `row` (not necessarily the session's own) on session `s`.
+    /// Amendment 33l (D1, D2): every way a branch read can fail, a wrong value or a failed read, is reported with the
+    /// model-check marker ("branch forked at trunk write") and the error text, as NOT A RESULT (exit 1), never as a
+    /// panic (rc 134), so the scorer reads it as a correctness finding.
     fn check_row(&self, s: &Session, row: i64, what: &str) {
-        let got = read_v(&s.conn, row);
         let want = self.model.value_at(row, s.writes_at_fork);
-        if got != want {
-            not_a_result(&format!(
+        match try_read_v(&s.conn, row) {
+            Ok(got) if got == want => {}
+            Ok(got) => not_a_result(&format!(
                 "{what}: branch forked at trunk write {} read row {row} = {got:?}, model says {want:?}",
                 s.writes_at_fork
-            ));
+            )),
+            Err(e) => not_a_result(&format!(
+                "{what}: branch forked at trunk write {} read row {row} failed: {e}",
+                s.writes_at_fork
+            )),
         }
     }
 
@@ -393,11 +409,12 @@ impl Bench {
         // Amendment 33k (C14): the requirement against the retained set, both directions.
         let (children, versions, over, under) = self.db.walpin_required_versions_diff();
         let st = self.db.branch_stats();
+        // Amendment 33l (D6): the free list too, so a leak into it (capacity growing) shows.
         println!(
             "# req H={h} fork_epoch={fork_epoch} req_pages={req} req_versions={versions} over_retained={over} \
              under_retained={under} \
-             live_trunk_children={children} arena_in_use={} live_branches={}",
-            st.arena_slots_in_use, st.live_branches
+             live_trunk_children={children} arena_in_use={} live_branches={} arena_slots_free={}",
+            st.arena_slots_in_use, st.live_branches, st.arena_slots_free
         );
     }
 
