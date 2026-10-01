@@ -744,6 +744,14 @@ impl BranchStore {
                             None
                         };
                         inner.rebuild(recovered.snapshot.take(), &recovered.records)?;
+                        // Whether the arena file was there before redo, which creates it: a lost
+                        // slot in a recreated arena is a missing file, never a flight to cut
+                        // (r12-optfs review 2, finding 3).
+                        let arena_present = match std::fs::metadata(&files.arena) {
+                            Ok(_) => true,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                            Err(e) => return Err(crate::error::io_error(e, "stat branch arena")),
+                        };
                         // The redo rule: the recovered records' slots are put back from their
                         // images before the arena counts what its file holds.
                         super::journal::redo_page_images(
@@ -762,6 +770,13 @@ impl BranchStore {
                             if let Some(lost) =
                                 inner.lost_slot(&files, recovered.page_size, flight)?
                             {
+                                if !arena_present {
+                                    return Err(LimboError::Corrupt(format!(
+                                        "branch store: the arena file {} is missing while the \
+                                         branch log names {lost}",
+                                        files.arena.display()
+                                    )));
+                                }
                                 tracing::warn!(
                                     "branch log {}: the last flight (byte {}) names {}; it was \
                                      never acknowledged, and it is cut",
@@ -791,10 +806,23 @@ impl BranchStore {
                             &referenced,
                         )?);
                         let mut journal = recovered.journal;
-                        // Made durable only once the rest of the open has been checked, so an open
-                        // that refuses leaves the log as it found it (review, finding 2).
                         if let Some(start) = cut {
+                            // Made durable only once the rest of the open has been checked, so an
+                            // open that refuses leaves the log as it found it (review, finding 2).
                             journal.cut_last_flight(start)?;
+                            // The cut took the flight's id floor with it: log the raised counter
+                            // now, so a second crash before any fork cannot lower it (review 2,
+                            // finding 2).
+                            journal.buffer(&Record::IdFloor {
+                                next_id: inner.next_id,
+                            })?;
+                            journal.take_flight(None, None)?.write()?;
+                        } else if !recovered.records.is_empty() {
+                            // The last process's final flight may sit whole in the page cache,
+                            // never synced; recovery acted on it, and its frees become reusable
+                            // now. It is made durable first, or a power loss could drop those frees
+                            // after their slots were reused (review 2, finding 1).
+                            journal.sync_log()?;
                         }
                         journal.mark_flights();
                         inner.journal = Some(journal);

@@ -836,6 +836,17 @@ impl Journal {
         }))
     }
 
+    /// Sync the log as it stands (a no-op without `sync`). Recovery calls it before the store acts
+    /// on what it read: the last process's final flight may sit whole in the page cache, never
+    /// synced, and its frees must not be reused until it is durable (r12-optfs review 2, finding 1).
+    pub(crate) fn sync_log(&self) -> Result<()> {
+        self.check_live()?;
+        if self.sync {
+            fsync_file(&self.file)?;
+        }
+        Ok(())
+    }
+
     /// Cut the log back to `start`, where its last whole flight began (the checksum rule): that
     /// flight was never acknowledged. Recovery calls this before anything is appended.
     pub(crate) fn cut_last_flight(&mut self, start: u64) -> Result<()> {

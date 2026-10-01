@@ -3480,17 +3480,53 @@ fn a_cut_flight_never_lowers_the_id_counter() {
             },
         ],
     );
+    let with_flight = std::fs::metadata(&files.log).unwrap().len();
     let db = reopen(&path, incarnation);
     assert_eq!(db.branch_ids().unwrap(), vec![b_id], "the cut kept part of the last flight");
-    assert_eq!(
-        std::fs::metadata(&files.log).unwrap().len(),
-        log_len,
-        "the log was not cut back to where the crafted flight began"
+    let after = std::fs::metadata(&files.log).unwrap().len();
+    assert!(
+        log_len < after && after < with_flight,
+        "the log was not cut back to where the crafted flight began, then given the raised \
+         counter: {log_len} -> {with_flight} -> {after}"
     );
+    // No fork ran in that open: only the open itself logged the raised counter (review 2, finding
+    // 2). A second open must still hand out no id below the cut flight's floor.
+    let incarnation = db.incarnation;
+    drop(db);
+    let db = reopen(&path, incarnation);
     let next = db.connect().unwrap().fork_branch().unwrap();
     assert!(
         next.id().0 >= floor,
         "fork id {} is below the cut flight's id floor {floor}",
         next.id().0
     );
+}
+
+/// r12-optfs review 2, finding 1: an open that recovers records syncs the log before the store acts
+/// on them. The last process's final flight may sit whole in the page cache, never synced; its frees
+/// become reusable at once, so it must be durable before a slot it freed can be written again.
+/// (Under the checksum rule nothing else at this open syncs: there is no image to redo.)
+#[test]
+fn an_open_that_recovers_records_syncs_the_log_first() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        db.branches.set_optfs(true);
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let b = trunk.fork_branch().unwrap();
+        set(&b.connect().unwrap(), 7, "b");
+        let _ = b.into_id();
+    }
+    let fsyncs = crate::branch::churn_counters().thread_fsyncs;
+    let db = reopen(&path, incarnation);
+    assert_eq!(
+        crate::branch::churn_counters().thread_fsyncs - fsyncs,
+        1,
+        "the open did not sync the log it recovered, or synced something else too"
+    );
+    drop(db);
 }
