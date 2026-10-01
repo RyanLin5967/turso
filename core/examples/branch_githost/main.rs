@@ -2197,10 +2197,34 @@ fn stack(args: &Args) {
 // ---------------------------------------------------------------------------------------------
 // r13-compose R1: crash images and the restart (PREREG §3.3, A2.F7's A12, A2.F10, A4.C3).
 
+/// r13-compose A5.8: this process's device bytes written and read (proc_pid_rusage RUSAGE_INFO_V4,
+/// as r12-catload's branch_restart reads them): D_c's instrument, an upper bound on a clone's
+/// copy-on-write divergence (a rewrite counts again).
+fn diskio_line(cmd: &str) -> String {
+    // SAFETY: a zeroed plain-integer struct, filled by the call.
+    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a rusage_info_v4, which RUSAGE_INFO_V4 writes.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as i32,
+            libc::RUSAGE_INFO_V4,
+            &mut info as *mut libc::rusage_info_v4 as *mut libc::rusage_info_t,
+        )
+    };
+    if rc != 0 {
+        not_a_result("proc_pid_rusage failed");
+    }
+    format!(
+        "DISKIO\tcmd={cmd}\tbytes_written={}\tbytes_read={}",
+        info.ri_diskio_byteswritten, info.ri_diskio_bytesread
+    )
+}
+
 /// Kill this process at an op boundary (the harness failpoint): every op before it returned, so the
 /// image holds exactly the model's state. The sidecar is written first.
 fn sigkill(db_path: &Path, sc: &Sidecar) -> ! {
     write_sidecar(db_path, sc);
+    println!("{}", diskio_line("crash"));
     println!("# SIGKILL at an op boundary");
     let _ = std::io::stdout().flush();
     // SAFETY: kill(2) on our own pid with a valid signal number.
@@ -2526,6 +2550,7 @@ fn main() {
         "restart" => restart(&args),
         other => die(&format!("unknown command {other}")),
     }
+    println!("{}", diskio_line(&args.cmd));
 }
 
 /// r13-compose A4.S1's K = 0 check: a digest of `Model::advance`'s StepPlan for s <= 10,000 in
