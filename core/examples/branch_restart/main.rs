@@ -1215,7 +1215,7 @@ fn reaprate(args: &Args) {
         files.line(),
         rss_bytes(),
         // r12-e3 amendments 3 and 7: the run-time arms, as this process saw them.
-        ["R12_CAT_CACHE_KIB", "R12_CAT_PREWARM", "R12_SIEVE_BEHIND", "R12_RERUN_CAP"]
+        ["R12_CAT_CACHE_KIB", "R12_CAT_PREWARM", "R12_SIEVE_BEHIND", "R12_RERUN_CAP", "R12_CAT_CKPT_KEEP", "R12_A8"]
             .map(|k| format!("{k}={}", std::env::var(k).unwrap_or_else(|_| "-".to_string())))
     );
     // r12-e3 amendment 8: name the catalog's statements once.
