@@ -1425,32 +1425,62 @@ pub(crate) fn append_flight_for_test(files: &BranchFiles, records: &[Record]) {
     write_at(&file, &bytes, at).unwrap();
 }
 
-/// Recovery's redo pass (the redo rule): write every `PageImage` of the recovered records into its
-/// arena slot, in log order, then sync the arena once. Idempotent, so a crash inside it is repaired
-/// by the next recovery: the images stay in the log until a compaction has synced the arena. Runs
-/// before the arena is opened, so a slot the arena file never grew to is there when it is counted.
-/// An image of the wrong size is corruption: a frame whose CRC matched cannot be torn.
+/// Recovery's redo pass (the redo rule): put each slot's bytes back from its image, then sync the
+/// arena once. An image belongs to the first record after it that names its slot, so each slot gets
+/// the image of the LAST record naming it. If that record has no image — it was written under the
+/// checksum rule (r12-optfs) or the measurement switch's `no_redo`, in a log that also holds images
+/// from before the switch — the slot keeps what the arena holds: an older image there is a previous
+/// owner's page, and writing it would destroy the bytes the last record's crc names (r12-optfs
+/// review, finding 1). An image no record names yet is written as before, the latest one per slot.
+/// Idempotent, so a crash inside it is repaired by the next recovery: the images stay in the log
+/// until a compaction has synced the arena. Runs before the arena is opened, so a slot the arena
+/// file never grew to is there when it is counted. An image of the wrong size is corruption: a
+/// frame whose CRC matched cannot be torn.
 pub(crate) fn redo_page_images(
     files: &BranchFiles,
     page_size: usize,
     records: &[Record],
     sync: bool,
 ) -> Result<()> {
-    let mut images = records.iter().filter_map(|r| match r {
-        Record::PageImage { slot, bytes } => Some((*slot, bytes)),
-        _ => None,
-    });
-    let Some(first) = images.next() else {
-        return Ok(());
-    };
-    let arena = open_rw(&files.arena, false)?;
-    for (slot, bytes) in std::iter::once(first).chain(images) {
-        if bytes.len() != page_size {
-            return Err(corrupt(&format!(
-                "a page image of slot {slot} holds {} bytes, not the {page_size}-byte page",
-                bytes.len()
-            )));
+    // Per slot: the image waiting for the record that names it, and what the slot's last naming
+    // record left (its image, or none).
+    let mut waiting: std::collections::HashMap<Slot, &[u8]> = std::collections::HashMap::new();
+    let mut last: std::collections::HashMap<Slot, Option<&[u8]>> = std::collections::HashMap::new();
+    for record in records {
+        match record {
+            Record::PageImage { slot, bytes } => {
+                if bytes.len() != page_size {
+                    return Err(corrupt(&format!(
+                        "a page image of slot {slot} holds {} bytes, not the {page_size}-byte page",
+                        bytes.len()
+                    )));
+                }
+                waiting.insert(*slot, bytes.as_slice());
+            }
+            Record::Commit { pages, .. } => {
+                for &(_, slot, _) in pages {
+                    last.insert(slot, waiting.remove(&slot));
+                }
+            }
+            Record::TrunkRetain { slot, .. } => {
+                last.insert(*slot, waiting.remove(slot));
+            }
+            _ => {}
         }
+    }
+    for (slot, bytes) in waiting {
+        last.insert(slot, Some(bytes));
+    }
+    let mut writes: Vec<(Slot, &[u8])> = last
+        .into_iter()
+        .filter_map(|(slot, image)| image.map(|bytes| (slot, bytes)))
+        .collect();
+    if writes.is_empty() {
+        return Ok(());
+    }
+    writes.sort_unstable_by_key(|&(slot, _)| slot);
+    let arena = open_rw(&files.arena, false)?;
+    for (slot, bytes) in writes {
         write_at(&arena, bytes, slot as u64 * page_size as u64)?;
     }
     if sync {
@@ -2245,6 +2275,43 @@ mod tests {
         let recovered = Journal::recover(&files, false).unwrap().expect("state");
         assert_eq!(forks(&recovered.records), vec![1]);
         assert_eq!(recovered.last_flight, Some((starts[0], 0)));
+    }
+
+    /// r12-optfs review, finding 1: a slot reused under the checksum rule (no image) keeps its bytes
+    /// at redo; an older owner's image of it is not written over them. Reused under the redo rule,
+    /// the slot gets its last owner's image.
+    #[test]
+    fn redo_writes_only_the_image_of_each_slots_last_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let page = |b: u8| vec![b; 512];
+        let commit = |branch: u64, slot: Slot, bytes: &[u8]| Record::Commit {
+            branch,
+            pages: vec![(2, slot, crc32c::crc32c(bytes))],
+        };
+        // The arena holds B's page in slot 1, written under the checksum rule.
+        std::fs::write(&files.arena, [page(0), page(0xBB)].concat()).unwrap();
+        let reused_without_image = vec![
+            Record::PageImage { slot: 1, bytes: page(0xAA) },
+            commit(5, 1, &page(0xAA)),
+            Record::Release { branch: 5 },
+            commit(6, 1, &page(0xBB)),
+        ];
+        redo_page_images(&files, 512, &reused_without_image, false).unwrap();
+        assert_eq!(
+            &std::fs::read(&files.arena).unwrap()[512..],
+            page(0xBB).as_slice(),
+            "redo wrote a previous owner's image over a slot its last record wrote without one"
+        );
+        let reused_with_image = vec![
+            Record::PageImage { slot: 1, bytes: page(0xAA) },
+            commit(5, 1, &page(0xAA)),
+            Record::Release { branch: 5 },
+            Record::PageImage { slot: 1, bytes: page(0xCC) },
+            commit(6, 1, &page(0xCC)),
+        ];
+        redo_page_images(&files, 512, &reused_with_image, false).unwrap();
+        assert_eq!(&std::fs::read(&files.arena).unwrap()[512..], page(0xCC).as_slice());
     }
 
     /// Recovery's redo pass puts every image into its slot in log order, so a slot imaged twice

@@ -64,11 +64,11 @@ impl PowerModel {
     /// Everything held, written to the file: a full sync of the arena itself. The device's older
     /// writes go first, so a slot written again since ends with its newer bytes.
     fn persist_all(&mut self, file: &File, page_size: usize) -> Result<()> {
-        let device = std::mem::take(&mut self.device);
-        let unsynced = std::mem::take(&mut self.unsynced);
-        for (slot, bytes) in device.into_iter().chain(unsynced) {
-            write_at(file, &bytes, slot as u64 * page_size as u64)?;
+        for (slot, bytes) in self.device.iter().chain(self.unsynced.iter()) {
+            write_at(file, bytes, *slot as u64 * page_size as u64)?;
         }
+        self.device.clear();
+        self.unsynced.clear();
         Ok(())
     }
 }
@@ -103,9 +103,10 @@ impl ArenaSync {
         {
             // Written under the model's lock, so a reader finds each slot in the model or the file.
             let mut model = self.model.lock().unwrap();
-            for (slot, bytes) in std::mem::take(&mut model.device) {
-                write_at(&self.file, &bytes, slot as u64 * self.page_size as u64)?;
+            for (slot, bytes) in &model.device {
+                write_at(&self.file, bytes, *slot as u64 * self.page_size as u64)?;
             }
+            model.device.clear();
         }
         Ok(())
     }

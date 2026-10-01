@@ -3431,9 +3431,11 @@ fn an_optfs_last_flight_whose_slot_fails_its_crc_is_cut_and_an_earlier_one_is_no
     }
 }
 
-/// r12-optfs PREREG §3.6: a cut never lowers the id counter. A crafted last flight forks X under a
-/// new id floor F and commits X into a slot the arena file does not hold: the open cuts it (not a
-/// "past the end" refusal), X is gone, and the next fork's id is at least F, so no id that flight
+/// r12-optfs PREREG §3.6 and amendment 2: a cut takes the WHOLE last flight and never lowers the
+/// id counter. A crafted last flight forks X under a new id floor F and commits X into a slot whose
+/// bytes are whole on disk, then forks Y and commits Y into a slot the arena file does not hold. The
+/// open cuts all of it (not a "past the end" refusal, and not only Y's commit): X and Y are gone,
+/// the log ends where the flight began, and the next fork's id is at least F, so no id that flight
 /// carried can be handed out again even had it been acknowledged.
 #[test]
 fn a_cut_flight_never_lowers_the_id_counter() {
@@ -3453,20 +3455,33 @@ fn a_cut_flight_never_lowers_the_id_counter() {
     let files = super::journal::BranchFiles::for_db(path.to_str().unwrap());
     let slots = std::fs::metadata(&files.arena).unwrap().len() / page_size;
     let log_len = std::fs::metadata(&files.log).unwrap().len();
-    let (x, floor) = (b_id.0 + 1_000, b_id.0 + 1_000_000);
+    // X's slot: a whole page appended to the arena file, with its crc in X's commit.
+    let x_page = vec![0x5Au8; page_size as usize];
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&files.arena).unwrap();
+        f.write_all(&x_page).unwrap();
+    }
+    let (x, y, floor) = (b_id.0 + 1_000, b_id.0 + 1_001, b_id.0 + 1_000_000);
+    use super::journal::Record;
     super::journal::append_flight_for_test(
         &files,
         &[
-            super::journal::Record::Fork { child: x, parent: 0 },
-            super::journal::Record::IdFloor { next_id: floor },
-            super::journal::Record::Commit {
+            Record::Fork { child: x, parent: 0 },
+            Record::IdFloor { next_id: floor },
+            Record::Commit {
                 branch: x,
+                pages: vec![(2, slots as u32, crc32c::crc32c(&x_page))],
+            },
+            Record::Fork { child: y, parent: 0 },
+            Record::Commit {
+                branch: y,
                 pages: vec![(2, slots as u32 + 10, 0)],
             },
         ],
     );
     let db = reopen(&path, incarnation);
-    assert_eq!(db.branch_ids().unwrap(), vec![b_id], "the cut flight's fork survived");
+    assert_eq!(db.branch_ids().unwrap(), vec![b_id], "the cut kept part of the last flight");
     assert_eq!(
         std::fs::metadata(&files.log).unwrap().len(),
         log_len,

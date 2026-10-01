@@ -756,6 +756,7 @@ impl BranchStore {
                         // fails its crc in the arena file means that flight's full sync never
                         // returned. It was never acknowledged, and all of it goes.
                         let check = last.filter(|_| !crash::mutant("no_crc_check"));
+                        let mut cut = None;
                         if let Some((start, first)) = check {
                             let flight = &recovered.records[first..];
                             if let Some(lost) =
@@ -775,11 +776,11 @@ impl BranchStore {
                                     Record::IdFloor { next_id } => at_least.max(*next_id),
                                     _ => at_least,
                                 });
-                                recovered.journal.cut_last_flight(start)?;
                                 recovered.records.truncate(first);
                                 inner = StoreInner::fresh(Some(files.clone()), sync, default_lease);
                                 inner.rebuild(snapshot, &recovered.records)?;
                                 inner.next_id = inner.next_id.max(ids);
+                                cut = Some(start);
                             }
                         }
                         let referenced = inner.referenced_slots();
@@ -790,6 +791,11 @@ impl BranchStore {
                             &referenced,
                         )?);
                         let mut journal = recovered.journal;
+                        // Made durable only once the rest of the open has been checked, so an open
+                        // that refuses leaves the log as it found it (review, finding 2).
+                        if let Some(start) = cut {
+                            journal.cut_last_flight(start)?;
+                        }
                         journal.mark_flights();
                         inner.journal = Some(journal);
                         // Every id handed out before the crash is below the recovered counter:
@@ -2751,9 +2757,11 @@ impl StoreInner {
     }
 
     /// The checksum rule (r12-optfs): the first slot that `flight` names, that this recovered state
-    /// still references, and whose bytes in the arena file fail the crc the flight recorded — read
-    /// short or lying past the end of the file counts. A slot the flight named and then freed is
-    /// not checked: it may have been reused after the flight was acknowledged.
+    /// still references, and whose bytes in the arena file fail the crc the flight recorded — a
+    /// slot reaching past the end of the file counts. A slot the flight named and then freed is not
+    /// checked: it may have been reused after the flight was acknowledged. Any other read error, and
+    /// a missing arena file (it is created, durably, before any record can name a slot), is an
+    /// error, never a cut (review, finding 3).
     fn lost_slot(
         &self,
         files: &BranchFiles,
@@ -2777,20 +2785,21 @@ impl StoreInner {
         if named.is_empty() {
             return Ok(None);
         }
-        let arena = match std::fs::File::open(&files.arena) {
-            Ok(arena) => Some(arena),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(crate::error::io_error(e, "open branch arena")),
-        };
+        let arena = std::fs::File::open(&files.arena)
+            .map_err(|e| crate::error::io_error(e, "open branch arena"))?;
+        let len = arena
+            .metadata()
+            .map_err(|e| crate::error::io_error(e, "stat branch arena"))?
+            .len();
         let mut page = vec![0u8; page_size];
         for (slot, crc) in named {
-            let read = arena.as_ref().map(|arena| {
-                super::journal::read_at(arena, &mut page, slot as u64 * page_size as u64)
-            });
-            match read {
-                Some(Ok(())) if crc32c::crc32c(&page) == crc => {}
-                Some(Ok(())) => return Ok(Some(format!("arena slot {slot}, which fails its crc"))),
-                _ => return Ok(Some(format!("arena slot {slot}, which the file does not hold"))),
+            let at = slot as u64 * page_size as u64;
+            if at + page_size as u64 > len {
+                return Ok(Some(format!("arena slot {slot}, past the end of the arena file")));
+            }
+            super::journal::read_at(&arena, &mut page, at)?;
+            if crc32c::crc32c(&page) != crc {
+                return Ok(Some(format!("arena slot {slot}, which fails its crc")));
             }
         }
         Ok(None)
