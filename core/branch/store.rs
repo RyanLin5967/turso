@@ -370,7 +370,7 @@ impl Lineage {
         let mut freed = 0;
         while let Some(root) = heap.as_ref() {
             work.gc_heap_examined += 1;
-            if hi.is_some_and(|hi| root.died > hi) {
+            if hi.is_some_and(|hi| root.died > hi + 1) { // MUTANT M4: off by one
                 break;
             }
             let mut root = heap.take().expect("checked above");
