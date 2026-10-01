@@ -3,6 +3,10 @@
 
 mod run;
 
+/// The system allocator, counted (amendment 13: live heap bytes beside the footprint).
+#[global_allocator]
+static GLOBAL: run::Counting<std::alloc::System> = run::Counting(std::alloc::System);
+
 /// libmalloc's purge on demand over every zone (`malloc_zone_pressure_relief`, goal 0: as much as
 /// it can). Off macOS there is nothing to call.
 fn relieve() -> usize {

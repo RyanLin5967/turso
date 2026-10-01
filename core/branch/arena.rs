@@ -79,6 +79,13 @@ unsafe impl Sync for ChunkMem {}
 impl ChunkMem {
     #[cfg(unix)]
     fn new(len: usize) -> Self {
+        // On macOS an anonymous mapping's fd argument carries a VM tag, which `footprint` and
+        // `vmmap` report per tag: the arena's chunks show as tag 240 (VM_MEMORY_APPLICATION_SPECIFIC_1),
+        // apart from the allocators' regions (lane r12-f9-shrink amendment 13, attribution).
+        #[cfg(target_os = "macos")]
+        let fd = ((libc::VM_MEMORY_APPLICATION_SPECIFIC_1 as u32) << 24) as libc::c_int; // VM_MAKE_TAG
+        #[cfg(not(target_os = "macos"))]
+        let fd = -1;
         // SAFETY: an anonymous private mapping; nothing else refers to it.
         let p = unsafe {
             libc::mmap(
@@ -86,7 +93,7 @@ impl ChunkMem {
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
+                fd,
                 0,
             )
         };

@@ -24,8 +24,10 @@
 //! lives here so that `branch_peak` (system allocator) and `branch_peak_mi` (mimalloc) run the same
 //! code.
 
+use std::alloc::{GlobalAlloc, Layout};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use turso_core::branch::{Branch, BranchResident};
 use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO};
@@ -45,6 +47,9 @@ struct Args {
     /// After each post-peak checkpoint, ask the allocator to return its free memory and read again
     /// (r12-f9-shrink amendment 3, D2).
     relief: bool,
+    /// After each post-peak checkpoint (and its relief), print `footprint -p` of this process,
+    /// split by VM region category (amendment 13, attribution).
+    attribute: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -65,6 +70,7 @@ fn parse_args() -> Args {
         reap_oldest: false,
         untimed: false,
         relief: false,
+        attribute: false,
         window: 5000,
         stall_us: 100.0,
         seed: 0x9E37_79B9_7F4A_7C15,
@@ -93,6 +99,7 @@ fn parse_args() -> Args {
             "--seed" => a.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
             "--untimed" => a.untimed = true,
             "--relief" => a.relief = true,
+            "--attribute" => a.attribute = true,
             o => die(&format!("unknown argument {o}")),
         }
     }
@@ -173,14 +180,103 @@ fn malloc_zones() -> Option<(usize, usize)> {
     None
 }
 
+/// Bytes and blocks live in the process heap, counted at the global allocator whichever it is
+/// (amendment 13): what live objects take, so an allocator region's dirty bytes minus this is what
+/// the allocator holds for no live object. Both examples install `Counting` as `#[global_allocator]`.
+pub static HEAP_LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static HEAP_LIVE_BLOCKS: AtomicUsize = AtomicUsize::new(0);
+
+pub struct Counting<A>(pub A);
+
+// SAFETY: every call forwards to the wrapped allocator unchanged; the counters only observe.
+unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = self.0.alloc(layout);
+        if !p.is_null() {
+            HEAP_LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            HEAP_LIVE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let p = self.0.alloc_zeroed(layout);
+        if !p.is_null() {
+            HEAP_LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            HEAP_LIVE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.0.dealloc(ptr, layout);
+        HEAP_LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        HEAP_LIVE_BLOCKS.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = self.0.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            HEAP_LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
+            HEAP_LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        p
+    }
+}
+
 fn mem_fields() -> String {
     let (fp, res) = footprint().unwrap_or((0, 0));
     let (in_use, allocated) = malloc_zones().unwrap_or((0, 0));
     format!(
         "footprint_bytes={fp} resident_bytes={res} rss_bytes={} malloc_in_use={in_use} \
-         malloc_allocated={allocated}",
-        rss_bytes()
+         malloc_allocated={allocated} heap_live_bytes={} heap_live_blocks={}",
+        rss_bytes(),
+        HEAP_LIVE_BYTES.load(Ordering::Relaxed),
+        HEAP_LIVE_BLOCKS.load(Ordering::Relaxed)
     )
+}
+
+/// `footprint -p <this pid>` (amendment 13): phys_footprint split by VM region category, each line
+/// printed as `# attr <label> <line>`. The arena's chunks are tag 240, mimalloc's own memory is tag
+/// 100 (footprint names it IOAccelerator), the system allocator's regions are MALLOC_*. Bounded at
+/// 120 s; a failure is printed, never fatal.
+fn attribute(label: &str) {
+    let spawned = std::process::Command::new("/usr/bin/footprint")
+        .arg("-p")
+        .arg(std::process::id().to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            println!("# attr {label} footprint not run: {e}");
+            return;
+        }
+    };
+    let mut out = child.stdout.take().expect("stdout is piped");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::Read::read_to_string(&mut out, &mut s);
+        s
+    });
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let text = reader.join().unwrap_or_default();
+    for line in text.lines() {
+        println!("# attr {label} {line}");
+    }
+    println!("# attr {label} end status={status:?} {}", mem_fields());
 }
 
 /// Fire-check of the footprint instrument (PREREG section 3c): map 64 MiB, touch every 4 KiB,
@@ -620,6 +716,9 @@ pub fn main(allocator: &str, relieve: fn() -> usize) {
         let r = db.branch_resident();
         println!("{} relief_returned={returned}", resident_line("reaped_relief", created, live.len(), &r));
     }
+    if args.attribute {
+        attribute("reaped");
+    }
     println!(
         "# phase grow seconds={grow_s:.1} {grow_summary} (fork+connect+write per branch) stalls_ge={} \
          listed={:?}",
@@ -715,6 +814,9 @@ pub fn main(allocator: &str, relieve: fn() -> usize) {
             let returned = relieve();
             let r = db.branch_resident();
             println!("{} relief_returned={returned}", resident_line("churn_relief", created, live.len(), &r));
+        }
+        if args.attribute {
+            attribute(&format!("churn{cycles}"));
         }
         if !args.untimed {
             for (i, v) in ops.iter_mut().enumerate() {
