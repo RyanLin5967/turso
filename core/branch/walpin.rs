@@ -30,6 +30,10 @@ pub(crate) static FW2_REFUSED_INIT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW2_REFUSED_FORK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW2_REFUSED_TRUNK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FW2_REFUSED_INIT_ONLY: AtomicU64 = AtomicU64::new(0);
+/// r11-walpin-conc amendment 33a: refusals in which a reader tagged WRITER (a trunk writer's own read
+/// transaction, tagged by the harness) was among the blockers; with it, the untagged TRUNK bucket counts only
+/// readers nobody tagged.
+pub(crate) static FW2_REFUSED_WRITER: AtomicU64 = AtomicU64::new(0);
 /// Read transactions that ended under an origin with no reader counted: an instrument failure,
 /// counted instead of asserted so that the attribution can never stop the process.
 pub(crate) static FW2_ORIGIN_UNDERFLOW: AtomicU64 = AtomicU64::new(0);
@@ -144,6 +148,8 @@ pub struct WalPinCounters {
     pub fw2_refused_fork: u64,
     pub fw2_refused_trunk: u64,
     pub fw2_refused_init_only: u64,
+    /// Those refusals in which a WRITER-tagged reader was among the blockers (amendment 33a).
+    pub fw2_refused_writer: u64,
     /// Read transactions ended under an origin with no reader counted (instrument failures).
     pub fw2_origin_underflow: u64,
     /// FW3: branch reads of a trunk page (WAL frame or database file).
@@ -189,6 +195,7 @@ pub fn counters() -> WalPinCounters {
         fw2_refused_fork: FW2_REFUSED_FORK.load(Relaxed),
         fw2_refused_trunk: FW2_REFUSED_TRUNK.load(Relaxed),
         fw2_refused_init_only: FW2_REFUSED_INIT_ONLY.load(Relaxed),
+        fw2_refused_writer: FW2_REFUSED_WRITER.load(Relaxed),
         fw2_origin_underflow: FW2_ORIGIN_UNDERFLOW.load(Relaxed),
         fw3_trunk_reads: FW3_TRUNK_READS.load(Relaxed),
         fw3_retries: FW3_RETRIES.load(Relaxed),
@@ -292,7 +299,9 @@ pub(crate) mod origin {
     pub(crate) const TRUNK: u8 = 0;
     pub(crate) const INIT: u8 = 1;
     pub(crate) const FORK: u8 = 2;
-    pub(crate) const ORIGINS: usize = 3;
+    /// Amendment 33a: a trunk writer's own read transaction, tagged by the harness ([`super::with_writer_tag`]).
+    pub(crate) const WRITER: u8 = 3;
+    pub(crate) const ORIGINS: usize = 4;
 
     thread_local! {
         static TAG: Cell<u8> = const { Cell::new(TRUNK) };
@@ -370,6 +379,14 @@ pub(crate) mod origin {
             SEEN.with(|s| s.borrow_mut().take().unwrap_or_default())
         }
     }
+}
+
+/// r11-walpin-conc amendment 33a: run `f` with this thread's read transactions tagged WRITER, for a harness's
+/// trunk writes, so that FW2's refusal attribution can tell a writer's own snapshot from an untagged reader.
+/// Observation only.
+#[doc(hidden)]
+pub fn with_writer_tag<R>(f: impl FnOnce() -> R) -> R {
+    origin::with(origin::WRITER, f)
 }
 
 /// r11-walpin-conc amendment 21: how the last FW2 open recovered the two WAL files (`Wal2Recovered::code`; 0 = none

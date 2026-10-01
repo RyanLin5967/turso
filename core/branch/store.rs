@@ -706,6 +706,26 @@ impl BranchStore {
         }
     }
 
+    /// r11-walpin-conc amendment 33a: the versions trunk child `id`'s snapshot must keep, one per trunk page
+    /// written since its fork (`written[p] > fork_epoch`) that existed at the fork (`p <=` the fork-time size
+    /// recorded for its epoch, when there is one). Returns (fork epoch, required pages). Observation only.
+    pub(crate) fn walpin_required_pages(&self, id: BranchId) -> Result<(u64, usize)> {
+        let inner = self.lock_inner(2);
+        let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
+        if !st.parent.is_trunk() {
+            return Err(LimboError::InternalError(format!("{id:?} is not a trunk child")));
+        }
+        let f = st.fork_epoch;
+        let size = inner.trunk.fork_sizes.get(&f).copied();
+        let n = inner
+            .trunk
+            .written
+            .iter()
+            .filter(|&(&p, &e)| e > f && size.is_none_or(|s| p <= s))
+            .count();
+        Ok((f, n))
+    }
+
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
         let inner = self.lock_inner(2);
         let Some(st) = inner.branches.get(&id) else {

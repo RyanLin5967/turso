@@ -20,6 +20,7 @@ struct Refusals {
     trunk: u64,
     init_only: u64,
     underflow: u64,
+    writer: u64,
 }
 
 fn open_db() -> (tempfile::TempDir, Arc<Database>) {
@@ -96,12 +97,14 @@ fn refusals_blocked_by(tags: &[Option<u8>], untagged: bool) -> Refusals {
         trunk: c1.fw2_refused_trunk - c0.fw2_refused_trunk,
         init_only: c1.fw2_refused_init_only - c0.fw2_refused_init_only,
         underflow: c1.fw2_origin_underflow - c0.fw2_origin_underflow,
+        writer: c1.fw2_refused_writer - c0.fw2_refused_writer,
     }
 }
 
 fn assert_refused(r: &Refusals) {
     assert!(r.refused >= 1, "the checkpoints after the switch were refused: {r:?}");
     assert_eq!(r.underflow, 0, "every read ended under the origin it began under: {r:?}");
+    assert_eq!(r.writer, 0, "no reader was tagged WRITER unless the arm tagged one: {r:?}");
 }
 
 /// (a) A reader tagged INIT (the trunk read of every branch connection) blocks every refusal, and
@@ -185,6 +188,45 @@ fn fw2_an_origin_mismatch_is_counted_not_asserted() {
     walpin::set_fixes(fw1, fw2, fw3);
     assert_eq!(mismatched, (1, [0; 4], 1), "begun INIT, ended TRUNK");
     assert_eq!(matched, (0, [0; 4], 0), "begun and ended INIT");
+}
+
+/// (h) r11-walpin-conc amendment 33a: a reader tagged WRITER (a trunk writer's own read transaction, as the
+/// harness tags it) is counted as WRITER alone, so the untagged TRUNK bucket counts only readers nobody tagged.
+#[test]
+#[ignore = "sets the process-global FW2 switch: run alone with --test-threads=1 --include-ignored"]
+fn fw2_refusals_blocked_by_a_writer_tagged_read_are_counted_as_writer() {
+    let r = refusals_blocked_by(&[Some(origin::WRITER)], false);
+    assert!(r.refused >= 1, "the checkpoints after the switch were refused: {r:?}");
+    assert_eq!(r.underflow, 0, "{r:?}");
+    assert_eq!(
+        (r.writer, r.init, r.init_only, r.fork, r.trunk),
+        (r.refused, 0, 0, 0, 0),
+        "{r:?}"
+    );
+}
+
+/// (i) r11-walpin-conc amendment 33a: a trunk child's required retention is one version per trunk page written since
+/// its fork that existed at its fork. A rewrite in the same epoch adds nothing; a later fork leaves the older child's
+/// count as it was; a page past the child's fork-time size is not required.
+#[test]
+fn required_pages_count_each_page_written_since_the_fork_once() {
+    let store = super::store::BranchStore::new();
+    let schema = || Arc::new(crate::schema::Schema::default());
+    let page = vec![0u8; 4096];
+    let a = store.fork_trunk_sized(schema(), 4096, 50).unwrap();
+    assert_eq!(store.walpin_required_pages(a).unwrap().1, 0);
+    for p in [5, 6, 7] {
+        store.first_write_trunk(p, &page);
+    }
+    store.first_write_trunk(5, &page);
+    assert_eq!(store.walpin_required_pages(a).unwrap().1, 3, "5, 6, 7: the rewrite of 5 adds nothing");
+    let b = store.fork_trunk_sized(schema(), 4096, 50).unwrap();
+    store.first_write_trunk(5, &page);
+    store.first_write_trunk(8, &page);
+    store.first_write_trunk(60, &page);
+    assert_eq!(store.walpin_required_pages(a).unwrap().1, 4, "a: 5, 6, 7, 8 (60 is past its size)");
+    assert_eq!(store.walpin_required_pages(b).unwrap().1, 2, "b: 5 and 8 since its fork");
+    assert!(store.walpin_required_pages(BranchId(999)).is_err(), "an unknown branch is refused");
 }
 
 /// The tags the calling thread's read transactions began under during `f`.

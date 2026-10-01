@@ -357,16 +357,30 @@ impl Bench {
     }
 
     /// One trunk autocommit of `row`; the per-commit checkpoint counters are read after it.
+    /// r11-walpin-conc amendment 33a: the open reader's required retention at `h`, for branch session `s` (the
+    /// oldest open reader): pages the trunk wrote since its fork, against the arena's slots in use.
+    fn req_line(&self, h: u64, s: &Session) {
+        let (fork_epoch, req) = self
+            .db
+            .walpin_required_pages(s._branch.id())
+            .unwrap_or_else(|e| not_a_result(&format!("required pages: {e}")));
+        let st = self.db.branch_stats();
+        println!(
+            "# req H={h} fork_epoch={fork_epoch} req_pages={req} arena_in_use={} live_branches={}",
+            st.arena_slots_in_use, st.live_branches
+        );
+    }
+
     fn trunk_write(&mut self, row: i64) {
         let g = self.model.record(row);
         let sql = format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_gen_value(g));
         let before = walpin::counters();
         if self.timing {
             let t = Instant::now();
-            self.trunk.execute(sql).unwrap();
+            walpin::with_writer_tag(|| self.trunk.execute(sql)).unwrap();
             self.commit_ns.push(t.elapsed().as_nanos() as u64);
         } else {
-            self.trunk.execute(sql).unwrap();
+            walpin::with_writer_tag(|| self.trunk.execute(sql)).unwrap();
         }
         let after = walpin::counters();
         self.win_commits += 1;
@@ -393,7 +407,7 @@ impl Bench {
              scan_per_ckpt_max={} sum_max_frame_at_ckpt={} d_find_calls={} d_find_scanned={} \
              d_restarts={} d_fw2_switches={} d_fw2_refused={} d_fw3_trunk_reads={} d_fw3_retries={} \
              d_fw2_refused_init={} d_fw2_refused_fork={} d_fw2_refused_trunk={} \
-             d_fw2_refused_init_only={} d_fw2_origin_underflow={}",
+             d_fw2_refused_init_only={} d_fw2_origin_underflow={} d_fw2_refused_writer={}",
             s.max_frame,
             s.nbackfills,
             s.checkpoint_seq,
@@ -427,6 +441,7 @@ impl Bench {
             d(c.fw2_refused_trunk, self.last.fw2_refused_trunk),
             d(c.fw2_refused_init_only, self.last.fw2_refused_init_only),
             d(c.fw2_origin_underflow, self.last.fw2_origin_underflow),
+            d(c.fw2_refused_writer, self.last.fw2_refused_writer),
         );
         if self.timing && self.win_commits > 0 {
             let n = (self.win_commits as usize).min(1_000);
@@ -578,6 +593,7 @@ fn run_pin(bench: &mut Bench, args: &Args) {
         bench.trunk_write(spread_row(h));
         if h == args.points[next] {
             bench.state("point", h);
+            bench.req_line(h, &s);
             bench.check(&s, "pin_reread");
             next += 1;
         }
@@ -613,6 +629,7 @@ fn run_overlap(bench: &mut Bench, args: &Args) {
         begin_select(bench, s);
         if h == args.points[next] {
             bench.state("point", h);
+            bench.req_line(h, &sessions[0]);
             next += 1;
         }
     }

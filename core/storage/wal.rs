@@ -3271,12 +3271,12 @@ impl Wal2State {
     /// r11-walpin-conc amendment 28: count one refused checkpoint of file `f` by the origins of
     /// the readers ending in it.
     fn count_refusal_origins(&self, f: usize) {
-        use walpin::origin::{FORK, INIT, TRUNK};
+        use walpin::origin::{FORK, INIT, TRUNK, WRITER};
         let by = |o: u8| {
             let r = &self.origin_readers[usize::from(o)];
             r[2 * f] + r[2 * f + 1]
         };
-        let (init, fork, trunk) = (by(INIT), by(FORK), by(TRUNK));
+        let (init, fork, trunk, writer) = (by(INIT), by(FORK), by(TRUNK), by(WRITER));
         if init > 0 {
             walpin::FW2_REFUSED_INIT.fetch_add(1, Relaxed);
         }
@@ -3286,7 +3286,10 @@ impl Wal2State {
         if trunk > 0 {
             walpin::FW2_REFUSED_TRUNK.fetch_add(1, Relaxed);
         }
-        if init > 0 && fork == 0 && trunk == 0 {
+        if writer > 0 {
+            walpin::FW2_REFUSED_WRITER.fetch_add(1, Relaxed);
+        }
+        if init > 0 && fork == 0 && trunk == 0 && writer == 0 {
             walpin::FW2_REFUSED_INIT_ONLY.fetch_add(1, Relaxed);
         }
     }

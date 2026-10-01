@@ -406,7 +406,8 @@ fn writer(
         let t0 = Instant::now();
         let svc = loop {
             let t1 = Instant::now();
-            match conn.execute(&sql) {
+            // r11-walpin-conc amendment 33a: the writer's own read transaction is tagged WRITER.
+            match walpin::with_writer_tag(|| conn.execute(&sql)) {
                 Ok(()) => break t1.elapsed(),
                 Err(LimboError::Busy) => {
                     bump(&sh.w_busy);

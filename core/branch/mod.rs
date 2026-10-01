@@ -424,6 +424,13 @@ impl Database {
             .load(crate::sync::atomic::Ordering::Acquire)
     }
 
+    /// r11-walpin-conc amendment 33a: trunk child `id`'s required retention, (fork epoch, pages written since its
+    /// fork), for the instrument. Observation only.
+    #[doc(hidden)]
+    pub fn walpin_required_pages(&self, id: BranchId) -> crate::Result<(u64, usize)> {
+        self.branches.walpin_required_pages(id)
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {
