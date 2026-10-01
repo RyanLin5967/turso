@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use turso_core::branch::walpin::{self, WalPinCounters, WalPinStats};
-use turso_core::branch::Branch;
+use turso_core::branch::{Branch, BranchWork};
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value, IO};
 
 const TRUNK_ROWS: i64 = 20_000;
@@ -323,6 +323,8 @@ struct Bench {
     commit_ns: Vec<u64>,
     /// Counters at the previous state line.
     last: WalPinCounters,
+    /// The store's work counters at the previous state line (r11-walpin-conc amendment 33k, C11).
+    last_work: BranchWork,
     /// Per-commit checkpoint work since the previous state line.
     win_commits: u64,
     win_ckpt_commits: u64,
@@ -388,10 +390,12 @@ impl Bench {
             }
             None => ("none".to_string(), 0),
         };
-        let (children, versions) = self.db.walpin_required_versions();
+        // Amendment 33k (C14): the requirement against the retained set, both directions.
+        let (children, versions, over, under) = self.db.walpin_required_versions_diff();
         let st = self.db.branch_stats();
         println!(
-            "# req H={h} fork_epoch={fork_epoch} req_pages={req} req_versions={versions} \
+            "# req H={h} fork_epoch={fork_epoch} req_pages={req} req_versions={versions} over_retained={over} \
+             under_retained={under} \
              live_trunk_children={children} arena_in_use={} live_branches={}",
             st.arena_slots_in_use, st.live_branches
         );
@@ -437,7 +441,8 @@ impl Bench {
              d_fw2_refused_init={} d_fw2_refused_fork={} d_fw2_refused_trunk={} \
              d_fw2_refused_init_only={} d_fw2_origin_underflow={} d_fw2_refused_writer={} \
              d_begins_trunk={} d_begins_init={} d_begins_fork={} d_begins_writer={} | arena_in_use={} \
-             live_branches={} wal2_readers={:?} wal2_origin_readers={:?}",
+             live_branches={} wal2_readers={:?} wal2_origin_readers={:?} d_resolve_calls={} \
+             d_resolve_retained_examined={} d_gc_examined={} d_gc_range_entries={}",
             s.max_frame,
             s.nbackfills,
             s.checkpoint_seq,
@@ -482,6 +487,11 @@ impl Bench {
             arena.live_branches,
             s.wal2_readers,
             s.wal2_origin_readers,
+            // Amendment 33k (C11): the store's per-window work (BranchWork deltas).
+            d(arena.work.resolve_calls, self.last_work.resolve_calls),
+            d(arena.work.resolve_retained_examined, self.last_work.resolve_retained_examined),
+            d(arena.work.gc_examined, self.last_work.gc_examined),
+            d(arena.work.gc_range_entries, self.last_work.gc_range_entries),
         );
         if self.timing && self.win_commits > 0 {
             // Amendment 33f (F2): every commit of the window, not the last 1,000 (commit_ns holds only this window).
@@ -499,6 +509,7 @@ impl Bench {
         println!("{line}");
         self.commit_ns.clear();
         self.last = c;
+        self.last_work = arena.work;
         self.win_commits = 0;
         self.win_ckpt_commits = 0;
         self.win_scan_min = u64::MAX;
@@ -601,6 +612,7 @@ fn main() {
         timing: args.timing,
         commit_ns: Vec::new(),
         last: walpin::counters(),
+        last_work: db.branch_stats().work,
         win_commits: 0,
         win_ckpt_commits: 0,
         win_scan_min: u64::MAX,
@@ -732,6 +744,9 @@ fn run_refork(bench: &mut Bench, args: &Args) {
             // Amendment 33g: the row this commit rewrote, read on the oldest open snapshot (forked before it), so a
             // retained version's content is model-checked at every point. After the point's lines; not timed.
             bench.check_row(oldest, spread_row(h), "refork_retained");
+            // Amendment 33k (C14): and the first row the trunk rewrote after the oldest's fork, so the oldest
+            // retained version the arm needs is read too.
+            bench.check_row(oldest, spread_row(oldest.writes_at_fork), "refork_oldest_retained");
             next += 1;
         }
     }

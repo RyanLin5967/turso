@@ -430,3 +430,80 @@ fn fw2_reader_stats_report_open_readers_and_change_nothing() {
         "{closed:?}"
     );
 }
+
+/// r11-walpin-conc amendment 33k (C14): the p33-shaped store schedule. FWB on, one fork-time size (64 pages), one
+/// long-lived child (the pin), `k` rotating children reaped oldest first, and one trunk write between forks (one write
+/// in nine to page 70, past the size, which FWB skips). After every write and every reap it records (arena slots in
+/// use, required versions, retained but not required, required but not retained). `arm_at` arms a GC mutant just
+/// before that step's reap.
+fn p33_schedule(k: usize, steps: u64, arm_at: Option<(u64, u8)>) -> (Vec<(usize, usize, usize, usize)>, bool) {
+    use super::store::gc_mutant;
+    let fwb = walpin::fwb();
+    walpin::set_birth_gate(true);
+    let store = super::store::BranchStore::new();
+    let schema = || Arc::new(crate::schema::Schema::default());
+    let page = vec![0u8; 4096];
+    let mut out = Vec::new();
+    let snap = |store: &super::store::BranchStore, out: &mut Vec<(usize, usize, usize, usize)>| {
+        let (_, req, over, under) = store.walpin_required_versions_diff();
+        out.push((store.stats().arena_slots_in_use, req, over, under));
+    };
+    let _pin = store.fork_trunk_sized(schema(), 4096, 64).unwrap();
+    let mut rotating: std::collections::VecDeque<BranchId> = (0..k)
+        .map(|_| store.fork_trunk_sized(schema(), 4096, 64).unwrap())
+        .collect();
+    let mut fired = false;
+    for step in 0..steps {
+        let p = if step % 9 == 8 { 70 } else { (step * 37 % 64) as u32 + 1 };
+        store.first_write_trunk(p, &page);
+        snap(&store, &mut out);
+        rotating.push_back(store.fork_trunk_sized(schema(), 4096, 64).unwrap());
+        if arm_at.is_some_and(|(at, _)| at == step) {
+            gc_mutant::arm(arm_at.unwrap().1);
+        }
+        store.release_handle(rotating.pop_front().unwrap());
+        fired |= gc_mutant::fired();
+        snap(&store, &mut out);
+    }
+    gc_mutant::arm(gc_mutant::NONE);
+    walpin::set_birth_gate(fwb);
+    (out, fired)
+}
+
+/// (n) r11-walpin-conc amendment 33k (C14): on the p33-shaped schedule the store retains exactly the required versions
+/// at every step: arena slots in use == required, with nothing retained that is not required and nothing required that
+/// is not retained. The requirement is non-trivial (the pin's versions plus the rotating children's).
+#[test]
+#[ignore = "sets the process-global FWB switch: run alone with --test-threads=1 --include-ignored"]
+fn the_store_retains_exactly_the_required_versions_on_a_p33_schedule() {
+    let (steps, fired) = p33_schedule(4, 300, None);
+    assert!(!fired);
+    let bad: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, &(a, r, o, u))| a != r || o != 0 || u != 0)
+        .collect();
+    assert!(bad.is_empty(), "arena != required at {:?}", &bad[..bad.len().min(5)]);
+    assert!(steps.iter().any(|&(_, r, _, _)| r >= 60), "a non-trivial requirement: {:?}", steps.last());
+}
+
+/// (o) r11-walpin-conc amendment 33k (C14): the detector fires both ways. A GC that keeps one version only the reaped
+/// child saw reads d = +1 (one retained, not required) from that reap on; a GC that also frees a version the next
+/// child still sees reads d = -1 (one required, not retained) at that reap. Before the mutant, d = 0.
+#[test]
+#[ignore = "sets the process-global FWB switch: run alone with --test-threads=1 --include-ignored"]
+fn the_retention_detector_fires_on_both_gc_mutants() {
+    use super::store::gc_mutant;
+    let (skip, fired) = p33_schedule(4, 300, Some((100, gc_mutant::SKIP_RELEASE)));
+    assert!(fired, "the skip-release mutant fired");
+    let at = 2 * 100 + 1; // the snapshot after step 100's reap
+    assert!(skip[..at].iter().all(|&(a, r, o, u)| a == r && o == 0 && u == 0), "clean before the mutant");
+    let (a, r, o, u) = skip[at];
+    assert_eq!((a as i64 - r as i64, o, u), (1, 1, 0), "skip-release: d = +1 at {at}");
+    assert!(skip[at..].iter().all(|&(a, r, o, _)| a == r + 1 && o == 1), "the kept version is never released");
+    let (free, fired) = p33_schedule(4, 300, Some((100, gc_mutant::FREE_NEXT_CHILD)));
+    assert!(fired, "the free-next-child mutant fired");
+    assert!(free[..at].iter().all(|&(a, r, o, u)| a == r && o == 0 && u == 0), "clean before the mutant");
+    let (a, r, o, u) = free[at];
+    assert_eq!((r as i64 - a as i64, o, u), (1, 0, 1), "free-next-child: d = -1 at {at}");
+}

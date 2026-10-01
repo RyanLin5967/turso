@@ -438,6 +438,13 @@ impl Database {
         self.branches.walpin_required_versions()
     }
 
+    /// r11-walpin-conc amendment 33k (C14): (live trunk children, required versions, retained but not required,
+    /// required but not retained), for the instrument. Observation only.
+    #[doc(hidden)]
+    pub fn walpin_required_versions_diff(&self) -> (usize, usize, usize, usize) {
+        self.branches.walpin_required_versions_diff()
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {

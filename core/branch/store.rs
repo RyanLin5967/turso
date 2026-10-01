@@ -79,7 +79,7 @@
 //! Tarjan's fat node (JCSS 1989) with a search tree over its version stamps. [`Lineage::retain`]
 //! refuses a version that would break the disjointness the search relies on.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
 
 use super::arena::{Arena, Slot};
@@ -243,7 +243,29 @@ impl Lineage {
         crate::turso_assert!(removed.is_some(), "detached a child the parent does not list");
         let lo = self.children.range(..f).next_back().map(|(&e, _)| e);
         let hi = self.children.range(f..).next().map(|(&e, _)| e);
-        let dead = self.garbage(f, lo, hi, work);
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut dead = self.garbage(f, lo, hi, work);
+        // r11-walpin-conc amendment 33k (C14): the GC mutants of the d detector's fire-check (test builds only).
+        #[cfg(test)]
+        match gc_mutant::armed() {
+            gc_mutant::SKIP_RELEASE if !dead.is_empty() => {
+                dead.remove(0);
+                gc_mutant::fire();
+            }
+            gc_mutant::FREE_NEXT_CHILD => {
+                let extra = hi.and_then(|h| {
+                    self.by_born
+                        .range(..=(h, NO_PAGE, u64::MAX))
+                        .copied()
+                        .find(|&(born, page, died)| born <= h && h < died && !dead.contains(&(born, page, died)))
+                });
+                if let Some(v) = extra {
+                    dead.push(v);
+                    gc_mutant::fire();
+                }
+            }
+            _ => {}
+        }
         for &(born, page, died) in &dead {
             let versions = self.retained.get_mut(&page).expect("indexed version is listed");
             let v = versions.remove(&born).expect("indexed version is listed");
@@ -346,6 +368,45 @@ impl Lineage {
 
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
+}
+
+/// r11-walpin-conc amendment 33k (C14): GC mutants for the fire-check of the retention detector (d = arena - required),
+/// test builds only. Armed per thread; a mutant fires once, at the first `Lineage::child_gone` that can apply it, and
+/// then disarms.
+#[cfg(test)]
+pub(crate) mod gc_mutant {
+    use std::cell::Cell;
+
+    pub(crate) const NONE: u8 = 0;
+    /// One version that only the departing child saw is kept: retention exceeds the requirement by one (d = +1).
+    pub(crate) const SKIP_RELEASE: u8 = 1;
+    /// One version the next live child still sees is released as well: retention falls one short (d = -1).
+    pub(crate) const FREE_NEXT_CHILD: u8 = 2;
+
+    thread_local! {
+        static ARMED: Cell<u8> = const { Cell::new(NONE) };
+        static FIRED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[cfg_attr(not(feature = "fs"), allow(dead_code))]
+    pub(crate) fn arm(m: u8) {
+        ARMED.with(|a| a.set(m));
+        FIRED.with(|f| f.set(false));
+    }
+
+    pub(crate) fn armed() -> u8 {
+        ARMED.with(|a| a.get())
+    }
+
+    #[cfg_attr(not(feature = "fs"), allow(dead_code))]
+    pub(crate) fn fired() -> bool {
+        FIRED.with(|f| f.get())
+    }
+
+    pub(crate) fn fire() {
+        ARMED.with(|a| a.set(NONE));
+        FIRED.with(|f| f.set(true));
+    }
 }
 
 impl BranchStore {
@@ -751,27 +812,46 @@ impl BranchStore {
         Ok((f, n))
     }
 
-    /// r11-walpin-conc amendment 33f (G9): the trunk's required retention over ALL its live children. A logged
-    /// superseded version `(p, born, died)` is required iff some live child forked in `[born, died)` (so it sees that
-    /// version) has `p <=` its recorded fork-time size, when there is one. Children forked inside one version's range
-    /// share it; a page rewritten between two forks needs one version per child. Returns (live trunk children,
-    /// required versions). Observation only: it reads the live-children set, the fork sizes and the log, never what
-    /// the store retained.
-    pub(crate) fn walpin_required_versions(&self) -> (usize, usize) {
+    /// r11-walpin-conc amendment 33k (C14): `walpin_required_versions` against what the store retained, in both
+    /// directions so that they cannot offset: (live trunk children, required versions, retained versions no live child
+    /// requires, required versions not retained). The retained set is `trunk.lineage.by_born`, as (page, born, died).
+    /// Observation only.
+    pub(crate) fn walpin_required_versions_diff(&self) -> (usize, usize, usize, usize) {
         let inner = self.lock_inner(2);
         let trunk = &inner.trunk;
         let children = &trunk.lineage.children;
-        let required = trunk
+        let required: HashSet<(u32, u64, u64)> = trunk
             .version_log
             .iter()
             .flatten()
-            .filter(|&&(p, born, died)| {
+            .copied()
+            .filter(|&(p, born, died)| {
                 children
                     .range(born..died)
                     .any(|(f, _)| trunk.fork_sizes.get(f).is_none_or(|&size| p <= size))
             })
-            .count();
-        (children.len(), required)
+            .collect();
+        let retained: HashSet<(u32, u64, u64)> = trunk
+            .lineage
+            .by_born
+            .iter()
+            .map(|&(born, page, died)| (page, born, died))
+            .collect();
+        let over = retained.difference(&required).count();
+        let under = required.difference(&retained).count();
+        (children.len(), required.len(), over, under)
+    }
+
+    /// r11-walpin-conc amendment 33f (G9): the trunk's required retention over ALL its live children. A logged
+    /// superseded version `(p, born, died)` is required iff some live child forked in `[born, died)` (so it sees that
+    /// version) has `p <=` its recorded fork-time size, when there is one. Children forked inside one version's range
+    /// share it; a page rewritten between two forks needs one version per child. Returns (live trunk children,
+    /// required versions). Observation only: the count reads the live-children set, the fork sizes and the log, never
+    /// what the store retained (33k: computed by `walpin_required_versions_diff`, which compares it with the retained
+    /// set only afterwards).
+    pub(crate) fn walpin_required_versions(&self) -> (usize, usize) {
+        let (children, required, _, _) = self.walpin_required_versions_diff();
+        (children, required)
     }
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {
