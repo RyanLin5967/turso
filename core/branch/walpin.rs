@@ -34,6 +34,9 @@ pub(crate) static FW2_REFUSED_INIT_ONLY: AtomicU64 = AtomicU64::new(0);
 /// transaction, tagged by the harness) was among the blockers; with it, the untagged TRUNK bucket counts only
 /// readers nobody tagged.
 pub(crate) static FW2_REFUSED_WRITER: AtomicU64 = AtomicU64::new(0);
+/// r11-walpin-conc amendment 33f (G6): FW2 read transactions begun, by the origin they began under (indexed by
+/// `origin`: TRUNK, INIT, FORK, WRITER); one per successful registration with the wal2 reader classes.
+pub(crate) static FW2_BEGINS: [AtomicU64; origin::ORIGINS] = [const { AtomicU64::new(0) }; origin::ORIGINS];
 /// Read transactions that ended under an origin with no reader counted: an instrument failure,
 /// counted instead of asserted so that the attribution can never stop the process.
 pub(crate) static FW2_ORIGIN_UNDERFLOW: AtomicU64 = AtomicU64::new(0);
@@ -152,6 +155,8 @@ pub struct WalPinCounters {
     pub fw2_refused_writer: u64,
     /// Read transactions ended under an origin with no reader counted (instrument failures).
     pub fw2_origin_underflow: u64,
+    /// FW2 read transactions begun, by origin, in the order TRUNK, INIT, FORK, WRITER (amendment 33f).
+    pub fw2_begins: [u64; origin::ORIGINS],
     /// FW3: branch reads of a trunk page (WAL frame or database file).
     pub fw3_trunk_reads: u64,
     /// FW3: those reads that failed validation and were retried.
@@ -197,6 +202,7 @@ pub fn counters() -> WalPinCounters {
         fw2_refused_init_only: FW2_REFUSED_INIT_ONLY.load(Relaxed),
         fw2_refused_writer: FW2_REFUSED_WRITER.load(Relaxed),
         fw2_origin_underflow: FW2_ORIGIN_UNDERFLOW.load(Relaxed),
+        fw2_begins: std::array::from_fn(|i| FW2_BEGINS[i].load(Relaxed)),
         fw3_trunk_reads: FW3_TRUNK_READS.load(Relaxed),
         fw3_retries: FW3_RETRIES.load(Relaxed),
         fw3_calls_trunk: FW3_CALLS_TRUNK.load(Relaxed),
@@ -286,6 +292,11 @@ pub struct WalPinStats {
     /// FW1's frame -> page log: entries and bytes by capacity.
     pub log_frames: u64,
     pub log_bytes: u64,
+    /// r11-walpin-conc amendment 33f (F9): FW2's open readers in its four classes (`Wal2State::readers`); the read
+    /// marks above are unused under FW2, so `mark_readers` cannot see them.
+    pub wal2_readers: [u32; 4],
+    /// The same readers by the origin they began under, in the order TRUNK, INIT, FORK, WRITER.
+    pub wal2_origin_readers: [[u32; 4]; origin::ORIGINS],
 }
 
 /// r11-walpin-conc amendment 28: which kind of trunk reader a read transaction is, for the

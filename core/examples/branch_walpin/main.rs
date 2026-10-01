@@ -6,8 +6,12 @@
 //!
 //!   pin       one branch holds `BEGIN; SELECT` open while the trunk makes H one-row autocommits
 //!   nopin     the same, with the branch's SELECT autocommitted (control)
+//!   nobranch  the same trunk commits with no live child: the branch is reaped after its one autocommitted read
+//!             (r11-walpin-conc amendment 33f, G8)
 //!   overlap   K branch sessions; after each trunk commit one of them ends its read tx and begins a
 //!             new one, so K read transactions are always open, each spanning K trunk commits
+//!   refork    as overlap, but each re-begin is on a NEW fork (the session's previous branch is then reaped), so
+//!             the K open snapshots sit at K distinct trunk epochs (r11-walpin-conc amendment 33f, G9)
 //!   u3        `overlap 1` in the background; the trunk rewrites one row k times, then 3,000 rows on
 //!             other pages; then fresh branches read that row (the per-miss frame-list walk)
 //!   conc      T trunk writer threads and R reader threads over K branch sessions (r11-walpin-conc;
@@ -41,7 +45,11 @@ const U3_PHASE_B: u64 = 3_000;
 enum Arm {
     Pin,
     NoPin,
+    /// Amendment 33f (G8).
+    NoBranch,
     Overlap,
+    /// Amendment 33f (G9).
+    Refork,
     U3,
     Conc,
 }
@@ -109,7 +117,9 @@ fn parse_args() -> Args {
                 arm = Some(match val().as_str() {
                     "pin" => Arm::Pin,
                     "nopin" => Arm::NoPin,
+                    "nobranch" => Arm::NoBranch,
                     "overlap" => Arm::Overlap,
+                    "refork" => Arm::Refork,
                     "u3" => Arm::U3,
                     "conc" => Arm::Conc,
                     other => die(&format!("unknown arm {other}")),
@@ -356,21 +366,31 @@ impl Bench {
         }
     }
 
-    /// One trunk autocommit of `row`; the per-commit checkpoint counters are read after it.
     /// r11-walpin-conc amendment 33a: the open reader's required retention at `h`, for branch session `s` (the
-    /// oldest open reader): pages the trunk wrote since its fork, against the arena's slots in use.
-    fn req_line(&self, h: u64, s: &Session) {
-        let (fork_epoch, req) = self
-            .db
-            .walpin_required_pages(s._branch.id())
-            .unwrap_or_else(|e| not_a_result(&format!("required pages: {e}")));
+    /// oldest open reader): pages the trunk wrote since its fork, against the arena's slots in use. Amendment 33f
+    /// (G9): also the requirement over ALL live trunk children (`req_versions`), which the scorer reads; `s` is None
+    /// when no session is live (nobranch), and then req_pages is 0.
+    fn req_line(&self, h: u64, s: Option<&Session>) {
+        let (fork_epoch, req) = match s {
+            Some(s) => {
+                let (f, req) = self
+                    .db
+                    .walpin_required_pages(s._branch.id())
+                    .unwrap_or_else(|e| not_a_result(&format!("required pages: {e}")));
+                (f.to_string(), req)
+            }
+            None => ("none".to_string(), 0),
+        };
+        let (children, versions) = self.db.walpin_required_versions();
         let st = self.db.branch_stats();
         println!(
-            "# req H={h} fork_epoch={fork_epoch} req_pages={req} arena_in_use={} live_branches={}",
+            "# req H={h} fork_epoch={fork_epoch} req_pages={req} req_versions={versions} \
+             live_trunk_children={children} arena_in_use={} live_branches={}",
             st.arena_slots_in_use, st.live_branches
         );
     }
 
+    /// One trunk autocommit of `row`; the per-commit checkpoint counters are read after it.
     fn trunk_write(&mut self, row: i64) {
         let g = self.model.record(row);
         let sql = format!("UPDATE t SET v = '{}' WHERE id = {row}", trunk_gen_value(g));
@@ -399,6 +419,7 @@ impl Bench {
     fn state(&mut self, label: &str, h: u64) {
         let s = self.stats();
         let c = walpin::counters();
+        let arena = self.db.branch_stats();
         let d = |a: u64, b: u64| a - b;
         let mut line = format!(
             "# {label} H={h} max_frame={} nbackfills={} ckpt_seq={} marks={:?} mark_readers={:?} \
@@ -407,7 +428,9 @@ impl Bench {
              scan_per_ckpt_max={} sum_max_frame_at_ckpt={} d_find_calls={} d_find_scanned={} \
              d_restarts={} d_fw2_switches={} d_fw2_refused={} d_fw3_trunk_reads={} d_fw3_retries={} \
              d_fw2_refused_init={} d_fw2_refused_fork={} d_fw2_refused_trunk={} \
-             d_fw2_refused_init_only={} d_fw2_origin_underflow={} d_fw2_refused_writer={}",
+             d_fw2_refused_init_only={} d_fw2_origin_underflow={} d_fw2_refused_writer={} \
+             d_begins_trunk={} d_begins_init={} d_begins_fork={} d_begins_writer={} | arena_in_use={} \
+             live_branches={} wal2_readers={:?} wal2_origin_readers={:?}",
             s.max_frame,
             s.nbackfills,
             s.checkpoint_seq,
@@ -442,13 +465,24 @@ impl Bench {
             d(c.fw2_refused_init_only, self.last.fw2_refused_init_only),
             d(c.fw2_origin_underflow, self.last.fw2_origin_underflow),
             d(c.fw2_refused_writer, self.last.fw2_refused_writer),
+            // Amendment 33f (G6, F9): begins by origin in the order TRUNK, INIT, FORK, WRITER; the arena; FW2's open
+            // readers by class and by origin (same order).
+            d(c.fw2_begins[0], self.last.fw2_begins[0]),
+            d(c.fw2_begins[1], self.last.fw2_begins[1]),
+            d(c.fw2_begins[2], self.last.fw2_begins[2]),
+            d(c.fw2_begins[3], self.last.fw2_begins[3]),
+            arena.arena_slots_in_use,
+            arena.live_branches,
+            s.wal2_readers,
+            s.wal2_origin_readers,
         );
         if self.timing && self.win_commits > 0 {
-            let n = (self.win_commits as usize).min(1_000);
+            // Amendment 33f (F2): every commit of the window, not the last 1,000 (commit_ns holds only this window).
+            let n = self.win_commits as usize;
             let mut w: Vec<u64> = self.commit_ns[self.commit_ns.len() - n..].to_vec();
             w.sort_unstable();
             line.push_str(&format!(
-                " | commit_us last={n} p50={:.2} p90={:.2} p99={:.2} max={:.2}",
+                " | commit_us window={n} p50={:.2} p90={:.2} p99={:.2} max={:.2}",
                 percentile(&w, 50.0) as f64 / 1e3,
                 percentile(&w, 90.0) as f64 / 1e3,
                 percentile(&w, 99.0) as f64 / 1e3,
@@ -456,6 +490,7 @@ impl Bench {
             ));
         }
         println!("{line}");
+        self.commit_ns.clear();
         self.last = c;
         self.win_commits = 0;
         self.win_ckpt_commits = 0;
@@ -568,8 +603,9 @@ fn main() {
     bench.state("setup", 0);
 
     match args.arm {
-        Arm::Pin | Arm::NoPin => run_pin(&mut bench, &args),
+        Arm::Pin | Arm::NoPin | Arm::NoBranch => run_pin(&mut bench, &args),
         Arm::Overlap => run_overlap(&mut bench, &args),
+        Arm::Refork => run_refork(&mut bench, &args),
         Arm::U3 => run_u3(&mut bench, &args),
         Arm::Conc => conc::run_conc(&mut bench, &args),
     }
@@ -580,11 +616,21 @@ fn run_pin(bench: &mut Bench, args: &Args) {
     // One trunk commit first, so the branch's read begins while the WAL holds an unbackfilled frame.
     bench.trunk_write(spread_row(0));
     let r0 = spread_row(5_000);
-    let mut s = bench.fork_session(r0);
+    let mut s = Some(bench.fork_session(r0));
     if args.arm == Arm::Pin {
-        begin_select(bench, &mut s);
+        begin_select(bench, s.as_mut().unwrap());
     } else {
-        bench.check(&s, "nopin_select");
+        bench.check(s.as_ref().unwrap(), "nopin_select");
+    }
+    if args.arm == Arm::NoBranch {
+        // Amendment 33f (G8): the same trunk commits with no live child. The connection goes first, so the reap
+        // frees the branch at once (an open connection would defer it).
+        let Session { _branch, conn, .. } = s.take().unwrap();
+        drop(conn);
+        let reaped = _branch.reap().unwrap();
+        if reaped.deferred {
+            not_a_result("nobranch: the reap was deferred, so a child is still live");
+        }
     }
     bench.state("pinned", 0);
     let h_max = *args.points.last().unwrap();
@@ -593,20 +639,24 @@ fn run_pin(bench: &mut Bench, args: &Args) {
         bench.trunk_write(spread_row(h));
         if h == args.points[next] {
             bench.state("point", h);
-            bench.req_line(h, &s);
-            bench.check(&s, "pin_reread");
+            bench.req_line(h, s.as_ref());
+            if let Some(s) = &s {
+                bench.check(s, "pin_reread");
+            }
             next += 1;
         }
     }
-    if s.in_tx {
-        end_tx(&mut s);
+    if let Some(s) = s.as_mut().filter(|s| s.in_tx) {
+        end_tx(s);
     }
     bench.state("released", h_max);
     for i in 1..=2 {
         bench.trunk_write(spread_row(h_max + i));
         bench.state("after_release", h_max + i);
     }
-    bench.check(&s, "after_release");
+    if let Some(s) = &s {
+        bench.check(s, "after_release");
+    }
 }
 
 fn run_overlap(bench: &mut Bench, args: &Args) {
@@ -629,7 +679,49 @@ fn run_overlap(bench: &mut Bench, args: &Args) {
         begin_select(bench, s);
         if h == args.points[next] {
             bench.state("point", h);
-            bench.req_line(h, &sessions[0]);
+            bench.req_line(h, Some(&sessions[0]));
+            next += 1;
+        }
+    }
+    for s in sessions.iter_mut() {
+        end_tx(s);
+    }
+    bench.state("closed", h_max);
+}
+
+/// Amendment 33f (G9): `overlap`, except that each re-begin is on a new fork of the trunk, so the K open snapshots
+/// sit at K distinct trunk epochs and the trunk must keep one version per page per epoch range a live child sees.
+/// The new fork is made first, then the session's previous branch is reaped (connection first, so the reap is
+/// immediate): K + 1 children are live for that moment and K at every point line. The req line names the oldest open
+/// session.
+fn run_refork(bench: &mut Bench, args: &Args) {
+    bench.trunk_write(spread_row(0));
+    let k = args.k as usize;
+    let mut sessions: Vec<Session> = (0..k)
+        .map(|i| bench.fork_session(spread_row(7_919 * (i as u64 + 1))))
+        .collect();
+    for s in sessions.iter_mut() {
+        begin_select(bench, s);
+    }
+    bench.state("opened", 0);
+    let h_max = *args.points.last().unwrap();
+    let mut next = 0;
+    for h in 1..=h_max {
+        bench.trunk_write(spread_row(h));
+        let i = (h as usize) % k;
+        end_tx(&mut sessions[i]);
+        let row = sessions[i].row;
+        let fresh = bench.fork_session(row);
+        let Session { _branch, conn, .. } = std::mem::replace(&mut sessions[i], fresh);
+        drop(conn);
+        if _branch.reap().unwrap().deferred {
+            not_a_result("refork: a replaced session's reap was deferred");
+        }
+        begin_select(bench, &mut sessions[i]);
+        if h == args.points[next] {
+            let oldest = sessions.iter().min_by_key(|s| s.writes_at_fork).unwrap();
+            bench.state("point", h);
+            bench.req_line(h, Some(oldest));
             next += 1;
         }
     }

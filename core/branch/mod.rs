@@ -431,6 +431,13 @@ impl Database {
         self.branches.walpin_required_pages(id)
     }
 
+    /// r11-walpin-conc amendment 33f (G9): the trunk's required retention over all its live children, (live trunk
+    /// children, required versions), for the instrument. Observation only.
+    #[doc(hidden)]
+    pub fn walpin_required_versions(&self) -> (usize, usize) {
+        self.branches.walpin_required_versions()
+    }
+
     /// Whether `slot` is on the arena free list, for membership assertions.
     #[doc(hidden)]
     pub fn branch_slot_is_free(&self, slot: u32) -> bool {

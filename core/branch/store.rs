@@ -152,6 +152,28 @@ struct TrunkState {
     /// the epoch and the latest child in a range bounds them all. A child resolves from the trunk
     /// only pages up to its own size, which the recorded value never undercuts.
     fork_sizes: BTreeMap<u64, u32>,
+    /// r11-walpin-conc amendment 33f (G9): every trunk version superseded while the trunk had a live child, as
+    /// `(page, born, died)` in trunk epochs. Logged before the birth gate and the copy decision and independent of
+    /// both, so [`BranchStore::walpin_required_versions`] computes the requirement without reading what the store
+    /// retained. Observation only: nothing in the mechanism reads it. In chunks of `VERSION_LOG_CHUNK` entries, so
+    /// an append never copies the log inside a trunk write.
+    version_log: Vec<Vec<(u32, u64, u64)>>,
+}
+
+/// Entries per chunk of [`TrunkState::version_log`].
+const VERSION_LOG_CHUNK: usize = 1 << 16;
+
+impl TrunkState {
+    fn log_version(&mut self, page: u32, born: u64, died: u64) {
+        match self.version_log.last_mut() {
+            Some(chunk) if chunk.len() < VERSION_LOG_CHUNK => chunk.push((page, born, died)),
+            _ => {
+                let mut chunk = Vec::with_capacity(VERSION_LOG_CHUNK);
+                chunk.push((page, born, died));
+                self.version_log.push(chunk);
+            }
+        }
+    }
 }
 
 struct BranchState {
@@ -336,6 +358,7 @@ impl BranchStore {
                     lineage: Lineage::default(),
                     written: HashMap::new(),
                     fork_sizes: BTreeMap::new(),
+                    version_log: Vec::new(),
                 },
                 branches: HashMap::new(),
                 work: BranchWork::default(),
@@ -596,6 +619,8 @@ impl BranchStore {
         if born >= epoch {
             return;
         }
+        // Amendment 33f (G9): the version `[born, epoch)` is superseded now, whatever is decided below.
+        trunk.log_version(page, born, epoch);
         // FWB, the birth gate (r11-walpin-conc amendment 26): a page past the fork-time database size of
         // every child that could see this version did not exist for any of them, and a child resolves
         // from the trunk only pages up to its fork-time size (its own pages past it are its own), so no
@@ -724,6 +749,29 @@ impl BranchStore {
             .filter(|&(&p, &e)| e > f && size.is_none_or(|s| p <= s))
             .count();
         Ok((f, n))
+    }
+
+    /// r11-walpin-conc amendment 33f (G9): the trunk's required retention over ALL its live children. A logged
+    /// superseded version `(p, born, died)` is required iff some live child forked in `[born, died)` (so it sees that
+    /// version) has `p <=` its recorded fork-time size, when there is one. Children forked inside one version's range
+    /// share it; a page rewritten between two forks needs one version per child. Returns (live trunk children,
+    /// required versions). Observation only: it reads the live-children set, the fork sizes and the log, never what
+    /// the store retained.
+    pub(crate) fn walpin_required_versions(&self) -> (usize, usize) {
+        let inner = self.lock_inner(2);
+        let trunk = &inner.trunk;
+        let children = &trunk.lineage.children;
+        let required = trunk
+            .version_log
+            .iter()
+            .flatten()
+            .filter(|&&(p, born, died)| {
+                children
+                    .range(born..died)
+                    .any(|(f, _)| trunk.fork_sizes.get(f).is_none_or(|&size| p <= size))
+            })
+            .count();
+        (children.len(), required)
     }
 
     pub(crate) fn owned_slots(&self, id: BranchId) -> Vec<u32> {

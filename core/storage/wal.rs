@@ -1202,6 +1202,8 @@ impl WalCoordination for InProcessWalCoordination {
             // r11-walpin-conc amendment 28: and by origin; the caller hands the same tag back to
             // `end_read_tx_origin`.
             w.origin_readers[usize::from(origin)][class] += 1;
+            // Amendment 33f (G6): and the begin itself, cumulatively, so a window's begins by origin are a delta.
+            walpin::FW2_BEGINS[usize::from(origin)].fetch_add(1, Relaxed);
             return Some(ReadGuardKind::ReadMark(
                 NonZeroUsize::new(class + 1).expect("class + 1 is non-zero"),
             ));
@@ -6564,6 +6566,11 @@ impl WalFileShared {
             stats.mark_values[i] = lock.get_value();
             stats.mark_readers[i] = lock.reader_count();
         }
+        // Amendment 33f (F9): FW2's reader classes, read under the wal2 lock alone (no other lock of this
+        // function is held here). Copies only.
+        let w = self.runtime.wal2.lock();
+        stats.wal2_readers = w.readers;
+        stats.wal2_origin_readers = w.origin_readers;
         stats
     }
 

@@ -286,3 +286,147 @@ fn the_origin_tag_is_restored_after_with() {
     assert!(unwound.is_err());
     assert_eq!(origin::current(), origin::TRUNK);
 }
+
+/// (j) r11-walpin-conc amendment 33f (G9): the required retention over ALL live trunk children is one version per
+/// superseded (page, version) that some live child can see. Children forked inside one version's range share it; a page
+/// rewritten between two forks needs one version per child; a version only a reaped child could see stops counting; a
+/// page past every fork-time size in its range counts nothing. Expected counts are worked by hand from the epochs.
+#[test]
+fn required_versions_count_one_per_version_some_live_child_sees() {
+    let store = super::store::BranchStore::new();
+    let schema = || Arc::new(crate::schema::Schema::default());
+    let page = vec![0u8; 4096];
+    assert_eq!(store.walpin_required_versions(), (0, 0));
+    let a = store.fork_trunk_sized(schema(), 4096, 50).unwrap(); // fork epoch 0
+    let b = store.fork_trunk_sized(schema(), 4096, 50).unwrap(); // fork epoch 1
+    store.first_write_trunk(5, &page); // supersedes (5, 0, 2): a and b see it
+    store.first_write_trunk(5, &page); // the same epoch: nothing superseded
+    assert_eq!(store.walpin_required_versions(), (2, 1), "a and b share page 5's one version");
+    let c = store.fork_trunk_sized(schema(), 4096, 50).unwrap(); // fork epoch 2
+    store.first_write_trunk(5, &page); // supersedes (5, 2, 3): c sees it
+    store.first_write_trunk(60, &page); // supersedes (60, 0, 3): past a's, b's and c's size of 50
+    assert_eq!(store.walpin_required_versions(), (3, 2), "page 5: one version for a and b, one for c");
+    let d = store.fork_trunk_sized(schema(), 4096, 50).unwrap(); // fork epoch 3
+    store.first_write_trunk(5, &page); // supersedes (5, 3, 4): d sees it
+    assert_eq!(store.walpin_required_versions(), (4, 3), "one version of page 5 per rewrite with a live child");
+    store.release_handle(c);
+    assert_eq!(store.walpin_required_versions(), (3, 2), "(5, 2, 3) was c's alone");
+    store.release_handle(a);
+    assert_eq!(store.walpin_required_versions(), (2, 2), "b still sees (5, 0, 2)");
+    store.release_handle(b);
+    store.release_handle(d);
+    assert_eq!(store.walpin_required_versions(), (0, 0));
+}
+
+/// (k) r11-walpin-conc amendment 33f (G6): the harness's own write path, `with_writer_tag` around a trunk UPDATE,
+/// begins every read transaction under WRITER; under the mutant that drops the tag, none is WRITER.
+#[test]
+fn a_writer_tagged_trunk_write_begins_every_read_under_writer() {
+    for untagged in [false, true] {
+        let (_dir, db) = open_db();
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        trunk.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+        origin::mutant::set_untagged(untagged);
+        let tags = tags_during(|| {
+            walpin::with_writer_tag(|| trunk.execute("UPDATE t SET v = 'w' WHERE id = 1")).unwrap();
+        });
+        origin::mutant::set_untagged(false);
+        if untagged {
+            assert!(!tags.is_empty() && !tags.contains(&origin::WRITER), "mutant: {tags:?}");
+        } else {
+            assert!(
+                !tags.is_empty() && tags.iter().all(|&t| t == origin::WRITER),
+                "write: {tags:?}"
+            );
+        }
+    }
+}
+
+/// (l) r11-walpin-conc amendment 33f (G6): FW2 counts each read transaction it registers under the origin it began
+/// under: a WRITER-tagged trunk UPDATE moves only the WRITER count, an untagged one only TRUNK, and the mutant moves
+/// the tagged write to TRUNK.
+#[test]
+#[ignore = "sets the process-global FW2 switch: run alone with --test-threads=1 --include-ignored"]
+fn fw2_begins_are_counted_by_origin() {
+    let (fw1, fw2, fw3) = (walpin::fw1(), walpin::fw2(), walpin::fw3());
+    walpin::set_fixes(true, true, false);
+    let (_dir, db) = open_db();
+    db.walpin_open_wal2().unwrap();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    trunk.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+    let begins = |f: &dyn Fn()| -> [u64; 4] {
+        let c0 = walpin::counters().fw2_begins;
+        f();
+        let c1 = walpin::counters().fw2_begins;
+        std::array::from_fn(|i| c1[i] - c0[i])
+    };
+    let tagged = begins(&|| {
+        walpin::with_writer_tag(|| trunk.execute("UPDATE t SET v = 'w' WHERE id = 1")).unwrap();
+    });
+    let untagged = begins(&|| {
+        trunk.execute("UPDATE t SET v = 'u' WHERE id = 1").unwrap();
+    });
+    origin::mutant::set_untagged(true);
+    let mutant = begins(&|| {
+        walpin::with_writer_tag(|| trunk.execute("UPDATE t SET v = 'm' WHERE id = 1")).unwrap();
+    });
+    origin::mutant::set_untagged(false);
+    drop(trunk);
+    walpin::set_fixes(fw1, fw2, fw3);
+    let (t, w) = (usize::from(origin::TRUNK), usize::from(origin::WRITER));
+    assert!(tagged[w] >= 1 && tagged.iter().sum::<u64>() == tagged[w], "tagged: {tagged:?}");
+    assert!(untagged[t] >= 1 && untagged.iter().sum::<u64>() == untagged[t], "untagged: {untagged:?}");
+    assert!(mutant[t] >= 1 && mutant[w] == 0, "mutant: {mutant:?}");
+}
+
+/// (m) r11-walpin-conc amendment 33f (F9): `walpin_stats` reports FW2's open readers by class and by origin, and
+/// reading it changes nothing: two reads agree, no process counter moves, and the reader's end empties both.
+#[test]
+#[ignore = "sets the process-global FW2 switch: run alone with --test-threads=1 --include-ignored"]
+fn fw2_reader_stats_report_open_readers_and_change_nothing() {
+    let (fw1, fw2, fw3) = (walpin::fw1(), walpin::fw2(), walpin::fw3());
+    walpin::set_fixes(true, true, false);
+    let (_dir, db) = open_db();
+    db.walpin_open_wal2().unwrap();
+    let trunk = db.connect().unwrap();
+    trunk
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    trunk.execute("INSERT INTO t VALUES (1, 'seed')").unwrap();
+    trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let reader = db.connect().unwrap();
+    let pager = reader.pager.load().clone();
+    let idle = db.walpin_stats();
+    origin::with(origin::FORK, || pager.begin_read_tx()).unwrap();
+    let c0 = walpin::counters();
+    let open = db.walpin_stats();
+    let again = db.walpin_stats();
+    let c1 = walpin::counters();
+    pager.end_read_tx();
+    let closed = db.walpin_stats();
+    drop(pager);
+    drop(reader);
+    drop(trunk);
+    walpin::set_fixes(fw1, fw2, fw3);
+    assert_eq!(idle.wal2_readers, [0; 4], "{idle:?}");
+    assert_eq!(open.wal2_readers.iter().sum::<u32>(), 1, "{open:?}");
+    assert_eq!(
+        open.wal2_origin_readers[usize::from(origin::FORK)],
+        open.wal2_readers,
+        "the one reader is FORK's: {open:?}"
+    );
+    assert_eq!(open.wal2_origin_readers.iter().flatten().sum::<u32>(), 1, "{open:?}");
+    assert_eq!(open, again, "a second read sees the same state");
+    assert_eq!(c0, c1, "reading the stats moved no counter");
+    assert_eq!(
+        (closed.wal2_readers, closed.wal2_origin_readers),
+        ([0; 4], [[0; 4]; 4]),
+        "{closed:?}"
+    );
+}
