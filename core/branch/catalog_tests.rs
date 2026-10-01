@@ -1105,20 +1105,29 @@ fn the_fw_knobs_reproduce_the_store_before_the_fixes() {
         assert_eq!(listed.len(), ids.len(), "call {call}");
         let catalog_rows = s1.ids_catalog_rows - s0.ids_catalog_rows;
         if fw1_off {
-            // Every call reads every unreleased row the store does not hold resident.
-            let non_resident = ids.len() as u64 - s0.resident_states;
-            assert_eq!(catalog_rows, non_resident, "fw1 off, call {call}: {s1:?}");
+            // Every call reads every unreleased row of the catalog, resident or not: the base's own
+            // count (78e9a77ab store.rs:1722-1723; PREREG amendment 8 restates A2.F12's wording).
+            assert_eq!(catalog_rows, ids.len() as u64, "fw1 off, call {call}: {s1:?}");
         } else {
             assert_eq!(catalog_rows, 0, "fw1 on, call {call}: {s1:?}");
         }
+    }
+    // Writes since the last checkpoint put three branches in F-W2's holder set, so the checkpoint
+    // below has holders to visit (review wf_5c230f31 H1: without them the I2 identity held vacuously).
+    let written: Vec<BranchId> = ids.iter().step_by(40).copied().collect();
+    assert_eq!(written.len(), 3);
+    for &id in &written {
+        let b = db.branch(id).unwrap();
+        b.connect().unwrap().execute("UPDATE t SET v = 'holder' WHERE id = 7").unwrap();
+        let _ = b.into_id();
     }
     let s0 = db.branch_cat_shape();
     db.branch_compact_now().unwrap();
     let s1 = db.branch_cat_shape();
     let walked = s1.ckpt_states_walked - s0.ckpt_states_walked;
     if fw2_off {
-        assert_eq!(walked, s0.resident_states, "fw2 off: every resident state walked: {s1:?}");
+        assert_eq!(walked, s0.resident_states, "fw2 off: every resident state walked, once: {s1:?}");
     } else {
-        assert_eq!(walked, 0, "fw2 on: no branch reserved a slot: {s1:?}");
+        assert_eq!(walked, written.len() as u64, "fw2 on: the holders written since the last checkpoint: {s1:?}");
     }
 }
