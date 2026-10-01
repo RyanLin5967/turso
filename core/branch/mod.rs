@@ -54,6 +54,7 @@
 
 pub(crate) mod arena;
 pub(crate) mod page_map;
+pub(crate) mod small;
 pub(crate) mod store;
 pub(crate) mod table;
 

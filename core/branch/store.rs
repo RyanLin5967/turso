@@ -120,6 +120,7 @@ use std::ops::Bound;
 
 use super::arena::{Arena, Slot};
 use super::page_map::PageMap;
+use super::small::{SmallMap, SmallSet};
 use super::table::BranchTable;
 use super::{BranchId, BranchResident, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
@@ -193,9 +194,11 @@ struct BranchState {
     lineage: Lineage,
     /// The branch's current version of every page it has written, or read through a spliced-out
     /// ancestor (see "Splicing a zombie out").
-    current: HashMap<u32, Owned>,
+    ///
+    /// Inline in the state up to `INLINE_PAGES` pages (F9-F, see [`super::small`]).
+    current: SmallMap<u32, Owned, INLINE_PAGES>,
     /// `current` as `(born, page)`, so the versions born after a given epoch are a range.
-    current_by_born: BTreeSet<(u64, u32)>,
+    current_by_born: SmallSet<(u64, u32), INLINE_PAGES>,
     /// The branch's committed schema. Shared with the parent at fork (an `Arc` clone), replaced by
     /// a committed DDL on the branch.
     schema: Arc<Schema>,
@@ -221,7 +224,11 @@ struct BranchState {
     view: Option<PageMap>,
 }
 
-#[derive(Clone, Copy)]
+/// Pages a branch's `current` maps hold inline before they spill to the heap (F9-F). Most
+/// branches write one or two pages; each inline page costs 40 bytes of the state.
+const INLINE_PAGES: usize = 2;
+
+#[derive(Clone, Copy, Default)]
 struct Owned {
     slot: Slot,
     born: u64,
@@ -1116,8 +1123,8 @@ impl BranchState {
                 epoch: fork_epoch + 1,
                 ..Lineage::default()
             },
-            current: HashMap::new(),
-            current_by_born: BTreeSet::new(),
+            current: SmallMap::default(),
+            current_by_born: SmallSet::default(),
             schema,
             handle: true,
             open: false,
