@@ -793,6 +793,11 @@ impl Journal {
         self.generation
     }
 
+    /// Bytes of the log holding whole records, header included (githost-shape instrument).
+    pub(crate) fn log_len(&self) -> u64 {
+        self.len
+    }
+
     /// The log's logical end: the bytes in the file plus those still buffered. A fuzzy checkpoint
     /// captures the state as of this position (r11-restart-r2, F-FZ); it is a frame boundary.
     pub(crate) fn mark(&self) -> u64 {

@@ -162,6 +162,7 @@ use std::time::{Duration, Instant};
 use super::arena::{Arena, Slot};
 use super::catalog::{CatBranch, Catalog, Meta};
 use super::prewarm::{self, Prewarm, PrewarmStats, Targets};
+use super::id_set::{IdSet, IdSetWork};
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::page_map::PageMap;
 use super::{
@@ -270,6 +271,52 @@ struct StoreInner {
     /// F-EXP: the last expiry pass stopped at its bound with more due (in memory, or in the
     /// catalog sweep): `expire_now` runs another.
     expire_more: bool,
+    /// githost-shape lane instrument (observing only): see [`super::BranchCatShape`].
+    shape: ShapeCounters,
+    /// F-W2 (githost-shape lane): every branch that reserved a slot (`first_write_branch`, the one
+    /// place a `pending` entry is made) since the last catalog checkpoint pruned this set; a superset
+    /// of the branches that hold a reserved slot now. The checkpoint collects reserved slots from
+    /// these alone instead of walking every resident state (a dirty list, as ARIES's dirty page
+    /// table is for pages).
+    pending_holders: HashSet<BranchId>,
+    /// F-W3 (githost-shape lane): the most branch states a catalog store keeps resident after a
+    /// checkpoint. `None` keeps every state it has touched since the open (the catalog as published).
+    resident_cap: Option<usize>,
+    /// F-W1 (githost-shape lane; F-cat-snap, r11-diff-list 8c0945ebb / 421e2e125, as r2 ported it in
+    /// 8618d2e46): every unreleased branch id, as a persistent set a listing clones in O(1) under the
+    /// mutex and walks after releasing it. Built by the first listing of a process (`None` until
+    /// then, so an open reads nothing for it), and kept current from then on by every fork and every
+    /// release.
+    live_ids: Option<IdSet>,
+}
+
+/// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
+/// trie, and is refused rather than truncated (githost-shape r2, 8618d2e46).
+fn id_key(id: BranchId) -> u32 {
+    u32::try_from(id.0)
+        .unwrap_or_else(|_| panic!("branch id {} is past the live-id set's u32 keys", id.0))
+}
+
+/// githost-shape lane instrument (observing only): the cumulative fields of
+/// [`super::BranchCatShape`]. Each is bumped under the store mutex by the call that does the work,
+/// from a length that call has in hand; nothing in the mechanism reads them.
+#[derive(Default)]
+struct ShapeCounters {
+    checkpoints: u64,
+    checkpoint_ns: u64,
+    ckpt_trunk_inserted: u64,
+    ckpt_trunk_deleted: u64,
+    ckpt_branch_rows: u64,
+    ckpt_rows_written: u64,
+    ckpt_states_walked: u64,
+    ids_calls: u64,
+    ids_resident_visited: u64,
+    ids_catalog_rows: u64,
+    ids_build_rows: u64,
+    table_grows: u64,
+    table_moved: u64,
+    evictions: u64,
+    evicted_states: u64,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -1025,6 +1072,15 @@ struct Captured {
     arena: Option<std::fs::File>,
     lease_now: u64,
     fail_after_commit: bool,
+    /// githost-shape instrument (observing only; r13-compose S-1): when the capture began, and the
+    /// rows, trunk versions inserted and trunk versions deleted it captured. Counted at the install.
+    shape_started: Instant,
+    shape_rows: u64,
+    shape_trunk_new: u64,
+    shape_trunk_gone: u64,
+    /// Catalog rows the writer connection wrote for this capture, set by the caller of
+    /// `checkpoint_write` (the writer, not `cat.catalog`, writes every checkpoint: S-1).
+    shape_rows_written: u64,
 }
 
 /// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
@@ -1117,18 +1173,25 @@ fn run_flight(
     // set: no checkpoint would start again and the read snapshot would stay pinned.
     let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut w = writer.lock();
+        let r0 = w.counters.rows_written;
         let written = checkpoint_write(&mut w, &cap, Some(&*hold));
         if written.is_err() {
             w.rollback();
         }
-        written
+        (written, w.counters.rows_written - r0)
     }))
     .unwrap_or_else(|_| {
         writer.lock().rollback();
-        Err(LimboError::InternalError(
-            "the branch catalog checkpoint's writer panicked".to_string(),
-        ))
+        (
+            Err(LimboError::InternalError(
+                "the branch catalog checkpoint's writer panicked".to_string(),
+            )),
+            0,
+        )
     });
+    let (written, rows_written) = written;
+    let mut cap = cap;
+    cap.shape_rows_written = rows_written;
     let write_ns = ns(t);
     if written.is_ok() {
         pause_at(Some(&*hold), HOLD_AFTER_COMMIT);
@@ -2188,6 +2251,8 @@ impl BranchStore {
             if let Some(st) = inner.branches.get_mut(&id) {
                 st.handle = Handle::ReleasePending;
             }
+            // F-W1: gone from the caller's point of view, so not listed (as `is_released` says).
+            inner.live_ids_remove(id);
             return Err(LimboError::InternalError(format!(
                 "branch {} was not released durably ({e}); it is kept, and comes back at the next \
                  open",
@@ -2240,27 +2305,27 @@ impl BranchStore {
     }
 
     /// Every unreleased branch. Refused on a trunk-only store, where "none" would be a lie.
+    ///
+    /// F-W1 (githost-shape lane; F-cat-snap, r11-diff-list, as r2 ported it): the live-id set is
+    /// cloned under the mutex in O(1) and walked after it is released, in id order, so a listing of
+    /// every branch holds the lock for a reference-count increment, not for a scan of the resident
+    /// states, a catalog query over every unreleased row, and a sort. The first listing of a process
+    /// builds the set once (`build_live_ids`: the same scan and query, under the mutex, counted).
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
-        let mut inner = self.inner.lock();
-        let mut ids: Vec<BranchId> = inner
-            .branches
-            .iter()
-            .filter(|(_, st)| !st.handle.is_released())
-            .map(|(&id, _)| id)
-            .collect();
-        // Catalog stores: every unreleased row, less what memory knows better (resident states
-        // are listed above; removed ones are gone).
-        let StoreInner { cat, branches, .. } = &mut *inner;
-        if let Some(cat) = cat.as_mut() {
-            for id in cat.catalog.unreleased_ids()?.into_iter().map(BranchId) {
-                if !branches.contains_key(&id) && !cat.removed.contains(&id) {
-                    ids.push(id);
-                }
+        let snapshot = {
+            let mut inner = self.inner.lock();
+            // githost-shape instrument (observing only).
+            inner.shape.ids_calls += 1;
+            if inner.live_ids.is_none() {
+                let set = inner.build_live_ids()?;
+                inner.live_ids = Some(set);
             }
-        }
-        ids.sort();
-        ids.dedup();
+            inner.live_ids.clone().expect("built above")
+        };
+        let mut ids = Vec::with_capacity(snapshot.len() as usize);
+        let mut work = IdSetWork::default();
+        snapshot.for_each(&mut work, &mut |key| ids.push(BranchId(u64::from(key))));
         Ok(ids)
     }
 
@@ -2344,7 +2409,10 @@ impl BranchStore {
         }
         inner.refill_free()?;
         let StoreInner {
-            arena, branches, ..
+            arena,
+            branches,
+            pending_holders,
+            ..
         } = &mut *inner;
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
@@ -2356,6 +2424,8 @@ impl BranchStore {
         }
         if let std::collections::hash_map::Entry::Vacant(e) = st.pending.entry(page) {
             e.insert(arena.alloc());
+            // F-W2: this branch may hold a reserved slot at the next checkpoint.
+            pending_holders.insert(id);
         }
         Ok(())
     }
@@ -2665,6 +2735,56 @@ impl BranchStore {
         self.prewarm.merged(catalog)
     }
 
+    /// F-W3 (githost-shape lane): the most branch states a catalog store keeps resident after each
+    /// checkpoint; `None` keeps every state touched since the open. It takes effect at the next
+    /// checkpoint.
+    pub(crate) fn set_resident_cap(&self, cap: Option<usize>) {
+        self.inner.lock().resident_cap = cap;
+    }
+
+    /// githost-shape instrument (observing only): see [`super::BranchCatShape`]. Runs no catalog
+    /// query, so it does not move the catalog counters it sits beside.
+    pub(crate) fn cat_shape(&self) -> super::BranchCatShape {
+        let inner = self.inner.lock();
+        let s = &inner.shape;
+        let mut shape = super::BranchCatShape {
+            checkpoints: s.checkpoints,
+            checkpoint_ns: s.checkpoint_ns,
+            ckpt_trunk_inserted: s.ckpt_trunk_inserted,
+            ckpt_trunk_deleted: s.ckpt_trunk_deleted,
+            ckpt_branch_rows: s.ckpt_branch_rows,
+            ckpt_rows_written: s.ckpt_rows_written,
+            ckpt_states_walked: s.ckpt_states_walked,
+            ids_calls: s.ids_calls,
+            ids_resident_visited: s.ids_resident_visited,
+            ids_catalog_rows: s.ids_catalog_rows,
+            ids_build_rows: s.ids_build_rows,
+            table_grows: s.table_grows,
+            table_moved: s.table_moved,
+            evictions: s.evictions,
+            evicted_states: s.evicted_states,
+            resident_states: inner.branches.len() as u64,
+            trunk_overlay_versions: inner
+                .trunk
+                .lineage
+                .retained
+                .values()
+                .map(|v| v.len() as u64)
+                .sum(),
+            log_len: inner.journal.as_ref().map_or(0, |j| j.log_len()),
+            ..Default::default()
+        };
+        if let Some(c) = inner.cat.as_ref() {
+            shape.dirty_branches = c.dirty.len() as u64;
+            shape.trunk_cache_versions = c.trunk_cache.values().map(|v| v.len() as u64).sum();
+            shape.trunk_cache_pages = c.trunk_cache.len() as u64;
+            shape.trunk_known_pages = c.trunk_known.len() as u64;
+            shape.trunk_probes = c.trunk_probes;
+            shape.trunk_rows = c.trunk_rows;
+        }
+        shape
+    }
+
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
     /// read)` since open (r11-restart lane instrument; zeros for a snapshot store).
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {
@@ -2676,6 +2796,17 @@ impl BranchStore {
                 c.catalog.counters.queries,
                 c.catalog.counters.rows_read,
             )
+        })
+    }
+
+    /// githost-shape r3 instrument (observation only): `(len, nodes, bytes)` of F-W1's live-id set as the store
+    /// holds it, or `None` before this process's first listing builds it. A walk under the store mutex,
+    /// O(nodes): called only outside measured operations.
+    pub(crate) fn live_id_census(&self) -> Option<(u64, u64, u64)> {
+        let inner = self.inner.lock();
+        inner.live_ids.as_ref().map(|set| {
+            let (nodes, bytes) = set.census();
+            (set.len(), nodes, bytes)
         })
     }
 
@@ -2923,6 +3054,112 @@ impl StoreInner {
             parked_records: 0,
             parked_applied: 0,
             expire_more: false,
+            shape: ShapeCounters::default(),
+            pending_holders: HashSet::new(),
+            resident_cap: None,
+            live_ids: None,
+        }
+    }
+
+    /// F-W1: the live-id set as the listing before it computed the list: every resident state that
+    /// is not released, and every unreleased catalog row that is neither resident (memory knows
+    /// better) nor removed since the last checkpoint. Once per process, under the mutex; its catalog
+    /// rows are counted as `ids_build_rows`, apart from a listing's.
+    fn build_live_ids(&mut self) -> Result<IdSet> {
+        let mut set = IdSet::default();
+        for (&id, st) in &self.branches {
+            if !st.handle.is_released() {
+                set.insert(id_key(id));
+            }
+        }
+        self.shape.ids_resident_visited += self.branches.len() as u64;
+        if let Some(cat) = self.cat.as_mut() {
+            let rows = cat.catalog.unreleased_ids()?;
+            self.shape.ids_build_rows += rows.len() as u64;
+            for id in rows.into_iter().map(BranchId) {
+                if !self.branches.contains_key(&id) && !cat.removed.contains(&id) {
+                    set.insert(id_key(id));
+                }
+            }
+        }
+        Ok(set)
+    }
+
+    /// F-W1: `id` is listed from now on (a fork), if the set exists.
+    fn live_ids_insert(&mut self, id: BranchId) {
+        if let Some(set) = self.live_ids.as_mut() {
+            set.insert(id_key(id));
+        }
+    }
+
+    /// F-W1: `id` is not listed from now on (a release, durable or not), if the set exists.
+    fn live_ids_remove(&mut self, id: BranchId) {
+        if let Some(set) = self.live_ids.as_mut() {
+            set.remove(id_key(id));
+        }
+    }
+
+    /// githost-shape instrument (observing only): an insert into `branches` that raised its
+    /// capacity by more than one reallocated or rehashed the table, which moved every entry it held
+    /// before the insert. (hashbrown's `capacity()` is items + growth_left, so reusing a tombstone
+    /// raises it by exactly one and moves nothing: githost-shape r2, da8d26a7d.)
+    fn note_table_growth(&mut self, len_before: usize, cap_before: usize) {
+        if self.branches.capacity() > cap_before + 1 {
+            self.shape.table_grows += 1;
+            self.shape.table_moved += len_before as u64;
+        }
+    }
+
+    /// F-W3 (githost-shape lane, PREREG G5.3): evict clean branch states while more than
+    /// `resident_cap` are resident. Called when a catalog checkpoint has committed, so the catalog
+    /// holds every state that is not dirty. A state is clean when the catalog holds all of it and
+    /// this process holds nothing of its own in it: not dirty, no parked Commit, handle Detached or
+    /// Released (an attached handle is this process's), no connection, no write transaction, no
+    /// reserved slot. What else it carries is derived and rebuilt on its next touch (its F4 page map
+    /// from its parent, its child view, its schema), and its lease deadline is in the catalog's lease
+    /// index, which `lease_floor` (just recomputed) covers. So an evicted state is exactly a state no
+    /// one has touched since the open, and `ensure` reads it back the same way (on-demand recovery,
+    /// Graefe and Sauer). Prior art: a buffer pool's eviction of clean pages (ARC, Megiddo and Modha,
+    /// FAST 2003); the victims here are in table order, random replacement, since the claim is a
+    /// bound on what stays resident, not a hit rate. The trunk-version read cache (clean copies of
+    /// catalog rows) is dropped when it holds more than the cap.
+    fn evict_clean(&mut self) {
+        let Some(cap) = self.resident_cap else {
+            return;
+        };
+        let Some(cat) = self.cat.as_mut() else {
+            return;
+        };
+        if self.branches.len() > cap {
+            let excess = self.branches.len() - cap;
+            let parked = &self.parked;
+            let victims: Vec<BranchId> = self
+                .branches
+                .iter()
+                .filter(|(id, st)| {
+                    !cat.dirty.contains_key(*id)
+                        && !parked.contains_key(*id)
+                        && matches!(st.handle, Handle::Detached | Handle::Released)
+                        && !st.open
+                        && !st.writer
+                        && st.pending.is_empty()
+                })
+                .map(|(&id, _)| id)
+                .take(excess)
+                .collect();
+            for id in &victims {
+                if let Some(st) = self.branches.remove(id) {
+                    if let Some(deadline) = st.lease {
+                        self.leases.remove(&(deadline, *id));
+                    }
+                }
+            }
+            self.shape.evictions += 1;
+            self.shape.evicted_states += victims.len() as u64;
+        }
+        let cached: usize = cat.trunk_cache.values().map(BTreeMap::len).sum();
+        if cached > cap {
+            cat.trunk_cache.clear();
         }
     }
 
@@ -3127,6 +3364,7 @@ impl StoreInner {
         if let Some(deadline) = lease {
             self.leases.insert((deadline, id));
         }
+        let (len_before, cap_before) = (self.branches.len(), self.branches.capacity());
         self.branches.insert(
             id,
             BranchState {
@@ -3149,6 +3387,7 @@ impl StoreInner {
                 view: None,
             },
         );
+        self.note_table_growth(len_before, cap_before);
     }
 
     /// Catalog stores: make the trunk's `written` epoch of `page` at least the `died` of the page's
@@ -3524,11 +3763,13 @@ impl StoreInner {
         let t = Instant::now();
         let writer = cat.writer.clone();
         let q0 = cat.catalog.counters.queries;
-        let cap = self.checkpoint_capture(fail_after_commit)?;
+        let mut cap = self.checkpoint_capture(fail_after_commit)?;
         let mut w = writer.lock();
         let w0 = w.counters.queries;
+        let r0 = w.counters.rows_written;
         let written = checkpoint_write(&mut w, &cap, None);
         let wrote = w.counters.queries - w0;
+        cap.shape_rows_written = w.counters.rows_written - r0;
         let installed = self.checkpoint_install(cap, written);
         if installed.is_ok() {
             truncate_catalog_wal(&mut w);
@@ -3557,6 +3798,8 @@ impl StoreInner {
                 "a branch catalog checkpoint needs its log, arena and catalog".to_string(),
             ));
         };
+        // githost-shape instrument (observing only).
+        let started = Instant::now();
         journal.check_live()?;
         if !self.parked.is_empty() || cat.flight {
             return Err(LimboError::InternalError(
@@ -3590,12 +3833,22 @@ impl StoreInner {
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
         let trunk_gone: Vec<(u32, u64)> = cat.trunk_gone.iter().copied().collect();
+        // githost-shape instrument (observing only): the walk below visits the pending holders.
+        let (n_rows, n_trunk_new, n_trunk_gone) =
+            (rows.len() as u64, trunk_new.len() as u64, trunk_gone.len() as u64);
+        self.shape.ckpt_states_walked += self.pending_holders.len() as u64;
         // Slots reserved by open write transactions are named by no durable state: the catalog
         // lists them free (a crash frees them), and this process keeps them as taken.
+        // F-W2: only a branch that reserved a slot since the last prune can hold one, so the walk
+        // visits those alone; the ones holding none any more (committed, rolled back, closed,
+        // collected) leave the set here.
+        let branches = &self.branches;
+        self.pending_holders
+            .retain(|id| branches.get(id).is_some_and(|st| !st.pending.is_empty()));
         let reserved: Vec<Slot> = self
-            .branches
-            .values()
-            .flat_map(|st| st.pending.values().copied())
+            .pending_holders
+            .iter()
+            .flat_map(|id| branches[id].pending.values().copied())
             .collect();
         // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
         if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
@@ -3669,6 +3922,11 @@ impl StoreInner {
             arena: arena_file,
             lease_now: now,
             fail_after_commit,
+            shape_started: started,
+            shape_rows: n_rows,
+            shape_trunk_new: n_trunk_new,
+            shape_trunk_gone: n_trunk_gone,
+            shape_rows_written: 0,
         }))
     }
 
@@ -3752,6 +4010,22 @@ impl StoreInner {
         cat.lease_floor = cat.catalog.lease_min()?;
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         self.lease.durable_at_least(cap.lease_now);
+        // githost-shape instrument (observing only; r13-compose S-1): counted from the capture,
+        // with the rows the WRITER connection wrote (`cat.catalog`, the reader, writes none).
+        // `checkpoint_ns` spans capture to install, the writer's thread included on the fuzzy path.
+        self.shape.checkpoint_ns +=
+            u64::try_from(cap.shape_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.shape.checkpoints += 1;
+        self.shape.ckpt_trunk_inserted += cap.shape_trunk_new;
+        self.shape.ckpt_trunk_deleted += cap.shape_trunk_gone;
+        self.shape.ckpt_branch_rows += cap.shape_rows;
+        self.shape.ckpt_rows_written += cap.shape_rows_written;
+        // F-W3: the catalog now holds every state that is not dirty. A state changed since the
+        // capture is dirty again, so `evict_clean` keeps it (r13-compose S-2b). Only after the log
+        // was cut: a failed rewrite leaves the old log, whose replay is correct, and nothing evicted.
+        if rewritten.is_ok() {
+            self.evict_clean();
+        }
         rewritten
     }
 
@@ -3827,6 +4101,7 @@ impl StoreInner {
         };
         self.children.insert(parent, f, child);
         self.next_id = self.next_id.max(child.0 + 1);
+        let (len_before, cap_before) = (self.branches.len(), self.branches.capacity());
         self.branches.insert(
             child,
             BranchState {
@@ -3845,6 +4120,9 @@ impl StoreInner {
                 view: None,
             },
         );
+        self.note_table_growth(len_before, cap_before);
+        // F-W1: a new branch is listed (no fork is ever of a released branch).
+        self.live_ids_insert(child);
         self.n_states += 1;
         self.mark_dirty(parent, DIRTY_ROW);
         self.mark_dirty(child, DIRTY_NEW);
@@ -3923,6 +4201,8 @@ impl StoreInner {
                 self.leases.remove(&(deadline, id));
             }
         }
+        // F-W1: a released branch is not listed.
+        self.live_ids_remove(id);
         self.mark_dirty(id, DIRTY_ROW);
         self.collect(id, freed)
     }
@@ -4533,27 +4813,44 @@ mod sota_helpers {
         generation.to_le_bytes().repeat(PAGE / 8)
     }
 
-    /// The store modes the lane tests run in (a12-durable-open lane: catalog mode added).
+    /// The store modes the lane tests run in (a12-durable-open lane: catalog mode added;
+    /// githost-shape lane: catalog mode with a resident cap of 0, so every checkpoint evicts every
+    /// clean state (F-W3) and the tests' reads after it go through `ensure`'s reload).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) enum Mode {
         Volatile,
         Durable,
         Catalog,
+        CatalogEvict,
     }
 
-    pub(super) const MODES: [Mode; 3] = [Mode::Volatile, Mode::Durable, Mode::Catalog];
+    pub(super) const MODES: [Mode; 4] = [Mode::Volatile, Mode::Durable, Mode::Catalog, Mode::CatalogEvict];
 
     impl Mode {
         fn durability(self) -> BranchDurability {
             match self {
                 Mode::Volatile => BranchDurability::Volatile,
                 Mode::Durable => BranchDurability::Durable { sync: false },
-                Mode::Catalog => BranchDurability::Catalog { sync: false },
+                Mode::Catalog | Mode::CatalogEvict => BranchDurability::Catalog { sync: false },
             }
         }
 
         pub(super) fn durable(self) -> bool {
             self != Mode::Volatile
+        }
+
+        /// A catalog store, evicting or not.
+        pub(super) fn catalog(self) -> bool {
+            matches!(self, Mode::Catalog | Mode::CatalogEvict)
+        }
+
+        /// Open a store of this mode at `path` (F-W3's cap applied for `CatalogEvict`).
+        fn open_at(self, path: &str) -> BranchStore {
+            let store = BranchStore::open(self.durability(), None, path).unwrap();
+            if self == Mode::CatalogEvict {
+                store.set_resident_cap(Some(0));
+            }
+            store
         }
     }
 
@@ -4564,7 +4861,7 @@ mod sota_helpers {
         } else {
             ":memory:".to_string()
         };
-        BranchStore::open(mode.durability(), None, &path).unwrap()
+        mode.open_at(&path)
     }
 
     /// Copy every branch file of the store at `dir/name` to `dir/<image>` while it is open, and
@@ -4586,7 +4883,7 @@ mod sota_helpers {
                 std::fs::copy(&src, &dst).unwrap();
             }
         }
-        BranchStore::open(mode.durability(), None, to_str(&dir.join(image))).unwrap()
+        mode.open_at(to_str(&dir.join(image)))
     }
 
     fn to_str(p: &std::path::Path) -> &str {
@@ -4731,7 +5028,7 @@ mod sota_index_tests {
                     // place, in doubling batches (at most 4x the smaller range plus 64) or one range
                     // whose entries are garbage or reaped since the checkpoint: so at most the
                     // contract, plus max(64, 8 (contract + 1)), plus the versions reaped since.
-                    if mode == Mode::Catalog {
+                    if mode.catalog() {
                         let bound = contract + (8 * (contract + 1)).max(64) + store.trunk_gone_len();
                         assert!(
                             visited <= bound,
@@ -5018,7 +5315,7 @@ mod sota_tree_tests {
     /// empty, so no recovery leaked a slot or freed one twice.
     #[test]
     fn every_branch_reads_as_the_model_says_after_a_kill_at_any_failpoint() {
-        for mode in [Mode::Durable, Mode::Catalog] {
+        for mode in [Mode::Durable, Mode::Catalog, Mode::CatalogEvict] {
             for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
                 run_killed(seed, mode);
             }

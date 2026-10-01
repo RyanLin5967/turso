@@ -123,6 +123,10 @@ pub(crate) mod catalog;
 #[doc(hidden)]
 pub use catalog::catalog_only_fixture;
 pub use catalog::CatalogProbe;
+pub(crate) mod id_set;
+
+#[doc(hidden)]
+pub use id_set::id_set_census;
 pub(crate) mod journal;
 pub(crate) mod page_map;
 pub(crate) mod prewarm;
@@ -372,6 +376,57 @@ pub struct BranchOpenStats {
     /// of the tail, a release or the expiry pass touched the branch).
     pub parked_records: u64,
     pub parked_applied: u64,
+}
+
+/// githost-shape lane instrument (observing only; r3, on a12-durable-open's C-P + C-R): the catalog
+/// store's checkpoint work, what it keeps resident, and what a listing does while it holds the store
+/// mutex. Cumulative fields count since the open; the rest are the state now. Taking it runs no
+/// catalog query, so it moves none of the catalog counters it sits beside.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchCatShape {
+    /// Catalog checkpoints run, and the nanoseconds inside them (settling parked commits excluded).
+    pub checkpoints: u64,
+    pub checkpoint_ns: u64,
+    /// Trunk version rows the checkpoints inserted (versions retained since the previous one) and
+    /// deleted (catalog versions reaped since).
+    pub ckpt_trunk_inserted: u64,
+    pub ckpt_trunk_deleted: u64,
+    /// Branch states the checkpoints wrote, and catalog rows written by them in all.
+    pub ckpt_branch_rows: u64,
+    pub ckpt_rows_written: u64,
+    /// Branch states the checkpoints visited to collect the slots open write transactions reserve.
+    pub ckpt_states_walked: u64,
+    /// Listings (`ids`): calls, resident states visited and catalog rows read while holding the
+    /// store mutex, and catalog rows read to build a live-id set (0 unless a fix builds one).
+    pub ids_calls: u64,
+    pub ids_resident_visited: u64,
+    pub ids_catalog_rows: u64,
+    pub ids_build_rows: u64,
+    /// Resident-table growths (a capacity jump of more than one at an insert) and the entries the
+    /// table held when each happened, which that growth moved.
+    pub table_grows: u64,
+    pub table_moved: u64,
+    /// Checkpoints that evicted clean resident states, and the states evicted (0 unless a fix
+    /// evicts).
+    pub evictions: u64,
+    pub evicted_states: u64,
+    /// Branch states resident now, and dirty now.
+    pub resident_states: u64,
+    pub dirty_branches: u64,
+    /// Trunk versions in memory that the catalog does not hold yet (retained since the last
+    /// checkpoint); catalog trunk versions cached in memory, and the pages they are on; trunk pages
+    /// whose `written` epoch this process has read.
+    pub trunk_overlay_versions: u64,
+    pub trunk_cache_versions: u64,
+    pub trunk_cache_pages: u64,
+    pub trunk_known_pages: u64,
+    /// The log's whole-record length.
+    pub log_len: u64,
+    /// C-P's trunk-version probes and range reads since open, and the version rows they returned
+    /// (cumulative; the open's own share is also in `BranchOpenStats`).
+    pub trunk_probes: u64,
+    pub trunk_rows: u64,
 }
 
 /// A snapshot of the branch arena's accounting.
@@ -626,6 +681,20 @@ impl Database {
         )
     }
 
+    /// The catalog store's checkpoint work, resident state and listing work (githost-shape
+    /// instrument; runs no catalog query).
+    #[doc(hidden)]
+    pub fn branch_cat_shape(&self) -> BranchCatShape {
+        self.branches.cat_shape()
+    }
+
+    /// Catalog stores: keep at most `cap` branch states resident after each checkpoint, evicting
+    /// clean ones (githost-shape lane F-W3); `None` keeps every state touched since the open.
+    #[doc(hidden)]
+    pub fn branch_set_resident_cap(&self, cap: Option<usize>) {
+        self.branches.set_resident_cap(cap)
+    }
+
     /// Catalog statements that wrote a row since open; 0 for a store that is not a catalog store.
     #[doc(hidden)]
     pub fn branch_catalog_rows_written(&self) -> u64 {
@@ -636,6 +705,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_read_counters(&self) -> (u64, u64) {
         self.branches.read_counters()
+    }
+
+    /// `(len, nodes, bytes)` of F-W1's live-id set as the store holds it, `None` before the first listing of
+    /// this process (githost-shape r3 instrument; a walk, O(nodes)).
+    #[doc(hidden)]
+    pub fn branch_live_id_census(&self) -> Option<(u64, u64, u64)> {
+        self.branches.live_id_census()
     }
 
     /// Trunk pre-images the store holds now (r11-restart lane instrument).

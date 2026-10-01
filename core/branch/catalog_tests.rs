@@ -779,3 +779,254 @@ fn catalog_prewarm_reads_what_its_mode_names() {
         assert!(got == want, "a branch loads differently after the {mode:?} prewarm");
     }
 }
+
+/// F-W2 (githost-shape lane, PREREG G5.3): a checkpoint collects the slots open write transactions
+/// reserved from the branches that reserved one since the last checkpoint, not by walking every
+/// resident state; and a slot reserved across the checkpoint stays the transaction's: no other
+/// write is handed it, and the commit that follows publishes it. On the store before F-W2 the walk
+/// visits every resident state (here the 300 grown branches), so the count assertion fails.
+#[test]
+fn a_checkpoint_walks_only_the_branches_that_reserved_a_slot() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let ids = grow(&db, 300);
+    db.branch_compact_now().unwrap();
+    // One write transaction open across the next checkpoint: its page copy holds a reserved slot.
+    let writer = db.branch(ids[7]).unwrap();
+    let conn = writer.connect().unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE t SET v = 'across' WHERE id = 5").unwrap();
+    let before = db.branch_cat_shape();
+    db.branch_compact_now().unwrap();
+    let after = db.branch_cat_shape();
+    assert_eq!(after.checkpoints - before.checkpoints, 1, "one checkpoint: {after:?}");
+    assert!(after.resident_states >= 300, "the grown branches are resident: {after:?}");
+    assert_eq!(
+        after.ckpt_states_walked - before.ckpt_states_walked,
+        1,
+        "the checkpoint walked more than the one branch holding a reserved slot, with {} resident",
+        after.resident_states
+    );
+    // Work after the checkpoint allocates slots; none may be the writer's reserved one.
+    let other = trunk.fork_branch().unwrap();
+    other.connect().unwrap().execute("UPDATE t SET v = 'other' WHERE id = 5").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(value(&conn, 5), "across");
+    assert_eq!(value(&other.connect().unwrap(), 5), "other");
+    drop(conn);
+    let (wid, oid) = (writer.into_id(), other.into_id());
+    let in_use = db.branch_stats().unwrap().arena_slots_in_use;
+    db.branch_compact_now().unwrap();
+    drop(trunk);
+    drop(db);
+    let db = open_at(&path, catalog()).unwrap();
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, in_use, "the slot count moved across a reopen");
+    let w = db.branch(wid).unwrap();
+    assert_eq!(value(&w.connect().unwrap(), 5), "across");
+    let _ = w.into_id();
+    let o = db.branch(oid).unwrap();
+    assert_eq!(value(&o.connect().unwrap(), 5), "other");
+    let _ = o.into_id();
+}
+
+/// F-W3 (githost-shape lane, PREREG G5.3): with a resident cap, a checkpoint evicts clean branch
+/// states until at most the cap stay resident; a state this process holds something of (an attached
+/// handle with a connection) stays. Every evicted branch then reads back exactly (its own row, and a
+/// trunk row the trunk rewrote after its fork, as of its fork), takes a write, and is reaped, as a
+/// branch no one had touched since the open would; after a reopen the listing, the rows and the slot
+/// count are what the store held. On the store before F-W3 nothing is evicted, so the residency
+/// assertion fails.
+#[test]
+fn a_checkpoint_evicts_clean_states_above_the_cap_and_they_read_back() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    db.branch_set_resident_cap(Some(16));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let ids = grow(&db, 300);
+    // After every fork: each branch must still read row 400 as it was when it forked.
+    trunk.execute("UPDATE t SET v = 'moved' WHERE id = 400").unwrap();
+    let old_400 = format!("trunk-0400-{}", "x".repeat(80));
+    // One branch stays attached, with a connection: it may not be evicted.
+    let pinned = db.branch(ids[3]).unwrap();
+    let pinned_conn = pinned.connect().unwrap();
+    db.branch_compact_now().unwrap();
+    let s = db.branch_cat_shape();
+    assert!(s.resident_states <= 16, "resident after the checkpoint: {s:?}");
+    assert!(s.evicted_states >= 300 - 16, "evicted: {s:?}");
+    assert_eq!(value(&pinned_conn, 4), format!("b{}", ids[3].0));
+    assert_eq!(value(&pinned_conn, 400), old_400);
+    // Every other branch reads back as before; one in three takes a write.
+    for (i, &id) in ids.iter().enumerate() {
+        if i == 3 {
+            continue;
+        }
+        let b = db.branch(id).unwrap();
+        let conn = b.connect().unwrap();
+        let row = 1 + (i % 400) as i64;
+        assert_eq!(value(&conn, row), format!("b{}", id.0), "branch {} after eviction", id.0);
+        assert_eq!(value(&conn, 400), old_400, "branch {}: trunk row 400 as of its fork", id.0);
+        if i % 3 == 0 {
+            conn.execute(format!("UPDATE t SET v = 'w{}' WHERE id = {row}", id.0)).unwrap();
+        }
+        drop(conn);
+        let _ = b.into_id();
+    }
+    // Evicted again by this checkpoint, then one in five is reaped from the catalog.
+    db.branch_compact_now().unwrap();
+    assert!(db.branch_cat_shape().resident_states <= 16, "resident after the second checkpoint");
+    let mut live = vec![(3usize, ids[3])];
+    for (i, &id) in ids.iter().enumerate() {
+        if i == 3 {
+            continue;
+        }
+        if i % 5 == 0 {
+            let r = db.branch(id).unwrap().reap().unwrap();
+            assert!(!r.deferred, "branch {} has no child", id.0);
+        } else {
+            live.push((i, id));
+        }
+    }
+    drop(pinned_conn);
+    let _ = pinned.into_id();
+    let in_use = db.branch_stats().unwrap().arena_slots_in_use;
+    db.branch_compact_now().unwrap();
+    drop(trunk);
+    drop(db);
+    let db = open_at(&path, catalog()).unwrap();
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use, in_use, "the slot count moved across a reopen");
+    let mut listed: Vec<u64> = db.branch_ids().unwrap().iter().map(|b| b.0).collect();
+    listed.sort_unstable();
+    let mut want: Vec<u64> = live.iter().map(|&(_, id)| id.0).collect();
+    want.sort_unstable();
+    assert_eq!(listed, want, "the listing after a reopen");
+    for &(i, id) in &live {
+        let b = db.branch(id).unwrap();
+        let conn = b.connect().unwrap();
+        let row = 1 + (i % 400) as i64;
+        let own = if i % 3 == 0 && i != 3 { format!("w{}", id.0) } else { format!("b{}", id.0) };
+        assert_eq!(value(&conn, row), own, "branch {} after the reopen", id.0);
+        assert_eq!(value(&conn, 400), old_400, "branch {}: trunk row 400 after the reopen", id.0);
+        drop(conn);
+        let _ = b.into_id();
+    }
+}
+
+/// F-W1 (githost-shape lane, PREREG G5.3): a listing after the first of a process reads no catalog row
+/// and visits no resident state while it holds the store mutex, and still lists exactly the live
+/// branches through forks, reaps of branches resident and not, and checkpoints that evict. The first
+/// listing builds the live-id set from the catalog once (counted as `ids_build_rows`). On the store
+/// before F-W1 every listing reads every unreleased catalog row under the mutex, so the first
+/// assertion on a later listing fails.
+#[test]
+fn a_listing_after_the_first_reads_nothing_under_the_mutex() {
+    use std::collections::BTreeSet;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let ids;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        ids = grow(&db, 200);
+        db.branch_compact_now().unwrap();
+    }
+    let db = open_at(&path, catalog()).unwrap();
+    let listed = |db: &Arc<Database>| -> BTreeSet<u64> { db.branch_ids().unwrap().iter().map(|b| b.0).collect() };
+    let mut want: BTreeSet<u64> = ids.iter().map(|b| b.0).collect();
+    let s0 = db.branch_cat_shape();
+    assert_eq!(listed(&db), want, "the first listing after a reopen");
+    let s1 = db.branch_cat_shape();
+    // After the first listing: forks, reaps (the reaped are read back from the catalog first), and
+    // a checkpoint that evicts all but four states.
+    let trunk = db.connect().unwrap();
+    for _ in 0..5 {
+        let b = trunk.fork_branch().unwrap();
+        want.insert(b.id().0);
+        let _ = b.into_id();
+    }
+    for &id in ids.iter().step_by(7) {
+        let r = db.branch(id).unwrap().reap().unwrap();
+        assert!(!r.deferred);
+        want.remove(&id.0);
+    }
+    db.branch_set_resident_cap(Some(4));
+    db.branch_compact_now().unwrap();
+    for &id in ids.iter().skip(3).step_by(11) {
+        if want.remove(&id.0) {
+            db.branch(id).unwrap().reap().unwrap();
+        }
+    }
+    let s2 = db.branch_cat_shape();
+    for _ in 0..3 {
+        assert_eq!(listed(&db), want, "a later listing");
+    }
+    let s3 = db.branch_cat_shape();
+    assert_eq!(s3.ids_calls - s2.ids_calls, 3);
+    assert_eq!(s3.ids_catalog_rows - s2.ids_catalog_rows, 0, "a later listing read catalog rows: {s3:?}");
+    assert_eq!(
+        s3.ids_resident_visited - s2.ids_resident_visited,
+        0,
+        "a later listing walked the resident states: {s3:?}"
+    );
+    assert_eq!(s1.ids_build_rows - s0.ids_build_rows, 200, "the set is built from the catalog once: {s1:?}");
+    assert_eq!(s3.ids_build_rows, s1.ids_build_rows, "the set was built again: {s3:?}");
+    // A reopen builds it again, from what the checkpoint and the log hold.
+    drop(trunk);
+    drop(db);
+    let db = open_at(&path, catalog()).unwrap();
+    assert_eq!(listed(&db), want, "the first listing after the second reopen");
+}
+
+/// r13-compose S-2b + S-1 (PREREG r13-compose §1 step 2): F-W3's eviction inside a FUZZY install
+/// takes only states clean at that install. A state written between the capture and the install is
+/// dirty again (the capture swapped the dirty map out), so with a cap of 0 it alone stays resident,
+/// and it reads back after a reopen. Also S-1's fire-check: the checkpoint counters count the rows
+/// the WRITER connection wrote (on the sharp and the fuzzy path), never 0 for a checkpoint with rows.
+#[test]
+fn a_fuzzy_checkpoint_evicts_only_states_clean_at_its_install() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let mut model;
+    {
+        let db = open_at(&path, catalog()).unwrap();
+        seed(&db.connect().unwrap());
+        model = grown(&db, 60);
+        db.branch_set_resident_cap(Some(0));
+        let s0 = db.branch_cat_shape();
+        db.branch_compact_now().unwrap();
+        let s1 = db.branch_cat_shape();
+        assert!(s1.ckpt_rows_written > s0.ckpt_rows_written, "sharp: no rows counted: {s1:?}");
+        assert_eq!(s1.resident_states, 0, "cap 0 after a sharp checkpoint: {s1:?}");
+        let mut ids: Vec<BranchId> = model.keys().copied().collect();
+        ids.sort();
+        // Dirty before the capture: captured, clean at the install.
+        for &id in ids.iter().step_by(4) {
+            let v = format!("c{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+        }
+        db.branch_checkpoint_hold(store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no fuzzy checkpoint started");
+        wait_held(&db, store::HOLD_BEFORE_COMMIT);
+        // Dirty after the capture: dirty again at the install, so never evicted by it.
+        let late: Vec<BranchId> = ids.iter().skip(1).step_by(4).copied().collect();
+        for &id in &late {
+            let v = format!("d{}", id.0);
+            write(&db, id, model[&id].0, &v);
+            model.get_mut(&id).unwrap().1 = v;
+        }
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        let s2 = db.branch_cat_shape();
+        assert!(s2.ckpt_rows_written > s1.ckpt_rows_written, "fuzzy: no rows counted: {s2:?}");
+        assert_eq!(s2.dirty_branches, late.len() as u64, "dirty after the install: {s2:?}");
+        assert_eq!(s2.resident_states, late.len() as u64, "resident after the install: {s2:?}");
+        check(&db, &model);
+    }
+    let db = open_at(&path, catalog()).unwrap();
+    check(&db, &model);
+}
