@@ -1987,6 +1987,18 @@ impl BranchStore {
         w
     }
 
+    /// r13-compose I13 (A4.X3): a RESIDENT state's distinct pages over `current` ∪ its retained
+    /// versions (observing only). A child loaded under this state takes one inherited-map entry per
+    /// such page that has a version at its fork, so for a stack level read when its child forked,
+    /// this is the child's cold-load `derived_inserts`. `None` when the state is not resident.
+    pub(crate) fn state_pages(&self, id: BranchId) -> Option<u64> {
+        let inner = self.inner.lock();
+        let st = inner.branches.get(&id)?;
+        let mut pages: BTreeSet<u32> = st.current.keys().copied().collect();
+        pages.extend(st.lineage.retained.keys().copied());
+        Some(pages.len() as u64)
+    }
+
     /// Add to the Merger's counters.
     pub(crate) fn merge_counted(&self, f: impl FnOnce(&mut super::BranchMergeWork)) {
         f(&mut self.inner.lock().merge_work);

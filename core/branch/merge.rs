@@ -597,7 +597,7 @@ impl Merger {
         let n = prep.rows.len() as u64;
         self.store.merge_counted(|w| {
             w.mv4_keys += n;
-            w.derive_pages_read += pages;
+            w.mv4_base_reads += pages;
             if conflicts > 0 && same == conflicts {
                 w.refusals_same_change += 1;
             }

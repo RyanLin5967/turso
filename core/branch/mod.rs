@@ -417,6 +417,10 @@ pub struct BranchMergeWork {
     pub derive_keys: u64,
     /// MV4's base rows compared with the trunk now.
     pub mv4_keys: u64,
+    /// I8: pages MV4 read from the trunk NOW to compare each changed row with its base (A2.F9's
+    /// "mv4_base_reads per key <= depth"). Kept out of `derive_pages_read`, whose KNOWN bound
+    /// (A6.5) covers the derivation only.
+    pub mv4_base_reads: u64,
 }
 
 /// githost-shape lane instrument (observing only; r3, on a12-durable-open's C-P + C-R): the catalog
@@ -750,6 +754,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_merge_work(&self) -> BranchMergeWork {
         self.branches.merge_work()
+    }
+
+    /// r13-compose I13: a resident branch state's distinct pages over its current and retained
+    /// versions; `None` when the state is not resident (observing only; S1 reads it at each push).
+    #[doc(hidden)]
+    pub fn branch_state_pages(&self, id: BranchId) -> Option<u64> {
+        self.branches.state_pages(id)
     }
 
     /// The catalog store's checkpoint work, resident state and listing work (githost-shape
