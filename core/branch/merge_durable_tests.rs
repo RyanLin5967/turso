@@ -3,13 +3,15 @@
 //! `R13_MUTANT=<name>` switch that must turn it red.
 //!
 //! The derivation's oracle (A6.2) is OWNED BY THE TEST: the SQL each test committed builds model(B),
-//! and a SELECT snapshot of the trunk taken at the fork builds model(base). Neither is ever read
-//! through the branch store under test.
+//! applied by the test to model(base), and a SELECT snapshot of the trunk taken on a TRUNK connection
+//! at the fork builds model(base). Neither model is ever read through the branch under test; the
+//! store's reads of a branch are compared with model(B) as a separate assertion. Fixture premises
+//! (tree depth, freelist length) come from the test's own walk of the trunk's file.
 
 use super::merge::{MergePolicy, Merger, Refusal, Validation};
 use super::*;
 use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,8 +93,8 @@ fn snapshot(conn: &Arc<Connection>, table: &str) -> BTreeMap<i64, String> {
         .collect()
 }
 
-/// The keys whose rendered rows differ between two snapshots of one table.
-fn differing(root: i64, a: &BTreeMap<i64, String>, b: &BTreeMap<i64, String>) -> BTreeSet<(i64, i64)> {
+/// The keys whose rows differ between two snapshots (or models) of one table.
+fn differing<V: PartialEq>(root: i64, a: &BTreeMap<i64, V>, b: &BTreeMap<i64, V>) -> BTreeSet<(i64, i64)> {
     a.keys()
         .chain(b.keys())
         .filter(|k| a.get(k) != b.get(k))
@@ -140,143 +142,385 @@ fn text(n: usize, tag: u64) -> String {
     unit.repeat(n / unit.len().max(1) + 1)[..n].to_string()
 }
 
+/// A row as the tests model it: `v`, and `w` for table t (`None` for table a).
+type Row = (String, Option<i64>);
+
+/// `table`'s rows (t or a) read through `conn`, as values, not renderings.
+fn rows_of(conn: &Arc<Connection>, table: &str) -> BTreeMap<i64, Row> {
+    let sql = if table == "t" {
+        "SELECT id, v, w FROM t ORDER BY id"
+    } else {
+        "SELECT id, v FROM a ORDER BY id"
+    };
+    conn.prepare(sql)
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            let v = match &r[1] {
+                crate::Value::Text(t) => t.as_str().to_string(),
+                other => panic!("{table}: v is {other:?}"),
+            };
+            let w = (table == "t").then(|| r[2].as_int().unwrap());
+            (r[0].as_int().unwrap(), (v, w))
+        })
+        .collect()
+}
+
+/// One statement of D-T1's branch workload, and what it does to the model: A6.2's model(B) is built
+/// from the SQL the test committed, never read through B.
+#[derive(Debug, Clone)]
+enum Op {
+    SetV(i64, String),
+    Upsert(i64, String, i64),
+    DelRange(i64, i64),
+    AddW(i64),
+    Revert(i64),
+    SetA(i64, String),
+    Noop(i64),
+}
+
+impl Op {
+    fn next(rng: &mut Rng, step: u64) -> Op {
+        let id = 1 + rng.below(900) as i64;
+        match rng.below(10) {
+            0 | 1 => Op::SetV(id, format!("u{step}-{}", text(rng.below(40) as usize, step))),
+            2 => Op::Upsert(800 + rng.below(400) as i64, format!("ins{step}"), (step % 97) as i64),
+            3 => Op::DelRange(id, id + rng.below(30) as i64),
+            4 => Op::SetV(id, text(1500 + rng.below(3000) as usize, step)),
+            5 => Op::AddW(id),
+            6 => Op::Revert(id),
+            7 => Op::SetA(1 + rng.below(50) as i64, format!("b{step}")),
+            _ => Op::Noop(id),
+        }
+    }
+
+    /// The row the statement aims at (the trunk writes next to it, A6.3 (i)).
+    fn id(&self) -> i64 {
+        match self {
+            Op::SetV(id, _) | Op::Upsert(id, _, _) | Op::AddW(id) | Op::Revert(id) | Op::SetA(id, _) | Op::Noop(id) => *id,
+            Op::DelRange(lo, _) => *lo,
+        }
+    }
+
+    fn sql(&self) -> String {
+        match self {
+            Op::SetV(id, v) => format!("UPDATE t SET v = '{v}' WHERE id = {id}"),
+            Op::Upsert(id, v, w) => format!("INSERT OR REPLACE INTO t VALUES ({id}, '{v}', {w})"),
+            Op::DelRange(lo, hi) => format!("DELETE FROM t WHERE id BETWEEN {lo} AND {hi}"),
+            Op::AddW(id) => format!("UPDATE t SET w = w + 1000 WHERE id = {id}"),
+            Op::Revert(id) => format!("UPDATE t SET v = 'base-{id:05}', w = {} WHERE id = {id}", id % 97),
+            Op::SetA(id, v) => format!("UPDATE a SET v = '{v}' WHERE id = {id}"),
+            Op::Noop(id) => format!("UPDATE t SET v = v WHERE id = {id}"),
+        }
+    }
+
+    /// What the statement does to the models of t and a.
+    fn apply(&self, t: &mut BTreeMap<i64, Row>, a: &mut BTreeMap<i64, Row>) {
+        match self {
+            Op::SetV(id, v) => {
+                if let Some(r) = t.get_mut(id) {
+                    r.0 = v.clone();
+                }
+            }
+            Op::Upsert(id, v, w) => {
+                t.insert(*id, (v.clone(), Some(*w)));
+            }
+            Op::DelRange(lo, hi) => t.retain(|k, _| k < lo || k > hi),
+            Op::AddW(id) => {
+                if let Some(r) = t.get_mut(id) {
+                    r.1 = r.1.map(|w| w + 1000);
+                }
+            }
+            Op::Revert(id) => {
+                if let Some(r) = t.get_mut(id) {
+                    *r = (format!("base-{id:05}"), Some(id % 97));
+                }
+            }
+            Op::SetA(id, v) => {
+                if let Some(r) = a.get_mut(id) {
+                    r.0 = v.clone();
+                }
+            }
+            Op::Noop(_) => {}
+        }
+    }
+}
+
+/// How a D-T1 run ends: derived live, after a checkpoint and a reopen with a tail, or after a kill at
+/// a failpoint (A5.4, A6.2): the statement the failpoint stops is IN DOUBT, so the derived set must
+/// be the acknowledged model's diff or that plus the in-doubt statement, and B must read one of the
+/// two whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    Live,
+    Reopen,
+    Kill(BranchFailpoint),
+}
+
 /// D-T1 (A5.4 as amended by A6.2/A6.3): the derived write set equals the test-owned content diff,
 /// model(B) against model(base), under random workloads with splits, deletes (balances that free
 /// pages), overflow payloads, an indexed column and reverts, in two tables, with TRUNK commits after
-/// the fork on the leaves the branch owns (so a base read from the trunk now is caught), in every
-/// mode, live and after a reopen. It also asserts that the store's reads of B equal model(B).
-/// Mutants that must turn it red: r13_base_trunk_now, r13_first_root, r13_leaves_only,
-/// r13_skip_freed_base.
+/// the fork on the leaves the branch owns and a trunk revert to the fork-time value (so a base read
+/// from the trunk now is caught), in every mode, live, after a reopen, and across a kill at each
+/// failpoint a branch or trunk commit can die at. model(B) is the SQL the test committed (review
+/// wf_5c230f31 H2: it was read through B's own view); the store's reads of B are a separate assertion.
+/// Mutants that must turn it red: r13_base_trunk_now, r13_first_root, r13_skip_freed_base
+/// (r13_leaves_only is equivalent on admitted workloads, amendment 8; its red is
+/// `derive_enumerates_a_subtree_the_branch_unlinked_without_writing`).
 #[test]
 fn a_derived_write_set_equals_the_recorded_one_under_random_workloads() {
+    d_t1(open);
+}
+
+/// D-T1's body over an opener: the step-9 tree runs it again in the F7 splice arm.
+fn d_t1(open: fn(&Path, Mode) -> Arc<Database>) {
+    let ends = [
+        End::Live,
+        End::Reopen,
+        End::Kill(BranchFailpoint::CommitAfterSlotsBeforeRecord),
+        End::Kill(BranchFailpoint::LogFlushFails),
+        End::Kill(BranchFailpoint::BarrierBeforeRecords),
+    ];
     for mode in MODES {
         for seed_no in 1..=3u64 {
-            for reopen in [false, true] {
-                if reopen && !mode.durable() {
+            for end in ends {
+                if end != End::Live && !mode.durable() {
                     continue;
                 }
-                let what = format!("{mode:?} seed {seed_no} reopen {reopen}");
+                let what = format!("{mode:?} seed {seed_no} {end:?}");
                 let dir = tempfile::TempDir::new().unwrap();
                 let path = dir.path().join("m.db");
                 let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed_no);
-                let (b_id, roots, base_t, base_a, mut model_t, mut model_a);
+                let (b_id, roots, base_t, base_a);
+                let (mut ack_t, mut ack_a);
+                let mut doubt: Option<Op> = None;
                 {
                     let db = open(&path, mode);
                     let trunk = db.connect().unwrap();
                     seed(&trunk, 800);
                     roots = (root_of(&trunk, "t"), root_of(&trunk, "a"));
                     let b = trunk.fork_branch().unwrap();
-                    base_t = snapshot(&trunk, "t");
-                    base_a = snapshot(&trunk, "a");
+                    // model(base): the trunk as B forked it, read on a TRUNK connection before any
+                    // later trunk commit (A6.2).
+                    base_t = rows_of(&trunk, "t");
+                    base_a = rows_of(&trunk, "a");
+                    ack_t = base_t.clone();
+                    ack_a = base_a.clone();
                     let conn = b.connect().unwrap();
+                    let kill_at = 25 + 7 * seed_no;
+                    let mut trunk_changed: Option<i64> = None;
                     for step in 0..60u64 {
-                        let id = 1 + rng.below(900) as i64;
-                        match rng.below(10) {
-                            0 | 1 => exec(&conn, &format!("UPDATE t SET v = 'u{step}-{}' WHERE id = {id}", text(rng.below(40) as usize, step))),
-                            2 => exec(&conn, &format!("INSERT OR REPLACE INTO t VALUES ({}, 'ins{step}', {})", 800 + rng.below(400), step % 97)),
-                            3 => exec(&conn, &format!("DELETE FROM t WHERE id BETWEEN {id} AND {}", id + rng.below(30) as i64)),
-                            4 => exec(&conn, &format!("UPDATE t SET v = '{}' WHERE id = {id}", text(1500 + rng.below(3000) as usize, step))),
-                            5 => exec(&conn, &format!("UPDATE t SET w = w + 1000 WHERE id = {id}")),
-                            6 => exec(&conn, &format!("UPDATE t SET v = 'base-{id:05}', w = {} WHERE id = {id}", id % 97)),
-                            7 => exec(&conn, &format!("UPDATE a SET v = 'b{step}' WHERE id = {}", 1 + rng.below(50))),
-                            _ => exec(&conn, &format!("UPDATE t SET v = v WHERE id = {id}")),
+                        let op = Op::next(&mut rng, step);
+                        if let End::Kill(fp) = end {
+                            if step == kill_at {
+                                db.branch_failpoint(Some(fp));
+                                if fp == BranchFailpoint::BarrierBeforeRecords {
+                                    // A trunk commit dies at its barrier; B's model is unchanged.
+                                    let _ = trunk.execute("UPDATE t SET v = 'killed' WHERE id = 1");
+                                } else if conn.execute(op.sql()).is_ok() {
+                                    // Nothing to commit reached the failpoint: acknowledged.
+                                    op.apply(&mut ack_t, &mut ack_a);
+                                } else {
+                                    doubt = Some(op);
+                                }
+                                db.branch_failpoint(None);
+                                break;
+                            }
                         }
-                        // Trunk commits after the fork, on rows next to the branch's (A6.3 (i)).
+                        exec(&conn, &op.sql());
+                        op.apply(&mut ack_t, &mut ack_a);
+                        // Trunk commits after the fork, on rows next to the branch's (A6.3 (i)), and
+                        // a revert of the row the last round changed to its fork-time value.
                         if step % 7 == 0 {
-                            exec(&trunk, &format!("UPDATE t SET v = 'trunk{step}' WHERE id = {}", (id + 1).min(800)));
+                            let x = (op.id() + 1).min(800);
+                            exec(&trunk, &format!("UPDATE t SET v = 'trunk{step}' WHERE id = {x}"));
                             exec(&trunk, &format!("INSERT OR REPLACE INTO t VALUES ({}, 'tins', 1)", 2000 + step));
-                            exec(&trunk, &format!("DELETE FROM t WHERE id = {}", (id + 2).min(800)));
+                            exec(&trunk, &format!("DELETE FROM t WHERE id = {}", (op.id() + 2).min(800)));
+                            if let Some(y) = trunk_changed.take() {
+                                if let Some((v, w)) = base_t.get(&y) {
+                                    exec(&trunk, &format!("UPDATE t SET v = '{v}', w = {} WHERE id = {y}", w.unwrap()));
+                                }
+                            }
+                            trunk_changed = Some(x);
                         }
                     }
-                    model_t = snapshot(&conn, "t");
-                    model_a = snapshot(&conn, "a");
                     drop(conn);
                     b_id = b.into_id();
-                    settle(&db, mode);
-                    if !reopen {
-                        let b = db.branch(b_id).unwrap();
-                        check_derived(&db, &trunk, &b, roots, (&base_t, &base_a), (&model_t, &model_a), &what);
-                        let _ = b.into_id();
-                        continue;
+                    match end {
+                        End::Live => {
+                            settle(&db, mode);
+                            let b = db.branch(b_id).unwrap();
+                            reads_are(&b, &[(&ack_t, &ack_a)], &what);
+                            check_derived(&db, &trunk, &b, roots, (&base_t, &base_a), &[(&ack_t, &ack_a)], &what);
+                            let _ = b.into_id();
+                            continue;
+                        }
+                        End::Reopen => {
+                            // Rows both checkpointed and in the log's tail.
+                            settle(&db, mode);
+                            let op = Op::next(&mut rng, 99);
+                            let b = db.branch(b_id).unwrap();
+                            exec(&b.connect().unwrap(), &op.sql());
+                            op.apply(&mut ack_t, &mut ack_a);
+                            let _ = b.into_id();
+                        }
+                        End::Kill(_) => {}
                     }
                 }
                 let db = open(&path, mode);
                 let trunk = db.connect().unwrap();
                 let b = db.branch(b_id).unwrap();
-                // The store's reads of B after the reopen are model(B) (A6.2).
-                {
-                    let conn = b.connect().unwrap();
-                    assert_eq!(snapshot(&conn, "t"), model_t, "{what}: B reads t after the reopen");
-                    assert_eq!(snapshot(&conn, "a"), model_a, "{what}: B reads a after the reopen");
-                    model_t = snapshot(&conn, "t");
-                    model_a = snapshot(&conn, "a");
+                let (mut op_t, mut op_a) = (ack_t.clone(), ack_a.clone());
+                if let Some(op) = &doubt {
+                    op.apply(&mut op_t, &mut op_a);
                 }
+                let models: Vec<(&BTreeMap<i64, Row>, &BTreeMap<i64, Row>)> = if doubt.is_some() {
+                    vec![(&ack_t, &ack_a), (&op_t, &op_a)]
+                } else {
+                    vec![(&ack_t, &ack_a)]
+                };
+                reads_are(&b, &models, &what);
                 settle(&db, mode);
-                check_derived(&db, &trunk, &b, roots, (&base_t, &base_a), (&model_t, &model_a), &what);
+                check_derived(&db, &trunk, &b, roots, (&base_t, &base_a), &models, &what);
                 let _ = b.into_id();
             }
         }
     }
 }
 
+/// The store's reads of B equal one of the models, whole (A6.2's second assertion).
+fn reads_are(b: &Branch, models: &[(&BTreeMap<i64, Row>, &BTreeMap<i64, Row>)], what: &str) {
+    let conn = b.connect().unwrap();
+    let (t, a) = (rows_of(&conn, "t"), rows_of(&conn, "a"));
+    assert!(
+        models.iter().any(|(mt, ma)| **mt == t && **ma == a),
+        "{what}: B reads neither model ({} rows of t; first model {} rows)",
+        t.len(),
+        models[0].0.len()
+    );
+}
+
+/// The derived set equals the content diff of base against one of the models (one model unless a
+/// statement is in doubt).
 fn check_derived(
     db: &Arc<Database>,
     trunk: &Arc<Connection>,
     b: &Branch,
     roots: (i64, i64),
-    base: (&BTreeMap<i64, String>, &BTreeMap<i64, String>),
-    model: (&BTreeMap<i64, String>, &BTreeMap<i64, String>),
+    base: (&BTreeMap<i64, Row>, &BTreeMap<i64, Row>),
+    models: &[(&BTreeMap<i64, Row>, &BTreeMap<i64, Row>)],
     what: &str,
 ) {
-    let mut want = differing(roots.0, base.0, model.0);
-    want.extend(differing(roots.1, base.1, model.1));
+    let wants: Vec<BTreeSet<(i64, i64)>> = models
+        .iter()
+        .map(|(mt, ma)| {
+            let mut want = differing(roots.0, base.0, mt);
+            want.extend(differing(roots.1, base.1, ma));
+            want
+        })
+        .collect();
     let mut merger = Merger::new(trunk.clone()).unwrap();
     let got = merger.derive_only(b).unwrap();
     assert_eq!(got.scope, None, "{what}: refused");
     let got: BTreeSet<(i64, i64)> = got.keys.into_iter().collect();
-    assert_eq!(
-        got.symmetric_difference(&want).copied().collect::<Vec<_>>(),
-        Vec::<(i64, i64)>::new(),
-        "{what}: derived {} keys, the model {} ({:?})",
+    assert!(
+        wants.iter().any(|want| *want == got),
+        "{what}: derived {} keys; the model's diffs have {:?} keys; first model only {:?}, derived only {:?} ({:?})",
         got.len(),
-        want.len(),
+        wants.iter().map(BTreeSet::len).collect::<Vec<_>>(),
+        wants[0].difference(&got).take(5).collect::<Vec<_>>(),
+        got.difference(&wants[0]).take(5).collect::<Vec<_>>(),
         db.branch_merge_work()
     );
-    assert!(!want.is_empty(), "{what}: a workload that changed nothing tests nothing");
+    assert!(!wants[0].is_empty(), "{what}: a workload that changed nothing tests nothing");
+}
+
+/// Checkpoint the sharp way.
+fn sharp(db: &Arc<Database>) {
+    db.branch_compact_now().unwrap();
+}
+
+/// Checkpoint the fuzzy way (F-FZ), and wait for its install.
+fn fuzzy(db: &Arc<Database>) {
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no fuzzy flight started");
+    db.branch_checkpoint_wait();
+}
+
+/// A sharp checkpoint whose write fails before its catalog commit (A5.4's failed-write order).
+fn fail_write(db: &Arc<Database>) {
+    db.branch_failpoint(Some(BranchFailpoint::CheckpointWriteFails));
+    assert!(db.branch_compact_now().is_err(), "the checkpoint-write failpoint did not fire");
+}
+
+/// A merge of `b_id` commits and installs both of D-T2's rows.
+fn merge_installs_both(db: &Arc<Database>, trunk: &Arc<Connection>, b_id: BranchId, what: &str) {
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let out = merger.merge(db.branch(b_id).unwrap(), policy(Validation::BaseRead)).unwrap();
+    assert_eq!(out.refused, None, "{what}: {out:?}");
+    assert_eq!(out.rows_changed, 2, "{what}: {out:?}");
+    let rows = snapshot(trunk, "t");
+    assert!(rows[&10].contains("first") && rows[&250].contains("second"), "{what}");
 }
 
 /// D-T2 (A5.4): a merge after an eviction, after a reopen with rows both checkpointed and in the
-/// log's tail, and during a fuzzy checkpoint's flight (held before and after its catalog commit),
-/// installs every row the branch changed. The four adversary rounds' loss orders, end to end.
+/// log's tail, during a fuzzy checkpoint's flight (held before and after its catalog commit), and
+/// after a checkpoint whose write failed (then merged at once, after an evicting checkpoint, and
+/// after a reopen), installs every row the branch changed. The eviction and restart orders run with
+/// sharp and with fuzzy checkpoints. The four adversary rounds' loss orders, end to end.
 #[test]
 fn a_merge_after_eviction_restart_and_fuzzy_capture_installs_every_row() {
     for (mode, case) in [
         (Mode::CatalogEvict, "evict-then-update"),
+        (Mode::CatalogEvict, "evict-then-update-fuzzy"),
         (Mode::Catalog, "restart-with-tail"),
+        (Mode::Catalog, "restart-with-tail-fuzzy"),
         (Mode::Catalog, "fuzzy-before-commit"),
         (Mode::Catalog, "fuzzy-after-commit"),
+        (Mode::Catalog, "failed-write"),
+        (Mode::CatalogEvict, "failed-write-then-evict"),
+        (Mode::Catalog, "failed-write-restart"),
     ] {
-        let what = format!("{case}");
+        let what = case.to_string();
+        let ck: fn(&Arc<Database>) = if case.ends_with("-fuzzy") { fuzzy } else { sharp };
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("m.db");
-        let b_id;
-        {
-            let db = open(&path, mode);
-            let trunk = db.connect().unwrap();
-            seed(&trunk, 300);
-            let b = trunk.fork_branch().unwrap();
-            exec(&b.connect().unwrap(), "UPDATE t SET v = 'first' WHERE id = 10");
-            b_id = b.into_id();
-            db.branch_compact_now().unwrap();
-            let b = db.branch(b_id).unwrap();
-            exec(&b.connect().unwrap(), "UPDATE t SET v = 'second' WHERE id = 250");
-            let _ = b.into_id();
-            match case {
-                "evict-then-update" => db.branch_compact_now().unwrap(),
-                "restart-with-tail" => {}
-                _ => {}
+        let db = open(&path, mode);
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 300);
+        let b = trunk.fork_branch().unwrap();
+        exec(&b.connect().unwrap(), "UPDATE t SET v = 'first' WHERE id = 10");
+        let b_id = b.into_id();
+        ck(&db);
+        let b = db.branch(b_id).unwrap();
+        exec(&b.connect().unwrap(), "UPDATE t SET v = 'second' WHERE id = 250");
+        let _ = b.into_id();
+        let (db, trunk) = match case {
+            "evict-then-update" | "evict-then-update-fuzzy" => {
+                ck(&db);
+                (db, trunk)
             }
-            if case.starts_with("fuzzy") {
+            "restart-with-tail" | "restart-with-tail-fuzzy" | "failed-write-restart" => {
+                if case == "failed-write-restart" {
+                    fail_write(&db);
+                }
+                drop(trunk);
+                drop(db);
+                let db = open(&path, mode);
+                let trunk = db.connect().unwrap();
+                (db, trunk)
+            }
+            "failed-write" => {
+                fail_write(&db);
+                (db, trunk)
+            }
+            "failed-write-then-evict" => {
+                fail_write(&db);
+                sharp(&db);
+                (db, trunk)
+            }
+            _ => {
                 let stage = if case == "fuzzy-before-commit" {
                     store::HOLD_BEFORE_COMMIT
                 } else {
@@ -299,26 +543,8 @@ fn a_merge_after_eviction_restart_and_fuzzy_capture_installs_every_row() {
                 assert!(rows[&10].contains("first") && rows[&250].contains("second"), "{what}");
                 continue;
             }
-            if case == "restart-with-tail" {
-                drop(trunk);
-                drop(db);
-                let db = open(&path, mode);
-                let trunk = db.connect().unwrap();
-                let mut merger = Merger::new(trunk.clone()).unwrap();
-                let out = merger.merge(db.branch(b_id).unwrap(), policy(Validation::BaseRead)).unwrap();
-                assert_eq!(out.refused, None, "{what}: {out:?}");
-                assert_eq!(out.rows_changed, 2, "{what}: {out:?}");
-                let rows = snapshot(&trunk, "t");
-                assert!(rows[&10].contains("first") && rows[&250].contains("second"), "{what}");
-                continue;
-            }
-            let mut merger = Merger::new(trunk.clone()).unwrap();
-            let out = merger.merge(db.branch(b_id).unwrap(), policy(Validation::BaseRead)).unwrap();
-            assert_eq!(out.refused, None, "{what}: {out:?}");
-            assert_eq!(out.rows_changed, 2, "{what}: {out:?}");
-            let rows = snapshot(&trunk, "t");
-            assert!(rows[&10].contains("first") && rows[&250].contains("second"), "{what}");
-        }
+        };
+        merge_installs_both(&db, &trunk, b_id, &what);
     }
 }
 
@@ -382,46 +608,65 @@ fn the_same_change_on_both_sides_is_refused_and_counted() {
     assert_eq!(w1.refusals_same_change - w0.refusals_same_change, 1, "{w1:?}");
 }
 
-/// D-T5 and A6.4 (i): the derivation's refusals: DDL, a clear (and a DML delete of every row, which
-/// the pages cannot tell apart), and an incremental blob write on a row whose leaf the branch did
-/// not write.
-#[test]
-fn derivation_refusals_ddl_clear_delete_all_and_unowned_blob_write() {
-    for case in ["ddl", "clear", "delete-all", "blob"] {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db = open(&dir.path().join("m.db"), Mode::Catalog);
-        let trunk = db.connect().unwrap();
-        seed(&trunk, 300);
-        exec(&trunk, "CREATE TABLE big(id INTEGER PRIMARY KEY, b BLOB)");
-        exec(&trunk, "INSERT INTO big VALUES (1, zeroblob(6000))");
-        let b = trunk.fork_branch().unwrap();
-        {
-            let conn = b.connect().unwrap();
-            match case {
-                "ddl" => exec(&conn, "CREATE TABLE extra(x)"),
-                "clear" => exec(&conn, "DELETE FROM a"),
-                "delete-all" => exec(&conn, "DELETE FROM a WHERE id > 0"),
-                _ => {
-                    let mut blob = conn.blob_open("big", "b", 1, true).unwrap();
-                    blob.write(5000, b"xyz").unwrap();
-                }
+/// D-T5 and A6.4 (i): one derivation refusal, by case: DDL, a clear, a DML delete of every row (the
+/// pages cannot tell it from a clear), and an incremental blob write on a row whose leaf the branch
+/// did not write. Each is refused as Scope and counted under its own reason.
+fn derivation_refusal(case: &str) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open(&dir.path().join("m.db"), Mode::Catalog);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 300);
+    exec(&trunk, "CREATE TABLE big(id INTEGER PRIMARY KEY, b BLOB)");
+    exec(&trunk, "INSERT INTO big VALUES (1, zeroblob(6000))");
+    let b = trunk.fork_branch().unwrap();
+    {
+        let conn = b.connect().unwrap();
+        match case {
+            "ddl" => exec(&conn, "CREATE TABLE extra(x)"),
+            "clear" => exec(&conn, "DELETE FROM a"),
+            "delete-all" => exec(&conn, "DELETE FROM a WHERE id > 0"),
+            _ => {
+                let mut blob = conn.blob_open("big", "b", 1, true).unwrap();
+                blob.write(5000, b"xyz").unwrap();
             }
         }
-        let b_id = b.into_id();
-        let w0 = db.branch_merge_work();
-        let mut merger = Merger::new(trunk.clone()).unwrap();
-        let out = merger.merge(db.branch(b_id).unwrap(), policy(Validation::BaseRead)).unwrap();
-        assert_eq!(out.refused, Some(Refusal::Scope), "{case}: {out:?}");
-        let w1 = db.branch_merge_work();
-        let counted = match case {
-            "ddl" => w1.derive_refusals_ddl - w0.derive_refusals_ddl,
-            "clear" | "delete-all" => {
-                w1.derive_refusals_clear_or_delete_all - w0.derive_refusals_clear_or_delete_all
-            }
-            _ => w1.derive_refusals_unattributed - w0.derive_refusals_unattributed,
-        };
-        assert_eq!(counted, 1, "{case}: refused for another reason: {out:?} {w1:?}");
     }
+    let b_id = b.into_id();
+    let w0 = db.branch_merge_work();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let out = merger.merge(db.branch(b_id).unwrap(), policy(Validation::BaseRead)).unwrap();
+    assert_eq!(out.refused, Some(Refusal::Scope), "{case}: {out:?}");
+    let w1 = db.branch_merge_work();
+    let counted = match case {
+        "ddl" => w1.derive_refusals_ddl - w0.derive_refusals_ddl,
+        "clear" | "delete-all" => w1.derive_refusals_clear_or_delete_all - w0.derive_refusals_clear_or_delete_all,
+        _ => w1.derive_refusals_unattributed - w0.derive_refusals_unattributed,
+    };
+    assert_eq!(counted, 1, "{case}: refused for another reason: {out:?} {w1:?}");
+}
+
+/// D-T5 (review wf_5c230f31: one test per registered red, so each mutant's red is its own).
+#[test]
+fn a_ddl_branch_is_refused() {
+    derivation_refusal("ddl");
+}
+
+/// D-T5.
+#[test]
+fn a_clear_is_refused() {
+    derivation_refusal("clear");
+}
+
+/// A6.4 (i): a DML delete of every row is refused as a clear is.
+#[test]
+fn a_delete_of_every_row_is_refused() {
+    derivation_refusal("delete-all");
+}
+
+/// D-T5.
+#[test]
+fn an_incremental_blob_write_on_an_unowned_leaf_is_refused() {
+    derivation_refusal("blob");
 }
 
 /// D-T5: an index-kind write when the schema has a WITHOUT ROWID table is refused.
@@ -442,9 +687,35 @@ fn a_without_rowid_write_is_refused() {
     assert!(db.branch_merge_work().derive_refusals_without_rowid >= 1);
 }
 
-/// A6.3: a DELETE that makes a balance free a sibling leaf (free_page's AddToTrunk path does not
-/// write the freed page): the derived set holds every deleted row. Mutants r13_leaves_only and
-/// r13_skip_freed_base must turn it red.
+/// Amendment 8 (review wf_5c230f31 M, algorithm D as built): an index write of a ROWID table is
+/// refused too when the schema has any WITHOUT ROWID table, though the branch never touched it: the
+/// derivation does not attribute index pages, so it cannot tell whose index page it owns. Wider than
+/// A5.2 registered (a refusal, never a lost row); G1's schema has no WITHOUT ROWID table.
+#[test]
+fn an_index_write_beside_an_unrelated_without_rowid_table_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open(&dir.path().join("m.db"), Mode::Catalog);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    exec(&trunk, "CREATE TABLE wr(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID");
+    exec(&trunk, "INSERT INTO wr VALUES ('a', '1')");
+    let b = trunk.fork_branch().unwrap();
+    // An indexed column of the ROWID table t: the branch writes a t_w index page, and nothing of wr.
+    exec(&b.connect().unwrap(), "UPDATE t SET w = 500 WHERE id = 9");
+    let b_id = b.into_id();
+    let w0 = db.branch_merge_work();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let out = merger.merge(db.branch(b_id).unwrap(), policy(Validation::BaseRead)).unwrap();
+    assert_eq!(out.refused, Some(Refusal::Scope), "{out:?}");
+    let w1 = db.branch_merge_work();
+    assert_eq!(w1.derive_refusals_without_rowid - w0.derive_refusals_without_rowid, 1, "{w1:?}");
+}
+
+/// A6.3: a DELETE that makes a balance free sibling leaves: the derived set holds every deleted row.
+/// Mutant r13_skip_freed_base must turn it red (the freed owned pages' base rows go missing).
+/// Amendment 8: r13_leaves_only is EQUIVALENT here (balance dirties every sibling before it frees
+/// any, so every freed page is owned, and no unowned subtree is ever dropped on an admitted
+/// workload); its red is `derive_enumerates_a_subtree_the_branch_unlinked_without_writing`.
 #[test]
 fn a_delete_that_makes_a_balance_free_a_sibling_derives_every_deleted_row() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -458,8 +729,10 @@ fn a_delete_that_makes_a_balance_free_a_sibling_derives_every_deleted_row() {
     // Wide deletes: whole leaves empty out and are freed, siblings rebalance.
     exec(&conn, "DELETE FROM t WHERE id BETWEEN 400 AND 900");
     exec(&conn, "DELETE FROM t WHERE id % 3 = 0 AND id BETWEEN 1200 AND 1600");
-    let model = snapshot(&conn, "t");
     drop(conn);
+    // model(B): the SQL above applied to model(base) by the test (A6.2), never read through B.
+    let mut model = base.clone();
+    model.retain(|&k, _| !(400..=900).contains(&k) && !(k % 3 == 0 && (1200..=1600).contains(&k)));
     let b_id = b.into_id();
     db.branch_compact_now().unwrap();
     let want = differing(root, &base, &model);
@@ -470,49 +743,152 @@ fn a_delete_that_makes_a_balance_free_a_sibling_derives_every_deleted_row() {
     let got: BTreeSet<(i64, i64)> = got.keys.into_iter().collect();
     assert_eq!(got, want, "deleted rows missed or extra: {:?}", db.branch_merge_work());
     let w = db.branch_merge_work();
-    assert!(w.derive_subtrees_enumerated + w.derive_freelist_reads > 0, "no freed page was exercised: {w:?}");
+    // The premise r13_skip_freed_base needs: the branch's own freelist was walked (its freed pages).
+    assert!(w.derive_freelist_reads > 0, "no freed page was exercised: {w:?}");
 }
 
-/// D-T4 (A6.3): an interior balance that relinks a subtree the branch did not write derives no
-/// change for its rows; the cancellation fired and nothing was enumerated. Mutant
-/// r13_no_relink_cancel must turn it red (its output is the same; only the counters tell).
+/// The trunk's database file, read by the TEST (a premise the test owns; never the store under
+/// test): after a WAL checkpoint, page n is at (n - 1) x the page size.
+struct DbFile {
+    bytes: Vec<u8>,
+    ps: usize,
+}
+
+impl DbFile {
+    fn read(trunk: &Arc<Connection>, path: &Path) -> DbFile {
+        exec(trunk, "PRAGMA wal_checkpoint(TRUNCATE)");
+        let bytes = std::fs::read(path).unwrap();
+        let ps = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
+        DbFile {
+            bytes,
+            ps: if ps == 1 { 65536 } else { ps },
+        }
+    }
+
+    fn page(&self, n: u32) -> &[u8] {
+        let at = (n as usize - 1) * self.ps;
+        &self.bytes[at..at + self.ps]
+    }
+
+    /// A table interior page's (left child, key) cells and its rightmost child; `None` otherwise.
+    fn interior(&self, n: u32) -> Option<(Vec<(u32, i64)>, u32)> {
+        let (p, h) = (self.page(n), if n == 1 { 100 } else { 0 });
+        if p[h] != 0x05 {
+            return None;
+        }
+        let count = u16::from_be_bytes([p[h + 3], p[h + 4]]) as usize;
+        let right = u32::from_be_bytes(p[h + 8..h + 12].try_into().unwrap());
+        let cells = (0..count)
+            .map(|i| {
+                let at = u16::from_be_bytes([p[h + 12 + 2 * i], p[h + 13 + 2 * i]]) as usize;
+                let left = u32::from_be_bytes(p[at..at + 4].try_into().unwrap());
+                (left, varint(&p[at + 4..]) as i64)
+            })
+            .collect();
+        Some((cells, right))
+    }
+
+    /// Levels from `root` down its leftmost path to a leaf.
+    fn depth(&self, root: u32) -> u64 {
+        let (mut d, mut n) = (1, root);
+        while let Some((cells, right)) = self.interior(n) {
+            n = cells.first().map_or(right, |c| c.0);
+            d += 1;
+        }
+        d
+    }
+
+    /// The trunk pages of the freelist chain page 1's header starts.
+    fn freelist_trunks(&self) -> u64 {
+        let mut n = u32::from_be_bytes(self.bytes[32..36].try_into().unwrap());
+        let mut k = 0;
+        while n != 0 {
+            k += 1;
+            assert!(k < 1 << 20, "a freelist chain that does not end");
+            n = u32::from_be_bytes(self.page(n)[0..4].try_into().unwrap());
+        }
+        k
+    }
+}
+
+/// A SQLite varint's value.
+fn varint(b: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for (i, &x) in b.iter().enumerate().take(9) {
+        if i == 8 {
+            return (v << 8) | x as u64;
+        }
+        v = (v << 7) | (x & 0x7f) as u64;
+        if x & 0x80 == 0 {
+            return v;
+        }
+    }
+    v
+}
+
+/// D-T4 (A6.3): an interior balance that relinks subtrees the branch did not write derives no change
+/// for their rows; the cancellation fired, nothing was enumerated, and derive_pages_read stays under
+/// A6.5's KNOWN bound for the case. The fixture is three levels deep (asserted by the test's own walk
+/// of the trunk file), and the branch deletes ~75% of the rows under ONE level-2 interior page, so
+/// that page underflows and an interior balance moves its siblings' children (review wf_5c230f31 M:
+/// the old 6,000-row fixture could not reach an interior balance). Mutant r13_no_relink_cancel must
+/// turn it red (its output is the same; only the counters tell).
 #[test]
 fn an_interior_balance_that_relinks_a_subtree_derives_no_change_for_its_rows() {
     let dir = tempfile::TempDir::new().unwrap();
-    let db = open(&dir.path().join("m.db"), Mode::Catalog);
+    let path = dir.path().join("m.db");
+    let db = open(&path, Mode::Catalog);
     let trunk = db.connect().unwrap();
-    // Three levels at 1 KiB pages: interior pages over many leaves.
-    seed(&trunk, 6000);
+    seed(&trunk, 20_000);
     let root = root_of(&trunk, "t");
-    let b = trunk.fork_branch().unwrap();
+    let file = DbFile::read(&trunk, &path);
+    let depth = file.depth(root as u32);
+    assert!(depth >= 3, "the fixture is {depth} levels deep, not 3");
+    let (cells, _) = file.interior(root as u32).expect("t's root is an interior page");
+    assert!(cells.len() >= 2, "the root has {} cells", cells.len());
+    let (p, lo, hi) = (cells[1].0, cells[0].1, cells[1].1);
+    let (under, _) = file.interior(p).expect("the root's second child is a level-2 interior page");
+    assert!(under.len() >= 8, "the level-2 page has only {} children", under.len());
     let base = snapshot(&trunk, "t");
-    let conn = b.connect().unwrap();
-    // Empty most leaves under one interior page, so that interior page underflows and its
-    // siblings take its remaining children: those children move without being written.
-    exec(&conn, "DELETE FROM t WHERE id BETWEEN 3000 AND 3370");
-    let model = snapshot(&conn, "t");
-    drop(conn);
+    let b = trunk.fork_branch().unwrap();
+    exec(&b.connect().unwrap(), &format!("DELETE FROM t WHERE id > {lo} AND id <= {hi} AND id % 4 != 0"));
     let b_id = b.into_id();
+    // model(B): the SQL above applied to model(base) (A6.2).
+    let mut model = base.clone();
+    model.retain(|&k, _| !(k > lo && k <= hi && k % 4 != 0));
     let w0 = db.branch_merge_work();
     let mut merger = Merger::new(trunk.clone()).unwrap();
     let got = merger.derive_only(&db.branch(b_id).unwrap()).unwrap();
+    let owned = got.owned;
     let got: BTreeSet<(i64, i64)> = got.keys.into_iter().collect();
     assert_eq!(got, differing(root, &base, &model));
     let w1 = db.branch_merge_work();
     assert!(w1.derive_subtrees_cancelled > w0.derive_subtrees_cancelled, "no relink was cancelled: {w1:?}");
     assert_eq!(w1.derive_subtrees_enumerated, w0.derive_subtrees_enumerated, "a relink was enumerated: {w1:?}");
+    // A6.5's KNOWN bound with no dropped subtree and no overflow: 2|O| + 2 R depth |O| + (owned
+    // freelist prefix + 1), R = the table b-trees attribution descends (sqlite_schema, a, t).
+    let r_kind = 3;
+    let freelist = w1.derive_freelist_reads - w0.derive_freelist_reads;
+    let bound = 2 * owned + 2 * r_kind * depth * owned + freelist + 1;
+    let read = w1.derive_pages_read - w0.derive_pages_read;
+    assert!(read <= bound, "derive_pages_read {read} > A6.5's bound {bound} (|O| {owned}, depth {depth})");
 }
 
 /// A6.5: the freelist walk reads only the branch's owned prefix of the chain, however long the
-/// trunk's freelist is. Mutant r13_freelist_whole must turn it red.
+/// trunk's freelist is. The trunk's chain is at least 3 trunk pages (asserted by the test's own walk
+/// of the trunk file; review wf_5c230f31 M: a 1-trunk chain let the mutant pass). Mutant
+/// r13_freelist_whole must turn it red.
 #[test]
 fn a_branch_over_a_long_trunk_freelist_reads_only_its_owned_prefix() {
     let dir = tempfile::TempDir::new().unwrap();
-    let db = open(&dir.path().join("m.db"), Mode::Catalog);
+    let path = dir.path().join("m.db");
+    let db = open(&path, Mode::Catalog);
     let trunk = db.connect().unwrap();
-    seed(&trunk, 4000);
+    seed(&trunk, 30_000);
     // A long trunk freelist.
     exec(&trunk, "DELETE FROM t WHERE id > 200");
+    let trunks = DbFile::read(&trunk, &path).freelist_trunks();
+    assert!(trunks >= 3, "the trunk's freelist has {trunks} trunk pages, not 3");
     let b = trunk.fork_branch().unwrap();
     exec(&b.connect().unwrap(), "UPDATE t SET v = 'x' WHERE id = 3");
     let b_id = b.into_id();
@@ -521,6 +897,7 @@ fn a_branch_over_a_long_trunk_freelist_reads_only_its_owned_prefix() {
     let got = merger.derive_only(&db.branch(b_id).unwrap()).unwrap();
     assert_eq!(got.keys.len(), 1);
     let w1 = db.branch_merge_work();
+    // The branch owns no freelist trunk page: at most the first, non-owned one is looked at.
     assert!(w1.derive_freelist_reads - w0.derive_freelist_reads <= 1, "read the trunk's freelist: {w1:?}");
 }
 
@@ -600,8 +977,10 @@ fn a_second_merge_of_a_kept_ref_is_refused() {
 }
 
 /// A6.1 (splice-off part; the splice-on arm is added with F7's merge): land a stack top over cap-0
-/// evictions, a reopen, and a released middle level: every level's rows go in. Mutant
-/// r13_owned_current_only must turn it red.
+/// evictions, a reopen, and a released middle level: every level's rows go in. The lower half of
+/// the stack is checkpointed; the upper half's commits are only in the log's tail when the process
+/// ends without a checkpoint (review wf_5c230f31 M: "a kill and reopen", so the replay parks Commits
+/// on stack levels). Mutant r13_owned_current_only must turn it red.
 #[test]
 fn a_land_top_installs_every_levels_rows_across_evict_restart_and_a_released_middle_level() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -619,6 +998,7 @@ fn a_land_top_installs_every_levels_rows_across_evict_restart_and_a_released_mid
             if i == d / 2 {
                 // A released middle level: retired and kept while its child lives (splice off).
                 drop(level);
+                db.branch_compact_now().unwrap();
             } else {
                 _held.push(level.into_id());
             }
@@ -626,7 +1006,7 @@ fn a_land_top_installs_every_levels_rows_across_evict_restart_and_a_released_mid
         }
         exec(&level.connect().unwrap(), "UPDATE t SET v = 'top' WHERE id = 399");
         top_id.set(level.into_id());
-        db.branch_compact_now().unwrap();
+        // No checkpoint: the process ends with the upper levels' commits in the tail.
     }
     let db = open(&path, Mode::CatalogEvict);
     let trunk = db.connect().unwrap();
@@ -642,4 +1022,316 @@ fn a_land_top_installs_every_levels_rows_across_evict_restart_and_a_released_mid
         assert!(rows[&(i * 20)].contains(&format!("level{i}")), "level {i}'s row is missing");
     }
     assert!(rows[&399].contains("top"));
+}
+
+/// D-M6 (§2): a crash after a merge's trunk COMMIT and before its release neither loses nor
+/// re-applies the merge. A keep-merged merge leaves exactly that durable state (the trunk holds the
+/// rows; the branch is live), the process ends without a checkpoint, and after the reopen a second
+/// merge of the branch is refused under both validators (MV4: ours differs from base; KeyStamp: the
+/// stamps died with the process, so the restart horizon hands the verdict to MV4, I7), and the trunk
+/// is unchanged.
+#[test]
+fn a_crash_between_a_merges_commit_and_its_release_neither_loses_nor_reapplies_it() {
+    for validation in [Validation::BaseRead, Validation::KeyStamp] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("m.db");
+        let b_id;
+        {
+            let db = open(&path, Mode::Catalog);
+            let trunk = db.connect().unwrap();
+            seed(&trunk, 100);
+            let b = trunk.fork_branch().unwrap();
+            exec(&b.connect().unwrap(), "UPDATE t SET v = 'once' WHERE id = 8");
+            b_id = b.into_id();
+            let keep = MergePolicy {
+                validation,
+                keep_merged: true,
+            };
+            let out = Merger::new(trunk.clone()).unwrap().merge(db.branch(b_id).unwrap(), keep).unwrap();
+            assert_eq!(out.refused, None, "{validation:?}: {out:?}");
+        }
+        let db = open(&path, Mode::Catalog);
+        let trunk = db.connect().unwrap();
+        let before = snapshot(&trunk, "t");
+        assert!(before[&8].contains("once"), "{validation:?}: the committed merge was lost");
+        let w0 = db.branch_merge_work();
+        let out = Merger::new(trunk.clone())
+            .unwrap()
+            .merge(db.branch(b_id).unwrap(), policy(validation))
+            .unwrap();
+        assert!(out.refused.is_some(), "{validation:?}: the merge went in twice: {out:?}");
+        assert_eq!(snapshot(&trunk, "t"), before, "{validation:?}: the trunk changed");
+        if validation == Validation::KeyStamp {
+            let w1 = db.branch_merge_work();
+            assert!(w1.v3_horizon_fallbacks > w0.v3_horizon_fallbacks, "no horizon fallback: {w1:?}");
+        }
+    }
+}
+
+/// Review wf_5c230f31 (A31, amendment 8): while an old child lives, one key written at k trunk
+/// epochs holds k stamp entries (A31's term) and one distinct key (`stamps_held`).
+#[test]
+fn one_key_written_at_k_epochs_under_an_old_child_holds_k_stamp_entries() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open(&dir.path().join("m.db"), Mode::Catalog);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    let old = trunk.fork_branch().unwrap().into_id();
+    let w0 = db.branch_merge_work();
+    let k = 12u64;
+    let mut kids = Vec::new();
+    for i in 0..k {
+        // Each fork moves the trunk's epoch; the write after it is stamped at the new one.
+        kids.push(trunk.fork_branch().unwrap().into_id());
+        exec(&trunk, &format!("UPDATE t SET v = 'e{i}' WHERE id = 5"));
+    }
+    let w1 = db.branch_merge_work();
+    assert_eq!(w1.stamp_entries - w0.stamp_entries, k, "{w1:?}");
+    assert_eq!(w1.stamps_held - w0.stamps_held, 1, "{w1:?}");
+    let _ = (old, kids);
+}
+
+/// A version of the database made of synthetic pages (the derivation's unit tests).
+struct Pages(HashMap<u32, Arc<Vec<u8>>>);
+
+impl super::derive::PageSource for Pages {
+    fn read(&mut self, page: u32) -> crate::Result<Option<Arc<Vec<u8>>>> {
+        Ok(self.0.get(&page).cloned())
+    }
+}
+
+/// A 1 KiB table leaf page holding `rows` (rowids and payload lengths below 128: one-byte varints).
+fn leaf_page(rows: &[(i64, &[u8])]) -> Arc<Vec<u8>> {
+    let mut p = vec![0u8; 1024];
+    p[0] = 0x0D;
+    let mut end = p.len();
+    for (i, (rowid, payload)) in rows.iter().enumerate() {
+        let mut cell = vec![payload.len() as u8, *rowid as u8];
+        cell.extend_from_slice(payload);
+        end -= cell.len();
+        p[end..end + cell.len()].copy_from_slice(&cell);
+        p[8 + 2 * i..10 + 2 * i].copy_from_slice(&(end as u16).to_be_bytes());
+    }
+    p[3..5].copy_from_slice(&(rows.len() as u16).to_be_bytes());
+    p[5..7].copy_from_slice(&(end as u16).to_be_bytes());
+    Arc::new(p)
+}
+
+/// A 1 KiB table interior page: (left child, key) cells and the rightmost child.
+fn interior_page(cells: &[(u32, i64)], right: u32) -> Arc<Vec<u8>> {
+    let mut p = vec![0u8; 1024];
+    p[0] = 0x05;
+    let mut end = p.len();
+    for (i, (left, key)) in cells.iter().enumerate() {
+        let mut cell = left.to_be_bytes().to_vec();
+        cell.push(*key as u8);
+        end -= cell.len();
+        p[end..end + cell.len()].copy_from_slice(&cell);
+        p[12 + 2 * i..14 + 2 * i].copy_from_slice(&(end as u16).to_be_bytes());
+    }
+    p[3..5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+    p[5..7].copy_from_slice(&(end as u16).to_be_bytes());
+    p[8..12].copy_from_slice(&right.to_be_bytes());
+    Arc::new(p)
+}
+
+/// Amendment 8 (review wf_5c230f31 M): r13_leaves_only's red. No admitted SQL workload drops a
+/// subtree the branch did not write (balance dirties every sibling first), so the derivation is run
+/// on synthetic pages: the base's root links leaves 3, 4 and 5; the branch rewrote only the root,
+/// which no longer links leaf 4. Leaf 4's rows are deleted on the branch, found by enumerating the
+/// unlinked base subtree. Mutant r13_leaves_only (no link accounting) derives nothing and must turn
+/// it red.
+#[test]
+fn derive_enumerates_a_subtree_the_branch_unlinked_without_writing() {
+    let leaves = [
+        (3u32, leaf_page(&[(1, b"r1"), (2, b"r2"), (3, b"r3")])),
+        (4, leaf_page(&[(4, b"r4"), (5, b"r5"), (6, b"r6")])),
+        (5, leaf_page(&[(7, b"r7"), (8, b"r8"), (9, b"r9")])),
+    ];
+    let mut base = Pages(leaves.iter().cloned().collect());
+    base.0.insert(2, interior_page(&[(3, 3), (4, 6)], 5));
+    let mut theirs = Pages(leaves.iter().cloned().collect());
+    theirs.0.insert(2, interior_page(&[(3, 3)], 5));
+    let trees = [super::derive::Tree {
+        root: 2,
+        table: true,
+        without_rowid: false,
+    }];
+    let d = super::derive::derive(&mut theirs, &mut base, &[2], &trees, 1024).unwrap();
+    assert_eq!(d.refusal, None);
+    let keys: Vec<(u32, i64)> = d.changes.keys().copied().collect();
+    assert_eq!(keys, vec![(2, 4), (2, 5), (2, 6)], "{:?}", d.counters);
+    assert!(d.changes.values().all(|c| c.theirs.is_none() && c.base.is_some()));
+    assert_eq!(d.counters.subtrees_enumerated, 1, "{:?}", d.counters);
+}
+
+/// D-M10 (§2): b161e861d's model test, restricted to the ported validators {KeyStamp, MV4} x Replay,
+/// in Catalog and CatalogEvict, single members (batches are not ported, D-M8). Up to 24 live
+/// branches write, the trunk writes, and branches merge under a random validator. A merge is refused
+/// exactly when the model says: MV4 when the trunk's row now differs from the base on a row the
+/// branch changed (content), KeyStamp when the trunk wrote such a row after the fork (a merge's
+/// install is a trunk write). After each step the trunk equals the model; every 50 steps each live
+/// branch reads its own view. Each validator must both commit and refuse at least once.
+#[test]
+fn merges_match_a_model_under_every_policy() {
+    let mut tally: BTreeMap<(String, bool), u64> = BTreeMap::new();
+    for mode in [Mode::Catalog, Mode::CatalogEvict] {
+        for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+            for with_index in [false, true] {
+                model_run(mode, seed, with_index, &mut tally);
+            }
+        }
+    }
+    for v in ["BaseRead", "KeyStamp"] {
+        for refused in [false, true] {
+            let n = tally.get(&(v.to_string(), refused)).copied().unwrap_or(0);
+            assert!(n > 0, "no {v} merge with refused={refused}: {tally:?}");
+        }
+    }
+}
+
+const GAP: i64 = 4;
+const MODEL_ROWS: i64 = 200;
+
+/// One live branch of the model test: its handle, the trunk it forked from (base), its own view,
+/// and the keys the trunk wrote since its fork.
+struct LiveB {
+    branch: Branch,
+    base: BTreeMap<i64, String>,
+    view: BTreeMap<i64, String>,
+    trunk_wrote: BTreeSet<i64>,
+}
+
+fn read_all(conn: &Arc<Connection>) -> BTreeMap<i64, String> {
+    conn.prepare("SELECT id, v FROM t ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|r| match &r[1] {
+            crate::Value::Text(t) => (r[0].as_int().unwrap(), t.as_str().to_string()),
+            other => panic!("v is {other:?}"),
+        })
+        .collect()
+}
+
+/// One write through `conn`, mirrored in `map` (b161e861d's write_one): an UPDATE of a key, an
+/// INSERT of a key between the seeded ones, or a DELETE. Returns the key the SQL wrote, if any.
+fn write_one(rng: &mut Rng, conn: &Arc<Connection>, map: &mut BTreeMap<i64, String>, gen: &mut u64, tag: &str) -> Option<i64> {
+    *gen += 1;
+    let v = format!("{tag}{:08}{}", *gen, "x".repeat(10 + rng.below(50) as usize));
+    match rng.below(10) {
+        0..=5 => {
+            let id = (1 + rng.below(MODEL_ROWS as u64) as i64) * GAP;
+            exec(conn, &format!("UPDATE t SET v = '{v}' WHERE id = {id}"));
+            map.contains_key(&id).then(|| {
+                map.insert(id, v);
+                id
+            })
+        }
+        6..=8 => {
+            let id = (1 + rng.below(MODEL_ROWS as u64) as i64) * GAP + 1 + rng.below(GAP as u64 - 1) as i64;
+            if map.contains_key(&id) {
+                return None;
+            }
+            exec(conn, &format!("INSERT INTO t VALUES ({id}, '{v}')"));
+            map.insert(id, v);
+            Some(id)
+        }
+        _ => {
+            let keys: Vec<i64> = map.keys().copied().collect();
+            let id = keys[rng.below(keys.len() as u64) as usize];
+            exec(conn, &format!("DELETE FROM t WHERE id = {id}"));
+            map.remove(&id);
+            Some(id)
+        }
+    }
+}
+
+fn model_run(mode: Mode, seed: u64, with_index: bool, tally: &mut BTreeMap<(String, bool), u64>) {
+    let what = format!("{mode:?} seed {seed:#x} index {with_index}");
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open(&dir.path().join("m.db"), mode);
+    let trunk = db.connect().unwrap();
+    exec(&trunk, "PRAGMA page_size = 1024");
+    exec(&trunk, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+    if with_index {
+        exec(&trunk, "CREATE INDEX tv ON t(v)");
+    }
+    let mut rows = BTreeMap::new();
+    exec(&trunk, "BEGIN");
+    for i in 1..=MODEL_ROWS {
+        let v = format!("t-{i}");
+        exec(&trunk, &format!("INSERT INTO t VALUES ({}, '{v}')", i * GAP));
+        rows.insert(i * GAP, v);
+    }
+    exec(&trunk, "COMMIT");
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let mut rng = Rng(seed);
+    let mut live: Vec<LiveB> = Vec::new();
+    let mut gen = 0u64;
+    for step in 0..600 {
+        match rng.below(20) {
+            0..=3 if live.len() < 24 => live.push(LiveB {
+                branch: trunk.fork_branch().unwrap(),
+                base: rows.clone(),
+                view: rows.clone(),
+                trunk_wrote: BTreeSet::new(),
+            }),
+            4..=9 if !live.is_empty() => {
+                let i = rng.below(live.len() as u64) as usize;
+                let l = &mut live[i];
+                let conn = l.branch.connect().unwrap();
+                exec(&conn, "BEGIN");
+                for _ in 0..=rng.below(3) {
+                    write_one(&mut rng, &conn, &mut l.view, &mut gen, "b");
+                }
+                exec(&conn, "COMMIT");
+            }
+            10..=12 => {
+                if let Some(id) = write_one(&mut rng, &trunk, &mut rows, &mut gen, "t") {
+                    for l in &mut live {
+                        l.trunk_wrote.insert(id);
+                    }
+                }
+            }
+            13..=16 if !live.is_empty() => {
+                let LiveB { branch, base, view, trunk_wrote } = live.swap_remove(rng.below(live.len() as u64) as usize);
+                let validation = if rng.below(2) == 0 { Validation::BaseRead } else { Validation::KeyStamp };
+                let changed: BTreeSet<i64> =
+                    base.keys().chain(view.keys()).filter(|k| base.get(k) != view.get(k)).copied().collect();
+                let want_refused = changed.iter().any(|k| match validation {
+                    Validation::BaseRead => rows.get(k) != base.get(k),
+                    Validation::KeyStamp => trunk_wrote.contains(k),
+                });
+                let o = merger.merge(branch, policy(validation)).unwrap();
+                assert_eq!(o.scope, None, "{what} step {step}: {o:?}");
+                assert_eq!(o.rows_changed, changed.len(), "{what} step {step}: {o:?}");
+                assert_eq!(o.refused.is_some(), want_refused, "{what} step {step}: {validation:?} {o:?}");
+                if o.refused.is_none() {
+                    for k in &changed {
+                        match view.get(k) {
+                            Some(v) => rows.insert(*k, v.clone()),
+                            None => rows.remove(k),
+                        };
+                    }
+                    for l in &mut live {
+                        l.trunk_wrote.extend(changed.iter().copied());
+                    }
+                }
+                *tally.entry((format!("{validation:?}"), o.refused.is_some())).or_default() += 1;
+            }
+            _ => {}
+        }
+        if mode == Mode::CatalogEvict && step % 60 == 0 {
+            db.branch_compact_now().unwrap();
+        }
+        assert_eq!(read_all(&trunk), rows, "{what} step {step}: the trunk disagrees with the model");
+        if step % 50 == 0 {
+            for l in &live {
+                let conn = l.branch.connect().unwrap();
+                assert_eq!(read_all(&conn), l.view, "{what} step {step}: a live branch lost its snapshot");
+            }
+        }
+    }
 }
