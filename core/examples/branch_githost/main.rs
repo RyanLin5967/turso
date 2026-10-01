@@ -720,6 +720,11 @@ fn sid(x: u64) -> BranchId {
 
 static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
+/// The state a command leaves on disk, for the census driver: the next command's `--n` is `live`.
+fn state_line(model: &Model) -> String {
+    format!("STATE\tlive={}\tsteps={}\textra={}", model.live, model.steps, model.extra.len())
+}
+
 impl Model {
     /// The model of a sidecar's state: the schedule replayed, the stacks' live levels, and image
     /// e's untouched-branch commits (the `bump` smallest live unmerged schedule ids, one more
@@ -1538,6 +1543,7 @@ fn grow(args: &Args) {
     drop(side);
     sc.steps = model.steps;
     write_sidecar(&args.db, &sc);
+    println!("{}", state_line(&model));
     let t = Instant::now();
     drop(trunk);
     drop(db);
@@ -2018,6 +2024,13 @@ fn stack(args: &Args) {
     };
     let mut merger = Merger::new(trunk.clone()).unwrap_or_else(|e| not_a_result(&format!("merger: {e}")));
     let mut findings = 0u64;
+    // The -MRG arms (R13_MERGER=off) have no Merger: land-tops are absent by ablation there (A4.C2).
+    let lands = if std::env::var("R13_MERGER").is_ok_and(|v| v == "off") {
+        println!("# land-tops absent by ablation (R13_MERGER=off)");
+        0
+    } else {
+        args.lands
+    };
     for &d in &args.depths {
         serial += 1;
         let st = build_stack(&db, &trunk, serial, d);
@@ -2125,7 +2138,7 @@ fn stack(args: &Args) {
         );
         // land-top, each on a fresh stack (untimed build), the stack reaped afterwards.
         let mut s = Series::default();
-        for _ in 0..args.lands {
+        for _ in 0..lands {
             serial += 1;
             let ls = build_stack(&db, &trunk, serial, d);
             expect_ids(&ls.ids, &mut made);
@@ -2157,7 +2170,7 @@ fn stack(args: &Args) {
         // The zombie sub-arm (splice fixture only).
         if args.splice && d >= 3 {
             let mut s = Series::default();
-            for _ in 0..args.lands {
+            for _ in 0..lands {
                 serial += 1;
                 let zs = build_stack(&db, &trunk, serial, d);
                 expect_ids(&zs.ids, &mut made);
@@ -2225,6 +2238,7 @@ fn stack(args: &Args) {
         merge_work_line(&db.branch_merge_work()).replace(' ', "\t")
     );
     write_sidecar(&args.db, &sc);
+    println!("{}", state_line(&model));
     drop(trunk);
     drop(db);
 }
@@ -2309,6 +2323,7 @@ fn crash(args: &Args) {
     }
     sc.steps = model.steps;
     println!("CRASH\timage={}\tsteps={}\tlive={}\tbump={}", args.image, model.steps, model.live, sc.bump);
+    println!("{}", state_line(&model));
     sigkill(&args.db, &sc)
 }
 
