@@ -3531,50 +3531,63 @@ fn an_open_that_recovers_records_syncs_the_log_first() {
     drop(db);
 }
 
-/// r12-optfs reviews 2 and 3 (G3/H1): a missing arena file refuses the open BEFORE redo can create
-/// it, and the refusal changes nothing, so it survives a retry; with the file put back, every
-/// acknowledged commit is there. The log is mixed — an image-logged commit, then one under the
-/// checksum rule as the last flight — the shape in which a recreated arena let the rule cut an
-/// acknowledged flight.
+/// r12-optfs reviews 2-4 (G3/H1/A1): a missing arena file refuses the open BEFORE redo can create
+/// it, and the refusal survives a retry; with the file put back, every acknowledged commit is there.
+/// The log is mixed — an image-logged commit, then one under the checksum rule as the last flight —
+/// the shape in which a recreated arena let the rule cut an acknowledged flight. With a torn tail,
+/// the first open's own torn-tail cut runs before its refusal (idempotent); nothing else changes.
 #[test]
 fn a_missing_arena_refuses_the_open_and_changes_nothing() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("durable.db");
-    let (incarnation, p_id, b_id);
-    {
-        let db = open_at(&path, durable()).unwrap();
-        incarnation = db.incarnation;
-        let trunk = db.connect().unwrap();
-        seed(&trunk, 200);
-        let p = trunk.fork_branch().unwrap();
-        set(&p.connect().unwrap(), 7, "p"); // the redo rule: P's image is logged
-        p_id = p.into_id();
-        db.branches.set_optfs(true);
-        let b = trunk.fork_branch().unwrap();
-        set(&b.connect().unwrap(), 150, "b"); // the checksum rule: no image, the last flight
-        b_id = b.into_id();
-    }
-    let arena = std::path::PathBuf::from(format!("{}-branch-arena", path.display()));
-    let log = std::path::PathBuf::from(format!("{}-branch-log", path.display()));
-    let aside = dir.path().join("arena.aside");
-    std::fs::rename(&arena, &aside).unwrap();
-    let log_before = std::fs::read(&log).unwrap();
-    for attempt in 1..=2 {
-        let err = match open_at(&path, durable()) {
-            Ok(_) => panic!("open {attempt} accepted a missing arena file"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("is missing"), "open {attempt} refused for another reason: {err}");
-        assert!(!arena.exists(), "open {attempt} created the arena file");
-        assert_eq!(std::fs::read(&log).unwrap(), log_before, "open {attempt} changed the log");
-    }
-    std::fs::rename(&aside, &arena).unwrap();
-    let db = reopen(&path, incarnation);
-    let ids: BTreeSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
-    assert_eq!(ids, BTreeSet::from([p_id, b_id]), "an acknowledged branch was lost");
-    for (id, row, want) in [(p_id, 7, "p"), (b_id, 150, "b")] {
-        let branch = db.branch(id).unwrap();
-        assert_eq!(value(&branch.connect().unwrap(), row).as_deref(), Some(want));
-        let _ = branch.into_id();
+    for torn in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("durable.db");
+        let (incarnation, p_id, b_id);
+        {
+            let db = open_at(&path, durable()).unwrap();
+            incarnation = db.incarnation;
+            let trunk = db.connect().unwrap();
+            seed(&trunk, 200);
+            let p = trunk.fork_branch().unwrap();
+            set(&p.connect().unwrap(), 7, "p"); // the redo rule: P's image is logged
+            p_id = p.into_id();
+            db.branches.set_optfs(true);
+            let b = trunk.fork_branch().unwrap();
+            set(&b.connect().unwrap(), 150, "b"); // the checksum rule: no image, the last flight
+            b_id = b.into_id();
+        }
+        let arena = std::path::PathBuf::from(format!("{}-branch-arena", path.display()));
+        let log = std::path::PathBuf::from(format!("{}-branch-log", path.display()));
+        let aside = dir.path().join("arena.aside");
+        std::fs::rename(&arena, &aside).unwrap();
+        if torn {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            f.write_all(&[0xAB; 5]).unwrap();
+        }
+        let mut log_before = std::fs::read(&log).unwrap();
+        for attempt in 1..=2 {
+            let err = match open_at(&path, durable()) {
+                Ok(_) => panic!("open {attempt} (torn {torn}) accepted a missing arena file"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("is missing"), "open {attempt} refused for another reason: {err}");
+            assert!(!arena.exists(), "open {attempt} (torn {torn}) created the arena file");
+            let log_now = std::fs::read(&log).unwrap();
+            if torn && attempt == 1 {
+                assert_eq!(log_now.len() + 5, log_before.len(), "the torn tail was not cut first");
+                log_before = log_now;
+            } else {
+                assert_eq!(log_now, log_before, "open {attempt} (torn {torn}) changed the log");
+            }
+        }
+        std::fs::rename(&aside, &arena).unwrap();
+        let db = reopen(&path, incarnation);
+        let ids: BTreeSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
+        assert_eq!(ids, BTreeSet::from([p_id, b_id]), "an acknowledged branch was lost (torn {torn})");
+        for (id, row, want) in [(p_id, 7, "p"), (b_id, 150, "b")] {
+            let branch = db.branch(id).unwrap();
+            assert_eq!(value(&branch.connect().unwrap(), row).as_deref(), Some(want));
+            let _ = branch.into_id();
+        }
     }
 }

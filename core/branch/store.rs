@@ -748,9 +748,12 @@ impl BranchStore {
                         // arena is created, with a directory sync, before any record can name a
                         // slot, so state that names one with no arena is damage, never a flight to
                         // cut — and a refusal that redo had already "repaired" would not survive a
-                        // retry (r12-optfs reviews 2 and 3, G3/H1). Nothing is written first.
-                        match std::fs::metadata(&files.arena) {
-                            Ok(_) => {}
+                        // retry (r12-optfs reviews 2 and 3, G3/H1). Nothing that depends on the
+                        // arena is written first; recovery's own idempotent steps (a torn tail cut,
+                        // a stale temp snapshot removed, an older generation's log reset) may have
+                        // run, and a retry meets the same refusal.
+                        let arena_missing = match std::fs::metadata(&files.arena) {
+                            Ok(_) => false,
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                 let named = inner.referenced_slots().len();
                                 if named > 0 {
@@ -760,9 +763,10 @@ impl BranchStore {
                                         files.arena.display()
                                     )));
                                 }
+                                true
                             }
                             Err(e) => return Err(crate::error::io_error(e, "stat branch arena")),
-                        }
+                        };
                         // The redo rule: the recovered records' slots are put back from their
                         // images before the arena counts what its file holds.
                         super::journal::redo_page_images(
@@ -809,6 +813,13 @@ impl BranchStore {
                             false,
                             &referenced,
                         )?);
+                        // An arena this open created (the state named no slot) gets its directory
+                        // entry made durable now, as a first fork's creation does: later records
+                        // will name its slots, and the check above refuses a missing arena
+                        // (r12-optfs review 4, A2).
+                        if arena_missing && sync {
+                            super::journal::fsync_dir_of(&files.arena)?;
+                        }
                         let mut journal = recovered.journal;
                         if let Some(start) = cut {
                             // Only once the rest of the open has been checked, so an open that
