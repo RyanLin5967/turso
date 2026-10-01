@@ -1010,10 +1010,10 @@ mod tests {
 
     /// The trunk's retained-version index against a brute-force model, through the store's own
     /// entry points (`fork_trunk`, `first_write_trunk`, `release_handle`, `resolve_into`), and the
-    /// garbage query's cost against its contract: a reap with no older live sibling, or no younger
-    /// one, visits exactly the versions it frees, and one with both visits 2·|B| index entries if
-    /// |B| <= |D| and 2·|D| + 1 otherwise, where B and D are the versions born in `(lo, f]` and
-    /// dying in `(f, hi]`.
+    /// garbage query's cost against its contract: a reap examines exactly the versions it frees,
+    /// plus one heap root when some version filed under the reaped child survives it — a version
+    /// with `born` in `(lo, f]` and `died > hi` — and never any other version; and no reap's melds
+    /// walk more than 2·(log2(V + 1) + 1) right-spine nodes.
     ///
     /// The trunk rewrites a handful of pages, several per epoch, so versions share `born` and `died`
     /// across pages; children are reaped oldest-first, newest-first and at random, so the garbage
@@ -1074,14 +1074,15 @@ mod tests {
                     let lo = at.checked_sub(1).map(|i| live[i].1);
                     let hi = live.get(at + 1).map(|c| c.1);
                     let (id, f, _) = live.remove(at);
-                    let b = history
+                    let filed = |&&(_, born, died): &&(u32, u64, u64)| {
+                        lo.is_none_or(|lo| born > lo) && born <= f && f < died
+                    };
+                    let survivors = history
                         .iter()
-                        .filter(|&&(_, born, _)| lo.is_none_or(|lo| born > lo) && born <= f)
+                        .filter(filed)
+                        .filter(|&&(_, _, died)| hi.is_some_and(|hi| died > hi))
                         .count() as u64;
-                    let d = history
-                        .iter()
-                        .filter(|&&(_, _, died)| f < died && hi.is_none_or(|hi| died <= hi))
-                        .count() as u64;
+                    let versions = history.len() as f64;
                     let before = store.stats();
                     let reaped = store.release_handle(id);
                     let after = store.stats();
@@ -1091,16 +1092,23 @@ mod tests {
                         reaped.freed_pages,
                         "seed {seed:#x} step {step}: the reap's report disagrees with the arena"
                     );
-                    let visited = after.work.gc_range_entries - before.work.gc_range_entries;
-                    let contract = match (lo, hi) {
-                        (None, _) | (_, None) => reaped.freed_pages as u64,
-                        _ if b <= d => 2 * b,
-                        _ => 2 * d + 1,
-                    };
+                    let examined = after.work.gc_heap_examined - before.work.gc_heap_examined;
+                    let contract = reaped.freed_pages as u64 + u64::from(survivors > 0);
                     assert_eq!(
-                        visited, contract,
+                        examined, contract,
                         "seed {seed:#x} step {step}: reaping the child forked at {f} (lo {lo:?}, \
-                         hi {hi:?}, |B| {b}, |D| {d}) visited {visited} index entries"
+                         hi {hi:?}, {survivors} filed survivors) examined {examined} heap roots"
+                    );
+                    let steps = after.work.gc_meld_steps - before.work.gc_meld_steps;
+                    let bound = 2.0 * ((versions + 1.0).log2() + 1.0) * (1.0 + examined as f64);
+                    assert!(
+                        steps as f64 <= bound,
+                        "seed {seed:#x} step {step}: the reap's melds walked {steps} nodes over \
+                         {versions} versions"
+                    );
+                    assert_eq!(
+                        after.work.gc_range_entries, before.work.gc_range_entries,
+                        "the range walks are gone"
                     );
                     if reaped.freed_pages > 0 {
                         match at {
