@@ -133,7 +133,6 @@ pub mod merge;
 pub(crate) mod page_map;
 pub(crate) mod prewarm;
 pub(crate) mod store;
-pub(crate) mod table;
 
 use crate::error::LimboError;
 use crate::storage::pager::{AutoVacuumMode, Pager};
@@ -449,8 +448,8 @@ pub struct BranchCatShape {
     pub ids_resident_visited: u64,
     pub ids_catalog_rows: u64,
     pub ids_build_rows: u64,
-    /// Resident-table growths and what they moved. Under F8' (r13-compose step 3) these are the
-    /// table's DIRECTORY reallocations and the chunk pointers they moved: no branch state moves.
+    /// Resident-table growths (a capacity jump of more than one at an insert) and the entries the
+    /// table held when each happened, which that growth moved.
     pub table_grows: u64,
     pub table_moved: u64,
     /// Checkpoints that evicted clean resident states, and the states evicted (0 unless a fix
