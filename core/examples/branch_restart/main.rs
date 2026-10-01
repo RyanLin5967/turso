@@ -88,6 +88,8 @@ struct Args {
     db: PathBuf,
     n: usize,
     probes: usize,
+    /// `open --probes`: the live counts at which each growth process of the state's chain began (r12-catload A7.20).
+    grow_starts: Vec<u64>,
     writes: usize,
     seed: u64,
     label: String,
@@ -114,6 +116,7 @@ fn parse_args() -> Args {
         db: PathBuf::new(),
         n: 0,
         probes: 0,
+        grow_starts: Vec::new(),
         writes: 200,
         seed: 0x9E37_79B9_7F4A_7C15,
         label: String::new(),
@@ -131,6 +134,12 @@ fn parse_args() -> Args {
             "--db" => args.db = PathBuf::from(val()),
             "--to" | "--n" => args.n = val().parse().unwrap_or_else(|_| die("bad --n/--to")),
             "--probes" => args.probes = val().parse().unwrap_or_else(|_| die("bad --probes")),
+            "--grow-starts" => {
+                args.grow_starts = val()
+                    .split(',')
+                    .map(|v| v.parse().unwrap_or_else(|_| die("bad --grow-starts")))
+                    .collect()
+            }
             "--writes" => args.writes = val().parse().unwrap_or_else(|_| die("bad --writes")),
             "--seed" => args.seed = val().parse().unwrap_or_else(|_| die("bad --seed")),
             "--label" => args.label = val(),
@@ -300,6 +309,27 @@ fn row_for(id: u64) -> i64 {
 }
 
 /// A row about half the table away, so on another leaf page.
+/// r12-catload A7.20: the trunk value branch `id` must read at `other` = far_row(row_for(id)), computed from the growth
+/// chain's own write schedule, never read from the engine. The grower forks ids in order (id = live + 1) and, with
+/// --trunk-every 1, writes far_row(row_for(X)) = trunk_write_value(X - start(X)) right after forking X, where start(X)
+/// is the live count at which X's growth process began (its write counter starts at 0). row_for is a bijection mod
+/// TRUNK_ROWS, so the writes landing on `other` come from the ids congruent to `id`; the latest forked before `id` is
+/// id - TRUNK_ROWS. A child (--child-every 2) sees its parent id - 1's view, forked after that write as well. A write
+/// made after `id`'s fork, its own included, must never be visible.
+fn expected_trunk(id: u64, other: i64, starts: &[u64]) -> String {
+    if id <= TRUNK_ROWS as u64 {
+        return trunk_value(other);
+    }
+    let x = id - TRUNK_ROWS as u64;
+    let start = starts
+        .iter()
+        .copied()
+        .filter(|&s| s < x)
+        .max()
+        .unwrap_or_else(|| not_a_result(&format!("--grow-starts has no start below id {x}")));
+    trunk_write_value(x - start)
+}
+
 fn far_row(row: i64) -> i64 {
     (row - 1 + TRUNK_ROWS / 2) % TRUNK_ROWS + 1
 }
@@ -674,6 +704,20 @@ fn open(args: &Args) {
     println!("OPENRU\tn={}\tlabel={}\t{}", args.n, args.label, oru.fields("open_"));
     prewarm_line(args, db.branch_prewarm());
     if args.probes > 0 {
+        if args.grow_starts.is_empty() {
+            not_a_result("--probes needs --grow-starts (the state's growth starts; r12-catload A7.20)");
+        }
+        // Fire-check ONLY (A7.20): R12_PROBE_MUTANT=livetrunk reads the trunk row through the LIVE trunk, so a branch
+        // sees trunk writes made after its fork; the probe must then fail. Registered runs never carry it.
+        let live_trunk = std::env::var("R12_PROBE_MUTANT").ok().as_deref() == Some("livetrunk");
+        let tconn = if live_trunk { Some(db.connect().unwrap()) } else { None };
+        println!(
+            "PROBECFG\tn={}\tlabel={}\tgrow_starts={:?}\tmutant={}",
+            args.n,
+            args.label,
+            args.grow_starts,
+            if live_trunk { "livetrunk" } else { "none" }
+        );
         let mut rng = Rng(args.seed);
         let mut seen = std::collections::HashSet::new();
         let (mut c_t, mut own_t, mut trunk_t, mut own2_t) = (vec![], vec![], vec![], vec![]);
@@ -711,7 +755,10 @@ fn open(args: &Args) {
             own_t.push(t.elapsed().as_secs_f64() * 1e6);
             let (c2, k2) = (db.branch_read_counters(), cc(&db));
             let t = Instant::now();
-            let v_trunk = read_v(&conn, other);
+            let v_trunk = match &tconn {
+                Some(t) => read_v(t, other),
+                None => read_v(&conn, other),
+            };
             trunk_t.push(t.elapsed().as_secs_f64() * 1e6);
             let (c3, k3) = (db.branch_read_counters(), cc(&db));
             let t = Instant::now();
@@ -721,7 +768,7 @@ fn open(args: &Args) {
             if v_own != branch_value(row) || v_own2 != branch_value(row) {
                 not_a_result(&format!("branch {id} read its own row {row} as {v_own:.12}"));
             }
-            if v_trunk != trunk_value(other) {
+            if v_trunk != expected_trunk(id, other, &args.grow_starts) {
                 not_a_result(&format!("branch {id} read trunk row {other} as {v_trunk:.12}"));
             }
             let d = |a: (u64, u64), b: (u64, u64)| (b.0 - a.0, b.1 - a.1);
