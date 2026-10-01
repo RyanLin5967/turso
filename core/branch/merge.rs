@@ -516,7 +516,10 @@ impl Merger {
             install_error: None,
         };
         let view = self.store.merge_view(branch.id())?;
-        let early = if !view.parent_is_trunk && !land {
+        let early = if super::store::knob_off("merger") {
+            // I10 (R13_MERGER=off): the census's -MRG arm; the harness installs by replay-update.
+            Some("the Merger is off (R13_MERGER=off)")
+        } else if !view.parent_is_trunk && !land {
             Some("the branch is not a child of the trunk")
         } else if view.open || view.writer {
             Some("the branch has an open connection")

@@ -31,6 +31,8 @@ pub(crate) struct BranchTable<T> {
     /// Directory reallocations, and the chunk pointers they moved (observation only).
     dir_grows: u64,
     dir_moved: u64,
+    /// Chunks allocated since the table was made (r13-compose I6, observation only).
+    chunk_allocs: u64,
 }
 
 impl<T> BranchTable<T> {
@@ -41,6 +43,7 @@ impl<T> BranchTable<T> {
             chunks: 0,
             dir_grows: 0,
             dir_moved: 0,
+            chunk_allocs: 0,
         }
     }
 
@@ -81,6 +84,7 @@ impl<T> BranchTable<T> {
         if old.is_none() {
             if chunk.live == 0 {
                 self.chunks += 1;
+                self.chunk_allocs += 1;
             }
             chunk.live += 1;
             self.len += 1;
@@ -112,6 +116,11 @@ impl<T> BranchTable<T> {
     /// Slots in allocated chunks.
     pub(crate) fn capacity(&self) -> usize {
         self.chunks * CHUNK
+    }
+
+    /// `(chunks allocated now, chunks allocated since the table was made)` (r13-compose I6).
+    pub(crate) fn chunk_stats(&self) -> (u64, u64) {
+        (self.chunks as u64, self.chunk_allocs)
     }
 
     /// `(directory reallocations, chunk pointers they moved)` since the table was made.

@@ -326,6 +326,15 @@ struct ShapeCounters {
     table_moved: u64,
     evictions: u64,
     evicted_states: u64,
+    /// r13-compose I4: `ensure` calls that loaded at least one state, the states they loaded in
+    /// all, and the most loaded by one call.
+    ensure_cold: u64,
+    ensure_chain_sum: u64,
+    ensure_chain_max: u64,
+    /// r13-compose I5: evicted states that were the parent of a state resident at that eviction.
+    evicted_with_resident_descendant: u64,
+    /// r13-compose I11: items yielded by walks of the branch table (evictions, live-id builds).
+    walk_items_yielded: u64,
 }
 
 /// What one trunk write transaction wrote while the trunk had a live child, kept by the writing
@@ -1386,6 +1395,48 @@ impl Drop for Backpressure<'_> {
     }
 }
 
+/// r13-compose's runtime ablation knobs (PREREG A2.0 step 7: I1, I2, I10): `R13_FW1=off` lists by the
+/// scan and catalog query under the mutex at every listing (the store before F-W1), `R13_FW2=off`
+/// makes a checkpoint walk every resident state for reserved slots (before F-W2), and
+/// `R13_MERGER=off` turns the Merger off (it refuses every merge) and with it the trunk's row
+/// stamping and its prune (A3.F17). Each is read once per process; unset, every fix is on.
+pub(crate) fn knob_off(name: &str) -> bool {
+    static KNOBS: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
+    let k = KNOBS.get_or_init(|| {
+        let off = |v: &str| std::env::var(v).is_ok_and(|x| x == "off");
+        [off("R13_FW1"), off("R13_FW2"), off("R13_MERGER")]
+    });
+    match name {
+        "fw1" => k[0],
+        "fw2" => k[1],
+        "merger" => k[2],
+        _ => panic!("unknown r13 knob {name}"),
+    }
+}
+
+/// r13-compose I9: the bytes of one branch state, and of one branch-table slot.
+pub(crate) fn state_sizes() -> (usize, usize) {
+    (
+        std::mem::size_of::<BranchState>(),
+        std::mem::size_of::<Option<(BranchId, BranchState)>>(),
+    )
+}
+
+/// r13-compose I12: with `R13_VICTIM_LOG=<path>`, each evicting checkpoint appends one line, the
+/// checkpoint count then and its victims' ids in eviction order (observing only; A3.F14's
+/// determinism check and A3.L1's attribution read it).
+fn victim_log(checkpoint: u64, victims: &[BranchId]) {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("R13_VICTIM_LOG").ok()).as_deref() else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let ids: Vec<String> = victims.iter().map(|v| v.0.to_string()).collect();
+        let _ = writeln!(f, "{checkpoint} {}", ids.join(","));
+    }
+}
+
 /// r13-compose's registered mutants (PREREG §5, A6): `R13_MUTANT` names one deliberate defect, so
 /// each red test can be shown to fail on its mutant from the same test binary. Unset, every mutant is
 /// off. Read once per process.
@@ -1840,7 +1891,7 @@ impl BranchStore {
     /// the WAL write lock on the durable store, so the epoch is that of every write in the
     /// transaction). Returns whether anything was stamped (then the caller prunes).
     pub(crate) fn stamp_committed(&self, tx: TrunkPending) -> bool {
-        if tx.is_empty() {
+        if tx.is_empty() || knob_off("merger") {
             return false;
         }
         let mut inner = self.inner.lock();
@@ -2579,11 +2630,22 @@ impl BranchStore {
             let mut inner = self.inner.lock();
             // githost-shape instrument (observing only).
             inner.shape.ids_calls += 1;
-            if inner.live_ids.is_none() {
+            if knob_off("fw1") {
+                // I1: the store before F-W1: the scan and the catalog query, under the mutex, at
+                // every listing; its catalog rows are a listing's (ids_catalog_rows).
+                let before = inner.shape.ids_build_rows;
                 let set = inner.build_live_ids()?;
-                inner.live_ids = Some(set);
+                let rows = inner.shape.ids_build_rows - before;
+                inner.shape.ids_build_rows = before;
+                inner.shape.ids_catalog_rows += rows;
+                set
+            } else {
+                if inner.live_ids.is_none() {
+                    let set = inner.build_live_ids()?;
+                    inner.live_ids = Some(set);
+                }
+                inner.live_ids.clone().expect("built above")
             }
-            inner.live_ids.clone().expect("built above")
         };
         let mut ids = Vec::with_capacity(snapshot.len() as usize);
         let mut work = IdSetWork::default();
@@ -3093,6 +3155,17 @@ impl BranchStore {
             table_moved: s.table_moved,
             evictions: s.evictions,
             evicted_states: s.evicted_states,
+            ensure_cold: s.ensure_cold,
+            ensure_chain_sum: s.ensure_chain_sum,
+            ensure_chain_max: s.ensure_chain_max,
+            evicted_with_resident_descendant: s.evicted_with_resident_descendant,
+            walk_items_yielded: s.walk_items_yielded,
+            derived_inserts: inner.derived_inserts,
+            table_chunks: inner.branches.chunk_stats().0,
+            chunk_allocs: inner.branches.chunk_stats().1,
+            table_slots_allocated: inner.branches.capacity() as u64,
+            table_slot_bytes: (inner.branches.capacity()
+                * std::mem::size_of::<Option<(BranchId, BranchState)>>()) as u64,
             resident_states: inner.branches.len() as u64,
             trunk_overlay_versions: inner
                 .trunk
@@ -3406,6 +3479,7 @@ impl StoreInner {
             }
         }
         self.shape.ids_resident_visited += self.branches.len() as u64;
+        self.shape.walk_items_yielded += self.branches.len() as u64;
         if let Some(cat) = self.cat.as_mut() {
             let rows = cat.catalog.unreleased_ids()?;
             self.shape.ids_build_rows += rows.len() as u64;
@@ -3465,9 +3539,11 @@ impl StoreInner {
         if self.branches.len() > cap {
             let excess = self.branches.len() - cap;
             let parked = &self.parked;
+            let mut yielded = 0u64;
             let victims: Vec<BranchId> = self
                 .branches
                 .iter()
+                .inspect(|_| yielded += 1)
                 .filter(|(id, st)| {
                     !cat.dirty.contains_key(*id)
                         && !parked.contains_key(*id)
@@ -3479,6 +3555,14 @@ impl StoreInner {
                 .map(|(&id, _)| id)
                 .take(excess)
                 .collect();
+            // I5: a victim that is the parent of a state resident at this eviction (its child's
+            // next cold touch re-derives through it: N2's amplification, S-11).
+            let parents: HashSet<BranchId> = self.branches.values().map(|st| st.parent).collect();
+            yielded += self.branches.len() as u64;
+            self.shape.evicted_with_resident_descendant +=
+                victims.iter().filter(|v| parents.contains(v)).count() as u64;
+            self.shape.walk_items_yielded += yielded;
+            victim_log(self.shape.checkpoints, &victims);
             for id in &victims {
                 if let Some(st) = self.branches.remove(id) {
                     if let Some(deadline) = st.lease {
@@ -3601,6 +3685,12 @@ impl StoreInner {
             cat.branch_loads += 1;
             next = BranchId(b.parent);
             chain.push(b);
+        }
+        if !chain.is_empty() {
+            let n = chain.len() as u64;
+            self.shape.ensure_cold += 1;
+            self.shape.ensure_chain_sum += n;
+            self.shape.ensure_chain_max = self.shape.ensure_chain_max.max(n);
         }
         while let Some(b) = chain.pop() {
             let loaded = BranchId(b.id);
@@ -4188,11 +4278,17 @@ impl StoreInner {
         let branches = &self.branches;
         self.pending_holders
             .retain(|id| branches.get(id).is_some_and(|st| !st.pending.is_empty()));
-        let reserved: Vec<Slot> = self
-            .pending_holders
-            .iter()
-            .flat_map(|id| branches[id].pending.values().copied())
-            .collect();
+        let reserved: Vec<Slot> = if knob_off("fw2") {
+            // I2: the store before F-W2: every resident state is walked for reserved slots.
+            self.shape.ckpt_states_walked += branches.len() as u64
+                - self.pending_holders.len() as u64;
+            branches.values().flat_map(|st| st.pending.values().copied()).collect()
+        } else {
+            self.pending_holders
+                .iter()
+                .flat_map(|id| branches[id].pending.values().copied())
+                .collect()
+        };
         // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
         if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
             cat.dirty = dirty;

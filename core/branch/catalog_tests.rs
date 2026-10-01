@@ -1077,3 +1077,48 @@ fn a_catalog_of_another_format_is_refused_even_with_a_torn_log_header() {
         assert!(err.contains("format version"), "format {other}: refused for another reason: {err}");
     }
 }
+
+/// r13-compose A2.F12: the I1/I2 knobs reproduce the store before F-W1/F-W2, by exact identity.
+/// Run it twice: with `R13_FW1=off R13_FW2=off` (the identities of the base) and without (F-W1's and
+/// F-W2's own counts). The knobs are read once per process.
+#[test]
+fn the_fw_knobs_reproduce_the_store_before_the_fixes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    seed(&db.connect().unwrap());
+    let ids = grow(&db, 120);
+    db.branch_compact_now().unwrap();
+    // Reopen: no state resident, every branch in the catalog.
+    drop(db);
+    let db = open_at(&path, catalog()).unwrap();
+    let fw1_off = store::knob_off("fw1");
+    let fw2_off = store::knob_off("fw2");
+    // Touch a few, so some are resident and some are not.
+    for &id in ids.iter().step_by(10) {
+        let _ = db.branch(id).unwrap().into_id();
+    }
+    for call in 0..3 {
+        let s0 = db.branch_cat_shape();
+        let listed = db.branch_ids().unwrap();
+        let s1 = db.branch_cat_shape();
+        assert_eq!(listed.len(), ids.len(), "call {call}");
+        let catalog_rows = s1.ids_catalog_rows - s0.ids_catalog_rows;
+        if fw1_off {
+            // Every call reads every unreleased row the store does not hold resident.
+            let non_resident = ids.len() as u64 - s0.resident_states;
+            assert_eq!(catalog_rows, non_resident, "fw1 off, call {call}: {s1:?}");
+        } else {
+            assert_eq!(catalog_rows, 0, "fw1 on, call {call}: {s1:?}");
+        }
+    }
+    let s0 = db.branch_cat_shape();
+    db.branch_compact_now().unwrap();
+    let s1 = db.branch_cat_shape();
+    let walked = s1.ckpt_states_walked - s0.ckpt_states_walked;
+    if fw2_off {
+        assert_eq!(walked, s0.resident_states, "fw2 off: every resident state walked: {s1:?}");
+    } else {
+        assert_eq!(walked, 0, "fw2 on: no branch reserved a slot: {s1:?}");
+    }
+}

@@ -452,6 +452,23 @@ pub struct BranchCatShape {
     /// evicts).
     pub evictions: u64,
     pub evicted_states: u64,
+    /// r13-compose I4: `ensure` calls that loaded at least one state (cold), the states they loaded
+    /// in all, and the most loaded by one call.
+    pub ensure_cold: u64,
+    pub ensure_chain_sum: u64,
+    pub ensure_chain_max: u64,
+    /// r13-compose I5: evicted states that were the parent of a state resident at that eviction.
+    pub evicted_with_resident_descendant: u64,
+    /// r13-compose I11: items yielded by walks of the branch table.
+    pub walk_items_yielded: u64,
+    /// r13-compose I3: F4 page-map inserts made deriving loaded states, since open (live).
+    pub derived_inserts: u64,
+    /// r13-compose I6/I11 (gauges): the table's chunks now, chunks allocated since open, slots in
+    /// allocated chunks, and those slots' bytes (one slot = one `Option<(BranchId, BranchState)>`).
+    pub table_chunks: u64,
+    pub chunk_allocs: u64,
+    pub table_slots_allocated: u64,
+    pub table_slot_bytes: u64,
     /// Branch states resident now, and dirty now.
     pub resident_states: u64,
     pub dirty_branches: u64,
@@ -720,6 +737,13 @@ impl Database {
             p.cache_pages,
             p.ns,
         )
+    }
+
+    /// r13-compose I9: `(size_of::<BranchState>(), size_of::<Option<(BranchId, BranchState)>>())`,
+    /// the bytes behind one resident state and one table slot.
+    #[doc(hidden)]
+    pub fn branch_state_sizes() -> (usize, usize) {
+        store::state_sizes()
     }
 
     /// The Merger's work since open (r13-compose, the Merger port; observing only).
