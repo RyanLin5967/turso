@@ -283,7 +283,10 @@ struct StoreInner {
     sync: bool,
     next_id: u64,
     trunk: TrunkState,
-    branches: HashMap<BranchId, BranchState>,
+    /// B_noF8 (r13-compose A3.F14): std's HashMap with a FIXED hasher, so F-W3's victims (taken in
+    /// table order) are the same in every process; std's per-process RandomState would make each
+    /// run a single random draw.
+    branches: HashMap<BranchId, BranchState, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>,
     failpoint: Option<BranchFailpoint>,
     orphans: Vec<Slot>,
     lease: LeaseClock,
@@ -1543,6 +1546,24 @@ impl Drop for Backpressure<'_> {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+}
+
+/// B_noF8 (r13-compose A3.F14, amendment 8): std's HashMap has no chunk slots to count, so a walk's
+/// `walk_slots_scanned` reads 0 here (A2.F5: reported for B_ALL only).
+trait ScanCounted<K, V> {
+    fn iter_scanned<'a>(
+        &'a self,
+        scanned: &'a std::cell::Cell<u64>,
+    ) -> std::collections::hash_map::Iter<'a, K, V>;
+}
+
+impl<K, V, S> ScanCounted<K, V> for HashMap<K, V, S> {
+    fn iter_scanned<'a>(
+        &'a self,
+        _scanned: &'a std::cell::Cell<u64>,
+    ) -> std::collections::hash_map::Iter<'a, K, V> {
+        self.iter()
     }
 }
 
@@ -3425,11 +3446,13 @@ impl BranchStore {
             settle_sharp_loads: s.settle_sharp_loads,
             settle_sharp_max_loads: s.settle_sharp_max_loads,
             derived_inserts: inner.derived_inserts,
-            table_chunks: inner.branches.chunk_stats().0,
-            chunk_allocs: inner.branches.chunk_stats().1,
+            // B_noF8 (A3.F14): no chunks (absent by ablation, A4.C2); slots are hashbrown buckets,
+            // a bucket's bytes one (BranchId, BranchState) (control bytes not counted).
+            table_chunks: 0,
+            chunk_allocs: 0,
             table_slots_allocated: inner.branches.capacity() as u64,
             table_slot_bytes: (inner.branches.capacity()
-                * std::mem::size_of::<Option<(BranchId, BranchState)>>()) as u64,
+                * std::mem::size_of::<(BranchId, BranchState)>()) as u64,
             resident_states: inner.branches.len() as u64,
             trunk_overlay_versions: inner
                 .trunk
@@ -3736,7 +3759,7 @@ impl StoreInner {
                 lineage: Lineage::default(),
                 written: HashMap::new(),
             },
-            branches: HashMap::new(),
+            branches: HashMap::default(),
             failpoint: None,
             orphans: Vec::new(),
             lease: LeaseClock::new(),
