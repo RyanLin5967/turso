@@ -123,6 +123,35 @@ impl PageMap {
             };
         }
     }
+
+    /// Every mapped page number, ascending: a walk of the map, O(nodes). The Merger reads it to
+    /// derive a stack top's write set (r13-compose A6.1: a top sees its levels' pages through here).
+    pub(crate) fn pages(&self) -> Vec<u32> {
+        fn walk(node: &Node, level: u32, prefix: u32, out: &mut Vec<u32>) {
+            match node {
+                Node::Inner(kids) => {
+                    for (i, kid) in kids.iter().enumerate() {
+                        if let Some(kid) = kid {
+                            let p = prefix | ((i as u32) << (BITS * level));
+                            walk(kid, level - 1, p, out);
+                        }
+                    }
+                }
+                Node::Leaf(slots) => {
+                    for (i, m) in slots.iter().enumerate() {
+                        if m.0 != EMPTY {
+                            out.push(prefix | i as u32);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(root) = self.root.as_deref() {
+            walk(root, self.height, 0, &mut out);
+        }
+        out
+    }
 }
 
 #[cfg(test)]

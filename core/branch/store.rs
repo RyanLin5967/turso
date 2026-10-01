@@ -154,7 +154,7 @@
 //! version holding a fork epoch, `trunk_written_known` reads a page's last version once, and a trunk
 //! child's reap adds the catalog's garbage (`trunk_catalog_garbage`) to what F2 finds in memory.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -293,6 +293,10 @@ struct StoreInner {
     live_ids: Option<IdSet>,
     /// V4 base reads (r11-merge PREREG A20; observing only).
     v4: V4Counters,
+    /// V3's row and table stamps (r13-compose, the Merger port), under this one mutex.
+    stamps: RowStamps,
+    /// The Merger's work since open (observing only).
+    merge_work: super::BranchMergeWork,
 }
 
 /// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
@@ -322,6 +326,82 @@ struct ShapeCounters {
     table_moved: u64,
     evictions: u64,
     evicted_states: u64,
+}
+
+/// What one trunk write transaction wrote while the trunk had a live child, kept by the writing
+/// connection's pager and handed to the store only if the transaction commits: its rows and tables
+/// are stamped with the trunk's epoch at the commit (Silo's TIDs are assigned at commit, SOSP 2013),
+/// and one that rolls back stamps nothing (r13-compose, the Merger port from b161e861d; the page set
+/// and its interior subset are not ported: no registered validator reads them).
+#[derive(Default, Debug)]
+pub(crate) struct TrunkPending {
+    /// Table rows written or deleted, as (table root, rowid).
+    pub(crate) rows: HashSet<(i64, i64)>,
+    /// Tables written without naming the rows (clear, destroy, incremental blob I/O).
+    pub(crate) tables: HashSet<i64>,
+}
+
+impl TrunkPending {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.tables.is_empty()
+    }
+}
+
+/// V3's row and table stamps (r13-compose, the Merger port of b161e861d store.rs:359-418), under
+/// the store's one mutex: (table root, rowid) -> the trunk epoch of its last committed write while
+/// the trunk had a child. A stamp `e` refuses a branch iff `e > trunk_at`.
+///
+/// D-M5, the RESTART HORIZON: stamps are in memory only. `horizon` is the trunk's lineage epoch when
+/// this process opened the store; a branch forked at or after it (`trunk_at >= horizon`) has every
+/// trunk write after its fork stamped, and KeyStamp decides for it. One forked before it may have
+/// had a conflicting write before the restart that no stamp records, so KeyStamp gives NO verdict
+/// (None) and the Merger decides by its stateless base read (MV4) instead. Without the horizon a
+/// restart would let every pre-restart conflict through: a lost update.
+#[derive(Default)]
+struct RowStamps {
+    row_stamps: HashMap<(i64, i64), u64>,
+    /// `row_stamps` in stamping order (epochs ascend), for pruning.
+    stamp_order: VecDeque<(u64, i64, i64)>,
+    /// Tables the trunk wrote without naming the rows: root -> epoch.
+    table_stamps: HashMap<i64, u64>,
+    horizon: u64,
+}
+
+impl RowStamps {
+    fn stamp_row(&mut self, root: i64, rowid: i64, epoch: u64) {
+        if self.row_stamps.insert((root, rowid), epoch) != Some(epoch) {
+            self.stamp_order.push_back((epoch, root, rowid));
+        }
+    }
+
+    /// Drop every stamp at or below `oldest`, the oldest live trunk child's fork epoch: no live or
+    /// future child is refused by it. `None` (no child) drops everything. A stale (smaller)
+    /// `oldest` only keeps more.
+    fn prune(&mut self, oldest: Option<u64>) {
+        let keep = |e: u64| oldest.is_some_and(|o| e > o);
+        while let Some(&(e, root, rowid)) = self.stamp_order.front() {
+            if keep(e) {
+                break;
+            }
+            self.stamp_order.pop_front();
+            if self.row_stamps.get(&(root, rowid)) == Some(&e) {
+                self.row_stamps.remove(&(root, rowid));
+            }
+        }
+        self.table_stamps.retain(|_, e| keep(*e));
+    }
+}
+
+/// What the Merger reads of a branch before it derives the branch's writes (r13-compose A5/A6.1).
+pub(crate) struct MergeView {
+    pub(crate) parent_is_trunk: bool,
+    /// The fork epoch at which the branch's ancestry leaves the trunk: the base is the trunk then.
+    pub(crate) trunk_at: u64,
+    pub(crate) live_children: u64,
+    pub(crate) open: bool,
+    pub(crate) writer: bool,
+    /// O = keys(current) ∪ keys(inherited), ascending (A6.1).
+    pub(crate) owned: Vec<u32>,
 }
 
 /// A V4 merge's base reads since open: `base_page_into` calls, those answered from the arena (a
@@ -876,6 +956,23 @@ impl ChildIndex {
         Ok(mem.max(self.resolve(p, row, true)))
     }
 
+    /// The fork epoch of `parent`'s oldest live child (F7-durable's `lowest`, 582f9b476
+    /// store.rs:758-770, ported verbatim for the Merger's stamp prune: r13-compose A2.R1; step 9
+    /// keeps one copy). The in-memory index holds only children forked since the last checkpoint, so
+    /// the catalog's lowest row is merged in, through the removal links.
+    fn lowest(&self, cat: Option<&mut Catalog>, parent: BranchId) -> Result<Option<u64>> {
+        let p = parent.0;
+        let mem = self.map.range((p, 0)..=(p, u64::MAX)).next().map(|(&(_, e), _)| e);
+        let Some(cat) = cat else {
+            return Ok(mem);
+        };
+        let row = cat.children_in(p, 0, u64::MAX, 1)?.into_iter().next();
+        Ok(match (mem, self.resolve(p, row, false)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        })
+    }
+
     /// The nearest live child of `p` above `f`.
     fn above(&self, cat: Option<&mut Catalog>, parent: BranchId, f: u64) -> Result<Option<u64>> {
         let p = parent.0;
@@ -1289,6 +1386,14 @@ impl Drop for Backpressure<'_> {
     }
 }
 
+/// r13-compose's registered mutants (PREREG §5, A6): `R13_MUTANT` names one deliberate defect, so
+/// each red test can be shown to fail on its mutant from the same test binary. Unset, every mutant is
+/// off. Read once per process.
+pub(crate) fn mutant(name: &str) -> bool {
+    static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ON.get_or_init(|| std::env::var("R13_MUTANT").ok()).as_deref() == Some(name)
+}
+
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
@@ -1548,6 +1653,12 @@ impl BranchStore {
             }
         }
         store.open_stats = stats;
+        // D-M5: every trunk write from here on is stamped; a branch forked before this epoch is
+        // validated by the base read, never by stamps a restart lost.
+        {
+            let mut inner = store.inner.lock();
+            inner.stamps.horizon = inner.trunk.lineage.epoch;
+        }
         Ok(store)
     }
 
@@ -1723,6 +1834,113 @@ impl BranchStore {
 
     /// A trunk-only store answers yes, so every trunk page write reaches `first_write_trunk` and
     /// its refusal.
+    /// Stamp a committed trunk transaction's rows and tables with the trunk's epoch. Called by the
+    /// committing pager while it still holds the WAL write lock, which every fork and every merge
+    /// validation also take, so no fork lands between the commit and its stamps (D-M2: forks take
+    /// the WAL write lock on the durable store, so the epoch is that of every write in the
+    /// transaction). Returns whether anything was stamped (then the caller prunes).
+    pub(crate) fn stamp_committed(&self, tx: TrunkPending) -> bool {
+        if tx.is_empty() {
+            return false;
+        }
+        let mut inner = self.inner.lock();
+        let epoch = inner.trunk.lineage.epoch;
+        let st = &mut inner.stamps;
+        for (root, rowid) in tx.rows {
+            st.stamp_row(root, rowid, epoch);
+        }
+        for root in tx.tables {
+            st.table_stamps.insert(root, epoch);
+        }
+        inner.merge_work.stamp_commits += 1;
+        inner.merge_work.stamps_held = inner.stamps.row_stamps.len() as u64;
+        true
+    }
+
+    /// Prune the stamps below the oldest live trunk child (A2.R1): `ChildIndex::lowest` merges the
+    /// in-memory index with the catalog, so a child forked before the last checkpoint (and so gone
+    /// from the in-memory map) still counts. Reading the map alone would find a child that is too
+    /// young and prune stamps an older child still needs: a lost update. A catalog error keeps every
+    /// stamp (keeping more is safe).
+    pub(crate) fn prune_stamps(&self) {
+        let mut inner = self.inner.lock();
+        let StoreInner { children, cat, stamps, merge_work, .. } = &mut *inner;
+        let catalog = cat.as_mut().map(|c| &mut c.catalog);
+        let oldest = if mutant("r13_prune_map_only") {
+            children.lowest(None, BranchId::TRUNK)
+        } else {
+            children.lowest(catalog, BranchId::TRUNK)
+        };
+        match oldest {
+            Ok(oldest) => {
+                stamps.prune(oldest);
+                merge_work.stamp_prunes += 1;
+            }
+            Err(e) => tracing::warn!("branch stamps not pruned (kept): {e}"),
+        }
+        merge_work.stamps_held = stamps.row_stamps.len() as u64;
+    }
+
+    /// KeyStamp's verdict (V3, with D-M5's horizon): `Some(true)` if the trunk wrote any of `keys`
+    /// (or wrote one of `roots` without naming rows) after `trunk_at`, or the transaction in
+    /// progress (`pending`) did; `Some(false)` if not; `None` if `trunk_at` is before this process's
+    /// horizon, so the stamps cannot answer.
+    pub(crate) fn keystamp_verdict(
+        &self,
+        trunk_at: u64,
+        keys: &[(i64, i64)],
+        roots: &[i64],
+        pending: &TrunkPending,
+    ) -> Option<bool> {
+        let mut inner = self.inner.lock();
+        if trunk_at < inner.stamps.horizon && !mutant("r13_no_horizon") {
+            inner.merge_work.v3_horizon_fallbacks += 1;
+            return None;
+        }
+        let st = &inner.stamps;
+        let stamped = |e: Option<&u64>| e.is_some_and(|&e| e > trunk_at);
+        let conflict = keys.iter().any(|k| stamped(st.row_stamps.get(k)) || pending.rows.contains(k))
+            || roots
+                .iter()
+                .any(|r| stamped(st.table_stamps.get(r)) || pending.tables.contains(r));
+        Some(conflict)
+    }
+
+    /// The Merger's view of branch `id` (r13-compose A5/A6.1): made resident first (`ensure`
+    /// applies its parked Commits, D-M9's rule), then its scope facts and its owned page set.
+    pub(crate) fn merge_view(&self, id: BranchId) -> Result<MergeView> {
+        let mut inner = self.inner.lock();
+        if !inner.ensure(id)? {
+            return Err(gone(id));
+        }
+        let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
+        let mut owned: BTreeSet<u32> = st.current.keys().copied().collect();
+        if !mutant("r13_owned_current_only") {
+            owned.extend(st.inherited.pages());
+        }
+        Ok(MergeView {
+            parent_is_trunk: st.parent.is_trunk(),
+            trunk_at: st.trunk_at,
+            live_children: st.lineage.n_children,
+            open: st.open,
+            writer: st.writer,
+            owned: owned.into_iter().collect(),
+        })
+    }
+
+    /// The Merger's counters since open, with the stamps held now.
+    pub(crate) fn merge_work(&self) -> super::BranchMergeWork {
+        let inner = self.inner.lock();
+        let mut w = inner.merge_work;
+        w.stamps_held = inner.stamps.row_stamps.len() as u64;
+        w
+    }
+
+    /// Add to the Merger's counters.
+    pub(crate) fn merge_counted(&self, f: impl FnOnce(&mut super::BranchMergeWork)) {
+        f(&mut self.inner.lock().merge_work);
+    }
+
     pub(crate) fn trunk_has_children(&self) -> bool {
         self.trunk_only || self.trunk_children.load(Ordering::Acquire) > 0
     }
@@ -3171,6 +3389,8 @@ impl StoreInner {
             resident_cap: None,
             live_ids: None,
             v4: V4Counters::default(),
+            stamps: RowStamps::default(),
+            merge_work: super::BranchMergeWork::default(),
         }
     }
 

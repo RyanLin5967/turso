@@ -120,6 +120,7 @@ pub(crate) fn count_backfill_io(which: usize) {
     BACKFILL_IO[which].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
 }
 pub(crate) mod catalog;
+pub(crate) mod derive;
 #[doc(hidden)]
 pub use catalog::catalog_only_fixture;
 pub use catalog::CatalogProbe;
@@ -128,6 +129,7 @@ pub(crate) mod id_set;
 #[doc(hidden)]
 pub use id_set::id_set_census;
 pub(crate) mod journal;
+pub mod merge;
 pub(crate) mod page_map;
 pub(crate) mod prewarm;
 pub(crate) mod store;
@@ -377,6 +379,44 @@ pub struct BranchOpenStats {
     /// of the tail, a release or the expiry pass touched the branch).
     pub parked_records: u64,
     pub parked_applied: u64,
+}
+
+/// The Merger's work since open (r13-compose, the Merger port; observing only). Every field is an
+/// integer count bumped by the call that does the work.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BranchMergeWork {
+    /// Merges attempted, committed, and refused by kind.
+    pub merge_attempts: u64,
+    pub merge_commits: u64,
+    pub merge_refused_scope: u64,
+    pub merge_refused_key: u64,
+    pub merge_refused_base: u64,
+    pub merge_refused_install: u64,
+    /// MV4 refusals where theirs == ours on every conflicting key (A6.4 (ii)).
+    pub refusals_same_change: u64,
+    /// KeyStamp verdicts handed to the base read because the branch forked before the horizon (D-M5).
+    pub v3_horizon_fallbacks: u64,
+    /// Trunk commits stamped, stamp prunes, and stamps held now (A31's term).
+    pub stamp_commits: u64,
+    pub stamp_prunes: u64,
+    pub stamps_held: u64,
+    /// The derived write set (r13-compose A5/A6): pages read (branch and base versions, descents,
+    /// freelist, overflow), attribution descents, rows compared, subtrees enumerated and cancelled,
+    /// freelist trunk pages read, refusals by reason, and keys derived.
+    pub derive_pages_read: u64,
+    pub derive_attribution_seeks: u64,
+    pub derive_rows_compared: u64,
+    pub derive_subtrees_enumerated: u64,
+    pub derive_subtrees_cancelled: u64,
+    pub derive_freelist_reads: u64,
+    pub derive_refusals_ddl: u64,
+    pub derive_refusals_unattributed: u64,
+    pub derive_refusals_without_rowid: u64,
+    pub derive_refusals_clear_or_delete_all: u64,
+    pub derive_keys: u64,
+    /// MV4's base rows compared with the trunk now.
+    pub mv4_keys: u64,
 }
 
 /// githost-shape lane instrument (observing only; r3, on a12-durable-open's C-P + C-R): the catalog
@@ -680,6 +720,12 @@ impl Database {
             p.cache_pages,
             p.ns,
         )
+    }
+
+    /// The Merger's work since open (r13-compose, the Merger port; observing only).
+    #[doc(hidden)]
+    pub fn branch_merge_work(&self) -> BranchMergeWork {
+        self.branches.merge_work()
     }
 
     /// The catalog store's checkpoint work, resident state and listing work (githost-shape
