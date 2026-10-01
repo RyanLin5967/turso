@@ -523,6 +523,19 @@ impl Model {
     fn live_ids(&self) -> Vec<u64> {
         (1..=self.steps).filter(|&id| !self.dead[id as usize]).collect()
     }
+
+    /// A31's bound from the model (amendment 8): the trunk's row writes since the oldest live
+    /// schedule child forked. The store keeps one stamp entry per key re-stamped at a new epoch, so
+    /// `stamp_entries` is at most this (same-epoch rewrites of a key collapse).
+    fn trunk_writes_since_oldest(&self) -> u64 {
+        let Some(&oldest) = self.live_ids().first() else {
+            return 0;
+        };
+        self.writes
+            .iter()
+            .map(|ws| ws.iter().filter(|&&(m, _)| m >= oldest).count() as u64)
+            .sum()
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -810,7 +823,8 @@ fn shape_line(s: &BranchCatShape) -> String {
          dirty_branches={} trunk_overlay_versions={} trunk_cache_versions={} trunk_cache_pages={} \
          trunk_known_pages={} trunk_probes={} trunk_rows={} log_len={} ensure_cold={} ensure_chain_sum={} \
          ensure_chain_max={} evicted_with_resident_descendant={} walk_items_yielded={} derived_inserts={} \
-         table_chunks={} chunk_allocs={} table_slots_allocated={} table_slot_bytes={}",
+         table_chunks={} chunk_allocs={} table_slots_allocated={} table_slot_bytes={} walk_slots_scanned={} \
+         instrument_walk_items={} settle_sharp_calls={} settle_sharp_loads={} settle_sharp_max_loads={}",
         s.checkpoints,
         s.checkpoint_ns,
         s.ckpt_trunk_inserted,
@@ -844,7 +858,12 @@ fn shape_line(s: &BranchCatShape) -> String {
         s.table_chunks,
         s.chunk_allocs,
         s.table_slots_allocated,
-        s.table_slot_bytes
+        s.table_slot_bytes,
+        s.walk_slots_scanned,
+        s.instrument_walk_items,
+        s.settle_sharp_calls,
+        s.settle_sharp_loads,
+        s.settle_sharp_max_loads
     )
 }
 
@@ -853,7 +872,7 @@ fn merge_work_line(w: &BranchMergeWork) -> String {
     format!(
         "merge_attempts={} merge_commits={} merge_refused_scope={} merge_refused_key={} merge_refused_base={} \
          merge_refused_install={} refusals_same_change={} v3_horizon_fallbacks={} stamp_commits={} stamp_prunes={} \
-         stamps_held={} derive_pages_read={} derive_attribution_seeks={} derive_rows_compared={} \
+         stamps_held={} stamp_entries={} derive_pages_read={} derive_attribution_seeks={} derive_rows_compared={} \
          derive_subtrees_enumerated={} derive_subtrees_cancelled={} derive_freelist_reads={} derive_refusals_ddl={} \
          derive_refusals_unattributed={} derive_refusals_without_rowid={} derive_refusals_clear_or_delete_all={} \
          derive_keys={} mv4_keys={} mv4_base_reads={}",
@@ -868,6 +887,7 @@ fn merge_work_line(w: &BranchMergeWork) -> String {
         w.stamp_commits,
         w.stamp_prunes,
         w.stamps_held,
+        w.stamp_entries,
         w.derive_pages_read,
         w.derive_attribution_seeks,
         w.derive_rows_compared,
@@ -892,7 +912,7 @@ fn gauge_line(db: &Arc<Database>, n: u64, label: &str, at: &str) -> String {
     format!(
         "GAUGE\tn={n}\tlabel={label}\tat={at}\tresident_states={}\ttable_chunks={}\ttable_slots_allocated={}\t\
          table_slot_bytes={}\ttable_chunks_per_resident={:.6}\ttable_slots_per_resident={:.3}\t\
-         table_slot_bytes_per_resident={:.3}\tstamps_held={}\tensure_chain_max={}\tdirty_branches={}\tlog_len={}\t\
+         table_slot_bytes_per_resident={:.3}\tstamps_held={}\tstamp_entries={}\tensure_chain_max={}\tdirty_branches={}\tlog_len={}\t\
          trunk_overlay_versions={}\trss={}",
         s.resident_states,
         s.table_chunks,
@@ -902,6 +922,7 @@ fn gauge_line(db: &Arc<Database>, n: u64, label: &str, at: &str) -> String {
         per(s.table_slots_allocated),
         per(s.table_slot_bytes),
         w.stamps_held,
+        w.stamp_entries,
         s.ensure_chain_max,
         s.dirty_branches,
         s.log_len,
@@ -1012,7 +1033,7 @@ fn snap(db: &Arc<Database>) -> Snap {
 /// five are `getrusage` deltas (load-dependent; attribution only). r13-compose adds I3-I6, I11's
 /// walk counter, and the Merger's work (I7, I8, the derivation), all cumulative deltas; the gauges
 /// are printed by `gauge_line` instead.
-const NC: usize = 50;
+const NC: usize = 53;
 const COUNTERS: [&str; NC] = [
     "resolve_calls",
     "arena_reads",
@@ -1039,6 +1060,9 @@ const COUNTERS: [&str; NC] = [
     "derived_inserts",
     "evicted_with_resident_descendant",
     "walk_items_yielded",
+    "walk_slots_scanned",
+    "instrument_walk_items",
+    "settle_sharp_loads",
     "chunk_allocs",
     "merge_attempts",
     "merge_commits",
@@ -1096,6 +1120,9 @@ fn delta(a: &Snap, b: &Snap) -> [i64; NC] {
         d(s.derived_inserts, t.derived_inserts),
         d(s.evicted_with_resident_descendant, t.evicted_with_resident_descendant),
         d(s.walk_items_yielded, t.walk_items_yielded),
+        d(s.walk_slots_scanned, t.walk_slots_scanned),
+        d(s.instrument_walk_items, t.instrument_walk_items),
+        d(s.settle_sharp_loads, t.settle_sharp_loads),
         d(s.chunk_allocs, t.chunk_allocs),
         d(m.merge_attempts, n.merge_attempts),
         d(m.merge_commits, n.merge_commits),
@@ -1704,6 +1731,14 @@ fn probe(args: &Args) {
     ops.reap.print("reap", n, label);
     println!("{window}");
     println!("{}", gauge_line(&db, n, label, "window_end"));
+    let mw = db.branch_merge_work();
+    println!(
+        "A31\tn={n}\tlabel={label}\tstamp_entries={}\tstamps_held={}\tmodel_trunk_writes_since_oldest={}\twithin_bound={}",
+        mw.stamp_entries,
+        mw.stamps_held,
+        model.trunk_writes_since_oldest(),
+        mw.stamp_entries <= model.trunk_writes_since_oldest()
+    );
     println!(
         "MERGEWORK\tn={n}\tlabel={label}\tat=window_end\tmerges_installed={}\tmerges_refused={}\tmerges_skipped={}\t\
          model_refused={}\t{}",
