@@ -1381,6 +1381,9 @@ impl BranchStore {
     #[cfg(test)]
     fn batched(mut self) -> Self {
         crate::turso_assert!(self.trunk(TrunkSite::Observe).lineage.epoch == 0, "batched after a fork");
+        // FL is refused with F-FB at construction (`fl_refusal`); a test store made batched after construction must not
+        // carry FL either, whatever the process's mask (the gate runs every test under TURSO_R11_FIX with L).
+        self.fl = false;
         self.fork_batch = Some(ForkBatcher::new());
         self
     }
@@ -1630,6 +1633,8 @@ impl BranchStore {
         attempts: ForkAttempts,
     ) -> Result<TrunkFork> {
         crate::turso_assert!(seen.is_none() || self.fl, "a lock-free trunk fork without FL");
+        // FL's arrive inside the listing hold ran (only on the plain path; FK and F-FB are refused with FL).
+        let mut arrived = false;
         let format = *self.trunk_format.get_or_init(|| (page_size, reserved_space));
         if format != (page_size, reserved_space) {
             return Err(LimboError::InternalError(format!(
@@ -1669,6 +1674,7 @@ impl BranchStore {
                 if fl_mutant() != 6 {
                     crate::coherence::bump(crate::coherence::Class::StoreGlobal, 1);
                     self.trunk_children_ctr().fetch_add(1, Ordering::AcqRel);
+                    arrived = true;
                 }
                 let work = &mut trunk.work;
                 if seen.is_some() {
@@ -1684,7 +1690,7 @@ impl BranchStore {
         if let Some(hook) = self.after_fork_hold.lock().unwrap().as_ref() {
             hook(self);
         }
-        self.finish_trunk_fork(id, f, schema, self.fl && fl_mutant() != 6);
+        self.finish_trunk_fork(id, f, schema, arrived);
         Ok(TrunkFork::Forked(id))
     }
 
