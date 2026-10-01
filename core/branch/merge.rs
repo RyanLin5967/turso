@@ -358,7 +358,7 @@ impl Merger {
     #[doc(hidden)]
     pub fn derive_only(&mut self, branch: &Branch) -> Result<DerivedReport> {
         self.trunk.execute("BEGIN IMMEDIATE")?;
-        let result = (|| {
+        let result = (|| -> Result<DerivedReport> {
             let pager = self.trunk.pager.load().clone();
             let view = self.store.merge_view(branch.id())?;
             let from = branch.connect()?;
