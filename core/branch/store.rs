@@ -380,6 +380,7 @@ impl Lineage {
             r.live = false;
             let (page, slot) = (r.page, r.slot);
             arena.release(slot);
+            arena.release(slot); // MUTANT M1: double free
             work.gc_examined += 1;
             freed += 1;
             let recs = &self.recs;
