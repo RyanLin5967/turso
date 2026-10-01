@@ -138,6 +138,26 @@ impl<T> BranchTable<T> {
     pub(crate) fn values(&self) -> impl Iterator<Item = &T> {
         self.iter().map(|(_, v)| v)
     }
+
+    /// `iter`, adding to `scanned` every directory entry and every chunk slot the walk visits, empty
+    /// or not, as far as the walk is driven (r13-compose: A2.F5's `walk_slots_scanned`, reported
+    /// for B_ALL only; review wf_5c230f31 M: a walk's cost is the slots, not the live items).
+    pub(crate) fn iter_scanned<'a>(
+        &'a self,
+        scanned: &'a std::cell::Cell<u64>,
+    ) -> impl Iterator<Item = (&'a BranchId, &'a T)> + 'a {
+        self.dir
+            .iter()
+            .inspect(move |_| scanned.set(scanned.get() + 1))
+            .flatten()
+            .flat_map(move |c| {
+                c.entries
+                    .iter()
+                    .inspect(move |_| scanned.set(scanned.get() + 1))
+                    .flatten()
+                    .map(|(id, v)| (id, v))
+            })
+    }
 }
 
 impl<'a, T> IntoIterator for &'a BranchTable<T> {

@@ -272,6 +272,9 @@ pub enum BranchFailpoint {
     /// The next branch-log creation fails to take the log's lock just after creating the file —
     /// as a filesystem without `flock` would — leaving an empty log behind.
     CreateLockFails,
+    /// The next SHARP catalog checkpoint's write fails before its catalog commit, as an I/O error
+    /// would (r13-compose D-T2's failed-write order, A5.4; review wf_5c230f31).
+    CheckpointWriteFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -397,10 +400,15 @@ pub struct BranchMergeWork {
     pub refusals_same_change: u64,
     /// KeyStamp verdicts handed to the base read because the branch forked before the horizon (D-M5).
     pub v3_horizon_fallbacks: u64,
-    /// Trunk commits stamped, stamp prunes, and stamps held now (A31's term).
+    /// Trunk commits stamped, stamp prunes, and the stamps held now: `stamps_held` is the distinct
+    /// stamped keys (bounded by the key space), `stamp_entries` the prune queue's (key, epoch)
+    /// entries, one per key re-stamped at a new epoch, which is A31's term: it grows with the
+    /// trunk's row writes since the oldest live child (review wf_5c230f31: stamps_held alone
+    /// saturates at the key count; PREREG amendment 8 scores A31 on stamp_entries).
     pub stamp_commits: u64,
     pub stamp_prunes: u64,
     pub stamps_held: u64,
+    pub stamp_entries: u64,
     /// The derived write set (r13-compose A5/A6): pages read (branch and base versions, descents,
     /// freelist, overflow), attribution descents, rows compared, subtrees enumerated and cancelled,
     /// freelist trunk pages read, refusals by reason, and keys derived.
@@ -461,10 +469,21 @@ pub struct BranchCatShape {
     pub ensure_cold: u64,
     pub ensure_chain_sum: u64,
     pub ensure_chain_max: u64,
-    /// r13-compose I5: evicted states that were the parent of a state resident at that eviction.
+    /// r13-compose I5: evicted states that were the parent of a state still resident after that
+    /// eviction (amendment 8).
     pub evicted_with_resident_descendant: u64,
-    /// r13-compose I11: items yielded by walks of the branch table.
+    /// r13-compose I11: items yielded by walks of the branch table, and the slots those walks
+    /// visited, empty ones included (A2.F5's `walk_slots_scanned`: B_ALL's table; B_noF8 reads 0).
     pub walk_items_yielded: u64,
+    pub walk_slots_scanned: u64,
+    /// I5's own walk of an eviction's survivors (instrument cost, apart from I11).
+    pub instrument_walk_items: u64,
+    /// C-R's settle on the sharp path: calls that loaded parked branches, the branches they loaded,
+    /// and the most in one call (amendment 8's C-R row; the fuzzy path's are in
+    /// `branch_checkpoint_counters`).
+    pub settle_sharp_calls: u64,
+    pub settle_sharp_loads: u64,
+    pub settle_sharp_max_loads: u64,
     /// r13-compose I3: F4 page-map inserts made deriving loaded states, since open (live).
     pub derived_inserts: u64,
     /// r13-compose I6/I11 (gauges): the table's chunks now, chunks allocated since open, slots in

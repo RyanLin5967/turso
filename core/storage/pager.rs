@@ -3849,8 +3849,10 @@ impl Pager {
         if self.branch.get().is_some() {
             return;
         }
+        // r13-compose A3.F17: under R13_MERGER=off the -MRG arm records nothing for stamping
+        // (review wf_5c230f31 L: the per-write insert had stayed on).
         if let Some(store) = self.branch_store.get() {
-            if store.trunk_has_children() {
+            if store.trunk_has_children() && !crate::branch::store::knob_off("merger") {
                 self.trunk_pending.lock().rows.insert((root, rowid));
             }
         }
@@ -3864,7 +3866,7 @@ impl Pager {
             return;
         }
         if let Some(store) = self.branch_store.get() {
-            if store.trunk_has_children() {
+            if store.trunk_has_children() && !crate::branch::store::knob_off("merger") {
                 self.trunk_pending.lock().tables.insert(root);
             }
         }

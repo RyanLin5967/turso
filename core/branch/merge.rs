@@ -53,6 +53,7 @@ use super::store::BranchStore;
 use super::{Branch, BranchId};
 use crate::schema::{BTreeTable, ResolvedFkRef, Schema, Table};
 use crate::storage::pager::Pager;
+use crate::util::IOExt as _;
 use crate::{Connection, LimboError, Result, Statement, Value};
 
 /// What a merge is validated against. See the module doc.
@@ -352,6 +353,8 @@ impl PageSource for TrunkNow<'_> {
 pub struct DerivedReport {
     pub scope: Option<&'static str>,
     pub keys: Vec<(i64, i64)>,
+    /// |O|, the pages the branch owns (A6.5's KNOWN bound for derive_pages_read is in |O|).
+    pub owned: u64,
 }
 
 impl Merger {
@@ -369,6 +372,7 @@ impl Merger {
             Ok(DerivedReport {
                 scope: prep.scope,
                 keys: prep.rows,
+                owned: view.owned.len() as u64,
             })
         })();
         self.trunk.execute("ROLLBACK")?;

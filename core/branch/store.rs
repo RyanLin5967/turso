@@ -331,10 +331,21 @@ struct ShapeCounters {
     ensure_cold: u64,
     ensure_chain_sum: u64,
     ensure_chain_max: u64,
-    /// r13-compose I5: evicted states that were the parent of a state resident at that eviction.
+    /// r13-compose I5: evicted states that were the parent of a state still resident after that
+    /// eviction (amendment 8).
     evicted_with_resident_descendant: u64,
-    /// r13-compose I11: items yielded by walks of the branch table (evictions, live-id builds).
+    /// r13-compose I11: items yielded by walks of the branch table (evictions, live-id builds), and
+    /// the slots those walks visited, empty ones included (A2.F5's `walk_slots_scanned`).
     walk_items_yielded: u64,
+    walk_slots_scanned: u64,
+    /// r13-compose I5's own walk of the survivors of an eviction (an instrument, kept out of I11).
+    instrument_walk_items: u64,
+    /// C-R's settle on the SHARP path (`settle`): calls that loaded parked branches, the branches
+    /// they loaded, and the most in one call (review wf_5c230f31 M: the fuzzy path's settle_batch
+    /// counters read 0 in a sharp-only census).
+    settle_sharp_calls: u64,
+    settle_sharp_loads: u64,
+    settle_sharp_max_loads: u64,
 }
 
 /// What one trunk write transaction wrote while the trunk had a live child, kept by the writing
@@ -1883,8 +1894,6 @@ impl BranchStore {
         Ok(())
     }
 
-    /// A trunk-only store answers yes, so every trunk page write reaches `first_write_trunk` and
-    /// its refusal.
     /// Stamp a committed trunk transaction's rows and tables with the trunk's epoch. Called by the
     /// committing pager while it still holds the WAL write lock, which every fork and every merge
     /// validation also take, so no fork lands between the commit and its stamps (D-M2: forks take
@@ -1905,6 +1914,7 @@ impl BranchStore {
         }
         inner.merge_work.stamp_commits += 1;
         inner.merge_work.stamps_held = inner.stamps.row_stamps.len() as u64;
+        inner.merge_work.stamp_entries = inner.stamps.stamp_order.len() as u64;
         true
     }
 
@@ -1930,6 +1940,7 @@ impl BranchStore {
             Err(e) => tracing::warn!("branch stamps not pruned (kept): {e}"),
         }
         merge_work.stamps_held = stamps.row_stamps.len() as u64;
+        merge_work.stamp_entries = stamps.stamp_order.len() as u64;
     }
 
     /// KeyStamp's verdict (V3, with D-M5's horizon): `Some(true)` if the trunk wrote any of `keys`
@@ -1984,6 +1995,7 @@ impl BranchStore {
         let inner = self.inner.lock();
         let mut w = inner.merge_work;
         w.stamps_held = inner.stamps.row_stamps.len() as u64;
+        w.stamp_entries = inner.stamps.stamp_order.len() as u64;
         w
     }
 
@@ -2004,6 +2016,8 @@ impl BranchStore {
         f(&mut self.inner.lock().merge_work);
     }
 
+    /// A trunk-only store answers yes, so every trunk page write reaches `first_write_trunk` and
+    /// its refusal.
     pub(crate) fn trunk_has_children(&self) -> bool {
         self.trunk_only || self.trunk_children.load(Ordering::Acquire) > 0
     }
@@ -3036,7 +3050,8 @@ impl BranchStore {
     /// Fill `out` with `page` as the trunk held it when branch `id` forked, if that version lives
     /// in the arena (a retained trunk version). `false` means the trunk's current version is the
     /// base, which the caller reads through the ordinary path; an error means the base is gone
-    /// (r11-merge A20: V4's base read; observing only, nothing else calls it).
+    /// (r11-merge A20: V4's base read). The durable Merger's derivation reads every base page
+    /// through it (r13-compose A5), so V4's base_reads/base_arena counters include Merger work.
     pub(crate) fn base_page_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
         let mut inner = self.inner.lock();
         let mut examined = 0;
@@ -3172,6 +3187,11 @@ impl BranchStore {
             ensure_chain_max: s.ensure_chain_max,
             evicted_with_resident_descendant: s.evicted_with_resident_descendant,
             walk_items_yielded: s.walk_items_yielded,
+            walk_slots_scanned: s.walk_slots_scanned,
+            instrument_walk_items: s.instrument_walk_items,
+            settle_sharp_calls: s.settle_sharp_calls,
+            settle_sharp_loads: s.settle_sharp_loads,
+            settle_sharp_max_loads: s.settle_sharp_max_loads,
             derived_inserts: inner.derived_inserts,
             table_chunks: inner.branches.chunk_stats().0,
             chunk_allocs: inner.branches.chunk_stats().1,
@@ -3485,13 +3505,15 @@ impl StoreInner {
     /// rows are counted as `ids_build_rows`, apart from a listing's.
     fn build_live_ids(&mut self) -> Result<IdSet> {
         let mut set = IdSet::default();
-        for (&id, st) in &self.branches {
+        let scanned = std::cell::Cell::new(0u64);
+        for (&id, st) in self.branches.iter_scanned(&scanned) {
             if !st.handle.is_released() {
                 set.insert(id_key(id));
             }
         }
         self.shape.ids_resident_visited += self.branches.len() as u64;
         self.shape.walk_items_yielded += self.branches.len() as u64;
+        self.shape.walk_slots_scanned += scanned.get();
         if let Some(cat) = self.cat.as_mut() {
             let rows = cat.catalog.unreleased_ids()?;
             self.shape.ids_build_rows += rows.len() as u64;
@@ -3552,9 +3574,10 @@ impl StoreInner {
             let excess = self.branches.len() - cap;
             let parked = &self.parked;
             let mut yielded = 0u64;
+            let scanned = std::cell::Cell::new(0u64);
             let victims: Vec<BranchId> = self
                 .branches
-                .iter()
+                .iter_scanned(&scanned)
                 .inspect(|_| yielded += 1)
                 .filter(|(id, st)| {
                     !cat.dirty.contains_key(*id)
@@ -3567,13 +3590,8 @@ impl StoreInner {
                 .map(|(&id, _)| id)
                 .take(excess)
                 .collect();
-            // I5: a victim that is the parent of a state resident at this eviction (its child's
-            // next cold touch re-derives through it: N2's amplification, S-11).
-            let parents: HashSet<BranchId> = self.branches.values().map(|st| st.parent).collect();
-            yielded += self.branches.len() as u64;
-            self.shape.evicted_with_resident_descendant +=
-                victims.iter().filter(|v| parents.contains(v)).count() as u64;
             self.shape.walk_items_yielded += yielded;
+            self.shape.walk_slots_scanned += scanned.get();
             victim_log(self.shape.checkpoints, &victims);
             for id in &victims {
                 if let Some(st) = self.branches.remove(id) {
@@ -3582,6 +3600,19 @@ impl StoreInner {
                     }
                 }
             }
+            // I5 (amendment 8): a victim that is the parent of a state STILL resident after this
+            // eviction (its child's next cold touch re-derives through it: N2's amplification,
+            // S-11); a child evicted in the same batch does not count. The survivors' walk is the
+            // instrument's own, counted apart from I11 (review wf_5c230f31 L).
+            let victim_set: HashSet<BranchId> = victims.iter().copied().collect();
+            let mut with_child: HashSet<BranchId> = HashSet::new();
+            for st in self.branches.values() {
+                self.shape.instrument_walk_items += 1;
+                if victim_set.contains(&st.parent) {
+                    with_child.insert(st.parent);
+                }
+            }
+            self.shape.evicted_with_resident_descendant += with_child.len() as u64;
             self.shape.evictions += 1;
             self.shape.evicted_states += victims.len() as u64;
         }
@@ -3745,6 +3776,10 @@ impl StoreInner {
     /// whose catalog must hold the state the log describes, and before the slot instruments.
     fn settle(&mut self) -> Result<()> {
         let ids: Vec<BranchId> = self.parked.keys().copied().collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let loads0 = self.cat.as_ref().map_or(0, |c| c.branch_loads);
         for id in ids {
             if !self.ensure(id)? {
                 return Err(LimboError::Corrupt(format!(
@@ -3753,6 +3788,10 @@ impl StoreInner {
                 )));
             }
         }
+        let loads = self.cat.as_ref().map_or(0, |c| c.branch_loads) - loads0;
+        self.shape.settle_sharp_calls += 1;
+        self.shape.settle_sharp_loads += loads;
+        self.shape.settle_sharp_max_loads = self.shape.settle_sharp_max_loads.max(loads);
         Ok(())
     }
 
@@ -4209,10 +4248,20 @@ impl StoreInner {
         let writer = cat.writer.clone();
         let q0 = cat.catalog.counters.queries;
         let mut cap = self.checkpoint_capture(fail_after_commit)?;
+        let fail_write = self.failpoint == Some(BranchFailpoint::CheckpointWriteFails);
+        if fail_write {
+            self.failpoint = None;
+        }
         let mut w = writer.lock();
         let w0 = w.counters.queries;
         let r0 = w.counters.rows_written;
-        let written = checkpoint_write(&mut w, &cap, None);
+        let written = if fail_write {
+            Err(LimboError::InternalError(
+                "failpoint: the catalog checkpoint's write failed before its commit".to_string(),
+            ))
+        } else {
+            checkpoint_write(&mut w, &cap, None)
+        };
         let wrote = w.counters.queries - w0;
         cap.shape_rows_written = w.counters.rows_written - r0;
         let installed = self.checkpoint_install(cap, written);
@@ -4278,22 +4327,27 @@ impl StoreInner {
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
         let trunk_gone: Vec<(u32, u64)> = cat.trunk_gone.iter().copied().collect();
-        // githost-shape instrument (observing only): the walk below visits the pending holders.
         let (n_rows, n_trunk_new, n_trunk_gone) =
             (rows.len() as u64, trunk_new.len() as u64, trunk_gone.len() as u64);
-        self.shape.ckpt_states_walked += self.pending_holders.len() as u64;
         // Slots reserved by open write transactions are named by no durable state: the catalog
         // lists them free (a crash frees them), and this process keeps them as taken.
         // F-W2: only a branch that reserved a slot since the last prune can hold one, so the walk
         // visits those alone; the ones holding none any more (committed, rolled back, closed,
-        // collected) leave the set here.
+        // collected) leave the set here. githost-shape instrument (observing only): F-W2's walk
+        // counts the holders it visits; under I2 the base's walk counts every resident state and
+        // nothing else (the holder set is still kept, uncounted, so it stays exact; r13-compose
+        // review wf_5c230f31 H1: counting both double-counted the holders written since the last
+        // checkpoint).
+        let fw2_off = knob_off("fw2");
+        if !fw2_off {
+            self.shape.ckpt_states_walked += self.pending_holders.len() as u64;
+        }
         let branches = &self.branches;
         self.pending_holders
             .retain(|id| branches.get(id).is_some_and(|st| !st.pending.is_empty()));
-        let reserved: Vec<Slot> = if knob_off("fw2") {
+        let reserved: Vec<Slot> = if fw2_off {
             // I2: the store before F-W2: every resident state is walked for reserved slots.
-            self.shape.ckpt_states_walked += branches.len() as u64
-                - self.pending_holders.len() as u64;
+            self.shape.ckpt_states_walked += branches.len() as u64;
             branches.values().flat_map(|st| st.pending.values().copied()).collect()
         } else {
             self.pending_holders
