@@ -1930,8 +1930,10 @@ fn build_stack(db: &Arc<Database>, trunk: &Arc<Connection>, serial: u64, d: u64)
 
 /// What the top of `st` must read: its own second row (an amend at d/2 = 1 rewrites the top's FIRST
 /// row), the root's first row, the middle level's second row (the top sees every level as of the next
-/// level's fork, so an amend below it is invisible to it), and one trunk row of the schedule's table.
-fn stack_read_plan(model: &Model, st_serial: u64, d: u64, pick: u64) -> Vec<(u64, String)> {
+/// level's fork, so an amend below it is invisible to it), and one trunk row of the schedule's table
+/// as the stack's root saw it at its fork, `fork_step` (S1 forks every stack after step s0, so it is
+/// s0 + 1; a later schedule write or a restart's merge is invisible to the stack: second review).
+fn stack_read_plan(model: &Model, st_serial: u64, d: u64, pick: u64, fork_step: u64) -> Vec<(u64, String)> {
     let mut reads = vec![(stack_row(st_serial, d - 1, 1), stack_value(st_serial, d - 1, 1, 0))];
     if d > 1 {
         reads.push((stack_row(st_serial, 0, 0), stack_value(st_serial, 0, 0, 0)));
@@ -1939,7 +1941,7 @@ fn stack_read_plan(model: &Model, st_serial: u64, d: u64, pick: u64) -> Vec<(u64
         reads.push((stack_row(st_serial, mid, 1), stack_value(st_serial, mid, 1, 0)));
     }
     let r = pick % ROWS + 1;
-    reads.push((r, model.trunk_at(r, model.steps + model.virt + 1)));
+    reads.push((r, model.trunk_at(r, fork_step)));
     reads
 }
 
@@ -2036,7 +2038,8 @@ fn stack(args: &Args) {
         let st = build_stack(&db, &trunk, serial, d);
         expect_ids(&st.ids, &mut made);
         println!(
-            "STACK\tn={n}\tlabel={label}\td={d}\tserial={}\ttop={}\tI13_pages_per_level={:?}\tI13_ancestors_sum={}",
+            "STACK\tn={n}\tlabel={label}\td={}\tserial={}\ttop={}\tI13_pages_per_level={:?}\tI13_ancestors_sum={}",
+            st.d(),
             st.serial,
             st.top().0,
             st.pages,
@@ -2090,10 +2093,10 @@ fn stack(args: &Args) {
             &[(stack_row(st.serial, h, 0), stack_value(st.serial, h, 0, args.touches))],
         );
         // warm top read (one untimed read first).
-        read_rows(&db, st.top(), &stack_read_plan(&model, st.serial, d, 0));
+        read_rows(&db, st.top(), &stack_read_plan(&model, st.serial, d, 0, s0 + 1));
         let mut s = Series::default();
         for i in 0..args.touches {
-            let plan = stack_read_plan(&model, st.serial, d, mix(i ^ 0x54 ^ w()));
+            let plan = stack_read_plan(&model, st.serial, d, mix(i ^ 0x54 ^ w()), s0 + 1);
             timed_op(&db, &mut s, &mut || {
                 read_rows(&db, st.top(), &plan);
                 vec![]
@@ -2107,7 +2110,7 @@ fn stack(args: &Args) {
             db.branch_set_resident_cap(Some(0));
             db.branch_compact_now().unwrap_or_else(|e| not_a_result(&format!("cold-read checkpoint: {e}")));
             db.branch_set_resident_cap(arm_cap());
-            let plan = stack_read_plan(&model, st.serial, d, mix(i ^ 0x55 ^ w()));
+            let plan = stack_read_plan(&model, st.serial, d, mix(i ^ 0x55 ^ w()), s0 + 1);
             let c = timed_op(&db, &mut s, &mut || {
                 read_rows(&db, st.top(), &plan);
                 vec![]
@@ -2186,7 +2189,7 @@ fn stack(args: &Args) {
                 db.branch_set_resident_cap(Some(0));
                 db.branch_compact_now().unwrap_or_else(|e| not_a_result(&format!("zombie checkpoint: {e}")));
                 db.branch_set_resident_cap(arm_cap());
-                let mut plan = stack_read_plan(&model, zs.serial, d, 7);
+                let mut plan = stack_read_plan(&model, zs.serial, d, 7, s0 + 1);
                 plan.push((stack_row(zs.serial, z as u64, 1), stack_value(zs.serial, z as u64, 1, 0)));
                 read_rows(&db, zs.top(), &plan);
                 let top = db.branch(zs.top()).unwrap_or_else(|e| not_a_result(&format!("attach zombie top: {e}")));
@@ -2449,7 +2452,8 @@ impl Restart {
                 }
                 let st = &sc.stacks[(i as usize) % sc.stacks.len()];
                 let top = BranchId(*st.ids.last().unwrap());
-                let plan = stack_read_plan(model, st.serial, st.d, mix(i ^ 0x57 ^ w()));
+                let fork_step = sc.shift.map_or(model.steps + 1, |(after, _)| after + 1);
+                let plan = stack_read_plan(model, st.serial, st.d, mix(i ^ 0x57 ^ w()), fork_step);
                 timed_op(db, series, &mut || {
                     read_rows(db, top, &plan);
                     vec![("d".to_string(), st.d as i64)]
