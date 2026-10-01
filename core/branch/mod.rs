@@ -272,8 +272,9 @@ pub enum BranchFailpoint {
     /// The next branch-log creation fails to take the log's lock just after creating the file —
     /// as a filesystem without `flock` would — leaving an empty log behind.
     CreateLockFails,
-    /// The next SHARP catalog checkpoint's write fails before its catalog commit, as an I/O error
-    /// would (r13-compose D-T2's failed-write order, A5.4; review wf_5c230f31).
+    /// The next catalog checkpoint's write (sharp, or a fuzzy flight's) fails before its catalog
+    /// commit, as an I/O error would (r13-compose D-T2's failed-write order, A5.4; review
+    /// wf_5c230f31).
     CheckpointWriteFails,
 }
 

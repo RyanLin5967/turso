@@ -1220,6 +1220,9 @@ struct Captured {
     arena: Option<std::fs::File>,
     lease_now: u64,
     fail_after_commit: bool,
+    /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
+    /// catalog commit, on the sharp path and on a fuzzy flight alike (D-T2's failed-write order).
+    fail_write: bool,
     /// githost-shape instrument (observing only; r13-compose S-1): when the capture began, and the
     /// rows, trunk versions inserted and trunk versions deleted it captured. Counted at the install.
     shape_started: Instant,
@@ -1234,6 +1237,11 @@ struct Captured {
 /// F-FZ phase 2: write a capture into the catalog through `catalog` (the writer connection) in ONE
 /// transaction. Holds no store lock: nothing here reads the store.
 fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU8>) -> Result<()> {
+    if cap.fail_write {
+        return Err(LimboError::InternalError(
+            "failpoint: the catalog checkpoint's write failed before its commit".to_string(),
+        ));
+    }
     // Every slot the catalog is about to name must be durable first.
     if let Some(file) = cap.arena.as_ref() {
         super::journal::fsync_file(file)?;
@@ -4248,20 +4256,10 @@ impl StoreInner {
         let writer = cat.writer.clone();
         let q0 = cat.catalog.counters.queries;
         let mut cap = self.checkpoint_capture(fail_after_commit)?;
-        let fail_write = self.failpoint == Some(BranchFailpoint::CheckpointWriteFails);
-        if fail_write {
-            self.failpoint = None;
-        }
         let mut w = writer.lock();
         let w0 = w.counters.queries;
         let r0 = w.counters.rows_written;
-        let written = if fail_write {
-            Err(LimboError::InternalError(
-                "failpoint: the catalog checkpoint's write failed before its commit".to_string(),
-            ))
-        } else {
-            checkpoint_write(&mut w, &cap, None)
-        };
+        let written = checkpoint_write(&mut w, &cap, None);
         let wrote = w.counters.queries - w0;
         cap.shape_rows_written = w.counters.rows_written - r0;
         let installed = self.checkpoint_install(cap, written);
@@ -4339,7 +4337,8 @@ impl StoreInner {
         // review wf_5c230f31 H1: counting both double-counted the holders written since the last
         // checkpoint).
         let fw2_off = knob_off("fw2");
-        if !fw2_off {
+        // r13_fw2_double_count (amendment 8.6): H1's double count, as I2's red evidence.
+        if !fw2_off || mutant("r13_fw2_double_count") {
             self.shape.ckpt_states_walked += self.pending_holders.len() as u64;
         }
         let branches = &self.branches;
@@ -4428,6 +4427,10 @@ impl StoreInner {
             arena: arena_file,
             lease_now: now,
             fail_after_commit,
+            fail_write: self
+                .failpoint
+                .take_if(|f| *f == BranchFailpoint::CheckpointWriteFails)
+                .is_some(),
             shape_started: started,
             shape_rows: n_rows,
             shape_trunk_new: n_trunk_new,
@@ -4448,8 +4451,11 @@ impl StoreInner {
         cat.catalog.end_read_snapshot();
         cat.flight = false;
         if let Err(e) = written {
-            for (id, what) in cap.dirty {
-                *cat.dirty.entry(id).or_insert(0) |= what;
+            // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
+            if !mutant("r13_install_err_drops_dirty") {
+                for (id, what) in cap.dirty {
+                    *cat.dirty.entry(id).or_insert(0) |= what;
+                }
             }
             return Err(e);
         }

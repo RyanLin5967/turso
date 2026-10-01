@@ -408,7 +408,7 @@ pub(crate) fn derive(
     let mut seeks = 0u64;
 
     // The branch side: owned pages that are not on its freelist.
-    for &page in owned.iter().filter(|p| !free.contains(p)) {
+    for &page in owned.iter().filter(|p| !free.contains(*p)) {
         let Some(parsed) = b.btree(page)? else {
             unattributed.push(page);
             continue;
@@ -446,7 +446,7 @@ pub(crate) fn derive(
     // r13_skip_freed_base skips the pages on the branch's freelist here.
     let mut base_chain = HashSet::new();
     let skip_freed = super::store::mutant("r13_skip_freed_base");
-    for &page in owned.iter().filter(|p| !(skip_freed && free.contains(p))) {
+    for &page in owned.iter().filter(|p| !(skip_freed && free.contains(*p))) {
         let Some(parsed) = a.btree(page)? else {
             continue;
         };
