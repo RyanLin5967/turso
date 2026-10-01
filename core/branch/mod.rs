@@ -715,6 +715,33 @@ impl Database {
         self.branches.live_id_census()
     }
 
+    /// V4's base read (r11-merge PREREG A20): fill `out` with `page` as the trunk held it when
+    /// branch `id` forked. `Ok(true)`: read from the arena (a retained trunk version); `Ok(false)`:
+    /// the trunk's current version is the base, and `out` is untouched.
+    #[doc(hidden)]
+    pub fn branch_base_page(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
+        self.branches.base_page_into(id, page, out)
+    }
+
+    /// `(base reads, arena-resolved, refused, retained versions examined, C-P trunk probes, C-P
+    /// trunk rows)` since open (r11-merge A20 instrument).
+    #[doc(hidden)]
+    pub fn branch_v4_counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+        self.branches.v4_counters()
+    }
+
+    /// `(probes, rows)` of the once-per-page `written` probe since open (r12-composition K8-B).
+    #[doc(hidden)]
+    pub fn branch_twk_counters(&self) -> (u64, u64) {
+        self.branches.twk_counters()
+    }
+
+    /// `(twk reads, tva probes, tva rows, tva reads)` since open (r12-composition K8-B amendment 13).
+    #[doc(hidden)]
+    pub fn branch_probe_split_counters(&self) -> (u64, u64, u64, u64) {
+        self.branches.probe_split_counters()
+    }
+
     /// Trunk pre-images the store holds now (r11-restart lane instrument).
     #[doc(hidden)]
     pub fn branch_trunk_retained(&self) -> u64 {

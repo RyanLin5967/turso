@@ -291,6 +291,8 @@ struct StoreInner {
     /// then, so an open reads nothing for it), and kept current from then on by every fork and every
     /// release.
     live_ids: Option<IdSet>,
+    /// V4 base reads (r11-merge PREREG A20; observing only).
+    v4: V4Counters,
 }
 
 /// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
@@ -320,6 +322,16 @@ struct ShapeCounters {
     table_moved: u64,
     evictions: u64,
     evicted_states: u64,
+}
+
+/// A V4 merge's base reads since open: `base_page_into` calls, those answered from the arena (a
+/// retained trunk version) and those refused, and the retained versions compared (r11-merge A20).
+#[derive(Debug, Default, Clone, Copy)]
+struct V4Counters {
+    base_reads: u64,
+    base_arena: u64,
+    base_refused: u64,
+    base_examined: u64,
 }
 
 /// Catalog mode's bookkeeping beside the in-memory cache of branch states (see `catalog.rs`).
@@ -374,6 +386,16 @@ struct CatState {
     flight: bool,
     /// Checkpoint and settle counters (observing only).
     ckpt: CkptCounters,
+    /// The part of `trunk_probes`/`trunk_rows` made by `trunk_written_known`'s once-per-page probe
+    /// (r12-composition K8-B instrument; observing only).
+    twk_probes: u64,
+    twk_rows: u64,
+    /// Database page reads made inside those probes, and the same three for `trunk_version_at`'s
+    /// probe (r12-composition K8-B amendment 13: T2's reads split by probe kind; observing only).
+    twk_reads: u64,
+    tva_probes: u64,
+    tva_rows: u64,
+    tva_reads: u64,
 }
 
 /// Catalog checkpoints and C-R settle batches, as counted (r11-restart-r2 instrument, observing
@@ -497,6 +519,12 @@ impl CatState {
             trunk_page_loads: 0,
             trunk_probes: 0,
             trunk_rows: 0,
+            twk_probes: 0,
+            twk_rows: 0,
+            twk_reads: 0,
+            tva_probes: 0,
+            tva_rows: 0,
+            tva_reads: 0,
         })
     }
 }
@@ -2700,6 +2728,74 @@ impl BranchStore {
         Ok(true)
     }
 
+    /// Fill `out` with `page` as the trunk held it when branch `id` forked, if that version lives
+    /// in the arena (a retained trunk version). `false` means the trunk's current version is the
+    /// base, which the caller reads through the ordinary path; an error means the base is gone
+    /// (r11-merge A20: V4's base read; observing only, nothing else calls it).
+    pub(crate) fn base_page_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        let mut examined = 0;
+        let resolved = inner.base_resolve(id, page, &mut examined);
+        inner.v4.base_reads += 1;
+        inner.v4.base_examined += examined;
+        if resolved.is_err() {
+            inner.v4.base_refused += 1;
+        }
+        let Some((slot, crc)) = resolved? else {
+            return Ok(false);
+        };
+        let arena = inner
+            .arena
+            .as_ref()
+            .expect("a slot resolved, so the arena exists");
+        // An arena read counts only once its page is read and checked; a failed read or checksum
+        // is a refusal, as the caller sees it.
+        let read = arena.read_slot(slot, out).and_then(|()| {
+            if arena.is_file_backed() && crc32c::crc32c(out) != crc {
+                return Err(LimboError::Corrupt(format!(
+                    "branch {}'s base page {page} (arena slot {slot}) failed its checksum",
+                    id.0
+                )));
+            }
+            Ok(())
+        });
+        match &read {
+            Ok(()) => inner.v4.base_arena += 1,
+            Err(_) => inner.v4.base_refused += 1,
+        }
+        read.map(|()| true)
+    }
+
+    /// `(base reads, arena-resolved, refused, retained versions examined, C-P trunk probes, C-P
+    /// trunk rows)` since open (r11-merge A20). Does not settle, so reading it moves nothing.
+    pub(crate) fn v4_counters(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let inner = self.inner.lock();
+        let v = inner.v4;
+        let (probes, rows) = inner
+            .cat
+            .as_ref()
+            .map_or((0, 0), |c| (c.trunk_probes, c.trunk_rows));
+        (v.base_reads, v.base_arena, v.base_refused, v.base_examined, probes, rows)
+    }
+
+    /// `(probes, rows)` of `trunk_written_known`'s once-per-page catalog probe since open
+    /// (r12-composition K8-B instrument). Does not settle.
+    pub(crate) fn twk_counters(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        inner.cat.as_ref().map_or((0, 0), |c| (c.twk_probes, c.twk_rows))
+    }
+
+    /// `(twk reads, tva probes, tva rows, tva reads)`: database page reads inside
+    /// `trunk_written_known`'s probes, and `trunk_version_at`'s probes, rows and reads, since open
+    /// (r12-composition K8-B amendment 13). Does not settle.
+    pub(crate) fn probe_split_counters(&self) -> (u64, u64, u64, u64) {
+        let inner = self.inner.lock();
+        inner
+            .cat
+            .as_ref()
+            .map_or((0, 0, 0, 0), |c| (c.twk_reads, c.tva_probes, c.tva_rows, c.tva_reads))
+    }
+
     pub(crate) fn open_stats(&self) -> BranchOpenStats {
         self.open_stats
     }
@@ -3061,6 +3157,7 @@ impl StoreInner {
             pending_holders: HashSet::new(),
             resident_cap: None,
             live_ids: None,
+            v4: V4Counters::default(),
         }
     }
 
@@ -3403,8 +3500,13 @@ impl StoreInner {
             return Ok(());
         }
         cat.trunk_probes += 1;
-        if let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, u64::MAX)? {
+        cat.twk_probes += 1;
+        let reads0 = super::page_io()[0];
+        let pred = cat.catalog.trunk_pred(page, u64::MAX);
+        cat.twk_reads += super::page_io()[0] - reads0;
+        if let Some((born, died, slot, crc)) = pred? {
             cat.trunk_rows += 1;
+            cat.twk_rows += 1;
             // A version reaped since the checkpoint still dates the page's last write.
             if !cat.trunk_gone.contains(&(page, born)) {
                 cat.trunk_cache
@@ -3452,10 +3554,15 @@ impl StoreInner {
             }
         }
         cat.trunk_probes += 1;
-        let Some((born, died, slot, crc)) = cat.catalog.trunk_pred(page, at)? else {
+        cat.tva_probes += 1;
+        let reads0 = super::page_io()[0];
+        let pred = cat.catalog.trunk_pred(page, at);
+        cat.tva_reads += super::page_io()[0] - reads0;
+        let Some((born, died, slot, crc)) = pred? else {
             return Ok(None);
         };
         cat.trunk_rows += 1;
+        cat.tva_rows += 1;
         *examined += 1;
         // A reaped version held no live child, so it cannot be the one a live child reads.
         if at >= died || cat.trunk_gone.contains(&(page, born)) {
@@ -4339,6 +4446,34 @@ impl StoreInner {
             return Err(LimboError::Corrupt(format!(
                 "branch {} would read trunk page {page} written after its fork; the pre-image was \
                  not retained",
+                id.0
+            )));
+        }
+        Ok(None)
+    }
+
+    /// The version of `page` the trunk held when branch `id` forked: `resolve`'s trunk tail at the
+    /// branch's `trunk_at`, ignoring the branch's own and inherited pages (the base a V4 merge
+    /// diffs against, r11-merge A20). `None`: the trunk has not rewritten the page since, so its
+    /// current version is the base.
+    fn base_resolve(
+        &mut self,
+        id: BranchId,
+        page: u32,
+        examined: &mut u64,
+    ) -> Result<Option<(Slot, u32)>> {
+        if !self.ensure(id)? {
+            return Err(gone(id));
+        }
+        let at = self.branches.get(&id).ok_or_else(|| gone(id))?.trunk_at;
+        self.trunk_written_known(page)?;
+        if let Some(found) = self.trunk_version_at(page, at, examined)? {
+            return Ok(Some(found));
+        }
+        let born = self.trunk.written.get(&page).copied().unwrap_or(0);
+        if born > at {
+            return Err(LimboError::Corrupt(format!(
+                "branch {}'s base page {page} was written after its fork and not retained",
                 id.0
             )));
         }
