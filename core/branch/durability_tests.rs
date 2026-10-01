@@ -2794,9 +2794,14 @@ enum LogAfterKill {
     Torn,
 }
 
-/// One crash and one recovery; `Err` names every invariant that failed.
+/// One crash and one recovery; `Err` names every invariant that failed. With `optfs` the child runs
+/// under the checksum rule (r12-optfs, `TURSO_BRANCH_ABLATE=optfs`) instead of the redo rule.
 #[cfg(unix)]
-fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result<(), String> {
+fn no_force_crash_once(
+    optfs: bool,
+    at: &str,
+    log_after: LogAfterKill,
+) -> std::result::Result<(), String> {
     use std::os::unix::process::ExitStatusExt;
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("durable.db");
@@ -2829,6 +2834,7 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
             "--nocapture",
         ])
         .env("TURSO_NF_CRASH_CHILD_DB", &path)
+        .env("TURSO_BRANCH_ABLATE", if optfs { "optfs" } else { "" })
         .env("TURSO_NF_CRASH_AT", at)
         .env("TURSO_NF_CRASH_LOG", &progress)
         .env("TURSO_BRANCH_CRASH_NOTE", &note)
@@ -2881,6 +2887,22 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
         bytes.get(off..off + page_size as usize).map(<[u8]>::to_vec)
     };
     let before_redo = b_slot.map(slot_bytes);
+    // r12-optfs: the slots the killed flight had fsync(2)ed, with their crcs as its note names
+    // them, and what the arena file held there when the child died.
+    let plain_before: Vec<(u64, u32, Option<Vec<u8>>)> = noted
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("plain="))
+        .map(|list| {
+            list.split(',')
+                .filter(|e| !e.is_empty())
+                .map(|e| {
+                    let (slot, crc) = e.split_once(':').expect("slot:crc");
+                    let slot: u64 = slot.parse().unwrap();
+                    (slot, crc.parse().unwrap(), slot_bytes(slot))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     if log_after != LogAfterKill::AsLeft {
         let start: u64 = noted
             .split_whitespace()
@@ -2892,6 +2914,16 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
         let file = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
         if log_after == LogAfterKill::Cut {
             file.set_len(start).unwrap();
+        } else if optfs {
+            // No page image: the flight is shorter than 4 KiB. Zero all of it but its end frame
+            // (21 bytes), so the end survives the lost start.
+            let len = file.metadata().unwrap().len();
+            let n = 4096u64.min(len.saturating_sub(start + 21));
+            if n < 8 {
+                return Err(format!("{at}: the flight is too short to tear ({len} B, at {start})"));
+            }
+            use std::os::unix::fs::FileExt;
+            file.write_all_at(&vec![0u8; n as usize], start).unwrap();
         } else {
             let len = file.metadata().unwrap().len();
             // Room for the zeroed 4 KiB and, whole after it, at least the flight's end frame.
@@ -2908,10 +2940,12 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
     let mut failed = Vec::new();
     // What must hold, by kill point: B is durable once its commit's flight has synced (or, for
     // flight-after-write left uncut, once its frames reached the file), and gone once released.
+    // Under the checksum rule a flight killed before its full sync returned lost its slot with the
+    // kill (the power-loss model), so recovery cuts it: B is gone at flight-after-write.
     let b_expected = match at {
         "after-first-fork" | "after-fork" | "after-connect" | "commit-after-slots"
         | "commit-after-buffer" | "after-release" => false,
-        "flight-after-write" => !cut_log,
+        "flight-after-write" => !cut_log && !optfs,
         _ => true,
     };
     let ids: BTreeSet<BranchId> = match db.branch_ids() {
@@ -3012,10 +3046,44 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
         )),
         Err(e) => failed.push(format!("R5: a fork after recovery failed: {e}")),
     }
+    // The premises that make this a test of the checksum rule (r12-optfs): where a flight was
+    // killed before its full sync returned, every slot it had fsync(2)ed was in the arena file
+    // (Q's freed slot) and did NOT hold its bytes, so only the crc check can cut it; where B's
+    // commit was acknowledged, its page was in the arena file and recovery did not write it (there
+    // is no redo).
+    if optfs {
+        if at == "flight-after-write" && log_after == LogAfterKill::AsLeft {
+            if plain_before.is_empty() {
+                failed.push("premise: the killed flight fsync(2)ed no arena slot".to_string());
+            }
+            for (slot, crc, bytes) in &plain_before {
+                match bytes {
+                    None => failed.push(format!(
+                        "premise: slot {slot} lay past the end of the arena file, not in Q's slot"
+                    )),
+                    Some(bytes) if crc32c::crc32c(bytes) == *crc => failed.push(format!(
+                        "premise: slot {slot} held the flight's bytes when the child died \
+                         (the power-loss model kept them)"
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+        if b_expected && committed && at != "after-release" {
+            if !matches!(before_redo, Some(Some(_))) {
+                failed.push(format!(
+                    "premise: B's slot {b_slot:?} was not in the arena file (not Q's freed slot)"
+                ));
+            }
+            if b_slot.map(slot_bytes) != before_redo {
+                failed.push(format!("premise: recovery rewrote B's slot {b_slot:?}"));
+            }
+        }
+    }
     // The premise that makes this a test of the redo rule: where B's commit was acknowledged, its
     // page was NOT in the arena file when the child died; only the log could bring it back.
-    if b_expected && committed && at != "after-release" {
-        if before_redo.is_none() {
+    if !optfs && b_expected && committed && at != "after-release" {
+        if !matches!(before_redo, Some(Some(_))) {
             failed.push(format!(
                 "premise: B's slot {b_slot:?} lay past the end of the arena file, not in Q's freed slot"
             ));
@@ -3042,6 +3110,22 @@ fn no_force_crash_once(at: &str, log_after: LogAfterKill) -> std::result::Result
 #[cfg(unix)]
 #[test]
 fn no_force_crash_recovers_at_every_kill_point() {
+    crash_at_every_kill_point(false);
+}
+
+/// r12-optfs PREREG §3.4: the same 13 recoveries with the child under the checksum rule
+/// (`TURSO_BRANCH_ABLATE=optfs`: no page image; the arena fsync(2)ed with no barrier before the
+/// log's full sync) and the power-loss model in which a plain-fsynced slot survives only once a
+/// later full sync returned. With `TURSO_NF_MUTANT` set (MO1 `no_crc_check`, MO2
+/// `optfs_no_arena_fsync`) it must FAIL.
+#[cfg(unix)]
+#[test]
+fn optfs_crash_recovers_at_every_kill_point() {
+    crash_at_every_kill_point(true);
+}
+
+#[cfg(unix)]
+fn crash_at_every_kill_point(optfs: bool) {
     use LogAfterKill::*;
     let mut failures = Vec::new();
     let mut runs = 0;
@@ -3053,8 +3137,9 @@ fn no_force_crash_recovers_at_every_kill_point() {
         };
         for &log_after in logs {
             runs += 1;
-            let verdict = no_force_crash_once(at, log_after);
-            println!("no-force crash {at} ({log_after:?}): {verdict:?}");
+            let verdict = no_force_crash_once(optfs, at, log_after);
+            let mode = if optfs { "optfs" } else { "no-force" };
+            println!("{mode} crash {at} ({log_after:?}): {verdict:?}");
             if let Err(e) = verdict {
                 failures.push(e);
             }
@@ -3216,4 +3301,181 @@ fn a_close_waits_for_a_removed_childs_release() {
         "D came back reading another branch's page through its released parent"
     );
     let _ = d.into_id();
+}
+
+/// Flip one byte in the middle of an arena slot on disk.
+fn flip_arena_byte(path: &Path, slot: u32, page_size: u64) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let arena = format!("{}-branch-arena", path.to_str().unwrap());
+    let offset = slot as u64 * page_size + page_size / 2;
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&arena).unwrap();
+    let mut byte = [0u8; 1];
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    f.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0xFF;
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    f.write_all(&byte).unwrap();
+}
+
+/// r12-optfs PREREG §3.1 (O1-O4): under the checksum rule a lifecycle pays the log's sync and ONE
+/// plain fsync(2) of the arena, both in its commit's flight. A fork under a durable id floor pays
+/// nothing, and a batch release and the first fork after an open pay the log's sync alone.
+#[test]
+fn an_optfs_lifecycle_syncs_the_arena_plainly_and_the_log_once() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let incarnation;
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        let warm = trunk.fork_branch().unwrap();
+        set(&warm.connect().unwrap(), 7, "warm");
+        let _ = warm.into_id();
+    }
+    let db = reopen(&path, incarnation);
+    db.branches.set_optfs(true);
+    let trunk = db.connect().unwrap();
+    // (every sync, the plain ones among them), on this thread
+    let syncs = || {
+        (
+            crate::branch::churn_counters().thread_fsyncs,
+            super::journal::THREAD_PLAIN_FSYNCS.with(|n| n.get()),
+        )
+    };
+
+    let (all, plain) = syncs();
+    let w = trunk.fork_branch().unwrap();
+    assert_eq!(syncs(), (all + 1, plain), "O4: the first fork after an open syncs the log alone");
+
+    let (all, plain) = syncs();
+    let b = trunk.fork_branch().unwrap();
+    assert_eq!(syncs(), (all, plain), "O1: a fork under a durable id floor is not forced");
+
+    let bc = b.connect().unwrap();
+    let (all, plain) = syncs();
+    set(&bc, 150, "b");
+    assert_eq!(
+        syncs(),
+        (all + 2, plain + 1),
+        "O2: a branch commit fsync(2)s the arena once and syncs the log once"
+    );
+    drop(bc);
+
+    let (all, plain) = syncs();
+    db.reap_branches(vec![b]).unwrap();
+    assert_eq!(syncs(), (all + 1, plain), "O3: a batch release is one flush of the log alone");
+    drop(w);
+}
+
+/// r12-optfs PREREG §3.6: the checksum rule cuts the LAST flight when a live slot it names fails
+/// its crc on disk — its full sync never returned, so it was never acknowledged — and never an
+/// earlier one, whose full sync did return: there a failed crc stays a checksum error.
+#[test]
+fn an_optfs_last_flight_whose_slot_fails_its_crc_is_cut_and_an_earlier_one_is_not() {
+    for damage_last in [true, false] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("durable.db");
+        let (incarnation, page_size, b1_id, b1_slot, b2_id, b2_slot);
+        {
+            let db = open_at(&path, durable()).unwrap();
+            db.branches.set_optfs(true);
+            incarnation = db.incarnation;
+            let trunk = db.connect().unwrap();
+            seed(&trunk, 200);
+            page_size = rows(&trunk, "PRAGMA page_size")[0][0].as_int().unwrap() as u64;
+            // b1's commit is its own flight; b2's fork rides on b2's commit, the last flight.
+            let b1 = trunk.fork_branch().unwrap();
+            set(&b1.connect().unwrap(), 7, "one");
+            b1_slot = b1.owned_slots();
+            b1_id = b1.into_id();
+            let b2 = trunk.fork_branch().unwrap();
+            set(&b2.connect().unwrap(), 150, "two");
+            b2_slot = b2.owned_slots();
+            b2_id = b2.into_id();
+        }
+        assert_eq!((b1_slot.len(), b2_slot.len()), (1, 1), "one page per commit");
+        flip_arena_byte(&path, if damage_last { b2_slot[0] } else { b1_slot[0] }, page_size);
+        let db = reopen(&path, incarnation);
+        let ids: BTreeSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
+        // A dropped handle releases its branch: each read detaches its handle again.
+        let read = |id: BranchId, row: i64| {
+            let branch = db.branch(id).unwrap();
+            let got = branch
+                .connect()
+                .unwrap()
+                .prepare(format!("SELECT v FROM t WHERE id = {row}"))
+                .and_then(|mut s| s.run_collect_rows())
+                .map(|r| format!("{:?}", r[0][0]))
+                .map_err(|e| e.to_string());
+            let _ = branch.into_id();
+            got
+        };
+        if damage_last {
+            assert_eq!(
+                ids,
+                BTreeSet::from([b1_id]),
+                "the last flight was kept although its slot failed its crc"
+            );
+            assert_eq!(read(b1_id, 7), Ok(format!("{:?}", Value::from_text("one"))));
+            assert!(!in_use(&db).contains(&b2_slot[0]), "the cut flight's slot is still in use");
+            let next = db.connect().unwrap().fork_branch().unwrap();
+            assert!(next.id().0 > b2_id.0, "fork id {} handed out again", next.id().0);
+        } else {
+            assert_eq!(ids, BTreeSet::from([b1_id, b2_id]), "a flight before the last was cut");
+            assert_eq!(read(b2_id, 150), Ok(format!("{:?}", Value::from_text("two"))));
+            let err = read(b1_id, 7).expect_err("a corrupted page under an earlier flight was read");
+            assert!(err.contains("checksum"), "{err}");
+        }
+    }
+}
+
+/// r12-optfs PREREG §3.6: a cut never lowers the id counter. A crafted last flight forks X under a
+/// new id floor F and commits X into a slot the arena file does not hold: the open cuts it (not a
+/// "past the end" refusal), X is gone, and the next fork's id is at least F, so no id that flight
+/// carried can be handed out again even had it been acknowledged.
+#[test]
+fn a_cut_flight_never_lowers_the_id_counter() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("durable.db");
+    let (incarnation, page_size, b_id);
+    {
+        let db = open_at(&path, durable()).unwrap();
+        incarnation = db.incarnation;
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 200);
+        page_size = rows(&trunk, "PRAGMA page_size")[0][0].as_int().unwrap() as u64;
+        let b = trunk.fork_branch().unwrap();
+        set(&b.connect().unwrap(), 7, "b");
+        b_id = b.into_id();
+    }
+    let files = super::journal::BranchFiles::for_db(path.to_str().unwrap());
+    let slots = std::fs::metadata(&files.arena).unwrap().len() / page_size;
+    let log_len = std::fs::metadata(&files.log).unwrap().len();
+    let (x, floor) = (b_id.0 + 1_000, b_id.0 + 1_000_000);
+    super::journal::append_flight_for_test(
+        &files,
+        &[
+            super::journal::Record::Fork { child: x, parent: 0 },
+            super::journal::Record::IdFloor { next_id: floor },
+            super::journal::Record::Commit {
+                branch: x,
+                pages: vec![(2, slots as u32 + 10, 0)],
+            },
+        ],
+    );
+    let db = reopen(&path, incarnation);
+    assert_eq!(db.branch_ids().unwrap(), vec![b_id], "the cut flight's fork survived");
+    assert_eq!(
+        std::fs::metadata(&files.log).unwrap().len(),
+        log_len,
+        "the log was not cut back to where the crafted flight began"
+    );
+    let next = db.connect().unwrap().fork_branch().unwrap();
+    assert!(
+        next.id().0 >= floor,
+        "fork id {} is below the cut flight's id floor {floor}",
+        next.id().0
+    );
 }

@@ -1,7 +1,8 @@
 //! Branch lifecycles per second against concurrent agents on the DURABLE branch store: what a
 //! group commit with the flush outside the store mutex buys (r11-churn lane; the specification is
 //! `frontier/round11/r11-churn/PREREG.md` amendment 4 in artie-research, and this file is its
-//! implementation). r12-noforce appends five columns (see below); the first fourteen are unchanged.
+//! implementation). r12-noforce appends five columns and r12-optfs one (see below); the first
+//! fourteen are unchanged.
 //!
 //!   TURSO_BRANCH_FULLFSYNC=0|1 cargo run -p turso_core --release --example branch_gc -- \
 //!       --threads 1,2,4,8,16 [--warm-ms 3000] [--window-ms 15000] [--lease-ms 1000] [--w 1] \
@@ -27,6 +28,9 @@
 //!                      inside its write-and-commit (r12-noforce: which step pays which sync)
 //!   compactions_per_arrival, compact_fsyncs_per_arrival, log_bytes_per_arrival  the checkpoint's
 //!                      share, and the bytes flights wrote to the log (page images under no-force)
+//!   plain_fsyncs_per_arrival  the plain fsync(2) calls among the fsyncs: the arena's, under
+//!                      TURSO_BRANCH_ABLATE=optfs (r12-optfs); every other sync is the instrument's
+//!                      class (F_FULLFSYNC with TURSO_BRANCH_FULLFSYNC=1)
 //!
 //! Which sync the store issues is printed from the instrument: plain fsync(2), or `F_FULLFSYNC`
 //! with `TURSO_BRANCH_FULLFSYNC=1`.
@@ -346,7 +350,7 @@ fn main() {
          flights_per_s locked_flushes_per_s waits_per_s already_durable_per_s \
          busy_retries_per_arrival cycle_p50_us cycle_p90_us cycle_p99_us cycle_max_us \
          fork_fsyncs_per_arrival commit_fsyncs_per_arrival compactions_per_arrival \
-         compact_fsyncs_per_arrival log_bytes_per_arrival"
+         compact_fsyncs_per_arrival log_bytes_per_arrival plain_fsyncs_per_arrival"
     );
     let shared = Arc::new(Shared {
         queue: Mutex::new(VecDeque::new()),
@@ -404,7 +408,7 @@ fn main() {
         let per_arrival = |x: u64| x as f64 / arrivals.max(1.0);
         println!(
             "# gc {t} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1} {:.1} {:.4} {:.1} {:.1} {:.1} {:.1} \
-             {:.4} {:.4} {:.5} {:.4} {:.1}",
+             {:.4} {:.4} {:.5} {:.4} {:.1} {:.4}",
             per_s(r1 - r0),
             arrivals / secs,
             (k1.fsyncs - k0.fsyncs) as f64 / arrivals.max(1.0),
@@ -423,6 +427,7 @@ fn main() {
             per_arrival(k1.compactions - k0.compactions),
             per_arrival(k1.compact_fsyncs - k0.compact_fsyncs),
             per_arrival(k1.log_bytes - k0.log_bytes),
+            per_arrival(k1.plain_fsyncs - k0.plain_fsyncs),
         );
         // Quiescent between thread counts: agents stopped, and the reaper releases only what is
         // due, so the engine holds exactly the branches still in the table.

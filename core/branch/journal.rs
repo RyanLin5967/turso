@@ -32,6 +32,19 @@
 //! late. (It used to be ordered instead: the arena synced before the log, one more sync per
 //! commit.)
 //!
+//! # The checksum rule (OptFS-class, r12-optfs; `TURSO_BRANCH_ABLATE=optfs`)
+//!
+//! The measurement switch's third mode logs no image. A flight that carries a record naming a slot
+//! fsync(2)s the arena with no barrier, writes its frames and fully syncs the log; on Apple
+//! platforms the log's `F_FULLFSYNC` "drains the entire queue of the device ... data that had been
+//! fsync'd on the same device before is guaranteed to be persisted when this call returns" (`man 2
+//! fcntl`). Until it returns nothing orders the two, so the device may hold the record without the
+//! slot — but only in the LAST flight, the only one that can have been in the air. Recovery
+//! therefore checks the crc of every live slot the last whole flight names and cuts that flight
+//! whole on a mismatch ([`Recovered::last_flight`], `BranchStore::open`); it was never acknowledged.
+//! Every earlier flight's full sync returned, and a slot that fails its crc there is an error, as
+//! before. The check runs for every log: after redo, a log written under the redo rule passes it.
+//!
 //! # One store per set of files
 //!
 //! A journal holds an exclusive `flock` on the log for its whole life (review N1; LevelDB's `LOCK`
@@ -53,7 +66,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-use super::arena::{Arena, Slot};
+use super::arena::{Arena, ArenaSync, Slot};
 use crate::error::io_error;
 use crate::{LimboError, Result};
 
@@ -473,6 +486,10 @@ pub(crate) struct Recovered {
     pub(crate) snapshot: Option<SnapshotState>,
     pub(crate) records: Vec<Record>,
     pub(crate) journal: Journal,
+    /// The last whole flight, which ends the recovered log: `(byte offset where it begins, index
+    /// in `records` of its first record)`. The checksum rule may cut it
+    /// (`Journal::cut_last_flight`).
+    pub(crate) last_flight: Option<(u64, usize)>,
 }
 
 pub(crate) struct Journal {
@@ -668,6 +685,7 @@ impl Journal {
         };
 
         let mut records = Vec::new();
+        let mut last_flight = None;
         match header {
             Some((log_ps, log_gen)) if log_gen == generation => {
                 if log_ps != page_size {
@@ -676,6 +694,10 @@ impl Journal {
                 let mut pos = LOG_HEADER_LEN;
                 // Where the last whole flight ends, and how many records precede it (`FlightEnd`).
                 let mut flight_end: Option<(usize, usize)> = None;
+                // Where each record's frame begins, and where the last whole flight began: its
+                // start offset and the index of its first record.
+                let mut offsets: Vec<usize> = Vec::new();
+                let mut last_start: Option<(usize, usize)> = None;
                 // How the scan stopped: `None` at the clean end of the file, else what it met.
                 let mut damage: Option<&str> = None;
                 loop {
@@ -720,10 +742,13 @@ impl Journal {
                             damage = Some("a flight whose checksum fails");
                             break;
                         }
+                        let first = offsets.partition_point(|&at| at < from as usize);
+                        last_start = Some((from as usize, first));
                         pos = start + len;
                         flight_end = Some((pos, records.len()));
                         continue;
                     }
+                    offsets.push(pos);
                     records.push(record);
                     pos = start + len;
                 }
@@ -779,6 +804,8 @@ impl Journal {
                         pos = end;
                     }
                 }
+                // For the checksum rule: the last whole flight, which now ends the log.
+                last_flight = last_start.map(|(from, first)| (from as u64, first));
                 journal.len = pos as u64;
                 if (pos as u64) < bytes.len() as u64 {
                     // The torn tail: a record that was never durable. Cut it off so appends resume
@@ -805,7 +832,28 @@ impl Journal {
             snapshot: snapshot_state,
             records,
             journal,
+            last_flight,
         }))
+    }
+
+    /// Cut the log back to `start`, where its last whole flight began (the checksum rule): that
+    /// flight was never acknowledged. Recovery calls this before anything is appended.
+    pub(crate) fn cut_last_flight(&mut self, start: u64) -> Result<()> {
+        self.check_live()?;
+        if start < LOG_HEADER_LEN as u64 || start > self.len || !self.pending.is_empty() {
+            return Err(LimboError::InternalError(format!(
+                "branch log: cannot cut a flight at byte {start} of a {}-byte log",
+                self.len
+            )));
+        }
+        self.file
+            .set_len(start)
+            .map_err(|e| io_error(e, "truncate branch log"))?;
+        if self.sync {
+            fsync_file(&self.file)?;
+        }
+        self.len = start;
+        Ok(())
     }
 
     /// Whether this journal may write nothing more: an I/O failure, a crash failpoint, or a fork.
@@ -948,8 +996,13 @@ impl Journal {
     /// it; the caller guarantees no other flight is in the air (one leader at a time), which is
     /// also what makes the on-disk length check below exact. No arena descriptor comes along: the
     /// slots these frames name are carried by their `PageImage` frames (the redo rule) -- except
-    /// under the measurement switch's `no_redo`, where `arena` is the dirty arena to sync first.
-    pub(crate) fn take_flight(&mut self, arena: Option<File>) -> Result<Flight> {
+    /// under the measurement switch's `no_redo`, where `arena` is the dirty arena to sync first, and
+    /// under `optfs`, where `plain` is the dirty arena to fsync(2) first (the checksum rule).
+    pub(crate) fn take_flight(
+        &mut self,
+        arena: Option<File>,
+        plain: Option<ArenaSync>,
+    ) -> Result<Flight> {
         let fail = std::mem::take(&mut self.fail_next_write);
         self.check_live()?;
         let end_lsn = self.lsn;
@@ -957,6 +1010,7 @@ impl Journal {
             return Ok(Flight {
                 log: None,
                 arena: None,
+                plain: None,
                 bytes: Vec::new(),
                 at: self.len,
                 sync: self.sync,
@@ -988,6 +1042,7 @@ impl Journal {
         Ok(Flight {
             log: Some(log),
             arena,
+            plain,
             bytes,
             at,
             sync: self.sync,
@@ -1130,6 +1185,9 @@ pub(crate) struct Flight {
     log: Option<File>,
     /// Only under `ablate().no_redo`: the arena to sync before the frames (gc2's rule-1 order).
     arena: Option<File>,
+    /// Only under `ablate().optfs`: the arena to fsync(2) before the frames, with no barrier; the
+    /// log's full sync makes it durable (the checksum rule).
+    plain: Option<ArenaSync>,
     bytes: Vec<u8>,
     at: u64,
     sync: bool,
@@ -1153,12 +1211,26 @@ impl Flight {
             if let Some(arena) = &self.arena {
                 fsync_file(arena)?;
             }
+            if let Some(plain) = &self.plain {
+                if !super::store::crash::mutant("optfs_no_arena_fsync") {
+                    plain.sync_plain()?;
+                }
+            }
         }
         write_at(&log, &self.bytes, self.at)?;
         LOG_BYTES.fetch_add(self.bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        super::store::crash::point("flight-after-write", || format!("at={}", self.at));
+        super::store::crash::point("flight-after-write", || {
+            #[cfg(test)]
+            if let Some(plain) = &self.plain {
+                return format!("at={} plain={}", self.at, plain.device_note());
+            }
+            format!("at={}", self.at)
+        });
         if self.sync {
             fsync_file(&log)?;
+            if let Some(plain) = &self.plain {
+                plain.full_sync_returned()?;
+            }
         }
         Ok(())
     }
@@ -1334,6 +1406,25 @@ fn read_snapshot(path: &Path) -> Result<(u32, u64, SnapshotState, u64)> {
     Ok((page_size, generation, state, bytes.len() as u64))
 }
 
+/// Test only: append `records` to the log at `files` as one flight, as a group flush writes it
+/// (frames, then the end frame), taking no lock and syncing nothing.
+#[cfg(test)]
+pub(crate) fn append_flight_for_test(files: &BranchFiles, records: &[Record]) {
+    let file = OpenOptions::new().write(true).open(&files.log).unwrap();
+    let at = file.metadata().unwrap().len();
+    let mut bytes = Vec::new();
+    for record in records {
+        let mut payload = Vec::new();
+        record.encode(&mut payload);
+        put_u32(&mut bytes, payload.len() as u32);
+        put_u32(&mut bytes, crc32c::crc32c(&payload));
+        bytes.extend_from_slice(&payload);
+    }
+    let end = flight_end_frame(at, &bytes);
+    bytes.extend_from_slice(&end);
+    write_at(&file, &bytes, at).unwrap();
+}
+
 /// Recovery's redo pass (the redo rule): write every `PageImage` of the recovered records into its
 /// arena slot, in log order, then sync the arena once. Idempotent, so a crash inside it is repaired
 /// by the next recovery: the images stay in the log until a compaction has synced the arena. Runs
@@ -1429,8 +1520,12 @@ pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
 pub(crate) static FSYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Observation only (r12-noforce instrument): frame bytes group flights wrote to the log.
 pub(crate) static LOG_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Observation only (r12-optfs instrument): the `fsync_plain` calls among `FSYNCS`.
+pub(crate) static PLAIN_FSYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 thread_local! {
     pub(crate) static THREAD_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The `fsync_plain` calls among `THREAD_FSYNCS` (r12-optfs).
+    pub(crate) static THREAD_PLAIN_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// `fsync(2)`, as Turso's own `FileSyncType::Fsync` — deliberately NOT `F_FULLFSYNC`, which std's
@@ -1466,15 +1561,42 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
     }
 }
 
+/// `fsync(2)` and never `F_FULLFSYNC`, whatever `TURSO_BRANCH_FULLFSYNC` says (r12-optfs): on Apple
+/// platforms it hands the bytes to the device without flushing its cache or ordering them, and a
+/// later full sync on the same device makes them durable. Counted in `FSYNCS` and `PLAIN_FSYNCS`.
+pub(crate) fn fsync_plain(file: &File) -> Result<()> {
+    FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PLAIN_FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    THREAD_FSYNCS.with(|n| n.set(n.get() + 1));
+    THREAD_PLAIN_FSYNCS.with(|n| n.set(n.get() + 1));
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        file.sync_all()
+            .map_err(|e| io_error(e, "fsync branch file"))
+    }
+}
+
 /// Measurement switch (r12-noforce PREREG amendment 6, sub-question ABL; observation of which sync
 /// each removal carries, not a mechanism): `TURSO_BRANCH_ABLATE` lists `force_fork` (every fork
 /// waits for its own records, restoring sync #1) and/or `no_redo` (no `PageImage` is logged and a
-/// flight syncs the arena before the log, restoring sync #2 in gc2's order). Unset: no-force as
+/// flight syncs the arena before the log, restoring sync #2 in gc2's order), or `optfs` (r12-optfs:
+/// no `PageImage`, and a flight fsync(2)s the arena with no barrier before the log's full sync —
+/// the checksum rule; a store copies it at creation, see `StoreInner::optfs`). Unset: no-force as
 /// built. Read once per process.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Ablate {
     pub(crate) force_fork: bool,
     pub(crate) no_redo: bool,
+    pub(crate) optfs: bool,
 }
 
 pub(crate) fn ablate() -> Ablate {
@@ -1485,6 +1607,7 @@ pub(crate) fn ablate() -> Ablate {
         Ablate {
             force_fork: has("force_fork"),
             no_redo: has("no_redo"),
+            optfs: has("optfs"),
         }
     })
 }
@@ -2007,7 +2130,7 @@ mod tests {
                 .unwrap();
             journal.buffer(&Record::Clock { now_ms: 7 }).unwrap();
             *start = journal.len;
-            journal.take_flight(None).unwrap().write().unwrap();
+            journal.take_flight(None, None).unwrap().write().unwrap();
         }
         (files, starts)
     }
@@ -2099,6 +2222,29 @@ mod tests {
             .expect("a torn last flight is not corruption")
             .expect("state");
         assert_eq!(forks(&recovered.records), vec![1, 2]);
+    }
+
+    /// r12-optfs: recovery names the last whole flight for the checksum rule — where it begins and
+    /// the index of its first record — and a cut takes the log back to where it began.
+    #[test]
+    fn recover_names_the_last_whole_flight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        let recovered = Journal::recover(&files, false).unwrap().expect("state");
+        assert_eq!(recovered.last_flight, Some((starts[2], 4)));
+        drop(recovered);
+        // The third flight torn: the second is the last whole one.
+        let len = std::fs::metadata(&files.log).unwrap().len();
+        OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
+        let mut recovered = Journal::recover(&files, false).unwrap().expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 2]);
+        assert_eq!(recovered.last_flight, Some((starts[1], 2)));
+        recovered.journal.cut_last_flight(starts[1]).unwrap();
+        drop(recovered);
+        assert_eq!(std::fs::metadata(&files.log).unwrap().len(), starts[1]);
+        let recovered = Journal::recover(&files, false).unwrap().expect("state");
+        assert_eq!(forks(&recovered.records), vec![1]);
+        assert_eq!(recovered.last_flight, Some((starts[0], 0)));
     }
 
     /// Recovery's redo pass puts every image into its slot in log order, so a slot imaged twice

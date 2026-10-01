@@ -215,6 +215,11 @@ struct StoreInner {
     id_floor: u64,
     /// Buffered floors, under the log sequence number that makes each durable.
     id_floor_pending: VecDeque<(u64, u64)>,
+    /// The checksum rule (r12-optfs, `TURSO_BRANCH_ABLATE=optfs`): no `PageImage` is logged, and a
+    /// flight fsync(2)s the arena before the log's full sync. Copied from the switch at creation; a
+    /// test sets it per store (`BranchStore::set_optfs`). Recovery does not read it: its check runs
+    /// for every log.
+    optfs: bool,
 }
 
 /// Fork ids reserved ahead of the counter by an `IdFloor` record (r12-noforce), the way PostgreSQL
@@ -224,6 +229,13 @@ struct StoreInner {
 /// a flush that happens anyway; a fork waits for its own record only when its id is not yet under
 /// a durable floor — the first fork after an open, or one that outran every flush by half of these.
 const ID_RESERVE: u64 = 1 << 16;
+
+/// Whether any of `records` names an arena slot (a `Commit` or a `TrunkRetain`).
+fn names_a_slot(records: &[Record]) -> bool {
+    records
+        .iter()
+        .any(|r| matches!(r, Record::Commit { .. } | Record::TrunkRetain { .. }))
+}
 
 /// Crash points and mutants for the no-force crash test (r12-noforce). A test arms a point by name;
 /// the process then SIGKILLs itself when it reaches it, after writing a note to the file named by
@@ -720,19 +732,18 @@ impl BranchStore {
                 let files = BranchFiles::for_db(db_path);
                 let mut inner = StoreInner::fresh(Some(files.clone()), sync, default_lease);
                 if files.exist() {
-                    if let Some(recovered) = Journal::recover(&files, sync)? {
-                        if let Some(snapshot) = recovered.snapshot {
-                            inner.load_snapshot(snapshot)?;
-                        }
-                        // Frees during replay are not acted on: the free set is derived below
-                        // from what the recovered state references.
-                        let mut ignored = Vec::new();
-                        for record in &recovered.records {
-                            inner.replay(record, &mut ignored)?;
-                        }
-                        // A snapshot can hold a released branch that was kept only by an open
-                        // connection; after a restart nothing is open.
-                        inner.collect_released(&mut ignored);
+                    if let Some(mut recovered) = Journal::recover(&files, sync)? {
+                        // The checksum rule may rebuild the state without the last flight; only
+                        // then is a second copy of the snapshot needed.
+                        let last = recovered
+                            .last_flight
+                            .filter(|&(_, first)| names_a_slot(&recovered.records[first..]));
+                        let snapshot = if last.is_some() {
+                            recovered.snapshot.clone()
+                        } else {
+                            None
+                        };
+                        inner.rebuild(recovered.snapshot.take(), &recovered.records)?;
                         // The redo rule: the recovered records' slots are put back from their
                         // images before the arena counts what its file holds.
                         super::journal::redo_page_images(
@@ -741,6 +752,36 @@ impl BranchStore {
                             &recovered.records,
                             sync,
                         )?;
+                        // The checksum rule (r12-optfs): a live slot the last flight names that
+                        // fails its crc in the arena file means that flight's full sync never
+                        // returned. It was never acknowledged, and all of it goes.
+                        let check = last.filter(|_| !crash::mutant("no_crc_check"));
+                        if let Some((start, first)) = check {
+                            let flight = &recovered.records[first..];
+                            if let Some(lost) =
+                                inner.lost_slot(&files, recovered.page_size, flight)?
+                            {
+                                tracing::warn!(
+                                    "branch log {}: the last flight (byte {}) names {}; it was \
+                                     never acknowledged, and it is cut",
+                                    files.log.display(),
+                                    start,
+                                    lost
+                                );
+                                // A cut never lowers the id counter: an id the flight carried may
+                                // have been handed out before it was durable.
+                                let ids = flight.iter().fold(0, |at_least, r| match r {
+                                    Record::Fork { child, .. } => at_least.max(child + 1),
+                                    Record::IdFloor { next_id } => at_least.max(*next_id),
+                                    _ => at_least,
+                                });
+                                recovered.journal.cut_last_flight(start)?;
+                                recovered.records.truncate(first);
+                                inner = StoreInner::fresh(Some(files.clone()), sync, default_lease);
+                                inner.rebuild(snapshot, &recovered.records)?;
+                                inner.next_id = inner.next_id.max(ids);
+                            }
+                        }
                         let referenced = inner.referenced_slots();
                         inner.arena = Some(Arena::open_file(
                             &files.arena,
@@ -1745,6 +1786,7 @@ impl BranchStore {
             arena,
             trunk,
             journal,
+            optfs,
             ..
         } = &mut *inner;
         let epoch = trunk.lineage.epoch;
@@ -1773,7 +1815,8 @@ impl BranchStore {
             trunk.lineage.retain(page, retained);
             if let Some(journal) = journal.as_mut() {
                 // The redo rule: the image goes first, so the barrier's flush syncs the log alone.
-                if !crash::mutant("no_redo") && !super::journal::ablate().no_redo {
+                // (Under `optfs` the flush fsync(2)s the arena instead: the checksum rule.)
+                if !crash::mutant("no_redo") && !super::journal::ablate().no_redo && !*optfs {
                     journal.buffer(&Record::PageImage {
                         slot,
                         bytes: pre_image.to_vec(),
@@ -1909,6 +1952,7 @@ impl BranchStore {
                 journal,
                 failpoint,
                 orphans,
+                optfs,
                 ..
             } = &mut *inner;
             let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
@@ -1931,6 +1975,7 @@ impl BranchStore {
                 if journal.is_some()
                     && !crash::mutant("no_redo")
                     && !super::journal::ablate().no_redo
+                    && !*optfs
                 {
                     images.push(Record::PageImage {
                         slot,
@@ -2068,6 +2113,12 @@ impl BranchStore {
         self.inner.lock().orphans.clone()
     }
 
+    /// Test only: switch the checksum rule (r12-optfs) on or off for this store alone.
+    #[cfg(test)]
+    pub(crate) fn set_optfs(&self, on: bool) {
+        self.inner.lock().optfs = on;
+    }
+
     pub(crate) fn compact_now(&self) -> Result<()> {
         let mut inner = self.inner.lock();
         let fail = inner.failpoint == Some(BranchFailpoint::CompactAfterRenameBeforeLogReset);
@@ -2161,6 +2212,7 @@ impl StoreInner {
             id_floor_durable: 1,
             id_floor: 1,
             id_floor_pending: VecDeque::new(),
+            optfs: super::journal::ablate().optfs,
         }
     }
 
@@ -2337,7 +2389,13 @@ impl StoreInner {
         } else {
             None
         };
-        journal.take_flight(dirty).map(Some)
+        // `optfs` (r12-optfs): the flight fsync(2)s the arena first, with no barrier.
+        let plain = if self.optfs && journal.has_pending() {
+            arena.take_plain_sync()?
+        } else {
+            None
+        };
+        journal.take_flight(dirty, plain).map(Some)
     }
 
     /// The floor a fork of `id` must buffer ahead of its own records, when fewer than half of the
@@ -2673,6 +2731,69 @@ impl StoreInner {
                 Ok(())
             }
         }
+    }
+
+    /// Recovery's replay: the snapshot, then every record through the same `apply_*` code.
+    fn rebuild(&mut self, snapshot: Option<SnapshotState>, records: &[Record]) -> Result<()> {
+        if let Some(snapshot) = snapshot {
+            self.load_snapshot(snapshot)?;
+        }
+        // Frees during replay are not acted on: the free set is derived at open from what the
+        // recovered state references.
+        let mut ignored = Vec::new();
+        for record in records {
+            self.replay(record, &mut ignored)?;
+        }
+        // A snapshot can hold a released branch that was kept only by an open connection; after a
+        // restart nothing is open.
+        self.collect_released(&mut ignored);
+        Ok(())
+    }
+
+    /// The checksum rule (r12-optfs): the first slot that `flight` names, that this recovered state
+    /// still references, and whose bytes in the arena file fail the crc the flight recorded — read
+    /// short or lying past the end of the file counts. A slot the flight named and then freed is
+    /// not checked: it may have been reused after the flight was acknowledged.
+    fn lost_slot(
+        &self,
+        files: &BranchFiles,
+        page_size: usize,
+        flight: &[Record],
+    ) -> Result<Option<String>> {
+        let mut named: BTreeMap<Slot, u32> = BTreeMap::new();
+        for record in flight {
+            match record {
+                Record::Commit { pages, .. } => {
+                    named.extend(pages.iter().map(|&(_, slot, crc)| (slot, crc)));
+                }
+                Record::TrunkRetain { slot, crc, .. } => {
+                    named.insert(*slot, *crc);
+                }
+                _ => {}
+            }
+        }
+        let live: BTreeSet<Slot> = self.referenced_slots().into_iter().collect();
+        named.retain(|slot, _| live.contains(slot));
+        if named.is_empty() {
+            return Ok(None);
+        }
+        let arena = match std::fs::File::open(&files.arena) {
+            Ok(arena) => Some(arena),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(crate::error::io_error(e, "open branch arena")),
+        };
+        let mut page = vec![0u8; page_size];
+        for (slot, crc) in named {
+            let read = arena.as_ref().map(|arena| {
+                super::journal::read_at(arena, &mut page, slot as u64 * page_size as u64)
+            });
+            match read {
+                Some(Ok(())) if crc32c::crc32c(&page) == crc => {}
+                Some(Ok(())) => return Ok(Some(format!("arena slot {slot}, which fails its crc"))),
+                _ => return Ok(Some(format!("arena slot {slot}, which the file does not hold"))),
+            }
+        }
+        Ok(None)
     }
 
     /// Every slot the state names: what the arena must NOT treat as free after a reopen.

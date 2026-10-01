@@ -232,6 +232,8 @@ pub struct ChurnCounters {
     pub compact_ns_max: u64,
     pub compact_fsyncs: u64,
     pub compact_bytes_last: u64,
+    /// The plain fsync(2) calls among `fsyncs`: the arena's, under the checksum rule (r12-optfs).
+    pub plain_fsyncs: u64,
 }
 
 #[doc(hidden)]
@@ -257,6 +259,7 @@ pub fn churn_counters() -> ChurnCounters {
         compact_ns_max: COMPACT_NS_MAX.load(Relaxed),
         compact_fsyncs: COMPACT_FSYNCS.load(Relaxed),
         compact_bytes_last: COMPACT_BYTES_LAST.load(Relaxed),
+        plain_fsyncs: journal::PLAIN_FSYNCS.load(Relaxed),
     }
 }
 

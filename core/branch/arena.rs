@@ -16,7 +16,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use super::journal::{fsync_file, open_rw, read_at, write_at};
+use super::journal::{fsync_file, fsync_plain, open_rw, read_at, write_at};
 use crate::{turso_assert, LimboError, Result};
 
 /// Index of a page-sized slot in the arena.
@@ -41,15 +41,94 @@ pub(crate) struct Arena {
     /// cannot answer "is this slot free" without a scan, and releasing an already-free slot must be
     /// caught AT the release — found later, it is two owners of one page and nothing says which.
     free_bits: Vec<u64>,
-    /// Test only: file writes since the last `sync`, held here while [`LOSE_UNSYNCED_WRITES`] is set.
+    /// Test only: file writes not yet durable, held here while [`LOSE_UNSYNCED_WRITES`] is set.
     #[cfg(test)]
-    unsynced: std::collections::HashMap<Slot, Vec<u8>>,
+    model: std::sync::Arc<std::sync::Mutex<PowerModel>>,
 }
 
-/// Test only (r12-noforce crash test): while set, a FILE arena keeps every slot write since its last
-/// `sync` in memory and puts it in the file only at that sync, so a process killed before the sync
-/// loses it. That is the arena's worst case under power loss (nothing unsynced reached the disk); a
-/// plain kill would leave the writes in the page cache and prove nothing about the redo rule.
+/// Test only (r12-optfs): where an arena write is under [`LOSE_UNSYNCED_WRITES`], as power loss
+/// sees it. A write is `unsynced` (the OS cache) until a plain fsync(2) hands it to the device; it
+/// is then in the `device`'s volatile cache until a later full sync RETURNS (`man 2 fcntl`:
+/// F_FULLFSYNC "drains the entire queue of the device ... data that had been fsync'd on the same
+/// device before is guaranteed to be persisted when this call returns"), and only then reaches the
+/// file. Both die with the process. A flight shares the model with its arena (`ArenaSync`).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct PowerModel {
+    unsynced: std::collections::HashMap<Slot, Vec<u8>>,
+    device: std::collections::HashMap<Slot, Vec<u8>>,
+}
+
+#[cfg(test)]
+impl PowerModel {
+    /// Everything held, written to the file: a full sync of the arena itself. The device's older
+    /// writes go first, so a slot written again since ends with its newer bytes.
+    fn persist_all(&mut self, file: &File, page_size: usize) -> Result<()> {
+        let device = std::mem::take(&mut self.device);
+        let unsynced = std::mem::take(&mut self.unsynced);
+        for (slot, bytes) in device.into_iter().chain(unsynced) {
+            write_at(file, &bytes, slot as u64 * page_size as u64)?;
+        }
+        Ok(())
+    }
+}
+
+/// A flight's hold on the arena under `ablate().optfs` (r12-optfs): the flight fsync(2)s it before
+/// the log is written, with no barrier, and the log's full sync makes those bytes durable.
+pub(crate) struct ArenaSync {
+    file: File,
+    #[cfg(test)]
+    model: std::sync::Arc<std::sync::Mutex<PowerModel>>,
+    #[cfg(test)]
+    page_size: usize,
+}
+
+impl ArenaSync {
+    /// Hand the arena's written slots to the device: fsync(2), never `F_FULLFSYNC`.
+    pub(crate) fn sync_plain(&self) -> Result<()> {
+        fsync_plain(&self.file)?;
+        #[cfg(test)]
+        {
+            let mut model = self.model.lock().unwrap();
+            let unsynced = std::mem::take(&mut model.unsynced);
+            model.device.extend(unsynced);
+        }
+        Ok(())
+    }
+
+    /// The log's full sync returned: what `sync_plain` handed to the device is durable. Only the
+    /// test model has anything to do here.
+    pub(crate) fn full_sync_returned(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            // Written under the model's lock, so a reader finds each slot in the model or the file.
+            let mut model = self.model.lock().unwrap();
+            for (slot, bytes) in std::mem::take(&mut model.device) {
+                write_at(&self.file, &bytes, slot as u64 * self.page_size as u64)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Test only, for the crash note: each slot the device holds and its crc32c, `slot:crc,...`.
+    #[cfg(test)]
+    pub(crate) fn device_note(&self) -> String {
+        let model = self.model.lock().unwrap();
+        let mut slots: Vec<String> = model
+            .device
+            .iter()
+            .map(|(slot, bytes)| format!("{slot}:{}", crc32c::crc32c(bytes)))
+            .collect();
+        slots.sort();
+        slots.join(",")
+    }
+}
+
+/// Test only (r12-noforce crash test): while set, a FILE arena keeps every slot write in memory
+/// ([`PowerModel`]) and puts it in the file only once a full sync makes it durable, so a process
+/// killed before that loses it. That is the arena's worst case under power loss (nothing unsynced
+/// reached the disk); a plain kill would leave the writes in the page cache and prove nothing about
+/// the redo rule, or about the checksum that replaces the order under `ablate().optfs`.
 #[cfg(test)]
 pub(crate) static LOSE_UNSYNCED_WRITES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -63,7 +142,7 @@ impl Arena {
             free: Vec::new(),
             free_bits: Vec::new(),
             #[cfg(test)]
-            unsynced: std::collections::HashMap::new(),
+            model: Default::default(),
         }
     }
 
@@ -117,7 +196,7 @@ impl Arena {
             free,
             free_bits,
             #[cfg(test)]
-            unsynced: std::collections::HashMap::new(),
+            model: Default::default(),
         })
     }
 
@@ -183,7 +262,7 @@ impl Arena {
         if let Backing::File { file, dirty } = &mut self.backing {
             #[cfg(test)]
             if LOSE_UNSYNCED_WRITES.load(std::sync::atomic::Ordering::Relaxed) {
-                self.unsynced.insert(slot, bytes.to_vec());
+                self.model.lock().unwrap().unsynced.insert(slot, bytes.to_vec());
                 *dirty = true;
                 return Ok(());
             }
@@ -200,9 +279,12 @@ impl Arena {
         let offset = self.check(slot) as u64 * self.page_size as u64;
         if let Backing::File { file, .. } = &self.backing {
             #[cfg(test)]
-            if let Some(bytes) = self.unsynced.get(&slot) {
-                out.copy_from_slice(bytes);
-                return Ok(());
+            {
+                let model = self.model.lock().unwrap();
+                if let Some(bytes) = model.unsynced.get(&slot).or_else(|| model.device.get(&slot)) {
+                    out.copy_from_slice(bytes);
+                    return Ok(());
+                }
             }
             return read_at(file, out, offset);
         }
@@ -216,9 +298,7 @@ impl Arena {
     pub(crate) fn take_dirty_file(&mut self) -> Result<Option<File>> {
         if let Backing::File { file, dirty } = &mut self.backing {
             #[cfg(test)]
-            for (slot, bytes) in self.unsynced.drain() {
-                write_at(file, &bytes, slot as u64 * self.page_size as u64)?;
-            }
+            self.model.lock().unwrap().persist_all(file, self.page_size)?;
             if *dirty {
                 let dup = file
                     .try_clone()
@@ -230,14 +310,35 @@ impl Arena {
         Ok(None)
     }
 
+    /// For a flight under `ablate().optfs` (r12-optfs): the arena to fsync(2) before the log, if
+    /// slots were written since the last sync, clearing the mark. `None` for the memory backing or
+    /// a clean arena. Taken under the store mutex, after every buffered record's slots were
+    /// written.
+    pub(crate) fn take_plain_sync(&mut self) -> Result<Option<ArenaSync>> {
+        if let Backing::File { file, dirty } = &mut self.backing {
+            if *dirty {
+                let dup = file
+                    .try_clone()
+                    .map_err(|e| crate::error::io_error(e, "dup branch arena"))?;
+                *dirty = false;
+                return Ok(Some(ArenaSync {
+                    file: dup,
+                    #[cfg(test)]
+                    model: self.model.clone(),
+                    #[cfg(test)]
+                    page_size: self.page_size,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Make every slot written so far durable. A no-op for the memory backing. Under the redo rule
     /// only a compaction (the checkpoint) and recovery need this; no commit waits for it.
     pub(crate) fn sync(&mut self) -> Result<()> {
         if let Backing::File { file, dirty } = &mut self.backing {
             #[cfg(test)]
-            for (slot, bytes) in self.unsynced.drain() {
-                write_at(file, &bytes, slot as u64 * self.page_size as u64)?;
-            }
+            self.model.lock().unwrap().persist_all(file, self.page_size)?;
             if *dirty {
                 fsync_file(file)?;
                 *dirty = false;
