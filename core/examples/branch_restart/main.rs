@@ -911,6 +911,7 @@ fn main() {
         "churn" => churn(&args),
         "reaprate" => reaprate(&args),
         "explain" => explain(&args),
+        "pagemap" => pagemap(&args),
         other => die(&format!("unknown command {other}")),
     }
 }
@@ -1155,6 +1156,29 @@ fn ss_cell(
         after[0],
         after[1],
     );
+}
+
+/// r12-e3 amendment 9: per B-tree of the branch catalog, its leaf and interior page counts, from the
+/// store's own page map (the leaf counts L_i of amendment 9's coupon-collector formula). Open it on a
+/// clone: the store's open may write.
+fn pagemap(args: &Args) {
+    let db = open_db(&args.db, true, true);
+    let map = db
+        .branch_catalog_page_map()
+        .unwrap_or_else(|e| die(&format!("page map: {e}")));
+    let mut per: std::collections::BTreeMap<String, [u64; 2]> = std::collections::BTreeMap::new();
+    for (_, name, _, ty) in &map {
+        let e = per.entry(name.clone()).or_default();
+        if *ty == 10 || *ty == 13 {
+            e[0] += 1;
+        } else {
+            e[1] += 1;
+        }
+    }
+    println!("# pagemap db={} mapped_pages={}", args.db.display(), map.len());
+    for (name, [leaf, interior]) in per {
+        println!("# pagemap btree={name} leaf={leaf} interior={interior}");
+    }
 }
 
 /// r12-e3 amendment 9 (A8-P3'): EXPLAIN QUERY PLAN, from this build's own planner, of the RES
