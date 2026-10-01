@@ -375,6 +375,9 @@ impl Lineage {
             }
             let mut root = heap.take().expect("checked above");
             heap = meld(root.left.take(), root.right.take(), &mut work.gc_meld_steps);
+            if root.rec == 0 {
+                continue; // MUTANT M2: skip one in-range entry
+            }
             let r = &mut self.recs[root.rec as usize];
             crate::turso_assert!(r.live, "a filed version was already freed");
             r.live = false;
