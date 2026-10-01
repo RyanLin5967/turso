@@ -171,6 +171,23 @@ struct HeapNode {
 
 type Heap = Option<Box<HeapNode>>;
 
+/// MUTANT M3: a subtree's size by walking it; every node visited is a meld step.
+fn size(h: &Heap, steps: &mut u64) -> u64 {
+    let mut n = 0;
+    let mut stack: Vec<&HeapNode> = h.as_deref().into_iter().collect();
+    while let Some(x) = stack.pop() {
+        n += 1;
+        *steps += 1;
+        if let Some(l) = x.left.as_deref() {
+            stack.push(l);
+        }
+        if let Some(r) = x.right.as_deref() {
+            stack.push(r);
+        }
+    }
+    n
+}
+
 fn rank(h: &Heap) -> u32 {
     h.as_ref().map_or(0, |n| n.rank)
 }
@@ -186,7 +203,7 @@ fn meld(a: Heap, b: Heap, steps: &mut u64) -> Heap {
             }
             let right = x.right.take();
             x.right = meld(right, Some(y), steps);
-            if rank(&x.left) < rank(&x.right) {
+            if size(&x.left, steps) < size(&x.right, steps) { // MUTANT M3: uncached weights
                 std::mem::swap(&mut x.left, &mut x.right);
             }
             x.rank = rank(&x.right) + 1;
