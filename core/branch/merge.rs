@@ -343,7 +343,35 @@ impl PageSource for TrunkNow<'_> {
     }
 }
 
+/// What [`Merger::derive_only`] found: the changed keys in install order, or the scope refusal.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedReport {
+    pub scope: Option<&'static str>,
+    pub keys: Vec<(i64, i64)>,
+}
+
 impl Merger {
+    /// The derived write set of `branch`, as a merge would compute it, without validating or
+    /// installing anything (an instrument for the derivation's tests: r13-compose D-T1). Runs in a
+    /// trunk write transaction it rolls back.
+    #[doc(hidden)]
+    pub fn derive_only(&mut self, branch: &Branch) -> Result<DerivedReport> {
+        self.trunk.execute("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let pager = self.trunk.pager.load().clone();
+            let view = self.store.merge_view(branch.id())?;
+            let from = branch.connect()?;
+            let prep = self.prepare(branch.id(), &view, &from, &pager)?;
+            Ok(DerivedReport {
+                scope: prep.scope,
+                keys: prep.rows,
+            })
+        })();
+        self.trunk.execute("ROLLBACK")?;
+        result
+    }
+
     /// A merger for the trunk `trunk` is connected to, which must be a trunk connection. The
     /// merger writes through a connection of its own.
     pub fn new(trunk: Arc<Connection>) -> Result<Self> {
@@ -402,6 +430,19 @@ impl Merger {
     /// Merge one branch. The branch is released afterwards, merged or refused, unless the policy
     /// keeps merged branches (then it is detached, merged or refused).
     pub fn merge(&mut self, branch: Branch, policy: MergePolicy) -> Result<MergeOutcome> {
+        self.merge_as(branch, policy, false)
+    }
+
+    /// Land a stack's TOP (D-M11 as restated by A6.1): the rows the top sees that differ from the
+    /// trunk at the stack root's fork, its levels' writes included (O = keys(current) ∪
+    /// keys(inherited); a released or spliced level's pages are still among them), validated and
+    /// installed in one trunk transaction, as one squashed change. The top must have no live child
+    /// and no open connection; its parent may be a branch.
+    pub fn land_top(&mut self, top: Branch, policy: MergePolicy) -> Result<MergeOutcome> {
+        self.merge_as(top, policy, true)
+    }
+
+    fn merge_as(&mut self, branch: Branch, policy: MergePolicy, land: bool) -> Result<MergeOutcome> {
         if !self.caller.get_auto_commit() {
             return Err(LimboError::InvalidArgument(
                 "the caller's connection has a transaction open; a merge commits its own"
@@ -410,7 +451,7 @@ impl Merger {
         }
         self.mirror_settings();
         let fk_on = self.caller.foreign_keys_enabled();
-        let outcome = self.run(&branch, policy, fk_on);
+        let outcome = self.run(&branch, policy, fk_on, land);
         self.store.merge_counted(|w| {
             w.merge_attempts += 1;
             if let Ok(o) = &outcome {
@@ -431,11 +472,17 @@ impl Merger {
         outcome
     }
 
-    fn run(&mut self, branch: &Branch, policy: MergePolicy, fk_on: bool) -> Result<MergeOutcome> {
+    fn run(
+        &mut self,
+        branch: &Branch,
+        policy: MergePolicy,
+        fk_on: bool,
+        land: bool,
+    ) -> Result<MergeOutcome> {
         // BEGIN IMMEDIATE checks the schema cookie once it holds the write lock, so from here to
         // COMMIT the merger's schema is the trunk's.
         self.trunk.execute("BEGIN IMMEDIATE")?;
-        let result = self.validate_and_install(branch, policy, fk_on);
+        let result = self.validate_and_install(branch, policy, fk_on, land);
         match &result {
             Ok(outcome) if outcome.refused.is_none() => {
                 if let Err(err) = self.trunk.execute("COMMIT") {
@@ -453,6 +500,7 @@ impl Merger {
         branch: &Branch,
         policy: MergePolicy,
         fk_on: bool,
+        land: bool,
     ) -> Result<MergeOutcome> {
         let pager = self.trunk.pager.load().clone();
         crate::turso_assert!(
@@ -468,7 +516,7 @@ impl Merger {
             install_error: None,
         };
         let view = self.store.merge_view(branch.id())?;
-        let early = if !view.parent_is_trunk {
+        let early = if !view.parent_is_trunk && !land {
             Some("the branch is not a child of the trunk")
         } else if view.open || view.writer {
             Some("the branch has an open connection")

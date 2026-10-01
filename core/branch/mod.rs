@@ -1051,6 +1051,9 @@ mod durability_tests;
 #[cfg(all(test, feature = "fs"))]
 mod catalog_tests;
 
+#[cfg(all(test, feature = "fs"))]
+mod merge_durable_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
