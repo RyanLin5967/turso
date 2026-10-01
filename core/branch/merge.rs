@@ -289,7 +289,10 @@ struct StoreView<'a> {
 impl StoreView<'_> {
     fn fetch(&mut self, page: u32) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; self.page_size];
-        let held = if self.base {
+        // D-T1's mutant r13_base_trunk_now: the base read from the trunk NOW, not at the fork.
+        let held = if self.base && super::store::mutant("r13_base_trunk_now") {
+            false
+        } else if self.base {
             self.store.base_page_into(self.id, page, &mut buf)?
         } else {
             self.store.resolve_into(self.id, page, &mut buf)?

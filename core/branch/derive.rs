@@ -296,6 +296,10 @@ fn attribute(
         // An empty page that is not a root belongs to no tree.
         return Ok(None);
     };
+    // D-T1's mutant r13_first_root: every page goes to the first table root of its kind.
+    if super::store::mutant("r13_first_root") {
+        return Ok(trees.iter().find(|t| t.table && t.root != 1).map(|t| t.root));
+    }
     for t in trees.iter().filter(|t| t.table) {
         *seeks += 1;
         if reaches(src, t.root, key, page)? {
@@ -438,9 +442,11 @@ pub(crate) fn derive(
         return Ok(finish(out, &b, &a, seeks));
     }
 
-    // The base side: the base version of every owned page (freed ones included).
+    // The base side: the base version of every owned page (freed ones included). D-T1's mutant
+    // r13_skip_freed_base skips the pages on the branch's freelist here.
     let mut base_chain = HashSet::new();
-    for &page in &owned {
+    let skip_freed = super::store::mutant("r13_skip_freed_base");
+    for &page in owned.iter().filter(|p| !(skip_freed && free.contains(p))) {
         let Some(parsed) = a.btree(page)? else {
             continue;
         };
@@ -472,7 +478,10 @@ pub(crate) fn derive(
         .copied()
         .collect();
     let cancel = !super::store::mutant("r13_no_relink_cancel");
-    for &root in &roots {
+    // D-T1's mutant r13_leaves_only: owned leaves only, no link accounting (a dropped subtree's
+    // rows are never enumerated).
+    let leaves_only = super::store::mutant("r13_leaves_only");
+    for &root in roots.iter().filter(|_| !leaves_only) {
         let empty = HashMap::new();
         let bl = b_links.get(&root).unwrap_or(&empty);
         let al = a_links.get(&root).unwrap_or(&empty);
