@@ -1535,6 +1535,28 @@ fn contend_arm(b: &mut Bench, t: usize, ops: usize, own: bool, n: usize) {
         (w1.lock_wait_ns - w0.lock_wait_ns) as f64 / reads,
         elapsed.as_secs_f64(),
     );
+    // r13-fs10-olc: the lock-free paths and the partition locks, per read, and every lock class on
+    // the read path together (store lock + partitions).
+    println!(
+        "# contend_r13 t={t} own={own} readpath={:?} reads={} fast_per_read={:.4} fallbacks_per_read={:.6} \
+         part_takes_per_read={:.4} part_contended_per_read={:.6} part_contended_total={} \
+         part_wait_ns_per_read={:.2} slot_refs_per_read={:.4} trunk_hits_per_read={:.4} \
+         all_takes_per_read={:.4} all_contended_per_read={:.6} reads_per_s={:.1}",
+        fs("TURSO_R13_READPATH"),
+        t * ops,
+        (w1.fast_resolves - w0.fast_resolves) as f64 / reads,
+        (w1.fast_fallbacks - w0.fast_fallbacks) as f64 / reads,
+        (w1.part_acquisitions - w0.part_acquisitions) as f64 / reads,
+        (w1.part_contended - w0.part_contended) as f64 / reads,
+        w1.part_contended - w0.part_contended,
+        (w1.part_wait_ns - w0.part_wait_ns) as f64 / reads,
+        (w1.slot_ref_hits - w0.slot_ref_hits) as f64 / reads,
+        (w1.trunk_page_hits - w0.trunk_page_hits) as f64 / reads,
+        ((w1.lock_acquisitions - w0.lock_acquisitions) + (w1.part_acquisitions - w0.part_acquisitions)) as f64
+            / reads,
+        ((w1.lock_contended - w0.lock_contended) + (w1.part_contended - w0.part_contended)) as f64 / reads,
+        reads / elapsed.as_secs_f64(),
+    );
 }
 
 /// The pinning arm (amendment 17; the fresh-context adversary's claim 3). `n` sessions fork from the

@@ -1476,3 +1476,154 @@ fn inherited_ancestor_versions_are_shared_by_slot_and_released_with_it() {
     assert_eq!(value(&a1c, 10), Some("a1-v2".to_string()));
     assert_eq!(value(&trunk, 10), Some(original(10)));
 }
+
+// ---------------------------------------------------------------------------------------------
+// r13-fs10-olc: the lock-free read paths through SQL.
+
+/// T3 (r13-fs10-olc PREREG §0.8). Every lock-free read path under real threads, in the
+/// configuration the contention arm measures (FS10 fill + FS11, and FS13): four threads each own
+/// branches forked before the trunk starts writing; each thread rewrites its own branches' rows and
+/// reads them back, every statement re-resolving its pages (FS10), while the main thread rewrites
+/// trunk rows — so readers meet retained versions, F6 fills and other branches' arena allocations
+/// as they happen — and forks, reads and drops branches of its own. Every value is checked against
+/// the model the test keeps.
+#[test]
+fn branches_read_their_rows_under_every_read_path_while_the_trunk_writes() {
+    for path in [store::ReadPath::Olc, store::ReadPath::Part, store::ReadPath::PartX] {
+        run_read_path_threads(path);
+    }
+}
+
+fn run_read_path_threads(path: store::ReadPath) {
+    const ROWS: i64 = 300;
+    const THREADS: usize = 4;
+    const PER: usize = 3;
+    let (_dir, db) = open_db();
+    db.set_branch_read_path(path);
+    db.set_fs10(true);
+    db.set_fs10_fill(true);
+    db.set_fs11(true);
+    db.set_fs13(true);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, ROWS);
+    let original_table: BTreeMap<i64, String> = (1..=ROWS).map(|id| (id, original(id))).collect();
+    let groups: Vec<Vec<Branch>> = (0..THREADS)
+        .map(|_| (0..PER).map(|_| trunk.fork_branch().unwrap()).collect())
+        .collect();
+    let go = Arc::new(std::sync::Barrier::new(THREADS + 1));
+    let readers: Vec<_> = groups
+        .into_iter()
+        .enumerate()
+        .map(|(t, branches)| {
+            let (go, base) = (go.clone(), original_table.clone());
+            std::thread::spawn(move || {
+                let conns: Vec<_> = branches.iter().map(|b| b.connect().unwrap()).collect();
+                let mut expected: Vec<BTreeMap<i64, String>> = vec![base; PER];
+                go.wait();
+                let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (t as u64 + 1);
+                for step in 0..200 {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let k = (rng % PER as u64) as usize;
+                    let id = (rng >> 8) as i64 % ROWS + 1;
+                    if step % 3 == 0 {
+                        let v = format!("t{t}-b{k}-s{step:03}");
+                        set(&conns[k], id, &v);
+                        expected[k].insert(id, v);
+                    }
+                    for probe in [id, (id * 7) % ROWS + 1, 1, ROWS] {
+                        assert_eq!(
+                            value(&conns[k], probe).as_deref(),
+                            Some(expected[k][&probe].as_str()),
+                            "{path:?}: thread {t} branch {k} row {probe} at step {step}"
+                        );
+                    }
+                    if step % 50 == 49 {
+                        assert_eq!(table(&conns[k]), expected[k], "{path:?}: thread {t} branch {k}");
+                    }
+                }
+                drop(conns);
+                drop(branches);
+            })
+        })
+        .collect();
+    go.wait();
+    let mut current = original_table.clone();
+    let mut rng = 0xD1B5_4A32_D192_ED03u64;
+    for step in 0..300 {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let id = (rng % ROWS as u64) as i64 + 1;
+        let v = format!("trunk-s{step:03}-r{id:03}");
+        set(&trunk, id, &v);
+        current.insert(id, v);
+        if step % 60 == 59 {
+            let b = trunk.fork_branch().unwrap();
+            let c = b.connect().unwrap();
+            assert_eq!(table(&c), current, "{path:?}: a branch forked by the trunk at step {step}");
+        }
+    }
+    for r in readers {
+        r.join().unwrap();
+    }
+    let work = db.branch_stats().work;
+    assert!(
+        work.fast_resolves > 0 && work.fast_fallbacks > 0,
+        "{path:?}: the lock-free path was not exercised both ways: {work:?}"
+    );
+    if path != store::ReadPath::Olc {
+        assert!(work.part_acquisitions > 0, "{path:?}: no partition was taken");
+    }
+    assert_eq!(db.branch_stats().live_branches, 0, "{path:?}: branches leaked");
+    assert_eq!(db.branch_partition_entries(), 0, "{path:?}: partition entries leaked");
+}
+
+/// T4 (r13-fs10-olc PREREG §0.8). The instrument the contention arm reads: with FS10 releasing a
+/// held session's shared pages, every warm point read re-resolves its pages; on the lock-free paths
+/// none of those takes the store lock, each is counted as a resolution of its kind
+/// (`R13_COUNT_SKIP` drops the count), and on the partitioned paths each takes one partition lock.
+/// The session's own written row is resolved by reference from its slot (FS11).
+#[test]
+fn a_warm_read_takes_no_store_lock_on_the_fast_paths() {
+    for path in [store::ReadPath::Olc, store::ReadPath::Part, store::ReadPath::PartX] {
+        let (_dir, db) = open_db();
+        db.set_branch_read_path(path);
+        db.set_fs10(true);
+        db.set_fs10_fill(true);
+        db.set_fs11(true);
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 300);
+        let b = trunk.fork_branch().unwrap();
+        let c = b.connect().unwrap();
+        set(&c, 8, "own-row");
+        assert_eq!(value(&c, 7), Some(original(7)));
+        assert_eq!(value(&c, 8), Some("own-row".to_string()));
+        let w0 = db.branch_stats().work;
+        for _ in 0..50 {
+            assert_eq!(value(&c, 7), Some(original(7)));
+            assert_eq!(value(&c, 8), Some("own-row".to_string()));
+        }
+        let w1 = db.branch_stats().work;
+        let kinds = (w1.trunk_page_hits - w0.trunk_page_hits)
+            + (w1.trunk_page_misses - w0.trunk_page_misses)
+            + (w1.slot_ref_hits - w0.slot_ref_hits);
+        let resolves = w1.resolve_calls - w0.resolve_calls;
+        assert!(kinds >= 100, "{path:?}: the reads did not re-resolve (FS10 did not release): {kinds}");
+        assert_eq!(resolves, kinds, "{path:?}: a fast resolve was not counted");
+        assert_eq!(w1.fast_resolves - w0.fast_resolves, resolves, "{path:?}: a resolve fell back");
+        assert!(w1.slot_ref_hits - w0.slot_ref_hits >= 50, "{path:?}: the own row was not read by reference");
+        assert_eq!(
+            w1.lock_acquisitions - w0.lock_acquisitions,
+            1,
+            "{path:?}: a warm read took the store lock (the 1 is the closing stats call)"
+        );
+        let parts = w1.part_acquisitions - w0.part_acquisitions;
+        if path == store::ReadPath::Olc {
+            assert_eq!(parts, 0, "olc took a partition");
+        } else {
+            assert_eq!(parts, resolves, "{path:?}: partition takes are not one per resolution");
+        }
+    }
+}

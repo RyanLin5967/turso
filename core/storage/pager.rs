@@ -3754,10 +3754,12 @@ impl Pager {
             ));
         }
         let mut buf = Arc::new(self.buffer_pool.get_page());
-        match branch
-            .store
-            .resolve_shared(branch.id, page_idx as u32, buf.as_mut_slice())?
-        {
+        match branch.store.resolve_bound(
+            branch.id,
+            branch.olc.as_deref(),
+            page_idx as u32,
+            buf.as_mut_slice(),
+        )? {
             Resolved::Trunk(key) => return Ok(BranchRead::Trunk(key)),
             // The trunk's cached version, held by reference: every open session that reads this
             // version shares one copy of its bytes (FS5). `copy_on_write_decision` gives the page

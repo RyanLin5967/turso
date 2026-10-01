@@ -304,6 +304,19 @@ pub struct BranchWork {
     /// FS11: writes to a slot whose bytes a reader held, which gave the slot a fresh copy (read
     /// from the arena at `stats`, not counted in `work` itself).
     pub slot_unshared_writes: u64,
+    /// r13-fs10-olc: resolutions answered without the store lock (`TURSO_R13_READPATH` olc, part or
+    /// partx). Also counted in `resolve_calls` and in their kind (`trunk_page_hits`,
+    /// `trunk_page_misses`, `slot_ref_hits`). Counted per thread stripe, not under the lock.
+    pub fast_resolves: u64,
+    /// r13-fs10-olc: lock-free resolutions that fell back to the store lock (a validation that
+    /// failed, or a case the fast path does not cover).
+    pub fast_fallbacks: u64,
+    /// r13-fs10-olc: acquisitions of the 128 partition locks (part, partx), readers' and writers'.
+    pub part_acquisitions: u64,
+    /// r13-fs10-olc: those that found the partition held and waited.
+    pub part_contended: u64,
+    /// r13-fs10-olc: nanoseconds those waited, summed (the clock read only on the waiting path).
+    pub part_wait_ns: u64,
 }
 
 impl Branch {
@@ -362,6 +375,8 @@ impl Drop for Branch {
 pub(crate) struct BranchBinding {
     pub(crate) store: Arc<BranchStore>,
     pub(crate) id: BranchId,
+    /// r13-fs10-olc `olc`: the branch's published view, read without the store lock.
+    pub(crate) olc: Option<Arc<store::OlcShadow>>,
 }
 
 impl Drop for BranchBinding {
@@ -557,6 +572,19 @@ impl Database {
         self.branches.set_fs13(on);
     }
 
+    /// r13-fs10-olc: how this database's branch pagers resolve pages (normally from
+    /// `TURSO_R13_READPATH`). Refused once a branch exists.
+    #[doc(hidden)]
+    pub(crate) fn set_branch_read_path(&self, path: store::ReadPath) {
+        self.branches.set_read_path(path);
+    }
+
+    /// r13-fs10-olc: branch views held in the read partitions (part, partx). Observation only.
+    #[doc(hidden)]
+    pub fn branch_partition_entries(&self) -> usize {
+        self.branches.partition_entries()
+    }
+
     /// Trunk pages held in the shared trunk-page cache (the FS10 pool's size). Observation only.
     #[doc(hidden)]
     pub fn trunk_cache_pages(&self) -> usize {
@@ -634,11 +662,12 @@ impl Database {
     /// page after it — is read as the BRANCH sees it, and nothing of the trunk's can be left in it.
     pub(crate) fn connect_branch(self: &Arc<Database>, id: BranchId) -> Result<Arc<Connection>> {
         session_probe("begin");
-        let schema = self.branches.open(id)?;
+        let (schema, olc) = self.branches.open(id)?;
         // Built before anything fallible below, so an error there still closes the branch.
         let binding = BranchBinding {
             store: self.branches.clone(),
             id,
+            olc,
         };
         session_probe("store_open");
         let pager = self._init_branch(binding)?;

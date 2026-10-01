@@ -79,6 +79,31 @@
 //! an older generation is never served. The cache is filled by the pager after it reads a page for
 //! a branch ([`BranchStore::fill_trunk_page`]), under the key [`BranchStore::resolve_into`] gave.
 //!
+//! # Reading without the store's lock (r13-fs10-olc)
+//!
+//! FS10 releases a held session's shared pages at the end of every statement, so every statement
+//! re-resolves the pages it touches, and every resolution took the one store lock: 0.645 contended
+//! acquisitions per point read at 8 threads (r11-sessions v3e). `TURSO_R13_READPATH` picks how a
+//! branch pager resolves instead ([`ReadPath`]); writers keep the lock in every mode.
+//!
+//! * What a resolution needs is made readable without the lock in every mode: the trunk's write
+//!   epoch per page in a [`Radix`] of atomics (F5's epoch radix), stored right after the locked
+//!   `written` map; the arena's slot bytes in a never-moving directory of atomic pointers
+//!   ([`super::arena::SlotDir`]); F6's cache already was. A branch's `view` (its inherited map plus
+//!   its own pages, which today exists only once it forks) is kept from its creation.
+//! * **olc** (LeanStore's optimistic latches, ICDE 2018 §IV-F; Linux seqcount): each branch
+//!   publishes its view in an [`OlcShadow`] behind a sequence counter its writers make odd while
+//!   they change the branch. A reader takes no lock: it reads the counter, resolves against the
+//!   published view, the epoch radix and F6 (whose key is itself a version, validated on lookup),
+//!   and keeps the answer only if the counter did not move. Anything it does not cover falls back.
+//! * **part** (PostgreSQL's buffer-mapping partitions, `NUM_BUFFER_PARTITIONS` = 128): the views
+//!   live in 128 hash-table partitions, each behind its own padded reader-writer lock, by a hash
+//!   of the branch id. A reader takes its branch's partition shared and resolves while holding it
+//!   (PostgreSQL pins before it releases the mapping lock); a view change takes it exclusive.
+//!   **partx** takes the partition exclusive for reads too: lock striping.
+//! * Resolutions these paths do not cover take the lock as before: a trunk version retained for
+//!   the branch, any arena page with FS11 off, and `resolve_into`.
+//!
 //! # What this does not do
 //!
 //! * One `Mutex` guards every branch. Correct, and a known wall under concurrent writers on
@@ -104,16 +129,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Bound, Deref, DerefMut};
 use std::time::Instant;
 
-use super::arena::{Arena, Slot};
+use super::arena::{Arena, Slot, SlotDir};
 use super::page_map::PageMap;
 use super::table::BranchTable;
 use super::{BranchId, BranchStats, BranchWork, Reaped};
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
-use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use crate::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crate::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockWriteGuard};
 use crate::{LimboError, Result};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use crossbeam_utils::CachePadded;
 
 pub(crate) struct BranchStore {
     inner: Mutex<StoreInner>,
@@ -158,6 +184,128 @@ pub(crate) struct BranchStore {
     fs13: AtomicBool,
     /// FS9B (r11-sessions): serve inherited ancestor-branch versions by reference (`Arena::clones`).
     fs9b: AtomicBool,
+    /// r13-fs10-olc: how branch pagers resolve ([`ReadPath`] as a `u8`). Fixed once a branch exists.
+    read_path: AtomicU8,
+    /// r13-fs10-olc: `trunk.written`, readable without the lock (stored after it, under the lock).
+    written_at: Radix<AtomicU64>,
+    /// r13-fs10-olc: the arena's slot bytes, readable without the lock (the arena writes them).
+    slot_dir: Arc<SlotDir>,
+    /// r13-fs10-olc `part`/`partx`: every live branch's view, partitioned by branch id.
+    parts: Box<[CachePadded<RwLock<HashMap<BranchId, ReadView>>>]>,
+    /// r13-fs10-olc: what the lock-free paths did, counted per thread stripe (see [`FastWork`]).
+    fast: FastWork,
+}
+
+/// How a branch pager resolves a page (r13-fs10-olc; module doc "Reading without the store's
+/// lock"). Read from `TURSO_R13_READPATH` when the store is created; an unknown value refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadPath {
+    /// Every resolution under the store lock (the base).
+    Locked = 0,
+    /// Optimistic: no lock, validated by the branch's sequence counter.
+    Olc = 1,
+    /// The branch's partition taken shared.
+    Part = 2,
+    /// The branch's partition taken exclusive.
+    PartX = 3,
+}
+
+impl ReadPath {
+    fn from_env() -> Self {
+        match std::env::var("TURSO_R13_READPATH") {
+            Err(_) => ReadPath::Locked,
+            Ok(v) => match v.as_str() {
+                "" => ReadPath::Locked,
+                "olc" => ReadPath::Olc,
+                "part" => ReadPath::Part,
+                "partx" => ReadPath::PartX,
+                other => panic!("TURSO_R13_READPATH={other}: expected olc, part or partx (or unset)"),
+            },
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ReadPath::Olc,
+            2 => ReadPath::Part,
+            3 => ReadPath::PartX,
+            _ => ReadPath::Locked,
+        }
+    }
+}
+
+/// What a lock-free resolution reads about a branch: the fork epoch at which its ancestry leaves
+/// the trunk, and every arena page it sees (its `view`: inherited pages plus its own).
+#[derive(Clone)]
+pub(crate) struct ReadView {
+    trunk_at: u64,
+    pages: PageMap,
+}
+
+/// A branch's view published for optimistic readers (r13-fs10-olc `olc`). `seq` is a Linux-style
+/// sequence count: odd while a store call changes the branch (its view or its own slots' bytes),
+/// even otherwise; a reader keeps what it resolved only if `seq` was even and unchanged across.
+pub(crate) struct OlcShadow {
+    seq: AtomicU64,
+    view: ArcSwap<ReadView>,
+}
+
+/// PostgreSQL's `NUM_BUFFER_PARTITIONS`.
+const PARTITIONS: usize = 128;
+
+/// A branch's partition: the top 7 bits of a Fibonacci hash of its id.
+fn partition(id: BranchId) -> usize {
+    (id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57) as usize
+}
+
+/// Counters of the lock-free paths, one cache-line-padded block per thread stripe, so counting
+/// writes a line no other thread is writing (unless more than [`STRIPES`] threads read). Summed into
+/// [`BranchWork`] by `stats`. Observation only.
+struct FastWork {
+    stripes: Box<[CachePadded<FastStripe>]>,
+}
+
+const STRIPES: usize = 64;
+
+#[derive(Default)]
+struct FastStripe {
+    resolves: AtomicU64,
+    trunk_hits: AtomicU64,
+    trunk_misses: AtomicU64,
+    slot_refs: AtomicU64,
+    fast_fallbacks: AtomicU64,
+    part_acquisitions: AtomicU64,
+    part_contended: AtomicU64,
+    part_wait_ns: AtomicU64,
+}
+
+static NEXT_STRIPE: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static STRIPE: usize = NEXT_STRIPE.fetch_add(1, Ordering::Relaxed) % STRIPES;
+}
+
+impl FastWork {
+    fn new() -> Self {
+        Self {
+            stripes: (0..STRIPES).map(|_| CachePadded::new(FastStripe::default())).collect(),
+        }
+    }
+
+    fn mine(&self) -> &FastStripe {
+        &self.stripes[STRIPE.with(|s| *s)]
+    }
+
+    fn sum(&self, field: impl Fn(&FastStripe) -> &AtomicU64) -> u64 {
+        self.stripes.iter().map(|s| field(s).load(Ordering::Relaxed)).sum()
+    }
+}
+
+/// What a lock-free resolution found, for counting once it is kept.
+enum FastKind {
+    TrunkHit,
+    TrunkMiss,
+    SlotRef,
 }
 
 /// Where the page a branch asked for comes from.
@@ -176,7 +324,7 @@ pub(crate) enum Resolved {
 
 /// A version of a trunk page: the page, the trunk epoch of its last write, and the cache
 /// generation it was resolved in.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TrunkPageKey {
     page: u32,
     epoch: u64,
@@ -187,7 +335,7 @@ pub(crate) struct TrunkPageKey {
 /// 2^10 and 2^12 entries over the 32-bit page number, each installed once and never freed or moved
 /// until the store drops. A lookup is three acquire loads and no write, so readers share the lines
 /// they read instead of taking them from one another.
-struct Radix<T> {
+pub(super) struct Radix<T> {
     top: OnceLock<Box<[OnceLock<Box<[OnceLock<Box<[T]>>]>>]>>,
 }
 
@@ -196,7 +344,7 @@ impl<T: Default> Radix<T> {
     const MID: usize = 1 << 10;
     const LEAF: usize = 1 << 12;
 
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             top: OnceLock::new(),
         }
@@ -207,7 +355,7 @@ impl<T: Default> Radix<T> {
         (page >> 22, (page >> 12) & (Self::MID - 1), page & (Self::LEAF - 1))
     }
 
-    fn get(&self, page: u32) -> Option<&T> {
+    pub(super) fn get(&self, page: u32) -> Option<&T> {
         let (t, m, l) = Self::split(page);
         let leaf = self.top.get()?[t].get()?[m].get()?;
         Some(&leaf[l])
@@ -225,7 +373,7 @@ impl<T: Default> Radix<T> {
             .sum()
     }
 
-    fn get_or_insert(&self, page: u32) -> &T {
+    pub(super) fn get_or_insert(&self, page: u32) -> &T {
         let (t, m, l) = Self::split(page);
         let top = self
             .top
@@ -422,6 +570,9 @@ struct BranchState {
     /// FS13: the copy decisions of the write transaction in progress, in order, so a rollback (or
     /// a commit that finds a write undone) can take them back. Empty outside a transaction.
     tx: Vec<TxDecision>,
+    /// r13-fs10-olc `olc`: the view published for optimistic readers (shared with the pager's
+    /// binding). `None` in the other modes.
+    olc: Option<Arc<OlcShadow>>,
 }
 
 /// FS13: one copy decision of a branch write transaction.
@@ -637,6 +788,27 @@ pub(crate) mod mutants {
     }
 }
 
+/// r13-fs10-olc test hook: a closure an optimistic read runs once, on this thread, between its
+/// view load and its validation, so a test can change the branch at exactly that moment.
+#[cfg(test)]
+pub(crate) mod olc_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(f: Box<dyn FnOnce()>) {
+        HOOK.with(|h| *h.borrow_mut() = Some(f));
+    }
+
+    pub(crate) fn fire() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}
+
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
@@ -671,6 +843,13 @@ impl BranchStore {
             fs11: AtomicBool::new(std::env::var("TURSO_R11S_FS11").is_ok_and(|v| v == "1")),
             fs13: AtomicBool::new(std::env::var("TURSO_R11S_FS13").is_ok_and(|v| v == "1")),
             fs9b: AtomicBool::new(fs9b_from_env()),
+            read_path: AtomicU8::new(ReadPath::from_env() as u8),
+            written_at: Radix::new(),
+            slot_dir: Arc::new(SlotDir::new()),
+            parts: (0..PARTITIONS)
+                .map(|_| CachePadded::new(RwLock::new(HashMap::new())))
+                .collect(),
+            fast: FastWork::new(),
         }
     }
 
@@ -751,6 +930,247 @@ impl BranchStore {
         self.fw3.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// r13-fs10-olc: choose how this database's branch pagers resolve. Refused once a branch
+    /// exists, because the views, shadows and partition entries are made at fork.
+    pub(crate) fn set_read_path(&self, path: ReadPath) {
+        let inner = self.lock();
+        crate::turso_assert!(
+            inner.branches.is_empty(),
+            "the read path is chosen before the first fork"
+        );
+        self.read_path.store(path as u8, Ordering::Relaxed);
+    }
+
+    pub(crate) fn read_path(&self) -> ReadPath {
+        ReadPath::from_u8(self.read_path.load(Ordering::Relaxed))
+    }
+
+    /// Branch views held in the partitions (`part`/`partx`); 0 in the other modes. Observation only.
+    pub(crate) fn partition_entries(&self) -> usize {
+        self.parts.iter().map(|p| p.read().len()).sum()
+    }
+
+    /// A partition's lock taken exclusive, counted like a reader's take.
+    fn part_write(&self, id: BranchId) -> RwLockWriteGuard<'_, HashMap<BranchId, ReadView>> {
+        let lock = &self.parts[partition(id)];
+        let stripe = self.fast.mine();
+        stripe.part_acquisitions.fetch_add(1, Ordering::Relaxed);
+        match lock.try_write() {
+            Some(guard) => guard,
+            None => Self::part_waited(stripe, || lock.write()),
+        }
+    }
+
+    /// A partition acquisition that found its lock held: counted, and its wait timed by the waiter.
+    fn part_waited<G>(stripe: &FastStripe, take: impl FnOnce() -> G) -> G {
+        #[cfg(test)]
+        let count = !mutants::on("R13_PART_NO_CONTEND_COUNT");
+        #[cfg(not(test))]
+        let count = true;
+        if count {
+            stripe.part_contended.fetch_add(1, Ordering::Relaxed);
+        }
+        let start = Instant::now();
+        let guard = take();
+        stripe
+            .part_wait_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        guard
+    }
+
+    /// A new branch's read side (under the store lock): its `view` from creation, and its shadow
+    /// (`olc`) or partition entry (`part`/`partx`). Nothing in the locked mode.
+    fn read_side_new(&self, id: BranchId, st: &mut BranchState) {
+        let path = self.read_path();
+        if path == ReadPath::Locked {
+            return;
+        }
+        if st.view.is_none() {
+            st.view = Some(st.inherited.clone());
+        }
+        let view = ReadView {
+            trunk_at: st.trunk_at,
+            pages: st.view.clone().expect("just set"),
+        };
+        match path {
+            ReadPath::Olc => {
+                st.olc = Some(Arc::new(OlcShadow {
+                    seq: AtomicU64::new(0),
+                    view: ArcSwap::from_pointee(view),
+                }));
+            }
+            ReadPath::Part | ReadPath::PartX => {
+                self.part_write(id).insert(id, view);
+            }
+            ReadPath::Locked => {}
+        }
+    }
+
+    /// Start a store call that changes branch `st` — its view, or the bytes of its own slots: the
+    /// shadow's sequence count goes odd (Linux `write_seqcount_begin`). Pair with `change_end`.
+    fn change_begin(st: &BranchState) {
+        if let Some(sh) = &st.olc {
+            sh.seq.fetch_add(1, Ordering::Relaxed);
+            fence(Ordering::Release);
+        }
+    }
+
+    /// End it: publish the branch's view (unless `publish` is false, a test mutant), then make the
+    /// count even again.
+    fn change_end(&self, id: BranchId, st: &BranchState, publish: bool) {
+        let view = || ReadView {
+            trunk_at: st.trunk_at,
+            pages: st.view.clone().expect("every branch keeps a view outside the locked mode"),
+        };
+        match self.read_path() {
+            ReadPath::Locked => {}
+            ReadPath::Olc => {
+                if let Some(sh) = &st.olc {
+                    if publish {
+                        sh.view.store(std::sync::Arc::new(view()));
+                    }
+                    sh.seq.fetch_add(1, Ordering::Release);
+                }
+            }
+            ReadPath::Part | ReadPath::PartX => {
+                if publish {
+                    self.part_write(id).insert(id, view());
+                }
+            }
+        }
+    }
+
+    /// A removed branch's partition entry goes with it.
+    fn read_side_drop(&self, id: BranchId) {
+        #[cfg(test)]
+        if mutants::on("R13_PART_NO_REMOVE") {
+            return;
+        }
+        if matches!(self.read_path(), ReadPath::Part | ReadPath::PartX) {
+            self.part_write(id).remove(&id);
+        }
+    }
+
+    /// The pager's resolution of `page` for branch `id` (r13-fs10-olc): the read path's lock-free
+    /// answer when it has one, else [`Self::resolve_shared`] under the store lock. `olc` is the
+    /// binding's shadow (`olc` mode).
+    pub(crate) fn resolve_bound(
+        &self,
+        id: BranchId,
+        olc: Option<&OlcShadow>,
+        page: u32,
+        out: &mut [u8],
+    ) -> Result<Resolved> {
+        let fast = match self.read_path() {
+            ReadPath::Locked => return self.resolve_shared(id, page, out),
+            ReadPath::Olc => olc.and_then(|sh| self.resolve_olc(sh, page)),
+            ReadPath::Part => self.resolve_part(id, page, false),
+            ReadPath::PartX => self.resolve_part(id, page, true),
+        };
+        let stripe = self.fast.mine();
+        match fast {
+            Some((resolved, kind)) => {
+                #[cfg(test)]
+                let count = !mutants::on("R13_COUNT_SKIP");
+                #[cfg(not(test))]
+                let count = true;
+                if count {
+                    stripe.resolves.fetch_add(1, Ordering::Relaxed);
+                }
+                let of_kind = match kind {
+                    FastKind::TrunkHit => &stripe.trunk_hits,
+                    FastKind::TrunkMiss => &stripe.trunk_misses,
+                    FastKind::SlotRef => &stripe.slot_refs,
+                };
+                of_kind.fetch_add(1, Ordering::Relaxed);
+                Ok(resolved)
+            }
+            None => {
+                stripe.fast_fallbacks.fetch_add(1, Ordering::Relaxed);
+                self.resolve_shared(id, page, out)
+            }
+        }
+    }
+
+    /// `olc`: read the branch's sequence count, resolve against its published view without a lock,
+    /// and keep the answer only if the count was even and did not move (LeanStore's optimistic
+    /// latch; Linux `read_seqcount_begin`/`read_seqcount_retry`). `None` = take the lock instead.
+    fn resolve_olc(&self, sh: &OlcShadow, page: u32) -> Option<(Resolved, FastKind)> {
+        let s1 = sh.seq.load(Ordering::Acquire);
+        if s1 & 1 == 1 {
+            return None;
+        }
+        let view = sh.view.load();
+        let found = self.resolve_view(&view, page)?;
+        #[cfg(test)]
+        olc_hook::fire();
+        fence(Ordering::Acquire);
+        #[cfg(test)]
+        if mutants::on("R13_OLC_NO_VALIDATE") {
+            return Some(found);
+        }
+        (sh.seq.load(Ordering::Relaxed) == s1).then_some(found)
+    }
+
+    /// `part`/`partx`: take the branch's partition (shared, or exclusive), resolve while holding
+    /// it, release. `None` = take the store lock instead.
+    fn resolve_part(&self, id: BranchId, page: u32, exclusive: bool) -> Option<(Resolved, FastKind)> {
+        let lock = &self.parts[partition(id)];
+        let stripe = self.fast.mine();
+        stripe.part_acquisitions.fetch_add(1, Ordering::Relaxed);
+        if exclusive {
+            let map = match lock.try_write() {
+                Some(guard) => guard,
+                None => Self::part_waited(stripe, || lock.write()),
+            };
+            map.get(&id).and_then(|view| self.resolve_view(view, page))
+        } else {
+            let map = match lock.try_read() {
+                Some(guard) => guard,
+                None => Self::part_waited(stripe, || lock.read()),
+            };
+            map.get(&id).and_then(|view| self.resolve_view(view, page))
+        }
+    }
+
+    /// Steps the lock-free paths share: a page in the branch's view is its arena slot's bytes by
+    /// reference (FS11 only; FS11 off copies, under the lock); any other page is the trunk's current
+    /// version when the trunk last wrote it at or before the branch's `trunk_at` (else a retained
+    /// version, under the lock), served from F6 under the key the locked path would give.
+    fn resolve_view(&self, view: &ReadView, page: u32) -> Option<(Resolved, FastKind)> {
+        if let Some(slot) = view.pages.get(page) {
+            #[cfg(test)]
+            if mutants::on("FS11_READ_COPY") {
+                return None;
+            }
+            if !self.fs11.load(Ordering::Relaxed) {
+                return None;
+            }
+            let bytes = self.slot_dir.load(slot)?;
+            return Some((Resolved::Shared(bytes), FastKind::SlotRef));
+        }
+        let written = self
+            .written_at
+            .get(page)
+            .map_or(0, |epoch| epoch.load(Ordering::Acquire));
+        #[cfg(test)]
+        let check = !mutants::on("R13_OLC_NO_WRITTEN_CHECK");
+        #[cfg(not(test))]
+        let check = true;
+        if check && written > view.trunk_at {
+            return None;
+        }
+        let key = TrunkPageKey {
+            page,
+            epoch: written,
+            generation: self.trunk_pages.generation.load(Ordering::Acquire),
+        };
+        Some(match self.trunk_pages.get(key) {
+            Some(bytes) => (Resolved::Shared(bytes), FastKind::TrunkHit),
+            None => (Resolved::Trunk(key), FastKind::TrunkMiss),
+        })
+    }
+
     /// Take the store's lock, counting the acquisition into `work`: every one, the ones that found
     /// the lock held, and how long those waited. The counts are written under the lock itself, so
     /// counting adds no shared write the lock does not already make, and the clock is read only on
@@ -809,7 +1229,7 @@ impl BranchStore {
         }
         let mut inner = self.lock();
         match &inner.arena {
-            None => inner.arena = Some(Arena::new(page_size)),
+            None => inner.arena = Some(Arena::new(page_size, self.slot_dir.clone())),
             Some(arena) if arena.page_size() != page_size => {
                 return Err(LimboError::InternalError(format!(
                     "branch arena holds {}-byte pages but the database now uses {page_size}",
@@ -823,10 +1243,9 @@ impl BranchStore {
         let f = inner.trunk.lineage.epoch;
         inner.trunk.lineage.epoch += 1;
         inner.trunk.lineage.children.insert(f, id);
-        inner.branches.insert(
-            id,
-            BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default()),
-        );
+        let mut st = BranchState::new(BranchId::TRUNK, f, schema, f, PageMap::default());
+        self.read_side_new(id, &mut st);
+        inner.branches.insert(id, st);
         self.trunk_children.fetch_add(1, Ordering::AcqRel);
         Ok(id)
     }
@@ -857,16 +1276,16 @@ impl BranchStore {
             .clone();
         let trunk_at = st.trunk_at;
         inner.next_id += 1;
-        inner
-            .branches
-            .insert(id, BranchState::new(parent, f, schema, trunk_at, view));
+        let mut st = BranchState::new(parent, f, schema, trunk_at, view);
+        self.read_side_new(id, &mut st);
+        inner.branches.insert(id, st);
         Ok(id)
     }
 
     /// Mark the branch open for a connection and return its committed schema. One connection per
     /// branch: two would each hold a private page cache of the same page space, and nothing would
     /// tell one that the other had committed — a silently stale read, so it is refused.
-    pub(crate) fn open(&self, id: BranchId) -> Result<Arc<Schema>> {
+    pub(crate) fn open(&self, id: BranchId) -> Result<(Arc<Schema>, Option<Arc<OlcShadow>>)> {
         let mut inner = self.lock();
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
         if st.open {
@@ -878,7 +1297,7 @@ impl BranchStore {
             )));
         }
         st.open = true;
-        Ok(st.schema.clone())
+        Ok((st.schema.clone(), st.olc.clone()))
     }
 
     /// The connection on `id` has gone. Releases its write lock if a transaction was abandoned.
@@ -939,9 +1358,11 @@ impl BranchStore {
         let Some(arena) = arena.as_mut() else {
             return;
         };
+        Self::change_begin(st);
         for d in decisions.into_iter().rev() {
             st.undo(d, arena);
         }
+        self.change_end(id, st, true);
     }
 
     pub(crate) fn end_write(&self, id: BranchId) {
@@ -978,12 +1399,13 @@ impl BranchStore {
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
         let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
         crate::turso_assert!(st.writer, "branch page written outside a write transaction");
+        Self::change_begin(st);
         let epoch = st.lineage.epoch;
         let log = self.fs13.load(Ordering::Relaxed);
         match st.current.get(&page).copied() {
             None => {
                 let slot = arena.alloc();
-                arena.page_mut(slot).copy_from_slice(pre_image);
+                arena.write(slot, pre_image);
                 st.current.insert(page, Owned { slot, born: epoch });
                 if let Some(view) = st.view.as_mut() {
                     view.insert(page, slot);
@@ -1005,7 +1427,7 @@ impl BranchStore {
                 let retain = st.lineage.has_child_in(owned.born, epoch);
                 if retain {
                     let slot = arena.alloc();
-                    arena.page_mut(slot).copy_from_slice(pre_image);
+                    arena.write(slot, pre_image);
                     st.lineage.retain(
                         page,
                         Retained {
@@ -1047,6 +1469,11 @@ impl BranchStore {
                 }
             }
         }
+        #[cfg(test)]
+        let publish = !mutants::on("R13_STALE_VIEW");
+        #[cfg(not(test))]
+        let publish = true;
+        self.change_end(id, st, publish);
         Ok(())
     }
 
@@ -1063,7 +1490,7 @@ impl BranchStore {
         if trunk.lineage.has_child_in(born, epoch) {
             let arena = arena.as_mut().expect("the trunk has a child, so the arena exists");
             let slot = arena.alloc();
-            arena.page_mut(slot).copy_from_slice(pre_image);
+            arena.write(slot, pre_image);
             trunk.lineage.retain(
                 page,
                 Retained {
@@ -1074,6 +1501,17 @@ impl BranchStore {
             );
         }
         trunk.written.insert(page, epoch);
+        // After the retention, so a lock-free reader that sees the new epoch finds the version it
+        // falls back to (r13-fs10-olc S1).
+        #[cfg(test)]
+        let mirror = !mutants::on("R13_WRITTEN_NO_MIRROR");
+        #[cfg(not(test))]
+        let mirror = true;
+        if mirror {
+            self.written_at
+                .get_or_insert(page)
+                .store(epoch, Ordering::Release);
+        }
     }
 
     /// Commit a branch's dirty pages into the slots their copy decisions allocated. Under FS11 it
@@ -1095,62 +1533,67 @@ impl BranchStore {
             return Ok(Vec::new());
         }
         let arena = arena.as_mut().expect("a branch exists, so the arena does");
-        // FS13: a decision whose page is not committed (a savepoint rollback discarded it), or whose
-        // committed bytes are the pre-image its slot holds (a savepoint rolled the write back, or it
-        // changed nothing), is taken back instead of committed.
-        let mut undone = std::collections::HashSet::new();
-        #[cfg(test)]
-        let commit_undo = !mutants::on("FS13_NO_COMMIT_UNDO");
-        #[cfg(not(test))]
-        let commit_undo = true;
-        if commit_undo {
-            let committed: HashMap<u32, &PageRef> =
-                pages.iter().map(|p| (p.get().id as u32, p)).collect();
-            for d in decisions.into_iter().rev() {
-                let unchanged = match (committed.get(&d.page), d.new_slot) {
-                    (None, _) => true,
-                    (Some(page), Some(slot)) => {
-                        page.get_contents().as_slice() == arena.page(slot)
+        // The branch's own slots change bytes here, and FS13 may change its view: optimistic readers
+        // of this branch fall back until it is done (r13-fs10-olc).
+        Self::change_begin(st);
+        let result = 'commit: {
+            // FS13: a decision whose page is not committed (a savepoint rollback discarded it), or whose
+            // committed bytes are the pre-image its slot holds (a savepoint rolled the write back, or it
+            // changed nothing), is taken back instead of committed.
+            let mut undone = std::collections::HashSet::new();
+            #[cfg(test)]
+            let commit_undo = !mutants::on("FS13_NO_COMMIT_UNDO");
+            #[cfg(not(test))]
+            let commit_undo = true;
+            if commit_undo {
+                let committed: HashMap<u32, &PageRef> =
+                    pages.iter().map(|p| (p.get().id as u32, p)).collect();
+                for d in decisions.into_iter().rev() {
+                    let unchanged = match (committed.get(&d.page), d.new_slot) {
+                        (None, _) => true,
+                        (Some(page), Some(slot)) => {
+                            page.get_contents().as_slice() == arena.page(slot)
+                        }
+                        (Some(_), None) => false,
+                    };
+                    if unchanged {
+                        st.undo(d, arena);
+                        undone.insert(d.page);
                     }
-                    (Some(_), None) => false,
+                }
+            }
+            let mut refs = Vec::with_capacity(if fs11 { pages.len() } else { 0 });
+            for page in pages {
+                if undone.contains(&(page.get().id as u32)) {
+                    if fs11 {
+                        // The branch sees its earlier version again: hold that by reference if the
+                        // arena has it; a trunk version stays this page's own bytes.
+                        let no = page.get().id as u32;
+                        let slot = st.current.get(&no).map(|o| o.slot).or_else(|| st.inherited.get(no));
+                        refs.push(slot.map(|s| arena.shared_ref(s)));
+                    }
+                    continue;
+                }
+                let no = page.get().id as u32;
+                let Some(owned) = st.current.get(&no).copied() else {
+                    break 'commit Err(LimboError::InternalError(format!(
+                        "branch {} committed page {no} with no copy decision behind it",
+                        id.0
+                    )));
                 };
-                if unchanged {
-                    st.undo(d, arena);
-                    undone.insert(d.page);
-                }
-            }
-        }
-        let mut refs = Vec::with_capacity(if fs11 { pages.len() } else { 0 });
-        for page in pages {
-            if undone.contains(&(page.get().id as u32)) {
+                crate::turso_assert!(
+                    owned.born == st.lineage.epoch,
+                    "a committed branch page was decided in an earlier epoch"
+                );
+                arena.write(owned.slot, page.get_contents().as_slice());
                 if fs11 {
-                    // The branch sees its earlier version again: hold that by reference if the
-                    // arena has it; a trunk version stays this page's own bytes.
-                    let no = page.get().id as u32;
-                    let slot = st.current.get(&no).map(|o| o.slot).or_else(|| st.inherited.get(no));
-                    refs.push(slot.map(|s| arena.shared_ref(s)));
+                    refs.push(Some(arena.shared_ref(owned.slot)));
                 }
-                continue;
             }
-            let no = page.get().id as u32;
-            let owned = st.current.get(&no).copied().ok_or_else(|| {
-                LimboError::InternalError(format!(
-                    "branch {} committed page {no} with no copy decision behind it",
-                    id.0
-                ))
-            })?;
-            crate::turso_assert!(
-                owned.born == st.lineage.epoch,
-                "a committed branch page was decided in an earlier epoch"
-            );
-            arena
-                .page_mut(owned.slot)
-                .copy_from_slice(page.get_contents().as_slice());
-            if fs11 {
-                refs.push(Some(arena.shared_ref(owned.slot)));
-            }
-        }
-        Ok(refs)
+            Ok(refs)
+        };
+        self.change_end(id, st, true);
+        result
     }
 
     pub(crate) fn set_schema(&self, id: BranchId, schema: Arc<Schema>) -> Result<()> {
@@ -1299,12 +1742,25 @@ impl BranchStore {
 
     pub(crate) fn stats(&self) -> BranchStats {
         let inner = self.lock();
+        let fast = &self.fast;
+        let fast_resolves = fast.sum(|s| &s.resolves);
         BranchStats {
             live_branches: inner.branches.len(),
             arena_slots_in_use: inner.arena.as_ref().map_or(0, |a| a.in_use()),
             arena_slots_free: inner.arena.as_ref().map_or(0, |a| a.free_count()),
             work: BranchWork {
                 slot_unshared_writes: inner.arena.as_ref().map_or(0, |a| a.unshared_writes()),
+                // The lock-free paths' resolutions count as resolutions of their kind, so every
+                // instrument that reads these keeps its meaning (r13-fs10-olc).
+                resolve_calls: inner.work.resolve_calls + fast_resolves,
+                trunk_page_hits: inner.work.trunk_page_hits + fast.sum(|s| &s.trunk_hits),
+                trunk_page_misses: inner.work.trunk_page_misses + fast.sum(|s| &s.trunk_misses),
+                slot_ref_hits: inner.work.slot_ref_hits + fast.sum(|s| &s.slot_refs),
+                fast_resolves,
+                fast_fallbacks: fast.sum(|s| &s.fast_fallbacks),
+                part_acquisitions: fast.sum(|s| &s.part_acquisitions),
+                part_contended: fast.sum(|s| &s.part_contended),
+                part_wait_ns: fast.sum(|s| &s.part_wait_ns),
                 ..inner.work
             },
         }
@@ -1350,6 +1806,7 @@ impl BranchStore {
                 return freed;
             }
             let st = inner.branches.remove(&id).expect("just looked it up");
+            self.read_side_drop(id);
             let StoreInner {
                 arena,
                 trunk,
@@ -1468,6 +1925,7 @@ impl BranchState {
             inherited,
             view: None,
             tx: Vec::new(),
+            olc: None,
         }
     }
 
@@ -1942,5 +2400,326 @@ mod tests {
             store.release_handle(id);
         }
         assert_eq!(store.stats().arena_slots_in_use, 0, "seed {seed:#x}: versions leaked");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // r13-fs10-olc: the lock-free read paths.
+
+    impl BranchStore {
+        /// The current mode's lock-free answer, without falling back and without counting.
+        fn try_fast(&self, id: BranchId, olc: Option<&OlcShadow>, page: u32) -> Option<Resolved> {
+            let found = match self.read_path() {
+                ReadPath::Locked => None,
+                ReadPath::Olc => olc.and_then(|sh| self.resolve_olc(sh, page)),
+                ReadPath::Part => self.resolve_part(id, page, false),
+                ReadPath::PartX => self.resolve_part(id, page, true),
+            };
+            found.map(|(resolved, _)| resolved)
+        }
+
+        /// Where the locked path finds `page` for `id`.
+        fn origin_kind(&self, id: BranchId, page: u32) -> &'static str {
+            let inner = self.lock();
+            let (mut levels, mut examined) = (0, 0);
+            match inner.resolve_origin(id, page, &mut levels, &mut examined).unwrap() {
+                Origin::Arena(_) => "arena",
+                Origin::Inherited(_) => "inherited",
+                Origin::TrunkRetained { .. } => "retained",
+                Origin::Trunk => "trunk",
+            }
+        }
+    }
+
+    struct PathNode {
+        id: BranchId,
+        sees: HashMap<u32, u64>,
+        olc: Option<Arc<OlcShadow>>,
+    }
+
+    /// T1 (PREREG §0.8). Every lock-free read path against the locked one, through the store's own
+    /// entry points: forks from the trunk and from branches, trunk writes with children (retaining)
+    /// and without (so the cache generation moves), F6 fills of misses, branch writes checked both
+    /// inside the transaction and after its commit, rollbacks (FS13), and reaps. After every step
+    /// every live branch resolves every page both ways: a lock-free answer must be the locked one —
+    /// same variant, same key, the very same bytes — and the right version by the model; it may be
+    /// absent only where the path does not cover the case (a trunk-retained version, or an arena
+    /// page with FS11 off). The partitions must hold exactly the live branches.
+    #[test]
+    fn every_read_path_agrees_with_the_locked_path() {
+        for path in [ReadPath::Olc, ReadPath::Part, ReadPath::PartX] {
+            for fs11 in [true, false] {
+                for seed in [0x9E37_79B9_7F4A_7C15u64, 0xD1B5_4A32_D192_ED03, 0x2545_F491_4F6C_DD1D] {
+                    run_paths(path, fs11, seed);
+                }
+            }
+        }
+    }
+
+    fn check_paths(
+        store: &BranchStore,
+        nodes: &[PathNode],
+        trunk: &HashMap<u32, u64>,
+        fs11: bool,
+        ctx: &str,
+        seen: &mut [u64; 4],
+    ) {
+        let mut buf = vec![0u8; PAGE];
+        for n in nodes {
+            for page in 0..PAGES {
+                let fast = store.try_fast(n.id, n.olc.as_deref(), page);
+                let origin = store.origin_kind(n.id, page);
+                let locked = store.resolve_shared(n.id, page, &mut buf).unwrap();
+                let got = match &locked {
+                    Resolved::Filled => u64::from_le_bytes(buf[..8].try_into().unwrap()),
+                    Resolved::Shared(bytes) => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                    Resolved::Trunk(key) => {
+                        store.fill_trunk_page(*key, &image(trunk[&page]));
+                        trunk[&page]
+                    }
+                };
+                assert_eq!(got, n.sees[&page], "{ctx}: branch {} read the wrong page {page}", n.id.0);
+                match fast {
+                    Some(fast) => {
+                        let agree = match (&fast, &locked) {
+                            (Resolved::Shared(a), Resolved::Shared(b)) => Arc::ptr_eq(a, b),
+                            (Resolved::Trunk(a), Resolved::Trunk(b)) => a == b,
+                            _ => false,
+                        };
+                        assert!(
+                            agree,
+                            "{ctx}: the fast path disagrees with the locked path for branch {} page \
+                             {page} (origin {origin})",
+                            n.id.0
+                        );
+                        seen[match fast {
+                            Resolved::Trunk(_) => 0,
+                            Resolved::Shared(_) if origin == "trunk" => 1,
+                            _ => 2,
+                        }] += 1;
+                    }
+                    None => {
+                        let uncovered = origin == "retained" || (!fs11 && origin != "trunk");
+                        assert!(
+                            uncovered,
+                            "{ctx}: the fast path fell back on a case it covers: branch {} page \
+                             {page} (origin {origin})",
+                            n.id.0
+                        );
+                        seen[3] += 1;
+                    }
+                }
+            }
+        }
+        if matches!(store.read_path(), ReadPath::Part | ReadPath::PartX) {
+            assert_eq!(
+                store.partition_entries(),
+                store.stats().live_branches,
+                "{ctx}: partition entries outlived their branches"
+            );
+        }
+    }
+
+    fn run_paths(path: ReadPath, fs11: bool, seed: u64) {
+        let store = BranchStore::new();
+        store.set_read_path(path);
+        store.set_fs11(fs11);
+        store.set_fs13(true);
+        let mut rng = Rng(seed);
+        let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
+        let mut nodes: Vec<PathNode> = Vec::new();
+        let mut generation = 0u64;
+        // [fast trunk misses, fast F6 hits, fast slot refs, fallbacks]
+        let mut seen = [0u64; 4];
+        let (mut rollbacks, mut emptied) = (0u64, 0u64);
+        for step in 0..1200 {
+            let ctx = format!("{path:?} fs11={fs11} seed {seed:#x} step {step}");
+            match rng.below(12) {
+                0..=1 if nodes.len() < 24 => {
+                    let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+                    let (_, olc) = store.open(id).unwrap();
+                    nodes.push(PathNode {
+                        id,
+                        sees: trunk.clone(),
+                        olc,
+                    });
+                }
+                2..=3 if !nodes.is_empty() && nodes.len() < 24 => {
+                    let parent = rng.below(nodes.len() as u64) as usize;
+                    let id = store.fork_branch(nodes[parent].id).unwrap();
+                    let (_, olc) = store.open(id).unwrap();
+                    let sees = nodes[parent].sees.clone();
+                    nodes.push(PathNode { id, sees, olc });
+                }
+                4..=5 => {
+                    let page = rng.below(u64::from(PAGES)) as u32;
+                    if store.trunk_has_children() {
+                        store.first_write_trunk(page, &image(trunk[&page]));
+                    }
+                    generation += 1;
+                    trunk.insert(page, generation);
+                }
+                6..=9 if !nodes.is_empty() => {
+                    let v = rng.below(nodes.len() as u64) as usize;
+                    let id = nodes[v].id;
+                    let rollback = rng.below(4) == 0;
+                    store.begin_write(id).unwrap();
+                    let mut committed = Vec::new();
+                    let mut wrote = Vec::new();
+                    for _ in 0..=rng.below(2) {
+                        let page = rng.below(u64::from(PAGES)) as u32;
+                        if wrote.contains(&page) {
+                            continue;
+                        }
+                        store
+                            .first_write_branch(id, page, &image(nodes[v].sees[&page]))
+                            .unwrap();
+                        wrote.push(page);
+                        generation += 1;
+                        committed.push((page, generation));
+                    }
+                    // Inside the transaction every branch still sees what it saw: the writer's new
+                    // slots hold the pre-image until the commit.
+                    check_paths(&store, &nodes, &trunk, fs11, &format!("{ctx} (in tx)"), &mut seen);
+                    if rollback {
+                        store.rollback_writes(id);
+                        rollbacks += 1;
+                    } else {
+                        let pages: Vec<PageRef> =
+                            committed.iter().map(|&(p, g)| page_with(p, g)).collect();
+                        store.commit_pages(id, &pages).unwrap();
+                        for (p, g) in committed {
+                            nodes[v].sees.insert(p, g);
+                        }
+                    }
+                    store.end_write(id);
+                }
+                10..=11 if !nodes.is_empty() => {
+                    let n = nodes.swap_remove(rng.below(nodes.len() as u64) as usize);
+                    store.release_handle(n.id);
+                    store.close(n.id);
+                    if nodes.is_empty() {
+                        emptied += 1;
+                    }
+                }
+                _ => {}
+            }
+            // Every 300 steps every branch goes, so the trunk also writes with no child and the
+            // cache generation moves.
+            if step % 300 == 299 {
+                for n in nodes.drain(..) {
+                    store.release_handle(n.id);
+                    store.close(n.id);
+                }
+                emptied += 1;
+            }
+            check_paths(&store, &nodes, &trunk, fs11, &ctx, &mut seen);
+        }
+        // The shapes the paths exist for must have occurred, or a green run says nothing.
+        let slot_refs_needed = if fs11 { seen[2] > 0 } else { true };
+        assert!(
+            seen[0] > 0 && seen[1] > 0 && slot_refs_needed && seen[3] > 0 && rollbacks > 0 && emptied > 0,
+            "{path:?} fs11={fs11} seed {seed:#x}: fast misses {}, fast F6 hits {}, fast slot refs {}, \
+             fallbacks {}, rollbacks {rollbacks}, times the last branch went {emptied}",
+            seen[0],
+            seen[1],
+            seen[2],
+            seen[3]
+        );
+        for n in nodes {
+            store.release_handle(n.id);
+            store.close(n.id);
+        }
+        assert_eq!(store.stats().live_branches, 0, "{path:?} seed {seed:#x}: branches leaked");
+        assert_eq!(store.partition_entries(), 0, "{path:?} seed {seed:#x}: partition entries outlived their branches");
+        assert_eq!(store.stats().arena_slots_in_use, 0, "{path:?} seed {seed:#x}: slots leaked");
+    }
+
+    /// T2 (PREREG §0.8). An optimistic read whose branch changes between its view load and its
+    /// validation (the test hook runs a write of the page at exactly that point) must discard what
+    /// it read and take the lock: the validation is what makes the read correct
+    /// (`R13_OLC_NO_VALIDATE` skips it).
+    #[test]
+    fn an_optimistic_read_that_overlaps_a_view_change_falls_back() {
+        let store = Arc::new(BranchStore::new());
+        store.set_read_path(ReadPath::Olc);
+        store.set_fs11(true);
+        let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        let (_, olc) = store.open(id).unwrap();
+        let olc = olc.expect("olc gives every branch a shadow");
+        let mut buf = vec![0u8; PAGE];
+        // Page 2 is the trunk's, cached in F6.
+        let Resolved::Trunk(key) = store.resolve_shared(id, 2, &mut buf).unwrap() else {
+            panic!("page 2 was not the trunk's");
+        };
+        store.fill_trunk_page(key, &image(0));
+        assert!(
+            matches!(store.try_fast(id, Some(&olc), 2), Some(Resolved::Shared(_))),
+            "a quiet optimistic read of a cached trunk page did not succeed"
+        );
+        let writer = store.clone();
+        olc_hook::set(Box::new(move || {
+            writer.begin_write(id).unwrap();
+            writer.first_write_branch(id, 2, &image(0)).unwrap();
+        }));
+        let before = store.stats().work;
+        let got = store.resolve_bound(id, Some(&olc), 2, &mut buf).unwrap();
+        let after = store.stats().work;
+        assert_eq!(
+            after.fast_fallbacks - before.fast_fallbacks,
+            1,
+            "an optimistic read that overlapped a view change was not discarded"
+        );
+        match (got, store.resolve_shared(id, 2, &mut buf).unwrap()) {
+            (Resolved::Shared(a), Resolved::Shared(b)) => assert!(
+                Arc::ptr_eq(&a, &b),
+                "the fallback did not return the branch's new slot"
+            ),
+            _ => panic!("the fallback did not return the branch's new slot by reference"),
+        }
+        store.commit_pages(id, &[page_with(2, 1)]).unwrap();
+        store.end_write(id);
+        store.release_handle(id);
+        store.close(id);
+        assert_eq!(store.stats().arena_slots_in_use, 0);
+    }
+
+    /// T5 (PREREG §0.8). `partx`: a resolution that finds its branch's partition held waits, and
+    /// that is counted once with a non-zero wait; resolutions on one thread contend for nothing.
+    #[test]
+    fn a_partition_wait_is_counted() {
+        let store = Arc::new(BranchStore::new());
+        store.set_read_path(ReadPath::PartX);
+        let id = store.fork_trunk(Arc::new(Schema::default()), PAGE, 0).unwrap();
+        let mut buf = vec![0u8; PAGE];
+        let base = store.stats().work;
+        for page in 0..PAGES {
+            if let Resolved::Trunk(key) = store.resolve_bound(id, None, page, &mut buf).unwrap() {
+                store.fill_trunk_page(key, &image(0));
+            }
+        }
+        let quiet = store.stats().work;
+        assert_eq!(quiet.part_contended - base.part_contended, 0, "one thread contended a partition");
+        assert!(quiet.part_acquisitions - base.part_acquisitions >= u64::from(PAGES));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let held = store.parts[partition(id)].write();
+                tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(held);
+            })
+        };
+        rx.recv().unwrap();
+        store.resolve_bound(id, None, 2, &mut buf).unwrap();
+        holder.join().unwrap();
+        let forced = store.stats().work;
+        assert_eq!(
+            forced.part_contended - quiet.part_contended,
+            1,
+            "the waiting partition acquisition was not counted"
+        );
+        assert!(forced.part_wait_ns > quiet.part_wait_ns, "a contended partition take waited 0 ns");
+        store.release_handle(id);
     }
 }
