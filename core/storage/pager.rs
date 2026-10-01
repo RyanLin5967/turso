@@ -3,7 +3,7 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
-use crate::branch::store::BranchStore;
+use crate::branch::store::{BranchStore, TrunkPending};
 use crate::branch::{BranchBinding, BranchId};
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -1519,6 +1519,12 @@ pub struct Pager {
     /// Set when this pager serves a branch instead of the trunk: reads resolve through the
     /// branch's page space and commits go to it, never to the WAL.
     branch: OnceLock<BranchBinding>,
+    /// On a TRUNK pager: the table rows and the tables (written without naming rows) that the write
+    /// transaction in progress wrote while the trunk had a live child. Handed to the branch store at
+    /// commit, which stamps them with the commit's epoch (V3's KeyStamp; r13-compose, the Merger
+    /// port, from b161e861d); dropped at rollback. A savepoint rolled back keeps its entries:
+    /// over-stating a write set can only refuse a merge, never admit one.
+    trunk_pending: Mutex<TrunkPending>,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1808,6 +1814,7 @@ impl Pager {
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
             branch_store: OnceLock::new(),
             branch: OnceLock::new(),
+            trunk_pending: Mutex::new(TrunkPending::default()),
         })
     }
 
@@ -3180,6 +3187,8 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
+        // A transaction that rolled back left its merge writes here; this one starts from none.
+        *self.trunk_pending.lock() = TrunkPending::default();
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
@@ -3299,8 +3308,26 @@ impl Pager {
                         _ => false,
                     };
 
+                    // The branch store's merge record: this transaction's writes are committed, and
+                    // are stamped with the trunk's epoch while the WAL write lock is still held, so
+                    // no fork (which takes that lock) and no merge validation (which runs inside a
+                    // trunk write transaction) falls between the commit and its stamps.
+                    let stamped = if let Some(store) = self.branch_store.get() {
+                        let tx = std::mem::take(&mut *self.trunk_pending.lock());
+                        store.stamp_committed(tx)
+                    } else {
+                        false
+                    };
+
                     wal.end_write_tx();
                     wal.end_read_tx();
+                    // Pruned off the WAL write lock (A19 of r11-merge): a prune drops only stamps
+                    // no live or future trunk child can be refused by.
+                    if stamped {
+                        if let Some(store) = self.branch_store.get() {
+                            store.prune_stamps();
+                        }
+                    }
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
@@ -3396,6 +3423,10 @@ impl Pager {
             _ => (false, false),
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
+        if is_write && self.branch.get().is_none() {
+            // A rolled-back trunk transaction stamps nothing.
+            *self.trunk_pending.lock() = TrunkPending::default();
+        }
         if is_write {
             self.clear_savepoints()
                 .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
@@ -3808,6 +3839,42 @@ impl Pager {
             }
         }
         Ok(())
+    }
+
+    /// A table cursor wrote or deleted `rowid` in the b-tree rooted at `root`. On the trunk, while
+    /// it has a live child, the row joins the transaction's pending merge writes, stamped when it
+    /// commits. On a branch nothing is recorded: the Merger DERIVES a branch's writes from its own
+    /// pages at merge time (r13-compose A5), so no second record of them can be lost.
+    pub(crate) fn note_row_write(&self, root: i64, rowid: i64) {
+        if self.branch.get().is_some() {
+            return;
+        }
+        if let Some(store) = self.branch_store.get() {
+            if store.trunk_has_children() {
+                self.trunk_pending.lock().rows.insert((root, rowid));
+            }
+        }
+    }
+
+    /// A cursor wrote the table rooted at `root` without naming the rows (clear, destroy,
+    /// incremental blob I/O). On the trunk, while it has a live child, the whole table is stamped
+    /// at the commit; on a branch nothing is recorded (see [`Pager::note_row_write`]).
+    pub(crate) fn note_bulk_write(&self, root: i64) {
+        if self.branch.get().is_some() {
+            return;
+        }
+        if let Some(store) = self.branch_store.get() {
+            if store.trunk_has_children() {
+                self.trunk_pending.lock().tables.insert(root);
+            }
+        }
+    }
+
+    /// Run `f` over what the trunk write transaction in progress has written so far (a merge
+    /// validates later batch members against it).
+    pub(crate) fn with_trunk_pending<T>(&self, f: impl FnOnce(&TrunkPending) -> T) -> T {
+        let pending = self.trunk_pending.lock();
+        f(&pending)
     }
 
     pub fn wal_state(&self) -> Result<WalState> {

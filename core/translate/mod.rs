@@ -127,6 +127,8 @@ pub fn translate(
         },
         &prepare_options.unqualified_database_search_path,
     );
+    // A branch merge applying row images compiles with no triggers (see `branch::merge`).
+    resolver.triggers_disabled = connection.row_image_apply();
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here

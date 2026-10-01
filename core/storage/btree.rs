@@ -5966,6 +5966,8 @@ impl BTreeCursor {
         if data.is_empty() {
             return Ok(IOResult::Done(()));
         }
+        // The branch store's merge record (r13-compose, the Merger port): a write naming no row.
+        self.pager.note_bulk_write(self.root_page);
         return_if_io!(self.blob_write_range(payload_off, data));
         Ok(IOResult::Done(()))
     }
@@ -6577,6 +6579,11 @@ impl CursorTrait for BTreeCursor {
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
+        // The branch store's merge record (r13-compose, the Merger port): a trunk table row written
+        // while the trunk has a live child is stamped at its commit (V3's KeyStamp).
+        if let (Some(rowid), None) = (key.maybe_rowid(), &self.index_info) {
+            self.pager.note_row_write(self.root_page, rowid);
+        }
         self.invalidate_count_cache();
         if key.maybe_rowid().is_some() {
             self.set_has_record(true);
@@ -6624,10 +6631,12 @@ impl CursorTrait for BTreeCursor {
                         page.get_contents().page_type()?,
                         PageType::TableLeaf | PageType::TableInterior
                     ) {
-                        if return_if_io!(self.rowid()).is_none() {
+                        let Some(rowid) = return_if_io!(self.rowid()) else {
                             self.state = CursorState::None;
                             return Ok(IOResult::Done(()));
-                        }
+                        };
+                        // The branch store's merge record (r13-compose, the Merger port).
+                        self.pager.note_row_write(self.root_page, rowid);
                     } else if !self.has_record() {
                         self.state = CursorState::None;
                         return Ok(IOResult::Done(()));
@@ -7020,6 +7029,7 @@ impl CursorTrait for BTreeCursor {
         // positions that wouldn't outlive the clear (cf. sqlite3BtreeClearTable,
         // btree.c:10194).
         if matches!(self.state, CursorState::None) {
+            self.pager.note_bulk_write(self.root_page);
             self.pager.invalidate_peer_cursors(self);
             self.invalidate_count_cache();
             // Every page in this btree is about to be freed, so our own cached
@@ -7040,6 +7050,7 @@ impl CursorTrait for BTreeCursor {
     fn btree_destroy(&mut self) -> Result<IOResult<Option<usize>>> {
         // See clear_btree for the state==None gate rationale.
         if matches!(self.state, CursorState::None) {
+            self.pager.note_bulk_write(self.root_page);
             self.pager.invalidate_peer_cursors(self);
         }
         self.destroy_btree_contents(false)

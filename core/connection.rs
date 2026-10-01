@@ -496,6 +496,10 @@ pub struct Connection {
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
+    /// Statements compile with no triggers while set: a branch merge applies row images, whose
+    /// trigger effects are already rows of their own (PostgreSQL's session_replication_role =
+    /// replica). See `branch::merge` (r13-compose, the Merger port from b161e861d).
+    pub(crate) row_image_apply: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Number of active top-level write statements on this connection.
     ///
@@ -1954,6 +1958,17 @@ impl Connection {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    /// Compile statements with no triggers (see `row_image_apply`). Bumps the prepare generation, so
+    /// a statement prepared under the other setting is reprepared before it runs.
+    pub(crate) fn set_row_image_apply(&self, on: bool) {
+        self.row_image_apply.store(on, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn row_image_apply(&self) -> bool {
+        self.row_image_apply.load(Ordering::Acquire)
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
