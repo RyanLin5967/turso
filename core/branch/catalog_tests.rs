@@ -1104,6 +1104,10 @@ fn the_fw_knobs_reproduce_the_store_before_the_fixes() {
         let s1 = db.branch_cat_shape();
         assert_eq!(listed.len(), ids.len(), "call {call}");
         let catalog_rows = s1.ids_catalog_rows - s0.ids_catalog_rows;
+        // A8.3's restated identity: F-W1's one build reads every unreleased catalog row, once.
+        let built = s1.ids_build_rows - s0.ids_build_rows;
+        let want_built = if !fw1_off && call == 0 { ids.len() as u64 } else { 0 };
+        assert_eq!(built, want_built, "ids_build_rows, fw1 off {fw1_off}, call {call}: {s1:?}");
         if fw1_off {
             // Every call reads every unreleased row of the catalog, resident or not: the base's own
             // count (78e9a77ab store.rs:1722-1723; PREREG amendment 8 restates A2.F12's wording).

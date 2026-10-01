@@ -97,7 +97,7 @@ fn snapshot(conn: &Arc<Connection>, table: &str) -> BTreeMap<i64, String> {
 fn differing<V: PartialEq>(root: i64, a: &BTreeMap<i64, V>, b: &BTreeMap<i64, V>) -> BTreeSet<(i64, i64)> {
     a.keys()
         .chain(b.keys())
-        .filter(|k| a.get(k) != b.get(k))
+        .filter(|&&k| a.get(&k) != b.get(&k))
         .map(|&k| (root, k))
         .collect()
 }
@@ -121,15 +121,17 @@ fn exec(conn: &Arc<Connection>, sql: &str) {
 }
 
 /// Two tables (`a` created first, so `t`'s root is not the first table root, A6.3 (ii)), an index on
-/// `t.w`, and enough rows for interior pages at a small page size.
+/// `t.w`, and enough rows for interior pages at a small page size. `a` holds 800 rows of ~40 bytes,
+/// several leaves, so a write to a non-root page of `a` exists for r13_first_root to misattribute
+/// whichever table it takes first (second review).
 fn seed(conn: &Arc<Connection>, rows: i64) {
     exec(conn, "PRAGMA page_size = 1024");
     exec(conn, "CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT)");
     exec(conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w INTEGER)");
     exec(conn, "CREATE INDEX t_w ON t(w)");
     exec(conn, "BEGIN");
-    for id in 1..=50 {
-        exec(conn, &format!("INSERT INTO a VALUES ({id}, 'a{id}')"));
+    for id in 1..=800 {
+        exec(conn, &format!("INSERT INTO a VALUES ({id}, 'a{id:05}-{}')", "y".repeat(32)));
     }
     for id in 1..=rows {
         exec(conn, &format!("INSERT INTO t VALUES ({id}, 'base-{id:05}', {})", id % 97));
@@ -191,7 +193,7 @@ impl Op {
             4 => Op::SetV(id, text(1500 + rng.below(3000) as usize, step)),
             5 => Op::AddW(id),
             6 => Op::Revert(id),
-            7 => Op::SetA(1 + rng.below(50) as i64, format!("b{step}")),
+            7 => Op::SetA(1 + rng.below(800) as i64, format!("b{step}")),
             _ => Op::Noop(id),
         }
     }
@@ -263,19 +265,24 @@ enum End {
 /// model(B) against model(base), under random workloads with splits, deletes (balances that free
 /// pages), overflow payloads, an indexed column and reverts, in two tables, with TRUNK commits after
 /// the fork on the leaves the branch owns and a trunk revert to the fork-time value (so a base read
-/// from the trunk now is caught), in every mode, live, after a reopen, and across a kill at each
-/// failpoint a branch or trunk commit can die at. model(B) is the SQL the test committed (review
-/// wf_5c230f31 H2: it was read through B's own view); the store's reads of B are a separate assertion.
-/// Mutants that must turn it red: r13_base_trunk_now, r13_first_root, r13_skip_freed_base
-/// (r13_leaves_only is equivalent on admitted workloads, amendment 8; its red is
-/// `derive_enumerates_a_subtree_the_branch_unlinked_without_writing`).
+/// from the trunk now is caught), in every mode, live, after a reopen with a content change in the
+/// log's tail, and across a kill at each failpoint a branch or trunk commit can die at. Each kill is
+/// asserted to fire; every one stops its commit before the Commit record, so the statement is known
+/// absent and the acknowledged model is the only one (second review: A6.2's range would also let a
+/// recovery that applied an unrecorded commit pass). model(B) is the SQL the test committed; the
+/// store's reads of B are a separate assertion. Mutants that must turn it red: r13_base_trunk_now and
+/// r13_first_root (r13_skip_freed_base's red is the delete-balance red; r13_leaves_only's is
+/// `derive_enumerates_a_subtree_the_branch_unlinked_without_writing`, amendment 8).
 #[test]
 fn a_derived_write_set_equals_the_recorded_one_under_random_workloads() {
-    d_t1(open);
+    d_t1(open, false);
 }
 
-/// D-T1's body over an opener: the step-9 tree runs it again in the F7 splice arm.
-fn d_t1(open: fn(&Path, Mode) -> Arc<Database>) {
+/// D-T1's body over an opener. `zombie` (the step-9 tree's splice arm, amendment 8.6): B is forked
+/// from a branch Z that wrote rows before and after B's fork and is then released while B lives, so
+/// the splice streams Z's versions into B; model(B) starts from Z's view at B's fork, and the base is
+/// the trunk at Z's fork.
+fn d_t1(open: fn(&Path, Mode) -> Arc<Database>, zombie: bool) {
     let ends = [
         End::Live,
         End::Reopen,
@@ -284,51 +291,76 @@ fn d_t1(open: fn(&Path, Mode) -> Arc<Database>) {
         End::Kill(BranchFailpoint::BarrierBeforeRecords),
     ];
     for mode in MODES {
+        if zombie && !mode.durable() {
+            continue;
+        }
         for seed_no in 1..=3u64 {
             for end in ends {
                 if end != End::Live && !mode.durable() {
                     continue;
                 }
-                let what = format!("{mode:?} seed {seed_no} {end:?}");
+                let what = format!("{mode:?} seed {seed_no} {end:?} zombie {zombie}");
                 let dir = tempfile::TempDir::new().unwrap();
                 let path = dir.path().join("m.db");
                 let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed_no);
                 let (b_id, roots, base_t, base_a);
                 let (mut ack_t, mut ack_a);
-                let mut doubt: Option<Op> = None;
                 {
                     let db = open(&path, mode);
                     let trunk = db.connect().unwrap();
                     seed(&trunk, 800);
                     roots = (root_of(&trunk, "t"), root_of(&trunk, "a"));
-                    let b = trunk.fork_branch().unwrap();
-                    // model(base): the trunk as B forked it, read on a TRUNK connection before any
-                    // later trunk commit (A6.2).
+                    let parent = zombie.then(|| trunk.fork_branch().unwrap());
+                    // model(base): the trunk as B's line forked from it (Z's fork for a zombie), read
+                    // on a TRUNK connection before any later trunk commit (A6.2).
                     base_t = rows_of(&trunk, "t");
                     base_a = rows_of(&trunk, "a");
                     ack_t = base_t.clone();
                     ack_a = base_a.clone();
+                    let b = match &parent {
+                        Some(z) => {
+                            let zc = z.connect().unwrap();
+                            for step in 0..10u64 {
+                                let op = Op::next(&mut rng, 100 + step);
+                                exec(&zc, &op.sql());
+                                op.apply(&mut ack_t, &mut ack_a);
+                            }
+                            let b = z.fork().unwrap();
+                            // Z's write after B's fork is not B's.
+                            exec(&zc, &Op::next(&mut rng, 120).sql());
+                            drop(zc);
+                            b
+                        }
+                        None => trunk.fork_branch().unwrap(),
+                    };
+                    if let Some(z) = parent {
+                        let r = z.reap().unwrap();
+                        assert!(r.deferred, "{what}: the zombie had a live child: {r:?}");
+                    }
                     let conn = b.connect().unwrap();
                     let kill_at = 25 + 7 * seed_no;
                     let mut trunk_changed: Option<i64> = None;
                     for step in 0..60u64 {
-                        let op = Op::next(&mut rng, step);
                         if let End::Kill(fp) = end {
                             if step == kill_at {
                                 db.branch_failpoint(Some(fp));
                                 if fp == BranchFailpoint::BarrierBeforeRecords {
-                                    // A trunk commit dies at its barrier; B's model is unchanged.
-                                    let _ = trunk.execute("UPDATE t SET v = 'killed' WHERE id = 1");
-                                } else if conn.execute(op.sql()).is_ok() {
-                                    // Nothing to commit reached the failpoint: acknowledged.
-                                    op.apply(&mut ack_t, &mut ack_a);
+                                    // The trunk's first write of a's pages since the fork needs its
+                                    // pre-image kept, so this commit reaches the barrier and dies.
+                                    let r = trunk.execute("UPDATE a SET v = 'killed' WHERE id = 1");
+                                    assert!(r.is_err(), "{what}: the barrier failpoint did not fire");
                                 } else {
-                                    doubt = Some(op);
+                                    // A content change to a row B holds: the commit has pages, so
+                                    // the failpoint fires, before the Commit record.
+                                    let k = *ack_t.keys().next().unwrap();
+                                    let r = conn.execute(Op::SetV(k, format!("killed{seed_no}")).sql());
+                                    assert!(r.is_err(), "{what}: the failpoint did not fire");
                                 }
                                 db.branch_failpoint(None);
                                 break;
                             }
                         }
+                        let op = Op::next(&mut rng, step);
                         exec(&conn, &op.sql());
                         op.apply(&mut ack_t, &mut ack_a);
                         // Trunk commits after the fork, on rows next to the branch's (A6.3 (i)), and
@@ -358,9 +390,11 @@ fn d_t1(open: fn(&Path, Mode) -> Arc<Database>) {
                             continue;
                         }
                         End::Reopen => {
-                            // Rows both checkpointed and in the log's tail.
+                            // Rows both checkpointed and in the log's tail: a content change to a row
+                            // B holds, after the checkpoint.
                             settle(&db, mode);
-                            let op = Op::next(&mut rng, 99);
+                            let k = *ack_t.keys().nth(1).unwrap();
+                            let op = Op::SetV(k, format!("tail{seed_no}"));
                             let b = db.branch(b_id).unwrap();
                             exec(&b.connect().unwrap(), &op.sql());
                             op.apply(&mut ack_t, &mut ack_a);
@@ -372,18 +406,9 @@ fn d_t1(open: fn(&Path, Mode) -> Arc<Database>) {
                 let db = open(&path, mode);
                 let trunk = db.connect().unwrap();
                 let b = db.branch(b_id).unwrap();
-                let (mut op_t, mut op_a) = (ack_t.clone(), ack_a.clone());
-                if let Some(op) = &doubt {
-                    op.apply(&mut op_t, &mut op_a);
-                }
-                let models: Vec<(&BTreeMap<i64, Row>, &BTreeMap<i64, Row>)> = if doubt.is_some() {
-                    vec![(&ack_t, &ack_a), (&op_t, &op_a)]
-                } else {
-                    vec![(&ack_t, &ack_a)]
-                };
-                reads_are(&b, &models, &what);
+                reads_are(&b, &[(&ack_t, &ack_a)], &what);
                 settle(&db, mode);
-                check_derived(&db, &trunk, &b, roots, (&base_t, &base_a), &models, &what);
+                check_derived(&db, &trunk, &b, roots, (&base_t, &base_a), &[(&ack_t, &ack_a)], &what);
                 let _ = b.into_id();
             }
         }
@@ -466,9 +491,10 @@ fn merge_installs_both(db: &Arc<Database>, trunk: &Arc<Connection>, b_id: Branch
 
 /// D-T2 (A5.4): a merge after an eviction, after a reopen with rows both checkpointed and in the
 /// log's tail, during a fuzzy checkpoint's flight (held before and after its catalog commit), and
-/// after a checkpoint whose write failed (then merged at once, after an evicting checkpoint, and
-/// after a reopen), installs every row the branch changed. The eviction and restart orders run with
-/// sharp and with fuzzy checkpoints. The four adversary rounds' loss orders, end to end.
+/// after a checkpoint whose write failed, sharp (then merged at once, after an evicting checkpoint,
+/// and after a reopen) or fuzzy (then evicted), installs every row the branch changed. The eviction
+/// and restart orders run with sharp and with fuzzy checkpoints. The four adversary rounds' loss
+/// orders, end to end. Mutant r13_install_err_drops_dirty must turn it red (amendment 8.6).
 #[test]
 fn a_merge_after_eviction_restart_and_fuzzy_capture_installs_every_row() {
     for (mode, case) in [
@@ -481,6 +507,7 @@ fn a_merge_after_eviction_restart_and_fuzzy_capture_installs_every_row() {
         (Mode::Catalog, "failed-write"),
         (Mode::CatalogEvict, "failed-write-then-evict"),
         (Mode::Catalog, "failed-write-restart"),
+        (Mode::CatalogEvict, "failed-write-fuzzy"),
     ] {
         let what = case.to_string();
         let ck: fn(&Arc<Database>) = if case.ends_with("-fuzzy") { fuzzy } else { sharp };
@@ -517,6 +544,15 @@ fn a_merge_after_eviction_restart_and_fuzzy_capture_installs_every_row() {
             }
             "failed-write-then-evict" => {
                 fail_write(&db);
+                sharp(&db);
+                (db, trunk)
+            }
+            "failed-write-fuzzy" => {
+                // A fuzzy flight whose write fails: its install re-merges the captured dirt, so the
+                // next (evicting) checkpoint still persists the second row.
+                db.branch_failpoint(Some(BranchFailpoint::CheckpointWriteFails));
+                assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "{what}: no flight");
+                db.branch_checkpoint_wait();
                 sharp(&db);
                 (db, trunk)
             }
@@ -669,11 +705,25 @@ fn an_incremental_blob_write_on_an_unowned_leaf_is_refused() {
     derivation_refusal("blob");
 }
 
+/// A catalog store with WITHOUT ROWID tables allowed (the option is off by default; second review).
+fn open_without_rowid(path: &Path) -> Arc<Database> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        Mode::Catalog.opts().with_without_rowid(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap()
+}
+
 /// D-T5: an index-kind write when the schema has a WITHOUT ROWID table is refused.
 #[test]
 fn a_without_rowid_write_is_refused() {
     let dir = tempfile::TempDir::new().unwrap();
-    let db = open(&dir.path().join("m.db"), Mode::Catalog);
+    let db = open_without_rowid(&dir.path().join("m.db"));
     let trunk = db.connect().unwrap();
     seed(&trunk, 50);
     exec(&trunk, "CREATE TABLE wr(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID");
@@ -694,7 +744,7 @@ fn a_without_rowid_write_is_refused() {
 #[test]
 fn an_index_write_beside_an_unrelated_without_rowid_table_is_refused() {
     let dir = tempfile::TempDir::new().unwrap();
-    let db = open(&dir.path().join("m.db"), Mode::Catalog);
+    let db = open_without_rowid(&dir.path().join("m.db"));
     let trunk = db.connect().unwrap();
     seed(&trunk, 50);
     exec(&trunk, "CREATE TABLE wr(k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID");
@@ -798,6 +848,21 @@ impl DbFile {
         d
     }
 
+    /// In a 3-level tree under `root`: each leaf's level-2 parent (the children of the root's
+    /// children).
+    fn level2_parents(&self, root: u32) -> HashMap<u32, u32> {
+        let mut out = HashMap::new();
+        let (cells, right) = self.interior(root).expect("an interior root");
+        for q in cells.iter().map(|c| c.0).chain([right]) {
+            if let Some((qc, qr)) = self.interior(q) {
+                for leaf in qc.iter().map(|c| c.0).chain([qr]) {
+                    out.insert(leaf, q);
+                }
+            }
+        }
+        out
+    }
+
     /// The trunk pages of the freelist chain page 1's header starts.
     fn freelist_trunks(&self) -> u64 {
         let mut n = u32::from_be_bytes(self.bytes[32..36].try_into().unwrap());
@@ -829,10 +894,11 @@ fn varint(b: &[u8]) -> u64 {
 /// D-T4 (A6.3): an interior balance that relinks subtrees the branch did not write derives no change
 /// for their rows; the cancellation fired, nothing was enumerated, and derive_pages_read stays under
 /// A6.5's KNOWN bound for the case. The fixture is three levels deep (asserted by the test's own walk
-/// of the trunk file), and the branch deletes ~75% of the rows under ONE level-2 interior page, so
-/// that page underflows and an interior balance moves its siblings' children (review wf_5c230f31 M:
-/// the old 6,000-row fixture could not reach an interior balance). Mutant r13_no_relink_cancel must
-/// turn it red (its output is the same; only the counters tell).
+/// of the trunk file), and the branch deletes ~94% of the rows under ONE level-2 interior page. The
+/// premise that this moves a sibling's unwritten leaf under another interior page is the test's own:
+/// the same DELETE on a plain copy of the trunk, walked before and after (second review: at ~75% the
+/// underflow had almost no margin). Mutant r13_no_relink_cancel must turn it red (its output is the
+/// same; only the counters tell).
 #[test]
 fn an_interior_balance_that_relinks_a_subtree_derives_no_change_for_its_rows() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -849,16 +915,35 @@ fn an_interior_balance_that_relinks_a_subtree_derives_no_change_for_its_rows() {
     let (p, lo, hi) = (cells[1].0, cells[0].1, cells[1].1);
     let (under, _) = file.interior(p).expect("the root's second child is a level-2 interior page");
     assert!(under.len() >= 8, "the level-2 page has only {} children", under.len());
+    let delete = format!("DELETE FROM t WHERE id > {lo} AND id <= {hi} AND id % 16 != 0");
+    // The premise, on a plain copy (same seed, same layout, no branch): some leaf of a sibling of p
+    // ends under a different level-2 page, i.e. an interior balance relinked it without writing it.
+    {
+        let plain_path = dir.path().join("plain.db");
+        let plain = open(&plain_path, Mode::Catalog);
+        let pt = plain.connect().unwrap();
+        seed(&pt, 20_000);
+        let before = DbFile::read(&pt, &plain_path).level2_parents(root as u32);
+        assert_eq!(before, file.level2_parents(root as u32), "the plain copy's layout differs");
+        exec(&pt, &delete);
+        let after = DbFile::read(&pt, &plain_path).level2_parents(root as u32);
+        let moved = before
+            .iter()
+            .filter(|&(leaf, q)| *q != p && after.get(leaf).is_some_and(|q2| q2 != q))
+            .count();
+        assert!(moved > 0, "the DELETE relinked no sibling leaf: no interior balance to test");
+    }
     let base = snapshot(&trunk, "t");
     let b = trunk.fork_branch().unwrap();
-    exec(&b.connect().unwrap(), &format!("DELETE FROM t WHERE id > {lo} AND id <= {hi} AND id % 4 != 0"));
+    exec(&b.connect().unwrap(), &delete);
     let b_id = b.into_id();
     // model(B): the SQL above applied to model(base) (A6.2).
     let mut model = base.clone();
-    model.retain(|&k, _| !(k > lo && k <= hi && k % 4 != 0));
+    model.retain(|&k, _| !(k > lo && k <= hi && k % 16 != 0));
     let w0 = db.branch_merge_work();
     let mut merger = Merger::new(trunk.clone()).unwrap();
     let got = merger.derive_only(&db.branch(b_id).unwrap()).unwrap();
+    assert_eq!(got.scope, None);
     let owned = got.owned;
     let got: BTreeSet<(i64, i64)> = got.keys.into_iter().collect();
     assert_eq!(got, differing(root, &base, &model));
@@ -1008,9 +1093,9 @@ fn a_land_top_installs_every_levels_rows_across_evict_restart_and_a_released_mid
         top_id.set(level.into_id());
         // No checkpoint: the process ends with the upper levels' commits in the tail.
     }
+    // No checkpoint after the reopen: land_top's own loads apply the stack levels' parked Commits.
     let db = open(&path, Mode::CatalogEvict);
     let trunk = db.connect().unwrap();
-    db.branch_compact_now().unwrap();
     let mut merger = Merger::new(trunk.clone()).unwrap();
     let out = merger
         .land_top(db.branch(top_id.get()).unwrap(), policy(Validation::BaseRead))
@@ -1059,7 +1144,8 @@ fn a_crash_between_a_merges_commit_and_its_release_neither_loses_nor_reapplies_i
             .unwrap()
             .merge(db.branch(b_id).unwrap(), policy(validation))
             .unwrap();
-        assert!(out.refused.is_some(), "{validation:?}: the merge went in twice: {out:?}");
+        assert_eq!(out.refused, Some(Refusal::Base), "{validation:?}: {out:?}");
+        assert_eq!(out.decided_by, Validation::BaseRead, "{validation:?}: {out:?}");
         assert_eq!(snapshot(&trunk, "t"), before, "{validation:?}: the trunk changed");
         if validation == Validation::KeyStamp {
             let w1 = db.branch_merge_work();
@@ -1193,10 +1279,11 @@ fn merges_match_a_model_under_every_policy() {
 const GAP: i64 = 4;
 const MODEL_ROWS: i64 = 200;
 
-/// One live branch of the model test: its handle, the trunk it forked from (base), its own view,
-/// and the keys the trunk wrote since its fork.
+/// One live branch of the model test: its id (detached between ops, so CatalogEvict can evict it;
+/// second review), the trunk it forked from (base), its own view, and the keys the trunk wrote since
+/// its fork.
 struct LiveB {
-    branch: Branch,
+    id: BranchId,
     base: BTreeMap<i64, String>,
     view: BTreeMap<i64, String>,
     trunk_wrote: BTreeSet<i64>,
@@ -1273,7 +1360,7 @@ fn model_run(mode: Mode, seed: u64, with_index: bool, tally: &mut BTreeMap<(Stri
     for step in 0..600 {
         match rng.below(20) {
             0..=3 if live.len() < 24 => live.push(LiveB {
-                branch: trunk.fork_branch().unwrap(),
+                id: trunk.fork_branch().unwrap().into_id(),
                 base: rows.clone(),
                 view: rows.clone(),
                 trunk_wrote: BTreeSet::new(),
@@ -1281,12 +1368,15 @@ fn model_run(mode: Mode, seed: u64, with_index: bool, tally: &mut BTreeMap<(Stri
             4..=9 if !live.is_empty() => {
                 let i = rng.below(live.len() as u64) as usize;
                 let l = &mut live[i];
-                let conn = l.branch.connect().unwrap();
+                let branch = db.branch(l.id).unwrap();
+                let conn = branch.connect().unwrap();
                 exec(&conn, "BEGIN");
                 for _ in 0..=rng.below(3) {
                     write_one(&mut rng, &conn, &mut l.view, &mut gen, "b");
                 }
                 exec(&conn, "COMMIT");
+                drop(conn);
+                let _ = branch.into_id();
             }
             10..=12 => {
                 if let Some(id) = write_one(&mut rng, &trunk, &mut rows, &mut gen, "t") {
@@ -1296,15 +1386,15 @@ fn model_run(mode: Mode, seed: u64, with_index: bool, tally: &mut BTreeMap<(Stri
                 }
             }
             13..=16 if !live.is_empty() => {
-                let LiveB { branch, base, view, trunk_wrote } = live.swap_remove(rng.below(live.len() as u64) as usize);
+                let LiveB { id, base, view, trunk_wrote } = live.swap_remove(rng.below(live.len() as u64) as usize);
                 let validation = if rng.below(2) == 0 { Validation::BaseRead } else { Validation::KeyStamp };
                 let changed: BTreeSet<i64> =
-                    base.keys().chain(view.keys()).filter(|k| base.get(k) != view.get(k)).copied().collect();
+                    base.keys().chain(view.keys()).filter(|&&k| base.get(&k) != view.get(&k)).copied().collect();
                 let want_refused = changed.iter().any(|k| match validation {
                     Validation::BaseRead => rows.get(k) != base.get(k),
                     Validation::KeyStamp => trunk_wrote.contains(k),
                 });
-                let o = merger.merge(branch, policy(validation)).unwrap();
+                let o = merger.merge(db.branch(id).unwrap(), policy(validation)).unwrap();
                 assert_eq!(o.scope, None, "{what} step {step}: {o:?}");
                 assert_eq!(o.rows_changed, changed.len(), "{what} step {step}: {o:?}");
                 assert_eq!(o.refused.is_some(), want_refused, "{what} step {step}: {validation:?} {o:?}");
@@ -1329,9 +1419,16 @@ fn model_run(mode: Mode, seed: u64, with_index: bool, tally: &mut BTreeMap<(Stri
         assert_eq!(read_all(&trunk), rows, "{what} step {step}: the trunk disagrees with the model");
         if step % 50 == 0 {
             for l in &live {
-                let conn = l.branch.connect().unwrap();
+                let branch = db.branch(l.id).unwrap();
+                let conn = branch.connect().unwrap();
                 assert_eq!(read_all(&conn), l.view, "{what} step {step}: a live branch lost its snapshot");
+                drop(conn);
+                let _ = branch.into_id();
             }
         }
+    }
+    if mode == Mode::CatalogEvict {
+        let s = db.branch_cat_shape();
+        assert!(s.evicted_states > 0, "{what}: CatalogEvict evicted no live branch: {s:?}");
     }
 }
