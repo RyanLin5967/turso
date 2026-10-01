@@ -2614,10 +2614,13 @@ impl BranchStore {
         inner.release_slots(freed);
         self.sync_trunk_children(&inner);
         self.sync_lease_flag(&inner);
+        // Kept for a live child is decided now: the checkpoint `maybe_compact` may run can evict the
+        // released state under a resident cap, which would report it as freed (second review).
+        let deferred = inner.branches.contains_key(&id);
         self.maybe_compact(&mut inner);
         Ok(Reaped {
             freed_pages,
-            deferred: inner.branches.contains_key(&id),
+            deferred,
         })
     }
 
