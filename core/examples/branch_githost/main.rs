@@ -361,6 +361,9 @@ struct Model {
     /// r13-compose R1: trunk writes made outside the schedule (restart's merges) are stamped at
     /// virtual steps after the last schedule step, so no schedule fork sees them.
     virt: u64,
+    /// The (schedule or virtual) step of every trunk commit, ascending: R1's realised H is the
+    /// commits since the oldest live child's fork (third review: H is measured, not assumed).
+    commits: Vec<u64>,
 }
 
 /// What a MERGE step does.
@@ -396,6 +399,7 @@ impl Model {
             merges_refused: 0,
             extra: Vec::new(),
             virt: 0,
+            commits: Vec::new(),
         }
     }
 
@@ -417,9 +421,13 @@ impl Model {
         self.live += 1;
         let mut merges = Vec::new();
         for k in 0..if is_merge(s) { mps() } else { 0 } {
-            if merge_mode() == MergeMode::Update {
+            // Merges j >= 1 of a step (R1's H axis, --mps) are plain trunk UPDATEs in every mode, so
+            // H grows with M whatever the merge mode (third review: PR merges alone cap H at the
+            // step count). j = 0 is the schedule's merge, by the mode.
+            if merge_mode() == MergeMode::Update || k > 0 {
                 let r = merge_row_j(s, k);
                 self.writes[r as usize].push((s, merge_value(s)));
+                self.commits.push(s);
                 merges.push(MergePlan::Update(r));
             } else {
                 match merge_pick(s, k) {
@@ -475,6 +483,7 @@ impl Model {
             self.writes[row as usize].push((at, own_value(p, gen)));
             self.writes[far_row(row) as usize].push((at, far_value(p)));
             self.merged[p as usize] = true;
+            self.commits.push(at);
         }
         MergePlan::Pr { p, gen, refused }
     }
@@ -522,6 +531,14 @@ impl Model {
 
     fn live_ids(&self) -> Vec<u64> {
         (1..=self.steps).filter(|&id| !self.dead[id as usize]).collect()
+    }
+
+    /// R1's realised H: trunk commits since the oldest live schedule child forked.
+    fn h(&self) -> u64 {
+        let Some(&oldest) = self.live_ids().first() else {
+            return 0;
+        };
+        (self.commits.len() - self.commits.partition_point(|&m| m < oldest)) as u64
     }
 
     /// A31's bound from the model (amendment 8): the trunk's row writes since the oldest live
@@ -599,6 +616,9 @@ struct Sidecar {
     extra: Vec<u64>,
     stacks: Vec<StackRec>,
     bump: u64,
+    /// R1: the arena slots in use when a crash image was killed (`slots=N`), which the restart must
+    /// find exactly after its settle (§3.3 R1: slot accounting is exact).
+    slots: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -648,6 +668,7 @@ fn read_sidecar(db: &Path) -> Sidecar {
                 _ => not_a_result(&format!("sidecar stack line {v:?}: needs d, serial and d ids")),
             },
             "bump" => sc.bump = v.trim().parse().unwrap_or_else(|_| not_a_result("unparseable sidecar bump")),
+            "slots" => sc.slots = Some(v.trim().parse().unwrap_or_else(|_| not_a_result("unparseable sidecar slots"))),
             other => not_a_result(&format!("unknown sidecar key {other:?}")),
         }
     }
@@ -704,6 +725,9 @@ fn write_sidecar(db: &Path, sc: &Sidecar) {
     if sc.bump > 0 {
         text.push_str(&format!("bump={}\n", sc.bump));
     }
+    if let Some(n) = sc.slots {
+        text.push_str(&format!("slots={n}\n"));
+    }
     std::fs::write(sidecar(db), text).unwrap_or_else(|e| not_a_result(&format!("sidecar: {e}")));
 }
 
@@ -722,7 +746,14 @@ static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// The state a command leaves on disk, for the census driver: the next command's `--n` is `live`.
 fn state_line(model: &Model) -> String {
-    format!("STATE\tlive={}\tsteps={}\textra={}", model.live, model.steps, model.extra.len())
+    format!(
+        "STATE\tlive={}\tsteps={}\textra={}\th={}\tmodel_trunk_writes_since_oldest={}",
+        model.live,
+        model.steps,
+        model.extra.len(),
+        model.h(),
+        model.trunk_writes_since_oldest()
+    )
 }
 
 impl Model {
@@ -936,6 +967,16 @@ fn gauge_line(db: &Arc<Database>, n: u64, label: &str, at: &str) -> String {
     )
 }
 
+/// r13-compose (third review): what this open's prewarm (P, `R12_PREWARM`) did.
+fn prewarm_line(db: &Arc<Database>) -> String {
+    let (mode, files, bytes, advised, pages, interior, cache_pages, ns) = db.branch_prewarm();
+    format!(
+        "prewarm_mode={mode} prewarm_files={files} prewarm_bytes={bytes} prewarm_advised={advised} \
+         prewarm_pages={pages} prewarm_interior={interior} prewarm_cache_pages={cache_pages} prewarm_us={:.1}",
+        ns as f64 / 1e3
+    )
+}
+
 fn open_line(s: &BranchOpenStats) -> String {
     format!(
         "snap_bytes={} log_bytes={} records={} snap_branches={} branches={} current_entries={} \
@@ -990,6 +1031,13 @@ struct Snap {
     shape: BranchCatShape,
     mw: BranchMergeWork,
     ru: Usage,
+    /// r13-compose (third review): page I/O (process-wide: db reads/writes, WAL reads/writes), the
+    /// K8 `written` probe and its split, and V4's base-read counters, so P's cold reads and the KNOWN
+    /// K8/MV4 terms have their counters.
+    io: [u64; 4],
+    twk: (u64, u64),
+    split: (u64, u64, u64, u64),
+    v4: (u64, u64, u64, u64, u64, u64),
 }
 
 /// This process's resource usage (`getrusage(RUSAGE_SELF)`): an attribution instrument for time,
@@ -1031,6 +1079,10 @@ fn snap(db: &Arc<Database>) -> Snap {
         shape: db.branch_cat_shape(),
         mw: db.branch_merge_work(),
         ru: usage(),
+        io: turso_core::branch::page_io(),
+        twk: db.branch_twk_counters(),
+        split: db.branch_probe_split_counters(),
+        v4: db.branch_v4_counters(),
     }
 }
 
@@ -1038,7 +1090,7 @@ fn snap(db: &Arc<Database>) -> Snap {
 /// five are `getrusage` deltas (load-dependent; attribution only). r13-compose adds I3-I6, I11's
 /// walk counter, and the Merger's work (I7, I8, the derivation), all cumulative deltas; the gauges
 /// are printed by `gauge_line` instead.
-const NC: usize = 53;
+const NC: usize = 69;
 const COUNTERS: [&str; NC] = [
     "resolve_calls",
     "arena_reads",
@@ -1088,6 +1140,22 @@ const COUNTERS: [&str; NC] = [
     "derive_keys",
     "mv4_keys",
     "mv4_base_reads",
+    "io_db_reads",
+    "io_db_writes",
+    "io_wal_reads",
+    "io_wal_writes",
+    "twk_probes",
+    "twk_rows",
+    "split_twk_reads",
+    "split_tva_probes",
+    "split_tva_rows",
+    "split_tva_reads",
+    "v4_base_reads",
+    "v4_arena_resolved",
+    "v4_refused",
+    "v4_retained_examined",
+    "v4_cp_trunk_probes",
+    "v4_cp_trunk_rows",
     "ru_inblock",
     "ru_oublock",
     "ru_majflt",
@@ -1148,6 +1216,22 @@ fn delta(a: &Snap, b: &Snap) -> [i64; NC] {
         d(m.derive_keys, n.derive_keys),
         d(m.mv4_keys, n.mv4_keys),
         d(m.mv4_base_reads, n.mv4_base_reads),
+        d(a.io[0], b.io[0]),
+        d(a.io[1], b.io[1]),
+        d(a.io[2], b.io[2]),
+        d(a.io[3], b.io[3]),
+        d(a.twk.0, b.twk.0),
+        d(a.twk.1, b.twk.1),
+        d(a.split.0, b.split.0),
+        d(a.split.1, b.split.1),
+        d(a.split.2, b.split.2),
+        d(a.split.3, b.split.3),
+        d(a.v4.0, b.v4.0),
+        d(a.v4.1, b.v4.1),
+        d(a.v4.2, b.v4.2),
+        d(a.v4.3, b.v4.3),
+        d(a.v4.4, b.v4.4),
+        d(a.v4.5, b.v4.5),
         b.ru.inblock - a.ru.inblock,
         b.ru.oublock - a.ru.oublock,
         b.ru.majflt - a.ru.majflt,
@@ -1215,7 +1299,10 @@ impl Series {
 /// The store-level step: what `plan` says, against the store. Returns the time of each op kind done.
 struct Ops {
     new_pr: Series,
+    /// Merges that installed, and (real mode) merges the Merger refused: apart, since their mix moves
+    /// with N (third review). replay-update's refused merges do no work and are not timed.
     merge: Series,
+    merge_refused: Series,
     pr_update: Series,
     reap: Series,
 }
@@ -1247,6 +1334,8 @@ struct MergeSide {
     policy: MergePolicy,
     installed: u64,
     refused: u64,
+    /// |O| over the Merger's merges (A6.5's bound is in |O|): sum, min, max.
+    owned: (u64, u64, u64),
 }
 
 impl MergeSide {
@@ -1261,7 +1350,16 @@ impl MergeSide {
             },
             installed: 0,
             refused: 0,
+            owned: (0, u64::MAX, 0),
         }
+    }
+
+    fn owned_line(&self) -> String {
+        let (sum, min, max) = self.owned;
+        format!(
+            "owned_sum={sum}\towned_min={}\towned_max={max}",
+            if min == u64::MAX { 0 } else { min }
+        )
     }
 }
 
@@ -1277,6 +1375,8 @@ fn do_merge_pr(db: &Arc<Database>, trunk: &Arc<Connection>, side: &mut MergeSide
             let out = merger
                 .merge(branch, side.policy)
                 .unwrap_or_else(|e| not_a_result(&format!("merge {p}: {e}")));
+            let o = out.owned as u64;
+            side.owned = (side.owned.0 + o, side.owned.1.min(o), side.owned.2.max(o));
             match (out.refused, refused) {
                 (None, false) => {
                     if out.rows_changed != 2 {
@@ -1284,7 +1384,20 @@ fn do_merge_pr(db: &Arc<Database>, trunk: &Arc<Connection>, side: &mut MergeSide
                     }
                     side.installed += 1;
                 }
-                (Some(Refusal::Base | Refusal::Key), true) => side.refused += 1,
+                // The refusal must be the validator's own: MV4's Base under v4; under v3h KeyStamp's
+                // Key, or Base when the horizon handed the verdict to MV4 (third review).
+                (Some(r), true) => {
+                    let ok = matches!(
+                        (side.policy.validation, r, out.decided_by),
+                        (Validation::BaseRead, Refusal::Base, Validation::BaseRead)
+                            | (Validation::KeyStamp, Refusal::Key, Validation::KeyStamp)
+                            | (Validation::KeyStamp, Refusal::Base, Validation::BaseRead)
+                    );
+                    if !ok {
+                        not_a_result(&format!("merge {p}: refused by the wrong verdict: {out:?}"));
+                    }
+                    side.refused += 1;
+                }
                 (got, want) => not_a_result(&format!(
                     "merge {p}: {got:?}, the model predicts refused={want} ({out:?})"
                 )),
@@ -1303,6 +1416,36 @@ fn do_merge_pr(db: &Arc<Database>, trunk: &Arc<Connection>, side: &mut MergeSide
             side.installed += 1;
         }
     }
+}
+
+/// N13's gate and A2.F4's identity (third review): an installed merge's two rows read back on the
+/// trunk as the PR wrote them, in both merge modes (untimed). A mismatch is NOT A RESULT.
+fn installed_rows_are(trunk: &Arc<Connection>, p: u64, gen: u64) {
+    let row = row_for(p);
+    for (r, want) in [(row, own_value(p, gen)), (far_row(row), far_value(p))] {
+        let got = read_v(trunk, r);
+        if got != want {
+            not_a_result(&format!("merge {p}: the trunk's row {r} = {got:.30}, the PR wrote {want:.30}"));
+        }
+    }
+}
+
+/// The trunk table's content, as one digest (rows, FNV-1a 64 over "id:v\n"): the -MRG arm's trunk
+/// must equal the real arm's at the same step (A2.F4), across raws.
+fn trunk_digest(trunk: &Arc<Connection>) -> (u64, u64) {
+    let rows = trunk.prepare("SELECT id, v FROM t ORDER BY id").unwrap().run_collect_rows().unwrap();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for r in &rows {
+        let v = match &r[1] {
+            Value::Text(t) => t.as_str().to_string(),
+            other => not_a_result(&format!("trunk digest: v is {other:?}")),
+        };
+        for b in format!("{}:{v}\n", r[0].as_int().unwrap()).bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    (rows.len() as u64, h)
 }
 
 fn do_update(db: &Arc<Database>, t: u64, gen: u64) {
@@ -1352,9 +1495,20 @@ fn step(
             MergePlan::Update(row) => {
                 timed(ops.as_deref_mut().map(|o| &mut o.merge), &mut || do_merge(trunk, plan.s, row))
             }
-            MergePlan::Pr { p, gen, refused } => timed(ops.as_deref_mut().map(|o| &mut o.merge), &mut || {
-                do_merge_pr(db, trunk, side, p, gen, refused)
-            }),
+            MergePlan::Pr { p, gen, refused } => {
+                if refused && side.merger.is_none() {
+                    // replay-update skips what the Merger would refuse: no work, so no timed op.
+                    side.refused += 1;
+                    continue;
+                }
+                timed(
+                    ops.as_deref_mut().map(|o| if refused { &mut o.merge_refused } else { &mut o.merge }),
+                    &mut || do_merge_pr(db, trunk, side, p, gen, refused),
+                );
+                if !refused {
+                    installed_rows_are(trunk, p, gen);
+                }
+            }
         }
     }
     if let Some((t, gen)) = plan.update {
@@ -1558,7 +1712,7 @@ fn arm_cap() -> Option<usize> {
 /// r13-compose A10, A11 and A5.7: force a checkpoint, run the fixed run-in (`--runin`, 25,000 steps)
 /// untimed while recording the steps at which AUTO checkpoints ran, and take C_arm as their mean
 /// spacing. Then step (untimed) to the next auto checkpoint, and time a window of m x C_arm steps,
-/// m = ceil(50,000 / C_arm), starting right after it. NOT A RESULT: fewer than 2 auto checkpoints in
+/// m = ceil(52,000 / C_arm) (A8.7), starting right after it. NOT A RESULT: fewer than 2 auto checkpoints in
 /// the run-in (C_arm unmeasurable), no auto checkpoint within 2 x C_arm after it, fewer than 2
 /// checkpoints in the window, or (cap set) fewer than 2 EVICTING ones. A period inside the window more
 /// than 5% from C_arm is reported with the phase bound (W mod C_win) / W, C_win the window's mean
@@ -1614,7 +1768,9 @@ fn steady_window(
         }
     }
     let start = model.steps;
-    let m = 50_000u64.div_ceil(c_arm);
+    // A8.7: m = ceil(52,000 / C_arm), so a window holds >= 1,000 reaps (0.02 per step, less skips),
+    // A2.F8's floor (third review: at 50,000 a C_arm near 10,000 left it at ~980).
+    let m = 52_000u64.div_ceil(c_arm);
     let w_steps = m * c_arm;
     let cap = arm_cap();
     let mut at = Vec::new();
@@ -1629,6 +1785,25 @@ fn steady_window(
             if sh.evicted_states > e0 {
                 evicting += 1;
             }
+            // Per checkpoint (third review: totals alone hide the per-checkpoint bounds, A2.F8/F9).
+            println!(
+                "CKPT\tn={n}\tstep={}\tdirty_before={}\tresident_before={}\tckpt_branch_rows={}\tckpt_states_walked={}\t\
+                 ckpt_rows_written={}\tckpt_trunk_inserted={}\tckpt_trunk_deleted={}\tevicted_states={}\tcheckpoint_us={:.1}\t\
+                 walk_slots_scanned={}\tinstrument_walk_items={}\tresident_after={}",
+                model.steps,
+                sh0.dirty_branches,
+                sh0.resident_states,
+                sh.ckpt_branch_rows - sh0.ckpt_branch_rows,
+                sh.ckpt_states_walked - sh0.ckpt_states_walked,
+                sh.ckpt_rows_written - sh0.ckpt_rows_written,
+                sh.ckpt_trunk_inserted - sh0.ckpt_trunk_inserted,
+                sh.ckpt_trunk_deleted - sh0.ckpt_trunk_deleted,
+                sh.evicted_states - sh0.evicted_states,
+                (sh.checkpoint_ns - sh0.checkpoint_ns) as f64 / 1e3,
+                sh.walk_slots_scanned - sh0.walk_slots_scanned,
+                sh.instrument_walk_items - sh0.instrument_walk_items,
+                sh.resident_states
+            );
         }
     }
     let mut periods = Vec::new();
@@ -1715,7 +1890,7 @@ fn probe(args: &Args) {
         "OPEN\tn={n}\tlabel={label}\tsteps={}\topen_us={open_us:.1}\ttrunk_connect_us={connect_us:.1}\trss_before={rss0}\t\
          rss_after_open={rss1}\tpage_count={page_count}\t{}\t{}\tfiles_before: {files_before}",
         model.steps,
-        open_line(&os).replace(' ', "\t"),
+        format!("{} {}", open_line(&os), prewarm_line(&db)).replace(' ', "\t"),
         shape_line(&db.branch_cat_shape()).replace(' ', "\t")
     );
     println!("{}", idset_line(&db, &model, n, label, "open"));
@@ -1726,6 +1901,7 @@ fn probe(args: &Args) {
     let mut ops = Ops {
         new_pr: Series::default(),
         merge: Series::default(),
+        merge_refused: Series::default(),
         pr_update: Series::default(),
         reap: Series::default(),
     };
@@ -1733,6 +1909,7 @@ fn probe(args: &Args) {
     check_invariants(&db, &model, "after steady ops");
     ops.new_pr.print("new_pr", n, label);
     ops.merge.print("merge", n, label);
+    ops.merge_refused.print("merge_refused", n, label);
     ops.pr_update.print("pr_update", n, label);
     ops.reap.print("reap", n, label);
     println!("{window}");
@@ -1745,13 +1922,16 @@ fn probe(args: &Args) {
         model.trunk_writes_since_oldest(),
         mw.stamp_entries <= model.trunk_writes_since_oldest()
     );
+    let (rows, digest) = trunk_digest(&trunk);
+    println!("TRUNKDIGEST\tn={n}\tlabel={label}\tat=window_end\tsteps={}\trows={rows}\tdigest={digest:#018x}", model.steps);
     println!(
         "MERGEWORK\tn={n}\tlabel={label}\tat=window_end\tmerges_installed={}\tmerges_refused={}\tmerges_skipped={}\t\
-         model_refused={}\t{}",
+         model_refused={}\t{}\t{}",
         side.installed,
         side.refused,
         model.merges_skipped,
         model.merges_refused,
+        side.owned_line(),
         merge_work_line(&db.branch_merge_work()).replace(' ', "\t")
     );
 
@@ -1939,6 +2119,9 @@ fn stack_read_plan(model: &Model, st_serial: u64, d: u64, pick: u64, fork_step: 
         reads.push((stack_row(st_serial, 0, 0), stack_value(st_serial, 0, 0, 0)));
         let mid = (d / 2).max(1) - 1;
         reads.push((stack_row(st_serial, mid, 1), stack_value(st_serial, mid, 1, 0)));
+        // The amended row itself, at generation 0: an amend below the top is invisible to it, so a
+        // top that resolved the amended level's new version reads a lost pre-image (third review).
+        reads.push((stack_row(st_serial, mid, 0), stack_value(st_serial, mid, 0, 0)));
     }
     let r = pick % ROWS + 1;
     reads.push((r, model.trunk_at(r, fork_step)));
@@ -2300,6 +2483,7 @@ fn crash(args: &Args) {
     }
     check_invariants(&db, &model, "crash open");
     let mut side = MergeSide::new(&trunk, args.validator);
+    let ck0 = db.branch_cat_shape().checkpoints;
     match args.image.as_str() {
         "a" => {
             db.branch_compact_now().unwrap_or_else(|e| not_a_result(&format!("image a checkpoint: {e}")));
@@ -2325,7 +2509,19 @@ fn crash(args: &Args) {
         other => die(&format!("bad --image {other:?} (a, b, e, e2)")),
     }
     sc.steps = model.steps;
-    println!("CRASH\timage={}\tsteps={}\tlive={}\tbump={}", args.image, model.steps, model.live, sc.bump);
+    // The slots in use at the kill (after a settle, which a restart's settle repeats), for R1's exact
+    // slot check.
+    let st = db.branch_stats().unwrap_or_else(|e| not_a_result(&format!("crash settle: {e}")));
+    sc.slots = Some(st.arena_slots_in_use as u64);
+    println!(
+        "CRASH\timage={}\tsteps={}\tlive={}\tbump={}\tslots={}\tcheckpoints_before_kill={}",
+        args.image,
+        model.steps,
+        model.live,
+        sc.bump,
+        st.arena_slots_in_use,
+        db.branch_cat_shape().checkpoints - ck0
+    );
     println!("{}", state_line(&model));
     sigkill(&args.db, &sc)
 }
@@ -2410,6 +2606,7 @@ impl Restart {
                 if merge_mode() == MergeMode::Update {
                     let r = mix(at ^ 0xA5A5_0005 ^ w()) % ROWS + 1;
                     model.writes[r as usize].push((at, merge_value(at)));
+                    model.commits.push(at);
                     timed_op(db, series, &mut || {
                         do_merge(trunk, at, r);
                         vec![("row".to_string(), r as i64)]
@@ -2434,6 +2631,9 @@ impl Restart {
                     do_merge_pr(db, trunk, side, p, gen, refused);
                     vec![("pr".to_string(), p as i64), ("refused".to_string(), refused as i64)]
                 });
+                if !refused {
+                    installed_rows_are(trunk, p, gen);
+                }
             }
             3 => {
                 let want = &self.want;
@@ -2500,17 +2700,35 @@ fn restart(args: &Args) {
     let settle_us = t.elapsed().as_secs_f64() * 1e6;
     let (c1, sh1) = (db.branch_catalog_counters(), db.branch_cat_shape());
     println!(
-        "RESTART_OPEN\tn={n}\tlabel={label}\tsteps={}\tbump={}\tstacks={}\topen_us={open_us:.1}\tsettle_us={settle_us:.1}\t\
-         settle_branch_loads={}\tsettle_cat_queries={}\tsettle_trunk_probes={}\t{}\tfiles_before: {files_before}",
+        "RESTART_OPEN\tn={n}\tlabel={label}\tsteps={}\tbump={}\tstacks={}\th={}\topen_us={open_us:.1}\t\
+         settle_us={settle_us:.1}\tsettle_branch_loads={}\tsettle_cat_queries={}\tsettle_trunk_probes={}\t\
+         settle_sharp_max_loads={}\tcr_sharp_bound={}\t{}\tfiles_before: {files_before}",
         model.steps,
         sc.bump,
         sc.stacks.len(),
+        model.h(),
         c1.0 - c0.0,
         c1.2 - c0.2,
         sh1.trunk_probes - sh0.trunk_probes,
-        open_line(&db.branch_open_stats()).replace(' ', "\t")
+        sh1.settle_sharp_max_loads,
+        // A8.3's sharp C-R bound: the parked branches x (1 + the deepest parked chain); a trunk
+        // child's chain is 1, a stack's its depth.
+        db.branch_open_stats().parked_applied * (1 + sc.stacks.iter().map(|st| st.d).max().unwrap_or(1)),
+        format!("{} {}", open_line(&db.branch_open_stats()), prewarm_line(&db)).replace(' ', "\t")
     );
-    check_invariants(&db, &model, "restart open");
+    // Before the post-open sequence only memory is checked: the full invariants query the catalog
+    // (branch_trunk_retained) and would warm it in every arm before P is measured (third review); they
+    // run after the first checkpoint.
+    let st = db.branch_stats().unwrap();
+    if st.live_branches as u64 != model.live + model.extra.len() as u64 {
+        not_a_result(&format!("restart open: {} branch states, model {}", st.live_branches, model.live + model.extra.len() as u64));
+    }
+    if let Some(want) = sc.slots {
+        if st.arena_slots_in_use as u64 != want {
+            println!("FINDING\tR1 slot accounting\tslots_after_restart={}\tslots_at_kill={want}", st.arena_slots_in_use);
+            not_a_result("R1: the arena's slots in use after the restart differ from the kill's (§3.3)");
+        }
+    }
     let ck0 = db.branch_cat_shape().checkpoints;
     let mut r = Restart {
         side: MergeSide::new(&trunk, args.validator),
@@ -2550,10 +2768,13 @@ fn restart(args: &Args) {
     });
     s.print("first_checkpoint", n, label);
     check_invariants(&db, &model, "restart end");
+    let (rows, digest) = trunk_digest(&trunk);
+    println!("TRUNKDIGEST\tn={n}\tlabel={label}\tat=restart_end\tsteps={}\trows={rows}\tdigest={digest:#018x}", model.steps);
     println!(
-        "MERGEWORK\tn={n}\tlabel={label}\tat=restart_end\tmerges_installed={}\tmerges_refused={}\t{}",
+        "MERGEWORK\tn={n}\tlabel={label}\tat=restart_end\tmerges_installed={}\tmerges_refused={}\t{}\t{}",
         side.installed,
         side.refused,
+        side.owned_line(),
         merge_work_line(&db.branch_merge_work()).replace(' ', "\t")
     );
     drop(side);
@@ -2561,7 +2782,19 @@ fn restart(args: &Args) {
     drop(db);
 }
 
+/// The R11_/R12_/R13_ variables a census run may carry (third review: the release binaries hold
+/// runtime mutants and other knobs). An ALLOWLIST: anything else with those prefixes is refused.
+/// Blind spot, stated: other variables (RUST_*, TURSO_*) are not checked here; census.sh runs every
+/// command under `env -i` with its own allowlist.
+const CENSUS_ENV: [&str; 6] = ["R11_RESIDENT_CAP", "R12_PREWARM", "R13_FW1", "R13_FW2", "R13_MERGER", "R13_VICTIM_LOG"];
+
 fn main() {
+    for (k, _) in std::env::vars() {
+        let ours = ["R11_", "R12_", "R13_"].iter().any(|p| k.starts_with(p));
+        if ours && !CENSUS_ENV.contains(&k.as_str()) {
+            die(&format!("{k} is set: a census run carries only {CENSUS_ENV:?}"));
+        }
+    }
     let args = parse_args();
     if cfg!(debug_assertions) {
         println!("# DEBUG build: not a timing result");
