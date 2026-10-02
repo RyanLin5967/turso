@@ -102,6 +102,9 @@ pub struct MergeOutcome {
     pub decided_by: Validation,
     /// Why the install refused, when `refused` is [`Refusal::Install`].
     pub install_error: Option<String>,
+    /// |O|, the pages the branch owns, which A6.5's KNOWN bound for derive_pages_read is in
+    /// (observing only; 0 when the merge stopped before the derivation).
+    pub owned: usize,
 }
 
 /// What [`Merger::prepare`] found for one branch.
@@ -521,8 +524,10 @@ impl Merger {
             rows_changed: 0,
             decided_by: policy.validation,
             install_error: None,
+            owned: 0,
         };
         let view = self.store.merge_view(branch.id())?;
+        outcome.owned = view.owned.len();
         let early = if super::store::knob_off("merger") {
             // I10 (R13_MERGER=off): the census's -MRG arm; the harness installs by replay-update.
             Some("the Merger is off (R13_MERGER=off)")
