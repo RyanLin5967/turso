@@ -216,7 +216,6 @@ use super::prewarm::{self, Prewarm, PrewarmStats, Targets};
 use super::id_set::{IdSet, IdSetWork};
 use super::journal::{BranchFiles, Journal, Record, SnapBranch, SnapshotState};
 use super::page_map::PageMap;
-use super::table::BranchTable;
 use super::{
     BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchStats, BranchWork, Expired,
     Reaped,
@@ -284,9 +283,7 @@ struct StoreInner {
     sync: bool,
     next_id: u64,
     trunk: TrunkState,
-    /// F8' (r11-ever's F8 5d580203f as ported in e343173dc; r13-compose step 3): chunks that never
-    /// move, so no fork moves the table.
-    branches: BranchTable<BranchState>,
+    branches: HashMap<BranchId, BranchState>,
     failpoint: Option<BranchFailpoint>,
     orphans: Vec<Slot>,
     lease: LeaseClock,
@@ -3750,7 +3747,7 @@ impl StoreInner {
                 lineage: Lineage::default(),
                 written: HashMap::new(),
             },
-            branches: BranchTable::new(),
+            branches: HashMap::new(),
             failpoint: None,
             orphans: Vec::new(),
             lease: LeaseClock::new(),
@@ -3821,14 +3818,15 @@ impl StoreInner {
         }
     }
 
-    /// githost-shape instrument (observing only), F8' meaning (r13-compose R4.9, S-9): the table's
-    /// directory reallocations at this insert, and the chunk POINTERS they moved. No branch state
-    /// moves under F8'; `capacity()` jumps by a whole chunk at every new chunk, so the hashbrown test
-    /// this replaced would count every chunk allocation as a growth that moved every entry.
-    fn note_table_growth(&mut self, before: (u64, u64)) {
-        let (grows, moved) = self.branches.growth();
-        self.shape.table_grows += grows - before.0;
-        self.shape.table_moved += moved - before.1;
+    /// githost-shape instrument (observing only): an insert into `branches` that raised its
+    /// capacity by more than one reallocated or rehashed the table, which moved every entry it held
+    /// before the insert. (hashbrown's `capacity()` is items + growth_left, so reusing a tombstone
+    /// raises it by exactly one and moves nothing: githost-shape r2, da8d26a7d.)
+    fn note_table_growth(&mut self, len_before: usize, cap_before: usize) {
+        if self.branches.capacity() > cap_before + 1 {
+            self.shape.table_grows += 1;
+            self.shape.table_moved += len_before as u64;
+        }
     }
 
     /// F-W3 (githost-shape lane, PREREG G5.3): evict clean branch states while more than
@@ -4119,7 +4117,7 @@ impl StoreInner {
         if let Some(deadline) = lease {
             self.leases.insert((deadline, id));
         }
-        let grown_before = self.branches.growth();
+        let (len_before, cap_before) = (self.branches.len(), self.branches.capacity());
         self.branches.insert(
             id,
             BranchState {
@@ -4145,7 +4143,7 @@ impl StoreInner {
                 view: None,
             },
         );
-        self.note_table_growth(grown_before);
+        self.note_table_growth(len_before, cap_before);
     }
 
     /// Catalog stores: make the trunk's `written` epoch of `page` at least the `died` of the page's
@@ -4914,7 +4912,7 @@ impl StoreInner {
         };
         self.children.insert(parent, f, child);
         self.next_id = self.next_id.max(child.0 + 1);
-        let grown_before = self.branches.growth();
+        let (len_before, cap_before) = (self.branches.len(), self.branches.capacity());
         self.branches.insert(
             child,
             BranchState {
@@ -4940,7 +4938,7 @@ impl StoreInner {
                 view: None,
             },
         );
-        self.note_table_growth(grown_before);
+        self.note_table_growth(len_before, cap_before);
         // F-W1: a new branch is listed (no fork is ever of a released branch).
         self.live_ids_insert(child);
         self.n_states += 1;
