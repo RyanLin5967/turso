@@ -527,7 +527,6 @@ impl Merger {
             owned: 0,
         };
         let view = self.store.merge_view(branch.id())?;
-        outcome.owned = view.owned.len();
         let early = if super::store::knob_off("merger") {
             // I10 (R13_MERGER=off): the census's -MRG arm; the harness installs by replay-update.
             Some("the Merger is off (R13_MERGER=off)")
@@ -546,6 +545,7 @@ impl Merger {
             return Ok(outcome);
         }
         let from = branch.connect()?;
+        outcome.owned = view.owned.len();
         let prep = self.prepare(branch.id(), &view, &from, &pager)?;
         outcome.rows_changed = prep.rows.len();
         if let Some(scope) = prep.scope {

@@ -1079,10 +1079,12 @@ fn a_catalog_of_another_format_is_refused_even_with_a_torn_log_header() {
 }
 
 /// r13-compose §3.2's fire-checks for I5, the walk counters and I4 (third review: registered, gated
-/// nowhere). A three-level stack under cap 1: a checkpoint evicts the two lower levels (ascending-id
-/// victims) and keeps the top, so I5 counts the middle level (the parent of a state still resident)
-/// and not the root (its child went in the same batch); the eviction walk scanned slots and I5's own
-/// walk is counted apart. Then cap 0 and a cold touch of the top load its whole chain (I4).
+/// nowhere). A three-level stack under cap 1: a checkpoint evicts two of the three levels. With F8''s
+/// table (ascending-id victims) the top survives, so I5 counts the middle level (the parent of a state
+/// still resident) and not the root (its child went in the same batch), and the eviction walk scanned
+/// slots. B_noF8's HashMap takes its victims in hash order and scans no slots, so there the survivor
+/// is read back and I5 is 1 unless the survivor is the root (amendment 8.8). I5's own walk is counted
+/// apart in both. Then cap 0 and a cold touch of the top load its whole chain (I4).
 #[test]
 fn the_eviction_instruments_fire() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -1095,14 +1097,26 @@ fn the_eviction_instruments_fire() {
     l2.connect().unwrap().execute("UPDATE t SET v = 'l2' WHERE id = 2").unwrap();
     let l3 = l2.fork().unwrap();
     l3.connect().unwrap().execute("UPDATE t SET v = 'l3' WHERE id = 3").unwrap();
-    let (_i1, _i2, i3) = (l1.into_id(), l2.into_id(), l3.into_id());
+    let (i1, i2, i3) = (l1.into_id(), l2.into_id(), l3.into_id());
     db.branch_set_resident_cap(Some(1));
     let s0 = db.branch_cat_shape();
     db.branch_compact_now().unwrap();
     let s1 = db.branch_cat_shape();
     assert_eq!(s1.resident_states, 1, "{s1:?}");
-    assert_eq!(s1.evicted_with_resident_descendant - s0.evicted_with_resident_descendant, 1, "I5: {s1:?}");
-    assert!(s1.walk_slots_scanned > s0.walk_slots_scanned, "{s1:?}");
+    let survivor: Vec<BranchId> =
+        [i1, i2, i3].into_iter().filter(|&id| db.branch_state_pages(id).is_some()).collect();
+    assert_eq!(survivor.len(), 1, "{survivor:?}");
+    let i5 = s1.evicted_with_resident_descendant - s0.evicted_with_resident_descendant;
+    if s1.table_chunks > 0 {
+        // F8''s table: ascending-id victims, slots scanned.
+        assert_eq!(survivor[0], i3, "{s1:?}");
+        assert_eq!(i5, 1, "I5: {s1:?}");
+        assert!(s1.walk_slots_scanned > s0.walk_slots_scanned, "{s1:?}");
+    } else {
+        // B_noF8: hash-order victims; walk_slots_scanned reads 0 (A2.F5).
+        assert_eq!(i5, u64::from(survivor[0] != i1), "I5 with survivor {survivor:?}: {s1:?}");
+        assert_eq!(s1.walk_slots_scanned, 0, "{s1:?}");
+    }
     assert!(s1.instrument_walk_items > s0.instrument_walk_items, "{s1:?}");
     db.branch_set_resident_cap(Some(0));
     db.branch_compact_now().unwrap();

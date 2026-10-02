@@ -251,9 +251,9 @@ impl Op {
 }
 
 /// How a D-T1 run ends: derived live, after a checkpoint and a reopen with a tail, or after a kill at
-/// a failpoint (A5.4, A6.2): the statement the failpoint stops is IN DOUBT, so the derived set must
-/// be the acknowledged model's diff or that plus the in-doubt statement, and B must read one of the
-/// two whole.
+/// a failpoint (A5.4). Every failpoint here stops its commit before the Commit record, so the killed
+/// statement is known absent: B reads the acknowledged model whole and the derived set is its diff
+/// (amendment 8.6, stricter than A6.2's in-doubt range).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum End {
     Live,
