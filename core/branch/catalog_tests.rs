@@ -1079,7 +1079,7 @@ fn a_catalog_of_another_format_is_refused_even_with_a_torn_log_header() {
 }
 
 /// r13-compose §3.2's fire-checks for I5, the walk counters and I4 (third review: registered, gated
-/// nowhere). A three-level stack under cap 1: a checkpoint evicts two of the three levels. With F8''s
+/// nowhere). A three-level stack under cap 1: a checkpoint evicts two of the three levels. With F8′'s
 /// table (ascending-id victims) the top survives, so I5 counts the middle level (the parent of a state
 /// still resident) and not the root (its child went in the same batch), and the eviction walk scanned
 /// slots. B_noF8's HashMap takes its victims in hash order and scans no slots, so there the survivor
@@ -1108,7 +1108,7 @@ fn the_eviction_instruments_fire() {
     assert_eq!(survivor.len(), 1, "{survivor:?}");
     let i5 = s1.evicted_with_resident_descendant - s0.evicted_with_resident_descendant;
     if s1.table_chunks > 0 {
-        // F8''s table: ascending-id victims, slots scanned.
+        // F8′'s table: ascending-id victims, slots scanned.
         assert_eq!(survivor[0], i3, "{s1:?}");
         assert_eq!(i5, 1, "I5: {s1:?}");
         assert!(s1.walk_slots_scanned > s0.walk_slots_scanned, "{s1:?}");
