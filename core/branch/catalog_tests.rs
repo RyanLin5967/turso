@@ -1078,6 +1078,41 @@ fn a_catalog_of_another_format_is_refused_even_with_a_torn_log_header() {
     }
 }
 
+/// r13-compose §3.2's fire-checks for I5, the walk counters and I4 (third review: registered, gated
+/// nowhere). A three-level stack under cap 1: a checkpoint evicts the two lower levels (ascending-id
+/// victims) and keeps the top, so I5 counts the middle level (the parent of a state still resident)
+/// and not the root (its child went in the same batch); the eviction walk scanned slots and I5's own
+/// walk is counted apart. Then cap 0 and a cold touch of the top load its whole chain (I4).
+#[test]
+fn the_eviction_instruments_fire() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("c.db"), catalog()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let l1 = trunk.fork_branch().unwrap();
+    l1.connect().unwrap().execute("UPDATE t SET v = 'l1' WHERE id = 1").unwrap();
+    let l2 = l1.fork().unwrap();
+    l2.connect().unwrap().execute("UPDATE t SET v = 'l2' WHERE id = 2").unwrap();
+    let l3 = l2.fork().unwrap();
+    l3.connect().unwrap().execute("UPDATE t SET v = 'l3' WHERE id = 3").unwrap();
+    let (_i1, _i2, i3) = (l1.into_id(), l2.into_id(), l3.into_id());
+    db.branch_set_resident_cap(Some(1));
+    let s0 = db.branch_cat_shape();
+    db.branch_compact_now().unwrap();
+    let s1 = db.branch_cat_shape();
+    assert_eq!(s1.resident_states, 1, "{s1:?}");
+    assert_eq!(s1.evicted_with_resident_descendant - s0.evicted_with_resident_descendant, 1, "I5: {s1:?}");
+    assert!(s1.walk_slots_scanned > s0.walk_slots_scanned, "{s1:?}");
+    assert!(s1.instrument_walk_items > s0.instrument_walk_items, "{s1:?}");
+    db.branch_set_resident_cap(Some(0));
+    db.branch_compact_now().unwrap();
+    let s2 = db.branch_cat_shape();
+    let _ = db.branch(i3).unwrap().into_id();
+    let s3 = db.branch_cat_shape();
+    assert_eq!(s3.ensure_cold - s2.ensure_cold, 1, "I4: {s3:?}");
+    assert_eq!(s3.ensure_chain_sum - s2.ensure_chain_sum, 3, "I4: the top's chain is three states: {s3:?}");
+}
+
 /// r13-compose A2.F12: the I1/I2 knobs reproduce the store before F-W1/F-W2, by exact identity.
 /// Run it twice: with `R13_FW1=off R13_FW2=off` (the identities of the base) and without (F-W1's and
 /// F-W2's own counts). The knobs are read once per process.
