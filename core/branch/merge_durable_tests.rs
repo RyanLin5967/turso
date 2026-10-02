@@ -662,8 +662,21 @@ fn derivation_refusal(case: &str) {
             "clear" => exec(&conn, "DELETE FROM a"),
             "delete-all" => exec(&conn, "DELETE FROM a WHERE id > 0"),
             _ => {
+                // A blob handle's writes commit at close(); a dropped handle rolls them back, which
+                // left the branch unwritten and the merge with nothing to refuse (lift 2026-10-02,
+                // amendment 8.10). The premise is asserted: the branch reads the written bytes.
                 let mut blob = conn.blob_open("big", "b", 1, true).unwrap();
                 blob.write(5000, b"xyz").unwrap();
+                blob.close().unwrap();
+                let rows = conn
+                    .prepare("SELECT substr(b, 5001, 3) FROM big WHERE id = 1")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                match &rows[0][0] {
+                    crate::Value::Blob(got) => assert_eq!(&got[..], &b"xyz"[..], "blob: the write did not land on the branch"),
+                    other => panic!("blob: the branch read {other:?}"),
+                }
             }
         }
     }
