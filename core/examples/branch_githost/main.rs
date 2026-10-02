@@ -2442,8 +2442,11 @@ fn victims_line(s0: u64, made: u64, n: u64, label: &str) {
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let (mut lines, mut all, mut stack) = (0u64, 0u64, 0u64);
     for line in text.lines() {
-        lines += 1;
-        // "<checkpoint> <id>,<id>,..." (store.rs's victim_log).
+        // "<checkpoint> <id>,<id>,..." (store.rs's victim_log); a checkpoint that evicted nothing
+        // writes its number alone.
+        if line.split_whitespace().nth(1).is_some() {
+            lines += 1;
+        }
         for id in line.split_whitespace().skip(1).flat_map(|x| x.split(',')).filter_map(|x| x.parse::<u64>().ok()) {
             all += 1;
             if id > s0 && id <= s0 + made {
@@ -2651,6 +2654,11 @@ impl Restart {
                 let MergePlan::Pr { p, gen, refused } = model.plan_pr_merge(at, p) else {
                     unreachable!("plan_pr_merge plans a PR merge")
                 };
+                if refused && self.side.merger.is_none() {
+                    // replay-update skips what the Merger would refuse: no work, no timed op (as step).
+                    self.side.refused += 1;
+                    return;
+                }
                 let side = &mut self.side;
                 timed_op(db, series, &mut || {
                     do_merge_pr(db, trunk, side, p, gen, refused);
@@ -2738,7 +2746,11 @@ fn restart(args: &Args) {
         sh1.settle_sharp_max_loads,
         // A8.3's sharp C-R bound: the parked branches x (1 + the deepest parked chain); a trunk
         // child's chain is 1, a stack's its depth.
-        db.branch_open_stats().parked_applied * (1 + sc.stacks.iter().map(|st| st.d).max().unwrap_or(1)),
+        // (parked records the open left for the settle bound its parked branches from above.)
+        {
+            let os = db.branch_open_stats();
+            (os.parked_records - os.parked_applied) * (1 + sc.stacks.iter().map(|st| st.d).max().unwrap_or(1))
+        },
         format!("{} {}", open_line(&db.branch_open_stats()), prewarm_line(&db)).replace(' ', "\t")
     );
     // Before the post-open sequence only memory is checked: the full invariants query the catalog
@@ -2814,9 +2826,10 @@ fn restart(args: &Args) {
 const CENSUS_ENV: [&str; 6] = ["R11_RESIDENT_CAP", "R12_PREWARM", "R13_FW1", "R13_FW2", "R13_MERGER", "R13_VICTIM_LOG"];
 
 fn main() {
-    for (k, _) in std::env::vars() {
+    for (k, _) in std::env::vars_os() {
+        let k = k.to_string_lossy();
         let ours = ["R11_", "R12_", "R13_"].iter().any(|p| k.starts_with(p));
-        if ours && !CENSUS_ENV.contains(&k.as_str()) {
+        if ours && !CENSUS_ENV.contains(&&*k) {
             die(&format!("{k} is set: a census run carries only {CENSUS_ENV:?}"));
         }
     }
@@ -2830,16 +2843,14 @@ fn main() {
     let env = |k: &str| std::env::var(k).unwrap_or_else(|_| "unset".to_string());
     let (state_bytes, slot_bytes) = Database::branch_state_sizes();
     println!(
-        "# R11_RESIDENT_CAP={} R11_CKPT={} R12_PREWARM={} R13_FW1={} R13_FW2={} R13_MERGER={} R13_MUTANT={} \
+        "# R11_RESIDENT_CAP={} R12_PREWARM={} R13_FW1={} R13_FW2={} R13_MERGER={} \
          R13_VICTIM_LOG={} seed={} W={:#x} merge={} validator={:?} deaths={} runin={} \
          size_of_branch_state={state_bytes} size_of_table_slot={slot_bytes}",
         env("R11_RESIDENT_CAP"),
-        env("R11_CKPT"),
         env("R12_PREWARM"),
         env("R13_FW1"),
         env("R13_FW2"),
         env("R13_MERGER"),
-        env("R13_MUTANT"),
         env("R13_VICTIM_LOG"),
         args.seed,
         w(),
