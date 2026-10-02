@@ -85,8 +85,10 @@ const SCHEMA: &[&str] = &[
      lease INTEGER, n_children INTEGER NOT NULL)",
     "CREATE INDEX IF NOT EXISTS branch_children ON branch(parent, fork_epoch)",
     "CREATE INDEX IF NOT EXISTS branch_lease ON branch(lease)",
-    // Released branches with no live child: only these can be collected at an open (a released
-    // interior with children is retired and stays), so an open never walks retired interiors.
+    // `released` is 0, 1, or 2 for a branch released while a connection held it open (r11-ever's
+    // F7 durable port): only those can be collected at an open (a released branch no connection
+    // held was collected at its release: freed, retired or spliced), so an open reads them alone and
+    // never walks retired interiors.
     "CREATE INDEX IF NOT EXISTS branch_released ON branch(released, n_children)",
     // k = branch << 32 | page: one B-tree lookup per (branch, page), one range per branch.
     "CREATE TABLE IF NOT EXISTS cur(k INTEGER PRIMARY KEY, slot INTEGER NOT NULL, \
@@ -116,7 +118,8 @@ const LOOKUPS: &[&str] = &[
     "SELECT id, lease FROM branch WHERE lease > ?2 AND lease <= ?1 ORDER BY lease ASC, id ASC LIMIT ?3",
     "SELECT lease FROM branch WHERE lease > -1 ORDER BY lease ASC LIMIT 1",
     "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
-    "SELECT id FROM branch WHERE released = 1 AND n_children = 0",
+    "SELECT id FROM branch WHERE released = 2",
+    "SELECT id FROM branch WHERE parent = ?1 AND fork_epoch = ?2",
     "SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2",
     "SELECT slot FROM free WHERE slot > -1 ORDER BY slot ASC LIMIT ?1",
     "SELECT 1 FROM free WHERE slot = ?1",
@@ -127,6 +130,7 @@ const LOOKUPS: &[&str] = &[
     "DELETE FROM free WHERE slot = ?1",
     "DELETE FROM branch WHERE id = ?1",
     "UPDATE branch SET epoch = ?2, released = ?3, lease = ?4, n_children = ?5 WHERE id = ?1",
+    "UPDATE branch SET parent = ?2, fork_epoch = ?3 WHERE id = ?1",
 ];
 
 const META_GENERATION: i64 = 1;
@@ -182,11 +186,11 @@ pub(crate) struct Meta {
     pub(crate) arena_hw: u32,
     pub(crate) in_use: u64,
     pub(crate) states: u64,
-    /// The store's format version (`journal::format_version`), so that a catalog opened with a torn
-    /// log header, which has no version to check, is still refused by a store of another format
-    /// (0: written before the catalog carried it). Carried in the high 32 bits of the page-size key's
-    /// value, so the meta row keeps its nine keys (F7-durable fa16116b3's encoding, re-implemented
-    /// for the composed store before F7's merge: r13-compose A2.R6).
+    /// The store's format version (`journal::format_version`: 5, or 6 in the F7 splice arm), so that
+    /// a catalog opened with a torn log header, which has no version to check, is still refused by a
+    /// store of another format or arm (0: written before the catalog carried it). Carried in the
+    /// high 32 bits of the page-size key's value, so the meta row keeps its nine keys (F7-durable
+    /// fa16116b3; r13-compose A2.R6, S-6).
     pub(crate) format: u32,
 }
 
@@ -198,6 +202,9 @@ pub(crate) struct CatBranch {
     pub(crate) fork_epoch: u64,
     pub(crate) epoch: u64,
     pub(crate) released: bool,
+    /// Released while a connection held it open: kept whole until that connection's `Close`, or the
+    /// end of the next recovery (`released` column 2; r11-ever's F7 durable port).
+    pub(crate) held_open: bool,
     pub(crate) lease: Option<u64>,
     pub(crate) n_children: u64,
     /// (page, slot, born, crc)
@@ -236,6 +243,15 @@ fn ret_row(row: &[Value]) -> Result<(u32, u64, u64, Slot, u32)> {
         get(row, 3)? as Slot,
         get(row, 4)? as u32,
     ))
+}
+
+/// The `released` column: 0, 1, or 2 when released while a connection held it open.
+fn released_code(b: &CatBranch) -> Value {
+    Value::from_i64(match (b.released, b.held_open) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => 2,
+    })
 }
 
 /// The catalog key of `(branch, page)`. Refused past 2^31 branch ids rather than wrapped.
@@ -284,6 +300,117 @@ impl Stmt {
     }
 }
 
+/// A SQLite varint at `at` in `d`: its value and its length in bytes (1 to 9; the ninth byte
+/// carries 8 bits). `None` past the end.
+fn varint(d: &[u8], at: usize) -> Option<(u64, usize)> {
+    let mut v = 0u64;
+    for i in 0..9 {
+        let b = *d.get(at + i)?;
+        if i == 8 {
+            return Some(((v << 8) | u64::from(b), 9));
+        }
+        v = (v << 7) | u64::from(b & 0x7f);
+        if b & 0x80 == 0 {
+            return Some((v, i + 1));
+        }
+    }
+    None
+}
+
+/// Adds one leaf page's cells to `c` (r11-ever amendment 35's census). `d` is the page, `h` its
+/// header's offset (100 on page 1); `table` is true for a table leaf (type 13: payload-length
+/// varint, rowid varint, record) and false for an index leaf (type 10: payload-length varint,
+/// record). A record is a header-length varint, one serial-type varint per field, then the body.
+/// `None` if a cell does not parse as the file format says.
+fn census_leaf(d: &[u8], h: usize, table: bool, c: &mut super::LeafCensus) -> Option<()> {
+    let usable = d.len();
+    let n = u16::from_be_bytes([*d.get(h + 3)?, *d.get(h + 4)?]) as usize;
+    // The largest payload a cell keeps on its page: U - 35 on a table leaf, and
+    // ((U - 12) * 64 / 255) - 23 on an index page (fileformat2, "B-tree Pages").
+    let max_local = if table { usable - 35 } else { (usable - 12) * 64 / 255 - 23 };
+    c.leaf_pages += 1;
+    c.used_bytes += 8 + 2 * n as u64;
+    for i in 0..n {
+        let p = h + 8 + 2 * i;
+        let at = u16::from_be_bytes([*d.get(p)?, *d.get(p + 1)?]) as usize;
+        let (len, l1) = varint(d, at)?;
+        let mut body = at + l1;
+        let mut cell = l1 as u64;
+        if table {
+            let (_, l2) = varint(d, body)?;
+            body += l2;
+            cell += l2 as u64;
+            c.rowid_varint_bytes += l2 as u64;
+        }
+        c.cells += 1;
+        if len as usize > max_local {
+            // Its on-page part needs the min-local rule; a spilled cell is counted, not measured.
+            c.overflow_cells += 1;
+            continue;
+        }
+        cell += len;
+        c.cell_bytes += cell;
+        c.used_bytes += cell;
+        let rec = d.get(body..body + len as usize)?;
+        let (hlen, l3) = varint(rec, 0)?;
+        let mut f = l3;
+        while f < hlen as usize {
+            let (t, l) = varint(rec, f)?;
+            f += l;
+            match t {
+                1..=6 => c.ints[t as usize - 1] += 1,
+                8 | 9 => c.ints[6] += 1,
+                _ => {}
+            }
+        }
+    }
+    Some(())
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+
+    /// The census reads integer widths and rowid varints as SQLite stores them: a planted table
+    /// whose rows straddle 2^21 (rowid varint 3 -> 4 bytes) and 2^23 (a value 3 -> 4 bytes).
+    #[test]
+    fn the_census_reads_integer_widths_and_rowid_varints_as_stored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cat = Catalog::open(&dir.path().join("c.db"), false).unwrap();
+        cat.conn
+            .execute("CREATE TABLE plant(k INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .unwrap();
+        for (k, v) in [(5i64, 5i64), ((1 << 21) - 1, (1 << 23) - 1), (1 << 21, 1 << 23)] {
+            cat.conn
+                .execute(format!("INSERT INTO plant VALUES ({k}, {v})"))
+                .unwrap();
+        }
+        let shape = cat.shape().unwrap();
+        assert_eq!(shape.unaccounted, 0, "{shape:?}");
+        let (_, c) = shape
+            .census
+            .iter()
+            .find(|(n, _)| n == "plant")
+            .expect("the planted table's census");
+        assert_eq!((c.leaf_pages, c.cells, c.overflow_cells), (1, 3, 0), "{c:?}");
+        // k is the rowid (stored as NULL in the record); v is 5, 2^23 - 1, 2^23.
+        assert_eq!(c.ints, [1, 0, 1, 1, 0, 0, 0], "{c:?}");
+        assert_eq!(c.rowid_varint_bytes, 1 + 3 + 4, "{c:?}");
+        assert_eq!(shape.page_size, 4096, "{shape:?}");
+    }
+
+    #[test]
+    fn a_varint_reads_as_the_file_format_writes_it() {
+        assert_eq!(varint(&[0x05], 0), Some((5, 1)));
+        assert_eq!(varint(&[0x81, 0x00], 0), Some((128, 2)));
+        // 2^21 - 1 is the largest 3-byte varint.
+        assert_eq!(varint(&[0xff, 0xff, 0x7f], 0), Some(((1 << 21) - 1, 3)));
+        assert_eq!(varint(&[0x81, 0x80, 0x80, 0x00], 0), Some((1 << 21, 4)));
+        assert_eq!(varint(&[0xff; 9], 0), Some((u64::MAX, 9)));
+        assert_eq!(varint(&[0x81], 0), None);
+    }
+}
+
 pub(crate) struct Catalog {
     _db: Arc<Database>,
     conn: Arc<Connection>,
@@ -295,6 +422,7 @@ pub(crate) struct Catalog {
     branch_get: Stmt,
     branch_put: Stmt,
     branch_update: Stmt,
+    branch_rekey: Stmt,
     branch_del: Stmt,
     cur_range: Stmt,
     cur_del_range: Stmt,
@@ -313,6 +441,7 @@ pub(crate) struct Catalog {
     child_above: Stmt,
     lease_tie: Stmt,
     lease_page: Stmt,
+    child_at: Stmt,
     lease_min: Stmt,
     lease_min_after: Stmt,
     released: Stmt,
@@ -380,6 +509,7 @@ impl Catalog {
             branch_update: p(
                 "UPDATE branch SET epoch = ?2, released = ?3, lease = ?4, n_children = ?5 WHERE id = ?1",
             )?,
+            branch_rekey: p("UPDATE branch SET parent = ?2, fork_epoch = ?3 WHERE id = ?1")?,
             branch_del: p("DELETE FROM branch WHERE id = ?1")?,
             cur_range: p("SELECT k, slot, born, crc FROM cur WHERE k >= ?1 AND k < ?2")?,
             cur_del_range: p("DELETE FROM cur WHERE k >= ?1 AND k < ?2")?,
@@ -416,6 +546,7 @@ impl Catalog {
                 "SELECT fork_epoch, id FROM branch WHERE parent = ?1 AND fork_epoch > ?2 \
                  ORDER BY fork_epoch ASC LIMIT ?3",
             )?,
+            child_at: p("SELECT id FROM branch WHERE parent = ?1 AND fork_epoch = ?2")?,
             // Range seeks on `branch_lease`: NULL sorts first in the index, so `lease > -1` skips
             // every unleased row instead of walking them (deadlines are never negative).
             // F-EXP's keyset pages over `branch_lease`, whose entries sort by deadline then row id:
@@ -429,7 +560,7 @@ impl Catalog {
             lease_min_after: p(
                 "SELECT lease FROM branch WHERE lease > ?1 ORDER BY lease ASC LIMIT 1",
             )?,
-            released: p("SELECT id FROM branch WHERE released = 1 AND n_children = 0")?,
+            released: p("SELECT id FROM branch WHERE released = 2")?,
             unreleased: p("SELECT id FROM branch WHERE released = 0")?,
             free_after: p("SELECT slot FROM free WHERE slot > ?1 ORDER BY slot ASC LIMIT ?2")?,
             free_first: p("SELECT slot FROM free WHERE slot > -1 ORDER BY slot ASC LIMIT ?1")?,
@@ -572,6 +703,111 @@ impl Catalog {
         Ok(Some(m))
     }
 
+    /// The file's shape (see `CatalogShape`): `PRAGMA page_count` and `freelist_count`, each
+    /// table's rows, and each B-tree's pages per level, walked from its root through the interior
+    /// pages' child pointers (SQLite's file format: an interior page, type 2 or 5, lists a left child
+    /// in the first four bytes of each cell and its right-most child at header offset 8; page 1's
+    /// header starts at byte 100). Pages are read through this connection's pager inside one read
+    /// transaction (the snapshot a `BEGIN` and a first read take), so the WAL's latest versions
+    /// count and nothing moves pages mid-walk; `sqlite_dbpage` would do the same but is built only
+    /// with the `cli_only` feature. Unprepared statements, outside `counters`: an instrument. It
+    /// writes nothing: the transaction only reads, and is rolled back.
+    pub(crate) fn shape(&self) -> Result<super::CatalogShape> {
+        self.conn.execute("BEGIN")?;
+        let shape = self.shape_in_read_tx();
+        let _ = self.conn.execute("ROLLBACK");
+        shape
+    }
+
+    fn shape_in_read_tx(&self) -> Result<super::CatalogShape> {
+        let bad = |what: String| LimboError::Corrupt(format!("branch catalog shape: {what}"));
+        let one_int = |sql: &str| -> Result<u64> {
+            let rows = self.conn.prepare(sql)?.run_collect_rows()?;
+            rows.first()
+                .and_then(|r| r.first())
+                .and_then(Value::as_int)
+                .map(|v| v as u64)
+                .ok_or_else(|| bad(format!("{sql} returned no integer")))
+        };
+        // A table read first: it takes the transaction's read snapshot.
+        let mut rows = Vec::new();
+        for table in ["meta", "branch", "cur", "ret", "free"] {
+            rows.push((table.to_string(), one_int(&format!("SELECT count(*) FROM {table}"))?));
+        }
+        let page_count = one_int("PRAGMA page_count")?;
+        let freelist_count = one_int("PRAGMA freelist_count")?;
+        let mut roots = vec![("sqlite_schema".to_string(), 1u64)];
+        for row in self
+            .conn
+            .prepare("SELECT name, rootpage FROM sqlite_schema WHERE rootpage > 0 ORDER BY name")?
+            .run_collect_rows()?
+        {
+            match (row.first(), row.get(1).and_then(Value::as_int)) {
+                (Some(Value::Text(name)), Some(root)) => roots.push((name.as_str().to_string(), root as u64)),
+                _ => return Err(bad("an unreadable sqlite_schema row".to_string())),
+            }
+        }
+        let pager = self.conn.get_pager();
+        let page = |pgno: u64| -> Result<Vec<u8>> {
+            let (page_ref, completion) = pager.io.block(|| pager.read_page(pgno as i64))?;
+            if let Some(c) = completion {
+                pager.io.wait_for_completion(c)?;
+            }
+            Ok(page_ref.get_contents().as_slice().to_vec())
+        };
+        let u16_at = |d: &[u8], at: usize| -> Result<usize> {
+            d.get(at..at + 2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+                .ok_or_else(|| bad(format!("a u16 past a page's end at {at}")))
+        };
+        let u32_at = |d: &[u8], at: usize| -> Result<u64> {
+            d.get(at..at + 4)
+                .map(|b| u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])))
+                .ok_or_else(|| bad(format!("a u32 past a page's end at {at}")))
+        };
+        let mut trees = Vec::new();
+        let mut census = Vec::new();
+        let mut page_size = 0u64;
+        let mut in_trees = 0u64;
+        for (name, root) in roots {
+            let (mut levels, mut frontier) = (Vec::new(), vec![root]);
+            let mut leaves = super::LeafCensus::default();
+            while !frontier.is_empty() {
+                levels.push(frontier.len() as u64);
+                in_trees += frontier.len() as u64;
+                let mut next = Vec::new();
+                for pgno in frontier {
+                    let d = page(pgno)?;
+                    page_size = d.len() as u64;
+                    let h = if pgno == 1 { 100 } else { 0 };
+                    match d.get(h).copied() {
+                        Some(0x02) | Some(0x05) => {
+                            for i in 0..u16_at(&d, h + 3)? {
+                                next.push(u32_at(&d, u16_at(&d, h + 12 + 2 * i)?)?);
+                            }
+                            next.push(u32_at(&d, h + 8)?);
+                        }
+                        Some(t @ (0x0A | 0x0D)) => census_leaf(&d, h, t == 0x0D, &mut leaves)
+                            .ok_or_else(|| bad(format!("a cell of leaf page {pgno} of {name} does not parse")))?,
+                        other => return Err(bad(format!("page {pgno} of {name} has type {other:?}"))),
+                    }
+                }
+                frontier = next;
+            }
+            census.push((name.clone(), leaves));
+            trees.push((name, levels));
+        }
+        Ok(super::CatalogShape {
+            page_count,
+            freelist_count,
+            rows,
+            trees,
+            unaccounted: page_count as i64 - in_trees as i64 - freelist_count as i64,
+            census,
+            page_size,
+        })
+    }
+
     pub(crate) fn begin(&mut self) -> Result<()> {
         self.conn.execute("BEGIN")?;
         Ok(())
@@ -694,11 +930,22 @@ impl Catalog {
             parent: get(row, 0)?,
             fork_epoch: get(row, 1)?,
             epoch: get(row, 2)?,
-            released: get(row, 3)? != 0,
+            released: false,
+            held_open: false,
             lease,
             n_children: get(row, 5)?,
             current: Vec::new(),
             retained: Vec::new(),
+        };
+        (b.released, b.held_open) = match get(row, 3)? {
+            0 => (false, false),
+            1 => (true, false),
+            2 => (true, true),
+            other => {
+                return Err(LimboError::Corrupt(format!(
+                    "branch catalog: branch {id} has released = {other}"
+                )))
+            }
         };
         let lo = cur_key(id, 0)?;
         let hi = lo + (1i64 << 32);
@@ -727,18 +974,26 @@ impl Catalog {
     }
 
     /// Rewrite the mutable columns of a branch row the catalog already holds (parent and fork
-    /// epoch never change, so the children index is not touched).
+    /// epoch change only in a splice, which `rekey` writes; this leaves the children index alone).
     pub(crate) fn update_row(&mut self, b: &CatBranch) -> Result<()> {
         self.branch_update.exec(
             &[
                 int(b.id),
                 int(b.epoch),
-                Value::from_i64(b.released as i64),
+                released_code(b),
                 b.lease.map_or(Value::Null, int),
                 int(b.n_children),
             ],
             &mut self.counters,
         )
+    }
+
+    /// Move a branch row to a new (parent, fork epoch) key: a splice put it in its spliced-out
+    /// parent's place (r11-ever's F7 durable port, finding U6). The `branch_children` index follows
+    /// the row, so the parent's children are listed under the key they are queried by.
+    pub(crate) fn rekey(&mut self, b: &CatBranch) -> Result<()> {
+        self.branch_rekey
+            .exec(&[int(b.id), int(b.parent), int(b.fork_epoch)], &mut self.counters)
     }
 
     /// Replace a branch's `cur` rows.
@@ -789,7 +1044,7 @@ impl Catalog {
                 int(b.parent),
                 int(b.fork_epoch),
                 int(b.epoch),
-                Value::from_i64(b.released as i64),
+                released_code(b),
                 b.lease.map_or(Value::Null, int),
                 int(b.n_children),
             ],
@@ -988,6 +1243,15 @@ impl Catalog {
         }
     }
 
+    /// The child `parent` forked at `f`, if the catalog lists one (its id: the child queries above
+    /// return only fork epochs).
+    pub(crate) fn child_at(&mut self, parent: u64, f: u64) -> Result<Option<u64>> {
+        let rows = self.child_at.rows(&[int(parent), int(f)], &mut self.counters)?;
+        rows.first().map(|row| get(row, 0)).transpose()
+    }
+
+    /// Branches released while a connection held them open: what an open collects (see the
+    /// `branch_released` index).
     pub(crate) fn released_ids(&mut self) -> Result<Vec<u64>> {
         self.released
             .rows(&[], &mut self.counters)?
