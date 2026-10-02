@@ -1445,3 +1445,213 @@ fn model_run(mode: Mode, seed: u64, with_index: bool, tally: &mut BTreeMap<(Stri
         assert!(s.evicted_states > 0, "{what}: CatalogEvict evicted no live branch: {s:?}");
     }
 }
+
+// ---- r13-compose step 9: the reds that need F7's splice arm (A3.F16: their red evidence is a mutant
+// on the step-9 tree) ----
+
+fn spliced_opts(mode: Mode) -> DatabaseOpts {
+    mode.opts().with_branch_splice(true)
+}
+
+fn open_spliced(path: &Path, mode: Mode) -> Arc<Database> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        spliced_opts(mode),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    if mode == Mode::CatalogEvict {
+        db.branch_set_resident_cap(Some(0));
+    }
+    db
+}
+
+/// D-T3 (A5.4, A6.6): a spliced child merges the zombie's rows, in the splice-on arm, on the
+/// in-memory spliced child and after splice, checkpoint, cap-0 eviction and a reopen. The zombie's
+/// write after the child's fork is not the child's (retire_current freed it) and is not merged.
+/// Mutant r13_splice_no_stream (the splice does not stream the zombie's versions into the child's
+/// current) must turn it red.
+#[test]
+fn a_spliced_child_merges_the_zombies_rows() {
+    for reload in [false, true] {
+        let what = format!("reload {reload}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("m.db");
+        let c_id;
+        {
+            let db = open_spliced(&path, Mode::CatalogEvict);
+            let trunk = db.connect().unwrap();
+            seed(&trunk, 300);
+            let z = trunk.fork_branch().unwrap();
+            exec(&z.connect().unwrap(), "UPDATE t SET v = 'zombie-before' WHERE id = 30");
+            let c = z.fork().unwrap();
+            exec(&z.connect().unwrap(), "UPDATE t SET v = 'zombie-after' WHERE id = 31");
+            exec(&c.connect().unwrap(), "UPDATE t SET v = 'child' WHERE id = 200");
+            c_id = c.into_id();
+            let r = z.reap().unwrap();
+            assert!(r.deferred, "{what}: the zombie had a live child: {r:?}");
+            if !reload {
+                let mut merger = Merger::new(trunk.clone()).unwrap();
+                let out = merger.merge(db.branch(c_id).unwrap(), policy(Validation::BaseRead)).unwrap();
+                assert_eq!(out.refused, None, "{what}: {out:?}");
+                assert_eq!(out.rows_changed, 2, "{what}: the zombie's row and the child's: {out:?}");
+                let rows = snapshot(&trunk, "t");
+                assert!(rows[&30].contains("zombie-before"), "{what}: the zombie's row is missing");
+                assert!(rows[&200].contains("child"), "{what}");
+                assert!(rows[&31].contains("base-00031"), "{what}: the zombie's post-fork write leaked");
+                continue;
+            }
+            db.branch_compact_now().unwrap();
+        }
+        let db = open_spliced(&path, Mode::CatalogEvict);
+        let trunk = db.connect().unwrap();
+        db.branch_compact_now().unwrap();
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let out = merger.merge(db.branch(c_id).unwrap(), policy(Validation::BaseRead)).unwrap();
+        assert_eq!(out.refused, None, "{what}: {out:?}");
+        assert_eq!(out.rows_changed, 2, "{what}: {out:?}");
+        let rows = snapshot(&trunk, "t");
+        assert!(rows[&30].contains("zombie-before") && rows[&200].contains("child"), "{what}");
+        assert!(rows[&31].contains("base-00031"), "{what}");
+    }
+}
+
+/// A6.1's splice-on arm: land a stack top whose middle level was released and spliced into its
+/// child; every level's rows go in, across a cap-0 eviction and a reopen.
+#[test]
+fn a_land_top_installs_every_levels_rows_in_the_splice_arm() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("m.db");
+    let d = 12i64;
+    let top;
+    {
+        let db = open_spliced(&path, Mode::CatalogEvict);
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 400);
+        let mut level = trunk.fork_branch().unwrap();
+        let mut _held = Vec::new();
+        for i in 1..=d {
+            exec(&level.connect().unwrap(), &format!("UPDATE t SET v = 'level{i}' WHERE id = {}", i * 20));
+            let next = level.fork().unwrap();
+            if i == d / 2 {
+                drop(level); // released with one live child: spliced into it
+                db.branch_compact_now().unwrap();
+            } else {
+                _held.push(level.into_id());
+            }
+            level = next;
+        }
+        exec(&level.connect().unwrap(), "UPDATE t SET v = 'top' WHERE id = 399");
+        top = level.into_id();
+        // No checkpoint: the upper levels' commits are only in the log's tail (amendment 8.6).
+    }
+    let db = open_spliced(&path, Mode::CatalogEvict);
+    let trunk = db.connect().unwrap();
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let out = merger.land_top(db.branch(top).unwrap(), policy(Validation::BaseRead)).unwrap();
+    assert_eq!(out.refused, None, "{out:?}");
+    assert_eq!(out.rows_changed as i64, d + 1, "{out:?}");
+    let rows = snapshot(&trunk, "t");
+    for i in 1..=d {
+        assert!(rows[&(i * 20)].contains(&format!("level{i}")), "level {i}'s row is missing");
+    }
+    assert!(rows[&399].contains("top"), "the top's own row is missing");
+}
+
+/// A4.G's G-a: the public fuzzy checkpoint on a splice-arm catalog store returns G-a's own error,
+/// and G-b's counter does not move (so G-b cannot mask G-a's mutant r13_guard_a_debug, run in a
+/// release test build).
+#[test]
+fn branch_checkpoint_fuzzy_now_on_a_splice_arm_store_is_refused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_spliced(&dir.path().join("m.db"), Mode::Catalog);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    // The store builds its catalog, log and arena at the first fork; without one the guard is never
+    // reached (amendment 8.6).
+    let _b = trunk.fork_branch().unwrap().into_id();
+    let before = db.branches.fuzzy_refused_splice();
+    let err = db.branch_checkpoint_fuzzy_now().expect_err("a splice-arm store started a fuzzy checkpoint");
+    assert!(err.to_string().contains("fuzzy checkpoint refused: splice arm"), "{err}");
+    assert_eq!(db.branches.fuzzy_refused_splice(), before, "G-b fired: G-a did not stop it first");
+}
+
+/// A4.G's G-b: `start_flight` called directly refuses a splice-arm store, counts it, and enters no
+/// capture (so G-c cannot mask G-b's mutant r13_guard_b_debug, run in a release test build).
+#[test]
+fn start_flight_refuses_a_splice_arm_store() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_spliced(&dir.path().join("m.db"), Mode::Catalog);
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 50);
+    // The store builds its catalog, log and arena at the first fork; without one the guard is never
+    // reached (amendment 8.6).
+    let _b = trunk.fork_branch().unwrap().into_id();
+    let before = db.branches.fuzzy_refused_splice();
+    let entered = store::CAPTURE_ENTERED.with(|c| c.get());
+    assert!(!db.branches.start_flight_for_test(), "a flight started on a splice-arm store");
+    assert_eq!(db.branches.fuzzy_refused_splice(), before + 1, "G-b did not count its refusal");
+    assert_eq!(store::CAPTURE_ENTERED.with(|c| c.get()), entered, "the capture was entered");
+}
+
+/// A4.G's G-c: a fuzzy capture of a splice-arm store returns Err (in a release test build too: its
+/// mutant r13_guard_c_debug must turn this red there).
+#[test]
+fn a_fuzzy_capture_of_a_splice_arm_store_returns_err() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_spliced(&dir.path().join("m.db"), Mode::Catalog);
+    seed(&db.connect().unwrap(), 50);
+    let err = db.branches.capture_fuzzy_for_test().expect_err("a fuzzy capture of a splice-arm store");
+    assert!(err.to_string().contains("fuzzy capture refused: splice arm"), "{err}");
+}
+
+/// A1.1 (S-3 widened): a splice-arm catalog store reopens after a checkpoint, and after crash state
+/// S1 (the catalog committed, the log not yet cut: recovery rewrites the log at open). Its log's
+/// header must keep the splice arm's format. Mutant r13_log_header_fixed must turn it red.
+#[test]
+fn a_splice_arm_catalog_store_reopens_after_a_checkpoint_and_after_crash_state_s1() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("m.db");
+    let b_id;
+    {
+        let db = open_spliced(&path, Mode::Catalog);
+        let trunk = db.connect().unwrap();
+        seed(&trunk, 100);
+        let b = trunk.fork_branch().unwrap();
+        exec(&b.connect().unwrap(), "UPDATE t SET v = 'one' WHERE id = 3");
+        b_id = b.into_id();
+        db.branch_compact_now().unwrap();
+    }
+    {
+        let db = open_spliced(&path, Mode::Catalog);
+        let b = db.branch(b_id).unwrap();
+        assert!(snapshot(&b.connect().unwrap(), "t")[&3].contains("one"), "after a checkpoint");
+        exec(&b.connect().unwrap(), "UPDATE t SET v = 'two' WHERE id = 4");
+        let _ = b.into_id();
+        // Crash state S1: the catalog commits, the log is not cut.
+        db.branches
+            .set_failpoint(Some(BranchFailpoint::CompactAfterRenameBeforeLogReset));
+        assert!(db.branch_compact_now().is_err(), "the failpoint did not fire");
+    }
+    for round in 0..2 {
+        let db = open_spliced(&path, Mode::Catalog);
+        let b = db.branch(b_id).unwrap();
+        let rows = snapshot(&b.connect().unwrap(), "t");
+        assert!(rows[&3].contains("one") && rows[&4].contains("two"), "round {round} after S1");
+        let _ = b.into_id();
+        db.branch_compact_now().unwrap();
+    }
+}
+
+/// D-T1 in the F7 splice arm (A5.4: "in both splice arms"; review wf_5c230f31 M; amendment 8.6):
+/// the same workloads, ends and kills, on stores opened with the splice arm on, B being the child of
+/// a zombie that wrote rows before and after B's fork and was released while B lived, so the splice
+/// streams the zombie's versions into B.
+#[test]
+fn a_derived_write_set_equals_the_recorded_one_in_the_splice_arm() {
+    d_t1(open_spliced, true);
+}

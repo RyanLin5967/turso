@@ -30,6 +30,10 @@
 //! PREREG D3); it is round 10's harness (`b9230a8bb`) with that flag and the durable store's `Result`-returning
 //! `branch_stats` as the only differences.
 //!
+//! `--splice on|off` (default off) opens the store in the F7 splice arm or not (r11-ever amendment 15:
+//! a released branch left with one live child is spliced into it). Only the chain arm's cascade
+//! releases an interior branch, and it checks the rule of the arm it runs in; the header names it.
+//!
 //! Every read a sample makes is checked against a model the harness keeps itself (never against
 //! the engine), and the engine's own counts are checked against the workload before a number is
 //! printed; a mismatch prints `NOT A RESULT` and exits 1. Beside each latency the harness prints
@@ -78,6 +82,7 @@ struct Args {
     arm: Arm,
     victim: Victim,
     durability: BranchDurability,
+    splice: bool,
     checkpoints: Vec<usize>,
     samples: usize,
     seed: u64,
@@ -100,6 +105,7 @@ fn parse_args() -> Args {
         arm: Arm::Hot,
         victim: Victim::Random,
         durability: BranchDurability::Volatile,
+        splice: false,
         checkpoints: vec![100, 1000],
         samples: 200,
         seed: 0x9E37_79B9_7F4A_7C15,
@@ -149,6 +155,13 @@ fn parse_args() -> Args {
                     "durable" => BranchDurability::Durable { sync: true },
                     "durable-nosync" => BranchDurability::Durable { sync: false },
                     other => die(&format!("unknown --durability {other}")),
+                }
+            }
+            "--splice" => {
+                args.splice = match val().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => die(&format!("unknown --splice {other}")),
                 }
             }
             "--victim" => {
@@ -486,7 +499,9 @@ fn main() {
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
-        DatabaseOpts::new().with_branch_durability(args.durability),
+        DatabaseOpts::new()
+            .with_branch_durability(args.durability)
+            .with_branch_splice(args.splice),
         None,
         Arc::new(SqliteDialect),
     )
@@ -524,12 +539,13 @@ fn main() {
 
     println!("# branch_arms — Turso fork, per-branch CoW arena, PREREG amendment 1");
     println!(
-        "# arm={:?} victim={:?} durability={:?} checkpoints={:?} samples={} seed={:#x} cycles={} windows={} w={:?} \
+        "# arm={:?} victim={:?} durability={:?} splice={} checkpoints={:?} samples={} seed={:#x} cycles={} windows={} w={:?} \
          trunk_rows={TRUNK_ROWS} value_len={VALUE_LEN} page_size={page_size} \
          trunk_pages={trunk_pages} trunk_synchronous={synchronous} no_autocheckpoint={}",
         args.arm,
         args.victim,
         args.durability,
+        if args.splice { "on" } else { "off" },
         args.checkpoints,
         args.samples,
         args.seed,
@@ -830,26 +846,36 @@ fn arm_chain(b: &mut Bench, args: &Args) {
             "read_anc",
         ],
     );
-    // The cascade: release every ancestor handle (each deferred: a live child reads through it),
-    // then reap the tip, which frees the whole chain in one call. One sample, labelled as such.
+    // The cascade: release every ancestor handle, root first, then reap the tip, which frees what
+    // is left of the chain in one call. One sample, labelled as such. Off the splice arm (the base's
+    // rule) each ancestor is kept for its live child (`deferred`, 0 pages) and the tip's reap frees
+    // the chain's d pages. In the F7 splice arm (r11-ever-durable-cat, `--splice on`) each released
+    // root has one live child and is spliced into it (`deferred`), and a page of it that the child
+    // wrote too is freed at that splice (the child's own copy shadows it and the child's children
+    // forked after its write): at most one page per ancestor, and the chain's d pages in all.
     let d = chain.len();
     let tip = chain.pop().unwrap();
+    let most_at_release = usize::from(args.splice);
+    let mut freed_early = 0;
     for l in chain {
         let r = l.branch.reap().unwrap();
-        if !r.deferred || r.freed_pages != 0 {
+        if !r.deferred || r.freed_pages > most_at_release {
             not_a_result(&format!("an ancestor with a live child was freed: {r:?}"));
         }
+        freed_early += r.freed_pages;
     }
     let before = b.work();
     let t = Instant::now();
     let r = tip.branch.reap().unwrap();
     let us = t.elapsed().as_secs_f64() * 1e6;
     let after = b.work();
-    if r.deferred || r.freed_pages != d {
-        not_a_result(&format!("the cascade freed {r:?}, expected {d} pages"));
+    if r.deferred || freed_early + r.freed_pages != d {
+        not_a_result(&format!(
+            "the cascade freed {r:?} after {freed_early} pages at the splices, expected {d} in all"
+        ));
     }
     println!(
-        "# cascade_reap d={d} us={us:.2} freed_pages={} gc_range_entries={} (ONE sample)",
+        "# cascade_reap d={d} us={us:.2} freed_pages={} freed_at_splices={freed_early} gc_range_entries={} (ONE sample)",
         r.freed_pages,
         after.gc_range_entries - before.gc_range_entries
     );

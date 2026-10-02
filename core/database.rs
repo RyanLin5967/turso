@@ -86,6 +86,10 @@ pub struct DatabaseOpts {
     /// The lease every new branch is given; `None` (the default) forks branches that never
     /// expire unless `Branch::lease` gives them one.
     pub branch_lease: Option<std::time::Duration>,
+    /// The F7 SPLICE arm of the branch store (r11-ever, UNBUILT): a released branch left with one
+    /// live child is spliced into it. Off by default; a durable store opens only in the arm its
+    /// files were written in.
+    pub branch_splice: bool,
 }
 
 impl DatabaseOpts {
@@ -156,6 +160,11 @@ impl DatabaseOpts {
 
     pub fn with_branch_lease(mut self, lease: Option<std::time::Duration>) -> Self {
         self.branch_lease = lease;
+        self
+    }
+
+    pub fn with_branch_splice(mut self, splice: bool) -> Self {
+        self.branch_splice = splice;
         self
     }
 
@@ -944,6 +953,7 @@ impl Database {
         let branches = Arc::new(crate::branch::store::BranchStore::open_with_flags(
             opts.branch_durability,
             opts.branch_lease,
+            opts.branch_splice,
             branch_base,
             flags.contains(OpenFlags::ReadOnly),
         )?);
@@ -1278,6 +1288,7 @@ impl Database {
         flags: OpenFlags,
         durability: crate::branch::BranchDurability,
         lease: Option<std::time::Duration>,
+        splice: bool,
         for_attach: bool,
     ) -> Result<()> {
         if db.branches.is_trunk_only() && !flags.contains(OpenFlags::ReadOnly) {
@@ -1310,6 +1321,20 @@ impl Database {
                  for {:?}: it would receive that instance, whose forks would be leased otherwise \
                  than it asked; close the other handle first, or open with the same branch lease",
                 db.path, db.opts.branch_lease, lease
+            )));
+        }
+        if !flags.contains(OpenFlags::ReadOnly)
+            && !for_attach
+            && !db.branches.is_trunk_only()
+            && db.opts.branch_splice != splice
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "{} is open in this process with the branch splice arm {}, and this open asks for \
+                 it {}: it would receive that instance, whose releases would be collected by the \
+                 other rule; close the other handle first, or open with the same splice arm",
+                db.path,
+                if db.opts.branch_splice { "on" } else { "off" },
+                if splice { "on" } else { "off" }
             )));
         }
         Ok(())
@@ -1448,6 +1473,7 @@ impl Database {
                     options.flags,
                     options.db_opts.branch_durability,
                     options.db_opts.branch_lease,
+                    options.db_opts.branch_splice,
                     options.for_attach,
                 )?;
                 return Ok(Some(db));
@@ -1613,6 +1639,7 @@ impl Database {
                                 options.flags,
                                 options.db_opts.branch_durability,
                                 options.db_opts.branch_lease,
+                                options.db_opts.branch_splice,
                                 options.for_attach,
                             )?;
                             return Ok(IOResult::Done(db));

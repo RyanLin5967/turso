@@ -306,7 +306,9 @@ pub struct Reaped {
     /// ancestor was retaining only for it.
     pub freed_pages: usize,
     /// True when the branch could not be freed yet (an open connection or a live child still reads
-    /// through it); its pages are freed when the last of those goes away.
+    /// through it); its pages are freed when the last of those goes away. Also true when it was
+    /// spliced out (its only live child now holds what it read through it): it has left the store's
+    /// branch states, but its pages live on in that child.
     pub deferred: bool,
 }
 
@@ -349,7 +351,7 @@ pub struct BranchOpenStats {
     pub load_ns: u64,
     /// Replay (records).
     pub replay_ns: u64,
-    /// `collect_released` (branches scanned).
+    /// `close_held`: closing and collecting what a crash left held (`released_scanned`).
     pub collect_ns: u64,
     /// `referenced_slots` (referenced_slots).
     pub referenced_ns: u64,
@@ -361,7 +363,10 @@ pub struct BranchOpenStats {
     pub total_ns: u64,
     /// Branch states that exist, resident or not (catalog stores keep most on disk).
     pub states: u64,
-    /// Released branches the open's collection pass examined.
+    /// Released branches the open's collection pass examined: since the F7 durable port, the ones a
+    /// crash left held (a snapshot's `held_open`, a catalog row's `released = 2`, or a replayed
+    /// `ReleaseOpen`), each closed and collected there. (Before: every released branch in memory,
+    /// plus the catalog's released rows with no child.)
     pub released_scanned: u64,
     /// Catalog stores: opening the catalog and reading its meta row.
     pub catalog_ns: u64,
@@ -511,10 +516,58 @@ pub struct BranchCatShape {
     pub trunk_rows: u64,
 }
 
+/// The catalog file's shape (r11-ever amendment 19): what its pages hold, so a size can be
+/// attributed to rows, tree levels or the free list. Observation only; it reads every page of the
+/// catalog, so it is an instrument for a harness's checkpoints, never a store path.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogShape {
+    /// Pages in the catalog file, and on its free list (SQLite's header count: trunks and leaves).
+    pub page_count: u64,
+    pub freelist_count: u64,
+    /// Rows per table.
+    pub rows: Vec<(String, u64)>,
+    /// Pages per B-tree level, root first, per table and index (`sqlite_schema` first).
+    pub trees: Vec<(String, Vec<u64>)>,
+    /// `page_count` less the trees' pages and the free list: overflow pages, or a tree this walk
+    /// did not reach. 0 when the ledger closes.
+    pub unaccounted: i64,
+    /// Per tree (the order of `trees`), what its leaf pages hold, field by field (r11-ever amendment
+    /// 35's census): so leaf growth can be split into bytes (wider integers) and fill.
+    pub census: Vec<(String, LeafCensus)>,
+    /// The page size the census read (bytes per page).
+    pub page_size: u64,
+}
+
+/// One B-tree's leaf pages, cell by cell (r11-ever amendment 35). SQLite's record format stores an
+/// integer in the fewest of 1, 2, 3, 4, 6 or 8 bytes that hold it (0 and 1 in none), and a rowid
+/// or a length as a varint, so a key or value that crosses 2^23 or a rowid that crosses 2^21 widens
+/// its cell by a byte with no other change. Observation only.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeafCensus {
+    pub leaf_pages: u64,
+    pub cells: u64,
+    /// Bytes of the cells: length and rowid varints plus the payload held on the page.
+    pub cell_bytes: u64,
+    /// `cell_bytes` plus each leaf page's 8-byte header and 2-byte cell pointers.
+    pub used_bytes: u64,
+    /// Integer fields stored in 1, 2, 3, 4, 6 and 8 bytes (serial types 1-6), then the 0/1
+    /// constants (serial types 8 and 9).
+    pub ints: [u64; 7],
+    /// Bytes of the rowid varints (table leaves only).
+    pub rowid_varint_bytes: u64,
+    /// Cells whose payload spills to an overflow page: counted, not width-parsed.
+    pub overflow_cells: u64,
+}
+
 /// A snapshot of the branch arena's accounting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BranchStats {
-    /// Branch states that exist, including reaped branches kept alive by a live child.
+    /// Branch states that exist, including reaped branches kept alive by an open connection or by a
+    /// live child. In the F7 splice arm (`DatabaseOpts::with_branch_splice`) only by two or more: one
+    /// with exactly one is spliced into it and is not counted, while its pages are (they now belong
+    /// to that child).
     pub live_branches: usize,
     /// Arena pages owned by some branch (or retained for one).
     pub arena_slots_in_use: usize,
@@ -546,6 +599,16 @@ pub struct BranchWork {
     pub gc_examined: u64,
     /// Index entries (`by_born` and `by_died`) visited by `child_gone`'s garbage query.
     pub gc_range_entries: u64,
+    /// F7 durable port: released branches spliced into their only live child, splices that merged
+    /// the child into the zombie's map (the child's side was the smaller), and versions the splices
+    /// visited (the zombie's retained ones plus the smaller side of each merge).
+    pub splices: u64,
+    pub splice_commits: u64,
+    pub splice_entries: u64,
+    /// Entries a branch's lazily built page map (`view`) inserted at its first fork: its current
+    /// versions born after its `inherited` map was taken (r11-ever amendment 17; r11-adversarial's
+    /// counter of the same name counted all of `current`).
+    pub view_build_entries: u64,
 }
 
 impl Branch {
@@ -801,6 +864,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_catalog_rows_written(&self) -> u64 {
         self.branches.catalog_rows_written()
+    }
+
+    /// The catalog file's shape (see [`CatalogShape`]); `None` for a store that is not a catalog
+    /// store or has no catalog yet. Reads every catalog page.
+    #[doc(hidden)]
+    pub fn branch_catalog_shape(&self) -> Result<Option<CatalogShape>> {
+        self.branches.catalog_shape()
     }
 
     /// `(resolve calls, arena slot reads)` since open (r11-restart lane instrument).

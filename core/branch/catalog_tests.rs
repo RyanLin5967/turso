@@ -1031,50 +1031,54 @@ fn a_fuzzy_checkpoint_evicts_only_states_clean_at_its_install() {
     check(&db, &model);
 }
 
-/// r13-compose A2.R6 (S-6 for the build before F7's merge): the catalog carries the store's format
-/// version in its meta row, and an open checks it before the log. With the log header torn (no
-/// version to check there), a catalog of another format -- 0 (before the key), 2 (the base), 3 or 4
-/// (F7-durable's arms, no-force's 3) -- is refused, never reinterpreted, and the store's own opens.
+/// r13-compose A2.R6 and S-6: the catalog carries the store's format version in its meta row, and
+/// an open checks it before the log. With the log header torn (no version to check there), a catalog
+/// of another format -- 0 (before the key), 2 (the base), 3 or 4 (F7-durable's arms, no-force's 3),
+/// 7 (the build before F7's merge), or the other splice arm's -- is refused, never reinterpreted, and
+/// the store's own opens. Both splice arms.
 #[test]
 fn a_catalog_of_another_format_is_refused_even_with_a_torn_log_header() {
-    let own = journal::format_version();
-    for other in [0u32, 2, 3, 4] {
-        assert_ne!(other, own, "the test needs a format this store does not write");
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("c.db");
-        let b_id;
-        {
-            let db = open_at(&path, catalog()).unwrap();
-            let trunk = db.connect().unwrap();
-            seed(&trunk);
-            let b = db.branch(trunk.fork_branch().unwrap().into_id()).unwrap();
-            b.connect().unwrap().execute("UPDATE t SET v = 'b' WHERE id = 7").unwrap();
-            b_id = b.into_id();
-            db.branch_compact_now().unwrap();
+    for splice in [false, true] {
+        let own = journal::format_version(splice);
+        for other in [0u32, 2, 3, 4, 5, 6, 7].into_iter().filter(|&f| f != own) {
+            let what = format!("splice {splice}, format {other}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("c.db");
+            let opts = catalog().with_branch_splice(splice);
+            let b_id;
+            {
+                let db = open_at(&path, opts).unwrap();
+                let trunk = db.connect().unwrap();
+                seed(&trunk);
+                let b = db.branch(trunk.fork_branch().unwrap().into_id()).unwrap();
+                b.connect().unwrap().execute("UPDATE t SET v = 'b' WHERE id = 7").unwrap();
+                b_id = b.into_id();
+                db.branch_compact_now().unwrap();
+            }
+            let files = journal::BranchFiles::for_db(path.to_str().unwrap());
+            std::fs::write(&files.log, b"").unwrap();
+            {
+                let db = open_at(&path, opts).expect("the store's own format opens");
+                let b = db.branch(b_id).unwrap();
+                assert_eq!(value(&b.connect().unwrap(), 7), "b", "{what}: own open");
+                let _ = b.into_id();
+            }
+            {
+                let mut cat = catalog::Catalog::open(&files.cat, false).unwrap();
+                let mut m = cat.meta().unwrap().expect("a checkpointed catalog has a meta row");
+                assert_eq!(m.format, own, "{what}: the key was not written");
+                m.format = other;
+                cat.begin().unwrap();
+                cat.put_meta(&m).unwrap();
+                cat.commit().unwrap();
+            }
+            std::fs::write(&files.log, b"").unwrap();
+            let err = match open_at(&path, opts) {
+                Ok(_) => panic!("{what}: a catalog of format {other} opened in a store of format {own}"),
+                Err(err) => err.to_string(),
+            };
+            assert!(err.contains("format version"), "{what}: refused for another reason: {err}");
         }
-        let files = journal::BranchFiles::for_db(path.to_str().unwrap());
-        std::fs::write(&files.log, b"").unwrap();
-        {
-            let db = open_at(&path, catalog()).expect("the store's own format opens");
-            let b = db.branch(b_id).unwrap();
-            assert_eq!(value(&b.connect().unwrap(), 7), "b", "format {other}: own open");
-            let _ = b.into_id();
-        }
-        {
-            let mut cat = catalog::Catalog::open(&files.cat, false).unwrap();
-            let mut m = cat.meta().unwrap().expect("a checkpointed catalog has a meta row");
-            assert_eq!(m.format, own, "the key was not written");
-            m.format = other;
-            cat.begin().unwrap();
-            cat.put_meta(&m).unwrap();
-            cat.commit().unwrap();
-        }
-        std::fs::write(&files.log, b"").unwrap();
-        let err = match open_at(&path, catalog()) {
-            Ok(_) => panic!("a catalog of format {other} opened in a store of format {own}"),
-            Err(err) => err.to_string(),
-        };
-        assert!(err.contains("format version"), "format {other}: refused for another reason: {err}");
     }
 }
 
@@ -1183,4 +1187,454 @@ fn the_fw_knobs_reproduce_the_store_before_the_fixes() {
     } else {
         assert_eq!(walked, written.len() as u64, "fw2 on: the holders written since the last checkpoint: {s1:?}");
     }
+}
+
+// ---- r11-ever: the F7 durable port on the composed base (UNBUILT; r11-ever amendment 14) ----
+
+/// `catalog()` in the F7 splice arm: the tests that assert a splice
+/// (r11-ever amendment 15).
+fn spliced() -> DatabaseOpts {
+    catalog().with_branch_splice(true)
+}
+
+fn set(conn: &Arc<Connection>, id: i64, v: &str) {
+    conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {id}")).unwrap();
+}
+
+/// U6 (r11-invariant-matrix): a splice moves a child to its spliced-out parent's key, and a catalog
+/// store must move the child's row, and its `branch_children` entry, with it. P writes a page, forks
+/// Z, Q1 and Q2, and rewrites the page, so P keeps its first version for Z's key and both Q's; Z
+/// forks C. After a checkpoint (all of them catalog rows) Z's release splices C into Z's key under
+/// P. Q1's reap, BEFORE the next checkpoint (the matrix's interleaving: the catalog still lists Z
+/// at that key, the in-memory index C), keeps P's first version: C, at Z's key, is its neighbour
+/// below. A second checkpoint writes the splice. After a reopen, C is read from the catalog under P
+/// (a row still naming the deleted Z would be "a missing parent"), Q2's reap keeps the version the
+/// same way (now from the re-keyed catalog row), and C still reads it and releases cleanly.
+#[test]
+fn a_spliced_child_is_listed_under_its_new_parent_after_a_checkpoint_and_a_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let (p_id, q_id, c_id, p7);
+    {
+        let db = open_at(&path, spliced()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let p = trunk.fork_branch().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&p.connect().unwrap(), 7, "p-first");
+        p7 = db
+            .branch_slots_in_use()
+            .into_iter()
+            .filter(|s| !s0.contains(s))
+            .collect::<Vec<u32>>();
+        assert!(!p7.is_empty(), "p's write took no slot of its own");
+        let z = p.fork().unwrap();
+        let q1 = p.fork().unwrap();
+        let q = p.fork().unwrap();
+        set(&p.connect().unwrap(), 7, "p-second"); // P retains its first version for Z, Q1 and Q
+        let c = z.fork().unwrap();
+        db.branch_compact_now().unwrap(); // P, Z, Q1, Q and C are catalog rows
+        let reaped = z.reap().unwrap(); // one live child: C takes Z's key under P
+        assert!(reaped.deferred, "{reaped:?}");
+        let reaped = q1.reap().unwrap();
+        assert!(!reaped.deferred, "{reaped:?}");
+        for slot in &p7 {
+            assert!(!db.branch_slot_is_free(*slot), "slot {slot}: C still reads it, freed by Q1's reap");
+        }
+        assert_eq!(value(&c.connect().unwrap(), 7), "p-first");
+        db.branch_compact_now().unwrap(); // Z deleted, C re-keyed
+        assert_eq!(db.branch_stats().unwrap().live_branches, 3);
+        p_id = p.into_id();
+        q_id = q.into_id();
+        c_id = c.into_id();
+    }
+    let db = open_at(&path, spliced()).unwrap();
+    let c = db.branch(c_id).expect("the spliced child names a missing parent");
+    assert_eq!(value(&c.connect().unwrap(), 7), "p-first");
+    let _ = c.into_id();
+    let reaped = db.branch(q_id).unwrap().reap().unwrap();
+    assert!(!reaped.deferred, "{reaped:?}");
+    for slot in &p7 {
+        assert!(!db.branch_slot_is_free(*slot), "slot {slot}: C still reads it, freed by Q's reap");
+    }
+    let c = db.branch(c_id).unwrap();
+    assert_eq!(value(&c.connect().unwrap(), 7), "p-first", "C lost P's first version");
+    let reaped = c.reap().unwrap();
+    assert!(!reaped.deferred, "{reaped:?}");
+    for slot in &p7 {
+        assert!(db.branch_slot_is_free(*slot), "slot {slot}: no reader is left, still held");
+    }
+    assert_eq!(db.branch_stats().unwrap().live_branches, 1, "P alone should be left");
+    let _ = db.branch(p_id).unwrap().into_id();
+}
+
+/// U7 (r11-invariant-matrix, as the refuter corrected it: the node never made resident is the
+/// zombie's CHILD): redo on demand parks a replayed Commit of a branch recovery did not read, and a
+/// splice moves that branch's maps. Z and its one child C are catalog rows; C's Commit, rewriting
+/// the page it read through Z, sits in the log's tail; a crash follows. Recovery parks the Commit
+/// (C is not read). Z's release then splices Z into C, which must make C resident, its parked Commit
+/// applied, before any map moves: C keeps its own version, and Z's version, which only C's own write
+/// shadowed, is freed.
+#[test]
+fn a_splice_after_recovery_applies_the_childs_parked_commit_first() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let (z_id, c_id, z7, image);
+    {
+        let db = open_at(&path, spliced()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let z = trunk.fork_branch().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&z.connect().unwrap(), 7, "z");
+        z7 = db
+            .branch_slots_in_use()
+            .into_iter()
+            .filter(|s| !s0.contains(s))
+            .collect::<Vec<u32>>();
+        assert!(!z7.is_empty(), "z's write took no slot of its own");
+        let c = z.fork().unwrap();
+        db.branch_compact_now().unwrap(); // Z and C are catalog rows
+        set(&c.connect().unwrap(), 7, "c"); // a Commit in the tail
+        image = crash_image(&path, dir.path());
+        z_id = z.into_id();
+        c_id = c.into_id();
+    }
+    let db = open_at(&image, spliced()).unwrap();
+    let s = db.branch_open_stats();
+    assert_eq!(s.parked_records, 1, "premise: C's Commit was not parked: {s:?}");
+    assert_eq!(s.branch_loads, 0, "premise: recovery read a branch: {s:?}");
+    let reaped = db.branch(z_id).unwrap().reap().unwrap();
+    assert!(reaped.deferred, "{reaped:?}");
+    assert_eq!(db.branch_stats().unwrap().live_branches, 1, "z was not spliced");
+    for slot in &z7 {
+        assert!(db.branch_slot_is_free(*slot), "slot {slot}: shadowed by C's own write, still held");
+    }
+    let c = db.branch(c_id).unwrap();
+    assert_eq!(value(&c.connect().unwrap(), 7), "c", "C lost its parked Commit");
+    let _ = c.into_id();
+}
+
+/// Review of c47df7e64, finding 1: a held branch's catalog row must stop saying held once its
+/// connection closes. Otherwise a checkpoint after the close leaves `released = 2` with the `Close`
+/// gone from the log, a restart holds the branch again, and replay skips the collects the live store
+/// made since: here C2's reap, which retires P a second time (freeing P's page written between
+/// C1's fork and C2's) and, in the splice arm, splices it into C1. D then reuses that slot, and at
+/// the end of that recovery the late collect would free it under D's page. P, released while its
+/// connection is open, has two children; the close retires it; checkpoint; C2's reap; D's commit;
+/// crash. The image must keep D's slot in use and read D's page. The hold and its end are in both
+/// arms, so the test runs in both (amendment 15): off, P stays, retired, beside C1 and D.
+#[test]
+fn a_closed_branch_is_not_held_again_after_a_checkpoint_and_a_crash() {
+    for (splice, live) in [(false, 3), (true, 2)] {
+        closed_branch_not_held_again(catalog().with_branch_splice(splice), live);
+    }
+}
+
+fn closed_branch_not_held_again(opts: DatabaseOpts, live: usize) {
+    let what = format!("splice={}", opts.branch_splice);
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let (image, d_id, d_slots, c1_id, in_use_live);
+    {
+        let db = open_at(&path, opts).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let p = trunk.fork_branch().unwrap();
+        let c1 = p.fork().unwrap();
+        let pc = p.connect().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&pc, 7, "p-between");
+        let x: Vec<u32> = db
+            .branch_slots_in_use()
+            .into_iter()
+            .filter(|s| !s0.contains(s))
+            .collect();
+        assert_eq!(x.len(), 1, "{what}: premise: p's write took one slot");
+        let c2 = p.fork().unwrap();
+        drop(p); // released under pc: held
+        db.branch_compact_now().unwrap(); // the row says released = 2
+        drop(pc); // Close: P retired, two children kept
+        db.branch_compact_now().unwrap(); // the row must say 1 now; the Close leaves the log
+        let reaped = c2.reap().unwrap(); // P retired again (x is freed), spliced into C1 if on
+        assert!(!reaped.deferred, "{what}: {reaped:?}");
+        assert!(db.branch_slot_is_free(x[0]), "{what}: premise: C2's reap did not free p's page");
+        let d = trunk.fork_branch().unwrap();
+        set(&d.connect().unwrap(), 150, "d");
+        d_slots = d.owned_slots();
+        assert!(d_slots.contains(&x[0]), "{what}: premise: d did not reuse the freed slot: {d_slots:?}");
+        in_use_live = db.branch_slots_in_use();
+        image = crash_image(&path, dir.path());
+        d_id = d.into_id();
+        c1_id = c1.into_id();
+    }
+    let db = open_at(&image, opts).unwrap();
+    for slot in &d_slots {
+        assert!(!db.branch_slot_is_free(*slot), "{what}: slot {slot}: d's page, freed by the recovery");
+    }
+    let mut got = db.branch_slots_in_use();
+    got.sort_unstable();
+    let mut want = in_use_live;
+    want.sort_unstable();
+    assert_eq!(got, want, "{what}: the recovery's slot set is not the crashed store's");
+    assert_eq!(db.branch_stats().unwrap().live_branches, live, "{what}: c1 and d (and P if off)");
+    let d = db.branch(d_id).unwrap();
+    assert_eq!(value(&d.connect().unwrap(), 150), "d", "{what}");
+    let _ = d.into_id();
+    let _ = db.branch(c1_id).unwrap().into_id();
+}
+
+/// Review 3 (of 9ae27b4b2..3f3036b18), finding A1: the red test above ends the hold in the live
+/// store only (`close`), so the two other places a hold ends, a replayed `Close` and the end of
+/// recovery (`close_held`), each marking the row DIRTY_ROW, had no killer. Session 1: P, with
+/// children C1 and C2, writes page x between the two forks and is released under its open
+/// connection; a checkpoint writes `released = 2`; then either the connection closes (the `Close`
+/// is in the log's tail) or not (P is still held), and the process crashes. Session 2 recovers,
+/// which ends the hold (by replaying the `Close`, or at the end of recovery), checkpoints (the row
+/// must say 1 now), reaps C2 (x is freed) and lets D reuse x; crash. Session 3's recovery must
+/// not hold P again and free x under D's page. Both arms, both ways the hold ends.
+#[test]
+fn a_held_row_is_cleared_when_a_recovery_ends_the_hold() {
+    for (splice, live) in [(false, 3), (true, 2)] {
+        for closed_before_crash in [true, false] {
+            held_row_cleared_by_recovery(catalog().with_branch_splice(splice), live, closed_before_crash);
+        }
+    }
+}
+
+fn held_row_cleared_by_recovery(opts: DatabaseOpts, live: usize, closed_before_crash: bool) {
+    let what = format!("splice={} closed_before_crash={closed_before_crash}", opts.branch_splice);
+    let dir = tempfile::TempDir::new().unwrap();
+    let (one, two) = (dir.path().join("one"), dir.path().join("two"));
+    std::fs::create_dir(&one).unwrap();
+    std::fs::create_dir(&two).unwrap();
+    let path = dir.path().join("c.db");
+    let (image1, x, c1_id, c2_id);
+    {
+        let db = open_at(&path, opts).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let p = trunk.fork_branch().unwrap();
+        let c1 = p.fork().unwrap();
+        let pc = p.connect().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&pc, 7, "p-between");
+        let fresh: Vec<u32> = db.branch_slots_in_use().into_iter().filter(|s| !s0.contains(s)).collect();
+        assert_eq!(fresh.len(), 1, "{what}: premise: p's write took one slot");
+        x = fresh[0];
+        let c2 = p.fork().unwrap();
+        drop(p); // released under pc: held
+        db.branch_compact_now().unwrap(); // the row says released = 2
+        if closed_before_crash {
+            drop(pc); // the Close is in the log's tail
+        }
+        image1 = crash_image(&path, &one);
+        c1_id = c1.into_id();
+        c2_id = c2.into_id();
+    }
+    let (image2, d_id, d_slots, in_use_live);
+    {
+        let db = open_at(&image1, opts).unwrap(); // the recovery ends P's hold
+        db.branch_compact_now().unwrap(); // the row must say 1 now
+        let reaped = db.branch(c2_id).unwrap().reap().unwrap(); // P retired again: x is freed
+        assert!(!reaped.deferred, "{what}: {reaped:?}");
+        assert!(db.branch_slot_is_free(x), "{what}: premise: C2's reap did not free p's page");
+        let trunk = db.connect().unwrap();
+        let d = trunk.fork_branch().unwrap();
+        set(&d.connect().unwrap(), 150, "d");
+        d_slots = d.owned_slots();
+        assert!(d_slots.contains(&x), "{what}: premise: d did not reuse the freed slot: {d_slots:?}");
+        in_use_live = db.branch_slots_in_use();
+        image2 = crash_image(&image1, &two);
+        d_id = d.into_id();
+    }
+    let db = open_at(&image2, opts).unwrap();
+    for slot in &d_slots {
+        assert!(!db.branch_slot_is_free(*slot), "{what}: slot {slot}: d's page, freed by the recovery");
+    }
+    let mut got = db.branch_slots_in_use();
+    got.sort_unstable();
+    let mut want = in_use_live;
+    want.sort_unstable();
+    assert_eq!(got, want, "{what}: the recovery's slot set is not the crashed store's");
+    assert_eq!(db.branch_stats().unwrap().live_branches, live, "{what}: c1 and d (and P if off)");
+    let d = db.branch(d_id).unwrap();
+    assert_eq!(value(&d.connect().unwrap(), 150), "d", "{what}");
+    let _ = d.into_id();
+    let _ = db.branch(c1_id).unwrap().into_id();
+}
+
+/// Review 3, finding A2: in the U6 test above Q1's reap cannot tell whether the lookup found C at
+/// Z's key, because Q, forked later, keeps P's first version either way. Here Q1 is P's NEWEST
+/// child and C, at Z's key, the only other child P forked inside that version's life, so the
+/// version survives Q1's reap only if the lookup finds C (the in-memory index says C; the catalog,
+/// until the next checkpoint, still says Z). Then a checkpoint and a reopen, and C still reads it;
+/// C's reap frees it.
+#[test]
+fn a_spliced_childs_key_keeps_its_parents_version_when_the_newest_sibling_goes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let (p_id, c_id, p7);
+    {
+        let db = open_at(&path, spliced()).unwrap();
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let p = trunk.fork_branch().unwrap();
+        let s0: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        set(&p.connect().unwrap(), 7, "p-first");
+        p7 = db
+            .branch_slots_in_use()
+            .into_iter()
+            .filter(|s| !s0.contains(s))
+            .collect::<Vec<u32>>();
+        assert!(!p7.is_empty(), "p's write took no slot of its own");
+        let z = p.fork().unwrap();
+        let q1 = p.fork().unwrap(); // the newest child
+        set(&p.connect().unwrap(), 7, "p-second"); // P retains its first version for Z and Q1
+        let c = z.fork().unwrap();
+        db.branch_compact_now().unwrap(); // P, Z, Q1 and C are catalog rows
+        let reaped = z.reap().unwrap(); // one live child: C takes Z's key under P
+        assert!(reaped.deferred, "{reaped:?}");
+        let reaped = q1.reap().unwrap(); // lo = C at Z's key, hi = none
+        assert!(!reaped.deferred, "{reaped:?}");
+        for slot in &p7 {
+            assert!(!db.branch_slot_is_free(*slot), "slot {slot}: C still reads it, freed by Q1's reap");
+        }
+        assert_eq!(value(&c.connect().unwrap(), 7), "p-first");
+        db.branch_compact_now().unwrap();
+        p_id = p.into_id();
+        c_id = c.into_id();
+    }
+    let db = open_at(&path, spliced()).unwrap();
+    let c = db.branch(c_id).expect("the spliced child names a missing parent");
+    assert_eq!(value(&c.connect().unwrap(), 7), "p-first", "C lost P's first version");
+    let reaped = c.reap().unwrap();
+    assert!(!reaped.deferred, "{reaped:?}");
+    for slot in &p7 {
+        assert!(db.branch_slot_is_free(*slot), "slot {slot}: no reader is left, still held");
+    }
+    assert_eq!(db.branch_stats().unwrap().live_branches, 1, "P alone should be left");
+    let _ = db.branch(p_id).unwrap().into_id();
+}
+
+/// Amendment 17 (the lead's decision on the catalog format key): a catalog store refuses the other
+/// splice arm, and a catalog written before the F7 port, from its meta row alone, which carries the
+/// format version in the page-size key's high bits. Here the log is cut to nothing after a
+/// checkpoint, a torn header with no version to check (a crash while the log was being reset leaves
+/// one), so only the catalog can refuse. The store's own arm then opens it and reads its branch;
+/// last, the meta's key is set to 0, as the base wrote it, and even the own arm is refused. The open
+/// reads the same nine meta rows as before: the key rides in a value, not a row.
+#[test]
+fn a_catalog_with_a_torn_log_header_opens_only_in_its_own_arm() {
+    for splice in [false, true] {
+        let what = format!("splice={splice}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.db");
+        let own = catalog().with_branch_splice(splice);
+        let b_id;
+        {
+            let db = open_at(&path, own).unwrap();
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            set(&b.connect().unwrap(), 7, "b");
+            b_id = b.into_id();
+            db.branch_compact_now().unwrap();
+        }
+        let files = journal::BranchFiles::for_db(path.to_str().unwrap());
+        std::fs::write(&files.log, b"").unwrap();
+        let err = match open_at(&path, own.with_branch_splice(!splice)) {
+            Ok(_) => panic!("{what}: the other arm opened a catalog whose log header is torn"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("splice"), "{what}: refused for another reason: {err}");
+        {
+            let db = open_at(&path, own).expect("its own arm opens it");
+            let b = db.branch(b_id).unwrap();
+            assert_eq!(value(&b.connect().unwrap(), 7), "b", "{what}");
+            let _ = b.into_id();
+        }
+        {
+            let mut cat = catalog::Catalog::open(&files.cat, false).unwrap();
+            let mut m = cat.meta().unwrap().expect("a checkpointed catalog has a meta row");
+            assert_eq!(m.format, journal::format_version(splice), "{what}: the key was not written");
+            m.format = 0;
+            cat.begin().unwrap();
+            cat.put_meta(&m).unwrap();
+            cat.commit().unwrap();
+        }
+        std::fs::write(&files.log, b"").unwrap();
+        assert!(open_at(&path, own).is_err(), "{what}: a catalog written before the port opened");
+    }
+}
+
+/// Amendment 35's census, made to fire before it is trusted: on a grown catalog every table tree's
+/// leaf cells are its rows, and every index tree's are its table's rows, so no leaf cell is missed
+/// or counted twice; the census walks the same pages as the shape (the ledger still closes).
+#[test]
+fn the_catalog_census_counts_every_row_once() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    seed(&db.connect().unwrap());
+    let _ids = grow(&db, 300);
+    db.branch_compact_now().unwrap();
+    let s = db.branch_catalog_shape().unwrap().expect("a catalog store has a shape");
+    assert_eq!(s.unaccounted, 0, "the ledger does not close: {s:?}");
+    let rows = |t: &str| s.rows.iter().find(|(n, _)| n == t).map(|(_, n)| *n).unwrap();
+    let cells = |t: &str| s.census.iter().find(|(n, _)| n == t).map(|(_, c)| c.cells).unwrap();
+    for (tree, table) in [
+        ("meta", "meta"),
+        ("branch", "branch"),
+        ("branch_children", "branch"),
+        ("branch_lease", "branch"),
+        ("branch_released", "branch"),
+        ("cur", "cur"),
+        ("ret", "ret"),
+        ("ret_page", "ret"),
+        ("ret_born", "ret"),
+        ("ret_died", "ret"),
+        ("free", "free"),
+    ] {
+        assert_eq!(cells(tree), rows(table), "{tree}'s leaf cells against {table}'s rows: {s:?}");
+    }
+    assert_eq!(rows("branch"), 300, "premise: {s:?}");
+    for (name, c) in &s.census {
+        assert_eq!(c.overflow_cells, 0, "{name} spilled a cell: {c:?}");
+        let levels = &s.trees.iter().find(|(n, _)| n == name).unwrap().1;
+        assert_eq!(c.leaf_pages, *levels.last().unwrap(), "{name}'s leaves against its last level: {s:?}");
+        assert!(c.used_bytes <= c.leaf_pages * s.page_size, "{name} uses more than its pages hold: {c:?}");
+    }
+}
+
+/// Amendment 19's instrument, made to fire before it is trusted: the catalog shape's ledger closes
+/// (every page is a tree page or a free-list page) on a grown catalog, its row counts are the
+/// store's, and a mass reap moves pages onto the free list without shrinking the file (no
+/// auto_vacuum), so a freelist count of zero in the run is a reading, not a blind spot.
+#[test]
+fn the_catalog_shape_closes_its_ledger_and_sees_freed_pages() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    let db = open_at(&path, catalog()).unwrap();
+    seed(&db.connect().unwrap());
+    let ids = grow(&db, 300);
+    db.branch_compact_now().unwrap();
+    let grown = db.branch_catalog_shape().unwrap().expect("a catalog store has a shape");
+    assert_eq!(grown.unaccounted, 0, "the ledger does not close: {grown:?}");
+    let rows = |s: &CatalogShape, t: &str| s.rows.iter().find(|(n, _)| n == t).map(|(_, n)| *n);
+    assert_eq!(rows(&grown, "branch"), Some(300), "{grown:?}");
+    assert_eq!(rows(&grown, "meta"), Some(9), "{grown:?}");
+    assert!(rows(&grown, "cur").unwrap() >= 300, "each branch wrote a page: {grown:?}");
+    let cur = grown.trees.iter().find(|(n, _)| n == "cur").expect("the cur table's tree");
+    assert_eq!(cur.1[0], 1, "a tree has one root: {grown:?}");
+    assert!(cur.1.len() >= 2, "premise: the cur table outgrew one page: {grown:?}");
+    for id in ids {
+        db.branch(id).unwrap().reap().unwrap();
+    }
+    db.branch_compact_now().unwrap();
+    let reaped = db.branch_catalog_shape().unwrap().unwrap();
+    assert_eq!(reaped.unaccounted, 0, "the ledger does not close: {reaped:?}");
+    assert_eq!(rows(&reaped, "branch"), Some(0), "{reaped:?}");
+    assert!(reaped.freelist_count > 0, "a mass delete freed no page: {reaped:?}");
+    assert_eq!(reaped.page_count, grown.page_count, "the file shrank without a vacuum: {reaped:?}");
 }
