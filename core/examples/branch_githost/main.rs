@@ -2425,8 +2425,33 @@ fn stack(args: &Args) {
     );
     write_sidecar(&args.db, &sc);
     println!("{}", state_line(&model));
+    victims_line(s0, made, n, label);
     drop(trunk);
     drop(db);
+}
+
+/// A3.L1's attribution, from I12's victim log (`R13_VICTIM_LOG`, one line per evicting checkpoint:
+/// the checkpoint count, then the victims' ids): how many victims this run evicted, and how many of
+/// them were S1's (ids in (s0, s0 + made]). The census keeps this line, not the log (third review:
+/// the logs are megabytes per arm).
+fn victims_line(s0: u64, made: u64, n: u64, label: &str) {
+    let Ok(path) = std::env::var("R13_VICTIM_LOG") else {
+        println!("VICTIMS\tn={n}\tlabel={label}\tlog=unset");
+        return;
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let (mut lines, mut all, mut stack) = (0u64, 0u64, 0u64);
+    for line in text.lines() {
+        lines += 1;
+        // "<checkpoint> <id>,<id>,..." (store.rs's victim_log).
+        for id in line.split_whitespace().skip(1).flat_map(|x| x.split(',')).filter_map(|x| x.parse::<u64>().ok()) {
+            all += 1;
+            if id > s0 && id <= s0 + made {
+                stack += 1;
+            }
+        }
+    }
+    println!("VICTIMS\tn={n}\tlabel={label}\tevicting_checkpoints={lines}\tvictims={all}\tstack_victims={stack}");
 }
 
 // ---------------------------------------------------------------------------------------------
