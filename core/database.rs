@@ -2886,7 +2886,14 @@ impl Database {
             executing_triggers: RwLock::new(Vec::new()),
             encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
-            sync_mode: AtomicSyncMode::new(SyncMode::Full),
+            // D0 (`SyncClass::Off`) opens every connection `synchronous = OFF`; any other class, or
+            // a database without durable branches, the default FULL.
+            sync_mode: AtomicSyncMode::new(
+                self.opts
+                    .branch_durability
+                    .sync_class()
+                    .map_or(SyncMode::Full, |class| class.sync_mode()),
+            ),
             temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
@@ -3494,6 +3501,11 @@ impl Database {
             self.init_page_1.clone(),
         )?;
         pager.set_branch_store(self.branches.clone());
+        // The durability class governs the trunk as well as the branch store (see
+        // `branch::SyncClass`): every pager of this database syncs its WAL and database file in it.
+        if let Some(class) = self.opts.branch_durability.sync_class() {
+            pager.set_sync_type(class.file_sync_type());
+        }
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);

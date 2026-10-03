@@ -3088,10 +3088,13 @@ impl BranchStore {
 
     /// Make every buffered trunk pre-image durable. `Pager::commit_wal` calls this before it writes
     /// a single frame, so a trunk commit is never durable ahead of the pre-images it overwrote.
+    /// `trunk` is the class the commit will sync its WAL in: when it is stronger than the store's,
+    /// the pre-images are flushed in it, so the commit is never MORE durable than they are (a D1
+    /// store under a `PRAGMA fullfsync` trunk connection; see [`SyncClass`]).
     ///
     /// While a lease is outstanding it also stamps the lease clock, at most once per
     /// `STAMP_EVERY_MS` (review N2), and flushes a stamp still only queued.
-    pub(crate) fn durability_barrier(&self) -> Result<()> {
+    pub(crate) fn durability_barrier(&self, trunk: SyncClass) -> Result<()> {
         if !self.unsynced.load(Ordering::Acquire)
             && !self.leases_outstanding.load(Ordering::Acquire)
         {
@@ -3159,7 +3162,8 @@ impl BranchStore {
                 lease.queued(now);
             }
         }
-        journal.flush(arena)?;
+        let class = journal.sync_class().max(trunk);
+        journal.flush_as(arena, class)?;
         lease.flushed();
         self.unsynced.store(false, Ordering::Release);
         self.maybe_compact(&mut inner);
@@ -6144,7 +6148,7 @@ mod sota_index_tests {
                         current.insert(page, generation);
                     }
                     // The trunk commit: its barrier makes the buffered pre-image records durable.
-                    store.durability_barrier().unwrap();
+                    store.durability_barrier(SyncClass::Off).unwrap();
                 }
                 _ if !live.is_empty() => {
                     let at = match rng.below(3) {
@@ -6354,7 +6358,7 @@ mod sota_tree_tests {
                     if store.trunk_has_children() {
                         store.first_write_trunk(page, &image(trunk[&page])).unwrap();
                     }
-                    store.durability_barrier().unwrap();
+                    store.durability_barrier(SyncClass::Off).unwrap();
                     generation += 1;
                     trunk.insert(page, generation);
                 }
@@ -6532,7 +6536,7 @@ mod sota_tree_tests {
                         store.first_write_trunk(page, &image(trunk[&page])).unwrap();
                     }
                     arm(&store, BranchFailpoint::BarrierBeforeRecords);
-                    match store.durability_barrier() {
+                    match store.durability_barrier(SyncClass::Off) {
                         Ok(()) => {
                             generation += 1;
                             trunk.insert(page, generation);

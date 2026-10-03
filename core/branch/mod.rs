@@ -269,8 +269,8 @@ impl BranchDurability {
 /// with no error. So the class is set once, here, and the database applies it to every trunk
 /// connection it opens (see `Database::_init`); a trunk connection that later asks for a stronger
 /// flush (`PRAGMA fullfsync`) has the branch store's barrier raised to match
-/// (`BranchStore::durability_barrier`), never the other way round.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (`BranchStore::durability_barrier`), never the other way round. Ordered weakest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SyncClass {
     /// D0: nothing is synced, on the branch store or the trunk (`synchronous = OFF`). A
     /// measurement arm with no durability guarantee: an acknowledged operation can be lost by any
@@ -295,6 +295,24 @@ impl SyncClass {
         match self {
             SyncClass::FullFsync => crate::io::FileSyncType::FullFsync,
             SyncClass::Off | SyncClass::Fsync => crate::io::FileSyncType::Fsync,
+        }
+    }
+
+    /// The trunk's sync mode in this class: `Off` opens trunk connections `synchronous = OFF`.
+    pub(crate) fn sync_mode(self) -> crate::SyncMode {
+        match self {
+            SyncClass::Off => crate::SyncMode::Off,
+            SyncClass::Fsync | SyncClass::FullFsync => crate::SyncMode::Full,
+        }
+    }
+
+    /// The class a trunk commit actually syncs its WAL in, from its connection's settings: a commit
+    /// syncs only under `synchronous = FULL` (`Pager::commit_wal_inner`'s `WaitSync`).
+    pub(crate) fn of_trunk(mode: crate::SyncMode, sync_type: crate::io::FileSyncType) -> Self {
+        match (mode, sync_type) {
+            (crate::SyncMode::Full, crate::io::FileSyncType::FullFsync) => SyncClass::FullFsync,
+            (crate::SyncMode::Full, crate::io::FileSyncType::Fsync) => SyncClass::Fsync,
+            (crate::SyncMode::Off | crate::SyncMode::Normal, _) => SyncClass::Off,
         }
     }
 }

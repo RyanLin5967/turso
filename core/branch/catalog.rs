@@ -495,6 +495,10 @@ impl Catalog {
         } else {
             "PRAGMA synchronous = OFF"
         })?;
+        // D2: the catalog's commits are F_FULLFSYNC, as the log's and the arena's are.
+        if sync == SyncClass::FullFsync {
+            conn.execute("PRAGMA fullfsync = ON")?;
+        }
         conn.execute(format!("PRAGMA cache_size = {}", cat_cache_pages()))?;
         let p = |sql: &str| -> Result<Stmt> { Ok(Stmt { stmt: conn.prepare(sql)? }) };
         Ok(Catalog {

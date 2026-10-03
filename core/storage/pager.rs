@@ -4491,7 +4491,10 @@ impl Pager {
         // durable before the commit that overwrites its page can be, or a crash after this commit
         // leaves the branch reading the NEW page. Idempotent across IO re-entry.
         if let Some(store) = self.branch_store.get() {
-            store.durability_barrier()?;
+            store.durability_barrier(crate::branch::SyncClass::of_trunk(
+                sync_mode,
+                self.get_sync_type(),
+            ))?;
         }
 
         let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);

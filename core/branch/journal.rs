@@ -1023,6 +1023,12 @@ impl Journal {
 
     /// Make every buffered record durable: arena first, then the records, then the log.
     pub(crate) fn flush(&mut self, arena: &mut Arena) -> Result<()> {
+        self.flush_as(arena, self.sync)
+    }
+
+    /// `flush`, syncing in `class` instead of this journal's own: a trunk commit's pre-image barrier
+    /// raises it to the class its WAL is synced in, when that is stronger (see [`SyncClass`]).
+    pub(crate) fn flush_as(&mut self, arena: &mut Arena, class: SyncClass) -> Result<()> {
         // Taken first, so the failpoint is spent by exactly this call whatever it returns — it
         // cannot outlive the barrier that armed it (review 5 T-1).
         let fail_next_write = std::mem::take(&mut self.fail_next_write);
@@ -1035,7 +1041,7 @@ impl Journal {
                 "failpoint: a branch log write failed".to_string(),
             ))
         } else {
-            self.write_pending(arena)
+            self.write_pending(arena, class)
         };
         match written {
             Ok(()) => {
@@ -1051,7 +1057,7 @@ impl Journal {
         }
     }
 
-    fn write_pending(&self, arena: &mut Arena) -> Result<()> {
+    fn write_pending(&self, arena: &mut Arena, class: SyncClass) -> Result<()> {
         // Append only where this journal believes the log ends. A log that is longer than that was
         // written by someone else: writing at the stale offset would cut their records off at the
         // next recovery, so refuse — reading the file's state, not trusting the in-memory length
@@ -1067,14 +1073,19 @@ impl Journal {
                 "the branch log changed under this journal; another store instance wrote it",
             ));
         }
-        if self.sync.syncs() {
-            arena.sync(self.sync)?;
+        if class.syncs() {
+            arena.sync(class)?;
         }
         write_at(&self.file, &self.pending, self.len)?;
-        if self.sync.syncs() {
-            fsync_file(&self.file, self.sync)?;
+        if class.syncs() {
+            fsync_file(&self.file, class)?;
         }
         Ok(())
+    }
+
+    /// The class this journal syncs in.
+    pub(crate) fn sync_class(&self) -> SyncClass {
+        self.sync
     }
 
     pub(crate) fn wants_compaction(&self) -> bool {
@@ -1407,8 +1418,9 @@ pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
     }
 }
 
-/// Sync `file` in `class` (see [`SyncClass`]): `fsync(2)`, as Turso's own `FileSyncType::Fsync`.
-/// `Off` syncs nothing; callers test `syncs()` first and never reach here with it.
+/// Sync `file` in `class` (see [`SyncClass`]): `Fsync` is `fsync(2)`, as Turso's own
+/// `FileSyncType::Fsync`; `FullFsync` is `fcntl(F_FULLFSYNC)` on Apple platforms, as Turso's
+/// `FileSyncType::FullFsync` (`io/unix.rs`), and `fsync(2)` elsewhere. `Off` syncs nothing.
 pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
     if !class.syncs() {
         return Ok(());
@@ -1416,6 +1428,15 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
+        #[cfg(target_vendor = "apple")]
+        if class == SyncClass::FullFsync {
+            // SAFETY: as below.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+                return Err(io_error(std::io::Error::last_os_error(), "F_FULLFSYNC branch file"));
+            }
+            crate::io::count_sync(true);
+            return Ok(());
+        }
         // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));
