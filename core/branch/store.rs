@@ -274,6 +274,113 @@ pub(crate) struct BranchStore {
     /// `resolve_into` calls and the arena slot reads they made (r11-restart lane instrument).
     resolve_calls: AtomicU64,
     arena_reads: AtomicU64,
+    /// Per-fork lock holds (fastest-engine M1 item 5; observing only).
+    holds: ForkHoldCounters,
+}
+
+/// One histogram of [`super::HoldStats`], kept in atomics so a fork records into it after it has
+/// released every lock (fastest-engine M1 item 5; observing only).
+struct HoldHist {
+    count: AtomicU64,
+    sum_ns: AtomicU64,
+    max_ns: AtomicU64,
+    buckets: Box<[AtomicU64]>,
+}
+
+impl HoldHist {
+    fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            sum_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            buckets: (0..super::HOLD_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn record(&self, ns: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        self.buckets[super::hold_bucket(ns)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A snapshot. Each field is read on its own, so one taken while forks record can be off by the
+    /// forks in flight; read it with the store quiet for an exact one.
+    fn stats(&self) -> super::HoldStats {
+        super::HoldStats {
+            count: self.count.load(Ordering::Relaxed),
+            sum_ns: self.sum_ns.load(Ordering::Relaxed),
+            max_ns: self.max_ns.load(Ordering::Relaxed),
+            buckets: self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).collect(),
+        }
+    }
+}
+
+/// The per-fork hold histograms (see [`super::ForkHolds`]).
+struct ForkHoldCounters {
+    store: HoldHist,
+    wal: HoldHist,
+    locked_trunk_forks: AtomicU64,
+}
+
+impl ForkHoldCounters {
+    fn new() -> Self {
+        Self {
+            store: HoldHist::new(),
+            wal: HoldHist::new(),
+            locked_trunk_forks: AtomicU64::new(0),
+        }
+    }
+}
+
+/// A trunk fork's hold of the trunk's WAL write lock, for [`BranchStore::record_fork`]: `ns` 0 and
+/// `locked` false for a fork that never took it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WalHold {
+    pub(crate) ns: u64,
+    pub(crate) locked: bool,
+}
+
+thread_local! {
+    /// Nanoseconds this thread has held the store mutex through [`BranchStore::lock_counted`] since
+    /// the last [`take_counted_hold`] (fastest-engine M1 item 5; observing only). A fork resets it
+    /// when it begins and takes it when it ends, so it holds exactly that fork's holds: forks do
+    /// not nest, and a thread runs one at a time.
+    static COUNTED_HOLD_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The nanoseconds this thread held the store mutex through `lock_counted` since the last call, and
+/// start counting again from zero.
+pub(crate) fn take_counted_hold() -> u64 {
+    COUNTED_HOLD_NS.with(|c| c.replace(0))
+}
+
+/// The store mutex's guard on a fork path: the hold, from the moment the lock is granted to the
+/// moment the guard is dropped, is added to this thread's counted total. The clock is read once
+/// inside the critical section (at the drop), so a counted hold includes one clock read.
+struct Counted<G: std::ops::DerefMut<Target = StoreInner>> {
+    guard: G,
+    since: Instant,
+}
+
+impl<G: std::ops::DerefMut<Target = StoreInner>> std::ops::Deref for Counted<G> {
+    type Target = StoreInner;
+    fn deref(&self) -> &StoreInner {
+        &self.guard
+    }
+}
+
+impl<G: std::ops::DerefMut<Target = StoreInner>> std::ops::DerefMut for Counted<G> {
+    fn deref_mut(&mut self) -> &mut StoreInner {
+        &mut self.guard
+    }
+}
+
+impl<G: std::ops::DerefMut<Target = StoreInner>> Drop for Counted<G> {
+    fn drop(&mut self) {
+        let ns = u64::try_from(self.since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        COUNTED_HOLD_NS.with(|c| c.set(c.get().saturating_add(ns)));
+    }
 }
 
 struct StoreInner {
@@ -1688,6 +1795,7 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+            holds: ForkHoldCounters::new(),
         }
     }
 
@@ -1876,6 +1984,7 @@ impl BranchStore {
             open_stats: BranchOpenStats::default(),
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
+            holds: ForkHoldCounters::new(),
         };
         // A branch whose lease ran out before the last close — or before the last flush that
         // carried a stamp, if the process crashed — goes now, with nobody having to ask: this is
@@ -2649,7 +2758,7 @@ impl BranchStore {
     pub(crate) fn fork_trunk(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_counted();
         inner.ensure_backing(page_size)?;
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
         let id = BranchId(inner.next_id);
@@ -2673,7 +2782,7 @@ impl BranchStore {
     pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<BranchId> {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_counted();
         // Reap what has expired first, so a parent whose lease ran out is refused rather than
         // revived by a child that would pin it (Neon refuses to "create children from expiring
         // branches").
@@ -3506,7 +3615,31 @@ impl BranchStore {
 
     /// Per-fork lock holds since open (fastest-engine M1 item 5).
     pub(crate) fn fork_holds(&self) -> super::ForkHolds {
-        super::ForkHolds::default()
+        super::ForkHolds {
+            store: self.holds.store.stats(),
+            wal: self.holds.wal.stats(),
+            locked_trunk_forks: self.holds.locked_trunk_forks.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Record one fork's holds: `store_ns` from [`take_counted_hold`], and a trunk fork's WAL hold.
+    pub(crate) fn record_fork(&self, store_ns: u64, wal: Option<WalHold>) {
+        self.holds.store.record(store_ns);
+        if let Some(wal) = wal {
+            self.holds.wal.record(wal.ns);
+            if wal.locked {
+                self.holds.locked_trunk_forks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Lock the store mutex on a fork path, timing the hold (see [`Counted`]).
+    fn lock_counted(&self) -> Counted<impl std::ops::DerefMut<Target = StoreInner> + '_> {
+        let guard = self.inner.lock();
+        Counted {
+            guard,
+            since: Instant::now(),
+        }
     }
 
     pub(crate) fn stats(&self) -> Result<BranchStats> {

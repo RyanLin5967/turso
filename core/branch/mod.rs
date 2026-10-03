@@ -348,15 +348,26 @@ pub struct HoldStats {
 /// 2^64.
 pub(crate) const HOLD_BUCKETS: usize = 16 + 60 * 16;
 
-/// The bucket holding `ns`.
+/// The bucket holding `ns`: `ns` itself below 16; above, 16 buckets per power of two, indexed by
+/// the four bits after the leading one (HdrHistogram's log-linear layout, Tene).
 pub(crate) fn hold_bucket(ns: u64) -> usize {
-    let _ = ns;
-    0
+    if ns < 16 {
+        return ns as usize;
+    }
+    let e = 63 - ns.leading_zeros() as usize;
+    let m = ((ns >> (e - 4)) & 15) as usize;
+    16 + (e - 4) * 16 + m
 }
 
 /// The largest value bucket `b` holds.
 pub(crate) fn hold_bucket_upper(b: usize) -> u64 {
-    b as u64
+    if b < 16 {
+        return b as u64;
+    }
+    let e = (b - 16) / 16 + 4;
+    let m = ((b - 16) % 16) as u128;
+    let next = (16 + m + 1) << (e - 4);
+    u64::try_from(next - 1).unwrap_or(u64::MAX)
 }
 
 impl HoldStats {
@@ -784,7 +795,12 @@ impl Branch {
     /// No admissibility check here: this branch passed [`check_forkable`] when its root was forked
     /// from the trunk, and journal-mode changes are refused while any branch exists.
     pub fn fork(&self) -> Result<Branch> {
-        let id = self.db.branches.fork_branch(self.id)?;
+        let store = &self.db.branches;
+        store::take_counted_hold();
+        let forked = store.fork_branch(self.id);
+        let held = store::take_counted_hold();
+        let id = forked?;
+        store.record_fork(held, None);
         Ok(Branch::new(self.db.clone(), id))
     }
 
@@ -877,10 +893,16 @@ impl Connection {
         }
         let pager = self.pager.load().clone();
         check_forkable(&self.db, &pager)?;
-        let id = match pager.branch_id() {
-            Some(parent) => self.db.branches.fork_branch(parent)?,
-            None => self.fork_trunk(&pager)?,
+        let store = &self.db.branches;
+        // fastest-engine item 5: this fork's store-mutex holds, counted from here.
+        store::take_counted_hold();
+        let forked = match pager.branch_id() {
+            Some(parent) => store.fork_branch(parent).map(|id| (id, None)),
+            None => self.fork_trunk(&pager).map(|(id, wal)| (id, Some(wal))),
         };
+        let held = store::take_counted_hold();
+        let (id, wal) = forked?;
+        store.record_fork(held, wal);
         Ok(Branch::new(self.db.clone(), id))
     }
 
@@ -888,7 +910,7 @@ impl Connection {
     /// in flight across the fork took its copy decisions for the previous epoch, so the pages it
     /// commits afterwards would be visible to the new branch. Holding the writer lock means there
     /// is no such transaction, and the read snapshot it forces is the latest commit.
-    fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<BranchId> {
+    fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<(BranchId, store::WalHold)> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
         loop {
@@ -908,10 +930,16 @@ impl Connection {
                     return Err(err);
                 }
             }
+            // fastest-engine item 5: the WAL write lock is held from here to `end_write_tx`.
+            let locked = std::time::Instant::now();
             let forked = self.fork_trunk_locked(pager);
             pager.end_write_tx();
+            let wal = store::WalHold {
+                ns: u64::try_from(locked.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                locked: true,
+            };
             pager.end_read_tx();
-            return forked;
+            return forked.map(|id| (id, wal));
         }
     }
 
