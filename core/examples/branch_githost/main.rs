@@ -1520,7 +1520,8 @@ fn step(
 }
 
 /// Invariants the catalog store can check alone: live states == the model's live count, and the arena
-/// holds at least two own pages per live branch plus the trunk's versions. The EXACT slot check is across
+/// holds at least two own pages per live schedule branch, one per live stack level, plus the trunk's
+/// versions. The EXACT slot check is across
 /// arms: at the same step count the port's grow/probe files print its exact arena and trunk counts, and the
 /// two stores make the same retain and free decisions (analysis compares them). The trunk count QUERIES
 /// the catalog (`branch_trunk_retained`: overlay + catalog rows - reaped since), so this runs only
@@ -1537,10 +1538,16 @@ fn check_invariants(db: &Arc<Database>, model: &Model, what: &str) {
             model.extra.len()
         ));
     }
-    if (st.arena_slots_in_use as u64) < 2 * live + trunk_versions {
+    // A stack level owns only the pages its k = 2 rows wrote, and one leaf can hold both, so its floor
+    // is one own page (amendment 8.16: at 1e6 the old floor of two per level fired at stack end while
+    // the arena held every page; 148 of census k0's 190 ancestor levels own one).
+    let floor = 2 * model.live + model.extra.len() as u64 + trunk_versions;
+    if (st.arena_slots_in_use as u64) < floor {
         not_a_result(&format!(
-            "{what}: arena in use {} < 2 x live {live} + trunk versions {trunk_versions}",
-            st.arena_slots_in_use
+            "{what}: arena in use {} < 2 x schedule live {} + stack levels {} + trunk versions {trunk_versions}",
+            st.arena_slots_in_use,
+            model.live,
+            model.extra.len()
         ));
     }
     println!(
