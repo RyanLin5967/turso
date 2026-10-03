@@ -477,11 +477,20 @@ impl File for UnixFile {
         } else {
             #[cfg(target_vendor = "apple")]
             match sync_type {
-                FileSyncType::FullFsync => trace!("fcntl(F_FULLFSYNC)"),
-                FileSyncType::Fsync => trace!("fsync"),
+                FileSyncType::FullFsync => {
+                    trace!("fcntl(F_FULLFSYNC)");
+                    super::count_sync(true);
+                }
+                FileSyncType::Fsync => {
+                    trace!("fsync");
+                    super::count_sync(false);
+                }
             }
             #[cfg(not(target_vendor = "apple"))]
-            trace!("fsync");
+            {
+                trace!("fsync");
+                super::count_sync(false);
+            }
 
             c.complete(0);
             Ok(c)

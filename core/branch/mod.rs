@@ -241,14 +241,83 @@ pub enum BranchDurability {
     #[default]
     Volatile,
     /// Arena pages, page maps, lineage and releases are written to files next to the database and
-    /// recovered at open. `sync: false` writes the files without fsync: a measurement arm, not a
-    /// durability guarantee.
-    Durable { sync: bool },
+    /// recovered at open. `sync` is the flush every acknowledged branch operation waits for, and
+    /// the trunk's (see [`SyncClass`]).
+    Durable { sync: SyncClass },
     /// Durable, with the published fixes for an open that grows with the number of branches
     /// (r11-restart lane prototype; see `catalog.rs`): the same operation log, checkpointed
     /// incrementally into a B-tree catalog `<db>-branch-cat` instead of a whole-state snapshot, and
     /// read back on demand. `sync` as for `Durable`.
-    Catalog { sync: bool },
+    Catalog { sync: SyncClass },
+}
+
+impl BranchDurability {
+    /// The flush class of a durable store; `None` for a volatile one.
+    pub fn sync_class(&self) -> Option<SyncClass> {
+        match *self {
+            BranchDurability::Volatile => None,
+            BranchDurability::Durable { sync } | BranchDurability::Catalog { sync } => Some(sync),
+        }
+    }
+}
+
+/// How a durable write reaches the disk (fastest-engine PREREG §4's modes). ONE class governs the
+/// branch store's files AND the trunk's WAL and database file, because the two are ordered: a
+/// trunk commit that overwrites a page a branch reads must never be more durable than the
+/// pre-image kept for that branch. With the branch store weaker than the trunk, a power cut could
+/// keep the trunk's new page and lose the pre-image, and the branch would then read the new page
+/// with no error. So the class is set once, here, and the database applies it to every trunk
+/// connection it opens (see `Database::_init`); a trunk connection that later asks for a stronger
+/// flush (`PRAGMA fullfsync`) has the branch store's barrier raised to match
+/// (`BranchStore::durability_barrier`), never the other way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncClass {
+    /// D0: nothing is synced, on the branch store or the trunk (`synchronous = OFF`). A
+    /// measurement arm with no durability guarantee: an acknowledged operation can be lost by any
+    /// crash that loses the OS page cache.
+    Off,
+    /// D1: `fsync(2)`. On Linux that reaches stable storage; on Apple platforms it hands the data
+    /// to the drive, whose volatile cache may still lose it on power loss.
+    Fsync,
+    /// D2: `fcntl(F_FULLFSYNC)` on Apple platforms, which also flushes the drive's cache; elsewhere
+    /// the same as `Fsync`. The trunk's connections get `PRAGMA fullfsync` (`FileSyncType::FullFsync`).
+    FullFsync,
+}
+
+impl SyncClass {
+    /// Whether anything is synced at all.
+    pub fn syncs(self) -> bool {
+        self != SyncClass::Off
+    }
+
+    /// The trunk's file sync type in this class (`Off` syncs nothing; its type is moot).
+    pub(crate) fn file_sync_type(self) -> crate::io::FileSyncType {
+        match self {
+            SyncClass::FullFsync => crate::io::FileSyncType::FullFsync,
+            SyncClass::Off | SyncClass::Fsync => crate::io::FileSyncType::Fsync,
+        }
+    }
+}
+
+/// Every sync this process issued through the branch store's files or the platform IO backend, by
+/// primitive (fastest-engine instrument V1-in-process; observing only): `fsync(2)` calls and
+/// `fcntl(F_FULLFSYNC)` calls. A cross-check of the DYLD syscall shim, never a substitute for it:
+/// a sync issued by anything else (the catalog's own IO is the platform backend, so it IS counted)
+/// does not appear.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyncCounts {
+    pub fsync: u64,
+    pub full_fsync: u64,
+}
+
+#[doc(hidden)]
+pub fn sync_counts() -> SyncCounts {
+    use crate::sync::atomic::Ordering::Relaxed;
+    SyncCounts {
+        fsync: crate::io::SYNC_COUNTS[0].load(Relaxed),
+        full_fsync: crate::io::SYNC_COUNTS[1].load(Relaxed),
+    }
 }
 
 /// Failure injection for the durability tests.
@@ -1178,6 +1247,9 @@ mod catalog_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod merge_durable_tests;
+
+#[cfg(all(test, feature = "fs"))]
+mod fastest_tests;
 
 #[cfg(test)]
 mod tests {

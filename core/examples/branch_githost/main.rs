@@ -587,7 +587,7 @@ fn open_db(path: &Path, sync: bool) -> Arc<Database> {
         path.to_str().unwrap(),
         OpenFlags::Create,
         DatabaseOpts::new()
-            .with_branch_durability(BranchDurability::Catalog { sync })
+            .with_branch_durability(BranchDurability::Catalog { sync: if sync { turso_core::branch::SyncClass::Fsync } else { turso_core::branch::SyncClass::Off } })
             .with_branch_splice(splice),
         None,
         Arc::new(SqliteDialect),

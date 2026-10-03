@@ -19,12 +19,12 @@
 //! before it (attached by id, forked, detached again) instead of a fork of the trunk, so the store holds parents
 //! with live children, whose page maps an open after a snapshot load must derive.
 //!
-//! `grow` is the kill -9 VICTIM: it opens the database `Durable { sync: false }` (the files are the
+//! `grow` is the kill -9 VICTIM: it opens the database `Durable { sync: turso_core::branch::SyncClass::Off }` (the files are the
 //! same bytes as with sync; only fsyncs differ), grows it to N live branches — each forked from the
 //! trunk, each updating one row (one leaf page), each detached so it outlives the process — prints
 //! `READY n=N pid=P` and blocks on stdin until the driver SIGKILLs it. It prints counters only.
 //!
-//! `open` opens `Durable { sync: true }` in this fresh process and times the open, prints the
+//! `open` opens `Durable { sync: turso_core::branch::SyncClass::Fsync }` in this fresh process and times the open, prints the
 //! store's open counters, then (with --probes) times first reads on K distinct random branches:
 //! attach + connect, the branch's own row, a trunk row on another leaf, and the own row again.
 //! Every value is checked. It closes cleanly and times the close.
@@ -396,9 +396,9 @@ fn open_db(path: &Path, sync: bool, catalog: bool) -> Arc<Database> {
 fn open_db_leased(path: &Path, sync: bool, catalog: bool, lease_ms: u64) -> Arc<Database> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let durability = if catalog {
-        BranchDurability::Catalog { sync }
+        BranchDurability::Catalog { sync: if sync { turso_core::branch::SyncClass::Fsync } else { turso_core::branch::SyncClass::Off } }
     } else {
-        BranchDurability::Durable { sync }
+        BranchDurability::Durable { sync: if sync { turso_core::branch::SyncClass::Fsync } else { turso_core::branch::SyncClass::Off } }
     };
     Database::open_file_with_flags(
         io,

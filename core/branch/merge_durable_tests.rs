@@ -28,8 +28,8 @@ impl Mode {
     fn opts(self) -> DatabaseOpts {
         let d = match self {
             Mode::Volatile => BranchDurability::Volatile,
-            Mode::Durable => BranchDurability::Durable { sync: false },
-            Mode::Catalog | Mode::CatalogEvict => BranchDurability::Catalog { sync: false },
+            Mode::Durable => BranchDurability::Durable { sync: crate::branch::SyncClass::Off },
+            Mode::Catalog | Mode::CatalogEvict => BranchDurability::Catalog { sync: crate::branch::SyncClass::Off },
         };
         DatabaseOpts::new().with_branch_durability(d)
     }

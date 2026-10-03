@@ -219,7 +219,7 @@ use super::page_map::PageMap;
 use super::table::BranchTable;
 use super::{
     BranchDurability, BranchFailpoint, BranchId, BranchOpenStats, BranchStats, BranchWork, Expired,
-    Reaped,
+    Reaped, SyncClass,
 };
 use crate::schema::Schema;
 use crate::storage::pager::PageRef;
@@ -281,7 +281,7 @@ struct StoreInner {
     journal: Option<Journal>,
     /// `Some` for a durable store.
     files: Option<BranchFiles>,
-    sync: bool,
+    sync: SyncClass,
     next_id: u64,
     trunk: TrunkState,
     /// F8' (r11-ever's F8 5d580203f as ported in e343173dc; r13-compose step 3): chunks that never
@@ -656,7 +656,7 @@ fn fuzzy_checkpoints() -> bool {
 }
 
 impl CatState {
-    fn new(catalog: Catalog, sync: bool, generation: u64) -> Result<Self> {
+    fn new(catalog: Catalog, sync: SyncClass, generation: u64) -> Result<Self> {
         let writer = Arc::new(Mutex::new(catalog.writer(sync)?));
         Ok(Self {
             writer,
@@ -1354,8 +1354,9 @@ struct Captured {
     /// `ChildIndex` keys (children forked, and removal links) as of the capture.
     child_keys: Vec<(u64, u64)>,
     child_removed: Vec<(u64, u64)>,
-    /// A handle on the arena file: synced before the catalog names the slots.
+    /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
     arena: Option<std::fs::File>,
+    arena_sync: SyncClass,
     lease_now: u64,
     fail_after_commit: bool,
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
@@ -1382,7 +1383,7 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     }
     // Every slot the catalog is about to name must be durable first.
     if let Some(file) = cap.arena.as_ref() {
-        super::journal::fsync_file(file)?;
+        super::journal::fsync_file(file, cap.arena_sync)?;
     }
     catalog.begin()?;
     let written = (|| -> Result<()> {
@@ -1673,7 +1674,7 @@ impl BranchStore {
 
     fn trunk_only() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(StoreInner::fresh(None, false, None))),
+            inner: Arc::new(Mutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
             flights: Mutex::new(Vec::new()),
             flight_hold: Arc::new(AtomicU8::new(0)),
@@ -1764,7 +1765,7 @@ impl BranchStore {
                          silently change what those branches read"
                     )));
                 }
-                let mut inner = StoreInner::fresh(None, false, default_lease);
+                let mut inner = StoreInner::fresh(None, SyncClass::Off, default_lease);
                 inner.splice = splice;
                 inner
             }
@@ -1932,7 +1933,7 @@ impl BranchStore {
     fn recover_catalog(
         inner: &mut StoreInner,
         files: &BranchFiles,
-        sync: bool,
+        sync: SyncClass,
         stats: &mut BranchOpenStats,
         (warm, targets): (Prewarm, Targets),
     ) -> Result<()> {
@@ -3183,6 +3184,7 @@ impl BranchStore {
                 journal,
                 failpoint,
                 orphans,
+                sync,
                 ..
             } = &mut *inner;
             let st = branches.get_mut(&id).ok_or_else(|| gone(id))?;
@@ -3209,7 +3211,7 @@ impl BranchStore {
             }
             if *failpoint == Some(BranchFailpoint::CommitAfterSlotsBeforeRecord) {
                 *failpoint = None;
-                arena.sync()?;
+                arena.sync(*sync)?;
                 *orphans = entries.iter().map(|&(_, slot, _)| slot).collect();
                 for &(_, slot, _) in &entries {
                     arena.release(slot);
@@ -3730,13 +3732,13 @@ fn reaped(id: BranchId) -> LimboError {
 }
 
 impl StoreInner {
-    fn fresh(files: Option<BranchFiles>, sync: bool, default_lease: Option<Duration>) -> Self {
+    fn fresh(files: Option<BranchFiles>, sync: SyncClass, default_lease: Option<Duration>) -> Self {
         Self::fresh_mode(files, sync, default_lease, false)
     }
 
     fn fresh_mode(
         files: Option<BranchFiles>,
-        sync: bool,
+        sync: SyncClass,
         default_lease: Option<Duration>,
         catalog_mode: bool,
     ) -> Self {
@@ -4434,8 +4436,8 @@ impl StoreInner {
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
                 // The journal's create synced the directory before the arena file existed.
-                if self.sync {
-                    super::journal::fsync_dir_of(&files.arena)?;
+                if self.sync.syncs() {
+                    super::journal::fsync_dir_of(&files.arena, self.sync)?;
                 }
                 self.arena = Some(arena);
             }
@@ -4691,7 +4693,7 @@ impl StoreInner {
                 arena.in_use()
             );
         }
-        let arena_file = if self.sync {
+        let arena_file = if self.sync.syncs() {
             match arena.sync_handle() {
                 Ok(f) => f,
                 Err(e) => {
@@ -4723,6 +4725,7 @@ impl StoreInner {
             child_keys: self.children.map.keys().copied().collect(),
             child_removed: self.children.removed.keys().copied().collect(),
             arena: arena_file,
+            arena_sync: self.sync,
             lease_now: now,
             fail_after_commit,
             fail_write: self
@@ -5774,7 +5777,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("db");
         let path = path.to_str().unwrap();
-        let durable = BranchDurability::Durable { sync: false };
+        let durable = BranchDurability::Durable { sync: crate::branch::SyncClass::Off };
         {
             let first = BranchStore::open(durable, None, path).unwrap();
             first.inner.lock().ensure_backing(512).unwrap();
@@ -5797,7 +5800,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("db");
         let path = path.to_str().unwrap();
-        let store = BranchStore::open(BranchDurability::Durable { sync: false }, None, path).unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
         store.inner.lock().ensure_backing(512).unwrap();
         let files = BranchFiles::for_db(path);
         // The open arena's file is replaced by a directory: the restart's reopen fails.
@@ -5823,7 +5826,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("db");
         let path = path.to_str().unwrap();
-        let store = BranchStore::open(BranchDurability::Durable { sync: false }, None, path).unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
         store.inner.lock().ensure_backing(512).unwrap();
         store
             .inner
@@ -5835,7 +5838,7 @@ mod tests {
             store.log(&mut inner, Record::Release { branch: 9 }).unwrap();
         }
         drop(store);
-        let recovered = Journal::recover(&BranchFiles::for_db(path), false)
+        let recovered = Journal::recover(&BranchFiles::for_db(path), SyncClass::Off)
             .unwrap()
             .expect("state");
         assert_eq!(recovered.page_size, 1024, "the store kept the old page size");
@@ -5849,7 +5852,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("db");
         let path = path.to_str().unwrap();
-        let store = BranchStore::open(BranchDurability::Durable { sync: false }, None, path).unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
         let mut inner = store.inner.lock();
         inner.ensure_backing(512).unwrap();
         inner
@@ -5866,7 +5869,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("db");
         let path = path.to_str().unwrap();
-        let store = BranchStore::open(BranchDurability::Durable { sync: false }, None, path).unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
         let files = BranchFiles::for_db(path);
         // A directory where the arena file goes: the first attempt's arena open fails.
         std::fs::create_dir(&files.arena).unwrap();
@@ -5878,7 +5881,7 @@ mod tests {
             store.log(&mut inner, Record::Release { branch: 9 }).unwrap();
         }
         drop(store);
-        let recovered = Journal::recover(&files, false).unwrap().expect("state");
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
         assert_eq!(recovered.page_size, 1024, "the log kept the failed attempt's page size");
         assert_eq!(recovered.records, vec![Record::Release { branch: 9 }]);
     }
@@ -5892,7 +5895,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("db");
         let path = path.to_str().unwrap();
-        let durable = BranchDurability::Durable { sync: false };
+        let durable = BranchDurability::Durable { sync: crate::branch::SyncClass::Off };
         let late = BranchStore::open(durable, None, path).unwrap();
         {
             let first = BranchStore::open(durable, None, path).unwrap();
@@ -5910,7 +5913,7 @@ mod tests {
             "a store started over files another store had written since it opened"
         );
         let files = BranchFiles::for_db(path);
-        let recovered = Journal::recover(&files, false).unwrap().expect("state");
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
         assert_eq!(recovered.records, vec![Record::Release { branch: 7 }]);
     }
 
@@ -5919,13 +5922,13 @@ mod tests {
     /// permanent.
     #[test]
     fn a_zero_deadline_is_still_a_lease_after_a_snapshot() {
-        let mut live = StoreInner::fresh(None, false, None);
+        let mut live = StoreInner::fresh(None, SyncClass::Off, None);
         let id = BranchId(1);
         live.apply_fork(BranchId::TRUNK, id, None, Handle::Detached)
             .unwrap();
         live.apply_lease(id, 0);
         let snapshot = live.snapshot();
-        let mut recovered = StoreInner::fresh(None, false, None);
+        let mut recovered = StoreInner::fresh(None, SyncClass::Off, None);
         recovered.load_snapshot(snapshot).unwrap();
         assert_eq!(recovered.branches[&id].lease, Some(0), "a 0 deadline read back as no lease");
         assert!(recovered.leases.contains(&(0, id)), "the deadline index lost it");
@@ -5971,8 +5974,8 @@ mod sota_helpers {
         fn durability(self) -> BranchDurability {
             match self {
                 Mode::Volatile => BranchDurability::Volatile,
-                Mode::Durable => BranchDurability::Durable { sync: false },
-                Mode::Catalog | Mode::CatalogEvict => BranchDurability::Catalog { sync: false },
+                Mode::Durable => BranchDurability::Durable { sync: crate::branch::SyncClass::Off },
+                Mode::Catalog | Mode::CatalogEvict => BranchDurability::Catalog { sync: crate::branch::SyncClass::Off },
             }
         }
 

@@ -7,7 +7,7 @@ use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, Value,
 use std::path::Path;
 
 fn catalog() -> DatabaseOpts {
-    DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: true })
+    DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: crate::branch::SyncClass::Fsync })
 }
 
 fn open_at(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
@@ -224,7 +224,7 @@ fn the_two_durable_modes_refuse_each_others_files() {
         seed(&db.connect().unwrap());
         grow(&db, 3);
     }
-    let durable = DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: true });
+    let durable = DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: crate::branch::SyncClass::Fsync });
     assert!(open_at(&cat_path, durable).is_err(), "a snapshot store opened a catalog store's files");
     let snap_path = dir.path().join("s.db");
     {
@@ -243,7 +243,7 @@ fn the_two_durable_modes_refuse_each_others_files() {
 #[test]
 fn every_catalog_lookup_is_a_seek() {
     let dir = tempfile::TempDir::new().unwrap();
-    let cat = super::catalog::Catalog::open(&dir.path().join("cat"), false).unwrap();
+    let cat = super::catalog::Catalog::open(&dir.path().join("cat"), crate::branch::SyncClass::Off).unwrap();
     let mut bad = Vec::new();
     for (sql, lines) in cat.plans().unwrap() {
         eprintln!("{sql}\n    {}", lines.join("\n    "));
@@ -734,7 +734,7 @@ fn catalog_prewarm_reads_what_its_mode_names() {
     let cat = std::path::PathBuf::from(format!("{}-branch-cat", path.display()));
     let wal = std::path::PathBuf::from(format!("{}-wal", cat.display()));
     let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
-    let mut plain = Catalog::open(&cat, false).unwrap();
+    let mut plain = Catalog::open(&cat, crate::branch::SyncClass::Off).unwrap();
     let pages = plain.ints("PRAGMA page_count").unwrap()[0];
     let trees = 1 + plain
         .ints("SELECT count(*) FROM sqlite_schema WHERE rootpage > 1")
@@ -751,7 +751,7 @@ fn catalog_prewarm_reads_what_its_mode_names() {
         Prewarm::Buffer,
         Prewarm::Interior,
     ] {
-        let mut c = Catalog::open(&cat, false).unwrap();
+        let mut c = Catalog::open(&cat, crate::branch::SyncClass::Off).unwrap();
         c.prewarm(&cat, mode).unwrap();
         let st = c.prewarm;
         assert_eq!(st.mode, mode);
@@ -1064,7 +1064,7 @@ fn a_catalog_of_another_format_is_refused_even_with_a_torn_log_header() {
                 let _ = b.into_id();
             }
             {
-                let mut cat = catalog::Catalog::open(&files.cat, false).unwrap();
+                let mut cat = catalog::Catalog::open(&files.cat, crate::branch::SyncClass::Off).unwrap();
                 let mut m = cat.meta().unwrap().expect("a checkpointed catalog has a meta row");
                 assert_eq!(m.format, own, "{what}: the key was not written");
                 m.format = other;
@@ -1555,7 +1555,7 @@ fn a_catalog_with_a_torn_log_header_opens_only_in_its_own_arm() {
             let _ = b.into_id();
         }
         {
-            let mut cat = catalog::Catalog::open(&files.cat, false).unwrap();
+            let mut cat = catalog::Catalog::open(&files.cat, crate::branch::SyncClass::Off).unwrap();
             let mut m = cat.meta().unwrap().expect("a checkpointed catalog has a meta row");
             assert_eq!(m.format, journal::format_version(splice), "{what}: the key was not written");
             m.format = 0;

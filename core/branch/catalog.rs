@@ -69,6 +69,7 @@ use std::num::NonZero;
 use std::path::Path;
 
 use super::arena::Slot;
+use super::SyncClass;
 use super::prewarm::{warm_files, wal_of, Prewarm, PrewarmStats};
 use crate::storage::pager::{PageRef, Pager};
 use crate::sync::Arc;
@@ -376,7 +377,7 @@ mod census_tests {
     #[test]
     fn the_census_reads_integer_widths_and_rowid_varints_as_stored() {
         let dir = tempfile::TempDir::new().unwrap();
-        let cat = Catalog::open(&dir.path().join("c.db"), false).unwrap();
+        let cat = Catalog::open(&dir.path().join("c.db"), SyncClass::Off).unwrap();
         cat.conn
             .execute("CREATE TABLE plant(k INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
             .unwrap();
@@ -456,10 +457,10 @@ pub(crate) struct Catalog {
 }
 
 impl Catalog {
-    /// Open (creating if absent) the catalog at `path`. `sync` selects `synchronous = FULL`, so a
-    /// checkpoint's commit is durable before the log starts over; without it, OFF (a measurement
-    /// arm, like `Durable { sync: false }`).
-    pub(crate) fn open(path: &Path, sync: bool) -> Result<Catalog> {
+    /// Open (creating if absent) the catalog at `path`. A `sync` class that syncs selects
+    /// `synchronous = FULL`, so a checkpoint's commit is durable before the log starts over; `Off`
+    /// selects OFF (a measurement arm, like `Durable { sync: SyncClass::Off }`).
+    pub(crate) fn open(path: &Path, sync: SyncClass) -> Result<Catalog> {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
         let path = path.to_str().ok_or_else(|| {
             LimboError::InvalidArgument("branch catalog path is not UTF-8".to_string())
@@ -482,14 +483,14 @@ impl Catalog {
     /// A second handle on the same catalog database, over its own connection: the writer of a
     /// fuzzy checkpoint (F-FZ), which runs without the store mutex while the store's own
     /// connection keeps serving on-demand reads from a pinned snapshot.
-    pub(crate) fn writer(&self, sync: bool) -> Result<Catalog> {
+    pub(crate) fn writer(&self, sync: SyncClass) -> Result<Catalog> {
         let conn = self._db.connect()?;
         Self::prepared(self._db.clone(), conn, sync)
     }
 
     /// Set a connection's pragmas and prepare every statement on it.
-    fn prepared(db: Arc<Database>, conn: Arc<Connection>, sync: bool) -> Result<Catalog> {
-        conn.execute(if sync {
+    fn prepared(db: Arc<Database>, conn: Arc<Connection>, sync: SyncClass) -> Result<Catalog> {
+        conn.execute(if sync.syncs() {
             "PRAGMA synchronous = FULL"
         } else {
             "PRAGMA synchronous = OFF"
@@ -1319,7 +1320,7 @@ pub struct CatalogProbe {
 
 impl CatalogProbe {
     pub fn open(path: &Path) -> Result<CatalogProbe> {
-        let mut cat = Catalog::open(path, false)?;
+        let mut cat = Catalog::open(path, SyncClass::Off)?;
         cat.meta()?;
         let (mode, targets) = super::prewarm::from_env()?;
         if !mode.warms_files() || targets.catalog {
@@ -1365,7 +1366,7 @@ impl CatalogProbe {
 pub fn catalog_only_fixture(path: &Path, n: u64, d: u64, measure: bool, seed: u64) -> Result<String> {
     let page = |id: u64| 2 + (id % 1000) as u32;
     if !measure {
-        let mut cat = Catalog::open(path, false)?;
+        let mut cat = Catalog::open(path, SyncClass::Off)?;
         let mut lo = 1u64;
         while lo <= n {
             let hi = (lo + 99_999).min(n);
@@ -1409,7 +1410,7 @@ pub fn catalog_only_fixture(path: &Path, n: u64, d: u64, measure: bool, seed: u6
         }
         return Ok(format!("CATONLY_BUILD\tn={n}\tcur_rows={count}"));
     }
-    let mut cat = Catalog::open(path, true)?;
+    let mut cat = Catalog::open(path, SyncClass::Fsync)?;
     let mut x = seed | 1;
     let mut ids = std::collections::HashSet::new();
     while (ids.len() as u64) < d.min(n) {

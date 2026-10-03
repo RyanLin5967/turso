@@ -123,6 +123,19 @@ pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
     Ok(FileId::from_path_hash(path))
 }
 
+/// Syncs issued process-wide, `[fsync(2), fcntl(F_FULLFSYNC)]`, by the unix backend and the branch
+/// store's own files (fastest-engine instrument; observing only, read by `branch::sync_counts`).
+#[doc(hidden)]
+pub static SYNC_COUNTS: [crate::sync::atomic::AtomicU64; 2] = [
+    crate::sync::atomic::AtomicU64::new(0),
+    crate::sync::atomic::AtomicU64::new(0),
+];
+
+/// Count one sync: `full` for `fcntl(F_FULLFSYNC)`, else `fsync(2)`.
+pub(crate) fn count_sync(full: bool) {
+    SYNC_COUNTS[usize::from(full)].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+}
+
 /// Controls which sync mechanism to use for durability.
 /// `FullFsync` only has effect on Apple platforms (uses F_FULLFSYNC fcntl).
 /// On other platforms, both variants behave the same (regular fsync).

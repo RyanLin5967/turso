@@ -17,7 +17,7 @@
 //! truth (the trunk wrote the key after the fork). `--plant` expects the wrong base for the first
 //! sampled key (a fire-check: it must print FINDING and exit 3). `victim`/`reopen` are unchanged.
 //!
-//! `victim` is the kill -9 VICTIM. It opens a fresh catalog-mode store (`Catalog { sync: false }`;
+//! `victim` is the kill -9 VICTIM. It opens a fresh catalog-mode store (`Catalog { sync: turso_core::branch::SyncClass::Off }`;
 //! the files are the same bytes as with sync), creates t(id INTEGER PRIMARY KEY, v TEXT) with R
 //! rows of 100-byte values, forks B (the long-lived PR, branch id 1), and B updates K scattered
 //! keys in one transaction and is detached, so it outlives the process. Then the trunk takes A
@@ -25,7 +25,7 @@
 //! UPDATE is a no-op). Then `PRAGMA wal_checkpoint(TRUNCATE)` and `Database::branch_compact_now`,
 //! `READY`, and it blocks until the driver SIGKILLs it.
 //!
-//! `reopen` opens that crash image in a fresh process (`Catalog { sync: true }`) and performs V4's
+//! `reopen` opens that crash image in a fresh process (`Catalog { sync: turso_core::branch::SyncClass::Fsync }`) and performs V4's
 //! per-key base read: for each key B wrote, a descent of t's b-tree from its root in the base (the
 //! trunk as of B's fork) through `Database::branch_base_page`, reading a page from the database
 //! file whenever the store answers that the trunk's current version is the base. A minimal SQLite
@@ -232,7 +232,7 @@ fn open_db(path: &Path, sync: bool) -> Arc<Database> {
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
-        DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync }),
+        DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: if sync { turso_core::branch::SyncClass::Fsync } else { turso_core::branch::SyncClass::Off } }),
         None,
         Arc::new(SqliteDialect),
     )

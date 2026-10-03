@@ -49,6 +49,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use super::arena::{Arena, Slot};
+use super::SyncClass;
 use crate::error::io_error;
 use crate::{LimboError, Result};
 
@@ -530,7 +531,7 @@ pub(crate) struct Journal {
     /// Arena slots named by records still in `pending` (the failpoint reports them as orphans).
     pub(crate) pending_slots: Vec<Slot>,
     snapshot_len: u64,
-    sync: bool,
+    sync: SyncClass,
     /// Set by an I/O failure, or a failpoint standing in for a crash. From then on nothing more is
     /// written: the next process recovers from what is on disk, and nothing this one does can make
     /// that worse. (Fail-stop on I/O error — the post-"fsyncgate" rule.)
@@ -553,14 +554,14 @@ impl Journal {
     /// Refused while another journal holds the log (review N1), and over files that hold state:
     /// the caller found nothing recoverable when it opened, so state here was written since by
     /// another store instance, and starting it over would destroy that store's branches.
-    pub(crate) fn create(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
+    pub(crate) fn create(files: &BranchFiles, page_size: usize, sync: SyncClass) -> Result<Journal> {
         let mut journal = Self::open_fresh(files, page_size, sync)?;
         journal.start(false)?;
         Ok(journal)
     }
 
     /// The first half of `create`: lock the log and check it holds no state. Writes nothing.
-    pub(crate) fn open_fresh(files: &BranchFiles, page_size: usize, sync: bool) -> Result<Journal> {
+    pub(crate) fn open_fresh(files: &BranchFiles, page_size: usize, sync: SyncClass) -> Result<Journal> {
         Self::open_fresh_with(files, page_size, sync, false)
     }
 
@@ -568,7 +569,7 @@ impl Journal {
     pub(crate) fn open_fresh_with(
         files: &BranchFiles,
         page_size: usize,
-        sync: bool,
+        sync: SyncClass,
         fail_lock: bool,
     ) -> Result<Journal> {
         // Lock before touching anything, so a refused create has truncated nothing.
@@ -624,8 +625,8 @@ impl Journal {
                     "failpoint: branch log creation stopped after its header".to_string(),
                 ));
             }
-            if self.sync {
-                fsync_dir_of(&self.files.log)?;
+            if self.sync.syncs() {
+                fsync_dir_of(&self.files.log, self.sync)?;
             }
             Ok(())
         });
@@ -656,7 +657,7 @@ impl Journal {
     /// `recover_as` at the default arm's format version: the tests' shorthand (the store opens
     /// through `recover_as`, in its own arm).
     #[cfg(test)]
-    pub(crate) fn recover(files: &BranchFiles, sync: bool) -> Result<Option<Recovered>> {
+    pub(crate) fn recover(files: &BranchFiles, sync: SyncClass) -> Result<Option<Recovered>> {
         Self::recover_base(files, sync, None, FORMAT_VERSION)
     }
 
@@ -665,7 +666,7 @@ impl Journal {
     /// before its header was durable): the store starts empty.
     pub(crate) fn recover_as(
         files: &BranchFiles,
-        sync: bool,
+        sync: SyncClass,
         format: u32,
     ) -> Result<Option<Recovered>> {
         Self::recover_base(files, sync, None, format)
@@ -682,7 +683,7 @@ impl Journal {
     /// rewritten to them under the catalog's generation before the open goes on.
     pub(crate) fn recover_catalog_as(
         files: &BranchFiles,
-        sync: bool,
+        sync: SyncClass,
         base: Option<(u32, u64)>,
         format: u32,
     ) -> Result<Option<Recovered>> {
@@ -691,7 +692,7 @@ impl Journal {
 
     fn recover_base(
         files: &BranchFiles,
-        sync: bool,
+        sync: SyncClass,
         catalog: Option<Option<(u32, u64)>>,
         format: u32,
     ) -> Result<Option<Recovered>> {
@@ -822,8 +823,8 @@ impl Journal {
                         .file
                         .set_len(pos as u64)
                         .map_err(|e| io_error(e, "truncate branch log"))?;
-                    if sync {
-                        fsync_file(&journal.file)?;
+                    if sync.syncs() {
+                        fsync_file(&journal.file, sync)?;
                     }
                 }
                 if log_gen != generation {
@@ -941,8 +942,8 @@ impl Journal {
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
             }
-            if self.sync {
-                fsync_file(&f)?;
+            if self.sync.syncs() {
+                fsync_file(&f, self.sync)?;
             }
             Ok(f)
         })();
@@ -967,8 +968,8 @@ impl Journal {
             self.pending.drain(..drop_pending);
             self.pending_slots = slots_named(&self.pending);
         }
-        if self.sync {
-            if let Err(e) = fsync_dir_of(&self.files.log) {
+        if self.sync.syncs() {
+            if let Err(e) = fsync_dir_of(&self.files.log, self.sync) {
                 self.poisoned = true;
                 return Err(e);
             }
@@ -1066,12 +1067,12 @@ impl Journal {
                 "the branch log changed under this journal; another store instance wrote it",
             ));
         }
-        if self.sync {
-            arena.sync()?;
+        if self.sync.syncs() {
+            arena.sync(self.sync)?;
         }
         write_at(&self.file, &self.pending, self.len)?;
-        if self.sync {
-            fsync_file(&self.file)?;
+        if self.sync.syncs() {
+            fsync_file(&self.file, self.sync)?;
         }
         Ok(())
     }
@@ -1098,8 +1099,8 @@ impl Journal {
         self.check_live()?;
         // The snapshot names slots that buffered-but-unwritten records also name; they must be
         // durable before the snapshot is.
-        if self.sync {
-            arena.sync()?;
+        if self.sync.syncs() {
+            arena.sync(self.sync)?;
         }
         let generation = self.generation + 1;
         let mut out = Vec::with_capacity(64);
@@ -1115,8 +1116,8 @@ impl Journal {
         {
             let f = open_rw(&tmp, true)?;
             write_at(&f, &out, 0)?;
-            if self.sync {
-                fsync_file(&f)?;
+            if self.sync.syncs() {
+                fsync_file(&f, self.sync)?;
             }
         }
         std::fs::rename(&tmp, &self.files.snap).map_err(|e| {
@@ -1124,8 +1125,8 @@ impl Journal {
             io_error(e, "rename branch snapshot")
         })?;
         // From here the snapshot is the truth; the old log is stale by generation.
-        if self.sync {
-            if let Err(e) = fsync_dir_of(&self.files.snap) {
+        if self.sync.syncs() {
+            if let Err(e) = fsync_dir_of(&self.files.snap, self.sync) {
                 self.poisoned = true;
                 return Err(e);
             }
@@ -1153,8 +1154,8 @@ impl Journal {
             .set_len(0)
             .map_err(|e| io_error(e, "truncate branch log"))?;
         write_at(&self.file, &header, 0)?;
-        if self.sync {
-            fsync_file(&self.file)?;
+        if self.sync.syncs() {
+            fsync_file(&self.file, self.sync)?;
         }
         self.generation = generation;
         self.len = LOG_HEADER_LEN as u64;
@@ -1406,10 +1407,12 @@ pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
     }
 }
 
-/// `fsync(2)`, as Turso's own `FileSyncType::Fsync` — deliberately NOT `F_FULLFSYNC`, which std's
-/// `sync_all` uses on Apple platforms: branch state gets the durability class the trunk gets under
-/// default settings, no stronger and no weaker.
-pub(crate) fn fsync_file(file: &File) -> Result<()> {
+/// Sync `file` in `class` (see [`SyncClass`]): `fsync(2)`, as Turso's own `FileSyncType::Fsync`.
+/// `Off` syncs nothing; callers test `syncs()` first and never reach here with it.
+pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
+    if !class.syncs() {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
@@ -1417,6 +1420,7 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));
         }
+        crate::io::count_sync(false);
         Ok(())
     }
     #[cfg(not(unix))]
@@ -1426,8 +1430,8 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
     }
 }
 
-/// Make a file's creation or rename durable: on POSIX that is an fsync of its directory.
-pub(crate) fn fsync_dir_of(path: &Path) -> Result<()> {
+/// Make a file's creation or rename durable: on POSIX that is a sync of its directory, in `class`.
+pub(crate) fn fsync_dir_of(path: &Path, class: SyncClass) -> Result<()> {
     #[cfg(unix)]
     {
         let dir = match path.parent() {
@@ -1435,11 +1439,11 @@ pub(crate) fn fsync_dir_of(path: &Path) -> Result<()> {
             _ => Path::new("."),
         };
         let d = File::open(dir).map_err(|e| io_error(e, "open branch directory"))?;
-        fsync_file(&d)
+        fsync_file(&d, class)
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = (path, class);
         Ok(())
     }
 }
@@ -1496,17 +1500,17 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         let mut arena = Arena::new(512);
-        let mut stale = Journal::create(&files, 512, false).unwrap();
+        let mut stale = Journal::create(&files, 512, SyncClass::Off).unwrap();
         stale.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
         stale.flush(&mut arena).unwrap();
 
-        let mut fresh = Journal::recover(&files, false).unwrap().expect("state");
+        let mut fresh = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
         fresh.journal.buffer(&Record::Release { branch: 1 }).unwrap();
         fresh.journal.flush(&mut arena).unwrap();
 
         stale.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
         assert!(stale.flush(&mut arena).is_err(), "a stale journal wrote over a newer one");
-        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        let records = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").records;
         assert_eq!(
             records,
             vec![
@@ -1523,7 +1527,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         let mut arena = Arena::new(512);
-        let mut journal = Journal::create(&files, 512, false).unwrap();
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
         journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
         journal.flush(&mut arena).unwrap();
 
@@ -1542,7 +1546,7 @@ mod tests {
         journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
         assert!(journal.flush(&mut arena).is_err(), "a journal appended over bytes it did not write");
         drop(journal);
-        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        let records = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").records;
         assert_eq!(
             records,
             vec![
@@ -1569,7 +1573,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         let mut arena = Arena::new(512);
-        let mut journal = Journal::create(&files, 512, false).unwrap();
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
         journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
         journal.flush(&mut arena).unwrap();
         // Buffered before the fork, so the child only has to flush it.
@@ -1598,7 +1602,7 @@ mod tests {
         // The parent is unaffected, and the log holds only what the parent wrote.
         journal.flush(&mut arena).unwrap();
         drop(journal);
-        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        let records = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").records;
         assert_eq!(
             records,
             vec![
@@ -1617,7 +1621,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         let mut arena = Arena::new(512);
-        let mut journal = Journal::create(&files, 512, false).unwrap();
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
         journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
         journal.flush(&mut arena).unwrap();
         drop(journal);
@@ -1627,7 +1631,7 @@ mod tests {
             let mut f = OpenOptions::new().append(true).open(&files.log).unwrap();
             f.write_all(&[0u8; 64]).unwrap();
         }
-        let recovered = Journal::recover(&files, false)
+        let recovered = Journal::recover(&files, SyncClass::Off)
             .expect("a zero tail is a torn write, not corruption")
             .expect("state");
         assert_eq!(recovered.records, vec![Record::Fork { child: 1, parent: 0 }]);
@@ -1644,7 +1648,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         let mut arena = Arena::new(512);
-        let mut journal = Journal::create(&files, 512, false).unwrap();
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
         journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
         journal.flush(&mut arena).unwrap();
         drop(journal);
@@ -1662,7 +1666,7 @@ mod tests {
         }
         let before = std::fs::read(&files.log).unwrap();
         assert!(
-            Journal::recover(&files, false).is_err(),
+            Journal::recover(&files, SyncClass::Off).is_err(),
             "a zeroed hole before a whole frame was cut as a torn tail"
         );
         assert_eq!(std::fs::read(&files.log).unwrap(), before, "the refused recovery cut the log");
@@ -1675,7 +1679,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         let mut arena = Arena::new(512);
-        let mut journal = Journal::create(&files, 512, false).unwrap();
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
         journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
         journal.flush(&mut arena).unwrap();
         drop(journal);
@@ -1692,7 +1696,7 @@ mod tests {
             f.write_all(&[0u8; 25]).unwrap();
             f.write_all(&frame).unwrap();
         }
-        let err = match Journal::recover(&files, false) {
+        let err = match Journal::recover(&files, SyncClass::Off) {
             Ok(_) => panic!("a zeroed hole before a whole frame was cut as a torn tail"),
             Err(err) => err.to_string(),
         };
@@ -1764,7 +1768,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         let mut arena = Arena::new(512);
-        let mut journal = Journal::create(&files, 512, false).unwrap();
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
         journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
         journal.flush(&mut arena).unwrap();
         let after_first = std::fs::metadata(&files.log).unwrap().len();
@@ -1780,7 +1784,7 @@ mod tests {
         journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
         assert!(journal.flush(&mut arena).is_err(), "a journal appended past a log that shrank");
         drop(journal);
-        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        let records = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").records;
         assert_eq!(records, vec![Record::Fork { child: 1, parent: 0 }]);
     }
 
@@ -1792,17 +1796,17 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
         let mut arena = Arena::new(512);
-        let mut first = Journal::create(&files, 512, false).unwrap();
+        let mut first = Journal::create(&files, 512, SyncClass::Off).unwrap();
         first.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
         first.flush(&mut arena).unwrap();
 
-        assert!(Journal::recover(&files, false).is_err(), "a second journal recovered a live log");
-        assert!(Journal::create(&files, 512, false).is_err(), "a second journal re-created a live log");
+        assert!(Journal::recover(&files, SyncClass::Off).is_err(), "a second journal recovered a live log");
+        assert!(Journal::create(&files, 512, SyncClass::Off).is_err(), "a second journal re-created a live log");
         // The refused create must not have truncated the live log on its way to being refused.
         first.buffer(&Record::Release { branch: 1 }).unwrap();
         first.flush(&mut arena).unwrap();
         drop(first);
-        let records = Journal::recover(&files, false).unwrap().expect("state").records;
+        let records = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").records;
         assert_eq!(
             records,
             vec![
@@ -1829,7 +1833,7 @@ mod tests {
         put_u32(&mut header, crc);
         put_u32(&mut header, 0);
         std::fs::write(&files.log, &header).unwrap();
-        assert!(Journal::recover(&files, false).is_err(), "a log of another version was accepted");
+        assert!(Journal::recover(&files, SyncClass::Off).is_err(), "a log of another version was accepted");
 
         std::fs::remove_file(&files.log).unwrap();
         let mut snap = Vec::new();
@@ -1841,7 +1845,7 @@ mod tests {
         let crc = crc32c::crc32c(&snap);
         put_u32(&mut snap, crc);
         std::fs::write(&files.snap, &snap).unwrap();
-        assert!(Journal::recover(&files, false).is_err(), "a snapshot of another version was accepted");
+        assert!(Journal::recover(&files, SyncClass::Off).is_err(), "a snapshot of another version was accepted");
     }
 
     /// r11-ever amendment 15: the F7 splice arm writes version 4 and the default arm 3, and each
@@ -1880,21 +1884,21 @@ mod tests {
 
             std::fs::write(&files.log, header(own, 0)).unwrap();
             assert!(
-                Journal::recover_as(&files, false, other).is_err(),
+                Journal::recover_as(&files, SyncClass::Off, other).is_err(),
                 "splice={written}: the other arm read this arm's log"
             );
-            let got = Journal::recover_as(&files, false, own).unwrap();
+            let got = Journal::recover_as(&files, SyncClass::Off, own).unwrap();
             assert!(got.is_some(), "splice={written}: its own arm found no state in its log");
             drop(got);
 
             std::fs::write(&files.snap, snapshot(own, 1)).unwrap();
             std::fs::write(&files.log, header(other, 1)).unwrap();
             assert!(
-                Journal::recover_as(&files, false, other).is_err(),
+                Journal::recover_as(&files, SyncClass::Off, other).is_err(),
                 "splice={written}: the other arm read this arm's snapshot"
             );
             std::fs::write(&files.log, header(own, 1)).unwrap();
-            let got = Journal::recover_as(&files, false, own).unwrap();
+            let got = Journal::recover_as(&files, SyncClass::Off, own).unwrap();
             assert!(
                 got.is_some_and(|r| r.snapshot.is_some()),
                 "splice={written}: its own arm did not read its snapshot"

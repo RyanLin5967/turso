@@ -98,7 +98,7 @@ fn parse_args() -> Args {
         read_every: 10,
         untimed: false,
         seed: 0x9E37_79B9_7F4A_7C15,
-        durability: BranchDurability::Durable { sync: true },
+        durability: BranchDurability::Durable { sync: turso_core::branch::SyncClass::Fsync },
         splice: false,
         reopen: false,
     };
@@ -125,10 +125,10 @@ fn parse_args() -> Args {
             }
             "--durability" => {
                 a.durability = match val().as_str() {
-                    "durable" => BranchDurability::Durable { sync: true },
-                    "durable-nosync" => BranchDurability::Durable { sync: false },
-                    "catalog" => BranchDurability::Catalog { sync: true },
-                    "catalog-nosync" => BranchDurability::Catalog { sync: false },
+                    "durable" => BranchDurability::Durable { sync: turso_core::branch::SyncClass::Fsync },
+                    "durable-nosync" => BranchDurability::Durable { sync: turso_core::branch::SyncClass::Off },
+                    "catalog" => BranchDurability::Catalog { sync: turso_core::branch::SyncClass::Fsync },
+                    "catalog-nosync" => BranchDurability::Catalog { sync: turso_core::branch::SyncClass::Off },
                     o => die(&format!(
                         "--durability must be durable, durable-nosync, catalog or catalog-nosync, not {o}"
                     )),

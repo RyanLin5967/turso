@@ -16,9 +16,9 @@ use std::path::Path;
 fn durable() -> DatabaseOpts {
     // r11-restart lane: R11_BRANCH_CATALOG=1 runs this whole file against catalog mode.
     let durability = if std::env::var_os("R11_BRANCH_CATALOG").is_some() {
-        BranchDurability::Catalog { sync: true }
+        BranchDurability::Catalog { sync: crate::branch::SyncClass::Fsync }
     } else {
-        BranchDurability::Durable { sync: true }
+        BranchDurability::Durable { sync: crate::branch::SyncClass::Fsync }
     };
     DatabaseOpts::new().with_branch_durability(durability)
 }
@@ -1439,7 +1439,7 @@ fn a_second_store_over_live_branch_files_refuses_at_open() {
     seed(&trunk, 20);
     let b = trunk.fork_branch().unwrap();
     set(&b.connect().unwrap(), 3, "b");
-    let durability = BranchDurability::Durable { sync: true };
+    let durability = BranchDurability::Durable { sync: crate::branch::SyncClass::Fsync };
     assert!(
         store::BranchStore::open(durability, None, path.to_str().unwrap()).is_err(),
         "a second store opened over a live store's branch log"
@@ -1460,7 +1460,7 @@ fn a_second_store_over_live_branch_files_refuses_at_open() {
 fn a_refused_lazy_create_leaves_the_live_stores_arena_intact() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("durable.db");
-    let durability = BranchDurability::Durable { sync: true };
+    let durability = BranchDurability::Durable { sync: crate::branch::SyncClass::Fsync };
     let late = store::BranchStore::open(durability, None, path.to_str().unwrap()).unwrap();
     let db = open_at(&path, durable()).unwrap();
     let trunk = db.connect().unwrap();
@@ -2180,7 +2180,7 @@ fn a_registry_hit_of_another_branch_durability_is_refused() {
     open_at(&path, durable()).expect("with the volatile handle closed, a durable open works");
 
     let path = dir.path().join("nosync.db");
-    let nosync = DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: false });
+    let nosync = DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: crate::branch::SyncClass::Off });
     let unsynced = open_at(&path, nosync).unwrap();
     seed(&unsynced.connect().unwrap(), 3);
     let err = match open_at(&path, durable()) {
@@ -2425,15 +2425,15 @@ fn log_records(path: &Path) -> Vec<journal::Record> {
     let files = journal::BranchFiles::for_db(path.to_str().unwrap());
     let format = journal::format_version(true);
     let recovered = if catalog_run() {
-        let meta = catalog::Catalog::open(&files.cat, false).unwrap().meta().unwrap();
+        let meta = catalog::Catalog::open(&files.cat, crate::branch::SyncClass::Off).unwrap().meta().unwrap();
         journal::Journal::recover_catalog_as(
             &files,
-            false,
+            crate::branch::SyncClass::Off,
             meta.map(|m| (m.page_size, m.generation)),
             format,
         )
     } else {
-        journal::Journal::recover_as(&files, false, format)
+        journal::Journal::recover_as(&files, crate::branch::SyncClass::Off, format)
     };
     recovered.unwrap().expect("the store has files").records
 }
@@ -2444,10 +2444,10 @@ fn log_records(path: &Path) -> Vec<journal::Record> {
 fn checkpointed_hold(path: &Path, id: BranchId) -> Option<bool> {
     let files = journal::BranchFiles::for_db(path.to_str().unwrap());
     if catalog_run() {
-        let b = catalog::Catalog::open(&files.cat, false).unwrap().load_branch(id.0).unwrap();
+        let b = catalog::Catalog::open(&files.cat, crate::branch::SyncClass::Off).unwrap().load_branch(id.0).unwrap();
         return b.map(|b| b.released && b.held_open);
     }
-    let snapshot = journal::Journal::recover_as(&files, false, journal::format_version(true))
+    let snapshot = journal::Journal::recover_as(&files, crate::branch::SyncClass::Off, journal::format_version(true))
         .unwrap()
         .unwrap()
         .snapshot?;

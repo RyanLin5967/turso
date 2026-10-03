@@ -83,8 +83,8 @@ fn parse_args() -> Args {
             "--durability" => {
                 args.durability = match val().as_str() {
                     "volatile" => BranchDurability::Volatile,
-                    "durable" => BranchDurability::Durable { sync: true },
-                    "durable-nosync" => BranchDurability::Durable { sync: false },
+                    "durable" => BranchDurability::Durable { sync: turso_core::branch::SyncClass::Fsync },
+                    "durable-nosync" => BranchDurability::Durable { sync: turso_core::branch::SyncClass::Off },
                     other => die(&format!(
                         "--durability must be volatile, durable or durable-nosync, not {other}"
                     )),
