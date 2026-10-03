@@ -1152,8 +1152,8 @@ fn snap() -> Counters {
 fn bench_main(args: &Args) {
     let workload = args.workload.as_str();
     let arm = args.arm.as_str();
-    if !matches!(arm, "eager" | "recipe" | "lazy") {
-        die("--arm must be eager, recipe or lazy");
+    if !matches!(arm, "eager" | "recipe" | "lazy" | "alt") {
+        die("--arm must be eager, recipe, lazy or alt");
     }
     if args.db.as_os_str().is_empty() || args.n < 1 || args.v < 1 {
         die("--db, --n and --v are required");
@@ -1236,14 +1236,26 @@ fn bench_main(args: &Args) {
         depth.push(parent.map_or(1, |p| depth[p] + 1));
         let conn = br.connect().unwrap();
         exec(&conn, "PRAGMA cache_size = -4000000");
-        conn.set_recipe_backfill(arm != "eager");
+        // "alt" interleaves the arms branch by branch for PREREG §10's timed run: even b eager,
+        // odd b recipe, on one trunk.
+        let recipe_on = match arm {
+            "eager" => false,
+            "alt" => b % 2 == 1,
+            _ => true,
+        };
+        conn.set_recipe_backfill(recipe_on);
         let thread = match workload {
             "dc" => b % 10,
             _ => b % 5,
         };
         let step = b;
         let owned_before = br.owned_slots().len();
-        let mut line = format!("BR b={b} parent={} depth={} thread={thread} step={step}", parent.map_or(-1, |p| p as i64), depth[b as usize]);
+        let mut line = format!(
+            "BR b={b} arm_b={} parent={} depth={} thread={thread} step={step}",
+            if recipe_on { if arm == "lazy" { "lazy" } else { "recipe" } } else { "eager" },
+            parent.map_or(-1, |p| p as i64),
+            depth[b as usize]
+        );
         let stmts = step_sql(workload, thread, step, &mut rng);
         let step_t0 = Instant::now();
         for (label, sql, kind) in &stmts {
@@ -1298,7 +1310,7 @@ fn bench_main(args: &Args) {
         if b % sample_every == 0 && args.points > 0 {
             drop(conn);
             let pc = br.connect().unwrap();
-            pc.set_recipe_backfill(arm != "eager");
+            pc.set_recipe_backfill(recipe_on);
             let mut prng = Rng(args.seed ^ 0xBEEF ^ b);
             let mut fetch_rowid = 0u64;
             let mut fetch_pk = 0u64;
@@ -1383,6 +1395,9 @@ fn bench_main(args: &Args) {
     }
     if arm != "eager" && (workload == "sd" || workload == "sdx") && io[counter::INSTALLED] == 0 {
         not_a_result("recipe arm installed no recipe");
+    }
+    if arm == "alt" && (io[counter::INSTALLED] == 0 || io[counter::INSTALLED] as usize > handles.len()) {
+        not_a_result("alt arm: recipe branches installed no recipe, or eager ones did");
     }
     if arm == "eager" && io[counter::INSTALLED] != 0 {
         not_a_result("eager arm installed a recipe");
