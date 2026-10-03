@@ -1,0 +1,7 @@
+# INTEGER PRIMARY KEY ON CONFLICT REPLACE (rowid_alias_conflict_clause). to_sql drops it.
+CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, b INTEGER, c TEXT)
+INSERT INTO t VALUES (1, 1, 'one')
+UPDATE t SET b = b + 100
+@reopen
+INSERT INTO t VALUES (1, 5, 'replaced')
+SELECT * FROM t ORDER BY id
