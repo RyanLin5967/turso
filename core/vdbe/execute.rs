@@ -1854,6 +1854,7 @@ pub fn op_column(
             dest: *dest,
             default,
         },
+        _pager,
     )
 }
 
@@ -1881,6 +1882,7 @@ pub fn op_column_range(
             dest: *dest,
             defaults,
         },
+        _pager,
     )
 }
 
@@ -1919,18 +1921,27 @@ impl ColumnFetch<'_> {
         program: &Program,
         state: &mut ProgramState,
         cursor_id: usize,
+        pager: &Arc<Pager>,
     ) -> Result<InsnFunctionStepResult> {
         match *self {
             ColumnFetch::Single {
                 column,
                 dest,
                 default,
-            } => op_column_fetch(program, state, cursor_id, column, dest, default),
+            } => op_column_fetch(program, state, cursor_id, column, dest, default, pager),
             ColumnFetch::Range {
                 start_column,
                 dest,
                 defaults,
-            } => op_column_range_fetch(program, state, cursor_id, start_column, dest, defaults),
+            } => op_column_range_fetch(
+                program,
+                state,
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+                pager,
+            ),
         }
     }
 }
@@ -1941,13 +1952,14 @@ fn op_column_impl(
     state: &mut ProgramState,
     cursor_id: usize,
     fetch: ColumnFetch<'_>,
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     // Fast path: no deferred seek pending and no suspended state machine. The
     // column fetch either completes or yields IO with nothing persisted, so the
     // op-state slot (enum write + drop on clear) is bypassed entirely. On IO
     // resume the slot is still idle and this path re-executes.
     if state.active_op_state.is_idle() && state.deferred_seeks[cursor_id].is_none() {
-        let result = fetch.fetch(program, state, cursor_id)?;
+        let result = fetch.fetch(program, state, cursor_id, pager)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
         }
@@ -2012,7 +2024,7 @@ fn op_column_impl(
                 *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
-                let result = fetch.fetch(program, state, cursor_id)?;
+                let result = fetch.fetch(program, state, cursor_id, pager)?;
                 if !matches!(result, InsnFunctionStepResult::Step) {
                     // IO yield: the slot stays at GetColumn so the resume
                     // re-enters this arm.
@@ -2036,7 +2048,21 @@ fn op_column_fetch(
     column: usize,
     dest: usize,
     default: &Option<Value>,
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    // Recipe backfill (lane k1-recipe-build): every column read of a table b-tree passes here, so
+    // a stale record's logical value is computed here and nowhere else (see `crate::recipe`).
+    if let Some((_, CursorType::BTreeTable(table))) = program.cursor_ref.get(cursor_id) {
+        if let Some(rs) = table.recipes.as_ref() {
+            match crate::recipe::column_fetch(
+                program, state, cursor_id, table, rs, column, dest, pager,
+            )? {
+                IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+                IOResult::Done(true) => return Ok(InsnFunctionStepResult::Step),
+                IOResult::Done(false) => {}
+            }
+        }
+    }
     // First check if this is a MaterializedViewCursor
     {
         let cursor = state.get_cursor(cursor_id);
@@ -2196,11 +2222,34 @@ fn op_column_range_fetch(
     start_column: usize,
     dest: usize,
     defaults: &[Option<Value>],
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     let (_, cursor_type) = program
         .cursor_ref
         .get(cursor_id)
         .expect("cursor_id should exist in cursor_ref");
+
+    // Recipe backfill: a range over a recipe table is read one column at a time through the
+    // single-column path, so the range cannot bypass the choke point.
+    if let CursorType::BTreeTable(table) = cursor_type {
+        if table.recipes.is_some() {
+            for (i, default) in defaults.iter().enumerate() {
+                match op_column_fetch(
+                    program,
+                    state,
+                    cursor_id,
+                    start_column + i,
+                    dest + i,
+                    default,
+                    pager,
+                )? {
+                    InsnFunctionStepResult::Step => {}
+                    other => return Ok(other),
+                }
+            }
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
 
     if !cursor_type.accepts_column_range_fusing() {
         crate::bail_parse_error!(
@@ -5660,6 +5709,16 @@ pub fn op_row_data(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowData { cursor_id, dest }, insn);
+
+    // Recipe backfill: a raw copy of a stale record would carry pre-recipe values. Refused.
+    if let Some((_, CursorType::BTreeTable(table))) = program.cursor_ref.get(*cursor_id) {
+        if return_if_io!(crate::recipe::row_is_stale(state, *cursor_id, table, _pager)) {
+            return Err(LimboError::InternalError(format!(
+                "RowData: refused a raw copy of a recipe-stale row of {}",
+                table.name
+            )));
+        }
+    }
 
     // Copy the row into the destination register's spent record buffer: one
     // payload copy, no allocation once the buffer has grown to the row size.
@@ -11752,9 +11811,20 @@ pub fn op_insert(
             OpInsertSubState::MaybeCaptureRecord => {
                 let has_dependent_views = {
                     let schema = program.connection.schema.read();
-                    !schema
+                    let has = !schema
                         .get_dependent_materialized_views(table_name)
-                        .is_empty()
+                        .is_empty();
+                    // Recipe backfill: the view maintenance below reads the raw old record.
+                    if has
+                        && schema
+                            .get_btree_table(table_name)
+                            .is_some_and(|t| t.recipes.is_some())
+                    {
+                        return Err(LimboError::InternalError(format!(
+                            "materialized view maintenance on recipe table {table_name} is refused"
+                        )));
+                    }
+                    has
                 };
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
@@ -12132,6 +12202,15 @@ pub fn op_delete(
                 if dependent_views.is_empty() {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
+                }
+                // Recipe backfill: the view maintenance below reads the raw record. Refused.
+                if schema
+                    .get_btree_table(table_name)
+                    .is_some_and(|t| t.recipes.is_some())
+                {
+                    return Err(LimboError::InternalError(format!(
+                        "materialized view maintenance on recipe table {table_name} is refused"
+                    )));
                 }
 
                 let deleted_record = {
@@ -16498,6 +16577,44 @@ pub fn op_add_column(
         Ok(())
     })??;
 
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// The in-memory half of a recipe backfill (lane k1-recipe-build, see `crate::recipe`): the
+/// `sqlite_schema` rows are already written; this attaches the recipe to the table and counts the
+/// rows the read-only pass matched as the UPDATE's changes.
+pub fn op_recipe_install(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(RecipeInstall { data }, insn);
+    if data.empty {
+        crate::recipe::count(crate::recipe::counter::EMPTY_MATCH, 1);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(crate::MAIN_DB_ID, |schema| {
+        crate::recipe::install_in_schema(
+            schema,
+            &data.table,
+            data.generation,
+            &data.sql,
+            data.add_gen_col,
+        )
+    })??;
+    let matched = match state.registers[data.count_reg].get_value() {
+        Value::Numeric(crate::numeric::Numeric::Integer(n)) if *n >= 0 => *n,
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "RecipeInstall: matched-row count is {other:?}"
+            )))
+        }
+    };
+    state.record_statement_changes(matched);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

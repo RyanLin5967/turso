@@ -307,6 +307,21 @@ pub struct AddColumnData {
     pub foreign_keys: Vec<Arc<ForeignKey>>,
 }
 
+/// Data for RecipeInstall (lane k1-recipe-build, see `crate::recipe`): the in-memory half of a
+/// recipe backfill, after its `sqlite_schema` rows are written.
+#[derive(Debug, Clone)]
+pub struct RecipeInstallData {
+    pub table: String,
+    pub generation: u64,
+    pub sql: String,
+    /// The table's first recipe also appends the hidden generation column.
+    pub add_gen_col: bool,
+    /// Rows the read-only pass matched: added to changes() and total_changes().
+    pub count_reg: usize,
+    /// The read-only pass matched no row: nothing is installed (only counted).
+    pub empty: bool,
+}
+
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct IntegrityCkData {
@@ -1873,6 +1888,10 @@ pub enum Insn {
     AddColumn {
         data: Box<AddColumnData>,
     },
+    /// Install a recipe backfill in the in-memory schema (see `crate::recipe`).
+    RecipeInstall {
+        data: Box<RecipeInstallData>,
+    },
     AlterColumn {
         db: usize,
         table: String,
@@ -2312,6 +2331,7 @@ impl InsnVariants {
             InsnVariants::RenameTable => execute::op_rename_table,
             InsnVariants::DropColumn => execute::op_drop_column,
             InsnVariants::AddColumn => execute::op_add_column,
+            InsnVariants::RecipeInstall => execute::op_recipe_install,
             InsnVariants::AlterColumn => execute::op_alter_column,
             InsnVariants::MaxPgcnt => execute::op_max_pgcnt,
             InsnVariants::JournalMode => execute::op_journal_mode,
@@ -2409,6 +2429,7 @@ impl Insn {
             | Self::RenameTable { .. }
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
+            | Self::RecipeInstall { .. }
             | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
             | Self::Vacuum { .. } => false,

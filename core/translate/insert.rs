@@ -2596,6 +2596,10 @@ fn build_insertion<'a>(
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
                 // Generated columns cannot be written to directly
                 col_in_table.ensure_not_generated("INSERT into", &column_name)?;
+                // Nor can a recipe table's generation column (see `crate::recipe`).
+                if crate::recipe::is_gen_column(col_in_table) {
+                    crate::bail_parse_error!("column {} is reserved", crate::recipe::GEN_COLUMN);
+                }
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -2804,6 +2808,20 @@ fn translate_column(
         });
     } else if column.is_virtual_generated() {
         // virtual columns are computed in a separate pass in compute_virtual_columns
+    } else if crate::recipe::is_gen_column(column) {
+        // A recipe table's generation column: every new row is written at the table's current
+        // generation, its in-memory DEFAULT (see `crate::recipe`).
+        match (column.default.as_ref(), crate::recipe::mutant()) {
+            (Some(default_expr), m) if m != crate::recipe::Mutant::M2 => {
+                translate_expr(program, None, default_expr, column_register, resolver)?;
+            }
+            _ => {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: column_register,
+                });
+            }
+        }
     } else if column.hidden() {
         program.emit_insn(Insn::Null {
             dest: column_register,

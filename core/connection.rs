@@ -422,6 +422,9 @@ pub struct Connection {
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
     pub(super) query_only: AtomicBool,
+    /// Recipe backfill (lane k1-recipe-build, see `crate::recipe`): eligible bulk UPDATEs on this
+    /// connection become recipes instead of table rewrites. Reads honour recipes either way.
+    pub(super) recipe_backfill: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -3923,6 +3926,16 @@ impl Connection {
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    /// Turn recipe backfill on or off for this connection (see `crate::recipe`).
+    pub fn set_recipe_backfill(&self, value: bool) {
+        self.recipe_backfill.store(value, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn recipe_backfill(&self) -> bool {
+        self.recipe_backfill.load(Ordering::SeqCst)
     }
 
     pub fn set_vdbe_trace(&self, value: bool) {

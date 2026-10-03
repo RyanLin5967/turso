@@ -3387,6 +3387,7 @@ impl Pager {
             }
             pages
         };
+        crate::recipe::count(crate::recipe::counter::BRANCH_DIRTY, dirty.len() as u64);
         branch.store.commit_pages(branch.id, &dirty)?;
         if schema_did_change {
             branch
@@ -3578,6 +3579,7 @@ impl Pager {
     #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<IOResult<(PageRef, Option<Completion>)>> {
         turso_assert_greater_than_or_equal!(page_idx, 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
+        crate::recipe::count(crate::recipe::counter::PAGE_FETCH, 1);
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
         #[cfg(test)]
         if self.spill_yield.should_yield_for(page_idx) {
@@ -4570,6 +4572,10 @@ impl Pager {
                         continue;
                     }
                     commit_info.initialize(dirty_pages.len() as usize);
+                    crate::recipe::count(
+                        crate::recipe::counter::TRUNK_DIRTY,
+                        dirty_pages.len() as u64,
+                    );
                     let mut cache = self.page_cache.write();
 
                     for page_id in dirty_pages.iter() {

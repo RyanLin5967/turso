@@ -1995,6 +1995,7 @@ impl Schema {
                 has_virtual_columns: false,
                 logical_to_physical_map,
                 column_dependencies: Default::default(),
+                recipes: None,
             })));
 
             // Only add to schema if compatible
@@ -2401,6 +2402,9 @@ impl Schema {
                     tbl_name.name.as_str(),
                 )?;
             }
+            crate::recipe::SCHEMA_TYPE => {
+                crate::recipe::handle_schema_row(self, name, table_name, maybe_sql)?;
+            }
             // Types are stored in sqlite_turso_types, not sqlite_schema
             _ => {}
         };
@@ -2729,6 +2733,7 @@ impl TryClone for BTreeTable {
             has_virtual_columns: self.has_virtual_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
+            recipes: self.recipes.clone(),
         })
     }
 }
@@ -3329,6 +3334,9 @@ pub struct BTreeTable {
     pub has_virtual_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
+    /// Recipe backfills pending on this table (lane k1-recipe-build, see `crate::recipe`); `None`
+    /// when the table has none.
+    pub recipes: Option<Arc<crate::recipe::TableRecipes>>,
 }
 
 pub struct ColumnsMut<'a> {
@@ -3393,6 +3401,7 @@ impl BTreeTable {
             has_virtual_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
+            recipes: None,
         }
     }
 
@@ -5039,6 +5048,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         has_virtual_columns: false,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
+        recipes: None,
     };
     table.prepare_generated_columns()?;
     if !table.has_rowid {
@@ -5631,6 +5641,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         has_virtual_columns: false,
         logical_to_physical_map,
         column_dependencies: Default::default(),
+        recipes: None,
     })
 }
 
@@ -6585,6 +6596,7 @@ mod tests {
             has_virtual_columns: false,
             logical_to_physical_map,
             column_dependencies: Default::default(),
+            recipes: None,
         };
 
         let result = Index::automatic_from_primary_key(
