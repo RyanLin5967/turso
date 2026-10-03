@@ -1018,8 +1018,9 @@ fn load_fr(trunk: &Arc<Connection>, rng: &mut Rng) {
 fn step_sql(workload: &str, thread: u64, step: u64, rng: &mut Rng) -> Vec<(String, String, char)> {
     let sfx = format!("t{thread}_s{step}");
     match workload {
-        // SoftwareDevOps, macrobench/workflows.py @ 58cf262, M_s = 2 (PREREG P2).
-        "sd" => vec![
+        // SoftwareDevOps, macrobench/workflows.py @ 58cf262, M_s = 2 (PREREG P2). "sdx" is the
+        // amendment-2 variant (NOT verbatim): each branch's credit_lim backfill differs.
+        "sd" | "sdx" => vec![
             ("ddl1".into(), format!("ALTER TABLE customer ADD COLUMN loyalty_tier_{sfx} VARCHAR(8);"), 'D'),
             ("ddl2".into(), format!("ALTER TABLE customer ADD COLUMN credit_lim_{sfx} DECIMAL(10,2);"), 'D'),
             ("dml".into(), format!(
@@ -1029,7 +1030,7 @@ fn step_sql(workload: &str, thread: u64, step: u64, rng: &mut Rng) -> Vec<(Strin
                        WHEN c_ytd_payment > 5000 THEN 'Silver'
                        ELSE 'Bronze'
                    END,
-                   credit_lim_{sfx} = c_credit_lim;"), 'M'),
+                   credit_lim_{sfx} = c_credit_lim{};", if workload == "sdx" { format!(" + {step}") } else { String::new() }), 'M'),
             ("eval1".into(), format!("SELECT COUNT(*) FROM customer WHERE loyalty_tier_{sfx} IS NULL;"), 'Q'),
             ("eval2".into(), format!(
                 "SELECT loyalty_tier_{sfx}, COUNT(*), AVG(credit_lim_{sfx})
@@ -1119,7 +1120,7 @@ fn step_sql(workload: &str, thread: u64, step: u64, rng: &mut Rng) -> Vec<(Strin
 fn lazy_migration(workload: &str, thread: u64, step: u64) -> Option<String> {
     let sfx = format!("t{thread}_s{step}");
     match workload {
-        "sd" => Some(format!("UPDATE customer SET loyalty_tier_{sfx} = loyalty_tier_{sfx};")),
+        "sd" | "sdx" => Some(format!("UPDATE customer SET loyalty_tier_{sfx} = loyalty_tier_{sfx};")),
         "dc" | "repair" => Some("UPDATE customer SET c_balance = c_balance;".to_string()),
         _ => None,
     }
@@ -1380,7 +1381,7 @@ fn bench_main(args: &Args) {
     if handles.is_empty() || total_owned == 0 {
         not_a_result("no branch owned any page: the instrument read nothing");
     }
-    if arm != "eager" && workload == "sd" && io[counter::INSTALLED] == 0 {
+    if arm != "eager" && (workload == "sd" || workload == "sdx") && io[counter::INSTALLED] == 0 {
         not_a_result("recipe arm installed no recipe");
     }
     if arm == "eager" && io[counter::INSTALLED] != 0 {
