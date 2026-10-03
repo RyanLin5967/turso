@@ -5,7 +5,7 @@
 //!   branch_recipe diff  --seeds S [--start S0] --ops K --dir DIR [--no-sqlite]
 //!   branch_recipe bench --workload sd|dc|repair|fr --arm eager|recipe|lazy --n N --v V
 //!                       --shape fan|tree|chain --db PATH [--points P] [--sample B] [--seed X]
-//!                       [--dedup] [--reap] [--fr F] [--fi F] [--depth D]
+//!                       [--dedup] [--reap] [--fr F] [--fi F] [--depth D] [--dirty-map]
 //!   branch_recipe crash --seeds S [--start S0] --n N --ops K --dir DIR
 //!
 //! `crash` is PREREG A4.4 (a): per seed a child process runs a W-SD op stream with recipes on, on
@@ -1189,6 +1189,126 @@ fn page_hashes(conn: &Arc<Connection>) -> Vec<u128> {
         .collect()
 }
 
+/// `--dirty-map`: every page image the connection sees, by page number (128-bit hash).
+fn page_map(conn: &Arc<Connection>) -> BTreeMap<u32, u128> {
+    use std::hash::{Hash, Hasher};
+    let rs = rows(conn, "SELECT pgno, data FROM sqlite_dbpage")
+        .unwrap_or_else(|e| not_a_result(&format!("sqlite_dbpage: {e}")));
+    rs.iter()
+        .map(|r| {
+            let p = r[0].as_int().unwrap_or_else(|| not_a_result("sqlite_dbpage pgno")) as u32;
+            let bytes: &[u8] = match r[1].as_ref() {
+                ValueRef::Blob(b) => b,
+                other => not_a_result(&format!("sqlite_dbpage data is {other:?}")),
+            };
+            let mut a = std::collections::hash_map::DefaultHasher::new();
+            0u8.hash(&mut a);
+            bytes.hash(&mut a);
+            let mut b = std::collections::hash_map::DefaultHasher::new();
+            1u8.hash(&mut b);
+            bytes.hash(&mut b);
+            (p, ((a.finish() as u128) << 64) | b.finish() as u128)
+        })
+        .collect()
+}
+
+fn page_bytes(conn: &Arc<Connection>, p: u32) -> Vec<u8> {
+    let rs = rows(conn, &format!("SELECT data FROM sqlite_dbpage WHERE pgno = {p}"))
+        .unwrap_or_else(|e| not_a_result(&format!("sqlite_dbpage {p}: {e}")));
+    match rs.first().map(|r| r[0].as_ref()) {
+        Some(ValueRef::Blob(b)) => b.to_vec(),
+        other => not_a_result(&format!("sqlite_dbpage {p}: {other:?}")),
+    }
+}
+
+fn varint(b: &[u8]) -> (u64, usize) {
+    let mut v = 0u64;
+    for (i, &x) in b.iter().take(9).enumerate() {
+        if i == 8 {
+            return ((v << 8) | x as u64, 9);
+        }
+        v = (v << 7) | (x & 0x7f) as u64;
+        if x & 0x80 == 0 {
+            return (v, i + 1);
+        }
+    }
+    (v, 9)
+}
+
+fn be32(b: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// `--dirty-map`: label pages by where they sit, from the page images alone: page 1, sqlite_schema's b-tree (walked
+/// from page 1: interior children, leaf cells' overflow chains, by SQLite's file format), the freelist (trunks from
+/// header offset 32), and the roots named in sqlite_schema. Anything else is NON-SCHEMA.
+fn page_classes(conn: &Arc<Connection>) -> BTreeMap<u32, String> {
+    let p1 = page_bytes(conn, 1);
+    let page_size = match u16::from_be_bytes([p1[16], p1[17]]) {
+        1 => 65536usize,
+        n => n as usize,
+    };
+    let usable = page_size - p1[20] as usize;
+    let mut out: BTreeMap<u32, String> = BTreeMap::new();
+    let mut stack = vec![1u32];
+    while let Some(p) = stack.pop() {
+        let b = if p == 1 { p1.clone() } else { page_bytes(conn, p) };
+        let off = if p == 1 { 100 } else { 0 };
+        let ty = b[off];
+        let ncells = u16::from_be_bytes([b[off + 3], b[off + 4]]) as usize;
+        let hdr = if ty == 5 { 12 } else { 8 };
+        let cell = |i: usize| u16::from_be_bytes([b[off + hdr + 2 * i], b[off + hdr + 2 * i + 1]]) as usize;
+        match ty {
+            5 => {
+                out.insert(p, format!("schema-interior{}", if p == 1 { "(p1)" } else { "" }));
+                for i in 0..ncells {
+                    stack.push(be32(&b, cell(i)));
+                }
+                stack.push(be32(&b, off + 8));
+            }
+            13 => {
+                out.insert(p, format!("schema-leaf{}", if p == 1 { "(p1)" } else { "" }));
+                for i in 0..ncells {
+                    let c = cell(i);
+                    let (payload, n1) = varint(&b[c..]);
+                    let (_, n2) = varint(&b[c + n1..]);
+                    let payload = payload as usize;
+                    let x = usable - 35;
+                    if payload <= x {
+                        continue;
+                    }
+                    let m = ((usable - 12) * 32 / 255) - 23;
+                    let k = m + ((payload - m) % (usable - 4));
+                    let local = if k <= x { k } else { m };
+                    let mut ov = be32(&b, c + n1 + n2 + local);
+                    while ov != 0 {
+                        out.insert(ov, "schema-overflow".into());
+                        ov = be32(&page_bytes(conn, ov), 0);
+                    }
+                }
+            }
+            other => {
+                out.insert(p, format!("schema-page-of-type-{other}"));
+            }
+        }
+    }
+    let mut trunk = be32(&p1, 32);
+    while trunk != 0 {
+        let t = page_bytes(conn, trunk);
+        out.insert(trunk, "freelist-trunk".into());
+        for i in 0..be32(&t, 4) as usize {
+            out.insert(be32(&t, 8 + 4 * i), "freelist-leaf".into());
+        }
+        trunk = be32(&t, 0);
+    }
+    for r in rows(conn, "SELECT name, rootpage FROM sqlite_schema WHERE rootpage > 0").unwrap_or_default() {
+        if let (Some(ValueRef::Text(n)), Some(root)) = (r.first().map(|v| v.as_ref()), r.get(1).and_then(|v| v.as_int())) {
+            out.entry(root as u32).or_insert_with(|| format!("root-of-{}", n.as_str()));
+        }
+    }
+    out
+}
+
 fn bench_main(args: &Args) {
     let workload = args.workload.as_str();
     let arm = args.arm.as_str();
@@ -1332,6 +1452,8 @@ fn bench_main(args: &Args) {
                     ));
                 }
             }
+            // --dirty-map snapshots sit outside the statement's counter window, so its counters are unchanged.
+            let before = (args.dirty_map && label == "dml").then(|| page_map(&conn));
             let c0 = snap();
             let u0 = cpu_us();
             let t = Instant::now();
@@ -1349,6 +1471,23 @@ fn bench_main(args: &Args) {
             ));
             if kind == &'M' {
                 line.push_str(&format!(" {label}_changes={}", conn.changes()));
+            }
+            if let Some(before) = before {
+                let after = page_map(&conn);
+                let mut changed: Vec<u32> =
+                    after.iter().filter(|(p, h)| before.get(p) != Some(h)).map(|(p, _)| *p).collect();
+                changed.extend(before.keys().filter(|p| !after.contains_key(p)));
+                let classes = page_classes(&conn);
+                let labels: Vec<String> = changed
+                    .iter()
+                    .map(|p| format!("{p}:{}", classes.get(p).map_or("NON-SCHEMA", |c| c.as_str())))
+                    .collect();
+                line.push_str(&format!(
+                    " {label}_changed_n={} {label}_changed={} schema_pages={}",
+                    changed.len(),
+                    labels.join(","),
+                    classes.values().filter(|c| c.starts_with("schema")).count()
+                ));
             }
             if kind == &'Q' {
                 let h = result_hash(&out);
@@ -2086,6 +2225,8 @@ struct Args {
     /// bench: DEDUP arm (A4.1), reap each branch after its step (A4.3), tree fanouts and depth.
     dedup: bool,
     reap: bool,
+    /// bench: page numbers the dml statement changed, labelled by b-tree (needs --features cli_only).
+    dirty_map: bool,
     fr: u64,
     fi: u64,
     depth: u64,
@@ -2113,6 +2254,7 @@ fn parse_args() -> Args {
         no_recipe: false,
         dedup: false,
         reap: false,
+        dirty_map: false,
         fr: 5,
         fi: 3,
         depth: 4,
@@ -2128,6 +2270,7 @@ fn parse_args() -> Args {
             "--no-recipe" => a.no_recipe = true,
             "--dedup" => a.dedup = true,
             "--reap" => a.reap = true,
+            "--dirty-map" => a.dirty_map = true,
             "--fr" => a.fr = val().parse().unwrap_or_else(|_| die("bad --fr")),
             "--fi" => a.fi = val().parse().unwrap_or_else(|_| die("bad --fi")),
             "--depth" => a.depth = val().parse().unwrap_or_else(|_| die("bad --depth")),
