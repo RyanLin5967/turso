@@ -347,12 +347,87 @@ fn referenced_columns(expr: &Expr, out: &mut Vec<usize>) -> Result<()> {
     Ok(())
 }
 
-/// Resolve one SET/WHERE expression for a recipe: deterministic, row-local, every name a column.
+/// Scalar functions a recipe may call: deterministic, row-local, reading neither the schema nor
+/// any connection state, and returning plain values (no JSON subtype). An allowlist, because
+/// `is_deterministic` admitted `table_columns_json_array`, which reads the schema at run time
+/// (k1-recipe-build adversary finding).
+const RECIPE_FUNCTIONS: [&str; 27] = [
+    "abs", "char", "coalesce", "concat", "concat_ws", "hex", "ifnull", "iif", "instr", "length",
+    "lower", "ltrim", "max", "min", "nullif", "octet_length", "quote", "replace", "round", "rtrim",
+    "sign", "substr", "substring", "trim", "typeof", "unicode", "upper",
+];
+
+fn functions_allowed(expr: &Expr) -> Result<bool> {
+    let mut ok = true;
+    walk_expr(expr, &mut |e| {
+        if let Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } = e {
+            let n = normalize_ident(name.as_str());
+            if !RECIPE_FUNCTIONS.iter().any(|f| *f == n) {
+                ok = false;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(ok)
+}
+
+/// Resolve one SET/WHERE expression for a recipe: deterministic, row-local, every name a column,
+/// every function on the allowlist.
 fn resolve_recipe_expr(expr: &Expr, columns: &[Column]) -> Result<Expr> {
     validate_generated_expr(expr)?;
+    if !functions_allowed(expr)? {
+        return Err(LimboError::ParseError(
+            "recipe: a function outside the recipe allowlist".to_string(),
+        ));
+    }
     let mut e = expr.clone();
     resolve_gencol_expr_columns(&mut e, columns)?;
     Ok(e)
+}
+
+/// Parse a CREATE TABLE text back into a table (the rewrite check).
+fn reparse_table(sql: &str, root_page: i64) -> Result<BTreeTable> {
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let Some(ast::Cmd::Stmt(ast::Stmt::CreateTable { tbl_name, body, .. })) = parser.next_cmd()? else {
+        return Err(LimboError::ParseError(format!("not a CREATE TABLE: {sql}")));
+    };
+    crate::schema::create_table(tbl_name.name.as_str(), &body, root_page)
+}
+
+/// A name the regenerated CREATE TABLE text reproduces exactly.
+fn plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The first recipe rewrites the table's CREATE TABLE text through `BTreeTable::to_sql`, which
+/// drops ON CONFLICT clauses, PRIMARY KEY DESC, collations inside a table-level UNIQUE, and
+/// mis-renders foreign keys and quoted key names (k1-recipe-build adversary finding). Recipes are
+/// allowed only on tables inside the subset it reproduces exactly; the text is also re-parsed and
+/// compared before any recipe is planned.
+fn table_rewrite_is_faithful(btree: &BTreeTable) -> bool {
+    plain_identifier(&btree.name)
+        && btree.foreign_keys.is_empty()
+        && btree.rowid_alias_conflict_clause.is_none()
+        && btree
+            .primary_key_columns
+            .iter()
+            .all(|(n, o)| plain_identifier(n) && *o == ast::SortOrder::Asc)
+        && btree.unique_sets.iter().all(|u| {
+            u.conflict_clause.is_none()
+                && u.columns.iter().all(|c| {
+                    plain_identifier(&c.name)
+                        && c.collation.is_none()
+                        && c.sort_order == ast::SortOrder::Asc
+                        && c.nulls_order.is_none()
+                })
+        })
+        && btree.columns().iter().all(|c| {
+            c.name.as_deref().is_some_and(plain_identifier)
+                && c.notnull_conflict_clause.is_none()
+                && !c.has_explicit_collation()
+        })
 }
 
 /// Parse a persisted recipe and resolve it against the table's current columns. Install and
@@ -550,16 +625,36 @@ fn plan_recipe(
     {
         return refuse("context");
     }
+    // Branch connections only: a branch has one connection, so a recipe (which makes this UPDATE
+    // a schema change) cannot disturb another connection's open read transaction, as it does on a
+    // shared trunk (k1-recipe-build adversary finding R5).
+    if connection.branch_id().is_none() {
+        return refuse("trunk connection");
+    }
     let schema = resolver.schema();
     let name = normalize_ident(body.tbl_name.name.as_str());
     if name.starts_with("sqlite_") || name.starts_with("__turso_internal") {
         return refuse("system table");
+    }
+    // The name must resolve to the main database: a TEMP table of the same name shadows it for
+    // the eager UPDATE (adversary finding).
+    match resolver.resolve_existing_table_database_id_qualified(&body.tbl_name) {
+        Ok(db) if db == MAIN_DB_ID => {}
+        _ => return refuse("name resolves outside main"),
+    }
+    if resolver.has_temp_database()
+        && resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_table(&name).is_some())
+    {
+        return refuse("a TEMP table shadows the name");
     }
     let Some(btree) = schema.get_btree_table(&name) else {
         return refuse("not a b-tree table");
     };
     if !btree.has_rowid || btree.is_strict || btree.has_virtual_columns {
         return refuse("table shape");
+    }
+    if btree.recipes.is_none() && !table_rewrite_is_faithful(&btree) {
+        return refuse("CREATE TABLE text would not survive the rewrite");
     }
     if !btree.check_constraints.is_empty() {
         return refuse("check constraints");
@@ -665,6 +760,30 @@ fn plan_recipe(
     };
     let generation = btree.recipes.as_ref().map_or(0, |r| r.generation()) + 1;
     let sql = recipe_sql(&btree.name, &sets, body.where_clause.as_deref());
+    // The rewritten CREATE TABLE text must re-parse to the same table plus the gen column.
+    if btree.recipes.is_none() {
+        let mut with_gen = (*btree).clone();
+        with_gen.columns_mut().push(gen_column()?);
+        let reparsed = reparse_table(&with_gen.to_sql(), btree.root_page);
+        let same = reparsed.as_ref().is_ok_and(|t| {
+            let cols = t.columns();
+            cols.len() == with_gen.columns().len()
+                && cols.iter().zip(with_gen.columns()).all(|(a, b)| {
+                    a.name == b.name
+                        && a.ty_str == b.ty_str
+                        && a.hidden() == b.hidden()
+                        && a.notnull() == b.notnull()
+                        && a.primary_key() == b.primary_key()
+                        && a.default.as_ref().map(|d| d.to_string())
+                            == b.default.as_ref().map(|d| d.to_string())
+                })
+                && t.primary_key_columns == btree.primary_key_columns
+                && t.unique_sets.len() == btree.unique_sets.len()
+        });
+        if !same {
+            return refuse("rewritten CREATE TABLE text does not re-parse to the same table");
+        }
+    }
     // The text must round-trip to the same targets, or install would disagree with this plan.
     {
         let mut probe = (*btree).clone();
@@ -1051,7 +1170,12 @@ impl CompiledRecipe {
         );
         if matched {
             for (k, &t) in self.targets.iter().enumerate() {
-                values[t] = self.state.get_register(self.outs[k]).get_value().clone();
+                // A stored value carries no subtype; the eager UPDATE's round trip through the
+                // record drops it, so the recipe's output must too (adversary finding).
+                values[t] = match self.state.get_register(self.outs[k]).get_value() {
+                    Value::Text(text) => Value::Text(crate::types::Text::new(text.as_str().to_string())),
+                    other => other.clone(),
+                };
             }
         }
         Ok(())
@@ -1073,12 +1197,32 @@ struct RowCache {
 pub(crate) struct RecipeExec {
     compiled: HashMap<(usize, usize), CompiledRecipe>,
     rows: Vec<RowCache>,
+    /// Cursors opened by OpenEphemeral / OpenAutoindex (or duplicated from one): their records
+    /// are whatever the statement stored there, never a table's stale rows.
+    ephemeral: Vec<bool>,
 }
 
 impl RecipeExec {
     pub(crate) fn clear(&mut self) {
         self.compiled.clear();
         self.rows.clear();
+        self.ephemeral.clear();
+    }
+
+    pub(crate) fn set_ephemeral(&mut self, cursor_id: usize, ephemeral: bool) {
+        if self.ephemeral.len() <= cursor_id {
+            if !ephemeral {
+                return;
+            }
+            self.ephemeral.resize(cursor_id + 1, false);
+        }
+        self.ephemeral[cursor_id] = ephemeral;
+        // A reopened cursor's cached row belongs to its previous b-tree.
+        self.rows.retain(|r| r.cursor_id != cursor_id);
+    }
+
+    pub(crate) fn is_ephemeral(&self, cursor_id: usize) -> bool {
+        self.ephemeral.get(cursor_id).copied().unwrap_or(false)
     }
 }
 
@@ -1104,14 +1248,18 @@ fn current_row(
     rs: &TableRecipes,
     pager: &Arc<Pager>,
 ) -> Result<IOResult<Option<(i64, u64)>>> {
+    // Any cursor on the table's own b-tree counts, whatever pager reaches it (an ATTACHed copy
+    // of the same file has its own pager: comparing pagers served it stale values, an adversary
+    // finding). Ephemeral tables are recognised by how they were opened, not by their pager.
+    let _ = pager;
+    if state.recipe_exec.is_ephemeral(cursor_id) {
+        return Ok(IOResult::Done(None));
+    }
     let cursor = state.get_cursor(cursor_id);
     let crate::types::Cursor::BTree(btc) = cursor else {
         return Ok(IOResult::Done(None));
     };
-    if btc.root_page() != table.root_page
-        || !Arc::ptr_eq(&btc.get_pager(), pager)
-        || btc.get_null_flag()
-    {
+    if btc.root_page() != table.root_page || btc.get_null_flag() {
         return Ok(IOResult::Done(None));
     }
     let Some(rowid) = crate::return_if_io!(btc.rowid()) else {

@@ -1,0 +1,1342 @@
+===== 00_sanity
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y'), (3, NULL)   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = a * 10   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+3
+    both  : 1, 1, '10' | 2, 2, '20' | 3, 3, '30' changes=3
+[main] SELECT __turso_gen FROM t   <DIFF> 
+    recipe: 1 | 1 | 1 changes=3
+    eager : ERROR Parse error: no such column: __turso_gen
+[main] SELECT type, name, sql FROM sqlite_schema   <DIFF> 
+    recipe: 'table', 't', 'CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, __turso_gen INTEGER HIDDEN)' | 'recipe', '__turso_recipe_t_1', 'UPDATE "t" SET "b" = a * 10' changes=3
+    eager : 'table', 't', 'CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)' changes=3
+[main] SELECT count(*) FROM sqlite_schema   <DIFF> 
+    recipe: 2 changes=3
+    eager : 1 changes=3
+SUMMARY statements=7 diffs=3
+rc=3
+===== 01_table_columns
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, c TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a) VALUES (1), (2)   <same> 
+    both  : (no rows) changes=2
+-- @expect-diff the gen column already shows in the recipe arm
+[main] UPDATE t SET c = table_columns_json_array('t')   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, c FROM t ORDER BY id   <DIFF> stale-reads+2
+    recipe: 1, '["id","a","c","__turso_gen"]' | 2, '["id","a","c","__turso_gen"]' changes=2
+    eager : 1, '["id","a","c"]' | 2, '["id","a","c"]' changes=2
+[main] ALTER TABLE t ADD COLUMN later INTEGER   <same> 
+    both  : (no rows) changes=2
+[main] SELECT id, c FROM t ORDER BY id   <DIFF> stale-reads+2
+    recipe: 1, '["id","a","c","__turso_gen","later"]' | 2, '["id","a","c","__turso_gen","later"]' changes=2
+    eager : 1, '["id","a","c"]' | 2, '["id","a","c"]' changes=2
+SUMMARY statements=6 diffs=2
+rc=3
+===== 02a_unique_replace
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT UNIQUE ON CONFLICT REPLACE, b INTEGER)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(u, b) VALUES ('k', 1), ('m', 2)   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = b + 100   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT sql FROM sqlite_schema WHERE name = 't'   <DIFF> 
+    recipe: 'CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE, b INTEGER, __turso_gen INTEGER HIDDEN)' changes=2
+    eager : 'CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE ON CONFLICT REPLACE, b INTEGER)' changes=2
+[main] INSERT INTO t(u, b) VALUES ('k', 9)   <same> 
+    both  : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+1
+    both  : 2, 'm', 102 | 3, 'k', 9 changes=1
+-- @reopen: eager database reopened
+open /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/k1adv/db/02a_unique_replace/recipe.db failed: Corrupt database: table t has a recipe but no __turso_gen column
+rc=2
+===== 02b_notnull_replace
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 7, b INTEGER)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(n, b) VALUES (1, 1)   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET b = b + 100   <same> INSTALLED+1
+    both  : (no rows) changes=1
+-- @reopen: eager database reopened
+open /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/k1adv/db/02b_notnull_replace/recipe.db failed: Corrupt database: table t has a recipe but no __turso_gen column
+rc=2
+===== 02c_ipk_replace
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, b INTEGER, c TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t VALUES (1, 1, 'one')   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET b = b + 100   <same> INSTALLED+1
+    both  : (no rows) changes=1
+-- @reopen: eager database reopened
+open /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/k1adv/db/02c_ipk_replace/recipe.db failed: Corrupt database: table t has a recipe but no __turso_gen column
+rc=2
+===== 02d_unique_collate
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, u TEXT, b INTEGER, UNIQUE (u COLLATE NOCASE))   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(u, b) VALUES ('abc', 1)   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET b = b + 100   <same> INSTALLED+1
+    both  : (no rows) changes=1
+[main] SELECT sql FROM sqlite_schema WHERE name = 't'   <DIFF> 
+    recipe: 'CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT, b INTEGER, __turso_gen INTEGER HIDDEN, UNIQUE (u))' changes=1
+    eager : 'CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT, b INTEGER, UNIQUE (u COLLATE NOCASE))' changes=1
+-- @reopen: eager database reopened
+open /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/k1adv/db/02d_unique_collate/recipe.db failed: Corrupt database: table t has a recipe but no __turso_gen column
+rc=2
+===== 02e_fk_noparentcols
+[main] PRAGMA foreign_keys = ON   <same> 
+    both  : (no rows) changes=0
+[main] CREATE TABLE p(id INTEGER PRIMARY KEY)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO p VALUES (1)   <same> 
+    both  : (no rows) changes=1
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p, b INTEGER)   <same> 
+    both  : (no rows) changes=1
+[main] INSERT INTO t(pid, b) VALUES (1, 1)   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET b = b + 100   <same> INSTALLED+1
+    both  : (no rows) changes=1
+[main] SELECT sql FROM sqlite_schema WHERE name = 't'   <DIFF> 
+    recipe: 'CREATE TABLE t (id INTEGER PRIMARY KEY, pid INTEGER, b INTEGER, __turso_gen INTEGER HIDDEN, FOREIGN KEY (pid) REFERENCES p())' changes=1
+    eager : 'CREATE TABLE t (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p, b INTEGER)' changes=1
+-- @reopen: eager database reopened
+open /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/k1adv/db/02e_fk_noparentcols/recipe.db failed: near ")": syntax error
+rc=2
+===== 02f_pk_keyword
+[main] CREATE TABLE t("order" INTEGER, "x y" INTEGER, b INTEGER, PRIMARY KEY ("order", "x y"))   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t VALUES (1, 1, 1)   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET b = b + 100   <same> INSTALLED+1
+    both  : (no rows) changes=1
+[main] SELECT sql FROM sqlite_schema WHERE name = 't'   <DIFF> 
+    recipe: 'CREATE TABLE t ("order" INTEGER, "x y" INTEGER, b INTEGER, __turso_gen INTEGER HIDDEN, PRIMARY KEY (order, x y))' changes=1
+    eager : 'CREATE TABLE t ("order" INTEGER, "x y" INTEGER, b INTEGER, PRIMARY KEY ("order", "x y"))' changes=1
+-- @reopen: eager database reopened
+open /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/k1adv/db/02f_pk_keyword/recipe.db failed: near "order": syntax error
+rc=2
+===== 02g_pk_desc
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY DESC, b INTEGER)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t VALUES (10, 1), (20, 2)   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = b + 100   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT sql FROM sqlite_schema WHERE name = 't'   <DIFF> 
+    recipe: 'CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER, __turso_gen INTEGER HIDDEN)' changes=2
+    eager : 'CREATE TABLE t (id INTEGER PRIMARY KEY DESC, b INTEGER)' changes=2
+[main] SELECT rowid, id, b FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 10, 101 | 2, 20, 102 changes=2
+-- @reopen: eager database reopened
+open /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/k1adv/db/02g_pk_desc/recipe.db failed: Corrupt database: table t has a recipe but no __turso_gen column
+rc=2
+===== 02h_reopen_minimal
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x')   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET b = 'y'   <same> INSTALLED+1
+    both  : (no rows) changes=1
+-- @reopen: eager database reopened
+open /private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad/k1adv/db/02h_reopen_minimal/recipe.db failed: Corrupt database: table t has a recipe but no __turso_gen column
+rc=2
+===== 03_insert_values
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] CREATE TABLE src(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t VALUES (1, 1, 'x'), (2, 2, 'y')   <same> 
+    both  : (no rows) changes=2
+[main] INSERT INTO src VALUES (10, 10, 'p')   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET b = a * 10   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] INSERT INTO t VALUES (3, 3, 'z')   <DIFF> 
+    recipe: ERROR Parse error: table t has 4 columns but 3 values were supplied
+    eager : (no rows) changes=1
+[main] INSERT INTO t SELECT * FROM src   <DIFF> 
+    recipe: ERROR Parse error: table t has 4 columns but 3 values were supplied
+    eager : (no rows) changes=1
+[main] INSERT INTO t SELECT id + 100, a, b FROM t   <DIFF> 
+    recipe: ERROR Parse error: table t has 4 columns but 3 values were supplied
+    eager : (no rows) changes=4
+[main] SELECT * FROM t ORDER BY id   <DIFF> stale-reads+2
+    recipe: 1, 1, '10' | 2, 2, '20' changes=2
+    eager : 1, 1, '10' | 2, 2, '20' | 3, 3, 'z' | 10, 10, 'p' | 101, 1, '10' | 102, 2, '20' | 103, 3, 'z' | 110, 10, 'p' changes=4
+[main] SELECT * FROM t WHERE id > 100 ORDER BY id   <DIFF> 
+    recipe: (no rows) changes=2
+    eager : 101, 1, '10' | 102, 2, '20' | 103, 3, 'z' | 110, 10, 'p' changes=4
+[main] CREATE TABLE copy AS SELECT * FROM t   <DIFF> stale-reads+2
+    recipe: (no rows) changes=2
+    eager : (no rows) changes=4
+[main] SELECT * FROM copy ORDER BY id   <DIFF> 
+    recipe: 1, 1, '10' | 2, 2, '20' changes=2
+    eager : 1, 1, '10' | 2, 2, '20' | 3, 3, 'z' | 10, 10, 'p' | 101, 1, '10' | 102, 2, '20' | 103, 3, 'z' | 110, 10, 'p' changes=4
+[main] PRAGMA table_info(t)   <DIFF> 
+    recipe: 0, 'id', 'INTEGER', 0, NULL, 1 | 1, 'a', 'INTEGER', 0, NULL, 0 | 2, 'b', 'TEXT', 0, NULL, 0 changes=2
+    eager : 0, 'id', 'INTEGER', 0, NULL, 1 | 1, 'a', 'INTEGER', 0, NULL, 0 | 2, 'b', 'TEXT', 0, NULL, 0 changes=4
+SUMMARY statements=13 diffs=8
+rc=3
+===== 04_subtype
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, c TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a) VALUES (1), (2)   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET c = json_object('k', a)   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, c FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, '{"k":1}' | 2, '{"k":2}' changes=2
+-- @expect-diff subtype leaks through the recipe path
+[main] SELECT id, json_array(c) FROM t ORDER BY id   <DIFF> stale-reads+2
+    recipe: 1, '[{"k":1}]' | 2, '[{"k":2}]' changes=2
+    eager : 1, '["{\"k\":1}"]' | 2, '["{\"k\":2}"]' changes=2
+[main] SELECT id, json_object('x', c) FROM t ORDER BY id   <DIFF> stale-reads+2
+    recipe: 1, '{"x":{"k":1}}' | 2, '{"x":{"k":2}}' changes=2
+    eager : 1, '{"x":"{\"k\":1}"}' | 2, '{"x":"{\"k\":2}"}' changes=2
+[main] SELECT id, subtype(c) FROM t ORDER BY id   <DIFF> stale-reads+2
+    recipe: 1, 74 | 2, 74 changes=2
+    eager : 1, 0 | 2, 0 changes=2
+[main] SELECT id, json_insert('{}', '$.v', c) FROM t ORDER BY id   <DIFF> stale-reads+2
+    recipe: 1, '{"v":{"k":1}}' | 2, '{"v":{"k":2}}' changes=2
+    eager : 1, '{"v":"{\"k\":1}"}' | 2, '{"v":"{\"k\":2}"}' changes=2
+[main] SELECT json_group_array(c) FROM t   <DIFF> stale-reads+2
+    recipe: '[{"k":1},{"k":2}]' changes=2
+    eager : '["{\"k\":1}","{\"k\":2}"]' changes=2
+SUMMARY statements=9 diffs=5
+rc=3
+===== 05_exprs
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, r REAL, n NUMERIC, x, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b, r, n, x) VALUES (1, 'Abc', 1.5, '12', x'00ff'), (-3, 'x%y', -0.5, 'abc', NULL), (NULL, NULL, NULL, NULL, 'q')   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET c1 = - -a   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c2 = a - -1   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c3 = NOT NOT a   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c4 = 'it''s' || b   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c5 = x'41' || b   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c6 = b COLLATE NOCASE = 'abc'   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c7 = a IS NOT NULL   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c8 = a NOTNULL   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c9 = a IS NOT DISTINCT FROM 1   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c10 = a NOT BETWEEN 0 AND 2   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c11 = a NOT IN (1, 2)   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c12 = b LIKE 'x!%%' ESCAPE '!'   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c13 = b NOT GLOB 'A*'   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c14 = CASE a WHEN 1 THEN 'one' WHEN -3 THEN 'mthree' END   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c15 = ~a + (a << 2) - (a >> 1) + (a & 3) + (a | 4) + (a % 3)   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c16 = CAST(n AS INTEGER)   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c17 = TRUE + FALSE   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c18 = 9223372036854775807 + a   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c19 = -9223372036854775808   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c20 = 1e3 + .5 + 0x10   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c21 = r * -0.0   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c22 = "a" + [a] + `a`   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c23 = printf('%5.2f|%s', r, b)   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c24 = iif(a > 0, 'pos', 'neg')   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c25 = '{"k":[1,2]}' -> '$.k'   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c26 = '{"k":[1,2]}' ->> '$.k[1]'   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c27 = a IN ()   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c28 = b COLLATE RTRIM = 'Abc   '   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c29 = typeof(x) || hex(x) || quote(x)   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c30 = - 9223372036854775808   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+90
+    both  : 1, 1, 'Abc', 1.5r, 12, x'00ff', 1, 2, 1, 'it'sAbc', 'AAbc', 1, 1, 1, 1, 0, 0, 0, 0, 'one', 9, 12, 1, 9.223372036854776e18r, -9223372036854775808, 1016.5r, -0.0r, 3, ' 1.50|Abc', 'pos', '[1,2]', 2, 0, 1, 'blob00FFX'00FF'', -9223372036854775808 | 2, -3, 'x%y', -0.5r, 'abc', NULL, -3, -2, 1, 'it'sx%y', 'Ax%y', 0, 1, 1, 0, 1, 1, 1, 1, 'mthree', -10, 0, 1, 9223372036854775804, -9223372036854775808, 1016.5r, 0.0r, -9, '-0.50|x%y', 'neg', '[1,2]', 2, 0, 0, 'nullNULL', -9223372036854775808 | 3, NULL, NULL, NULL, NULL, 'q', NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1, NULL, -9223372036854775808, 1016.5r, NULL, NULL, ' 0.00|', 'neg', '[1,2]', 2, 0, NULL, 'text71'q'', -9223372036854775808 changes=3
+[main] SELECT type, sql FROM sqlite_schema WHERE type = 'recipe'   <DIFF> 
+    recipe: 'recipe', 'UPDATE "t" SET "c1" = - - a' | 'recipe', 'UPDATE "t" SET "c2" = a - - 1' | 'recipe', 'UPDATE "t" SET "c3" = NOT NOT a' | 'recipe', 'UPDATE "t" SET "c4" = 'it''s' || b' | 'recipe', 'UPDATE "t" SET "c5" = x'41'|| b' | 'recipe', 'UPDATE "t" SET "c6" = b COLLATE NOCASE = 'abc'' | 'recipe', 'UPDATE "t" SET "c7" = a IS NOT NULL' | 'recipe', 'UPDATE "t" SET "c8" = a NOTNULL' | 'recipe', 'UPDATE "t" SET "c9" = a IS 1' | 'recipe', 'UPDATE "t" SET "c10" = a NOT BETWEEN 0 AND 2' | 'recipe', 'UPDATE "t" SET "c11" = a NOT IN (1, 2)' | 'recipe', 'UPDATE "t" SET "c12" = b LIKE 'x!%%' ESCAPE '!'' | 'recipe', 'UPDATE "t" SET "c13" = b NOT GLOB 'A*'' | 'recipe', 'UPDATE "t" SET "c14" = CASE a WHEN 1 THEN 'one' WHEN - 3 THEN 'mthree' END' | 'recipe', 'UPDATE "t" SET "c15" = ~ a + (a << 2) - (a >> 1) + (a & 3) + (a | 4) + (a % 3)' | 'recipe', 'UPDATE "t" SET "c16" = CAST (n AS INTEGER)' | 'recipe', 'UPDATE "t" SET "c17" = TRUE + FALSE' | 'recipe', 'UPDATE "t" SET "c18" = 9223372036854775807 + a' | 'recipe', 'UPDATE "t" SET "c19" = - 9223372036854775808' | 'recipe', 'UPDATE "t" SET "c20" = 1e3 + .5 + 0x10' | 'recipe', 'UPDATE "t" SET "c21" = r * - 0.0' | 'recipe', 'UPDATE "t" SET "c22" = "a" + [a] + `a`' | 'recipe', 'UPDATE "t" SET "c23" = printf ('%5.2f|%s', r, b)' | 'recipe', 'UPDATE "t" SET "c24" = iif (a > 0, 'pos', 'neg')' | 'recipe', 'UPDATE "t" SET "c25" = '{"k":[1,2]}' -> '$.k'' | 'recipe', 'UPDATE "t" SET "c26" = '{"k":[1,2]}' ->> '$.k[1]'' | 'recipe', 'UPDATE "t" SET "c27" = 0' | 'recipe', 'UPDATE "t" SET "c28" = b COLLATE RTRIM = 'Abc   '' | 'recipe', 'UPDATE "t" SET "c29" = typeof (x) || hex (x) || quote (x)' | 'recipe', 'UPDATE "t" SET "c30" = - 9223372036854775808' changes=3
+    eager : (no rows) changes=3
+SUMMARY statements=34 diffs=1
+rc=3
+===== 06_affinity
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, r REAL, n NUMERIC, s TEXT, d DECIMAL(10,2), v VARCHAR(4), bl BLOB, u)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a) VALUES (1), (2)   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET r = -0.0   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET n = ' 12 '   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET a = '0x10'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET s = 1.0   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET d = '3.0'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET v = 2.50   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET bl = '12'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET u = 1e999   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, a, typeof(a), r, typeof(r), n, typeof(n), s, typeof(s), d, typeof(d), v, typeof(v), bl, typeof(bl), u, typeof(u) FROM t ORDER BY id   <same> stale-reads+32
+    both  : 1, '0x10', 'text', -0.0r, 'real', 12, 'integer', '1.0', 'text', 3, 'integer', '2.5', 'text', '12', 'text', infr, 'real' | 2, '0x10', 'text', -0.0r, 'real', 12, 'integer', '1.0', 'text', 3, 'integer', '2.5', 'text', '12', 'text', infr, 'real' changes=2
+[main] SELECT id, printf('%f', r), 1 / r, CAST(r AS TEXT), r = 0 FROM t ORDER BY id   <same> stale-reads+8
+    both  : 1, '0.000000', NULL, '0.0', 1 | 2, '0.000000', NULL, '0.0', 1 changes=2
+[main] UPDATE t SET u = 9007199254740993   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET r = 9007199254740993   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, u, typeof(u), r FROM t ORDER BY id   <same> stale-reads+6
+    both  : 1, 9007199254740993, 'integer', 9007199254740992.0r | 2, 9007199254740993, 'integer', 9007199254740992.0r changes=2
+[main] UPDATE t SET r = 3   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET u = typeof(r) || ':' || r   <same> INSTALLED+1 stale-reads+2
+    both  : (no rows) changes=2
+[main] SELECT id, r, u FROM t ORDER BY id   <same> stale-reads+4
+    both  : 1, 3.0r, 'real:3.0' | 2, 3.0r, 'real:3.0' changes=2
+[main] UPDATE t SET n = 1e20   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET u = typeof(n) || ':' || n   <same> INSTALLED+1 stale-reads+2
+    both  : (no rows) changes=2
+[main] SELECT id, n, u FROM t ORDER BY id   <same> stale-reads+4
+    both  : 1, 1e20r, 'real:1.0e+20' | 2, 1e20r, 'real:1.0e+20' changes=2
+[main] UPDATE t SET n = '1.0e+3'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] UPDATE t SET s = n   <same> INSTALLED+1 stale-reads+2
+    both  : (no rows) changes=2
+[main] SELECT id, n, typeof(n), s, typeof(s) FROM t ORDER BY id   <same> stale-reads+8
+    both  : 1, 1000, 'integer', '1000', 'text' | 2, 1000, 'integer', '1000', 'text' changes=2
+[main] UPDATE t SET r = '  7.25e1'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, r, typeof(r) FROM t ORDER BY id   <same> stale-reads+4
+    both  : 1, 72.5r, 'real' | 2, 72.5r, 'real' changes=2
+[main] UPDATE t SET u = zeroblob(3)   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, length(u), typeof(u), hex(u) FROM t ORDER BY id   <same> stale-reads+6
+    both  : 1, 3, 'blob', '000000' | 2, 3, 'blob', '000000' changes=2
+[main] UPDATE t SET s = char(97, 0, 98)   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, length(s), hex(s) FROM t ORDER BY id   <same> stale-reads+4
+    both  : 1, 1, '610062' | 2, 1, '610062' changes=2
+SUMMARY statements=30 diffs=0
+rc=0
+===== 07_temp_shadow
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'main1'), (2, 'main2')   <same> 
+    both  : (no rows) changes=2
+[main] CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=2
+[main] INSERT INTO temp.t(a, b) VALUES (1, 'temp1'), (2, 'temp2')   <same> 
+    both  : (no rows) changes=2
+-- @expect-diff the recipe lands on main.t, eager writes temp.t
+[main] UPDATE t SET b = 'updated'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT * FROM main.t ORDER BY id   <DIFF> stale-reads+2
+    recipe: 1, 1, 'updated' | 2, 2, 'updated' changes=2
+    eager : 1, 1, 'main1' | 2, 2, 'main2' changes=2
+[main] SELECT * FROM temp.t ORDER BY id   <DIFF> 
+    recipe: 1, 1, 'temp1' | 2, 2, 'temp2' changes=2
+    eager : 1, 1, 'updated' | 2, 2, 'updated' changes=2
+[main] SELECT * FROM t ORDER BY id   <DIFF> 
+    recipe: 1, 1, 'temp1' | 2, 2, 'temp2' changes=2
+    eager : 1, 1, 'updated' | 2, 2, 'updated' changes=2
+SUMMARY statements=8 diffs=3
+rc=3
+===== 08_txn
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')   <same> 
+    both  : (no rows) changes=2
+[main] BEGIN   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = 'r1'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'r1' | 2, 2, 'r1' changes=2
+[main] ROLLBACK   <same> 
+    both  : (no rows) changes=2
+[main] SELECT * FROM t ORDER BY id   <same> 
+    both  : 1, 1, 'x' | 2, 2, 'y' changes=2
+[main] SELECT count(*) FROM sqlite_schema WHERE type = 'recipe'   <same> 
+    both  : 0 changes=2
+[main] BEGIN   <same> 
+    both  : (no rows) changes=2
+[main] SAVEPOINT s1   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = 's1'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] INSERT INTO t(a, b) VALUES (3, 'z')   <same> 
+    both  : (no rows) changes=1
+[main] ROLLBACK TO s1   <same> 
+    both  : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <same> 
+    both  : 1, 1, 'x' | 2, 2, 'y' changes=1
+[main] UPDATE t SET b = b || '-after'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] RELEASE s1   <same> 
+    both  : (no rows) changes=2
+[main] COMMIT   <same> 
+    both  : (no rows) changes=2
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'x-after' | 2, 2, 'y-after' changes=2
+[main] BEGIN   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET a = a + 10   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] INSERT INTO t(a, b) VALUES (4, 'w')   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET a = a * 2   <same> INSTALLED+1 stale-reads+2
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = 'pt' WHERE id = 1   <same> fallback+1 stale-reads+1
+    both  : (no rows) changes=1
+[main] SAVEPOINT s2   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET a = a + 1000   <same> INSTALLED+1 stale-reads+2
+    both  : (no rows) changes=3
+[main] ROLLBACK TO s2   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = b || '!'   <same> INSTALLED+1 stale-reads+1
+    both  : (no rows) changes=3
+[main] COMMIT   <same> 
+    both  : (no rows) changes=3
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+5
+    both  : 1, 22, 'pt!' | 2, 24, 'y-after!' | 3, 8, 'w!' changes=3
+[main] BEGIN   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET a = 0   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] INSERT INTO t(a, b) VALUES (5, 'v')   <same> 
+    both  : (no rows) changes=1
+[main] ROLLBACK   <same> 
+    both  : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+5
+    both  : 1, 22, 'pt!' | 2, 24, 'y-after!' | 3, 8, 'w!' changes=1
+[main] UPDATE t SET a = a + 1   <same> INSTALLED+1 stale-reads+2
+    both  : (no rows) changes=3
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+6
+    both  : 1, 23, 'pt!' | 2, 25, 'y-after!' | 3, 9, 'w!' changes=3
+SUMMARY statements=36 diffs=0
+rc=0
+===== 09_prepared
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')   <same> 
+    both  : (no rows) changes=3
+-- @prep sel SELECT id, a, b FROM t ORDER BY id: recipe ok eager ok
+-- @prep ins INSERT INTO t(a, b) VALUES (?1, ?2): recipe ok eager ok
+-- @prep upd UPDATE t SET a = a + ?1 WHERE id = ?2: recipe ok eager ok
+[main] @bind sel   <same> 
+    both  : 1, 1, 'x' | 2, 2, 'y' | 3, 3, 'z' changes=3
+[main] UPDATE t SET b = 'r' || a   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] @bind sel   <same> stale-reads+3
+    both  : 1, 1, 'r1' | 2, 2, 'r2' | 3, 3, 'r3' changes=3
+[main] @bind ins 4 'new'   <same> 
+    both  : (no rows) changes=1
+[main] @bind sel   <same> stale-reads+3
+    both  : 1, 1, 'r1' | 2, 2, 'r2' | 3, 3, 'r3' | 4, 4, 'new' changes=1
+[main] @bind upd 100 1   <same> fallback+1 stale-reads+1
+    both  : (no rows) changes=1
+[main] @bind sel   <same> stale-reads+2
+    both  : 1, 101, 'r1' | 2, 2, 'r2' | 3, 3, 'r3' | 4, 4, 'new' changes=1
+[main] UPDATE t SET a = a * 10   <same> INSTALLED+1
+    both  : (no rows) changes=4
+[main] @bind ins 5 'new5'   <same> 
+    both  : (no rows) changes=1
+[main] @bind sel   <same> stale-reads+6
+    both  : 1, 1010, 'r1' | 2, 20, 'r2' | 3, 30, 'r3' | 4, 40, 'new' | 5, 5, 'new5' changes=1
+-- @conn c2
+-- @prep sel2 SELECT id, a, b FROM t ORDER BY id: recipe ok eager ok
+-- @prep ins2 INSERT INTO t(a, b) VALUES (?1, ?2): recipe ok eager ok
+[c2] @bind sel2   <same> stale-reads+6
+    both  : 1, 1010, 'r1' | 2, 20, 'r2' | 3, 30, 'r3' | 4, 40, 'new' | 5, 5, 'new5' changes=0
+-- @conn main
+[main] UPDATE t SET b = b || '+'   <same> INSTALLED+1 stale-reads+2
+    both  : (no rows) changes=5
+-- @conn c2
+[c2] @bind sel2   <same> stale-reads+9
+    both  : 1, 1010, 'r1+' | 2, 20, 'r2+' | 3, 30, 'r3+' | 4, 40, 'new+' | 5, 5, 'new5+' changes=0
+[c2] @bind ins2 6 'c2'   <same> 
+    both  : (no rows) changes=1
+[c2] @bind sel2   <same> stale-reads+9
+    both  : 1, 1010, 'r1+' | 2, 20, 'r2+' | 3, 30, 'r3+' | 4, 40, 'new+' | 5, 5, 'new5+' | 6, 6, 'c2' changes=1
+-- @conn main
+[main] @bind sel   <same> stale-reads+9
+    both  : 1, 1010, 'r1+' | 2, 20, 'r2+' | 3, 30, 'r3+' | 4, 40, 'new+' | 5, 5, 'new5+' | 6, 6, 'c2' changes=5
+[main] @open sel   <same> 
+    both  : (no rows) changes=0
+[main] @next sel   <same> stale-reads+2
+    both  : 1, 1010, 'r1+' changes=0
+[main] @next sel   <same> stale-reads+2
+    both  : 2, 20, 'r2+' changes=0
+[main] UPDATE t SET a = -a   <same> INSTALLED+1 stale-reads+4
+    both  : (no rows) changes=6
+[main] @next sel   <DIFF> stale-reads+2
+    recipe: 3, 30, 'r3+' changes=0
+    eager : 3, -30, 'r3+' changes=0
+[main] @next sel   <DIFF> stale-reads+2
+    recipe: 4, 40, 'new+' changes=0
+    eager : 4, -40, 'new+' changes=0
+[main] @next sel   <DIFF> stale-reads+1
+    recipe: 5, 5, 'new5+' changes=0
+    eager : 5, -5, 'new5+' changes=0
+[main] @next sel   <DIFF> 
+    recipe: 6, 6, 'c2' changes=0
+    eager : 6, -6, 'c2' changes=0
+[main] @next sel   <same> 
+    both  : DONE changes=0
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+11
+    both  : 1, -1010, 'r1+' | 2, -20, 'r2+' | 3, -30, 'r3+' | 4, -40, 'new+' | 5, -5, 'new5+' | 6, -6, 'c2' changes=6
+SUMMARY statements=28 diffs=4
+rc=3
+===== 10_snapshot
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')   <same> 
+    both  : (no rows) changes=2
+-- @conn c2
+-- @prep held SELECT id, a, b FROM t ORDER BY id: recipe ok eager ok
+[c2] BEGIN   <same> 
+    both  : (no rows) changes=0
+[c2] SELECT * FROM t ORDER BY id   <same> 
+    both  : 1, 1, 'x' | 2, 2, 'y' changes=0
+-- @conn main
+[main] UPDATE t SET b = 'installed'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'installed' | 2, 2, 'installed' changes=2
+-- @conn c2
+[c2] SELECT * FROM t ORDER BY id   <same> 
+    both  : 1, 1, 'x' | 2, 2, 'y' changes=0
+[c2] @bind held   <same> 
+    both  : 1, 1, 'x' | 2, 2, 'y' changes=0
+-- @recipe off
+[c2] @bind held   <DIFF> 
+    recipe: ERROR Database schema changed
+    eager : 1, 1, 'x' | 2, 2, 'y' changes=0
+[c2] SELECT * FROM t ORDER BY id   <DIFF> 
+    recipe: ERROR Database schema changed
+    eager : 1, 1, 'x' | 2, 2, 'y' changes=0
+-- @recipe on
+[c2] SELECT * FROM t ORDER BY id   <DIFF> 
+    recipe: ERROR Database schema changed
+    eager : 1, 1, 'x' | 2, 2, 'y' changes=0
+[c2] PRAGMA cache_size = 100   <same> 
+    both  : (no rows) changes=0
+[c2] @bind held   <DIFF> 
+    recipe: ERROR Database schema changed
+    eager : 1, 1, 'x' | 2, 2, 'y' changes=0
+[c2] SELECT * FROM t ORDER BY id   <DIFF> 
+    recipe: ERROR Database schema changed
+    eager : 1, 1, 'x' | 2, 2, 'y' changes=0
+[c2] COMMIT   <same> 
+    both  : (no rows) changes=0
+[c2] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'installed' | 2, 2, 'installed' changes=0
+[c2] @bind held   <same> stale-reads+2
+    both  : 1, 1, 'installed' | 2, 2, 'installed' changes=0
+SUMMARY statements=17 diffs=5
+rc=3
+===== 10b_snapshot_pragma
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')   <same> 
+    both  : (no rows) changes=2
+-- @conn c2
+-- @prep cached SELECT id, a, b FROM t ORDER BY id: recipe ok eager ok
+[c2] BEGIN   <same> 
+    both  : (no rows) changes=0
+[c2] @bind cached   <same> 
+    both  : 1, 1, 'x' | 2, 2, 'y' changes=0
+-- @conn main
+[main] UPDATE t SET b = 'installed'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+-- @conn c2
+[c2] PRAGMA cache_size = 100   <same> 
+    both  : (no rows) changes=0
+[c2] @bind cached   <DIFF> 
+    recipe: ERROR Database schema changed
+    eager : 1, 1, 'x' | 2, 2, 'y' changes=0
+[c2] SELECT count(*) FROM t   <DIFF> 
+    recipe: ERROR Database schema changed
+    eager : 2 changes=0
+[c2] COMMIT   <same> 
+    both  : (no rows) changes=0
+[c2] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'installed' | 2, 2, 'installed' changes=0
+SUMMARY statements=10 diffs=2
+rc=3
+===== 11_inflight_write
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 0), (2, 0), (3, 0)   <same> 
+    both  : (no rows) changes=3
+-- @prep ret UPDATE t SET a = a + 100 RETURNING id, a, b: recipe ok eager ok
+[main] @open ret   <same> 
+    both  : (no rows) changes=0
+[main] @next ret   <same> 
+    both  : 1, 101, 0 changes=0
+-- @expect-diff the recipe (b = a) is applied to rows the in-flight statement writes after it
+[main] UPDATE t SET b = a   <same> 
+    both  : ERROR cannot start a write statement - SQL statements in progress
+[main] @next ret   <same> 
+    both  : 2, 102, 0 changes=0
+[main] @next ret   <same> 
+    both  : 3, 103, 0 changes=0
+[main] @next ret   <same> 
+    both  : DONE changes=0
+[main] SELECT * FROM t ORDER BY id   <same> 
+    both  : 1, 101, 0 | 2, 102, 0 | 3, 103, 0 changes=3
+[main] SELECT id, a, b FROM t WHERE b = a ORDER BY id   <same> 
+    both  : (no rows) changes=3
+SUMMARY statements=10 diffs=0
+rc=0
+===== 12_readpaths
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, g TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] CREATE TABLE u(id INTEGER PRIMARY KEY, tid INTEGER, v INTEGER)   <same> 
+    both  : (no rows) changes=0
+[main] CREATE TABLE log(id INTEGER PRIMARY KEY, what TEXT, val)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b, c, g) VALUES (1, 10, 'p', 'k1'), (2, 20, 'q', 'k1'), (3, 30, 'r', 'k2'), (4, 40, NULL, 'k2'), (5, 50, 's', NULL)   <same> 
+    both  : (no rows) changes=5
+[main] INSERT INTO u(tid, v) VALUES (1, 100), (2, 200), (3, 300), (9, 900)   <same> 
+    both  : (no rows) changes=4
+[main] UPDATE t SET b = a * 1000 + b   <same> INSTALLED+1
+    both  : (no rows) changes=5
+[main] UPDATE t SET c = c || ':' || b   <same> INSTALLED+1 stale-reads+5
+    both  : (no rows) changes=5
+[main] UPDATE t SET g = coalesce(g, 'k3') WHERE a > 2   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] SELECT t.id, t.b, u.v FROM t JOIN u ON u.tid = t.id ORDER BY t.id   <same> stale-reads+3
+    both  : 1, 1010, 100 | 2, 2020, 200 | 3, 3030, 300 changes=3
+[main] SELECT t.id, t.b, u.v FROM u LEFT JOIN t ON u.tid = t.id ORDER BY u.id   <same> stale-reads+3
+    both  : 1, 1010, 100 | 2, 2020, 200 | 3, 3030, 300 | NULL, NULL, 900 changes=3
+[main] SELECT x.id, y.id, x.b, y.b FROM t x JOIN t y ON x.b < y.b AND y.a = x.a + 1 ORDER BY x.id   <same> stale-reads+14
+    both  : 1, 2, 1010, 2020 | 2, 3, 2020, 3030 | 3, 4, 3030, 4040 | 4, 5, 4040, 5050 changes=3
+[main] SELECT id, b, (SELECT max(b) FROM t t2 WHERE t2.g = t.g) FROM t ORDER BY id   <same> stale-reads+20
+    both  : 1, 1010, 2020 | 2, 2020, 2020 | 3, 3030, 4040 | 4, 4040, 4040 | 5, 5050, 5050 changes=3
+[main] SELECT id FROM t WHERE b IN (SELECT b FROM t WHERE a % 2 = 1) ORDER BY id   <same> stale-reads+8
+    both  : 1 | 3 | 5 changes=3
+[main] SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = t.id AND u.v * 10 < t.b) ORDER BY id   <same> stale-reads+3
+    both  : 1 | 2 | 3 changes=3
+[main] WITH w AS (SELECT id, b, c FROM t WHERE b > 2000) SELECT * FROM w ORDER BY b DESC   <same> stale-reads+13
+    both  : 5, 5050, 's:5050' | 4, 4040, NULL | 3, 3030, 'r:3030' | 2, 2020, 'q:2020' changes=3
+[main] WITH RECURSIVE r(n, s) AS (SELECT 1, (SELECT b FROM t WHERE id = 1) UNION ALL SELECT n + 1, s + (SELECT b FROM t WHERE id = n + 1) FROM r WHERE n < 5) SELECT * FROM r   <same> stale-reads+5
+    both  : 1, 1010 | 2, 3030 | 3, 6060 | 4, 10100 | 5, 15150 changes=3
+[main] SELECT id, b, sum(b) OVER (PARTITION BY g ORDER BY id), row_number() OVER (ORDER BY b DESC), lag(c) OVER (ORDER BY id) FROM t ORDER BY id   <same> stale-reads+15
+    both  : 1, 1010, 1010, 5, NULL | 2, 2020, 3030, 4, 'p:1010' | 3, 3030, 3030, 3, 'q:2020' | 4, 4040, 7070, 2, 'r:3030' | 5, 5050, 5050, 1, NULL changes=3
+[main] SELECT g, count(*), sum(b), group_concat(c, ';'), max(c) FROM t GROUP BY g ORDER BY g   <same> stale-reads+15
+    both  : 'k1', 2, 3030, 'p:1010;q:2020', 'q:2020' | 'k2', 2, 7070, 'r:3030', 'r:3030' | 'k3', 1, 5050, 's:5050', 's:5050' changes=3
+[main] SELECT DISTINCT g FROM t ORDER BY 1   <same> stale-reads+5
+    both  : 'k1' | 'k2' | 'k3' changes=3
+[main] SELECT max(b), min(b), avg(b), total(b) FROM t   <same> stale-reads+20
+    both  : 5050, 1010, 3030.0r, 15150.0r changes=3
+[main] SELECT b FROM t UNION SELECT v FROM u ORDER BY 1   <same> stale-reads+5
+    both  : 100 | 200 | 300 | 900 | 1010 | 2020 | 3030 | 4040 | 5050 changes=3
+[main] SELECT c FROM t EXCEPT SELECT c FROM t WHERE a = 1 ORDER BY 1   <same> stale-reads+6
+    both  : NULL | 'q:2020' | 'r:3030' | 's:5050' changes=3
+[main] SELECT id, b FROM t ORDER BY b DESC LIMIT 2 OFFSET 1   <same> stale-reads+5
+    both  : 4, 4040 | 3, 3030 changes=3
+[main] SELECT * FROM t ORDER BY c COLLATE NOCASE, id   <same> stale-reads+20
+    both  : 4, 4, 4040, NULL, 'k2' | 1, 1, 1010, 'p:1010', 'k1' | 2, 2, 2020, 'q:2020', 'k1' | 3, 3, 3030, 'r:3030', 'k2' | 5, 5, 5050, 's:5050', 'k3' changes=3
+[main] CREATE VIEW vt AS SELECT id, b * 2 AS b2, upper(c) AS uc FROM t   <same> 
+    both  : (no rows) changes=3
+[main] SELECT * FROM vt ORDER BY id   <same> stale-reads+10
+    both  : 1, 2020, 'P:1010' | 2, 4040, 'Q:2020' | 3, 6060, 'R:3030' | 4, 8080, NULL | 5, 10100, 'S:5050' changes=3
+[main] CREATE TRIGGER trd AFTER DELETE ON t BEGIN INSERT INTO log(what, val) VALUES ('del-b', old.b); INSERT INTO log(what, val) VALUES ('del-c', old.c); END   <same> 
+    both  : (no rows) changes=3
+[main] CREATE TRIGGER tru AFTER UPDATE ON t BEGIN INSERT INTO log(what, val) VALUES ('upd-old-b', old.b); INSERT INTO log(what, val) VALUES ('upd-new-c', new.c); END   <same> 
+    both  : (no rows) changes=3
+[main] DELETE FROM t WHERE id = 5   <same> stale-reads+3
+    both  : (no rows) changes=1
+[main] UPDATE t SET a = a + 1 WHERE id = 4   <same> fallback+1 stale-reads+6
+    both  : (no rows) changes=1
+[main] SELECT * FROM log ORDER BY id   <same> 
+    both  : 1, 'del-b', 5050 | 2, 'del-c', 's:5050' | 3, 'upd-old-b', 4040 | 4, 'upd-new-c', NULL changes=1
+[main] DELETE FROM t WHERE id = 3 RETURNING id, b, c, g   <same> stale-reads+3
+    both  : 3, 3030, 'r:3030', 'k2' changes=1
+[main] UPDATE t SET a = a WHERE id = 2 RETURNING id, a, b, c   <same> fallback+1 stale-reads+6
+    both  : 2, 2, 2020, 'q:2020' changes=1
+[main] INSERT INTO t(id, a) VALUES (1, 77) ON CONFLICT(id) DO UPDATE SET a = excluded.a + b RETURNING id, a, b, c   <same> stale-reads+3
+    both  : 1, 1087, 1010, 'p:1010' changes=1
+[main] INSERT INTO u(tid, v) SELECT id, b FROM t WHERE id <= 2   <same> 
+    both  : (no rows) changes=2
+[main] SELECT * FROM u ORDER BY id   <same> 
+    both  : 1, 1, 100 | 2, 2, 200 | 3, 3, 300 | 4, 9, 900 | 5, 1, 1010 | 6, 2, 2020 changes=2
+[main] CREATE INDEX ib ON t(b)   <same> 
+    both  : (no rows) changes=0
+[main] CREATE INDEX igc ON t(g, c)   <same> 
+    both  : (no rows) changes=0
+[main] SELECT b FROM t WHERE b > 1000 ORDER BY b   <same> 
+    both  : 1010 | 2020 | 4040 changes=0
+[main] SELECT g, c FROM t WHERE g = 'k1' ORDER BY c   <same> 
+    both  : 'k1', 'p:1010' | 'k1', 'q:2020' changes=0
+[main] SELECT count(*) FROM t WHERE c LIKE '%:%'   <same> 
+    both  : 2 changes=0
+[main] PRAGMA integrity_check   <same> 
+    both  : 'ok' changes=0
+[main] SELECT * FROM t ORDER BY id   <same> 
+    both  : 1, 1087, 1010, 'p:1010', 'k1' | 2, 2, 2020, 'q:2020', 'k1' | 4, 5, 4040, NULL, 'k2' changes=0
+[main] UPDATE t SET a = a + 1   <same> fallback+1
+    both  : (no rows) changes=3
+[main] SELECT * FROM t ORDER BY id   <same> 
+    both  : 1, 1088, 1010, 'p:1010', 'k1' | 2, 3, 2020, 'q:2020', 'k1' | 4, 6, 4040, NULL, 'k2' changes=3
+[main] SELECT * FROM log ORDER BY id   <same> 
+    both  : 1, 'del-b', 5050 | 2, 'del-c', 's:5050' | 3, 'upd-old-b', 4040 | 4, 'upd-new-c', NULL | 5, 'del-b', 3030 | 6, 'del-c', 'r:3030' | 7, 'upd-old-b', 2020 | 8, 'upd-new-c', 'q:2020' | 9, 'upd-old-b', 1010 | 10, 'upd-new-c', 'p:1010' | 11, 'upd-old-b', 1010 | 12, 'upd-new-c', 'p:1010' | 13, 'upd-old-b', 2020 | 14, 'upd-new-c', 'q:2020' | 15, 'upd-old-b', 4040 | 16, 'upd-new-c', NULL changes=3
+SUMMARY statements=46 diffs=0
+rc=0
+===== 13_branches
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b, c) VALUES (1, 0, 'p'), (2, 0, 'q'), (3, 0, 'r')   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = a * 10   <same> INSTALLED+1
+    both  : (no rows) changes=3
+-- @fork b1: recipe ok eager ok
+[b1] SELECT * FROM t ORDER BY id   <same> stale-reads+3
+    both  : 1, 1, 10, 'p' | 2, 2, 20, 'q' | 3, 3, 30, 'r' changes=0
+[b1] UPDATE t SET c = c || b   <same> INSTALLED+1 stale-reads+3
+    both  : (no rows) changes=3
+[b1] INSERT INTO t(a, b, c) VALUES (4, 4, 's')   <same> 
+    both  : (no rows) changes=1
+-- @fork b2: recipe ok eager ok
+[b2] UPDATE t SET b = b + 1   <same> INSTALLED+1 stale-reads+3
+    both  : (no rows) changes=4
+[b2] UPDATE t SET a = 0 WHERE id = 2   <same> fallback+1 stale-reads+2
+    both  : (no rows) changes=1
+[b2] SELECT * FROM t ORDER BY id   <same> stale-reads+5
+    both  : 1, 1, 11, 'p10' | 2, 0, 21, 'q20' | 3, 3, 31, 'r30' | 4, 4, 5, 's' changes=1
+-- @conn main
+[main] UPDATE t SET b = -b   <same> INSTALLED+1 stale-reads+3
+    both  : (no rows) changes=3
+[main] UPDATE t SET c = 'trunk' || a   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+6
+    both  : 1, 1, -10, 'trunk1' | 2, 2, -20, 'trunk2' | 3, 3, -30, 'trunk3' changes=3
+-- @conn b1
+[b1] SELECT * FROM t ORDER BY id   <same> stale-reads+6
+    both  : 1, 1, 10, 'p10' | 2, 2, 20, 'q20' | 3, 3, 30, 'r30' | 4, 4, 4, 's' changes=1
+[b1] UPDATE t SET b = b * 2   <same> INSTALLED+1 stale-reads+3
+    both  : (no rows) changes=4
+[b1] SELECT * FROM t ORDER BY id   <same> stale-reads+7
+    both  : 1, 1, 20, 'p10' | 2, 2, 40, 'q20' | 3, 3, 60, 'r30' | 4, 4, 8, 's' changes=4
+-- @reap b1 (current connection is now main; prepared statements dropped)
+-- @conn b2
+[b2] SELECT * FROM t ORDER BY id   <same> stale-reads+5
+    both  : 1, 1, 11, 'p10' | 2, 0, 21, 'q20' | 3, 3, 31, 'r30' | 4, 4, 5, 's' changes=1
+-- @reconnect b2 (prepared statements dropped)
+[b2] SELECT * FROM t ORDER BY id   <same> stale-reads+5
+    both  : 1, 1, 11, 'p10' | 2, 0, 21, 'q20' | 3, 3, 31, 'r30' | 4, 4, 5, 's' changes=0
+[b2] UPDATE t SET c = c || '!'   <same> INSTALLED+1 stale-reads+2
+    both  : (no rows) changes=4
+-- @fork b3: recipe ok eager ok
+[b3] SELECT * FROM t ORDER BY id   <same> stale-reads+7
+    both  : 1, 1, 11, 'p10!' | 2, 0, 21, 'q20!' | 3, 3, 31, 'r30!' | 4, 4, 5, 's!' changes=0
+-- @reap b2 (current connection is now main; prepared statements dropped)
+-- @conn b3
+[b3] SELECT * FROM t ORDER BY id   <same> stale-reads+7
+    both  : 1, 1, 11, 'p10!' | 2, 0, 21, 'q20!' | 3, 3, 31, 'r30!' | 4, 4, 5, 's!' changes=0
+-- @reconnect b3 (prepared statements dropped)
+[b3] SELECT * FROM t ORDER BY id   <same> stale-reads+7
+    both  : 1, 1, 11, 'p10!' | 2, 0, 21, 'q20!' | 3, 3, 31, 'r30!' | 4, 4, 5, 's!' changes=0
+[b3] BEGIN   <same> 
+    both  : (no rows) changes=0
+[b3] UPDATE t SET a = a + 100   <same> INSTALLED+1
+    both  : (no rows) changes=4
+[b3] ROLLBACK   <same> 
+    both  : (no rows) changes=4
+[b3] SELECT * FROM t ORDER BY id   <same> stale-reads+7
+    both  : 1, 1, 11, 'p10!' | 2, 0, 21, 'q20!' | 3, 3, 31, 'r30!' | 4, 4, 5, 's!' changes=4
+-- @conn main
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+6
+    both  : 1, 1, -10, 'trunk1' | 2, 2, -20, 'trunk2' | 3, 3, -30, 'trunk3' changes=3
+-- @reconnect main (prepared statements dropped)
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+6
+    both  : 1, 1, -10, 'trunk1' | 2, 2, -20, 'trunk2' | 3, 3, -30, 'trunk3' changes=0
+SUMMARY statements=27 diffs=0
+rc=0
+===== 14_attach_self
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = 'upd' || a   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'upd1' | 2, 2, 'upd2' changes=2
+[main] ATTACH '$SELF' AS o   <same> 
+    both  : (no rows) changes=2
+[main] SELECT * FROM o.t ORDER BY id   <DIFF> 
+    recipe: 1, 1, 'x' | 2, 2, 'y' changes=2
+    eager : 1, 1, 'upd1' | 2, 2, 'upd2' changes=2
+SUMMARY statements=6 diffs=1
+rc=3
+===== 14b_attach_write
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = 'upd' || a   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'upd1' | 2, 2, 'upd2' changes=2
+[main] ATTACH '$SELF' AS o   <same> 
+    both  : (no rows) changes=2
+-- @expect-diff the attached write freezes row 1 with its pre-recipe b
+[main] UPDATE o.t SET a = a + 10 WHERE id = 1   <same> fallback+1
+    both  : (no rows) changes=1
+[main] DETACH o   <same> 
+    both  : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <DIFF> stale-reads+1
+    recipe: 1, 11, 'x' | 2, 2, 'upd2' changes=1
+    eager : 1, 11, 'upd1' | 2, 2, 'upd2' changes=1
+-- @reconnect main (prepared statements dropped)
+[main] SELECT * FROM t ORDER BY id   <DIFF> stale-reads+1
+    recipe: 1, 11, 'x' | 2, 2, 'upd2' changes=0
+    eager : 1, 11, 'upd1' | 2, 2, 'upd2' changes=0
+SUMMARY statements=9 diffs=2
+rc=3
+===== 15_write_paths
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER DEFAULT 5, b INTEGER, c TEXT DEFAULT 'd')   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b, c) VALUES (1, 1, 'x'), (2, 2, 'y'), (3, 3, 'z')   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = id * 100 + a   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c = c || b   <same> INSTALLED+1 stale-reads+3
+    both  : (no rows) changes=3
+[main] INSERT INTO t DEFAULT VALUES   <DIFF> 
+    recipe: ERROR Parse error: table t has 5 columns but 4 values were supplied
+    eager : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <DIFF> stale-reads+6
+    recipe: 1, 1, 101, 'x101' | 2, 2, 202, 'y202' | 3, 3, 303, 'z303' changes=3
+    eager : 1, 1, 101, 'x101' | 2, 2, 202, 'y202' | 3, 3, 303, 'z303' | 4, 5, NULL, 'd' changes=1
+[main] REPLACE INTO t(id, a, b) VALUES (2, 20, NULL)   <same> 
+    both  : (no rows) changes=1
+[main] INSERT OR IGNORE INTO t(id, a) VALUES (1, 99)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(id, a) VALUES (3, 99) ON CONFLICT DO NOTHING   <same> 
+    both  : (no rows) changes=0
+[main] SELECT * FROM t ORDER BY id   <DIFF> stale-reads+4
+    recipe: 1, 1, 101, 'x101' | 2, 20, NULL, 'd' | 3, 3, 303, 'z303' changes=0
+    eager : 1, 1, 101, 'x101' | 2, 20, NULL, 'd' | 3, 3, 303, 'z303' | 4, 5, NULL, 'd' changes=0
+[main] UPDATE t SET id = id + 100 WHERE a > 0   <DIFF> fallback+1 stale-reads+4
+    recipe: (no rows) changes=3
+    eager : (no rows) changes=4
+[main] SELECT * FROM t ORDER BY id   <DIFF> 
+    recipe: 101, 1, 101, 'x101' | 102, 20, NULL, 'd' | 103, 3, 303, 'z303' changes=3
+    eager : 101, 1, 101, 'x101' | 102, 20, NULL, 'd' | 103, 3, 303, 'z303' | 104, 5, NULL, 'd' changes=4
+[main] CREATE INDEX ib ON t(b)   <same> 
+    both  : (no rows) changes=0
+[main] UPDATE t SET b = b + 1 WHERE b > 0   <same> fallback+1
+    both  : (no rows) changes=2
+[main] SELECT * FROM t ORDER BY id   <DIFF> 
+    recipe: 101, 1, 102, 'x101' | 102, 20, NULL, 'd' | 103, 3, 304, 'z303' changes=2
+    eager : 101, 1, 102, 'x101' | 102, 20, NULL, 'd' | 103, 3, 304, 'z303' | 104, 5, NULL, 'd' changes=2
+[main] UPDATE t SET c = 'all'   <DIFF> INSTALLED+1
+    recipe: (no rows) changes=3
+    eager : (no rows) changes=4
+[main] UPDATE t SET b = b * 2 WHERE b IS NOT NULL   <same> fallback+1 stale-reads+2
+    both  : (no rows) changes=2
+[main] SELECT * FROM t ORDER BY id   <DIFF> stale-reads+1
+    recipe: 101, 1, 204, 'all' | 102, 20, NULL, 'all' | 103, 3, 608, 'all' changes=2
+    eager : 101, 1, 204, 'all' | 102, 20, NULL, 'all' | 103, 3, 608, 'all' | 104, 5, NULL, 'all' changes=2
+[main] SELECT b, id FROM t WHERE b IS NOT NULL ORDER BY b   <same> 
+    both  : 204, 101 | 608, 103 changes=2
+[main] PRAGMA integrity_check   <same> 
+    both  : 'ok' changes=2
+SUMMARY statements=20 diffs=8
+rc=3
+===== 16_drop_recreate
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x')   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET b = 'old'   <same> INSTALLED+1
+    both  : (no rows) changes=1
+[main] DROP TABLE t   <same> 
+    both  : (no rows) changes=1
+[main] SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name   <same> 
+    both  : (no rows) changes=1
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=1
+[main] INSERT INTO t(a, b) VALUES (7, 'n')   <same> 
+    both  : (no rows) changes=1
+[main] SELECT * FROM t   <same> 
+    both  : 1, 7, 'n' changes=1
+[main] UPDATE t SET b = 'new'   <same> INSTALLED+1
+    both  : (no rows) changes=1
+[main] SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name   <DIFF> 
+    recipe: 'recipe', '__turso_recipe_t_1', 't' | 'table', 't', 't' changes=1
+    eager : 'table', 't', 't' changes=1
+[main] SELECT * FROM t   <same> stale-reads+1
+    both  : 1, 7, 'new' changes=1
+-- @conn c2
+[c2] SELECT * FROM t   <same> stale-reads+1
+    both  : 1, 7, 'new' changes=0
+SUMMARY statements=12 diffs=1
+rc=3
+===== 17_cdc
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = 'recipe' || a   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] PRAGMA capture_data_changes_conn('full')   <same> 
+    both  : (no rows) changes=1
+[main] UPDATE t SET a = a + 10 WHERE id = 1   <same> fallback+1 stale-reads+2
+    both  : (no rows) changes=1
+[main] DELETE FROM t WHERE id = 2   <same> stale-reads+1
+    both  : (no rows) changes=1
+[main] SELECT change_type, table_name, id, bin_record_json_object(table_columns_json_array('t'), before), bin_record_json_object(table_columns_json_array('t'), after) FROM turso_cdc ORDER BY change_id   <DIFF> 
+    recipe: 0, 't', 1, '{"id":1,"a":1,"b":"recipe1","__turso_gen":1}', '{"id":1,"a":11,"b":"recipe1","__turso_gen":1}' | 2, NULL, NULL, NULL, NULL | -1, 't', 2, '{"id":2,"a":2,"b":"recipe2","__turso_gen":1}', NULL | 2, NULL, NULL, NULL, NULL changes=1
+    eager : 0, 't', 1, '{"id":1,"a":1,"b":"recipe1"}', '{"id":1,"a":11,"b":"recipe1"}' | 2, NULL, NULL, NULL, NULL | -1, 't', 2, '{"id":2,"a":2,"b":"recipe2"}', NULL | 2, NULL, NULL, NULL, NULL changes=1
+[main] SELECT change_type, table_name, id, hex(before), hex(after) FROM turso_cdc ORDER BY change_id   <DIFF> 
+    recipe: 0, 't', 1, '0509091B0972656369706531', '0509011B090B72656369706531' | 2, NULL, NULL, '', '' | -1, 't', 2, '0501011B09020272656369706532', '' | 2, NULL, NULL, '', '' changes=1
+    eager : 0, 't', 1, '0409091B72656369706531', '0409011B0B72656369706531' | 2, NULL, NULL, '', '' | -1, 't', 2, '0401011B020272656369706532', '' | 2, NULL, NULL, '', '' changes=1
+SUMMARY statements=8 diffs=2
+rc=3
+===== 18_indexes_ddl
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, a INTEGER, b INTEGER, c TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b, c) VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 30, 'z')   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = b + 1000   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET c = c || b   <same> INSTALLED+1 stale-reads+3
+    both  : (no rows) changes=3
+[main] CREATE INDEX ie ON t(b + 1)   <same> stale-reads+3
+    both  : (no rows) changes=0
+[main] CREATE INDEX ip ON t(a) WHERE b > 1015   <same> stale-reads+3
+    both  : (no rows) changes=0
+[main] CREATE INDEX icov ON t(c, b)   <same> stale-reads+6
+    both  : (no rows) changes=0
+[main] SELECT id FROM t WHERE b + 1 = 1011   <same> 
+    both  : 1 changes=0
+[main] SELECT a FROM t WHERE b > 1015 ORDER BY a   <same> 
+    both  : 2 | 3 changes=0
+[main] SELECT c, b FROM t WHERE c > 'x' ORDER BY c   <same> 
+    both  : 'x1010', 1010 | 'y1020', 1020 | 'z1030', 1030 changes=0
+[main] UPDATE t SET b = 5 WHERE id = 2   <same> fallback+1 stale-reads+5
+    both  : (no rows) changes=1
+[main] SELECT a FROM t WHERE b > 1015 ORDER BY a   <same> 
+    both  : 3 changes=1
+[main] SELECT id FROM t WHERE b + 1 = 6   <same> 
+    both  : 2 changes=1
+[main] REINDEX   <same> stale-reads+8
+    both  : (no rows) changes=1
+[main] PRAGMA integrity_check   <same> stale-reads+8
+    both  : 'ok' changes=1
+[main] ALTER TABLE t ADD COLUMN x INTEGER DEFAULT 7   <same> 
+    both  : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+4
+    both  : 1, 1, 1010, 'x1010', 7 | 2, 2, 5, 'y1020', 7 | 3, 3, 1030, 'z1030', 7 changes=1
+[main] INSERT INTO t(a, b, c) VALUES (4, 40, 'w')   <same> 
+    both  : (no rows) changes=1
+[main] DELETE FROM t WHERE id = 4   <same> 
+    both  : (no rows) changes=1
+[main] INSERT INTO t(a, b, c) VALUES (5, 50, 'v')   <same> 
+    both  : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+4
+    both  : 1, 1, 1010, 'x1010', 7 | 2, 2, 5, 'y1020', 7 | 3, 3, 1030, 'z1030', 7 | 5, 5, 50, 'v', 7 changes=1
+[main] SELECT name, seq FROM sqlite_sequence   <same> 
+    both  : 't', 5 changes=1
+[main] CREATE TABLE d(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER DEFAULT 9)   <same> 
+    both  : (no rows) changes=1
+[main] INSERT INTO d(a, b) VALUES (1, 1), (2, 2)   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE d SET b = DEFAULT   <same> 
+    both  : ERROR Parse error: DEFAULT is only valid in INSERT VALUES
+[main] SELECT * FROM d ORDER BY id   <same> 
+    both  : 1, 1, 1 | 2, 2, 2 changes=2
+[main] CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER, __turso_gen INTEGER)   <same> 
+    both  : (no rows) changes=2
+[main] INSERT INTO g(a, __turso_gen) VALUES (1, 100), (2, 200)   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE g SET a = a + 1   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, a, __turso_gen FROM g ORDER BY id   <same> stale-reads+2
+    both  : 1, 2, 100 | 2, 3, 200 changes=2
+[main] SELECT * FROM g ORDER BY id   <same> stale-reads+2
+    both  : 1, 2, 100 | 2, 3, 200 changes=2
+[main] INSERT INTO g(a, __turso_gen) VALUES (3, 300)   <same> 
+    both  : (no rows) changes=1
+[main] SELECT * FROM g ORDER BY id   <same> stale-reads+2
+    both  : 1, 2, 100 | 2, 3, 200 | 3, 3, 300 changes=1
+[main] UPDATE g SET a = a * 10   <same> INSTALLED+1 stale-reads+2
+    both  : (no rows) changes=3
+[main] SELECT * FROM g ORDER BY id   <same> stale-reads+3
+    both  : 1, 20, 100 | 2, 30, 200 | 3, 30, 300 changes=3
+SUMMARY statements=35 diffs=0
+rc=0
+===== 19_subprograms
+[main] PRAGMA foreign_keys = ON   <same> 
+    both  : (no rows) changes=0
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] CREATE TABLE u(x INTEGER)   <same> 
+    both  : (no rows) changes=0
+[main] CREATE TABLE log(v)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = 'upd' || a   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] CREATE TRIGGER tr AFTER INSERT ON u BEGIN UPDATE t SET a = a + 1 WHERE id = NEW.x; INSERT INTO log SELECT b FROM t WHERE id = NEW.x + 1; END   <same> 
+    both  : (no rows) changes=3
+[main] INSERT INTO u VALUES (1)   <same> fallback+1 stale-reads+2
+    both  : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 2, 'upd1' | 2, 2, 'upd2' | 3, 3, 'upd3' changes=1
+[main] SELECT * FROM log   <same> 
+    both  : 'upd2' changes=1
+[main] CREATE TABLE p(id INTEGER PRIMARY KEY)   <same> 
+    both  : (no rows) changes=1
+[main] INSERT INTO p VALUES (1), (2)   <same> 
+    both  : (no rows) changes=2
+[main] CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON UPDATE CASCADE ON DELETE SET NULL, v TEXT)   <same> 
+    both  : (no rows) changes=2
+[main] INSERT INTO c(pid, v) VALUES (1, 'a'), (2, 'b'), (1, 'c')   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE c SET v = 'recipe-' || v   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] SELECT * FROM c ORDER BY id   <same> stale-reads+3
+    both  : 1, 1, 'recipe-a' | 2, 2, 'recipe-b' | 3, 1, 'recipe-c' changes=3
+[main] UPDATE p SET id = 10 WHERE id = 1   <same> fallback+2 stale-reads+2
+    both  : (no rows) changes=1
+[main] SELECT * FROM c ORDER BY id   <same> stale-reads+1
+    both  : 1, 10, 'recipe-a' | 2, 2, 'recipe-b' | 3, 10, 'recipe-c' changes=1
+[main] DELETE FROM p WHERE id = 2   <same> fallback+1 stale-reads+1
+    both  : (no rows) changes=1
+[main] SELECT * FROM c ORDER BY id   <same> 
+    both  : 1, 10, 'recipe-a' | 2, NULL, 'recipe-b' | 3, 10, 'recipe-c' changes=1
+SUMMARY statements=20 diffs=0
+rc=0
+===== 20_merge
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = 'r' || a   <same> INSTALLED+1
+    both  : (no rows) changes=3
+-- @fork b1: recipe ok eager ok
+[b1] UPDATE t SET a = 100 WHERE id = 1   <same> fallback+1 stale-reads+1
+    both  : (no rows) changes=1
+[main] @merge b1   <DIFF>
+    recipe: ERROR Parse error: column __turso_gen is reserved
+    eager : merged rows_changed=1
+[main] SELECT * FROM t ORDER BY id   <DIFF> stale-reads+3
+    recipe: 1, 1, 'r1' | 2, 2, 'r2' | 3, 3, 'r3' changes=3
+    eager : 1, 100, 'r1' | 2, 2, 'r2' | 3, 3, 'r3' changes=3
+-- @fork b2: recipe ok eager ok
+[b2] UPDATE t SET a = a + 1000   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] @merge b2   <DIFF>
+    recipe: refused Scope scope=Some("the branch changed the schema") install_error=None
+    eager : merged rows_changed=3
+[main] SELECT * FROM t ORDER BY id   <DIFF> stale-reads+3
+    recipe: 1, 1, 'r1' | 2, 2, 'r2' | 3, 3, 'r3' changes=3
+    eager : 1, 1100, 'r1' | 2, 1002, 'r2' | 3, 1003, 'r3' changes=3
+-- @fork b3: recipe ok eager ok
+[b3] UPDATE t SET b = 'branch' WHERE id = 3   <same> fallback+1
+    both  : (no rows) changes=1
+-- @conn main
+[main] UPDATE t SET b = b || '+' WHERE a < 3   <DIFF> INSTALLED+1 stale-reads+3
+    recipe: (no rows) changes=2
+    eager : (no rows) changes=0
+[main] @merge b3   <DIFF>
+    recipe: refused Scope scope=Some("the trunk changed its schema since the fork") install_error=None
+    eager : merged rows_changed=1
+[main] SELECT * FROM t ORDER BY id   <DIFF> stale-reads+3
+    recipe: 1, 1, 'r1+' | 2, 2, 'r2+' | 3, 3, 'r3' changes=2
+    eager : 1, 1100, 'r1' | 2, 1002, 'r2' | 3, 1003, 'branch' changes=0
+SUMMARY statements=13 diffs=7
+rc=3
+===== 21_blob_io
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, x BLOB, y BLOB, n INTEGER)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(x, y, n) VALUES (x'00112233', x'aabbccdd', 0), (x'44556677', x'eeff0011', 0)   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET x = x'99999999'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, hex(x) FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, '99999999' | 2, '99999999' changes=2
+-- @expect-diff the blob handle reads the stored bytes, not the recipe's value
+[main] @blobread t x 1   <DIFF>
+    recipe: bytes=4 x'00112233'
+    eager : bytes=4 x'99999999'
+[main] UPDATE t SET n = length(y) + unicode(CAST(y AS TEXT))   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT id, n, hex(y) FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 65537, 'AABBCCDD' | 2, 65537, 'EEFF0011' changes=2
+-- @expect-diff the write to y changes the input a stale row's recipe re-reads
+[main] @blobwrite t y 2 01020304   <same>
+    both  : wrote 4 bytes
+[main] SELECT id, n, hex(y) FROM t ORDER BY id   <DIFF> stale-reads+2
+    recipe: 1, 65537, 'AABBCCDD' | 2, 5, '01020304' changes=2
+    eager : 1, 65537, 'AABBCCDD' | 2, 65537, '01020304' changes=2
+SUMMARY statements=9 diffs=2
+rc=3
+===== 22_misc
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c BLOB)   <same> 
+    both  : (no rows) changes=0
+[main] CREATE INDEX ia ON t(a)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b, c) VALUES (1, 'x', x'00'), (2, 'y', x'01'), (3, 'z', x'02')   <same> 
+    both  : (no rows) changes=3
+[main] SELECT last_insert_rowid(), total_changes()   <same> 
+    both  : 3, 3 changes=3
+[main] PRAGMA schema_version   <same> 
+    both  : 2 changes=3
+[main] UPDATE t SET b = 'r' || a   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] SELECT last_insert_rowid(), total_changes(), changes()   <same> 
+    both  : 3, 6, 3 changes=3
+[main] PRAGMA schema_version   <DIFF> 
+    recipe: 3 changes=3
+    eager : 2 changes=3
+[main] SELECT b FROM t WHERE a = 2   <same> stale-reads+1
+    both  : 'r2' changes=3
+[main] SELECT id, b FROM t WHERE a > 1 ORDER BY a DESC   <same> stale-reads+2
+    both  : 3, 'r3' | 2, 'r2' changes=3
+[main] UPDATE t SET c = zeroblob(20000)   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = b || hex(substr(c, 19990, 4)) || length(c)   <same> INSTALLED+1 stale-reads+6
+    both  : (no rows) changes=3
+[main] SELECT id, b, length(c) FROM t ORDER BY id   <same> stale-reads+6
+    both  : 1, 'r10000000020000', 20000 | 2, 'r20000000020000', 20000 | 3, 'r30000000020000', 20000 changes=3
+[main] UPDATE t SET b = CAST(x'ff00fe41' AS TEXT)   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] SELECT id, hex(b), length(b), typeof(b) FROM t ORDER BY id   <same> stale-reads+9
+    both  : 1, 'EFBFBD00EFBFBD41', 1, 'text' | 2, 'EFBFBD00EFBFBD41', 1, 'text' | 3, 'EFBFBD00EFBFBD41', 1, 'text' changes=3
+[main] UPDATE t SET c = CAST(x'c3' AS TEXT) || 'a'   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] SELECT id, hex(c), length(c), typeof(c) FROM t ORDER BY id   <same> stale-reads+9
+    both  : 1, 'EFBFBD61', 2, 'text' | 2, 'EFBFBD61', 2, 'text' | 3, 'EFBFBD61', 2, 'text' changes=3
+[main] CREATE INDEX __turso_recipe_t_9 ON t(a, id)   <same> 
+    both  : (no rows) changes=0
+[main] UPDATE t SET b = 'nine'   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] SELECT type, name FROM sqlite_schema WHERE name LIKE '__turso_recipe%' ORDER BY type, name   <DIFF> 
+    recipe: 'index', '__turso_recipe_t_9' | 'recipe', '__turso_recipe_t_1' | 'recipe', '__turso_recipe_t_2' | 'recipe', '__turso_recipe_t_3' | 'recipe', '__turso_recipe_t_4' | 'recipe', '__turso_recipe_t_5' | 'recipe', '__turso_recipe_t_6' changes=3
+    eager : 'index', '__turso_recipe_t_9' changes=3
+[main] DROP INDEX __turso_recipe_t_9   <same> 
+    both  : (no rows) changes=3
+[main] SELECT type, name FROM sqlite_schema WHERE name LIKE '__turso_recipe%' ORDER BY type, name   <DIFF> 
+    recipe: 'recipe', '__turso_recipe_t_1' | 'recipe', '__turso_recipe_t_2' | 'recipe', '__turso_recipe_t_3' | 'recipe', '__turso_recipe_t_4' | 'recipe', '__turso_recipe_t_5' | 'recipe', '__turso_recipe_t_6' changes=3
+    eager : (no rows) changes=3
+[main] SELECT id, b FROM t ORDER BY id   <same> stale-reads+3
+    both  : 1, 'nine' | 2, 'nine' | 3, 'nine' changes=3
+-- @conn c2
+[c2] SELECT id, b FROM t ORDER BY id   <same> stale-reads+3
+    both  : 1, 'nine' | 2, 'nine' | 3, 'nine' changes=0
+SUMMARY statements=24 diffs=3
+rc=3
+===== 23_autovacuum
+[main] PRAGMA auto_vacuum = FULL   <same> 
+    both  : (no rows) changes=0
+[main] CREATE TABLE a0(x)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO a0 VALUES (1)   <same> 
+    both  : (no rows) changes=1
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=1
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = 'r' || a   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' ORDER BY name   <same> 
+    both  : 'a0', 3 | 't', 4 changes=2
+[main] DROP TABLE a0   <same> 
+    both  : (no rows) changes=2
+[main] SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' ORDER BY name   <same> 
+    both  : 't', 4 changes=2
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'r1' | 2, 2, 'r2' changes=2
+[main] UPDATE t SET a = a + 1 WHERE id = 1   <same> fallback+1 stale-reads+1
+    both  : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+1
+    both  : 1, 2, 'r1' | 2, 2, 'r2' changes=1
+-- @conn c2
+[c2] SELECT * FROM t ORDER BY id   <same> stale-reads+1
+    both  : 1, 2, 'r1' | 2, 2, 'r2' changes=0
+SUMMARY statements=13 diffs=0
+rc=0
+===== 24_count_changes
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y'), (3, 'z')   <same> 
+    both  : (no rows) changes=3
+[main] PRAGMA count_changes = 1   <same> 
+    both  : (no rows) changes=3
+[main] UPDATE t SET b = 'r' || a   <same> INSTALLED+1
+    both  : 3 changes=3
+[main] UPDATE t SET b = 'q' WHERE a > 1   <same> INSTALLED+1
+    both  : 2 changes=2
+[main] UPDATE t SET b = 'none' WHERE a > 100   <same> empty-match+1
+    both  : 0 changes=0
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+3
+    both  : 1, 1, 'r1' | 2, 2, 'q' | 3, 3, 'q' changes=0
+SUMMARY statements=7 diffs=0
+rc=0
+===== 25_schema_aba
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')   <same> 
+    both  : (no rows) changes=2
+[main] PRAGMA schema_version   <same> 
+    both  : 1 changes=2
+[main] BEGIN   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = 'rolled-back'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+-- @prep held SELECT id, a, b FROM t ORDER BY id: recipe ok eager ok
+-- @prep heldw UPDATE t SET a = a + 1 WHERE id = 1: recipe ok eager ok
+[main] @bind held   <same> stale-reads+2
+    both  : 1, 1, 'rolled-back' | 2, 2, 'rolled-back' changes=2
+[main] ROLLBACK   <same> 
+    both  : (no rows) changes=2
+[main] SELECT * FROM t ORDER BY id   <same> 
+    both  : 1, 1, 'x' | 2, 2, 'y' changes=2
+[main] PRAGMA schema_version   <same> 
+    both  : 1 changes=2
+[main] CREATE TABLE other(x)   <same> 
+    both  : (no rows) changes=2
+[main] PRAGMA schema_version   <same> 
+    both  : 2 changes=2
+-- @expect-diff the held statement still applies the rolled-back recipe
+[main] @bind held   <DIFF> stale-reads+2
+    recipe: 1, 1, 'rolled-back' | 2, 2, 'rolled-back' changes=2
+    eager : 1, 1, 'x' | 2, 2, 'y' changes=2
+[main] @bind heldw   <same> stale-reads+1
+    both  : (no rows) changes=1
+[main] SELECT * FROM t ORDER BY id   <DIFF> 
+    recipe: 1, 2, 'rolled-back' | 2, 2, 'y' changes=1
+    eager : 1, 2, 'x' | 2, 2, 'y' changes=1
+[main] @bind held   <DIFF> stale-reads+1
+    recipe: 1, 2, 'rolled-back' | 2, 2, 'rolled-back' changes=1
+    eager : 1, 2, 'x' | 2, 2, 'y' changes=1
+SUMMARY statements=15 diffs=3
+rc=3
+===== 25b_schema_aba_dml_only
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b, c) VALUES (1, 'x', 'p'), (2, 'y', 'q')   <same> 
+    both  : (no rows) changes=2
+-- @prep cached SELECT id, a, b, c FROM t ORDER BY id: recipe ok eager ok
+[main] BEGIN   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET b = 'rolled-back'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+[main] @bind cached   <same> stale-reads+2
+    both  : 1, 1, 'rolled-back', 'p' | 2, 2, 'rolled-back', 'q' changes=2
+[main] ROLLBACK   <same> 
+    both  : (no rows) changes=2
+[main] UPDATE t SET c = 'committed'   <same> INSTALLED+1
+    both  : (no rows) changes=2
+-- @expect-diff the cached statement shows b from the rolled-back recipe and misses the committed one
+[main] @bind cached   <DIFF> stale-reads+2
+    recipe: 1, 1, 'rolled-back', 'p' | 2, 2, 'rolled-back', 'q' changes=2
+    eager : 1, 1, 'x', 'committed' | 2, 2, 'y', 'committed' changes=2
+[main] SELECT id, a, b, c FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'x', 'committed' | 2, 2, 'y', 'committed' changes=2
+SUMMARY statements=9 diffs=1
+rc=3
+===== 26_abandoned_stmt
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')   <same> 
+    both  : (no rows) changes=2
+[main] PRAGMA count_changes = 1   <same> 
+    both  : (no rows) changes=2
+-- @prep u UPDATE t SET b = 'abandoned': recipe ok eager ok
+[main] @open u   <same> 
+    both  : (no rows) changes=0
+[main] @next u   <same> INSTALLED+1
+    both  : 2 changes=0
+-- @drop u
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'abandoned' | 2, 2, 'abandoned' changes=2
+[main] SELECT count(*) FROM sqlite_schema WHERE type = 'recipe'   <DIFF> 
+    recipe: 1 changes=2
+    eager : 0 changes=2
+-- @conn c2
+[c2] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'abandoned' | 2, 2, 'abandoned' changes=0
+-- @conn main
+-- @prep u2 UPDATE t SET b = 'reset': recipe ok eager ok
+[main] @open u2   <same> 
+    both  : (no rows) changes=0
+[main] @next u2   <same> INSTALLED+1
+    both  : 2 changes=0
+[main] @open u2   <same> 
+    both  : (no rows) changes=0
+[main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'reset' | 2, 2, 'reset' changes=2
+-- @conn c2
+[c2] SELECT * FROM t ORDER BY id   <same> stale-reads+2
+    both  : 1, 1, 'reset' | 2, 2, 'reset' changes=0
+SUMMARY statements=13 diffs=1
+rc=3
+===== 27_null_chain
+[main] CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, s TEXT, n NUMERIC, u, cs TEXT COLLATE NOCASE)   <same> 
+    both  : (no rows) changes=0
+[main] INSERT INTO t(i, r, s, n, u, cs) VALUES (NULL, NULL, NULL, NULL, NULL, 'Abc'), (1, 1.0, '1', '1', 1, 'abc'), (2, 2.5, '02', ' 2 ', '2', 'ABD'), (3, NULL, 'x', 'x', x'00', NULL)   <same> 
+    both  : (no rows) changes=4
+[main] UPDATE t SET u = i * 2 WHERE r IS NULL OR i > 1   <same> INSTALLED+1
+    both  : (no rows) changes=3
+[main] UPDATE t SET s = u WHERE NOT (u = 2)   <same> INSTALLED+1 stale-reads+4
+    both  : (no rows) changes=3
+[main] UPDATE t SET i = NULL WHERE s > 5   <same> INSTALLED+1 stale-reads+4
+    both  : (no rows) changes=1
+[main] UPDATE t SET r = s WHERE i IS NULL   <same> INSTALLED+1 stale-reads+8
+    both  : (no rows) changes=2
+[main] UPDATE t SET n = r + 0 WHERE NOT (n IN (1, 2))   <same> INSTALLED+1 stale-reads+4
+    both  : (no rows) changes=1
+[main] UPDATE t SET cs = 'ABC' WHERE s IS NOT NULL   <same> INSTALLED+1 stale-reads+4
+    both  : (no rows) changes=3
+[main] UPDATE t SET u = NULLIF(u, 6)   <same> INSTALLED+1 stale-reads+4
+    both  : (no rows) changes=4
+[main] SELECT id, i, typeof(i), r, typeof(r), s, typeof(s), n, typeof(n), u, typeof(u), cs FROM t ORDER BY id   <same> stale-reads+44
+    both  : 1, NULL, 'null', NULL, 'null', NULL, 'null', NULL, 'null', NULL, 'null', 'Abc' | 2, 1, 'integer', 1.0r, 'real', '1', 'text', 1, 'integer', 1, 'integer', 'ABC' | 3, 2, 'integer', 2.5r, 'real', '4', 'text', 2, 'integer', 4, 'integer', 'ABC' | 4, NULL, 'null', 6.0r, 'real', '6', 'text', 6, 'integer', NULL, 'null', 'ABC' changes=4
+[main] SELECT id FROM t WHERE cs = 'abc' ORDER BY id   <same> stale-reads+4
+    both  : 1 | 2 | 3 | 4 changes=4
+[main] SELECT id FROM t WHERE s = 6 ORDER BY id   <same> stale-reads+4
+    both  : 4 changes=4
+[main] SELECT id FROM t WHERE s > 5 ORDER BY id   <same> stale-reads+4
+    both  : 4 changes=4
+[main] SELECT id FROM t WHERE r = '1' ORDER BY id   <same> stale-reads+4
+    both  : 2 changes=4
+[main] SELECT cs, count(*) FROM t GROUP BY cs ORDER BY cs   <same> stale-reads+4
+    both  : 'Abc', 4 changes=4
+[main] SELECT DISTINCT cs FROM t ORDER BY cs   <same> stale-reads+4
+    both  : 'Abc' changes=4
+[main] SELECT id, i IS NULL, s IS NULL, r IS NULL FROM t ORDER BY id   <same> stale-reads+12
+    both  : 1, 1, 1, 1 | 2, 0, 0, 0 | 3, 0, 0, 0 | 4, 1, 0, 0 changes=4
+SUMMARY statements=17 diffs=0
+rc=0

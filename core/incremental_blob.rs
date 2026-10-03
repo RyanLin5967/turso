@@ -297,6 +297,13 @@ impl Connection {
             let tbl = schema
                 .get_btree_table(table)
                 .ok_or_else(|| LimboError::InternalError(format!("no such table: {table}")))?;
+            // Recipe backfill: a blob handle reads and writes the stored bytes, bypassing the
+            // read-path upgrade and the write-path freeze (see `crate::recipe`). Refused.
+            if tbl.recipes.is_some() {
+                return Err(LimboError::InternalError(format!(
+                    "cannot open a blob on {table}: the table has recipe backfills"
+                )));
+            }
             if !tbl.has_rowid {
                 return Err(LimboError::InternalError(format!(
                     "cannot open table without rowid: {table}"

@@ -1224,6 +1224,9 @@ pub fn op_open_read(
         },
         insn
     );
+    // Recipe backfill: a cursor reopened on a b-tree is no longer ephemeral, and its cached row
+    // belongs to what it read before.
+    state.recipe_exec.set_ephemeral(*cursor_id, false);
 
     invalidate_deferred_seeks_for_cursor(state, *cursor_id);
 
@@ -13068,6 +13071,7 @@ pub fn op_open_write(
         insn
     );
     invalidate_deferred_seeks_for_cursor(state, *cursor_id);
+    state.recipe_exec.set_ephemeral(*cursor_id, false);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -15417,6 +15421,9 @@ pub fn op_open_ephemeral(
         Insn::OpenAutoindex { cursor_id } => (*cursor_id, false),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+    // Recipe backfill: an ephemeral table typed as a recipe table holds the statement's own
+    // records, never the table's stale rows (see `crate::recipe::current_row`).
+    state.recipe_exec.set_ephemeral(cursor_id, true);
     let mv_store = program.connection.mv_store();
     match state.active_op_state.open_ephemeral() {
         OpOpenEphemeralState::Start => {
@@ -15613,6 +15620,9 @@ pub fn op_open_dup(
         },
         insn
     );
+    // Recipe backfill: a duplicate of an ephemeral cursor is ephemeral (see `crate::recipe`).
+    let dup_ephemeral = state.recipe_exec.is_ephemeral(*original_cursor_id);
+    state.recipe_exec.set_ephemeral(*new_cursor_id, dup_ephemeral);
     let mv_store = program.connection.mv_store();
 
     let original_cursor = state.get_cursor(*original_cursor_id);

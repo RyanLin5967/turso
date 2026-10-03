@@ -4902,6 +4902,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
+                // A HIDDEN type marks a hidden column exactly as `Column::try_from` does at CREATE
+                // time; without this a table re-read from sqlite_schema lost the flag (found by the
+                // k1-recipe-build adversary: a recipe table could not be reopened).
+                let hidden = ty_str.contains("HIDDEN");
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
@@ -4917,7 +4921,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         notnull,
                         explicit_notnull,
                         unique,
-                        hidden: false,
+                        hidden,
                         notnull_conflict_clause,
                     },
                 );

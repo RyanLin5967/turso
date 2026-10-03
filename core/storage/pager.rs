@@ -6167,6 +6167,10 @@ impl Pager {
                     .expect("the branch is open, so it exists"),
                 None => connection.db.clone_schema(),
             };
+            // Statements prepared under the discarded schema carry its version, which the next
+            // schema change reuses; only a context bump makes them reprepare (k1-recipe-build
+            // adversary finding: a cached SELECT served a rolled-back recipe).
+            connection.bump_prepare_context_generation();
         }
         // A branch transaction never appended to the WAL, so there is nothing there to undo.
         if is_write && self.branch.get().is_none() {

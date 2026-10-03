@@ -2144,7 +2144,12 @@ fn init_source_emission<'a>(
     database_id: usize,
 ) -> Result<()> {
     let required_column_count = if columns.is_empty() {
-        table.columns().iter().filter(|c| !c.is_generated()).count()
+        // Hidden columns take no value from a column-less INSERT (the mapping below skips them).
+        table
+            .columns()
+            .iter()
+            .filter(|c| !c.is_generated() && !c.hidden())
+            .count()
     } else {
         columns.len()
     };
@@ -2346,10 +2351,11 @@ fn init_source_emission<'a>(
             }
         }
         InsertBody::DefaultValues => {
+            // Hidden columns take no value here either: the column mapping skips them.
             let storable_columns: Vec<_> = table
                 .columns()
                 .iter()
-                .filter(|c| !c.is_generated())
+                .filter(|c| !c.is_generated() && !c.hidden())
                 .collect();
             let num_values = storable_columns.len();
             let is_strict = table.is_strict();
