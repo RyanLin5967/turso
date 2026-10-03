@@ -1149,6 +1149,39 @@ fn snap() -> Counters {
     Counters(recipe_io(), turso_core::branch::page_io())
 }
 
+/// This process's CPU time (user + system) in microseconds (getrusage RUSAGE_SELF).
+fn cpu_us() -> u64 {
+    // SAFETY: getrusage fills the struct it is given; a zeroed rusage is a valid initial value.
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        (ru.ru_utime.tv_sec as u64 * 1_000_000 + ru.ru_utime.tv_usec as u64)
+            + (ru.ru_stime.tv_sec as u64 * 1_000_000 + ru.ru_stime.tv_usec as u64)
+    }
+}
+
+/// DEDUP arm (PREREG A4.1): a 128-bit hash of every page image the connection sees.
+fn page_hashes(conn: &Arc<Connection>) -> Vec<u128> {
+    use std::hash::{Hash, Hasher};
+    let rs = rows(conn, "SELECT data FROM sqlite_dbpage")
+        .unwrap_or_else(|e| not_a_result(&format!("sqlite_dbpage: {e}")));
+    rs.iter()
+        .map(|r| {
+            let bytes: &[u8] = match r[0].as_ref() {
+                ValueRef::Blob(b) => b,
+                other => not_a_result(&format!("sqlite_dbpage data is {other:?}")),
+            };
+            let mut a = std::collections::hash_map::DefaultHasher::new();
+            0u8.hash(&mut a);
+            bytes.hash(&mut a);
+            let mut b = std::collections::hash_map::DefaultHasher::new();
+            1u8.hash(&mut b);
+            bytes.hash(&mut b);
+            ((a.finish() as u128) << 64) | b.finish() as u128
+        })
+        .collect()
+}
+
 fn bench_main(args: &Args) {
     let workload = args.workload.as_str();
     let arm = args.arm.as_str();
@@ -1179,14 +1212,31 @@ fn bench_main(args: &Args) {
     println!(
         "# bench workload={workload} arm={arm} n={} v={} shape={} seed={} page_size={page_size} \
          page_count={page_count} checkpoint={ckpt:?} synchronous={sync:?} load_ns={load_ns} \
-         mutant={:?}",
+         mutant={:?} fr={} fi={} depth={} dedup={} reap={}",
         args.n,
         args.v,
         args.shape,
         args.seed,
-        turso_core::recipe::mutant()
+        turso_core::recipe::mutant(),
+        args.fr,
+        args.fi,
+        args.depth,
+        args.dedup,
+        args.reap
     );
 
+    // DEDUP arm: the trunk's page images seed the content-addressed set.
+    let mut dedup: HashSet<u128> = HashSet::new();
+    let mut dedup_new_per_branch: Vec<usize> = Vec::new();
+    if args.dedup {
+        for h in page_hashes(&trunk) {
+            dedup.insert(h);
+        }
+        println!("# dedup seed: {} trunk page images, {} distinct", page_count, dedup.len());
+    }
+    if args.reap && args.shape != "fan" {
+        die("--reap needs --shape fan (a reaped parent cannot be forked from)");
+    }
     // The branch tree.
     let mut handles: Vec<Branch> = Vec::with_capacity(args.v as usize);
     let mut parent_of: Vec<Option<usize>> = Vec::new();
@@ -1207,16 +1257,16 @@ fn bench_main(args: &Args) {
             "chain" => b.checked_sub(1).map(|p| p as usize),
             "tree" => {
                 let mut eligible: Vec<Option<usize>> = Vec::new();
-                if root_children < 5 {
+                if root_children < args.fr {
                     eligible.push(None);
                 }
                 for (i, d) in depth.iter().enumerate() {
-                    if *d < 4 && children[i] < 3 {
+                    if *d < args.depth && children[i] < args.fi {
                         eligible.push(Some(i));
                     }
                 }
                 if eligible.is_empty() {
-                    not_a_result("tree full: BranchBench's F_r=5, F_i=3, D=4 caps the tree at 200 nodes");
+                    not_a_result("tree full: F_r, F_i and D cap the tree below --v");
                 }
                 *tree_rng.pick(&eligible)
             }
@@ -1276,13 +1326,15 @@ fn bench_main(args: &Args) {
                 }
             }
             let c0 = snap();
+            let u0 = cpu_us();
             let t = Instant::now();
             let out = rows(&conn, sql).unwrap_or_else(|e| not_a_result(&format!("branch {b} {label}: {e}: {sql}")));
             let ns = t.elapsed().as_nanos();
+            let cpu = cpu_us() - u0;
             let c1 = snap();
             let dd = |i: usize| c1.0[i] - c0.0[i];
             line.push_str(&format!(
-                " {label}_fetch={} {label}_dirty={} {label}_evals={} {label}_installed={} {label}_ns={ns}",
+                " {label}_fetch={} {label}_dirty={} {label}_evals={} {label}_installed={} {label}_ns={ns} {label}_cpu_us={cpu}",
                 dd(counter::PAGE_FETCH),
                 dd(counter::BRANCH_DIRTY),
                 dd(counter::RECIPE_EVALS),
@@ -1305,6 +1357,18 @@ fn bench_main(args: &Args) {
             " owned_before={owned_before} owned={owned_after} arena_in_use={} step_ns={step_ns}",
             st.arena_slots_in_use
         ));
+        if args.dedup {
+            let hs = page_hashes(&conn);
+            let seen = hs.len();
+            let mut new = 0usize;
+            for h in hs {
+                if dedup.insert(h) {
+                    new += 1;
+                }
+            }
+            dedup_new_per_branch.push(new);
+            line.push_str(&format!(" dedup_pages={seen} dedup_new={new} dedup_set={}", dedup.len()));
+        }
         println!("{line}");
         // Point reads on sampled branches (KC3), on a fresh connection.
         if b % sample_every == 0 && args.points > 0 {
@@ -1356,7 +1420,11 @@ fn bench_main(args: &Args) {
         } else {
             drop(conn);
         }
-        handles.push(br);
+        if args.reap {
+            br.reap().unwrap_or_else(|e| not_a_result(&format!("reap {b}: {e}")));
+        } else {
+            handles.push(br);
+        }
     }
     let bench_ns = bench_t0.elapsed().as_nanos();
     let st = db.branch_stats().unwrap();
@@ -1370,17 +1438,30 @@ fn bench_main(args: &Args) {
     // Owned pages are re-read at the end: a later sibling never changes an earlier branch's.
     let final_owned: Vec<usize> = handles.iter().map(|h| h.owned_slots().len()).collect();
     let final_total: usize = final_owned.iter().sum();
+    let branches_run = per_branch_owned.len();
+    if args.dedup {
+        let total: usize = dedup_new_per_branch.iter().sum();
+        let half = &dedup_new_per_branch[dedup_new_per_branch.len() / 2..];
+        let marginal = half.iter().sum::<usize>() as f64 / half.len().max(1) as f64;
+        println!(
+            "DEDUP branches={} new_pages_total={total} amortised={:.3} marginal_second_half={marginal:.3} first={} set={}",
+            dedup_new_per_branch.len(),
+            total as f64 / dedup_new_per_branch.len().max(1) as f64,
+            dedup_new_per_branch.first().copied().unwrap_or(0),
+            dedup.len()
+        );
+    }
     let io = recipe_io();
     println!(
         "SUMMARY workload={workload} arm={arm} n={} v={} shape={} branches={} sum_owned={total_owned} \
          sum_owned_end={final_total} min_owned={min_owned} max_owned={max_owned} mean_owned={:.3} \
          arena_in_use={} arena_free={} live_branches={} point_lines={point_lines} installed={} fallbacks={} \
-         recipe_evals={} stale_reads={} result_hash={hh:016x} bench_ns={bench_ns} page_io={:?}",
+         recipe_evals={} stale_reads={} result_hash={hh:016x} bench_ns={bench_ns} page_io={:?} reaped={}",
         args.n,
         args.v,
         args.shape,
-        handles.len(),
-        total_owned as f64 / handles.len().max(1) as f64,
+        branches_run,
+        total_owned as f64 / branches_run.max(1) as f64,
         st.arena_slots_in_use,
         st.arena_slots_free,
         st.live_branches,
@@ -1389,14 +1470,15 @@ fn bench_main(args: &Args) {
         io[counter::RECIPE_EVALS],
         io[counter::STALE_READS],
         turso_core::branch::page_io(),
+        args.reap,
     );
-    if handles.is_empty() || total_owned == 0 {
+    if branches_run == 0 || total_owned == 0 {
         not_a_result("no branch owned any page: the instrument read nothing");
     }
     if arm != "eager" && (workload == "sd" || workload == "sdx") && io[counter::INSTALLED] == 0 {
         not_a_result("recipe arm installed no recipe");
     }
-    if arm == "alt" && (io[counter::INSTALLED] == 0 || io[counter::INSTALLED] as usize > handles.len()) {
+    if arm == "alt" && (io[counter::INSTALLED] == 0 || io[counter::INSTALLED] as usize > branches_run) {
         not_a_result("alt arm: recipe branches installed no recipe, or eager ones did");
     }
     if arm == "eager" && io[counter::INSTALLED] != 0 {
@@ -1473,6 +1555,12 @@ struct Args {
     seed: u64,
     /// diff: run the RECIPE arm with recipes off too (the BASE control's mode, PREREG §3).
     no_recipe: bool,
+    /// bench: DEDUP arm (A4.1), reap each branch after its step (A4.3), tree fanouts and depth.
+    dedup: bool,
+    reap: bool,
+    fr: u64,
+    fi: u64,
+    depth: u64,
 }
 
 fn parse_args() -> Args {
@@ -1495,6 +1583,11 @@ fn parse_args() -> Args {
         sample: 10,
         seed: 0x6B31_5245_4349_5045,
         no_recipe: false,
+        dedup: false,
+        reap: false,
+        fr: 5,
+        fi: 3,
+        depth: 4,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -1505,6 +1598,11 @@ fn parse_args() -> Args {
             "--dir" => a.dir = PathBuf::from(val()),
             "--no-sqlite" => a.sqlite = false,
             "--no-recipe" => a.no_recipe = true,
+            "--dedup" => a.dedup = true,
+            "--reap" => a.reap = true,
+            "--fr" => a.fr = val().parse().unwrap_or_else(|_| die("bad --fr")),
+            "--fi" => a.fi = val().parse().unwrap_or_else(|_| die("bad --fi")),
+            "--depth" => a.depth = val().parse().unwrap_or_else(|_| die("bad --depth")),
             "--workload" => a.workload = val(),
             "--arm" => a.arm = val(),
             "--n" => a.n = val().parse().unwrap_or_else(|_| die("bad --n")),
