@@ -303,7 +303,9 @@ fn every_fork_records_its_store_hold_and_every_trunk_fork_its_wal_hold() {
         assert_eq!(
             after.wal.max_ns > 0,
             after.locked_trunk_forks > 0,
-            "catalog={catalog}: a WAL hold without a locked fork, or the reverse: {after:?}"
+            "catalog={catalog}: a WAL hold without a locked fork, or the reverse: max {} ns, {} locked",
+            after.wal.max_ns,
+            after.locked_trunk_forks
         );
         assert!(after.locked_trunk_forks <= 5);
         assert_eq!(after.store.buckets.iter().sum::<u64>(), after.store.count);
@@ -442,7 +444,7 @@ fn trunk_forks_after_the_first_take_no_wal_write_lock() {
         assert_eq!(holds.wal.count, 5);
         assert_eq!(
             holds.locked_trunk_forks, 1,
-            "catalog={catalog}: trunk forks that took the WAL write lock: {holds:?}"
+            "catalog={catalog}: trunk forks that took the WAL write lock (of {})", holds.wal.count
         );
         drop(kept);
     }
@@ -483,23 +485,40 @@ fn lock_free_durable_forks_racing_trunk_commits_read_every_fork_as_it_was() {
                     let mut generation = 0u64;
                     while !done.load(std::sync::atomic::Ordering::Acquire) {
                         let forks_before = db.branch_fork_holds().store.count;
-                        conn.execute("BEGIN").unwrap();
                         let mut next = states.read().unwrap().last().unwrap().clone();
                         x ^= x << 13;
                         x ^= x >> 7;
                         x ^= x << 17;
+                        let mut writes = Vec::new();
                         for _ in 0..=(x % 3) {
                             x ^= x << 13;
                             x ^= x >> 7;
                             x ^= x << 17;
-                            let id = 1 + (x % 50) as i64;
                             generation += 1;
-                            let v = format!("g{generation}");
-                            conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {id}")).unwrap();
-                            next[(id - 1) as usize].1 = v;
-                            std::thread::yield_now();
+                            writes.push((1 + (x % 50) as i64, format!("g{generation}")));
                         }
-                        conn.execute("COMMIT").unwrap();
+                        // A fork that fell back to the WAL write lock makes a statement Busy: the
+                        // transaction is retried whole, as a client would.
+                        let committed = (|| -> Result<()> {
+                            conn.execute("BEGIN")?;
+                            for (id, v) in &writes {
+                                conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {id}"))?;
+                                std::thread::yield_now();
+                            }
+                            conn.execute("COMMIT")
+                        })();
+                        match committed {
+                            Ok(()) => {}
+                            Err(LimboError::Busy) => {
+                                let _ = conn.execute("ROLLBACK");
+                                std::thread::yield_now();
+                                continue;
+                            }
+                            Err(e) => panic!("trunk writer: {e}"),
+                        }
+                        for (id, v) in writes {
+                            next[(id - 1) as usize].1 = v;
+                        }
                         states.write().unwrap().push(next);
                         if db.branch_fork_holds().store.count > forks_before {
                             mid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -555,7 +574,12 @@ fn lock_free_durable_forks_racing_trunk_commits_read_every_fork_as_it_was() {
             }
             let holds = db.branch_fork_holds();
             let fast = holds.wal.count - holds.locked_trunk_forks;
-            assert!(fast > 0, "catalog={catalog}: no trunk fork took the lock-free path: {holds:?}");
+            assert!(
+                fast > 0,
+                "catalog={catalog}: no trunk fork took the lock-free path ({} of {} locked)",
+                holds.locked_trunk_forks,
+                holds.wal.count
+            );
             assert!(
                 mid_txn_forks.load(std::sync::atomic::Ordering::Relaxed) > 0,
                 "catalog={catalog}: no fork landed inside an open trunk transaction"
