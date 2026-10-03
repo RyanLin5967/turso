@@ -309,3 +309,266 @@ fn every_fork_records_its_store_hold_and_every_trunk_fork_its_wal_hold() {
         assert_eq!(after.store.buckets.iter().sum::<u64>(), after.store.count);
     }
 }
+
+// ---- the lock-free durable trunk fork (fastest-engine M1 item 1: F-L 573642f19 on the durable
+// store) ----
+
+fn read_t(conn: &Arc<Connection>) -> Vec<(i64, String)> {
+    conn.prepare("SELECT id, v FROM t ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            let v = match &row[1] {
+                crate::Value::Text(t) => t.as_str().to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            (row[0].as_int().unwrap(), v)
+        })
+        .collect()
+}
+
+fn read_v(conn: &Arc<Connection>, id: i64) -> String {
+    read_t(conn).into_iter().find(|(i, _)| *i == id).unwrap().1
+}
+
+/// Reopen `path` and prove it is a new instance, not the registry's cached one.
+fn reopen(path: &Path, opts: DatabaseOpts, previous: u64) -> Arc<Database> {
+    let db = open_at(path, opts);
+    assert_ne!(db.incarnation, previous, "the registry returned the old Database: not a reopen");
+    db
+}
+
+/// K10-D1 and K10-D2 (r11-forklock's K10-1/K10-2, durable): a trunk fork made while another
+/// connection's trunk write transaction is OPEN does not wait it out and is not refused; the
+/// transaction's commit takes its copy decisions against the epoch at the commit, so the child
+/// forked inside it reads the version the commit overwrote — both when the page's last commit was
+/// in the epoch just before and when it was epochs back — and a child forked after the commit reads
+/// the new version. All of it holds again after a reopen. (The trunk's FIRST child is still forked
+/// under the WAL write lock, before the transaction.)
+#[test]
+fn a_trunk_fork_inside_an_open_trunk_transaction_reads_what_the_commit_overwrote() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fl.db");
+        let (ids, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let a = db.connect().unwrap();
+            let b = db.connect().unwrap();
+            seed(&a);
+            let first = a.fork_branch().unwrap();
+            // C1: page of id 7 last committed in the epoch just before.
+            a.execute("BEGIN").unwrap();
+            a.execute("UPDATE t SET v = 'c1' WHERE id = 7").unwrap();
+            let x = b
+                .fork_branch()
+                .expect("a trunk fork waited out, or was refused by, an open trunk write transaction");
+            a.execute("COMMIT").unwrap();
+            // C2: a fork between C1 and C2, so the page's last commit is epochs back at C2.
+            let between = b.fork_branch().unwrap();
+            a.execute("BEGIN").unwrap();
+            a.execute("UPDATE t SET v = 'c2' WHERE id = 7").unwrap();
+            let y = b.fork_branch().unwrap();
+            let z = b.fork_branch().unwrap();
+            a.execute("COMMIT").unwrap();
+            let after = b.fork_branch().unwrap();
+            let expect = [
+                (&first, "trunk-7"),
+                (&x, "trunk-7"),
+                (&between, "c1"),
+                (&y, "c1"),
+                (&z, "c1"),
+                (&after, "c2"),
+            ];
+            for (i, (br, want)) in expect.iter().enumerate() {
+                let c = br.connect().unwrap();
+                assert_eq!(read_v(&c, 7), *want, "catalog={catalog}: fork #{i} before the reopen");
+            }
+            let ids: Vec<(BranchId, &str)> = expect.iter().map(|(br, w)| (br.id(), *w)).collect();
+            let ids: Vec<(BranchId, String)> = ids.into_iter().map(|(i, w)| (i, w.to_string())).collect();
+            for br in [first, x, between, y, z, after] {
+                let _ = br.into_id();
+            }
+            (ids, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        for (i, (id, want)) in ids.iter().enumerate() {
+            let c = db.branch(*id).unwrap().connect().unwrap();
+            assert_eq!(&read_v(&c, 7), want, "catalog={catalog}: fork #{i} after the reopen");
+        }
+    }
+}
+
+/// The trunk's FIRST live child is still forked under the WAL write lock: with no live child, a
+/// writer captured no pre-image, so no child may appear before its commit. A fork while a trunk
+/// write transaction is open is then refused Busy (before the port and after it).
+#[test]
+fn the_trunks_first_child_still_waits_for_an_open_trunk_write_transaction() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("first.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        let b = db.connect().unwrap();
+        seed(&a);
+        a.execute("BEGIN").unwrap();
+        a.execute("UPDATE t SET v = 'mid' WHERE id = 7").unwrap();
+        let forked = b.fork_branch();
+        assert!(
+            matches!(forked, Err(LimboError::Busy)),
+            "catalog={catalog}: the trunk's first child was forked inside an open trunk write \
+             transaction: {:?}",
+            forked.map(|b| b.id())
+        );
+        a.execute("COMMIT").unwrap();
+        let c = b.fork_branch().unwrap().connect().unwrap();
+        assert_eq!(read_v(&c, 7), "mid");
+    }
+}
+
+/// After the first child, trunk forks take no WAL write lock: one locked fork in five.
+#[test]
+fn trunk_forks_after_the_first_take_no_wal_write_lock() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("nolock.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed(&a);
+        let kept: Vec<Branch> = (0..5).map(|_| a.fork_branch().unwrap()).collect();
+        let holds = db.branch_fork_holds();
+        assert_eq!(holds.wal.count, 5);
+        assert_eq!(
+            holds.locked_trunk_forks, 1,
+            "catalog={catalog}: trunk forks that took the WAL write lock: {holds:?}"
+        );
+        drop(kept);
+    }
+}
+
+/// K10-D5 (r11-forklock's K10, durable, through SQL): a writer commits one-to-three-row trunk
+/// transactions in a loop while four threads fork from the trunk on their own connections. Each
+/// child must read, at once, exactly one committed trunk state between the last commit returned
+/// before its fork began and the first one not yet returned when it ended; it must read that same
+/// state after every later commit and after a reopen. The shapes the port exists for must occur:
+/// lock-free forks, and forks inside an open trunk transaction.
+#[test]
+fn lock_free_durable_forks_racing_trunk_commits_read_every_fork_as_it_was() {
+    use std::sync::atomic::{AtomicBool as StdBool, AtomicU64 as StdU64};
+    use std::sync::RwLock;
+    let _s = serial();
+    const FORKERS: usize = 4;
+    const FORKS: usize = 40;
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("race.db");
+        let opts = || opts(catalog, SyncClass::Fsync);
+        let (kept, incarnation) = {
+            let db = open_at(&path, opts());
+            let seed_conn = db.connect().unwrap();
+            seed(&seed_conn);
+            let first = seed_conn.fork_branch().unwrap().into_id();
+            // states[j]: the trunk's table after the j-th commit (states[0]: the seed).
+            let states = Arc::new(RwLock::new(vec![read_t(&seed_conn)]));
+            let done = Arc::new(StdBool::new(false));
+            let mid_txn_forks = Arc::new(StdU64::new(0));
+            let writer = {
+                let (db, states, done, mid) =
+                    (db.clone(), states.clone(), done.clone(), mid_txn_forks.clone());
+                std::thread::spawn(move || {
+                    let conn = db.connect().unwrap();
+                    let mut x = 0x2545_F491_4F6C_DD1Du64;
+                    let mut generation = 0u64;
+                    while !done.load(std::sync::atomic::Ordering::Acquire) {
+                        let forks_before = db.branch_fork_holds().store.count;
+                        conn.execute("BEGIN").unwrap();
+                        let mut next = states.read().unwrap().last().unwrap().clone();
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        for _ in 0..=(x % 3) {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            let id = 1 + (x % 50) as i64;
+                            generation += 1;
+                            let v = format!("g{generation}");
+                            conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {id}")).unwrap();
+                            next[(id - 1) as usize].1 = v;
+                            std::thread::yield_now();
+                        }
+                        conn.execute("COMMIT").unwrap();
+                        states.write().unwrap().push(next);
+                        if db.branch_fork_holds().store.count > forks_before {
+                            mid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            let forkers: Vec<_> = (0..FORKERS)
+                .map(|_| {
+                    let (db, states) = (db.clone(), states.clone());
+                    std::thread::spawn(move || {
+                        let conn = db.connect().unwrap();
+                        let mut kept = Vec::new();
+                        for _ in 0..FORKS {
+                            let lo = states.read().unwrap().len() - 1;
+                            let branch = loop {
+                                match conn.fork_branch() {
+                                    Ok(b) => break b,
+                                    // Only a fork that falls back to the WAL write lock can see Busy.
+                                    Err(LimboError::Busy) => std::thread::yield_now(),
+                                    Err(e) => panic!("fork failed: {e}"),
+                                }
+                            };
+                            let hi = states.read().unwrap().len();
+                            let seen = read_t(&branch.connect().unwrap());
+                            let states = states.read().unwrap();
+                            let j = (lo..=hi.min(states.len() - 1))
+                                .find(|&j| states[j] == seen)
+                                .unwrap_or_else(|| {
+                                    panic!("a child forked between commits {lo} and {hi} reads no committed state")
+                                });
+                            kept.push((branch.into_id(), j));
+                        }
+                        kept
+                    })
+                })
+                .collect();
+            let mut kept: Vec<(BranchId, usize)> = Vec::new();
+            for f in forkers {
+                kept.extend(f.join().unwrap());
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+            writer.join().unwrap();
+            let states = states.read().unwrap().clone();
+            for &(id, j) in &kept {
+                // Re-attached, read, and detached again: a dropped handle would reap the branch.
+                let b = db.branch(id).unwrap();
+                let c = b.connect().unwrap();
+                assert_eq!(read_t(&c), states[j], "catalog={catalog}: branch {} moved after its fork", id.0);
+                drop(c);
+                let _ = b.into_id();
+            }
+            let holds = db.branch_fork_holds();
+            let fast = holds.wal.count - holds.locked_trunk_forks;
+            assert!(fast > 0, "catalog={catalog}: no trunk fork took the lock-free path: {holds:?}");
+            assert!(
+                mid_txn_forks.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                "catalog={catalog}: no fork landed inside an open trunk transaction"
+            );
+            let _ = first;
+            let kept: Vec<(BranchId, Vec<(i64, String)>)> =
+                kept.into_iter().map(|(id, j)| (id, states[j].clone())).collect();
+            (kept, db.incarnation)
+        };
+        let db = reopen(&path, opts(), incarnation);
+        for (id, want) in &kept {
+            let c = db.branch(*id).unwrap().connect().unwrap();
+            assert_eq!(&read_t(&c), want, "catalog={catalog}: branch {} after the reopen", id.0);
+        }
+    }
+}
