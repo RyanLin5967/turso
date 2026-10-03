@@ -11,6 +11,8 @@
 //!   @fork NAME          fork a branch from the current connection; NAME is the branch and its connection
 //!   @reap NAME          close branch NAME's connection and reap it
 //!   @close NAME         drop connection NAME (trunk connections)
+//!   @reconnect NAME     drop connection NAME and open a fresh one where it was (trunk or branch)
+//!   `$SELF` in a SQL line is replaced by each arm's own database path (for ATTACH)
 //!   @reopen             drop everything, reopen both databases, connection `main` on the trunk
 //!   @prep ID SQL        prepare SQL on the current connection, kept as ID
 //!   @bind ID V...       reset ID, bind V... (NULL, 12, 1.5, 'text', x'0a') to ?1.., and run to completion
@@ -38,7 +40,9 @@ fn open_db(path: &Path) -> Arc<Database> {
         io,
         path.to_str().unwrap(),
         OpenFlags::Create,
-        DatabaseOpts::new().with_branch_durability(BranchDurability::Volatile),
+        DatabaseOpts::new()
+            .with_branch_durability(BranchDurability::Volatile)
+            .with_attach(true),
         None,
         Arc::new(SqliteDialect),
     )
@@ -276,6 +280,25 @@ fn main() {
                 println!("-- {line}");
                 continue;
             }
+            "@reconnect" => {
+                // Drop connection NAME and open a fresh one on the same trunk or branch.
+                let name = rest[0].to_string();
+                for arm in [&mut r, &mut e] {
+                    arm.stmts.clear();
+                    arm.conns.remove(&name);
+                    match arm.home.get(&name).cloned().flatten() {
+                        None => arm.add_trunk_conn(&name),
+                        Some(b) => {
+                            let c = arm.branches[&b].connect().unwrap();
+                            c.set_recipe_backfill(arm.recipe);
+                            arm.conns.insert(name.clone(), c);
+                        }
+                    }
+                }
+                cur = name;
+                println!("-- {line} (prepared statements dropped)");
+                continue;
+            }
             "@recipe" => {
                 let on = rest[0] == "on";
                 r.conns[&cur].set_recipe_backfill(on);
@@ -403,12 +426,13 @@ fn main() {
             }
             _ => {}
         }
+        // `$SELF` is each arm's own database file, so a script can ATTACH the file it is running on.
+        let sql_r = line.replace("$SELF", &r.path.display().to_string());
+        let sql_e = line.replace("$SELF", &e.path.display().to_string());
         let before = recipe_io();
-        let ro = run_sql(&r.conns[&cur], line);
-        let mid = recipe_io();
-        let eo = run_sql(&e.conns[&cur], line);
+        let ro = run_sql(&r.conns[&cur], &sql_r);
+        let eo = run_sql(&e.conns[&cur], &sql_e);
         ran += 1;
-        let _ = mid;
         report(line, &cur, &ro, &eo, &before, &mut diffs);
     }
     println!("SUMMARY statements={ran} diffs={diffs}");
