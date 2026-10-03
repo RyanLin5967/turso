@@ -280,6 +280,110 @@ fn main() {
                 println!("-- {line}");
                 continue;
             }
+            "@merge" => {
+                // Close branch NAME's connection and merge it into the trunk (BaseRead validation).
+                use turso_core::branch::merge::{MergePolicy, Merger, Validation};
+                let name = rest[0].to_string();
+                let mut outs = Vec::new();
+                for arm in [&mut r, &mut e] {
+                    let names: Vec<String> = arm
+                        .home
+                        .iter()
+                        .filter(|(_, h)| h.as_deref() == Some(name.as_str()))
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    for n in names {
+                        arm.conns.remove(&n);
+                        arm.home.remove(&n);
+                    }
+                    arm.stmts.clear();
+                    let Some(b) = arm.branches.remove(&name) else {
+                        outs.push(format!("no branch {name}"));
+                        continue;
+                    };
+                    let main = arm.conns["main"].clone();
+                    let res = Merger::new(main).and_then(|mut m| {
+                        m.merge(
+                            b,
+                            MergePolicy {
+                                validation: Validation::BaseRead,
+                                keep_merged: false,
+                            },
+                        )
+                    });
+                    outs.push(match res {
+                        Ok(o) => match o.refused {
+                            None => format!("merged rows_changed={}", o.rows_changed),
+                            Some(why) => format!(
+                                "refused {why:?} scope={:?} install_error={:?}",
+                                o.scope, o.install_error
+                            ),
+                        },
+                        Err(err) => format!("ERROR {err}"),
+                    });
+                }
+                cur = "main".into();
+                ran += 1;
+                if outs[0] == outs[1] {
+                    println!("[main] {line}   <same>\n    both  : {}", outs[0]);
+                } else {
+                    diffs += 1;
+                    println!(
+                        "[main] {line}   <DIFF>\n    recipe: {}\n    eager : {}",
+                        outs[0], outs[1]
+                    );
+                }
+                continue;
+            }
+            "@blobread" | "@blobwrite" => {
+                // @blobread TABLE COL ROWID / @blobwrite TABLE COL ROWID HEX (at offset 0): the
+                // incremental blob API (sqlite3_blob_open family) on the current connection.
+                let (table, col, rowid) = (rest[0], rest[1], rest[2].parse::<i64>().unwrap());
+                let data: Vec<u8> = rest
+                    .get(3)
+                    .map(|h| {
+                        (0..h.len() / 2)
+                            .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut outs = Vec::new();
+                for arm in [&mut r, &mut e] {
+                    let conn = arm.conns[&cur].clone();
+                    let res = (|| -> turso_core::Result<String> {
+                        let mut b = conn.blob_open(table, col, rowid, head == "@blobwrite")?;
+                        let out = if head == "@blobread" {
+                            let mut buf = vec![0u8; b.bytes()];
+                            b.read(0, &mut buf)?;
+                            format!(
+                                "bytes={} x'{}'",
+                                buf.len(),
+                                buf.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                            )
+                        } else {
+                            b.write(0, &data)?;
+                            format!("wrote {} bytes", data.len())
+                        };
+                        b.close()?;
+                        Ok(out)
+                    })();
+                    outs.push(match res {
+                        Ok(s) => s,
+                        Err(err) => format!("ERROR {err}"),
+                    });
+                }
+                ran += 1;
+                if outs[0] == outs[1] {
+                    println!("[{cur}] {line}   <same>\n    both  : {}", outs[0]);
+                } else {
+                    diffs += 1;
+                    println!(
+                        "[{cur}] {line}   <DIFF>\n    recipe: {}\n    eager : {}",
+                        outs[0], outs[1]
+                    );
+                }
+                continue;
+            }
             "@reconnect" => {
                 // Drop connection NAME and open a fresh one on the same trunk or branch.
                 let name = rest[0].to_string();
