@@ -190,6 +190,11 @@ pub fn process_returning_clause(
                 // Handle RETURNING * by expanding to all table columns
                 // Use the shared internal_id for all columns
                 for (column_index, column) in table.columns().iter().enumerate() {
+                    // A hidden column is not part of `*`, as in SELECT (a recipe table's
+                    // generation column surfaced here: k1-recipe-build adversary 2).
+                    if column.hidden() {
+                        continue;
+                    }
                     let column_expr = Expr::Column {
                         database: None,
                         table: internal_id,

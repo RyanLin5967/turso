@@ -20,6 +20,14 @@
 //!   @next ID            step ID once; prints the row or DONE
 //!   @drop ID            drop prepared statement ID
 //!   @expect-diff        a marker only: echoed, so a reader sees which DIFFs a script targets
+//!   (k1-adv2, branch mode)
+//!   @trunk SQL          run SQL on each arm's trunk connection
+//!   @newmain            fork a fresh branch from the trunk and make it `main` (old main reaped)
+//!   @hfork CHILD        fork CHILD through the current branch's HANDLE (Branch::fork), switch to it
+//!   @reopenall          detach every branch, reopen from disk, re-attach each by id, reconnect
+//!   @detach NAME        detach branch NAME's handle (into_id); main's branch is `__main`
+//!   @attach NAME        re-attach a detached branch (Database::branch) and reconnect it
+//!   @interrupt          Connection::interrupt on the current connection
 //! Exit status: 3 when any DIFF was printed, 0 otherwise. A script that ran no statement exits 2.
 //!
 //! `RECIPE_ADV_BRANCH=1` (lane k1-recipe-build, after recipes became branch-only): both databases
@@ -58,7 +66,12 @@ fn open_db(path: &Path) -> Arc<Database> {
         DatabaseOpts::new()
             .with_branch_durability(durability)
             .with_attach(true)
-            .with_autovacuum(true),
+            .with_autovacuum(true)
+            // k1-adv2: experimental features a script can opt into, identically on both arms.
+            .with_custom_types(std::env::var_os("RECIPE_ADV_TYPES").is_some())
+            .with_views(std::env::var_os("RECIPE_ADV_VIEWS").is_some())
+            .with_vacuum(std::env::var_os("RECIPE_ADV_VACUUM").is_some())
+            .with_index_method(std::env::var_os("RECIPE_ADV_IDXM").is_some()),
         None,
         Arc::new(SqliteDialect),
     )
@@ -199,6 +212,8 @@ struct Arm {
     /// Branch mode: the branch connection `main` lives on, and the trunk connection that seeded it.
     main_branch: Option<BranchId>,
     trunk: Option<Arc<Connection>>,
+    /// k1-adv2 `@detach`: branches whose handle was detached (into_id), by name.
+    detached: HashMap<String, BranchId>,
 }
 
 impl Arm {
@@ -220,6 +235,7 @@ impl Arm {
             recipe,
             main_branch: None,
             trunk: None,
+            detached: HashMap::new(),
         };
         if branch_mode() {
             let t = a.db.as_ref().unwrap().connect().unwrap();
@@ -282,6 +298,84 @@ impl Arm {
             None => self.add_trunk_conn("main"),
         }
     }
+
+    /// k1-adv2 `@reopenall`: detach EVERY branch (not only main), reopen the database from disk,
+    /// re-attach each by id through `Database::branch`, and reconnect every connection that was on
+    /// one. Reports each step's outcome instead of exiting, so an arm that cannot re-attach shows as
+    /// a DIFF.
+    fn reopen_all(&mut self) -> String {
+        self.stmts.clear();
+        let homes: Vec<(String, Option<String>)> =
+            self.home.iter().map(|(n, h)| (n.clone(), h.clone())).collect();
+        self.conns.clear();
+        self.home.clear();
+        self.trunk = None;
+        let mut ids: Vec<(String, BranchId)> = Vec::new();
+        for (name, b) in self.branches.drain() {
+            ids.push((name, b.into_id()));
+        }
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        let old = self.db.take().unwrap();
+        let weak = Arc::downgrade(&old);
+        drop(old);
+        if weak.upgrade().is_some() {
+            println!("-- reopenall: the old Database is still referenced; not a real reopen");
+            std::process::exit(2);
+        }
+        self.db = Some(open_db(&self.path));
+        self.trunk = Some(self.db.as_ref().unwrap().connect().unwrap());
+        let mut out = Vec::new();
+        for (name, id) in ids {
+            match self.db.as_ref().unwrap().branch(id) {
+                Ok(b) => {
+                    self.branches.insert(name.clone(), b);
+                    out.push(format!("{name}:attached"));
+                }
+                Err(e) => out.push(format!("{name}:attach ERROR {e}")),
+            }
+        }
+        let mut homes = homes;
+        homes.sort();
+        for (cname, home) in homes {
+            match home {
+                None => self.add_trunk_conn(&cname),
+                Some(bname) => {
+                    let Some(b) = self.branches.get(&bname) else {
+                        continue;
+                    };
+                    match b.connect() {
+                        Ok(c) => {
+                            c.set_recipe_backfill(self.recipe);
+                            self.conns.insert(cname.clone(), c);
+                            self.home.insert(cname.clone(), Some(bname));
+                            out.push(format!("{cname}:connected"));
+                        }
+                        Err(e) => out.push(format!("{cname}:connect ERROR {e}")),
+                    }
+                }
+            }
+        }
+        out.join(" ")
+    }
+
+    /// The branch-handle name a connection lives on (`main` lives on `__main`).
+    fn branch_of(&self, conn: &str) -> Option<String> {
+        self.home.get(conn).cloned().flatten()
+    }
+}
+
+/// Compare two arms' one-line outcomes of a runner command, print, and count a DIFF.
+fn report_cmd(line: &str, cur: &str, outs: &[String], ran: &mut u64, diffs: &mut u64) {
+    *ran += 1;
+    if outs[0] == outs[1] {
+        println!("[{cur}] {line}   <same>\n    both  : {}", outs[0]);
+    } else {
+        *diffs += 1;
+        println!(
+            "[{cur}] {line}   <DIFF>\n    recipe: {}\n    eager : {}",
+            outs[0], outs[1]
+        );
+    }
 }
 
 fn main() {
@@ -320,6 +414,148 @@ fn main() {
                 println!("-- {line}");
                 continue;
             }
+            // ---- k1-adv2 commands -------------------------------------------------------------
+            "@trunk" => {
+                // @trunk SQL: run SQL on each arm's trunk connection (branch mode).
+                let sql = line.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+                let before = recipe_io();
+                let mut outs = Vec::new();
+                for arm in [&mut r, &mut e] {
+                    if arm.trunk.is_none() {
+                        arm.trunk = Some(arm.db.as_ref().unwrap().connect().unwrap());
+                    }
+                    outs.push(run_sql(arm.trunk.as_ref().unwrap(), sql));
+                }
+                ran += 1;
+                report(line, "trunk", &outs[0], &outs[1], &before, &mut diffs);
+                continue;
+            }
+            "@newmain" => {
+                // Fork a fresh branch from the trunk and make it `main`; the old main is reaped.
+                let mut outs = Vec::new();
+                for arm in [&mut r, &mut e] {
+                    arm.stmts.clear();
+                    if arm.trunk.is_none() {
+                        arm.trunk = Some(arm.db.as_ref().unwrap().connect().unwrap());
+                    }
+                    let res = arm.trunk.as_ref().unwrap().fork_branch();
+                    match res {
+                        Ok(b) => {
+                            arm.conns.remove("main");
+                            if let Some(old) = arm.branches.remove("__main") {
+                                let _ = old.reap();
+                            }
+                            arm.main_branch = Some(b.id());
+                            arm.attach_main(b);
+                            outs.push("ok".to_string());
+                        }
+                        Err(err) => outs.push(format!("ERROR {err}")),
+                    }
+                }
+                cur = "main".into();
+                report_cmd(line, &cur, &outs, &mut ran, &mut diffs);
+                continue;
+            }
+            "@hfork" => {
+                // @hfork CHILD: fork through the Branch HANDLE of the current connection's branch
+                // (Branch::fork, not Connection::fork_branch), connect CHILD there, switch to it.
+                let child = rest[0].to_string();
+                let mut outs = Vec::new();
+                for arm in [&mut r, &mut e] {
+                    let Some(parent) = arm.branch_of(&cur) else {
+                        outs.push("ERROR current connection is on the trunk".to_string());
+                        continue;
+                    };
+                    match arm.branches[&parent].fork() {
+                        Ok(b) => match b.connect() {
+                            Ok(c) => {
+                                c.set_recipe_backfill(arm.recipe);
+                                arm.conns.insert(child.clone(), c);
+                                arm.home.insert(child.clone(), Some(child.clone()));
+                                arm.branches.insert(child.clone(), b);
+                                outs.push("ok".to_string());
+                            }
+                            Err(err) => {
+                                arm.branches.insert(child.clone(), b);
+                                outs.push(format!("connect ERROR {err}"));
+                            }
+                        },
+                        Err(err) => outs.push(format!("ERROR {err}")),
+                    }
+                }
+                if r.conns.contains_key(&child) && e.conns.contains_key(&child) {
+                    cur = child;
+                }
+                report_cmd(line, &cur, &outs, &mut ran, &mut diffs);
+                continue;
+            }
+            "@reopenall" => {
+                let ro = r.reopen_all();
+                let eo = e.reopen_all();
+                cur = "main".into();
+                report_cmd(line, &cur, &[ro, eo], &mut ran, &mut diffs);
+                continue;
+            }
+            "@detach" | "@attach" => {
+                // @detach NAME: drop the connections on branch NAME and detach its handle
+                // (Branch::into_id); @attach NAME: Database::branch(id) and reconnect NAME. For main
+                // use NAME = __main (its connection is `main`).
+                let name = rest[0].to_string();
+                let cname = if name == "__main" { "main".to_string() } else { name.clone() };
+                let mut outs = Vec::new();
+                for arm in [&mut r, &mut e] {
+                    arm.stmts.clear();
+                    if head == "@detach" {
+                        arm.conns.remove(&cname);
+                        match arm.branches.remove(&name) {
+                            Some(b) => {
+                                let id = b.into_id();
+                                arm.detached.insert(name.clone(), id);
+                                outs.push("detached".to_string());
+                            }
+                            None => outs.push(format!("no branch {name}")),
+                        }
+                    } else {
+                        let Some(id) = arm.detached.remove(&name) else {
+                            outs.push(format!("no detached branch {name}"));
+                            continue;
+                        };
+                        match arm.db.as_ref().unwrap().branch(id) {
+                            Ok(b) => match b.connect() {
+                                Ok(c) => {
+                                    c.set_recipe_backfill(arm.recipe);
+                                    arm.conns.insert(cname.clone(), c);
+                                    arm.home.insert(cname.clone(), Some(name.clone()));
+                                    arm.branches.insert(name.clone(), b);
+                                    outs.push("attached".to_string());
+                                }
+                                Err(err) => {
+                                    arm.branches.insert(name.clone(), b);
+                                    outs.push(format!("connect ERROR {err}"));
+                                }
+                            },
+                            Err(err) => outs.push(format!("attach ERROR {err}")),
+                        }
+                    }
+                }
+                if head == "@attach" && r.conns.contains_key(&cname) && e.conns.contains_key(&cname)
+                {
+                    cur = cname;
+                } else if head == "@detach" {
+                    cur = "main".into();
+                }
+                report_cmd(line, &cur, &outs, &mut ran, &mut diffs);
+                continue;
+            }
+            "@interrupt" => {
+                // @interrupt: Connection::interrupt on the current connection.
+                for arm in [&mut r, &mut e] {
+                    arm.conns[&cur].interrupt();
+                }
+                println!("-- {line}");
+                continue;
+            }
+            // ---- end k1-adv2 commands ---------------------------------------------------------
             "@conn" => {
                 let name = rest[0].to_string();
                 for arm in [&mut r, &mut e] {
