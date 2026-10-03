@@ -1525,6 +1525,18 @@ pub struct Pager {
     /// port, from b161e861d); dropped at rollback. A savepoint rolled back keeps its entries:
     /// over-stating a write set can only refuse a merge, never admit one.
     trunk_pending: Mutex<TrunkPending>,
+    /// On a TRUNK pager, the write set's pre-images: each page as it was before this write
+    /// transaction first touched it, captured while the trunk had a live child. The branch store
+    /// takes the transaction's copy decisions from them at its commit (F-L on the durable store,
+    /// `BranchStore::begin_trunk_commit`), so a branch forked while the transaction is open is seen.
+    /// BLIND SPOT (stated, not bounded): one full page per page the transaction writes while the
+    /// trunk has a live child, held in memory until the commit; a huge trunk transaction with live
+    /// branches holds that many pages.
+    trunk_pre_images: Mutex<HashMap<u32, Box<[u8]>>>,
+    /// This trunk pager's commit holds the branch store's commit gate open: set when its commit
+    /// took its copy decisions, cleared when the gate is closed (after publication, or when the
+    /// write lock is released after a failed commit).
+    trunk_gate_open: AtomicBool,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1815,6 +1827,8 @@ impl Pager {
             branch_store: OnceLock::new(),
             branch: OnceLock::new(),
             trunk_pending: Mutex::new(TrunkPending::default()),
+            trunk_pre_images: Mutex::new(HashMap::new()),
+            trunk_gate_open: AtomicBool::new(false),
         })
     }
 
@@ -3187,8 +3201,10 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
         wal.begin_write_tx(allowed_auto_actions)?;
-        // A transaction that rolled back left its merge writes here; this one starts from none.
+        // A transaction that rolled back left its merge writes and its captures here; this one
+        // starts from none.
         *self.trunk_pending.lock() = TrunkPending::default();
+        self.trunk_pre_images.lock().clear();
         // Must run after the upgrade (and any log restart it performed) so
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
@@ -3309,15 +3325,18 @@ impl Pager {
                     };
 
                     // The branch store's merge record: this transaction's writes are committed, and
-                    // are stamped with the trunk's epoch while the WAL write lock is still held, so
-                    // no fork (which takes that lock) and no merge validation (which runs inside a
-                    // trunk write transaction) falls between the commit and its stamps.
+                    // are stamped with the trunk's epoch while the commit gate is still open (no
+                    // fork registers inside it, so the epoch is the one the commit's copy decisions
+                    // were taken at) and the WAL write lock is still held (no merge validation, which
+                    // runs inside a trunk write transaction, falls between the commit and its
+                    // stamps). Then the gate closes.
                     let stamped = if let Some(store) = self.branch_store.get() {
                         let tx = std::mem::take(&mut *self.trunk_pending.lock());
                         store.stamp_committed(tx)
                     } else {
                         false
                     };
+                    self.close_trunk_gate();
 
                     wal.end_write_tx();
                     wal.end_read_tx();
@@ -3465,6 +3484,8 @@ impl Pager {
             branch.store.end_write(branch.id);
             return;
         }
+        // A commit that failed after its copy decisions left the gate open (F-L).
+        self.close_trunk_gate();
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
@@ -3505,6 +3526,7 @@ impl Pager {
             self.reset_internal_states();
             self.set_schema_cookie(None);
             wal.rollback(None);
+            self.close_trunk_gate();
             wal.end_write_tx();
         } else {
             self.cleanup_read_tx();
@@ -3821,10 +3843,15 @@ impl Pager {
     /// * On a branch: a fresh slot of the branch's own page space is reserved for the page; the
     ///   commit writes the page there and moves the branch's map to it (the version it replaces is
     ///   kept for a live child that can still see it, else freed). A rollback returns the slot.
-    /// * On the trunk: a page a live branch can still see has its pre-image copied into the arena
-    ///   before the write, so neither this commit nor a later checkpoint reaches the branch.
+    /// * On the trunk: the page as it is now — the version this transaction overwrites — is
+    ///   captured while the trunk has a live child, and the decision is taken at the commit, against
+    ///   the epoch there (`BranchStore::begin_trunk_commit`): a live branch that can still see the
+    ///   version gets a durable copy before the commit's first frame is written, so neither the
+    ///   commit nor a later checkpoint reaches it, and a branch forked while the transaction is open
+    ///   is seen (F-L on the durable store).
     ///
-    /// A page that is already dirty was decided at its first `add_dirty` in this transaction.
+    /// A page that is already dirty was decided at its first `add_dirty` in this transaction. A page
+    /// dirtied again after a spill or a savepoint rollback keeps its first capture.
     fn copy_on_write_decision(&self, page: &Page) -> Result<()> {
         if page.is_dirty() {
             return Ok(());
@@ -3835,10 +3862,25 @@ impl Pager {
         }
         if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() {
-                store.first_write_trunk(page_no, page.get_contents().as_slice())?;
+                // A trunk-only store refuses every trunk page write here, at the first one.
+                store.refuse_if_trunk_only("a trunk page write")?;
+                self.trunk_pre_images
+                    .lock()
+                    .entry(page_no)
+                    .or_insert_with(|| page.get_contents().as_slice().into());
             }
         }
         Ok(())
+    }
+
+    /// Close the branch store's commit gate if this pager's commit holds it open (F-L): once the
+    /// commit's frames are published, or when the write lock is released after a failed commit.
+    fn close_trunk_gate(&self) {
+        if self.trunk_gate_open.swap(false, Ordering::AcqRel) {
+            if let Some(store) = self.branch_store.get() {
+                store.end_trunk_commit();
+            }
+        }
     }
 
     /// A table cursor wrote or deleted `rowid` in the b-tree rooted at `root`. On the trunk, while
@@ -4487,6 +4529,20 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
+        // The branch store's copy decisions for this commit, once (IO re-entry finds the gate open):
+        // taken now, against the trunk's epoch now, from the pre-images captured at first write, and
+        // the commit gate opened until the frames are published (F-L on the durable store).
+        if let Some(store) = self.branch_store.get() {
+            if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
+                let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
+                let dirty = self.dirty_pages.read();
+                store.begin_trunk_commit(
+                    dirty
+                        .iter()
+                        .map(|page| (page, captured.get(&page).map(|bytes| &bytes[..]))),
+                )?;
+            }
+        }
         // Durable branches: every pre-image this transaction retained for a live branch must be
         // durable before the commit that overwrites its page can be, or a crash after this commit
         // leaves the branch reading the NEW page. Idempotent across IO re-entry.

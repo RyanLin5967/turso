@@ -5,8 +5,12 @@
 //!
 //! A branch B forked from the trunk at trunk epoch `trunk_at` has changed some rows. Merging it makes
 //! B's changes the trunk's, inside ONE trunk write transaction (`BEGIN IMMEDIATE` … `COMMIT`), so
-//! validation and install both run under the trunk's WAL write lock: no trunk commit and no fork
-//! (forks take that lock on this store) can fall between deciding and writing. The semantics are a
+//! validation and install both run under the trunk's WAL write lock: no trunk commit can fall
+//! between deciding and writing. A trunk FORK can (F-L on the durable store, fastest-engine: forks
+//! take no WAL write lock after the trunk's first child), and needs nothing from the merge: the
+//! merge's commit takes its copy decisions at the commit, so a branch forked during the merge
+//! reads the trunk without it, and the merge's stamps (epoch of that commit) refuse that branch's
+//! later merge of the same rows. The semantics are a
 //! three-way merge's: base = the trunk as B forked it, ours = the trunk now, theirs = B. B's change
 //! to a row is refused when the trunk changed that row after the fork.
 //!

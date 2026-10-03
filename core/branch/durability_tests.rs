@@ -1469,7 +1469,7 @@ fn a_refused_lazy_create_leaves_the_live_stores_arena_intact() {
     set(&b.connect().unwrap(), 3, "b");
     let schema = trunk.schema.read().clone();
     assert!(
-        late.fork_trunk(schema, 4096).is_err(),
+        late.fork_trunk_locked(schema, 4096).is_err(),
         "a second store forked over a live store's branch files"
     );
     // A fresh connection has an empty page cache, so this read comes from the arena file.
