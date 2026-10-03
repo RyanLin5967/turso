@@ -358,6 +358,8 @@ struct Model {
     merges_refused: u64,
     /// r13-compose S1: live branches outside the schedule (stack levels), from the sidecar.
     extra: Vec<u64>,
+    /// The pages those levels own, summed (amendment 8.17: the arena floor's stack term).
+    extra_pages: u64,
     /// r13-compose R1: trunk writes made outside the schedule (restart's merges) are stamped at
     /// virtual steps after the last schedule step, so no schedule fork sees them.
     virt: u64,
@@ -398,6 +400,7 @@ impl Model {
             merges_skipped: 0,
             merges_refused: 0,
             extra: Vec::new(),
+            extra_pages: 0,
             virt: 0,
             commits: Vec::new(),
         }
@@ -605,7 +608,8 @@ fn sidecar(db: &Path) -> PathBuf {
 /// `merge=<mode>`, `deaths=<rate>` and `mps=M`, and the state outside the schedule: `shift=S0,L`
 /// (S1's stack command consumed the ids S0+1..=S0+L, so every later schedule fork s > S0 gets the
 /// id s + L), `extra=<id>,...` (stack levels still live), one `stack=<d>,<serial>,<root id>,...,<top
-/// id>` per S1 main stack, and `bump=<count>` (R1 image e's untouched-branch commits, made after the
+/// id>` per S1 main stack with its `pages=<serial>,<p_0>,...,<p_{d-1}>` (each level's own pages, the
+/// arena floor's stack term: amendment 8.17), and `bump=<count>` (R1 image e's untouched-branch commits, made after the
 /// last step). Missing parameter lines are 310705857's (K = 0, update, 0.02, 1). A run whose schedule
 /// parameters differ from the sidecar's is refused: its schedule would not be the one the fixture
 /// grew under.
@@ -627,6 +631,8 @@ struct StackRec {
     serial: u64,
     /// Level ids, root first, top last.
     ids: Vec<u64>,
+    /// Each level's own pages (`branch_state_pages`), root first, top last (amendment 8.17).
+    pages: Vec<u64>,
 }
 
 fn ids_of(v: &str, what: &str) -> Vec<u64> {
@@ -643,6 +649,7 @@ fn read_sidecar(db: &Path) -> Sidecar {
     };
     let mut sc = Sidecar::default();
     let mut steps = None;
+    let mut pages_lines: Vec<(u64, Vec<u64>)> = Vec::new();
     let (mut seed, mut merge, mut deaths, mut m) = (0u64, "update".to_string(), "0.02".to_string(), 1u64);
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else {
@@ -664,8 +671,13 @@ fn read_sidecar(db: &Path) -> Sidecar {
                     d: *d,
                     serial: *serial,
                     ids: ids.to_vec(),
+                    pages: Vec::new(),
                 }),
                 _ => not_a_result(&format!("sidecar stack line {v:?}: needs d, serial and d ids")),
+            },
+            "pages" => match &ids_of(v, "pages")[..] {
+                [serial, pages @ ..] => pages_lines.push((*serial, pages.to_vec())),
+                _ => not_a_result(&format!("sidecar pages line {v:?}: needs a serial")),
             },
             "bump" => sc.bump = v.trim().parse().unwrap_or_else(|_| not_a_result("unparseable sidecar bump")),
             "slots" => sc.slots = Some(v.trim().parse().unwrap_or_else(|_| not_a_result("unparseable sidecar slots"))),
@@ -673,6 +685,24 @@ fn read_sidecar(db: &Path) -> Sidecar {
         }
     }
     sc.steps = steps.unwrap_or_else(|| not_a_result("unparseable sidecar"));
+    // Amendment 8.17: every stack has exactly one pages line with d counts, no pages line is
+    // orphaned, and `extra` is exactly the stacks' ids; otherwise the floor's stack term is unknown.
+    if pages_lines.len() != sc.stacks.len() {
+        not_a_result(&format!("sidecar: {} stack lines, {} pages lines", sc.stacks.len(), pages_lines.len()));
+    }
+    for (serial, pages) in pages_lines {
+        let Some(st) = sc.stacks.iter_mut().find(|st| st.serial == serial && st.pages.is_empty()) else {
+            not_a_result(&format!("sidecar pages line for serial {serial} matches no stack"));
+        };
+        if pages.len() as u64 != st.d {
+            not_a_result(&format!("sidecar pages line for serial {serial}: {} counts, d = {}", pages.len(), st.d));
+        }
+        st.pages = pages;
+    }
+    let stack_ids: Vec<u64> = sc.stacks.iter().flat_map(|st| st.ids.iter().copied()).collect();
+    if stack_ids != sc.extra {
+        not_a_result("sidecar: extra is not exactly the stacks' level ids");
+    }
     if seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) != w()
         || merge != merge_mode().name()
         || deaths != deaths_name()
@@ -721,6 +751,7 @@ fn write_sidecar(db: &Path, sc: &Sidecar) {
     }
     for st in &sc.stacks {
         text.push_str(&format!("stack={},{},{}\n", st.d, st.serial, join(&st.ids)));
+        text.push_str(&format!("pages={},{}\n", st.serial, join(&st.pages)));
     }
     if sc.bump > 0 {
         text.push_str(&format!("bump={}\n", sc.bump));
@@ -763,6 +794,7 @@ impl Model {
     fn from_sidecar(sc: &Sidecar) -> Self {
         let mut m = Self::replay(sc.steps);
         m.extra = sc.extra.clone();
+        m.extra_pages = sc.stacks.iter().flat_map(|st| st.pages.iter()).sum();
         for t in m.bump_targets(sc.bump) {
             m.gen[t as usize] += 1;
         }
@@ -1520,12 +1552,12 @@ fn step(
 }
 
 /// Invariants the catalog store can check alone: live states == the model's live count, and the arena
-/// holds at least two own pages per live schedule branch, one per live stack level, plus the trunk's
-/// versions. The EXACT slot check is across
-/// arms: at the same step count the port's grow/probe files print its exact arena and trunk counts, and the
-/// two stores make the same retain and free decisions (analysis compares them). The trunk count QUERIES
-/// the catalog (`branch_trunk_retained`: overlay + catalog rows - reaped since), so this runs only
-/// outside measured operations.
+/// holds at least two own pages per live schedule branch, plus the pages each live stack level owns
+/// (amendment 8.17: the store's own count, carried in the sidecar), plus the trunk's versions. The
+/// EXACT slot check is across arms: at the same step count the port's grow/probe files print its exact
+/// arena and trunk counts, and the two stores make the same retain and free decisions (analysis
+/// compares them). The trunk count QUERIES the catalog (`branch_trunk_retained`: overlay + catalog rows
+/// - reaped since), so this runs only outside measured operations.
 fn check_invariants(db: &Arc<Database>, model: &Model, what: &str) {
     let st = db.branch_stats().unwrap();
     let trunk_versions = db.branch_trunk_retained();
@@ -1538,24 +1570,27 @@ fn check_invariants(db: &Arc<Database>, model: &Model, what: &str) {
             model.extra.len()
         ));
     }
-    // A stack level owns only the pages its k = 2 rows wrote, and one leaf can hold both, so its floor
-    // is one own page (amendment 8.16: at 1e6 the old floor of two per level fired at stack end while
-    // the arena held every page; 148 of census k0's 190 ancestor levels own one).
-    let floor = 2 * model.live + model.extra.len() as u64 + trunk_versions;
+    let floor = 2 * model.live + model.extra_pages + trunk_versions;
     if (st.arena_slots_in_use as u64) < floor {
-        not_a_result(&format!(
-            "{what}: arena in use {} < 2 x schedule live {} + stack levels {} + trunk versions {trunk_versions}",
+        println!(
+            "FINDING\tarena floor\t{what}\tarena_in_use={}\tfloor={floor}\tdeficit={}",
             st.arena_slots_in_use,
-            model.live,
-            model.extra.len()
+            floor - st.arena_slots_in_use as u64
+        );
+        not_a_result(&format!(
+            "{what}: arena in use {} < 2 x schedule live {} + stack level pages {} + trunk versions {trunk_versions}",
+            st.arena_slots_in_use, model.live, model.extra_pages
         ));
     }
     println!(
-        "# invariants {what}: live={} extra={} steps={} arena_in_use={} trunk_versions={trunk_versions}",
+        "# invariants {what}: live={} extra={} steps={} arena_in_use={} trunk_versions={trunk_versions} extra_pages={} \
+         floor_slack={}",
         model.live,
         model.extra.len(),
         model.steps,
-        st.arena_slots_in_use
+        st.arena_slots_in_use,
+        model.extra_pages,
+        st.arena_slots_in_use as u64 - floor
     );
 }
 
@@ -2055,6 +2090,11 @@ struct Stack {
     /// I13 (A4.X3): each level's distinct pages over current ∪ retained, read from its resident
     /// state when its child forked (the store's own count, not a model).
     pages: Vec<u64>,
+    /// The top's own pages, read the same way at the end of the build (amendment 8.17).
+    top_pages: u64,
+    /// Arena slots and trunk versions the build added (amendment 8.17's exact build identity).
+    arena_added: u64,
+    trunk_added: u64,
 }
 
 impl Stack {
@@ -2069,6 +2109,13 @@ impl Stack {
     /// The expected derived_inserts of a cold load of the top: I13 summed over the d - 1 ancestors.
     fn ancestors_pages(&self) -> u64 {
         self.pages.iter().sum()
+    }
+
+    /// Every level's own pages, root first, top last: the arena floor's stack term (amendment 8.17).
+    fn level_pages(&self) -> Vec<u64> {
+        let mut v = self.pages.clone();
+        v.push(self.top_pages);
+        v
     }
 }
 
@@ -2090,17 +2137,28 @@ fn insert_level_rows(branch: &turso_core::branch::Branch, serial: u64, level: u6
 }
 
 /// Build a stack of depth d: a trunk child, then d - 1 levels each forked from the last, every level
-/// inserting its own two rows before its child forks. Untimed.
+/// inserting its own two rows before its child forks. Untimed. Amendment 8.17's exact build identity:
+/// a level writes its rows in one transaction before its child forks, so the arena slots the build
+/// adds, less the trunk versions it adds, equal the sum of its levels' own pages exactly; any
+/// difference is a FINDING and NOT A RESULT.
 fn build_stack(db: &Arc<Database>, trunk: &Arc<Connection>, serial: u64, d: u64) -> Stack {
+    let arena = |db: &Arc<Database>| db.branch_stats().unwrap().arena_slots_in_use as u64;
+    let (arena0, trunk0) = (arena(db), db.branch_trunk_retained());
     let mut st = Stack {
         serial,
         ids: Vec::new(),
         pages: Vec::new(),
+        top_pages: 0,
+        arena_added: 0,
+        trunk_added: 0,
     };
     let mut level = trunk.fork_branch().unwrap_or_else(|e| not_a_result(&format!("stack root: {e}")));
     for i in 0..d {
         insert_level_rows(&level, serial, i, 0);
         if i + 1 == d {
+            st.top_pages = db
+                .branch_state_pages(level.id())
+                .unwrap_or_else(|| not_a_result(&format!("stack top (level {i}) not resident after its build")));
             st.ids.push(level.into_id());
             break;
         }
@@ -2112,7 +2170,52 @@ fn build_stack(db: &Arc<Database>, trunk: &Arc<Connection>, serial: u64, d: u64)
         st.ids.push(level.into_id());
         level = next;
     }
+    let (arena1, trunk1) = (arena(db), db.branch_trunk_retained());
+    st.arena_added = arena1.wrapping_sub(arena0);
+    st.trunk_added = trunk1.wrapping_sub(trunk0);
+    let want: u64 = st.level_pages().iter().sum();
+    if arena1 < arena0 || trunk1 < trunk0 || st.arena_added - st.trunk_added != want {
+        println!(
+            "FINDING\tS1 stack pages\td={d}\tserial={serial}\tarena_before={arena0}\tarena_after={arena1}\t\
+             trunk_before={trunk0}\ttrunk_after={trunk1}\tlevel_pages_sum={want}"
+        );
+        not_a_result(&format!(
+            "stack d={d} serial={serial}: the build added {arena0}->{arena1} arena slots and {trunk0}->{trunk1} trunk \
+             versions, but its levels own {want} pages"
+        ));
+    }
     st
+}
+
+/// G-1 (amendment 8.17): the -MRG arms' land-top, by plain trunk writes of exactly the rows the Merger
+/// installs for a fresh stack (A2.F4's replay rule): its 2d rows at generation 0, INSERTs (no stack
+/// row is in the trunk), in one transaction. The top's handle is then dropped, as `land_top` drops it
+/// with keep_merged off. Returns the rows written.
+fn replay_land_top(trunk: &Arc<Connection>, top: turso_core::branch::Branch, serial: u64, d: u64) -> u64 {
+    exec(trunk, "BEGIN");
+    let mut n = 0u64;
+    for level in 0..d {
+        for x in 0..2 {
+            exec(
+                trunk,
+                &format!(
+                    "INSERT INTO t VALUES ({}, '{}')",
+                    stack_row(serial, level, x),
+                    stack_value(serial, level, x, 0)
+                ),
+            );
+            n += 1;
+        }
+    }
+    exec(trunk, "COMMIT");
+    drop(top);
+    n
+}
+
+/// A TRUNKDIGEST line (probe's format) at `at`.
+fn print_trunk_digest(trunk: &Arc<Connection>, n: u64, label: &str, at: &str, steps: u64) {
+    let (rows, digest) = trunk_digest(trunk);
+    println!("TRUNKDIGEST\tn={n}\tlabel={label}\tat={at}\tsteps={steps}\trows={rows}\tdigest={digest:#018x}");
 }
 
 /// What the top of `st` must read: its own second row (an amend at d/2 = 1 rewrites the top's FIRST
@@ -2216,24 +2319,29 @@ fn stack(args: &Args) {
     };
     let mut merger = Merger::new(trunk.clone()).unwrap_or_else(|e| not_a_result(&format!("merger: {e}")));
     let mut findings = 0u64;
-    // The -MRG arms (R13_MERGER=off) have no Merger: land-tops are absent by ablation there (A4.C2).
-    let lands = if std::env::var("R13_MERGER").is_ok_and(|v| v == "off") {
-        println!("# land-tops absent by ablation (R13_MERGER=off)");
-        0
-    } else {
-        args.lands
-    };
+    // The -MRG arms (R13_MERGER=off) have no Merger: their land-tops are REPLAYED as plain trunk
+    // writes of the Merger's rows (G-1, amendment 8.17), so the IN-NONE / IN-MRG trunk identity holds
+    // by construction and is checked by the TRUNKDIGEST lines. The zombie sub-arm is Merger-only.
+    let merger_off = std::env::var("R13_MERGER").is_ok_and(|v| v == "off");
+    if merger_off && args.splice {
+        not_a_result("--splice runs on the Merger only: the zombie sub-arm has no replay (amendment 8.17)");
+    }
+    let lands = args.lands;
     for &d in &args.depths {
         serial += 1;
         let st = build_stack(&db, &trunk, serial, d);
         expect_ids(&st.ids, &mut made);
         println!(
-            "STACK\tn={n}\tlabel={label}\td={}\tserial={}\ttop={}\tI13_pages_per_level={:?}\tI13_ancestors_sum={}",
+            "STACK\tn={n}\tlabel={label}\td={}\tserial={}\ttop={}\tI13_pages_per_level={:?}\tI13_ancestors_sum={}\t\
+             I13_top_pages={}\tarena_added={}\ttrunk_added={}",
             st.d(),
             st.serial,
             st.top().0,
             st.pages,
-            st.ancestors_pages()
+            st.ancestors_pages(),
+            st.top_pages,
+            st.arena_added,
+            st.trunk_added
         );
         // push: a child of the top, then reaped (untimed) before the next push.
         let mut s = Series::default();
@@ -2331,26 +2439,38 @@ fn stack(args: &Args) {
         );
         // land-top, each on a fresh stack (untimed build), the stack reaped afterwards.
         let mut s = Series::default();
-        for _ in 0..lands {
+        for k in 0..lands {
             serial += 1;
             let ls = build_stack(&db, &trunk, serial, d);
             expect_ids(&ls.ids, &mut made);
             let top = db.branch(ls.top()).unwrap_or_else(|e| not_a_result(&format!("attach land top: {e}")));
-            let mut out = None;
             let mut top = Some(top);
-            timed_op(&db, &mut s, &mut || {
-                out = Some(
-                    merger
-                        .land_top(top.take().unwrap(), policy(false))
-                        .unwrap_or_else(|e| not_a_result(&format!("land_top: {e}"))),
-                );
-                vec![]
-            });
-            let out = out.unwrap();
-            if out.refused.is_some() || out.rows_changed as u64 != 2 * d {
-                findings += 1;
-                println!("FINDING\tS1 land-top\td={d}\tserial={}\twant=2d={}\tgot={out:?}", ls.serial, 2 * d);
+            if merger_off {
+                let mut wrote = 0;
+                timed_op(&db, &mut s, &mut || {
+                    wrote = replay_land_top(&trunk, top.take().unwrap(), ls.serial, d);
+                    vec![]
+                });
+                if wrote != 2 * d {
+                    not_a_result(&format!("replayed land-top wrote {wrote} rows, want 2d = {}", 2 * d));
+                }
+            } else {
+                let mut out = None;
+                timed_op(&db, &mut s, &mut || {
+                    out = Some(
+                        merger
+                            .land_top(top.take().unwrap(), policy(false))
+                            .unwrap_or_else(|e| not_a_result(&format!("land_top: {e}"))),
+                    );
+                    vec![]
+                });
+                let out = out.unwrap();
+                if out.refused.is_some() || out.rows_changed as u64 != 2 * d {
+                    findings += 1;
+                    println!("FINDING\tS1 land-top\td={d}\tserial={}\twant=2d={}\tgot={out:?}", ls.serial, 2 * d);
+                }
             }
+            print_trunk_digest(&trunk, n, label, &format!("land_top_d{d}_l{k}"), model.steps);
             for &id in ls.ids[..ls.ids.len() - 1].iter().rev() {
                 let b = db.branch(id).unwrap_or_else(|e| not_a_result(&format!("attach {id:?} to reap: {e}")));
                 let r = b.reap().unwrap_or_else(|e| not_a_result(&format!("reap {id:?}: {e}")));
@@ -2363,7 +2483,7 @@ fn stack(args: &Args) {
         // The zombie sub-arm (splice fixture only).
         if args.splice && d >= 3 {
             let mut s = Series::default();
-            for _ in 0..lands {
+            for k in 0..lands {
                 serial += 1;
                 let zs = build_stack(&db, &trunk, serial, d);
                 expect_ids(&zs.ids, &mut made);
@@ -2398,6 +2518,7 @@ fn stack(args: &Args) {
                     findings += 1;
                     println!("FINDING\tS1 zombie land-top\td={d}\tserial={}\twant=2d={}\tgot={out:?}", zs.serial, 2 * d);
                 }
+                print_trunk_digest(&trunk, n, label, &format!("zombie_land_top_d{d}_l{k}"), model.steps);
                 for (i, &id) in zs.ids[..zs.ids.len() - 1].iter().enumerate().rev() {
                     if i == z {
                         continue;
@@ -2412,9 +2533,12 @@ fn stack(args: &Args) {
             d,
             serial: st.serial,
             ids: st.ids.iter().map(|id| id.0).collect(),
+            pages: st.level_pages(),
         });
         model.extra.extend(st.ids.iter().map(|id| id.0));
+        model.extra_pages += st.level_pages().iter().sum::<u64>();
     }
+    print_trunk_digest(&trunk, n, label, "window_end", model.steps);
     drop(merger);
     drop(side);
     // The S1 state: the shift for later schedule forks, and the main stacks still live.
