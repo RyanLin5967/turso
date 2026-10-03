@@ -196,6 +196,7 @@ struct Diff {
     stats: DiffStats,
     seed: u64,
     log: Vec<String>,
+    recipes: bool,
 }
 
 const BASE_COLS: [(&str, &str); 6] = [
@@ -458,7 +459,7 @@ impl Diff {
             .unwrap_or_else(|e| not_a_result(&format!("fork eager: {e}")));
         let c_r = br_r.connect().unwrap();
         let c_e = br_e.connect().unwrap();
-        c_r.set_recipe_backfill(true);
+        c_r.set_recipe_backfill(self.recipes);
         let idx = self.nodes.len();
         let sq_path = self.dir.join(format!("s{}_n{idx}.db", self.seed));
         let sq = if self.use_sqlite {
@@ -657,7 +658,14 @@ impl Diff {
     }
 }
 
-fn run_diff_seed(seed: u64, ops: u64, dir: &Path, use_sqlite: bool, totals: &mut DiffStats) {
+fn run_diff_seed(
+    seed: u64,
+    ops: u64,
+    dir: &Path,
+    use_sqlite: bool,
+    recipes: bool,
+    totals: &mut DiffStats,
+) {
     let sub = dir.join(format!("seed{seed}"));
     let _ = std::fs::remove_dir_all(&sub);
     std::fs::create_dir_all(&sub).unwrap();
@@ -665,7 +673,7 @@ fn run_diff_seed(seed: u64, ops: u64, dir: &Path, use_sqlite: bool, totals: &mut
     let db_e = open_db(&sub.join("e.db"), BranchDurability::Volatile);
     let c_r = db_r.connect().unwrap();
     let c_e = db_e.connect().unwrap();
-    c_r.set_recipe_backfill(true);
+    c_r.set_recipe_backfill(recipes);
     let sq_path = sub.join("s_trunk.db");
     let sq = use_sqlite.then(|| rusqlite::Connection::open(&sq_path).unwrap());
     let mut d = Diff {
@@ -685,6 +693,7 @@ fn run_diff_seed(seed: u64, ops: u64, dir: &Path, use_sqlite: bool, totals: &mut
         },
         seed,
         log: Vec::new(),
+        recipes,
     };
     let cols: Vec<Col> = BASE_COLS
         .iter()
@@ -770,7 +779,7 @@ fn diff_main(args: &Args) {
     let mut seeds_with_mismatch = 0u64;
     for seed in args.start..args.start + args.seeds {
         let m0 = totals.mismatches;
-        run_diff_seed(seed, args.ops, &args.dir, args.sqlite, &mut totals);
+        run_diff_seed(seed, args.ops, &args.dir, args.sqlite, !args.no_recipe, &mut totals);
         if totals.mismatches > m0 {
             seeds_with_mismatch += 1;
         }
@@ -781,7 +790,7 @@ fn diff_main(args: &Args) {
         "DIFF mutant={mutant} seeds={} start={} ops_per_seed={} ops={} compares={} rows_compared={} \
          mismatches={} seeds_with_mismatch={seeds_with_mismatch} sqlite_divergences={} refusals_checked={} \
          live_recipe_tables_at_end={} recipes_installed={} fallbacks={} stale_reads={} recipe_evals={} \
-         cache_hits={} empty_match={} sqlite={}",
+         cache_hits={} empty_match={} sqlite={} recipes={}",
         args.seeds,
         args.start,
         args.ops,
@@ -798,9 +807,13 @@ fn diff_main(args: &Args) {
         d(counter::RECIPE_EVALS),
         d(counter::CACHE_HITS),
         d(counter::EMPTY_MATCH),
-        args.sqlite
+        args.sqlite,
+        !args.no_recipe
     );
-    if totals.ops == 0 || totals.compares == 0 || d(counter::INSTALLED) == 0 || d(counter::STALE_READS) == 0 {
+    if totals.ops == 0 || totals.compares == 0 {
+        not_a_result("the differential collected nothing");
+    }
+    if !args.no_recipe && (d(counter::INSTALLED) == 0 || d(counter::STALE_READS) == 0) {
         not_a_result("the differential collected nothing on the recipe path");
     }
     if totals.mismatches > 0 {
@@ -1442,6 +1455,8 @@ struct Args {
     points: u64,
     sample: u64,
     seed: u64,
+    /// diff: run the RECIPE arm with recipes off too (the BASE control's mode, PREREG §3).
+    no_recipe: bool,
 }
 
 fn parse_args() -> Args {
@@ -1463,6 +1478,7 @@ fn parse_args() -> Args {
         points: 1000,
         sample: 10,
         seed: 0x6B31_5245_4349_5045,
+        no_recipe: false,
     };
     while let Some(flag) = it.next() {
         let mut val = || it.next().unwrap_or_else(|| die(&format!("{flag} needs a value")));
@@ -1472,6 +1488,7 @@ fn parse_args() -> Args {
             "--ops" => a.ops = val().parse().unwrap_or_else(|_| die("bad --ops")),
             "--dir" => a.dir = PathBuf::from(val()),
             "--no-sqlite" => a.sqlite = false,
+            "--no-recipe" => a.no_recipe = true,
             "--workload" => a.workload = val(),
             "--arm" => a.arm = val(),
             "--n" => a.n = val().parse().unwrap_or_else(|_| die("bad --n")),

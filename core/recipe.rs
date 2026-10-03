@@ -182,6 +182,9 @@ pub struct TableRecipes {
     deps: Vec<Vec<usize>>,
     /// Per column: the newest generation in its closure (0 when the closure is empty).
     newest: Vec<u64>,
+    /// Per column: the other columns whose closure lies inside this one's, so one evaluation
+    /// yields their logical values too.
+    share: Vec<Vec<usize>>,
     /// Per column: the value a short record reads (the constant DEFAULT with affinity), exactly
     /// what the `Column` instruction applies.
     defaults: Vec<Option<Value>>,
@@ -231,6 +234,23 @@ impl TableRecipes {
                 self.deps[c] = (0..n).filter(|&i| in_set[i]).collect();
             }
             self.closure[c] = members;
+        }
+        self.share = vec![Vec::new(); n];
+        for c in 0..n {
+            for &ri in &self.closure[c] {
+                for &t in &self.recipes[ri].targets {
+                    if t != c
+                        && t < n
+                        && !self.closure[t].is_empty()
+                        && self.closure[t]
+                            .iter()
+                            .all(|r| self.closure[c].binary_search(r).is_ok())
+                        && !self.share[c].contains(&t)
+                    {
+                        self.share[c].push(t);
+                    }
+                }
+            }
         }
         self.defaults = (0..n).map(|i| column_read_default(columns, i)).collect();
         self.rowid_alias = columns.iter().map(|c| c.is_rowid_alias()).collect();
@@ -400,6 +420,7 @@ pub fn attach_recipe(btree: &mut BTreeTable, recipe: Recipe) -> Result<()> {
         closure: Vec::new(),
         deps: Vec::new(),
         newest: Vec::new(),
+        share: Vec::new(),
         defaults: Vec::new(),
         rowid_alias: Vec::new(),
     });
@@ -1042,7 +1063,8 @@ struct RowCache {
     cursor_id: usize,
     rowid: i64,
     phys_gen: u64,
-    physical: Vec<Value>,
+    /// Fields decoded so far (lazily: only those a closure read needs).
+    physical: Vec<Option<Value>>,
     logical: Vec<Option<Value>>,
 }
 
@@ -1185,6 +1207,7 @@ pub(crate) fn column_fetch(
             let r = &exec.rows[s];
             m == Mutant::M7 || (r.rowid == rowid && r.phys_gen == phys_gen)
         });
+        let n = rs.defaults.len().max(table.columns().len());
         if hit {
             if let Some(v) = &exec.rows[slot.unwrap()].logical[column] {
                 count(counter::CACHE_HITS, 1);
@@ -1192,31 +1215,12 @@ pub(crate) fn column_fetch(
                 return Ok(IOResult::Done(true));
             }
         } else {
-            // Decode the record's fields; a short record reads each missing column's default.
-            let physical = {
-                let cursor = state.get_cursor(cursor_id);
-                let btc = cursor.as_btree_mut();
-                let Some(record) = crate::return_if_io!(btc.record()) else {
-                    return Ok(IOResult::Done(false));
-                };
-                let mut vals = record.get_values_owned()?;
-                let n = rs.defaults.len().max(table.columns().len());
-                for i in vals.len()..n {
-                    vals.push(rs.defaults.get(i).cloned().flatten().unwrap_or(Value::Null));
-                }
-                for (i, alias) in rs.rowid_alias.iter().enumerate() {
-                    if *alias && i < vals.len() {
-                        vals[i] = Value::from_i64(rowid);
-                    }
-                }
-                vals
-            };
             let entry = RowCache {
                 cursor_id,
                 rowid,
                 phys_gen,
-                logical: vec![None; physical.len()],
-                physical,
+                physical: vec![None; n],
+                logical: vec![None; n],
             };
             match slot {
                 Some(s) => exec.rows[s] = entry,
@@ -1228,9 +1232,34 @@ pub(crate) fn column_fetch(
             .iter()
             .position(|r| r.cursor_id == cursor_id)
             .expect("row cache entry was just ensured");
-        let mut vals = vec![Value::Null; exec.rows[s].physical.len()];
-        for &i in rs.deps.get(column).map_or(&[][..], |d| d.as_slice()) {
-            vals[i] = exec.rows[s].physical[i].clone();
+        let deps = rs.deps.get(column).map_or(&[][..], |d| d.as_slice());
+        // Decode only the fields the closure reads; a short record reads the column's default.
+        if deps.iter().any(|&i| exec.rows[s].physical[i].is_none()) {
+            let cursor = state.get_cursor(cursor_id);
+            let btc = cursor.as_btree_mut();
+            let Some(record) = crate::return_if_io!(btc.record()) else {
+                return Ok(IOResult::Done(false));
+            };
+            for &i in deps {
+                if exec.rows[s].physical[i].is_some() {
+                    continue;
+                }
+                let v = if rs.rowid_alias.get(i).copied().unwrap_or(false) {
+                    Value::from_i64(rowid)
+                } else {
+                    match record.get_value_opt(i) {
+                        Some(v) => v.to_owned()?,
+                        None => rs.defaults.get(i).cloned().flatten().unwrap_or(Value::Null),
+                    }
+                };
+                exec.rows[s].physical[i] = Some(v);
+            }
+        }
+        let mut vals = vec![Value::Null; n];
+        for &i in deps {
+            vals[i] = exec.rows[s].physical[i]
+                .clone()
+                .expect("every dependency was just decoded");
         }
         let order: Vec<usize> = if m == Mutant::M4 {
             closure.iter().rev().copied().collect()
@@ -1251,6 +1280,13 @@ pub(crate) fn column_fetch(
                 .get_mut(&(key_base, ri))
                 .expect("compiled recipe was just inserted")
                 .run(&mut vals, rowid, pager)?;
+        }
+        // A column whose closure is inside this one's now holds its logical value too (the
+        // targets of a multi-column recipe are computed together).
+        for &x in rs.share.get(column).map_or(&[][..], |d| d.as_slice()) {
+            if exec.rows[s].logical[x].is_none() {
+                exec.rows[s].logical[x] = Some(vals[x].clone());
+            }
         }
         let v = vals[column].clone();
         state.set_register(dest, Register::Value(v.clone()));
