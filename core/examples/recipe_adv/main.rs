@@ -463,8 +463,11 @@ fn main() {
                 continue;
             }
             "@reopen" => {
-                r.reopen();
+                // Eager first, so a recipe-arm open failure (which exits) shows the eager reopen held.
                 e.reopen();
+                println!("-- @reopen: eager database reopened");
+                r.reopen();
+                println!("-- @reopen: recipe database reopened");
                 cur = "main".into();
                 println!("-- {line}");
                 continue;
