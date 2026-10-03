@@ -132,6 +132,9 @@ pub enum Mutant {
     M7,
     /// A write reads unchanged columns physically: no freeze (compute-on-read "screen").
     M8,
+    /// Crash mutant (PREREG A4.4 (a)): the recipe is installed in memory only; its `sqlite_schema`
+    /// row is never written, so a reopened database has lost it.
+    MC,
 }
 
 fn debug() -> bool {
@@ -150,6 +153,7 @@ pub fn mutant() -> Mutant {
         Ok("M6") => Mutant::M6,
         Ok("M7") => Mutant::M7,
         Ok("M8") => Mutant::M8,
+        Ok("MC") => Mutant::MC,
         _ => Mutant::None,
     })
 }
@@ -993,33 +997,35 @@ fn emit_recipe_update(
         });
         program.preassign_label_to_next_insn(s_end);
     }
-    program.emit_insn(Insn::NewRowid {
-        cursor: sch,
-        rowid_reg: rid,
-        prev_largest_reg: 0,
-    });
-    program.emit_string8(SCHEMA_TYPE.to_string(), row);
-    program.emit_string8(recipe_name(&btree.name, plan.generation), row + 1);
-    program.emit_string8(normalize_ident(&btree.name), row + 2);
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: row + 3,
-    });
-    program.emit_string8(plan.sql.clone(), row + 4);
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(row),
-        count: to_u32(5),
-        dest_reg: to_u32(rec),
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: sch,
-        key_reg: rid,
-        record_reg: rec,
-        flag: flags,
-        table_name: crate::schema::SCHEMA_TABLE_NAME.to_string(),
-    });
+    if mutant() != Mutant::MC {
+        program.emit_insn(Insn::NewRowid {
+            cursor: sch,
+            rowid_reg: rid,
+            prev_largest_reg: 0,
+        });
+        program.emit_string8(SCHEMA_TYPE.to_string(), row);
+        program.emit_string8(recipe_name(&btree.name, plan.generation), row + 1);
+        program.emit_string8(normalize_ident(&btree.name), row + 2);
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: row + 3,
+        });
+        program.emit_string8(plan.sql.clone(), row + 4);
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(row),
+            count: to_u32(5),
+            dest_reg: to_u32(rec),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: sch,
+            key_reg: rid,
+            record_reg: rec,
+            flag: flags,
+            table_name: crate::schema::SCHEMA_TABLE_NAME.to_string(),
+        });
+    }
     program.emit_insn(Insn::SetCookie {
         db: MAIN_DB_ID,
         cookie: Cookie::SchemaVersion,

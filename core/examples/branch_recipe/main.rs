@@ -5,6 +5,13 @@
 //!   branch_recipe diff  --seeds S [--start S0] --ops K --dir DIR [--no-sqlite]
 //!   branch_recipe bench --workload sd|dc|repair|fr --arm eager|recipe|lazy --n N --v V
 //!                       --shape fan|tree|chain --db PATH [--points P] [--sample B] [--seed X]
+//!                       [--dedup] [--reap] [--fr F] [--fi F] [--depth D]
+//!   branch_recipe crash --seeds S [--start S0] --n N --ops K --dir DIR
+//!
+//! `crash` is PREREG A4.4 (a): per seed a child process runs a W-SD op stream with recipes on, on
+//! `Durable { sync: true }` branches, and is SIGKILLed at a seeded point; the parent reopens the
+//! database and every live branch must equal an EAGER oracle at the child's last committed op (or,
+//! with an op in flight, at the one after it). `K1_RECIPE_MUTANT=MC` must make it differ.
 //!
 //! `diff` is KC1: one seeded op stream over a tree of branches runs on a RECIPE database and an
 //! EAGER database of this binary (and on stock SQLite, one file per branch copied at fork). After
@@ -1484,7 +1491,528 @@ fn bench_main(args: &Args) {
     if arm == "eager" && io[counter::INSTALLED] != 0 {
         not_a_result("eager arm installed a recipe");
     }
+    if args.dedup {
+        // Fire-check (A4.1), after SUMMARY so it moves none of its counters: a branch that changed
+        // nothing adds no page image. One probe forked from the trunk, one from the last measured
+        // branch when it is still held.
+        let mut probes = vec![(
+            "trunk",
+            trunk
+                .fork_branch()
+                .unwrap_or_else(|e| not_a_result(&format!("dedup probe fork: {e}"))),
+        )];
+        if let Some(last) = handles.last() {
+            probes.push((
+                "last",
+                last.fork()
+                    .unwrap_or_else(|e| not_a_result(&format!("dedup probe fork: {e}"))),
+            ));
+        }
+        for (what, probe) in probes {
+            let pc = probe.connect().unwrap();
+            let hs = page_hashes(&pc);
+            drop(pc);
+            let seen = hs.len();
+            let new = hs.iter().filter(|h| !dedup.contains(h)).count();
+            println!("DEDUP-FIRECHECK probe={what} pages={seen} new={new}");
+            if seen == 0 || new != 0 {
+                not_a_result(&format!("dedup fire-check: an unchanged {what} branch read {seen} pages, {new} new"));
+            }
+            probe
+                .reap()
+                .unwrap_or_else(|e| not_a_result(&format!("dedup probe reap: {e}")));
+        }
+    }
     drop(handles);
+}
+
+// ---------------------------------------------------------------------------------------------
+// crash (PREREG A4.4 (a))
+// ---------------------------------------------------------------------------------------------
+
+/// One op of a crash seed's stream. Node 0 is the trunk; node k is the branch the k-th `Fork` made.
+#[derive(Clone, Debug)]
+enum COp {
+    Fork { parent: usize },
+    Sql { node: usize, sql: String },
+    Reap { node: usize },
+}
+
+/// The op stream of one crash seed: W-SD steps (each statement its own op, so a kill can land
+/// between the ALTERs and the backfill), repairs, point writes of recipe inputs and targets,
+/// INSERTs, DELETEs, trunk writes, forks of forks and reaps of leaves.
+fn crash_ops(seed: u64, n: i64, len: usize) -> Vec<COp> {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xC4A5);
+    let mut ops = Vec::new();
+    let mut alive = vec![true];
+    let mut parent: Vec<Option<usize>> = vec![None];
+    let mut cols: Vec<Vec<String>> = vec![Vec::new()];
+    let mut next_id = n + 1;
+    while ops.len() < len {
+        let live: Vec<usize> = (1..alive.len()).filter(|&i| alive[i]).collect();
+        let roll = rng.below(100);
+        if live.is_empty() || (roll < 12 && live.len() < 6) {
+            let mut from = vec![0];
+            from.extend(&live);
+            let p = *rng.pick(&from);
+            ops.push(COp::Fork { parent: p });
+            alive.push(true);
+            parent.push(Some(p));
+            cols.push(cols[p].clone());
+            continue;
+        }
+        let node = *rng.pick(&live);
+        let k = rng.range(1, n + 20);
+        match roll {
+            0..=39 => {
+                let sfx = format!("t{node}_s{}", ops.len());
+                let salt = if rng.chance(50) { format!(" + {}", ops.len()) } else { String::new() };
+                ops.push(COp::Sql { node, sql: format!("ALTER TABLE customer ADD COLUMN loyalty_tier_{sfx} VARCHAR(8)") });
+                ops.push(COp::Sql { node, sql: format!("ALTER TABLE customer ADD COLUMN credit_lim_{sfx} DECIMAL(10,2)") });
+                ops.push(COp::Sql {
+                    node,
+                    sql: format!(
+                        "UPDATE customer SET loyalty_tier_{sfx} = CASE WHEN c_ytd_payment > 9000 THEN 'Gold' \
+                         WHEN c_ytd_payment > 5000 THEN 'Silver' ELSE 'Bronze' END, credit_lim_{sfx} = c_credit_lim{salt}"
+                    ),
+                });
+                cols[node].push(format!("loyalty_tier_{sfx}"));
+                cols[node].push(format!("credit_lim_{sfx}"));
+            }
+            40..=47 => {
+                let wh = if rng.chance(50) {
+                    format!(" WHERE c_ytd_payment > {}", rng.range(0, 9) * 1000)
+                } else {
+                    String::new()
+                };
+                ops.push(COp::Sql { node, sql: format!("UPDATE customer SET c_balance = c_balance - 72.50{wh}") });
+            }
+            48..=59 => ops.push(COp::Sql {
+                node,
+                sql: format!("UPDATE customer SET c_ytd_payment = {} WHERE rowid = {k}", rng.range(0, 10) * 1000),
+            }),
+            60..=69 => {
+                let c = if cols[node].is_empty() { "c_balance".to_string() } else { rng.pick(&cols[node]).clone() };
+                ops.push(COp::Sql { node, sql: format!("UPDATE customer SET {c} = 'Z{}' WHERE rowid = {k}", rng.below(9)) });
+            }
+            70..=77 => {
+                ops.push(COp::Sql {
+                    node,
+                    sql: format!(
+                        "INSERT INTO customer (c_id, c_d_id, c_w_id, c_credit_lim, c_balance, c_ytd_payment, c_data) \
+                         VALUES ({next_id}, 1, 99, 50000.00, -10.00, {}, '{}')",
+                        rng.range(0, 9) * 1000,
+                        rng.alpha(40)
+                    ),
+                });
+                next_id += 1;
+            }
+            78..=85 => ops.push(COp::Sql { node, sql: format!("DELETE FROM customer WHERE rowid = {k}") }),
+            86..=92 => ops.push(COp::Sql {
+                node: 0,
+                sql: format!("UPDATE customer SET c_data = '{}' WHERE rowid = {k}", rng.alpha(30)),
+            }),
+            _ => {
+                let leaves: Vec<usize> = live
+                    .iter()
+                    .copied()
+                    .filter(|&b| !(1..alive.len()).any(|c| alive[c] && parent[c] == Some(b)))
+                    .collect();
+                if let Some(&b) = leaves.first() {
+                    ops.push(COp::Reap { node: b });
+                    alive[b] = false;
+                }
+            }
+        }
+    }
+    ops
+}
+
+/// A database the crash stream runs on: the child's (RECIPE, durable) or the oracle's (EAGER).
+/// Fields drop in order: connections before the handles that would release their branches.
+struct CrashDb {
+    conns: Vec<Option<Arc<Connection>>>,
+    trunk: Arc<Connection>,
+    handles: Vec<Option<Branch>>,
+    db: Arc<Database>,
+    recipes: bool,
+}
+
+impl CrashDb {
+    fn new(db: Arc<Database>, recipes: bool) -> Self {
+        let trunk = db.connect().unwrap();
+        Self {
+            db,
+            trunk,
+            handles: vec![None],
+            conns: vec![None],
+            recipes,
+        }
+    }
+
+    fn conn(&self, node: usize) -> Result<&Arc<Connection>, String> {
+        if node == 0 {
+            Ok(&self.trunk)
+        } else {
+            self.conns[node].as_ref().ok_or_else(|| format!("node {node} has no connection"))
+        }
+    }
+
+    /// Apply one op. Ok carries a note for the progress log (a fork's branch id, a statement's
+    /// changes()); Err is the engine's refusal, which the oracle must reproduce. A failed fork
+    /// still takes its node number, so later ops address the same nodes in every database.
+    fn apply(&mut self, op: &COp) -> Result<String, String> {
+        match op {
+            COp::Fork { parent } => {
+                let made = (|| {
+                    let br = if *parent == 0 {
+                        self.trunk.fork_branch()
+                    } else {
+                        self.handles[*parent]
+                            .as_ref()
+                            .ok_or_else(|| turso_core::LimboError::InternalError("parent gone".into()))?
+                            .fork()
+                    }?;
+                    let c = br.connect()?;
+                    c.set_recipe_backfill(self.recipes);
+                    Ok::<_, turso_core::LimboError>((br, c))
+                })();
+                match made {
+                    Ok((br, c)) => {
+                        let id = br.id().0;
+                        self.handles.push(Some(br));
+                        self.conns.push(Some(c));
+                        Ok(format!("id={id}"))
+                    }
+                    Err(e) => {
+                        self.handles.push(None);
+                        self.conns.push(None);
+                        Err(e.to_string())
+                    }
+                }
+            }
+            COp::Sql { node, sql } => {
+                let c = self.conn(*node)?;
+                c.execute(sql).map_err(|e| e.to_string())?;
+                Ok(format!("changes={}", c.changes()))
+            }
+            COp::Reap { node } => {
+                // The connection goes first: a reap waits for open connections.
+                self.conns[*node] = None;
+                let br = self.handles[*node].take().ok_or("reap of a node with no handle")?;
+                let id = br.id().0;
+                br.reap().map_err(|e| e.to_string())?;
+                Ok(format!("id={id}"))
+            }
+        }
+    }
+
+    /// Every live node's content: (columns, rows, hash) of `SELECT * FROM customer ORDER BY rowid`.
+    fn state(&self) -> BTreeMap<usize, (usize, usize, u64)> {
+        let mut out = BTreeMap::new();
+        for node in 0..self.conns.len() {
+            if let Ok(c) = self.conn(node) {
+                out.insert(node, content(c).unwrap_or_else(|e| not_a_result(&format!("oracle read: {e}"))));
+            }
+        }
+        out
+    }
+}
+
+fn content(conn: &Arc<Connection>) -> Result<(usize, usize, u64), String> {
+    let rs = rows(conn, "SELECT * FROM customer ORDER BY rowid").map_err(|e| e.to_string())?;
+    Ok((rs.first().map_or(0, |r| r.len()), rs.len(), result_hash(&rs)))
+}
+
+/// What the child left on disk, reopened: each live node's content, keyed by the node the child's
+/// progress log names (`ids`: branch id to node). `in_flight_fork` is the node an unlogged fork
+/// would have made. Returns the connections too, for the post-reopen writes (each before its
+/// handle, so a connection drops first).
+#[allow(clippy::type_complexity)]
+fn crash_recover(
+    path: &Path,
+    ids: &BTreeMap<u64, usize>,
+    in_flight_fork: Option<usize>,
+) -> Result<(Arc<Database>, BTreeMap<usize, (usize, usize, u64)>, BTreeMap<usize, (Arc<Connection>, Branch)>), String> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_branch_durability(BranchDurability::Durable { sync: true }),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .map_err(|e| format!("reopen: {e}"))?;
+    let trunk = db.connect().map_err(|e| format!("trunk connect: {e}"))?;
+    let mut state = BTreeMap::new();
+    state.insert(0, content(&trunk).map_err(|e| format!("trunk read: {e}"))?);
+    let mut live = BTreeMap::new();
+    let mut unknown = Vec::new();
+    for id in db.branch_ids().map_err(|e| format!("branch_ids: {e}"))? {
+        unknown.push(id);
+    }
+    unknown.retain(|id| {
+        let Some(&node) = ids.get(&id.0) else { return true };
+        live.insert(node, *id);
+        false
+    });
+    match (unknown.as_slice(), in_flight_fork) {
+        ([], _) => {}
+        ([id], Some(node)) => {
+            live.insert(node, *id);
+        }
+        (more, _) => return Err(format!("recovered branch ids the child never logged: {more:?}")),
+    }
+    let mut conns = BTreeMap::new();
+    for (node, id) in live {
+        let br = db.branch(id).map_err(|e| format!("attach {}: {e}", id.0))?;
+        let c = br.connect().map_err(|e| format!("connect {}: {e}", id.0))?;
+        c.set_recipe_backfill(true);
+        state.insert(node, content(&c).map_err(|e| format!("node {node} read: {e}"))?);
+        conns.insert(node, (c, br));
+    }
+    drop(trunk);
+    Ok((db, state, conns))
+}
+
+fn crash_child(args: &Args) {
+    let ops = crash_ops(args.seed, args.n, args.ops as usize);
+    let db = open_db(&args.dir.join("c.db"), BranchDurability::Durable { sync: true });
+    let mut cdb = CrashDb::new(db, true);
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(args.dir.join("progress.log"))
+        .unwrap_or_else(|e| die(&format!("progress log: {e}")));
+    // write(2) per line: a SIGKILL loses no byte a returned write handed the kernel.
+    let mut say = |s: String| {
+        log.write_all(format!("{s}\n").as_bytes())
+            .unwrap_or_else(|e| die(&format!("progress log: {e}")))
+    };
+    say("start 0 load".into());
+    load_customer(&cdb.trunk, args.n, 0, &mut Rng(args.seed ^ 0x10AD));
+    say("done 0 ok".into());
+    for (i, op) in ops.iter().enumerate() {
+        let i = i + 1;
+        say(format!("start {i}"));
+        let before = recipe_io()[counter::INSTALLED];
+        let r = cdb.apply(op);
+        let installed = recipe_io()[counter::INSTALLED] - before;
+        match r {
+            Ok(note) => say(format!("done {i} ok {note} installed={installed}")),
+            Err(e) => say(format!("done {i} err installed={installed} {}", e.replace('\n', " "))),
+        }
+    }
+    say("end".into());
+    // exit() runs no destructors: dropping a Branch handle would release the branch.
+    std::process::exit(0);
+}
+
+/// Replay ops 1..=upto on a fresh EAGER database; return it with each op's outcome (true = Ok).
+fn crash_oracle(args: &Args, seed: u64, ops: &[COp], upto: usize, dir: &Path) -> (CrashDb, Vec<bool>) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    let db = open_db(&dir.join("o.db"), BranchDurability::Volatile);
+    let mut o = CrashDb::new(db, false);
+    load_customer(&o.trunk, args.n, 0, &mut Rng(seed ^ 0x10AD));
+    let mut outcomes = Vec::new();
+    for op in &ops[..upto] {
+        outcomes.push(o.apply(op).is_ok());
+    }
+    (o, outcomes)
+}
+
+fn crash_main(args: &Args) {
+    let mutant = std::env::var("K1_RECIPE_MUTANT").unwrap_or_else(|_| "none".into());
+    std::fs::create_dir_all(&args.dir).unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let (mut killed, mut mid_op, mut matched_a, mut matched_b, mut mismatches) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut with_recipe, mut post_mismatches, mut ran_to_end) = (0u64, 0u64, 0u64);
+    println!(
+        "# crash seeds={} start={} n={} ops={} mutant={mutant} durability=Durable{{sync:true}} \
+         (SIGKILL is a process crash: kernel buffers survive it; power loss is not tested)",
+        args.seeds, args.start, args.n, args.ops
+    );
+    for seed in args.start..args.start + args.seeds {
+        let sub = args.dir.join(format!("seed{seed}"));
+        let _ = std::fs::remove_dir_all(&sub);
+        std::fs::create_dir_all(&sub).unwrap();
+        let ops = crash_ops(seed, args.n, args.ops as usize);
+        let mut krng = Rng(seed ^ 0x5EED_C4A5);
+        // 1..=len kills after op `target` starts; len + 1 lets the child run to its end.
+        let target = 1 + krng.below(ops.len() as u64 + 1) as usize;
+        let delay_us = if krng.chance(50) { krng.below(200) } else { krng.below(3_000) };
+        let out = std::fs::File::create(sub.join("child.txt")).unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .args(["crash-child", "--seed", &seed.to_string(), "--n", &args.n.to_string()])
+            .args(["--ops", &args.ops.to_string(), "--dir", sub.to_str().unwrap()])
+            .stdout(out.try_clone().unwrap())
+            .stderr(out)
+            .spawn()
+            .unwrap_or_else(|e| die(&format!("spawn child: {e}")));
+        let progress = sub.join("progress.log");
+        let want = format!("start {target}\n");
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break Some(st);
+            }
+            if std::fs::read_to_string(&progress).map_or(false, |s| s.contains(&want)) {
+                std::thread::sleep(std::time::Duration::from_micros(delay_us));
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        };
+        let was_killed = match status {
+            None => true,
+            Some(st) if st.success() => false,
+            Some(st) => not_a_result(&format!("seed {seed}: child exited {st}; see {}", sub.join("child.txt").display())),
+        };
+        let text = std::fs::read_to_string(&progress).unwrap_or_default();
+        let mut last_done = None;
+        let mut started = 0usize;
+        let mut ids: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut child_ok: Vec<bool> = Vec::new();
+        let mut recipes_before = 0u64;
+        let mut next_node = 1usize;
+        for line in text.lines() {
+            let mut w = line.split_whitespace();
+            match (w.next(), w.next().and_then(|x| x.parse::<usize>().ok())) {
+                (Some("start"), Some(i)) => started = started.max(i),
+                (Some("done"), Some(i)) => {
+                    last_done = Some(i);
+                    if i == 0 {
+                        continue;
+                    }
+                    let ok = w.next() == Some("ok");
+                    child_ok.push(ok);
+                    if line.contains("installed=1") {
+                        recipes_before += 1;
+                    }
+                    if let COp::Fork { .. } = ops[i - 1] {
+                        if ok {
+                            let id: u64 = line.split("id=").nth(1).and_then(|x| x.split_whitespace().next())
+                                .and_then(|x| x.parse().ok())
+                                .unwrap_or_else(|| not_a_result(&format!("seed {seed}: fork line without id: {line}")));
+                            ids.insert(id, next_node);
+                        }
+                        next_node += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(last_done) = last_done else {
+            not_a_result(&format!("seed {seed}: no op committed, not even the load (target {target})"));
+        };
+        let in_flight = (started > last_done).then_some(last_done + 1);
+        if was_killed {
+            killed += 1;
+        } else {
+            ran_to_end += 1;
+        }
+        if in_flight.is_some() {
+            mid_op += 1;
+        }
+        if recipes_before > 0 {
+            with_recipe += 1;
+        }
+        // Reopen what the child left. A reopen or read that fails is a difference, not an abort.
+        let in_flight_fork = in_flight.filter(|&f| matches!(ops[f - 1], COp::Fork { .. })).map(|_| next_node);
+        let recovered = crash_recover(&sub.join("c.db"), &ids, in_flight_fork);
+        let mut verdict = "NONE";
+        let mut oracle = None;
+        match &recovered {
+            Err(e) => println!("  seed={seed} recovery failed: {e}"),
+            Ok((_, rec_state, _)) => {
+                // The oracle at the last committed op, else (an op in flight) at the one after it.
+                for (label, upto) in [("A", Some(last_done)), ("B", in_flight)] {
+                    let Some(upto) = upto else { continue };
+                    let (o, outcomes) = crash_oracle(args, seed, &ops, upto, &sub.join(format!("oracle_{label}")));
+                    let k = child_ok.len().min(upto);
+                    if outcomes[..k] != child_ok[..k] {
+                        println!("  seed={seed} op outcomes differ (child {child_ok:?} oracle {outcomes:?})");
+                        break;
+                    }
+                    let st = o.state();
+                    if &st == rec_state {
+                        verdict = label;
+                        oracle = Some(o);
+                        break;
+                    }
+                    if label == "B" || in_flight.is_none() {
+                        for (node, want) in &st {
+                            let got = rec_state.get(node);
+                            if got != Some(want) {
+                                println!("  seed={seed} oracle_{label} node={node} want (cols, rows, hash)={want:?} got={got:?}");
+                            }
+                        }
+                        for node in rec_state.keys().filter(|n| !st.contains_key(n)) {
+                            println!("  seed={seed} oracle_{label} node={node} recovered but not live in the oracle");
+                        }
+                    }
+                }
+            }
+        }
+        // After reopen: a point write and a new recipe on every recovered branch, compared again.
+        let mut post = "skipped";
+        if let (Some(o), Ok((_, _, conns))) = (&oracle, &recovered) {
+            post = "ok";
+            for (&node, (c, _)) in conns {
+                let oc = o.conn(node).unwrap_or_else(|e| not_a_result(&e));
+                for sql in ["UPDATE customer SET c_balance = 7 WHERE rowid = 3", "UPDATE customer SET c_balance = c_balance + 1"] {
+                    let r = c.execute(sql).map(|_| c.changes()).map_err(|e| e.to_string());
+                    let e = oc.execute(sql).map(|_| oc.changes()).map_err(|e| e.to_string());
+                    if r != e {
+                        post = "MISMATCH";
+                        println!("  seed={seed} post-reopen node={node} {sql}: recovered {r:?} oracle {e:?}");
+                    }
+                }
+                if content(c) != content(oc) {
+                    post = "MISMATCH";
+                    println!("  seed={seed} post-reopen node={node}: content differs after the post-reopen writes");
+                }
+            }
+        }
+        match verdict {
+            "A" => matched_a += 1,
+            "B" => matched_b += 1,
+            _ => mismatches += 1,
+        }
+        if post == "MISMATCH" {
+            post_mismatches += 1;
+        }
+        println!(
+            "CRASH seed={seed} ops={} target={target} delay_us={delay_us} killed={was_killed} last_done={last_done} \
+             in_flight={} in_flight_op={} recipes_installed_before={recipes_before} branches_recovered={} \
+             matched={verdict} post_reopen={post}",
+            ops.len(),
+            in_flight.map_or("-".to_string(), |f| f.to_string()),
+            in_flight.map_or("-".to_string(), |f| match &ops[f - 1] {
+                COp::Fork { .. } => "fork".to_string(),
+                COp::Reap { .. } => "reap".to_string(),
+                COp::Sql { sql, .. } => sql.split_whitespace().next().unwrap_or("?").to_string(),
+            }),
+            recovered.as_ref().map_or(0, |(_, _, c)| c.len())
+        );
+        drop(oracle);
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(&sub);
+    }
+    println!(
+        "CRASHSUM mutant={mutant} seeds={} killed={killed} ran_to_end={ran_to_end} killed_mid_op={mid_op} \
+         seeds_with_recipe_before_kill={with_recipe} matched_last_done={matched_a} matched_in_flight={matched_b} \
+         mismatches={mismatches} post_reopen_mismatches={post_mismatches}",
+        args.seeds
+    );
+    if killed == 0 || mid_op == 0 || with_recipe == 0 {
+        not_a_result("the crash run collected nothing: no kill, no mid-op kill, or no recipe before a kill");
+    }
+    if mismatches + post_mismatches > 0 {
+        std::process::exit(3);
+    }
 }
 
 /// Debug aid: run the trunk-only (`[0] `) lines of a `mismatch_seed*.log` on a RECIPE and an
@@ -1628,6 +2156,13 @@ fn main() {
             diff_main(&args)
         }
         "bench" => bench_main(&args),
+        "crash" => {
+            if args.seeds == 0 || args.dir.as_os_str().is_empty() || args.n < 1 {
+                die("crash needs --seeds, --dir and --n");
+            }
+            crash_main(&args)
+        }
+        "crash-child" => crash_child(&args),
         "replay" => replay_main(&args),
         other => die(&format!("unknown command {other}")),
     }
