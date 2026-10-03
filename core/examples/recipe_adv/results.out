@@ -1159,7 +1159,7 @@ SUMMARY statements=24 diffs=3
 rc=3
 ===== 23_autovacuum
 [main] PRAGMA auto_vacuum = FULL   <same> 
-    both  : ERROR Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.
+    both  : (no rows) changes=0
 [main] CREATE TABLE a0(x)   <same> 
     both  : (no rows) changes=0
 [main] INSERT INTO a0 VALUES (1)   <same> 
@@ -1171,11 +1171,11 @@ rc=3
 [main] UPDATE t SET b = 'r' || a   <same> INSTALLED+1
     both  : (no rows) changes=2
 [main] SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' ORDER BY name   <same> 
-    both  : 'a0', 2 | 't', 3 changes=2
+    both  : 'a0', 3 | 't', 4 changes=2
 [main] DROP TABLE a0   <same> 
     both  : (no rows) changes=2
 [main] SELECT name, rootpage FROM sqlite_schema WHERE type = 'table' ORDER BY name   <same> 
-    both  : 't', 3 changes=2
+    both  : 't', 4 changes=2
 [main] SELECT * FROM t ORDER BY id   <same> stale-reads+2
     both  : 1, 1, 'r1' | 2, 2, 'r2' changes=2
 [main] UPDATE t SET a = a + 1 WHERE id = 1   <same> fallback+1 stale-reads+1

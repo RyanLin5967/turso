@@ -42,7 +42,8 @@ fn open_db(path: &Path) -> Arc<Database> {
         OpenFlags::Create,
         DatabaseOpts::new()
             .with_branch_durability(BranchDurability::Volatile)
-            .with_attach(true),
+            .with_attach(true)
+            .with_autovacuum(true),
         None,
         Arc::new(SqliteDialect),
     )
