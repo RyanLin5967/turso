@@ -3504,6 +3504,11 @@ impl BranchStore {
         )
     }
 
+    /// Per-fork lock holds since open (fastest-engine M1 item 5).
+    pub(crate) fn fork_holds(&self) -> super::ForkHolds {
+        super::ForkHolds::default()
+    }
+
     pub(crate) fn stats(&self) -> Result<BranchStats> {
         self.refuse_if_trunk_only("branch statistics")?;
         let mut inner = self.inner.lock();

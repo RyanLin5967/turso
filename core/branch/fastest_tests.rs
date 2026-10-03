@@ -224,3 +224,88 @@ fn a_full_fsync_trunk_connection_raises_the_pre_image_barrier() {
         assert_eq!(v[0][0], crate::Value::from_text("trunk-7"), "the branch read the trunk's new page");
     }
 }
+
+// ---- per-fork bracketing counters (fastest-engine M1 item 5) ----
+
+/// The histogram the hold counters keep: every value lands in a bucket whose range holds it, each
+/// bucket at or above 16 ns is at most 1/16 of its value wide, and a quantile read from it brackets
+/// the true one from above by at most that width (the maximum is exact).
+#[test]
+fn hold_buckets_bound_every_value_and_a_quantile_brackets_the_true_one() {
+    let mut values: Vec<u64> = (0..200).collect();
+    for e in 4..63 {
+        let p = 1u64 << e;
+        values.extend([p - 1, p, p + 1, p + p / 3]);
+    }
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..10_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        values.push(x >> (x % 40));
+    }
+    for &v in &values {
+        let b = hold_bucket(v);
+        assert!(b < HOLD_BUCKETS, "{v} has bucket {b}, past {HOLD_BUCKETS}");
+        assert!(hold_bucket_upper(b) >= v, "{v} is above its bucket {b}'s upper bound");
+        if b > 0 {
+            assert!(hold_bucket_upper(b - 1) < v, "{v} also fits bucket {}", b - 1);
+        }
+        if v >= 16 {
+            let width = hold_bucket_upper(b) - v;
+            assert!(width as f64 <= v as f64 / 16.0, "{v}: bucket {b} is {width} wide above it");
+        }
+    }
+    // 1..=1000 microseconds, once each: the true median is 500 us.
+    let mut stats = HoldStats {
+        buckets: vec![0; HOLD_BUCKETS],
+        ..HoldStats::default()
+    };
+    for us in 1..=1000u64 {
+        let ns = us * 1000;
+        stats.count += 1;
+        stats.sum_ns += ns;
+        stats.max_ns = stats.max_ns.max(ns);
+        stats.buckets[hold_bucket(ns)] += 1;
+    }
+    let p50 = stats.quantile_ns(0.5);
+    assert!(
+        (500_000..=500_000 + 500_000 / 16).contains(&p50),
+        "the median of 1..=1000 us read as {p50} ns"
+    );
+    assert_eq!(stats.quantile_ns(1.0), 1_000_000, "the maximum is exact");
+}
+
+/// Every fork records ONE store-mutex hold, and every trunk fork ONE WAL-lock hold (0 when it took
+/// no WAL lock); the WAL histogram reads a non-zero hold exactly when some trunk fork took the lock.
+#[test]
+fn every_fork_records_its_store_hold_and_every_trunk_fork_its_wal_hold() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("holds.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let before = db.branch_fork_holds();
+        let mut kept = Vec::new();
+        for _ in 0..5 {
+            kept.push(trunk.fork_branch().unwrap());
+        }
+        for _ in 0..3 {
+            let child = kept[0].fork().unwrap();
+            kept.push(child);
+        }
+        let after = db.branch_fork_holds();
+        assert_eq!(after.store.count - before.store.count, 8, "catalog={catalog}: store holds");
+        assert_eq!(after.wal.count - before.wal.count, 5, "catalog={catalog}: WAL holds");
+        assert!(after.store.max_ns > 0, "catalog={catalog}: no store hold was timed");
+        assert!(after.store.sum_ns >= after.store.max_ns);
+        assert_eq!(
+            after.wal.max_ns > 0,
+            after.locked_trunk_forks > 0,
+            "catalog={catalog}: a WAL hold without a locked fork, or the reverse: {after:?}"
+        );
+        assert!(after.locked_trunk_forks <= 5);
+        assert_eq!(after.store.buckets.iter().sum::<u64>(), after.store.count);
+    }
+}

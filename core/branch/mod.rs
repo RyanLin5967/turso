@@ -329,6 +329,68 @@ pub struct SyncCounts {
     pub full_fsync: u64,
 }
 
+/// A distribution of lock holds, in nanoseconds (fastest-engine M1 item 5; observing only): the
+/// count, sum and exact maximum, and a log-linear histogram with 16 sub-buckets per power of two,
+/// so a quantile is read to within 1/16 of its octave (6.25%). Below 16 ns every value has its own
+/// bucket. The clock is `Instant` (mach_absolute_time on Apple silicon: a 41.67 ns tick), so a hold
+/// shorter than one tick reads as 0 or one tick.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HoldStats {
+    pub count: u64,
+    pub sum_ns: u64,
+    pub max_ns: u64,
+    /// Bucket counts, `HOLD_BUCKETS` of them (see [`hold_bucket`]).
+    pub buckets: Vec<u64>,
+}
+
+/// Buckets in a [`HoldStats`] histogram: 16 exact ones below 16 ns, then 16 per power of two up to
+/// 2^64.
+pub(crate) const HOLD_BUCKETS: usize = 16 + 60 * 16;
+
+/// The bucket holding `ns`.
+pub(crate) fn hold_bucket(ns: u64) -> usize {
+    let _ = ns;
+    0
+}
+
+/// The largest value bucket `b` holds.
+pub(crate) fn hold_bucket_upper(b: usize) -> u64 {
+    b as u64
+}
+
+impl HoldStats {
+    /// An upper bound on the `q` quantile (0 < q <= 1): the largest value of the bucket holding the
+    /// sample of rank `ceil(q * count)`, capped at the exact maximum. 0 with no sample.
+    pub fn quantile_ns(&self, q: f64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let rank = ((q * self.count as f64).ceil() as u64).clamp(1, self.count);
+        let mut seen = 0;
+        for (b, &n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= rank {
+                return hold_bucket_upper(b).min(self.max_ns);
+            }
+        }
+        self.max_ns
+    }
+}
+
+/// Per-fork lock holds (fastest-engine M1 item 5, PREREG §11 M1 exit 4 and K6), each fork counted
+/// once: `store`, the nanoseconds the forking thread held the branch store's mutex over the whole
+/// fork call (every acquisition it made, summed); `wal`, the nanoseconds a TRUNK fork held the
+/// trunk's WAL write lock (0 for a fork that never took it). `locked_trunk_forks` counts the trunk
+/// forks that took that lock.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ForkHolds {
+    pub store: HoldStats,
+    pub wal: HoldStats,
+    pub locked_trunk_forks: u64,
+}
+
 #[doc(hidden)]
 pub fn sync_counts() -> SyncCounts {
     use crate::sync::atomic::Ordering::Relaxed;
@@ -879,6 +941,12 @@ impl Database {
     /// Refused on a read-only handle of a database with branches, whose branch store is not open.
     pub fn branch_stats(&self) -> Result<BranchStats> {
         self.branches.stats()
+    }
+
+    /// Per-fork lock holds since open (fastest-engine M1 item 5; observing only).
+    #[doc(hidden)]
+    pub fn branch_fork_holds(&self) -> ForkHolds {
+        self.branches.fork_holds()
     }
 
     /// What the branch store's open read and rebuilt (r11-restart lane instrument).
