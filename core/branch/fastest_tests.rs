@@ -729,3 +729,80 @@ fn concurrent_d2_branch_commits_share_their_flushes() {
         );
     }
 }
+
+/// G1 (gc 389b474b4's failpoint test, durable store): a group flight that fails after an
+/// early-released release was applied fail-stops the store, reports the release as not durable,
+/// and frees NOTHING of the branch — now or later in this process — since no flight will ever cover
+/// its Release (rule 2). After a reopen the branch is back with its write. Mutant
+/// `free_before_durable` (M-g) frees at once, and this test must fail on it.
+#[test]
+fn a_failed_group_flight_fail_stops_the_store_and_frees_nothing() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("gff.db");
+        let (id, owned, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            let bc = b.connect().unwrap();
+            bc.execute("UPDATE t SET v = 'mine' WHERE id = 3").unwrap();
+            drop(bc);
+            let owned = b.owned_slots();
+            assert!(!owned.is_empty(), "premise: the branch owns a slot");
+            let id = b.id();
+            db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+            assert!(b.reap().is_err(), "catalog={catalog}: a release whose flight failed was reported");
+            for slot in &owned {
+                assert!(
+                    !db.branch_slot_is_free(*slot),
+                    "catalog={catalog}: slot {slot} was freed though its Release is not durable"
+                );
+            }
+            assert!(trunk.fork_branch().is_err(), "catalog={catalog}: a fail-stopped store forked");
+            (id, owned, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let b = db.branch(id).expect("the branch whose release failed is back after a reopen");
+        assert_eq!(read_v(&b.connect().unwrap(), 3), "mine", "catalog={catalog}");
+        assert_eq!(b.owned_slots().len(), owned.len());
+    }
+}
+
+/// G2 (gc3's N1, durable store): a trunk commit that retains nothing — its only child was just
+/// released, early, and no live child can see the page — must still not become durable ahead of
+/// that Release. Its barrier waits for every record buffered before its decisions; when that flight
+/// failed, the commit is refused, because after a restart the child comes back (its Release lost)
+/// and nothing kept the page it reads. After the reopen the child reads its fork-point page. Mutant
+/// `barrier_own_only` (the barrier flushes only the commit's own pre-images) must fail this.
+#[test]
+fn a_trunk_commit_is_refused_when_an_early_release_it_relied_on_failed() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("n1.db");
+        let (id, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let x = trunk.fork_branch().unwrap();
+            let id = x.id();
+            db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+            assert!(x.reap().is_err(), "premise: the release's flight failed");
+            let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+            assert!(
+                committed.is_err(),
+                "catalog={catalog}: a trunk commit became durable ahead of a Release it relied on"
+            );
+            (id, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let x = db.branch(id).expect("the child whose release failed is back");
+        assert_eq!(
+            read_v(&x.connect().unwrap(), 7),
+            "trunk-7",
+            "catalog={catalog}: the child reads a trunk page written after its fork"
+        );
+    }
+}

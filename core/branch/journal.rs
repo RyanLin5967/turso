@@ -546,6 +546,13 @@ pub(crate) struct Journal {
     fail_next_write: bool,
     /// The format version this journal writes and was read at (`format_version`).
     format: u32,
+    /// Frame bytes ever buffered by this journal: the log sequence number a group flight makes
+    /// durable up to (fastest-engine M1 item 2, gc 389b474b4's `lsn`). Monotone across compactions
+    /// and log rewrites, unlike `len`.
+    lsn: u64,
+    /// The strongest class a buffered record asked for (a trunk commit's pre-images under a
+    /// stronger trunk class, `BranchStore::begin_trunk_commit`): the next flight syncs in it.
+    pending_class: SyncClass,
 }
 
 impl Journal {
@@ -606,6 +613,8 @@ impl Journal {
             pid: std::process::id(),
             fail_next_write: false,
             format: FORMAT_VERSION,
+            lsn: 0,
+            pending_class: SyncClass::Off,
         })
     }
 
@@ -747,6 +756,8 @@ impl Journal {
             pid: std::process::id(),
             fail_next_write: false,
             format,
+            lsn: 0,
+            pending_class: SyncClass::Off,
         };
 
         let mut records = Vec::new();
@@ -1013,6 +1024,7 @@ impl Journal {
         put_u32(&mut self.pending, payload.len() as u32);
         put_u32(&mut self.pending, crc32c::crc32c(&payload));
         self.pending.extend_from_slice(&payload);
+        self.lsn += (FRAME_HEADER_LEN + payload.len()) as u64;
         match record {
             Record::TrunkRetain { slot, .. } => self.pending_slots.push(*slot),
             Record::Commit { pages, .. } => self.pending_slots.extend(pages.iter().map(|p| p.1)),
@@ -1028,7 +1040,7 @@ impl Journal {
 
     /// `flush`, syncing in `class` instead of this journal's own: a trunk commit's pre-image barrier
     /// raises it to the class its WAL is synced in, when that is stronger (see [`SyncClass`]).
-    pub(crate) fn flush_as(&mut self, arena: &mut Arena, class: SyncClass) -> Result<()> {
+    fn flush_as(&mut self, arena: &mut Arena, class: SyncClass) -> Result<()> {
         // Taken first, so the failpoint is spent by exactly this call whatever it returns — it
         // cannot outlive the barrier that armed it (review 5 T-1).
         let fail_next_write = std::mem::take(&mut self.fail_next_write);
@@ -1036,6 +1048,7 @@ impl Journal {
         if self.pending.is_empty() {
             return Ok(());
         }
+        let class = class.max(self.pending_class);
         let written = if fail_next_write {
             Err(LimboError::InternalError(
                 "failpoint: a branch log write failed".to_string(),
@@ -1048,6 +1061,7 @@ impl Journal {
                 self.len += self.pending.len() as u64;
                 self.pending.clear();
                 self.pending_slots.clear();
+                self.pending_class = SyncClass::Off;
                 Ok(())
             }
             Err(e) => {
@@ -1086,6 +1100,90 @@ impl Journal {
     /// The class this journal syncs in.
     pub(crate) fn sync_class(&self) -> SyncClass {
         self.sync
+    }
+
+    /// Frame bytes ever buffered (see the `lsn` field).
+    pub(crate) fn lsn(&self) -> u64 {
+        self.lsn
+    }
+
+    /// Frame bytes buffered and not yet taken by a flush or a flight.
+    pub(crate) fn pending_len(&self) -> u64 {
+        self.pending.len() as u64
+    }
+
+    /// The next flight syncs in at least `class` (see `pending_class`).
+    pub(crate) fn raise_pending_class(&mut self, class: SyncClass) {
+        self.pending_class = self.pending_class.max(class);
+    }
+
+    /// Take everything buffered as one [`Flight`], for a group flush written outside the store
+    /// mutex (fastest-engine M1 item 2; gc 389b474b4's `take_flight`). The log region is reserved
+    /// here, so the next flight goes after it; the caller guarantees no other flight is in the air
+    /// (one at a time, `BranchStore`'s group), which is also what makes the on-disk length check
+    /// exact. The arena descriptor comes along when slots were written since the last sync: those
+    /// slots are named by frames in this flight (or a later one), and rule 1 wants them durable
+    /// before the frames are. The flight syncs in the strongest of `class`, this journal's own and
+    /// what the buffered records asked for. With nothing buffered, the flight is an UPGRADE when
+    /// `upgrade` is set — a sync of the log alone in `class`, which an F_FULLFSYNC makes cover every
+    /// write the device took before it — and otherwise empty.
+    pub(crate) fn take_flight(
+        &mut self,
+        arena: &mut Arena,
+        class: SyncClass,
+        upgrade: bool,
+    ) -> Result<Flight> {
+        let fail = std::mem::take(&mut self.fail_next_write);
+        self.check_live()?;
+        let class = class.max(self.sync).max(self.pending_class);
+        let end_lsn = self.lsn;
+        if self.pending.is_empty() && !upgrade {
+            return Ok(Flight {
+                log: None,
+                arena: None,
+                bytes: Vec::new(),
+                at: self.len,
+                class,
+                fail: false,
+                end_lsn,
+            });
+        }
+        let on_disk = self
+            .file
+            .metadata()
+            .map_err(|e| io_error(e, "stat branch log"))?
+            .len();
+        if on_disk != self.len {
+            self.poisoned = true;
+            return Err(corrupt(
+                "the branch log changed under this journal; another store instance wrote it",
+            ));
+        }
+        let log = self
+            .file
+            .try_clone()
+            .map_err(|e| io_error(e, "dup branch log"))?;
+        // A flight that syncs nothing (D0) leaves the arena's mark set, so a later flight in a
+        // syncing class (an upgrade) still syncs the slots these frames name.
+        let arena = if class.syncs() {
+            arena.take_dirty_file()?
+        } else {
+            None
+        };
+        let bytes = std::mem::take(&mut self.pending);
+        self.pending_slots.clear();
+        self.pending_class = SyncClass::Off;
+        let at = self.len;
+        self.len += bytes.len() as u64;
+        Ok(Flight {
+            log: Some(log),
+            arena,
+            bytes,
+            at,
+            class,
+            fail,
+            end_lsn,
+        })
     }
 
     pub(crate) fn wants_compaction(&self) -> bool {
@@ -1150,6 +1248,7 @@ impl Journal {
         }
         self.pending.clear();
         self.pending_slots.clear();
+        self.pending_class = SyncClass::Off;
         self.snapshot_len = out.len() as u64;
         if let Err(e) = self.reset_log(generation) {
             self.poisoned = true;
@@ -1218,6 +1317,57 @@ fn slots_named(frames: &[u8]) -> Vec<Slot> {
         pos = start + len;
     }
     out
+}
+
+/// One group flight (fastest-engine M1 item 2; gc 389b474b4): frames taken from a journal's buffer,
+/// the log offset they go to, the arena descriptor to sync first, and the class to sync in. Written
+/// by [`Flight::write`] with no lock held; the journal already counts the region as written, so a
+/// failed write must fail-stop it.
+pub(crate) struct Flight {
+    log: Option<File>,
+    arena: Option<File>,
+    bytes: Vec<u8>,
+    at: u64,
+    pub(crate) class: SyncClass,
+    fail: bool,
+    /// The journal's `lsn` at the end of these frames: what the flight makes durable.
+    pub(crate) end_lsn: u64,
+}
+
+impl Flight {
+    /// Arena first, then the frames, then the log: the order `Journal::flush` keeps.
+    pub(crate) fn write(self) -> Result<()> {
+        if self.fail {
+            return Err(LimboError::InternalError(
+                "failpoint: a branch log write failed".to_string(),
+            ));
+        }
+        let Some(log) = self.log else {
+            return Ok(());
+        };
+        if self.class.syncs() {
+            if let Some(arena) = &self.arena {
+                fsync_file(arena, self.class)?;
+            }
+        }
+        if !self.bytes.is_empty() {
+            write_at(&log, &self.bytes, self.at)?;
+        }
+        if self.class.syncs() {
+            fsync_file(&log, self.class)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this flight writes or syncs anything.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.log.is_none()
+    }
+
+    /// Frame bytes in this flight (observation only).
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 /// Whether a failed `stat` of a branch sidecar means the file CANNOT be there (review 6 item 5,

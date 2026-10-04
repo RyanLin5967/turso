@@ -436,6 +436,10 @@ pub enum BranchFailpoint {
     /// commit, as an I/O error would (r13-compose D-T2's failed-write order, A5.4; review
     /// wf_5c230f31).
     CheckpointWriteFails,
+    /// The next group flight (fastest-engine M1 item 2, gc 389b474b4's failpoint) — the flush that
+    /// carries an early-released operation's records — fails as an I/O error would, after the
+    /// operation was applied.
+    GroupFlightFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -813,7 +817,11 @@ impl Branch {
     pub fn fork(&self) -> Result<Branch> {
         let store = &self.db.branches;
         store::take_counted_hold();
-        let forked = store.fork_branch(self.id);
+        // Early release (fastest-engine M1 item 2): the fork is applied and every lock released;
+        // the branch is handed out only once its records are durable.
+        let forked = store
+            .fork_branch(self.id)
+            .and_then(|(id, lsn)| store.wait_durable(lsn, store.sync_class()).map(|()| id));
         let held = store::take_counted_hold();
         let id = forked?;
         store.record_fork(held, None);
@@ -913,9 +921,15 @@ impl Connection {
         // fastest-engine item 5: this fork's store-mutex holds, counted from here.
         store::take_counted_hold();
         let forked = match pager.branch_id() {
-            Some(parent) => store.fork_branch(parent).map(|id| (id, None)),
-            None => self.fork_trunk(&pager).map(|(id, wal)| (id, Some(wal))),
+            Some(parent) => store.fork_branch(parent).map(|(id, lsn)| (id, None, lsn)),
+            None => self.fork_trunk(&pager).map(|(id, wal, lsn)| (id, Some(wal), lsn)),
         };
+        // Early release (fastest-engine M1 item 2): the fork is applied and every lock is released,
+        // the trunk's WAL write lock included; the branch is handed out only once its records are
+        // durable.
+        let forked = forked.and_then(|(id, wal, lsn)| {
+            store.wait_durable(lsn, store.sync_class()).map(|()| (id, wal))
+        });
         let held = store::take_counted_hold();
         let (id, wal) = forked?;
         store.record_fork(held, wal);
@@ -932,7 +946,10 @@ impl Connection {
     /// The trunk's first live child is forked under the WAL write lock instead: a writer that saw no
     /// child captured no pre-images, so no child may appear before its commit. So is a fork that
     /// lost to trunk commits on every lock-free attempt, so a stream of commits cannot starve it.
-    fn fork_trunk(self: &Arc<Connection>, pager: &Arc<Pager>) -> Result<(BranchId, store::WalHold)> {
+    fn fork_trunk(
+        self: &Arc<Connection>,
+        pager: &Arc<Pager>,
+    ) -> Result<(BranchId, store::WalHold, u64)> {
         const LOCK_FREE_ATTEMPTS: usize = 8;
         let store = &self.db.branches;
         for _ in 0..LOCK_FREE_ATTEMPTS {
@@ -945,7 +962,9 @@ impl Connection {
             let forked = self.fork_trunk_registered(pager, Some(seen));
             pager.end_read_tx();
             match forked? {
-                store::TrunkFork::Forked(id) => return Ok((id, store::WalHold::default())),
+                store::TrunkFork::Forked { id, lsn } => {
+                    return Ok((id, store::WalHold::default(), lsn))
+                }
                 store::TrunkFork::Retry => continue,
                 store::TrunkFork::NeedsWriterLock => break,
             }
@@ -958,7 +977,7 @@ impl Connection {
     fn fork_trunk_locked(
         self: &Arc<Connection>,
         pager: &Arc<Pager>,
-    ) -> Result<(BranchId, store::WalHold)> {
+    ) -> Result<(BranchId, store::WalHold, u64)> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
         loop {
@@ -988,7 +1007,7 @@ impl Connection {
             };
             pager.end_read_tx();
             return match forked? {
-                store::TrunkFork::Forked(id) => Ok((id, wal)),
+                store::TrunkFork::Forked { id, lsn } => Ok((id, wal, lsn)),
                 _ => Err(LimboError::InternalError(
                     "a trunk fork under the WAL write lock was not registered".to_string(),
                 )),
