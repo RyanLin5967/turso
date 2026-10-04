@@ -1540,6 +1540,9 @@ pub struct Pager {
     /// How far the branch journal was on the device when this commit issued its WAL F_FULLFSYNC
     /// (`BranchStore::order_riders`): durable once that flush returns (lead review 1 item 6).
     trunk_sync_frontier: AtomicU64,
+    /// What this commit's barrier must make durable, fixed at its decisions
+    /// (`BranchStore::begin_trunk_commit`; lead review 1 item 10).
+    trunk_required: AtomicU64,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1833,6 +1836,7 @@ impl Pager {
             trunk_pre_images: Mutex::new(HashMap::new()),
             trunk_gate_open: AtomicBool::new(false),
             trunk_sync_frontier: AtomicU64::new(0),
+            trunk_required: AtomicU64::new(0),
         })
     }
 
@@ -4576,7 +4580,17 @@ impl Pager {
         // taken now, against the trunk's epoch now, from the pre-images captured at first write, and
         // the commit gate opened until the frames are published (F-L on the durable store).
         if let Some(store) = self.branch_store.get() {
-            if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
+            // A trunk with no live child, now or at any page's first write (the first child needs
+            // this commit's WAL write lock), takes no copy decision and opens no gate (lead review
+            // 1 item 10); its barrier still covers every early-released Release. Mutant
+            // `childless_commit_gated` (test builds only).
+            let childless = !self.trunk_gate_open.load(Ordering::Acquire)
+                && !store.trunk_has_children()
+                && self.trunk_pre_images.lock().is_empty()
+                && !crate::branch::store::fe_mutant("childless_commit_gated");
+            if childless {
+                self.trunk_required.store(store.release_floor(), Ordering::Release);
+            } else if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
                 let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
                 let decided = {
                     let dirty = self.dirty_pages.read();
@@ -4586,6 +4600,9 @@ impl Pager {
                             .map(|page| (page, captured.get(&page).map(|bytes| &bytes[..]))),
                     )
                 };
+                if let Ok(required) = decided {
+                    self.trunk_required.store(required, Ordering::Release);
+                }
                 if let Err(e) = decided {
                     // fastest-engine mutant `decision_retry_skips` (test builds only): as before
                     // review A-F2, the latch stays set and the retry takes no decision.
@@ -4610,10 +4627,10 @@ impl Pager {
         // durable before the commit that overwrites its page can be, or a crash after this commit
         // leaves the branch reading the NEW page. Idempotent across IO re-entry.
         if let Some(store) = self.branch_store.get() {
-            store.durability_barrier(crate::branch::SyncClass::of_trunk(
-                sync_mode,
-                self.get_sync_type(),
-            ))?;
+            store.durability_barrier_to(
+                crate::branch::SyncClass::of_trunk(sync_mode, self.get_sync_type()),
+                self.trunk_required.load(Ordering::Acquire),
+            )?;
         }
 
         let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);

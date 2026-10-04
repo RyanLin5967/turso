@@ -309,6 +309,10 @@ pub(crate) struct BranchStore {
     trunk_same_device: AtomicBool,
     /// Trunk commit barriers that took the store mutex (observation only; lead review 1 item 10).
     barrier_locks: AtomicU64,
+    /// The log sequence number that makes the newest early-released Release durable: every trunk
+    /// commit's barrier covers it, since a commit retains nothing for a child released before its
+    /// decisions (gc3's N1; lead review 1 item 10).
+    last_release_lsn: AtomicU64,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -350,6 +354,9 @@ pub(crate) struct BranchStore {
 pub(crate) struct Group {
     state: std::sync::Mutex<GroupState>,
     cv: std::sync::Condvar,
+    /// `GroupState::durable`, readable without the group's lock (lead review 1 item 10): written
+    /// under it, after the state, by `set_durable`.
+    durable_now: [AtomicU64; 3],
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
 }
@@ -396,8 +403,15 @@ impl Group {
                 ..GroupState::default()
             }),
             cv: std::sync::Condvar::new(),
+            durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
             failed,
         }
+    }
+
+    /// Every journal byte below `end` is durable in class index `c` (called holding the lock, `g`).
+    fn set_durable(&self, g: &mut GroupState, c: usize, end: u64) {
+        g.durable[c] = g.durable[c].max(end);
+        self.durable_now[c].fetch_max(end, Ordering::AcqRel);
     }
 
     /// A flight failed, or could not be taken: nothing more becomes durable in this process, and
@@ -437,7 +451,7 @@ impl Group {
         g.flushing = false;
         if ok {
             for c in 0..=class_index(class) {
-                g.durable[c] = g.durable[c].max(end);
+                self.set_durable(&mut g, c, end);
             }
         } else {
             self.failed.store(true, Ordering::Release);
@@ -446,7 +460,7 @@ impl Group {
     }
 
     fn durable(&self, class: SyncClass) -> u64 {
-        self.lock().durable[class_index(class)]
+        self.durable_now[class_index(class)].load(Ordering::Acquire)
     }
 
     /// An ordered flight's outcome (`BranchStore::order_for_trunk`): on success every byte below
@@ -455,7 +469,7 @@ impl Group {
         let mut g = self.lock();
         g.flushing = false;
         if ok {
-            g.durable[0] = g.durable[0].max(end);
+            self.set_durable(&mut g, 0, end);
             g.ordered = g.ordered.max(end);
         } else {
             self.failed.store(true, Ordering::Release);
@@ -470,7 +484,7 @@ impl Group {
     fn mark_durable(&self, end: u64, class: SyncClass) {
         let mut g = self.lock();
         for c in 0..=class_index(class) {
-            g.durable[c] = g.durable[c].max(end);
+            self.set_durable(&mut g, c, end);
         }
         self.cv.notify_all();
     }
@@ -2295,6 +2309,7 @@ impl BranchStore {
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
             barrier_locks: AtomicU64::new(0),
+            last_release_lsn: AtomicU64::new(0),
         }
     }
 
@@ -2482,6 +2497,7 @@ impl BranchStore {
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
             barrier_locks: AtomicU64::new(0),
+            last_release_lsn: AtomicU64::new(0),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -3592,6 +3608,13 @@ impl BranchStore {
         // be the first one.
         let mut schema = Some(schema);
         let mut after = None;
+        // A fork under the WAL write lock moves the gate's count (lead review 1 item 10): a commit
+        // made while the trunk had no child opened no gate, so a lock-free fork whose snapshot
+        // predates it learns of it here — it registers only once this child exists. Mutant
+        // `no_locked_fork_bump` (test builds only).
+        if seen.is_none() && !fe_mutant("no_locked_fork_bump") {
+            self.trunk_commits.fetch_add(2, Ordering::AcqRel);
+        }
         if let Some(seen) = seen {
             if inner.trunk.lineage.n_children == 0 {
                 return Ok(TrunkFork::NeedsWriterLock);
@@ -3874,6 +3897,7 @@ impl BranchStore {
                 )));
             }
         };
+        self.last_release_lsn.fetch_max(lsn, Ordering::AcqRel);
         let mut freed = Vec::new();
         let spliced = match inner.apply_release(id, &mut freed) {
             Ok(spliced) => spliced,
@@ -4183,7 +4207,7 @@ impl BranchStore {
     pub(crate) fn begin_trunk_commit<'p>(
         &self,
         pages: impl IntoIterator<Item = (u32, Option<&'p [u8]>)>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         // The second fence of a trunk-only store, behind the connection's read-only check: this
         // write would retain no pre-image for the branches on disk.
         self.refuse_if_trunk_only("a trunk page write")?;
@@ -4194,18 +4218,37 @@ impl BranchStore {
         inner.work.trunk_commits_decided += 1;
         let epoch = inner.trunk.lineage.epoch;
         inner.trunk_commit_epoch = epoch;
+        let retained_before = inner.work.trunk_pre_images_retained;
         let decided = self.decide_trunk_pages(&mut inner, pages, epoch);
+        // What must be durable before the commit's first frame (lead review 1 item 10), fixed here
+        // so a re-entry of the commit never waits for, or fails on, records buffered after it: its
+        // own pre-images, and every early-released Release (it retained nothing for those
+        // children). Mutant `barrier_own_only`: the Releases left out.
+        let retained_end = if inner.work.trunk_pre_images_retained > retained_before {
+            inner.journal.as_ref().map_or(0, Journal::lsn)
+        } else {
+            0
+        };
         drop(inner);
-        if decided.is_err() {
+        if let Err(e) = decided {
             // Refused part-way: the gate closes, and the pager takes the whole pass again
             // (`Pager::commit_wal`; review A-F2).
             self.end_trunk_commit();
-            return decided;
+            return Err(e);
         }
         kill_point("trunk.decided");
         #[cfg(test)]
         pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_DECIDED);
-        Ok(())
+        Ok(retained_end.max(self.release_floor()))
+    }
+
+    /// What a trunk commit that took no copy decision — its trunk had no live child — must still
+    /// make durable before its first frame: every early-released Release (gc3's N1).
+    pub(crate) fn release_floor(&self) -> u64 {
+        if fe_mutant("barrier_own_only") {
+            return 0;
+        }
+        self.last_release_lsn.load(Ordering::Acquire)
     }
 
     /// `begin_trunk_commit`'s decisions, one per page the commit writes, at `epoch`.
@@ -4270,7 +4313,7 @@ impl BranchStore {
     pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) -> Result<()> {
         let decided = self.begin_trunk_commit([(page, Some(pre_image))]);
         self.end_trunk_commit();
-        decided
+        decided.map(|_| ())
     }
 
     /// One captured page's decision at `epoch` (see `begin_trunk_commit`): if a live child forked
@@ -4347,15 +4390,31 @@ impl BranchStore {
         Ok(())
     }
 
-    /// Make every buffered trunk pre-image durable. `Pager::commit_wal` calls this before it writes
-    /// a single frame, so a trunk commit is never durable ahead of the pre-images it overwrote.
-    /// `trunk` is the class the commit will sync its WAL in: when it is stronger than the store's,
+    /// The barrier as the store's model tests drive it, with no pager: everything buffered so far.
+    #[cfg(test)]
+    pub(crate) fn durability_barrier(&self, trunk: SyncClass) -> Result<()> {
+        let required = self.inner.lock().journal.as_ref().map_or(0, Journal::lsn);
+        self.durability_barrier_to(trunk, required)
+    }
+
+    /// Make what a trunk commit relies on durable (`required`, from `begin_trunk_commit`).
+    /// `Pager::commit_wal` calls this before it writes a single frame, so a trunk commit is never
+    /// durable ahead of the pre-images it overwrote. A commit with nothing to make durable and no
+    /// stamp due returns at once, taking no lock. `trunk` is the class the commit will sync its WAL in: when it is stronger than the store's,
     /// the pre-images are flushed in it, so the commit is never MORE durable than they are (a D1
     /// store under a `PRAGMA fullfsync` trunk connection; see [`SyncClass`]).
     ///
     /// While a lease is outstanding it also stamps the lease clock, at most once per
     /// `STAMP_EVERY_MS` (review N2), and flushes a stamp still only queued.
-    pub(crate) fn durability_barrier(&self, trunk: SyncClass) -> Result<()> {
+    pub(crate) fn durability_barrier_to(&self, trunk: SyncClass, required: u64) -> Result<()> {
+        // Nothing to make durable, no stamp to write: no lock at all (lead review 1 item 10).
+        let class = self.class.max(trunk);
+        if !self.unsynced.load(Ordering::Acquire)
+            && !self.leases_outstanding.load(Ordering::Acquire)
+            && self.group.durable(class) >= required
+        {
+            return Ok(());
+        }
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
@@ -4383,21 +4442,8 @@ impl BranchStore {
                     .to_string(),
             ));
         }
-        let class = journal.sync_class().max(trunk);
-        // What must be durable before the commit's first frame: every record buffered before its
-        // decisions — its own pre-images, and any early-released operation's, such as the Release
-        // of a trunk child this commit therefore retained nothing for (gc3's N1).
-        let required = if fe_mutant("barrier_own_only") {
-            // Mutant: the barrier makes durable only this commit's own pre-images (the store before
-            // group commit), not an early-released operation still in flight.
-            if unsynced {
-                journal.lsn()
-            } else {
-                self.group.durable(SyncClass::Off)
-            }
-        } else {
-            journal.lsn()
-        };
+        // What must be durable before the commit's first frame was fixed at its decisions
+        // (`begin_trunk_commit`): its own pre-images, and every early-released Release.
         let mut target = required;
         let mut stamp_due = false;
         if leases_exist && !journal.is_poisoned() {
@@ -4577,7 +4623,7 @@ impl BranchStore {
         }
         let mut g = self.group.lock();
         for c in 0..=class_index(SyncClass::FullFsync) {
-            g.durable[c] = g.durable[c].max(frontier);
+            self.group.set_durable(&mut g, c, frontier);
         }
         if g.pending_full.is_some_and(|p| p <= frontier) {
             g.pending_full = None;
