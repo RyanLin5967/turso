@@ -5,7 +5,7 @@
 //!
 //!   fastest_profile --dir DIR [--class full|fsync|off|async] [--catalog] [--clients C]
 //!       [--ops N] [--warmup W] [--rows R] [--mode phases|cycle] [--out DIR]
-//!       [--perf-ctl CTL_FIFO,ACK_FIFO] [--mark]
+//!       [--perf-ctl CTL_FIFO,ACK_FIFO [--perf-only WINDOW]] [--mark]
 //!
 //! One op per client is the cycle: `trunk.create_branch(name)` (create), `db.connect_named(name)`
 //! (connect), one autocommit UPDATE of a random existing row of `t` (first write: it copies a
@@ -20,7 +20,8 @@
 //! Windows are fenced for outside instruments, each fence after every client has finished the
 //! previous phase and before any starts the next:
 //! * `--perf-ctl CTL,ACK`: perf's `--control fifo:CTL,ACK` with `--delay=-1`: counting is enabled
-//!   only over the measured windows (never over setup or warm-up), waiting for perf's ack.
+//!   only over the measured windows (never over setup or warm-up), waiting for perf's ack; with
+//!   `--perf-only W`, over window W alone (`create`, `connect`, `write`, `delete` or `cycle`).
 //! * `--mark`: a `write(-1, "FASTEST_PHASE <phase> begin|end")` (EBADF) at each fence, so a full
 //!   `strace -f` trace can be cut into windows exactly.
 //! The per-op phase functions are `#[no_mangle]` (`fastest_phase_create`, `_connect`, `_write`,
@@ -35,11 +36,14 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use turso_core::branch::{sync_counts, BranchDurability, SyncClass};
-use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
+use turso_core::{
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, SqliteDialect, IO,
+};
 
 const PHASES: [&str; 4] = ["create", "connect", "write", "delete"];
 
@@ -61,6 +65,7 @@ struct Args {
     mode: Mode,
     out: Option<PathBuf>,
     perf_ctl: Option<(String, String)>,
+    perf_only: Option<String>,
     mark: bool,
 }
 
@@ -82,6 +87,7 @@ fn parse_args() -> Args {
         mode: Mode::Phases,
         out: None,
         perf_ctl: None,
+        perf_only: None,
         mark: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -130,6 +136,7 @@ fn parse_args() -> Args {
                 let (c, k) = v.split_once(',').unwrap_or_else(|| not_a_result("--perf-ctl CTL,ACK"));
                 a.perf_ctl = Some((c.to_string(), k.to_string()));
             }
+            "--perf-only" => a.perf_only = Some(val(&mut i)),
             "--mark" => a.mark = true,
             x => not_a_result(&format!("unknown argument {x}")),
         }
@@ -141,6 +148,12 @@ fn parse_args() -> Args {
     if a.dir.exists() {
         not_a_result(&format!("{} exists: every run starts from a fresh directory", a.dir.display()));
     }
+    if let Some(w) = &a.perf_only {
+        let known = PHASES.contains(&w.as_str()) || w == "cycle";
+        if a.perf_ctl.is_none() || !known {
+            not_a_result(&format!("--perf-only {w}: needs --perf-ctl and a window name"));
+        }
+    }
     if a.clients == 0 || a.ops == 0 || a.rows < 1 {
         not_a_result("--clients, --ops and --rows must be at least 1");
     }
@@ -150,6 +163,7 @@ fn parse_args() -> Args {
 /// Fences for outside instruments: perf's control FIFO and strace-visible markers.
 struct Fence {
     perf: Option<(std::fs::File, std::fs::File)>,
+    perf_only: Option<String>,
     mark: bool,
 }
 
@@ -163,7 +177,7 @@ impl Fence {
             let k = std::fs::File::open(ack).unwrap_or_else(|e| not_a_result(&format!("perf ack fifo {ack}: {e}")));
             (c, k)
         });
-        Fence { perf, mark: a.mark }
+        Fence { perf, perf_only: a.perf_only.clone(), mark: a.mark }
     }
 
     fn perf(&mut self, cmd: &str) {
@@ -186,13 +200,21 @@ impl Fence {
         }
     }
 
+    fn counts(&self, window: &str) -> bool {
+        self.perf_only.as_deref().is_none_or(|w| w == window)
+    }
+
     fn begin(&mut self, window: &str) {
         self.marker(&format!("FASTEST_PHASE {window} begin"));
-        self.perf("enable");
+        if self.counts(window) {
+            self.perf("enable");
+        }
     }
 
     fn end(&mut self, window: &str) {
-        self.perf("disable");
+        if self.counts(window) {
+            self.perf("disable");
+        }
         self.marker(&format!("FASTEST_PHASE {window} end"));
     }
 }
@@ -226,34 +248,50 @@ impl Rng {
     }
 }
 
+/// Busy/SchemaUpdated retries per phase, over the whole run (warm-up included; the windows'
+/// deltas are reported). A client retries them as the engine's own C0 harness does (`retrying`
+/// in crash_tests.rs), inside the operation's timing (PREREG: client retries are inside one
+/// operation's latency), and gives up at 30 s (PREREG: a failed operation).
+static RETRIES: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn retry<T>(phase: usize, what: &str, mut f: impl FnMut() -> turso_core::Result<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match f() {
+            Ok(v) => return v,
+            Err(LimboError::Busy | LimboError::BusySnapshot | LimboError::SchemaUpdated) if Instant::now() < deadline => {
+                RETRIES[phase].fetch_add(1, Ordering::Relaxed);
+                std::thread::yield_now();
+            }
+            Err(e) => not_a_result(&format!("{what}: {e}")),
+        }
+    }
+}
+
 #[no_mangle]
 #[inline(never)]
 pub fn fastest_phase_create(trunk: &Arc<Connection>, name: &str) {
-    if let Err(e) = trunk.create_branch(name) {
-        not_a_result(&format!("create {name}: {e}"));
-    }
+    retry(0, &format!("create {name}"), || trunk.create_branch(name));
 }
 
 #[no_mangle]
 #[inline(never)]
 pub fn fastest_phase_connect(db: &Arc<Database>, name: &str) -> Arc<Connection> {
-    db.connect_named(name).unwrap_or_else(|e| not_a_result(&format!("connect {name}: {e}")))
+    retry(1, &format!("connect {name}"), || db.connect_named(name))
 }
 
 #[no_mangle]
 #[inline(never)]
 pub fn fastest_phase_write(conn: &Arc<Connection>, id: i64, name: &str) {
-    if let Err(e) = conn.execute(format!("UPDATE t SET v = 'w-{name}' WHERE id = {id}")) {
-        not_a_result(&format!("first write on {name}: {e}"));
-    }
+    retry(2, &format!("first write on {name}"), || {
+        conn.execute(format!("UPDATE t SET v = 'w-{name}' WHERE id = {id}"))
+    });
 }
 
 #[no_mangle]
 #[inline(never)]
 pub fn fastest_phase_delete(db: &Arc<Database>, name: &str) {
-    if let Err(e) = db.drop_branch(name) {
-        not_a_result(&format!("delete {name}: {e}"));
-    }
+    retry(3, &format!("delete {name}"), || db.drop_branch(name));
 }
 
 /// One client thread's run: its own trunk connection (connections stay on the thread that made
@@ -376,7 +414,9 @@ fn main() {
         Mode::Cycle => vec!["cycle"],
     };
     let gate = Barrier::new(a.clients + 1);
-    let mut windows: Vec<(String, f64, u64, u64)> = Vec::new(); // (window, secs, fsync, full_fsync)
+    // (window, secs, fsync, full_fsync, busy retries in the window, all phases)
+    let mut windows: Vec<(String, f64, u64, u64, u64)> = Vec::new();
+    let retries = || RETRIES.iter().map(|r| r.load(Ordering::Relaxed)).sum::<u64>();
     let per_client: Vec<[Vec<u64>; 4]> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..a.clients)
             .map(|id| {
@@ -390,6 +430,7 @@ fn main() {
         fence.marker("FASTEST_PHASE warmup end");
         for w in &windows_wanted {
             let s0 = sync_counts();
+            let r0 = retries();
             fence.begin(w);
             let t = Instant::now();
             gate.wait(); // every client starts the window
@@ -397,7 +438,7 @@ fn main() {
             let secs = t.elapsed().as_secs_f64();
             fence.end(w);
             let s1 = sync_counts();
-            windows.push((w.to_string(), secs, s1.fsync - s0.fsync, s1.full_fsync - s0.full_fsync));
+            windows.push((w.to_string(), secs, s1.fsync - s0.fsync, s1.full_fsync - s0.full_fsync, retries() - r0));
         }
         handles
             .into_iter()
@@ -428,9 +469,9 @@ fn main() {
         a.rows,
         if a.mode == Mode::Phases { "phases" } else { "cycle" }
     );
-    for (k, (name, secs, fs, ffs)) in windows.iter().enumerate() {
+    for (k, (name, secs, fs, ffs, busy)) in windows.iter().enumerate() {
         json.push_str(&format!(
-            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_fsync\":{fs},\"engine_full_fsync\":{ffs},\"ops\":{ops_total}}}",
+            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_fsync\":{fs},\"engine_full_fsync\":{ffs},\"busy_retries\":{busy},\"ops\":{ops_total}}}",
             if k > 0 { "," } else { "" }
         ));
     }
