@@ -760,7 +760,12 @@ fn decode_ops(words: &[&str]) -> Vec<Op> {
 
 fn c1_opts() -> DatabaseOpts {
     let catalog = std::env::var("FE_C1_CATALOG").is_ok_and(|v| v == "1");
-    opts(catalog, env_class_named("FE_C1_CLASS"))
+    let opts = opts(catalog, env_class_named("FE_C1_CLASS"));
+    // E3's database gives every fork a lease, which a named branch must not take (E3 a).
+    if std::env::var_os("FE_E3_CHILD").is_some() {
+        return opts.with_branch_lease(Some(std::time::Duration::from_secs(1)));
+    }
+    opts
 }
 
 fn env_class_named(var: &str) -> SyncClass {
@@ -1282,4 +1287,119 @@ fn c1_sigkill_at_aimed_points() {
     println!("{summary}");
     assert!(violations.is_empty(), "{summary}\n{}", violations.join("\n"));
     assert!(landed > 0, "{summary}: no kill landed where it was aimed");
+}
+
+// ---- E3: create, kill -9, restart, connect by name from a new process (PREREG M1 exit 5) ----
+
+/// The E3 child: create the named branch `FE_E3_NAME` from the trunk, write one row on it, record
+/// the acknowledgement, and SIGKILL itself (no destructor, flush or clean close runs).
+#[test]
+fn e3_child() {
+    let Ok(path) = std::env::var("FE_E3_CHILD") else {
+        return;
+    };
+    let name = std::env::var("FE_E3_NAME").unwrap();
+    let db = open_at(Path::new(&path), c1_opts());
+    let trunk = db.connect().unwrap();
+    trunk.create_branch(&name).unwrap();
+    let c = db.connect_named(&name).unwrap();
+    let row = 1 + (name.len() as i64 * 7 + name.bytes().map(i64::from).sum::<i64>()) % ROWS;
+    c.execute(sql(&Op::Set(row, name.replace('-', "")))).unwrap();
+    super::store::crash_log(&format!("E3A {name} {row}"));
+    // SAFETY: signals this process; nothing after it runs.
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGKILL);
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// E3 (M1 exit 5; amendment 54's create-kill-restart-connect half): `FE_E3_TRIALS` times (default
+/// 20; registered 1000), a child process creates a named branch, writes it, and is killed by
+/// SIGKILL; then THIS process — a different one — opens the database (a recovery) and connects to
+/// the new branch by name, and to up to ten older ones, each reading its write, none carrying a
+/// lease. Every trial must pass.
+#[test]
+fn e3_kill9_restart_connect_by_name() {
+    if std::env::var_os("FE_E3_CHILD").is_some() || std::env::var_os("FE_C1_CHILD").is_some() {
+        return;
+    }
+    let _s = serial();
+    let trials = env_u64("FE_E3_TRIALS", 20);
+    let exe = std::env::current_exe().unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("e3.db");
+    let log_path = dir.path().join("e3.log");
+    let catalog = std::env::var("FE_C1_CATALOG").is_ok_and(|v| v == "1");
+    let class = env_class_named("FE_C1_CLASS");
+    // Every fork gets a one-second lease; a named branch must take none (E3 a).
+    let opts = || opts(catalog, class).with_branch_lease(Some(std::time::Duration::from_secs(1)));
+    {
+        let db = open_at(&path, opts());
+        let trunk = db.connect().unwrap();
+        seed_trunk(&trunk);
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let mut rng = Rng(0xE3E3_E3E3 | 1);
+    let mut created: Vec<(String, i64)> = Vec::new();
+    let mut checks = 0u64;
+    for trial in 0..trials {
+        let name = format!("e3-{trial}");
+        let status = std::process::Command::new(&exe)
+            .args(["branch::crash_tests::e3_child", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_E3_CHILD", &path)
+            .env("FE_E3_NAME", &name)
+            .env("FE_CRASH_LOG", &log_path)
+            .env("FE_C1_CATALOG", if catalog { "1" } else { "0" })
+            .env("FE_C1_CLASS", std::env::var("FE_C1_CLASS").unwrap_or_default())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "trial {trial}: the child was not killed: {status:?}");
+        let acked = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let line = acked
+            .lines()
+            .find(|l| l.starts_with(&format!("E3A {name} ")))
+            .unwrap_or_else(|| panic!("trial {trial}: the child never acknowledged {name}"));
+        let row: i64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+        created.push((name.clone(), row));
+        // The restart, in this process: every check reads through a fresh open.
+        let db = open_at(&path, opts());
+        let mut sample = vec![created.len() - 1];
+        for _ in 0..10.min(created.len() - 1) {
+            sample.push(rng.below(created.len() as u64 - 1) as usize);
+        }
+        for i in sample {
+            let (name, row) = &created[i];
+            let c = db
+                .connect_named(name)
+                .unwrap_or_else(|e| panic!("trial {trial}: {name} is not connectable by name after kill -9: {e}"));
+            let got = read_state(&c).unwrap();
+            assert_eq!(
+                got.rows.get(row).map(String::as_str),
+                Some(name.replace('-', "").as_str()),
+                "trial {trial}: {name} lost its acknowledged write"
+            );
+            checks += 1;
+        }
+        // E3 (a): a server branch carries no lease, even after its restart, though every unnamed
+        // fork does (the setup's anchor is reaped by the first pass, which shows leases expire).
+        // The named branches' ids BEFORE the pass (a reaped one would free its name).
+        let named: BTreeSet<BranchId> = created
+            .iter()
+            .map(|(name, _)| db.branch_named(name).unwrap().expect("named"))
+            .collect();
+        db.branch_lease_clock_advance(std::time::Duration::from_secs(1 << 30));
+        let expired = db.expire_branches().unwrap();
+        for id in &expired.reaped {
+            assert!(!named.contains(id), "trial {trial}: an expiry pass reaped named branch {}", id.0);
+        }
+        if trial == 0 {
+            assert_eq!(expired.reaped.len(), 1, "premise: the leased anchor expires");
+        }
+    }
+    println!("E3 catalog={catalog} class={class:?} trials={trials} kills={trials} checks={checks} failures=0");
 }
