@@ -1538,3 +1538,57 @@ fn a_flight_that_fails_to_write_fail_stops_every_later_write() {
         let _ = y.into_id();
     }
 }
+
+// ---- lead review 1 item 1: one full flush per flight (the arena ordered by a barrier) ----
+
+/// Lead review 1 item 1: a D2 branch's first write is exactly ONE F_FULLFSYNC and no fsync(2). Its
+/// slots need only be ORDERED before the log record that names them (F_BARRIERFSYNC on Apple); the
+/// log's F_FULLFSYNC then drains the device's cache, slots included. Two full flushes (arena, then
+/// log) were the shape before.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_first_write_is_exactly_one_full_fsync() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("d2fw.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        let counted = syncs_of(|| write_v(&bc, 3, "mine"));
+        assert_eq!(counted, (0, 1), "catalog={catalog}: a D2 first write's (fsync, F_FULLFSYNC)");
+    }
+}
+
+/// Lead review 1 item 1 (V1 in-process, the CFW arm): `FE_V1_CREATES` (default 200) create-then-
+/// first-write pairs at C=1, D2, issue exactly 2.00 to 2.01 F_FULLFSYNC per pair (the create's one
+/// and the first write's one) and no fsync(2).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn v1_in_process_create_then_first_write_is_two_full_fsyncs_at_c1() {
+    let _s = serial();
+    let pairs = std::env::var("FE_V1_CREATES").ok().and_then(|v| v.parse().ok()).unwrap_or(200u64);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("v1cfw.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let counted = syncs_of(|| {
+            for i in 0..pairs {
+                let name = format!("cfw-{i}");
+                trunk.create_branch(&name).unwrap();
+                let c = db.connect_named(&name).unwrap();
+                write_v(&c, 1 + (i as i64 % 50), "cfw");
+            }
+        });
+        let per_pair = counted.1 as f64 / pairs as f64;
+        assert_eq!(counted.0, 0, "catalog={catalog}: fsync(2) issued during D2 CFW: {counted:?}");
+        assert!(
+            (2.0..=2.01).contains(&per_pair),
+            "catalog={catalog}: {} F_FULLFSYNC over {pairs} create+first-write pairs = {per_pair:.4} per pair",
+            counted.1
+        );
+    }
+}
