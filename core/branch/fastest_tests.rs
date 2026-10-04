@@ -1494,3 +1494,47 @@ fn an_empty_raw_wal_session_leaves_the_gate_closed_for_another_connection() {
         assert_eq!(read_wide(&c, 3), "trunk-3", "catalog={catalog}");
     }
 }
+
+/// Review B-F1's other door (a guard, green before the fix: the failed flight's leader poisoned the
+/// journal itself then): a flight that fails to WRITE fail-stops the whole store as one taken-and-
+/// failed does — no later commit writes an arena slot, and the close of the branch whose release it
+/// carried frees nothing. Mutant `split_fail_stop` must fail it.
+#[test]
+fn a_flight_that_fails_to_write_fail_stops_every_later_write() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("write-fail.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let x = trunk.fork_branch().unwrap();
+        let xc = x.connect().unwrap();
+        write_v(&xc, 3, "x");
+        let y = trunk.fork_branch().unwrap();
+        let yc = y.connect().unwrap();
+        write_v(&yc, 4, "y");
+        let owned = x.owned_slots();
+        assert!(!owned.is_empty(), "premise: the branch owns a slot");
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(x.reap().is_err(), "catalog={catalog}: premise: the release's flight failed");
+        let arena = arena_path(&db);
+        let before = std::fs::read(&arena).unwrap();
+        assert!(
+            yc.execute("UPDATE t SET v = 'y2' WHERE id = 9").is_err(),
+            "catalog={catalog}: a branch committed after the store fail-stopped"
+        );
+        assert!(
+            std::fs::read(&arena).unwrap() == before,
+            "catalog={catalog}: an arena slot was written after the store fail-stopped"
+        );
+        drop(xc);
+        for slot in &owned {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "catalog={catalog}: slot {slot} was freed though its Release is not durable"
+            );
+        }
+        drop(yc);
+        let _ = y.into_id();
+    }
+}
