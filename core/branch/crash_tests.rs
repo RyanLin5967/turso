@@ -1160,7 +1160,8 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
             .env("FE_C1_CATALOG", if catalog { "1" } else { "0" })
             .env("FE_C1_CLASS", class_name)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            // The child's stderr is kept: a worker thread that panics dies silently otherwise.
+            .stderr(std::fs::File::create(dir.path().join("child.stderr")).unwrap());
         if recover_only {
             cmd.env("FE_C1_RECOVER_ONLY", "1");
         }
@@ -1205,6 +1206,14 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
         }
         what.push_str(&format!(" log={counts:?} first_err={first_err:?}"));
     }
+    // A panic in the child (a dead worker thread) is a harness or engine failure, never noise.
+    let stderr = std::fs::read_to_string(dir.path().join("child.stderr")).unwrap_or_default();
+    let child_panic = stderr
+        .lines()
+        .skip_while(|l| !l.contains("panicked"))
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" | ");
     if let Some(m) = recover_kill {
         // Phase 8: a second kill inside recovery's replay, then the parent's own recovery.
         let mut rec = spawn(format!("recover.replay:{m}"), true);
@@ -1212,7 +1221,10 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
         what.push_str(&format!(" + recover.replay:{m}"));
     }
     let db = open_at(&path, opts(catalog, class));
-    let bad = verify_c1(&db, &log, &base);
+    let mut bad = verify_c1(&db, &log, &base);
+    if !child_panic.is_empty() {
+        bad.push(format!("the child panicked: {child_panic}"));
+    }
     (landed, bad, what)
 }
 
