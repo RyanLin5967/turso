@@ -10,8 +10,9 @@
 #
 # One raw file per step, banked before anything reads it: <out>/<step>.txt, opening with a header
 # (binary sha256, TMPDIR and its fstype, env, command, start) and closing with "# end ... rc=N".
-# <out>/verdict.tsv gets one row per check: step, expected, got, PASS|FAIL. Exit 1 if any row is
-# FAIL, including a step that passed no test (a run that collected nothing has not passed).
+# <out>/verdict.tsv gets one row per check: step, expected, got, PASS|FAIL|INFO. Exit 1 if any row
+# is FAIL, including a step that passed no test (a run that collected nothing has not passed). INFO
+# rows are exploratory measurements and never decide the verdict.
 set -u
 bin=${1:?usage: run_gates.sh <test-binary> <out-dir> <core-dir>}
 out=${2:?out dir}
@@ -100,8 +101,10 @@ for s in $steps; do
       v=$(echo "$line" | sed -n 's/.*violations=\([0-9]*\).*/\1/p')
       got=CLEAN; [ "${v:-0}" -gt 0 ] && got=VIOLATIONS
       [ -z "$line" ] && got=NO-RESULT
-      [ "$got" = "$expect" ] && row "$label" "$expect" "$got :: ${line#C1 }" PASS \
-                             || row "$label" "$expect" "$got :: ${line#C1 }" FAIL
+      local pass=PASS fail=FAIL
+      [ -n "${FC_EXPLORE:-}" ] && { pass=INFO; fail=INFO; }
+      [ "$got" = "$expect" ] && row "$label" "$expect" "$got :: ${line#C1 }" $pass \
+                             || row "$label" "$expect" "$got :: ${line#C1 }" $fail
     }
     fc c1fc-mc-ack_before_pwrite VIOLATIONS FE_MUTANT=ack_before_pwrite FE_C1_TRIALS=$((6 * scale))
     fc c1fc-md-fork_without_parent VIOLATIONS FE_MUTANT=fork_without_parent FE_C1_TRIALS=$((6 * scale))
@@ -109,6 +112,13 @@ for s in $steps; do
     fc c1fc-d0-control VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=off FE_C1_TRIALS=$((20 * scale))
     fc c1fc-ma-no_flight_sync VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=no_flight_sync FE_C1_TRIALS=$((6 * scale))
     fc c1fc-mb-ack_before_sync VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=5 FE_C1_TRIALS=$((6 * scale))
+    # Linux arm (run 37174637886: at 5 ms the registered row caught 0-13 violations against 68 on the
+    # Mac, and missed on x86_64 XFS): the same mutant killed with no delay, a gating row; and 1 and
+    # 2 ms, exploratory rows (INFO: recorded, never a verdict) that show how the catch varies with
+    # the delay on a sub-millisecond fsync.
+    fc c1fc-mb-ack_before_sync-delay0 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=0 FE_C1_TRIALS=$((6 * scale))
+    FC_EXPLORE=1 fc c1fc-mb-ack_before_sync-delay1 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=1 FE_C1_TRIALS=$((6 * scale))
+    FC_EXPLORE=1 fc c1fc-mb-ack_before_sync-delay2 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=2 FE_C1_TRIALS=$((6 * scale))
     fc c1fc-catalog CLEAN FE_C1_CATALOG=1 FE_C1_TRIALS=$((18 * scale))
     fc c1fc-recover-kill CLEAN FE_C1_RECOVER_KILL=1 FE_C1_TRIALS=$((9 * scale)) ;;
   e3)
