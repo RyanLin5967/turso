@@ -1192,6 +1192,19 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
     let log = parse_c1_log(&text, &base);
     let landed = !unaimed && log.killed_at.is_some();
     let mut what = format!("{point}:{n}{}", if unaimed { " (unaimed)" } else { "" });
+    if unaimed {
+        // What the child did instead, for the report (a point it never reached).
+        let mut counts: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut first_err = None;
+        for line in text.lines() {
+            let tag = line.split(' ').next().unwrap_or("");
+            *counts.entry(tag).or_default() += 1;
+            if tag == "ERR" && first_err.is_none() {
+                first_err = Some(line.to_string());
+            }
+        }
+        what.push_str(&format!(" log={counts:?} first_err={first_err:?}"));
+    }
     if let Some(m) = recover_kill {
         // Phase 8: a second kill inside recovery's replay, then the parent's own recovery.
         let mut rec = spawn(format!("recover.replay:{m}"), true);
@@ -1239,6 +1252,9 @@ fn c1_sigkill_at_aimed_points() {
         } else {
             unaimed += 1;
             e.1 += 1;
+        }
+        if !hit {
+            println!("C1 trial {trial} unaimed: {what}");
         }
         for b in bad {
             violations.push(format!("trial {trial} [{what}]: {b}"));
