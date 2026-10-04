@@ -22,15 +22,17 @@ on:
     branches: [fastest-branching]
     paths:
       - "core/**"
+      - "!core/examples/fastest_profile/**"
       - "Cargo.lock"
       - "fastest/linux/gates/**"
       - "fastest/linux/hw/**"
       - "fastest/linux/fs/**"
       - ".github/workflows/fastest-gates.yml"
 
+# A gates run is evidence: a newer push queues behind an in-flight run and never cancels it.
 concurrency:
   group: fastest-gates-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
