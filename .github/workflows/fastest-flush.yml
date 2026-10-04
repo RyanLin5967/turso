@@ -1,0 +1,90 @@
+name: fastest-flush
+# Lane fastest-linux-flush: build the V1 Linux flush counter (LD_PRELOAD shim fastest/linux/flush/syncshim.so, with
+# v1run and v1ctl) and fire-check it on ubuntu x86_64 and arm64, on the runner's own ext4 (no reflink: every clone op
+# must fail and still be counted) and on an XFS loop (reflink=1: clone ops succeed). The kernel-side witness in the
+# raw-syscall, Go and sqlite arms is lane fastest-linux-comp's strace counter (trace.sh + stracecount.py), fetched by
+# the pinned sha below, never copied or re-implemented here. Counts only: nothing here is timed or credited.
+# Raw output (build, every probe's output, every report, strace traces, verdict.json) is uploaded per job.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fastest-branching, fastest-linux-flush]
+    paths:
+      - "fastest/linux/flush/**"
+      - "fastest/linux/fs/**"
+      - ".github/workflows/fastest-flush.yml"
+
+concurrency:
+  group: fastest-flush-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # fork branch fastest-linux-comp a9978d381: its strace fire-check passed in run 37175962413. (6e0533b08 changes
+  # stracecount.py only in attach mode, which this workflow does not use, and is not on the fork.)
+  STRACE_TOOLS_SHA: a9978d381331d6e2bfa2cc38e6f92ad6d79064b3
+
+jobs:
+  firecheck:
+    name: fire-check (${{ matrix.runner }}, ${{ matrix.fs }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        fs: [ext4, xfs]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      RAW: ${{ github.workspace }}/fastest-raw
+      MNT: /mnt/fastest-flush-${{ matrix.fs }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: fastest/linux/flush/probe_go/go.sum
+      - name: Packages (strace, XFS tools, the system libsqlite3, file)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q strace xfsprogs libsqlite3-0 file
+      - name: Run info
+        run: |
+          mkdir -p "$RAW"
+          { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }}";
+            echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
+            uname -a; ldd --version | head -1; gcc --version | head -1; go version; strace -V | head -1;
+            echo "ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null)"; df -hT / /mnt /dev/shm; } \
+            | tee "$RAW/run-info.txt"
+      - name: Strace counter (lane fastest-linux-comp, pinned by sha)
+        run: |
+          git fetch --no-tags --depth=1 origin "$STRACE_TOOLS_SHA"
+          mkdir -p "$RUNNER_TEMP/strace-tools" "$RAW/strace-tools"
+          for f in trace.sh stracecount.py; do
+            git show "$STRACE_TOOLS_SHA:fastest/linux/competitors/$f" > "$RUNNER_TEMP/strace-tools/$f"
+            cp "$RUNNER_TEMP/strace-tools/$f" "$RAW/strace-tools/$f"
+          done
+          (cd "$RUNNER_TEMP/strace-tools" && sha256sum trace.sh stracecount.py) | tee "$RAW/strace-tools/sha256.txt"
+      - name: Build (shim, mutants, v1run, v1ctl, C and Go probes)
+        run: |
+          set -o pipefail
+          timeout 1200 bash fastest/linux/flush/build.sh "$RAW/build" 2>&1 | tee "$RAW/build.log"
+      - name: Filesystem under test
+        run: |
+          set -o pipefail
+          bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 4G 2>&1 | tee "$RAW/mkloop.txt"
+      - name: Fire-check
+        run: |
+          set -o pipefail
+          timeout 1800 python3 -B fastest/linux/flush/firecheck.py --build "$RAW/build" --work "$MNT/fc" \
+            --out "$RAW/firecheck" --fs ${{ matrix.fs }} --strace-tools "$RUNNER_TEMP/strace-tools" \
+            2>&1 | tee "$RAW/firecheck.log"
+      - name: Upload raw
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flush-firecheck-${{ matrix.runner }}-${{ matrix.fs }}
+          path: fastest-raw/
+          retention-days: 90

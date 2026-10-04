@@ -9,13 +9,11 @@
  * operation with v1_set_mark, so calls can be attributed per marked operation across processes.
  *
  * Every exec and posix_spawn the shim sees is written to an EXEC table; `v1ctl report` refuses when an exec'd
- * image never attached (a static binary, a Go binary built with CGO_ENABLED=0, a setuid binary, an envp without
- * LD_PRELOAD): that process was NOT counted, and a missing count must never read as zero.
+ * image never attached (a static binary, a CGO_ENABLED=0 Go build, a setuid binary, an envp without LD_PRELOAD):
+ * that process was NOT counted, and a missing count must never read as zero.
  *
- * v1_set_mark also issues one marker syscall, lseek(V1_MARK_FD, mark, SEEK_SET), which fails with EBADF and has
- * no other effect. The strace counter (v1strace.py) reads marks from it, so one client API marks both instruments.
- *
- * Clock: clock_gettime(CLOCK_MONOTONIC), system-wide, the clock the load generator must use.
+ * Clock: clock_gettime(CLOCK_MONOTONIC), system-wide; a load generator that wants to line events up with its own
+ * timestamps must use the same clock.
  */
 #ifndef SYNCSHIM_H
 #define SYNCSHIM_H
@@ -27,25 +25,23 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
-#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
 #define V1_MAGIC 0x31584e4c4e595356ULL /* "VSYNLNX1" little-endian */
-#define V1_VERSION 1u
+#define V1_VERSION 2u
 
-/* Kinds. Keep in step with V1_KIND_NAMES and with KINDS in v1strace.py / firecheck.py. */
+/* Kinds. Keep in step with V1_KIND_NAMES and with KINDS in firecheck.py. */
 enum {
     V1K_FSYNC = 0,           /* fsync() */
     V1K_FDATASYNC = 1,       /* fdatasync() */
     V1K_SFR_WRITE_WAIT = 2,  /* sync_file_range() with SYNC_FILE_RANGE_WRITE and SYNC_FILE_RANGE_WAIT_AFTER */
     V1K_SFR_WRITE = 3,       /* sync_file_range() with WRITE but not WAIT_AFTER: starts writeback, does not wait */
-    V1K_SFR_WAIT = 4,        /* sync_file_range() without WRITE: waits on writeback already in flight (or no-op) */
+    V1K_SFR_WAIT = 4,        /* sync_file_range() without WRITE: waits on writeback already in flight, or no-op */
     V1K_SYNCFS = 5,          /* syncfs() */
     V1K_SYNC = 6,            /* sync() */
     V1K_MSYNC_SYNC = 7,      /* msync() with MS_SYNC */
@@ -57,7 +53,7 @@ enum {
     V1K_COPY_FILE_RANGE = 13,/* clone op: copy_file_range() */
     V1K_NKINDS = 14
 };
-#define V1K_NSYNC 11 /* kinds below this are flushes; the rest are clone ops, never summed with flushes */
+#define V1K_NFLUSH 11 /* kinds below this are flush requests; the rest are clone ops, never summed with flushes */
 #define V1_KIND_SLOTS 16
 static const char *const V1_KIND_NAMES[V1K_NKINDS] = {
     "fsync", "fdatasync", "sfr_write_wait", "sfr_write", "sfr_wait", "syncfs", "sync", "msync_SYNC",
@@ -70,8 +66,6 @@ static const char *const V1_KIND_NAMES[V1K_NKINDS] = {
 /* Marks: the client stores op ids here. V1_MARK_IDLE is OR-ed in after an ack, so calls that land between
  * operations (background work) are attributed to "after op k", not to op k. */
 #define V1_MARK_IDLE (1ULL << 63)
-/* The strace marker: lseek on this (never valid) fd carries the mark as its offset. */
-#define V1_MARK_FD (-22065)
 
 /* Slot flags. */
 #define V1_SLOT_GO 1u /* the image is a Go binary: its syscalls are raw, this slot's counts are NOT its flushes */
@@ -87,8 +81,7 @@ typedef struct {
     int32_t ret;             /* 0, or -1 on failure */
     int16_t kind;            /* V1K_* + 1, stored last with release order; 0 = claimed, never completed */
     int16_t err;             /* errno when ret == -1, else 0 */
-    uint8_t via_syscall;     /* 1: came through the generic syscall(2) entry point */
-    uint8_t pad[7];
+    uint8_t pad[8];
 } v1_event; /* 64 bytes */
 
 typedef struct {
@@ -97,14 +90,14 @@ typedef struct {
     uint64_t count[V1_KIND_SLOTS];
     uint64_t fail[V1_KIND_SLOTS];
     uint64_t fd_untracked;    /* writes on fds >= V1_FD_BITS (the O_SYNC tracker cannot see them) */
-    uint64_t via_syscall;     /* counted calls that came through the generic syscall(2) entry point */
+    uint64_t unresolved;      /* bit i: the shim's real-function table entry i was not found by dlsym */
     uint32_t flags;           /* V1_SLOT_* */
     uint32_t pad0;
     char exe[128];
     uint8_t pad[512 - 8 - 8 - 2 * 8 * V1_KIND_SLOTS - 8 - 8 - 8 - 128];
 } v1_slot; /* 512 bytes */
 
-/* Exec records: one per execve-family call or successful posix_spawn the shim saw. */
+/* Exec records: one per exec-family call or successful posix_spawn the shim saw. */
 enum { V1X_PENDING = 1, V1X_FAILED = 2, V1X_SPAWNED = 3 };
 typedef struct {
     int32_t pid;              /* the pid that runs the new image (exec keeps the pid; posix_spawn: the child) */
@@ -116,6 +109,7 @@ typedef struct {
 } v1_exec; /* 128 bytes */
 static const char *const V1_EXEC_VIA[] = {"?", "execve", "execv", "execvp", "execvpe", "execl", "execle", "execlp",
                                           "fexecve", "execveat", "posix_spawn", "posix_spawnp"};
+#define V1_NVIA ((int)(sizeof V1_EXEC_VIA / sizeof *V1_EXEC_VIA))
 
 typedef struct {
     uint64_t magic;
@@ -131,9 +125,8 @@ typedef struct {
     volatile uint64_t slot_overflow;  /* claims refused for lack of a slot (their counts go to slot 0) */
     volatile uint64_t ev_next;        /* events claimed */
     volatile uint64_t ev_dropped;     /* events not stored because the log was full */
-    volatile uint64_t attach_errors;
     volatile uint64_t exec_next;      /* exec records claimed (> exec_cap means some were dropped) */
-    uint8_t pad[4096 - 8 - 8 - 8 - 8 - 8 - 8 - 8 - 7 * 8];
+    uint8_t pad[4096 - 7 * 8 - 6 * 8];
 } v1_hdr; /* 4096 bytes; then slots, then exec records, then events */
 
 _Static_assert(sizeof(v1_event) == 64, "v1_event");
@@ -182,8 +175,8 @@ static inline v1_hdr *v1_map(const char *run, const char **why) {
     close(fd);
     if (p == MAP_FAILED) { *why = "mmap failed"; return NULL; }
     v1_hdr *h = (v1_hdr *)p;
-    if (h->magic != V1_MAGIC || h->version != V1_VERSION || h->total_size != (uint64_t)st.st_size ||
-        v1_total_size(h->nslots, h->exec_cap, h->ev_cap) != h->total_size) {
+    if (__atomic_load_n(&h->magic, __ATOMIC_ACQUIRE) != V1_MAGIC || h->version != V1_VERSION ||
+        h->total_size != (uint64_t)st.st_size || v1_total_size(h->nslots, h->exec_cap, h->ev_cap) != h->total_size) {
         munmap(p, (size_t)st.st_size);
         *why = "bad magic/version/size";
         return NULL;
@@ -191,12 +184,13 @@ static inline v1_hdr *v1_map(const char *run, const char **why) {
     return h;
 }
 
-/* Set the run mark. h may be NULL (a client counted by strace only). The marker lseek is issued either way. */
-static inline void v1_set_mark(v1_hdr *h, uint64_t m) {
-    if (h) __atomic_store_n(&h->mark, m, __ATOMIC_SEQ_CST);
-    int e = errno;
-    (void)lseek(V1_MARK_FD, (off_t)m, SEEK_SET);
-    errno = e;
+/* Client API. v1_client() maps the run named by SYNCSHIM_RUN (set by v1run), or returns NULL when the variable is
+ * unset; a client that was launched under v1run and gets NULL here must refuse, not run unmarked. */
+static inline v1_hdr *v1_client(const char **why) {
+    const char *run = getenv("SYNCSHIM_RUN");
+    if (!run || !*run) { *why = "SYNCSHIM_RUN is unset"; return NULL; }
+    return v1_map(run, why);
 }
+static inline void v1_set_mark(v1_hdr *h, uint64_t m) { __atomic_store_n(&h->mark, m, __ATOMIC_SEQ_CST); }
 
 #endif

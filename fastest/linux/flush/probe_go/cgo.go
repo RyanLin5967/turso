@@ -5,7 +5,16 @@ package main
 // #include <unistd.h>
 import "C"
 
+import "fmt"
+
 // With CGO_ENABLED=1 this file makes probe_go a real cgo binary, dynamically linked against glibc, as Dolt and
-// Doltgres are: LD_PRELOAD then loads the shim into it, and the shim must still see none of Go's raw syscalls.
-// Without a cgo package the Go linker would emit a static binary even under CGO_ENABLED=1.
-func init() { cgoUsed = 1 + 0*int(C.getpid()) }
+// Doltgres are: LD_PRELOAD then loads the shim into it. cFsync calls glibc's fsync through cgo -- the one path from
+// Go code that the shim can see.
+const cgoBuild = true
+
+func cFsync(fd int) error {
+	if C.fsync(C.int(fd)) != 0 {
+		return fmt.Errorf("C.fsync(%d) failed", fd)
+	}
+	return nil
+}

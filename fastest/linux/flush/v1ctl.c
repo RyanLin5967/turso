@@ -6,27 +6,26 @@
  *   v1ctl bymark <run>                            completed events grouped by (slot, mark, kind), TSV
  *   v1ctl mark <run> <u64>                        set the run mark (scripts; the load generator uses the API)
  *   v1ctl rm <run>
- *   v1ctl consts                                  the constants v1strace.py decodes, from this build's headers (JSON)
  *
- * report exit codes -- a run that counted nothing has not passed, and a process that was not counted is never 0:
- *   0 ok
+ * report exit codes -- a run that counted nothing has not passed, and a process that was not counted is never 0.
+ * The first that applies wins:
  *   2 run missing or malformed
- *   3 no process attached
  *   4 the root pid recorded by v1run never attached (a static binary such as a CGO_ENABLED=0 Go build, a setuid
  *     binary, a non-glibc binary): NO COUNT for it
+ *   3 no process attached
+ *   5 VOID: slot overflow, exec-table overflow, or writes on fds the O_SYNC tracker cannot see (fd_untracked).
+ *     Per-process counts or the exec guard below cannot be trusted; not waived by --allow-incomplete.
  *   6 an image the shim saw being exec'd or posix_spawned never attached: NO COUNT for that process
  *   7 a Go binary attached: Go makes raw syscalls, so its counts are NOT its flushes (--allow-go returns 0 for a
  *     cross-check, where the miss is the point)
- *   5 incomplete: slot overflow, exec-table overflow, dropped or unfinished events (counts still printed;
- *     --allow-incomplete returns 0 for counts-only use)
+ *   5 INCOMPLETE: dropped or unfinished events. The counts are exact; per-mark attribution is not.
+ *     --allow-incomplete returns 0 for counts-only use.
  */
 #include "syncshim.h"
 #include <inttypes.h>
-#include <sched.h>
-#include <stdlib.h>
 
 static int usage(void) {
-    fprintf(stderr, "usage: v1ctl create|report|events|bymark|mark|rm <run> ... | v1ctl consts\n");
+    fprintf(stderr, "usage: v1ctl create|report|events|bymark|mark|rm <run> ...\n");
     return 2;
 }
 
@@ -49,13 +48,14 @@ static int cmd_create(const char *run, int argc, char **argv) {
     size_t sz = v1_total_size(nslots, exec_cap, ev_cap);
     if (ftruncate(fd, (off_t)sz) != 0) {
         fprintf(stderr, "v1ctl: ftruncate: %s\n", strerror(errno));
+        close(fd);
         shm_unlink(name);
         return 2;
     }
     v1_hdr *h = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (h == MAP_FAILED) { shm_unlink(name); return 2; }
-    /* tmpfs pages arrive zeroed; set the header last, magic last of all. */
+    /* tmpfs pages arrive zeroed; set the header, magic last of all. */
     h->version = V1_VERSION;
     h->hdr_size = sizeof(v1_hdr);
     h->total_size = sz;
@@ -103,7 +103,7 @@ static void json_counts(const uint64_t *c) {
     putchar('}');
 }
 
-/* Did the image an exec record names attach? A slot with that pid, attached after the record's time. */
+/* Did the image an exec record names attach? A slot with that pid, attached at or after the record's time. */
 static int exec_attached(v1_hdr *h, const v1_exec *x, uint64_t nslot) {
     v1_slot *sl = v1_slots(h);
     for (uint64_t i = 1; i <= nslot; i++)
@@ -131,7 +131,7 @@ static int cmd_report(const char *run, int argc, char **argv) {
     uint64_t exec_next = h->exec_next, exec_dropped = exec_next > h->exec_cap ? exec_next - h->exec_cap : 0;
     for (uint64_t i = 0; i < nev; i++)
         if (__atomic_load_n(&ev[i].kind, __ATOMIC_ACQUIRE) == 0) incomplete++;
-    uint64_t tot[V1K_NKINDS] = {0};
+    uint64_t tot[V1K_NKINDS] = {0}, fd_untracked = 0, unresolved = 0;
     int attached = 0, root_seen = 0, go_slots = 0;
     for (uint64_t i = 0; i <= nslot; i++) {
         if (i > 0 && __atomic_load_n(&sl[i].pid, __ATOMIC_ACQUIRE) == 0) continue;
@@ -139,6 +139,8 @@ static int cmd_report(const char *run, int argc, char **argv) {
         if (i > 0 && h->root_pid && sl[i].pid == h->root_pid) root_seen = 1;
         if (i > 0 && (sl[i].flags & V1_SLOT_GO)) go_slots++;
         for (int k = 0; k < V1K_NKINDS; k++) tot[k] += sl[i].count[k];
+        fd_untracked += sl[i].fd_untracked;
+        unresolved |= sl[i].unresolved;
     }
     uint64_t unattached = 0, unwritten = 0;
     for (uint64_t i = 0; i < nx; i++) {
@@ -155,40 +157,46 @@ static int cmd_report(const char *run, int argc, char **argv) {
     } else if (attached == 0) {
         rc = 3;
         verdict = "REFUSED: no process attached (nothing was counted)";
-    } else if (unattached) {
+    } else if (overflow || exec_dropped || fd_untracked) {
+        rc = 5;
+        verdict = "VOID: slot overflow, exec-table overflow or untracked fds; per-process counts and the exec guard "
+                  "cannot be trusted (totals printed, not waivable)";
+    } else if (unattached || unwritten) {
         rc = 6;
         verdict = "REFUSED: an exec'd or spawned image never attached (static/Go/setuid binary or LD_PRELOAD "
                   "dropped from its environment): NO COUNT for it";
     } else if (go_slots && !allow_go) {
         rc = 7;
-        verdict = "REFUSED: a Go binary attached; Go makes raw syscalls, so its counts are not its flushes (use "
-                  "v1strace.py)";
-    } else if ((overflow || dropped || incomplete || exec_dropped || unwritten) && !allow) {
+        verdict = "REFUSED: a Go binary attached; Go makes raw syscalls, so its counts are not its flushes (count it "
+                  "with the strace counter)";
+    } else if ((dropped || incomplete) && !allow) {
         rc = 5;
-        verdict = "INCOMPLETE: slot overflow, exec-table overflow, dropped or unfinished events";
+        verdict = "INCOMPLETE: dropped or unfinished events (counts exact, per-mark attribution not)";
     }
     if (json) {
-        printf("{\"instrument\":\"shim\",\"run\":");
+        printf("{\"instrument\":\"syncshim\",\"run\":");
         json_str(run);
         printf(",\"verdict\":");
         json_str(verdict);
         printf(",\"rc\":%d,\"root_pid\":%d,\"root_attached\":%s,\"attached\":%d,\"go_slots\":%d,\"slot_overflow\":%" PRIu64
                ",\"events_claimed\":%" PRIu64 ",\"events_dropped\":%" PRIu64 ",\"events_incomplete\":%" PRIu64
                ",\"execs_claimed\":%" PRIu64 ",\"execs_dropped\":%" PRIu64 ",\"execs_unwritten\":%" PRIu64
-               ",\"execs_unattached\":%" PRIu64 ",\"mark\":%" PRIu64 ",\"totals\":",
+               ",\"execs_unattached\":%" PRIu64 ",\"fd_untracked\":%" PRIu64 ",\"unresolved_mask\":%" PRIu64
+               ",\"mark\":%" PRIu64 ",\"totals\":",
                rc, h->root_pid, root_seen ? "true" : "false", attached, go_slots, overflow, h->ev_next, dropped,
-               incomplete, exec_next, exec_dropped, unwritten, unattached, h->mark);
+               incomplete, exec_next, exec_dropped, unwritten, unattached, fd_untracked, unresolved, h->mark);
         json_counts(tot);
         printf(",\"slots\":[");
         int first = 1;
         for (uint64_t i = 0; i <= nslot; i++) {
             if (i == 0 && !overflow) continue;
             if (i > 0 && sl[i].pid == 0) continue;
-            printf("%s{\"idx\":%" PRIu64 ",\"pid\":%d,\"ppid\":%d,\"go\":%s,\"exe\":", first ? "" : ",", i, sl[i].pid,
-                   sl[i].ppid, (sl[i].flags & V1_SLOT_GO) ? "true" : "false");
+            printf("%s{\"idx\":%" PRIu64 ",\"pid\":%d,\"ppid\":%d,\"go\":%s,\"attach_ns\":%" PRIu64 ",\"exe\":",
+                   first ? "" : ",", i, sl[i].pid, sl[i].ppid, (sl[i].flags & V1_SLOT_GO) ? "true" : "false",
+                   sl[i].attach_ns);
             json_str(i == 0 ? "(overflow)" : sl[i].exe);
-            printf(",\"fd_untracked\":%" PRIu64 ",\"via_syscall\":%" PRIu64 ",\"counts\":", sl[i].fd_untracked,
-                   sl[i].via_syscall);
+            printf(",\"fd_untracked\":%" PRIu64 ",\"unresolved_mask\":%" PRIu64 ",\"counts\":", sl[i].fd_untracked,
+                   sl[i].unresolved);
             json_counts(sl[i].count);
             printf(",\"fails\":");
             json_counts(sl[i].fail);
@@ -200,8 +208,7 @@ static int cmd_report(const char *run, int argc, char **argv) {
             int st = __atomic_load_n(&xs[i].state, __ATOMIC_ACQUIRE);
             int via = xs[i].via;
             printf("%s{\"pid\":%d,\"by_pid\":%d,\"state\":\"%s\",\"via\":\"%s\",\"attached\":%s,\"path\":", i ? "," : "",
-                   xs[i].pid, xs[i].by_pid, exec_state(st),
-                   (via > 0 && via < (int)(sizeof V1_EXEC_VIA / sizeof *V1_EXEC_VIA)) ? V1_EXEC_VIA[via] : "?",
+                   xs[i].pid, xs[i].by_pid, exec_state(st), (via > 0 && via < V1_NVIA) ? V1_EXEC_VIA[via] : "?",
                    (st == V1X_PENDING || st == V1X_SPAWNED) && exec_attached(h, &xs[i], nslot) ? "true" : "false");
             char p[sizeof xs[i].path + 1];
             memcpy(p, xs[i].path, sizeof xs[i].path);
@@ -213,9 +220,9 @@ static int cmd_report(const char *run, int argc, char **argv) {
     } else {
         printf("run %s: %s\n", run, verdict);
         printf("root_pid %d attached=%s procs=%d go=%d slot_overflow=%" PRIu64 " events=%" PRIu64 " dropped=%" PRIu64
-               " unfinished=%" PRIu64 " execs=%" PRIu64 " unattached=%" PRIu64 "\n",
+               " unfinished=%" PRIu64 " execs=%" PRIu64 " unattached=%" PRIu64 " fd_untracked=%" PRIu64 "\n",
                h->root_pid, root_seen ? "yes" : "no", attached, go_slots, overflow, h->ev_next, dropped, incomplete,
-               exec_next, unattached);
+               exec_next, unattached, fd_untracked);
         printf("%-6s %-7s %-7s", "slot", "pid", "ppid");
         for (int k = 0; k < V1K_NKINDS; k++) printf(" %s", V1_KIND_NAMES[k]);
         printf("  exe\n");
@@ -239,14 +246,13 @@ static int cmd_events(const char *run) {
     if (!h) return 2;
     v1_event *ev = v1_events(h);
     uint64_t n = stored_events(h);
-    printf("idx\tt0_ns\tt1_ns\tmark\tpid\ttid\tslot\tfd\tkind\taux\tret\terr\tvia_syscall\n");
+    printf("idx\tt0_ns\tt1_ns\tmark\tpid\ttid\tslot\tfd\tkind\taux\tret\terr\n");
     for (uint64_t i = 0; i < n; i++) {
         int k = __atomic_load_n(&ev[i].kind, __ATOMIC_ACQUIRE);
         if (k == 0) continue;
-        printf("%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%d\t%u\t%u\t%d\t%s\t%" PRId64 "\t%d\t%d\t%u\n", i,
+        printf("%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%d\t%u\t%u\t%d\t%s\t%" PRId64 "\t%d\t%d\n", i,
                ev[i].t0_ns, ev[i].t1_ns, ev[i].mark, ev[i].pid, ev[i].tid, ev[i].slot, ev[i].fd,
-               (k - 1) < V1K_NKINDS ? V1_KIND_NAMES[k - 1] : "?", ev[i].aux, ev[i].ret, ev[i].err,
-               (unsigned)ev[i].via_syscall);
+               (k - 1) < V1K_NKINDS ? V1_KIND_NAMES[k - 1] : "?", ev[i].aux, ev[i].ret, ev[i].err);
     }
     return h->ev_dropped ? 5 : 0;
 }
@@ -283,28 +289,7 @@ static int cmd_bymark(const char *run) {
     return h->ev_dropped ? 5 : 0;
 }
 
-#ifndef CLOSE_RANGE_UNSHARE
-#define CLOSE_RANGE_UNSHARE (-1)
-#endif
-#ifndef CLOSE_RANGE_CLOEXEC
-#define CLOSE_RANGE_CLOEXEC (-1)
-#endif
-static int cmd_consts(void) {
-    printf("{\"O_SYNC\":%d,\"O_DSYNC\":%d,\"O_CLOEXEC\":%d,\"FD_CLOEXEC\":%d,\"F_DUPFD\":%d,\"F_DUPFD_CLOEXEC\":%d,"
-           "\"F_SETFD\":%d,\"F_SETFL\":%d,\"F_GETFL\":%d,\"MS_SYNC\":%d,\"MS_ASYNC\":%d,\"MS_INVALIDATE\":%d,"
-           "\"SYNC_FILE_RANGE_WAIT_BEFORE\":%d,\"SYNC_FILE_RANGE_WRITE\":%d,\"SYNC_FILE_RANGE_WAIT_AFTER\":%d,"
-           "\"RWF_DSYNC\":%d,\"RWF_SYNC\":%d,\"FICLONE\":%lu,\"FICLONERANGE\":%lu,\"CLONE_VM\":%d,\"CLONE_FILES\":%d,"
-           "\"CLONE_VFORK\":%d,\"CLONE_THREAD\":%d,\"CLOSE_RANGE_UNSHARE\":%d,\"CLOSE_RANGE_CLOEXEC\":%d,"
-           "\"V1_MARK_FD\":%d,\"AT_FDCWD\":%d}\n",
-           O_SYNC, O_DSYNC, O_CLOEXEC, FD_CLOEXEC, F_DUPFD, F_DUPFD_CLOEXEC, F_SETFD, F_SETFL, F_GETFL, MS_SYNC,
-           MS_ASYNC, MS_INVALIDATE, SYNC_FILE_RANGE_WAIT_BEFORE, SYNC_FILE_RANGE_WRITE, SYNC_FILE_RANGE_WAIT_AFTER,
-           RWF_DSYNC, RWF_SYNC, V1_FICLONE, V1_FICLONERANGE, CLONE_VM, CLONE_FILES, CLONE_VFORK, CLONE_THREAD,
-           (int)CLOSE_RANGE_UNSHARE, (int)CLOSE_RANGE_CLOEXEC, V1_MARK_FD, AT_FDCWD);
-    return 0;
-}
-
 int main(int argc, char **argv) {
-    if (argc == 2 && !strcmp(argv[1], "consts")) return cmd_consts();
     if (argc < 3) return usage();
     const char *cmd = argv[1], *run = argv[2];
     if (!strcmp(cmd, "create")) return cmd_create(run, argc - 3, argv + 3);
