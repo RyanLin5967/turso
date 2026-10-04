@@ -933,6 +933,16 @@ impl Connection {
         }
         let pager = self.pager.load().clone();
         check_forkable(&self.db, &pager)?;
+        // fastest-engine E2 scope rule (PREREG v1 amendments 10-11): an attached database (a
+        // Postgres frontend's non-public schema is one) would not be branched with the fork.
+        let attached = self.attached_database_names();
+        if !attached.is_empty() {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot fork with attached databases ({}): they are not branched, so the branch \
+                 would not hold them; DETACH them first",
+                attached.join(", ")
+            )));
+        }
         let store = &self.db.branches;
         // fastest-engine item 5: this fork's store-mutex holds, counted from here.
         store::take_counted_hold();

@@ -3495,6 +3495,16 @@ impl Connection {
                     if self.is_closed() {
                         return Err(LimboError::InternalError("Connection closed".to_string()));
                     }
+                    // fastest-engine E2 scope rule (PREREG v1 amendments 10-11): an attached file
+                    // is not branched, so a branch that attached one would share its writes with
+                    // every branch and with its parent. Refused here, at the statement.
+                    if self.branch_id().is_some() {
+                        return Err(LimboError::InvalidArgument(
+                            "ATTACH is refused on a branch: an attached database is not branched, \
+                             so its writes would be shared by every branch and its parent"
+                                .to_string(),
+                        ));
+                    }
 
                     if self.is_attached(alias) {
                         return Err(LimboError::InvalidArgument(format!(
