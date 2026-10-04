@@ -296,6 +296,26 @@ impl Stmt {
         Ok(rows)
     }
 
+    /// Run with no parameters, handing each row to `f` as it is read (a scan too large to collect).
+    fn each_row(
+        &mut self,
+        counters: &mut CatalogCounters,
+        mut f: impl FnMut(&crate::Row) -> Result<()>,
+    ) -> Result<()> {
+        self.stmt.reset()?;
+        let mut n = 0u64;
+        let ran = self.stmt.run_with_row_callback(|row| {
+            n += 1;
+            f(row)
+        });
+        // Reset at once, finished or not (see `rows`).
+        self.stmt.reset()?;
+        ran?;
+        counters.queries += 1;
+        counters.rows_read += n;
+        Ok(())
+    }
+
     fn exec(&mut self, params: &[Value], counters: &mut CatalogCounters) -> Result<()> {
         self.stmt.reset()?;
         for (i, p) in params.iter().enumerate() {
@@ -467,6 +487,7 @@ pub(crate) struct Catalog {
     free_del: Stmt,
     free_put: Stmt,
     name_get: Stmt,
+    name_all: Stmt,
     name_of: Stmt,
     name_put: Stmt,
     name_del: Stmt,
@@ -592,6 +613,7 @@ impl Catalog {
             free_del: p("DELETE FROM free WHERE slot = ?1")?,
             free_put: p("INSERT OR REPLACE INTO free(slot) VALUES (?1)")?,
             name_get: p("SELECT id FROM branch_name WHERE name = ?1")?,
+            name_all: p("SELECT name FROM branch_name")?,
             name_of: p("SELECT name FROM branch_name WHERE id = ?1")?,
             name_put: p("INSERT OR REPLACE INTO branch_name(name, id) VALUES (?1, ?2)")?,
             name_del: p("DELETE FROM branch_name WHERE name = ?1")?,
@@ -1019,6 +1041,31 @@ impl Catalog {
     }
 
     /// The unreleased branch named `name`, as of the last checkpoint.
+    /// `hash` of every name in the catalog, read as a stream (lead review 1 item 2: the name
+    /// filter's build, off the store mutex). Stops with an error when `stop` is set.
+    pub(crate) fn name_hashes(
+        &mut self,
+        hash: impl Fn(&str) -> u64,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        self.name_all.each_row(&mut self.counters, |row| {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(LimboError::Interrupt);
+            }
+            match row.get_value(0) {
+                Value::Text(t) => out.push(hash(t.as_str())),
+                other => {
+                    return Err(LimboError::Corrupt(format!(
+                        "branch catalog: a branch name is not text: {other:?}"
+                    )))
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     pub(crate) fn name_get(&mut self, name: &str) -> Result<Option<u64>> {
         let rows = self.name_get.rows(&[Value::from_text(name.to_string())], &mut self.counters)?;
         rows.first().map(|row| get(row, 0)).transpose()

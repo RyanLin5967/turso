@@ -239,6 +239,9 @@ pub(crate) struct BranchStore {
     /// Threads of fuzzy checkpoints started (F-FZ): joined by `compact_now`, by `Drop`, and once
     /// more than `FLIGHTS_KEPT` accumulate (the oldest is long past its install).
     flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
+    /// The name filter's build after open (`start_name_filter`), and its stop flag (set at drop).
+    name_filter_build: Mutex<Option<crate::thread::JoinHandle<()>>>,
+    name_filter_stop: Arc<std::sync::atomic::AtomicBool>,
     /// Test and harness hook (F-FZ): while it holds `HOLD_BEFORE_COMMIT` or `HOLD_AFTER_COMMIT`, a
     /// fuzzy checkpoint in flight waits at that point (its catalog rows written but not committed;
     /// or committed but not installed), so a caller can act on the store there, or image its files.
@@ -1278,12 +1281,77 @@ struct BranchState {
 #[derive(Default)]
 struct NameIndex {
     map: HashMap<Arc<str>, BranchId>,
+    filter: NameFilter,
     fresh: HashMap<Arc<str>, BranchId>,
     /// Each released name, with the release count at its release: an install drops it only if no
     /// later release of the same name moved it.
     gone: HashMap<Arc<str>, u64>,
     releases: u64,
 }
+
+/// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
+/// held, so a create of a NEW name — every successful server create — is answered "free" without a
+/// catalog query under the store mutex. Insert-only: a released name stays in it, and costs one
+/// query if it is ever looked up again; a hash collision costs the same. Built off the mutex after
+/// open from the catalog's names (`BranchStore::start_name_filter`) plus every name applied while
+/// the build ran (`pending`); until then, lookups query the catalog as before. Empty and built at
+/// once for a store with no catalog yet.
+#[derive(Default)]
+struct NameFilter {
+    hasher: std::collections::hash_map::RandomState,
+    built: Option<HashSet<u64, BuildIdHasher>>,
+    pending: Option<HashSet<u64, BuildIdHasher>>,
+}
+
+impl NameFilter {
+    fn hash(&self, name: &str) -> u64 {
+        use std::hash::BuildHasher;
+        self.hasher.hash_one(name)
+    }
+
+    /// `name` is held by a branch from now on.
+    fn note(&mut self, name: &str) {
+        if self.built.is_none() && self.pending.is_none() {
+            return;
+        }
+        let h = self.hash(name);
+        if let Some(built) = self.built.as_mut() {
+            built.insert(h);
+        }
+        if let Some(pending) = self.pending.as_mut() {
+            pending.insert(h);
+        }
+    }
+
+    /// No branch ever held `name` (`false` while the filter is not built: ask the catalog).
+    fn says_absent(&self, name: &str) -> bool {
+        // fastest-engine mutant `filter_says_absent` (test builds only).
+        if fe_mutant("filter_says_absent") {
+            return self.built.is_some();
+        }
+        self.built.as_ref().is_some_and(|built| !built.contains(&self.hash(name)))
+    }
+}
+
+/// The name filter's keys are keyed hashes already: hashed again as themselves.
+#[derive(Default, Clone, Copy)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v;
+    }
+}
+
+type BuildIdHasher = std::hash::BuildHasherDefault<IdHasher>;
 
 /// The names a branch may have: 1 to 255 bytes, no NUL (fastest-engine M1 item 4). A server's
 /// connection syntax may narrow this; the store refuses nothing narrower.
@@ -2161,6 +2229,8 @@ impl BranchStore {
             inner: Arc::new(Mutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
             flights: Mutex::new(Vec::new()),
+            name_filter_build: Mutex::new(None),
+            name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
             truncating: Arc::new(AtomicBool::new(false)),
@@ -2372,6 +2442,8 @@ impl BranchStore {
             inner: Arc::new(Mutex::new(inner)),
             prewarm: warmed,
             flights: Mutex::new(Vec::new()),
+            name_filter_build: Mutex::new(None),
+            name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
             truncating: Arc::new(AtomicBool::new(false)),
@@ -2429,6 +2501,7 @@ impl BranchStore {
             let mut inner = store.inner.lock();
             inner.stamps.horizon = inner.trunk.lineage.epoch;
         }
+        store.start_name_filter();
         Ok(store)
     }
 
@@ -4626,7 +4699,70 @@ impl BranchStore {
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
     /// read)` since open (r11-restart lane instrument; zeros for a snapshot store).
     /// See `Database::branch_wait_name_filter`.
-    pub(crate) fn wait_name_filter(&self) {}
+    pub(crate) fn wait_name_filter(&self) {
+        if let Some(build) = self.name_filter_build.lock().take() {
+            let _ = build.join();
+        }
+    }
+
+    /// Build a catalog store's name filter (`NameFilter`) after open, off the store mutex: the
+    /// names in the catalog, read on a connection of its own, plus every name applied while the
+    /// read ran — those held now (the resident and since-checkpoint names, seeded here under the
+    /// mutex) and those created from now on (`NameFilter::note`). A failed read leaves the filter
+    /// unbuilt: lookups keep asking the catalog.
+    fn start_name_filter(&self) {
+        let reader = {
+            let mut inner = self.inner.lock();
+            let StoreInner { cat, names, sync, .. } = &mut *inner;
+            let Some(cat) = cat.as_ref() else {
+                return;
+            };
+            if names.filter.built.is_some() {
+                return;
+            }
+            let reader = match cat.catalog.writer(*sync) {
+                Ok(reader) => reader,
+                Err(e) => {
+                    tracing::warn!("branch name filter not built: {e}");
+                    return;
+                }
+            };
+            let mut pending: HashSet<u64, BuildIdHasher> = HashSet::default();
+            for name in names.map.keys().chain(names.fresh.keys()) {
+                pending.insert(names.filter.hash(name));
+            }
+            names.filter.pending = Some(pending);
+            reader
+        };
+        let hasher = self.inner.lock().names.filter.hasher.clone();
+        let shared = self.inner.clone();
+        let stop = self.name_filter_stop.clone();
+        let spawned = crate::thread::Builder::new()
+            .name("branch-name-filter".to_string())
+            .spawn(move || {
+                use std::hash::BuildHasher;
+                let mut reader = reader;
+                let scanned = reader.name_hashes(|name| hasher.hash_one(name), &stop);
+                let mut inner = shared.lock();
+                let filter = &mut inner.names.filter;
+                let pending = filter.pending.take().unwrap_or_default();
+                match scanned {
+                    Ok(hashes) => {
+                        let mut built: HashSet<u64, BuildIdHasher> = hashes.into_iter().collect();
+                        built.extend(pending);
+                        filter.built = Some(built);
+                    }
+                    Err(e) => tracing::debug!("branch name filter not built: {e}"),
+                }
+            });
+        match spawned {
+            Ok(handle) => *self.name_filter_build.lock() = Some(handle),
+            Err(e) => {
+                tracing::warn!("branch name filter thread not started: {e}");
+                self.inner.lock().names.filter.pending = None;
+            }
+        }
+    }
 
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {
         let inner = self.inner.lock();
@@ -4893,6 +5029,9 @@ impl Drop for BranchStore {
     fn drop(&mut self) {
         self.flight_hold.store(0, Ordering::Release);
         self.join_flights();
+        // The name filter's build holds the store's files too: stopped, then joined.
+        self.name_filter_stop.store(true, Ordering::Release);
+        self.wait_name_filter();
         let mut inner = self.inner.lock();
         let now = inner.lease.now_ms();
         // With no lease outstanding the clock's value constrains nothing, so a close writes nothing.
@@ -5208,6 +5347,10 @@ impl StoreInner {
                 return Ok(Some(id));
             }
             if self.names.gone.contains_key(name) {
+                return Ok(None);
+            }
+            // Never held by any branch: no catalog query (lead review 1 item 2).
+            if self.names.filter.says_absent(name) {
                 return Ok(None);
             }
         }
@@ -5706,6 +5849,14 @@ impl StoreInner {
                         return Err(e);
                     }
                     self.cat = Some(CatState::new(catalog, self.sync, 0)?);
+                    // A new catalog holds no name: the filter is built, empty, at once.
+                    if self.names.filter.built.is_none() && self.names.filter.pending.is_none() {
+                        let mut built = HashSet::default();
+                        for name in self.names.map.keys() {
+                            built.insert(self.names.filter.hash(name));
+                        }
+                        self.names.filter.built = Some(built);
+                    }
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
                 // The journal's create synced the directory before the arena file existed.
@@ -6274,6 +6425,7 @@ impl StoreInner {
         );
         self.note_table_growth(grown_before);
         if let Some(name) = name {
+            self.names.filter.note(&name);
             self.names.map.insert(name.clone(), child);
             if self.cat.is_some() || self.catalog_mode {
                 self.names.fresh.insert(name, child);
