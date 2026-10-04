@@ -41,7 +41,7 @@ unit probe_go_cgo env -C "$HERE/probe_go" CGO_ENABLED=1 timeout 600 go build -tr
 fail() { echo "build.sh: PROOF FAILED: $*" >&2; exit 1; }
 # The interposes the shim must export (every wrapper in syncshim.c), and the one each mutant must lack.
 WRAPPERS="fsync fdatasync sync_file_range syncfs sync msync ioctl copy_file_range write __write pwrite pwrite64
-  __pwrite64 writev pwritev pwritev64 pwritev2 pwritev64v2 open open64 __open __open64 openat openat64 __open_2
+  __pwrite64 writev pwritev pwritev64 pwritev2 pwritev64v2 sendfile sendfile64 splice syscall open open64 __open __open64 openat openat64 __open_2
   __open64_2 __openat_2 __openat64_2 creat creat64 open_by_handle_at fcntl fcntl64 __fcntl dup dup2 __dup2 dup3
   close __close execve execv execvp execvpe execl execle execlp fexecve execveat posix_spawn posix_spawnp"
 exports() { nm -D --defined-only "$1" | awk '$2 == "T" || $2 == "W" {print $3}' | sort -u; }

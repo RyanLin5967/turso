@@ -2,11 +2,16 @@
  *
  * Port of the macOS DYLD counter (artie-research frontier/fastest/tools/v1). One RUN = one POSIX shm object
  * "/v1.<run>" (in /dev/shm) made by `v1ctl create <run>`. Every process that loads syncshim.so (LD_PRELOAD, set
- * by `v1run`) claims a SLOT and counts its own flush calls there. A process whose pid changes (fork, vfork, a raw
- * clone) claims a new slot at its first counted call. Counts live in shared memory, so they survive SIGKILL of
- * the counted process and can be read live by another process. Each call is also appended to an EVENT log with
- * CLOCK_MONOTONIC timestamps and the run's current MARK, which a client (the load generator) sets around each
- * operation with v1_set_mark, so calls can be attributed per marked operation across processes.
+ * by `v1run`) claims a SLOT and counts its own calls there: at load, and again in the child of every fork() (so a
+ * forked process is visible, and its liveness checkable, before it counts anything); a process whose pid changes
+ * without a fork handler (vfork, _Fork, a raw clone) claims at its first counted call. Counts live in shared memory,
+ * so they survive SIGKILL of the counted process and can be read live by another process. Each call is also
+ * appended to an EVENT log with CLOCK_MONOTONIC timestamps and the run's current MARK, which a client (the load
+ * generator) sets around each operation with v1_set_mark.
+ *
+ * ONE MARK PER RUN: the mark is a single run-wide value, so an event's mark says which operation was in flight when
+ * the call began, not which process asked for it. With concurrent clients or background processes (a checkpointer,
+ * a WAL writer) per-operation attribution is only valid per slot (per process); read `v1ctl bymark` with that in mind.
  *
  * Every exec and posix_spawn the shim sees is written to an EXEC table; `v1ctl report` refuses when an exec'd
  * image never attached (a static binary, a CGO_ENABLED=0 Go build, a setuid binary, an envp without LD_PRELOAD):
@@ -33,31 +38,35 @@
 #include <unistd.h>
 
 #define V1_MAGIC 0x31584e4c4e595356ULL /* "VSYNLNX1" little-endian */
-#define V1_VERSION 2u
+#define V1_VERSION 3u
 
-/* Kinds. Keep in step with V1_KIND_NAMES and with KINDS in firecheck.py. */
+/* Kinds, in three classes that are never summed across. Keep in step with V1_KIND_NAMES and firecheck.py KINDS.
+ *   FLUSH      a request that data reach stable storage (the class stracecount.py calls a flush, plus sync writes)
+ *   WRITEBACK  starts or waits on page-cache writeback, or is a no-op: makes nothing durable by itself
+ *   CLONE      a clone or copy op (the FASTEST branch primitives), counted apart from both */
 enum {
-    V1K_FSYNC = 0,           /* fsync() */
-    V1K_FDATASYNC = 1,       /* fdatasync() */
-    V1K_SFR_WRITE_WAIT = 2,  /* sync_file_range() with SYNC_FILE_RANGE_WRITE and SYNC_FILE_RANGE_WAIT_AFTER */
-    V1K_SFR_WRITE = 3,       /* sync_file_range() with WRITE but not WAIT_AFTER: starts writeback, does not wait */
-    V1K_SFR_WAIT = 4,        /* sync_file_range() without WRITE: waits on writeback already in flight, or no-op */
-    V1K_SYNCFS = 5,          /* syncfs() */
-    V1K_SYNC = 6,            /* sync() */
-    V1K_MSYNC_SYNC = 7,      /* msync() with MS_SYNC */
-    V1K_MSYNC_OTHER = 8,     /* msync() without MS_SYNC (MS_ASYNC / MS_INVALIDATE) */
-    V1K_OSYNC_WRITE = 9,     /* a write on an O_SYNC fd, or pwritev2(RWF_SYNC) */
-    V1K_ODSYNC_WRITE = 10,   /* a write on an O_DSYNC (not O_SYNC) fd, or pwritev2(RWF_DSYNC) */
-    V1K_FICLONE = 11,        /* clone op: ioctl(FICLONE) */
-    V1K_FICLONERANGE = 12,   /* clone op: ioctl(FICLONERANGE) */
-    V1K_COPY_FILE_RANGE = 13,/* clone op: copy_file_range() */
+    V1K_FSYNC = 0,            /* FLUSH: fsync() */
+    V1K_FDATASYNC = 1,        /* FLUSH: fdatasync() */
+    V1K_SYNCFS = 2,           /* FLUSH: syncfs() */
+    V1K_SYNC = 3,             /* FLUSH: sync() */
+    V1K_MSYNC_SYNC = 4,       /* FLUSH: msync() with MS_SYNC */
+    V1K_OSYNC_WRITE = 5,      /* FLUSH: a write of >= 1 byte on an O_SYNC fd, or pwritev2(RWF_SYNC) */
+    V1K_ODSYNC_WRITE = 6,     /* FLUSH: a write of >= 1 byte on an O_DSYNC (not O_SYNC) fd, or pwritev2(RWF_DSYNC) */
+    V1K_SFR_WRITE_WAIT = 7,   /* WRITEBACK: sync_file_range() with WRITE and WAIT_AFTER (no device cache flush) */
+    V1K_SFR_WRITE = 8,        /* WRITEBACK: sync_file_range() with WRITE, no WAIT_AFTER: starts writeback only */
+    V1K_SFR_WAIT = 9,         /* WRITEBACK: sync_file_range() without WRITE: waits on writeback in flight, or no-op */
+    V1K_MSYNC_OTHER = 10,     /* WRITEBACK: msync() without MS_SYNC (MS_ASYNC is a no-op on Linux; MS_INVALIDATE) */
+    V1K_FICLONE = 11,         /* CLONE: ioctl(FICLONE) */
+    V1K_FICLONERANGE = 12,    /* CLONE: ioctl(FICLONERANGE) */
+    V1K_COPY_FILE_RANGE = 13, /* CLONE: copy_file_range() (into an O_SYNC/O_DSYNC fd it is also a sync write) */
     V1K_NKINDS = 14
 };
-#define V1K_NFLUSH 11 /* kinds below this are flush requests; the rest are clone ops, never summed with flushes */
+#define V1K_FLUSH_END 7      /* kinds [0, 7) are FLUSH */
+#define V1K_WRITEBACK_END 11 /* kinds [7, 11) are WRITEBACK, [11, 14) CLONE */
 #define V1_KIND_SLOTS 16
 static const char *const V1_KIND_NAMES[V1K_NKINDS] = {
-    "fsync", "fdatasync", "sfr_write_wait", "sfr_write", "sfr_wait", "syncfs", "sync", "msync_SYNC",
-    "msync_other", "osync_write", "odsync_write", "FICLONE", "FICLONERANGE", "copy_file_range"};
+    "fsync", "fdatasync", "syncfs", "sync", "msync_SYNC", "osync_write", "odsync_write", "sfr_write_wait",
+    "sfr_write", "sfr_wait", "msync_other", "FICLONE", "FICLONERANGE", "copy_file_range"};
 
 /* ioctl numbers, spelled out so this header never includes <linux/fs.h> (whose RWF_* clash with glibc's). */
 #define V1_FICLONE 0x40049409UL      /* _IOW(0x94, 9, int) */
@@ -73,7 +82,8 @@ static const char *const V1_KIND_NAMES[V1K_NKINDS] = {
 typedef struct {
     uint64_t t0_ns, t1_ns;   /* CLOCK_MONOTONIC around the real call */
     uint64_t mark;           /* run mark at t0 */
-    int64_t aux;             /* flags (sync_file_range, msync, pwritev2) / write length / FICLONE source fd */
+    int64_t aux;             /* sync_file_range / msync: the flags; FICLONE: the source fd; writes, sendfile,
+                                splice, copy_file_range: the byte count asked for; else 0 */
     int32_t pid;
     int32_t fd;
     uint32_t tid;            /* gettid() */
@@ -87,15 +97,20 @@ typedef struct {
 typedef struct {
     int32_t pid, ppid;        /* pid 0 = free slot */
     uint64_t attach_ns;
+    uint64_t start_ticks;     /* /proc/<pid>/stat field 22 at claim: (pid, start_ticks) names the process for the
+                                 liveness check (an exec keeps both) */
     uint64_t count[V1_KIND_SLOTS];
     uint64_t fail[V1_KIND_SLOTS];
+    uint64_t missed[V1_KIND_SLOTS]; /* calls of a counted kind seen going through syscall(2): NOT in count[] */
     uint64_t fd_untracked;    /* writes on fds >= V1_FD_BITS (the O_SYNC tracker cannot see them) */
     uint64_t unresolved;      /* bit i: the shim's real-function table entry i was not found by dlsym */
+    uint64_t async_io;        /* io_uring_setup/enter/register, io_setup, io_submit seen through syscall(2) */
+    uint64_t inflight;        /* counted calls entered and not yet returned (a SIGKILL inside one leaves it > 0) */
     uint32_t flags;           /* V1_SLOT_* */
     uint32_t pad0;
     char exe[128];
-    uint8_t pad[512 - 8 - 8 - 2 * 8 * V1_KIND_SLOTS - 8 - 8 - 8 - 128];
-} v1_slot; /* 512 bytes */
+    uint8_t pad[1024 - 8 - 8 - 8 - 3 * 8 * V1_KIND_SLOTS - 4 * 8 - 8 - 128];
+} v1_slot; /* 1024 bytes */
 
 /* Exec records: one per exec-family call or successful posix_spawn the shim saw. */
 enum { V1X_PENDING = 1, V1X_FAILED = 2, V1X_SPAWNED = 3 };
@@ -130,7 +145,7 @@ typedef struct {
 } v1_hdr; /* 4096 bytes; then slots, then exec records, then events */
 
 _Static_assert(sizeof(v1_event) == 64, "v1_event");
-_Static_assert(sizeof(v1_slot) == 512, "v1_slot");
+_Static_assert(sizeof(v1_slot) == 1024, "v1_slot");
 _Static_assert(sizeof(v1_exec) == 128, "v1_exec");
 _Static_assert(sizeof(v1_hdr) == 4096, "v1_hdr");
 
@@ -153,6 +168,29 @@ static inline uint64_t v1_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Parse /proc/<pid>/stat text: the state letter (field 3) and starttime (field 22), read after the LAST ')' so a
+ * command name holding spaces or parentheses cannot shift the fields. Returns 0, or -1 if the text is malformed. */
+static inline int v1_parse_stat(const char *buf, size_t n, char *state, uint64_t *start_ticks) {
+    const char *p = NULL;
+    for (size_t i = 0; i < n; i++)
+        if (buf[i] == ')') p = buf + i;
+    if (!p || (size_t)(p - buf) + 3 >= n || p[1] != ' ') return -1;
+    const char *end = buf + n;
+    p += 2;
+    *state = *p;
+    for (int field = 3; field < 22; field++) { /* skip to field 22 */
+        while (p < end && *p != ' ') p++;
+        if (p >= end) return -1;
+        p++;
+    }
+    uint64_t v = 0;
+    int digits = 0;
+    while (p < end && *p >= '0' && *p <= '9') { v = v * 10 + (uint64_t)(*p - '0'); p++; digits++; }
+    if (!digits) return -1;
+    *start_ticks = v;
+    return 0;
 }
 
 /* "/v1.<run>". Returns 0, or -1 if the run name is empty, longer than 26 or has '/'. */

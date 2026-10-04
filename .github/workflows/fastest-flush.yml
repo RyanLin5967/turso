@@ -23,9 +23,9 @@ permissions:
   contents: read
 
 env:
-  # fork branch fastest-linux-comp a9978d381: its strace fire-check passed in run 37175962413. (6e0533b08 changes
-  # stracecount.py only in attach mode, which this workflow does not use, and is not on the fork.)
-  STRACE_TOOLS_SHA: a9978d381331d6e2bfa2cc38e6f92ad6d79064b3
+  # fork branch fastest-linux-comp 2fd6a83b9 (after its review round): its strace fire-check passed 12/12 in all 20
+  # run jobs of run 37225919842. This workflow uses its launch mode (strace_run) only.
+  STRACE_TOOLS_SHA: 2fd6a83b904f6fc3c6d4d6255ab9005c85c251b1
 
 jobs:
   firecheck:
@@ -78,6 +78,11 @@ jobs:
       - name: Fire-check
         run: |
           set -o pipefail
+          # The bigfd arm writes on fd 1048600 (beyond the shim's 2^20-fd tracker): raise the kernel's per-process
+          # cap and this shell's NOFILE hard limit, which the fire-check and its probes inherit.
+          sudo sysctl -w fs.nr_open=2097152
+          sudo prlimit --pid $$ --nofile=2097152:2097152
+          echo "nofile soft=$(ulimit -Sn) hard=$(ulimit -Hn)" | tee -a "$RAW/run-info.txt"
           timeout 1800 python3 -B fastest/linux/flush/firecheck.py --build "$RAW/build" --work "$MNT/fc" \
             --out "$RAW/firecheck" --fs ${{ matrix.fs }} --strace-tools "$RUNNER_TEMP/strace-tools" \
             2>&1 | tee "$RAW/firecheck.log"

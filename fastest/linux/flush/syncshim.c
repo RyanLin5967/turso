@@ -1,24 +1,29 @@
 /* syncshim.c -- V1 flush counter for Linux, an LD_PRELOAD interposition library for glibc (x86_64, aarch64).
  *
- * Counts, per process and per marked operation (layout and reader API: syncshim.h):
- *   flushes    fsync, fdatasync, sync_file_range (split by its flags: write+wait_after / write only / no write;
- *              the event log keeps the exact flags), syncfs, sync, msync (MS_SYNC vs the rest), and writes on an
- *              O_SYNC or O_DSYNC fd through write, __write, pwrite, pwrite64, __pwrite64, writev, pwritev,
- *              pwritev64, pwritev2, pwritev64v2 (pwritev2's per-call RWF_SYNC / RWF_DSYNC count too, even on a
- *              plain fd; the stronger of fd mode and call flag wins);
- *   clone ops  ioctl(FICLONE), ioctl(FICLONERANGE), copy_file_range -- separate kinds, never summed with flushes.
+ * COUNTS, per process and per marked operation (layout, kind classes and reader API: syncshim.h):
+ *   FLUSH      fsync, fdatasync, syncfs, sync, msync(MS_SYNC), and every write of >= 1 byte on an O_SYNC or O_DSYNC
+ *              fd through write, __write, pwrite, pwrite64, __pwrite64, writev, pwritev, pwritev64, pwritev2,
+ *              pwritev64v2, sendfile, sendfile64, splice and copy_file_range (pwritev2's per-call RWF_SYNC / RWF_DSYNC
+ *              count too, even on a plain fd; the stronger of fd mode and call flag wins);
+ *   WRITEBACK  sync_file_range split by its flags (write+wait_after / write only / no write; the event log keeps the
+ *              exact flags) and msync without MS_SYNC;
+ *   CLONE      ioctl(FICLONE), ioctl(FICLONERANGE), copy_file_range.
  * Launch with `v1run <run> cmd...`; read with `v1ctl report|bymark|events <run>`.
  *
+ * WATCHES, never counts, the generic syscall(2) entry point: a call of a counted kind made through it is tallied
+ * in slot->missed[kind] (the shim missed it, and says so: `v1ctl report` refuses with rc 9), an io_uring or Linux AIO
+ * setup/submit through it in slot->async_io (rc 9: flushes may go through the ring), and its opens, dups, fcntls and
+ * closes keep the O_SYNC tracker right.
+ *
  * REFUSES rather than counting nothing: if SYNCSHIM_RUN is unset, or the run's shm is missing or malformed, the
- * process writes the reason to stderr and _exit(97)s before main. `v1ctl report` refuses when the root pid never
- * attached (rc 4), when an image the shim saw being exec'd or posix_spawned never attached (rc 6), and when a Go
- * binary attached (rc 7).
+ * process writes the reason to stderr and _exit(97)s before main. `v1ctl report` lists every refusal (v1ctl.c).
  *
  * BLIND SPOTS (stated here because the shim cannot count them; FIRECHECK.md has the measured arms):
- *  - RAW SYSCALLS ARE NOT SEEN. The generic syscall(2) entry point is deliberately not interposed, and a raw
- *    syscall instruction (inline asm, a static binary, Rust's rustix linux_raw backend, liburing) never passes
- *    through libc at all. The fire-check's raw arm makes K of each through syscall(2) and as an inline `syscall` /
- *    `svc #0`, and passes only when the shim counts 0 of them while the strace witness sees all of them.
+ *  - RAW SYSCALL INSTRUCTIONS ARE NOT SEEN AT ALL: inline asm, a static binary, Rust's rustix linux_raw backend,
+ *    liburing >= 2.2 (its own inline syscalls), the io-uring crate's "direct-syscall" feature. Nothing refuses; the
+ *    fire-check's raw arm makes K fsync as an inline `syscall` / `svc #0` and shows the shim neither counts nor
+ *    reports them while the strace witness sees them. Calls through syscall(2) ARE reported (missed[], rc 9).
+ *    Before trusting the shim for an engine binary, compare one run of it with the strace counter.
  *  - GO BINARIES (Dolt, Doltgres) ARE RAW-SYSCALL PROGRAMS: on Linux the Go runtime and the os, syscall and
  *    x/sys/unix packages issue their syscalls directly, WITH OR WITHOUT cgo, so no flush a Go program makes through
  *    Go code passes through libc. CGO_ENABLED=0 binaries are static and never load the shim (report rc 4 as the
@@ -27,25 +32,36 @@
  *    cgo into C: their slot carries V1_SLOT_GO and `v1ctl report` refuses (rc 7). THE INSTRUMENT FOR A GO BINARY IS
  *    THE STRACE COUNTER (fastest/linux/competitors/stracecount.py with trace.sh). Go is detected by an ELF section
  *    .go.buildinfo / .note.go.buildid or a PT_NOTE owned by "Go"; a Go binary stripped of all three reads as C.
+ *  - ONLY PROCESSES DESCENDED FROM v1run's ROOT ARE COUNTED (through fork, exec and spawn with LD_PRELOAD intact). A
+ *    server started outside the tree -- by systemd, pg_ctlcluster, ssh, a container runtime, or already running --
+ *    is not counted at all. Start servers directly under v1run. A run where every attached process counted nothing
+ *    is refused (rc 8) unless --allow-zero; one where a counted client and an uncounted server both flushed is not.
  *  - glibc-internal calls are not interposed: stdio flushing a FILE* on an O_SYNC/O_DSYNC fd, POSIX AIO
- *    (aio_fsync, aio_write: glibc's helper threads call its internal fsync/pwrite), and the posix_spawn that
- *    system() and popen() make (the /bin/sh they start attaches on its own if it is dynamic).
- *  - io_uring (IORING_OP_FSYNC, IORING_OP_SYNC_FILE_RANGE, writes on O_DSYNC fds) and Linux AIO (io_submit,
- *    IOCB_CMD_FSYNC) submissions are invisible. The strace counter flags both (verdict INCOMPLETE).
+ *    (aio_fsync, aio_write: glibc's helper threads call its internal fsync/pwrite), mkostemp's open, and the
+ *    posix_spawn that system() and popen() make (the /bin/sh they start attaches on its own if it is dynamic).
+ *  - A library dlopen'ed with RTLD_DEEPBIND binds its libc calls in its own scope and bypasses the shim, undetected.
+ *    (dlopen is not wrapped: a wrapper would become the "caller", breaking the caller's RUNPATH and $ORIGIN.)
+ *  - io_uring and Linux AIO submissions are invisible as flushes; their setup through syscall(2) refuses (rc 9),
+ *    through raw instructions it is undetected (above). The strace counter flags both (verdict INCOMPLETE).
  *  - O_SYNC/O_DSYNC tracking follows open, open64, __open, __open64, openat, openat64, __open_2, __open64_2,
  *    __openat_2, __openat64_2, creat, creat64, open_by_handle_at, dup, dup2, __dup2, dup3, fcntl/fcntl64/__fcntl
- *    (F_DUPFD, F_DUPFD_CLOEXEC, F_SETFL) and close/__close; fds inherited across exec are seeded at load from
- *    /proc/self/fd. An fd made O_SYNC by any other path (SCM_RIGHTS, openat2, a raw open) is missed. A stale bit is
- *    never counted, because each candidate write re-reads F_GETFL first (so close_range/closefrom, which bypass
- *    close, are harmless). Linux ignores O_SYNC/O_DSYNC in F_SETFL; the fire-check measures that without the shim.
- *    Writes on fds >= V1_FD_BITS cannot be classified; each is tallied in slot->fd_untracked and the report then
- *    refuses (rc 5), because one of them may have been a sync write.
+ *    (F_DUPFD, F_DUPFD_CLOEXEC, F_SETFL), close/__close, and open/openat/openat2/creat/dup/dup2/dup3/fcntl/close
+ *    through syscall(2); fds inherited across exec are seeded at load from /proc/self/fd. An fd made O_SYNC by any
+ *    other path (SCM_RIGHTS, a raw-instruction open, mkostemp) is missed. A stale bit is never counted: each
+ *    candidate write re-reads F_GETFL first (so close_range/closefrom, which bypass close, are harmless). Only the
+ *    process that owns the tracking bitmap clears bits: a vfork child shares its parent's memory, and its close or
+ *    dup2 must not erase the parent's tracking (a child made by _Fork or a raw clone never clears either: harmless).
+ *    Linux ignores O_SYNC/O_DSYNC in F_SETFL; the fire-check measures that without the shim. Writes on fds
+ *    >= V1_FD_BITS cannot be classified; each is tallied in slot->fd_untracked and the report then refuses (rc 5).
+ *    fallocate and ftruncate on an O_SYNC fd are not counted.
  *  - The exec guard covers the exec family and posix_spawn/posix_spawnp called through libc. Execs made by raw
- *    syscalls (Go) or inside glibc (system, popen, pidfd_spawn) are not recorded.
- *  - A call is recorded after it returns: a process SIGKILLed inside a counted call does not count that call.
+ *    syscalls (Go) or inside glibc (system, popen, pidfd_spawn) are not recorded. It matches a new image by pid and
+ *    time; a pid reused inside one run could hide an unattached image (pid_max is 4194304 on these kernels).
+ *  - A call is recorded after it returns; slot->inflight counts calls entered and not returned, so a process
+ *    SIGKILLed inside one leaves it > 0 and the report refuses (rc 5) rather than show the count one short.
  *  - setuid and other secure-exec binaries ignore LD_PRELOAD: they never attach (rc 4 / rc 6, never zero).
- *  - A signal handler that makes a counted call while its own thread holds the one-time slot-claim lock (the
- *    process's first counted call, or the first after a fork) spins forever. The claim is once per process.
+ *  - A signal handler that makes a counted call while its own thread holds the one-time slot-claim lock spins
+ *    forever. The claim is made once per process (at load, at fork, or at the first counted call after _Fork).
  */
 #define _GNU_SOURCE
 #include "syncshim.h"
@@ -57,6 +73,8 @@
 #include <spawn.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
+#include <sys/sendfile.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 
@@ -80,8 +98,12 @@ REAL(ssize_t, pwritev, (int, const struct iovec *, int, __off_t));
 REAL(ssize_t, pwritev64, (int, const struct iovec *, int, __off64_t));
 REAL(ssize_t, pwritev2, (int, const struct iovec *, int, __off_t, int));
 REAL(ssize_t, pwritev64v2, (int, const struct iovec *, int, __off64_t, int));
+REAL(ssize_t, sendfile, (int, int, off_t *, size_t));
+REAL(ssize_t, sendfile64, (int, int, __off64_t *, size_t));
+REAL(ssize_t, splice, (int, __off64_t *, int, __off64_t *, size_t, unsigned int));
 REAL(int, ioctl, (int, unsigned long, ...));
 REAL(ssize_t, copy_file_range, (int, __off64_t *, int, __off64_t *, size_t, unsigned int));
+REAL(long, syscall, (long, ...));
 REAL(int, open, (const char *, int, ...));
 REAL(int, open64, (const char *, int, ...));
 REAL(int, __open, (const char *, int, ...));
@@ -115,15 +137,15 @@ REAL(int, posix_spawn, (pid_t *, const char *, const posix_spawn_file_actions_t 
 REAL(int, posix_spawnp, (pid_t *, const char *, const posix_spawn_file_actions_t *, const posix_spawnattr_t *,
                          char *const[], char *const[]));
 
-/* The table the constructor resolves; bit i of slot->unresolved = entry i not found (the fire-check requires 0). */
+/* The table the constructor resolves; bit i of slot->unresolved = entry i not found (the report refuses, rc 9). */
 #define T(name) {#name, (void *)&real_##name}
 static const struct { const char *name; void *ptr; } v1_tab[] = {
     T(fsync), T(fdatasync), T(sync_file_range), T(syncfs), T(sync), T(msync), T(write), T(__write), T(pwrite),
-    T(pwrite64), T(__pwrite64), T(writev), T(pwritev), T(pwritev64), T(pwritev2), T(pwritev64v2), T(ioctl),
-    T(copy_file_range), T(open), T(open64), T(__open), T(__open64), T(openat), T(openat64), T(__open_2),
-    T(__open64_2), T(__openat_2), T(__openat64_2), T(creat), T(creat64), T(open_by_handle_at), T(fcntl), T(fcntl64),
-    T(__fcntl), T(dup), T(dup2), T(__dup2), T(dup3), T(close), T(__close), T(execve), T(execv), T(execvp),
-    T(execvpe), T(fexecve), T(execveat), T(posix_spawn), T(posix_spawnp)};
+    T(pwrite64), T(__pwrite64), T(writev), T(pwritev), T(pwritev64), T(pwritev2), T(pwritev64v2), T(sendfile),
+    T(sendfile64), T(splice), T(ioctl), T(copy_file_range), T(syscall), T(open), T(open64), T(__open), T(__open64),
+    T(openat), T(openat64), T(__open_2), T(__open64_2), T(__openat_2), T(__openat64_2), T(creat), T(creat64),
+    T(open_by_handle_at), T(fcntl), T(fcntl64), T(__fcntl), T(dup), T(dup2), T(__dup2), T(dup3), T(close),
+    T(__close), T(execve), T(execv), T(execvp), T(execvpe), T(fexecve), T(execveat), T(posix_spawn), T(posix_spawnp)};
 #undef T
 _Static_assert(sizeof v1_tab / sizeof *v1_tab <= 64, "unresolved mask is 64 bits");
 static uint64_t g_unresolved;
@@ -163,6 +185,7 @@ static void v1_resolve_all(void) {
 static v1_hdr *g_hdr;
 static v1_slot *g_slot;       /* this process's slot; re-claimed whenever getpid() differs from g_slot_pid */
 static int32_t g_slot_pid;
+static int32_t g_bitmap_pid;  /* the process whose fd table g_osync describes: only it clears bits */
 static int g_claim_lock;
 static int g_is_go;
 static uint8_t g_osync[V1_FD_BITS / 8]; /* 1 = this fd MAY be O_SYNC/O_DSYNC (re-checked before counting) */
@@ -236,6 +259,19 @@ out:
     return go;
 }
 
+/* This process's starttime, from /proc/self/stat (async-signal-safe: it runs in the fork child handler too). */
+static uint64_t v1_self_start(void) {
+    char buf[1024];
+    int fd = real_open("/proc/self/stat", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, sizeof buf);
+    real_close(fd);
+    char st;
+    uint64_t t = 0;
+    if (n <= 0 || v1_parse_stat(buf, (size_t)n, &st, &t) != 0) return 0;
+    return t;
+}
+
 /* ---- slots ---- */
 static void v1_claim_slot(int32_t me) {
     uint64_t i = __atomic_fetch_add(&g_hdr->slots_used, 1, __ATOMIC_SEQ_CST) + 1; /* slot 0 = overflow */
@@ -254,6 +290,7 @@ static void v1_claim_slot(int32_t me) {
         s->exe[len] = 0;
         s->ppid = (int32_t)getppid();
         s->attach_ns = v1_now();
+        s->start_ticks = v1_self_start();
         s->flags = g_is_go ? V1_SLOT_GO : 0;
         s->unresolved = g_unresolved;
         __atomic_store_n(&s->pid, me, __ATOMIC_RELEASE); /* published last */
@@ -262,8 +299,8 @@ static void v1_claim_slot(int32_t me) {
     __atomic_store_n(&g_slot, s, __ATOMIC_RELEASE);
 }
 
-/* The calling process's slot. getpid() on every call, so a child made by fork, vfork, _Fork or a raw clone gets
- * its own slot even where no atfork handler runs. Counted calls are flushes, so the syscall is cheap beside them. */
+/* The calling process's slot. getpid() on every call, so a child made by vfork, _Fork or a raw clone (no fork
+ * handler) still gets its own slot. Counted calls are flushes, so the syscall is cheap beside them. */
 static v1_slot *v1_slot_get(int32_t *pid_out) {
     int32_t me = (int32_t)getpid();
     *pid_out = me;
@@ -279,18 +316,32 @@ static v1_slot *v1_slot_get(int32_t *pid_out) {
     return s;
 }
 
+/* fork() child: its own copy of the bitmap, and a slot at once, so the report sees it alive before it counts. */
 static void v1_after_fork_child(void) {
     __atomic_store_n(&g_slot, NULL, __ATOMIC_RELEASE);
     __atomic_store_n(&g_slot_pid, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_claim_lock, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_bitmap_pid, (int32_t)getpid(), __ATOMIC_RELEASE);
+    int32_t me;
+    (void)v1_slot_get(&me);
 }
 
 /* ---- O_SYNC / O_DSYNC fd tracking ---- */
-static inline void osync_set(int fd, int on) {
+static inline void osync_on(int fd) {
     if (fd < 0 || (unsigned)fd >= V1_FD_BITS) return;
-    uint8_t bit = (uint8_t)(1u << (fd & 7));
-    if (on) __atomic_fetch_or(&g_osync[fd >> 3], bit, __ATOMIC_RELAXED);
-    else __atomic_fetch_and(&g_osync[fd >> 3], (uint8_t)~bit, __ATOMIC_RELAXED);
+    __atomic_fetch_or(&g_osync[fd >> 3], (uint8_t)(1u << (fd & 7)), __ATOMIC_RELAXED);
+}
+/* Clearing is the only update that can lose a sync fd, so only the bitmap's owner does it (a vfork child shares
+ * this memory with its suspended parent). Setting is always safe: a stale bit is re-checked before it counts. */
+static inline void osync_off(int fd) {
+    if (fd < 0 || (unsigned)fd >= V1_FD_BITS) return;
+    if (!(__atomic_load_n(&g_osync[fd >> 3], __ATOMIC_RELAXED) & (1u << (fd & 7)))) return;
+    if ((int32_t)getpid() != __atomic_load_n(&g_bitmap_pid, __ATOMIC_ACQUIRE)) return;
+    __atomic_fetch_and(&g_osync[fd >> 3], (uint8_t)~(1u << (fd & 7)), __ATOMIC_RELAXED);
+}
+static inline void osync_set(int fd, int on) {
+    if (on) osync_on(fd);
+    else osync_off(fd);
 }
 static inline int osync_get(int fd) {
     if (fd < 0 || (unsigned)fd >= V1_FD_BITS) return 0;
@@ -324,7 +375,7 @@ static int osync_candidate(int fd) {
     RESOLVE(fcntl);
     int k = fl_kind(real_fcntl(fd, F_GETFL));
     errno = e;
-    if (k < 0) osync_set(fd, 0);
+    if (k < 0) osync_off(fd);
     return k;
 }
 static inline int rwf_kind(int flags) {
@@ -342,13 +393,18 @@ static inline int sfr_kind(unsigned int f) {
     return V1K_SFR_WAIT;
 }
 static inline int msync_kind(int f) { return (f & MS_SYNC) ? V1K_MSYNC_SYNC : V1K_MSYNC_OTHER; }
+static size_t iov_len(const struct iovec *v, long n) {
+    size_t s = 0;
+    for (long i = 0; v && i < n && i < 1024; i++) s += v[i].iov_len;
+    return s;
+}
 
 /* fds inherited across exec: read their status flags once, from /proc/self/fd (else fds 0..1023). */
 static void v1_seed_fds(void) {
     RESOLVE(fcntl);
     DIR *d = opendir("/proc/self/fd"); /* glibc opens it internally: no wrapper runs */
     if (!d) {
-        for (int fd = 0; fd < 1024; fd++) osync_set(fd, fl_kind(real_fcntl(fd, F_GETFL)) >= 0);
+        for (int fd = 0; fd < 1024; fd++) if (fl_kind(real_fcntl(fd, F_GETFL)) >= 0) osync_on(fd);
         return;
     }
     int dfd = dirfd(d);
@@ -357,7 +413,7 @@ static void v1_seed_fds(void) {
         if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
         int fd = atoi(de->d_name);
         if (fd == dfd) continue;
-        osync_set(fd, fl_kind(real_fcntl(fd, F_GETFL)) >= 0);
+        if (fl_kind(real_fcntl(fd, F_GETFL)) >= 0) osync_on(fd);
     }
     closedir(d);
 }
@@ -370,6 +426,7 @@ static void v1_init_once(void) {
     v1_hdr *h = v1_map(run, &why);
     if (!h) v1_die(why);
     g_is_go = v1_exe_is_go();
+    __atomic_store_n(&g_bitmap_pid, (int32_t)getpid(), __ATOMIC_RELEASE);
     v1_seed_fds();
     __atomic_store_n(&g_hdr, h, __ATOMIC_RELEASE);
     int32_t me;
@@ -381,9 +438,8 @@ static void v1_ensure_slow(void) { pthread_once(&g_once, v1_init_once); }
 __attribute__((constructor)) static void v1_ctor(void) { v1_ensure(); }
 
 /* ---- recording ---- */
-static void v1_rec(int kind, int fd, int64_t aux, uint64_t mark, uint64_t t0, uint64_t t1, int failed, int err) {
-    int32_t me;
-    v1_slot *s = v1_slot_get(&me);
+static void v1_rec(v1_slot *s, int32_t me, int kind, int fd, int64_t aux, uint64_t mark, uint64_t t0, uint64_t t1,
+                   int failed, int err) {
     __atomic_fetch_add(&s->count[kind], 1, __ATOMIC_RELAXED);
     if (failed) __atomic_fetch_add(&s->fail[kind], 1, __ATOMIC_RELAXED);
     uint64_t e = __atomic_fetch_add(&g_hdr->ev_next, 1, __ATOMIC_RELAXED);
@@ -405,16 +461,28 @@ static void v1_rec(int kind, int fd, int64_t aux, uint64_t mark, uint64_t t0, ui
     __atomic_store_n(&ev->kind, (int16_t)(kind + 1), __ATOMIC_RELEASE); /* kind+1: 0 means "never completed" */
 }
 
+/* BEGIN takes the slot and marks the call in flight before the real call; END records it, then clears in-flight. */
 #define V1_BEGIN()                                                                 \
     v1_ensure();                                                                   \
+    int32_t me_;                                                                   \
+    v1_slot *const s_ = v1_slot_get(&me_);                                         \
+    __atomic_fetch_add(&s_->inflight, 1, __ATOMIC_SEQ_CST);                        \
     const uint64_t mark_ = __atomic_load_n(&g_hdr->mark, __ATOMIC_SEQ_CST);        \
     const uint64_t t0_ = v1_now()
 #define V1_END(kind, fd, aux, failed)                                              \
     do {                                                                           \
         int e_ = errno;                                                            \
-        v1_rec((kind), (fd), (int64_t)(aux), mark_, t0_, v1_now(), (failed), e_);  \
+        v1_rec(s_, me_, (kind), (fd), (int64_t)(aux), mark_, t0_, v1_now(), (failed), e_); \
+        __atomic_fetch_sub(&s_->inflight, 1, __ATOMIC_SEQ_CST);                    \
         errno = e_;                                                                \
     } while (0)
+
+/* A call of a counted kind that went through syscall(2): reported, never counted. */
+static void v1_missed(int kind) {
+    int32_t me;
+    v1_ensure();
+    __atomic_fetch_add(&v1_slot_get(&me)->missed[kind], 1, __ATOMIC_RELAXED);
+}
 
 /* ---- flushes ---- */
 int fsync(int fd) {
@@ -477,24 +545,27 @@ int ioctl(int fd, unsigned long req, ...) {
 }
 ssize_t copy_file_range(int in, __off64_t *pin, int out, __off64_t *pout, size_t len, unsigned int flags) {
     RESOLVE_OR(copy_file_range, -1);
+    int k = len ? osync_candidate(out) : -1; /* into an O_SYNC/O_DSYNC fd it is also a sync write */
     V1_BEGIN();
     ssize_t r = real_copy_file_range(in, pin, out, pout, len, flags);
     V1_END(V1K_COPY_FILE_RANGE, out, (int64_t)len, r == -1);
+    if (k >= 0) {
+        int e = errno;
+        v1_rec(s_, me_, k, out, (int64_t)len, mark_, t0_, v1_now(), r == -1, e);
+        errno = e;
+    }
     return r;
 }
 
-/* ---- writes: counted only when the fd's status flags (re-read now) or pwritev2's flags ask for sync ---- */
-static size_t iov_len(const struct iovec *v, int n) {
-    size_t s = 0;
-    for (int i = 0; v && i < n; i++) s += v[i].iov_len;
-    return s;
-}
-#define V1_WRITE(kindexpr, call, fd, len)       \
-    int k_ = (kindexpr);                        \
-    if (k_ < 0) return call;                    \
-    V1_BEGIN();                                 \
-    ssize_t r_ = call;                          \
-    V1_END(k_, fd, len, r_ == -1);              \
+/* ---- writes: counted only when >= 1 byte is asked for and the fd's status flags (re-read now) or pwritev2's flags
+ * ask for sync. A zero-length write syncs nothing. ---- */
+#define V1_WRITE(kindexpr, call, fd, lenexpr)                \
+    int k_ = (kindexpr);                                     \
+    size_t len_ = k_ >= 0 ? (size_t)(lenexpr) : 0;           \
+    if (k_ < 0 || len_ == 0) return call;                    \
+    V1_BEGIN();                                              \
+    ssize_t r_ = call;                                       \
+    V1_END(k_, fd, len_, r_ == -1);                          \
     return r_
 
 ssize_t write(int fd, const void *b, size_t n) {
@@ -539,6 +610,18 @@ ssize_t pwritev64v2(int fd, const struct iovec *v, int c, __off64_t o, int f) {
     RESOLVE_ALT(pwritev64v2, pwritev2);
     if (real_pwritev64v2 == NULL) { errno = ENOSYS; return -1; }
     V1_WRITE(stronger(osync_candidate(fd), rwf_kind(f)), real_pwritev64v2(fd, v, c, o, f), fd, iov_len(v, c));
+}
+ssize_t sendfile(int out, int in, off_t *off, size_t n) {
+    RESOLVE(sendfile);
+    V1_WRITE(osync_candidate(out), real_sendfile(out, in, off, n), out, n);
+}
+ssize_t sendfile64(int out, int in, __off64_t *off, size_t n) {
+    RESOLVE_ALT(sendfile64, sendfile);
+    V1_WRITE(osync_candidate(out), real_sendfile64(out, in, off, n), out, n);
+}
+ssize_t splice(int in, __off64_t *pin, int out, __off64_t *pout, size_t n, unsigned int flags) {
+    RESOLVE_OR(splice, -1);
+    V1_WRITE(osync_candidate(out), real_splice(in, pin, out, pout, n, flags), out, n);
 }
 
 /* ---- fd lifecycle (no counting, no shm: these never call v1_ensure, so the constructor may use them) ---- */
@@ -681,13 +764,110 @@ int dup3(int fd, int fd2, int flags) {
 }
 int close(int fd) {
     RESOLVE(close);
-    osync_set(fd, 0);
+    osync_off(fd);
     return real_close(fd);
 }
 int __close(int fd) {
     RESOLVE_ALT(__close, close);
-    osync_set(fd, 0);
+    osync_off(fd);
     return real___close(fd);
+}
+
+/* ---- syscall(2): watched, never counted. Six pointer-sized varargs are forwarded, as glibc's own syscall() reads
+ * six registers whatever the call. Nothing but a switch runs for a syscall this does not watch (futex, getrandom).
+ * ---- */
+struct v1_open_how { uint64_t flags, mode, resolve; };
+long syscall(long n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    long a0 = va_arg(ap, long), a1 = va_arg(ap, long), a2 = va_arg(ap, long);
+    long a3 = va_arg(ap, long), a4 = va_arg(ap, long), a5 = va_arg(ap, long);
+    va_end(ap);
+    RESOLVE(syscall);
+    int miss = -1, miss2 = -1, async = 0, track = 0;
+    switch (n) {
+    case SYS_fsync: miss = V1K_FSYNC; break;
+    case SYS_fdatasync: miss = V1K_FDATASYNC; break;
+    case SYS_syncfs: miss = V1K_SYNCFS; break;
+    case SYS_sync: miss = V1K_SYNC; break;
+    case SYS_msync: miss = msync_kind((int)a2); break;
+    case SYS_sync_file_range: miss = sfr_kind((unsigned int)a3); break;
+    case SYS_ioctl:
+        if ((unsigned long)a1 == V1_FICLONE) miss = V1K_FICLONE;
+        else if ((unsigned long)a1 == V1_FICLONERANGE) miss = V1K_FICLONERANGE;
+        break;
+    case SYS_copy_file_range: miss = V1K_COPY_FILE_RANGE; miss2 = a4 ? osync_candidate((int)a2) : -1; break;
+    case SYS_write:
+    case SYS_pwrite64: miss = a2 ? osync_candidate((int)a0) : -1; break;
+    case SYS_writev:
+    case SYS_pwritev:
+        miss = osync_candidate((int)a0);
+        if (miss >= 0 && !iov_len((const struct iovec *)a1, a2)) miss = -1;
+        break;
+    /* raw pwritev2 is (fd, iov, iovcnt, pos_l, pos_h, flags): the flags are the SIXTH argument */
+    case SYS_pwritev2:
+        miss = stronger(osync_candidate((int)a0), rwf_kind((int)a5));
+        if (miss >= 0 && !iov_len((const struct iovec *)a1, a2)) miss = -1;
+        break;
+    case SYS_sendfile: miss = a3 ? osync_candidate((int)a0) : -1; break;
+    case SYS_splice: miss = a4 ? osync_candidate((int)a2) : -1; break;
+    case SYS_io_uring_setup:
+    case SYS_io_uring_enter:
+    case SYS_io_uring_register:
+    case SYS_io_setup:
+    case SYS_io_submit: async = 1; break;
+#ifdef SYS_open
+    case SYS_open:
+#endif
+#ifdef SYS_creat
+    case SYS_creat:
+#endif
+#ifdef SYS_dup2
+    case SYS_dup2:
+#endif
+    case SYS_openat:
+    case SYS_openat2:
+    case SYS_dup:
+    case SYS_dup3:
+    case SYS_fcntl: track = 1; break;
+    case SYS_close: osync_off((int)a0); break;
+    default: break;
+    }
+    long r = real_syscall(n, a0, a1, a2, a3, a4, a5);
+    if (miss < 0 && miss2 < 0 && !async && !(track && r >= 0)) return r;
+    int e = errno;
+    if (miss >= 0) v1_missed(miss);
+    if (miss2 >= 0) v1_missed(miss2);
+    if (async) {
+        int32_t me;
+        v1_ensure();
+        __atomic_fetch_add(&v1_slot_get(&me)->async_io, 1, __ATOMIC_RELAXED);
+    }
+    if (track && r >= 0) {
+        switch (n) {
+#ifdef SYS_open
+        case SYS_open: osync_set((int)r, flags_maybe_sync((int)a1)); break;
+#endif
+#ifdef SYS_creat
+        case SYS_creat: osync_off((int)r); break;
+#endif
+#ifdef SYS_dup2
+        case SYS_dup2: osync_set((int)r, osync_get((int)a0)); break;
+#endif
+        case SYS_openat: osync_set((int)r, flags_maybe_sync((int)a2)); break;
+        case SYS_openat2: {
+            const struct v1_open_how *h = (const struct v1_open_how *)a2;
+            osync_set((int)r, h != NULL && (h->flags & (uint64_t)(O_SYNC | O_DSYNC)) != 0);
+            break;
+        }
+        case SYS_dup:
+        case SYS_dup3: osync_set((int)r, osync_get((int)a0)); break;
+        case SYS_fcntl: (void)fcntl_after((int)r, (int)a0, (int)a1); break;
+        default: break;
+        }
+    }
+    errno = e;
+    return r;
 }
 
 /* ---- exec guard: every exec and posix_spawn is recorded; `v1ctl report` refuses (rc 6) when the new image
