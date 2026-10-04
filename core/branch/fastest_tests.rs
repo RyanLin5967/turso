@@ -543,8 +543,17 @@ fn lock_free_durable_forks_racing_trunk_commits_read_every_fork_as_it_was() {
                                     Err(e) => panic!("fork failed: {e}"),
                                 }
                             };
+                            // Commits recorded by the time the fork returned; the one at index `hi`
+                            // may have been in flight (published, its writer not yet recording it),
+                            // so it is waited for (bounded) before the child's state is matched.
                             let hi = states.read().unwrap().len();
                             let seen = read_t(&branch.connect().unwrap());
+                            let waited = std::time::Instant::now();
+                            while states.read().unwrap().len() <= hi
+                                && waited.elapsed() < std::time::Duration::from_millis(500)
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
                             let states = states.read().unwrap();
                             let j = (lo..=hi.min(states.len() - 1))
                                 .find(|&j| states[j] == seen)
