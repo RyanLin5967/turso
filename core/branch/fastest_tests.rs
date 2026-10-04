@@ -1340,12 +1340,11 @@ fn a_raised_pre_image_is_rewritten_in_the_raised_class() {
 
 /// Review C-F1 and C-F2: a name released before a fuzzy checkpoint's capture is free while the
 /// checkpoint is in flight — it resolves to nothing and can be given again — and the new branch
-/// keeps it after the install and after a reopen. (The splice arm takes no fuzzy checkpoint: there
-/// the refusal is the premise checked, and the property cannot arise.)
+/// keeps it after the install and after a reopen. (The store here is never a splice store:
+/// `R11_SPLICE` steers only the store's model tests.)
 #[test]
 fn a_released_name_is_free_while_a_fuzzy_checkpoint_is_in_flight() {
     let _s = serial();
-    let splice = std::env::var("R11_SPLICE").is_ok_and(|v| v == "1");
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("fuzzy-name.db");
     let (b, incarnation) = {
@@ -1356,12 +1355,7 @@ fn a_released_name_is_free_while_a_fuzzy_checkpoint_is_in_flight() {
         db.branch_compact_now().unwrap();
         db.drop_branch("x").unwrap();
         db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
-        let started = db.branch_checkpoint_fuzzy_now();
-        if splice {
-            assert!(started.is_err(), "premise of the splice arm: no fuzzy checkpoint");
-            return;
-        }
-        assert!(started.unwrap(), "premise: a fuzzy checkpoint started");
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
         let t = std::time::Instant::now();
         while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED {
             assert!(t.elapsed() < std::time::Duration::from_secs(10), "the checkpoint never arrived");
