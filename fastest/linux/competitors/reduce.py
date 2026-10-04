@@ -49,7 +49,9 @@ def expected_jobs(d, repo):
                             check=True, timeout=60).stdout
     except (subprocess.SubprocessError, OSError) as e:
         sys.exit(f"reduce: REFUSED: cannot read {WORKFLOW} at {sha} in {repo}: {e}")
-    job = re.search(r"^  run:\n(.*?)(?=^  \S|\Z)", wf, re.M | re.S)
+    # The `run` JOB, under the top-level jobs: key (a top-level `defaults: run:` also has a two-space "run:").
+    jobs = re.search(r"^jobs:\n(.*)", wf, re.M | re.S)
+    job = re.search(r"^  run:\n(.*?)(?=^  \S|\Z)", jobs.group(1), re.M | re.S) if jobs else None
     if not job:
         sys.exit(f"reduce: REFUSED: no `run` job in {WORKFLOW} at {sha}")
     axes = {}
