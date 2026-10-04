@@ -61,6 +61,17 @@ FDPATH = re.compile(r"^\s*-?\d+<([^>]*)>")
 # check proved every listed pid still alive was traced, so this line is benign -- for any pid but the server's own
 # (MAIN), whose loss is never benign (review finding 5).
 BENIGN = re.compile(r"attach: ptrace\(PTRACE_SEIZE, (\d+)\): (?:No such process|Operation not permitted)")
+# strace's entering/exiting state for a task disagreed with the kernel's PTRACE_GET_SYSCALL_INFO (strace 6.8 src/
+# syscall.c strace_get_syscall_info, "TODO: handle this" -- unhandled in master too). Seen on arm64 only (run
+# 37225919842): a PG io worker blocked in a syscall at the attach whose syscall then EXITED while strace expected an
+# entry. strace decodes that exit stop as an entry, so from then on it is inverted for that task: every later real
+# exit stop is again taken for an entry and prints this same message (strace fetches the syscall info at every
+# entering stop, traced or not), while its real entries are taken for exits silently. Hence one message for a task
+# means it completed no further syscall in the window, and its only misread stop is that exit, which can print a
+# phantom line only if the misdecoded number names a traced syscall. A window is therefore counted with such a task
+# ONLY when it has exactly one "entering, op == 2" message, it was in the attach roster (its syscall began before the
+# attach), and it has no call line at all; anything else is REFUSED.
+DESYNC = re.compile(r"pid (\d+): (entering|exiting), ptrace_syscall_info\.op == (\d+)")
 
 
 def parse_summary(text):
@@ -191,6 +202,7 @@ def count(trace, extras, root, window=None, clients=frozenset()):
         b = BENIGN.search(ln)
         return bool(b) and main is not None and b.group(1) != main
 
+    desync = {}  # tid -> [(entering|exiting, op)] from strace's state-mismatch messages (see DESYNC)
     for e in extras:
         if not os.path.exists(e):
             continue
@@ -199,9 +211,15 @@ def count(trace, extras, root, window=None, clients=frozenset()):
         if summary is None:
             summary = parse_summary(etext)
         if attached:
-            stray += [ln for ln in etext.splitlines() if ln.strip() and not ln.startswith(("% time", "------"))
-                      and not SUMROW.match(ln) and not benign(ln)]
+            for ln in etext.splitlines():
+                d = DESYNC.search(ln)
+                if d:
+                    desync.setdefault(d.group(1), []).append((d.group(2), d.group(3)))
+                elif ln.strip() and not ln.startswith(("% time", "------")) and not SUMROW.match(ln) \
+                        and not benign(ln):
+                    stray.append(ln)
     lines = {}
+    lines_by_tid = {}
     pending = {}
     calls = []  # (tid, name, args_and_rest)
     for line in text.splitlines():
@@ -216,6 +234,7 @@ def count(trace, extras, root, window=None, clients=frozenset()):
             continue
         pid, name, rest = m.groups()
         lines[name] = lines.get(name, 0) + 1
+        lines_by_tid[pid] = lines_by_tid.get(pid, 0) + 1
         if rest.endswith("<unfinished ...>"):
             pending[pid] = (name, rest[: -len("<unfinished ...>")])
         elif rest.endswith("<detached ...>"):
@@ -314,6 +333,16 @@ def count(trace, extras, root, window=None, clients=frozenset()):
                 if target.startswith("/") or not target:
                     pre_sync.append(f"pid {f[1]} fd {f[2]} flags {f[3]} {target or '(target unreadable)'}")
     out["fdsync_scanned"], out["osync_fds_at_attach"] = scanned, pre_sync
+    roster_tids = set()
+    rp = window[: -len(".window")] + ".pids" if window and window.endswith(".window") else None
+    if rp and os.path.exists(rp):
+        roster_tids = {ln.split(" ", 1)[0] for ln in open(rp, errors="replace") if ln.strip()}
+    out["desync"] = {t: {"messages": m, "lines": lines_by_tid.get(t, 0), "at_attach": t in roster_tids}
+                     for t, m in desync.items()}
+    for t, d in out["desync"].items():
+        if not (d["messages"] == [("entering", "2")] and d["at_attach"] and d["lines"] == 0):
+            problems.append(f"strace lost the syscall state of task {t} ({d['messages'][:3]}, {d['lines']} lines,"
+                            f" at attach: {d['at_attach']}): its calls cannot be counted")
     if attached:
         if not out["roster_found"]:
             problems.append("attach window has no pid roster (OUT.pids): its flushes cannot be attributed")
