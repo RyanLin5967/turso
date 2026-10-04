@@ -920,6 +920,12 @@ pub(crate) const HOLD_ARRIVED: u8 = 0x80;
 #[cfg(test)]
 pub(crate) const HOLD_TRUNK_DECIDED: u8 = 4;
 
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a group flight's leader
+/// waits here, its flight taken from the buffer and not yet written, so a test can act while an
+/// operation's records are in the air.
+#[cfg(test)]
+pub(crate) const HOLD_FLIGHT_TAKEN: u8 = 5;
+
 /// If the hook is at `stage`, mark the arrival and wait until it is moved (tests and the harness
 /// release it by storing 0).
 fn pause_at(hold: Option<&AtomicU8>, stage: u8) {
@@ -2732,6 +2738,11 @@ impl BranchStore {
             // Fails inside the flight's write, after this operation is applied.
             journal.fail_next_write();
         }
+        if *failpoint == Some(BranchFailpoint::GroupFlightTakeFails) {
+            *failpoint = None;
+            // Fails as the flight is taken, after this operation is applied.
+            journal.fail_next_take();
+        }
         for record in records {
             journal.buffer(record)?;
         }
@@ -2849,6 +2860,8 @@ impl BranchStore {
                 }
             };
             kill_point("flight.taken");
+            #[cfg(test)]
+            pause_at(Some(&*self.trunk_commit_hold), HOLD_FLIGHT_TAKEN);
             let (end, flight_class) = (flight.end_lsn, flight.class);
             // Mutant M-b (PREREG v1 amendment 36): the waiters are acknowledged after the pwrite
             // and before the sync. Caught by C1b and V2, not by SIGKILL.
@@ -3906,6 +3919,10 @@ impl BranchStore {
             };
             inner.work.trunk_pre_images_captured += 1;
             self.decide_trunk_page(&mut inner, page, pre_image, epoch)?;
+            if inner.failpoint == Some(BranchFailpoint::TrunkDecisionBusy) {
+                inner.failpoint = None;
+                return Err(LimboError::Busy);
+            }
         }
         drop(inner);
         kill_point("trunk.decided");

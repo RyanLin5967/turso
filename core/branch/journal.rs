@@ -619,6 +619,8 @@ pub(crate) struct Journal {
     pid: u32,
     /// See [`Journal::fail_next_write`].
     fail_next_write: bool,
+    /// See [`Journal::fail_next_take`].
+    fail_next_take: bool,
     /// The format version this journal writes and was read at (`format_version`).
     format: u32,
     /// Frame bytes ever buffered by this journal: the log sequence number a group flight makes
@@ -687,6 +689,7 @@ impl Journal {
             poisoned: false,
             pid: std::process::id(),
             fail_next_write: false,
+            fail_next_take: false,
             format: FORMAT_VERSION,
             lsn: 0,
             pending_class: SyncClass::Off,
@@ -830,6 +833,7 @@ impl Journal {
             poisoned: false,
             pid: std::process::id(),
             fail_next_write: false,
+            fail_next_take: false,
             format,
             lsn: 0,
             pending_class: SyncClass::Off,
@@ -1009,6 +1013,12 @@ impl Journal {
     /// the inherited lock.
     pub(crate) fn fork_parent(&self) -> Option<u32> {
         self.forked().then_some(self.pid)
+    }
+
+    /// Make the next `take_flight` fail as a failed descriptor duplication would (the
+    /// `GroupFlightTakeFails` failpoint).
+    pub(crate) fn fail_next_take(&mut self) {
+        self.fail_next_take = true;
     }
 
     /// Fail the next log write as an I/O error would — the `StampFlushFails` failpoint. It fails
@@ -1264,6 +1274,11 @@ impl Journal {
     ) -> Result<Flight> {
         let fail = std::mem::take(&mut self.fail_next_write);
         self.check_live()?;
+        if std::mem::take(&mut self.fail_next_take) {
+            return Err(LimboError::InternalError(
+                "failpoint: the flight's log descriptor could not be duplicated".to_string(),
+            ));
+        }
         let class = class.max(self.sync).max(self.pending_class);
         let end_lsn = self.lsn;
         if self.pending.is_empty() && !upgrade {
@@ -2557,18 +2572,18 @@ mod tests {
 mod flight_tests {
     use super::*;
 
-    /// Three flights, each written as a group flight writes it. Returns the files and where each
-    /// flight began.
-    fn three_flights(dir: &Path) -> (BranchFiles, [u64; 3]) {
+    /// Three flights, each written as a group flight writes it and synced in `class` (`Off`: none
+    /// is synced, as under D0). Returns the files and where each flight began.
+    fn three_flights(dir: &Path, class: SyncClass) -> (BranchFiles, [u64; 3]) {
         let files = BranchFiles::for_db(dir.join("db").to_str().unwrap());
-        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+        let mut journal = Journal::create(&files, 512, class).unwrap();
         let mut arena = Arena::new(512);
         let mut starts = [0; 3];
         for (i, start) in starts.iter_mut().enumerate() {
             journal.buffer(&Record::Fork { child: i as u64 + 1, parent: 0 }).unwrap();
             journal.buffer(&Record::Clock { now_ms: 7 }).unwrap();
             *start = journal.len;
-            journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+            journal.take_flight(&mut arena, class, false).unwrap().write().unwrap();
         }
         (files, starts)
     }
@@ -2596,7 +2611,7 @@ mod flight_tests {
     #[test]
     fn a_flight_torn_in_the_air_is_cut_not_corrupt() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (files, starts) = three_flights(dir.path());
+        let (files, starts) = three_flights(dir.path(), SyncClass::Fsync);
         zero(&files.log, starts[2], FRAME_HEADER_LEN + 4);
         let recovered = Journal::recover(&files, SyncClass::Off)
             .expect("a hole inside the last flight is a torn flight, not corruption")
@@ -2611,7 +2626,7 @@ mod flight_tests {
     #[test]
     fn a_hole_under_a_whole_later_flight_is_still_corrupt() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (files, starts) = three_flights(dir.path());
+        let (files, starts) = three_flights(dir.path(), SyncClass::Fsync);
         zero(&files.log, starts[1], FRAME_HEADER_LEN + 4);
         assert!(Journal::recover(&files, SyncClass::Off).is_err(), "a lost acknowledged flight was cut");
     }
@@ -2622,7 +2637,7 @@ mod flight_tests {
     #[test]
     fn a_flight_whose_end_is_torn_is_dropped_whole() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (files, starts) = three_flights(dir.path());
+        let (files, starts) = three_flights(dir.path(), SyncClass::Fsync);
         let len = std::fs::metadata(&files.log).unwrap().len();
         OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
         let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
@@ -2636,7 +2651,7 @@ mod flight_tests {
     #[test]
     fn a_garbled_frame_under_a_whole_later_flight_is_corrupt() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (files, starts) = three_flights(dir.path());
+        let (files, starts) = three_flights(dir.path(), SyncClass::Fsync);
         let mut byte = std::fs::read(&files.log).unwrap()[starts[1] as usize + FRAME_HEADER_LEN];
         byte ^= 0x5A;
         {
@@ -2647,12 +2662,28 @@ mod flight_tests {
         assert!(Journal::recover(&files, SyncClass::Off).is_err(), "damage under a later flight was cut");
     }
 
+    /// Review B-F5: under D0 no flight is synced, so a later flight that survived proves nothing
+    /// about an earlier one — the OS may write them back in any order. A flight lost under a later
+    /// one is cut there, with everything after it, instead of refusing the store.
+    #[test]
+    fn an_unsynced_flight_lost_under_a_later_unsynced_one_is_cut() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path(), SyncClass::Off);
+        zero(&files.log, starts[1], FRAME_HEADER_LEN + 4);
+        let recovered = Journal::recover(&files, SyncClass::Off)
+            .expect("nothing was synced, so nothing acknowledged-durable was lost")
+            .expect("state");
+        assert_eq!(forks(&recovered.records), vec![1], "not cut at the lost flight");
+        drop(recovered);
+        assert_eq!(std::fs::metadata(&files.log).unwrap().len(), starts[1]);
+    }
+
     /// The last flight lost its first block AND its end while a frame in its middle survived: never
     /// synced, so cut back to the flight before it (02c5ce7f0's R2-4).
     #[test]
     fn a_last_flight_that_lost_its_start_and_end_is_cut() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (files, starts) = three_flights(dir.path());
+        let (files, starts) = three_flights(dir.path(), SyncClass::Fsync);
         zero(&files.log, starts[2], FRAME_HEADER_LEN + 4);
         let len = std::fs::metadata(&files.log).unwrap().len();
         OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
@@ -2669,7 +2700,7 @@ mod flight_tests {
     #[test]
     fn a_cut_log_keeps_every_record_after_the_cut_even_mid_flight() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (files, starts) = three_flights(dir.path());
+        let (files, starts) = three_flights(dir.path(), SyncClass::Fsync);
         let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
         // The cut falls after flight 2's first frame: its Clock and all of flight 3 are kept.
         let fork_frame = {

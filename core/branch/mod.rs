@@ -440,6 +440,13 @@ pub enum BranchFailpoint {
     /// carries an early-released operation's records — fails as an I/O error would, after the
     /// operation was applied.
     GroupFlightFails,
+    /// The next group flight cannot even be taken: duplicating the log's descriptor for it fails,
+    /// as EMFILE would, after the operation was applied (fastest-engine review B-F1).
+    GroupFlightTakeFails,
+    /// The next trunk commit's copy-decision pass returns `Busy` after its first decision, as a
+    /// catalog read refused by the catalog's lock would; the statement retries the commit
+    /// (fastest-engine review A-F2).
+    TrunkDecisionBusy,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
