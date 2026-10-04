@@ -956,3 +956,60 @@ fn a_named_branch_carries_no_lease_even_with_a_default_lease() {
         assert_eq!(db.branch_named("server").unwrap(), Some(named), "catalog={catalog}");
     }
 }
+
+// ---- E2's scope rule (PREREG v1 amendments 10-11): an attached database is not branched ----
+
+/// A branch connection cannot ATTACH a database (a Postgres frontend's non-public schema is one):
+/// the file would not be branched, so its writes would be shared by every branch and its parent.
+/// Refused at the statement.
+#[test]
+fn attach_on_a_branch_is_refused_at_the_statement() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("e2a.db"), opts(catalog, SyncClass::Off).with_attach(true));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        let other = dir.path().join("s2.db");
+        let attached = bc.execute(format!("ATTACH DATABASE '{}' AS s2", other.display()));
+        assert!(
+            attached.is_err(),
+            "catalog={catalog}: a branch attached an unbranched database file"
+        );
+        // The control: the trunk may attach (nothing is forked from it while it is attached).
+        trunk
+            .execute(format!("ATTACH DATABASE '{}' AS s2", other.display()))
+            .unwrap();
+        trunk.execute("CREATE TABLE s2.u(x)").unwrap();
+    }
+}
+
+/// A fork from a connection with an attached database is refused at the fork: the attached schema
+/// would not be branched with it. Once detached, the fork goes through.
+#[test]
+fn a_fork_with_an_attached_database_is_refused() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("e2b.db"), opts(catalog, SyncClass::Off).with_attach(true));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let first = trunk.fork_branch().unwrap();
+        let other = dir.path().join("s2.db");
+        trunk
+            .execute(format!("ATTACH DATABASE '{}' AS s2", other.display()))
+            .unwrap();
+        assert!(
+            trunk.fork_branch().is_err(),
+            "catalog={catalog}: a fork went through with an unbranched schema attached"
+        );
+        assert!(
+            first.connect().unwrap().fork_branch().is_ok(),
+            "catalog={catalog}: a branch with nothing attached was refused a fork"
+        );
+        trunk.execute("DETACH DATABASE s2").unwrap();
+        assert!(trunk.fork_branch().is_ok(), "catalog={catalog}: refused after the DETACH");
+    }
+}
