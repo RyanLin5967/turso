@@ -409,7 +409,7 @@ int main(int argc, char **argv) {
 
     /* the clone arms on ext4: refused per arm, with the reason recorded */
     int sel[NARMS], na = 0, refused[NARMS] = {0}, nref = 0;
-    char reason[600] = "";
+    char reason[PATH_MAX + 1024] = "";
     for (int j = 0; j < nreq; j++) {
         if (is_clone(req[j]) && want == MAGIC_EXT4) {
             if (!reason[0]) ext4_clone_reason(reason, sizeof reason, &fi);
