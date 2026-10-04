@@ -782,7 +782,7 @@ fn c1_workload(db: Arc<Database>, threads: usize, seed: u64) {
         .map(|t| {
             let db = db.clone();
             std::thread::spawn(move || {
-                let mut rng = Rng((seed ^ ((t as u64 + 1) * 0x9E37_79B9_7F4A_7C15)) | 1);
+                let mut rng = Rng((seed ^ (t as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1);
                 let trunk = db.connect().unwrap();
                 // (name, id) of this thread's live branches.
                 let mut mine: Vec<(String, BranchId, bool)> = Vec::new();
