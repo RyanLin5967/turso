@@ -638,6 +638,10 @@ static int run_forkidle(int K, const char *variant) {
     else { fprintf(stderr, "probe_c: forkidle fork|_Fork|clone\n"); return 2; }
     if (c < 0) die("forkidle fork");
     if (c == 0) {
+        /* detach from the launcher's stdio pipes, as a daemon would, or the launcher waits for this child too */
+        int nul = open("/dev/null", O_RDWR);
+        if (nul < 0 || dup2(nul, 0) < 0 || dup2(nul, 1) < 0 || dup2(nul, 2) < 0) _exit(2);
+        if (nul > 2) close(nul);
         struct timespec ts = {2, 0};
         while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
         int cf = openf("forkidle_child", O_RDWR | O_TRUNC);
