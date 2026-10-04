@@ -2076,3 +2076,36 @@ fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
         let _ = b.into_id();
     }
 }
+
+/// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
+/// past the threshold still, so without a back-off every create would start (and pay for) another
+/// one: it waits for another threshold's worth of log.
+#[test]
+fn a_failed_checkpoint_is_not_retried_by_the_next_create() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("ckpt-backoff.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _first = trunk.fork_branch().unwrap().into_id();
+    let _t = Threshold::set(8 << 10);
+    db.branch_failpoint(Some(BranchFailpoint::CheckpointWriteFails));
+    // Forks until a checkpoint has started and failed.
+    let started = db.branch_checkpoint_counters()[1];
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_counters()[1] == started {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "no checkpoint started");
+    }
+    db.branch_checkpoint_wait();
+    let after_failure = db.branch_checkpoint_counters()[1];
+    for _ in 0..5 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    db.branch_checkpoint_wait();
+    assert_eq!(
+        db.branch_checkpoint_counters()[1],
+        after_failure,
+        "the creates right after a failed checkpoint started another"
+    );
+}
