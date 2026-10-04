@@ -22,7 +22,7 @@
  *   clean                         fsync                    nosync25     pwrite64
  *   clone1b   openat, ioctl(FICLONE), close, fsync(dir)    clone2b      openat, ioctl(FICLONE), fsync, close, fsync(dir)
  *   (the clone arms' teardown adds one unlinkat per clone, outside the timed window)
- * Setup per arm, before the loop: append25/nosync25 write 25 B + fsync; ow*/fdatasync4k/clean preallocate + fsync;
+ * Setup per arm, before the loop: append25/nosync25 write 25 B + fsync; ow*, fdatasync4k and clean preallocate + fsync;
  *   clone arms preallocate the source + fsync, mkdir the clones' directory + fsync it. Setup syncs are never mutated.
  *
  * Arms are interleaved round-robin, each round in a fresh seeded shuffle, so every arm shares the moment.
