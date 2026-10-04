@@ -621,6 +621,8 @@ struct StoreInner {
     /// Slots freed by an early-released operation whose records are not yet durable, under the log
     /// sequence number that makes them free (see [`Group`], rule 2).
     pending_free: VecDeque<(u64, Vec<Slot>)>,
+    /// Named server branches' names (fastest-engine M1 item 4).
+    names: NameIndex,
 }
 
 /// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
@@ -1201,6 +1203,31 @@ struct BranchState {
     /// branch's first fork and kept current by its commits from then on; `None` until it forks, and
     /// again once it is retired (a released branch takes no child).
     view: Option<PageMap>,
+    /// A named server branch's name (fastest-engine M1 item 4); taken at its release, which frees it.
+    name: Option<Arc<str>>,
+}
+
+/// Named server branches' names (fastest-engine M1 item 4), under the store mutex. An eager store
+/// holds every unreleased named branch in `map`. A catalog store holds there the names of resident
+/// states and every name created since its last checkpoint (`fresh`, written at the next), and
+/// masks with `gone` the catalog rows of names released since (deleted at the next); every other
+/// name is read from the catalog's `branch_name` table.
+#[derive(Default)]
+struct NameIndex {
+    map: HashMap<Arc<str>, BranchId>,
+    fresh: HashMap<Arc<str>, BranchId>,
+    gone: HashSet<Arc<str>>,
+}
+
+/// The names a branch may have: 1 to 255 bytes, no NUL (fastest-engine M1 item 4). A server's
+/// connection syntax may narrow this; the store refuses nothing narrower.
+fn check_branch_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 255 || name.contains('\0') {
+        return Err(LimboError::InvalidArgument(format!(
+            "branch name {name:?}: a name is 1 to 255 bytes with no NUL"
+        )));
+    }
+    Ok(())
 }
 
 impl BranchState {
@@ -1640,6 +1667,10 @@ struct Captured {
     /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
     arena: Option<std::fs::File>,
     arena_sync: SyncClass,
+    /// fastest-engine M1 item 4: names released since the last checkpoint (rows deleted first),
+    /// then names created since (rows written), as swapped out of the index at the capture.
+    names_gone: HashSet<Arc<str>>,
+    names_fresh: HashMap<Arc<str>, BranchId>,
     lease_now: u64,
     fail_after_commit: bool,
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
@@ -1698,6 +1729,14 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
         for &(page, born, died, slot, crc) in &cap.trunk_new {
             catalog.trunk_insert(page, born, died, slot, crc)?;
+        }
+        // fastest-engine M1 item 4: freed names first, so a name released and created again since
+        // the last checkpoint ends up naming its new branch.
+        for name in &cap.names_gone {
+            catalog.name_del(name)?;
+        }
+        for (name, id) in &cap.names_fresh {
+            catalog.name_put(name, id.0)?;
         }
         if let Some(cursor) = cap.free_cursor {
             catalog.free_delete_upto(cursor)?;
@@ -3199,7 +3238,11 @@ impl BranchStore {
         schema: Arc<Schema>,
         page_size: usize,
         seen: Option<u64>,
+        name: Option<&str>,
     ) -> Result<TrunkFork> {
+        if let Some(name) = name {
+            check_branch_name(name)?;
+        }
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.lock_counted();
@@ -3230,15 +3273,24 @@ impl BranchStore {
                 return Ok(TrunkFork::Retry);
             }
         }
+        // The name's uniqueness is decided in the same store-mutex hold that buffers its record.
+        if let Some(name) = name {
+            if inner.name_lookup(name)?.is_some() {
+                return Err(name_taken(name));
+            }
+        }
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now);
+        let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
         // Early release (fastest-engine M1 item 2): buffered, applied, and made durable by the
         // caller's `wait_durable` once it holds no lock.
         let lsn = self.buffer_records(&mut inner, &records)?;
-        if let Err(e) = inner.apply_fork(BranchId::TRUNK, id, Some(schema), Handle::Attached) {
+        let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
+        if let Err(e) =
+            inner.apply_fork(BranchId::TRUNK, id, Some(schema), handle, name.map(Arc::from))
+        {
             return Err(inner.fatal(e));
         }
         inner.apply_fork_lease(id, lease);
@@ -3259,7 +3311,7 @@ impl BranchStore {
     /// store's model tests, which drive the store without a pager: it always registers.
     #[cfg(test)]
     pub(crate) fn fork_trunk_locked(&self, schema: Arc<Schema>, page_size: usize) -> Result<BranchId> {
-        match self.fork_trunk(schema, page_size, None)? {
+        match self.fork_trunk(schema, page_size, None, None)? {
             TrunkFork::Forked { id, lsn } => {
                 self.wait_durable(lsn, self.sync_class())?;
                 Ok(id)
@@ -3272,7 +3324,7 @@ impl BranchStore {
     /// model tests.
     #[cfg(test)]
     pub(crate) fn fork_branch_durable(&self, parent: BranchId) -> Result<BranchId> {
-        let (id, lsn) = self.fork_branch(parent)?;
+        let (id, lsn) = self.fork_branch(parent, None)?;
         self.wait_durable(lsn, self.sync_class())?;
         Ok(id)
     }
@@ -3288,7 +3340,10 @@ impl BranchStore {
     ///
     /// Early release (fastest-engine M1 item 2), as `fork_trunk`: the caller waits on the returned
     /// log sequence number (`wait_durable`) before handing the branch out.
-    pub(crate) fn fork_branch(&self, parent: BranchId) -> Result<(BranchId, u64)> {
+    pub(crate) fn fork_branch(&self, parent: BranchId, name: Option<&str>) -> Result<(BranchId, u64)> {
+        if let Some(name) = name {
+            check_branch_name(name)?;
+        }
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.lock_counted();
@@ -3307,13 +3362,20 @@ impl BranchStore {
             return Err(reaped(parent));
         }
         let schema = st.schema.clone();
+        // The name's uniqueness is decided in the same store-mutex hold that buffers its record.
+        if let Some(name) = name {
+            if inner.name_lookup(name)?.is_some() {
+                return Err(name_taken(name));
+            }
+        }
         let id = BranchId(inner.next_id);
-        let (records, lease) = inner.fork_records(id, parent, now);
+        let (records, lease) = inner.fork_records(id, parent, now, name);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
         let lsn = self.buffer_records(&mut inner, &records)?;
-        if let Err(e) = inner.apply_fork(parent, id, schema, Handle::Attached) {
+        let handle = if name.is_some() { Handle::Detached } else { Handle::Attached };
+        if let Err(e) = inner.apply_fork(parent, id, schema, handle, name.map(Arc::from)) {
             return Err(inner.fatal(e));
         }
         inner.apply_fork_lease(id, lease);
@@ -3350,7 +3412,8 @@ impl BranchStore {
                 )));
             }
         }
-        if st.handle != Handle::Attached {
+        // A named server branch is connected by name and has no handle (fastest-engine item 4).
+        if st.handle != Handle::Attached && !(st.handle == Handle::Detached && st.name.is_some()) {
             return Err(LimboError::InvalidArgument(format!(
                 "branch {} has no attached handle; attach it with Database::branch first",
                 id.0
@@ -3512,6 +3575,13 @@ impl BranchStore {
             ))),
             Handle::Released | Handle::ReleasePending => Err(reaped(id)),
         }
+    }
+
+    /// The unreleased branch named `name` (fastest-engine M1 item 4).
+    pub(crate) fn branch_named(&self, name: &str) -> Result<Option<BranchId>> {
+        self.refuse_if_trunk_only("looking a branch up by name")?;
+        check_branch_name(name)?;
+        self.inner.lock().name_lookup(name)
     }
 
     /// Every unreleased branch. Refused on a trunk-only store, where "none" would be a lie.
@@ -4517,6 +4587,12 @@ fn injected_flush_failure(failpoint: &mut Option<BranchFailpoint>, journal: &mut
     Ok(())
 }
 
+fn name_taken(name: &str) -> LimboError {
+    LimboError::InvalidArgument(format!(
+        "branch name {name:?} already names an unreleased branch"
+    ))
+}
+
 fn reaped(id: BranchId) -> LimboError {
     LimboError::InvalidArgument(format!("branch {} has been reaped", id.0))
 }
@@ -4570,6 +4646,7 @@ impl StoreInner {
             stamps: RowStamps::default(),
             merge_work: super::BranchMergeWork::default(),
             pending_free: VecDeque::new(),
+            names: NameIndex::default(),
         }
     }
 
@@ -4672,6 +4749,12 @@ impl StoreInner {
                     if let Some(deadline) = st.lease {
                         self.leases.remove(&(deadline, *id));
                     }
+                    // The catalog holds its name (it is clean); a lookup reads it from there.
+                    if let Some(name) = st.name {
+                        if self.names.map.get(&name) == Some(id) {
+                            self.names.map.remove(&name);
+                        }
+                    }
                 }
             }
             // I5 (amendment 8): a victim that is the parent of a state STILL resident after this
@@ -4699,18 +4782,32 @@ impl StoreInner {
     /// The records a fork writes — the fork, and the default lease if there is one, flushed
     /// together so a fork is never durable without the lease it was given — and that lease's
     /// `(deadline, now)`, which the caller applies after the flush.
+    /// A NAMED server branch (fastest-engine M1 item 4) is forked by one `ForkNamed` record and
+    /// is never given the default lease.
     fn fork_records(
         &self,
         child: BranchId,
         parent: BranchId,
         now: u64,
+        name: Option<&str>,
     ) -> (Vec<Record>, Option<(u64, u64)>) {
-        let mut records = vec![Record::Fork {
-            child: child.0,
-            parent: parent.0,
+        // Mutant M-d (PREREG v1 amendment 36): the fork record written without its parent (as the
+        // trunk's child, whatever the parent was).
+        let logged_parent = if fe_mutant("fork_without_parent") { 0 } else { parent.0 };
+        let mut records = vec![match name {
+            None => Record::Fork {
+                child: child.0,
+                parent: logged_parent,
+            },
+            Some(name) => Record::ForkNamed {
+                child: child.0,
+                parent: logged_parent,
+                name: name.to_string(),
+            },
         }];
         let lease = self
             .default_lease
+            .filter(|_| name.is_none())
             .map(|ttl| (now.saturating_add(millis(ttl)), now));
         if let Some((deadline_ms, now_ms)) = lease {
             records.push(Record::Lease {
@@ -4745,6 +4842,25 @@ impl StoreInner {
 
     fn poisoned(&self) -> bool {
         self.journal.as_ref().is_some_and(|j| j.is_poisoned())
+    }
+
+    /// The unreleased branch named `name` (fastest-engine M1 item 4): the in-memory index, then —
+    /// unless a release since the last checkpoint freed the name — the catalog.
+    fn name_lookup(&mut self, name: &str) -> Result<Option<BranchId>> {
+        // Mutant M-i (PREREG v1 amendment 36): uniqueness checked against the CHECKPOINTED names
+        // only, outside what the log has made durable since.
+        if !fe_mutant("name_check_outside") {
+            if let Some(&id) = self.names.map.get(name) {
+                return Ok(Some(id));
+            }
+            if self.names.gone.contains(name) {
+                return Ok(None);
+            }
+        }
+        match self.cat.as_mut() {
+            Some(cat) => Ok(cat.catalog.name_get(name)?.map(BranchId)),
+            None => Ok(None),
+        }
     }
 
     /// A lease is outstanding: on a resident branch, or on a catalog row not loaded. (r11-restart-r2:
@@ -4936,9 +5052,18 @@ impl StoreInner {
                 inherited,
                 inherited_at: b.fork_epoch,
                 view: None,
+                name: None,
             },
         );
         self.note_table_growth(grown_before);
+        // A resident named branch's name is in the index, as every created one is.
+        if let Some(name) = b.name.filter(|_| !b.released) {
+            let name: Arc<str> = Arc::from(name);
+            self.names.map.insert(name.clone(), id);
+            if let Some(st) = self.branches.get_mut(&id) {
+                st.name = Some(name);
+            }
+        }
     }
 
     /// Catalog stores: make the trunk's `written` epoch of `page` at least the `died` of the page's
@@ -5518,6 +5643,8 @@ impl StoreInner {
             child_removed: self.children.removed.keys().copied().collect(),
             arena: arena_file,
             arena_sync: self.sync,
+            names_gone: std::mem::take(&mut self.names.gone),
+            names_fresh: std::mem::take(&mut self.names.fresh),
             lease_now: now,
             fail_after_commit,
             fail_write: self
@@ -5548,6 +5675,18 @@ impl StoreInner {
             if !mutant("r13_install_err_drops_dirty") {
                 for (id, what) in cap.dirty {
                     *cat.dirty.entry(id).or_insert(0) |= what;
+                }
+            }
+            // The names the capture took are written by the next checkpoint instead. Every freed
+            // name goes back to `gone` (a delete before the puts is harmless, and lookups read
+            // `map` first); a created name goes back to `fresh` only while it still names the same
+            // branch (one released since is in `gone`, one created since is in `fresh` already).
+            for name in cap.names_gone {
+                self.names.gone.insert(name);
+            }
+            for (name, id) in cap.names_fresh {
+                if self.names.map.get(&name) == Some(&id) {
+                    self.names.fresh.entry(name).or_insert(id);
                 }
             }
             return Err(e);
@@ -5699,6 +5838,7 @@ impl StoreInner {
         child: BranchId,
         schema: Option<Arc<Schema>>,
         handle: Handle,
+        name: Option<Arc<str>>,
     ) -> Result<()> {
         // An id at or past `next_id` was never allocated, so the catalog cannot hold it (C-R): only
         // an older id is looked up there.
@@ -5759,9 +5899,16 @@ impl StoreInner {
                 inherited,
                 inherited_at: f,
                 view: None,
+                name: name.clone(),
             },
         );
         self.note_table_growth(grown_before);
+        if let Some(name) = name {
+            self.names.map.insert(name.clone(), child);
+            if self.cat.is_some() || self.catalog_mode {
+                self.names.fresh.insert(name, child);
+            }
+        }
         // F-W1: a new branch is listed (no fork is ever of a released branch).
         self.live_ids_insert(child);
         self.n_states += 1;
@@ -5837,10 +5984,24 @@ impl StoreInner {
     /// Returns whether `id` was spliced out (see `collect`).
     fn apply_release(&mut self, id: BranchId, freed: &mut Vec<Slot>) -> Result<bool> {
         self.ensure(id)?;
+        let mut name = None;
         if let Some(st) = self.branches.get_mut(&id) {
             st.handle = Handle::Released;
             if let Some(deadline) = st.lease.take() {
                 self.leases.remove(&(deadline, id));
+            }
+            name = st.name.take();
+        }
+        // fastest-engine M1 item 4: a release frees its name at once.
+        if let Some(name) = name {
+            if self.names.map.get(&name) == Some(&id) {
+                self.names.map.remove(&name);
+            }
+            if self.names.fresh.get(&name) == Some(&id) {
+                self.names.fresh.remove(&name);
+            }
+            if self.cat.is_some() || self.catalog_mode {
+                self.names.gone.insert(name);
             }
         }
         // F-W1: a released branch is not listed.
@@ -6338,12 +6499,21 @@ impl StoreInner {
         };
         match record {
             Record::Fork { child, parent } => self
-                .apply_fork(BranchId(*parent), BranchId(*child), None, Handle::Detached)
+                .apply_fork(BranchId(*parent), BranchId(*child), None, Handle::Detached, None)
                 .map_err(corrupt),
-            // Not yet written by this build (fastest-engine item 4, red commit).
-            Record::ForkNamed { .. } => Err(corrupt(LimboError::InternalError(
-                "named branches: not implemented".to_string(),
-            ))),
+            Record::ForkNamed {
+                child,
+                parent,
+                name,
+            } => self
+                .apply_fork(
+                    BranchId(*parent),
+                    BranchId(*child),
+                    None,
+                    Handle::Detached,
+                    Some(Arc::from(name.as_str())),
+                )
+                .map_err(corrupt),
             Record::Commit { branch, pages } => {
                 let id = BranchId(*branch);
                 // C-R: in catalog recovery (the arena is not open yet), a Commit to a branch that is
@@ -6475,7 +6645,7 @@ impl StoreInner {
                     lease_deadline_ms: st.lease.map_or(0, |d| d.saturating_add(1)),
                     current,
                     retained: st.lineage.retained_list(),
-                    name: None,
+                    name: st.name.as_deref().map(str::to_string),
                 }
             })
             .collect();
@@ -6556,8 +6726,12 @@ impl StoreInner {
                     inherited: PageMap::default(),
                     inherited_at: 0,
                     view: None,
+                    name: b.name.as_deref().filter(|_| !b.released).map(Arc::from),
                 },
             );
+            if let Some(name) = b.name.filter(|_| !b.released) {
+                self.names.map.insert(Arc::from(name), BranchId(b.id));
+            }
         }
         for (parent, f, child) in edges {
             let lineage = if parent.is_trunk() {
@@ -6679,7 +6853,7 @@ mod tests {
         let mut inner = store.inner.lock();
         inner.ensure_backing(512).unwrap();
         inner
-            .apply_fork(BranchId::TRUNK, BranchId(1), None, Handle::Detached)
+            .apply_fork(BranchId::TRUNK, BranchId(1), None, Handle::Detached, None)
             .unwrap();
         assert!(inner.ensure_backing(1024).is_err(), "a store holding a branch changed page size");
     }
@@ -6747,7 +6921,7 @@ mod tests {
     fn a_zero_deadline_is_still_a_lease_after_a_snapshot() {
         let mut live = StoreInner::fresh(None, SyncClass::Off, None);
         let id = BranchId(1);
-        live.apply_fork(BranchId::TRUNK, id, None, Handle::Detached)
+        live.apply_fork(BranchId::TRUNK, id, None, Handle::Detached, None)
             .unwrap();
         live.apply_lease(id, 0);
         let snapshot = live.snapshot();

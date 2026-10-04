@@ -820,7 +820,7 @@ impl Branch {
         // Early release (fastest-engine M1 item 2): the fork is applied and every lock released;
         // the branch is handed out only once its records are durable.
         let forked = store
-            .fork_branch(self.id)
+            .fork_branch(self.id, None)
             .and_then(|(id, lsn)| store.wait_durable(lsn, store.sync_class()).map(|()| id));
         let held = store::take_counted_hold();
         let id = forked?;
@@ -906,6 +906,22 @@ impl Connection {
     /// Fork a branch from whatever this connection is on: the trunk, or the branch it was opened
     /// on. The branch sees the committed state at the moment of the fork.
     pub fn fork_branch(self: &Arc<Connection>) -> Result<Branch> {
+        let id = self.fork_with(None)?;
+        Ok(Branch::new(self.db.clone(), id))
+    }
+
+    /// Create a NAMED server branch of whatever this connection is on (fastest-engine M1 item 4):
+    /// detached — no [`Branch`] handle exists, so nothing reaps it but [`Database::drop_branch`] —
+    /// persistent across restarts, never leased (not even by `DatabaseOpts::with_branch_lease`),
+    /// and connectable by name ([`Database::connect_named`]) from any process that opens the
+    /// database. The name is unique among unreleased branches, and is durable with the fork: both
+    /// are one log record.
+    pub fn create_branch(self: &Arc<Connection>, name: &str) -> Result<BranchId> {
+        self.fork_with(Some(name))
+    }
+
+    /// A fork from this connection's position, named or not, durable when it returns.
+    fn fork_with(self: &Arc<Connection>, name: Option<&str>) -> Result<BranchId> {
         // First: on a read-only handle of a database with branches, nothing below would refuse.
         self.db.branches.refuse_if_trunk_only("fork")?;
         if self.get_tx_state() != TransactionState::None {
@@ -921,8 +937,8 @@ impl Connection {
         // fastest-engine item 5: this fork's store-mutex holds, counted from here.
         store::take_counted_hold();
         let forked = match pager.branch_id() {
-            Some(parent) => store.fork_branch(parent).map(|(id, lsn)| (id, None, lsn)),
-            None => self.fork_trunk(&pager).map(|(id, wal, lsn)| (id, Some(wal), lsn)),
+            Some(parent) => store.fork_branch(parent, name).map(|(id, lsn)| (id, None, lsn)),
+            None => self.fork_trunk(&pager, name).map(|(id, wal, lsn)| (id, Some(wal), lsn)),
         };
         // Early release (fastest-engine M1 item 2): the fork is applied and every lock is released,
         // the trunk's WAL write lock included; the branch is handed out only once its records are
@@ -933,7 +949,7 @@ impl Connection {
         let held = store::take_counted_hold();
         let (id, wal) = forked?;
         store.record_fork(held, wal);
-        Ok(Branch::new(self.db.clone(), id))
+        Ok(id)
     }
 
     /// Fork the trunk. A trunk commit takes its copy decisions at its serialization point, against
@@ -949,6 +965,7 @@ impl Connection {
     fn fork_trunk(
         self: &Arc<Connection>,
         pager: &Arc<Pager>,
+        name: Option<&str>,
     ) -> Result<(BranchId, store::WalHold, u64)> {
         const LOCK_FREE_ATTEMPTS: usize = 8;
         let store = &self.db.branches;
@@ -959,7 +976,7 @@ impl Connection {
                 break;
             };
             pager.begin_read_tx()?;
-            let forked = self.fork_trunk_registered(pager, Some(seen));
+            let forked = self.fork_trunk_registered(pager, Some(seen), name);
             pager.end_read_tx();
             match forked? {
                 store::TrunkFork::Forked { id, lsn } => {
@@ -969,7 +986,7 @@ impl Connection {
                 store::TrunkFork::NeedsWriterLock => break,
             }
         }
-        self.fork_trunk_locked(pager)
+        self.fork_trunk_locked(pager, name)
     }
 
     /// Fork the trunk under its WAL write lock: no trunk write transaction is in flight, and the
@@ -977,6 +994,7 @@ impl Connection {
     fn fork_trunk_locked(
         self: &Arc<Connection>,
         pager: &Arc<Pager>,
+        name: Option<&str>,
     ) -> Result<(BranchId, store::WalHold, u64)> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
@@ -999,7 +1017,7 @@ impl Connection {
             }
             // fastest-engine item 5: the WAL write lock is held from here to `end_write_tx`.
             let locked = std::time::Instant::now();
-            let forked = self.fork_trunk_registered(pager, None);
+            let forked = self.fork_trunk_registered(pager, None, name);
             pager.end_write_tx();
             let wal = store::WalHold {
                 ns: u64::try_from(locked.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -1022,6 +1040,7 @@ impl Connection {
         self: &Arc<Connection>,
         pager: &Arc<Pager>,
         seen: Option<u64>,
+        name: Option<&str>,
     ) -> Result<store::TrunkFork> {
         let cookie = pager
             .io
@@ -1035,18 +1054,7 @@ impl Connection {
             .find(|schema| schema.schema_version == cookie)
             .ok_or(LimboError::SchemaUpdated)?;
         let page_size = pager.get_page_size_unchecked().get() as usize;
-        self.db.branches.fork_trunk(schema, page_size, seen)
-    }
-
-    /// Create a NAMED server branch of whatever this connection is on (fastest-engine M1 item 4):
-    /// detached — no [`Branch`] handle exists, so nothing reaps it but [`Database::drop_branch`] —
-    /// persistent across restarts, never leased (not even by `DatabaseOpts::with_branch_lease`),
-    /// and connectable by name ([`Database::connect_named`]) from any process that opens the
-    /// database. The name is unique among unreleased branches, and is durable with the fork: both
-    /// are one log record.
-    pub fn create_branch(self: &Arc<Connection>, name: &str) -> Result<BranchId> {
-        let _ = name;
-        Err(LimboError::InternalError("named branches: not implemented".to_string()))
+        self.db.branches.fork_trunk(schema, page_size, seen, name)
     }
 
     /// The branch this connection is open on, if any.
@@ -1213,20 +1221,28 @@ impl Database {
 
     /// The unreleased branch named `name` (fastest-engine M1 item 4), if any.
     pub fn branch_named(&self, name: &str) -> Result<Option<BranchId>> {
-        let _ = name;
-        Err(LimboError::InternalError("named branches: not implemented".to_string()))
+        self.branches.branch_named(name)
     }
 
     /// A connection on the branch named `name`, which needs no handle (fastest-engine M1 item 4).
     pub fn connect_named(self: &Arc<Database>, name: &str) -> Result<Arc<Connection>> {
-        let _ = name;
-        Err(LimboError::InternalError("named branches: not implemented".to_string()))
+        let id = self
+            .branches
+            .branch_named(name)?
+            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
+        self.connect_branch(id)
     }
 
     /// Release the branch named `name` (fastest-engine M1 item 4); its name is free from here on.
     pub fn drop_branch(&self, name: &str) -> Result<Reaped> {
-        let _ = name;
-        Err(LimboError::InternalError("named branches: not implemented".to_string()))
+        let id = self
+            .branches
+            .branch_named(name)?
+            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
+        // A concurrent drop and re-create of the same name between the lookup and the release can
+        // only make this release the OLD branch twice, which is refused as reaped: the new branch
+        // is never touched (its id differs).
+        self.branches.release_handle(id)
     }
 
     /// Every unreleased branch, attached or not. Refused on a read-only handle of a database with
