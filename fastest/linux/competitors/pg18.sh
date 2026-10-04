@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # pg18.sh -- PostgreSQL 18.6 (Homebrew postgresql@18) for the branch benchmark. PREREG §4 settings.
 #
+# LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/competitors/pg18.sh @648ce2929):
+# PGDG postgresql-18 at FT_PG18 (default /usr/lib/postgresql/18/bin). fsync_writethrough does not exist on Linux
+# (PG refuses it), and on Linux fsync/fdatasync ARE the device flush, so MODE d2 here sets wal_sync_method=fdatasync
+# (also Linux's default). Consequence: on Linux `default` differs from `d2` ONLY in file_copy_method (copy vs clone);
+# its durability is already D2. file_copy_method=clone is copy_file_range(2) on Linux: a reflink on XFS/btrfs when
+# the kernel can, a silent byte copy when it cannot, which is why the driver proves the clone from shared extents.
+#
 #   pg18.sh init  DATA MODE PORT      initdb into DATA (must not exist; *.noindex), MODE = d2 | default | d1clone
 #   pg18.sh start DATA [V1RUN]        exec `postgres -D DATA` directly (never pg_ctl: its /bin/sh would strip the
 #                                     V1 shim), detached; pid -> DATA.ftpid, log -> DATA.log; waits until ready
@@ -40,7 +47,7 @@ init)
     echo "unix_socket_directories = ''"
     echo "max_connections = 1100"
     if [ "$MODE" = d2 ]; then
-      echo "wal_sync_method = fsync_writethrough"
+      echo "wal_sync_method = fdatasync"  # Linux port: fsync_writethrough is macOS/Windows only
       echo "fsync = on"
       echo "full_page_writes = on"
       echo "synchronous_commit = on"
@@ -58,14 +65,14 @@ start)
   require_port_free "$(port_of)"
   launch "$PIDF" "$LOG" "$(dirname "$DATA")" "$V1" "$FT_PG18/postgres" -D "$DATA"
   wait_ready "$PIDF" "$DATA" "$LOG" 60 "$FT_PG18/pg_isready" -q -h 127.0.0.1 -p "$(port_of)" -t 1
-  echo "settings: $(psqlc -d postgres -At -c "SELECT string_agg(name || '=' || setting, ' ' ORDER BY name) FROM pg_settings WHERE name IN ('wal_sync_method','fsync','full_page_writes','synchronous_commit','file_copy_method','max_connections','server_version')")"
+  echo "settings: $(psqlc -d postgres -At -c "SELECT string_agg(name || '=' || setting, ' ' ORDER BY name) FROM pg_settings WHERE name IN ('wal_sync_method','fsync','full_page_writes','synchronous_commit','file_copy_method','max_connections','server_version','io_method','checkpoint_timeout','shared_buffers','log_min_messages')")"
   ;;
 seed)
   ROWS=${3:-}
   [ -n "$ROWS" ] || die "usage: pg18.sh seed DATA ROWS"
   alive "$PIDF" "$DATA" || die "REFUSED: no running server recorded for $DATA"
   psqlc -d postgres -c "CREATE DATABASE p"
-  /opt/homebrew/bin/python3 -B "$FT_HERE/gen_seed.py" "$ROWS" | psqlc -d p
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" "$ROWS" | psqlc -d p
   psqlc -d p -c "VACUUM ANALYZE t" -c "CHECKPOINT"
   echo "seeded p.t rows=$(psqlc -d p -At -c 'SELECT count(*) FROM t') size=$(psqlc -d p -At -c "SELECT pg_size_pretty(pg_database_size('p'))")"
   ;;

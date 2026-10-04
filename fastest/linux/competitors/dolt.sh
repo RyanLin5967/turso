@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # dolt.sh -- Dolt 2.3.5 sql-server (MySQL protocol) for the branch benchmark, native settings (PREREG §4).
+# LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/competitors/dolt.sh @648ce2929):
+# unchanged except that the binaries and python come from common.sh (FT_DOLT = the dolt-linux-<arch> release
+# tarball, sha256-checked by fetch_dolt.sh; FT_MARIADB = Ubuntu's mariadb client).
 #
 #   dolt.sh init  DATA PORT         DATA must not exist (*.noindex). DOLT_ROOT_PATH=DATA/root holds the global
 #                                   config (never ~/.dolt; metrics and version check off, see common.sh);
@@ -43,7 +46,7 @@ seed)
   ROWS=${3:-}
   [ -n "$ROWS" ] || die "usage: dolt.sh seed DATA ROWS"
   alive "$PIDF" "$DATA/dbs" || die "REFUSED: no running server recorded for $DATA"
-  /opt/homebrew/bin/python3 -B "$FT_HERE/gen_seed.py" "$ROWS" | my bench
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" "$ROWS" | my bench
   my -N bench -e "CALL DOLT_COMMIT('-Am', 'seed')" >/dev/null
   echo "seeded bench.t rows=$(my -N bench -e 'SELECT count(*) FROM t') branch=$(my -N bench -e 'SELECT active_branch()')"
   ;;

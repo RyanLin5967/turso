@@ -39,29 +39,120 @@
  * flights.tsv (b0), summary.json, hdr_total.txt. Clock: CLOCK_UPTIME_RAW (the V1 shim's).
  * Every directory must be on APFS with a *.noindex component, or the command refuses (rc 2).
  * Exit: 0 ok | 2 usage/refused | 3 no measured op succeeded, or any op failed.
+ *
+ * LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/baselines/clonebench.c
+ * @10c484e4a). Every change is an #if block; the macOS branches are the original lines. On Linux:
+ *   - clonefile(src, dst) = open dst O_CREAT|O_EXCL + ioctl(FICLONE) of the whole source; directories must be XFS
+ *     or btrfs (FICLONE-capable) with a *.noindex component (kept so paths stay interchangeable with the Mac's).
+ *   - B1's per-create flush (lane brief): fsync(clone fd), then fsync(branch dir fd). --sync d0: neither.
+ *     On Linux fsync IS the device flush (no F_FULLFSYNC split), so B1 = 2 flushes per create by construction.
+ *   - --mode b0 REFUSES (rc 2): its flight design rests on F_FULLFSYNC being separate from fsync, and Linux needs
+ *     its own registered recipe before a B0 number means anything.
+ *   - extents: FIEMAP (FS_IOC_FIEMAP), which also reports FIEMAP_EXTENT_SHARED extents (the clone proof).
+ *   - clock CLOCK_MONOTONIC; V1/C1b hooks only with BB_HOOKS=1 (as bbload.c): --v1-run and C1B_RUN refuse without.
  */
+#ifndef BB_HOOKS
+#ifdef __APPLE__
+#define BB_HOOKS 1
+#else
+#define BB_HOOKS 0
+#endif
+#endif
+#if BB_HOOKS
+#ifndef __APPLE__
+#error "BB_HOOKS=1 needs the Linux V1/C1b shim (lane fastest-linux-flush); build with -DBB_HOOKS=0 until it lands"
+#endif
 #include "../v1/syncshim.h"
 #include "../c1b/c1btrace.h"
+#else
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+/* Hooks off: the names the call sites use, never reached (V1 stays NULL and g_have_c1b 0; the inputs refuse). */
+typedef struct v1_hdr v1_hdr;
+typedef struct { int unused; } c1b_client;
+#define V1_MARK_IDLE (1ULL << 63)
+static inline void v1_set_mark(v1_hdr *h, uint64_t m) { (void)h; (void)m; }
+static inline void c1b_opstart(c1b_client *c, uint64_t op, const char *l) { (void)c; (void)op; (void)l; }
+static inline void c1b_ack(c1b_client *c, uint64_t op, const char *l) { (void)c; (void)op; (void)l; }
+#endif
 #include <errno.h>
 #include <hdr/hdr_histogram.h>
 #include <pthread.h>
 #include <sqlite3.h>
 #include <stdlib.h>
+#ifdef __APPLE__
 #include <sys/clonefile.h>
 #include <sys/mount.h>
+#else
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <linux/magic.h>
+#include <sys/ioctl.h>
+#include <sys/vfs.h>
+#ifndef XFS_SUPER_MAGIC
+#define XFS_SUPER_MAGIC 0x58465342
+#endif
+#ifndef BTRFS_SUPER_MAGIC
+#define BTRFS_SUPER_MAGIC 0x9123683E
+#endif
+#endif
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
 
 #define MIB (1u << 20)
+#ifdef __APPLE__
+#define BB_CLOCK_NAME "CLOCK_UPTIME_RAW"
+#define B1_BARRIER "F_FULLFSYNC(dir)"
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+#else
+#define BB_CLOCK_NAME "CLOCK_MONOTONIC"
+#define B1_BARRIER "fsync(clone)+fsync(dir)"
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+/* clonefile(src, dst, 0) on Linux: a NEW file (O_EXCL: clonefile refuses an existing dst) that shares every extent
+ * of src (FICLONE). clone_open returns the open dst fd (B1 fsyncs it), or -1 with errno and no dst left behind. */
+static int clone_open(const char *src, const char *dst) {
+    int s = open(src, O_RDONLY | O_CLOEXEC);
+    if (s < 0) return -1;
+    int d = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (d < 0) { int e = errno; close(s); errno = e; return -1; }
+    if (ioctl(d, FICLONE, s) != 0) { int e = errno; close(d); close(s); unlink(dst); errno = e; return -1; }
+    close(s);
+    return d;
+}
+static int clonefile(const char *src, const char *dst, int flags) {
+    (void)flags;
+    int d = clone_open(src, dst);
+    if (d < 0) return -1;
+    close(d);
+    return 0;
+}
+#endif
 static void die(const char *w) { fprintf(stderr, "clonebench: %s: %s\n", w, strerror(errno)); exit(2); }
 static uint64_t xs(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
 
 static int guard_dir(const char *d) {
     struct statfs sf;
     if (statfs(d, &sf) != 0) { fprintf(stderr, "clonebench: REFUSED: %s: %s\n", d, strerror(errno)); return -1; }
+#ifdef __APPLE__
     if (strcmp(sf.f_fstypename, "apfs")) { fprintf(stderr, "clonebench: REFUSED: %s is %s, not apfs\n", d, sf.f_fstypename); return -1; }
+#else
+    uint32_t ft = (uint32_t)sf.f_type;
+    if (ft != (uint32_t)XFS_SUPER_MAGIC && ft != (uint32_t)BTRFS_SUPER_MAGIC) {
+        fprintf(stderr, "clonebench: REFUSED: %s is filesystem type 0x%x, not xfs or btrfs (FICLONE)\n", d, ft);
+        return -1;
+    }
+#endif
     if (!strstr(d, ".noindex/") && !(strlen(d) >= 8 && !strcmp(d + strlen(d) - 8, ".noindex"))) {
         fprintf(stderr, "clonebench: REFUSED: %s has no *.noindex component\n", d);
         return -1;
@@ -78,6 +169,7 @@ static int guard_file_dir(const char *f) {
 }
 
 /* ---------- extents ---------- */
+#ifdef __APPLE__
 static long extents(const char *path, off_t *size_out) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
@@ -97,6 +189,42 @@ static long extents(const char *path, off_t *size_out) {
     if (size_out) *size_out = st.st_size;
     return n;
 }
+#else
+static long g_ext_shared; /* FIEMAP_EXTENT_SHARED extents found by the last extents() call */
+static long extents(const char *path, off_t *size_out) {
+    enum { NEXT = 256 };
+    uint64_t buf[(sizeof(struct fiemap) + NEXT * sizeof(struct fiemap_extent)) / sizeof(uint64_t) + 1];
+    struct fiemap *fm = (struct fiemap *)buf;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    fstat(fd, &st);
+    if (size_out) *size_out = st.st_size;
+    long n = 0;
+    uint64_t start = 0;
+    g_ext_shared = 0;
+    for (;;) {
+        memset(fm, 0, sizeof *fm);
+        fm->fm_start = start;
+        fm->fm_length = FIEMAP_MAX_OFFSET - start;
+        fm->fm_flags = FIEMAP_FLAG_SYNC;
+        fm->fm_extent_count = NEXT;
+        if (ioctl(fd, FS_IOC_FIEMAP, fm) != 0) { n = -1; break; }
+        if (fm->fm_mapped_extents == 0) break;
+        int last = 0;
+        for (unsigned i = 0; i < fm->fm_mapped_extents; i++) {
+            struct fiemap_extent *e = &fm->fm_extents[i];
+            n++;
+            if (e->fe_flags & FIEMAP_EXTENT_SHARED) g_ext_shared++;
+            if (e->fe_flags & FIEMAP_EXTENT_LAST) last = 1;
+            start = e->fe_logical + e->fe_length;
+        }
+        if (last) break;
+    }
+    close(fd);
+    return n;
+}
+#endif
 
 /* ---------- sqlite helpers ---------- */
 static void sq_exec(sqlite3 *db, const char *sql) {
@@ -232,7 +360,12 @@ static void *flusher(void *arg) {
         uint64_t snap = f_submitted; /* every ticket <= snap had its clonefile return before this line */
         pthread_mutex_unlock(&f_mu);
         uint64_t t0 = now_ns();
+#ifdef __APPLE__
         int rc = SYNC_D0 ? 0 : fcntl(g_dirfd, F_FULLFSYNC);
+#else
+        int rc = -1; /* unreachable: --mode b0 is refused off macOS */
+        errno = ENOTSUP;
+#endif
         uint64_t t1 = now_ns();
         pthread_mutex_lock(&f_mu);
         if (rc == -1) f_err = errno;
@@ -262,12 +395,24 @@ static int create_branch(const char *dst, rec_t *r) {
         pthread_rwlock_unlock(&g_parent_rw);
         pthread_rwlock_rdlock(&g_parent_rw);
     }
+#ifdef __APPLE__
     int rc = clonefile(PARENT, dst, 0);
     pthread_rwlock_unlock(&g_parent_rw);
     if (rc != 0) return -1;
     r->clone_done = now_ns();
     if (SYNC_D0 && !MODE_B0) return 0;
     if (!MODE_B0) return fcntl(g_dirfd, F_FULLFSYNC) == -1 ? -1 : 0;
+#else
+    int cfd = clone_open(PARENT, dst);
+    pthread_rwlock_unlock(&g_parent_rw);
+    if (cfd < 0) return -1;
+    r->clone_done = now_ns();
+    /* B1 (Linux): fsync the clone (its extent map and inode), then fsync the directory (its entry). D0: neither. */
+    int brc = 0;
+    if (!SYNC_D0) brc = (fsync(cfd) != 0 || fsync(g_dirfd) != 0) ? -1 : 0;
+    close(cfd);
+    return brc; /* b0 is refused off macOS, so nothing below runs here */
+#endif
     pthread_mutex_lock(&f_mu);
     uint64_t t = ++f_submitted;
     r->ticket = t;
@@ -393,12 +538,26 @@ static int cmd_run(int argc, char **argv) {
     }
     if (OP_M1 && ROWS < 1) { fprintf(stderr, "clonebench: --op m1 needs --rows (the parent's row count)\n"); return 2; }
     if (MUTANT_EARLY && !MODE_B0) { fprintf(stderr, "clonebench: --mutant-early-ack is a b0 mutant\n"); return 2; }
+#ifndef __APPLE__
+    if (MODE_B0) {
+        fprintf(stderr, "clonebench: REFUSED: --mode b0 is not ported to Linux (its flights assume F_FULLFSYNC apart from fsync)\n");
+        return 2;
+    }
+#endif
+#if !BB_HOOKS
+    if (v1run) { fprintf(stderr, "clonebench: REFUSED: --v1-run, but this build has no V1 hooks (BB_HOOKS=0)\n"); return 2; }
+    if (getenv("C1B_RUN") && *getenv("C1B_RUN")) {
+        fprintf(stderr, "clonebench: REFUSED: C1B_RUN is set, but this build has no C1b hooks (BB_HOOKS=0)\n");
+        return 2;
+    }
+#endif
     if (guard_dir(BDIR) || guard_file_dir(PARENT)) return 2;
     if (!(g_parent = sq_open(PARENT, 0))) return 2;
     sq_exec(g_parent, "PRAGMA synchronous=FULL; PRAGMA fullfsync=1; PRAGMA checkpoint_fullfsync=1; SELECT count(*) FROM t");
     snprintf(g_parent_wal, sizeof g_parent_wal, "%s-wal", PARENT);
     if ((g_dirfd = open(BDIR, O_RDONLY)) < 0) die("open branch dir");
     if (mkdir(out, 0755) != 0) { fprintf(stderr, "clonebench: REFUSED: out dir %s must not exist: %s\n", out, strerror(errno)); return 2; }
+#if BB_HOOKS
     if (v1run) {
         const char *why = "?";
         if (!(V1 = v1_map(v1run, &why))) { fprintf(stderr, "clonebench: V1 run %s: %s\n", v1run, why); return 2; }
@@ -410,13 +569,16 @@ static int cmd_run(int argc, char **argv) {
         if (!self) { fprintf(stderr, "clonebench: REFUSED: --v1-run %s but this process is not attached (launch it with v1run)\n", v1run); return 2; }
         if (!MARKB) MARKB = ((uint64_t)time(NULL) & 0x7fffff) << 32;
     }
+#endif
     snprintf(RUN_TAG, sizeof RUN_TAG, "r%llx", (unsigned long long)(now_ns() & 0xffffffffff));
+#if BB_HOOKS
     const char *c1run = getenv("C1B_RUN");
     if (c1run && *c1run) {
         const char *why = "?";
         if (c1b_client_open(&g_c1b, c1run, &why) != 0) { fprintf(stderr, "clonebench: C1B client: %s\n", why); return 2; }
         g_have_c1b = 1;
     }
+#endif
     pthread_t fth;
     if (MODE_B0) pthread_create(&fth, NULL, flusher, NULL);
     client_t *cl = calloc((size_t)C, sizeof *cl);
@@ -517,7 +679,8 @@ static int cmd_run(int argc, char **argv) {
     int rc = (ok == 0 || bad) ? 3 : 0;
     snprintf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
-    fprintf(f, "{\"verdict\":\"%s\",\"rc\":%d,\"mode\":\"%s\",\"op\":\"%s\",\"sync\":\"%s\",\"clients\":%d,\"hold_us\":%llu,"
+    fprintf(f, "{\"clock\":\"%s\",\"b1_barrier\":\"%s\",", BB_CLOCK_NAME, SYNC_D0 ? "none" : B1_BARRIER); /* Linux port */
+    fprintf(f, "\"verdict\":\"%s\",\"rc\":%d,\"mode\":\"%s\",\"op\":\"%s\",\"sync\":\"%s\",\"clients\":%d,\"hold_us\":%llu,"
                "\"mutant_early_ack\":%d,\"drop\":%d,\"branch_locking\":\"%s\",\"parent\":\"%s\",\"window_s\":%.6f,\"measured_ops\":%llu,\"measured_ok\":%llu,"
                "\"failed_ops\":%llu,\"total_ops\":%zu,\"tput_per_s\":%.3f,\"parent_checkpoints\":%llu,\"flights_total\":%llu,"
                "\"flights_in_window\":%llu,\"creates_per_flight_in_window\":%.3f,\"cpu_s\":%.3f,\"cpu_cores\":%.3f,"
@@ -610,7 +773,11 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "extents") && argc == 3) {
         off_t sz;
         long e = extents(argv[2], &sz);
+#ifdef __APPLE__
         printf("{\"file\":\"%s\",\"bytes\":%lld,\"extents\":%ld}\n", argv[2], (long long)sz, e);
+#else
+        printf("{\"file\":\"%s\",\"bytes\":%lld,\"extents\":%ld,\"shared_extents\":%ld}\n", argv[2], (long long)sz, e, g_ext_shared);
+#endif
         return e < 0 ? 2 : 0;
     }
     fprintf(stderr, "clonebench: unknown command %s\n", argv[1]);

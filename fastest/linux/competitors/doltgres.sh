@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # doltgres.sh -- Doltgres (prebuilt darwin-arm64, go1.26.8) for the branch benchmark, native settings (PREREG §4).
+# LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/competitors/doltgres.sh
+# @648ce2929): unchanged except that the binaries and python come from common.sh (FT_DOLTGRES = the 1.3.3
+# doltgresql-linux-<arch> release tarball, sha256-checked by fetch_dolt.sh; psql from PGDG postgresql-18).
 #
 #   doltgres.sh init  DATA PORT       write DATA/config.yaml (DATA must not exist; *.noindex): data, cfg, auth,
 #                                     privilege and branch-control files all INSIDE DATA (the defaults are relative
@@ -57,7 +60,7 @@ seed)
   ROWS=${3:-}
   [ -n "$ROWS" ] || die "usage: doltgres.sh seed DATA ROWS"
   alive "$PIDF" "$CONF" || die "REFUSED: no running server recorded for $DATA"
-  /opt/homebrew/bin/python3 -B "$FT_HERE/gen_seed.py" "$ROWS" | psqlc
+  "$FT_PY" -B "$FT_HERE/gen_seed.py" "$ROWS" | psqlc
   psqlc -At -c "SELECT dolt_commit('-Am', 'seed')"
   echo "seeded t rows=$(psqlc -At -c 'SELECT count(*) FROM t') branch=$(psqlc -At -c 'SELECT active_branch()')"
   ;;

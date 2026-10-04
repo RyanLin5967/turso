@@ -1,14 +1,18 @@
 # common.sh -- shared helpers for the competitor setup scripts (sourced, bash 3.2 compatible).
 # Every server: an explicit data dir with a *.noindex component, started detached in its own session with its
 # pid recorded at launch, and stopped ONLY by that recorded pid after checking the pid still runs our command.
+#
+# LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/competitors/common.sh @648ce2929).
+# Binaries come from the environment with Linux defaults: FT_PG18 (PGDG postgresql-18), FT_DOLT and FT_DOLTGRES
+# (release tarballs fetched by fetch_dolt.sh into FT_BIN), FT_MARIADB (Ubuntu mariadb-client), FT_PY. The V1 and
+# C1b launch prefixes are macOS-only until lane fastest-linux-flush lands its shim: launch() refuses them here.
 
-FT_SP=/private/tmp/claude-501/-Users-idide-projects-ferrodb/b2b44149-483d-42d1-b512-89bf5de5a135/scratchpad
-FT_PG18=/opt/homebrew/opt/postgresql@18/bin
-FT_DOLTGRES=/Users/idide/wt/branchbench/doltgresql-darwin-arm64/bin/doltgres
-FT_DOLT=$FT_SP/bb-waste/bin/dolt
-FT_MARIADB=/opt/homebrew/opt/mariadb/bin/mariadb
-FT_V1=${FT_V1:-$FT_SP/fastest-tools/v1-build-3f98730e8}
-FT_C1B=${FT_C1B:-$FT_SP/fastest-tools/c1b-build}
+FT_BIN=${FT_BIN:-$HOME/fastest-bin}
+FT_PG18=${FT_PG18:-/usr/lib/postgresql/18/bin}
+FT_DOLTGRES=${FT_DOLTGRES:-$FT_BIN/doltgres}
+FT_DOLT=${FT_DOLT:-$FT_BIN/dolt}
+FT_MARIADB=${FT_MARIADB:-/usr/bin/mariadb}
+FT_PY=${FT_PY:-python3}
 FT_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 die() { echo "$*" >&2; exit 2; }
@@ -45,13 +49,8 @@ launch() {
   shift 4
   [ -e "$pidf" ] && die "REFUSED: $pidf exists (a server we started is recorded there): stop it first"
   local pre=()  # expanded as ${pre[@]+...}: bash 3.2 calls an empty array unbound under set -u
-  if [ "${v1#c1b:}" != "$v1" ]; then
-    [ -x "$FT_C1B/c1brun" ] || die "REFUSED: no c1brun at $FT_C1B"
-    pre=("$FT_C1B/c1brun" "${v1#c1b:}")
-  elif [ "$v1" != "-" ]; then
-    [ -x "$FT_V1/v1run" ] || die "REFUSED: no v1run at $FT_V1"
-    pre=("$FT_V1/v1run" "$v1")
-  fi
+  # Linux port: no V1/C1b shim yet, so an instrumented launch refuses rather than running uncounted.
+  [ "$v1" = "-" ] || die "REFUSED: instrument '$v1' requested, but the V1/C1b shims are not ported to Linux yet"
   ( cd "$cwd" && exec /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!\n"' -- ${pre[@]+"${pre[@]}"} "$@" ) \
     </dev/null >>"$log" 2>&1 &
   echo $! >"$pidf"

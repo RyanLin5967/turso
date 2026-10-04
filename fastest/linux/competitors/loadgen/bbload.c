@@ -43,13 +43,51 @@
  * next op. C>1: B+1 warm-up, B+2 measured window, B+3 drain. v1_per_op.py reduces them.
  * Exit: 0 ok | 2 usage, spec or connect failure | 3 no measured op succeeded, min-ops not reached, or errors
  * without --allow-errors | 4 stall (no op completed for --stall-s, default 120).
+ *
+ * LINUX PORT (lane fastest-linux-comp; source artie-research frontier/fastest/tools/loadgen/bbload.c @648ce2929).
+ * Every change is an #if block; the macOS branches are the original lines. On Linux:
+ *   - clock: CLOCK_MONOTONIC (clock_gettime / clock_nanosleep TIMER_ABSTIME), recorded in summary.json as "clock".
+ *     It is the clock bpf_ktime_get_ns() reads, so an eBPF flush counter can share it; a shim on another clock
+ *     must rebuild with -DBB_CLOCK=<clock> (clock_nanosleep rejects CLOCK_MONOTONIC_RAW).
+ *   - the V1/C1b hooks are compiled only with BB_HOOKS=1 (default: 1 on macOS, 0 elsewhere). With them off,
+ *     --v1-run and --c1b-run REFUSE (rc 2) instead of running unmarked. BB_HOOKS=1 off macOS is a build error
+ *     until the Linux shim lands from lane fastest-linux-flush.
  */
+#ifndef BB_HOOKS
+#ifdef __APPLE__
+#define BB_HOOKS 1
+#else
+#define BB_HOOKS 0
+#endif
+#endif
+#if BB_HOOKS
+#ifndef __APPLE__
+#error "BB_HOOKS=1 needs the Linux V1/C1b shim (lane fastest-linux-flush); build with -DBB_HOOKS=0 until it lands"
+#endif
 #include "../v1/syncshim.h"
 #include "../c1b/c1btrace.h"
+#else
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+/* Hooks off: the names the call sites use, never reached (V1 stays NULL and HAVE_C1B 0; the flags refuse). */
+typedef struct v1_hdr v1_hdr;
+typedef struct { int unused; } c1b_client;
+#define V1_MARK_IDLE (1ULL << 63)
+static inline void v1_set_mark(v1_hdr *h, uint64_t m) { (void)h; (void)m; }
+static inline void c1b_opstart(c1b_client *c, uint64_t op, const char *l) { (void)c; (void)op; (void)l; }
+static inline void c1b_ack(c1b_client *c, uint64_t op, const char *l) { (void)c; (void)op; (void)l; }
+#endif
 #include <errno.h>
 #include <hdr/hdr_histogram.h>
 #include <libpq-fe.h>
+#ifdef __APPLE__
 #include <mach/mach_time.h>
+#endif
 #include <math.h>
 #include <mysql.h>
 #include <pthread.h>
@@ -122,6 +160,8 @@ static uint64_t g_errn[MAXERR];
 static int g_nerr;
 static uint64_t g_reconnects;
 
+#ifdef __APPLE__
+#define BB_CLOCK_NAME "CLOCK_UPTIME_RAW"
 static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 static mach_timebase_info_data_t TB;
 static void sleep_until(uint64_t t_ns) {
@@ -129,6 +169,23 @@ static void sleep_until(uint64_t t_ns) {
     if (t_ns <= n) return;
     mach_wait_until(mach_absolute_time() + (t_ns - n) * TB.denom / TB.numer);
 }
+#else
+#ifndef BB_CLOCK
+#define BB_CLOCK CLOCK_MONOTONIC
+#endif
+#define BB_STR2(x) #x
+#define BB_STR(x) BB_STR2(x)
+#define BB_CLOCK_NAME BB_STR(BB_CLOCK)
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(BB_CLOCK, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+static void sleep_until(uint64_t t_ns) {
+    struct timespec ts = {(time_t)(t_ns / 1000000000ULL), (long)(t_ns % 1000000000ULL)};
+    while (clock_nanosleep(BB_CLOCK, TIMER_ABSTIME, &ts, NULL) == EINTR) { }
+}
+#endif
 static uint64_t xs(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
 static double unif(uint64_t *s) { return ((xs(s) >> 11) + 0.5) / 9007199254740992.0; }
 
@@ -559,7 +616,9 @@ static void hdr_out(struct hdr_histogram *h, const char *dir, const char *name) 
 
 int main(int argc, char **argv) {
     const char *specp = NULL, *out = NULL, *v1run = NULL;
+#ifdef __APPLE__
     mach_timebase_info(&TB);
+#endif
     snprintf(RUNTAG, sizeof RUNTAG, "r%llx", (unsigned long long)(time(NULL) & 0xffffffff));
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -577,12 +636,23 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--stall-s") && v) STALL_S = atof(argv[++i]);
         else if (!strcmp(a, "--run-tag") && v) snprintf(RUNTAG, sizeof RUNTAG, "%s", argv[++i]);
         else if (!strcmp(a, "--seed") && v) SEED = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--v1-run") && v) v1run = argv[++i];
+        else if (!strcmp(a, "--v1-run") && v) {
+            v1run = argv[++i];
+#if !BB_HOOKS
+            fprintf(stderr, "bbload: REFUSED: --v1-run, but this build has no V1 hooks (BB_HOOKS=0)\n");
+            return 2;
+#endif
+        }
         else if (!strcmp(a, "--v1-mark-base") && v) MARKB = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(a, "--c1b-run") && v) {
+#if BB_HOOKS
             const char *why = "?";
             if (c1b_client_open(&C1B, argv[++i], &why) != 0) { fprintf(stderr, "bbload: --c1b-run: %s\n", why); return 2; }
             HAVE_C1B = 1;
+#else
+            fprintf(stderr, "bbload: REFUSED: --c1b-run, but this build has no C1b hooks (BB_HOOKS=0)\n");
+            return 2;
+#endif
         }
         else if (!strcmp(a, "--allow-errors")) ALLOW_ERR = 1;
         else if (!strcmp(a, "--set") && v) {
@@ -601,9 +671,11 @@ int main(int argc, char **argv) {
     if (load_spec(specp, &spectext) != 0) return 2;
     if (mkdir(out, 0755) != 0) { fprintf(stderr, "bbload: REFUSED: out dir %s must not exist: %s\n", out, strerror(errno)); return 2; }
     if (v1run) {
+#if BB_HOOKS
         const char *why = "?";
         if (!(V1 = v1_map(v1run, &why))) { fprintf(stderr, "bbload: V1 run %s: %s\n", v1run, why); return 2; }
         if (!MARKB) MARKB = ((uint64_t)time(NULL) & 0x7fffff) << 32;
+#endif
     }
     char p[2048];
     snprintf(p, sizeof p, "%s/spec.txt", out);
@@ -749,6 +821,7 @@ int main(int argc, char **argv) {
             (unsigned long long)g_warm_claimed, total, (unsigned long long)g_reconnects,
             win > 0 ? meas_ok / win : 0, win > 0 ? in_window_done / win : 0, cpu, win > 0 ? cpu / win : 0,
             v1run ? v1run : "", (unsigned long long)MARKB);
+    fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",
             hdr_value_at_percentile(ht, 50) / 1e3, hdr_value_at_percentile(ht, 90) / 1e3, hdr_value_at_percentile(ht, 99) / 1e3,
             meas_ok >= 10000 ? "" : "null,\"p999_unlicensed\":", hdr_value_at_percentile(ht, 99.9) / 1e3, "",
