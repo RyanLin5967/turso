@@ -970,7 +970,10 @@ impl Connection {
             Err(e) => {
                 // Not handed out, so released (review item 11): on a live store the Release rides
                 // the next flight; a fail-stopped one keeps it pending (`release_handle`).
-                let _ = store.release_handle(id);
+                // fastest-engine mutant `fork_failure_kept` (test builds only) keeps it.
+                if !store::fe_mutant("fork_failure_kept") {
+                    let _ = store.release_handle(id);
+                }
                 Err(e)
             }
         });
@@ -1010,7 +1013,10 @@ impl Connection {
                 // released (review item 11).
                 if let Some(c) = after {
                     if let Err(e) = store.wait_trunk_commit_published(c) {
-                        let _ = store.release_handle(id);
+                        // fastest-engine mutant `fork_failure_kept` (test builds only).
+                        if !store::fe_mutant("fork_failure_kept") {
+                            let _ = store.release_handle(id);
+                        }
                         return Err(e);
                     }
                 }

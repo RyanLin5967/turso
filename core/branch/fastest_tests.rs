@@ -1633,3 +1633,112 @@ fn a_d2_first_write_orders_its_slots_with_one_barrier() {
         assert_eq!(after.full_fsync - before.full_fsync, 1, "catalog={catalog}");
     }
 }
+
+// ---- lead review 1 item 11: an early-released operation whose wait fails is undone or fenced ----
+
+/// Lead review 1 item 11: a fork whose flight fails is not handed out, and it is released, so it is
+/// not listed. (The release landed in 22434231a; mutant `fork_failure_kept` restores the leak.)
+#[test]
+fn a_fork_whose_flight_fails_is_released_not_leaked() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("fork-fail.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let first = trunk.fork_branch().unwrap();
+        let before = db.branch_ids().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(trunk.create_branch("lost").is_err(), "catalog={catalog}: premise: the fork's flight failed");
+        assert_eq!(db.branch_ids().unwrap(), before, "catalog={catalog}: a fork that was not handed out is listed");
+        drop(first);
+    }
+}
+
+/// Lead review 1 item 11: a branch commit whose flight fails returned an error, so nothing reads it
+/// afterwards — the branch is refused (its state is in doubt until a reopen recovers it from disk),
+/// never shown with the failed commit's write. After a reopen it reads its last durable commit.
+#[test]
+fn a_branch_commit_whose_flight_fails_is_never_read() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("commit-fail.db");
+        let (id, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            {
+                let bc = b.connect().unwrap();
+                write_v(&bc, 3, "durable");
+                db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+                assert!(
+                    bc.execute("UPDATE t SET v = 'failed' WHERE id = 3").is_err(),
+                    "catalog={catalog}: premise: the commit's flight failed"
+                );
+                let seen = bc.prepare("SELECT v FROM t WHERE id = 3").and_then(|mut s| s.run_collect_rows());
+                if let Ok(rows) = seen {
+                    assert_eq!(
+                        rows[0][0],
+                        crate::Value::from_text("durable"),
+                        "catalog={catalog}: the failed commit's write was read on its own connection"
+                    );
+                }
+            }
+            let reopened = b.connect().and_then(|c| {
+                c.prepare("SELECT v FROM t WHERE id = 3").and_then(|mut s| s.run_collect_rows())
+            });
+            if let Ok(rows) = reopened {
+                assert_eq!(
+                    rows[0][0],
+                    crate::Value::from_text("durable"),
+                    "catalog={catalog}: the failed commit's write was read on a new connection"
+                );
+            }
+            (b.into_id(), db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let b = db.branch(id).unwrap();
+        assert_eq!(read_v(&b.connect().unwrap(), 3), "durable", "catalog={catalog}: after a reopen");
+    }
+}
+
+/// Lead review 1 item 11: a lock-free fork that times out waiting for the trunk commit it forks
+/// after is `Busy`, not handed out, and released: it is not listed, and after a reopen it is gone.
+/// The publication wait is shortened for the test (`BranchStore::set_publish_wait`).
+#[test]
+fn a_fork_that_times_out_on_a_trunk_commit_is_busy_and_released() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("publish-timeout.db");
+        let incarnation = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let a = db.connect().unwrap();
+            seed_wide(&a);
+            let first = a.fork_branch().unwrap().into_id();
+            db.branches.set_publish_wait(std::time::Duration::from_millis(200));
+            let hold = db.branches.trunk_commit_hold.clone();
+            hold.store(super::store::HOLD_TRUNK_DECIDED, std::sync::atomic::Ordering::Release);
+            let writer = {
+                let a = a.clone();
+                std::thread::spawn(move || write_v(&a, 7, "c1"))
+            };
+            wait_hold(&hold, super::store::HOLD_TRUNK_DECIDED);
+            let forked = db.connect().unwrap().create_branch("late");
+            hold.store(0, std::sync::atomic::Ordering::Release);
+            writer.join().unwrap();
+            assert!(
+                matches!(forked, Err(LimboError::Busy)),
+                "catalog={catalog}: a fork past its publication wait: {forked:?}"
+            );
+            assert_eq!(db.branch_ids().unwrap(), vec![first], "catalog={catalog}: the timed-out fork is listed");
+            assert_eq!(db.branch_named("late").unwrap(), None, "catalog={catalog}");
+            db.incarnation
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        assert_eq!(db.branch_ids().unwrap().len(), 1, "catalog={catalog}: after a reopen");
+        assert_eq!(db.branch_named("late").unwrap(), None, "catalog={catalog}: after a reopen");
+    }
+}

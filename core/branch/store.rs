@@ -299,6 +299,9 @@ pub(crate) struct BranchStore {
     /// (see `pause_at`), so a test can act on the store with the gate open.
     #[cfg(test)]
     pub(crate) trunk_commit_hold: Arc<AtomicU8>,
+    /// Test hook: the publication wait in milliseconds, in place of `PUBLISH_WAIT` (0: unset).
+    #[cfg(test)]
+    publish_wait_ms: AtomicU64,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -1146,7 +1149,8 @@ struct TrunkState {
 enum Handle {
     Attached,
     Detached,
-    /// Released, and the `Release` record is durable: `collect` may free it.
+    /// Released, and the `Release` record is durable or in the air (early release): `collect` may
+    /// free it, and what it frees waits for the record's flight (`pending_free`, rule 2).
     Released,
     /// Released by its handle, but the `Release` record could not be made durable (the journal
     /// failed). After a restart the branch comes back Detached and still names its slots, so
@@ -1192,6 +1196,16 @@ fn fail_stop_cause(journal: Option<&Journal>) -> String {
         ),
         None => "fail-stopped after an I/O failure, until the database is reopened".to_string(),
     }
+}
+
+/// A commit of branch `id` was applied in memory and its flight failed (`BranchState::in_doubt`).
+fn in_doubt(id: BranchId) -> LimboError {
+    LimboError::InternalError(format!(
+        "branch {} is in doubt: a commit of it failed to become durable after it was applied, so \
+         the store is fail-stopped and this branch is read again only after the database is \
+         reopened, which recovers it from disk",
+        id.0
+    ))
 }
 
 fn fail_stopped(journal: Option<&Journal>, id: BranchId, what: &str) -> LimboError {
@@ -1245,6 +1259,10 @@ struct BranchState {
     /// The log sequence number that makes this branch's fork durable; 0 for a branch loaded from
     /// disk, which is durable already (`BranchStore::settle`; review C-F4).
     fork_lsn: u64,
+    /// A commit of this branch was applied and its flight failed, so the caller got an error for a
+    /// write the store holds in memory: nothing reads the branch again in this process (lead
+    /// review 1 item 11). Only ever set on a fail-stopped store.
+    in_doubt: bool,
 }
 
 /// Named server branches' names (fastest-engine M1 item 4), under the store mutex. An eager store
@@ -2161,6 +2179,8 @@ impl BranchStore {
             class: SyncClass::Off,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
+            #[cfg(test)]
+            publish_wait_ms: AtomicU64::new(0),
         }
     }
 
@@ -2344,6 +2364,8 @@ impl BranchStore {
             class: inner.sync,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
+            #[cfg(test)]
+            publish_wait_ms: AtomicU64::new(0),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -3350,9 +3372,16 @@ impl BranchStore {
     pub(crate) fn wait_trunk_commit_published(&self, c: u64) -> Result<()> {
         let (lock, closed) = &self.gate_closed;
         let started = Instant::now();
+        #[cfg(test)]
+        let limit = match self.publish_wait_ms.load(Ordering::Acquire) {
+            0 => PUBLISH_WAIT,
+            ms => Duration::from_millis(ms),
+        };
+        #[cfg(not(test))]
+        let limit = PUBLISH_WAIT;
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         while self.trunk_commits.load(Ordering::Acquire) <= c {
-            if started.elapsed() > PUBLISH_WAIT {
+            if started.elapsed() > limit {
                 return Err(LimboError::Busy);
             }
             guard = closed
@@ -3361,6 +3390,13 @@ impl BranchStore {
                 .0;
         }
         Ok(())
+    }
+
+    /// Shorten the publication wait (`wait_trunk_commit_published`), for a test of its timeout.
+    #[cfg(test)]
+    pub(crate) fn set_publish_wait(&self, wait: Duration) {
+        self.publish_wait_ms
+            .store(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX).max(1), Ordering::Release);
     }
 
     /// Fork a child of the trunk.
@@ -3562,6 +3598,9 @@ impl BranchStore {
         if st.handle.is_released() {
             return Err(reaped(id));
         }
+        if st.in_doubt {
+            return Err(in_doubt(id));
+        }
         // A fail-stopped pass cannot reap (it cannot make a Release durable), so the refusal that
         // reaping gives an expired branch is given here instead (review N4). Unexpired branches
         // stay readable.
@@ -3715,6 +3754,13 @@ impl BranchStore {
         if let Err(e) = self.wait_durable(lsn, class) {
             // Applied in memory and not durable: the store is fail-stopped, and the slots it freed
             // never return (no flight will cover them); the branch comes back at the next open.
+            // `Released` means durable or in the air, so it becomes `ReleasePending`, which nothing
+            // ever frees (lead review 1 item 3).
+            if let Some(st) = self.inner.lock().branches.get_mut(&id) {
+                if st.handle == Handle::Released {
+                    st.handle = Handle::ReleasePending;
+                }
+            }
             return Err(LimboError::InternalError(format!(
                 "branch {} was not released durably ({e}); it comes back at the next open",
                 id.0
@@ -3823,8 +3869,10 @@ impl BranchStore {
         let (durable_at, snapshot) = {
             let mut inner = self.inner.lock();
             // No fork is listed before it is durable (review C-F4): the listing waits for the
-            // newest one, after the lock is released.
-            let durable_at = inner.last_fork_lsn;
+            // newest one, after the lock is released. A fail-stopped store makes nothing durable
+            // again, and every fork it did not make durable was released by its creator, so it
+            // lists without waiting (N4: a stopped store stays readable).
+            let durable_at = if inner.poisoned() { 0 } else { inner.last_fork_lsn };
             // githost-shape instrument (observing only).
             inner.shape.ids_calls += 1;
             if knob_off("fw1") {
@@ -4253,8 +4301,11 @@ impl BranchStore {
         }
     }
 
-    /// Commit a branch's dirty pages: write each into the slot its copy decision reserved, make
-    /// that durable with the `Commit` record, and only then move the branch's map.
+    /// Commit a branch's dirty pages: write each into the slot its copy decision reserved, buffer
+    /// the `Commit` record and move the branch's map under the store mutex, then wait — holding no
+    /// lock — until the record is durable before reporting the commit (early release, M1 item 2).
+    /// A commit whose wait fails leaves the branch in doubt: refused from then on (lead review 1
+    /// item 11).
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
@@ -4344,7 +4395,14 @@ impl BranchStore {
         let class = inner.sync;
         drop(inner);
         kill_point("commit.applied");
-        self.wait_durable(lsn, class)
+        let durable = self.wait_durable(lsn, class);
+        // fastest-engine mutant `commit_doubt_ignored` (test builds only).
+        if durable.is_err() && !fe_mutant("commit_doubt_ignored") {
+            if let Some(st) = self.inner.lock().branches.get_mut(&id) {
+                st.in_doubt = true;
+            }
+        }
+        durable
     }
 
     /// Fill `out` with `page` as branch `id` sees it, if that version lives in the arena. `false`
@@ -4352,6 +4410,10 @@ impl BranchStore {
     /// ordinary WAL / database-file path.
     pub(crate) fn resolve_into(&self, id: BranchId, page: u32, out: &mut [u8]) -> Result<bool> {
         let mut inner = self.inner.lock();
+        // One atomic load on the hot path: a branch can be in doubt only once the store stopped.
+        if inner.fail_stop.load(Ordering::Acquire) {
+            inner.refuse_in_doubt(id)?;
+        }
         self.resolve_calls.fetch_add(1, Ordering::Relaxed);
         let (mut levels, mut examined) = (0, 0);
         let resolved = inner.resolve(id, page, &mut levels, &mut examined);
@@ -5117,6 +5179,14 @@ impl StoreInner {
         shared || self.journal.as_ref().is_some_and(|j| j.is_poisoned())
     }
 
+    /// Refuse a read of branch `id` if a failed commit left it in doubt (`BranchState::in_doubt`).
+    fn refuse_in_doubt(&self, id: BranchId) -> Result<()> {
+        match self.branches.get(&id) {
+            Some(st) if st.in_doubt => Err(in_doubt(id)),
+            _ => Ok(()),
+        }
+    }
+
     /// A fork just applied is durable once `lsn` is (see `BranchState::fork_lsn`).
     fn note_fork_lsn(&mut self, id: BranchId, lsn: u64) {
         if let Some(st) = self.branches.get_mut(&id) {
@@ -5335,6 +5405,7 @@ impl StoreInner {
                 view: None,
                 name: None,
                 fork_lsn: 0,
+                in_doubt: false,
             },
         );
         self.note_table_growth(grown_before);
@@ -6195,6 +6266,7 @@ impl StoreInner {
                 view: None,
                 name: name.clone(),
                 fork_lsn: 0,
+                in_doubt: false,
             },
         );
         self.note_table_growth(grown_before);
@@ -7028,6 +7100,7 @@ impl StoreInner {
                     view: None,
                     name: b.name.as_deref().filter(|_| !b.released).map(Arc::from),
                     fork_lsn: 0,
+                    in_doubt: false,
                 },
             );
             if let Some(name) = b.name.filter(|_| !b.released) {
