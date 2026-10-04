@@ -684,3 +684,560 @@ fn c0_differential_model_catalog_mode() {
     let _s = serial();
     run_c0(true);
 }
+
+// ---- C1: SIGKILL aimed at named code points (PREREG v1 §8; amendments 35-38) ----
+//
+// A trial: the parent seeds a database and closes it; a CHILD (this test binary, running only
+// `c1_child`) opens it and runs the workload on `FE_C1_C` threads, writing every operation to the
+// crash log twice — an attempt line before it is issued and an ACK line after it returned — with
+// one `write(2)` each, so a line is in the file before the next step. `FE_KILL_AT=<point>:<n>`
+// SIGKILLs the child the n-th time it reaches `point` (`store::kill_point`); a child that never
+// gets there in `C1_TRIAL_SECS` is SIGKILLed by the parent instead (an UNAIMED kill, counted
+// apart). Optionally (`FE_C1_RECOVER_KILL`) a second child is killed inside recovery's replay.
+// Then the parent opens the database (a real recovery) and checks, from the log alone:
+// * I1: every acknowledged, undeleted branch exists (by name, or by id when unnamed) and reads its
+//   fork-point state plus its acknowledged writes;
+// * I2: an operation attempted and not acknowledged is all there or not at all;
+// * I3: the trunk is exactly its state at the last commit it recovered, which is at or past every
+//   acknowledged one; every branch is checked whole, so a sibling's or parent's write would show;
+// * I4: an acknowledged delete stays deleted, and frees its name;
+// * I5: the integrity check passes on the trunk and on every branch;
+// * I7: a dropped and re-created name names the newest branch.
+//
+// Log lines: `T <k> <ops>` (trunk attempt), `TA <k>`, `C <name> <parent|->` (create attempt),
+// `CA <name> <id> <k>`, `W <name> <ops>`, `WA <name>`, `D <name>`, `DA <name>`, and the kill
+// point's own `KILL-AT <point> <n>`. Ops: `s:<id>:<v>`, `d:<id>`, `t:<name>`.
+
+/// The kill points C1 aims at, by the phase they sit in (amendment 37).
+const C1_POINTS: &[&str] = &[
+    "fork.applied",
+    "flight.taken",
+    "flight.arena_synced",
+    "flight.log_written",
+    "flight.log_synced",
+    "flight.landed",
+    "commit.slots_written",
+    "commit.applied",
+    "release.applied",
+    "trunk.decided",
+    "trunk.barrier_done",
+    "trunk.wal_written",
+    "trunk.published",
+    "ckpt.captured",
+    "ckpt.written",
+    "ckpt.installed",
+    "compact.renamed",
+];
+
+const C1_TRIAL_SECS: u64 = 20;
+
+fn encode_ops(ops: &[Op]) -> String {
+    ops.iter()
+        .map(|op| match op {
+            Op::Set(id, v) => format!("s:{id}:{v}"),
+            Op::Del(id) => format!("d:{id}"),
+            Op::Table(name) => format!("t:{name}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn decode_ops(words: &[&str]) -> Vec<Op> {
+    words
+        .iter()
+        .map(|w| {
+            let mut parts = w.splitn(3, ':');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some("s"), Some(id), Some(v)) => Op::Set(id.parse().unwrap(), v.to_string()),
+                (Some("d"), Some(id), None) => Op::Del(id.parse().unwrap()),
+                (Some("t"), Some(name), None) => Op::Table(name.to_string()),
+                other => panic!("undecodable op {w:?}: {other:?}"),
+            }
+        })
+        .collect()
+}
+
+fn c1_opts() -> DatabaseOpts {
+    let catalog = std::env::var("FE_C1_CATALOG").is_ok_and(|v| v == "1");
+    opts(catalog, env_class_named("FE_C1_CLASS"))
+}
+
+fn env_class_named(var: &str) -> SyncClass {
+    match std::env::var(var).as_deref() {
+        Ok("off") => SyncClass::Off,
+        Ok("full") => SyncClass::FullFsync,
+        _ => SyncClass::Fsync,
+    }
+}
+
+fn log(line: &str) {
+    super::store::crash_log(line);
+}
+
+/// The child's workload: runs until it is killed (it never returns on its own).
+fn c1_workload(db: Arc<Database>, threads: usize, seed: u64) {
+    let writers = if threads == 1 { 0 } else { (threads / 4).clamp(1, 4) };
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let mut rng = Rng((seed ^ ((t as u64 + 1) * 0x9E37_79B9_7F4A_7C15)) | 1);
+                let trunk = db.connect().unwrap();
+                // (name, id) of this thread's live branches.
+                let mut mine: Vec<(String, BranchId, bool)> = Vec::new();
+                let mut counter = 0u64;
+                loop {
+                    let roll = rng.below(100);
+                    let trunk_turn = if t < writers { roll < 80 } else { threads == 1 && roll < 25 };
+                    if trunk_turn {
+                        let attempt = (|| -> Result<()> {
+                            trunk.execute("BEGIN")?;
+                            trunk.execute("UPDATE seq SET n = n + 1 WHERE id = 1")?;
+                            let k = trunk.prepare("SELECT n FROM seq WHERE id = 1")?.run_collect_rows()?[0][0]
+                                .as_int()
+                                .unwrap();
+                            let mut ops = Vec::new();
+                            for j in 0..=rng.below(3) {
+                                ops.push(match rng.below(100) {
+                                    0..=79 => Op::Set(1 + rng.below(ROWS as u64) as i64, format!("k{k}j{j}")),
+                                    80..=94 => Op::Set(10_000 + k as i64 * 4 + j as i64, format!("k{k}i{j}")),
+                                    _ => Op::Del(1 + rng.below(ROWS as u64) as i64),
+                                });
+                            }
+                            for op in &ops {
+                                trunk.execute(sql(op))?;
+                            }
+                            log(&format!("T {k} {}", encode_ops(&ops)));
+                            trunk.execute("COMMIT")?;
+                            log(&format!("TA {k}"));
+                            Ok(())
+                        })();
+                        if attempt.is_err() {
+                            let _ = trunk.execute("ROLLBACK");
+                        }
+                        continue;
+                    }
+                    let res: Result<()> = (|| {
+                        if mine.len() < 6 || (roll < 40 && mine.len() < 12) {
+                            counter += 1;
+                            let name = format!("c{t}-{counter}");
+                            let named = rng.below(4) != 0;
+                            let from = (!mine.is_empty() && rng.below(3) == 0)
+                                .then(|| mine[rng.below(mine.len() as u64) as usize].clone());
+                            log(&format!(
+                                "C {name} {}",
+                                from.as_ref().map_or("-".to_string(), |p| p.0.clone())
+                            ));
+                            let id = retrying(|| {
+                                let conn = match &from {
+                                    None => trunk.clone(),
+                                    Some((pname, pid, pnamed)) => c1_connect(&db, pname, *pid, *pnamed)?,
+                                };
+                                if named {
+                                    conn.create_branch(&name)
+                                } else {
+                                    conn.fork_branch().map(|b| b.into_id())
+                                }
+                            })?;
+                            let k = read_state(&c1_connect(&db, &name, id, named)?)?.seq;
+                            log(&format!("CA {name} {} {k}", id.0));
+                            mine.push((name, id, named));
+                        } else if roll < 75 {
+                            let i = rng.below(mine.len() as u64) as usize;
+                            let (name, id, named) = mine[i].clone();
+                            let c = c1_connect(&db, &name, id, named)?;
+                            let mut ops = Vec::new();
+                            for j in 0..=rng.below(3) {
+                                ops.push(match rng.below(100) {
+                                    0..=84 => Op::Set(1 + rng.below(ROWS as u64) as i64, format!("w{t}x{counter}j{j}r{}", rng.below(1000))),
+                                    _ => Op::Del(1 + rng.below(ROWS as u64) as i64),
+                                });
+                            }
+                            c.execute("BEGIN")?;
+                            for op in &ops {
+                                c.execute(sql(op))?;
+                            }
+                            log(&format!("W {name} {}", encode_ops(&ops)));
+                            c.execute("COMMIT")?;
+                            log(&format!("WA {name}"));
+                        } else if roll < 85 {
+                            let i = rng.below(mine.len() as u64) as usize;
+                            let (name, id, named) = mine.swap_remove(i);
+                            log(&format!("D {name}"));
+                            if named {
+                                db.drop_branch(&name)?;
+                            } else {
+                                db.branch(id)?.reap()?;
+                            }
+                            log(&format!("DA {name}"));
+                        } else if roll < 87 {
+                            // A store checkpoint (catalog) or snapshot compaction (snapshot mode).
+                            db.branch_compact_now()?;
+                        } else {
+                            let i = rng.below(mine.len() as u64) as usize;
+                            let (name, id, named) = mine[i].clone();
+                            read_state(&c1_connect(&db, &name, id, named)?)?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(e) = res {
+                        log(&format!("ERR thread {t}: {e}"));
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+fn c1_connect(db: &Arc<Database>, name: &str, id: BranchId, named: bool) -> Result<Arc<Connection>> {
+    if named {
+        db.connect_named(name)
+    } else {
+        let h = db.branch(id)?;
+        let c = h.connect();
+        let _ = h.into_id();
+        c
+    }
+}
+
+/// The C1 child: only when the parent spawned this binary to run it (`FE_C1_CHILD`).
+#[test]
+fn c1_child() {
+    let Ok(path) = std::env::var("FE_C1_CHILD") else {
+        return;
+    };
+    let db = open_at(Path::new(&path), c1_opts());
+    if std::env::var_os("FE_C1_RECOVER_ONLY").is_some() {
+        // A recovery that the parent aims a kill into (phase 8); the open above was it.
+        log("RECOVERED");
+        return;
+    }
+    let threads = env_u64("FE_C1_C", 16) as usize;
+    c1_workload(db, threads, env_u64("FE_C1_SEED", 1));
+}
+
+/// What the log says, replayed into models.
+#[derive(Default)]
+struct C1Log {
+    /// The last attempt of each trunk commit `k`.
+    trunk_try: BTreeMap<u64, Vec<Op>>,
+    trunk_acked: u64,
+    /// name -> branch: its id once acknowledged, its acknowledged model, a pending write, a
+    /// pending delete; in creation order (a re-created name is a new entry, the older one gone).
+    branches: Vec<C1Branch>,
+    killed_at: Option<String>,
+    errors: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct C1Branch {
+    name: String,
+    parent: Option<String>,
+    id: Option<BranchId>,
+    /// None until its create is acknowledged.
+    model: Option<State>,
+    pending_write: Option<Vec<Op>>,
+    delete: Option<bool>, // Some(false): attempted; Some(true): acknowledged
+}
+
+fn trunk_state(log: &C1Log, seed: &State, k: u64) -> Option<State> {
+    let mut state = seed.clone();
+    for j in 1..=k {
+        state.apply(log.trunk_try.get(&j)?);
+    }
+    state.seq = k;
+    Some(state)
+}
+
+fn parse_c1_log(text: &str, seed: &State) -> C1Log {
+    let mut log = C1Log::default();
+    for line in text.lines() {
+        let words: Vec<&str> = line.split(' ').collect();
+        match words.as_slice() {
+            ["T", k, ops @ ..] => {
+                log.trunk_try.insert(k.parse().unwrap(), decode_ops(ops));
+            }
+            ["TA", k] => log.trunk_acked = log.trunk_acked.max(k.parse().unwrap()),
+            ["C", name, parent] => log.branches.push(C1Branch {
+                name: name.to_string(),
+                parent: (*parent != "-").then(|| parent.to_string()),
+                id: None,
+                model: None,
+                pending_write: None,
+                delete: None,
+            }),
+            ["CA", name, id, k] => {
+                let k: u64 = k.parse().unwrap();
+                let i = log.branches.iter().rposition(|b| b.name == *name).expect("create attempt");
+                let model = match log.branches[i].parent.clone() {
+                    None => trunk_state(&log, seed, k),
+                    Some(p) => log
+                        .branches
+                        .iter()
+                        .rev()
+                        .find(|b| b.name == p && b.model.is_some())
+                        .and_then(|b| b.model.clone()),
+                };
+                let b = &mut log.branches[i];
+                b.id = Some(BranchId(id.parse().unwrap()));
+                if model.is_none() {
+                    log.errors.push(format!("{line}: no model for its fork point"));
+                }
+                b.model = model;
+            }
+            ["W", name, ops @ ..] => {
+                if let Some(b) = log.branches.iter_mut().rev().find(|b| b.name == *name) {
+                    b.pending_write = Some(decode_ops(ops));
+                }
+            }
+            ["WA", name] => {
+                if let Some(b) = log.branches.iter_mut().rev().find(|b| b.name == *name) {
+                    if let (Some(model), Some(ops)) = (b.model.as_mut(), b.pending_write.take()) {
+                        model.apply(&ops);
+                    }
+                }
+            }
+            ["D", name] => {
+                if let Some(b) = log.branches.iter_mut().rev().find(|b| b.name == *name) {
+                    b.delete = Some(false);
+                }
+            }
+            ["DA", name] => {
+                if let Some(b) = log.branches.iter_mut().rev().find(|b| b.name == *name) {
+                    b.delete = Some(true);
+                }
+            }
+            ["KILL-AT", point, n] => log.killed_at = Some(format!("{point}:{n}")),
+            _ => {}
+        }
+    }
+    log
+}
+
+fn integrity(conn: &Arc<Connection>) -> Result<String> {
+    let rows = conn.prepare("PRAGMA integrity_check")?.run_collect_rows()?;
+    Ok(match &rows[0][0] {
+        Value::Text(t) => t.as_str().to_string(),
+        other => format!("{other:?}"),
+    })
+}
+
+/// Check the recovered database against the log (see the C1 section's invariants). Returns the
+/// violations.
+fn verify_c1(db: &Arc<Database>, log: &C1Log, seed: &State) -> Vec<String> {
+    let mut bad = log.errors.clone();
+    let trunk = db.connect().unwrap();
+    match read_state(&trunk) {
+        Ok(got) => {
+            if got.seq < log.trunk_acked {
+                bad.push(format!("I3: trunk recovered at k={} < acknowledged {}", got.seq, log.trunk_acked));
+            }
+            match trunk_state(log, seed, got.seq) {
+                Some(want) if want == got => {}
+                Some(_) => bad.push(format!("I3: trunk at k={} differs from its commits", got.seq)),
+                None => bad.push(format!("I3: trunk at k={} has commits the log never attempted", got.seq)),
+            }
+        }
+        Err(e) => bad.push(format!("trunk unreadable: {e}")),
+    }
+    match integrity(&trunk) {
+        Ok(v) if v == "ok" => {}
+        other => bad.push(format!("I5: trunk integrity {other:?}")),
+    }
+    let live: BTreeSet<BranchId> = db.branch_ids().unwrap_or_default().into_iter().collect();
+    // The newest entry of each name decides what the name must name (I7).
+    let mut newest: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, b) in log.branches.iter().enumerate() {
+        newest.insert(&b.name, i);
+    }
+    for (i, b) in log.branches.iter().enumerate() {
+        let acked = b.model.is_some();
+        let deleted = b.delete == Some(true);
+        let maybe_deleted = b.delete == Some(false);
+        let named = db.branch_named(&b.name).ok().flatten();
+        let found = b.id.filter(|id| live.contains(id)).or_else(|| match (named, newest[b.name.as_str()] == i) {
+            (Some(id), true) => Some(id),
+            _ => None,
+        });
+        if deleted {
+            if let Some(id) = b.id.filter(|id| live.contains(id)) {
+                bad.push(format!("I4: deleted branch {} ({}) is back", id.0, b.name));
+            }
+            continue;
+        }
+        let Some(id) = found else {
+            if acked && !maybe_deleted {
+                bad.push(format!("I1: acknowledged branch {} ({:?}) is missing", b.name, b.id));
+            }
+            continue;
+        };
+        let conn = match db.branch(id) {
+            Ok(h) => {
+                let c = h.connect();
+                let _ = h.into_id();
+                c
+            }
+            Err(_) => db.connect_named(&b.name),
+        };
+        let got = match conn.and_then(|c| {
+            let state = read_state(&c)?;
+            let ok = integrity(&c)?;
+            Ok((state, ok))
+        }) {
+            Ok((state, ok)) => {
+                if ok != "ok" {
+                    bad.push(format!("I5: branch {} integrity {ok}", b.name));
+                }
+                state
+            }
+            Err(e) => {
+                bad.push(format!("branch {} unreadable: {e}", b.name));
+                continue;
+            }
+        };
+        match &b.model {
+            Some(model) => {
+                let mut with_pending = model.clone();
+                if let Some(ops) = &b.pending_write {
+                    with_pending.apply(ops);
+                }
+                if got != *model && got != with_pending {
+                    bad.push(format!(
+                        "I1/I2: branch {} ({}) reads neither its model nor its model plus its pending write",
+                        id.0, b.name
+                    ));
+                }
+            }
+            None => {
+                // An unacknowledged create that recovered: whole (I2), at a valid fork point.
+                let fork_point = match &b.parent {
+                    None => trunk_state(log, seed, got.seq),
+                    Some(p) => log
+                        .branches
+                        .iter()
+                        .rev()
+                        .find(|x| x.name == *p && x.model.is_some())
+                        .and_then(|x| x.model.clone()),
+                };
+                if fork_point.as_ref() != Some(&got) {
+                    bad.push(format!("I2: unacknowledged create {} recovered torn", b.name));
+                }
+            }
+        }
+    }
+    bad
+}
+
+/// One C1 trial. Returns (landed, violations, what was aimed).
+fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: &str, n: u64, seed: u64, recover_kill: Option<u64>) -> (bool, Vec<String>, String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c1.db");
+    let log_path = dir.path().join("c1.log");
+    let base = {
+        let db = open_at(&path, opts(catalog, class));
+        let trunk = db.connect().unwrap();
+        let base = seed_trunk(&trunk);
+        let _ = trunk.fork_branch().unwrap().into_id();
+        base
+    };
+    let class_name = match class {
+        SyncClass::Off => "off",
+        SyncClass::Fsync => "fsync",
+        SyncClass::FullFsync => "full",
+    };
+    let spawn = |kill_at: String, recover_only: bool| {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["branch::crash_tests::c1_child", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_C1_CHILD", &path)
+            .env("FE_CRASH_LOG", &log_path)
+            .env("FE_KILL_AT", kill_at)
+            .env("FE_C1_C", threads.to_string())
+            .env("FE_C1_SEED", seed.to_string())
+            .env("FE_C1_CATALOG", if catalog { "1" } else { "0" })
+            .env("FE_C1_CLASS", class_name)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if recover_only {
+            cmd.env("FE_C1_RECOVER_ONLY", "1");
+        }
+        cmd.spawn().unwrap()
+    };
+    let mut child = spawn(format!("{point}:{n}"), false);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(C1_TRIAL_SECS);
+    let mut unaimed = false;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            unaimed = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let log = parse_c1_log(&text, &base);
+    let landed = !unaimed && log.killed_at.is_some();
+    let mut what = format!("{point}:{n}{}", if unaimed { " (unaimed)" } else { "" });
+    if let Some(m) = recover_kill {
+        // Phase 8: a second kill inside recovery's replay, then the parent's own recovery.
+        let mut rec = spawn(format!("recover.replay:{m}"), true);
+        let _ = rec.wait();
+        what.push_str(&format!(" + recover.replay:{m}"));
+    }
+    let db = open_at(&path, opts(catalog, class));
+    let bad = verify_c1(&db, &log, &base);
+    (landed, bad, what)
+}
+
+/// C1: SIGKILLs aimed at every kill point, the database recovered and checked after each. Size
+/// from the environment: `FE_C1_TRIALS` (default 34), `FE_C1_C` (threads, default 16),
+/// `FE_C1_CATALOG`, `FE_C1_CLASS`, `FE_C1_SEED`, `FE_C1_RECOVER_KILL` (1: every third trial also
+/// kills a recovery mid-replay). Refuses a run in which no kill landed where it was aimed.
+#[test]
+fn c1_sigkill_at_aimed_points() {
+    if std::env::var_os("FE_C1_CHILD").is_some() {
+        return;
+    }
+    let _s = serial();
+    let exe = std::env::current_exe().unwrap();
+    let trials = env_u64("FE_C1_TRIALS", 34);
+    let threads = env_u64("FE_C1_C", 16) as usize;
+    let catalog = std::env::var("FE_C1_CATALOG").is_ok_and(|v| v == "1");
+    let class = env_class_named("FE_C1_CLASS");
+    let seed = env_u64("FE_C1_SEED", 7);
+    let recover_kill = std::env::var("FE_C1_RECOVER_KILL").is_ok_and(|v| v == "1");
+    let mut rng = Rng(seed | 1);
+    let (mut landed, mut unaimed, mut violations) = (0u64, 0u64, Vec::new());
+    let mut per_point: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for trial in 0..trials {
+        let point = C1_POINTS[trial as usize % C1_POINTS.len()];
+        let n = 1 + rng.below(40);
+        let rk = (recover_kill && trial % 3 == 2).then(|| 1 + rng.below(20));
+        let (hit, bad, what) = c1_trial(&exe, catalog, class, threads, point, n, seed ^ trial, rk);
+        let e = per_point.entry(point).or_default();
+        if hit {
+            landed += 1;
+            e.0 += 1;
+        } else {
+            unaimed += 1;
+            e.1 += 1;
+        }
+        for b in bad {
+            violations.push(format!("trial {trial} [{what}]: {b}"));
+        }
+    }
+    let summary = format!(
+        "C1 catalog={catalog} class={class:?} threads={threads} trials={trials} landed={landed} \
+         unaimed={unaimed} violations={} per point (landed, unaimed): {per_point:?}",
+        violations.len()
+    );
+    println!("{summary}");
+    assert!(violations.is_empty(), "{summary}\n{}", violations.join("\n"));
+    assert!(landed > 0, "{summary}: no kill landed where it was aimed");
+}
