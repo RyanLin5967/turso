@@ -2095,6 +2095,11 @@ mod tests {
         put_u32(&mut frame, payload.len() as u32);
         put_u32(&mut frame, crc32c::crc32c(&payload));
         frame.extend_from_slice(&payload);
+        // fastest-engine format 9 (FLAGGED TEST EDIT, fixture only): the foreign write is a whole
+        // flight, its frame and its end frame. A bare frame is a torn flight's remnant in a log
+        // written in flights, and recovery cuts it (r12-noforce's damage rule).
+        let start = std::fs::metadata(&files.log).unwrap().len();
+        frame.extend_from_slice(&flight_end_frame(start, &frame));
         {
             use std::io::Write;
             let mut foreign = OpenOptions::new().append(true).open(&files.log).unwrap();
@@ -2216,11 +2221,17 @@ mod tests {
         put_u32(&mut frame, payload.len() as u32);
         put_u32(&mut frame, crc32c::crc32c(&payload));
         frame.extend_from_slice(&payload);
+        // fastest-engine format 9 (FLAGGED TEST EDIT, fixture only): the later write that survived
+        // is a whole later FLIGHT, its frame and its end frame. A bare frame after the hole is a
+        // torn flight's remnant in a log written in flights, and recovery cuts it (r12-noforce's
+        // damage rule; `flight_tests` pins both sides).
+        let later = std::fs::metadata(&files.log).unwrap().len() + 25;
+        frame.extend_from_slice(&flight_end_frame(later, &frame));
         {
             use std::io::Write;
             let mut f = OpenOptions::new().append(true).open(&files.log).unwrap();
             f.write_all(&[0u8; 25]).unwrap(); // a lost frame, read back as zeros
-            f.write_all(&frame).unwrap(); // a later frame that survived
+            f.write_all(&frame).unwrap(); // a later flight that survived
         }
         let before = std::fs::read(&files.log).unwrap();
         assert!(
@@ -2248,6 +2259,9 @@ mod tests {
         put_u32(&mut frame, payload.len() as u32);
         put_u32(&mut frame, crc32c::crc32c(&payload));
         frame.extend_from_slice(&payload);
+        // fastest-engine format 9 (FLAGGED TEST EDIT, fixture only): a whole later flight, as in
+        // `a_zeroed_hole_followed_by_whole_frames_is_corrupt`.
+        frame.extend_from_slice(&flight_end_frame(hole_at + 25, &frame));
         {
             use std::io::Write;
             let mut f = OpenOptions::new().append(true).open(&files.log).unwrap();
