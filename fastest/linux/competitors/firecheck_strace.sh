@@ -151,7 +151,7 @@ start_probe2() {
   local mode=$1 i
   rm -f "$DIR/fc/$mode".* "$DIR/fc/go-$mode"
   ( exec /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die' -- python3 -B "$OUT/probe2.py" "$mode" "$DIR/fc" "$DIR/fc/go-$mode" ) \
-    </dev/null >"$OUT/probe2-$mode.log" 2>&1 &
+    </dev/null >"$OUT/probe2-$mode.log.txt" 2>&1 &
   PP2=$!
   for ((i = 0; i < 400; i++)); do [ -e "$DIR/fc/$mode.ready" ] && return 0; sleep 0.05; done
   return 1
@@ -177,7 +177,7 @@ check F1-launch "$OUT/f1.json" "$EXACT"
 # F2 and F3 share one detached probe: idle attach first (never triggered), then the triggered attach.
 rm -f "$DIR"/fc/probe.* "$DIR/fc/go"
 ( exec /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die' -- python3 -B "$OUT/probe.py" "$DIR/fc" "$DIR/fc/go" ) \
-  </dev/null >"$OUT/probe.log" 2>&1 &
+  </dev/null >"$OUT/probe.log.txt" 2>&1 &
 PP=$!
 sleep 0.5
 if strace_attach "$OUT/f3" "$PP"; then
