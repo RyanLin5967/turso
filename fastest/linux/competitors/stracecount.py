@@ -62,16 +62,37 @@ FDPATH = re.compile(r"^\s*-?\d+<([^>]*)>")
 # (MAIN), whose loss is never benign (review finding 5).
 BENIGN = re.compile(r"attach: ptrace\(PTRACE_SEIZE, (\d+)\): (?:No such process|Operation not permitted)")
 # strace's entering/exiting state for a task disagreed with the kernel's PTRACE_GET_SYSCALL_INFO (strace 6.8 src/
-# syscall.c strace_get_syscall_info, "TODO: handle this" -- unhandled in master too). Seen on arm64 only (run
-# 37225919842): a PG io worker blocked in a syscall at the attach whose syscall then EXITED while strace expected an
-# entry. strace decodes that exit stop as an entry, so from then on it is inverted for that task: every later real
-# exit stop is again taken for an entry and prints this same message (strace fetches the syscall info at every
-# entering stop, traced or not), while its real entries are taken for exits silently. Hence one message for a task
-# means it completed no further syscall in the window, and its only misread stop is that exit, which can print a
-# phantom line only if the misdecoded number names a traced syscall. A window is therefore counted with such a task
-# ONLY when it has exactly one "entering, op == 2" message, it was in the attach roster (its syscall began before the
-# attach), and it has no call line at all; anything else is REFUSED.
+# syscall.c strace_get_syscall_info, "TODO: handle this" -- unhandled in master too). Run 37225919842 printed it 7
+# times, x86_64 and arm64, all in PG deferred windows, each for a PG process blocked in a syscall at the attach (io
+# worker, walwriter, bgwriter, logical replication launcher, postmaster): that syscall's EXIT stop arrived while strace
+# expected an entry, and strace decoded it as one (number = the syscall's return value, args stale). That one stop is
+# the only misread one unless the state stays inverted -- and an inverted task prints this message again at its next
+# real exit stop (strace fetches the info at every stop it takes for an entry, traced or not), so a single message
+# means every later stop of the task was read right (the postmaster's 124 later clone lines in one such window pair
+# up and return real child pids). The misread stop can at most print one PHANTOM line, and only as the task's FIRST
+# line. A window is therefore counted with such a task ONLY when it has exactly one "entering, op == 2" message, it
+# was in the attach roster (its syscall began before the attach), and its first line is not a phantom candidate
+# (phantom_candidate); anything else is REFUSED.
 DESYNC = re.compile(r"pid (\d+): (entering|exiting), ptrace_syscall_info\.op == (\d+)")
+FD_FIRST = ("fsync", "fdatasync", "syncfs", "sync_file_range", "copy_file_range", "ioctl", "fcntl",
+            "pwritev2", "io_submit")
+
+
+def phantom_candidate(first):
+    """True if a task's first call line could be the phantom of a misread exit stop. A phantom's first argument is
+    the kernel's 1-byte is_error over stale bytes, so an fd-first call shows fd 0/1 or a huge number, never a real
+    file; sync() has no argument to tell by, msync's address would be 0/1. A count-relevant call (flush, clone
+    evidence, blind spot) that cannot be told apart is a candidate; any other call, or an fd naming a real file,
+    is not."""
+    if first is None:
+        return False
+    name, rest = first
+    if name in ("sync", "msync"):
+        return True
+    if name in FD_FIRST:
+        pm = FDPATH.match(rest)
+        return not (pm and pm.group(1).startswith("/") and pm.group(1) != "/dev/null")
+    return False
 
 
 def parse_summary(text):
@@ -219,7 +240,7 @@ def count(trace, extras, root, window=None, clients=frozenset()):
                         and not benign(ln):
                     stray.append(ln)
     lines = {}
-    lines_by_tid = {}
+    lines_by_tid, first_by_tid = {}, {}
     pending = {}
     calls = []  # (tid, name, args_and_rest)
     for line in text.splitlines():
@@ -235,6 +256,7 @@ def count(trace, extras, root, window=None, clients=frozenset()):
         pid, name, rest = m.groups()
         lines[name] = lines.get(name, 0) + 1
         lines_by_tid[pid] = lines_by_tid.get(pid, 0) + 1
+        first_by_tid.setdefault(pid, (name, rest))
         if rest.endswith("<unfinished ...>"):
             pending[pid] = (name, rest[: -len("<unfinished ...>")])
         elif rest.endswith("<detached ...>"):
@@ -337,12 +359,14 @@ def count(trace, extras, root, window=None, clients=frozenset()):
     rp = window[: -len(".window")] + ".pids" if window and window.endswith(".window") else None
     if rp and os.path.exists(rp):
         roster_tids = {ln.split(" ", 1)[0] for ln in open(rp, errors="replace") if ln.strip()}
-    out["desync"] = {t: {"messages": m, "lines": lines_by_tid.get(t, 0), "at_attach": t in roster_tids}
+    out["desync"] = {t: {"messages": m, "lines": lines_by_tid.get(t, 0), "at_attach": t in roster_tids,
+                         "first_line": " ".join(first_by_tid[t])[:160] if t in first_by_tid else None,
+                         "first_line_phantom_candidate": phantom_candidate(first_by_tid.get(t))}
                      for t, m in desync.items()}
     for t, d in out["desync"].items():
-        if not (d["messages"] == [("entering", "2")] and d["at_attach"] and d["lines"] == 0):
-            problems.append(f"strace lost the syscall state of task {t} ({d['messages'][:3]}, {d['lines']} lines,"
-                            f" at attach: {d['at_attach']}): its calls cannot be counted")
+        if not (d["messages"] == [("entering", "2")] and d["at_attach"] and not d["first_line_phantom_candidate"]):
+            problems.append(f"strace lost the syscall state of task {t} ({d['messages'][:3]}, at attach:"
+                            f" {d['at_attach']}, first line: {d['first_line']}): its calls cannot be counted")
     if attached:
         if not out["roster_found"]:
             problems.append("attach window has no pid roster (OUT.pids): its flushes cannot be attributed")
