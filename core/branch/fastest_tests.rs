@@ -596,3 +596,136 @@ fn lock_free_durable_forks_racing_trunk_commits_read_every_fork_as_it_was() {
         }
     }
 }
+
+// ---- group commit with the flush outside the store mutex (fastest-engine M1 item 2: gc
+// 389b474b4 on the durable store) ----
+
+/// A fork's store-mutex hold does not include its flush: at D2 every flush is an F_FULLFSYNC of
+/// about 3 ms on this Mac (device floor, banked by the tools lane's V3), so a mean hold per fork
+/// below 1 ms is impossible for a store that syncs under the mutex. Forks one at a time, so no
+/// other fork's flight can carry this one's records.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_forks_store_mutex_hold_excludes_its_flush() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("hold.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let first = trunk.fork_branch().unwrap();
+        let before = db.branch_fork_holds();
+        let mut kept = Vec::new();
+        let counted = syncs_of(|| {
+            for _ in 0..20 {
+                kept.push(trunk.fork_branch().unwrap());
+            }
+            for _ in 0..10 {
+                kept.push(first.fork().unwrap());
+            }
+        });
+        let after = db.branch_fork_holds();
+        let forks = after.store.count - before.store.count;
+        let mean = (after.store.sum_ns - before.store.sum_ns) / forks;
+        assert_eq!(forks, 30);
+        assert!(counted.1 >= 30, "catalog={catalog}: each fork alone is one F_FULLFSYNC: {counted:?}");
+        assert!(
+            mean < 1_000_000,
+            "catalog={catalog}: a D2 fork held the store mutex {mean} ns on average: its flush is \
+             inside the mutex"
+        );
+    }
+}
+
+/// Concurrent creates share flushes: eight threads forking at once at D2 need far fewer than one
+/// F_FULLFSYNC per fork, since every fork that arrives while a flight is in the air rides the next
+/// one. A store that flushes each fork under its mutex issues exactly one per fork.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn concurrent_d2_forks_share_their_flushes() {
+    let _s = serial();
+    const THREADS: usize = 8;
+    const FORKS: usize = 20;
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("group.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let first = trunk.fork_branch().unwrap();
+        let counted = syncs_of(|| {
+            let start = Arc::new(std::sync::Barrier::new(THREADS));
+            let threads: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let (db, start) = (db.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        let conn = db.connect().unwrap();
+                        start.wait();
+                        (0..FORKS)
+                            .map(|_| conn.fork_branch().unwrap().into_id())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for t in threads {
+                assert_eq!(t.join().unwrap().len(), FORKS);
+            }
+        });
+        let forks = (THREADS * FORKS) as u64;
+        assert!(
+            counted.1 * 2 <= forks,
+            "catalog={catalog}: {forks} concurrent D2 forks issued {} F_FULLFSYNC: no flush was shared",
+            counted.1
+        );
+        drop(first);
+    }
+}
+
+/// Concurrent first writes on different branches share flushes too: each branch commit at D2 is
+/// an arena sync and a log sync, both F_FULLFSYNC, and eight committers at once must issue far
+/// fewer than two per commit. A store that syncs each commit under its mutex issues exactly two.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn concurrent_d2_branch_commits_share_their_flushes() {
+    let _s = serial();
+    const THREADS: usize = 8;
+    const COMMITS: usize = 10;
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("commits.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let branches: Vec<Branch> = (0..THREADS).map(|_| trunk.fork_branch().unwrap()).collect();
+        let ids: Vec<BranchId> = branches.into_iter().map(|b| b.into_id()).collect();
+        let counted = syncs_of(|| {
+            let start = Arc::new(std::sync::Barrier::new(THREADS));
+            let threads: Vec<_> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    let (db, start) = (db.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        let b = db.branch(id).unwrap();
+                        let c = b.connect().unwrap();
+                        start.wait();
+                        for k in 0..COMMITS {
+                            c.execute(format!("UPDATE t SET v = 'b{i}-{k}' WHERE id = {}", 1 + k))
+                                .unwrap();
+                        }
+                        drop(c);
+                        let _ = b.into_id();
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+        });
+        let commits = (THREADS * COMMITS) as u64;
+        assert!(
+            counted.1 < commits * 3 / 2,
+            "catalog={catalog}: {commits} concurrent D2 branch commits issued {} F_FULLFSYNC (two \
+             each when no flush is shared)",
+            counted.1
+        );
+    }
+}
