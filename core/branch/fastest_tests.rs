@@ -2169,7 +2169,7 @@ fn a_last_flight_whose_slot_never_reached_the_disk_is_dropped() {
             drop(trunk);
             drop(db);
             // The slot's bytes never reached the disk.
-            let f = OpenOptions::new().write(true).open(&arena).unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&arena).unwrap();
             use std::os::unix::fs::FileExt;
             f.write_all_at(&vec![0u8; 4096], fresh[0] as u64 * 4096).unwrap();
             (id, incarnation)
