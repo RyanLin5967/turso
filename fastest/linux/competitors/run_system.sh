@@ -70,6 +70,13 @@ case "$(tail -1 "$FC" 2>/dev/null)" in
   "VERDICT PASS"*) ;;
   *) echo "REFUSED: the flush counter's fire-check did not pass: $FC ends [$(tail -1 "$FC" 2>/dev/null)]" | tee "$FUN"; exit 1 ;;
 esac
+# Every cell this run must produce, written BEFORE any runs: reduce.py reports a listed cell without a cell.json as
+# MISSING, so a cell that returns early cannot simply disappear (review finding 11).
+for spec in $SPECLIST; do
+  for c in $CLIENTS; do
+    if [ "$KIND" = b1 ]; then echo "b1-$spec-c$c"; else echo "$spec-c$c"; fi
+  done
+done >"$RAW/expected-cells.txt"
 { echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS]";
   echo "strace=$(strace -V | head -1) kernel=$(uname -r) arch=$(uname -m)"; } | tee "$RAW/run-info.txt"
 
