@@ -307,6 +307,8 @@ pub(crate) struct BranchStore {
     publish_wait_ms: AtomicU64,
     /// The trunk's WAL is on the branch files' device (`note_trunk_wal`, `ordered_trunk`).
     trunk_same_device: AtomicBool,
+    /// Trunk commit barriers that took the store mutex (observation only; lead review 1 item 10).
+    barrier_locks: AtomicU64,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -986,6 +988,11 @@ pub(crate) const HOLD_FLIGHT_TAKEN: u8 = 5;
 /// here, its pre-image barrier done and its commit gate open, before its first frame.
 #[cfg(test)]
 pub(crate) const HOLD_TRUNK_BARRIER_DONE: u8 = 6;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a lock-free trunk
+/// fork waits here, its read snapshot taken, before it registers.
+#[cfg(test)]
+pub(crate) const HOLD_FORK_REGISTERING: u8 = 7;
 
 /// How long a waiter an ordered flight covers waits for the trunk commit's WAL flush before it
 /// leads an upgrade flight of its own (liveness, should that commit stall: its caller may be the
@@ -2287,6 +2294,7 @@ impl BranchStore {
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
+            barrier_locks: AtomicU64::new(0),
         }
     }
 
@@ -2473,6 +2481,7 @@ impl BranchStore {
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
+            barrier_locks: AtomicU64::new(0),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -3556,6 +3565,10 @@ impl BranchStore {
         if let Some(name) = name {
             check_branch_name(name)?;
         }
+        #[cfg(test)]
+        if seen.is_some() {
+            pause_at(Some(&*self.trunk_commit_hold), HOLD_FORK_REGISTERING);
+        }
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.lock_counted();
@@ -4346,6 +4359,7 @@ impl BranchStore {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
+        self.barrier_locks.fetch_add(1, Ordering::Relaxed);
         // Re-read under the lock: `begin_trunk_commit` sets it while holding it.
         let unsynced = self.unsynced.load(Ordering::Acquire);
         let leases_exist = inner.leases_exist();
@@ -4895,6 +4909,11 @@ impl BranchStore {
 
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
     /// read)` since open (r11-restart lane instrument; zeros for a snapshot store).
+    /// Trunk commit barriers that took the store mutex (lead review 1 item 10's instrument).
+    pub(crate) fn barrier_locks(&self) -> u64 {
+        self.barrier_locks.load(Ordering::Relaxed)
+    }
+
     /// See `Database::branch_wait_name_filter`.
     pub(crate) fn wait_name_filter(&self) {
         if let Some(build) = self.name_filter_build.lock().take() {

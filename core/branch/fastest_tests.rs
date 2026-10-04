@@ -1876,3 +1876,82 @@ fn a_retaining_d2_trunk_commit_barriers_its_slot_and_its_record() {
         assert_eq!(after.barrier - before.barrier, 2, "catalog={catalog}: the slot's and the record's barriers");
     }
 }
+
+// ---- lead review 1 item 10: the trunk commit path pays nothing it does not need ----
+
+/// Lead review 1 item 10: a trunk commit on a store whose trunk has no live child opens no commit
+/// gate (nothing can fork lock-free while it is in flight: the first child needs its WAL write
+/// lock) and takes no copy decision.
+#[test]
+fn a_trunk_commit_with_no_child_opens_no_commit_gate() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("nogate.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        drop(trunk.fork_branch().unwrap());
+        let before = db.branches.trunk_commit_seq();
+        write_v(&trunk, 7, "new");
+        assert_eq!(db.branches.trunk_commit_seq(), before, "catalog={catalog}: a childless commit opened the gate");
+    }
+}
+
+/// Lead review 1 item 10: a trunk commit that retained nothing and relies on no release still in
+/// the air takes no store mutex for its barrier: nothing is to be made durable.
+#[test]
+fn a_trunk_commit_with_nothing_to_make_durable_takes_no_store_mutex() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("nolock.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _b = trunk.fork_branch().unwrap();
+        // The first write after the fork retains; the second, with no fork since, does not.
+        write_v(&trunk, 7, "first");
+        let before = db.branches.barrier_locks();
+        write_v(&trunk, 7, "second");
+        assert_eq!(db.branches.barrier_locks(), before, "catalog={catalog}: the barrier took the store mutex");
+    }
+}
+
+/// Lead review 1 item 10's guard (mutant M-f's schema hazard, which a commit that opens no gate
+/// would reopen): a lock-free fork whose read snapshot predates a DDL commit made while the trunk
+/// had no child — so no gate moved — and which registers after the trunk's first child was forked
+/// under the WAL write lock, still sees the DDL: that locked fork moves the gate's count. Green
+/// before the gate skip (the DDL commit moved it); mutant `no_locked_fork_bump` must fail it after.
+#[test]
+fn a_lock_free_fork_sees_ddl_committed_while_the_trunk_had_no_child() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("ddl0.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        drop(trunk.fork_branch().unwrap());
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FORK_REGISTERING, std::sync::atomic::Ordering::Release);
+        // F's lock-free attempt holds at the hook with its snapshot taken while the trunk had no
+        // child.
+        let f = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect().unwrap().create_branch("f").unwrap())
+        };
+        wait_hold(&hold, super::store::HOLD_FORK_REGISTERING);
+        trunk.execute("CREATE TABLE u(x)").unwrap();
+        trunk.execute("INSERT INTO u VALUES (1)").unwrap();
+        // The trunk's first child, under the WAL write lock (its own lock-free attempt passes the
+        // hook, which F holds).
+        let g = trunk.fork_branch().unwrap();
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        f.join().unwrap();
+        let c = db.connect_named("f").unwrap();
+        let n = c
+            .prepare("SELECT count(*) FROM u")
+            .and_then(|mut s| s.run_collect_rows())
+            .unwrap_or_else(|e| panic!("catalog={catalog}: the fork missed a DDL commit: {e}"));
+        assert_eq!(n[0][0].as_int(), Some(1), "catalog={catalog}");
+        drop(g);
+    }
+}
