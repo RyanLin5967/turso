@@ -48,7 +48,7 @@
  * Every change is an #if block; the macOS branches are the original lines. On Linux:
  *   - clock: CLOCK_MONOTONIC (clock_gettime / clock_nanosleep TIMER_ABSTIME), recorded in summary.json as "clock".
  *     It is the clock bpf_ktime_get_ns() reads, so an eBPF flush counter can share it; a shim on another clock
- *     must rebuild with -DBB_CLOCK=<clock> (clock_nanosleep rejects CLOCK_MONOTONIC_RAW).
+ *     must rebuild with -DBB_CLOCK=<clock> -DBB_CLOCK_NAME=\"<clock>\" (clock_nanosleep rejects CLOCK_MONOTONIC_RAW).
  *   - the V1/C1b hooks are compiled only with BB_HOOKS=1 (default: 1 on macOS, 0 elsewhere). With them off,
  *     --v1-run and --c1b-run REFUSE (rc 2) instead of running unmarked. BB_HOOKS=1 off macOS is a build error
  *     until the Linux shim lands from lane fastest-linux-flush.
@@ -170,12 +170,15 @@ static void sleep_until(uint64_t t_ns) {
     mach_wait_until(mach_absolute_time() + (t_ns - n) * TB.denom / TB.numer);
 }
 #else
+/* The name is spelled out, never stringified from BB_CLOCK: glibc defines CLOCK_MONOTONIC as 1, so #BB_CLOCK after
+ * expansion recorded "clock":"1" (review finding, run 37175962413). An override must name its clock too. */
 #ifndef BB_CLOCK
 #define BB_CLOCK CLOCK_MONOTONIC
+#define BB_CLOCK_NAME "CLOCK_MONOTONIC"
 #endif
-#define BB_STR2(x) #x
-#define BB_STR(x) BB_STR2(x)
-#define BB_CLOCK_NAME BB_STR(BB_CLOCK)
+#ifndef BB_CLOCK_NAME
+#error "-DBB_CLOCK=<clock> needs -DBB_CLOCK_NAME=\"<its name>\""
+#endif
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(BB_CLOCK, &ts);
