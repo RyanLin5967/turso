@@ -1,6 +1,6 @@
 /* v3floor.c -- V3 device-floor probe, Linux port of frontier/fastest/tools/v3/floor.c (PREREG §4 V3, §11 M0 exit 1).
  *
- *   v3floor --dir D --out O --n N [--arms a,b,...] [--seed S] [--mutant-nosync]
+ *   v3floor --dir D --out O --n N [--arms a,b,...] [--seed S] [--mutant-nosync] [--trace-clock]
  *
  * Arms (default: the M0 set plus the D0 control, append25,ow4k,ow64k,ow1m,clone1b,clone2b,clean,nosync25):
  *   append25     pwrite 25 B at EOF (the file grows) + fsync                        (the V3 floor; one fork frame)
@@ -17,30 +17,52 @@
  * fsync_file). Apple's F_FULLFSYNC and F_BARRIERFSYNC have no Linux counterpart, so the Mac's fsync4k and
  * barrier4k extras are not ported (fsync4k IS ow4k here).
  *
- * Syscalls per op, by definition (fastest/linux/v3/firecheck.sh checks them with strace -f -c):
- *   append25, ow4k, ow64k, ow1m   pwrite64, fsync          fdatasync4k  pwrite64, fdatasync
- *   clean                         fsync                    nosync25     pwrite64
- *   clone1b   openat, ioctl(FICLONE), close, fsync(dir)    clone2b      openat, ioctl(FICLONE), fsync, close, fsync(dir)
- *   (the clone arms' teardown adds one unlinkat per clone, outside the timed window)
- * Setup per arm, before the loop: append25/nosync25 write 25 B + fsync; ow*, fdatasync4k and clean preallocate + fsync;
- *   clone arms preallocate the source + fsync, mkdir the clones' directory + fsync it. Setup syncs are never mutated.
+ * Syscalls of op i, by definition (fastest/linux/v3/firecheck.sh checks counts with strace -f -c, and the exact
+ * sequence, files, sizes and offsets inside each timed window with strace -f -y under --trace-clock):
+ *   append25, nosync25   pwrite64(<arm>, 25, 25 + 25 i); append25 then fsync(<arm>)
+ *   ow4k, ow64k, ow1m    pwrite64(<arm>, rec, (i mod cap/rec) x rec); fsync(<arm>)    cap 16 MiB (ow1m: 128 MiB)
+ *   fdatasync4k          pwrite64 as ow4k; fdatasync(<arm>)
+ *   clean                fsync(<arm>)
+ *   clone1b              openat(<arm>.clones/c<i>, O_WRONLY|O_CREAT|O_EXCL), ioctl(c<i>, FICLONE, <arm>.src), close,
+ *                        fsync(<arm>.clones)
+ *   clone2b              the same with fsync(c<i>) before the close
+ *   Nothing runs between ops. The clone arms' teardown unlinks one clone per op, outside the timed window.
+ * Setup per arm, before the loop: append25/nosync25 write 25 B + fsync; ow*, fdatasync4k and clean preallocate +
+ *   fsync; clone arms preallocate the source + fsync, mkdir the clones' directory + fsync it. Teardown ends with one
+ *   fsync of D, so the unlinks are durable before the next batch. Setup and teardown syncs are never mutated.
  *
  * Arms are interleaved round-robin, each round in a fresh seeded shuffle, so every arm shares the moment.
- * Latency = CLOCK_MONOTONIC_RAW around the op (write + barrier(s)), in ns.
+ * Latency = CLOCK_MONOTONIC_RAW around the op (write + barrier(s)), in ns, read through the vDSO.
+ * --trace-clock reads the clock with a real clock_gettime syscall instead, so strace sees each timed window's
+ *   edges; it is for the fire-check only, and summary.json records it ("trace_clock":1).
  *
  * Output (raw first, then the summary computed from it): O/raw.tsv (arm, i, ns), O/summary.json.
  * Exit: 0 ok | 2 usage or refused setup | 1 an operation failed | 3 VOID: the flush control failed.
  * Flush control (D0, per arm, tools review 1 item 6): for EVERY selected M0 flushed arm (append25, ow4k, ow64k, ow1m,
  *   clone1b, clone2b), p50(arm) / p50(nosync25) must be > 10, else the run is void (rc 3). The fdatasync4k and
  *   clean ratios are reported, never gated. flush_d0_p50_ratio keeps the Mac's headline (append25 / nosync25).
+ *   What the control can and cannot see: run 37243798049's no-flush mutant read <= 5.9 for append25, ow4k and
+ *   fdatasync4k on every cell, but 2.8-14.7 for ow64k, 28-237 for ow1m and 10-24 for the clones, so for those arms a
+ *   missing flush can pass it. It shows that a flush cost something, never that it reached the device: it passed at
+ *   46-106x on hosted disks that report write-through, where the block layer sends the device no flush at all. The
+ *   per-arm flush identity is firecheck.sh's strace check, which must pass on the same binary (run.sh enforces it).
  * Reported, NOT a gate: the drafted M0 exit-1 ratio p50(append25) / p50(clean) > 10, and clean_fast_frac, the share
  *   of clean samples under 100 us (the Mac record found that ratio does not discriminate: tools/v3/FIRECHECK.md).
  *
- * Refusals (rc 2, nothing left behind): D's filesystem is not ext4, xfs or btrfs (the mount table's fstype for D's
- *   longest mount prefix and statfs's magic must agree, else "cannot determine" also refuses); nice != 0, or an I/O
- *   priority other than the default (class none, or best-effort level 4, the nice-0 default); the out dir exists;
- *   n is not a positive integer; an unknown or repeated arm; a flushed arm (append25, ow*, clone*, fdatasync4k)
- *   selected without nosync25, whose control would otherwise silently not run (tools review 1 item 6).
+ * Refusals (rc 2, nothing left behind):
+ *   - D's filesystem is not ext4, xfs or btrfs (the mount table's fstype for D's longest mount prefix and statfs's
+ *     magic must agree, else "cannot determine" also refuses);
+ *   - the flush path has a barrier switched off: D's mount, or, through each loop device, the mount holding its
+ *     backing file (up to 4 layers), carries nobarrier or barrier=0, so an fsync's cache flush never reaches the
+ *     device (the GitHub runners' root ext4 is mounted nobarrier); a layer whose device cannot be found in /sys, or
+ *     whose options cannot be read whole, refuses too. A leaf device that reports write-through is recorded, not
+ *     refused: it claims no volatile cache, so the block layer correctly sends it no flush;
+ *   - nice != 0, a scheduling policy other than SCHED_OTHER, or an I/O priority other than the default (class
+ *     none, or best-effort level 4, the nice-0 default);
+ *   - D's path is too long, the out dir exists, n is not a positive integer, an unknown or repeated arm;
+ *   - a flushed arm (append25, ow*, clone*, fdatasync4k) selected without nosync25, whose control would otherwise
+ *     silently not run (tools review 1 item 6), or every selected flushed arm refused (see below);
+ *   - a clone arm's <arm>.clones directory left in D by an earlier run.
  * The clone arms run on XFS and btrfs only. On ext4 every selected clone arm is REFUSED, never skipped silently: it
  *   does not run, and the reason (the filesystem and the errno a trial FICLONE returned there) is written to
  *   summary.json "refused_arms" and to stderr; the remaining arms run. On xfs or btrfs a failed FICLONE is an error
@@ -48,17 +70,19 @@
  * --mutant-nosync skips every flush in the flushed arms: a fire-check that the control above fails it.
  *
  * Blind spots, stated: foreign I/O on the device and cgroup I/O throttling are not observed here (run.sh's stamps
- *   record /proc/diskstats and PSI around the batch). The timing control cannot tell an arm whose write alone costs
- *   more than 10x nosync25 (ow1m, the clones) from the same arm with its flush; the exact flush identity is the
- *   strace count in firecheck.sh, which must run on the same binary (sha256) as any credited batch. On Linux an fsync
+ *   record /proc/diskstats and PSI around the batch); device-mapper, md and network block layers below D are not
+ *   followed (only loop devices are), so a barrier switched off beneath one of them is not seen. On Linux an fsync
  *   is per inode plus the filesystem's journal, not a device-wide cache flush as F_FULLFSYNC is on Apple, so what
  *   clone1b's one barrier makes durable is a question for a crash test, not for this probe (unverified).
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h>
 #include <limits.h>
 #include <linux/fs.h>
+#include <sched.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,6 +105,8 @@
 #define MAGIC_BTRFS 0x9123683Eu
 #define IOPRIO_WHO_PROC 1
 #define IOPRIO_SHIFT 13
+#define MAXLAYERS 4
+#define OPTS 4096
 
 enum { APPEND25, OW4K, OW64K, OW1M, CLONE1B, CLONE2B, CLEAN, FDATASYNC4K, NOSYNC25, NARMS };
 static const char *NAMES[NARMS] = {"append25", "ow4k", "ow64k", "ow1m", "clone1b", "clone2b", "clean",
@@ -91,7 +117,7 @@ static int flushed(int a) { return a <= CLONE2B || a == FDATASYNC4K; } /* a flus
 static int is_clone(int a) { return a == CLONE1B || a == CLONE2B; }
 
 static const char *DIR_;
-static int MUTANT;
+static int MUTANT, TRACE_CLOCK;
 static char buf[MIB];
 
 typedef struct {
@@ -100,8 +126,8 @@ typedef struct {
     size_t rec;
     int dfd;   /* clone arms: the clones' directory */
     int srcfd; /* clone arms: the durable source */
-    char cdir[1024];
-    char src[1024];
+    char cdir[PATH_MAX];
+    char src[PATH_MAX];
 } armst;
 
 static void die(const char *what) { fprintf(stderr, "v3floor: %s: %s\n", what, strerror(errno)); exit(1); }
@@ -109,8 +135,19 @@ static void barrier(int fd) { if (!MUTANT && fsync(fd) == -1) die("fsync"); }
 static void setup_sync(int fd, const char *what) { if (fsync(fd) == -1) die(what); } /* never mutated */
 static uint64_t now(void) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0) die("clock_gettime CLOCK_MONOTONIC_RAW");
+    int r = TRACE_CLOCK ? (int)syscall(SYS_clock_gettime, CLOCK_MONOTONIC_RAW, &ts) : clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    if (r != 0) die("clock_gettime CLOCK_MONOTONIC_RAW");
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* every path is built here: a path that does not fit is an error, never a silently truncated name */
+static void pathf(char *dst, size_t cap, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+static void pathf(char *dst, size_t cap, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(dst, cap, fmt, ap);
+    va_end(ap);
+    if (r < 0 || (size_t)r >= cap) { fprintf(stderr, "v3floor: path too long (%s...)\n", dst); exit(1); }
 }
 
 static void jstr(FILE *f, const char *s) { /* a JSON string */
@@ -134,8 +171,8 @@ static int parse_u64(const char *s, uint64_t *out) { /* a whole decimal number, 
 }
 
 static int mkfile(const char *name) {
-    char p[1100];
-    snprintf(p, sizeof p, "%s/%s", DIR_, name);
+    char p[PATH_MAX];
+    pathf(p, sizeof p, "%s/%s", DIR_, name);
     int fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) die(p);
     return fd;
@@ -163,11 +200,11 @@ static void setup(int a, armst *s) {
         prealloc(s->fd, s->cap);
         break;
     case CLONE1B: case CLONE2B:
-        snprintf(s->src, sizeof s->src, "%s/%s.src", DIR_, NAMES[a]);
+        pathf(s->src, sizeof s->src, "%s/%s.src", DIR_, NAMES[a]);
         s->srcfd = open(s->src, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (s->srcfd < 0) die("clone src");
         prealloc(s->srcfd, MIB);
-        snprintf(s->cdir, sizeof s->cdir, "%s/%s.clones", DIR_, NAMES[a]);
+        pathf(s->cdir, sizeof s->cdir, "%s/%s.clones", DIR_, NAMES[a]);
         if (mkdir(s->cdir, 0755) != 0) die("clone dir (must not exist)");
         s->dfd = open(s->cdir, O_RDONLY | O_DIRECTORY);
         if (s->dfd < 0) die("clone dir open");
@@ -196,8 +233,8 @@ static void op(int a, armst *s, uint64_t i) {
         else barrier(s->fd);
         break;
     case CLONE1B: case CLONE2B: {
-        char dst[1100];
-        snprintf(dst, sizeof dst, "%s/c%llu", s->cdir, (unsigned long long)i);
+        char dst[PATH_MAX];
+        pathf(dst, sizeof dst, "%s/c%llu", s->cdir, (unsigned long long)i);
         int fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0644);
         if (fd < 0) die("clone create");
         if (ioctl(fd, FICLONE, s->srcfd) != 0) die("ioctl FICLONE");
@@ -213,32 +250,31 @@ static void op(int a, armst *s, uint64_t i) {
 }
 
 static void teardown(int a, armst *s, uint64_t n) {
-    char p[1100];
+    char p[PATH_MAX];
     if (s->fd >= 0) {
-        close(s->fd);
-        snprintf(p, sizeof p, "%s/%s", DIR_, NAMES[a]);
-        unlinkat(AT_FDCWD, p, 0);
+        if (close(s->fd) != 0) die("teardown close");
+        pathf(p, sizeof p, "%s/%s", DIR_, NAMES[a]);
+        if (unlinkat(AT_FDCWD, p, 0) != 0) die("teardown unlink");
     }
     if (s->dfd >= 0) {
         for (uint64_t i = 0; i < n; i++) {
-            snprintf(p, sizeof p, "c%llu", (unsigned long long)i);
-            unlinkat(s->dfd, p, 0);
+            pathf(p, sizeof p, "c%llu", (unsigned long long)i);
+            if (unlinkat(s->dfd, p, 0) != 0) die("teardown unlink clone");
         }
-        close(s->dfd);
-        unlinkat(AT_FDCWD, s->cdir, AT_REMOVEDIR);
+        if (close(s->dfd) != 0) die("teardown close dir");
+        if (unlinkat(AT_FDCWD, s->cdir, AT_REMOVEDIR) != 0) die("teardown rmdir clones");
     }
     if (s->srcfd >= 0) {
-        close(s->srcfd);
-        unlinkat(AT_FDCWD, s->src, 0);
+        if (close(s->srcfd) != 0) die("teardown close src");
+        if (unlinkat(AT_FDCWD, s->src, 0) != 0) die("teardown unlink src");
     }
 }
 
-/* ---- the filesystem under D, from the mount table and statfs, which must agree ---- */
+/* ---- mounts: the longest mount-table prefix of a path ---- */
 typedef struct {
-    char real[PATH_MAX], fstype[64], mnt[PATH_MAX], source[512], mopts[1024], sopts[1024], dev[32];
-    unsigned long magic;
-    unsigned fsid0, fsid1;
-} fsinfo;
+    char real[PATH_MAX], mnt[PATH_MAX], fstype[64], source[PATH_MAX], mopts[OPTS], sopts[OPTS], dev[32];
+    int truncated;
+} mrec;
 
 static void unescape(char *s) { /* mountinfo escapes space, tab, newline and backslash as \ooo */
     char *w = s;
@@ -251,73 +287,136 @@ static void unescape(char *s) { /* mountinfo escapes space, tab, newline and bac
     *w = 0;
 }
 
-static const char *fs_of(const char *dir, fsinfo *fi) { /* NULL when known, else why it cannot be determined */
-    memset(fi, 0, sizeof *fi);
-    if (!realpath(dir, fi->real)) return "realpath failed";
-    FILE *m = fopen("/proc/self/mountinfo", "r");
-    if (!m) return "cannot read /proc/self/mountinfo";
+static int copy(char *dst, size_t cap, const char *src) { /* 1 when it did not fit */
+    size_t l = strlen(src);
+    if (l >= cap) { memcpy(dst, src, cap - 1); dst[cap - 1] = 0; return 1; }
+    memcpy(dst, src, l + 1);
+    return 0;
+}
+
+static const char *mount_of(const char *path, mrec *m) { /* NULL when found, else why not */
+    memset(m, 0, sizeof *m);
+    if (!realpath(path, m->real)) return "realpath failed";
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    if (!f) return "cannot read /proc/self/mountinfo";
     char *line = NULL;
-    size_t cap = 0;
-    size_t best = 0;
+    size_t cap = 0, best = 0;
     int found = 0;
-    while (getline(&line, &cap, m) > 0) {
+    while (getline(&line, &cap, f) > 0) {
         line[strcspn(line, "\n")] = 0;
-        char *f[64];
+        char *fl[64];
         int nf = 0;
-        for (char *t = strtok(line, " "); t && nf < 64; t = strtok(NULL, " ")) f[nf++] = t;
+        for (char *t = strtok(line, " "); t && nf < 64; t = strtok(NULL, " ")) fl[nf++] = t;
         int dash = -1;
-        for (int k = 6; k < nf; k++) if (!strcmp(f[k], "-")) { dash = k; break; }
+        for (int k = 6; k < nf; k++) if (!strcmp(fl[k], "-")) { dash = k; break; }
         if (dash < 0 || dash + 2 >= nf) continue; /* need the fstype and the source after "-" */
         char mp[PATH_MAX];
-        snprintf(mp, sizeof mp, "%s", f[4]);
+        if (copy(mp, sizeof mp, fl[4])) continue;
         unescape(mp);
         size_t l = strlen(mp);
-        int under = !strcmp(mp, "/") || (!strncmp(fi->real, mp, l) && (fi->real[l] == 0 || fi->real[l] == '/'));
+        int under = !strcmp(mp, "/") || (!strncmp(m->real, mp, l) && (m->real[l] == 0 || m->real[l] == '/'));
         if (!under) continue;
         size_t key = !strcmp(mp, "/") ? 1 : l + 1;
         if (key < best) continue; /* equal length: the later mount shadows the earlier one */
         best = key;
         found = 1;
-        snprintf(fi->mnt, sizeof fi->mnt, "%s", mp);
-        snprintf(fi->dev, sizeof fi->dev, "%s", f[2]);
-        snprintf(fi->mopts, sizeof fi->mopts, "%s", f[5]);
-        snprintf(fi->fstype, sizeof fi->fstype, "%s", f[dash + 1]);
-        snprintf(fi->source, sizeof fi->source, "%s", f[dash + 2]);
-        snprintf(fi->sopts, sizeof fi->sopts, "%s", dash + 3 < nf ? f[dash + 3] : "");
-        unescape(fi->source);
+        m->truncated = 0;
+        m->truncated |= copy(m->mnt, sizeof m->mnt, mp);
+        m->truncated |= copy(m->dev, sizeof m->dev, fl[2]);
+        m->truncated |= copy(m->mopts, sizeof m->mopts, fl[5]);
+        m->truncated |= copy(m->fstype, sizeof m->fstype, fl[dash + 1]);
+        m->truncated |= copy(m->source, sizeof m->source, fl[dash + 2]);
+        m->truncated |= copy(m->sopts, sizeof m->sopts, dash + 3 < nf ? fl[dash + 3] : "");
+        unescape(m->source);
     }
     free(line);
-    fclose(m);
-    if (!found) return "no mount in /proc/self/mountinfo covers it";
-    struct statfs sf;
-    if (statfs(dir, &sf) != 0) return "statfs failed";
-    fi->magic = (unsigned long)(uint32_t)sf.f_type;
-    memcpy(&fi->fsid0, &sf.f_fsid, sizeof fi->fsid0);
-    memcpy(&fi->fsid1, (const char *)&sf.f_fsid + sizeof fi->fsid0, sizeof fi->fsid1);
-    return NULL;
+    fclose(f);
+    return found ? NULL : "no mount in /proc/self/mountinfo covers it";
+}
+
+static int has_opt(const char *opts, const char *o) { /* o is one whole comma-separated token of opts */
+    size_t l = strlen(o);
+    for (const char *p = opts; (p = strstr(p, o)); p += l)
+        if ((p == opts || p[-1] == ',') && (p[l] == 0 || p[l] == ',')) return 1;
+    return 0;
+}
+static int barrier_off(const mrec *m) {
+    return has_opt(m->mopts, "nobarrier") || has_opt(m->sopts, "nobarrier") || has_opt(m->mopts, "barrier=0") ||
+           has_opt(m->sopts, "barrier=0");
+}
+
+static int read_line(const char *p, char *out, size_t cap) { /* 0 on success */
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;
+    int ok = fgets(out, (int)cap, f) != NULL;
+    fclose(f);
+    if (!ok) return -1;
+    out[strcspn(out, "\n")] = 0;
+    return 0;
+}
+
+/* ---- the flush path: D's mount, then through each loop device the mount holding its backing file ---- */
+typedef struct {
+    mrec m;
+    char disk[PATH_MAX];    /* the whole disk's /sys dir (a partition's parent) */
+    char backing[PATH_MAX]; /* a loop device's backing file, else "" */
+} layer;
+static layer L[MAXLAYERS];
+static int NL;
+static char WHY[3 * PATH_MAX + 512];
+
+static const char *flush_path(const char *dir) { /* NULL when every layer was read, else why not */
+    char cur[PATH_MAX];
+    pathf(cur, sizeof cur, "%s", dir);
+    for (NL = 0; NL < MAXLAYERS; NL++) {
+        layer *l = &L[NL];
+        const char *why = mount_of(cur, &l->m);
+        if (why) { snprintf(WHY, sizeof WHY, "layer %d (%s): %s", NL, cur, why); return WHY; }
+        if (l->m.truncated) { snprintf(WHY, sizeof WHY, "layer %d (%s): its mount record is too long to read whole", NL, l->m.mnt); return WHY; }
+        char sys[PATH_MAX], p[PATH_MAX];
+        pathf(p, sizeof p, "/sys/dev/block/%s", l->m.dev);
+        if (!realpath(p, sys)) {
+            const char *b = strrchr(l->m.source, '/');
+            pathf(p, sizeof p, "/sys/class/block/%s", b ? b + 1 : l->m.source);
+            if (strncmp(l->m.source, "/dev/", 5) || !realpath(p, sys)) {
+                snprintf(WHY, sizeof WHY, "layer %d (%s): cannot find the device of %s (dev %s) in /sys", NL, l->m.mnt,
+                         l->m.source, l->m.dev);
+                return WHY;
+            }
+        }
+        pathf(p, sizeof p, "%s/partition", sys);
+        if (access(p, F_OK) == 0) { char *d = dirname(sys); pathf(l->disk, sizeof l->disk, "%s", d); }
+        else pathf(l->disk, sizeof l->disk, "%s", sys);
+        pathf(p, sizeof p, "%s/loop/backing_file", l->disk);
+        if (access(p, F_OK) != 0) { NL++; return NULL; } /* not a loop: the leaf */
+        if (read_line(p, l->backing, sizeof l->backing) != 0 || !l->backing[0] || strstr(l->backing, " (deleted)")) {
+            snprintf(WHY, sizeof WHY, "layer %d (%s): cannot read a live backing file for loop %s", NL, l->m.mnt, l->disk);
+            return WHY;
+        }
+        pathf(cur, sizeof cur, "%s", l->backing);
+    }
+    return "more than 4 loop layers";
 }
 
 /* ---- ext4: a trial FICLONE, so a refused clone arm records what the filesystem actually said ---- */
-static void ext4_clone_reason(char *out, size_t cap, const fsinfo *fi) {
-    char a[1100], b[1100];
-    snprintf(a, sizeof a, "%s/.v3floor-ficlone-trial-%d.src", DIR_, (int)getpid());
-    snprintf(b, sizeof b, "%s/.v3floor-ficlone-trial-%d.dst", DIR_, (int)getpid());
+static void ext4_clone_reason(char *out, size_t cap, const mrec *m) {
+    char a[PATH_MAX], b[PATH_MAX];
+    pathf(a, sizeof a, "%s/.v3floor-ficlone-trial-%d.src", DIR_, (int)getpid());
+    pathf(b, sizeof b, "%s/.v3floor-ficlone-trial-%d.dst", DIR_, (int)getpid());
     int sfd = open(a, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (sfd < 0) die("FICLONE trial src");
     if (pwrite(sfd, buf, 4096, 0) != 4096) die("FICLONE trial write");
     int dfd = open(b, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (dfd < 0) die("FICLONE trial dst");
     int r = ioctl(dfd, FICLONE, sfd), e = errno;
-    close(dfd);
-    close(sfd);
-    unlinkat(AT_FDCWD, a, 0);
-    unlinkat(AT_FDCWD, b, 0);
+    if (close(dfd) != 0 || close(sfd) != 0 || unlinkat(AT_FDCWD, a, 0) != 0 || unlinkat(AT_FDCWD, b, 0) != 0)
+        die("FICLONE trial cleanup");
     if (r == 0) {
-        fprintf(stderr, "v3floor: ext4 at %s ACCEPTED a trial FICLONE: the ext4 clone refusal is wrong here\n", fi->mnt);
+        fprintf(stderr, "v3floor: ext4 at %s ACCEPTED a trial FICLONE: the ext4 clone refusal is wrong here\n", m->mnt);
         exit(1);
     }
     snprintf(out, cap, "%s at %s has no reflink: a trial ioctl(FICLONE) returned %s (%s); clone arms run on xfs and btrfs only",
-             fi->fstype, fi->mnt, e == EOPNOTSUPP ? "EOPNOTSUPP" : e == EXDEV ? "EXDEV" : e == EINVAL ? "EINVAL" : "errno",
+             m->fstype, m->mnt, e == EOPNOTSUPP ? "EOPNOTSUPP" : e == EXDEV ? "EXDEV" : e == EINVAL ? "EINVAL" : "errno",
              strerror(e));
 }
 
@@ -348,33 +447,61 @@ int main(int argc, char **argv) {
             if (parse_u64(argv[++i], &seed) != 0) { fprintf(stderr, "v3floor: REFUSED: --seed %s is not a whole number\n", argv[i]); return 2; }
             have_seed = 1;
         } else if (!strcmp(argv[i], "--mutant-nosync")) MUTANT = 1;
+        else if (!strcmp(argv[i], "--trace-clock")) TRACE_CLOCK = 1;
         else { fprintf(stderr, "v3floor: bad argument %s\n", argv[i]); return 2; }
     }
     if (!DIR_ || !out || !have_n || n == 0) {
-        fprintf(stderr, "usage: v3floor --dir D --out O --n N (N >= 1) [--arms ...] [--seed S] [--mutant-nosync]\n");
+        fprintf(stderr, "usage: v3floor --dir D --out O --n N (N >= 1) [--arms ...] [--seed S] [--mutant-nosync] [--trace-clock]\n");
+        return 2;
+    }
+    if (strlen(DIR_) > PATH_MAX - 128 || strlen(out) > PATH_MAX - 128) {
+        fprintf(stderr, "v3floor: REFUSED: the dir or out path is too long (over %d bytes)\n", PATH_MAX - 128);
         return 2;
     }
     if (have_seed) rng = seed | 1;
     const uint64_t seed_used = rng;
 
-    fsinfo fi;
-    const char *why = fs_of(DIR_, &fi);
-    if (why) { fprintf(stderr, "v3floor: REFUSED: cannot determine the filesystem under %s: %s\n", DIR_, why); return 2; }
-    unsigned long want = !strcmp(fi.fstype, "ext4") ? MAGIC_EXT4 : !strcmp(fi.fstype, "xfs") ? MAGIC_XFS
-                       : !strcmp(fi.fstype, "btrfs") ? MAGIC_BTRFS : 0;
+    /* the filesystem under D */
+    const char *why = flush_path(DIR_);
+    if (why) { fprintf(stderr, "v3floor: REFUSED: cannot determine the flush path under %s: %s\n", DIR_, why); return 2; }
+    const mrec *top = &L[0].m;
+    unsigned long want = !strcmp(top->fstype, "ext4") ? MAGIC_EXT4 : !strcmp(top->fstype, "xfs") ? MAGIC_XFS
+                       : !strcmp(top->fstype, "btrfs") ? MAGIC_BTRFS : 0;
     if (!want) {
-        fprintf(stderr, "v3floor: REFUSED: %s is on %s (mount %s), not ext4, xfs or btrfs\n", DIR_, fi.fstype, fi.mnt);
+        fprintf(stderr, "v3floor: REFUSED: %s is on %s (mount %s), not ext4, xfs or btrfs\n", DIR_, top->fstype, top->mnt);
         return 2;
     }
-    if (fi.magic != want) {
+    struct statfs sf;
+    if (statfs(DIR_, &sf) != 0) die("statfs");
+    unsigned long magic = (unsigned long)(uint32_t)sf.f_type;
+    unsigned fsid0, fsid1;
+    memcpy(&fsid0, &sf.f_fsid, sizeof fsid0);
+    memcpy(&fsid1, (const char *)&sf.f_fsid + sizeof fsid0, sizeof fsid1);
+    if (magic != want) {
         fprintf(stderr, "v3floor: REFUSED: cannot determine the filesystem under %s: the mount table says %s but statfs "
-                "magic is 0x%lx\n", DIR_, fi.fstype, fi.magic);
+                "magic is 0x%lx\n", DIR_, top->fstype, magic);
         return 2;
     }
+    for (int k = 0; k < NL; k++)
+        if (barrier_off(&L[k].m)) {
+            fprintf(stderr, "v3floor: REFUSED: the flush path has nobarrier: layer %d, %s (%s on %s, options %s,%s), so an "
+                    "fsync's cache flush never reaches the device\n", k, L[k].m.mnt, L[k].m.fstype, L[k].m.source,
+                    L[k].m.mopts, L[k].m.sopts);
+            return 2;
+        }
+    char wc[64] = "", fua[16] = "", p[PATH_MAX];
+    pathf(p, sizeof p, "%s/queue/write_cache", L[NL - 1].disk);
+    if (read_line(p, wc, sizeof wc) != 0) snprintf(wc, sizeof wc, "unknown");
+    pathf(p, sizeof p, "%s/queue/fua", L[NL - 1].disk);
+    if (read_line(p, fua, sizeof fua) != 0) snprintf(fua, sizeof fua, "unknown");
+
     errno = 0;
     int nice_v = getpriority(PRIO_PROCESS, 0);
     if (errno) die("getpriority");
     if (nice_v != 0) { fprintf(stderr, "v3floor: REFUSED: nice is %d, not 0\n", nice_v); return 2; }
+    int pol = sched_getscheduler(0);
+    if (pol < 0) die("sched_getscheduler");
+    if (pol != SCHED_OTHER) { fprintf(stderr, "v3floor: REFUSED: scheduling policy is %d, not SCHED_OTHER\n", pol); return 2; }
     long iop = syscall(SYS_ioprio_get, IOPRIO_WHO_PROC, 0);
     if (iop < 0) die("ioprio_get");
     int ioclass = (int)(iop >> IOPRIO_SHIFT), iolevel = (int)(iop & ((1 << IOPRIO_SHIFT) - 1));
@@ -408,17 +535,32 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof buf; i++) buf[i] = (char)xs();
 
     /* the clone arms on ext4: refused per arm, with the reason recorded */
-    int sel[NARMS], na = 0, refused[NARMS] = {0}, nref = 0;
+    int sel[NARMS], na = 0, refused[NARMS] = {0}, nref = 0, nflushed = 0;
     char reason[PATH_MAX + 1024] = "";
     for (int j = 0; j < nreq; j++) {
         if (is_clone(req[j]) && want == MAGIC_EXT4) {
-            if (!reason[0]) ext4_clone_reason(reason, sizeof reason, &fi);
+            if (!reason[0]) ext4_clone_reason(reason, sizeof reason, top);
             refused[req[j]] = 1;
             nref++;
             fprintf(stderr, "v3floor: REFUSED arm %s: %s\n", NAMES[req[j]], reason);
-        } else sel[na++] = req[j];
+        } else {
+            sel[na++] = req[j];
+            nflushed += flushed(req[j]);
+        }
     }
-    if (na == 0) { fprintf(stderr, "v3floor: REFUSED: every selected arm was refused\n"); return 2; }
+    if (first_flushed >= 0 && nflushed == 0) {
+        fprintf(stderr, "v3floor: REFUSED: every flushed arm selected was refused, so the run would measure no flush\n");
+        return 2;
+    }
+    for (int j = 0; j < na; j++)
+        if (is_clone(sel[j])) {
+            struct stat sb;
+            pathf(p, sizeof p, "%s/%s.clones", DIR_, NAMES[sel[j]]);
+            if (lstat(p, &sb) == 0) {
+                fprintf(stderr, "v3floor: REFUSED: %s is left over from an earlier run; remove it\n", p);
+                return 2;
+            }
+        }
     if (mkdir(out, 0755) != 0) { fprintf(stderr, "v3floor: REFUSED: out dir %s must not exist: %s\n", out, strerror(errno)); return 2; }
 
     armst st[NARMS];
@@ -440,11 +582,12 @@ int main(int argc, char **argv) {
         }
     }
     for (int j = 0; j < na; j++) teardown(sel[j], &st[j], n);
+    int dd = open(DIR_, O_RDONLY | O_DIRECTORY);
+    if (dd < 0 || fsync(dd) != 0 || close(dd) != 0) die("teardown fsync of the dir");
 
     /* Each output file gets one buffer big enough for all of it, so it costs a constant number of write(2)s
      * whatever n is: the fire-check's per-op syscall slope then sees only the timed ops. */
-    char p[1100];
-    snprintf(p, sizeof p, "%s/raw.tsv", out);
+    pathf(p, sizeof p, "%s/raw.tsv", out);
     FILE *f = fopen(p, "w");
     if (!f) die("raw.tsv");
     size_t rawcap = (size_t)n * (size_t)na * 64 + 64;
@@ -456,28 +599,46 @@ int main(int argc, char **argv) {
     if (fclose(f) != 0) die("raw.tsv close");
     free(rawbuf);
 
-    snprintf(p, sizeof p, "%s/summary.json", out);
+    pathf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
     if (!f) die("summary.json");
-    static char sumbuf[1 << 16];
+    static char sumbuf[1 << 17];
     if (setvbuf(f, sumbuf, _IOFBF, sizeof sumbuf) != 0) die("summary.json buffer");
     struct utsname u;
     if (uname(&u) != 0) die("uname");
-    fprintf(f, "{\"probe\":\"v3floor-linux\",\"n\":%llu,\"seed\":%llu,\"mutant_nosync\":%d,\"clock\":\"CLOCK_MONOTONIC_RAW\","
-            "\"barrier\":\"fsync(2)\",\"dir\":", (unsigned long long)n, (unsigned long long)seed_used, MUTANT);
+    fprintf(f, "{\"probe\":\"v3floor-linux\",\"n\":%llu,\"seed\":%llu,\"mutant_nosync\":%d,\"trace_clock\":%d,"
+            "\"clock\":\"CLOCK_MONOTONIC_RAW\",\"barrier\":\"fsync(2)\",\"dir\":", (unsigned long long)n,
+            (unsigned long long)seed_used, MUTANT, TRACE_CLOCK);
     jstr(f, DIR_);
-    fprintf(f, ",\"realpath\":"); jstr(f, fi.real);
-    fprintf(f, ",\"fstype\":"); jstr(f, fi.fstype);
-    fprintf(f, ",\"mount_point\":"); jstr(f, fi.mnt);
-    fprintf(f, ",\"mount_source\":"); jstr(f, fi.source);
-    fprintf(f, ",\"mount_opts\":"); jstr(f, fi.mopts);
-    fprintf(f, ",\"super_opts\":"); jstr(f, fi.sopts);
-    fprintf(f, ",\"dev\":"); jstr(f, fi.dev);
-    fprintf(f, ",\"statfs_magic\":\"0x%lx\",\"fsid\":\"%08x%08x\",\"uname\":", fi.magic, fi.fsid0, fi.fsid1);
+    fprintf(f, ",\"realpath\":"); jstr(f, top->real);
+    fprintf(f, ",\"fstype\":"); jstr(f, top->fstype);
+    fprintf(f, ",\"mount_point\":"); jstr(f, top->mnt);
+    fprintf(f, ",\"mount_source\":"); jstr(f, top->source);
+    fprintf(f, ",\"mount_opts\":"); jstr(f, top->mopts);
+    fprintf(f, ",\"super_opts\":"); jstr(f, top->sopts);
+    fprintf(f, ",\"dev\":"); jstr(f, top->dev);
+    fprintf(f, ",\"statfs_magic\":\"0x%lx\",\"fsid\":\"%08x%08x\",\"flush_path\":[", magic, fsid0, fsid1);
+    for (int k = 0; k < NL; k++) {
+        fprintf(f, "%s{\"mount\":", k ? "," : ""); jstr(f, L[k].m.mnt);
+        fprintf(f, ",\"fstype\":"); jstr(f, L[k].m.fstype);
+        fprintf(f, ",\"source\":"); jstr(f, L[k].m.source);
+        fprintf(f, ",\"options\":"); jstr(f, L[k].m.mopts);
+        fprintf(f, ",\"super_options\":"); jstr(f, L[k].m.sopts);
+        fprintf(f, ",\"sys\":"); jstr(f, L[k].disk);
+        fprintf(f, ",\"loop_backing\":"); jstr(f, L[k].backing);
+        fprintf(f, "}");
+    }
+    fprintf(f, "],\"leaf_write_cache\":"); jstr(f, wc);
+    fprintf(f, ",\"leaf_fua\":"); jstr(f, fua);
+    fprintf(f, ",\"flush_sent_to_device\":\"%s\"", !strcmp(wc, "write back") ? "yes: the leaf device reports a write-back cache"
+            : !strcmp(wc, "write through") ? "no: the leaf device reports write-through, so the block layer sends it no flush"
+            : "unknown");
+    fprintf(f, ",\"uname\":");
     char un[600];
     snprintf(un, sizeof un, "%s %s %s", u.sysname, u.release, u.machine);
     jstr(f, un);
-    fprintf(f, ",\"nice\":%d,\"ioprio_class\":%d,\"ioprio_level\":%d,\"arms_requested\":", nice_v, ioclass, iolevel);
+    fprintf(f, ",\"nice\":%d,\"sched_policy\":%d,\"ioprio_class\":%d,\"ioprio_level\":%d,\"arms_requested\":", nice_v, pol,
+            ioclass, iolevel);
     jstr(f, arms);
     fprintf(f, ",\"refused_arms\":{");
     for (int a = 0, k = 0; a < NARMS; a++)
