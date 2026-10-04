@@ -3200,6 +3200,8 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
+        // Every path that released the last write lock closed its commit gate (review A-F1).
+        turso_debug_assert!(!self.trunk_gate_open.load(Ordering::Acquire));
         wal.begin_write_tx(allowed_auto_actions)?;
         // A transaction that rolled back left its merge writes and its captures here; this one
         // starts from none.
@@ -3874,9 +3876,38 @@ impl Pager {
         Ok(())
     }
 
+    /// End a raw WAL session's trunk write transaction (`Connection::wal_insert_end`), before its
+    /// caller releases the WAL write lock: a commit it made is stamped and its commit gate closed,
+    /// as `commit_dirty_pages` does; otherwise its merge writes and captures are dropped and a gate
+    /// a failed commit left open is closed (review A-F1: the session released the lock with the
+    /// gate open). Returns whether stamps were made, for `prune_branch_stamps` once the lock is
+    /// released.
+    pub(crate) fn end_raw_trunk_write(&self, committed: bool) -> bool {
+        // fastest-engine mutant `raw_gate_left_open` (test builds only): as before review A-F1.
+        if crate::branch::store::fe_mutant("raw_gate_left_open") {
+            return false;
+        }
+        let tx = std::mem::take(&mut *self.trunk_pending.lock());
+        self.trunk_pre_images.lock().clear();
+        let stamped = match self.branch_store.get() {
+            Some(store) if committed => store.stamp_committed(tx),
+            _ => false,
+        };
+        self.close_trunk_gate();
+        stamped
+    }
+
+    /// Drop the merge stamps no live or future trunk child can be refused by (off the WAL write
+    /// lock, as `commit_dirty_pages` does).
+    pub(crate) fn prune_branch_stamps(&self) {
+        if let Some(store) = self.branch_store.get() {
+            store.prune_stamps();
+        }
+    }
+
     /// Close the branch store's commit gate if this pager's commit holds it open (F-L): once the
     /// commit's frames are published, or when the write lock is released after a failed commit.
-    fn close_trunk_gate(&self) {
+    pub(crate) fn close_trunk_gate(&self) {
         if self.trunk_gate_open.swap(false, Ordering::AcqRel) {
             if let Some(store) = self.branch_store.get() {
                 store.end_trunk_commit();
@@ -4530,18 +4561,45 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
+        // A branch pager commits to its branch (`commit_wal_inner` refuses it too): refused before
+        // it could open the TRUNK's commit gate without the WAL write lock (review A-F1).
+        if self.branch.get().is_some() {
+            return Err(LimboError::InternalError(
+                "a branch pager must commit to its branch, never to the WAL".to_string(),
+            ));
+        }
         // The branch store's copy decisions for this commit, once (IO re-entry finds the gate open):
         // taken now, against the trunk's epoch now, from the pre-images captured at first write, and
         // the commit gate opened until the frames are published (F-L on the durable store).
         if let Some(store) = self.branch_store.get() {
             if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
                 let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
-                let dirty = self.dirty_pages.read();
-                store.begin_trunk_commit(
-                    dirty
-                        .iter()
-                        .map(|page| (page, captured.get(&page).map(|bytes| &bytes[..]))),
-                )?;
+                let decided = {
+                    let dirty = self.dirty_pages.read();
+                    store.begin_trunk_commit(
+                        dirty
+                            .iter()
+                            .map(|page| (page, captured.get(&page).map(|bytes| &bytes[..]))),
+                    )
+                };
+                if let Err(e) = decided {
+                    // fastest-engine mutant `decision_retry_skips` (test builds only): as before
+                    // review A-F2, the latch stays set and the retry takes no decision.
+                    if crate::branch::store::fe_mutant("decision_retry_skips") {
+                        return Err(e);
+                    }
+                    // A pass refused part-way (a catalog read's `Busy`, retried by the statement)
+                    // is taken again whole on the retry (review A-F2): the captures go back, and
+                    // the gate the store closed on its way out is no longer this pager's. A page
+                    // decided already is decided again harmlessly (its `written` is this epoch, or
+                    // a child forked since needs the copy too).
+                    let mut images = self.trunk_pre_images.lock();
+                    for (page, bytes) in captured {
+                        images.entry(page).or_insert(bytes);
+                    }
+                    self.trunk_gate_open.store(false, Ordering::Release);
+                    return Err(e);
+                }
             }
         }
         // Durable branches: every pre-image this transaction retained for a live branch must be

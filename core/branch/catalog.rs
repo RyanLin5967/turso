@@ -425,6 +425,8 @@ mod census_tests {
 pub(crate) struct Catalog {
     _db: Arc<Database>,
     conn: Arc<Connection>,
+    /// The class this handle's commits sync in (`prepared`, `raise_sync`).
+    sync: SyncClass,
     pub(crate) counters: CatalogCounters,
     /// What this handle's open prewarmed (r12-catload; `Prewarm::Off` unless [`Catalog::prewarm`] ran).
     pub(crate) prewarm: PrewarmStats,
@@ -598,7 +600,23 @@ impl Catalog {
             prewarm: PrewarmStats::default(),
             conn,
             _db: db,
+            sync,
         })
+    }
+
+    /// Sync this handle's commits in `class` from now on, if it is stronger than their class:
+    /// a checkpoint replaces log records that were made durable in a raised class, and its commit
+    /// must keep them that durable (fastest-engine review B-F3).
+    pub(crate) fn raise_sync(&mut self, class: SyncClass) -> Result<()> {
+        if !class.syncs() || class <= self.sync {
+            return Ok(());
+        }
+        self.conn.execute("PRAGMA synchronous = FULL")?;
+        if class == SyncClass::FullFsync {
+            self.conn.execute("PRAGMA fullfsync = ON")?;
+        }
+        self.sync = class;
+        Ok(())
     }
 
     /// r12-catload: warm this catalog as `mode` says (see `super::prewarm`), once, at a store's

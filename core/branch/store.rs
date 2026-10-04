@@ -332,13 +332,16 @@ pub(crate) struct BranchStore {
 /// * **The class**: durability is tracked per class (`GroupState::durable`), so a flight synced in
 ///   D1 never satisfies a wait that needs D2; such a wait leads an UPGRADE flight, an F_FULLFSYNC of
 ///   the log, which drains the device's cache of everything synced before it.
-/// * **Failure**: a failed flight fail-stops the group and the journal, and every waiter gets the
-///   error. The in-memory state is then ahead of the disk; the fail-stop rule already governs that
+/// * **Failure**: a failed flight — or one that could not even be taken — fail-stops the group and
+///   the journal in one step, through the flag they share (`StoreInner::fail_stop`; review B-F1),
+///   and every waiter gets the error. The in-memory state is then ahead of the disk; the fail-stop rule already governs that
 ///   (nothing more is written, the next open recovers from disk), and the slots such operations
 ///   freed are never returned, because no flight will ever cover them.
 pub(crate) struct Group {
     state: std::sync::Mutex<GroupState>,
     cv: std::sync::Condvar,
+    /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
+    failed: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -348,8 +351,6 @@ struct GroupState {
     /// `durable[c]`: every journal byte below this log sequence number is durable in class `c` or
     /// a stronger one (indexed `Off`, `Fsync`, `FullFsync`; `Off` means written to the OS).
     durable: [u64; 3],
-    /// A flight failed: nothing more becomes durable in this process.
-    poisoned: bool,
     /// Observation only (fastest-engine M2): flights led outside the mutex, flushes taken under
     /// it, operations that waited, those already durable when they looked, upgrade flights, and
     /// the waits each flight released.
@@ -370,14 +371,27 @@ fn class_index(class: SyncClass) -> usize {
 }
 
 impl Group {
-    fn new(durable: u64) -> Self {
+    fn new(durable: u64, failed: Arc<AtomicBool>) -> Self {
         Self {
             state: std::sync::Mutex::new(GroupState {
                 durable: [durable; 3],
                 ..GroupState::default()
             }),
             cv: std::sync::Condvar::new(),
+            failed,
         }
+    }
+
+    /// A flight failed, or could not be taken: nothing more becomes durable in this process, and
+    /// the journal (which shares the flag) writes nothing more.
+    fn poisoned(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// Fail-stop the store and wake every waiter (called holding the group's lock, `_g`).
+    fn fail(&self, _g: &mut GroupState) {
+        self.failed.store(true, Ordering::Release);
+        self.cv.notify_all();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, GroupState> {
@@ -408,7 +422,7 @@ impl Group {
                 g.durable[c] = g.durable[c].max(end);
             }
         } else {
-            g.poisoned = true;
+            self.failed.store(true, Ordering::Release);
         }
         self.cv.notify_all();
     }
@@ -630,6 +644,12 @@ struct StoreInner {
     /// The trunk's epoch at the copy decisions of the trunk commit in flight (or the last one): the
     /// Merger stamps that commit's rows with it (`stamp_committed`).
     trunk_commit_epoch: u64,
+    /// The store's fail-stop flag, shared by its journal and its group: set once, by whichever fails
+    /// first, and read by every write path through `Journal::check_live` (review B-F1).
+    fail_stop: Arc<AtomicBool>,
+    /// The log sequence number that makes the newest fork durable: a listing waits for it, so no
+    /// branch is listed before its fork is durable (review C-F4).
+    last_fork_lsn: u64,
 }
 
 /// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
@@ -897,11 +917,16 @@ fn expire_batch() -> usize {
 /// F-FZ: fuzzy-checkpoint threads kept unjoined before the oldest is joined.
 const FLIGHTS_KEPT: usize = 64;
 
+/// How long a fork's creator, or an open of a new branch, waits for the trunk commit it forks after
+/// to be published before it is `Busy` (`BranchStore::wait_trunk_commit_published`).
+const PUBLISH_WAIT: Duration = Duration::from_secs(60);
+
 /// What a trunk fork's registration did (F-L on the durable store; see `BranchStore::fork_trunk`).
 pub(crate) enum TrunkFork {
     /// Registered and applied; durable once `lsn` is, and, when `after` is set, readable once the
-    /// trunk commit holding the gate at that count is published (wait for both with every lock
-    /// released: `wait_trunk_commit_published`, then `wait_durable`).
+    /// trunk commit holding the gate at that count is published. The creator waits for both with
+    /// every lock released (`wait_trunk_commit_published`, then `wait_durable`), and so does any
+    /// other opener of the branch (`BranchStore::settle`; review A-F3).
     Forked { id: BranchId, lsn: u64, after: Option<u64> },
     /// The trunk has no live child, so this fork would be the first: fork under the WAL write lock.
     NeedsWriterLock,
@@ -1217,6 +1242,9 @@ struct BranchState {
     view: Option<PageMap>,
     /// A named server branch's name (fastest-engine M1 item 4); taken at its release, which frees it.
     name: Option<Arc<str>>,
+    /// The log sequence number that makes this branch's fork durable; 0 for a branch loaded from
+    /// disk, which is durable already (`BranchStore::settle`; review C-F4).
+    fork_lsn: u64,
 }
 
 /// Named server branches' names (fastest-engine M1 item 4), under the store mutex. An eager store
@@ -1224,11 +1252,19 @@ struct BranchState {
 /// states and every name created since its last checkpoint (`fresh`, written at the next), and
 /// masks with `gone` the catalog rows of names released since (deleted at the next); every other
 /// name is read from the catalog's `branch_name` table.
+///
+/// A checkpoint's capture COPIES `fresh` and `gone`, and its install removes only the entries that
+/// are unchanged since (review C-F1, C-F2): until the catalog holds what the capture wrote, the
+/// index still masks and still names what it did, and a capture that is never written (a write
+/// that failed, a thread that did not start) leaves nothing to restore.
 #[derive(Default)]
 struct NameIndex {
     map: HashMap<Arc<str>, BranchId>,
     fresh: HashMap<Arc<str>, BranchId>,
-    gone: HashSet<Arc<str>>,
+    /// Each released name, with the release count at its release: an install drops it only if no
+    /// later release of the same name moved it.
+    gone: HashMap<Arc<str>, u64>,
+    releases: u64,
 }
 
 /// The names a branch may have: 1 to 255 bytes, no NUL (fastest-engine M1 item 4). A server's
@@ -1681,7 +1717,7 @@ struct Captured {
     arena_sync: SyncClass,
     /// fastest-engine M1 item 4: names released since the last checkpoint (rows deleted first),
     /// then names created since (rows written), as swapped out of the index at the capture.
-    names_gone: HashSet<Arc<str>>,
+    names_gone: HashMap<Arc<str>, u64>,
     names_fresh: HashMap<Arc<str>, BranchId>,
     lease_now: u64,
     fail_after_commit: bool,
@@ -1711,6 +1747,8 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     if let Some(file) = cap.arena.as_ref() {
         super::journal::fsync_file(file, cap.arena_sync)?;
     }
+    // And the commit as durable as any record it replaces (review B-F3).
+    catalog.raise_sync(cap.arena_sync)?;
     catalog.begin()?;
     let written = (|| -> Result<()> {
         for (b, what) in &cap.rows {
@@ -1744,7 +1782,7 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         }
         // fastest-engine M1 item 4: freed names first, so a name released and created again since
         // the last checkpoint ends up naming its new branch.
-        for name in &cap.names_gone {
+        for name in cap.names_gone.keys() {
             catalog.name_del(name)?;
         }
         for (name, id) in &cap.names_fresh {
@@ -2118,7 +2156,7 @@ impl BranchStore {
             resolve_calls: AtomicU64::new(0),
             arena_reads: AtomicU64::new(0),
             holds: ForkHoldCounters::new(),
-            group: Arc::new(Group::new(0)),
+            group: Arc::new(Group::new(0, Arc::new(AtomicBool::new(false)))),
             class: SyncClass::Off,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
@@ -2269,7 +2307,9 @@ impl BranchStore {
                             recovered.journal.flush(&mut arena)?;
                         }
                         inner.arena = Some(arena);
-                        inner.journal = Some(recovered.journal);
+                        let mut journal = recovered.journal;
+                        journal.share_fail_stop(&inner.fail_stop);
+                        inner.journal = Some(journal);
                     }
                 }
                 inner
@@ -2299,7 +2339,7 @@ impl BranchStore {
         // Every byte the open buffered was flushed by the recovery itself (single-threaded).
         let opened_lsn = inner.journal.as_ref().map_or(0, |j| j.lsn() - j.pending_len());
         let mut store = Self {
-            group: Arc::new(Group::new(opened_lsn)),
+            group: Arc::new(Group::new(opened_lsn, inner.fail_stop.clone())),
             class: inner.sync,
             #[cfg(test)]
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
@@ -2542,7 +2582,9 @@ impl BranchStore {
             recovered.journal.flush(&mut arena)?;
         }
         inner.arena = Some(arena);
-        inner.journal = Some(recovered.journal);
+        let mut journal = recovered.journal;
+        journal.share_fail_stop(&inner.fail_stop);
+        inner.journal = Some(journal);
         stats.arena_ns = ns(t);
         Ok(())
     }
@@ -2762,15 +2804,14 @@ impl BranchStore {
     /// the group's lock to land, never the store mutex, so waiting for it here cannot deadlock.
     fn flush_locked(&self, inner: &mut StoreInner, class: SyncClass) -> Result<()> {
         let mut g = self.group.quiesce();
-        if g.poisoned {
+        if self.group.poisoned() {
             return Err(group_poisoned());
         }
         let flight = match Self::take_flight(inner, class, false) {
             Ok(Some(flight)) if !flight.is_empty() => flight,
             Ok(_) => return Ok(()),
             Err(e) => {
-                g.poisoned = true;
-                self.group.cv.notify_all();
+                self.group.fail(&mut g);
                 return Err(e);
             }
         };
@@ -2814,7 +2855,7 @@ impl BranchStore {
                         }
                         return Ok(());
                     }
-                    if g.poisoned {
+                    if self.group.poisoned() {
                         return Err(group_poisoned());
                     }
                     if !g.flushing {
@@ -2832,7 +2873,7 @@ impl BranchStore {
                 if g.durable[need] >= lsn {
                     return Ok(());
                 }
-                if g.poisoned {
+                if self.group.poisoned() {
                     return Err(group_poisoned());
                 }
                 if g.flushing {
@@ -2853,8 +2894,7 @@ impl BranchStore {
                     // air: only a failed flush does that, and it poisons the group.
                     Ok(_) => return Err(group_poisoned()),
                     Err(e) => {
-                        g.poisoned = true;
-                        self.group.cv.notify_all();
+                        self.group.fail(&mut g);
                         return Err(e);
                     }
                 }
@@ -2871,12 +2911,9 @@ impl BranchStore {
                 flight.write()
             };
             if written.is_err() {
-                // Poison the group first (waking the waiters, some of whom hold the store mutex
-                // while they wait), then the journal under the mutex.
+                // Fail-stops the group and the journal in one step (they share the flag), and
+                // wakes the waiters, some of whom hold the store mutex while they wait.
                 self.group.land(end, flight_class, false);
-                if let Some(journal) = self.inner.lock().journal.as_mut() {
-                    journal.poison();
-                }
                 return written;
             }
             self.group.land(end, flight_class, true);
@@ -3306,19 +3343,16 @@ impl BranchStore {
 
     /// Wait until the trunk commit that holds the gate at the odd count `c` has closed it (its
     /// frames are published, or it failed). Every commit closes its gate when its writer releases
-    /// the WAL write lock, so this waits for one commit's write and sync; 60 s without a close is a
-    /// stalled writer, refused rather than waited on for ever.
+    /// the WAL write lock, so this waits for one commit's write and sync. Past `PUBLISH_WAIT` it is
+    /// `Busy`, as the WAL write lock's holder makes a fork of the base busy: a writer that never
+    /// publishes is not waited on for ever.
     pub(crate) fn wait_trunk_commit_published(&self, c: u64) -> Result<()> {
         let (lock, closed) = &self.gate_closed;
         let started = Instant::now();
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         while self.trunk_commits.load(Ordering::Acquire) <= c {
-            if started.elapsed() > Duration::from_secs(60) {
-                return Err(LimboError::InternalError(
-                    "a trunk commit held its commit gate open for 60 s; the fork waiting for it \
-                     was not handed out"
-                        .to_string(),
-                ));
+            if started.elapsed() > PUBLISH_WAIT {
+                return Err(LimboError::Busy);
             }
             guard = closed
                 .wait_timeout(guard, Duration::from_millis(100))
@@ -3342,10 +3376,11 @@ impl BranchStore {
     /// in flight with the gate open — the child forks AFTER it: it reads the trunk's current pages,
     /// which that commit wrote, so its schema is read from its own pages at its first connection
     /// (`schema: None`; the snapshot's cookie predates the commit), and a commit still in flight is
-    /// returned as `after`, whose publication the caller waits for before handing the child out,
-    /// so nobody reads the child while that commit is half there. A fork therefore waits for at
-    /// most ONE trunk commit and never retries; it is never the trunk's first child (a writer that
-    /// saw no child captured no pre-image, so the first child is forked under the writer's lock:
+    /// recorded as the one it forks after: nothing reads the child — not its creator, not a
+    /// connection that finds it by name — until that commit is published (`settle`, at every open;
+    /// review A-F3), so nobody reads it while the commit is half there. The fork itself waits for
+    /// no trunk commit and never retries; it is never the trunk's first child (a writer that saw no
+    /// child captured no pre-image, so the first child is forked under the writer's lock:
     /// `NeedsWriterLock`). The check, the registration and the children count move together in one
     /// store-mutex hold.
     pub(crate) fn fork_trunk(
@@ -3415,6 +3450,7 @@ impl BranchStore {
             return Err(inner.fatal(e));
         }
         inner.apply_fork_lease(id, lease);
+        inner.note_fork_lsn(id, lsn);
         self.sync_trunk_children(&inner);
         kill_point("fork.applied");
         let work = &mut inner.work;
@@ -3501,6 +3537,7 @@ impl BranchStore {
             return Err(inner.fatal(e));
         }
         inner.apply_fork_lease(id, lease);
+        inner.note_fork_lsn(id, lsn);
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
         Ok((id, lsn))
@@ -3511,6 +3548,7 @@ impl BranchStore {
     /// page cache of the same page space, and nothing would tell one that the other had committed
     /// — a silently stale read, so it is refused.
     pub(crate) fn open_conn(&self, id: BranchId) -> Result<Option<Arc<Schema>>> {
+        self.settle(id, true)?;
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
@@ -3561,9 +3599,9 @@ impl BranchStore {
         // A released branch is collected (and possibly spliced) here, outside any other logged
         // operation, so the close is logged: replay collects it at this same point (F7 durable
         // port). A `Close` that cannot be made durable leaves the store fail-stopped (every failed
-        // flush poisons the journal), so no record can follow it: recovery replays to the release,
-        // finds nothing open, and collects the branch at its end, freeing at least what this
-        // collect frees (a splice moves references and never adds one).
+        // flush fail-stops it), so no record can follow it: recovery replays to the release, finds
+        // nothing open, and collects the branch at its end. A fail-stopped store frees nothing in
+        // this process (review B-F1): its Release may not be durable either.
         let held = inner
             .branches
             .get(&id)
@@ -3581,6 +3619,10 @@ impl BranchStore {
             st.open = false;
             st.writer = false;
             freed.extend(st.pending.drain().map(|(_, slot)| slot));
+        }
+        // fastest-engine mutant `close_frees_when_stopped` (test builds only).
+        if inner.poisoned() && !fe_mutant("close_frees_when_stopped") {
+            return;
         }
         if let Err(e) = inner.collect(id, &mut freed) {
             tracing::warn!("branch {} not collected at close: {e}", id.0);
@@ -3600,19 +3642,32 @@ impl BranchStore {
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
         inner.ensure(id)?;
-        let Some(st) = inner.branches.get(&id) else {
+        // Released already — by a racing drop of the same name, say — and possibly collected: the
+        // Release may still be in the air, so this reports only once everything buffered so far is
+        // durable (review B-F2).
+        let released = match inner.branches.get(&id) {
+            None => Some(false),
+            Some(st) if st.handle == Handle::Released => Some(true),
+            Some(_) => None,
+        };
+        if let Some(deferred) = released {
+            // fastest-engine mutant `rerelease_no_wait` (test builds only): reported at once.
+            let lsn = if fe_mutant("rerelease_no_wait") {
+                0
+            } else {
+                inner.journal.as_ref().map_or(0, Journal::lsn)
+            };
+            let class = inner.sync;
+            drop(inner);
+            self.wait_durable(lsn, class)?;
             return Ok(Reaped {
                 freed_pages: 0,
-                deferred: false,
+                deferred,
             });
-        };
+        }
+        let st = inner.branches.get(&id).ok_or_else(|| gone(id))?;
         match st.handle {
-            Handle::Released => {
-                return Ok(Reaped {
-                    freed_pages: 0,
-                    deferred: true,
-                })
-            }
+            Handle::Released => unreachable!("answered above"),
             Handle::ReleasePending => {
                 return Err(fail_stopped(inner.journal.as_ref(), id, "no release"))
             }
@@ -3684,9 +3739,21 @@ impl BranchStore {
     /// Give a detached branch a handle again. One handle per branch.
     pub(crate) fn attach(&self, id: BranchId) -> Result<()> {
         self.refuse_if_trunk_only("attaching a branch")?;
+        self.settle(id, false)?;
         let mut inner = self.inner.lock();
         inner.ensure(id)?;
         let st = inner.branches.get_mut(&id).ok_or_else(|| gone(id))?;
+        // A named server branch takes no handle (review C-F3): a handle's drop would release it and
+        // a handle could lease it, and only `Database::drop_branch` may end it.
+        if let Some(name) = st.name.as_ref().filter(|_| !fe_mutant("named_attach")) {
+            if !st.handle.is_released() {
+                return Err(LimboError::InvalidArgument(format!(
+                    "branch {} is the named server branch {name:?}: it takes no handle; connect to \
+                     it with Database::connect_named and release it with Database::drop_branch",
+                    id.0
+                )));
+            }
+        }
         match st.handle {
             Handle::Detached => {
                 st.handle = Handle::Attached;
@@ -3704,7 +3771,43 @@ impl BranchStore {
     pub(crate) fn branch_named(&self, name: &str) -> Result<Option<BranchId>> {
         self.refuse_if_trunk_only("looking a branch up by name")?;
         check_branch_name(name)?;
-        self.inner.lock().name_lookup(name)
+        let found = self.inner.lock().name_lookup(name)?;
+        // Not before its fork is durable (review C-F4): a crash would lose a branch already found.
+        if let Some(id) = found {
+            self.settle(id, false)?;
+        }
+        Ok(found)
+    }
+
+    /// Wait, holding no lock, until branch `id` may be found, attached or (`readable`) opened
+    /// (review A-F3, C-F4): its fork's records are durable, and, for an open, no trunk commit it
+    /// forked after is still between its copy decisions and its publication. A branch whose
+    /// ancestry left the trunk at or after the open gate's decision epoch (`trunk_at`, which its
+    /// children inherit) forked after that commit, and nothing retained the pages it overwrites
+    /// for it: read before the publication, it would see them one way, and after it the other.
+    fn settle(&self, id: BranchId, readable: bool) -> Result<()> {
+        let (fork_lsn, after) = {
+            let mut inner = self.inner.lock();
+            if !inner.ensure(id)? {
+                return Ok(());
+            }
+            let Some(st) = inner.branches.get(&id) else {
+                return Ok(());
+            };
+            let gate = self.trunk_commits.load(Ordering::Acquire);
+            let after = (readable && gate % 2 == 1 && st.trunk_at >= inner.trunk_commit_epoch)
+                .then_some(gate);
+            (st.fork_lsn, after)
+        };
+        // fastest-engine mutants `open_no_publish_wait` and `find_no_durable_wait` (test builds
+        // only): an opener does not wait out the commit; a finder does not wait for durability.
+        if let Some(c) = after.filter(|_| !fe_mutant("open_no_publish_wait")) {
+            self.wait_trunk_commit_published(c)?;
+        }
+        if fe_mutant("find_no_durable_wait") {
+            return Ok(());
+        }
+        self.wait_durable(fork_lsn, self.class)
     }
 
     /// Every unreleased branch. Refused on a trunk-only store, where "none" would be a lie.
@@ -3716,8 +3819,11 @@ impl BranchStore {
     /// builds the set once (`build_live_ids`: the same scan and query, under the mutex, counted).
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
-        let snapshot = {
+        let (durable_at, snapshot) = {
             let mut inner = self.inner.lock();
+            // No fork is listed before it is durable (review C-F4): the listing waits for the
+            // newest one, after the lock is released.
+            let durable_at = inner.last_fork_lsn;
             // githost-shape instrument (observing only).
             inner.shape.ids_calls += 1;
             if knob_off("fw1") {
@@ -3728,15 +3834,16 @@ impl BranchStore {
                 let rows = inner.shape.ids_build_rows - before;
                 inner.shape.ids_build_rows = before;
                 inner.shape.ids_catalog_rows += rows;
-                set
+                (durable_at, set)
             } else {
                 if inner.live_ids.is_none() {
                     let set = inner.build_live_ids()?;
                     inner.live_ids = Some(set);
                 }
-                inner.live_ids.clone().expect("built above")
+                (durable_at, inner.live_ids.clone().expect("built above"))
             }
         };
+        self.wait_durable(durable_at, self.class)?;
         let mut ids = Vec::with_capacity(snapshot.len() as usize);
         let mut work = IdSetWork::default();
         snapshot.for_each(&mut work, &mut |key| ids.push(BranchId(u64::from(key))));
@@ -3899,6 +4006,27 @@ impl BranchStore {
         inner.work.trunk_commits_decided += 1;
         let epoch = inner.trunk.lineage.epoch;
         inner.trunk_commit_epoch = epoch;
+        let decided = self.decide_trunk_pages(&mut inner, pages, epoch);
+        drop(inner);
+        if decided.is_err() {
+            // Refused part-way: the gate closes, and the pager takes the whole pass again
+            // (`Pager::commit_wal`; review A-F2).
+            self.end_trunk_commit();
+            return decided;
+        }
+        kill_point("trunk.decided");
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_DECIDED);
+        Ok(())
+    }
+
+    /// `begin_trunk_commit`'s decisions, one per page the commit writes, at `epoch`.
+    fn decide_trunk_pages<'p>(
+        &self,
+        inner: &mut StoreInner,
+        pages: impl IntoIterator<Item = (u32, Option<&'p [u8]>)>,
+        epoch: u64,
+    ) -> Result<()> {
         for (page, pre_image) in pages {
             let Some(pre_image) = pre_image else {
                 // Uncaptured: the trunk had no live child at this page's first write. With no live
@@ -3918,16 +4046,12 @@ impl BranchStore {
                 continue;
             };
             inner.work.trunk_pre_images_captured += 1;
-            self.decide_trunk_page(&mut inner, page, pre_image, epoch)?;
+            self.decide_trunk_page(inner, page, pre_image, epoch)?;
             if inner.failpoint == Some(BranchFailpoint::TrunkDecisionBusy) {
                 inner.failpoint = None;
                 return Err(LimboError::Busy);
             }
         }
-        drop(inner);
-        kill_point("trunk.decided");
-        #[cfg(test)]
-        pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_DECIDED);
         Ok(())
     }
 
@@ -4790,6 +4914,8 @@ impl StoreInner {
             pending_free: VecDeque::new(),
             names: NameIndex::default(),
             trunk_commit_epoch: 0,
+            fail_stop: Arc::new(AtomicBool::new(false)),
+            last_fork_lsn: 0,
         }
     }
 
@@ -4984,7 +5110,18 @@ impl StoreInner {
     }
 
     fn poisoned(&self) -> bool {
-        self.journal.as_ref().is_some_and(|j| j.is_poisoned())
+        // fastest-engine mutant `split_fail_stop` (test builds only, with `Journal::share_fail_stop`'s
+        // half): the store reads only the journal's flag, as before review B-F1.
+        let shared = self.fail_stop.load(Ordering::Acquire) && !fe_mutant("split_fail_stop");
+        shared || self.journal.as_ref().is_some_and(|j| j.is_poisoned())
+    }
+
+    /// A fork just applied is durable once `lsn` is (see `BranchState::fork_lsn`).
+    fn note_fork_lsn(&mut self, id: BranchId, lsn: u64) {
+        if let Some(st) = self.branches.get_mut(&id) {
+            st.fork_lsn = lsn;
+        }
+        self.last_fork_lsn = self.last_fork_lsn.max(lsn);
     }
 
     /// The unreleased branch named `name` (fastest-engine M1 item 4): the in-memory index, then —
@@ -4996,7 +5133,7 @@ impl StoreInner {
             if let Some(&id) = self.names.map.get(name) {
                 return Ok(Some(id));
             }
-            if self.names.gone.contains(name) {
+            if self.names.gone.contains_key(name) {
                 return Ok(None);
             }
         }
@@ -5196,6 +5333,7 @@ impl StoreInner {
                 inherited_at: b.fork_epoch,
                 view: None,
                 name: None,
+                fork_lsn: 0,
             },
         );
         self.note_table_growth(grown_before);
@@ -5456,6 +5594,7 @@ impl StoreInner {
                         Journal::open_fresh_with(files, page_size, self.sync, fail_lock)?;
                     // The arm's format version, in the header `start` writes (amendment 15).
                     journal.set_format(super::journal::format_version(self.splice));
+                    journal.share_fail_stop(&self.fail_stop);
                     let started = journal.start(fail);
                     self.journal = Some(journal);
                     started?;
@@ -5788,9 +5927,16 @@ impl StoreInner {
             child_keys: self.children.map.keys().copied().collect(),
             child_removed: self.children.removed.keys().copied().collect(),
             arena: arena_file,
-            arena_sync: self.sync,
-            names_gone: std::mem::take(&mut self.names.gone),
-            names_fresh: std::mem::take(&mut self.names.fresh),
+            // Every record the catalog takes over stays as durable as it was (review B-F3).
+            arena_sync: self.journal.as_ref().map_or(self.sync, Journal::rewrite_class),
+            // fastest-engine mutant `names_taken_at_capture` (test builds only): as before review
+            // C-F1, the capture takes the names out of the index.
+            names_gone: if fe_mutant("names_taken_at_capture") {
+                std::mem::take(&mut self.names.gone)
+            } else {
+                self.names.gone.clone()
+            },
+            names_fresh: self.names.fresh.clone(),
             lease_now: now,
             fail_after_commit,
             fail_write: self
@@ -5823,22 +5969,23 @@ impl StoreInner {
                     *cat.dirty.entry(id).or_insert(0) |= what;
                 }
             }
-            // The names the capture took are written by the next checkpoint instead. Every freed
-            // name goes back to `gone` (a delete before the puts is harmless, and lookups read
-            // `map` first); a created name goes back to `fresh` only while it still names the same
-            // branch (one released since is in `gone`, one created since is in `fresh` already).
-            for name in cap.names_gone {
-                self.names.gone.insert(name);
-            }
-            for (name, id) in cap.names_fresh {
-                if self.names.map.get(&name) == Some(&id) {
-                    self.names.fresh.entry(name).or_insert(id);
-                }
-            }
+            // The capture copied the names; the index still holds them, for the next checkpoint.
             return Err(e);
         }
         cat.generation = cap.generation;
         cat.ckpt.count += 1;
+        // The catalog holds the captured names now: drop each entry no release or create since
+        // has moved (see `NameIndex`).
+        for (name, release) in &cap.names_gone {
+            if self.names.gone.get(name) == Some(release) {
+                self.names.gone.remove(name);
+            }
+        }
+        for (name, id) in &cap.names_fresh {
+            if self.names.fresh.get(name) == Some(id) {
+                self.names.fresh.remove(name);
+            }
+        }
         // From here the catalog is the truth up to the capture's log position.
         let Some(journal) = self.journal.as_mut() else {
             return Err(LimboError::InternalError(
@@ -6046,6 +6193,7 @@ impl StoreInner {
                 inherited_at: f,
                 view: None,
                 name: name.clone(),
+                fork_lsn: 0,
             },
         );
         self.note_table_growth(grown_before);
@@ -6147,7 +6295,8 @@ impl StoreInner {
                 self.names.fresh.remove(&name);
             }
             if self.cat.is_some() || self.catalog_mode {
-                self.names.gone.insert(name);
+                self.names.releases += 1;
+                self.names.gone.insert(name, self.names.releases);
             }
         }
         // F-W1: a released branch is not listed.
@@ -6877,6 +7026,7 @@ impl StoreInner {
                     inherited_at: 0,
                     view: None,
                     name: b.name.as_deref().filter(|_| !b.released).map(Arc::from),
+                    fork_lsn: 0,
                 },
             );
             if let Some(name) = b.name.filter(|_| !b.released) {

@@ -825,9 +825,13 @@ impl Branch {
         store::take_counted_hold();
         // Early release (fastest-engine M1 item 2): the fork is applied and every lock released;
         // the branch is handed out only once its records are durable.
-        let forked = store
-            .fork_branch(self.id, None)
-            .and_then(|(id, lsn)| store.wait_durable(lsn, store.sync_class()).map(|()| id));
+        let forked = store.fork_branch(self.id, None).and_then(|(id, lsn)| {
+            store.wait_durable(lsn, store.sync_class()).inspect_err(|_| {
+                // Not handed out, so released (review item 11).
+                let _ = store.release_handle(id);
+            })?;
+            Ok(id)
+        });
         let held = store::take_counted_hold();
         let id = forked?;
         store.record_fork(held, None);
@@ -959,8 +963,14 @@ impl Connection {
         // Early release (fastest-engine M1 item 2): the fork is applied and every lock is released,
         // the trunk's WAL write lock included; the branch is handed out only once its records are
         // durable.
-        let forked = forked.and_then(|(id, wal, lsn)| {
-            store.wait_durable(lsn, store.sync_class()).map(|()| (id, wal))
+        let forked = forked.and_then(|(id, wal, lsn)| match store.wait_durable(lsn, store.sync_class()) {
+            Ok(()) => Ok((id, wal)),
+            Err(e) => {
+                // Not handed out, so released (review item 11): on a live store the Release rides
+                // the next flight; a fail-stopped one keeps it pending (`release_handle`).
+                let _ = store.release_handle(id);
+                Err(e)
+            }
         });
         let held = store::take_counted_hold();
         let (id, wal) = forked?;
@@ -972,9 +982,10 @@ impl Connection {
     /// the epoch there (see `BranchStore::begin_trunk_commit`), so a fork needs no WAL write lock:
     /// it takes a read snapshot and registers in the branch store at once; a commit decided since
     /// its snapshot makes it fork after that commit, and one still in flight is waited out before
-    /// the branch is handed out (`BranchStore::fork_trunk`). It never waits out a write
-    /// transaction, never retries, and never serialises with another fork on the WAL (F-L,
-    /// r11-forklock 573642f19, on the durable store).
+    /// the branch is handed out, and by any other opener before it reads anything
+    /// (`BranchStore::settle`; review A-F3). It never waits out a write transaction, never retries,
+    /// and never serialises with another fork on the WAL (F-L, r11-forklock 573642f19, on the
+    /// durable store).
     ///
     /// The trunk's first live child is forked under the WAL write lock instead: a writer that saw no
     /// child captured no pre-images, so no child may appear before its commit.
@@ -991,9 +1002,15 @@ impl Connection {
         match forked? {
             store::TrunkFork::Forked { id, lsn, after } => {
                 // A trunk commit in flight at the registration: the child forks after it, and is
-                // handed out only once it is published.
+                // handed out only once it is published (its other openers wait in `settle`). The
+                // wait comes before the fork's own flight, which then does not contend with that
+                // commit's WAL flush (lead review 1, item 42). A fork that is not handed out is
+                // released (review item 11).
                 if let Some(c) = after {
-                    store.wait_trunk_commit_published(c)?;
+                    if let Err(e) = store.wait_trunk_commit_published(c) {
+                        let _ = store.release_handle(id);
+                        return Err(e);
+                    }
                 }
                 Ok((id, store::WalHold::default(), lsn))
             }
@@ -1225,7 +1242,8 @@ impl Database {
     }
 
     /// Re-attach a detached branch — one whose handle went through [`Branch::into_id`], or any
-    /// unreleased branch after a reopen.
+    /// unreleased branch after a reopen. A named server branch takes no handle: connect to it with
+    /// [`Database::connect_named`], release it with [`Database::drop_branch`].
     pub fn branch(self: &Arc<Database>, id: BranchId) -> Result<Branch> {
         self.branches.attach(id)?;
         Ok(Branch::new(self.clone(), id))
@@ -1252,8 +1270,9 @@ impl Database {
             .branch_named(name)?
             .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
         // A concurrent drop and re-create of the same name between the lookup and the release can
-        // only make this release the OLD branch twice, which is refused as reaped: the new branch
-        // is never touched (its id differs).
+        // only make this release the OLD branch twice: the second release reports success once
+        // the first one's Release is durable (both callers wanted it gone, and it is), and the new
+        // branch is never touched (its id differs).
         self.branches.release_handle(id)
     }
 
