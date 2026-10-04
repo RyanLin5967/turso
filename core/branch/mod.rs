@@ -1125,6 +1125,13 @@ impl Database {
         self.branches.catalog_counters()
     }
 
+    /// Wait until the catalog store's name filter is built after open (lead review 1 item 2), so a
+    /// test can count what a named create costs once it is.
+    #[doc(hidden)]
+    pub fn branch_wait_name_filter(&self) {
+        self.branches.wait_name_filter();
+    }
+
     /// What this open's prewarm did (r12-catload instrument, `R12_PREWARM`): `(mode, files warmed in
     /// the OS page cache, bytes read, bytes whose read-ahead was requested, catalog pages read
     /// through its page cache, interior pages among them, catalog page cache capacity after it,

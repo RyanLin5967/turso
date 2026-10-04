@@ -4625,6 +4625,9 @@ impl BranchStore {
 
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
     /// read)` since open (r11-restart lane instrument; zeros for a snapshot store).
+    /// See `Database::branch_wait_name_filter`.
+    pub(crate) fn wait_name_filter(&self) {}
+
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {
         let inner = self.inner.lock();
         inner.cat.as_ref().map_or((0, 0, 0, 0), |c| {

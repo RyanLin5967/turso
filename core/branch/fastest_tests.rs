@@ -1742,3 +1742,39 @@ fn a_fork_that_times_out_on_a_trunk_commit_is_busy_and_released() {
         assert_eq!(db.branch_named("late").unwrap(), None, "catalog={catalog}: after a reopen");
     }
 }
+
+// ---- lead review 1 item 2: a named create runs no catalog query under the store mutex ----
+
+/// Lead review 1 item 2: in a catalog store, a create of a NEW name — every successful server
+/// create — asks the catalog nothing: the name filter (every name the store ever held, insert-only)
+/// says no branch has it. Measured after a checkpoint, an eviction-free reopen and the filter's
+/// build, over `FE_NAMED_CREATES` (default 300) creates: 0 catalog queries. A taken name is still
+/// refused, before and after the reopen.
+#[test]
+fn a_named_create_of_a_new_name_asks_the_catalog_nothing() {
+    let _s = serial();
+    let creates = std::env::var("FE_NAMED_CREATES").ok().and_then(|v| v.parse().ok()).unwrap_or(300u64);
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("filter.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..50 {
+            trunk.create_branch(&format!("old-{i}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    assert!(trunk.create_branch("old-7").is_err(), "a name held before the reopen was given again");
+    let before = db.branch_catalog_counters().2;
+    for i in 0..creates {
+        trunk.create_branch(&format!("new-{i}")).unwrap();
+    }
+    let queries = db.branch_catalog_counters().2 - before;
+    assert_eq!(queries, 0, "{creates} named creates of new names made {queries} catalog queries");
+    assert!(trunk.create_branch("new-3").is_err(), "a name created since the reopen was given again");
+}
