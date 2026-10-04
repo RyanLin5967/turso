@@ -22,23 +22,32 @@ Arms (each must hold; the run exits 1 on any failure, 2 on a refused setup, and 
   perturb-* x6         the C-full checker, fed the passing K=7 data with ONE planted change (a count +1, a per-mark row
                        moved with totals unchanged, an exec record unattached, an sfr flag changed, a slot marked Go, a
                        missed call), must fail, each for its own reason
-  mutant-<name> x3     C-full K=7 under a shim missing one interpose (pwrite64, __open_2, fdatasync) must mismatch,
-                       and by exactly the predicted deficit
-  C-noise              only uncounted calls (zero-length O_DSYNC writes, creat, __close included): every kind 0, and
-                       the report refuses that as ZERO (rc 8) unless --allow-zero
-  raw K=7, K=23        through syscall(2): reported as MISSED (missed[] exactly, rc 9), never counted; an inline
-                       syscall instruction: invisible (strace sees exactly K more than counted + missed); libc control
-                       calls, and libc writes on fds opened / dup'd through syscall(2): counted exactly
-  uring                io_uring_setup and io_setup through syscall(2): rc 9 with async_io exactly 2
+  mutant-<name> x6     a shim missing one interpose (pwrite64, __open_2, fdatasync: C-full must mismatch by exactly the
+                       predicted deficit) or breaking one piece of logic (syscall(2) fcntl untracked, raw pwritev2 flags
+                       read from the wrong argument: the raw arm, exact deficit; no slot at fork: forkidle not LIVE)
+  C-noise              only uncounted calls (zero-length O_DSYNC writes, bad iovec pointers that must come back
+                       EFAULT, creat, __close): every kind 0, ZERO (rc 8); --allow-zero says "WAIVED: zero", never "ok"
+  raw K=7, K=23        every counted kind through syscall(2): reported as MISSED (missed[] exactly, rc 9), never
+                       counted; an inline syscall instruction: invisible (strace sees exactly K more than counted +
+                       missed); libc control calls, and libc writes on fds opened / dup'd / F_DUPFD'd through syscall(2)
+                       (open and dup2 too on x86_64): counted exactly
+  uring / liburing     io_uring_setup, io_uring_enter and io_setup through syscall(2), and io_uring_queue_init through a
+                       dynamically linked liburing.so: async I/O, rc 9 (the ring's fsyncs themselves are invisible)
   threads              8 threads race their first counted calls in a child made by _Fork: exactly one slot, exact counts
   Go-nocgo K=7, K=23   CGO_ENABLED=0 (static): report refuses rc 4, nothing attached; strace sees every call exactly
   Go-cgo K=7, K=23     CGO_ENABLED=1: report refuses rc 7; with --allow-go the root counts exactly the K cgo fsyncs and
                        nothing of Go's raw calls, the os/exec child attaches (Go flag) and counts 0; strace exact
   sqlite               a real library caller (system libsqlite3, one commit): shim counts == strace counts, >= 1
-  sigkill              K fsync read LIVE (rc 10, counts already there), then SIGKILL: the counts survive, rc 0
-  killmid              SIGKILL while blocked inside a counted call: inflight 1, rc 5 (the call is never silently lost)
-  live                 a background process outlives the root: rc 10 until it exits, then its K fsync count, rc 0
-  outside              the flushing process runs outside the v1run tree: ZERO (rc 8), never ok
+  sigkill / start_ticks K fsync read LIVE (rc 10), the slot's start time overwritten (another process: dead; none:
+                       unknown, so alive), then SIGKILL: the counts survive, rc 0
+  killmid              SIGKILL while blocked inside a counted call: inflight 1, INFLIGHT rc 11, not waived by
+                       --allow-incomplete
+  live, forkidle x3,   a background process outlives the root (rc 10 until it exits); a child of fork, _Fork or a
+  leaderexit           syscall(2) clone that has counted nothing is LIVE from birth; a zombie thread-group leader whose
+                       other thread still runs is LIVE
+  foreign              slots claimed in another pid namespace (sudo unshare --pid): rc 12, live or not
+  create               a run larger than /dev/shm is refused at create (posix_fallocate), never a SIGBUS later
+  outside              the flushing process runs outside the v1run tree while the tree clones: ZERO (rc 8), never ok
   bigfd                K writes on fd 1048600: fd_untracked exactly K, VOID (rc 5) not waivable
   refuse-*             SYNCSHIM_RUN unset -> 97; missing run -> 97; nothing attached -> rc 3; static root -> rc 4;
                        static / env-stripped children -> rc 6; event-log overflow -> rc 5 (waivable, counts exact);
@@ -66,20 +75,30 @@ ROUTES = ["posix_spawn", "posix_spawnp", "execve", "execv", "execvp", "execvpe",
 MS_ASYNC, MS_INVALIDATE, MS_SYNC = 1, 2, 4  # <sys/mman.h> on x86_64 and aarch64
 SFR_WB, SFR_W, SFR_WA = 1, 2, 4             # SYNC_FILE_RANGE_WAIT_BEFORE / WRITE / WAIT_AFTER
 SYS_WRITE = {"x86_64": 1, "aarch64": 64}    # the syscall number /proc/<pid>/syscall shows inside write(2)
-MUTANTS = {  # mutant -> {role: {kind: deficit as a function of K}}
-    "pwrite64": lambda K: {"root": {"odsync_write": -K}},
-    "open_2": lambda K: {"root": {"odsync_write": -K}},
-    "fdatasync": lambda K: {"root": {"fdatasync": -K}, "fork_child": {"fdatasync": -K}},
+MUTANTS = {  # mutant -> (the arm it runs under, its predicted deficit as a function of K)
+    "pwrite64": ("full", lambda K: {"root": {"odsync_write": -K}}),
+    "open_2": ("full", lambda K: {"root": {"odsync_write": -K}}),
+    "fdatasync": ("full", lambda K: {"root": {"fdatasync": -K}, "fork_child": {"fdatasync": -K}}),
+    "syscall_no_fcntl": ("raw", lambda K: {"counted": {"odsync_write": -K}}),   # mark 10: syscall(2) F_DUPFD fd
+    "pwritev2_a4": ("raw", lambda K: {"missed": {"odsync_write": -K}}),         # mark 14: raw pwritev2 RWF_DSYNC
+    "no_fork_claim": ("forkidle", lambda K: {"rc_first": 0, "totals_first": {"fsync": 1}}),  # child not seen live
 }
 PERTURB = ["root fsync +1", "a per-mark row moved, totals unchanged", "an exec record unattached",
            "an sfr flags value changed", "a slot marked Go", "one missed call"]
 REGISTERED = (["setfl-truth", "C-full K=7", "C-full K=23"] + ["perturb: %s caught" % p for p in PERTURB] +
               ["mutant-%s caught with the exact deficit" % m for m in MUTANTS] + ["C-noise"] +
-              ["raw K=%d" % k for k in (7, 23)] + ["uring: async I/O refused", "threads: one slot, exact counts"] +
+              ["raw K=%d" % k for k in (7, 23)] + ["uring: async I/O refused", "liburing: async I/O refused",
+                                                   "threads: one slot, exact counts"] +
               ["Go-%s K=%d" % (f, k) for f in ("nocgo", "cgo") for k in (7, 23)] +
               ["sqlite: shim == strace", "sigkill: live read, then counts survive",
-               "killmid: SIGKILL inside a counted call -> inflight, rc 5", "live: rc 10 until the last process exits",
-               "outside: flushes outside the tree -> ZERO rc 8", "bigfd: untracked fd -> VOID rc 5",
+               "start_ticks: a slot whose start time is not the process's reads dead",
+               "killmid: SIGKILL inside a counted call -> INFLIGHT rc 11", "live: rc 10 until the last process exits",
+               "forkidle fork: rc 10 while a child that counted nothing runs",
+               "forkidle _Fork: rc 10 while a child that counted nothing runs",
+               "forkidle clone: rc 10 while a child that counted nothing runs",
+               "leaderexit: a zombie leader with a running thread is LIVE",
+               "foreign pid namespace -> rc 12", "create refuses what /dev/shm cannot hold",
+               "outside: flushes outside the tree, clones inside -> ZERO rc 8", "bigfd: untracked fd -> VOID rc 5",
                "refuse: SYNCSHIM_RUN unset -> 97", "refuse: missing run -> 97", "refuse: nothing attached -> rc 3",
                "refuse: static root -> rc 4", "refuse: static and env-stripped children -> rc 6",
                "refuse: event-log overflow -> rc 5, waivable, counts exact",
@@ -296,7 +315,8 @@ def exp_execs(p):
 
 
 ZERO_KEYS = ("events_dropped", "events_incomplete", "inflight", "execs_dropped", "execs_unwritten", "execs_unattached",
-             "slot_overflow", "fd_untracked", "unresolved_mask", "go_slots", "async_io", "live")
+             "slot_overflow", "fd_untracked", "unresolved_mask", "go_slots", "async_io", "live", "claiming",
+             "foreign_ns")
 
 
 def gather_full(K, shim=None, tag="c"):
@@ -319,7 +339,7 @@ def check_full(K, data):
     d = {"report_rc": rc, "verdict": rep and rep["verdict"]}
     if rep is None:
         return False, d, None
-    ok = rc == 0
+    ok = rc == 0 and rep["verdict"] == "ok" and rep["waived"] == []
     for key in ZERO_KEYS:
         if rep[key] != 0:
             ok = False
@@ -474,11 +494,16 @@ def sec_full():
 
 
 def sec_mutants():
-    for m, pred in MUTANTS.items():
-        ok, d, diffs = check_full(7, gather_full(7, shim=B + "/syncshim_mut_%s.so" % m, tag="m"))
-        want = pred(7)
+    for m, (where, pred) in MUTANTS.items():
+        shim, want = B + "/syncshim_mut_%s.so" % m, pred(7)
+        if where == "full":
+            ok, d, diffs = check_full(7, gather_full(7, shim=shim, tag="m"))
+        elif where == "raw":
+            ok, d, diffs = check_raw(7, gather_raw(7, shim=shim, strace=False), use_strace=False)
+        else:
+            ok, d, diffs = check_forkidle(7, "fork", shim=shim)
         arm("mutant-%s caught with the exact deficit" % m, (not ok) and diffs == want,
-            {"checker_ok": ok, "diffs": diffs, "predicted": want, "detail": d})
+            {"arm": where, "checker_ok": ok, "diffs": diffs, "predicted": want, "detail": d})
 
 
 def sec_noise():
@@ -489,56 +514,113 @@ def sec_noise():
     rm(run)
     arm("C-noise", r.returncode == 0 and rc == 8 and rc2 == 0 and rep is not None and rep["attached"] == 1
         and rep["totals"] == counts() and rep["missed"] == counts() and len(rep["slots"]) == 1
-        and rep["slots"][0]["fails"] == counts(),
-        {"rc": rc, "rc_allow_zero": rc2, "probe_rc": r.returncode, "totals": rep and nz(rep["totals"]),
-         "verdict": rep and rep["verdict"]})
+        and rep["slots"][0]["fails"] == counts() and rep["verdict"].startswith("ZERO")
+        and rep2["waived"] == ["zero"] and rep2["verdict"].startswith("WAIVED: zero"),
+        {"rc": rc, "rc_allow_zero": rc2, "probe_rc": r.returncode, "probe_stderr": r.stderr[-300:],
+         "totals": rep and nz(rep["totals"]), "verdict": rep and rep["verdict"], "waived": rep2 and rep2["waived"],
+         "verdict_waived": rep2 and rep2["verdict"]})
+
+
+LEGACY = platform.machine() == "x86_64"  # x86_64 has the legacy open and dup2 syscalls; aarch64 has neither
+
+
+def raw_expect(K):
+    leg = 2 * K if LEGACY else 0
+    counted = counts(fsync=K, odsync_write=K + K + K + K + K + leg, osync_write=K)        # marks 5-13
+    missed = counts(fsync=K, fdatasync=K, odsync_write=5 * K, sfr_write_wait=K, syncfs=K, msync_SYNC=K,
+                    copy_file_range=K, FICLONE=K)                                         # marks 1, 2, 4, 14-21
+    marks = {(5, "fsync"): K, (6, "odsync_write"): K, (7, "odsync_write"): K, (8, "osync_write"): K,
+             (9, "odsync_write"): K, (10, "odsync_write"): K, (11, "odsync_write"): K}
+    if LEGACY:
+        marks[(12, "odsync_write")] = K
+        marks[(13, "odsync_write")] = K
+    strace = {"flush_by_syscall": {"fsync": 3 * K, "fdatasync": K, "syncfs": K, "sync": 0, "msync_sync": K},
+              "sync_file_range": K, "copy_file_range_calls": K, "ficlone": K, "rwf_sync_writes": K,
+              "osync_opens": 3 + (1 if LEGACY else 0)}
+    return counted, missed, marks, strace
+
+
+def gather_raw(K, shim=None, strace=True):
+    run = new_run("r")
+    r, sj = launch(run, [B + "/probe_c", "raw", str(K), W], shim=shim, strace=strace)
+    rc, rep = report(run)
+    rc2, rep2 = report(run, "--allow-uncounted")
+    bm = bymark(run)
+    rm(run)
+    return {"r": r, "sj": sj, "rc": rc, "rep": rep, "rc2": rc2, "rep2": rep2, "bm": bm, "p": pids_from(r.stdout)}
+
+
+def check_raw(K, g, use_strace=True):
+    counted_e, missed_e, marks_e, strace_e = raw_expect(K)
+    r, sj, rc, rep, p = g["r"], g["sj"], g["rc"], g["rep"], g["p"]
+    root = by_pid(rep).get(p.get("root")) if rep else None
+    d = {"report_rc": rc, "report_rc_allow_uncounted": g["rc2"], "probe_rc": r.returncode,
+         "probe_stderr": r.stderr[-300:], "verdict": rep and rep["verdict"],
+         "waived": g["rep2"] and g["rep2"]["waived"]}
+    if root is None:
+        return False, d, None
+    diffs = {}
+    dc, dm = diff(root["counts"], counted_e), diff(root["missed"], missed_e)
+    if dc:
+        diffs["counted"] = dc
+    if dm:
+        diffs["missed"] = dm
+    d.update({"MISSED_reported_by_shim": nz(root["missed"]), "counted": nz(root["counts"]), "diffs": diffs})
+    rt = p.get("root")
+    marks_exp = collections.Counter({(rt, 0, m, k): n for (m, k), n in marks_e.items()})
+    ok = (r.returncode == 0 and rc == 9 and g["rc2"] == 0 and g["rep2"]["waived"] == ["uncounted"]
+          and not diffs and g["bm"] == marks_exp and p.get("legacy_entry_points") == (1 if LEGACY else 0))
+    d["marks_ok"] = g["bm"] == marks_exp
+    if use_strace:
+        st = {k: sj.get(k) for k in strace_e}
+        fb = st["flush_by_syscall"] or {}
+        # what neither the counts nor missed[] hold and strace saw: the inline-instruction fsyncs, exactly K
+        inv = {"fsync": fb.get("fsync", 0) - root["counts"]["fsync"] - root["missed"]["fsync"],
+               "fdatasync": fb.get("fdatasync", 0) - root["counts"]["fdatasync"] - root["missed"]["fdatasync"],
+               "syncfs": fb.get("syncfs", 0) - root["counts"]["syncfs"] - root["missed"]["syncfs"],
+               "msync_sync": fb.get("msync_sync", 0) - root["counts"]["msync_SYNC"] - root["missed"]["msync_SYNC"]}
+        d.update({"INVISIBLE_to_shim (strace only)": inv, "strace": st, "strace_expected": strace_e,
+                  "strace_verdict": sj.get("verdict")})
+        ok = (ok and st == strace_e and inv == {"fsync": K, "fdatasync": 0, "syncfs": 0, "msync_sync": 0}
+              and not sj["verdict"].startswith("REFUSED"))
+    return ok, d, diffs
 
 
 def sec_raw():
     for K in (7, 23):
-        run = new_run("r")
-        r, sj = launch(run, [B + "/probe_c", "raw", str(K), W], strace=True)
-        rc, rep = report(run)
-        rc2, _ = report(run, "--allow-uncounted")
-        bm = bymark(run)
-        rm(run)
-        p = pids_from(r.stdout)
-        root = by_pid(rep).get(p.get("root")) if rep else None
-        shim_exp = counts(fsync=K, odsync_write=3 * K, osync_write=K)  # libc calls only (marks 5-9)
-        missed_exp = counts(fsync=K, fdatasync=K, odsync_write=K)      # syscall(2) (marks 1, 2, 4)
-        st_exp = {"fsync": 3 * K, "fdatasync": K, "syncfs": 0, "sync": 0, "msync_sync": 0}
-        st = sj.get("flush_by_syscall")
-        rt = p.get("root")
-        marks_exp = collections.Counter({(rt, 0, 5, "fsync"): K, (rt, 0, 6, "odsync_write"): K,
-                                         (rt, 0, 7, "odsync_write"): K, (rt, 0, 8, "osync_write"): K,
-                                         (rt, 0, 9, "odsync_write"): K})
-        invisible = None
-        if root and st:  # what neither the counts nor missed[] hold, and strace saw: the inline-asm fsyncs
-            invisible = {"fsync": st["fsync"] - root["counts"]["fsync"] - root["missed"]["fsync"],
-                         "fdatasync": st["fdatasync"] - root["counts"]["fdatasync"] - root["missed"]["fdatasync"]}
-        ok = (r.returncode == 0 and rc == 9 and rc2 == 0 and root is not None and root["counts"] == shim_exp
-              and root["missed"] == missed_exp and st == st_exp and invisible == {"fsync": K, "fdatasync": 0}
-              and not sj["verdict"].startswith("REFUSED") and bm == marks_exp)
-        arm("raw K=%d" % K, ok, {"MISSED_reported_by_shim": root and nz(root["missed"]),
-                                 "missed_expected": nz(missed_exp), "INVISIBLE_to_shim (strace only)": invisible,
-                                 "counted": root and nz(root["counts"]), "counted_expected": nz(shim_exp),
-                                 "strace": st, "strace_expected": st_exp, "strace_verdict": sj.get("verdict"),
-                                 "report_rc": rc, "report_rc_allow_uncounted": rc2, "probe_rc": r.returncode,
-                                 "marks_ok": bm == marks_exp, "verdict": rep and rep["verdict"]})
+        ok, d, _ = check_raw(K, gather_raw(K))
+        arm("raw K=%d" % K, ok, d)
 
 
 def sec_uring():
     run = new_run("u")
     r, _ = launch(run, [B + "/probe_c", "uring", "7", W])
     rc, rep = report(run)
-    rc2, _ = report(run, "--allow-uncounted")
+    rc2, rep2 = report(run, "--allow-uncounted")
     rm(run)
     p = pids_from(r.stdout)
     ro = by_pid(rep).get(p.get("root")) if rep else None
     arm("uring: async I/O refused", r.returncode == 0 and rc == 9 and rc2 == 0 and rep is not None
-        and rep["async_io"] == 2 and ro is not None and ro["counts"] == counts(fsync=7),
+        and rep["async_io"] == 3 and ro is not None and ro["counts"] == counts(fsync=7)
+        and rep2["waived"] == ["uncounted"],
         {"rc": rc, "rc_allow": rc2, "async_io": rep and rep["async_io"], "probe": r.stdout.strip(),
-         "verdict": rep and rep["verdict"]})
+         "verdict": rep and rep["verdict"], "waived": rep2 and rep2["waived"]})
+
+
+def sec_liburing():
+    run = new_run("w")
+    r, _ = launch(run, [B + "/probe_uring", "7", W])
+    rc, rep = report(run)
+    rc2, rep2 = report(run, "--allow-uncounted")
+    rm(run)
+    p = pids_from(r.stdout)
+    ro = by_pid(rep).get(p.get("root")) if rep else None
+    # the 7 ring fsyncs are invisible (liburing's raw syscalls); the ring's setup through liburing.so refuses
+    arm("liburing: async I/O refused", r.returncode == 0 and p.get("ring_fsyncs_done") == 7 and rc == 9 and rc2 == 0
+        and rep is not None and rep["async_io"] >= 1 and ro is not None and ro["counts"] == counts(fsync=1)
+        and rep2["waived"] == ["uncounted"],
+        {"rc": rc, "rc_allow": rc2, "async_io": rep and rep["async_io"], "probe": r.stdout.strip(),
+         "probe_stderr": r.stderr[-300:], "root": ro and nz(ro["counts"]), "verdict": rep and rep["verdict"]})
 
 
 def sec_threads():
@@ -583,7 +665,7 @@ def sec_go():
                 ok = (ok and rc == 7 and rc_go == 0 and rep_go is not None and len(rep_go["slots"]) == 2
                       and ro is not None and ch is not None and ro["go"] == [True] and ch["go"] == [True]
                       and ro["counts"] == counts(fsync=K) and ch["counts"] == counts() and rep_go["execs"] == []
-                      and rep_go["missed"] == counts())
+                      and rep_go["missed"] == counts() and rep_go["waived"] == ["go"])
                 d["shim_root"] = ro and nz(ro["counts"])
                 d["shim_child"] = ch and nz(ch["counts"])
                 d["go_flags"] = [ro and ro["go"], ch and ch["go"]]
@@ -614,12 +696,40 @@ def ready_pid(pr):
     return (int(m.group(1)) if m else None), line
 
 
+def poke_start(run, idx, value):
+    """Overwrite slot idx's start_ticks in the run's shared memory (the fire-check plays a reused pid)."""
+    import mmap
+    import struct
+    with open("/dev/shm/v1." + run, "r+b") as f:
+        mm = mmap.mmap(f.fileno(), 0)
+        off = 4096 + idx * 1024 + 16  # header, then 1024-byte slots; start_ticks after pid, ppid, attach_ns
+        old = struct.unpack_from("<Q", mm, off)[0]
+        struct.pack_into("<Q", mm, off, value)
+        mm.close()
+    return old
+
+
 def sec_sigkill():
     run = new_run("k")
     pr = subprocess.Popen([B + "/v1run", run, B + "/probe_c", "killme", "7", W], stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, text=True)
     pid, line = ready_pid(pr)
     rc_live, rep_live = report(run)
+    lv = by_pid(rep_live).get(pid) if (rep_live and pid) else None
+    # start_ticks decides liveness: the same pid with another start time is another process (dead to this slot);
+    # a slot with no start time is unknown, and unknown is alive
+    st = {}
+    if pid and rep_live:
+        idx = [s["idx"] for s in rep_live["slots"] if s["pid"] == pid][0]
+        orig = poke_start(run, idx, 0)
+        poke_start(run, idx, orig + 1)
+        st["rc_other_start"], r1 = report(run)
+        st["alive_other_start"] = r1 and [s["alive"] for s in r1["slots"] if s["pid"] == pid]
+        poke_start(run, idx, 0)
+        st["rc_no_start"], r2 = report(run)
+        poke_start(run, idx, orig)
+        st["rc_restored"], _ = report(run)
+        st["orig_start_ticks"] = orig
     if pid:
         os.kill(pid, signal.SIGKILL)
     else:
@@ -627,13 +737,15 @@ def sec_sigkill():
     rcp = pr.wait(timeout=60)
     rc, rep = report(run)
     rm(run)
-    lv = by_pid(rep_live).get(pid) if (rep_live and pid) else None
     ro = by_pid(rep).get(pid) if (rep and pid) else None
     arm("sigkill: live read, then counts survive", pid is not None and rc_live == 10 and lv is not None
         and lv["counts"] == counts(fsync=7) and lv["alive"] == [True] and rcp == -signal.SIGKILL and rc == 0
         and ro is not None and ro["counts"] == counts(fsync=7) and ro["alive"] == [False],
         {"line": line, "rc_live": rc_live, "live": lv and nz(lv["counts"]), "rc": rc, "probe_rc": rcp,
          "root": ro and nz(ro["counts"])})
+    arm("start_ticks: a slot whose start time is not the process's reads dead",
+        st.get("rc_other_start") == 0 and st.get("alive_other_start") == [False] and st.get("rc_no_start") == 10
+        and st.get("rc_restored") == 10 and st.get("orig_start_ticks", 0) > 0, st)
 
 
 def sec_killmid():
@@ -658,14 +770,16 @@ def sec_killmid():
     rcp = pr.wait(timeout=60)
     rc, rep = report(run)
     rc2, _ = report(run, "--allow-incomplete")
+    rc3, rep3 = report(run, "--allow-inflight")
     rm(run)
     ro = by_pid(rep).get(pid) if (rep and pid) else None
-    arm("killmid: SIGKILL inside a counted call -> inflight, rc 5", pid is not None and inside
-        and rcp == -signal.SIGKILL and rc == 5 and rc2 == 0 and ro is not None and ro["inflight"] == 1
-        and rep["inflight"] == 1 and ro["counts"] == counts(fsync=7),
-        {"line": line, "proc_syscall": seen and seen[:2], "inside_write": inside, "rc": rc, "rc_allow": rc2,
-         "probe_rc": rcp, "root": ro and {"inflight": ro["inflight"], "counts": nz(ro["counts"])},
-         "verdict": rep and rep["verdict"]})
+    arm("killmid: SIGKILL inside a counted call -> INFLIGHT rc 11", pid is not None and inside
+        and rcp == -signal.SIGKILL and rc == 11 and rc2 == 11 and rc3 == 0 and rep3["waived"] == ["inflight"]
+        and ro is not None and ro["inflight"] == 1 and rep["inflight"] == 1 and ro["counts"] == counts(fsync=7),
+        {"line": line, "proc_syscall": seen and seen[:2], "inside_write": inside, "rc": rc,
+         "rc_allow_incomplete": rc2, "rc_allow_inflight": rc3, "probe_rc": rcp,
+         "root": ro and {"inflight": ro["inflight"], "counts": nz(ro["counts"])}, "verdict": rep and rep["verdict"],
+         "waived": rep3 and rep3["waived"]})
 
 
 def poll_report(run, until, timeout_s=30):
@@ -699,6 +813,105 @@ def sec_live():
          "polls": polls, "totals_final": rep2 and nz(rep2["totals"]), "verdict_final": rep2 and rep2["verdict"]})
 
 
+def check_forkidle(K, variant, shim=None):
+    """The root makes 1 fsync and exits at once; its child (fork / _Fork / clone through syscall(2)) counts nothing
+    for 2 s, then K fsync. The first report must be LIVE (the child's slot exists from birth, with a zero count),
+    the last ok with 1 + K. Returns (ok, detail, diffs) -- diffs, for a mutant: what the first report said."""
+    run = new_run("i")
+    r, _ = launch(run, [B + "/probe_c", "forkidle", str(K), W, variant], shim=shim)
+    rc1, rep1 = report(run)
+    rc2, rep2, polls = poll_report(run, 10)
+    rm(run)
+    p = pids_from(r.stdout)
+    ch1 = by_pid(rep1).get(p.get("child")) if rep1 else None
+    ch2 = by_pid(rep2).get(p.get("child")) if rep2 else None
+    d = {"variant": variant, "root_rc": r.returncode, "rc_first": rc1, "child_first": ch1 and
+         {"slots": ch1["n"], "alive": ch1["alive"], "counts": nz(ch1["counts"])}, "rc_final": rc2, "polls": polls,
+         "totals_final": rep2 and nz(rep2["totals"]), "child_final": ch2 and {"slots": ch2["n"],
+                                                                                "counts": nz(ch2["counts"])}}
+    ok = (r.returncode == 0 and rc1 == 10 and ch1 is not None and ch1["alive"] == [True]
+          and ch1["counts"] == counts() and rc2 == 0 and rep2["totals"] == counts(fsync=1 + K)
+          and ch2 is not None and ch2["n"] == 1 and ch2["counts"] == counts(fsync=K))
+    diffs = {"rc_first": rc1, "totals_first": rep1 and nz(rep1["totals"])}
+    return ok, d, diffs
+
+
+def sec_forkidle():
+    for variant in ("fork", "_Fork", "clone"):
+        ok, d, _ = check_forkidle(7, variant)
+        arm("forkidle %s: rc 10 while a child that counted nothing runs" % variant, ok, d)
+
+
+def sec_leaderexit():
+    K = 7
+    run = new_run("x")
+    pr = subprocess.Popen([B + "/v1run", run, B + "/probe_c", "leaderexit", str(K), W], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
+    line = pr.stdout.readline()
+    m = re.search(r"ready pid=(\d+) fifo=(\S+)", line)
+    pid, fifo = (int(m.group(1)), m.group(2)) if m else (None, None)
+    state, deadline = None, time.time() + 15
+    while pid and time.time() < deadline:  # the leader has called pthread_exit: a zombie with a live thread
+        try:
+            raw = open("/proc/%d/stat" % pid).read()
+            state = raw[raw.rindex(")") + 2]
+        except (OSError, ValueError):
+            state = "?"
+        if state == "Z":
+            break
+        time.sleep(0.05)
+    rc1, rep1 = report(run)
+    if fifo:
+        with open(fifo, "w") as f:  # rendezvous with the worker's open, then let it go
+            f.write("g")
+    rcp = pr.wait(timeout=60)
+    rc2, rep2 = report(run)
+    rm(run)
+    ro1 = by_pid(rep1).get(pid) if (rep1 and pid) else None
+    arm("leaderexit: a zombie leader with a running thread is LIVE", pid is not None and state == "Z" and rc1 == 10
+        and ro1 is not None and ro1["alive"] == [True] and rcp == 0 and rc2 == 0
+        and rep2["totals"] == counts(fsync=1 + K),
+        {"line": line, "leader_state": state, "rc_first": rc1, "root_first": ro1 and {"alive": ro1["alive"]},
+         "probe_rc": rcp, "rc_final": rc2, "totals_final": rep2 and nz(rep2["totals"]),
+         "stderr": pr.stderr.read()[-300:] if pr.stderr else ""})
+
+
+def sec_foreign():
+    run = new_run("f")
+    flag = os.path.join(W, "ns.go")
+    try:
+        os.unlink(flag)
+    except FileNotFoundError:
+        pass
+    pr = subprocess.Popen(["sudo", "-n", "unshare", "--pid", "--fork", "--mount-proc", B + "/v1run", run,
+                           B + "/probe_c", "waitfile", "3", W, flag], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True)
+    pid, line = ready_pid(pr)
+    rc1, rep1 = report(run)
+    open(flag, "w").close()
+    rcp = pr.wait(timeout=60)
+    rc2, rep2 = report(run)
+    sh(["sudo", "-n", "rm", "-f", os.path.join(W, "waitfile")])  # root-owned
+    rm(run)
+    my_ns = os.stat("/proc/self/ns/pid").st_ino
+    nss = rep1 and sorted({s["pidns"] for s in rep1["slots"]})
+    arm("foreign pid namespace -> rc 12", line.startswith("ready") and rc1 == 12 and rcp == 0 and rc2 == 12
+        and nss is not None and my_ns not in nss and all(nss) and rep2["totals"] == counts(fsync=3),
+        {"line": line, "pid_inside": pid, "rc_live": rc1, "rc_after": rc2, "probe_rc": rcp, "slot_pidns": nss,
+         "my_pidns": my_ns, "verdict": rep2 and rep2["verdict"], "stderr": pr.stderr.read()[-300:]})
+
+
+def sec_create():
+    run = "fc%dbig" % (os.getpid() % 10000)
+    sh([B + "/v1ctl", "rm", run])
+    r = sh([B + "/v1ctl", "create", run, "--events", "4000000000"])  # 256 GB of events: more than any /dev/shm
+    exists = os.path.exists("/dev/shm/v1." + run)
+    if exists:
+        rm(run)
+    arm("create refuses what /dev/shm cannot hold", r.returncode == 2 and not exists
+        and "cannot reserve" in r.stderr, {"rc": r.returncode, "stderr": r.stderr[-300:], "left_behind": exists})
+
+
 def sec_outside():
     for f in ("out.go", "out.done"):
         try:
@@ -711,16 +924,18 @@ def sec_outside():
     helper = subprocess.Popen(["/bin/sh", "-c", 'while [ ! -e "$1/out.go" ]; do sleep 0.05; done; '
                                '"$2" spawned 5 "$1" && : > "$1/out.done"', "sh", W, B + "/probe_c"], env=env)
     run = new_run("o")
-    r, _ = launch(run, ["/bin/sh", "-c", ': > "$1/out.go"; while [ ! -e "$1/out.done" ]; do sleep 0.05; done',
-                        "sh", W])
+    # inside the tree: 3 FICLONE + 3 copy_file_range and no flush; outside it: the 5 fsyncs
+    r, _ = launch(run, ["/bin/sh", "-c", '"$2" cloneonly 3 "$1" && : > "$1/out.go"; '
+                        'while [ ! -e "$1/out.done" ]; do sleep 0.05; done', "sh", W, B + "/probe_c"])
     hrc = helper.wait(timeout=60)
     rc, rep = report(run)
     rc2, rep2 = report(run, "--allow-zero")
     rm(run)
-    arm("outside: flushes outside the tree -> ZERO rc 8", r.returncode == 0 and hrc == 0 and rc == 8 and rc2 == 0
-        and rep is not None and rep["totals"] == counts() and rep["attached"] >= 1,
+    arm("outside: flushes outside the tree, clones inside -> ZERO rc 8", r.returncode == 0 and hrc == 0 and rc == 8
+        and rc2 == 0 and rep is not None and rep["classes"] == {"flush": 0, "writeback": 0, "clone": 6}
+        and rep["totals"] == counts(FICLONE=3, copy_file_range=3) and rep2["waived"] == ["zero"],
         {"root_rc": r.returncode, "helper_rc": hrc, "rc": rc, "rc_allow_zero": rc2,
-         "attached": rep and rep["attached"], "verdict": rep and rep["verdict"]})
+         "classes": rep and rep["classes"], "verdict": rep and rep["verdict"], "waived": rep2 and rep2["waived"]})
 
 
 def sec_bigfd():
@@ -768,11 +983,11 @@ def sec_refusals():
     run = new_run("e", "--events", "5")
     r, _ = launch(run, [B + "/probe_c", "spawned", "7", W])
     rc, rep = report(run)
-    rc2, _ = report(run, "--allow-incomplete")
+    rc2, rep2 = report(run, "--allow-incomplete")
     rm(run)
     arm("refuse: event-log overflow -> rc 5, waivable, counts exact",
         r.returncode == 0 and rc == 5 and rep is not None and rep["events_dropped"] == 2
-        and rep["totals"] == counts(fsync=7) and rc2 == 0,
+        and rep["totals"] == counts(fsync=7) and rc2 == 0 and rep2["waived"] == ["incomplete"],
         {"rc": rc, "rc_allow": rc2, "dropped": rep and rep["events_dropped"], "totals": rep and nz(rep["totals"])})
     run = new_run("s", "--slots", "2")
     r, _ = launch(run, [B + "/probe_c", "fanout", "3", W])
@@ -817,8 +1032,9 @@ def finish():
 
 
 setup()
-for section in (sec_full, sec_mutants, sec_noise, sec_raw, sec_uring, sec_threads, sec_go, sec_sqlite, sec_sigkill,
-                sec_killmid, sec_live, sec_outside, sec_bigfd, sec_refusals):
+for section in (sec_full, sec_mutants, sec_noise, sec_raw, sec_uring, sec_liburing, sec_threads, sec_go, sec_sqlite,
+                sec_sigkill, sec_killmid, sec_live, sec_forkidle, sec_leaderexit, sec_foreign, sec_create,
+                sec_outside, sec_bigfd, sec_refusals):
     try:
         section()
     except Exception:  # a section that crashed has not passed; its arms show as missing, the rest still run

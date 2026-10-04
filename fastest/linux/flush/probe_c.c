@@ -34,6 +34,7 @@
 #include "syncshim.h"
 #include <dlfcn.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
@@ -147,6 +148,13 @@ static void noise_phases(int K) {
     for (int i = 0; i < K; i++) ck(pwrite64(z, buf, 0, 0), "zero pwrite64");
     for (int i = 0; i < K; i++) ck(writev(z, iv0, 2), "zero writev");
     for (int i = 0; i < K; i++) ck(pwritev2(z, iv0, 2, 0, RWF_DSYNC), "zero pwritev2 RWF_DSYNC");
+    /* a bad iovec pointer must come back EFAULT (the shim reads iovecs without trusting them), a bad count EINVAL;
+     * neither writes anything, and neither counts */
+    const struct iovec *bad = (const struct iovec *)8;
+    if (writev(z, bad, 1) != -1 || errno != EFAULT) die("writev(bad iovec) is not EFAULT");
+    if (pwritev2(z, bad, 1, 0, 0) != -1 || errno != EFAULT) die("pwritev2(bad iovec) is not EFAULT");
+    if (syscall(SYS_writev, z, bad, 1) != -1 || errno != EFAULT) die("syscall writev(bad iovec) is not EFAULT");
+    if (writev(z, iv, -1) != -1 || errno != EINVAL) die("writev(iovcnt -1) is not EINVAL");
     close(z);
     /* creat, creat64 and __close run, and change nothing counted */
     pathof("creat1", p, sizeof p);
@@ -479,17 +487,21 @@ static int run_full(int K) {
 static int run_raw(int K) {
     char buf[4096], p[4096];
     memset(buf, 'r', sizeof buf);
+    struct iovec iv[2] = {{buf, 100}, {buf, 412}};
     int fd = openf("raw", O_RDWR | O_TRUNC);
     ck(write(fd, buf, sizeof buf), "write raw");
     int d = openf("rawdsync", O_WRONLY | O_TRUNC | O_DSYNC);
+    /* through syscall(2): reported as MISSED, never counted */
     mark(1); for (int i = 0; i < K; i++) ck(syscall(SYS_fsync, fd), "syscall(2) fsync");
     mark(2); for (int i = 0; i < K; i++) ck(syscall(SYS_fdatasync, fd), "syscall(2) fdatasync");
+    /* as an inline syscall instruction: invisible */
     mark(3);
     for (int i = 0; i < K; i++) {
         long r = rawsys1(SYS_fsync, fd);
         if (r < 0) { errno = (int)-r; die("raw fsync"); }
     }
     mark(4); for (int i = 0; i < K; i++) ck(syscall(SYS_pwrite64, d, buf, 512, 0), "syscall(2) pwrite64 O_DSYNC");
+    /* through libc: counted (the control, and fds opened or dup'd through syscall(2)) */
     mark(5); for (int i = 0; i < K; i++) ck(fsync(fd), "libc fsync (control)");
     mark(6); for (int i = 0; i < K; i++) ck(pwrite64(d, buf, 512, 0), "libc pwrite64 O_DSYNC (control)");
     pathof("raw_openat", p, sizeof p);
@@ -505,12 +517,64 @@ static int run_raw(int K) {
     if (o3 < 0) die("syscall(2) dup");
     mark(9); for (int i = 0; i < K; i++) ck(write(o3, buf, 512), "libc write on a syscall(2)-dup'd O_DSYNC fd");
     ck(syscall(SYS_close, o3), "syscall(2) close");
+    int o4 = (int)syscall(SYS_fcntl, d, F_DUPFD, 300);
+    if (o4 < 0) die("syscall(2) fcntl F_DUPFD");
+    mark(10); for (int i = 0; i < K; i++) ck(write(o4, buf, 512), "libc write on a syscall(2) F_DUPFD fd");
+    close(o4);
+    int o5 = (int)syscall(SYS_dup3, d, 301, 0);
+    if (o5 != 301) die("syscall(2) dup3");
+    mark(11); for (int i = 0; i < K; i++) ck(write(o5, buf, 512), "libc write on a syscall(2) dup3 fd");
+    close(o5);
+    int legacy = 0;
+#if defined(SYS_dup2) && defined(SYS_open)
+    legacy = 1; /* x86_64 has the legacy dup2 and open entry points; aarch64 has neither */
+    int o6 = (int)syscall(SYS_dup2, d, 302);
+    if (o6 != 302) die("syscall(2) dup2");
+    mark(12); for (int i = 0; i < K; i++) ck(write(o6, buf, 512), "libc write on a syscall(2) dup2 fd");
+    close(o6);
+    pathof("raw_open", p, sizeof p);
+    int o7 = (int)syscall(SYS_open, p, O_WRONLY | O_CREAT | O_TRUNC | O_DSYNC, 0644);
+    if (o7 < 0) die("syscall(2) open O_DSYNC");
+    mark(13); for (int i = 0; i < K; i++) ck(write(o7, buf, 512), "libc write on a syscall(2)-opened O_DSYNC fd");
+    close(o7);
+#endif
+    /* every other counted kind through syscall(2): MISSED */
+    int pl = openf("rawplain", O_WRONLY | O_TRUNC);
+    mark(14);
+    for (int i = 0; i < K; i++) ck(syscall(SYS_pwritev2, pl, iv, 2, 0, 0, RWF_DSYNC), "syscall(2) pwritev2 RWF_DSYNC");
+    close(pl);
+    mark(15);
+    for (int i = 0; i < K; i++)
+        ck(syscall(SYS_sync_file_range, fd, 0, 0, SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER), "syscall(2) sfr");
+    mark(16); for (int i = 0; i < K; i++) ck(syscall(SYS_syncfs, fd), "syscall(2) syncfs");
+    char *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) die("mmap");
+    mark(17);
+    for (int i = 0; i < K; i++) { m[i % 4096] ^= 1; ck(syscall(SYS_msync, m, 4096, MS_SYNC), "syscall(2) msync"); }
+    munmap(m, 4096);
+    int src = openf("rawsrc", O_RDWR | O_TRUNC);
+    ck(write(src, buf, sizeof buf), "rawsrc");
+    mark(18); /* into the O_DSYNC fd: a copy_file_range AND a sync write, both missed */
+    for (int i = 0; i < K; i++) {
+        __off64_t in = 0, out = 0;
+        ck(syscall(SYS_copy_file_range, src, &in, d, &out, 512, 0), "syscall(2) copy_file_range");
+    }
+    int dst = openf("rawdst", O_RDWR | O_TRUNC);
+    mark(19); for (int i = 0; i < K; i++) (void)syscall(SYS_ioctl, dst, V1_FICLONE, src); /* fails on ext4: still a call */
+    mark(20);
+    for (int i = 0; i < K; i++) {
+        off_t off = 0;
+        ck(syscall(SYS_sendfile, d, src, &off, 512), "syscall(2) sendfile into O_DSYNC");
+    }
+    mark(21); for (int i = 0; i < K; i++) ck(syscall(SYS_writev, d, iv, 2), "syscall(2) writev O_DSYNC");
+    close(dst);
+    close(src);
     close(o2);
     close(o1);
     close(d);
     close(fd);
     mark(0);
-    printf("probe_c raw K=%d root=%d\n", K, (int)getpid());
+    printf("probe_c raw K=%d root=%d legacy_entry_points=%d\n", K, (int)getpid(), legacy);
     return 0;
 }
 
@@ -525,6 +589,7 @@ static int run_uring(int K) {
     memset(params, 0, sizeof params);
     long r = syscall(SYS_io_uring_setup, 4, params);
     int e1 = r < 0 ? errno : 0;
+    long r3 = syscall(SYS_io_uring_enter, r, 0, 0, 0, NULL, 0); /* a ring fd, or -1 (EBADF): a call either way */
     if (r >= 0) close((int)r);
     unsigned long ctx = 0; /* aio_context_t */
     long r2 = syscall(SYS_io_setup, 1, &ctx);
@@ -532,9 +597,106 @@ static int run_uring(int K) {
     if (r2 == 0) (void)syscall(SYS_io_destroy, ctx);
     close(fd);
     mark(0);
-    printf("probe_c uring K=%d root=%d io_uring_setup=%ld errno=%d io_setup=%ld errno=%d\n", K, (int)getpid(), r, e1,
-           r2, e2);
+    printf("probe_c uring K=%d root=%d io_uring_setup=%ld errno=%d io_uring_enter=%ld io_setup=%ld errno=%d\n", K,
+           (int)getpid(), r, e1, r3, r2, e2);
     return 0;
+}
+
+/* cloneonly: K FICLONE and K copy_file_range, and no flush at all (the ZERO check is keyed on the flush class) */
+static int run_cloneonly(int K) {
+    char buf[8192];
+    memset(buf, 'o', sizeof buf);
+    int src = openf("co_src", O_RDWR | O_TRUNC);
+    ck(write(src, buf, sizeof buf), "co_src");
+    int dst = openf("co_dst", O_RDWR | O_TRUNC);
+    for (int i = 0; i < K; i++) (void)ioctl(dst, V1_FICLONE, src);
+    for (int i = 0; i < K; i++) {
+        __off64_t in = 0, out = 0;
+        if (copy_file_range(src, &in, dst, &out, 4096, 0) != 4096) die("copy_file_range");
+    }
+    close(dst);
+    close(src);
+    printf("probe_c cloneonly K=%d root=%d\n", K, (int)getpid());
+    return 0;
+}
+
+/* forkidle: 1 fsync, then a child (fork, _Fork or a fork-like clone through syscall(2)) that counts nothing for
+ * 2 s and then makes K fsync; the root exits at once, leaving the child alive with a zero-count slot. */
+static int run_forkidle(int K, const char *variant) {
+    int fd = openf("forkidle_root", O_RDWR | O_TRUNC);
+    char b[512] = {0};
+    ck(write(fd, b, sizeof b), "write");
+    mark(1);
+    ck(fsync(fd), "forkidle root fsync");
+    close(fd);
+    pid_t c;
+    if (!strcmp(variant, "fork")) c = fork();
+    else if (!strcmp(variant, "_Fork")) c = _Fork();
+    else if (!strcmp(variant, "clone")) c = (pid_t)syscall(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+    else { fprintf(stderr, "probe_c: forkidle fork|_Fork|clone\n"); return 2; }
+    if (c < 0) die("forkidle fork");
+    if (c == 0) {
+        struct timespec ts = {2, 0};
+        while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+        int cf = openf("forkidle_child", O_RDWR | O_TRUNC);
+        if (write(cf, b, sizeof b) != (ssize_t)sizeof b) _exit(3);
+        for (int i = 0; i < K; i++) if (fsync(cf) != 0) _exit(4);
+        close(cf);
+        _exit(0);
+    }
+    printf("probe_c forkidle K=%d variant=%s root=%d child=%d\n", K, variant, (int)getpid(), (int)c);
+    fflush(stdout);
+    return 0;
+}
+
+/* leaderexit: 1 fsync, then a worker that waits on a FIFO and then makes K fsync, while the main thread calls
+ * pthread_exit: the thread-group leader is a zombie while the process still runs. */
+static int g_le_k;
+static char g_le_fifo[4096];
+static void *le_worker(void *arg) {
+    (void)arg;
+    int r = open(g_le_fifo, O_RDONLY); /* blocks until the fire-check opens the FIFO for writing */
+    char c;
+    if (r < 0 || read(r, &c, 1) != 1) _exit(5);
+    close(r);
+    int fd = openf("leader_worker", O_RDWR | O_TRUNC);
+    char b[512] = {0};
+    if (write(fd, b, sizeof b) != (ssize_t)sizeof b) _exit(6);
+    for (int i = 0; i < g_le_k; i++) if (fsync(fd) != 0) _exit(7);
+    close(fd);
+    return NULL; /* the last thread: the process exits 0 */
+}
+static int run_leaderexit(int K) {
+    g_le_k = K;
+    int fd = openf("leader_main", O_RDWR | O_TRUNC);
+    char b[512] = {0};
+    ck(write(fd, b, sizeof b), "write");
+    mark(1);
+    ck(fsync(fd), "leader fsync");
+    close(fd);
+    pathof("leader.fifo", g_le_fifo, sizeof g_le_fifo);
+    unlink(g_le_fifo);
+    if (mkfifo(g_le_fifo, 0644)) die("mkfifo");
+    pthread_t t;
+    if (pthread_create(&t, NULL, le_worker, NULL)) die("pthread_create");
+    printf("ready pid=%d fifo=%s\n", (int)getpid(), g_le_fifo);
+    fflush(stdout);
+    pthread_exit(NULL);
+}
+
+/* waitfile: K fsync, print ready, then wait until argv[4] exists and exit 0. */
+static int run_waitfile(int K, const char *flag) {
+    int fd = openf("waitfile", O_RDWR | O_TRUNC);
+    char b[512] = {0};
+    ck(write(fd, b, sizeof b), "write");
+    mark(1);
+    for (int i = 0; i < K; i++) ck(fsync(fd), "waitfile fsync");
+    close(fd);
+    printf("ready pid=%d\n", (int)getpid());
+    fflush(stdout);
+    struct timespec ts = {0, 50 * 1000 * 1000};
+    for (int i = 0; i < 1200 && access(flag, F_OK) != 0; i++) nanosleep(&ts, NULL);
+    return access(flag, F_OK) == 0 ? 0 : 1;
 }
 
 #define NTHREADS 8
@@ -643,7 +805,7 @@ static int run_sqlite(void) {
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: probe_c full|noise|spawned|inherited|raw|uring|threads|sqlite|killme|killmid|bigfd|"
-                        "execstatic|fanout|setfl-truth K dir [args]\n");
+                        "execstatic|fanout|cloneonly|forkidle|leaderexit|waitfile|setfl-truth K dir [args]\n");
         return 2;
     }
     const char *mode = argv[1];
@@ -687,6 +849,16 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "threads")) return run_threads(K);
     if (!strcmp(mode, "sqlite")) return run_sqlite();
     if (!strcmp(mode, "killmid")) return run_killmid(K);
+    if (!strcmp(mode, "cloneonly")) return run_cloneonly(K);
+    if (!strcmp(mode, "leaderexit")) return run_leaderexit(K);
+    if (!strcmp(mode, "forkidle")) {
+        if (argc < 5) { fprintf(stderr, "probe_c: forkidle needs fork|_Fork|clone\n"); return 2; }
+        return run_forkidle(K, argv[4]);
+    }
+    if (!strcmp(mode, "waitfile")) {
+        if (argc < 5) { fprintf(stderr, "probe_c: waitfile needs the flag file\n"); return 2; }
+        return run_waitfile(K, argv[4]);
+    }
     if (!strcmp(mode, "bigfd")) return run_bigfd(K);
     if (!strcmp(mode, "killme")) {
         int fd = openf("killme", O_RDWR | O_TRUNC);

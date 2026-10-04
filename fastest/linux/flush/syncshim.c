@@ -41,8 +41,21 @@
  *    posix_spawn that system() and popen() make (the /bin/sh they start attaches on its own if it is dynamic).
  *  - A library dlopen'ed with RTLD_DEEPBIND binds its libc calls in its own scope and bypasses the shim, undetected.
  *    (dlopen is not wrapped: a wrapper would become the "caller", breaking the caller's RUNPATH and $ORIGIN.)
- *  - io_uring and Linux AIO submissions are invisible as flushes; their setup through syscall(2) refuses (rc 9),
- *    through raw instructions it is undetected (above). The strace counter flags both (verdict INCOMPLETE).
+ *  - io_uring and Linux AIO submissions are invisible as flushes. Their setup refuses (rc 9) when it goes through
+ *    syscall(2) (the io-uring crate, liburing < 2.2) or through liburing.so's io_uring_queue_init[_params] /
+ *    io_uring_setup (a dynamically linked liburing); a statically linked liburing, the io-uring crate's
+ *    direct-syscall feature or rustix is undetected (above). The strace counter flags both (verdict INCOMPLETE).
+ *  - LIVENESS (rc 10) sees a process from its slot. A child of fork(), _Fork() or a fork-like clone through
+ *    syscall(2) has one at birth; a vfork child, a raw-instruction clone, and the child that system() or popen()
+ *    spawns have none until they count something or their image loads the shim, so in that window they are unseen.
+ *    The report must run in the pid namespace the counted processes ran in (else rc 12).
+ *  - A vfork child that makes a counted call before its exec claims a slot in memory it shares with its parent, so
+ *    the parent claims a second slot under the same pid; per-pid counts stay exact.
+ *  - A thread cancelled (pthread_cancel) inside a counted call leaves it in flight: the report refuses (rc 11) even
+ *    after a clean exit, because whether that call reached the disk is unknown.
+ *  - Capacity: --slots (default 65536; one per process, two for a fork that execs), --execs (65536) and --events
+ *    (2^20). A slot or exec-table overflow is VOID (rc 5); size them for fork-heavy programs. The whole object is
+ *    reserved at create (posix_fallocate), so a /dev/shm too small refuses at create, never SIGBUS in the program.
  *  - O_SYNC/O_DSYNC tracking follows open, open64, __open, __open64, openat, openat64, __open_2, __open64_2,
  *    __openat_2, __openat64_2, creat, creat64, open_by_handle_at, dup, dup2, __dup2, dup3, fcntl/fcntl64/__fcntl
  *    (F_DUPFD, F_DUPFD_CLOEXEC, F_SETFL), close/__close, and open/openat/openat2/creat/dup/dup2/dup3/fcntl/close
@@ -58,7 +71,7 @@
  *    syscalls (Go) or inside glibc (system, popen, pidfd_spawn) are not recorded. It matches a new image by pid and
  *    time; a pid reused inside one run could hide an unattached image (pid_max is 4194304 on these kernels).
  *  - A call is recorded after it returns; slot->inflight counts calls entered and not returned, so a process
- *    SIGKILLed inside one leaves it > 0 and the report refuses (rc 5) rather than show the count one short.
+ *    SIGKILLed inside one leaves it > 0 and the report refuses (rc 11) rather than show the count one short.
  *  - setuid and other secure-exec binaries ignore LD_PRELOAD: they never attach (rc 4 / rc 6, never zero).
  *  - A signal handler that makes a counted call while its own thread holds the one-time slot-claim lock spins
  *    forever. The claim is made once per process (at load, at fork, or at the first counted call after _Fork).
@@ -291,6 +304,8 @@ static void v1_claim_slot(int32_t me) {
         s->ppid = (int32_t)getppid();
         s->attach_ns = v1_now();
         s->start_ticks = v1_self_start();
+        struct stat ns;
+        s->pidns = stat("/proc/self/ns/pid", &ns) == 0 ? (uint64_t)ns.st_ino : 0;
         s->flags = g_is_go ? V1_SLOT_GO : 0;
         s->unresolved = g_unresolved;
         __atomic_store_n(&s->pid, me, __ATOMIC_RELEASE); /* published last */
@@ -316,14 +331,24 @@ static v1_slot *v1_slot_get(int32_t *pid_out) {
     return s;
 }
 
-/* fork() child: its own copy of the bitmap, and a slot at once, so the report sees it alive before it counts. */
-static void v1_after_fork_child(void) {
+/* The child of a fork-like call (fork, _Fork, a clone without CLONE_VM through syscall(2)): it has its own copy of
+ * the bitmap, and claims a slot at once, so the report sees it alive before it counts anything. Async-signal-safe
+ * (getpid, readlink, open/read/close, stat, atomics): it runs in a fork handler and after _Fork. */
+static void v1_child_born(int claim) {
     __atomic_store_n(&g_slot, NULL, __ATOMIC_RELEASE);
     __atomic_store_n(&g_slot_pid, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_claim_lock, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_bitmap_pid, (int32_t)getpid(), __ATOMIC_RELEASE);
+    if (!claim || __atomic_load_n(&g_hdr, __ATOMIC_ACQUIRE) == NULL) return;
     int32_t me;
     (void)v1_slot_get(&me);
+}
+static void v1_after_fork_child(void) {
+#ifdef V1_MUTANT_NO_FORK_CLAIM /* fire-check mutant: the forkidle arm must catch a fork child with no slot */
+    v1_child_born(0);
+#else
+    v1_child_born(1);
+#endif
 }
 
 /* ---- O_SYNC / O_DSYNC fd tracking ---- */
@@ -393,9 +418,28 @@ static inline int sfr_kind(unsigned int f) {
     return V1K_SFR_WAIT;
 }
 static inline int msync_kind(int f) { return (f & MS_SYNC) ? V1K_MSYNC_SYNC : V1K_MSYNC_OTHER; }
+/* Total bytes an iovec array asks for, read without trusting the pointer: the array is copied with
+ * process_vm_readv, so a bad pointer gives 0 here (and EFAULT from the real call), never a SIGSEGV in the shim. A
+ * count outside 1..IOV_MAX (the kernel says EINVAL) also gives 0. Only called for an fd already known to be sync. */
 static size_t iov_len(const struct iovec *v, long n) {
+    if (v == NULL || n <= 0 || n > 1024) return 0;
+    struct iovec chunk[64];
     size_t s = 0;
-    for (long i = 0; v && i < n && i < 1024; i++) s += v[i].iov_len;
+    for (long i = 0; i < n; i += 64) {
+        long m = n - i < 64 ? n - i : 64;
+        struct iovec local = {chunk, (size_t)m * sizeof *chunk};
+        struct iovec remote = {(void *)(v + i), (size_t)m * sizeof *chunk};
+        int e = errno;
+        ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        int why = errno;
+        errno = e;
+        if (got == -1 && why != EFAULT) { /* process_vm_readv refused (seccomp EPERM, ENOSYS): read it directly */
+            for (long j = 0; j < m; j++) s += v[i + j].iov_len;
+            continue;
+        }
+        if (got != (ssize_t)local.iov_len) return 0;
+        for (long j = 0; j < m; j++) s += chunk[j].iov_len;
+    }
     return s;
 }
 
@@ -461,7 +505,9 @@ static void v1_rec(v1_slot *s, int32_t me, int kind, int fd, int64_t aux, uint64
     __atomic_store_n(&ev->kind, (int16_t)(kind + 1), __ATOMIC_RELEASE); /* kind+1: 0 means "never completed" */
 }
 
-/* BEGIN takes the slot and marks the call in flight before the real call; END records it, then clears in-flight. */
+/* BEGIN takes the slot and marks the call in flight before the real call; END records it, then clears in-flight.
+ * END records only in the process that began the call: a child forked from a signal handler that interrupted a
+ * counted call resumes this frame holding its parent's slot, and must not count, or un-count, there. */
 #define V1_BEGIN()                                                                 \
     v1_ensure();                                                                   \
     int32_t me_;                                                                   \
@@ -472,8 +518,10 @@ static void v1_rec(v1_slot *s, int32_t me, int kind, int fd, int64_t aux, uint64
 #define V1_END(kind, fd, aux, failed)                                              \
     do {                                                                           \
         int e_ = errno;                                                            \
-        v1_rec(s_, me_, (kind), (fd), (int64_t)(aux), mark_, t0_, v1_now(), (failed), e_); \
-        __atomic_fetch_sub(&s_->inflight, 1, __ATOMIC_SEQ_CST);                    \
+        if (__builtin_expect((int32_t)getpid() == me_, 1)) {                       \
+            v1_rec(s_, me_, (kind), (fd), (int64_t)(aux), mark_, t0_, v1_now(), (failed), e_); \
+            __atomic_fetch_sub(&s_->inflight, 1, __ATOMIC_SEQ_CST);                \
+        }                                                                          \
         errno = e_;                                                                \
     } while (0)
 
@@ -549,7 +597,7 @@ ssize_t copy_file_range(int in, __off64_t *pin, int out, __off64_t *pout, size_t
     V1_BEGIN();
     ssize_t r = real_copy_file_range(in, pin, out, pout, len, flags);
     V1_END(V1K_COPY_FILE_RANGE, out, (int64_t)len, r == -1);
-    if (k >= 0) {
+    if (k >= 0 && (int32_t)getpid() == me_) {
         int e = errno;
         v1_rec(s_, me_, k, out, (int64_t)len, mark_, t0_, v1_now(), r == -1, e);
         errno = e;
@@ -773,103 +821,6 @@ int __close(int fd) {
     return real___close(fd);
 }
 
-/* ---- syscall(2): watched, never counted. Six pointer-sized varargs are forwarded, as glibc's own syscall() reads
- * six registers whatever the call. Nothing but a switch runs for a syscall this does not watch (futex, getrandom).
- * ---- */
-struct v1_open_how { uint64_t flags, mode, resolve; };
-long syscall(long n, ...) {
-    va_list ap;
-    va_start(ap, n);
-    long a0 = va_arg(ap, long), a1 = va_arg(ap, long), a2 = va_arg(ap, long);
-    long a3 = va_arg(ap, long), a4 = va_arg(ap, long), a5 = va_arg(ap, long);
-    va_end(ap);
-    RESOLVE(syscall);
-    int miss = -1, miss2 = -1, async = 0, track = 0;
-    switch (n) {
-    case SYS_fsync: miss = V1K_FSYNC; break;
-    case SYS_fdatasync: miss = V1K_FDATASYNC; break;
-    case SYS_syncfs: miss = V1K_SYNCFS; break;
-    case SYS_sync: miss = V1K_SYNC; break;
-    case SYS_msync: miss = msync_kind((int)a2); break;
-    case SYS_sync_file_range: miss = sfr_kind((unsigned int)a3); break;
-    case SYS_ioctl:
-        if ((unsigned long)a1 == V1_FICLONE) miss = V1K_FICLONE;
-        else if ((unsigned long)a1 == V1_FICLONERANGE) miss = V1K_FICLONERANGE;
-        break;
-    case SYS_copy_file_range: miss = V1K_COPY_FILE_RANGE; miss2 = a4 ? osync_candidate((int)a2) : -1; break;
-    case SYS_write:
-    case SYS_pwrite64: miss = a2 ? osync_candidate((int)a0) : -1; break;
-    case SYS_writev:
-    case SYS_pwritev:
-        miss = osync_candidate((int)a0);
-        if (miss >= 0 && !iov_len((const struct iovec *)a1, a2)) miss = -1;
-        break;
-    /* raw pwritev2 is (fd, iov, iovcnt, pos_l, pos_h, flags): the flags are the SIXTH argument */
-    case SYS_pwritev2:
-        miss = stronger(osync_candidate((int)a0), rwf_kind((int)a5));
-        if (miss >= 0 && !iov_len((const struct iovec *)a1, a2)) miss = -1;
-        break;
-    case SYS_sendfile: miss = a3 ? osync_candidate((int)a0) : -1; break;
-    case SYS_splice: miss = a4 ? osync_candidate((int)a2) : -1; break;
-    case SYS_io_uring_setup:
-    case SYS_io_uring_enter:
-    case SYS_io_uring_register:
-    case SYS_io_setup:
-    case SYS_io_submit: async = 1; break;
-#ifdef SYS_open
-    case SYS_open:
-#endif
-#ifdef SYS_creat
-    case SYS_creat:
-#endif
-#ifdef SYS_dup2
-    case SYS_dup2:
-#endif
-    case SYS_openat:
-    case SYS_openat2:
-    case SYS_dup:
-    case SYS_dup3:
-    case SYS_fcntl: track = 1; break;
-    case SYS_close: osync_off((int)a0); break;
-    default: break;
-    }
-    long r = real_syscall(n, a0, a1, a2, a3, a4, a5);
-    if (miss < 0 && miss2 < 0 && !async && !(track && r >= 0)) return r;
-    int e = errno;
-    if (miss >= 0) v1_missed(miss);
-    if (miss2 >= 0) v1_missed(miss2);
-    if (async) {
-        int32_t me;
-        v1_ensure();
-        __atomic_fetch_add(&v1_slot_get(&me)->async_io, 1, __ATOMIC_RELAXED);
-    }
-    if (track && r >= 0) {
-        switch (n) {
-#ifdef SYS_open
-        case SYS_open: osync_set((int)r, flags_maybe_sync((int)a1)); break;
-#endif
-#ifdef SYS_creat
-        case SYS_creat: osync_off((int)r); break;
-#endif
-#ifdef SYS_dup2
-        case SYS_dup2: osync_set((int)r, osync_get((int)a0)); break;
-#endif
-        case SYS_openat: osync_set((int)r, flags_maybe_sync((int)a2)); break;
-        case SYS_openat2: {
-            const struct v1_open_how *h = (const struct v1_open_how *)a2;
-            osync_set((int)r, h != NULL && (h->flags & (uint64_t)(O_SYNC | O_DSYNC)) != 0);
-            break;
-        }
-        case SYS_dup:
-        case SYS_dup3: osync_set((int)r, osync_get((int)a0)); break;
-        case SYS_fcntl: (void)fcntl_after((int)r, (int)a0, (int)a1); break;
-        default: break;
-        }
-    }
-    errno = e;
-    return r;
-}
-
 /* ---- exec guard: every exec and posix_spawn is recorded; `v1ctl report` refuses (rc 6) when the new image
  * never attached. vfork-safe: no allocation, no lock, only stores into the shared run. ---- */
 enum { VIA_EXECVE = 1, VIA_EXECV, VIA_EXECVP, VIA_EXECVPE, VIA_EXECL, VIA_EXECLE, VIA_EXECLP, VIA_FEXECVE,
@@ -990,5 +941,175 @@ int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t 
         errno = e;
     }
     if (pid) *pid = p;
+    return r;
+}
+
+/* ---- _Fork (glibc >= 2.34): a fork with no fork handlers, so the child is born here instead. glibc's own fork()
+ * calls its internal _Fork, not this symbol, so a fork() child is born once (in the fork handler). ---- */
+static pid_t (*real__Fork)(void);
+pid_t _Fork(void) {
+    RESOLVE_OR(_Fork, -1);
+    pid_t r = real__Fork();
+    if (r == 0) v1_child_born(1);
+    return r;
+}
+
+/* ---- liburing's setup entry points (when liburing.so is linked dynamically): async I/O, rc 9. liburing >= 2.2
+ * then makes its syscalls as raw instructions, so this is the only sign of a ring the shim can get. Not in v1_tab:
+ * a program without liburing never calls these, and dlsym finds liburing only in a program that links it. ---- */
+static int (*real_io_uring_queue_init)(unsigned, void *, unsigned);
+static int (*real_io_uring_queue_init_params)(unsigned, void *, void *);
+static int (*real_io_uring_setup)(unsigned, void *);
+static void v1_async(void) {
+    int32_t me;
+    v1_ensure();
+    __atomic_fetch_add(&v1_slot_get(&me)->async_io, 1, __ATOMIC_RELAXED);
+}
+int io_uring_queue_init(unsigned entries, void *ring, unsigned flags) {
+    RESOLVE(io_uring_queue_init);
+    v1_async();
+    return real_io_uring_queue_init ? real_io_uring_queue_init(entries, ring, flags) : -ENOSYS;
+}
+int io_uring_queue_init_params(unsigned entries, void *ring, void *p) {
+    RESOLVE(io_uring_queue_init_params);
+    v1_async();
+    return real_io_uring_queue_init_params ? real_io_uring_queue_init_params(entries, ring, p) : -ENOSYS;
+}
+int io_uring_setup(unsigned entries, void *p) {
+    RESOLVE(io_uring_setup);
+    v1_async();
+    return real_io_uring_setup ? real_io_uring_setup(entries, p) : -ENOSYS;
+}
+
+/* ---- syscall(2): watched, never counted. Six pointer-sized varargs are forwarded, as glibc's own syscall() reads
+ * six registers whatever the call. Nothing but a switch runs for a syscall this does not watch (futex, getrandom).
+ *   counted kinds   -> slot->missed[kind] (and the report refuses, rc 9)
+ *   io_uring / AIO  -> slot->async_io (rc 9)
+ *   fd lifecycle    -> the O_SYNC tracker (open, creat, openat, openat2, dup, dup2, dup3, fcntl, close)
+ *   fork-like clone -> the child is born (slot, bitmap) as after fork(); execve/execveat -> the exec table ---- */
+struct v1_open_how { uint64_t flags, mode, resolve; };
+static int v1_peek(const void *addr, void *buf, size_t n) { /* copy without trusting addr: 0, or -1 */
+    struct iovec local = {buf, n}, remote = {(void *)addr, n};
+    int e = errno;
+    ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    errno = e;
+    return got == (ssize_t)n ? 0 : -1;
+}
+long syscall(long n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    long a0 = va_arg(ap, long), a1 = va_arg(ap, long), a2 = va_arg(ap, long);
+    long a3 = va_arg(ap, long), a4 = va_arg(ap, long), a5 = va_arg(ap, long);
+    va_end(ap);
+    RESOLVE(syscall);
+    int miss = -1, miss2 = -1, async = 0, track = 0, forklike = 0;
+    int64_t xrec = -1;
+    switch (n) {
+    case SYS_fsync: miss = V1K_FSYNC; break;
+    case SYS_fdatasync: miss = V1K_FDATASYNC; break;
+    case SYS_syncfs: miss = V1K_SYNCFS; break;
+    case SYS_sync: miss = V1K_SYNC; break;
+    case SYS_msync: miss = msync_kind((int)a2); break;
+    case SYS_sync_file_range: miss = sfr_kind((unsigned int)a3); break;
+    case SYS_ioctl:
+        if ((unsigned long)a1 == V1_FICLONE) miss = V1K_FICLONE;
+        else if ((unsigned long)a1 == V1_FICLONERANGE) miss = V1K_FICLONERANGE;
+        break;
+    case SYS_copy_file_range: miss = V1K_COPY_FILE_RANGE; miss2 = a4 ? osync_candidate((int)a2) : -1; break;
+    case SYS_write:
+    case SYS_pwrite64: miss = a2 ? osync_candidate((int)a0) : -1; break;
+    case SYS_writev:
+    case SYS_pwritev:
+        miss = osync_candidate((int)a0);
+        if (miss >= 0 && !iov_len((const struct iovec *)a1, (int)a2)) miss = -1;
+        break;
+    /* raw pwritev2 is (fd, iov, iovcnt, pos_l, pos_h, flags): the flags are the SIXTH argument */
+    case SYS_pwritev2:
+#ifdef V1_MUTANT_PWRITEV2_A4 /* fire-check mutant: reads the flags from the wrong argument */
+        miss = stronger(osync_candidate((int)a0), rwf_kind((int)a4));
+#else
+        miss = stronger(osync_candidate((int)a0), rwf_kind((int)a5));
+#endif
+        if (miss >= 0 && !iov_len((const struct iovec *)a1, (int)a2)) miss = -1;
+        break;
+    case SYS_sendfile: miss = a3 ? osync_candidate((int)a0) : -1; break;
+    case SYS_splice: miss = a4 ? osync_candidate((int)a2) : -1; break;
+    case SYS_io_uring_setup:
+    case SYS_io_uring_enter:
+    case SYS_io_uring_register:
+    case SYS_io_setup:
+    case SYS_io_submit: async = 1; break;
+    /* fork-like only with no new stack (else the child returns into this frame on another stack, as it would in
+     * glibc's own syscall()), no shared memory and no shared thread group */
+    case SYS_clone: forklike = a1 == 0 && !((unsigned long)a0 & (CLONE_VM | CLONE_VFORK | CLONE_THREAD)); break;
+    case SYS_clone3: {
+        uint64_t ca[6]; /* struct clone_args: flags, pidfd, child_tid, parent_tid, exit_signal, stack */
+        forklike = v1_peek((const void *)a0, ca, sizeof ca) == 0 && ca[5] == 0 &&
+                   !(ca[0] & (uint64_t)(CLONE_VM | CLONE_VFORK | CLONE_THREAD));
+        break;
+    }
+#ifdef SYS_fork
+    case SYS_fork: forklike = 1; break;
+#endif
+    case SYS_execve:
+        xrec = v1_exec_note((int32_t)getpid(), (const char *)a0, VIA_EXECVE, v1_now(), V1X_PENDING);
+        break;
+    case SYS_execveat:
+        xrec = v1_exec_note((int32_t)getpid(), (const char *)a1, VIA_EXECVEAT, v1_now(), V1X_PENDING);
+        break;
+#ifdef SYS_open
+    case SYS_open:
+#endif
+#ifdef SYS_creat
+    case SYS_creat:
+#endif
+#ifdef SYS_dup2
+    case SYS_dup2:
+#endif
+    case SYS_openat:
+    case SYS_openat2:
+    case SYS_dup:
+    case SYS_dup3:
+#ifndef V1_MUTANT_SYSCALL_NO_FCNTL /* fire-check mutant: fcntl through syscall(2) not tracked */
+    case SYS_fcntl:
+#endif
+        track = 1;
+        break;
+    case SYS_close: osync_off((int)a0); break;
+    default: break;
+    }
+    long r = real_syscall(n, a0, a1, a2, a3, a4, a5);
+    if (miss < 0 && miss2 < 0 && !async && !(track && r >= 0) && !forklike && xrec < 0) return r;
+    int e = errno;
+    if (forklike && r == 0) { v1_child_born(1); errno = e; return r; } /* the child: born, nothing else to do */
+    if (xrec >= 0) v1_exec_failed(xrec); /* execve returned: it failed */
+    if (miss >= 0) v1_missed(miss);
+    if (miss2 >= 0) v1_missed(miss2);
+    if (async) v1_async();
+    if (track && r >= 0) {
+        switch (n) {
+#ifdef SYS_open
+        case SYS_open: osync_set((int)r, flags_maybe_sync((int)a1)); break;
+#endif
+#ifdef SYS_creat
+        case SYS_creat: osync_off((int)r); break;
+#endif
+#ifdef SYS_dup2
+        case SYS_dup2: osync_set((int)r, osync_get((int)a0)); break;
+#endif
+        case SYS_openat: osync_set((int)r, flags_maybe_sync((int)a2)); break;
+        case SYS_openat2: {
+            struct v1_open_how h;
+            osync_set((int)r, v1_peek((const void *)a2, &h, sizeof h) == 0 &&
+                                  (h.flags & (uint64_t)(O_SYNC | O_DSYNC)) != 0);
+            break;
+        }
+        case SYS_dup:
+        case SYS_dup3: osync_set((int)r, osync_get((int)a0)); break;
+        case SYS_fcntl: (void)fcntl_after((int)r, (int)a0, (int)a1); break;
+        default: break;
+        }
+    }
+    errno = e;
     return r;
 }

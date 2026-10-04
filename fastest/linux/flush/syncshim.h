@@ -2,9 +2,10 @@
  *
  * Port of the macOS DYLD counter (artie-research frontier/fastest/tools/v1). One RUN = one POSIX shm object
  * "/v1.<run>" (in /dev/shm) made by `v1ctl create <run>`. Every process that loads syncshim.so (LD_PRELOAD, set
- * by `v1run`) claims a SLOT and counts its own calls there: at load, and again in the child of every fork() (so a
- * forked process is visible, and its liveness checkable, before it counts anything); a process whose pid changes
- * without a fork handler (vfork, _Fork, a raw clone) claims at its first counted call. Counts live in shared memory,
+ * by `v1run`) claims a SLOT and counts its own calls there: at load, and again in the child of every fork(), _Fork()
+ * and fork-like clone made through syscall(2) (so a new process is visible, and its liveness checkable, before it
+ * counts anything); a process whose pid changes any other way (vfork, a raw-instruction clone) claims at its first
+ * counted call, and is invisible to the liveness check until then. Counts live in shared memory,
  * so they survive SIGKILL of the counted process and can be read live by another process. Each call is also
  * appended to an EVENT log with CLOCK_MONOTONIC timestamps and the run's current MARK, which a client (the load
  * generator) sets around each operation with v1_set_mark.
@@ -38,7 +39,7 @@
 #include <unistd.h>
 
 #define V1_MAGIC 0x31584e4c4e595356ULL /* "VSYNLNX1" little-endian */
-#define V1_VERSION 3u
+#define V1_VERSION 4u
 
 /* Kinds, in three classes that are never summed across. Keep in step with V1_KIND_NAMES and firecheck.py KINDS.
  *   FLUSH      a request that data reach stable storage (the class stracecount.py calls a flush, plus sync writes)
@@ -106,10 +107,11 @@ typedef struct {
     uint64_t unresolved;      /* bit i: the shim's real-function table entry i was not found by dlsym */
     uint64_t async_io;        /* io_uring_setup/enter/register, io_setup, io_submit seen through syscall(2) */
     uint64_t inflight;        /* counted calls entered and not yet returned (a SIGKILL inside one leaves it > 0) */
+    uint64_t pidns;           /* inode of /proc/self/ns/pid at claim: pid and liveness mean something only there */
     uint32_t flags;           /* V1_SLOT_* */
     uint32_t pad0;
     char exe[128];
-    uint8_t pad[1024 - 8 - 8 - 8 - 3 * 8 * V1_KIND_SLOTS - 4 * 8 - 8 - 128];
+    uint8_t pad[1024 - 8 - 8 - 8 - 3 * 8 * V1_KIND_SLOTS - 5 * 8 - 8 - 128];
 } v1_slot; /* 1024 bytes */
 
 /* Exec records: one per exec-family call or successful posix_spawn the shim saw. */
