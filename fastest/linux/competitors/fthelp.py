@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """fthelp.py -- small readers for the competitor driver (lane fastest-linux-comp).
 
-  fthelp.py ops OUTDIR            "<total> <ok> <created>" from a bbload or clonebench out dir (raw.tsv):
+  fthelp.py ops OUTDIR [K]        "<total> <ok> <created>" from a bbload or clonebench out dir (raw.tsv):
                                   total = rows (every op in the traced window, warm-up included),
-                                  ok = rows with ok=1, created = rows whose FIRST step succeeded (ok=1, or a later
-                                  step ran, or only the untimed after-step failed: err >= 1000) -- the branches
-                                  that must exist afterwards.
+                                  ok = rows with ok=1, created = rows whose create step K (default 1) succeeded
+                                  (ok=1, or a step after K ran, or only the untimed after-step failed:
+                                  err >= 1000) -- the branches that must exist afterwards.
   fthelp.py branch OUTDIR         the branch name of client 0's first ok op of a bbload run: b_<run_tag>_0_<seq>
   fthelp.py cloneproof A B        filefrag -v on A and B: extents, extents flagged shared, and how many of B's
                                   blocks sit on the same physical blocks as A's. Prints JSON; verdict "clone" if
@@ -24,14 +24,15 @@ def rows(d):
         return list(csv.DictReader(f, delimiter="\t"))
 
 
-def ops(d):
+def ops(d, create_step=1):
     rs = rows(d)
     ok = sum(1 for r in rs if r["ok"] == "1")
     created = 0
     for r in rs:
         err = int(r.get("err") or -1)
-        # bbload fills step<k>_ns for every step it attempted, so step 2 attempted means step 1 succeeded.
-        later = any((r.get(f"step{k}_ns") or "") != "" for k in range(2, 9))
+        # bbload fills step<k>_ns for every step it attempted, so step K+1 attempted means step K succeeded; K is the
+        # spec's create step (2 for amendment 14 variant (a), whose step 1 is the checkout of the parent).
+        later = any((r.get(f"step{k}_ns") or "") != "" for k in range(create_step + 1, 9))
         if "create_ns" in r:  # clonebench: err 1 = the create failed; 2 (open) and 3 (write) come after it
             later = err in (2, 3)
         if r["ok"] == "1" or later or err >= 1000:
@@ -89,8 +90,8 @@ def cloneproof(a, b):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "ops":
-        ops(sys.argv[2])
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "ops":
+        ops(sys.argv[2], int(sys.argv[3]) if len(sys.argv) == 4 else 1)
     elif len(sys.argv) == 3 and sys.argv[1] == "branch":
         branch(sys.argv[2])
     elif len(sys.argv) == 4 and sys.argv[1] == "cloneproof":

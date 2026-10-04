@@ -2,7 +2,7 @@
 # run_system.sh SYSTEM MNT RAW -- one competitor on one filesystem (lane fastest-linux-comp). SMOKE ONLY: no
 # latency here is credited or quoted before the lead registers the PREREG.
 #
-#   SYSTEM  pg18-d2 | pg18-default | dolt | doltgres | b1
+#   SYSTEM  pg18-d2 | pg18-defaults | dolt | doltgres | b1
 #   MNT     the filesystem under test (fs/mkloop.sh made it); everything this run writes lives in MNT/SYSTEM.noindex
 #   RAW     the output tree (uploaded as the job's artifact)
 #
@@ -33,10 +33,10 @@ source "$HERE/trace.sh"
 BB=${FT_BBLOAD:?FT_BBLOAD}
 CB=${FT_CLONEBENCH:?FT_CLONEBENCH}
 SQ3=${FT_SQLITE3:?FT_SQLITE3}
-N1=${FT_N1:-20}
-N4=${FT_N4:-40}
+N1=${FT_N1:-200}
+N4=${FT_N4:-200}
 ROWS=${FT_ROWS:-10000}
-IDLE_S=${FT_IDLE_S:-10}
+IDLE_S=${FT_IDLE_S:-30}
 CLIENTS=${FT_CLIENTS:-1 4}
 SC="$HERE/stracecount.py"
 FH="$HERE/fthelp.py"
@@ -56,14 +56,26 @@ expect() { # expect NAME GOT WANT
 nops() { [ "$1" = 1 ] && echo "$N1" || echo "$N4"; }
 fsused() { sync -f "$MNT"; df -B1 --output=used "$MNT" | tail -1 | tr -d ' '; }
 
+# Amendment 14's registered variants. PG18: STRATEGY=FILE_COPY with file_copy_method=clone and STRATEGY=WAL_LOG, each
+# at D2 (pg18-d2) and at defaults (pg18-defaults: PG's defaults plus file_copy_method=clone, pg18.sh MODE d1clone),
+# in the forms M1c-create (CREATE alone), M1c-connect (pg18-m1c*: CREATE, a new connection, SELECT 1) and M1 (CREATE,
+# connect, first write); pg18-defaults adds the clone proof's negative control (FILE_COPY with this session's
+# file_copy_method = copy). Dolt sql-server and Doltgres: variants (a) checkout(parent) + checkout('-b', name),
+# (b) dolt_branch(name, parent) + checkout(name), (c) dolt_branch(name, parent) + a new connection to db/name +
+# SELECT 1, each also as M1 (+ first write), and dolt_branch alone (M1c-create of (b) and (c)).
+PG_SPECS="pg18-select1 pg18-create pg18-m1c pg18-m1 pg18-create-wal pg18-m1c-wal pg18-m1-wal"
+DOLT_V="create a-m1c a-m1 b-m1c b-m1 c-m1c c-m1"
 case $SYSTEM in
-  pg18-d2) KIND=pg MODE=d2 PORT=55432 SPECLIST="pg18-select1 pg18-m1c pg18-m1 pg18-m1c-wal pg18-m1-wal" ;;
-  pg18-default) KIND=pg MODE=default PORT=55432 SPECLIST="pg18-select1 pg18-m1c pg18-m1 pg18-m1c-wal pg18-m1-wal" ;;
-  dolt) KIND=dolt PORT=53306 SPECLIST="dolt-select1 dolt-m1c dolt-m1c-branch dolt-m1" ;;
-  doltgres) KIND=doltgres PORT=55433 SPECLIST="doltgres-select1 doltgres-m1c doltgres-m1c-branch doltgres-m1" ;;
+  pg18-d2) KIND=pg MODE=d2 PORT=55432 SPECLIST="$PG_SPECS" ;;
+  pg18-defaults) KIND=pg MODE=d1clone PORT=55432 SPECLIST="$PG_SPECS pg18-create-copy" ;;
+  dolt) KIND=dolt PORT=53306 SPECLIST="dolt-select1$(for v in $DOLT_V; do printf ' dolt-%s' "$v"; done)" ;;
+  doltgres) KIND=doltgres PORT=55433 SPECLIST="doltgres-select1$(for v in $DOLT_V; do printf ' doltgres-%s' "$v"; done)" ;;
   b1) KIND=b1 SPECLIST="m1c-d2 m1-d2 m1c-d0 m1-d0" ;;
   *) echo "unknown system $SYSTEM" >&2; exit 2 ;;
 esac
+for spec in $SPECLIST; do  # a missing spec file is a harness defect, found before anything runs
+  [ "$KIND" = b1 ] || [ -f "$SPECS/$spec.spec" ] || { echo "REFUSED: no spec $SPECS/$spec.spec" >&2; exit 2; }
+done
 # The flush counter must have passed its fire-check on this runner and filesystem first (review finding 8).
 FC=${FT_FIRECHECK:?FT_FIRECHECK: the fire-check verdict file (firecheck_strace.sh OUT/firecheck.txt)}
 case "$(tail -1 "$FC" 2>/dev/null)" in
@@ -78,7 +90,8 @@ for spec in $SPECLIST; do
   done
 done >"$RAW/expected-cells.txt"
 { echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS]";
-  echo "strace=$(strace -V | head -1) kernel=$(uname -r) arch=$(uname -m)"; } | tee "$RAW/run-info.txt"
+  echo "strace=$(strace -V | sed -n 1p) kernel=$(uname -r) arch=$(uname -m)"
+  echo "## df (the loop backing file lives on / or /mnt)"; df -B1 / /mnt "$MNT" 2>&1; } | tee "$RAW/run-info.txt"
 
 # ---------------------------------------------------------------- server systems
 server_pid() { # the server's recorded main pid; strace_attach adds every live descendant (PG: the postmaster's
@@ -152,7 +165,9 @@ count() {
 # zero ops, which the cell then refuses (it used to turn silently into "0 0 0"). Called in the driver's own shell,
 # never inside $(...) or <(...), where fail()'s count would be lost.
 ops_of() {
-  if ! python3 "$FH" ops "$1" >"$2/ops.txt"; then fail "ops reader on $1"; echo "0 0 0" >"$2/ops.txt"; fi
+  local k=1
+  case $(basename "$2") in *-a-m1c-c*|*-a-m1-c*) k=2 ;; esac  # variant (a): step 1 checks out the parent, step 2 creates
+  if ! python3 "$FH" ops "$1" "$k" >"$2/ops.txt"; then fail "ops reader on $1"; echo "0 0 0" >"$2/ops.txt"; fi
 }
 # judge_cell CELLDIR -- the cell's verdict must be "ok"; anything else (REFUSED, INCOMPLETE, NOT CLEAN, a missing or
 # unreadable cell.json) FAILS the job.
@@ -175,13 +190,28 @@ run_server_cell() { # run_server_cell SPEC C
   strace_detach "$d/idle"
   if [ "$KIND" = pg ]; then template_idle || fail "$spec-c$c: a backend stayed on template p for 30 s"; fi
   used0=$(fsused)
+  local log0 log1
+  log0=$(stat -c %s "$DATA.log")
   strace_attach "$d/load" "$(server_pid)" || { fail "$spec-c$c load attach"; return; }
   rc=0
   bbload "$spec" "$c" "$n" "$d/bb" || rc=$?
   strace_detach "$d/load"
+  log1=$(stat -c %s "$DATA.log")
   used1=$(fsused)
   echo "fs_used_before=$used0 fs_used_after=$used1 delta=$((used1 - used0))" >"$d/space.txt"
   [ $rc -eq 0 ] || fail "$spec-c$c bbload rc=$rc ($(tail -1 "$d/bb.txt"))"
+  # The server log written during the load window. PG (amendment 14 section 6): a CREATE DATABASE that found a backend
+  # on the template waited in CountOtherDBBackends, which terminates autovacuum workers there (logged FATAL
+  # "terminating autovacuum process due to administrator command") and errors after 5 s if another backend stays
+  # ("source database ... is being accessed by other users"). Those creates are FLAGGED here, not dropped.
+  tail -c +$((log0 + 1)) "$DATA.log" | head -c $((log1 - log0)) >"$d/server_log_load.txt"
+  if [ "$KIND" = pg ]; then
+    local av busy
+    av=$(grep -c 'terminating autovacuum process due to administrator command' "$d/server_log_load.txt")
+    busy=$(grep -c 'is being accessed by other users' "$d/server_log_load.txt")
+    echo "autovacuum_terminated_in_window=$av template_busy_errors=$busy" >"$d/template_waits.txt"
+    [ "$av" = 0 ] && [ "$busy" = 0 ] || fun "FLAG $spec-c$c: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $av, busy-template errors $busy"
+  fi
   local defer=()
   if [ "$KIND" = pg ]; then
     # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost): a failed attach or a failed
@@ -212,8 +242,25 @@ server_main() {
     pg) srv init "$DATA" "$MODE" "$PORT" ;;
     *) srv init "$DATA" "$PORT" ;;
   esac
+  if [ "$KIND" = pg ]; then
+    # What Linux lacks: wal_sync_method=fsync_writethrough (macOS's F_FULLFSYNC; also Windows). Measured, not assumed:
+    # this postgres binary is asked to accept it and must refuse (on Linux fsync/fdatasync themselves send the device
+    # cache flush, so D2 here is wal_sync_method=fdatasync, which is also PG's Linux default).
+    srv writethrough "$DATA" >"$RAW/fsync_writethrough-probe.txt" 2>&1
+    if grep -q '^rc=0$' "$RAW/fsync_writethrough-probe.txt" ||
+      ! grep -q 'invalid value for parameter "wal_sync_method": "fsync_writethrough"' "$RAW/fsync_writethrough-probe.txt"; then
+      fail "Linux PG refuses wal_sync_method=fsync_writethrough: $(tr '\n' ' ' <"$RAW/fsync_writethrough-probe.txt" | cut -c1-300)"
+    else
+      pass "Linux PG refuses wal_sync_method=fsync_writethrough ($(grep -m1 'invalid value' "$RAW/fsync_writethrough-probe.txt" | cut -c1-160); $(tail -1 "$RAW/fsync_writethrough-probe.txt"))"
+    fi
+  fi
   srv start "$DATA" | tee "$RAW/server-start.txt" || { fail "server start"; return; }
   srv seed "$DATA" "$ROWS" | tee "$RAW/seed.txt" || { fail "seed"; return; }
+  if [ "$KIND" = pg ]; then
+    srv settings "$DATA" >"$RAW/pg_settings.tsv" || fail "pg_settings dump"
+    expect "server wal_sync_method" "$(awk -F'\t' '$1 == "wal_sync_method" {print $2}' "$RAW/pg_settings.tsv")" fdatasync
+    expect "server file_copy_method" "$(awk -F'\t' '$1 == "file_copy_method" {print $2}' "$RAW/pg_settings.tsv")" clone
+  fi
   [ "$KIND" = pg ] && sqlq "CHECKPOINT"
   [ "$KIND" = pg ] || dolt_quiet_root "$ROOT/vroot"  # the version commands below run with metrics/version check off too
   case $KIND in
@@ -238,37 +285,48 @@ server_main() {
   done
   [ "$KIND" = pg ] || want=$((want + 1))  # Dolt/Doltgres: main is a branch too
   expect "branch count (every created branch exists; created from raw.tsv)" "$(count_branches)" "$want"
-  for m1 in "${KIND/pg/pg18}-m1" pg18-m1-wal; do
-    [ -d "$RAW/cells/$m1-c1/bb" ] || continue
-    br=$(python3 "$FH" branch "$RAW/cells/$m1-c1/bb") || { fail "isolation $m1: no ok op to read back"; continue; }
+  local nm1=0
+  for d in "$RAW"/cells/*-m1-c1 "$RAW"/cells/*-m1-wal-c1; do  # every M1 variant's first branch: one UPDATE, sum 1
+    [ -d "$d/bb" ] || continue
+    m1=$(basename "$d")
+    nm1=$((nm1 + 1))
+    br=$(python3 "$FH" branch "$d/bb") || { fail "isolation $m1: no ok op to read back"; continue; }
     expect "isolation: $m1 branch $br count|sum(v) after one UPDATE" \
       "$(on_branch "$br" "SELECT count(*), sum(v) FROM t" | tr '\t' '|')" "$ROWS|1"
   done
+  [ $nm1 -gt 0 ] || fail "isolation: no M1 cell to read a branch from"
   srv stop "$DATA" | tee -a "$RAW/server-stop.txt" || fail "server stop by recorded pid"
   cp "$DATA.log" "$RAW/server_log.txt" 2>/dev/null
 }
 
 pg_clone_proof() {
-  # The template's table file vs. the m1c branch's: same physical blocks (and flagged shared) under
-  # file_copy_method=clone; disjoint under copy. The strace half: copy_file_range calls in the create window.
-  local br tfile bfile want cfr
-  br=$(python3 "$FH" branch "$RAW/cells/pg18-m1c-c1/bb") || { fail "clone proof: no m1c branch"; return; }
+  # The template's table file vs. a FILE_COPY branch's: same physical blocks (and flagged shared) under
+  # file_copy_method=clone; disjoint under copy. The strace half: copy_file_range calls in the create window. The
+  # server runs clone (both PG systems); pg18-create-copy (pg18-defaults only) is the negative control, its session
+  # SET to copy: the same two instruments must read "copy" and 0 there, or the proof could not tell them apart.
+  local cell want br tfile bfile cfr ncell=0
   tfile="$DATA/$(srv sql "$DATA" p "SELECT pg_relation_filepath('t')")"
-  bfile="$DATA/$(srv sql "$DATA" "$br" "SELECT pg_relation_filepath('t')")"
-  sync -f "$MNT"
-  python3 "$FH" cloneproof "$tfile" "$bfile" >"$RAW/cloneproof-m1c.json"
-  case $MODE in d2|d1clone) want=clone ;; *) want=copy ;; esac
-  expect "clone proof (filefrag, template t vs $br t): verdict" \
-    "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$RAW/cloneproof-m1c.json")" "$want"
-  cfr=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['copy_file_range_calls'])" "$RAW/cells/pg18-m1c-c1/load.json")
-  if [ "$want" = clone ]; then
-    [ "$cfr" -gt 0 ] && pass "clone proof (strace): copy_file_range calls in the m1c C=1 window = $cfr" ||
-      fail "clone proof (strace): no copy_file_range in the m1c C=1 window"
-  else
-    expect "copy control (strace): copy_file_range calls in the m1c C=1 window" "$cfr" 0
-  fi
-  [ "$(findmnt -n -o FSTYPE -T "$MNT")" = btrfs ] && btrfs filesystem du -s "$tfile" "$bfile" >"$RAW/cloneproof-btrfs-du.txt" 2>&1
-  echo "template_bytes=$(srv sql "$DATA" p "SELECT pg_database_size('p')")" >>"$RAW/cells/pg18-m1c-c1/space.txt"
+  for cell in pg18-create-c1 pg18-create-copy-c1; do
+    [ -d "$RAW/cells/$cell/bb" ] || continue
+    ncell=$((ncell + 1))
+    case $cell in *copy*) want=copy ;; *) want=clone ;; esac
+    br=$(python3 "$FH" branch "$RAW/cells/$cell/bb") || { fail "clone proof $cell: no ok create"; continue; }
+    bfile="$DATA/$(srv sql "$DATA" "$br" "SELECT pg_relation_filepath('t')")"
+    sync -f "$MNT"
+    python3 "$FH" cloneproof "$tfile" "$bfile" >"$RAW/cloneproof-$cell.json"
+    expect "clone proof $cell (filefrag, template t vs $br t): verdict" \
+      "$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$RAW/cloneproof-$cell.json")" "$want"
+    cfr=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['copy_file_range_calls'])" "$RAW/cells/$cell/load.json")
+    if [ "$want" = clone ]; then
+      [ "$cfr" -gt 0 ] && pass "clone proof $cell (strace): copy_file_range calls in the C=1 window = $cfr" ||
+        fail "clone proof $cell (strace): no copy_file_range in the C=1 window"
+    else
+      expect "copy control $cell (strace): copy_file_range calls in the C=1 window" "$cfr" 0
+    fi
+    [ "$(findmnt -n -o FSTYPE -T "$MNT")" = btrfs ] && btrfs filesystem du -s "$tfile" "$bfile" >"$RAW/cloneproof-$cell-btrfs-du.txt" 2>&1
+  done
+  [ $ncell -gt 0 ] || fail "clone proof: no FILE_COPY create cell ran"
+  echo "template_bytes=$(srv sql "$DATA" p "SELECT pg_database_size('p')")" >"$RAW/template-size.txt"
 }
 
 # ---------------------------------------------------------------- B1 (embedded)
