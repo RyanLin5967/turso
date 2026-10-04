@@ -653,27 +653,79 @@ fn a_session_connects_to_a_branch_by_its_startup_database_name() {
 }
 
 /// Branch calls are refused inside a transaction block with SQLSTATE 25001, as PostgreSQL refuses
-/// CREATE DATABASE there; the transaction is unharmed.
+/// CREATE DATABASE there, and the refusal aborts the transaction as any error does in PostgreSQL:
+/// the session reports 'E', refuses everything but its end with 25P02, and COMMIT rolls it back.
 #[test]
 fn branch_calls_inside_a_transaction_are_refused_with_25001() {
     let dir = Scratch::new("intx");
     let server = Server::start(&dir.db(), &[]);
     let mut a = seeded(&server);
     a.q("SELECT turso_branch_create('x')").ok("create x");
-    a.q("BEGIN").ok("begin");
-    a.q("INSERT INTO t VALUES (2, 'a')").ok("insert");
     for sql in [
         "SELECT turso_branch_create('y')",
         "SELECT turso_branch_switch('x')",
         "SELECT turso_branch_switch('main')",
         "SELECT turso_branch_delete('x')",
     ] {
-        let e = a.q(sql).err(sql);
+        a.q("BEGIN").ok("begin");
+        a.q("INSERT INTO t VALUES (2, 'a')").ok("insert");
+        let r = a.q(sql);
+        assert_eq!(r.status, b'E', "{sql}: the transaction is not marked failed");
+        let e = r.err(sql);
         assert_eq!(e.code, "25001", "{sql}: {e:?}");
+        let e = a.q("SELECT 1").err("a statement in the failed transaction");
+        assert_eq!(e.code, "25P02", "{sql}: {e:?}");
+        let r = a.q("COMMIT").ok("commit of a failed transaction");
+        assert_eq!(r.tags, vec!["ROLLBACK".to_string()], "{sql}");
+        assert_eq!(r.status, b'I', "{sql}");
+        assert_eq!(a.q("SELECT count(*) FROM t").single("count"), "1", "{sql}: committed");
     }
-    a.q("COMMIT").ok("commit");
-    assert_eq!(a.q("SELECT count(*) FROM t").single("count"), "2");
     assert_eq!(a.q("SELECT turso_branch_current()").single("current"), "main");
+    a.q("SELECT turso_branch_switch('x')").ok("x is still there");
+}
+
+/// Any error inside an explicit transaction aborts it, as in PostgreSQL: nothing of it commits,
+/// and a client that keeps going is told so (25P02) rather than having half a transaction commit.
+#[test]
+fn an_error_inside_a_transaction_aborts_it_as_in_postgres() {
+    let dir = Scratch::new("abort");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'a')").ok("insert 2");
+    let r = a.q("INSERT INTO t VALUES (1, 'duplicate')");
+    assert!(r.error.is_some(), "a duplicate key was accepted");
+    assert_eq!(r.status, b'E');
+    let r = a.q("INSERT INTO t VALUES (3, 'c')");
+    assert_eq!(r.status, b'E');
+    assert_eq!(r.err("insert 3").code, "25P02");
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.status, b'I');
+    assert_eq!(
+        a.q("SELECT count(*) FROM t").single("count"),
+        "1",
+        "part of a failed transaction committed"
+    );
+    // ROLLBACK and COMMIT outside a transaction are accepted with no effect (PostgreSQL warns).
+    assert_eq!(a.q("ROLLBACK").ok("rollback").status, b'I');
+    assert_eq!(a.q("COMMIT").ok("commit").status, b'I');
+}
+
+/// ROLLBACK TO SAVEPOINT recovers a failed transaction, as in PostgreSQL.
+#[test]
+fn rollback_to_savepoint_recovers_a_failed_transaction() {
+    let dir = Scratch::new("savepoint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'a')").ok("insert 2");
+    a.q("SAVEPOINT s").ok("savepoint");
+    assert_eq!(a.q("INSERT INTO t VALUES (1, 'duplicate')").status, b'E');
+    assert_eq!(a.q("ROLLBACK TO SAVEPOINT s").ok("rollback to").status, b'T');
+    a.q("INSERT INTO t VALUES (3, 'c')").ok("insert 3");
+    assert_eq!(a.q("COMMIT").ok("commit").tags, vec!["COMMIT".to_string()]);
+    assert_eq!(a.q("SELECT count(*) FROM t").single("count"), "3");
 }
 
 /// 'main' names the trunk, so no branch may take it.
