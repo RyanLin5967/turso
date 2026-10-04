@@ -957,6 +957,11 @@ pub(crate) const HOLD_TRUNK_DECIDED: u8 = 4;
 #[cfg(test)]
 pub(crate) const HOLD_FLIGHT_TAKEN: u8 = 5;
 
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a trunk commit waits
+/// here, its pre-image barrier done and its commit gate open, before its first frame.
+#[cfg(test)]
+pub(crate) const HOLD_TRUNK_BARRIER_DONE: u8 = 6;
+
 /// If the hook is at `stage`, mark the arrival and wait until it is moved (tests and the harness
 /// release it by storing 0).
 fn pause_at(hold: Option<&AtomicU8>, stage: u8) {
@@ -4361,6 +4366,8 @@ impl BranchStore {
                 self.maybe_compact(&mut inner);
                 drop(inner);
                 kill_point("trunk.barrier_done");
+                #[cfg(test)]
+                pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_BARRIER_DONE);
                 Ok(())
             }
             // Only stamps were at stake: a trunk commit does not fail because its stamp could not

@@ -1778,3 +1778,77 @@ fn a_named_create_of_a_new_name_asks_the_catalog_nothing() {
     assert_eq!(queries, 0, "{creates} named creates of new names made {queries} catalog queries");
     assert!(trunk.create_branch("new-3").is_err(), "a name created since the reopen was given again");
 }
+
+// ---- lead review 1 item 6: a retaining trunk commit is one full flush, and forks inside its gate
+// ride it ----
+
+/// Lead review 1 item 6: a D2 trunk commit that retains a pre-image for a live child is exactly
+/// ONE F_FULLFSYNC (its WAL's) and no fsync(2): the pre-image is ORDERED before the commit's frames
+/// (F_BARRIERFSYNC on the branch files), and the WAL's F_FULLFSYNC makes it durable with them.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_retaining_trunk_commit_is_one_full_fsync() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("d2rt.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let before = db.branch_trunk_retained();
+        let counted = syncs_of(|| write_v(&trunk, 7, "new"));
+        assert!(db.branch_trunk_retained() > before, "catalog={catalog}: premise: the commit retained");
+        assert_eq!(counted, (0, 1), "catalog={catalog}: a retaining D2 trunk commit's (fsync, F_FULLFSYNC)");
+        assert_eq!(read_v(&b.connect().unwrap(), 7), "trunk-7", "catalog={catalog}");
+    }
+}
+
+/// Lead review 1 item 6: forks registered while a D2 trunk commit is inside its gate — before its
+/// pre-image barrier, or after it and before its WAL flush — are made durable by that commit's
+/// WAL F_FULLFSYNC: the commit and the forks together issue ONE F_FULLFSYNC.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn forks_inside_a_d2_commit_gate_ride_its_wal_flush() {
+    let _s = serial();
+    for stage in [super::store::HOLD_TRUNK_DECIDED, super::store::HOLD_TRUNK_BARRIER_DONE] {
+        for catalog in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = open_at(&dir.path().join("ride.db"), opts(catalog, SyncClass::FullFsync));
+            let a = db.connect().unwrap();
+            seed_wide(&a);
+            let _first = a.fork_branch().unwrap().into_id();
+            let hold = db.branches.trunk_commit_hold.clone();
+            let forks_before = db.branch_stats().unwrap().work.trunk_forks;
+            let counted = syncs_of(|| {
+                hold.store(stage, std::sync::atomic::Ordering::Release);
+                let writer = {
+                    let a = a.clone();
+                    std::thread::spawn(move || write_v(&a, 7, "c1"))
+                };
+                wait_hold(&hold, stage);
+                let forkers: Vec<_> = (0..3)
+                    .map(|i| {
+                        let db = db.clone();
+                        std::thread::spawn(move || db.connect().unwrap().create_branch(&format!("ride-{i}")).unwrap())
+                    })
+                    .collect();
+                // The forks have registered before the commit goes on.
+                let t = std::time::Instant::now();
+                while db.branch_stats().unwrap().work.trunk_forks < forks_before + 3 {
+                    assert!(t.elapsed() < std::time::Duration::from_secs(10), "the forks never registered");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                hold.store(0, std::sync::atomic::Ordering::Release);
+                writer.join().unwrap();
+                for f in forkers {
+                    f.join().unwrap();
+                }
+            });
+            assert_eq!(
+                counted,
+                (0, 1),
+                "stage={stage} catalog={catalog}: a D2 trunk commit and three forks inside its gate"
+            );
+        }
+    }
+}
