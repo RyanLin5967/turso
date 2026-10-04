@@ -1471,3 +1471,26 @@ fn a_raw_wal_session_is_refused_on_a_branch() {
     let bc = b.connect().unwrap();
     assert!(bc.wal_insert_begin().is_err(), "a raw WAL session began on a branch");
 }
+
+/// Review A-F1, lead review 1 item 5 (b): a raw WAL session that commits nothing still leaves the
+/// commit gate closed, and a commit from another trunk connection afterwards goes through (an open
+/// gate makes it panic on "two trunk commits inside the commit gate at once").
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn an_empty_raw_wal_session_leaves_the_gate_closed_for_another_connection() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("raw0.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let child = a.fork_branch().unwrap();
+        a.wal_insert_begin().unwrap();
+        a.wal_insert_end(true).unwrap();
+        assert_eq!(db.branches.trunk_commit_seq() % 2, 0, "catalog={catalog}: the gate was left open");
+        let other = db.connect().unwrap();
+        write_v(&other, 3, "other");
+        let c = child.connect().unwrap();
+        assert_eq!(read_wide(&c, 3), "trunk-3", "catalog={catalog}");
+    }
+}
