@@ -7,9 +7,10 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
+    is_comment_on, is_refresh_matview, try_extract_branch_call, try_extract_copy_from,
+    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
+    PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
+    PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -120,6 +121,65 @@ impl PgConnection {
 
     pub fn query_runner<'a>(&'a self, sql: &'a [u8]) -> PgQueryRunner<'a> {
         PgQueryRunner::new(&self.inner, sql)
+    }
+
+    /// Take over `from`'s session settings (the search path): a wire session that moves to another
+    /// engine connection — onto a branch, or back to the trunk — keeps what it SET.
+    pub fn adopt_session_of(&self, from: &PgConnection) {
+        if Arc::ptr_eq(&self.inner, &from.inner) {
+            return;
+        }
+        let path = from.inner.session_state.lock().unwrap().search_path.clone();
+        self.inner.set_search_path(path);
+    }
+}
+
+/// The branch function call `sql` is, if it is one (see [`PgBranchCall`]). A statement whose text
+/// does not contain the branch-function prefix, in any case, is not parsed.
+pub fn branch_call(sql: &str) -> Option<PgBranchCall> {
+    let prefix = BRANCH_FUNCTION_PREFIX.as_bytes();
+    if !sql
+        .as_bytes()
+        .windows(prefix.len())
+        .any(|w| w.eq_ignore_ascii_case(prefix))
+    {
+        return None;
+    }
+    let parsed = turso_pg_parser::parse(sql).ok()?;
+    try_extract_branch_call(&parsed)
+}
+
+/// Attach every PostgreSQL schema database file (`turso-postgres-schema-<name>.db`) beside
+/// `db_file` to `conn`, so a connection opened after a `CREATE SCHEMA` sees the schema. Failures
+/// are logged and skipped.
+pub fn attach_schema_files(conn: &PgConnection, db_file: &str) {
+    if db_file == ":memory:" {
+        return;
+    }
+    let dir = std::path::Path::new(db_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(schema) = name
+            .strip_prefix("turso-postgres-schema-")
+            .and_then(|s| s.strip_suffix(".db"))
+        else {
+            continue;
+        };
+        let path = entry.path().to_string_lossy().to_string();
+        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
+        tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
+        if let Err(e) = conn.inner().execute(&sql) {
+            tracing::warn!("Failed to attach schema '{}': {}", schema, e);
+        }
     }
 }
 

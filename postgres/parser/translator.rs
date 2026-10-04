@@ -4972,6 +4972,125 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
         .to_ascii_uppercase()
 }
 
+/// The prefix every branch function of the wire server shares (`turso_branch_create` and the
+/// rest). A statement whose text does not contain it, in any case, is not a branch call, which
+/// lets the server skip the parse for every other statement.
+pub const BRANCH_FUNCTION_PREFIX: &str = "turso_branch_";
+
+/// One argument of a branch function call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgBranchArg {
+    Text(String),
+    Bool(bool),
+    Null,
+    /// `$n`, 1-based, bound by the extended protocol.
+    Param(usize),
+}
+
+/// A statement that is exactly one branch function call, `SELECT turso_branch_<op>(<args>)`, with
+/// no other target and no clause: the server executes it itself rather than handing it to the
+/// engine (the engine refuses a fork inside the read transaction a SELECT would open).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgBranchCall {
+    /// The function name, lower-cased, e.g. `turso_branch_create`.
+    pub function: String,
+    pub args: Vec<PgBranchArg>,
+}
+
+/// Recognise a branch function call (see [`PgBranchCall`]). Arguments may be string, boolean or
+/// NULL literals or `$n` parameters, each optionally cast (`'b'::text`, `$1::text`). Anything else
+/// — another target, a FROM or WHERE clause, a schema-qualified name, an expression argument — is
+/// not a branch call, and reaches the engine, which reports the function as unknown.
+pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCall> {
+    use pg_query::protobuf::{a_const::Val, node::Node};
+
+    let [raw] = parse_result.protobuf.stmts.as_slice() else {
+        return None;
+    };
+    let Some(Node::SelectStmt(select)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return None;
+    };
+    let pg_query::protobuf::SelectStmt {
+        distinct_clause,
+        into_clause,
+        target_list,
+        from_clause,
+        where_clause,
+        group_clause,
+        having_clause,
+        window_clause,
+        values_lists,
+        sort_clause,
+        limit_offset,
+        limit_count,
+        locking_clause,
+        with_clause,
+        larg,
+        rarg,
+        ..
+    } = select.as_ref();
+    let bare = distinct_clause.is_empty()
+        && into_clause.is_none()
+        && from_clause.is_empty()
+        && where_clause.is_none()
+        && group_clause.is_empty()
+        && having_clause.is_none()
+        && window_clause.is_empty()
+        && values_lists.is_empty()
+        && sort_clause.is_empty()
+        && limit_offset.is_none()
+        && limit_count.is_none()
+        && locking_clause.is_empty()
+        && with_clause.is_none()
+        && larg.is_none()
+        && rarg.is_none();
+    if !bare {
+        return None;
+    }
+    let [target] = target_list.as_slice() else {
+        return None;
+    };
+    let Some(Node::ResTarget(target)) = target.node.as_ref() else {
+        return None;
+    };
+    let Some(Node::FuncCall(call)) = target.val.as_ref().and_then(|v| v.node.as_ref()) else {
+        return None;
+    };
+    let [name] = call.funcname.as_slice() else {
+        return None;
+    };
+    let Some(Node::String(name)) = name.node.as_ref() else {
+        return None;
+    };
+    let function = name.sval.to_ascii_lowercase();
+    if !function.starts_with(BRANCH_FUNCTION_PREFIX)
+        || call.agg_star
+        || call.agg_distinct
+        || call.func_variadic
+        || call.agg_within_group
+        || call.over.is_some()
+        || call.agg_filter.is_some()
+        || !call.agg_order.is_empty()
+    {
+        return None;
+    }
+    fn arg(node: &pg_query::protobuf::Node) -> Option<PgBranchArg> {
+        match node.node.as_ref()? {
+            Node::AConst(c) if c.isnull => Some(PgBranchArg::Null),
+            Node::AConst(c) => match c.val.as_ref()? {
+                Val::Sval(s) => Some(PgBranchArg::Text(s.sval.clone())),
+                Val::Boolval(b) => Some(PgBranchArg::Bool(b.boolval)),
+                _ => None,
+            },
+            Node::ParamRef(p) if p.number > 0 => Some(PgBranchArg::Param(p.number as usize)),
+            Node::TypeCast(cast) => arg(cast.arg.as_deref()?),
+            _ => None,
+        }
+    }
+    let args = call.args.iter().map(arg).collect::<Option<Vec<_>>>()?;
+    Some(PgBranchCall { function, args })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7392,5 +7511,56 @@ mod tests {
             err.to_string().contains("SEARCH clause"),
             "expected SEARCH clause rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_branch_call_is_recognised_only_as_a_whole_statement() {
+        use super::{try_extract_branch_call, PgBranchArg as A, PgBranchCall};
+        let call = |sql: &str| try_extract_branch_call(&crate::parse(sql).unwrap());
+        let ok = |function: &str, args: Vec<A>| {
+            Some(PgBranchCall {
+                function: function.to_string(),
+                args,
+            })
+        };
+        assert_eq!(
+            call("SELECT turso_branch_create('b1')"),
+            ok("turso_branch_create", vec![A::Text("b1".into())])
+        );
+        assert_eq!(
+            call("select TURSO_BRANCH_SWITCH($1);"),
+            ok("turso_branch_switch", vec![A::Param(1)])
+        );
+        assert_eq!(
+            call("SELECT turso_branch_create($1::text, true)"),
+            ok("turso_branch_create", vec![A::Param(1), A::Bool(true)])
+        );
+        assert_eq!(
+            call("SELECT turso_branch_create('it''s'::varchar)"),
+            ok("turso_branch_create", vec![A::Text("it's".into())])
+        );
+        assert_eq!(
+            call("SELECT turso_branch_current()"),
+            ok("turso_branch_current", vec![])
+        );
+        assert_eq!(
+            call("SELECT turso_branch_delete(NULL)"),
+            ok("turso_branch_delete", vec![A::Null])
+        );
+        for not_a_call in [
+            "SELECT turso_branch_create('b') FROM t",
+            "SELECT turso_branch_create('b') WHERE false",
+            "SELECT turso_branch_create('b'), 1",
+            "SELECT turso_branch_create('b' || 'c')",
+            "SELECT turso_branch_create(1)",
+            "SELECT public.turso_branch_create('b')",
+            "SELECT count(*)",
+            "SELECT 'turso_branch_create'",
+            "SELECT turso_branch_create('a') UNION SELECT turso_branch_create('b')",
+            "SELECT turso_branch_create('a'); SELECT 1",
+            "UPDATE t SET v = turso_branch_current()",
+        ] {
+            assert_eq!(call(not_a_call), None, "{not_a_call}");
+        }
     }
 }

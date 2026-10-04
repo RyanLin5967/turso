@@ -154,7 +154,9 @@ impl Reply {
         let r = self.ok(sql);
         assert_eq!(r.rows.len(), 1, "{sql}: rows {:?}", r.rows);
         assert_eq!(r.rows[0].len(), 1, "{sql}: row {:?}", r.rows[0]);
-        r.rows[0][0].clone().unwrap_or_else(|| panic!("{sql}: NULL"))
+        r.rows[0][0]
+            .clone()
+            .unwrap_or_else(|| panic!("{sql}: NULL"))
     }
 
     fn err(self, sql: &str) -> WireError {
@@ -182,7 +184,8 @@ impl Wire {
             body.push(0);
         }
         body.push(0);
-        w.s.write_all(&((body.len() + 4) as i32).to_be_bytes()).unwrap();
+        w.s.write_all(&((body.len() + 4) as i32).to_be_bytes())
+            .unwrap();
         w.s.write_all(&body).unwrap();
         let r = w.read_reply();
         match r.error {
@@ -256,7 +259,8 @@ impl Wire {
                     let mut p = 2;
                     let mut row = Vec::with_capacity(n);
                     for _ in 0..n {
-                        let l = i32::from_be_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]);
+                        let l =
+                            i32::from_be_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]]);
                         p += 4;
                         if l < 0 {
                             row.push(None);
@@ -356,7 +360,8 @@ fn raise_nofile(want: u64) {
 
 fn seeded(server: &Server) -> Wire {
     let mut a = server.connect();
-    a.q("CREATE TABLE t(id INT PRIMARY KEY, v TEXT)").ok("create");
+    a.q("CREATE TABLE t(id INT PRIMARY KEY, v TEXT)")
+        .ok("create");
     a.q("INSERT INTO t VALUES (1, 'trunk')").ok("insert");
     a
 }
@@ -475,7 +480,11 @@ fn ready_for_query_reports_the_transaction_state() {
     assert_eq!(a.q("SELECT 1").status, b'I');
     assert_eq!(a.q("BEGIN").status, b'T', "after BEGIN");
     assert_eq!(a.q("INSERT INTO t VALUES (2, 'a')").status, b'T', "inside");
-    assert_eq!(a.x("SELECT v FROM t WHERE id = $1", &["2"]).status, b'T', "extended, inside");
+    assert_eq!(
+        a.x("SELECT v FROM t WHERE id = $1", &["2"]).status,
+        b'T',
+        "extended, inside"
+    );
     assert_eq!(a.q("COMMIT").status, b'I', "after COMMIT");
     assert_eq!(a.q("BEGIN").status, b'T');
     assert_eq!(a.q("ROLLBACK").status, b'I', "after ROLLBACK");
@@ -497,7 +506,11 @@ fn the_default_limit_admits_1040_live_sessions() {
         }
     }
     for (i, s) in sessions.iter_mut().enumerate() {
-        assert_eq!(s.q("SELECT count(*) FROM t").single("count"), "1", "session {i}");
+        assert_eq!(
+            s.q("SELECT count(*) FROM t").single("count"),
+            "1",
+            "session {i}"
+        );
     }
 }
 
@@ -554,9 +567,15 @@ fn branch_functions_create_switch_and_delete() {
         .unwrap()
         .parse::<i64>()
         .expect("create returns the branch id");
-    assert_eq!(a.q("SELECT turso_branch_current()").single("current"), "main");
+    assert_eq!(
+        a.q("SELECT turso_branch_current()").single("current"),
+        "main"
+    );
 
-    assert_eq!(a.q("SELECT turso_branch_switch('b1')").single("switch"), "b1");
+    assert_eq!(
+        a.q("SELECT turso_branch_switch('b1')").single("switch"),
+        "b1"
+    );
     assert_eq!(a.q("SELECT turso_branch_current()").single("current"), "b1");
     let r = a.q("UPDATE t SET v = 'b1' WHERE id = 1").ok("update on b1");
     assert_eq!(r.tags, vec!["UPDATE 1".to_string()]);
@@ -567,7 +586,10 @@ fn branch_functions_create_switch_and_delete() {
         "the branch's write reached the trunk"
     );
 
-    assert_eq!(a.q("SELECT turso_branch_switch('main')").single("switch"), "main");
+    assert_eq!(
+        a.q("SELECT turso_branch_switch('main')").single("switch"),
+        "main"
+    );
     assert_eq!(a.q("SELECT v FROM t WHERE id = 1").single("trunk"), "trunk");
     a.q("SELECT turso_branch_switch('b1')").ok("back to b1");
     assert_eq!(
@@ -577,8 +599,13 @@ fn branch_functions_create_switch_and_delete() {
     );
 
     a.q("SELECT turso_branch_switch('main')").ok("to main");
-    assert_eq!(a.q("SELECT turso_branch_delete('b1')").single("delete"), "b1");
-    let e = a.q("SELECT turso_branch_switch('b1')").err("switch to a deleted branch");
+    assert_eq!(
+        a.q("SELECT turso_branch_delete('b1')").single("delete"),
+        "b1"
+    );
+    let e = a
+        .q("SELECT turso_branch_switch('b1')")
+        .err("switch to a deleted branch");
     assert_eq!(e.code, "3D000", "{e:?}");
     a.q("SELECT turso_branch_create('b1')")
         .ok("the deleted branch's name is free");
@@ -600,7 +627,8 @@ fn a_branch_forks_from_the_sessions_current_branch() {
     a.q("SELECT turso_branch_switch('p')").ok("switch p");
     a.q("UPDATE t SET v = 'p' WHERE id = 1").ok("write p");
     a.q("SELECT turso_branch_create('c')").ok("create c from p");
-    a.q("UPDATE t SET v = 'p2' WHERE id = 1").ok("write p after the fork");
+    a.q("UPDATE t SET v = 'p2' WHERE id = 1")
+        .ok("write p after the fork");
     a.q("SELECT turso_branch_switch('c')").ok("switch c");
     assert_eq!(a.q("SELECT v FROM t WHERE id = 1").single("c"), "p");
 }
@@ -626,7 +654,9 @@ fn a_session_connects_to_a_branch_by_its_startup_database_name() {
         .err()
         .expect("a second session on b2 was admitted");
     assert!(!e.message.is_empty(), "{e:?}");
-    let e = a.q("SELECT turso_branch_switch('b2')").err("switch to b2 while b holds it");
+    let e = a
+        .q("SELECT turso_branch_switch('b2')")
+        .err("switch to b2 while b holds it");
     assert!(!e.message.is_empty(), "{e:?}");
 
     let e = server
@@ -670,7 +700,10 @@ fn branch_calls_inside_a_transaction_are_refused_with_25001() {
         a.q("BEGIN").ok("begin");
         a.q("INSERT INTO t VALUES (2, 'a')").ok("insert");
         let r = a.q(sql);
-        assert_eq!(r.status, b'E', "{sql}: the transaction is not marked failed");
+        assert_eq!(
+            r.status, b'E',
+            "{sql}: the transaction is not marked failed"
+        );
         let e = r.err(sql);
         assert_eq!(e.code, "25001", "{sql}: {e:?}");
         let e = a.q("SELECT 1").err("a statement in the failed transaction");
@@ -678,10 +711,18 @@ fn branch_calls_inside_a_transaction_are_refused_with_25001() {
         let r = a.q("COMMIT").ok("commit of a failed transaction");
         assert_eq!(r.tags, vec!["ROLLBACK".to_string()], "{sql}");
         assert_eq!(r.status, b'I', "{sql}");
-        assert_eq!(a.q("SELECT count(*) FROM t").single("count"), "1", "{sql}: committed");
+        assert_eq!(
+            a.q("SELECT count(*) FROM t").single("count"),
+            "1",
+            "{sql}: committed"
+        );
     }
-    assert_eq!(a.q("SELECT turso_branch_current()").single("current"), "main");
-    a.q("SELECT turso_branch_switch('x')").ok("x is still there");
+    assert_eq!(
+        a.q("SELECT turso_branch_current()").single("current"),
+        "main"
+    );
+    a.q("SELECT turso_branch_switch('x')")
+        .ok("x is still there");
 }
 
 /// Any error inside an explicit transaction aborts it, as in PostgreSQL: nothing of it commits,
@@ -722,7 +763,10 @@ fn rollback_to_savepoint_recovers_a_failed_transaction() {
     a.q("INSERT INTO t VALUES (2, 'a')").ok("insert 2");
     a.q("SAVEPOINT s").ok("savepoint");
     assert_eq!(a.q("INSERT INTO t VALUES (1, 'duplicate')").status, b'E');
-    assert_eq!(a.q("ROLLBACK TO SAVEPOINT s").ok("rollback to").status, b'T');
+    assert_eq!(
+        a.q("ROLLBACK TO SAVEPOINT s").ok("rollback to").status,
+        b'T'
+    );
     a.q("INSERT INTO t VALUES (3, 'c')").ok("insert 3");
     assert_eq!(a.q("COMMIT").ok("commit").tags, vec!["COMMIT".to_string()]);
     assert_eq!(a.q("SELECT count(*) FROM t").single("count"), "3");
@@ -745,13 +789,27 @@ fn branch_functions_take_bind_parameters() {
     let dir = Scratch::new("extended");
     let server = Server::start(&dir.db(), &[]);
     let mut a = seeded(&server);
-    let r = a.x("SELECT turso_branch_create($1)", &["b5"]).ok("create $1");
+    let r = a
+        .x("SELECT turso_branch_create($1)", &["b5"])
+        .ok("create $1");
     assert_eq!(r.rows.len(), 1, "{r:?}");
-    assert_eq!(a.x("SELECT turso_branch_switch($1)", &["b5"]).single("switch $1"), "b5");
-    assert_eq!(a.x("SELECT turso_branch_current()", &[]).single("current"), "b5");
-    a.x("UPDATE t SET v = $1 WHERE id = 1", &["b5"]).ok("update");
+    assert_eq!(
+        a.x("SELECT turso_branch_switch($1)", &["b5"])
+            .single("switch $1"),
+        "b5"
+    );
+    assert_eq!(
+        a.x("SELECT turso_branch_current()", &[]).single("current"),
+        "b5"
+    );
+    a.x("UPDATE t SET v = $1 WHERE id = 1", &["b5"])
+        .ok("update");
     a.x("SELECT turso_branch_switch($1)", &["main"]).ok("main");
-    assert_eq!(a.x("SELECT turso_branch_delete($1)", &["b5"]).single("delete $1"), "b5");
+    assert_eq!(
+        a.x("SELECT turso_branch_delete($1)", &["b5"])
+            .single("delete $1"),
+        "b5"
+    );
 }
 
 /// The server opens the database with durable branches by default: a branch and its write survive
@@ -768,7 +826,9 @@ fn a_branch_survives_a_server_kill_and_restart() {
     server.kill();
 
     let server = Server::start(&dir.db(), &[]);
-    let mut b = server.connect_to("postgres/b3").expect("connect to b3 after restart");
+    let mut b = server
+        .connect_to("postgres/b3")
+        .expect("connect to b3 after restart");
     assert_eq!(b.q("SELECT v FROM t WHERE id = 3").single("b3's row"), "b3");
     let mut m = server.connect();
     assert_eq!(m.q("SELECT count(*) FROM t").single("trunk"), "1");
