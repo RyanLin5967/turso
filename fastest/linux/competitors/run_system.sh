@@ -71,14 +71,10 @@ esac
   echo "strace=$(strace -V | head -1) kernel=$(uname -r) arch=$(uname -m)"; } | tee "$RAW/run-info.txt"
 
 # ---------------------------------------------------------------- server systems
-server_pids() {
-  local pid
-  pid=$(cat "$DATA.ftpid")
-  echo "$pid"
-  # PG: every running child of the postmaster (checkpointer, walwriter, bgwriter, io workers, launchers): they
-  # were forked before the attach, so -f alone would not reach them. Dolt/Doltgres are one process.
-  [ "$KIND" = pg ] && ps -o pid= --ppid "$pid" | tr -d ' '
-  return 0
+server_pid() { # the server's recorded main pid; strace_attach adds every live descendant (PG: the postmaster's
+  # checkpointer, walwriter, bgwriter, io workers, launchers and backends, forked before the attach, which -f alone
+  # would not reach) and proves none escaped. Dolt/Doltgres are one process.
+  cat "$DATA.ftpid"
 }
 srv() { # srv CMD ARGS... -- the system's own script
   case $KIND in
@@ -162,12 +158,12 @@ run_server_cell() { # run_server_cell SPEC C
   echo "=== $SYSTEM $spec C=$c N=$n"
   bbload "${KIND/pg/pg18}-select1" $((c + 16)) $((c + 16)) "$d/conncheck" >/dev/null ||
     fail "$spec-c$c conncheck: C+16=$((c + 16)) connections (rc $?, $(tail -1 "$d/conncheck.txt"))"
-  strace_attach "$d/idle" $(server_pids) || { fail "$spec-c$c idle attach"; return; }
+  strace_attach "$d/idle" "$(server_pid)" || { fail "$spec-c$c idle attach"; return; }
   sleep "$IDLE_S"
   strace_detach "$d/idle"
   if [ "$KIND" = pg ]; then template_idle || fail "$spec-c$c: a backend stayed on template p for 30 s"; fi
   used0=$(fsused)
-  strace_attach "$d/load" $(server_pids) || { fail "$spec-c$c load attach"; return; }
+  strace_attach "$d/load" "$(server_pid)" || { fail "$spec-c$c load attach"; return; }
   rc=0
   bbload "$spec" "$c" "$n" "$d/bb" || rc=$?
   strace_detach "$d/load"
@@ -179,7 +175,7 @@ run_server_cell() { # run_server_cell SPEC C
     # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost): a failed attach or a failed
     # CHECKPOINT FAILS the job, and the cell refuses without it (review finding 6: both used to drop it silently).
     defer=(--deferred "$d/deferred.json")
-    if strace_attach "$d/deferred" $(server_pids); then
+    if strace_attach "$d/deferred" "$(server_pid)"; then
       sqlq "CHECKPOINT" >"$d/deferred.checkpoint.txt" 2>&1 || fail "$spec-c$c deferred CHECKPOINT rc=$? ($(tail -1 "$d/deferred.checkpoint.txt"))"
       strace_detach "$d/deferred"
       count "$d/deferred"

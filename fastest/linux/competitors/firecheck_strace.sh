@@ -60,6 +60,11 @@ os.close(src); os.close(dst)
 subprocess.run(["cp", "--reflink=always", f"{d}/probe.dat", f"{d}/probe.clone"], check=True)
 os.close(fd)
 open(f"{d}/probe.done", "w").close()
+if trigger != "-":
+    # Attach mode: stay alive until the harness kills us, so the detach finds the traced main pid running (a window
+    # whose main pid is gone at the detach is refused).
+    while True:
+        time.sleep(1)
 PY
 
 check() { # check NAME JSON EXPR -- EXPR is a python expression over r (the count JSON)

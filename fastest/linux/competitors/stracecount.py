@@ -40,7 +40,10 @@ RESUMED = re.compile(r"^(?:(?:\[pid\s+)?(\d+)\]?\s+)?<\.\.\. ([a-z_0-9]+) resume
 SUMROW = re.compile(r"^\s*([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(?:(\d+)\s+)?([a-z_0-9]+)\s*$")
 RET = re.compile(r"\)\s+=\s+(-?\d+|\?)")
 FDPATH = re.compile(r"^\s*-?\d+<([^>]*)>")
-BENIGN = re.compile(r"attach: ptrace\(PTRACE_SEIZE, \d+\): No such process")
+# A pid that exited (or was a zombie) between the enumeration and the seize cannot be attached; trace.sh's TracerPid
+# check proved every listed pid still alive was traced, so this line is benign -- for any pid but the server's own
+# (MAIN), whose loss is never benign (review finding 5).
+BENIGN = re.compile(r"attach: ptrace\(PTRACE_SEIZE, (\d+)\): (?:No such process|Operation not permitted)")
 
 
 def parse_summary(text):
@@ -79,6 +82,14 @@ def count(trace, extras, root, window=None):
     stray = []  # strace's own stderr, minus a summary table, in an ATTACH window: attach/ptrace errors land here
     win = open(window).read() if window and os.path.exists(window) else ""
     attached = "attached_after_polls=" in win
+    mm = re.search(r"^main=(\d+) ", win, re.M)
+    main = mm.group(1) if mm else None
+    detach = {k: v for k, v in re.findall(r"\b(strace_alive_at_detach|main_alive_at_detach)=(\d)", win)}
+
+    def benign(ln):
+        b = BENIGN.search(ln)
+        return bool(b) and main is not None and b.group(1) != main
+
     for e in extras:
         if not os.path.exists(e):
             continue
@@ -87,10 +98,8 @@ def count(trace, extras, root, window=None):
         if summary is None:
             summary = parse_summary(etext)
         if attached:
-            # One benign line: a pid that exited between enumeration and attach (e.g. a PG backend finishing)
-            # cannot be seized and has nothing left to trace; the TracerPid check already skipped it.
             stray += [ln for ln in etext.splitlines() if ln.strip() and not ln.startswith(("% time", "------"))
-                      and not SUMROW.match(ln) and not BENIGN.search(ln)]
+                      and not SUMROW.match(ln) and not benign(ln)]
     lines = {}
     pending = {}
     calls = []  # (name, args_and_rest)
@@ -172,6 +181,20 @@ def count(trace, extras, root, window=None):
     out["by_class"] = by_class
     out["top_paths"] = sorted(by_path.items(), key=lambda kv: -kv[1])[:15]
     problems, blind = [], []
+    out["main_pid"], out["detach"] = main, detach
+    if attached:
+        # An attach window is a count of a LIVE server: its main pid must be named, and both the strace and the server
+        # must still have been running when the detach was requested (else every tracee died and an empty window
+        # would read as a clean zero -- review finding 5).
+        if main is None:
+            problems.append("attach window names no main pid")
+        if set(detach) != {"strace_alive_at_detach", "main_alive_at_detach"}:
+            problems.append("attach window has no detach record")
+        else:
+            if detach["strace_alive_at_detach"] != "1":
+                problems.append("strace had exited before the detach (every tracee gone)")
+            if detach["main_alive_at_detach"] != "1":
+                problems.append(f"the server (main pid {main}) was gone at the detach")
     if summary is None:
         problems.append("no -c summary table found")
     if stray:
