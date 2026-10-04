@@ -684,6 +684,9 @@ pub(crate) struct Journal {
     /// flight syncs the directory before its own log sync, so nothing is acknowledged before the
     /// rename is durable (review 2 #5: no directory sync under the store mutex).
     dir_dirty: bool,
+    /// After a failed checkpoint or compaction, no other is wanted until the log is past this
+    /// length (review 2 #5: no retry storm, every operation starting one). 0 after a rewrite.
+    compact_after: u64,
 }
 
 /// What a cut prepared off the store mutex copies (`Journal::cut_source`, read under it): the log's
@@ -778,6 +781,7 @@ impl Journal {
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
+            compact_after: 0,
         })
     }
 
@@ -934,6 +938,7 @@ impl Journal {
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
+            compact_after: 0,
         };
 
         let mut records = Vec::new();
@@ -1214,6 +1219,7 @@ impl Journal {
         // From here the new file is the log.
         self.file = f;
         self.rewrites += 1;
+        self.compact_after = 0;
         self.generation = generation;
         self.len = LOG_HEADER_LEN as u64 + suffix.len() as u64;
         self.synced_to = if class.syncs() { self.len } else { 0 };
@@ -1338,6 +1344,7 @@ impl Journal {
         // From here the new file is the log.
         self.file = prep.file;
         self.rewrites += 1;
+        self.compact_after = 0;
         self.generation = generation;
         self.len = len;
         self.synced_to = if class.syncs() { self.len } else { 0 };
@@ -1676,7 +1683,15 @@ impl Journal {
     }
 
     pub(crate) fn wants_compaction(&self) -> bool {
-        self.len > compact_min_log_bytes().max(2 * self.snapshot_len)
+        // fastest-engine mutant `no_compaction_backoff` (test builds only).
+        let backed_off = self.len <= self.compact_after && !super::store::fe_mutant("no_compaction_backoff");
+        self.len > compact_min_log_bytes().max(2 * self.snapshot_len) && !backed_off
+    }
+
+    /// A checkpoint or compaction failed: the next is wanted only once another threshold's worth of
+    /// log has been written (`compact_after`).
+    pub(crate) fn defer_compaction(&mut self) {
+        self.compact_after = self.len + compact_min_log_bytes();
     }
 
     /// Twice the compaction threshold: while a fuzzy checkpoint is in flight, an operation that
@@ -1755,6 +1770,7 @@ impl Journal {
         let class = self.rewrite_class();
         let header = log_header(self.format, self.page_size, generation, self.raised);
         self.rewrites += 1;
+        self.compact_after = 0;
         set_file_len(&self.file, 0)?;
         write_at(&self.file, &header, 0)?;
         if class.syncs() {

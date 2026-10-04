@@ -3557,6 +3557,9 @@ impl BranchStore {
         if inner.cat.is_none() || !self.fuzzy {
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
+                if let Some(journal) = inner.journal.as_mut() {
+                    journal.defer_compaction();
+                }
             }
             return;
         }
@@ -6689,6 +6692,10 @@ impl StoreInner {
                 }
             }
             // The capture copied the names; the index still holds them, for the next checkpoint.
+            // Not retried before another threshold's worth of log (review 2 #5).
+            if let Some(journal) = self.journal.as_mut() {
+                journal.defer_compaction();
+            }
             return Err(e);
         }
         cat.generation = cap.generation;
@@ -6712,6 +6719,7 @@ impl StoreInner {
             ));
         };
         if cap.fail_after_commit {
+            journal.defer_compaction();
             journal.poison();
             return Err(LimboError::InternalError(
                 "failpoint: branch checkpoint stopped after the catalog commit".to_string(),
@@ -6723,6 +6731,11 @@ impl StoreInner {
             Some(prep) => journal.finish_cut(prep, cap.log_from, cap.generation),
             None => journal.rewrite_from(cap.log_from, cap.generation),
         };
+        if rewritten.is_err() {
+            // The old log stays, correct and longer; not cut again before another threshold's
+            // worth of it (review 2 #5).
+            journal.defer_compaction();
+        }
         for id in &cap.removed {
             cat.removed.remove(id);
         }
