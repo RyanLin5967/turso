@@ -62,6 +62,10 @@ fn env_class() -> SyncClass {
 }
 
 fn open_at(path: &Path, opts: DatabaseOpts) -> Arc<Database> {
+    try_open_at(path, opts).unwrap()
+}
+
+fn try_open_at(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     Database::open_file_with_flags(
         io,
@@ -71,7 +75,6 @@ fn open_at(path: &Path, opts: DatabaseOpts) -> Arc<Database> {
         None,
         Arc::new(SqliteDialect),
     )
-    .unwrap()
 }
 
 fn opts(catalog: bool, sync: SyncClass) -> DatabaseOpts {
@@ -1225,8 +1228,13 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
         let _ = rec.wait();
         what.push_str(&format!(" + recover.replay:{m}"));
     }
-    let db = open_at(&path, opts(catalog, class));
-    let mut bad = verify_c1(&db, &log, &base);
+    // A recovery that refuses the store lost every acknowledged create at once: a violation the
+    // count must carry, not a harness panic that reads as no result (the D0 control's power cut
+    // can leave the snapshot header unwritten).
+    let mut bad = match try_open_at(&path, opts(catalog, class)) {
+        Ok(db) => verify_c1(&db, &log, &base),
+        Err(e) => vec![format!("recovery refused the store: {e:?}")],
+    };
     if !child_panic.is_empty() {
         bad.push(format!("the child panicked: {child_panic}"));
     }
