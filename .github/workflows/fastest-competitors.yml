@@ -38,6 +38,13 @@ concurrency:
 permissions:
   contents: read
 
+# Every run step under bash -eo pipefail (GitHub's `shell: bash`). The implicit default is `bash -e {0}` with NO
+# pipefail, so `mkloop.sh ... | tee` succeeded when mkloop failed and the steps.fs guard below could never trip
+# (review finding 7, run 37175962413).
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     name: build tools (${{ matrix.runner }})
@@ -111,7 +118,7 @@ jobs:
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
             echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S";
-            cat dist/build-info.txt; strace -V | head -1; /usr/lib/postgresql/18/bin/postgres --version;
+            cat dist/build-info.txt; strace -V | sed -n 1p; /usr/lib/postgresql/18/bin/postgres --version;
             mariadb --version; pg_lsclusters 2>&1 || true; } | tee "$RAW/run-info.txt"
       - name: Dolt and Doltgres release binaries
         if: matrix.system == 'dolt' || matrix.system == 'doltgres'
@@ -125,10 +132,13 @@ jobs:
         if: ${{ !cancelled() && steps.fs.outcome == 'success' }}
         run: sudo sysctl -w kernel.yama.ptrace_scope=0
       - name: Flush counter fire-check
+        id: fc
         if: ${{ !cancelled() && steps.fs.outcome == 'success' }}
         run: timeout 600 bash fastest/linux/competitors/firecheck_strace.sh "$RAW/firecheck" "$MNT/firecheck.noindex"
+      # Only after the counter's fire-check passed on this runner and filesystem (review finding 8: the run used to
+      # proceed after a failed fire-check and its cells still said ok). run_system.sh re-checks the verdict file.
       - name: Run ${{ matrix.system }}
-        if: ${{ !cancelled() && steps.fs.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.fs.outcome == 'success' && steps.fc.outcome == 'success' }}
         env:
           FT_BBLOAD: ${{ github.workspace }}/dist/bbload
           FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
