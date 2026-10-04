@@ -1955,3 +1955,52 @@ fn a_lock_free_fork_sees_ddl_committed_while_the_trunk_had_no_child() {
         drop(g);
     }
 }
+
+// ---- lead review 1 item 7: a checkpoint never flushes inside the store mutex ----
+
+/// Puts the compaction threshold back when a test that lowered it ends, however it ends.
+struct Threshold;
+
+impl Threshold {
+    fn set(bytes: u64) -> Self {
+        super::journal::set_compact_threshold(bytes);
+        Threshold
+    }
+}
+
+impl Drop for Threshold {
+    fn drop(&mut self) {
+        super::journal::set_compact_threshold(0);
+    }
+}
+
+/// Lead review 1 item 7: a catalog store's checkpoints — started by the create or first write that
+/// crossed the threshold, at the default (fuzzy) mode — issue NO sync while any thread holds the
+/// store mutex: neither the settling of what is buffered, nor the log's cut at the install. With
+/// the threshold lowered so `FE_CKPT_FORKS` (default 400) create-then-first-write pairs run at least
+/// three checkpoints, the syncs under the store mutex do not move.
+#[test]
+fn a_checkpoint_issues_no_sync_inside_the_store_mutex() {
+    let _s = serial();
+    let pairs = std::env::var("FE_CKPT_FORKS").ok().and_then(|v| v.parse().ok()).unwrap_or(400u64);
+    for class in [SyncClass::Fsync, SyncClass::FullFsync] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("ckpt-nosync.db"), opts(true, class));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let _t = Threshold::set(8 << 10);
+        let installed = db.branch_checkpoint_counters()[0];
+        let before = super::store::syncs_under_store_mutex();
+        for i in 0..pairs {
+            let b = trunk.fork_branch().unwrap();
+            write_v(&b.connect().unwrap(), 1 + (i as i64 % 50), "w");
+            let _ = b.into_id();
+        }
+        db.branch_checkpoint_wait();
+        let under = super::store::syncs_under_store_mutex() - before;
+        let ran = db.branch_checkpoint_counters()[0] - installed;
+        assert!(ran >= 3, "class={class:?}: premise: at least three checkpoints ran ({ran})");
+        assert_eq!(under, 0, "class={class:?}: {ran} checkpoints issued {under} syncs inside the store mutex");
+    }
+}

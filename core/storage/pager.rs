@@ -3890,6 +3890,7 @@ impl Pager {
     /// a failed commit left open is closed (review A-F1: the session released the lock with the
     /// gate open). Returns whether stamps were made, for `prune_branch_stamps` once the lock is
     /// released.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub(crate) fn end_raw_trunk_write(&self, committed: bool) -> bool {
         // fastest-engine mutant `raw_gate_left_open` (test builds only): as before review A-F1.
         if crate::branch::store::fe_mutant("raw_gate_left_open") {
@@ -3907,6 +3908,7 @@ impl Pager {
 
     /// Drop the merge stamps no live or future trunk child can be refused by (off the WAL write
     /// lock, as `commit_dirty_pages` does).
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub(crate) fn prune_branch_stamps(&self) {
         if let Some(store) = self.branch_store.get() {
             store.prune_stamps();

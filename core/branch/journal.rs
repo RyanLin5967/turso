@@ -94,6 +94,29 @@ const FRAME_HEADER_LEN: usize = 8;
 /// never more than a constant factor of the live state and compaction work is amortised O(1).
 const COMPACT_MIN_LOG_BYTES: u64 = 1 << 20;
 
+/// The compaction threshold: `COMPACT_MIN_LOG_BYTES`, or in test builds a smaller one a test sets
+/// (`set_compact_threshold`) so a few operations reach it.
+fn compact_min_log_bytes() -> u64 {
+    #[cfg(test)]
+    {
+        let set = COMPACT_THRESHOLD.load(Ordering::Acquire);
+        if set > 0 {
+            return set;
+        }
+    }
+    COMPACT_MIN_LOG_BYTES
+}
+
+#[cfg(test)]
+static COMPACT_THRESHOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the compaction threshold for this process's tests (0: the default). Tests that set it hold
+/// their own file's serial lock and put it back.
+#[cfg(test)]
+pub(crate) fn set_compact_threshold(bytes: u64) {
+    COMPACT_THRESHOLD.store(bytes, Ordering::Release);
+}
+
 /// The three files of a durable branch store.
 #[derive(Debug, Clone)]
 pub(crate) struct BranchFiles {
@@ -1467,7 +1490,7 @@ impl Journal {
     }
 
     pub(crate) fn wants_compaction(&self) -> bool {
-        self.len > COMPACT_MIN_LOG_BYTES.max(2 * self.snapshot_len)
+        self.len > compact_min_log_bytes().max(2 * self.snapshot_len)
     }
 
     /// Twice the compaction threshold: while a fuzzy checkpoint is in flight, an operation that
@@ -1475,7 +1498,7 @@ impl Journal {
     /// asynchronous one), so the log stays within twice the threshold plus the operations in
     /// flight (r11-restart-r2, F-FZ).
     pub(crate) fn past_hard_limit(&self) -> bool {
-        self.len > 2 * COMPACT_MIN_LOG_BYTES.max(2 * self.snapshot_len)
+        self.len > 2 * compact_min_log_bytes().max(2 * self.snapshot_len)
     }
 
     /// Replace the log with a snapshot of `state`. `fail_after_rename` is the crash failpoint.

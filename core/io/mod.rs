@@ -136,11 +136,15 @@ pub static SYNC_COUNTS: [crate::sync::atomic::AtomicU64; 3] = [
 /// Count one `fcntl(F_BARRIERFSYNC)`.
 pub(crate) fn count_barrier() {
     SYNC_COUNTS[2].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    crate::branch::store::note_sync();
 }
 
 /// Count one sync: `full` for `fcntl(F_FULLFSYNC)`, else `fsync(2)`.
 pub(crate) fn count_sync(full: bool) {
     SYNC_COUNTS[usize::from(full)].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    crate::branch::store::note_sync();
 }
 
 /// Controls which sync mechanism to use for durability.

@@ -232,7 +232,7 @@ use crate::{LimboError, Result};
 
 pub(crate) struct BranchStore {
     /// Shared with a fuzzy checkpoint's thread, which takes it for its install (F-FZ).
-    inner: Arc<Mutex<StoreInner>>,
+    inner: Arc<StoreMutex>,
     /// What this open's prewarm did to files other than the catalog (r12-catload; the catalog's
     /// own part is on its handle).
     prewarm: PrewarmStats,
@@ -571,6 +571,71 @@ thread_local! {
     /// when it begins and takes it when it ends, so it holds exactly that fork's holds: forks do
     /// not nest, and a thread runs one at a time.
     static COUNTED_HOLD_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The store mutex. A thin wrapper: in test builds its guard also marks this thread as holding it,
+/// so every sync issued meanwhile is counted (`syncs_under_store_mutex`; lead review 1 item 7's
+/// instrument — a flush inside the store mutex stalls every operation behind it).
+struct StoreMutex(Mutex<StoreInner>);
+
+impl StoreMutex {
+    fn new(inner: StoreInner) -> Self {
+        Self(Mutex::new(inner))
+    }
+
+    fn lock(&self) -> StoreGuard<'_> {
+        let guard = self.0.lock();
+        #[cfg(test)]
+        STORE_HELD.with(|held| held.set(held.get() + 1));
+        StoreGuard(guard)
+    }
+}
+
+struct StoreGuard<'a>(crate::sync::MutexGuard<'a, StoreInner>);
+
+impl std::ops::Deref for StoreGuard<'_> {
+    type Target = StoreInner;
+    fn deref(&self) -> &StoreInner {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut StoreInner {
+        &mut self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for StoreGuard<'_> {
+    fn drop(&mut self) {
+        STORE_HELD.with(|held| held.set(held.get() - 1));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many store-mutex guards this thread holds (test builds).
+    static STORE_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Syncs of any file (`io::count_sync`, `io::count_barrier`) issued while the issuing thread held a
+/// store mutex (test builds; lead review 1 item 7).
+#[cfg(test)]
+static SYNCS_UNDER_STORE_MUTEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A sync was issued: counted if this thread holds a store mutex (test builds).
+#[cfg(test)]
+pub(crate) fn note_sync() {
+    if STORE_HELD.with(|held| held.get()) > 0 {
+        SYNCS_UNDER_STORE_MUTEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// See `SYNCS_UNDER_STORE_MUTEX`.
+#[cfg(test)]
+pub(crate) fn syncs_under_store_mutex() -> u64 {
+    SYNCS_UNDER_STORE_MUTEX.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The nanoseconds this thread held the store mutex through `lock_counted` since the last call, and
@@ -1977,7 +2042,7 @@ fn truncate_catalog_wal(catalog: &mut Catalog) {
 /// is in flight, so the two cannot deadlock.
 #[allow(clippy::too_many_arguments)]
 fn run_flight(
-    inner: Arc<Mutex<StoreInner>>,
+    inner: Arc<StoreMutex>,
     group: Arc<Group>,
     writer: Arc<Mutex<Catalog>>,
     cap: Box<Captured>,
@@ -2258,6 +2323,7 @@ impl BranchStore {
     ///
     /// Durable + read-only with NO branch files stays refused: a fork would create them, and
     /// nothing below the connection refuses a fork on a read-only database.
+    #[cfg(test)]
     pub(crate) fn open_with_flags(
         durability: BranchDurability,
         default_lease: Option<Duration>,
@@ -2298,7 +2364,7 @@ impl BranchStore {
 
     fn trunk_only() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
+            inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
             flights: Mutex::new(Vec::new()),
             name_filter_build: Mutex::new(None),
@@ -2533,7 +2599,7 @@ impl BranchStore {
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
-            inner: Arc::new(Mutex::new(inner)),
+            inner: Arc::new(StoreMutex::new(inner)),
             prewarm: warmed,
             flights: Mutex::new(Vec::new()),
             name_filter_build: Mutex::new(None),
@@ -4988,6 +5054,7 @@ impl BranchStore {
     /// `(branch states read from the catalog, trunk pages read, catalog queries, catalog rows
     /// read)` since open (r11-restart lane instrument; zeros for a snapshot store).
     /// Trunk commit barriers that took the store mutex (lead review 1 item 10's instrument).
+    #[cfg(test)]
     pub(crate) fn barrier_locks(&self) -> u64 {
         self.barrier_locks.load(Ordering::Relaxed)
     }
