@@ -3285,7 +3285,9 @@ impl BranchStore {
     /// if it stayed open that long: the caller falls back to the WAL write lock.
     pub(crate) fn trunk_commit_seq(&self) -> Option<u64> {
         let seen = self.trunk_commits.load(Ordering::Acquire);
-        if seen % 2 == 0 {
+        // Mutant M-f, its first half: an open gate is not waited out (the second half is in
+        // `fork_trunk`'s check).
+        if seen % 2 == 0 || fe_mutant("gate_admits_inflight") {
             return Some(seen);
         }
         let (lock, closed) = &self.gate_closed;
