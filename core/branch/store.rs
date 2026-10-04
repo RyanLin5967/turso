@@ -6727,6 +6727,10 @@ impl StoreInner {
             // A checkpoint that did not commit (or did, and this is the log recovery cut after
             // it): nothing to redo (F-FZ).
             Record::Checkpoint { .. } => Ok(()),
+            // Recovery's scan consumes every end frame; one here is a scan defect.
+            Record::FlightEnd { .. } => Err(LimboError::InternalError(
+                "a branch log flight's end frame reached replay".to_string(),
+            )),
         }
     }
 
