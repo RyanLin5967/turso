@@ -1743,9 +1743,10 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
             "failpoint: the catalog checkpoint's write failed before its commit".to_string(),
         ));
     }
-    // Every slot the catalog is about to name must be durable first.
+    // Every slot the catalog is about to name is ordered before its commit, whose sync makes them
+    // durable with it (lead review 1 item 1).
     if let Some(file) = cap.arena.as_ref() {
-        super::journal::fsync_file(file, cap.arena_sync)?;
+        super::journal::barrier_file(file, cap.arena_sync)?;
     }
     // And the commit as durable as any record it replaces (review B-F3).
     catalog.raise_sync(cap.arena_sync)?;

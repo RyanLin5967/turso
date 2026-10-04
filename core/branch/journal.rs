@@ -1328,8 +1328,8 @@ impl Journal {
                 "the branch log changed under this journal; another store instance wrote it",
             ));
         }
-        if class.syncs() {
-            arena.sync(class)?;
+        if class.syncs() && !super::store::fe_mutant("no_arena_barrier") {
+            arena.barrier(class)?;
         }
         if let Some(raised) = header {
             write_at(&self.file, &raised, HEADER_RAISED_AT)?;
@@ -1487,10 +1487,10 @@ impl Journal {
         // Every record the snapshot replaces stays as durable as it was, raised ones included
         // (review B-F3).
         let class = self.rewrite_class();
-        // The snapshot names slots that buffered-but-unwritten records also name; they must be
-        // durable before the snapshot is.
+        // The snapshot names slots that buffered-but-unwritten records also name; they are ordered
+        // before it, and its sync below makes them durable with it.
         if class.syncs() {
-            arena.sync(class)?;
+            arena.barrier(class)?;
         }
         let generation = self.generation + 1;
         let mut out = Vec::with_capacity(64);
@@ -1666,9 +1666,11 @@ impl Flight {
         // Mutant M-a (PREREG v1 amendment 36): the sync removed (the frames are written, never
         // synced). Caught by V1 (0 F_FULLFSYNC per create) and C1b, not by SIGKILL.
         let syncs = self.class.syncs() && !super::store::fe_mutant("no_flight_sync");
-        if syncs {
+        // The slots these frames name are ordered before them; the log's sync below makes both
+        // durable (lead review 1 item 1). Mutant `no_arena_barrier` (test builds only) drops it.
+        if syncs && !super::store::fe_mutant("no_arena_barrier") {
             if let Some(arena) = &self.arena {
-                fsync_file(arena, self.class)?;
+                barrier_file(arena, self.class)?;
             }
         }
         super::store::kill_point("flight.arena_synced");
@@ -2092,7 +2094,9 @@ mod lose_unsynced {
         Ok(true)
     }
 
-    /// A sync: the held writes reach the file, in order.
+    /// A sync: the held writes reach the file, in order. Written while the held set is still
+    /// locked and removed only after, so a concurrent read never finds the bytes in neither place
+    /// (lead review 1 item 22d: an EOF, or a reused slot's old bytes).
     pub(super) fn apply(file: &File) -> Result<()> {
         if !armed() {
             return Ok(());
@@ -2100,11 +2104,12 @@ mod lose_unsynced {
         let Some(k) = key(file) else {
             return Ok(());
         };
-        let writes = held().lock().unwrap().remove(&k).unwrap_or_default();
-        for (at, bytes) in writes {
-            file.write_all_at(&bytes, at)
+        let mut held = held().lock().unwrap();
+        for (at, bytes) in held.get(&k).into_iter().flatten() {
+            file.write_all_at(bytes, *at)
                 .map_err(|e| io_error(e, "write branch file"))?;
         }
+        held.remove(&k);
         Ok(())
     }
 
@@ -2179,6 +2184,33 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
         file.sync_all()
             .map_err(|e| io_error(e, "fsync branch file"))
     }
+}
+
+/// ORDER every write made to `file` so far before every write made after this returns, in `class`
+/// (lead review 1 item 1): what the arena needs before the log record that names its slots, since
+/// the log's own sync in `class` then makes both durable. On Apple at `FullFsync` that is
+/// `fcntl(F_BARRIERFSYNC)` — the file's data reaches the device, ordered by a barrier, without
+/// draining the device's cache — falling back to `F_FULLFSYNC` where the filesystem refuses it. In
+/// every other case it is `fsync_file` (`fsync(2)` orders by making durable). `Off` does nothing.
+///
+/// Only a write that a LATER full sync in `class` covers may rest on this: the barrier alone makes
+/// nothing durable.
+pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
+    #[cfg(target_vendor = "apple")]
+    if class == SyncClass::FullFsync {
+        use std::os::fd::AsRawFd;
+        // Simulated power loss treats a barrier as a sync of the file (a blind spot: an
+        // acknowledgement resting on a barrier alone is C1b's to catch, not C1's).
+        #[cfg(test)]
+        lose_unsynced::apply(file)?;
+        // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
+            crate::io::count_barrier();
+            return Ok(());
+        }
+        return fsync_file(file, class);
+    }
+    fsync_file(file, class)
 }
 
 /// Make a file's creation or rename durable: on POSIX that is a sync of its directory, in `class`.

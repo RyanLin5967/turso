@@ -1592,3 +1592,44 @@ fn v1_in_process_create_then_first_write_is_two_full_fsyncs_at_c1() {
         );
     }
 }
+
+/// The barrier counter (lead review 1 item 1): `barrier_file` is one F_BARRIERFSYNC at D2, one
+/// fsync(2) at D1 and nothing at D0, each counted under its own primitive. Forced to fire each way.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_sync_counter_counts_a_barrier_under_its_own_primitive() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = super::journal::open_rw(&dir.path().join("f"), true).unwrap();
+    super::journal::write_at(&file, b"x", 0).unwrap();
+    let counted = |class| {
+        let before = sync_counts();
+        super::journal::barrier_file(&file, class).unwrap();
+        let after = sync_counts();
+        (after.fsync - before.fsync, after.full_fsync - before.full_fsync, after.barrier - before.barrier)
+    };
+    assert_eq!(counted(SyncClass::Off), (0, 0, 0), "D0 ordered a branch file");
+    assert_eq!(counted(SyncClass::Fsync), (1, 0, 0), "a D1 barrier is one fsync(2)");
+    assert_eq!(counted(SyncClass::FullFsync), (0, 0, 1), "a D2 barrier is one F_BARRIERFSYNC");
+}
+
+/// Lead review 1 item 1, the other half: a D2 first write still ORDERS its slots before its record
+/// — exactly one F_BARRIERFSYNC beside its one F_FULLFSYNC. Mutant `no_arena_barrier` must fail it.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_first_write_orders_its_slots_with_one_barrier() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("d2fwb.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        let before = sync_counts();
+        write_v(&bc, 3, "mine");
+        let after = sync_counts();
+        assert_eq!(after.barrier - before.barrier, 1, "catalog={catalog}: the slots were not ordered");
+        assert_eq!(after.full_fsync - before.full_fsync, 1, "catalog={catalog}");
+    }
+}

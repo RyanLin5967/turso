@@ -318,8 +318,8 @@ impl SyncClass {
 }
 
 /// Every sync this process issued through the branch store's files or the platform IO backend, by
-/// primitive (fastest-engine instrument V1-in-process; observing only): `fsync(2)` calls and
-/// `fcntl(F_FULLFSYNC)` calls. A cross-check of the DYLD syscall shim, never a substitute for it:
+/// primitive (fastest-engine instrument V1-in-process; observing only): `fsync(2)` calls,
+/// `fcntl(F_FULLFSYNC)` calls and `fcntl(F_BARRIERFSYNC)` calls. A cross-check of the DYLD syscall shim, never a substitute for it:
 /// a sync issued by anything else (the catalog's own IO is the platform backend, so it IS counted)
 /// does not appear.
 #[doc(hidden)]
@@ -327,6 +327,7 @@ impl SyncClass {
 pub struct SyncCounts {
     pub fsync: u64,
     pub full_fsync: u64,
+    pub barrier: u64,
 }
 
 /// A distribution of lock holds, in nanoseconds (fastest-engine M1 item 5; observing only): the
@@ -408,6 +409,7 @@ pub fn sync_counts() -> SyncCounts {
     SyncCounts {
         fsync: crate::io::SYNC_COUNTS[0].load(Relaxed),
         full_fsync: crate::io::SYNC_COUNTS[1].load(Relaxed),
+        barrier: crate::io::SYNC_COUNTS[2].load(Relaxed),
     }
 }
 

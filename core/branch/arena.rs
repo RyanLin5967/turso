@@ -16,7 +16,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use super::journal::{fsync_file, open_rw, read_at, write_at};
+use super::journal::{barrier_file, fsync_file, open_rw, read_at, write_at};
 use super::SyncClass;
 
 /// r11-restart lane instrument: `R11_TRACE_SLOTS` prints every slot transition (observing only).
@@ -274,6 +274,18 @@ impl Arena {
         if let Backing::File { file, dirty } = &mut self.backing {
             if *dirty {
                 fsync_file(file, class)?;
+                *dirty = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Order every slot written so far before every later write, in `class` (`journal::barrier_file`):
+    /// for a write that a later full sync in `class` covers. A no-op for the memory backing.
+    pub(crate) fn barrier(&mut self, class: SyncClass) -> Result<()> {
+        if let Backing::File { file, dirty } = &mut self.backing {
+            if *dirty {
+                barrier_file(file, class)?;
                 *dirty = false;
             }
         }
