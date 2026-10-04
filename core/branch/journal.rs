@@ -1394,6 +1394,7 @@ impl Journal {
                 fail: false,
                 end_lsn,
                 header: None,
+                ordered: false,
             });
         }
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
@@ -1454,6 +1455,7 @@ impl Journal {
             fail,
             end_lsn,
             header,
+            ordered: false,
         })
     }
 
@@ -1644,6 +1646,9 @@ pub(crate) struct Flight {
     pub(crate) end_lsn: u64,
     /// The header's raised-class field, when this flight is the first in a stronger class.
     header: Option<[u8; 4]>,
+    /// ORDERED, not synced (lead review 1 item 6): the log is barriered, not flushed, and a trunk
+    /// commit's own F_FULLFSYNC of its WAL, on the same device, makes the flight durable.
+    ordered: bool,
 }
 
 impl Flight {
@@ -1684,11 +1689,23 @@ impl Flight {
         after_pwrite();
         // After mutant M-b's early acknowledgement, before the log's sync.
         super::store::kill_point("flight.before_log_sync");
-        if syncs {
+        if syncs && !self.ordered {
             fsync_file(&log, self.class)?;
+        }
+        // Mutant M-j (PREREG v1 amendment 36; test builds only): the barrier between the branch
+        // log and the trunk's WAL removed. Caught by C1b.
+        if syncs && self.ordered && !super::store::fe_mutant("no_log_barrier") {
+            barrier_file(&log, self.class)?;
         }
         super::store::kill_point("flight.log_synced");
         Ok(())
+    }
+
+    /// Make this flight ORDERED instead of synced (see `ordered`): only for a trunk commit that will
+    /// F_FULLFSYNC its WAL, on the branch files' device, after it.
+    pub(crate) fn ordered(mut self) -> Self {
+        self.ordered = true;
+        self
     }
 
     /// Whether this flight writes or syncs anything.

@@ -195,7 +195,11 @@ fn d1_syncs_with_fsync_and_never_full_fsync() {
 /// The ordering guard: a trunk connection that asks for a STRONGER flush than the branch store's
 /// class (`PRAGMA fullfsync` on a D1 store) has the pre-image barrier raised to match, so the trunk
 /// commit that overwrites a page a branch reads is never more durable than the pre-image kept for
-/// it. Every sync of that commit, branch files and WAL, is F_FULLFSYNC.
+/// it. No sync of that commit is fsync(2).
+///
+/// FLAGGED TEST EDIT (lead review 1 item 6, a registered law change): the pre-image is now ORDERED
+/// before the commit's frames (F_BARRIERFSYNC) and made durable by the WAL's own F_FULLFSYNC, so
+/// the commit issues one F_FULLFSYNC and at least one barrier, where it issued two F_FULLFSYNC.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_full_fsync_trunk_connection_raises_the_pre_image_barrier() {
@@ -207,14 +211,20 @@ fn a_full_fsync_trunk_connection_raises_the_pre_image_barrier() {
         seed(&trunk);
         let b = trunk.fork_branch().unwrap();
         trunk.execute("PRAGMA fullfsync = ON").unwrap();
-        let counted = syncs_of(|| {
-            trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
-        });
+        let before = sync_counts();
+        trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
+        let after = sync_counts();
+        let counted = (
+            after.fsync - before.fsync,
+            after.full_fsync - before.full_fsync,
+            after.barrier - before.barrier,
+        );
         assert_eq!(
             counted.0, 0,
             "catalog={catalog}: a pre-image barrier under a fullfsync trunk issued fsync(2): {counted:?}"
         );
-        assert!(counted.1 >= 2, "catalog={catalog}: barrier and WAL: {counted:?}");
+        assert_eq!(counted.1, 1, "catalog={catalog}: the WAL's F_FULLFSYNC: {counted:?}");
+        assert!(counted.2 >= 1, "catalog={catalog}: the pre-image's barrier: {counted:?}");
         let bc = b.connect().unwrap();
         let v = bc
             .prepare("SELECT v FROM t WHERE id = 7")
@@ -1850,5 +1860,25 @@ fn forks_inside_a_d2_commit_gate_ride_its_wal_flush() {
                 "stage={stage} catalog={catalog}: a D2 trunk commit and three forks inside its gate"
             );
         }
+    }
+}
+
+/// Lead review 1 item 6, the count half of M-j (the ordering itself is C1b's): a retaining D2
+/// trunk commit barriers the arena (the pre-image's slot) AND the log (its `TrunkRetain` record)
+/// before its frames — two F_BARRIERFSYNC. Mutant `no_log_barrier` must fail it.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_retaining_d2_trunk_commit_barriers_its_slot_and_its_record() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("d2rb.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _b = trunk.fork_branch().unwrap();
+        let before = sync_counts();
+        write_v(&trunk, 7, "new");
+        let after = sync_counts();
+        assert_eq!(after.barrier - before.barrier, 2, "catalog={catalog}: the slot's and the record's barriers");
     }
 }

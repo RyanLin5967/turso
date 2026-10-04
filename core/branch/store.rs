@@ -305,6 +305,8 @@ pub(crate) struct BranchStore {
     /// Test hook: the publication wait in milliseconds, in place of `PUBLISH_WAIT` (0: unset).
     #[cfg(test)]
     publish_wait_ms: AtomicU64,
+    /// The trunk's WAL is on the branch files' device (`note_trunk_wal`, `ordered_trunk`).
+    trunk_same_device: AtomicBool,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -357,6 +359,14 @@ struct GroupState {
     /// `durable[c]`: every journal byte below this log sequence number is durable in class `c` or
     /// a stronger one (indexed `Off`, `Fsync`, `FullFsync`; `Off` means written to the OS).
     durable: [u64; 3],
+    /// Every journal byte below this was written by an ORDERED flight (`Flight::ordered`): on the
+    /// device ahead of anything written after it, durable once a full flush of that device is.
+    ordered: u64,
+    /// A trunk commit's WAL F_FULLFSYNC will make the journal durable up to this (lead review 1
+    /// item 6): a waiter it covers waits for it rather than lead an upgrade flight, a second
+    /// flusher on the same device. Cleared when the WAL is synced, and when the commit's gate
+    /// closes whether or not it was.
+    pending_full: Option<u64>,
     /// Observation only (fastest-engine M2): flights led outside the mutex, flushes taken under
     /// it, operations that waited, those already durable when they looked, upgrade flights, and
     /// the waits each flight released.
@@ -435,6 +445,21 @@ impl Group {
 
     fn durable(&self, class: SyncClass) -> u64 {
         self.lock().durable[class_index(class)]
+    }
+
+    /// An ordered flight's outcome (`BranchStore::order_for_trunk`): on success every byte below
+    /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so.
+    fn land_ordered(&self, end: u64, ok: bool) {
+        let mut g = self.lock();
+        g.flushing = false;
+        if ok {
+            g.durable[0] = g.durable[0].max(end);
+            g.ordered = g.ordered.max(end);
+        } else {
+            self.failed.store(true, Ordering::Release);
+            g.pending_full = None;
+        }
+        self.cv.notify_all();
     }
 
     /// Every byte below `end` is durable in `class` and every weaker one, by a rewrite of the log
@@ -961,6 +986,11 @@ pub(crate) const HOLD_FLIGHT_TAKEN: u8 = 5;
 /// here, its pre-image barrier done and its commit gate open, before its first frame.
 #[cfg(test)]
 pub(crate) const HOLD_TRUNK_BARRIER_DONE: u8 = 6;
+
+/// How long a waiter an ordered flight covers waits for the trunk commit's WAL flush before it
+/// leads an upgrade flight of its own (liveness, should that commit stall: its caller may be the
+/// thread that drives it).
+const PENDING_FULL_WAIT: Duration = Duration::from_millis(100);
 
 /// If the hook is at `stage`, mark the arrival and wait until it is moved (tests and the harness
 /// release it by storing 0).
@@ -2256,6 +2286,7 @@ impl BranchStore {
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
+            trunk_same_device: AtomicBool::new(false),
         }
     }
 
@@ -2441,6 +2472,7 @@ impl BranchStore {
             trunk_commit_hold: Arc::new(AtomicU8::new(0)),
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
+            trunk_same_device: AtomicBool::new(false),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -2958,6 +2990,22 @@ impl BranchStore {
                     }
                     if self.group.poisoned() {
                         return Err(group_poisoned());
+                    }
+                    // An ordered flight carries these bytes and a trunk commit's WAL flush is
+                    // about to make them durable (lead review 1 item 6): waited for, briefly,
+                    // rather than led past with an upgrade flight, a second flusher.
+                    if need > 0 && g.pending_full.is_some_and(|p| p >= lsn) {
+                        first = false;
+                        let (woken, timeout) = self
+                            .group
+                            .cv
+                            .wait_timeout(g, PENDING_FULL_WAIT)
+                            .unwrap_or_else(|e| e.into_inner());
+                        g = woken;
+                        if timeout.timed_out() && g.pending_full.is_some_and(|p| p >= lsn) && !g.flushing {
+                            break;
+                        }
+                        continue;
                     }
                     if !g.flushing {
                         break;
@@ -4187,6 +4235,14 @@ impl BranchStore {
     /// is this writer's open gate; an even one means its `begin_trunk_commit` refused before
     /// opening it.
     pub(crate) fn end_trunk_commit(&self) {
+        // The WAL flush that would have made an ordered flight durable did not come, or came and
+        // said so already: either way nothing waits on it any more.
+        {
+            let mut g = self.group.lock();
+            if g.pending_full.take().is_some() {
+                self.group.cv.notify_all();
+            }
+        }
         if self.trunk_commits.load(Ordering::Acquire) % 2 == 1 {
             self.trunk_commits.fetch_add(1, Ordering::AcqRel);
             let (lock, closed) = &self.gate_closed;
@@ -4355,7 +4411,13 @@ impl BranchStore {
             self.unsynced.store(false, Ordering::Release);
             return Ok(());
         }
-        let waited = self.wait_durable(target, class);
+        // A commit that F_FULLFSYNCs its WAL on the branch files' device needs its pre-images only
+        // ORDERED before its frames: that flush makes both durable (lead review 1 item 6).
+        let waited = if class == SyncClass::FullFsync && self.ordered_trunk() {
+            self.order_for_trunk(target)
+        } else {
+            self.wait_durable(target, class)
+        };
         let mut inner = self.inner.lock();
         match waited {
             Ok(()) => {
@@ -4379,6 +4441,134 @@ impl BranchStore {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Whether a trunk commit that F_FULLFSYNCs its WAL makes the branch files durable with it: Apple
+    /// (F_BARRIERFSYNC orders a device's writes, F_FULLFSYNC drains its whole cache), and the WAL on
+    /// the branch files' device (`note_trunk_wal`). Mutant `trunk_unordered` (test builds only).
+    fn ordered_trunk(&self) -> bool {
+        cfg!(target_vendor = "apple")
+            && self.trunk_same_device.load(Ordering::Acquire)
+            && !fe_mutant("trunk_unordered")
+    }
+
+    /// Record whether the trunk's WAL at `wal_path` is on the branch files' device (see
+    /// `ordered_trunk`): their directories' `st_dev`. Anything unknown reads as "not".
+    pub(crate) fn note_trunk_wal(&self, wal_path: &str) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let dev = |path: &std::path::Path| {
+                let dir = match path.parent() {
+                    Some(dir) if !dir.as_os_str().is_empty() => dir,
+                    _ => std::path::Path::new("."),
+                };
+                std::fs::metadata(dir).ok().map(|m| m.dev())
+            };
+            let log = self.inner.lock().files.as_ref().map(|f| f.log.clone());
+            let same = log.is_some_and(|log| {
+                let ours = dev(&log);
+                ours.is_some() && ours == dev(std::path::Path::new(wal_path))
+            });
+            self.trunk_same_device.store(same, Ordering::Release);
+        }
+        #[cfg(not(unix))]
+        let _ = wal_path;
+    }
+
+    /// Make the journal's first `lsn` bytes ORDERED ahead of a trunk commit's frames, leading an
+    /// ordered flight when nothing covers them (lead review 1 item 6): the arena and the log are
+    /// barriered, not flushed, and the commit's WAL F_FULLFSYNC makes them durable
+    /// (`trunk_wal_synced`). Called by that commit, holding the WAL write lock, so it is the only
+    /// trunk commit in flight; the flight it leads is marked pending until its WAL is synced.
+    fn order_for_trunk(&self, lsn: u64) -> Result<()> {
+        let full = class_index(SyncClass::FullFsync);
+        loop {
+            {
+                let mut g = self.group.lock();
+                loop {
+                    if g.durable[full] >= lsn || (g.ordered >= lsn && g.pending_full.is_some()) {
+                        return Ok(());
+                    }
+                    if self.group.poisoned() {
+                        return Err(group_poisoned());
+                    }
+                    if !g.flushing {
+                        break;
+                    }
+                    g = self.group.wait(g);
+                }
+            }
+            let flight = {
+                let mut inner = self.lock_counted();
+                let mut g = self.group.lock();
+                if g.durable[full] >= lsn || (g.ordered >= lsn && g.pending_full.is_some()) {
+                    return Ok(());
+                }
+                if self.group.poisoned() {
+                    return Err(group_poisoned());
+                }
+                if g.flushing {
+                    continue;
+                }
+                let upgrade = g.durable[0] >= lsn;
+                match Self::take_flight(&mut inner, SyncClass::FullFsync, upgrade) {
+                    Ok(Some(flight)) if !flight.is_empty() => {
+                        g.flushing = true;
+                        g.flights += 1;
+                        g.pending_full = Some(g.pending_full.unwrap_or(0).max(flight.end_lsn));
+                        flight.ordered()
+                    }
+                    Ok(_) => return Err(group_poisoned()),
+                    Err(e) => {
+                        self.group.fail(&mut g);
+                        return Err(e);
+                    }
+                }
+            };
+            let end = flight.end_lsn;
+            let written = flight.write();
+            self.group.land_ordered(end, written.is_ok());
+            written?;
+        }
+    }
+
+    /// Just before a trunk commit F_FULLFSYNCs its WAL (`Pager::commit_wal_inner`): order what was
+    /// buffered since its pre-image barrier — the forks that registered inside its gate — so that
+    /// flush carries them too, and return how far the branch journal is on the device ahead of it
+    /// (0: nothing rides). `trunk` is the class the WAL is synced in. A failed flight fail-stops
+    /// the store as any does; the commit, whose pre-images were ordered before, goes on.
+    pub(crate) fn order_riders(&self, trunk: SyncClass) -> u64 {
+        if trunk != SyncClass::FullFsync || !self.ordered_trunk() {
+            return 0;
+        }
+        let buffered = {
+            let inner = self.inner.lock();
+            inner.journal.as_ref().map_or(0, |j| if j.pending_len() > 0 { j.lsn() } else { 0 })
+        };
+        if buffered > 0 {
+            if let Err(e) = self.order_for_trunk(buffered) {
+                tracing::warn!("branch records not ordered ahead of a trunk WAL flush: {e}");
+            }
+        }
+        let g = self.group.lock();
+        g.ordered.max(g.durable[class_index(SyncClass::Fsync)])
+    }
+
+    /// The trunk commit's WAL F_FULLFSYNC returned: every journal byte below `frontier` (read by
+    /// `order_riders` before it was issued) is durable in every class.
+    pub(crate) fn trunk_wal_synced(&self, frontier: u64) {
+        if frontier == 0 {
+            return;
+        }
+        let mut g = self.group.lock();
+        for c in 0..=class_index(SyncClass::FullFsync) {
+            g.durable[c] = g.durable[c].max(frontier);
+        }
+        if g.pending_full.is_some_and(|p| p <= frontier) {
+            g.pending_full = None;
+        }
+        self.group.cv.notify_all();
     }
 
     /// Commit a branch's dirty pages: write each into the slot its copy decision reserved, buffer

@@ -1537,6 +1537,9 @@ pub struct Pager {
     /// took its copy decisions, cleared when the gate is closed (after publication, or when the
     /// write lock is released after a failed commit).
     trunk_gate_open: AtomicBool,
+    /// How far the branch journal was on the device when this commit issued its WAL F_FULLFSYNC
+    /// (`BranchStore::order_riders`): durable once that flush returns (lead review 1 item 6).
+    trunk_sync_frontier: AtomicU64,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1829,6 +1832,7 @@ impl Pager {
             trunk_pending: Mutex::new(TrunkPending::default()),
             trunk_pre_images: Mutex::new(HashMap::new()),
             trunk_gate_open: AtomicBool::new(false),
+            trunk_sync_frontier: AtomicU64::new(0),
         })
     }
 
@@ -4882,6 +4886,16 @@ impl Pager {
                     let sync_c = match pending {
                         Some(c) => Some(c),
                         None if sync_mode == SyncMode::Full && need_fsync => {
+                            // The branch records buffered since this commit's pre-image barrier ride
+                            // its WAL flush (lead review 1 item 6), and how far the branch journal is
+                            // on the device ahead of it is noted, to be marked durable when it returns.
+                            if let Some(store) = self.branch_store.get() {
+                                let frontier = store.order_riders(crate::branch::SyncClass::of_trunk(
+                                    sync_mode,
+                                    self.get_sync_type(),
+                                ));
+                                self.trunk_sync_frontier.store(frontier, Ordering::Release);
+                            }
                             let sync_c = wal.sync(self.get_sync_type())?;
                             self.commit_info.write().completions.push(sync_c.clone());
                             Some(sync_c)
@@ -4905,12 +4919,21 @@ impl Pager {
                                     sync_c.get_error()
                                 );
                             }
+                            self.trunk_sync_frontier.store(0, Ordering::Release);
                             return Err(LimboError::CompletionError(CompletionError::IOError(
                                 std::io::ErrorKind::Other,
                                 "sync",
                             )));
                         }
                         commit_info.completions.clear();
+                        // The WAL's F_FULLFSYNC drained the device: the branch journal noted before
+                        // it is durable too (lead review 1 item 6).
+                        let frontier = self.trunk_sync_frontier.swap(0, Ordering::AcqRel);
+                        if frontier > 0 {
+                            if let Some(store) = self.branch_store.get() {
+                                store.trunk_wal_synced(frontier);
+                            }
+                        }
                     }
                     let mut commit_info = self.commit_info.write();
                     if commit_info.prepared_frames.is_empty() {
