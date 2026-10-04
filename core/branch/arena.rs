@@ -305,6 +305,14 @@ impl Arena {
         }
     }
 
+    /// A slot handed out and never released here is free in the catalog now (a deferred free a
+    /// checkpoint listed; lead review 1 item 7): not in use, and not on the in-memory list.
+    pub(crate) fn forget_listed(&mut self, slot: Slot) {
+        turso_assert!(slot < self.high_water, "a listed slot past the high-water mark");
+        turso_assert!(!self.is_free(slot), "a deferred slot was already free");
+        self.in_use -= 1;
+    }
+
     /// Take `slots` off the in-memory free list if they are on it (a fuzzy checkpoint committed
     /// them to the catalog's free table: the catalog lists them free now). Not an allocation: the
     /// count in use does not change. Returns the slots that were NOT on the list.

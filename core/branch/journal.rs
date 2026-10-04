@@ -677,6 +677,38 @@ pub(crate) struct Journal {
     flight_synced_end: Option<u64>,
     /// The header's raised-class field must be rewritten by the next write (`raised` grew).
     header_stale: bool,
+    /// Every rewrite of the log file (a reset, a cut, a compaction) moves this: a cut prepared off
+    /// the store mutex (`prepare_cut`) is installed only over the log it was prepared from.
+    rewrites: u64,
+    /// The log was renamed into place by a cut whose directory entry is not yet synced: the next
+    /// flight syncs the directory before its own log sync, so nothing is acknowledged before the
+    /// rename is durable (review 2 #5: no directory sync under the store mutex).
+    dir_dirty: bool,
+}
+
+/// What a cut prepared off the store mutex copies (`Journal::cut_source`, read under it): the log's
+/// bytes up to `upto`, which nothing writes while the cut is prepared (the group's `cutting`).
+pub(crate) struct CutSource {
+    log: File,
+    upto: u64,
+    rewrites: u64,
+    format: u32,
+    page_size: u32,
+    raised: SyncClass,
+    class: SyncClass,
+    tmp: PathBuf,
+}
+
+/// A cut prepared off the store mutex (`Journal::prepare_cut`): the new log, as a temp file holding
+/// the header and the kept records `[from, upto)` of the old one as one flight, synced; locked.
+pub(crate) struct CutPrep {
+    file: File,
+    from: u64,
+    upto: u64,
+    rewrites: u64,
+    generation: u64,
+    /// Bytes after the header.
+    written: u64,
 }
 
 impl Journal {
@@ -744,6 +776,8 @@ impl Journal {
             synced_to: 0,
             flight_synced_end: None,
             header_stale: false,
+            rewrites: 0,
+            dir_dirty: false,
         })
     }
 
@@ -898,6 +932,8 @@ impl Journal {
             synced_to: 0,
             flight_synced_end: None,
             header_stale: false,
+            rewrites: 0,
+            dir_dirty: false,
         };
 
         let mut records = Vec::new();
@@ -1177,6 +1213,7 @@ impl Journal {
         }
         // From here the new file is the log.
         self.file = f;
+        self.rewrites += 1;
         self.generation = generation;
         self.len = LOG_HEADER_LEN as u64 + suffix.len() as u64;
         self.synced_to = if class.syncs() { self.len } else { 0 };
@@ -1194,6 +1231,120 @@ impl Journal {
                 return Err(e);
             }
         }
+        Ok(())
+    }
+
+    /// A cut's first phase, under the store mutex with no flight in the air and none to start (the
+    /// group's `cutting`): what `prepare_cut` copies off the mutex. `None` when the records the cut
+    /// keeps do not all lie in the file yet (some before `from` are still buffered): the install
+    /// then cuts the whole way under the mutex (`rewrite_from`).
+    pub(crate) fn cut_source(&self, from: u64) -> Result<Option<CutSource>> {
+        self.check_live()?;
+        if from < LOG_HEADER_LEN as u64 || from > self.len {
+            return Ok(None);
+        }
+        let log = self.file.try_clone().map_err(|e| io_error(e, "dup branch log"))?;
+        Ok(Some(CutSource {
+            log,
+            upto: self.len,
+            rewrites: self.rewrites,
+            format: self.format,
+            page_size: self.page_size,
+            raised: self.raised,
+            class: self.rewrite_class(),
+            tmp: self.files.log_tmp(),
+        }))
+    }
+
+    /// A cut's second phase, holding NO lock (review 1 item 7, review 2 #5): the records in
+    /// `[from, upto)` re-framed as one flight under a header of `generation`, written to the temp
+    /// log, synced in the rewrite class, and locked before it can become the log.
+    pub(crate) fn prepare_cut(src: CutSource, from: u64, generation: u64) -> Result<CutPrep> {
+        let mut kept = vec![0u8; (src.upto - from) as usize];
+        if !kept.is_empty() {
+            read_at(&src.log, &mut kept, from)?;
+        }
+        let mut suffix = record_frames(&kept)?;
+        if !suffix.is_empty() {
+            let end = flight_end_frame(LOG_HEADER_LEN as u64, LOG_HEADER_LEN as u64, &suffix);
+            suffix.extend_from_slice(&end);
+        }
+        let written = (|| -> Result<File> {
+            let f = open_rw(&src.tmp, true)?;
+            lock_exclusive(&f, &src.tmp)?;
+            write_at(&f, &log_header(src.format, src.page_size, generation, src.raised), 0)?;
+            if !suffix.is_empty() {
+                write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
+            }
+            if src.class.syncs() {
+                fsync_file(&f, src.class)?;
+            }
+            Ok(f)
+        })();
+        match written {
+            Ok(file) => Ok(CutPrep {
+                file,
+                from,
+                upto: src.upto,
+                rewrites: src.rewrites,
+                generation,
+                written: suffix.len() as u64,
+            }),
+            Err(e) => {
+                let _ = std::fs::remove_file(&src.tmp);
+                Err(e)
+            }
+        }
+    }
+
+    /// A cut's last phase, under the store mutex: `rewrite_from(from, generation)` with what
+    /// `prepare_cut` wrote. Only what reached the old log since (`[upto, len)`, written by a
+    /// synchronous flush while the cut was prepared, which group flights never are) is copied and
+    /// synced here; the rename's directory entry is synced by the next flight, before anything
+    /// is acknowledged (`dir_dirty`). A prep that no longer matches the log — rewritten since, or
+    /// for another cut — is dropped and the whole cut done here instead.
+    pub(crate) fn finish_cut(&mut self, prep: CutPrep, from: u64, generation: u64) -> Result<()> {
+        self.check_live()?;
+        let usable = prep.rewrites == self.rewrites
+            && prep.from == from
+            && prep.generation == generation
+            && prep.upto <= self.len
+            && !super::store::fe_mutant("cut_under_mutex");
+        if !usable {
+            drop(prep);
+            let _ = std::fs::remove_file(self.files.log_tmp());
+            return self.rewrite_from(from, generation);
+        }
+        let class = self.rewrite_class();
+        let mut len = LOG_HEADER_LEN as u64 + prep.written;
+        if self.len > prep.upto {
+            let mut delta = vec![0u8; (self.len - prep.upto) as usize];
+            read_at(&self.file, &mut delta, prep.upto)?;
+            let mut frames = record_frames(&delta)?;
+            if !frames.is_empty() {
+                let end = flight_end_frame(len, len, &frames);
+                frames.extend_from_slice(&end);
+                write_at(&prep.file, &frames, len)?;
+                if class.syncs() {
+                    fsync_file(&prep.file, class)?;
+                }
+                len += frames.len() as u64;
+            }
+        }
+        if let Err(e) = std::fs::rename(self.files.log_tmp(), &self.files.log) {
+            let _ = std::fs::remove_file(self.files.log_tmp());
+            return Err(io_error(e, "rename branch log rewrite"));
+        }
+        // From here the new file is the log.
+        self.file = prep.file;
+        self.rewrites += 1;
+        self.generation = generation;
+        self.len = len;
+        self.synced_to = if class.syncs() { self.len } else { 0 };
+        self.flight_synced_end = None;
+        self.header_stale = false;
+        self.snapshot_len = 0;
+        self.dir_dirty = class.syncs();
         Ok(())
     }
 
@@ -1304,6 +1455,13 @@ impl Journal {
         self.land_flight();
         self.note_class(class);
         let header = self.take_header_patch();
+        let dir = match self.take_dirty_dir(class) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
         // One flight: the buffered frames and their end frame, in one write.
         let mut frames = Vec::with_capacity(self.pending.len() + 32);
         frames.extend_from_slice(&self.pending);
@@ -1313,7 +1471,7 @@ impl Journal {
                 "failpoint: a branch log write failed".to_string(),
             ))
         } else {
-            self.write_frames(arena, class, &frames, header)
+            self.write_frames(arena, class, &frames, header, dir.as_ref())
         };
         match written {
             Ok(()) => {
@@ -1339,6 +1497,7 @@ impl Journal {
         class: SyncClass,
         frames: &[u8],
         header: Option<[u8; 4]>,
+        dir: Option<&File>,
     ) -> Result<()> {
         // Append only where this journal believes the log ends. A log that is longer than that was
         // written by someone else: writing at the stale offset would cut their records off at the
@@ -1358,6 +1517,9 @@ impl Journal {
             write_at(&self.file, &raised, HEADER_RAISED_AT)?;
         }
         write_at(&self.file, frames, self.len)?;
+        if let Some(dir) = dir {
+            fsync_file(dir, SyncClass::Fsync)?;
+        }
         if class.syncs() {
             fsync_file(&self.file, class)?;
         }
@@ -1418,6 +1580,7 @@ impl Journal {
                 end_lsn,
                 header: None,
                 ordered: false,
+                dir: None,
             });
         }
         // A flight that cannot be taken fail-stops the journal (review B-F1): its operations are
@@ -1455,6 +1618,14 @@ impl Journal {
                 return Err(e);
             }
         };
+        // A cut's rename is made durable by this flight, before its own log sync (`dir_dirty`).
+        let dir = match self.take_dirty_dir(class) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.set_poisoned();
+                return Err(e);
+            }
+        };
         self.note_class(class);
         let header = self.take_header_patch();
         let mut bytes = std::mem::take(&mut self.pending);
@@ -1479,7 +1650,22 @@ impl Journal {
             end_lsn,
             header,
             ordered: false,
+            dir,
         })
+    }
+
+    /// The log's directory, to sync before a log sync in `class` that follows a cut (`dir_dirty`).
+    fn take_dirty_dir(&mut self, class: SyncClass) -> Result<Option<File>> {
+        if !self.dir_dirty || !class.syncs() {
+            return Ok(None);
+        }
+        let dir = match self.files.log.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let d = File::open(dir).map_err(|e| io_error(e, "open branch directory"))?;
+        self.dir_dirty = false;
+        Ok(Some(d))
     }
 
     /// The flight in the air landed (see `flight_synced_end`).
@@ -1568,6 +1754,7 @@ impl Journal {
     fn reset_log(&mut self, generation: u64) -> Result<()> {
         let class = self.rewrite_class();
         let header = log_header(self.format, self.page_size, generation, self.raised);
+        self.rewrites += 1;
         set_file_len(&self.file, 0)?;
         write_at(&self.file, &header, 0)?;
         if class.syncs() {
@@ -1672,6 +1859,9 @@ pub(crate) struct Flight {
     /// ORDERED, not synced (lead review 1 item 6): the log is barriered, not flushed, and a trunk
     /// commit's own F_FULLFSYNC of its WAL, on the same device, makes the flight durable.
     ordered: bool,
+    /// The log's directory after a cut renamed the log into place (`Journal::dir_dirty`): synced
+    /// before the log, so the flight's own flush makes the rename durable too.
+    dir: Option<File>,
 }
 
 impl Flight {
@@ -1712,6 +1902,9 @@ impl Flight {
         after_pwrite();
         // After mutant M-b's early acknowledgement, before the log's sync.
         super::store::kill_point("flight.before_log_sync");
+        if let Some(dir) = &self.dir {
+            fsync_file(dir, SyncClass::Fsync)?;
+        }
         if syncs && !self.ordered {
             fsync_file(&log, self.class)?;
         }

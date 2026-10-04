@@ -378,6 +378,10 @@ struct GroupState {
     /// flusher on the same device. Cleared when the WAL is synced, and when the commit's gate
     /// closes whether or not it was.
     pending_full: Option<u64>,
+    /// A fuzzy checkpoint is copying the log for its cut, off the store mutex (`begin_cut`): no
+    /// group flight starts until its install, so the bytes it copies stay the log's last ones.
+    /// (A synchronous flush under the store mutex still may: the install copies what it wrote.)
+    cutting: bool,
     /// Observation only (fastest-engine M2): flights led outside the mutex, flushes taken under
     /// it, operations that waited, those already durable when they looked, upgrade flights, and
     /// the waits each flight released.
@@ -1917,6 +1921,13 @@ struct Captured {
     taken: Vec<Slot>,
     free_list: Vec<Slot>,
     reserved: Vec<Slot>,
+    /// Slots freed by early-released operations whose records were not yet durable at the
+    /// capture (`StoreInner::pending_free`, all at or below `deferred_lsn`): the capture's state
+    /// does not name them, so the catalog lists them free, and its commit makes their releases
+    /// durable. They stay out of the allocator until the install takes them out of memory; a
+    /// failed write leaves them waiting for their flight (lead review 1 item 7).
+    deferred: Vec<Slot>,
+    deferred_lsn: u64,
     meta: Meta,
     /// `ChildIndex` keys (children forked, and removal links) as of the capture.
     child_keys: Vec<(u64, u64)>,
@@ -2004,7 +2015,7 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         for &slot in &cap.taken {
             catalog.free_delete(slot)?;
         }
-        for &slot in cap.free_list.iter().chain(cap.reserved.iter()) {
+        for &slot in cap.free_list.iter().chain(cap.reserved.iter()).chain(cap.deferred.iter()) {
             catalog.free_put(slot)?;
         }
         catalog.put_meta(&cap.meta)
@@ -2080,13 +2091,16 @@ fn run_flight(
     if written.is_ok() {
         pause_at(Some(&*hold), HOLD_AFTER_COMMIT);
     }
+    // The cut's copy and sync, holding no lock (lead review 1 item 7): what it keeps of the log is
+    // fixed while it runs (no group flight starts), and the install below only renames it in.
+    let cut = written.as_ref().ok().and_then(|()| begin_cut(&inner, &group, &cap));
     let installed = {
         let mut guard = inner.lock();
         // The install cuts the log: no group flight may be writing it (fastest-engine M1 item 2),
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
         let t = Instant::now();
-        let installed = guard.checkpoint_install(cap, written);
+        let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
         if installed.is_ok() {
             if let Some(journal) = guard.journal.as_ref() {
                 group.mark_durable(journal.lsn() - journal.pending_len(), journal.sync_class());
@@ -2105,6 +2119,8 @@ fn run_flight(
         signal.notify_all();
         installed
     };
+    // Flights go on, into the new log.
+    drop(cut);
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
@@ -2119,6 +2135,96 @@ fn run_flight(
             }
         }
         Err(e) => tracing::warn!("branch catalog fuzzy checkpoint failed: {e}"),
+    }
+}
+
+/// A cut being prepared (`begin_cut`): holds the group's `cutting` until dropped, so no group flight
+/// writes the log while its kept part is copied, however the checkpoint ends.
+struct CutGate<'a> {
+    group: &'a Group,
+    prep: std::cell::Cell<Option<super::journal::CutPrep>>,
+}
+
+impl CutGate<'_> {
+    /// The prepared cut, for the install (once).
+    fn take(&self) -> Option<super::journal::CutPrep> {
+        self.prep.take()
+    }
+}
+
+impl Drop for CutGate<'_> {
+    fn drop(&mut self) {
+        let mut g = self.group.lock();
+        g.cutting = false;
+        self.group.cv.notify_all();
+    }
+}
+
+/// A fuzzy checkpoint's cut, after its catalog commit and before its install, holding no lock but
+/// briefly the store mutex (lead review 1 item 7, review 2 #5): wait — not holding the mutex — for
+/// no flight to be in the air; fly first what of the capture is still buffered; then stop group
+/// flights (`cutting`) and copy the kept part of the log into the temp log and sync it
+/// (`Journal::prepare_cut`). `None` (nothing prepared, the install cuts under the mutex as
+/// before): a poisoned store, a failed copy, or a log that changed under the capture.
+fn begin_cut<'a>(inner: &StoreMutex, group: &'a Group, cap: &Captured) -> Option<CutGate<'a>> {
+    loop {
+        let src = {
+            let mut guard = inner.lock();
+            let g = group.lock();
+            if group.poisoned() {
+                return None;
+            }
+            if g.flushing || g.cutting {
+                drop(guard);
+                drop(group.wait(g));
+                continue;
+            }
+            let buffered = guard.journal.as_ref()?.log_len() < cap.log_from;
+            if buffered {
+                // What the capture covers is still partly buffered: one flight writes it, as any
+                // leader would, and the cut is tried again after it lands.
+                let class = guard.journal.as_ref()?.sync_class();
+                let mut g = g;
+                let flight = match BranchStore::take_flight(&mut guard, class, false) {
+                    Ok(Some(flight)) if !flight.is_empty() => flight,
+                    Ok(_) => return None,
+                    Err(e) => {
+                        group.fail(&mut g);
+                        tracing::warn!("branch log cut not prepared: {e}");
+                        return None;
+                    }
+                };
+                g.flushing = true;
+                drop(g);
+                drop(guard);
+                let (end, class) = (flight.end_lsn, flight.class);
+                let written = flight.write();
+                group.land(end, class, written.is_ok());
+                if written.is_err() {
+                    return None;
+                }
+                continue;
+            }
+            let src = match guard.journal.as_ref()?.cut_source(cap.log_from) {
+                Ok(Some(src)) => src,
+                _ => return None,
+            };
+            let mut g = g;
+            g.cutting = true;
+            src
+        };
+        let gate = CutGate {
+            group,
+            prep: std::cell::Cell::new(None),
+        };
+        match Journal::prepare_cut(src, cap.log_from, cap.generation) {
+            Ok(prep) => gate.prep.set(Some(prep)),
+            Err(e) => {
+                tracing::warn!("branch log cut not prepared off the store mutex: {e}");
+                return None;
+            }
+        }
+        return Some(gate);
     }
 }
 
@@ -3125,12 +3231,16 @@ impl BranchStore {
                             .wait_timeout(g, PENDING_FULL_WAIT)
                             .unwrap_or_else(|e| e.into_inner());
                         g = woken;
-                        if timeout.timed_out() && g.pending_full.is_some_and(|p| p >= lsn) && !g.flushing {
+                        if timeout.timed_out()
+                            && g.pending_full.is_some_and(|p| p >= lsn)
+                            && !g.flushing
+                            && !g.cutting
+                        {
                             break;
                         }
                         continue;
                     }
-                    if !g.flushing {
+                    if !g.flushing && !g.cutting {
                         break;
                     }
                     first = false;
@@ -3148,7 +3258,7 @@ impl BranchStore {
                 if self.group.poisoned() {
                     return Err(group_poisoned());
                 }
-                if g.flushing {
+                if g.flushing || g.cutting {
                     continue;
                 }
                 // Written already in a weaker class: only an upgrade can make it durable in `class`.
@@ -3496,12 +3606,17 @@ impl BranchStore {
                 return false;
             }
         }
-        // Group commit (fastest-engine M1 item 2): everything buffered durable and every deferred
-        // free matured, so the free table this checkpoint writes lists them.
-        if let Err(e) = self.settle_durable(inner) {
-            tracing::warn!("branch catalog checkpoint not started: {e}");
-            return false;
+        // Nothing is flushed for the capture (lead review 1 item 7): what is buffered is in it, and
+        // the catalog's commit makes it durable; the frees still waiting for a flight are listed
+        // free in the catalog and taken out of memory only at the install (`Captured::deferred`).
+        // Mutant `settle_at_capture` (test builds only): the flush under the mutex, as before.
+        if fe_mutant("settle_at_capture") {
+            if let Err(e) = self.settle_durable(inner) {
+                tracing::warn!("branch catalog checkpoint not started: {e}");
+                return false;
+            }
         }
+        self.mature(inner);
         let t = Instant::now();
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
         let cap = match inner.checkpoint_capture_mode(false, true) {
@@ -3567,11 +3682,10 @@ impl BranchStore {
 
     fn compact(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
         if inner.cat.is_some() {
-            // Everything buffered durable and every deferred free matured first, so the free table
-            // the checkpoint writes lists them (group commit, fastest-engine M1 item 2); then no
-            // flight is in the air while it cuts the log, and none can start (this holds the
-            // store mutex).
-            self.settle_durable(inner)?;
+            // No flight is in the air while it cuts the log, and none can start (this holds the
+            // store mutex). What is buffered, and the frees waiting for it, the capture takes
+            // (`Captured::deferred`).
+            self.mature(inner);
             drop(self.group.quiesce());
             inner.checkpoint_catalog(fail_after_rename)?;
             if let Some(journal) = inner.journal.as_ref() {
@@ -4651,7 +4765,7 @@ impl BranchStore {
                     if self.group.poisoned() {
                         return Err(group_poisoned());
                     }
-                    if !g.flushing {
+                    if !g.flushing && !g.cutting {
                         break;
                     }
                     g = self.group.wait(g);
@@ -4666,7 +4780,7 @@ impl BranchStore {
                 if self.group.poisoned() {
                     return Err(group_poisoned());
                 }
-                if g.flushing {
+                if g.flushing || g.cutting {
                     continue;
                 }
                 let upgrade = g.durable[0] >= lsn;
@@ -6330,7 +6444,7 @@ impl StoreInner {
         kill_point("ckpt.written");
         let wrote = w.counters.queries - w0;
         cap.shape_rows_written = w.counters.rows_written - r0;
-        let installed = self.checkpoint_install(cap, written);
+        let installed = self.checkpoint_install(cap, written, None);
         kill_point("ckpt.installed");
         if installed.is_ok() {
             truncate_catalog_wal(&mut w);
@@ -6449,6 +6563,17 @@ impl StoreInner {
             return Err(e);
         }
         let log_from = journal.mark();
+        let deferred: Vec<Slot> = self.pending_free.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+        let deferred_lsn = journal.lsn();
+        // fastest-engine mutant `deferred_matured_at_capture` (test builds only): the capture hands
+        // the deferred frees to the allocator at once, before their releases are durable (rule 2).
+        if fe_mutant("deferred_matured_at_capture") {
+            for (_, slots) in std::mem::take(&mut self.pending_free) {
+                for slot in slots {
+                    arena.release(slot);
+                }
+            }
+        }
         let meta = Meta {
             generation,
             page_size: journal.page_size() as u32,
@@ -6457,7 +6582,7 @@ impl StoreInner {
             trunk_children: self.trunk.lineage.n_children,
             lease_now_ms: now,
             arena_hw: arena.high_water(),
-            in_use: (arena.in_use() - reserved.len()) as u64,
+            in_use: (arena.in_use() - reserved.len() - deferred.len()) as u64,
             states: self.n_states,
             format: super::journal::format_version(self.splice),
         };
@@ -6510,6 +6635,8 @@ impl StoreInner {
             taken: cat.taken.iter().copied().collect(),
             free_list: arena.free_list().to_vec(),
             reserved,
+            deferred,
+            deferred_lsn,
             meta,
             child_keys: self.children.map.keys().copied().collect(),
             child_removed: self.children.removed.keys().copied().collect(),
@@ -6542,7 +6669,12 @@ impl StoreInner {
     /// cut the log to what follows the capture and take out of memory exactly what the catalog now
     /// holds — nothing that changed since the capture. If it did not commit, what the capture swapped
     /// out is dirty again and nothing else has changed.
-    fn checkpoint_install(&mut self, cap: Box<Captured>, written: Result<()>) -> Result<()> {
+    fn checkpoint_install(
+        &mut self,
+        cap: Box<Captured>,
+        written: Result<()>,
+        prepared: Option<super::journal::CutPrep>,
+    ) -> Result<()> {
         let Some(cat) = self.cat.as_mut() else {
             return written;
         };
@@ -6587,7 +6719,10 @@ impl StoreInner {
         }
         // A failure before its rename leaves the old log in use, whose checkpoint marker says
         // where recovery cuts it: correct, only longer. The install below must happen either way.
-        let rewritten = journal.rewrite_from(cap.log_from, cap.generation);
+        let rewritten = match prepared {
+            Some(prep) => journal.finish_cut(prep, cap.log_from, cap.generation),
+            None => journal.rewrite_from(cap.log_from, cap.generation),
+        };
         for id in &cap.removed {
             cat.removed.remove(id);
         }
@@ -6621,11 +6756,28 @@ impl StoreInner {
         // free table is not read while a checkpoint is in flight, so nothing on the list came from
         // it after the capture.)
         if let Some(arena) = self.arena.as_mut() {
+            // The deferred frees the catalog now lists, still waiting for their flight: free in the
+            // catalog, so out of memory (their releases are durable with it). One that matured
+            // since the capture is on the in-memory list, and leaves it below like any listed slot.
+            let mut still_deferred: HashSet<Slot> = HashSet::new();
+            while self
+                .pending_free
+                .front()
+                .is_some_and(|&(lsn, _)| lsn <= cap.deferred_lsn)
+            {
+                let (_, slots) = self.pending_free.pop_front().expect("just looked");
+                for slot in slots {
+                    arena.forget_listed(slot);
+                    still_deferred.insert(slot);
+                }
+            }
             let listed: HashSet<Slot> = cap
                 .free_list
                 .iter()
                 .chain(cap.reserved.iter())
+                .chain(cap.deferred.iter())
                 .copied()
+                .filter(|slot| !still_deferred.contains(slot))
                 .collect();
             cat.taken = arena.remove_free(&listed).into_iter().collect();
         }

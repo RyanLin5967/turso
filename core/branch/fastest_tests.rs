@@ -2004,3 +2004,75 @@ fn a_checkpoint_issues_no_sync_inside_the_store_mutex() {
         assert_eq!(under, 0, "class={class:?}: {ran} checkpoints issued {under} syncs inside the store mutex");
     }
 }
+
+/// Lead review 1 item 7, rule 2 under the new capture: a fuzzy checkpoint captured while a release's
+/// flight is still in the air neither waits for that flight nor frees what the release frees: the
+/// slots stay out of the allocator until the release is durable, and then are free exactly once —
+/// not in use, after the install and after a reopen. Mutant `deferred_matured_at_capture` must
+/// fail it; at the head before item 7 the capture waited for the flight.
+#[test]
+fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("deferred.db");
+    let (owned, incarnation) = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let x = trunk.fork_branch().unwrap();
+        write_v(&x.connect().unwrap(), 3, "x");
+        let owned = x.owned_slots();
+        assert!(!owned.is_empty(), "premise: the branch owns a slot");
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let release = std::thread::spawn(move || x.reap().map(|_| ()));
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let starter = {
+            let db = db.clone();
+            std::thread::spawn(move || db.branch_checkpoint_fuzzy_now())
+        };
+        let t = std::time::Instant::now();
+        while !starter.is_finished() && t.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !starter.is_finished() {
+            // The capture is waiting for the flight, holding the store mutex: let it go first.
+            hold.store(0, std::sync::atomic::Ordering::Release);
+            let _ = release.join();
+            let _ = starter.join();
+            panic!("the capture waited for a flight in the air");
+        }
+        for slot in &owned {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "slot {slot} was freed before the release that frees it was durable"
+            );
+        }
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        release.join().unwrap().unwrap();
+        assert!(starter.join().unwrap().unwrap(), "premise: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        let in_use = db.branch_slots_in_use();
+        for slot in &owned {
+            assert!(!in_use.contains(slot), "slot {slot} is still in use after its release");
+        }
+        (owned, db.incarnation)
+    };
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    let in_use = db.branch_slots_in_use();
+    for slot in &owned {
+        assert!(!in_use.contains(slot), "slot {slot} is in use after a reopen");
+    }
+    // Free exactly once: reused by new branches without two of them sharing it.
+    let trunk = db.connect().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..8 {
+        let b = trunk.fork_branch().unwrap();
+        write_v(&b.connect().unwrap(), 1 + i, "y");
+        for s in b.owned_slots() {
+            assert!(seen.insert(s), "slot {s} handed to two live branches");
+        }
+        let _ = b.into_id();
+    }
+}
