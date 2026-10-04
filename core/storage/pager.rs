@@ -3337,6 +3337,7 @@ impl Pager {
                         false
                     };
                     self.close_trunk_gate();
+                    crate::branch::store::kill_point("trunk.published");
 
                     wal.end_write_tx();
                     wal.end_read_tx();
@@ -4807,6 +4808,7 @@ impl Pager {
                 // to ensure durability in the case of partial writes is to ensure the pwritev
                 // completes before the fsync is submitted.
                 CommitState::WaitSync => {
+                    crate::branch::store::kill_point("trunk.wal_written");
                     // A pending completion means a previous entry into this
                     // state already submitted the fsync; wait on it instead
                     // of submitting a second one. At most one fsync is ever in

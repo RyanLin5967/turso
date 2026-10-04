@@ -1286,6 +1286,7 @@ impl Journal {
             self.poisoned = true;
             io_error(e, "rename branch snapshot")
         })?;
+        super::store::kill_point("compact.renamed");
         // From here the snapshot is the truth; the old log is stale by generation.
         if self.sync.syncs() {
             if let Err(e) = fsync_dir_of(&self.files.snap, self.sync) {
@@ -1390,6 +1391,12 @@ pub(crate) struct Flight {
 impl Flight {
     /// Arena first, then the frames, then the log: the order `Journal::flush` keeps.
     pub(crate) fn write(self) -> Result<()> {
+        self.write_with(|| {})
+    }
+
+    /// `write`, running `after_pwrite` between the frames' write and the log's sync (mutant M-b's
+    /// seam: an acknowledgement there is an ack after the pwrite and before the sync).
+    pub(crate) fn write_with(self, after_pwrite: impl FnOnce()) -> Result<()> {
         if self.fail {
             return Err(LimboError::InternalError(
                 "failpoint: a branch log write failed".to_string(),
@@ -1398,17 +1405,24 @@ impl Flight {
         let Some(log) = self.log else {
             return Ok(());
         };
-        if self.class.syncs() {
+        // Mutant M-a (PREREG v1 amendment 36): the sync removed (the frames are written, never
+        // synced). Caught by V1 (0 F_FULLFSYNC per create) and C1b, not by SIGKILL.
+        let syncs = self.class.syncs() && !super::store::fe_mutant("no_flight_sync");
+        if syncs {
             if let Some(arena) = &self.arena {
                 fsync_file(arena, self.class)?;
             }
         }
+        super::store::kill_point("flight.arena_synced");
         if !self.bytes.is_empty() {
             write_at(&log, &self.bytes, self.at)?;
         }
-        if self.class.syncs() {
+        super::store::kill_point("flight.log_written");
+        after_pwrite();
+        if syncs {
             fsync_file(&log, self.class)?;
         }
+        super::store::kill_point("flight.log_synced");
         Ok(())
     }
 

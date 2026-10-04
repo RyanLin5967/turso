@@ -1013,3 +1013,57 @@ fn a_fork_with_an_attached_database_is_refused() {
         assert!(trunk.fork_branch().is_ok(), "catalog={catalog}: refused after the DETACH");
     }
 }
+
+/// K10-D6 (mutant M-f `gate_admits_inflight`): a fork that arrives while a trunk commit is inside
+/// its commit gate — its copy decisions taken without the fork, its frames not yet published — must
+/// not register until the commit is published, or the child would read the commit's pages one way
+/// before the publication and another after it. A hook holds a commit inside its gate while another
+/// thread forks and reads at once; the child's first read must equal every later one (and, since
+/// the fork registers only after the commit, show the commit).
+#[test]
+fn a_fork_waits_out_a_trunk_commit_inside_its_gate() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("gate.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let first = a.fork_branch().unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_TRUNK_DECIDED, std::sync::atomic::Ordering::Release);
+        let writer = {
+            let a = a.clone();
+            std::thread::spawn(move || write_v(&a, 7, "c1"))
+        };
+        let arrived = super::store::HOLD_TRUNK_DECIDED | super::store::HOLD_ARRIVED;
+        let started = std::time::Instant::now();
+        while hold.load(std::sync::atomic::Ordering::Acquire) != arrived {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "the commit never reached its gate hold");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let forker = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let b = db.connect().unwrap();
+                let child = b.fork_branch().unwrap();
+                let first_read = read_wide(&child.connect().unwrap(), 7);
+                (child.into_id(), first_read)
+            })
+        };
+        // Well inside GATE_WAIT: a fork that waits for the gate is still waiting when released.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        writer.join().unwrap();
+        let (child, first_read) = forker.join().unwrap();
+        let b = db.branch(child).unwrap();
+        let later = read_wide(&b.connect().unwrap(), 7);
+        assert_eq!(
+            first_read, later,
+            "catalog={catalog}: the child read a trunk commit's page before its publication and after it"
+        );
+        assert_eq!(later, "c1", "catalog={catalog}: the child registered inside the commit's gate");
+        write_v(&a, 7, "c2");
+        assert_eq!(read_wide(&b.connect().unwrap(), 7), "c1", "catalog={catalog}: moved after a later commit");
+        drop(first);
+    }
+}

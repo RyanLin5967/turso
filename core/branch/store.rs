@@ -295,6 +295,10 @@ pub(crate) struct BranchStore {
     group: Arc<Group>,
     /// The store's class, fixed at open (`Off` when volatile), readable without the mutex.
     class: SyncClass,
+    /// Test hook: while it holds `HOLD_TRUNK_DECIDED`, a trunk commit waits inside its commit gate
+    /// (see `pause_at`), so a test can act on the store with the gate open.
+    #[cfg(test)]
+    pub(crate) trunk_commit_hold: Arc<AtomicU8>,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -913,6 +917,11 @@ pub(crate) const HOLD_AFTER_COMMIT: u8 = 3;
 
 /// Or-ed into the hook's stage once the flight has arrived there (tests wait for it).
 pub(crate) const HOLD_ARRIVED: u8 = 0x80;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`): a trunk commit waits here, its copy
+/// decisions taken and its commit gate OPEN, before its barrier and its first frame.
+#[cfg(test)]
+pub(crate) const HOLD_TRUNK_DECIDED: u8 = 4;
 
 /// If the hook is at `stage`, mark the arrival and wait until it is moved (tests and the harness
 /// release it by storing 0).
@@ -1970,6 +1979,68 @@ pub(crate) fn fe_mutant(name: &str) -> bool {
     }
 }
 
+/// fastest-engine C1 (the SIGKILL crash harness, PREREG v1 §8): a named code point a crash test
+/// can aim a kill at. TEST BUILDS ONLY, and inert unless `FE_KILL_AT=<point>:<n>` is set: the n-th
+/// time this process reaches `point`, it appends `KILL-AT <point> <n>` to the file `FE_CRASH_LOG`
+/// names (the harness's own record, read after the kill) and SIGKILLs itself on the spot, which no
+/// destructor, flush or unwinding outlives.
+#[inline]
+pub(crate) fn kill_point(name: &'static str) {
+    #[cfg(all(test, unix))]
+    kill_point_aimed(name);
+    #[cfg(not(all(test, unix)))]
+    let _ = name;
+}
+
+#[cfg(all(test, unix))]
+fn kill_point_aimed(name: &str) {
+    static AIM: std::sync::OnceLock<Option<(String, u64)>> = std::sync::OnceLock::new();
+    static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let aim = AIM.get_or_init(|| {
+        let v = std::env::var("FE_KILL_AT").ok()?;
+        let (point, n) = v.rsplit_once(':')?;
+        Some((point.to_string(), n.parse().ok()?))
+    });
+    let Some((point, n)) = aim.as_ref() else {
+        return;
+    };
+    if point != name {
+        return;
+    }
+    if HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == *n {
+        crash_log(&format!("KILL-AT {name} {n}"));
+        // SAFETY: signals this process; nothing after it runs.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+}
+
+/// Append one line to the file `FE_CRASH_LOG` names, with one `write(2)` (O_APPEND), so it is in
+/// the file before the caller's next step, whatever kill follows. Test builds only.
+#[cfg(all(test, unix))]
+pub(crate) fn crash_log(line: &str) {
+    use std::io::Write as _;
+    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let log = LOG.get_or_init(|| {
+        let path = std::env::var_os("FE_CRASH_LOG")?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(std::sync::Mutex::new)
+    });
+    if let Some(log) = log {
+        let mut f = log.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+}
+
 fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
@@ -2041,6 +2112,8 @@ impl BranchStore {
             holds: ForkHoldCounters::new(),
             group: Arc::new(Group::new(0)),
             class: SyncClass::Off,
+            #[cfg(test)]
+            trunk_commit_hold: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -2157,6 +2230,7 @@ impl BranchStore {
                         let mut ignored = Vec::new();
                         let t = Instant::now();
                         for record in &recovered.records {
+                            kill_point("recover.replay");
                             inner.replay(record, &mut ignored)?;
                         }
                         stats.replay_ns = ns(t);
@@ -2219,6 +2293,8 @@ impl BranchStore {
         let mut store = Self {
             group: Arc::new(Group::new(opened_lsn)),
             class: inner.sync,
+            #[cfg(test)]
+            trunk_commit_hold: Arc::new(AtomicU8::new(0)),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -2380,6 +2456,7 @@ impl BranchStore {
             }
             inner.replay_pos = pos;
             let mut freed = Vec::new();
+            kill_point("recover.replay");
             inner.replay(record, &mut freed)?;
             // A parked Commit applied during this record (C-R) freed its slots here, in order.
             freed.append(&mut inner.deferred_freed);
@@ -2702,7 +2779,9 @@ impl BranchStore {
     /// is in the air: an ordinary one if anything is buffered, an UPGRADE one if the bytes were made
     /// durable only in a weaker class (see [`Group`]). Called WITHOUT the store mutex.
     pub(crate) fn wait_durable(&self, lsn: u64, class: SyncClass) -> Result<()> {
-        if lsn == 0 {
+        // Mutant M-c (PREREG v1 amendment 36): the operation is acknowledged before its records
+        // are even written.
+        if lsn == 0 || fe_mutant("ack_before_pwrite") {
             return Ok(());
         }
         let need = class_index(class);
@@ -2765,8 +2844,15 @@ impl BranchStore {
                     }
                 }
             };
+            kill_point("flight.taken");
             let (end, flight_class) = (flight.end_lsn, flight.class);
-            let written = flight.write();
+            // Mutant M-b (PREREG v1 amendment 36): the waiters are acknowledged after the pwrite
+            // and before the sync. Caught by C1b and V2, not by SIGKILL.
+            let written = if fe_mutant("ack_before_sync") {
+                flight.write_with(|| self.group.mark_durable(end, flight_class))
+            } else {
+                flight.write()
+            };
             if written.is_err() {
                 // Poison the group first (waking the waiters, some of whom hold the store mutex
                 // while they wait), then the journal under the mutex.
@@ -2777,6 +2863,7 @@ impl BranchStore {
                 return written;
             }
             self.group.land(end, flight_class, true);
+            kill_point("flight.landed");
         }
     }
 
@@ -3268,7 +3355,10 @@ impl BranchStore {
             if inner.trunk.lineage.n_children == 0 {
                 return Ok(TrunkFork::NeedsWriterLock);
             }
-            if seen % 2 == 1 || self.trunk_commits.load(Ordering::Acquire) != seen {
+            // Mutant M-f (PREREG v1 amendment 36): the gate admits a fork while a trunk commit is
+            // between its decisions and its publication, or after one it did not see.
+            let gate_moved = seen % 2 == 1 || self.trunk_commits.load(Ordering::Acquire) != seen;
+            if gate_moved && !fe_mutant("gate_admits_inflight") {
                 inner.work.trunk_fork_gate_retries += 1;
                 return Ok(TrunkFork::Retry);
             }
@@ -3295,6 +3385,7 @@ impl BranchStore {
         }
         inner.apply_fork_lease(id, lease);
         self.sync_trunk_children(&inner);
+        kill_point("fork.applied");
         let work = &mut inner.work;
         work.trunk_forks += 1;
         if seen.is_some() {
@@ -3533,6 +3624,7 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let class = inner.sync;
         drop(inner);
+        kill_point("release.applied");
         if let Err(e) = self.wait_durable(lsn, class) {
             // Applied in memory and not durable: the store is fail-stopped, and the slots it freed
             // never return (no flight will cover them); the branch comes back at the next open.
@@ -3793,6 +3885,10 @@ impl BranchStore {
             inner.work.trunk_pre_images_captured += 1;
             self.decide_trunk_page(&mut inner, page, pre_image, epoch)?;
         }
+        drop(inner);
+        kill_point("trunk.decided");
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_DECIDED);
         Ok(())
     }
 
@@ -3838,6 +3934,9 @@ impl BranchStore {
             let StoreInner { children, cat, .. } = &mut *inner;
             children.any_in(cat.as_mut().map(|c| &mut c.catalog), BranchId::TRUNK, born, epoch)?
         };
+        // Mutant M-e (PREREG v1 amendment 36): a trunk commit skips the TrunkRetain of a page a
+        // live branch reads.
+        let keep = keep && !fe_mutant("skip_trunk_retain");
         if keep {
             inner.refill_free()?;
             inner.work.trunk_pre_images_retained += 1;
@@ -3975,6 +4074,8 @@ impl BranchStore {
                 }
                 self.unsynced.store(false, Ordering::Release);
                 self.maybe_compact(&mut inner);
+                drop(inner);
+                kill_point("trunk.barrier_done");
                 Ok(())
             }
             // Only stamps were at stake: a trunk commit does not fail because its stamp could not
@@ -4066,6 +4167,7 @@ impl BranchStore {
                 inner.lease.queued(now);
             }
         }
+        kill_point("commit.slots_written");
         // Early release (fastest-engine M1 item 2): buffered, applied, and waited for with the
         // mutex released. The versions this commit supersedes are freed only once it is durable.
         let lsn = self.buffer_records(&mut inner, &records)?;
@@ -4077,6 +4179,7 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let class = inner.sync;
         drop(inner);
+        kill_point("commit.applied");
         self.wait_durable(lsn, class)
     }
 
@@ -5453,13 +5556,16 @@ impl StoreInner {
         let writer = cat.writer.clone();
         let q0 = cat.catalog.counters.queries;
         let mut cap = self.checkpoint_capture(fail_after_commit)?;
+        kill_point("ckpt.captured");
         let mut w = writer.lock();
         let w0 = w.counters.queries;
         let r0 = w.counters.rows_written;
         let written = checkpoint_write(&mut w, &cap, None);
+        kill_point("ckpt.written");
         let wrote = w.counters.queries - w0;
         cap.shape_rows_written = w.counters.rows_written - r0;
         let installed = self.checkpoint_install(cap, written);
+        kill_point("ckpt.installed");
         if installed.is_ok() {
             truncate_catalog_wal(&mut w);
         }
