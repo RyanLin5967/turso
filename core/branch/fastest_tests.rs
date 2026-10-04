@@ -1076,3 +1076,33 @@ fn a_fork_waits_out_a_trunk_commit_inside_its_gate() {
         drop(first);
     }
 }
+
+/// M1 exit 2, the in-process half (the DYLD shim, V1, is the registered instrument and the tools
+/// lane's): `FE_V1_CREATES` (default 200) creates at C=1 at D2, from the trunk and named, issue
+/// 1.00 to 1.01 F_FULLFSYNC each and no fsync(2) — the store's and the trunk's syncs alike, since
+/// the counter sees both. Counted after the store's files exist (the first create makes them).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn v1_in_process_one_full_fsync_per_create_at_c1() {
+    let _s = serial();
+    let creates = std::env::var("FE_V1_CREATES").ok().and_then(|v| v.parse().ok()).unwrap_or(200u64);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("v1.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let counted = syncs_of(|| {
+            for i in 0..creates {
+                trunk.create_branch(&format!("v1-{i}")).unwrap();
+            }
+        });
+        let per_create = counted.1 as f64 / creates as f64;
+        assert_eq!(counted.0, 0, "catalog={catalog}: fsync(2) issued during D2 creates: {counted:?}");
+        assert!(
+            (1.0..=1.01).contains(&per_create),
+            "catalog={catalog}: {} F_FULLFSYNC over {creates} creates = {per_create:.4} per create",
+            counted.1
+        );
+    }
+}
