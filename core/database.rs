@@ -90,6 +90,9 @@ pub struct DatabaseOpts {
     /// live child is spliced into it. Off by default; a durable store opens only in the arm its
     /// files were written in.
     pub branch_splice: bool,
+    /// How a catalog store checkpoints; `None` (the default) lets the open choose (see
+    /// [`crate::branch::BranchCheckpoint::resolve`]).
+    pub branch_checkpoint: Option<crate::branch::BranchCheckpoint>,
 }
 
 impl DatabaseOpts {
@@ -165,6 +168,11 @@ impl DatabaseOpts {
 
     pub fn with_branch_splice(mut self, splice: bool) -> Self {
         self.branch_splice = splice;
+        self
+    }
+
+    pub fn with_branch_checkpoint(mut self, checkpoint: crate::branch::BranchCheckpoint) -> Self {
+        self.branch_checkpoint = Some(checkpoint);
         self
     }
 
@@ -950,10 +958,11 @@ impl Database {
         let wal_path = wal_path.into();
         // Before anything else touches the file: a database whose branches are durable must not
         // be opened with volatile ones (see `BranchStore::open`), and a durable store recovers here.
-        let branches = Arc::new(crate::branch::store::BranchStore::open_with_flags(
+        let branches = Arc::new(crate::branch::store::BranchStore::open_with_checkpoint(
             opts.branch_durability,
             opts.branch_lease,
             opts.branch_splice,
+            opts.branch_checkpoint,
             branch_base,
             flags.contains(OpenFlags::ReadOnly),
         )?);

@@ -309,6 +309,8 @@ pub(crate) struct BranchStore {
     trunk_same_device: AtomicBool,
     /// Trunk commit barriers that took the store mutex (observation only; lead review 1 item 10).
     barrier_locks: AtomicU64,
+    /// A catalog store's checkpoints are fuzzy (`BranchCheckpoint`; lead review 1 item 7).
+    fuzzy: bool,
     /// The log sequence number that makes the newest early-released Release durable: every trunk
     /// commit's barrier covers it, since a commit retains nothing for a child released before its
     /// decisions (gc3's N1; lead review 1 item 10).
@@ -1029,11 +1031,11 @@ fn pause_at(hold: Option<&AtomicU8>, stage: u8) {
     }
 }
 
-/// F-FZ's arm switch (lead decision 27960c3d): `maybe_compact` checkpoints a catalog store the
-/// base's way (settle everything, then capture, write and install under the store mutex) unless
-/// `R11_CKPT=fuzzy`, which opts into the fuzzy checkpoint. The default suite therefore runs the base's
-/// checkpoint, and every measurement arm names its mode. (`compact_now`, and the tests' and harness's
-/// `checkpoint_fuzzy_now`, choose their own path whatever the switch says.)
+/// F-FZ's arm switch (lead decision 27960c3d) for the store's MODEL tests, which open without a
+/// database (`BranchStore::open_mode`): sharp unless `R11_CKPT=fuzzy`. A database's store resolves
+/// its own mode (`BranchCheckpoint::resolve`, fuzzy by default: lead review 1 item 7). (`compact_now`,
+/// and the tests' and harness's `checkpoint_fuzzy_now`, choose their own path whatever it says.)
+#[cfg(test)]
 fn fuzzy_checkpoints() -> bool {
     static FUZZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FUZZY.get_or_init(|| std::env::var("R11_CKPT").is_ok_and(|v| v == "fuzzy"))
@@ -2263,6 +2265,19 @@ impl BranchStore {
         db_path: &str,
         read_only: bool,
     ) -> Result<Self> {
+        Self::open_with_checkpoint(durability, default_lease, splice, None, db_path, read_only)
+    }
+
+    /// `open_with_flags`, with the checkpoint mode the database's options ask for (`None`: the
+    /// default, see `BranchCheckpoint::resolve`).
+    pub(crate) fn open_with_checkpoint(
+        durability: BranchDurability,
+        default_lease: Option<Duration>,
+        splice: bool,
+        checkpoint: Option<super::BranchCheckpoint>,
+        db_path: &str,
+        read_only: bool,
+    ) -> Result<Self> {
         if read_only {
             if !crate::is_memory_like(db_path) && BranchFiles::for_db(db_path).exist() {
                 return Ok(Self::trunk_only());
@@ -2277,7 +2292,8 @@ impl BranchStore {
                 )));
             }
         }
-        Self::open_mode(durability, default_lease, splice, db_path)
+        let fuzzy = super::BranchCheckpoint::resolve(checkpoint, splice) == super::BranchCheckpoint::Fuzzy;
+        Self::open_resolved(durability, default_lease, splice, fuzzy, db_path)
     }
 
     fn trunk_only() -> Self {
@@ -2310,6 +2326,7 @@ impl BranchStore {
             trunk_same_device: AtomicBool::new(false),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
+            fuzzy: false,
         }
     }
 
@@ -2339,24 +2356,38 @@ impl BranchStore {
         Self::open_mode(durability, default_lease, false, db_path)
     }
 
-    /// The store for a database whose sidecar files are named from `db_path`, in the F7 splice arm
-    /// (`splice`) or not. A durable store recovers whatever its files hold, if they were written in
-    /// the same arm; a volatile one refuses a database whose files say it has durable branches,
-    /// because opened volatile, the trunk's writes would skip the pre-image barrier and silently
-    /// change what those branches read.
+    /// `open_resolved` as the store's model tests open it: checkpoints sharp, the base's way, unless
+    /// `R11_CKPT=fuzzy` (their own arm switch, F-FZ's lead decision 27960c3d).
+    #[cfg(test)]
     pub(crate) fn open_mode(
         durability: BranchDurability,
         default_lease: Option<Duration>,
         splice: bool,
         db_path: &str,
     ) -> Result<Self> {
+        Self::open_resolved(durability, default_lease, splice, fuzzy_checkpoints(), db_path)
+    }
+
+    /// The store for a database whose sidecar files are named from `db_path`, in the F7 splice arm
+    /// (`splice`) or not. A durable store recovers whatever its files hold, if they were written in
+    /// the same arm; a volatile one refuses a database whose files say it has durable branches,
+    /// because opened volatile, the trunk's writes would skip the pre-image barrier and silently
+    /// change what those branches read.
+    pub(crate) fn open_resolved(
+        durability: BranchDurability,
+        default_lease: Option<Duration>,
+        splice: bool,
+        fuzzy: bool,
+        db_path: &str,
+    ) -> Result<Self> {
         let format = super::journal::format_version(splice);
-        // S-12 (r13-compose, A4.G: stands): the splice arm and the fuzzy checkpoint switch are refused
+        // S-12 (r13-compose, A4.G: stands): the splice arm and fuzzy checkpoints are refused
         // together at construction, as fl_refusal does for its switch pairs (8976dc691): a splice's
         // relink during a flight is untested. G-a..G-c refuse the same state on every other path.
-        if splice && fuzzy_checkpoints() && !matches!(durability, BranchDurability::Volatile) {
+        // (The splice arm resolves to sharp unless fuzzy is asked for.)
+        if splice && fuzzy && !matches!(durability, BranchDurability::Volatile) {
             return Err(LimboError::InvalidArgument(
-                "the F7 splice arm and R11_CKPT=fuzzy are refused together (r13-compose S-12)"
+                "the F7 splice arm and fuzzy checkpoints are refused together (r13-compose S-12)"
                     .to_string(),
             ));
         }
@@ -2489,6 +2520,7 @@ impl BranchStore {
         // Every byte the open buffered was flushed by the recovery itself (single-threaded).
         let opened_lsn = inner.journal.as_ref().map_or(0, |j| j.lsn() - j.pending_len());
         let mut store = Self {
+            fuzzy,
             group: Arc::new(Group::new(opened_lsn, inner.fail_stop.clone())),
             class: inner.sync,
             #[cfg(test)]
@@ -3346,7 +3378,7 @@ impl BranchStore {
         if !inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
             return;
         }
-        if inner.cat.is_none() || !fuzzy_checkpoints() {
+        if inner.cat.is_none() || !self.fuzzy {
             if let Err(e) = self.compact(inner, false) {
                 tracing::warn!("branch store compaction failed: {e}");
             }

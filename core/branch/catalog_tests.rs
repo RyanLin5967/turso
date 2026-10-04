@@ -97,11 +97,16 @@ fn an_open_after_a_checkpoint_reads_no_branch_state() {
 
 /// The log is bounded by the checkpoint threshold, not by twice the live state, and no snapshot
 /// file is ever written.
+///
+/// FLAGGED TEST EDIT (lead review 1 item 7, registered under PREREG amendment 7): checkpoints are
+/// fuzzy by default now, whose bound is twice the threshold
+/// (`the_log_stays_under_twice_the_threshold_with_fuzzy_checkpoints`); this test asks for the
+/// sharp checkpoint whose bound it states.
 #[test]
 fn the_log_stays_under_the_checkpoint_threshold() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("c.db");
-    let db = open_at(&path, catalog()).unwrap();
+    let db = open_at(&path, catalog().with_branch_checkpoint(crate::branch::BranchCheckpoint::Sharp)).unwrap();
     seed(&db.connect().unwrap());
     let files = journal::BranchFiles::for_db(path.to_str().unwrap());
     let trunk = db.connect().unwrap();

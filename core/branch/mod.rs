@@ -251,6 +251,31 @@ pub enum BranchDurability {
     Catalog { sync: SyncClass },
 }
 
+/// How a catalog store checkpoints (lead review 1 item 7). `Fuzzy` (the default): the capture is
+/// taken under the store mutex and everything else — the catalog write and its flushes — runs on a
+/// thread of its own, so no operation waits for it. `Sharp`: capture, write and install all under
+/// the store mutex, inside the operation that crossed the threshold (the base's checkpoint, which
+/// keeps the log under the threshold plus one operation's records). A snapshot store's compaction
+/// is always sharp; the F7 splice arm takes `Sharp` unless asked otherwise (and refuses `Fuzzy`,
+/// r13-compose S-12). `R11_CKPT=fuzzy|sharp` sets the mode an open does not name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchCheckpoint {
+    Fuzzy,
+    Sharp,
+}
+
+impl BranchCheckpoint {
+    /// The mode an open uses: `asked`, else `R11_CKPT`, else fuzzy (sharp in the splice arm).
+    pub(crate) fn resolve(asked: Option<BranchCheckpoint>, splice: bool) -> BranchCheckpoint {
+        asked.unwrap_or_else(|| match std::env::var("R11_CKPT").as_deref() {
+            Ok("fuzzy") => BranchCheckpoint::Fuzzy,
+            Ok("sharp") => BranchCheckpoint::Sharp,
+            _ if splice => BranchCheckpoint::Sharp,
+            _ => BranchCheckpoint::Fuzzy,
+        })
+    }
+}
+
 impl BranchDurability {
     /// The flush class of a durable store; `None` for a volatile one.
     pub fn sync_class(&self) -> Option<SyncClass> {
