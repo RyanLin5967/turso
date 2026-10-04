@@ -40,6 +40,7 @@ RESUMED = re.compile(r"^(?:(?:\[pid\s+)?(\d+)\]?\s+)?<\.\.\. ([a-z_0-9]+) resume
 SUMROW = re.compile(r"^\s*([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(?:(\d+)\s+)?([a-z_0-9]+)\s*$")
 RET = re.compile(r"\)\s+=\s+(-?\d+|\?)")
 FDPATH = re.compile(r"^\s*-?\d+<([^>]*)>")
+BENIGN = re.compile(r"attach: ptrace\(PTRACE_SEIZE, \d+\): No such process")
 
 
 def parse_summary(text):
@@ -86,8 +87,10 @@ def count(trace, extras, root, window=None):
         if summary is None:
             summary = parse_summary(etext)
         if attached:
+            # One benign line: a pid that exited between enumeration and attach (e.g. a PG backend finishing)
+            # cannot be seized and has nothing left to trace; the TracerPid check already skipped it.
             stray += [ln for ln in etext.splitlines() if ln.strip() and not ln.startswith(("% time", "------"))
-                      and not SUMROW.match(ln)]
+                      and not SUMROW.match(ln) and not BENIGN.search(ln)]
     lines = {}
     pending = {}
     calls = []  # (name, args_and_rest)
