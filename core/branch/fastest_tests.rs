@@ -813,9 +813,38 @@ fn write_v(conn: &Arc<Connection>, id: i64, v: &str) {
     conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {id}")).unwrap();
 }
 
-/// N1 (E3's core): a named branch needs no handle — nothing reaps it when the creating connection,
-/// or the whole database, goes away — survives a restart, and is connected to by name, with its
-/// own writes and nothing the trunk wrote after its fork. Branch-of-branch too.
+/// A table whose rows sit on many pages: 60 rows of ~1 KiB, about three to a 4 KiB leaf, so rows 3,
+/// 40 and 50 are on different pages and a branch's write to one leaves the others' pages to its
+/// ancestors. Values read back as `wide-<id>`'s first 7 bytes via `read_wide`.
+fn seed_wide(conn: &Arc<Connection>) {
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=60 {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, 'trunk-{id}-{}')", "x".repeat(1000)))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let pages = conn
+        .prepare("PRAGMA page_count")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()[0][0]
+        .as_int()
+        .unwrap();
+    assert!(pages >= 15, "premise: the table spans many pages ({pages})");
+}
+
+/// Row `id`'s value up to its first '-x' padding: `trunk-<id>` for an untouched seed_wide row.
+fn read_wide(conn: &Arc<Connection>, id: i64) -> String {
+    let v = read_v(conn, id);
+    v.split("-x").next().unwrap().to_string()
+}
+
+/// N1 (E3's core, and mutant M-d `fork_without_parent`): a named branch needs no handle — nothing
+/// reaps it when the creating connection, or the whole database, goes away — survives a restart,
+/// and is connected to by name, with its own writes and nothing the trunk wrote after its fork. A
+/// named branch of it, created from its connection, reads its parent's write from a page it never
+/// wrote itself, so the recovered parent pointer is what it reads through.
 #[test]
 fn a_named_branch_is_detached_persistent_and_connectable_by_name() {
     let _s = serial();
@@ -825,7 +854,7 @@ fn a_named_branch_is_detached_persistent_and_connectable_by_name() {
         let incarnation = {
             let db = open_at(&path, opts(catalog, SyncClass::Fsync));
             let trunk = db.connect().unwrap();
-            seed(&trunk);
+            seed_wide(&trunk);
             let alpha = trunk.create_branch("alpha").unwrap();
             assert_eq!(db.branch_named("alpha").unwrap(), Some(alpha));
             {
@@ -834,23 +863,28 @@ fn a_named_branch_is_detached_persistent_and_connectable_by_name() {
                 // A branch of the named branch, named, created from its connection.
                 c.create_branch("alpha.beta").unwrap();
             }
-            write_v(&trunk, 4, "trunk-later");
+            write_v(&trunk, 40, "trunk-later");
             {
                 let c = db.connect_named("alpha.beta").unwrap();
-                write_v(&c, 5, "beta-5");
+                write_v(&c, 50, "beta-50");
             }
             assert!(db.branch_ids().unwrap().contains(&alpha));
             db.incarnation
         };
         let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
         let a = db.connect_named("alpha").unwrap();
-        assert_eq!(read_v(&a, 3), "alpha-3", "catalog={catalog}");
-        assert_eq!(read_v(&a, 4), "trunk-4", "catalog={catalog}: a trunk write after the fork");
-        assert_eq!(read_v(&a, 5), "trunk-5", "catalog={catalog}: the child's write leaked up");
+        assert_eq!(read_wide(&a, 3), "alpha-3", "catalog={catalog}");
+        assert_eq!(read_wide(&a, 40), "trunk-40", "catalog={catalog}: a trunk write after the fork");
+        assert_eq!(read_wide(&a, 50), "trunk-50", "catalog={catalog}: the child's write leaked up");
         drop(a);
         let b = db.connect_named("alpha.beta").unwrap();
-        assert_eq!(read_v(&b, 3), "alpha-3", "catalog={catalog}: the child lost its parent's write");
-        assert_eq!(read_v(&b, 5), "beta-5", "catalog={catalog}");
+        assert_eq!(
+            read_wide(&b, 3),
+            "alpha-3",
+            "catalog={catalog}: the child lost its parent's write (read through its parent pointer)"
+        );
+        assert_eq!(read_wide(&b, 40), "trunk-40", "catalog={catalog}");
+        assert_eq!(read_wide(&b, 50), "beta-50", "catalog={catalog}");
         assert!(db.connect_named("gamma").is_err(), "catalog={catalog}: an unknown name connected");
     }
 }
