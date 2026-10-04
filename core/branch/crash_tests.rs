@@ -714,6 +714,7 @@ const C1_POINTS: &[&str] = &[
     "flight.taken",
     "flight.arena_synced",
     "flight.log_written",
+    "flight.before_log_sync",
     "flight.log_synced",
     "flight.landed",
     "commit.slots_written",
@@ -1163,6 +1164,13 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
         if recover_only {
             cmd.env("FE_C1_RECOVER_ONLY", "1");
         }
+        // Simulated power loss of the branch files' unsynced writes (journal.rs `lose_unsynced`).
+        if std::env::var("FE_C1_POWER").is_ok_and(|v| v == "1") {
+            cmd.env("FE_LOSE_UNSYNCED", "1");
+        }
+        if let Ok(ms) = std::env::var("FE_KILL_DELAY_MS") {
+            cmd.env("FE_KILL_DELAY_MS", ms);
+        }
         cmd.spawn().unwrap()
     };
     let mut child = spawn(format!("{point}:{n}"), false);
@@ -1216,7 +1224,11 @@ fn c1_sigkill_at_aimed_points() {
     let (mut landed, mut unaimed, mut violations) = (0u64, 0u64, Vec::new());
     let mut per_point: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for trial in 0..trials {
-        let point = C1_POINTS[trial as usize % C1_POINTS.len()];
+        let only = std::env::var("FE_C1_POINT").ok();
+        let point: &str = match only.as_deref() {
+            Some(p) => C1_POINTS.iter().copied().find(|q| *q == p).expect("a known kill point"),
+            None => C1_POINTS[trial as usize % C1_POINTS.len()],
+        };
         let n = 1 + rng.below(40);
         let rk = (recover_kill && trial % 3 == 2).then(|| 1 + rng.below(20));
         let (hit, bad, what) = c1_trial(&exe, catalog, class, threads, point, n, seed ^ trial, rk);
@@ -1232,9 +1244,11 @@ fn c1_sigkill_at_aimed_points() {
             violations.push(format!("trial {trial} [{what}]: {b}"));
         }
     }
+    let power = std::env::var("FE_C1_POWER").is_ok_and(|v| v == "1");
     let summary = format!(
-        "C1 catalog={catalog} class={class:?} threads={threads} trials={trials} landed={landed} \
-         unaimed={unaimed} violations={} per point (landed, unaimed): {per_point:?}",
+        "C1 catalog={catalog} class={class:?} power_loss_simulated={power} threads={threads} \
+         trials={trials} landed={landed} unaimed={unaimed} violations={} per point (landed, \
+         unaimed): {per_point:?}",
         violations.len()
     );
     println!("{summary}");

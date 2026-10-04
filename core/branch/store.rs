@@ -2008,6 +2008,11 @@ fn kill_point_aimed(name: &str) {
         return;
     }
     if HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == *n {
+        // `FE_KILL_DELAY_MS`: the other threads run on this long first (an acknowledgement a
+        // waiter was just given reaches the log before the kill).
+        if let Some(ms) = std::env::var("FE_KILL_DELAY_MS").ok().and_then(|v| v.parse().ok()) {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
         crash_log(&format!("KILL-AT {name} {n}"));
         // SAFETY: signals this process; nothing after it runs.
         unsafe {

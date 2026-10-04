@@ -75,10 +75,7 @@ impl Arena {
         referenced: &[Slot],
     ) -> Result<Self> {
         let file = open_rw(path, truncate)?;
-        let len = file
-            .metadata()
-            .map_err(|e| crate::error::io_error(e, "stat branch arena"))?
-            .len();
+        let len = super::journal::file_len(&file)?;
         // A partly written last slot is a slot whose record never became durable.
         let high = len / page_size as u64;
         let high_water = u32::try_from(high)

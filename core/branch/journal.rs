@@ -883,10 +883,7 @@ impl Journal {
                 {
                     // The torn tail: a record that was never durable. Cut it off so appends resume
                     // at a frame boundary.
-                    journal
-                        .file
-                        .set_len(pos as u64)
-                        .map_err(|e| io_error(e, "truncate branch log"))?;
+                    set_file_len(&journal.file, pos as u64)?;
                     if sync.syncs() {
                         fsync_file(&journal.file, sync)?;
                     }
@@ -1130,11 +1127,7 @@ impl Journal {
         // next recovery, so refuse — reading the file's state, not trusting the in-memory length
         // (review R8). On unix the log lock keeps a second JOURNAL out (N1); this check remains
         // the guard on other targets and against a writer that never asks for the lock.
-        let on_disk = self
-            .file
-            .metadata()
-            .map_err(|e| io_error(e, "stat branch log"))?
-            .len();
+        let on_disk = file_len(&self.file)?;
         if on_disk != self.len {
             return Err(corrupt(
                 "the branch log changed under this journal; another store instance wrote it",
@@ -1201,11 +1194,7 @@ impl Journal {
                 end_lsn,
             });
         }
-        let on_disk = self
-            .file
-            .metadata()
-            .map_err(|e| io_error(e, "stat branch log"))?
-            .len();
+        let on_disk = file_len(&self.file)?;
         if on_disk != self.len {
             self.poisoned = true;
             return Err(corrupt(
@@ -1314,9 +1303,7 @@ impl Journal {
     /// Truncate the log to a bare header for `generation`.
     fn reset_log(&mut self, generation: u64) -> Result<()> {
         let header = log_header(self.format, self.page_size, generation);
-        self.file
-            .set_len(0)
-            .map_err(|e| io_error(e, "truncate branch log"))?;
+        set_file_len(&self.file, 0)?;
         write_at(&self.file, &header, 0)?;
         if self.sync.syncs() {
             fsync_file(&self.file, self.sync)?;
@@ -1419,6 +1406,8 @@ impl Flight {
         }
         super::store::kill_point("flight.log_written");
         after_pwrite();
+        // After mutant M-b's early acknowledgement, before the log's sync.
+        super::store::kill_point("flight.before_log_sync");
         if syncs {
             fsync_file(&log, self.class)?;
         }
@@ -1584,13 +1573,19 @@ fn read_snapshot(path: &Path, format: u32) -> Result<(u32, u64, SnapshotState, u
 }
 
 pub(crate) fn open_rw(path: &Path, truncate: bool) -> Result<File> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(truncate)
         .open(path)
-        .map_err(|e| io_error(e, "open branch file"))
+        .map_err(|e| io_error(e, "open branch file"))?;
+    // A truncating open drops what the simulated power loss held for the file (test builds).
+    #[cfg(all(test, unix))]
+    if truncate {
+        lose_unsynced::truncate(&file, 0);
+    }
+    Ok(file)
 }
 
 fn read_all(file: &mut File) -> Result<Vec<u8>> {
@@ -1604,6 +1599,10 @@ fn read_all(file: &mut File) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn write_at(file: &File, bytes: &[u8], offset: u64) -> Result<()> {
+    #[cfg(all(test, unix))]
+    if lose_unsynced::hold(file, bytes, offset) {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -1622,6 +1621,10 @@ pub(crate) fn write_at(file: &File, bytes: &[u8], offset: u64) -> Result<()> {
 }
 
 pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
+    #[cfg(all(test, unix))]
+    if lose_unsynced::read(file, out, offset)? {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -1639,6 +1642,160 @@ pub(crate) fn read_at(file: &File, out: &mut [u8], offset: u64) -> Result<()> {
     }
 }
 
+/// A branch file's length, counting writes the simulated power loss holds (test builds).
+pub(crate) fn file_len(file: &File) -> Result<u64> {
+    let real = file
+        .metadata()
+        .map_err(|e| io_error(e, "stat branch file"))?
+        .len();
+    #[cfg(all(test, unix))]
+    return Ok(real.max(lose_unsynced::held_end(file)));
+    #[cfg(not(all(test, unix)))]
+    Ok(real)
+}
+
+/// Truncate (or extend) a branch file; held writes past the new end are dropped (test builds).
+pub(crate) fn set_file_len(file: &File, len: u64) -> Result<()> {
+    #[cfg(all(test, unix))]
+    lose_unsynced::truncate(file, len);
+    file.set_len(len).map_err(|e| io_error(e, "truncate branch file"))
+}
+
+/// fastest-engine C1, SIMULATED POWER LOSS of the branch files (TEST BUILDS ONLY, armed by
+/// `FE_LOSE_UNSYNCED=1` in the process that writes): every write to a branch file (log, arena,
+/// snapshot, a log rewrite's temp file) is held in this process's memory, per file (device, inode),
+/// and reaches the file only when THAT file is synced (`fsync_file`); reads and lengths see the held
+/// writes. A SIGKILL then loses exactly the writes no sync covered, as a power cut loses the OS page
+/// cache. NOT simulated (stated, not assumed away): the trunk's WAL and database file and the
+/// catalog (Turso's own IO, whose unsynced writes survive a SIGKILL); a write torn inside a page;
+/// a drive persisting synced writes out of order; a directory entry made durable without its
+/// directory's sync. So it can show a branch-file sync missing, never a trunk-side one.
+#[cfg(all(test, unix))]
+mod lose_unsynced {
+    use super::*;
+    use std::collections::HashMap;
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    use std::sync::{Mutex, OnceLock};
+
+    type Held = HashMap<(u64, u64), Vec<(u64, Vec<u8>)>>;
+
+    fn armed() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("FE_LOSE_UNSYNCED").is_ok_and(|v| v == "1"))
+    }
+
+    fn held() -> &'static Mutex<Held> {
+        static HELD: OnceLock<Mutex<Held>> = OnceLock::new();
+        HELD.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn key(file: &File) -> Option<(u64, u64)> {
+        file.metadata().ok().map(|m| (m.dev(), m.ino()))
+    }
+
+    /// Hold a write instead of making it; `false` when not armed (the caller writes).
+    pub(super) fn hold(file: &File, bytes: &[u8], offset: u64) -> bool {
+        if !armed() {
+            return false;
+        }
+        let Some(k) = key(file) else {
+            return false;
+        };
+        held().lock().unwrap().entry(k).or_default().push((offset, bytes.to_vec()));
+        true
+    }
+
+    /// Read through the held writes; `false` when not armed (the caller reads).
+    pub(super) fn read(file: &File, out: &mut [u8], offset: u64) -> Result<bool> {
+        if !armed() {
+            return Ok(false);
+        }
+        let Some(k) = key(file) else {
+            return Ok(false);
+        };
+        let held = held().lock().unwrap();
+        let writes = held.get(&k);
+        // The real bytes first (a short read past the real end is zeros, then overlaid).
+        out.fill(0);
+        let real_len = file.metadata().map_err(|e| io_error(e, "stat branch file"))?.len();
+        if offset < real_len {
+            let n = ((real_len - offset) as usize).min(out.len());
+            file.read_exact_at(&mut out[..n], offset)
+                .map_err(|e| io_error(e, "read branch file"))?;
+        }
+        let end = offset + out.len() as u64;
+        let mut covered_to = real_len;
+        for (at, bytes) in writes.into_iter().flatten() {
+            let (w_lo, w_hi) = (*at, *at + bytes.len() as u64);
+            covered_to = covered_to.max(w_hi);
+            let (lo, hi) = (w_lo.max(offset), w_hi.min(end));
+            if lo < hi {
+                out[(lo - offset) as usize..(hi - offset) as usize]
+                    .copy_from_slice(&bytes[(lo - w_lo) as usize..(hi - w_lo) as usize]);
+            }
+        }
+        if end > covered_to {
+            return Err(io_error(
+                std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+                "read branch file",
+            ));
+        }
+        Ok(true)
+    }
+
+    /// A sync: the held writes reach the file, in order.
+    pub(super) fn apply(file: &File) -> Result<()> {
+        if !armed() {
+            return Ok(());
+        }
+        let Some(k) = key(file) else {
+            return Ok(());
+        };
+        let writes = held().lock().unwrap().remove(&k).unwrap_or_default();
+        for (at, bytes) in writes {
+            file.write_all_at(&bytes, at)
+                .map_err(|e| io_error(e, "write branch file"))?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn held_end(file: &File) -> u64 {
+        if !armed() {
+            return 0;
+        }
+        let Some(k) = key(file) else {
+            return 0;
+        };
+        held()
+            .lock()
+            .unwrap()
+            .get(&k)
+            .into_iter()
+            .flatten()
+            .map(|(at, b)| at + b.len() as u64)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(super) fn truncate(file: &File, len: u64) {
+        if !armed() {
+            return;
+        }
+        let Some(k) = key(file) else {
+            return;
+        };
+        if let Some(writes) = held().lock().unwrap().get_mut(&k) {
+            writes.retain_mut(|(at, bytes)| {
+                if *at >= len {
+                    return false;
+                }
+                bytes.truncate((len - *at) as usize);
+                true
+            });
+        }
+    }
+}
+
 /// Sync `file` in `class` (see [`SyncClass`]): `Fsync` is `fsync(2)`, as Turso's own
 /// `FileSyncType::Fsync`; `FullFsync` is `fcntl(F_FULLFSYNC)` on Apple platforms, as Turso's
 /// `FileSyncType::FullFsync` (`io/unix.rs`), and `fsync(2)` elsewhere. `Off` syncs nothing.
@@ -1646,6 +1803,9 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
     if !class.syncs() {
         return Ok(());
     }
+    // A sync makes the held writes reach the file first (simulated power loss, test builds).
+    #[cfg(all(test, unix))]
+    lose_unsynced::apply(file)?;
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
