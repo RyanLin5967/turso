@@ -107,15 +107,29 @@ jobs:
           prefix-key: fastest-release-v1
           shared-key: ${{ matrix.runner }}
           cache-on-failure: true
-      - name: Build the engine in release (turso_core and its branch example drivers)
+      - name: Build the engine in release with debug symbols (turso_core + the Linux profiling driver)
+        # core/examples/branch_* (r11/r12 drivers) call libc::proc_pid_rusage, which is macOS-only
+        # (run 37174637886), so only the lib and fastest_profile are built here.
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "true"
+          CARGO_PROFILE_RELEASE_STRIP: "none"
         run: |
           set -o pipefail
           mkdir -p dist
-          timeout 6000 cargo build --release --locked -p turso_core --examples 2> dist/release.stderr \
+          timeout 6000 cargo build --release --locked -p turso_core --lib --example fastest_profile 2> dist/release.stderr \
             || { tail -50 dist/release.stderr; exit 1; }
-          for e in core/examples/*/; do n=$(basename "$e"); cp "target/release/examples/$n" dist/ ; done
+          cp target/release/examples/fastest_profile dist/
           { echo "git_sha=$GITHUB_SHA"; echo "runner=${{ matrix.runner }}"; rustc -V;
-            (cd dist && sha256sum branch_*); } | tee dist/release-info.txt
+            (cd dist && sha256sum fastest_profile); } | tee dist/release-info.txt
+      - name: Smoke the release driver (D2, C=1 and C=8; the async class must refuse, not run)
+        run: |
+          set -o pipefail
+          d=$(mktemp -d)
+          dist/fastest_profile --dir "$d/c1" --class full --clients 1 --ops 50 --warmup 5 --out dist/smoke-c1 | tail -1
+          dist/fastest_profile --dir "$d/c8" --class full --clients 8 --ops 20 --warmup 2 --mode cycle --out dist/smoke-c8 | tail -1
+          rc=0; dist/fastest_profile --dir "$d/async" --class async > dist/smoke-async.txt || rc=$?
+          cat dist/smoke-async.txt
+          [ $rc -eq 4 ] && grep -q '^NOT AVAILABLE' dist/smoke-async.txt || { echo "async class: rc=$rc, expected the rc 4 refusal"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: engine-release-${{ matrix.runner }}
