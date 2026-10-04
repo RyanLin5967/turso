@@ -218,6 +218,11 @@ def count(trace, extras, root, window=None, clients=frozenset()):
         lines[name] = lines.get(name, 0) + 1
         if rest.endswith("<unfinished ...>"):
             pending[pid] = (name, rest[: -len("<unfinished ...>")])
+        elif rest.endswith("<detached ...>"):
+            # In flight when the detach came: it never returns in this trace and strace's -c table does not count it
+            # (run 37225130145, pg18-default x86_64 XFS pg18-m1-wal-c4: table 485 sync_file_range, lines 486, the
+            # extra one "<detached ...>"). It is an unfinished call, never a completed one.
+            pending[pid] = (name, rest[: -len("<detached ...>")])
         else:
             calls.append((pid, name, rest))
     # strace allocates its -c counters at the first counted call, so a window in which no traced syscall happened
