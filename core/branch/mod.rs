@@ -1499,6 +1499,9 @@ mod merge_durable_tests;
 #[cfg(all(test, feature = "fs"))]
 mod fastest_tests;
 
+#[cfg(all(test, feature = "fs"))]
+mod crash_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
