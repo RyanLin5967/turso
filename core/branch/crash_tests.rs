@@ -252,6 +252,7 @@ struct Shared {
     branch_writes: StdU64,
     trunk_commits: StdU64,
     checkpoints: StdU64,
+    checkpoint_rounds: StdU64,
 }
 
 impl Shared {
@@ -280,7 +281,10 @@ fn trunk_txn(conn: &Arc<Connection>, rng: &mut Rng, shared: &Shared) -> Result<O
                 0..=69 => Op::Set(1 + rng.below(ROWS as u64) as i64, format!("k{k}j{j}")),
                 70..=89 => Op::Set(10_000 + (k * 4 + j) as i64, format!("k{k}i{j}")),
                 90..=97 => Op::Del(1 + rng.below(ROWS as u64) as i64),
-                _ => Op::Table(format!("d{k}")),
+                // A name per ATTEMPT: a rolled-back CREATE TABLE has been seen to leave its name
+                // taken in the connection that rolled it back (Turso behaviour this harness does
+                // not test; recorded in the lane notes).
+                _ => Op::Table(format!("d{k}a{}", rng.below(1 << 30))),
             };
             conn.execute(sql(&op))?;
             ops.push(op);
@@ -290,7 +294,7 @@ fn trunk_txn(conn: &Arc<Connection>, rng: &mut Rng, shared: &Shared) -> Result<O
     })();
     match attempt {
         Ok(done) => Ok(Some(done)),
-        Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => {
+        Err(LimboError::Busy) | Err(LimboError::BusySnapshot) | Err(LimboError::SchemaUpdated) => {
             let _ = conn.execute("ROLLBACK");
             Ok(None)
         }
@@ -311,11 +315,18 @@ fn writer_loop(db: Arc<Database>, shared: Arc<Shared>, seed: u64, quota: u64, ch
                 shared.acked.fetch_max(k, O::AcqRel);
                 shared.trunk_commits.fetch_add(1, O::Relaxed);
                 let n = shared.ops.fetch_add(1, O::AcqRel) + 1;
-                if n % checkpoint_every == 0 {
-                    // A forced trunk checkpoint (amendment 12); a busy one is skipped.
-                    if conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").is_ok() {
-                        shared.checkpoints.fetch_add(1, O::Relaxed);
-                    }
+                // A forced trunk checkpoint each time the operation count crosses a multiple of
+                // `checkpoint_every` (amendment 12), by whichever writer sees the crossing first.
+                let due = n / checkpoint_every;
+                let done = shared.checkpoint_rounds.load(O::Acquire);
+                if due > done
+                    && shared
+                        .checkpoint_rounds
+                        .compare_exchange(done, due, O::AcqRel, O::Acquire)
+                        .is_ok()
+                    && conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").is_ok()
+                {
+                    shared.checkpoints.fetch_add(1, O::Relaxed);
                 }
             }
             Ok(None) => std::thread::yield_now(),
@@ -581,6 +592,7 @@ fn run_c0(catalog: bool) -> String {
         branch_writes: StdU64::new(0),
         trunk_commits: StdU64::new(0),
         checkpoints: StdU64::new(0),
+        checkpoint_rounds: StdU64::new(0),
     });
     let gone = Arc::new(StdMutex::new(Vec::new()));
     let mut owned: Vec<Vec<Owned>> = vec![Vec::new(); DRIVERS];
