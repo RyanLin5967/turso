@@ -150,11 +150,13 @@ static void noise_phases(int K) {
     for (int i = 0; i < K; i++) ck(pwritev2(z, iv0, 2, 0, RWF_DSYNC), "zero pwritev2 RWF_DSYNC");
     /* a bad iovec pointer must come back EFAULT (the shim reads iovecs without trusting them), a bad count EINVAL;
      * neither writes anything, and neither counts */
-    const struct iovec *bad = (const struct iovec *)8;
+    /* volatile: the bad values are the point, and the compiler must not see (and refuse) them */
+    const struct iovec *volatile bad = (const struct iovec *)8;
+    volatile int neg = -1;
     if (writev(z, bad, 1) != -1 || errno != EFAULT) die("writev(bad iovec) is not EFAULT");
     if (pwritev2(z, bad, 1, 0, 0) != -1 || errno != EFAULT) die("pwritev2(bad iovec) is not EFAULT");
     if (syscall(SYS_writev, z, bad, 1) != -1 || errno != EFAULT) die("syscall writev(bad iovec) is not EFAULT");
-    if (writev(z, iv, -1) != -1 || errno != EINVAL) die("writev(iovcnt -1) is not EINVAL");
+    if (writev(z, iv, neg) != -1 || errno != EINVAL) die("writev(iovcnt -1) is not EINVAL");
     close(z);
     /* creat, creat64 and __close run, and change nothing counted */
     pathof("creat1", p, sizeof p);
