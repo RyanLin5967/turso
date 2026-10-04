@@ -143,6 +143,7 @@ jobs:
           FT_BBLOAD: ${{ github.workspace }}/dist/bbload
           FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
           FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
+          FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
         run: timeout 7200 bash fastest/linux/competitors/run_system.sh ${{ matrix.system }} "$MNT" "$RAW/run"
       - name: Compress traces
         if: always()

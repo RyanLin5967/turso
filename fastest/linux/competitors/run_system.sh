@@ -61,6 +61,12 @@ case $SYSTEM in
   b1) KIND=b1 SPECLIST="m1c-d2 m1-d2 m1c-d0 m1-d0" ;;
   *) echo "unknown system $SYSTEM" >&2; exit 2 ;;
 esac
+# The flush counter must have passed its fire-check on this runner and filesystem first (review finding 8).
+FC=${FT_FIRECHECK:?FT_FIRECHECK: the fire-check verdict file (firecheck_strace.sh OUT/firecheck.txt)}
+case "$(tail -1 "$FC" 2>/dev/null)" in
+  "VERDICT PASS"*) ;;
+  *) echo "REFUSED: the flush counter's fire-check did not pass: $FC ends [$(tail -1 "$FC" 2>/dev/null)]" | tee "$FUN"; exit 1 ;;
+esac
 { echo "system=$SYSTEM kind=$KIND mnt=$MNT fstype=$(findmnt -n -o FSTYPE -T "$MNT") rows=$ROWS n1=$N1 n4=$N4 idle_s=$IDLE_S clients=[$CLIENTS]";
   echo "strace=$(strace -V | head -1) kernel=$(uname -r) arch=$(uname -m)"; } | tee "$RAW/run-info.txt"
 
@@ -127,7 +133,26 @@ bbload() { # bbload SPEC C N OUT -> bbload's rc
   return $rc
 }
 
-count() { python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" >"$1.json" || true; }
+# count OUT -- stracecount over one window. A refused or crashed count FAILS the job (review finding 1: it used to
+# end in `|| true`, so a REFUSED window still left the job green); the cell carries the verdict too.
+count() {
+  local rc=0
+  python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" >"$1.json" || rc=$?
+  [ $rc -eq 0 ] || fail "count $1: stracecount rc=$rc ($(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$1.json" 2>&1 | tail -1))"
+}
+# ops_of BBOUT CELLDIR -- "<total> <ok> <created>" into CELLDIR/ops.txt. A reader failure FAILS the job and writes
+# zero ops, which the cell then refuses (it used to turn silently into "0 0 0"). Called in the driver's own shell,
+# never inside $(...) or <(...), where fail()'s count would be lost.
+ops_of() {
+  if ! python3 "$FH" ops "$1" >"$2/ops.txt"; then fail "ops reader on $1"; echo "0 0 0" >"$2/ops.txt"; fi
+}
+# judge_cell CELLDIR -- the cell's verdict must be "ok"; anything else (REFUSED, INCOMPLETE, NOT CLEAN, a missing or
+# unreadable cell.json) FAILS the job.
+judge_cell() {
+  local v
+  v=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$1/cell.json" 2>&1 | tail -1)
+  [ "$v" = ok ] || fail "cell $(basename "$1"): $v"
+}
 
 run_server_cell() { # run_server_cell SPEC C
   local spec=$1 c=$2 n d rc used0 used1 total ok created
@@ -151,16 +176,25 @@ run_server_cell() { # run_server_cell SPEC C
   [ $rc -eq 0 ] || fail "$spec-c$c bbload rc=$rc ($(tail -1 "$d/bb.txt"))"
   local defer=()
   if [ "$KIND" = pg ]; then
-    strace_attach "$d/deferred" $(server_pids) && { sqlq "CHECKPOINT"; strace_detach "$d/deferred"; count "$d/deferred"
-      defer=(--deferred "$d/deferred.json"); }
+    # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost): a failed attach or a failed
+    # CHECKPOINT FAILS the job, and the cell refuses without it (review finding 6: both used to drop it silently).
+    defer=(--deferred "$d/deferred.json")
+    if strace_attach "$d/deferred" $(server_pids); then
+      sqlq "CHECKPOINT" >"$d/deferred.checkpoint.txt" 2>&1 || fail "$spec-c$c deferred CHECKPOINT rc=$? ($(tail -1 "$d/deferred.checkpoint.txt"))"
+      strace_detach "$d/deferred"
+      count "$d/deferred"
+    else
+      fail "$spec-c$c deferred attach"
+    fi
   fi
   count "$d/idle"
   count "$d/load"
-  read -r total ok created < <(python3 "$FH" ops "$d/bb" 2>/dev/null || echo "0 0 0")
-  echo "$total $ok $created" >"$d/ops.txt"
+  ops_of "$d/bb" "$d"
+  read -r total ok created <"$d/ops.txt"
   python3 "$SC" cell --name "$SYSTEM/$spec-c$c" --load "$d/load.json" --idle "$d/idle.json" \
     --load-s "$(window_s "$d/load")" --idle-s "$(window_s "$d/idle")" --ops "$total" --ops-ok "$ok" \
-    ${defer[@]+"${defer[@]}"} >"$d/cell.json" || true
+    ${defer[@]+"${defer[@]}"} >"$d/cell.json"
+  judge_cell "$d"
   python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'raw/op', p.get('flushes_raw'), 'exact', c.get('exact'), 'deferred/op', c.get('deferred',{}).get('per_op'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
 }
 
@@ -250,10 +284,11 @@ b1_main() {
       cat "$d/bb.txt"
       [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"))"
       count "$d/load"
-      read -r total ok created < <(python3 "$FH" ops "$d/bb" 2>/dev/null || echo "0 0 0")
-      echo "$total $ok $created" >"$d/ops.txt"
+      ops_of "$d/bb" "$d"
+      read -r total ok created <"$d/ops.txt"
       python3 "$SC" cell --name "$SYSTEM/b1-$spec-c$c" --load "$d/load.json" --idle none \
-        --load-s "$(window_s "$d/load")" --idle-s 0 --ops "$total" --ops-ok "$ok" >"$d/cell.json" || true
+        --load-s "$(window_s "$d/load")" --idle-s 0 --ops "$total" --ops-ok "$ok" >"$d/cell.json"
+      judge_cell "$d"
       python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'by_class', c.get('load_by_class'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
       expect "b1-$spec-c$c branch files (every created branch exists)" \
         "$(find "$bdir" -maxdepth 1 -name 'b_*.db' | wc -l | tr -d ' ')" "$created"

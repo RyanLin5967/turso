@@ -201,6 +201,16 @@ def count(trace, extras, root, window=None):
 
 
 def cell(a):
+    # A window whose count is missing or unreadable is not a zero: the cell refuses and says which.
+    for k in ("load", "idle", "deferred"):
+        p = a.get(k)
+        if p is None or (k == "idle" and p == "none"):
+            continue
+        try:
+            json.load(open(p))
+        except (OSError, ValueError) as e:
+            return {"name": a.get("name"), "ops": a.get("ops"), "ops_ok": a.get("ops-ok"), "idle_s": a.get("idle-s"),
+                    "load_s": a.get("load-s"), "verdict": f"REFUSED: {k} window count unreadable: {e}"}
     load = json.load(open(a["load"]))
     embedded = a["idle"] == "none"
     if embedded:
