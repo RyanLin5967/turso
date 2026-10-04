@@ -367,12 +367,33 @@ fn a_torn_log_tail_is_discarded_and_the_branch_is_at_its_last_whole_commit() {
 
     let db = reopen(&path, incarnation);
     assert_eq!(in_use(&db), after_first, "the torn commit's slots were recovered as live");
-    let bc = db.branch(b_id).unwrap().connect().unwrap();
+    // fastest-engine (PREREG v1 amendment 39, a base red fixed, not registered): the handle is
+    // HELD. The base connected through a temporary `db.branch(b_id).unwrap()`, whose drop released
+    // the branch at the end of that statement, so the write below was refused ("branch 1 has been
+    // reaped") and the store's life past the truncated tail was never tested in any arm.
+    let b = db.branch(b_id).unwrap();
+    let bc = b.connect().unwrap();
     assert_eq!(value(&bc, 7), Some("first".to_string()));
     assert_eq!(value(&bc, 150), Some(original(150)), "a torn commit was applied");
     // And the store keeps working past the truncated tail.
     set(&bc, 150, "after-recovery");
     assert_eq!(value(&bc, 150), Some("after-recovery".to_string()));
+    // The law the line above was reaching for: recovery cut the log at its last whole frame, so
+    // what was appended after it survives the NEXT recovery (a tail left torn would stop that
+    // replay at the torn frame, or refuse the append; mutant `no_torn_tail_cut`).
+    drop(bc);
+    let b_id = b.into_id();
+    let incarnation = db.incarnation;
+    drop(db);
+    let db = reopen(&path, incarnation);
+    let b = db.branch(b_id).unwrap();
+    let bc = b.connect().unwrap();
+    assert_eq!(value(&bc, 7), Some("first".to_string()));
+    assert_eq!(
+        value(&bc, 150),
+        Some("after-recovery".to_string()),
+        "a commit made after the torn tail was cut did not survive the next recovery"
+    );
 }
 
 #[test]
@@ -1439,10 +1460,17 @@ fn a_second_store_over_live_branch_files_refuses_at_open() {
     seed(&trunk, 20);
     let b = trunk.fork_branch().unwrap();
     set(&b.connect().unwrap(), 3, "b");
-    let durability = BranchDurability::Durable { sync: crate::branch::SyncClass::Fsync };
+    // fastest-engine (PREREG v1 amendment 39, a base red fixed, not registered): the second store
+    // opens in the SAME mode as the first. The base opened it in snapshot mode whatever
+    // `R11_BRANCH_CATALOG` said, so in the catalog arm the first refusal below came from the mode
+    // check (a catalog store's files), not from the lock, and the open after the drop failed the
+    // same way: the lock was never tested in that arm. The refusal must now be the lock's.
+    let durability = durable().branch_durability;
+    let refused = store::BranchStore::open(durability, None, path.to_str().unwrap());
     assert!(
-        store::BranchStore::open(durability, None, path.to_str().unwrap()).is_err(),
-        "a second store opened over a live store's branch log"
+        matches!(refused, Err(LimboError::LockingError(_))),
+        "a second store over a live store's branch log was not refused by its lock: {:?}",
+        refused.map(|_| ())
     );
     let b_id = b.into_id();
     drop(trunk);

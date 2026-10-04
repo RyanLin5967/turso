@@ -827,7 +827,11 @@ impl Journal {
                     ends.push(pos);
                 }
                 journal.len = pos as u64;
-                if (pos as u64) < bytes.len() as u64 {
+                // fastest-engine mutant `no_torn_tail_cut` (test builds only): the torn tail is
+                // left in the file, so appends no longer resume at a frame boundary.
+                if (pos as u64) < bytes.len() as u64
+                    && !super::store::fe_mutant("no_torn_tail_cut")
+                {
                     // The torn tail: a record that was never durable. Cut it off so appends resume
                     // at a frame boundary.
                     journal
@@ -1466,6 +1470,10 @@ fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64)>> {
 /// wedge inherent to flock and to OFD locks, refused loudly rather than raced. `exec` releases it
 /// (std opens files close-on-exec; recalled, not verified here).
 fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
+    // fastest-engine mutant `no_log_lock` (test builds only): no lock is taken.
+    if super::store::fe_mutant("no_log_lock") {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
