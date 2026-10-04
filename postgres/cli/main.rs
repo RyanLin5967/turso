@@ -44,7 +44,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso_core::branch::{BranchDurability, SyncClass};
-use turso_core::{DatabaseOpts, LimboError, OpenFlags, Statement, Value};
+use turso_core::{LimboError, OpenFlags, Statement, Value};
 use turso_pg::Connection;
 use turso_pg_server::TursoPgServer;
 
@@ -160,15 +160,7 @@ fn open_database(
     readonly: bool,
     branches: BranchDurability,
 ) -> anyhow::Result<(Arc<dyn turso_core::IO>, Arc<turso_core::Database>)> {
-    let db_opts = DatabaseOpts::new()
-        .with_views(true)
-        .with_custom_types(true)
-        .with_encryption(true)
-        .with_index_method(true)
-        .with_autovacuum(true)
-        .with_attach(true)
-        .with_generated_columns(true)
-        .with_branch_durability(branches);
+    let db_opts = turso_pg_server::database_opts(branches);
 
     let flags = if readonly {
         OpenFlags::default().union(OpenFlags::ReadOnly)

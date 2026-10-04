@@ -71,6 +71,21 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 2048;
 /// statements a REPL would.
 const SESSION_STACK: usize = 8 << 20;
 
+/// The options `tursopg` opens a database with, as a server and in its REPL: every frontend
+/// feature on, and named branches kept per `branches`. Anything that must open a database exactly as
+/// the server does (an embedded measurement of the same operations) takes them from here.
+pub fn database_opts(branches: turso_core::branch::BranchDurability) -> turso_core::DatabaseOpts {
+    turso_core::DatabaseOpts::new()
+        .with_views(true)
+        .with_custom_types(true)
+        .with_encryption(true)
+        .with_index_method(true)
+        .with_autovacuum(true)
+        .with_attach(true)
+        .with_generated_columns(true)
+        .with_branch_durability(branches)
+}
+
 pub struct TursoPgServer {
     address: String,
     shared: Arc<Shared>,
