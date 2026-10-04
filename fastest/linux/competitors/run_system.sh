@@ -12,7 +12,10 @@
 #   load      : the same attach around one bbload run of exactly N ops (FT_N1 at C=1, FT_N4 otherwise)
 #   deferred  : PG only -- the same attach around one CHECKPOINT: the flushes the ops left for later (WAL_LOG's
 #               data files, every op's dirty pages), reported apart from the window and never added to it
-#   cell.json : stracecount.py cell: flushes per op = (load - idle x load_s/idle_s) / ops; "exact" when idle = 0
+#   cell.json : stracecount.py cell: flushes per op = (load - idle x load_s/idle_s) / ops, the raw count, and the
+#               split by process role (foreground: main, the load generator's backends, PG checkpointer/walwriter/
+#               bgwriter/io workers; background: everything else); background_free when the idle control and the
+#               load window's background processes flushed nothing
 # B1 is embedded (no server): its load window runs clonebench under strace from exec, there is no idle control
 # (no process exists outside the op loop), and the per-path classes in cell.json split branch from parent flushes.
 #
@@ -133,7 +136,9 @@ bbload() { # bbload SPEC C N OUT -> bbload's rc
 # end in `|| true`, so a REFUSED window still left the job green); the cell carries the verdict too.
 count() {
   local rc=0
-  python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" >"$1.json" || rc=$?
+  local cl=()
+  [ -n "${2:-}" ] && cl=(--clients "$2")
+  python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" ${cl[@]+"${cl[@]}"} >"$1.json" || rc=$?
   [ $rc -eq 0 ] || fail "count $1: stracecount rc=$rc ($(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$1.json" 2>&1 | tail -1))"
 }
 # ops_of BBOUT CELLDIR -- "<total> <ok> <created>" into CELLDIR/ops.txt. A reader failure FAILS the job and writes
@@ -184,14 +189,14 @@ run_server_cell() { # run_server_cell SPEC C
     fi
   fi
   count "$d/idle"
-  count "$d/load"
+  count "$d/load" "$d/bb/backends.tsv"
   ops_of "$d/bb" "$d"
   read -r total ok created <"$d/ops.txt"
   python3 "$SC" cell --name "$SYSTEM/$spec-c$c" --load "$d/load.json" --idle "$d/idle.json" \
     --load-s "$(window_s "$d/load")" --idle-s "$(window_s "$d/idle")" --ops "$total" --ops-ok "$ok" \
     ${defer[@]+"${defer[@]}"} >"$d/cell.json"
   judge_cell "$d"
-  python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'raw/op', p.get('flushes_raw'), 'exact', c.get('exact'), 'deferred/op', c.get('deferred',{}).get('per_op'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
+  python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'raw/op', p.get('flushes_raw'), 'foreground/op', p.get('foreground'), 'background/op', p.get('background'), 'background_free', c.get('background_free'), 'deferred/op', c.get('deferred',{}).get('per_op'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
 }
 
 server_main() {

@@ -17,8 +17,10 @@
 # kernel.yama.ptrace_scope must be 0 (the workflow sets it): the servers are not strace's descendants.
 TRACESET=fsync,fdatasync,sync_file_range,syncfs,sync,msync,copy_file_range,ioctl,openat,openat2,fcntl,pwritev2
 TRACESET=$TRACESET,io_submit,io_uring_setup,io_uring_enter,io_uring_register
-# x86_64 still has the legacy open/creat entry points; aarch64 has only openat.
-[ "$(uname -m)" = x86_64 ] && TRACESET=$TRACESET,open,creat
+# Process lineage, so stracecount can map each traced thread id to its process (and that process to a role):
+# clone/clone3 everywhere; x86_64 also has the legacy fork/vfork, open and creat entry points (aarch64 has none).
+TRACESET=$TRACESET,clone,clone3
+[ "$(uname -m)" = x86_64 ] && TRACESET=$TRACESET,open,creat,fork,vfork
 STRACE_OPTS=(-f -C -y -qq -s 160 -e signal=none -e "trace=$TRACESET")
 ST_PID=
 
@@ -69,6 +71,20 @@ fdsync_scan() {
   rm -f "$out.fdsync.tmp"
 }
 
+# pid_roster OUT PID... -- OUT.pids: one line per live task "<tid> <pid> <cmdline>" of each PID at the attach (the
+# cmdline with NULs as spaces: PG's process titles, e.g. "postgres: checkpointer"). stracecount maps a traced line's
+# tid to its process through this roster plus the clone/fork lines of the window.
+pid_roster() {
+  local out=$1 p t cl
+  shift
+  for p in "$@"; do
+    cl=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) || continue
+    for t in /proc/"$p"/task/*; do
+      [ -e "$t" ] && echo "${t##*/} $p $cl"
+    done
+  done >"$out.pids"
+}
+
 traced_all() { # traced_all STRACEPID MAIN [PID...] -> 0 when MAIN is alive and every live task of MAIN and each PID is traced by STRACEPID
   local st=$1 main=$2 p t tp
   shift
@@ -110,7 +126,9 @@ strace_attach() {
     # attaches it at fork), so an untraced descendant now was forked between the enumeration and the seize.
     miss=$(untraced_tasks "$ST_PID" $(descendants "$main") | tr '\n' ' ')
     if [ -z "${miss// /}" ]; then
-      fdsync_scan "$out" $(printf '%s\n' $pids $(descendants "$main") | sort -un)
+      pids=$(printf '%s\n' $pids $(descendants "$main") | sort -un | tr '\n' ' ')
+      fdsync_scan "$out" $pids
+      pid_roster "$out" $pids
       echo "main=$main pids=$pids strace_pid=$ST_PID attach_tries=$try attached_after_polls=$i t0=$(date +%s.%N)" >"$out.window"
       return 0
     fi

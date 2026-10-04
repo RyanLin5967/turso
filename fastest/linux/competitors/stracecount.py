@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """stracecount.py -- exact flush counts from `strace -f -C -y` output (lane fastest-linux-comp).
 
-  stracecount.py count TRACE [--extra FILE]... [--root DIR] [--window W]   -> JSON on stdout
+  stracecount.py count TRACE [--extra FILE]... [--root DIR] [--window W] [--clients BACKENDS.TSV]   -> JSON
                       (--extra: strace's stderr file; --window: trace.sh's OUT.window, whose proven-attach line is
-                      what licenses reading a table-less, call-less attach window as zero)
+                      what licenses reading a table-less, call-less attach window as zero; its OUT.pids roster and
+                      the window's clone/fork lines map every flushing thread to a process and a role; --clients:
+                      bbload's backends.tsv, whose PG backend pids are the role "client")
   stracecount.py cell --name N --load L.json --idle I.json --load-s S --idle-s S --ops N
                       [--deferred D.json] [--ops-ok N]          -> JSON on stdout
   stracecount.py table DIR                                       -> TSV of every cell.json under DIR
@@ -90,7 +92,91 @@ def klass(path, root):
     return "outside:" + os.path.dirname(path)
 
 
-def count(trace, extras, root, window=None):
+SPAWN = ("clone", "clone3", "fork", "vfork")
+# Roles whose flushes are the op's own work or work the op waits on (an allowlist): the server's main process, the
+# load generator's own backends (bbload backends.tsv), and the PG processes that write and flush on a backend's
+# behalf. Every other role -- autovacuum workers, other backends, processes born in the window that are not the load
+# generator's, unmapped thread ids -- is BACKGROUND OR UNKNOWN, and any flush from one clears background_free.
+FOREGROUND = ("main", "client", "aux:checkpointer", "aux:walwriter", "aux:background writer", "aux:io worker",
+              "launched")
+PG_AUX = ("checkpointer", "background writer", "walwriter", "walsummarizer", "autovacuum launcher",
+          "autovacuum worker", "logical replication launcher", "io worker", "startup", "archiver")
+
+
+def pg_role(cmd):
+    if cmd.startswith("postgres: "):
+        rest = cmd[len("postgres: "):].strip()
+        for a in PG_AUX:
+            if rest.startswith(a):
+                return "aux:" + a
+        return "backend (not the load generator's)"
+    return None
+
+
+def attribute(by_tid, spawned, window, main, clients, attached):
+    """Map each flushing thread id to its process (the attach roster OUT.pids, then the window's clone/fork lines:
+    CLONE_THREAD keeps the creator's process, anything else starts a new one) and each process to a role."""
+    roster_path = window[: -len(".window")] + ".pids" if window and window.endswith(".window") else None
+    tgid, cmd = {}, {}
+    launched = not attached  # strace_run: one command traced from exec; an attach window must have its roster
+    have_roster = roster_path is not None and os.path.exists(roster_path)
+    if not launched and have_roster:
+        for ln in open(roster_path, errors="replace"):
+            f = ln.rstrip("\n").split(" ", 2)
+            if len(f) >= 2:
+                tgid[f[0]] = f[1]
+                cmd[f[1]] = f[2] if len(f) > 2 else ""
+    born, thread_parent = set(), {}
+    for creator, new, thread in spawned:
+        if thread:
+            thread_parent[new] = creator
+        else:
+            tgid[new] = new
+            born.add(new)
+
+    def proc_of(t):  # follow thread-creation links (in any file order) to a known process
+        seen = set()
+        while t in thread_parent and t not in seen and t not in tgid:
+            seen.add(t)
+            t = thread_parent[t]
+        return tgid.get(t)
+
+    def role(p):
+        if launched:
+            return "launched"  # strace_run: one command traced from exec, no roster; its processes are the subject
+        if p == main:
+            return "main"
+        if p in clients:
+            return "client"
+        if p in born:
+            return "other (born in the window, not the load generator's)"
+        if p in cmd:
+            return pg_role(cmd[p]) or ("process at attach: " + cmd[p][:60])
+        return "unmapped"
+
+    by_role, by_proc, unmapped = {}, {}, 0
+    for t, ks in by_tid.items():
+        p = proc_of(t)
+        n = sum(ks.values())
+        if launched:
+            r, p = "launched", p or t
+        elif p is None:
+            r, p = "unmapped", t
+            unmapped += n
+        else:
+            r = role(p)
+        by_role[r] = by_role.get(r, 0) + n
+        e = by_proc.setdefault(p, {"role": r, "flushes": 0})
+        e["flushes"] += n
+    bg = sum(n for r, n in by_role.items() if r not in FOREGROUND)
+    return {"by_role": by_role, "foreground_flushes": sum(by_role.values()) - bg, "background_flushes": bg,
+            "unmapped_flushes": unmapped, "roster_found": have_roster,
+            "attribution": "launch" if launched else "roster+lineage",
+            "clients_known": len(clients),
+            "top_processes": sorted(([p, e["role"], e["flushes"]] for p, e in by_proc.items()), key=lambda x: -x[2])[:20]}
+
+
+def count(trace, extras, root, window=None, clients=frozenset()):
     with open(trace, errors="replace") as f:
         text = f.read()
     summary = parse_summary(text)
@@ -117,13 +203,13 @@ def count(trace, extras, root, window=None):
                       and not SUMROW.match(ln) and not benign(ln)]
     lines = {}
     pending = {}
-    calls = []  # (name, args_and_rest)
+    calls = []  # (tid, name, args_and_rest)
     for line in text.splitlines():
         m = RESUMED.match(line)
         if m:
             pid, name, rest = m.groups()
             if pid in pending and pending[pid][0] == name:
-                calls.append((name, pending.pop(pid)[1] + rest))
+                calls.append((pid, name, pending.pop(pid)[1] + rest))
             continue
         m = START.match(line)
         if not m:
@@ -133,7 +219,7 @@ def count(trace, extras, root, window=None):
         if rest.endswith("<unfinished ...>"):
             pending[pid] = (name, rest[: -len("<unfinished ...>")])
         else:
-            calls.append((name, rest))
+            calls.append((pid, name, rest))
     # strace allocates its -c counters at the first counted call, so a window in which no traced syscall happened
     # prints NO table. That is a true zero only when the attach was proven (trace.sh's TracerPid check wrote
     # attached_after_polls= into the window file) and strace said nothing on stderr; otherwise it stays refused.
@@ -147,13 +233,18 @@ def count(trace, extras, root, window=None):
     flush["msync_sync"] = 0
     other = {"sync_file_range": 0, "msync_nosync": 0, "copy_file_range_calls": 0, "copy_file_range_bytes": 0,
              "ficlone": 0, "osync_opens": 0, "osync_fcntl": 0, "rwf_sync_writes": 0, "io_uring": 0, "io_submit": 0}
-    by_class, by_path = {}, {}
+    by_class, by_path, by_tid = {}, {}, {}
+    spawned = []  # (creator tid, new tid, is a thread) from clone/clone3/fork/vfork lines
     # Calls still unfinished at the detach are not counted as flushes (strace's -c table counts a call when it
     # returns), but their arguments are still searched for blind spots: an O_DSYNC open in flight is still one.
-    for done, (name, rest) in [(True, c) for c in calls] + [(False, p) for p in pending.values()]:
+    for done, (tid, name, rest) in [(True, c) for c in calls] + [(False, (p, n, r)) for p, (n, r) in pending.items()]:
         rm = RET.search(rest)
         ret = rm.group(1) if rm else "?"
         if not done and (name in FLUSH or name in ("msync", "sync_file_range", "copy_file_range", "ioctl")):
+            continue
+        if name in SPAWN:
+            if done and ret.isdigit() and int(ret) > 0:
+                spawned.append((tid, ret, name.startswith("clone") and "CLONE_THREAD" in rest))
             continue
         if name in FLUSH or name == "msync":
             if name == "msync":
@@ -165,6 +256,8 @@ def count(trace, extras, root, window=None):
             else:
                 key = name
             flush[key] += 1
+            by_tid.setdefault(tid, {}).setdefault(key, 0)
+            by_tid[tid][key] += 1
             pm = FDPATH.match(rest)
             path = pm.group(1) if pm else None
             c = klass(path, root)
@@ -199,6 +292,7 @@ def count(trace, extras, root, window=None):
     out.update(other)
     out["by_class"] = by_class
     out["top_paths"] = sorted(by_path.items(), key=lambda kv: -kv[1])[:15]
+    out.update(attribute(by_tid, spawned, window, main, clients, attached))
     problems, blind = [], []
     out["main_pid"], out["detach"] = main, detach
     # The pre-attach fd scan (trace.sh fdsync_scan): fds already open with O_SYNC/O_DSYNC when the attach completed.
@@ -216,6 +310,8 @@ def count(trace, extras, root, window=None):
                     pre_sync.append(f"pid {f[1]} fd {f[2]} flags {f[3]} {target or '(target unreadable)'}")
     out["fdsync_scanned"], out["osync_fds_at_attach"] = scanned, pre_sync
     if attached:
+        if not out["roster_found"]:
+            problems.append("attach window has no pid roster (OUT.pids): its flushes cannot be attributed")
         if not scanned.get(main or "", 0):
             problems.append(f"no pre-attach O_SYNC/O_DSYNC fd scan of the main pid {main}")
         if pre_sync:
@@ -299,16 +395,39 @@ def cell(a):
         bg = res["idle"][k] * scale if scale is not None else None
         per[k] = round((res["load"][k] - bg) / ops, 4) if bg is not None else None
         per[k + "_raw"] = round(res["load"][k] / ops, 4)
+    # Attribution by process role (count(): attach roster + clone lineage + the load generator's backends).
+    per["foreground"] = round(load.get("foreground_flushes", 0) / ops, 4)
+    per["background"] = round(load.get("background_flushes", 0) / ops, 4)
     res["per_op"] = per
-    # Exact when the idle control saw nothing: then nothing is scaled or estimated.
-    # Embedded: there is no control to be zero, so "exact" is not claimed; read load_by_class instead.
-    res["exact"] = None if embedded else res["idle"]["flushes"] == 0
+    res["load_by_role"] = load.get("by_role", {})
+    res["idle_by_role"] = idle.get("by_role", {})
+    res["load_top_processes"] = load.get("top_processes", [])
+    notes = []
+    # The old "exact" (idle control saw zero) was wrong (review finding 2): background processes -- PG autovacuum
+    # workers, bursty and more frequent as databases accumulate -- flushed inside load windows it called exact.
+    # background_free claims only what was observed: the idle control saw no flush, AND no flush in the load window
+    # came from a background or unmapped process. It cannot see background work INSIDE the server's own process
+    # (one-process servers: Dolt, Doltgres), which load_by_class shows by path instead.
+    if embedded:
+        res["background_free"] = None
+    else:
+        res["background_free"] = (res["idle"]["flushes"] == 0 and load.get("background_flushes", 0) == 0
+                                  and load.get("unmapped_flushes", 0) == 0)
+        if set(res["load_by_role"]) <= {"main"} and res["load"]["flushes"]:
+            notes.append("one process: background work inside the server process is not separable by process "
+                         "(see load_by_class)")
+    if per["flushes"] is not None and per["flushes"] < 0:
+        # Review finding 9: an idle control scaled to the load window can exceed the window's own count.
+        notes.append(f"idle-subtracted estimate below zero ({per['flushes']}): the scaled idle control "
+                     f"({res['idle']['flushes']} x {scale:.4f}) exceeds the window's {res['load']['flushes']} flushes;"
+                     " read flushes_raw")
+    res["notes"] = notes
     res["load_by_class"] = load["by_class"]
     res["idle_by_class"] = idle["by_class"]
     if a.get("deferred"):
         d = json.load(open(a["deferred"]))
         res["deferred"] = {"flushes": d["flushes"], "verdict": d["verdict"], "by_class": d["by_class"],
-                           "per_op": round(d["flushes"] / ops, 4)}
+                           "by_role": d.get("by_role", {}), "per_op": round(d["flushes"] / ops, 4)}
     bad = [v for v in (load["verdict"], idle["verdict"]) if v != "ok"]
     if a.get("deferred") and res["deferred"]["verdict"] != "ok":
         bad.append(res["deferred"]["verdict"])
@@ -318,22 +437,40 @@ def cell(a):
     return res
 
 
+TABLE_COLS = ["name", "ops", "ops_ok", "flushes/op", "raw/op", "foreground/op", "background/op", "background_free",
+              "idle_flushes", "idle_s", "load_s", "fsync/op", "fdatasync/op", "sync_file_range/op",
+              "copy_file_range/op", "ficlone/op", "deferred/op", "verdict", "notes"]
+
+
+def table_row(c):
+    p = c.get("per_op", {})
+    return [c.get("name"), c.get("ops"), c.get("ops_ok"), p.get("flushes"), p.get("flushes_raw"), p.get("foreground"),
+            p.get("background"), c.get("background_free"), c.get("idle", {}).get("flushes"), c.get("idle_s"),
+            c.get("load_s"), p.get("fsync"), p.get("fdatasync"), p.get("sync_file_range"),
+            p.get("copy_file_range_calls"), p.get("ficlone"), c.get("deferred", {}).get("per_op", ""),
+            c.get("verdict"), " | ".join(c.get("notes", []))]
+
+
 def table(d):
-    cols = ["name", "ops", "ops_ok", "flushes/op", "raw/op", "exact", "idle_flushes", "idle_s", "load_s",
-            "fsync/op", "fdatasync/op", "sync_file_range/op", "copy_file_range/op", "ficlone/op", "deferred/op",
-            "verdict"]
-    print("\t".join(["path"] + cols))
+    print("\t".join(["path"] + TABLE_COLS))
     for root, _, files in sorted(os.walk(d)):
         for fn in sorted(files):
             if fn != "cell.json":
                 continue
             c = json.load(open(os.path.join(root, fn)))
-            p = c.get("per_op", {})
-            row = [c["name"], c["ops"], c["ops_ok"], p.get("flushes"), p.get("flushes_raw"), c.get("exact"),
-                   c.get("idle", {}).get("flushes"), c["idle_s"], c["load_s"], p.get("fsync"), p.get("fdatasync"),
-                   p.get("sync_file_range"), p.get("copy_file_range_calls"), p.get("ficlone"),
-                   c.get("deferred", {}).get("per_op", ""), c["verdict"]]
-            print("\t".join([os.path.relpath(root, d)] + [str(x) for x in row]))
+            print("\t".join([os.path.relpath(root, d)] + [str(x) for x in table_row(c)]))
+
+
+def clients_of(path):
+    """The load generator's PG backend pids from bbload's backends.tsv (MySQL-protocol connection ids are not
+    process ids and are not used)."""
+    if not path:
+        return frozenset()
+    with open(path) as f:
+        head = f.readline().rstrip("\n").split("\t")
+        if head[-1] != "backend_pid":
+            return frozenset()
+        return frozenset(ln.rstrip("\n").split("\t")[-1] for ln in f if ln.strip())
 
 
 def kv(argv):
@@ -356,7 +493,7 @@ def main():
     cmd = sys.argv[1]
     if cmd == "count" and len(sys.argv) >= 3:
         a = kv(sys.argv[3:])
-        r = count(sys.argv[2], a.get("extra", []), a.get("root"), a.get("window"))
+        r = count(sys.argv[2], a.get("extra", []), a.get("root"), a.get("window"), clients_of(a.get("clients")))
         print(json.dumps(r, indent=1))
         sys.exit(0 if not r["verdict"].startswith("REFUSED") else 3)
     if cmd == "cell":

@@ -136,6 +136,11 @@ typedef struct {
     size_t nrec, cap;
     int state; /* 0 connecting, 1 ready, -1 failed */
     char err[512];
+    /* Linux port addition (not in the Mac original): the server-side id of every connection this client opened --
+     * PG: the backend's pid (PQbackendPID), MySQL protocol: the connection id (mysql_thread_id) -- written to
+     * backends.tsv, so a flush counter can attribute a backend process's syscalls to this load generator. */
+    struct { uint32_t seq; uint8_t kind; long id; } *bk; /* kind 0 = home (seq unused), 1 = a step connect of op seq */
+    size_t nbk, capbk;
 } client_t;
 
 static spec_t S;
@@ -457,6 +462,19 @@ static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_
     return 0;
 }
 
+/* Linux port addition: remember the server-side id of a connection just opened (see client_t.bk). */
+static void note_backend(client_t *c, uint32_t seq, uint8_t kind, conn_t *x) {
+    if (c->nbk == c->capbk) {
+        c->capbk = c->capbk ? c->capbk * 2 : 256;
+        c->bk = realloc(c->bk, c->capbk * sizeof *c->bk);
+        if (!c->bk) { fprintf(stderr, "bbload: out of memory\n"); _exit(2); }
+    }
+    c->bk[c->nbk].seq = seq;
+    c->bk[c->nbk].kind = kind;
+    c->bk[c->nbk].id = x->proto == P_PG ? (long)PQbackendPID(x->pg) : (long)mysql_thread_id(x->my);
+    c->nbk++;
+}
+
 /* ---------- one operation ---------- */
 static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st, ctx_t *x, char *why, size_t wsz) {
     char text[8192], w[256];
@@ -471,6 +489,7 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
         char ci[4096];
         if (expand(S.connect, x, ci, sizeof ci, w) != 0) { snprintf(why, wsz, "%s", w); return -1; }
         if (conn_open(cur, ci, text, why, wsz) != 0) return -1;
+        note_backend(c, x->i, 1, cur);
         *have_branch = 1;
         return 0;
     }
@@ -493,6 +512,7 @@ static void reconnect_home(client_t *c) {
     char ci[4096], w[256];
     ctx_t x = {.c = c->id, .i = 0, .rng = &c->rng};
     if (expand(S.connect, &x, ci, sizeof ci, w) == 0 && conn_open(&c->home, ci, NULL, w, sizeof w) == 0) {
+        note_backend(c, 0, 0, &c->home);
         for (int k = 0; k < S.nsetup; k++) {
             char t[8192];
             if (expand(S.setup[k], &x, t, sizeof t, w) == 0) conn_exec(&c->home, t, 0, w, sizeof w);
@@ -507,6 +527,7 @@ static void *client_main(void *arg) {
     char ci[4096], w[512];
     ctx_t x0 = {.c = c->id, .i = 0, .rng = &c->rng};
     int fail = expand(S.connect, &x0, ci, sizeof ci, w) != 0 || conn_open(&c->home, ci, NULL, w, sizeof w) != 0;
+    if (!fail) note_backend(c, 0, 0, &c->home);
     for (int k = 0; !fail && k < S.nsetup; k++) {
         char t[8192];
         fail = expand(S.setup[k], &x0, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0;
@@ -782,6 +803,17 @@ int main(int argc, char **argv) {
     f = fopen(p, "w");
     for (int e = 0; f && e < g_nerr; e++) fprintf(f, "%d\t%llu\t%s\n", e, (unsigned long long)g_errn[e], g_errs[e]);
     if (f) fclose(f);
+    /* Linux port addition: every connection's server-side id (PG backend pid / MySQL connection id). */
+    snprintf(p, sizeof p, "%s/backends.tsv", out);
+    f = fopen(p, "w");
+    if (!f) { fprintf(stderr, "bbload: backends.tsv: %s\n", strerror(errno)); return 2; }
+    fprintf(f, "client\tseq\tkind\t%s\n", S.proto == P_PG ? "backend_pid" : "connection_id");
+    for (int i = 0; i < C; i++)
+        for (size_t b = 0; b < CL[i].nbk; b++) {
+            if (CL[i].bk[b].kind == 0) fprintf(f, "%d\t-\thome\t%ld\n", i, CL[i].bk[b].id);
+            else fprintf(f, "%d\t%u\tstep\t%ld\n", i, CL[i].bk[b].seq, CL[i].bk[b].id);
+        }
+    if (fclose(f) != 0) { fprintf(stderr, "bbload: backends.tsv close failed\n"); return 2; }
 
     /* Summary from the raw records. */
     struct hdr_histogram *ht, *hs[MAXSTEPS];
