@@ -182,6 +182,9 @@ def main():
     info = rd(os.path.join(OUT, "info.txt")) or ""
     check("cell: the work dir is on the cell's filesystem (findmnt, recorded by firecheck.sh)",
           ("work_fstype=%s\n" % FS) in info, {"info": info[-400:]})
+    pers = [l.split("=", 1)[1] for l in info.splitlines() if l.startswith("personality_under_setarch_R=")]
+    check("cell: setarch -R turns ASLR off for the traced runs (personality has ADDR_NO_RANDOMIZE 0x0040000)",
+          len(pers) == 1 and int(pers[0], 16) & 0x0040000 != 0, {"personality": pers})
 
     # F1: syscalls per op equal each arm's definition, under strace -f -c, at n = 1, 2, 3, 40
     f1 = {}

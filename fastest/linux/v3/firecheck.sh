@@ -7,7 +7,8 @@
 # Arms (verdicts by check.py, which reads only OUT; every expectation there comes from the arm definitions):
 #   F1  each arm set under strace -f -c at n = 1, 2, 3, 40: every syscall's count grows per op by exactly the
 #       arms' definitions, and the flush syscalls' totals equal setup + definition x n. A slope over four n
-#       cancels the setup and output syscalls, which strace -c cannot separate from the timed ops.
+#       cancels the setup and output syscalls, which strace -c cannot separate from the timed ops. The traced runs
+#       have ASLR off (setarch -R) so startup is identical run to run.
 #  F2   the same with --mutant-nosync (no flush in the flushed arms; clean keeps its fsync); F2c: the F1 check
 #       rejects the mutant's counts and the mutant check rejects F1's (the detector can fire); F2b: the mutant
 #       unwatched at n=200 fails the flush control (rc 3).
@@ -32,9 +33,16 @@ NS="1 2 3 40"
   echo "work=$W"
   echo "work_fstype=$(findmnt -n -o FSTYPE -T "$W")"
   echo "work_mount=$(findmnt -n -o SOURCE,TARGET,OPTIONS -T "$W")"
+  echo "root_mount=$(findmnt -n -o SOURCE,FSTYPE,OPTIONS /)"
+  echo "mnt_mount=$(findmnt -n -o SOURCE,FSTYPE,OPTIONS -T /mnt)"
+  losetup -l -n -O NAME,BACK-FILE,DIO 2>/dev/null | sed 's/^/loop /'
   echo "v3floor_sha256=$(sha256sum "$V3" | cut -d' ' -f1)"
   echo "uname=$(uname -srm)"
   echo "strace=$(strace -V | head -1)"
+  # setarch -R: the traced runs have no ASLR. Run 37243578945 (arm64 only) saw munmap vary by +-1 between runs,
+  # independent of n; address-dependent alignment trimming at startup is the suspected cause (unverified until a
+  # run under -R is exact). Flag 0x0040000 = ADDR_NO_RANDOMIZE.
+  echo "personality_under_setarch_R=$(setarch "$(uname -m)" -R cat /proc/self/personality)"
   for d in /sys/block/*; do echo "block ${d##*/} write_cache=[$(cat "$d/queue/write_cache" 2>/dev/null)] fua=[$(cat "$d/queue/fua" 2>/dev/null)]"; done
 } > "$OUT/info.txt" 2>&1
 cat "$OUT/info.txt"
@@ -47,7 +55,7 @@ traced() {
   shift 3
   local base
   base="$OUT/$stage/$(tagof "$set").n$n"
-  timeout 600 strace -f -c -o "$base.strace" "$V3" --dir "$W" --out "$base.out" --n "$n" --arms "$set" --seed 7 "$@" \
+  timeout 600 setarch "$(uname -m)" -R strace -f -c -o "$base.strace" "$V3" --dir "$W" --out "$base.out" --n "$n" --arms "$set" --seed 7 "$@" \
     > "$base.txt" 2>&1
   echo $? > "$base.rc"
 }
