@@ -21,20 +21,22 @@ CC=${CC:-gcc}
 # symbols, and the shim would define one symbol twice.
 CF=(-O2 -g -Wall -Wextra -Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -U_FILE_OFFSET_BITS)
 
-$CC "${CF[@]}" -fPIC -shared -o "$OUT/syncshim.so" "$HERE/syncshim.c" -ldl -lpthread
+# Every unit is attempted, so one run reports every compile error; any failure fails the build at the end.
+broken=()
+unit() { local name=$1; shift; "$@" || broken+=("$name"); }
+unit syncshim.so $CC "${CF[@]}" -fPIC -shared -o "$OUT/syncshim.so" "$HERE/syncshim.c" -ldl -lpthread
 for m in pwrite64 open_2 fdatasync; do
   M=$(echo "$m" | tr '[:lower:]' '[:upper:]')
-  $CC "${CF[@]}" -fPIC -shared "-DV1_MUTANT_DROP_$M" -o "$OUT/syncshim_mut_$m.so" "$HERE/syncshim.c" -ldl -lpthread
+  unit "syncshim_mut_$m.so" $CC "${CF[@]}" -fPIC -shared "-DV1_MUTANT_DROP_$M" -o "$OUT/syncshim_mut_$m.so" \
+    "$HERE/syncshim.c" -ldl -lpthread
 done
-$CC "${CF[@]}" -o "$OUT/v1ctl" "$HERE/v1ctl.c" -lrt
-$CC "${CF[@]}" -o "$OUT/v1run" "$HERE/v1run.c" -lrt
-$CC "${CF[@]}" -o "$OUT/probe_c" "$HERE/probe_c.c" -ldl -lrt
-$CC "${CF[@]}" -static -DPROBE_STATIC -o "$OUT/probe_c_static" "$HERE/probe_c.c"
-(
-  cd "$HERE/probe_go"
-  CGO_ENABLED=0 timeout 600 go build -trimpath -o "$OUT/probe_go_nocgo" .
-  CGO_ENABLED=1 timeout 600 go build -trimpath -o "$OUT/probe_go_cgo" .
-)
+unit v1ctl $CC "${CF[@]}" -o "$OUT/v1ctl" "$HERE/v1ctl.c" -lrt
+unit v1run $CC "${CF[@]}" -o "$OUT/v1run" "$HERE/v1run.c" -lrt
+unit probe_c $CC "${CF[@]}" -o "$OUT/probe_c" "$HERE/probe_c.c" -ldl -lrt
+unit probe_c_static $CC "${CF[@]}" -static -DPROBE_STATIC -o "$OUT/probe_c_static" "$HERE/probe_c.c"
+unit probe_go_nocgo env -C "$HERE/probe_go" CGO_ENABLED=0 timeout 600 go build -trimpath -o "$OUT/probe_go_nocgo" .
+unit probe_go_cgo env -C "$HERE/probe_go" CGO_ENABLED=1 timeout 600 go build -trimpath -o "$OUT/probe_go_cgo" .
+[ ${#broken[@]} -eq 0 ] || { echo "build.sh: FAILED to build: ${broken[*]}" >&2; exit 1; }
 
 fail() { echo "build.sh: PROOF FAILED: $*" >&2; exit 1; }
 # The interposes the shim must export (every wrapper in syncshim.c), and the one each mutant must lack.

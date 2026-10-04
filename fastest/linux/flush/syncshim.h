@@ -65,7 +65,7 @@ static const char *const V1_KIND_NAMES[V1K_NKINDS] = {
 
 /* Marks: the client stores op ids here. V1_MARK_IDLE is OR-ed in after an ack, so calls that land between
  * operations (background work) are attributed to "after op k", not to op k. */
-#define V1_MARK_IDLE (1ULL << 63)
+#define V1_MARK_IDLE ((uint64_t)1 << 63)
 
 /* Slot flags. */
 #define V1_SLOT_GO 1u /* the image is a Go binary: its syscalls are raw, this slot's counts are NOT its flushes */
