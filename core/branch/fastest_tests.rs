@@ -1015,11 +1015,11 @@ fn a_fork_with_an_attached_database_is_refused() {
 }
 
 /// K10-D6 (mutant M-f `gate_admits_inflight`): a fork that arrives while a trunk commit is inside
-/// its commit gate — its copy decisions taken without the fork, its frames not yet published — must
-/// not register until the commit is published, or the child would read the commit's pages one way
-/// before the publication and another after it. A hook holds a commit inside its gate while another
-/// thread forks and reads at once; the child's first read must equal every later one (and, since
-/// the fork registers only after the commit, show the commit).
+/// its commit gate — its copy decisions taken without the fork, its frames not yet published —
+/// forks AFTER that commit, and is not handed out until the commit is published, or the child would
+/// read the commit's pages one way before the publication and another after it. A hook holds a
+/// commit inside its gate while another thread forks and reads at once; the child's first read
+/// must equal every later one, and show the commit.
 #[test]
 fn a_fork_waits_out_a_trunk_commit_inside_its_gate() {
     let _s = serial();
