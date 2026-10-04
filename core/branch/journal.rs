@@ -66,8 +66,11 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// the build before F7's merge 7, each with a different record set under the same magic, so the
 /// composition takes two numbers none of its inputs wrote, and refuses every other, never
 /// reinterprets it. A splice arm reads only its own (replay repeats every splice).
-const FORMAT_VERSION: u32 = 5;
-const SPLICE_FORMAT_VERSION: u32 = 6;
+///
+/// 7 and 8 (fastest-engine M1 item 4): 5 and 6 plus the `ForkNamed` record and a name in every
+/// snapshot branch.
+const FORMAT_VERSION: u32 = 7;
+const SPLICE_FORMAT_VERSION: u32 = 8;
 
 /// The format version a store in the splice arm (`true`) or not writes, and reads (its log and
 /// snapshot headers, and a catalog's meta row).
@@ -145,6 +148,14 @@ pub(crate) enum Record {
         child: u64,
         parent: u64,
     },
+    /// A NAMED server branch's fork (fastest-engine M1 item 4): detached, never leased, its name
+    /// unique among unreleased branches. The name is in the record, so the fork and its name are
+    /// durable together, and recovery rebuilds the name index from the log.
+    ForkNamed {
+        child: u64,
+        parent: u64,
+        name: String,
+    },
     /// A branch commit: every dirty page and the fresh slot it was written to.
     Commit {
         branch: u64,
@@ -200,6 +211,8 @@ const TAG_CHECKPOINT: u8 = 7;
 /// r13-compose S-4: F7-durable's 7 and 8, renumbered past F-FZ's `Checkpoint` (7).
 const TAG_RELEASE_OPEN: u8 = 8;
 const TAG_CLOSE: u8 = 9;
+/// fastest-engine M1 item 4.
+const TAG_FORK_NAMED: u8 = 10;
 
 /// Every record tag is distinct (r13-compose S-4): two equal tag constants would compile, with only an
 /// unreachable-pattern warning, and decode one record as the other. Refused at compile time instead.
@@ -214,6 +227,7 @@ const _: () = {
         TAG_CHECKPOINT,
         TAG_RELEASE_OPEN,
         TAG_CLOSE,
+        TAG_FORK_NAMED,
     ];
     let mut i = 0;
     while i < tags.len() {
@@ -233,6 +247,17 @@ impl Record {
                 out.push(TAG_FORK);
                 put_u64(out, *child);
                 put_u64(out, *parent);
+            }
+            Record::ForkNamed {
+                child,
+                parent,
+                name,
+            } => {
+                out.push(TAG_FORK_NAMED);
+                put_u64(out, *child);
+                put_u64(out, *parent);
+                put_u32(out, name.len() as u32);
+                out.extend_from_slice(name.as_bytes());
             }
             Record::Commit { branch, pages } => {
                 out.push(TAG_COMMIT);
@@ -298,6 +323,17 @@ impl Record {
                 child: r.u64()?,
                 parent: r.u64()?,
             },
+            TAG_FORK_NAMED => {
+                let child = r.u64()?;
+                let parent = r.u64()?;
+                let len = r.u32()? as usize;
+                let name = String::from_utf8(r.take(len)?.to_vec()).ok()?;
+                Record::ForkNamed {
+                    child,
+                    parent,
+                    name,
+                }
+            }
             TAG_COMMIT => {
                 let branch = r.u64()?;
                 let n = r.u32()? as usize;
@@ -362,6 +398,9 @@ pub(crate) struct SnapBranch {
     pub(crate) current: Vec<(u32, Slot, u64, u32)>,
     /// (page, born, died, slot, crc)
     pub(crate) retained: Vec<(u32, u64, u64, Slot, u32)>,
+    /// A named server branch's name (fastest-engine M1 item 4); `None` for an unnamed one, and for
+    /// a released one (a release frees its name).
+    pub(crate) name: Option<String>,
 }
 
 impl SnapshotState {
@@ -390,6 +429,10 @@ impl SnapshotState {
                 put_u32(out, crc);
             }
             put_retained(out, &b.retained);
+            // A name is never empty, so length 0 is "no name".
+            let name = b.name.as_deref().unwrap_or("");
+            put_u32(out, name.len() as u32);
+            out.extend_from_slice(name.as_bytes());
         }
     }
 
@@ -419,6 +462,11 @@ impl SnapshotState {
                 current.push((r.u32()?, r.u32()?, r.u64()?, r.u32()?));
             }
             let retained = get_retained(&mut r)?;
+            let len = r.u32()? as usize;
+            let name = match len {
+                0 => None,
+                _ => Some(String::from_utf8(r.take(len)?.to_vec()).ok()?),
+            };
             branches.push(SnapBranch {
                 id,
                 parent,
@@ -429,6 +477,7 @@ impl SnapshotState {
                 lease_deadline_ms,
                 current,
                 retained,
+                name,
             });
         }
         r.at_end().then_some(SnapshotState {
@@ -1444,7 +1493,7 @@ fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64)>> {
     let version = field(8);
     if version != format {
         return Err(corrupt(&format!(
-            "log format version {version}; this store reads version {format} (4 is the F7 \
+            "log format version {version}; this store reads version {format} (8 is the F7 \
              splice arm's: open with the same DatabaseOpts::with_branch_splice)"
         )));
     }
@@ -1512,7 +1561,7 @@ fn read_snapshot(path: &Path, format: u32) -> Result<(u32, u64, SnapshotState, u
         return Err(corrupt("snapshot checksum"));
     }
     if u32::from_le_bytes(body[8..12].try_into().unwrap()) != format {
-        return Err(corrupt("snapshot format version (4 is the F7 splice arm's)"));
+        return Err(corrupt("snapshot format version (8 is the F7 splice arm's)"));
     }
     let page_size = u32::from_le_bytes(body[12..16].try_into().unwrap());
     let generation = u64::from_le_bytes(body[16..24].try_into().unwrap());
@@ -2120,6 +2169,7 @@ mod tests {
                     lease_deadline_ms: 120_000,
                     current: vec![(4, 5, 1, 6), (9, 10, 0, 11)],
                     retained: vec![(4, 0, 1, 3, 77)],
+                    name: Some("server-one".to_string()),
                 },
                 SnapBranch {
                     id: 10,
@@ -2131,6 +2181,7 @@ mod tests {
                     lease_deadline_ms: 0,
                     current: vec![],
                     retained: vec![],
+                    name: None,
                 },
                 // Format 3: released while a connection holds it open.
                 SnapBranch {
@@ -2143,6 +2194,7 @@ mod tests {
                     lease_deadline_ms: 0,
                     current: vec![(4, 20, 0, 21)],
                     retained: vec![],
+                    name: None,
                 },
             ],
         };

@@ -101,6 +101,10 @@ const SCHEMA: &[&str] = &[
     // a12-durable-open C-P: F2's other side, read in place for the trunk (owner 0).
     "CREATE INDEX IF NOT EXISTS ret_died ON ret(owner, died)",
     "CREATE TABLE IF NOT EXISTS free(slot INTEGER PRIMARY KEY)",
+    // fastest-engine M1 item 4: a named server branch's name, unique among unreleased branches (a
+    // release deletes its row), and the index a release and a branch load find it by.
+    "CREATE TABLE IF NOT EXISTS branch_name(name TEXT PRIMARY KEY, id INTEGER NOT NULL)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS branch_name_id ON branch_name(id)",
 ];
 
 /// The catalog's per-operation lookups, as prepared below (for the plan test).
@@ -132,6 +136,10 @@ const LOOKUPS: &[&str] = &[
     "DELETE FROM branch WHERE id = ?1",
     "UPDATE branch SET epoch = ?2, released = ?3, lease = ?4, n_children = ?5 WHERE id = ?1",
     "UPDATE branch SET parent = ?2, fork_epoch = ?3 WHERE id = ?1",
+    "SELECT id FROM branch_name WHERE name = ?1",
+    "SELECT name FROM branch_name WHERE id = ?1",
+    "DELETE FROM branch_name WHERE name = ?1",
+    "DELETE FROM branch_name WHERE id = ?1",
 ];
 
 const META_GENERATION: i64 = 1;
@@ -212,6 +220,8 @@ pub(crate) struct CatBranch {
     pub(crate) current: Vec<(u32, Slot, u64, u32)>,
     /// (page, born, died, slot, crc)
     pub(crate) retained: Vec<(u32, u64, u64, Slot, u32)>,
+    /// A named server branch's name (fastest-engine M1 item 4), kept in `branch_name`.
+    pub(crate) name: Option<String>,
 }
 
 /// Counters, observing only (r11-restart lane instrument).
@@ -454,6 +464,11 @@ pub(crate) struct Catalog {
     free_del_upto: Stmt,
     free_del: Stmt,
     free_put: Stmt,
+    name_get: Stmt,
+    name_of: Stmt,
+    name_put: Stmt,
+    name_del: Stmt,
+    name_del_id: Stmt,
 }
 
 impl Catalog {
@@ -574,6 +589,11 @@ impl Catalog {
             free_del_upto: p("DELETE FROM free WHERE slot <= ?1")?,
             free_del: p("DELETE FROM free WHERE slot = ?1")?,
             free_put: p("INSERT OR REPLACE INTO free(slot) VALUES (?1)")?,
+            name_get: p("SELECT id FROM branch_name WHERE name = ?1")?,
+            name_of: p("SELECT name FROM branch_name WHERE id = ?1")?,
+            name_put: p("INSERT OR REPLACE INTO branch_name(name, id) VALUES (?1, ?2)")?,
+            name_del: p("DELETE FROM branch_name WHERE name = ?1")?,
+            name_del_id: p("DELETE FROM branch_name WHERE id = ?1")?,
             counters: CatalogCounters::default(),
             prewarm: PrewarmStats::default(),
             conn,
@@ -941,6 +961,7 @@ impl Catalog {
             n_children: get(row, 5)?,
             current: Vec::new(),
             retained: Vec::new(),
+            name: None,
         };
         (b.released, b.held_open) = match get(row, 3)? {
             0 => (false, false),
@@ -975,7 +996,37 @@ impl Catalog {
                 get(&row, 4)? as u32,
             ));
         }
+        b.name = self.name_of(id)?;
         Ok(Some(b))
+    }
+
+    /// The unreleased branch named `name`, as of the last checkpoint.
+    pub(crate) fn name_get(&mut self, name: &str) -> Result<Option<u64>> {
+        let rows = self.name_get.rows(&[Value::from_text(name.to_string())], &mut self.counters)?;
+        rows.first().map(|row| get(row, 0)).transpose()
+    }
+
+    /// The name of branch `id`, as of the last checkpoint.
+    pub(crate) fn name_of(&mut self, id: u64) -> Result<Option<String>> {
+        let rows = self.name_of.rows(&[int(id)], &mut self.counters)?;
+        match rows.first().and_then(|row| row.first()) {
+            None => Ok(None),
+            Some(Value::Text(t)) => Ok(Some(t.as_str().to_string())),
+            Some(other) => Err(LimboError::Corrupt(format!(
+                "branch catalog: branch {id}'s name is {other:?}"
+            ))),
+        }
+    }
+
+    /// Name `id` (replacing any row the name had).
+    pub(crate) fn name_put(&mut self, name: &str, id: u64) -> Result<()> {
+        self.name_put
+            .exec(&[Value::from_text(name.to_string()), int(id)], &mut self.counters)
+    }
+
+    /// Free `name`.
+    pub(crate) fn name_del(&mut self, name: &str) -> Result<()> {
+        self.name_del.exec(&[Value::from_text(name.to_string())], &mut self.counters)
     }
 
     /// Rewrite the mutable columns of a branch row the catalog already holds (parent and fork
@@ -1090,6 +1141,7 @@ impl Catalog {
 
     pub(crate) fn delete_branch(&mut self, id: u64) -> Result<()> {
         self.branch_del.exec(&[int(id)], &mut self.counters)?;
+        self.name_del_id.exec(&[int(id)], &mut self.counters)?;
         let lo = cur_key(id, 0)?;
         self.cur_del_range.exec(
             &[Value::from_i64(lo), Value::from_i64(lo + (1i64 << 32))],

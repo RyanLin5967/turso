@@ -806,3 +806,119 @@ fn a_trunk_commit_is_refused_when_an_early_release_it_relied_on_failed() {
         );
     }
 }
+
+// ---- detached, named, persistent server branches (fastest-engine M1 item 4) ----
+
+fn write_v(conn: &Arc<Connection>, id: i64, v: &str) {
+    conn.execute(format!("UPDATE t SET v = '{v}' WHERE id = {id}")).unwrap();
+}
+
+/// N1 (E3's core): a named branch needs no handle — nothing reaps it when the creating connection,
+/// or the whole database, goes away — survives a restart, and is connected to by name, with its
+/// own writes and nothing the trunk wrote after its fork. Branch-of-branch too.
+#[test]
+fn a_named_branch_is_detached_persistent_and_connectable_by_name() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("named.db");
+        let incarnation = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let alpha = trunk.create_branch("alpha").unwrap();
+            assert_eq!(db.branch_named("alpha").unwrap(), Some(alpha));
+            {
+                let c = db.connect_named("alpha").unwrap();
+                write_v(&c, 3, "alpha-3");
+                // A branch of the named branch, named, created from its connection.
+                c.create_branch("alpha.beta").unwrap();
+            }
+            write_v(&trunk, 4, "trunk-later");
+            {
+                let c = db.connect_named("alpha.beta").unwrap();
+                write_v(&c, 5, "beta-5");
+            }
+            assert!(db.branch_ids().unwrap().contains(&alpha));
+            db.incarnation
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let a = db.connect_named("alpha").unwrap();
+        assert_eq!(read_v(&a, 3), "alpha-3", "catalog={catalog}");
+        assert_eq!(read_v(&a, 4), "trunk-4", "catalog={catalog}: a trunk write after the fork");
+        assert_eq!(read_v(&a, 5), "trunk-5", "catalog={catalog}: the child's write leaked up");
+        drop(a);
+        let b = db.connect_named("alpha.beta").unwrap();
+        assert_eq!(read_v(&b, 3), "alpha-3", "catalog={catalog}: the child lost its parent's write");
+        assert_eq!(read_v(&b, 5), "beta-5", "catalog={catalog}");
+        assert!(db.connect_named("gamma").is_err(), "catalog={catalog}: an unknown name connected");
+    }
+}
+
+/// N2 (I7, and mutant M-i `name_check_outside`): a name is unique among unreleased branches; a
+/// dropped name is free at once, and re-created it names the NEW branch — before and after a
+/// checkpoint, and after a reopen.
+#[test]
+fn branch_names_are_unique_and_a_dropped_name_names_its_new_branch() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("unique.db");
+        let (second, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let first = trunk.create_branch("n").unwrap();
+            let dup = trunk.create_branch("n");
+            assert!(dup.is_err(), "catalog={catalog}: a taken name was given twice: {dup:?}");
+            db.branch_compact_now().unwrap();
+            assert!(trunk.create_branch("n").is_err(), "catalog={catalog}: after a checkpoint");
+            {
+                let c = db.connect_named("n").unwrap();
+                write_v(&c, 3, "first");
+            }
+            db.drop_branch("n").unwrap();
+            assert_eq!(db.branch_named("n").unwrap(), None, "catalog={catalog}: a dropped name");
+            assert!(db.drop_branch("n").is_err(), "catalog={catalog}: dropped twice");
+            let second = trunk.create_branch("n").unwrap();
+            assert_ne!(second, first);
+            assert_eq!(db.branch_named("n").unwrap(), Some(second));
+            assert_eq!(read_v(&db.connect_named("n").unwrap(), 3), "trunk-3", "catalog={catalog}");
+            (second, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        assert_eq!(db.branch_named("n").unwrap(), Some(second), "catalog={catalog}: after a reopen");
+        assert_eq!(read_v(&db.connect_named("n").unwrap(), 3), "trunk-3", "catalog={catalog}");
+        db.branch_compact_now().unwrap();
+        assert_eq!(db.branch_named("n").unwrap(), Some(second), "catalog={catalog}: after a checkpoint");
+    }
+}
+
+/// N3 (E3 a): a named server branch carries no lease, even when the database gives every fork one,
+/// so no expiry pass reaps it however long it sits idle; an unnamed fork beside it is reaped.
+#[test]
+fn a_named_branch_carries_no_lease_even_with_a_default_lease() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("lease.db");
+        let leased = |catalog| opts(catalog, SyncClass::Fsync).with_branch_lease(Some(std::time::Duration::from_secs(1)));
+        let (named, incarnation) = {
+            let db = open_at(&path, leased(catalog));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let unnamed = trunk.fork_branch().unwrap().into_id();
+            let named = trunk.create_branch("server").unwrap();
+            db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
+            let expired = db.expire_branches().unwrap();
+            assert!(expired.reaped.contains(&unnamed), "catalog={catalog}: premise: leases expire");
+            assert!(!expired.reaped.contains(&named), "catalog={catalog}: a named branch was leased");
+            db.branch_compact_now().unwrap();
+            (named, db.incarnation)
+        };
+        let db = reopen(&path, leased(catalog), incarnation);
+        db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
+        db.expire_branches().unwrap();
+        assert_eq!(db.branch_named("server").unwrap(), Some(named), "catalog={catalog}");
+    }
+}

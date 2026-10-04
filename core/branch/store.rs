@@ -5410,6 +5410,7 @@ impl StoreInner {
                     .map(|(&page, o)| (page, o.slot, o.born, o.crc))
                     .collect(),
                 retained: st.lineage.retained_list(),
+                name: None,
             }, what))
             .collect();
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
@@ -6339,6 +6340,10 @@ impl StoreInner {
             Record::Fork { child, parent } => self
                 .apply_fork(BranchId(*parent), BranchId(*child), None, Handle::Detached)
                 .map_err(corrupt),
+            // Not yet written by this build (fastest-engine item 4, red commit).
+            Record::ForkNamed { .. } => Err(corrupt(LimboError::InternalError(
+                "named branches: not implemented".to_string(),
+            ))),
             Record::Commit { branch, pages } => {
                 let id = BranchId(*branch);
                 // C-R: in catalog recovery (the arena is not open yet), a Commit to a branch that is
@@ -6470,6 +6475,7 @@ impl StoreInner {
                     lease_deadline_ms: st.lease.map_or(0, |d| d.saturating_add(1)),
                     current,
                     retained: st.lineage.retained_list(),
+                    name: None,
                 }
             })
             .collect();

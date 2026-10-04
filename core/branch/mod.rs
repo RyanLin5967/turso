@@ -1038,6 +1038,17 @@ impl Connection {
         self.db.branches.fork_trunk(schema, page_size, seen)
     }
 
+    /// Create a NAMED server branch of whatever this connection is on (fastest-engine M1 item 4):
+    /// detached — no [`Branch`] handle exists, so nothing reaps it but [`Database::drop_branch`] —
+    /// persistent across restarts, never leased (not even by `DatabaseOpts::with_branch_lease`),
+    /// and connectable by name ([`Database::connect_named`]) from any process that opens the
+    /// database. The name is unique among unreleased branches, and is durable with the fork: both
+    /// are one log record.
+    pub fn create_branch(self: &Arc<Connection>, name: &str) -> Result<BranchId> {
+        let _ = name;
+        Err(LimboError::InternalError("named branches: not implemented".to_string()))
+    }
+
     /// The branch this connection is open on, if any.
     pub fn branch_id(&self) -> Option<BranchId> {
         self.pager.load().branch_id()
@@ -1198,6 +1209,24 @@ impl Database {
     pub fn branch(self: &Arc<Database>, id: BranchId) -> Result<Branch> {
         self.branches.attach(id)?;
         Ok(Branch::new(self.clone(), id))
+    }
+
+    /// The unreleased branch named `name` (fastest-engine M1 item 4), if any.
+    pub fn branch_named(&self, name: &str) -> Result<Option<BranchId>> {
+        let _ = name;
+        Err(LimboError::InternalError("named branches: not implemented".to_string()))
+    }
+
+    /// A connection on the branch named `name`, which needs no handle (fastest-engine M1 item 4).
+    pub fn connect_named(self: &Arc<Database>, name: &str) -> Result<Arc<Connection>> {
+        let _ = name;
+        Err(LimboError::InternalError("named branches: not implemented".to_string()))
+    }
+
+    /// Release the branch named `name` (fastest-engine M1 item 4); its name is free from here on.
+    pub fn drop_branch(&self, name: &str) -> Result<Reaped> {
+        let _ = name;
+        Err(LimboError::InternalError("named branches: not implemented".to_string()))
     }
 
     /// Every unreleased branch, attached or not. Refused on a read-only handle of a database with
