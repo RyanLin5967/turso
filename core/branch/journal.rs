@@ -2378,3 +2378,145 @@ mod tests {
         assert_eq!(SnapshotState::decode(&body[..body.len() - 1]), None);
     }
 }
+
+/// fastest-engine M2 (r12-noforce's flight framing 339c17b2a / 02c5ce7f0, ported to the r13 store's
+/// group flights): a log written in flights tells a flight torn in the air — written, never synced,
+/// so never acknowledged — from an acknowledged flight lost under a later one; and a catalog
+/// checkpoint's cut log keeps its suffix readable.
+#[cfg(test)]
+mod flight_tests {
+    use super::*;
+
+    /// Three flights, each written as a group flight writes it. Returns the files and where each
+    /// flight began.
+    fn three_flights(dir: &Path) -> (BranchFiles, [u64; 3]) {
+        let files = BranchFiles::for_db(dir.join("db").to_str().unwrap());
+        let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+        let mut arena = Arena::new(512);
+        let mut starts = [0; 3];
+        for (i, start) in starts.iter_mut().enumerate() {
+            journal.buffer(&Record::Fork { child: i as u64 + 1, parent: 0 }).unwrap();
+            journal.buffer(&Record::Clock { now_ms: 7 }).unwrap();
+            *start = journal.len;
+            journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+        }
+        (files, starts)
+    }
+
+    fn zero(path: &Path, at: u64, n: usize) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = OpenOptions::new().write(true).open(path).unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&vec![0u8; n]).unwrap();
+    }
+
+    fn forks(records: &[Record]) -> Vec<u64> {
+        records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Fork { child, .. } => Some(*child),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A flight spans blocks, so a power cut while it is in the air can keep its end and lose its
+    /// start. It was never synced, so never acknowledged: recovery cuts the whole flight instead of
+    /// refusing the store as Corrupt (339c17b2a's finding 3).
+    #[test]
+    fn a_flight_torn_in_the_air_is_cut_not_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        zero(&files.log, starts[2], FRAME_HEADER_LEN + 4);
+        let recovered = Journal::recover(&files, SyncClass::Off)
+            .expect("a hole inside the last flight is a torn flight, not corruption")
+            .expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 2], "the torn flight was not cut whole");
+        drop(recovered);
+        assert_eq!(std::fs::metadata(&files.log).unwrap().len(), starts[2]);
+    }
+
+    /// ...and the refusal stands where it protects something: a hole with a WHOLE later flight after
+    /// it means an earlier, acknowledged flight was lost under a later one.
+    #[test]
+    fn a_hole_under_a_whole_later_flight_is_still_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        zero(&files.log, starts[1], FRAME_HEADER_LEN + 4);
+        assert!(Journal::recover(&files, SyncClass::Off).is_err(), "a lost acknowledged flight was cut");
+    }
+
+    /// A flight whose end did not reach the disk whole is dropped whole: none of it was
+    /// acknowledged, and a whole record inside it is not replayed on its own (mutant M-h,
+    /// `apply_torn_flight`, must fail this).
+    #[test]
+    fn a_flight_whose_end_is_torn_is_dropped_whole() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        let len = std::fs::metadata(&files.log).unwrap().len();
+        OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 2], "a torn flight's whole record was replayed");
+        drop(recovered);
+        assert_eq!(std::fs::metadata(&files.log).unwrap().len(), starts[2]);
+    }
+
+    /// ANY damage under a whole later flight is Corrupt, not only a zeroed frame (02c5ce7f0's R2-3).
+    #[cfg(unix)]
+    #[test]
+    fn a_garbled_frame_under_a_whole_later_flight_is_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        let mut byte = std::fs::read(&files.log).unwrap()[starts[1] as usize + FRAME_HEADER_LEN];
+        byte ^= 0x5A;
+        {
+            use std::os::unix::fs::FileExt;
+            let f = OpenOptions::new().write(true).open(&files.log).unwrap();
+            f.write_all_at(&[byte], starts[1] + FRAME_HEADER_LEN as u64).unwrap();
+        }
+        assert!(Journal::recover(&files, SyncClass::Off).is_err(), "damage under a later flight was cut");
+    }
+
+    /// The last flight lost its first block AND its end while a frame in its middle survived: never
+    /// synced, so cut back to the flight before it (02c5ce7f0's R2-4).
+    #[test]
+    fn a_last_flight_that_lost_its_start_and_end_is_cut() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        zero(&files.log, starts[2], FRAME_HEADER_LEN + 4);
+        let len = std::fs::metadata(&files.log).unwrap().len();
+        OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
+        let recovered = Journal::recover(&files, SyncClass::Off)
+            .expect("a torn last flight is not corruption")
+            .expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 2]);
+    }
+
+    /// The r13 composition: a catalog checkpoint keeps the log's suffix after its capture, which can
+    /// begin INSIDE a flight. The cut log must read back every kept record, including the second
+    /// half of that flight, and a flight written after the cut (fastest-engine; r12-noforce's port
+    /// had no log rewrite).
+    #[test]
+    fn a_cut_log_keeps_every_record_after_the_cut_even_mid_flight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (files, starts) = three_flights(dir.path());
+        let mut journal = Journal::recover(&files, SyncClass::Off).unwrap().expect("state").journal;
+        // The cut falls after flight 2's first frame: its Clock and all of flight 3 are kept.
+        let fork_frame = {
+            let bytes = std::fs::read(&files.log).unwrap();
+            let at = starts[1] as usize;
+            FRAME_HEADER_LEN + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+        };
+        journal.rewrite_from(starts[1] + fork_frame as u64, 1).unwrap();
+        let mut arena = Arena::new(512);
+        journal.buffer(&Record::Fork { child: 4, parent: 0 }).unwrap();
+        journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+        drop(journal);
+        let recovered = Journal::recover_catalog_as(&files, SyncClass::Off, Some((512, 1)), FORMAT_VERSION)
+            .unwrap()
+            .expect("state");
+        assert_eq!(forks(&recovered.records), vec![3, 4], "the cut log lost a kept record");
+        let clocks = recovered.records.iter().filter(|r| matches!(r, Record::Clock { .. })).count();
+        assert_eq!(clocks, 2, "flight 2's kept Clock and flight 3's");
+    }
+}
