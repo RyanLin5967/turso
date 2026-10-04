@@ -15,8 +15,8 @@
 # Each window writes OUT.strace (per-call lines, then the -c table), OUT.strace.err and OUT.window (the window's
 # CLOCK_REALTIME bounds, from `date +%s.%N`: attach-complete to detach-request, and strace's rc).
 # kernel.yama.ptrace_scope must be 0 (the workflow sets it): the servers are not strace's descendants.
-TRACESET=fsync,fdatasync,sync_file_range,syncfs,sync,msync,copy_file_range,ioctl,openat,fcntl,pwritev2,io_submit
-TRACESET=$TRACESET,io_uring_setup,io_uring_enter,io_uring_register
+TRACESET=fsync,fdatasync,sync_file_range,syncfs,sync,msync,copy_file_range,ioctl,openat,openat2,fcntl,pwritev2
+TRACESET=$TRACESET,io_submit,io_uring_setup,io_uring_enter,io_uring_register
 # x86_64 still has the legacy open/creat entry points; aarch64 has only openat.
 [ "$(uname -m)" = x86_64 ] && TRACESET=$TRACESET,open,creat
 STRACE_OPTS=(-f -C -y -qq -s 160 -e signal=none -e "trace=$TRACESET")
@@ -40,6 +40,33 @@ untraced_tasks() { # untraced_tasks STRACEPID PID... -> each live task "<pid>/ta
       [ -z "$tp" ] || [ "$tp" = "$st" ] || echo "${t#/proc/}"
     done
   done
+}
+
+# fdsync_scan OUT PID... -- OUT.fdsync: every fd of each PID whose open-file flags hold O_DSYNC (0o10000) or __O_SYNC
+# (0o4000000) -- the asm-generic values, which x86_64 and aarch64 both use -- as "hit PID FD FLAGS TARGET", and one
+# "scanned PID NFDS" line per PID. Run once the attach is proven: an fd opened BEFORE the attach with O_SYNC/O_DSYNC
+# makes each of its writes a flush that strace cannot see (writes are not traced), and its openat happened before
+# the trace began (review finding 3). Blind spot left: such an fd written and closed between the attach and this
+# scan (milliseconds).
+fdsync_scan() {
+  local out=$1 p
+  shift
+  : >"$out.fdsync"
+  for p in "$@"; do
+    [ -d "/proc/$p/fdinfo" ] || continue
+    awk -v pid="$p" '
+      /^flags:/ {
+        n++; f = $2; v = 0
+        for (i = 1; i <= length(f); i++) v = v * 8 + substr(f, i, 1)
+        if (int(v / 4096) % 2 == 1 || int(v / 1048576) % 2 == 1) { fd = FILENAME; sub(/.*\//, "", fd); print "hit", pid, fd, f }
+      }
+      END { print "scanned", pid, n + 0 }' /proc/"$p"/fdinfo/* 2>/dev/null >>"$out.fdsync.tmp"
+  done
+  local w p2 fd fl
+  while read -r w p2 fd fl; do
+    if [ "$w" = hit ]; then echo "hit $p2 $fd $fl $(readlink "/proc/$p2/fd/$fd" 2>/dev/null)"; else echo "$w $p2 $fd"; fi
+  done <"$out.fdsync.tmp" >"$out.fdsync"
+  rm -f "$out.fdsync.tmp"
 }
 
 traced_all() { # traced_all STRACEPID MAIN [PID...] -> 0 when MAIN is alive and every live task of MAIN and each PID is traced by STRACEPID
@@ -83,6 +110,7 @@ strace_attach() {
     # attaches it at fork), so an untraced descendant now was forked between the enumeration and the seize.
     miss=$(untraced_tasks "$ST_PID" $(descendants "$main") | tr '\n' ' ')
     if [ -z "${miss// /}" ]; then
+      fdsync_scan "$out" $(printf '%s\n' $pids $(descendants "$main") | sort -un)
       echo "main=$main pids=$pids strace_pid=$ST_PID attach_tries=$try attached_after_polls=$i t0=$(date +%s.%N)" >"$out.window"
       return 0
     fi

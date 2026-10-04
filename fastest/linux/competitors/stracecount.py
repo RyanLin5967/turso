@@ -19,7 +19,10 @@ from half an instrument is not a count.
 What counts as a FLUSH (a request that data reach stable storage): fsync, fdatasync, syncfs, sync, and msync with
 MS_SYNC. Reported apart, never added: sync_file_range (writeback hint, no cache flush), msync without MS_SYNC.
 BLIND SPOTS this counter cannot close, so it refuses (verdict INCOMPLETE) when it sees one rather than undercount:
-  - a file opened, or F_SETFL'd, with O_SYNC/O_DSYNC (each write is then a flush; writes are not traced);
+  - a file opened (open, openat, openat2), or F_SETFL'd, with O_SYNC/O_DSYNC (each write is then a flush; writes
+    are not traced) -- in the window, and, for an attach window, an fd already open with either flag when the attach
+    completed (trace.sh's fdsync_scan of /proc/<pid>/fdinfo, OUT.fdsync; an attach window without that scan of its
+    main pid is REFUSED);
   - pwritev2 with RWF_SYNC/RWF_DSYNC;
   - io_uring (io_uring_setup/enter/register): an IORING_OP_FSYNC is invisible to strace;
   - io_submit (Linux AIO), whose iocbs may carry IOCB_FLAG / O_DSYNC semantics strace does not decode here.
@@ -33,7 +36,19 @@ import sys
 
 FLUSH = ("fsync", "fdatasync", "syncfs", "sync")
 TRACED = ("fsync", "fdatasync", "sync_file_range", "syncfs", "sync", "msync", "copy_file_range", "ioctl",
-          "openat", "fcntl", "pwritev2", "io_submit", "io_uring_setup", "io_uring_enter", "io_uring_register")
+          "openat", "openat2", "fcntl", "pwritev2", "io_submit", "io_uring_setup", "io_uring_enter",
+          "io_uring_register")  # plus open and creat on x86_64 (trace.sh); creat takes no flags
+OPENS = ("open", "openat", "openat2")
+# Quoted strings (C-escaped) and -y's <path> annotations are removed before a flag is looked for, so a path that
+# holds ")" or "O_DSYNC" can neither hide nor fake one (review finding 14: the parse stopped at the first ")").
+QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"(?:\.\.\.)?')
+ANNOT = re.compile(r"<[^<>]*>")
+
+
+def sync_flag(rest):
+    """True if the call's arguments (strings and fd paths removed) carry O_SYNC or O_DSYNC."""
+    args = ANNOT.sub("", QUOTED.sub('""', rest))
+    return re.search(r"\bO_D?SYNC\b", args) is not None
 # strace -f -o FILE prefixes every line with the pid ("%-5d "); stderr output uses "[pid N] "; accept both, and none.
 START = re.compile(r"^(?:(?:\[pid\s+)?(\d+)\]?\s+)?([a-z_0-9]+)\((.*)$")
 RESUMED = re.compile(r"^(?:(?:\[pid\s+)?(\d+)\]?\s+)?<\.\.\. ([a-z_0-9]+) resumed>(.*)$")
@@ -133,9 +148,13 @@ def count(trace, extras, root, window=None):
     other = {"sync_file_range": 0, "msync_nosync": 0, "copy_file_range_calls": 0, "copy_file_range_bytes": 0,
              "ficlone": 0, "osync_opens": 0, "osync_fcntl": 0, "rwf_sync_writes": 0, "io_uring": 0, "io_submit": 0}
     by_class, by_path = {}, {}
-    for name, rest in calls:
+    # Calls still unfinished at the detach are not counted as flushes (strace's -c table counts a call when it
+    # returns), but their arguments are still searched for blind spots: an O_DSYNC open in flight is still one.
+    for done, (name, rest) in [(True, c) for c in calls] + [(False, p) for p in pending.values()]:
         rm = RET.search(rest)
         ret = rm.group(1) if rm else "?"
+        if not done and (name in FLUSH or name in ("msync", "sync_file_range", "copy_file_range", "ioctl")):
+            continue
         if name in FLUSH or name == "msync":
             if name == "msync":
                 if "MS_SYNC" in rest:
@@ -162,11 +181,11 @@ def count(trace, extras, root, window=None):
         elif name == "ioctl":
             if "FICLONE" in rest or "BTRFS_IOC_CLONE" in rest:
                 other["ficlone"] += 1
-        elif name == "openat":
-            if re.search(r"\bO_D?SYNC\b", rest.split(")")[0]):
+        elif name in OPENS:  # open/openat/openat2 (review finding 10: open and openat2 were not inspected)
+            if sync_flag(rest):
                 other["osync_opens"] += 1
         elif name == "fcntl":
-            if "F_SETFL" in rest and re.search(r"\bO_D?SYNC\b", rest):
+            if "F_SETFL" in rest and sync_flag(rest):
                 other["osync_fcntl"] += 1
         elif name == "pwritev2":
             if re.search(r"RWF_D?SYNC", rest):
@@ -182,6 +201,25 @@ def count(trace, extras, root, window=None):
     out["top_paths"] = sorted(by_path.items(), key=lambda kv: -kv[1])[:15]
     problems, blind = [], []
     out["main_pid"], out["detach"] = main, detach
+    # The pre-attach fd scan (trace.sh fdsync_scan): fds already open with O_SYNC/O_DSYNC when the attach completed.
+    fds_path = window[: -len(".window")] + ".fdsync" if window and window.endswith(".window") else None
+    scanned, pre_sync = {}, []
+    if fds_path and os.path.exists(fds_path):
+        for ln in open(fds_path, errors="replace"):
+            f = ln.split()
+            if len(f) >= 3 and f[0] == "scanned":
+                scanned[f[1]] = scanned.get(f[1], 0) + int(f[2])
+            elif len(f) >= 4 and f[0] == "hit":
+                target = " ".join(f[4:])
+                # A socket, pipe or anon inode with O_DSYNC flushes no file; an unreadable target counts (unknown).
+                if target.startswith("/") or not target:
+                    pre_sync.append(f"pid {f[1]} fd {f[2]} flags {f[3]} {target or '(target unreadable)'}")
+    out["fdsync_scanned"], out["osync_fds_at_attach"] = scanned, pre_sync
+    if attached:
+        if not scanned.get(main or "", 0):
+            problems.append(f"no pre-attach O_SYNC/O_DSYNC fd scan of the main pid {main}")
+        if pre_sync:
+            blind.append(f"O_SYNC/O_DSYNC fd open before the attach x{len(pre_sync)} ({pre_sync[0][:120]})")
     if attached:
         # An attach window is a count of a LIVE server: its main pid must be named, and both the strace and the server
         # must still have been running when the detach was requested (else every tracee died and an empty window
