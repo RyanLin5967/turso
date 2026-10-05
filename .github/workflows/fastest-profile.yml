@@ -77,7 +77,7 @@ jobs:
             [ -n "$p" ] && sudo ln -sf "$p" /usr/local/bin/perf
           fi
           perf --version
-          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 kernel.perf_event_max_sample_rate=100000
           git clone -q https://github.com/brendangregg/FlameGraph "$RUNNER_TEMP/FlameGraph"
           mkdir -p "$RAW"
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }}";
@@ -130,11 +130,19 @@ jobs:
         run: |
           bash fastest/linux/fs/mkloop.sh ext4 "$MNT" 2>&1 | tee "$RAW/mkloop.txt"
           bash fastest/linux/hw/record.sh "$RAW/hw" "$MNT/hw" 15
+      # Each side's rc goes to a file and the Verdict step reads it, so one failed instrument run never
+      # skips the analysis of everything else (run 37256052378 lost its x86_64 analysis that way).
       - name: Profile head
-        run: FLAMEGRAPH_DIR="$RUNNER_TEMP/FlameGraph" bash fastest/linux/profile/profile.sh dist/head/fastest_profile head "$RAW" "$MNT/work"
+        run: |
+          rc=0
+          FLAMEGRAPH_DIR="$RUNNER_TEMP/FlameGraph" bash fastest/linux/profile/profile.sh dist/head/fastest_profile head "$RAW" "$MNT/work" || rc=$?
+          echo $rc > "$RAW/head.rc"
       - name: Profile base
         if: hashFiles('dist/base/fastest_profile') != ''
-        run: FLAMEGRAPH_DIR="$RUNNER_TEMP/FlameGraph" bash fastest/linux/profile/profile.sh dist/base/fastest_profile base "$RAW" "$MNT/work"
+        run: |
+          rc=0
+          FLAMEGRAPH_DIR="$RUNNER_TEMP/FlameGraph" bash fastest/linux/profile/profile.sh dist/base/fastest_profile base "$RAW" "$MNT/work" || rc=$?
+          echo $rc > "$RAW/base.rc"
       - name: Analyze and gate
         id: gate
         run: |
@@ -145,6 +153,9 @@ jobs:
           rc=$?
           cat "$RAW/analysis/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          green=0
+          [ $rc = 0 ] && [ "$(cat "$RAW/head.rc" 2>/dev/null)" = 0 ] && { [ ! -f "$RAW/base.rc" ] || [ "$(cat "$RAW/base.rc")" = 0 ]; } && green=1
+          echo "green=$green" >> "$GITHUB_OUTPUT"
           exit 0
       - name: Upload raw
         if: always()
@@ -154,7 +165,7 @@ jobs:
           path: profile-raw/
           retention-days: 90
       - name: Upload the baseline (green runs, or an explicit rebaseline)
-        if: steps.gate.outputs.rc == '0' || inputs.rebaseline == 'true'
+        if: steps.gate.outputs.green == '1' || inputs.rebaseline == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: profile-baseline-${{ matrix.runner }}
@@ -162,4 +173,11 @@ jobs:
           retention-days: 90
       - name: Verdict
         run: |
-          [ "${{ steps.gate.outputs.rc }}" = 0 ] || { echo "profile gates FAILED: see verdict.tsv"; cat "$RAW/analysis/verdict.tsv" 2>/dev/null; exit 1; }
+          bad=0
+          for side in head base; do
+            [ -f "$RAW/$side.rc" ] || continue
+            r=$(cat "$RAW/$side.rc"); [ "$r" = 0 ] || { echo "profile.sh $side rc=$r (runs.tsv lists the failed instrument runs)"; bad=1; }
+          done
+          [ -f "$RAW/head.rc" ] || { echo "the head was never profiled"; bad=1; }
+          [ "${{ steps.gate.outputs.rc }}" = 0 ] || { echo "profile gates FAILED: see verdict.tsv"; cat "$RAW/analysis/verdict.tsv" 2>/dev/null; bad=1; }
+          exit $bad
