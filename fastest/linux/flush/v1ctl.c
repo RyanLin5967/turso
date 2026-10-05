@@ -34,6 +34,7 @@
 #include "syncshim.h"
 #include <dirent.h>
 #include <inttypes.h>
+#include <signal.h>
 
 static int usage(void) {
     fprintf(stderr, "usage: v1ctl create|report|events|bymark|mark|rm <run> ...\n");
@@ -129,7 +130,12 @@ static int slot_alive(const v1_slot *s) {
     char st = '?';
     uint64_t t = 0;
     int got = read_stat(path, &st, &t);
-    if (got == 0) return 0;
+    if (got == 0) {
+        /* /proc says no such process -- but hidepid hides other users' processes from a reader without
+         * CAP_SYS_PTRACE (even euid 0), and kill(pid, 0) is not filtered by it: dead only if kill says ESRCH. */
+        if (kill(s->pid, 0) == 0 || errno == EPERM) return 1;
+        return 0;
+    }
     if (got < 0) return 1;
     if (s->start_ticks != 0 && t != s->start_ticks) return 0; /* the pid now names another process */
     if (st != 'Z' && st != 'X' && st != 'x') return 1;

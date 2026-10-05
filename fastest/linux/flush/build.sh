@@ -7,7 +7,8 @@
 #                                and three each breaking one piece of logic (no_fork_claim: a fork child gets no slot
 #                                at birth; syscall_no_fcntl: fcntl through syscall(2) is not tracked; pwritev2_a4: raw
 #                                pwritev2's flags are read from the wrong argument; no_recheck: a slow slot claim whose
-#                                waiters claim again without re-checking)
+#                                waiters claim again without re-checking; split_publish: a slot claim that publishes
+#                                the slot and the pid apart, with a window between)
 #   v1ctl, v1run                 run control and launcher
 #   probe_c, probe_c_static      the C probe, and a static build of its "spawned" mode (never loads the shim)
 #   probe_uring                  a C probe linked against liburing.so (io_uring_queue_init + IORING_OP_FSYNC)
@@ -26,7 +27,7 @@ CC=${CC:-gcc}
 # symbols, and the shim would define one symbol twice.
 CF=(-O2 -g -Wall -Wextra -Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -U_FILE_OFFSET_BITS)
 DROP_MUTANTS="pwrite64 open_2 fdatasync"
-LOGIC_MUTANTS="no_fork_claim syscall_no_fcntl pwritev2_a4 no_recheck"
+LOGIC_MUTANTS="no_fork_claim syscall_no_fcntl pwritev2_a4 no_recheck split_publish"
 
 # Every unit is attempted, so one run reports every compile error; any failure fails the build at the end.
 broken=()

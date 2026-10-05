@@ -26,6 +26,7 @@
  *     execstatic  three children that never attach: posix_spawn and fork+execv of the STATIC probe (argv[4]),
  *                 and fork+execve of this probe with an environment that has no LD_PRELOAD
  *     fanout      posix_spawn three "spawned" children (the slot- and exec-table overflow arms)
+ *     vforkrace   a thread fsyncs in a loop while K vfork children each fsync once: every count under its own pid
  *     setfl-truth (run WITHOUT the shim) prints 1 if F_SETFL O_DSYNC sticks on this kernel, else 0
  *
  * Each phase sets the run mark first (v1_set_mark). Expected counts are derived from K by firecheck.py, never read
@@ -716,6 +717,49 @@ static int run_leaderexit(int K) {
 }
 
 /* waitfile: K fsync, print ready, then wait until argv[4] exists and exit 0. */
+/* vforkrace: a thread fsyncs in a loop while the main thread makes K vfork children, each of which fsyncs once and
+ * _exits. A vfork child shares the parent's memory, so the slot it claims is published where the parent's counting
+ * thread reads its own: every count must land under the pid that made it. The thread prints how many it made. */
+static volatile int g_vr_stop;
+static long g_vr_count;
+static int g_vr_fd;
+static void *vr_thread(void *arg) {
+    (void)arg;
+    while (!__atomic_load_n(&g_vr_stop, __ATOMIC_ACQUIRE)) {
+        if (fsync(g_vr_fd) != 0) _exit(11);
+        g_vr_count++;
+    }
+    return NULL;
+}
+/* Its own function, so no local of run_vforkrace is live across the vfork (-Wclobbered). */
+static pid_t vfork_fsync_exit(int fd) {
+    pid_t p = vfork();
+    if (p == 0) _exit(fsync(fd) == 0 ? 0 : 12);
+    return p;
+}
+static int run_vforkrace(int K) {
+    char b[512] = {0};
+    g_vr_fd = openf("vforkrace_parent", O_RDWR | O_TRUNC);
+    int cfd = openf("vforkrace_child", O_RDWR | O_TRUNC);
+    ck(write(g_vr_fd, b, sizeof b), "write");
+    ck(write(cfd, b, sizeof b), "write");
+    pthread_t t;
+    if (pthread_create(&t, NULL, vr_thread, NULL)) die("pthread_create");
+    printf("probe_c vforkrace K=%d root=%d children=", K, (int)getpid());
+    for (int i = 0; i < K; i++) {
+        pid_t c = vfork_fsync_exit(cfd);
+        if (c < 0) die("vfork");
+        wait_ok(c, "vfork child");
+        printf("%s%d", i ? "," : "", (int)c);
+    }
+    __atomic_store_n(&g_vr_stop, 1, __ATOMIC_RELEASE);
+    pthread_join(t, NULL);
+    printf(" thread_fsyncs=%ld\n", g_vr_count);
+    close(cfd);
+    close(g_vr_fd);
+    return 0;
+}
+
 static int run_waitfile(int K, const char *flag) {
     int fd = openf("waitfile", O_RDWR | O_TRUNC);
     char b[512] = {0};
@@ -838,7 +882,7 @@ static int run_sqlite(void) {
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "usage: probe_c full|noise|spawned|inherited|raw|uring|threads|sqlite|killme|killmid|bigfd|"
-                        "execstatic|fanout|cloneonly|forkidle|leaderexit|waitfile|setfl-truth K dir [args]\n");
+                        "execstatic|fanout|cloneonly|forkidle|leaderexit|waitfile|vforkrace|setfl-truth K dir [args]\n");
         return 2;
     }
     const char *mode = argv[1];
@@ -888,6 +932,7 @@ int main(int argc, char **argv) {
         if (argc < 5) { fprintf(stderr, "probe_c: forkidle needs fork|_Fork|clone\n"); return 2; }
         return run_forkidle(K, argv[4]);
     }
+    if (!strcmp(mode, "vforkrace")) return run_vforkrace(K);
     if (!strcmp(mode, "waitfile")) {
         if (argc < 5) { fprintf(stderr, "probe_c: waitfile needs the flag file\n"); return 2; }
         return run_waitfile(K, argv[4]);

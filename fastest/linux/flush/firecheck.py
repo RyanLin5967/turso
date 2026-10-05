@@ -48,6 +48,10 @@ Arms (each must hold; the run exits 1 on any failure, 2 on a refused setup, and 
                        other thread still runs is LIVE
   foreign, foreign /proc  slots claimed in another pid namespace (sudo unshare --pid): rc 12, live or not; a report
                        inside the namespace that reads the host's /proc (no --mount-proc): rc 12
+  hidepid              /proc with hidepid=invisible: root without CAP_SYS_PTRACE still reads the hidden live process as
+                       LIVE (kill(pid, 0)), the user's report refuses (rc 12)
+  vforkrace            a counting thread races K vfork children that each fsync once: every count under its own pid;
+                       mutant split_publish (pid and slot published apart) misattributes and is caught
   create               a run larger than /dev/shm is refused at create (posix_fallocate), never a SIGBUS later
   outside              the flushing process runs outside the v1run tree while the tree clones: ZERO (rc 8), never ok
   bigfd                K writes on fd 1048600: fd_untracked exactly K, VOID (rc 5) not waivable
@@ -86,6 +90,7 @@ MUTANTS = {  # mutant -> (the arm it runs under, its predicted deficit as a func
     "no_fork_claim": ("forkidle", lambda K: {"rc_first": 0, "child_alive_at_first": True,
                                               "totals_final": {"fsync": 1 + K}}),  # alive, yet not seen live
     "no_recheck": ("threads", lambda K: {"child_slots": 8}),  # 8 racing threads, each claims again
+    "split_publish": ("vforkrace", lambda K: {"parent_short": True, "child_over": True}),  # a torn {pid, slot}
 }
 PERTURB = ["root fsync +1", "a per-mark row moved, totals unchanged", "an exec record unattached",
            "an sfr flags value changed", "a slot marked Go", "one missed call"]
@@ -104,6 +109,8 @@ REGISTERED = (["setfl-truth", "C-full K=7", "C-full K=23"] + ["perturb: %s caugh
                "leaderexit: a zombie leader with a running thread is LIVE",
                "foreign pid namespace -> rc 12",
                "foreign /proc: a report reading another namespace's /proc -> rc 12",
+               "hidepid: root without CAP_SYS_PTRACE reads the hidden process LIVE; the user's report refuses",
+               "vforkrace: every count under the pid that made it",
                "create refuses what /dev/shm cannot hold",
                "outside: flushes outside the tree, clones inside -> ZERO rc 8", "bigfd: untracked fd -> VOID rc 5",
                "refuse: SYNCSHIM_RUN unset -> 97", "refuse: missing run -> 97", "refuse: nothing attached -> rc 3",
@@ -508,7 +515,8 @@ def sec_mutants():
         elif where == "raw":
             ok, d, diffs = check_raw(7, gather_raw(7, shim=shim, strace=False), use_strace=False)
         else:
-            ok, d, diffs = check_forkidle(7, "fork", shim=shim) if where == "forkidle" else check_threads(7, shim)
+            ok, d, diffs = (check_forkidle(7, "fork", shim=shim) if where == "forkidle" else
+                            check_threads(7, shim) if where == "threads" else check_vforkrace(23, shim))
         arm("mutant-%s caught with the exact deficit" % m, (not ok) and diffs == want,
             {"arm": where, "checker_ok": ok, "diffs": diffs, "predicted": want, "detail": d})
 
@@ -625,7 +633,7 @@ def sec_liburing():
         ro = by_pid(rep).get(p.get("root")) if rep else None
         # the 7 ring fsyncs are invisible (liburing's raw syscalls); the ring's setup through liburing.so refuses
         arm(name, r.returncode == 0 and p.get("ring_fsyncs_done") == 7 and rc == 9 and rc2 == 0
-            and rep is not None and rep["async_io"] >= 1 and ro is not None and ro["counts"] == counts(fsync=1)
+            and rep is not None and rep["async_io"] == 1 and ro is not None and ro["counts"] == counts(fsync=1)
             and rep2["waived"] == ["uncounted"],
             {"how": how, "rc": rc, "rc_allow": rc2, "async_io": rep and rep["async_io"], "probe": r.stdout.strip(),
              "probe_rc": r.returncode, "probe_stderr": r.stderr[-300:], "root": ro and nz(ro["counts"]),
@@ -962,6 +970,74 @@ def sec_foreign_proc():
          "foreign_ns": rep and rep["foreign_ns"], "verdict": rep and rep["verdict"], "stderr": r.stderr[-300:]})
 
 
+def check_vforkrace(K, shim=None):
+    """A thread fsyncs in a loop while K vfork children each fsync once. Expected, from the probe's own counts: the
+    root pid holds exactly the thread's fsyncs, every child pid exactly 1. diffs (for a mutant): whether the root is
+    short and whether a child holds more than its own."""
+    run = new_run("v")
+    r, _ = launch(run, [B + "/probe_c", "vforkrace", str(K), W], shim=shim)
+    rc, rep = report(run)
+    rm(run)
+    p = pids_from(r.stdout)
+    m = re.search(r"children=([\d,]+)", r.stdout)
+    kids = [int(x) for x in m.group(1).split(",")] if m else []
+    agg = by_pid(rep) if rep else {}
+    ro = agg.get(p.get("root"))
+    tc = p.get("thread_fsyncs", -1)
+    per_child = {c: (agg[c]["counts"]["fsync"] if c in agg else None) for c in kids}
+    parent = ro["counts"]["fsync"] if ro else None
+    ok = (r.returncode == 0 and rc == 0 and len(kids) == K and tc > 0 and parent == tc
+          and all(v == 1 for v in per_child.values()) and rep["totals"] == counts(fsync=tc + K))
+    d = {"rc": rc, "probe_rc": r.returncode, "thread_fsyncs": tc, "root_fsync": parent,
+         "root_slots": ro and ro["n"], "children_not_1": {c: v for c, v in per_child.items() if v != 1},
+         "totals": rep and nz(rep["totals"]), "stderr": r.stderr[-300:]}
+    diffs = {"parent_short": parent is not None and parent < tc,
+             "child_over": any(v is not None and v > 1 for v in per_child.values())} if not ok else {}
+    return ok, d, diffs
+
+
+def sec_vforkrace():
+    ok, d, _ = check_vforkrace(23)
+    arm("vforkrace: every count under the pid that made it", ok, d)
+
+
+def sec_hidepid():
+    """/proc mounted with hidepid=invisible (in a private mount namespace). A report as root WITHOUT CAP_SYS_PTRACE
+    cannot see the runner-owned probe in /proc, and must still read it LIVE (rc 10), never dead (rc 0). A report as
+    the user refuses outright (rc 12): its /proc hides other users."""
+    import pwd
+    user = pwd.getpwuid(os.getuid()).pw_name
+    run = new_run("p")
+    flag = os.path.join(W, "hp.go")
+    try:
+        os.unlink(flag)
+    except FileNotFoundError:
+        pass
+    pr = subprocess.Popen([B + "/v1run", run, B + "/probe_c", "waitfile", "3", W, flag], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True)
+    pid, line = ready_pid(pr)
+    mnt = 'mount -t proc -o hidepid=invisible proc /proc && exec "$@"'
+    r_root = sh(["sudo", "-n", "unshare", "-m", "sh", "-c", mnt, "sh", "setpriv", "--bounding-set=-sys_ptrace",
+                 B + "/v1ctl", "report", run, "--json"], timeout=60)
+    r_user = sh(["sudo", "-n", "unshare", "-m", "sh", "-c", mnt, "sh", "setpriv", "--reuid=" + user, "--regid=" + user,
+                 "--init-groups", B + "/v1ctl", "report", run, "--json"], timeout=60)
+    open(flag, "w").close()
+    rcp = pr.wait(timeout=60)
+    rc_final, rep_final = report(run)
+    rm(run)
+    save(run + ".hidepid.txt", "root rc=%d\n%s\n%s\nuser rc=%d\n%s\n%s\n" % (
+        r_root.returncode, r_root.stdout, r_root.stderr, r_user.returncode, r_user.stdout, r_user.stderr))
+    jr = json.loads(r_root.stdout) if r_root.stdout.strip().startswith("{") else None
+    ju = json.loads(r_user.stdout) if r_user.stdout.strip().startswith("{") else None
+    arm("hidepid: root without CAP_SYS_PTRACE reads the hidden process LIVE; the user's report refuses",
+        pid is not None and r_root.returncode == 10 and jr is not None and jr["live"] >= 1
+        and r_user.returncode == 12 and ju is not None and ju["proc_untrusted"] is True and rcp == 0
+        and rc_final == 0 and rep_final["totals"] == counts(fsync=3),
+        {"line": line, "rc_root_no_ptrace": r_root.returncode, "live_root": jr and jr["live"],
+         "rc_user": r_user.returncode, "proc_untrusted_user": ju and ju["proc_untrusted"], "probe_rc": rcp,
+         "rc_final": rc_final, "stderr_root": r_root.stderr[-200:], "stderr_user": r_user.stderr[-200:]})
+
+
 def sec_create():
     run = "fc%dbig" % (os.getpid() % 10000)
     sh([B + "/v1ctl", "rm", run])
@@ -1094,7 +1170,8 @@ def finish():
 
 setup()
 for section in (sec_full, sec_mutants, sec_noise, sec_raw, sec_uring, sec_liburing, sec_threads, sec_go, sec_sqlite,
-                sec_sigkill, sec_killmid, sec_live, sec_forkidle, sec_leaderexit, sec_foreign, sec_foreign_proc, sec_create,
+                sec_sigkill, sec_killmid, sec_live, sec_forkidle, sec_leaderexit, sec_foreign, sec_foreign_proc,
+                sec_hidepid, sec_vforkrace, sec_create,
                 sec_outside, sec_bigfd, sec_refusals):
     try:
         section()

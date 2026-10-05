@@ -51,6 +51,9 @@
  *    Even a fork() child is unseen between the kernel creating it and its fork handler claiming the slot (a few
  *    syscalls), so a report read at that instant can miss it. The report must run in the pid namespace the counted
  *    processes ran in, reading a /proc mounted for that namespace and not hiding other users (else rc 12).
+ *  - Where process_vm_readv is refused (Docker's default seccomp profile without CAP_SYS_PTRACE), the shim reads
+ *    iovec arrays, openat2's open_how and clone3's clone_args directly: a program that passes a BAD pointer there gets
+ *    SIGSEGV instead of EFAULT. Valid pointers are unaffected.
  *  - The shim exports io_uring_queue_init, _params, _mem and io_uring_setup in every process. A program that probes
  *    for liburing with dlsym(RTLD_DEFAULT, ...) without linking it finds them, and a call returns -ENOSYS (and the
  *    report refuses, rc 9). dlsym on a dlopen'ed liburing handle is unaffected.
@@ -214,8 +217,10 @@ static void v1_resolve_all(void) {
 
 /* ---- state ---- */
 static v1_hdr *g_hdr;
-static v1_slot *g_slot;       /* this process's slot; re-claimed whenever getpid() differs from g_slot_pid */
-static int32_t g_slot_pid;
+/* This process's slot, as ONE word: (pid << 32) | slot index, 0 = none. One atomic load gives a pid and a slot that
+ * belong together; two separate words could tear (a vfork child shares this memory with its parent's other threads,
+ * and a thread could read the parent's pid with the child's slot). Re-claimed whenever the pid differs from getpid(). */
+static uint64_t g_slot_word;
 static int32_t g_bitmap_pid;  /* the process whose fd table g_osync describes: only it clears bits */
 static int g_claim_lock;
 static int g_is_go;
@@ -332,39 +337,40 @@ static void v1_claim_slot(int32_t me) {
     struct timespec ts = {0, 50 * 1000 * 1000};
     nanosleep(&ts, NULL);
 #endif
-    /* g_slot first, then g_slot_pid (release): a reader that loads g_slot_pid first (acquire) and sees its own pid
-     * is guaranteed to see this slot, never the stale one a raw-cloned child inherited from its parent. */
-    __atomic_store_n(&g_slot, s, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_slot_pid, me, __ATOMIC_RELEASE);
+    uint64_t idx = (uint64_t)(s - v1_slots(g_hdr));
+#ifdef V1_MUTANT_SPLIT_PUBLISH /* fire-check mutant: pid and slot published apart, with a window between them */
+    uint64_t old = __atomic_load_n(&g_slot_word, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_slot_word, (old & 0xffffffff00000000ULL) | idx, __ATOMIC_RELEASE);
+    struct timespec gap = {0, 20 * 1000 * 1000};
+    nanosleep(&gap, NULL);
+#endif
+    __atomic_store_n(&g_slot_word, ((uint64_t)(uint32_t)me << 32) | idx, __ATOMIC_RELEASE);
 }
 
 /* The calling process's slot. getpid() on every call, so a child made by vfork or a raw-instruction clone (no fork
  * handler, no birth claim) still gets its own slot. Counted calls are flushes, so the syscall is cheap beside them. */
+static inline int word_is(uint64_t w, int32_t me) { return w != 0 && (int32_t)(uint32_t)(w >> 32) == me; }
 static v1_slot *v1_slot_get(int32_t *pid_out) {
     int32_t me = (int32_t)getpid();
     *pid_out = me;
-    if (__builtin_expect(__atomic_load_n(&g_slot_pid, __ATOMIC_ACQUIRE) == me, 1)) {
-        v1_slot *s = __atomic_load_n(&g_slot, __ATOMIC_ACQUIRE);
-        if (__builtin_expect(s != NULL, 1)) return s;
-    }
+    uint64_t w = __atomic_load_n(&g_slot_word, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(word_is(w, me), 1)) return &v1_slots(g_hdr)[w & 0xffffffffULL];
     while (__atomic_exchange_n(&g_claim_lock, 1, __ATOMIC_ACQUIRE)) sched_yield();
 #ifdef V1_MUTANT_NO_RECHECK
     v1_claim_slot(me);
 #else
-    if (__atomic_load_n(&g_slot_pid, __ATOMIC_ACQUIRE) != me || __atomic_load_n(&g_slot, __ATOMIC_ACQUIRE) == NULL)
-        v1_claim_slot(me);
+    if (!word_is(__atomic_load_n(&g_slot_word, __ATOMIC_ACQUIRE), me)) v1_claim_slot(me);
 #endif
-    v1_slot *s = __atomic_load_n(&g_slot, __ATOMIC_ACQUIRE);
+    w = __atomic_load_n(&g_slot_word, __ATOMIC_ACQUIRE);
     __atomic_store_n(&g_claim_lock, 0, __ATOMIC_RELEASE);
-    return s;
+    return &v1_slots(g_hdr)[w & 0xffffffffULL];
 }
 
 /* The child of a fork-like call (fork, _Fork, a clone without CLONE_VM through syscall(2)): it has its own copy of
  * the bitmap, and claims a slot at once, so the report sees it alive before it counts anything. Async-signal-safe
  * (getpid, readlink, open/read/close, stat, atomics): it runs in a fork handler and after _Fork. */
 static void v1_child_born(int claim) {
-    __atomic_store_n(&g_slot, NULL, __ATOMIC_RELEASE);
-    __atomic_store_n(&g_slot_pid, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_slot_word, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_claim_lock, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_bitmap_pid, (int32_t)getpid(), __ATOMIC_RELEASE);
     if (!claim || __atomic_load_n(&g_hdr, __ATOMIC_ACQUIRE) == NULL) return;
@@ -449,8 +455,9 @@ static inline int msync_kind(int f) { return (f & MS_SYNC) ? V1K_MSYNC_SYNC : V1
 /* Copy n bytes from addr without trusting addr: process_vm_readv on the CALLING THREAD (gettid: a thread-group
  * leader that called pthread_exit is a zombie with no memory map, so its pid would give ESRCH). Returns 0 copied,
  * -1 the address is bad (EFAULT: the real call will say so too). If process_vm_readv itself is refused (seccomp
- * EPERM, ENOSYS, a kernel without cross-memory attach) the bytes are read directly: the caller gets the same answer
- * the real call would, at the risk the real call takes anyway. Async-signal-safe. */
+ * EPERM -- Docker's default profile refuses it without CAP_SYS_PTRACE --, ENOSYS, a kernel without cross-memory
+ * attach) the bytes are read directly, so a BAD pointer there is a SIGSEGV in the shim where the kernel would have
+ * said EFAULT (a stated blind spot). Async-signal-safe. */
 static int v1_copy_in(const void *addr, void *buf, size_t n) {
     struct iovec local = {buf, n}, remote = {(void *)addr, n};
     int e = errno;
