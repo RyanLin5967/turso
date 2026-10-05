@@ -461,16 +461,19 @@ int main(int argc, char **argv) {
     if (have_seed) rng = seed | 1;
     const uint64_t seed_used = rng;
 
-    /* the filesystem under D */
-    const char *why = flush_path(DIR_);
-    if (why) { fprintf(stderr, "v3floor: REFUSED: cannot determine the flush path under %s: %s\n", DIR_, why); return 2; }
-    const mrec *top = &L[0].m;
-    unsigned long want = !strcmp(top->fstype, "ext4") ? MAGIC_EXT4 : !strcmp(top->fstype, "xfs") ? MAGIC_XFS
-                       : !strcmp(top->fstype, "btrfs") ? MAGIC_BTRFS : 0;
+    /* the filesystem under D (its type first: a tmpfs has no device to follow), then the flush path below it */
+    static mrec top0;
+    const char *why = mount_of(DIR_, &top0);
+    if (why) { fprintf(stderr, "v3floor: REFUSED: cannot determine the filesystem under %s: %s\n", DIR_, why); return 2; }
+    unsigned long want = !strcmp(top0.fstype, "ext4") ? MAGIC_EXT4 : !strcmp(top0.fstype, "xfs") ? MAGIC_XFS
+                       : !strcmp(top0.fstype, "btrfs") ? MAGIC_BTRFS : 0;
     if (!want) {
-        fprintf(stderr, "v3floor: REFUSED: %s is on %s (mount %s), not ext4, xfs or btrfs\n", DIR_, top->fstype, top->mnt);
+        fprintf(stderr, "v3floor: REFUSED: %s is on %s (mount %s), not ext4, xfs or btrfs\n", DIR_, top0.fstype, top0.mnt);
         return 2;
     }
+    why = flush_path(DIR_);
+    if (why) { fprintf(stderr, "v3floor: REFUSED: cannot determine the flush path under %s: %s\n", DIR_, why); return 2; }
+    const mrec *top = &L[0].m;
     struct statfs sf;
     if (statfs(DIR_, &sf) != 0) die("statfs");
     unsigned long magic = (unsigned long)(uint32_t)sf.f_type;

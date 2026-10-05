@@ -251,6 +251,8 @@ def split_args(s):
 
 def canon(a):
     a = a.strip()
+    if a.startswith("AT_FDCWD<"):  # strace -y decorates AT_FDCWD with the cwd (run 37245436013)
+        return "AT_FDCWD"
     m = FD.match(a)
     if m:
         return "<" + m.group(1) + ">"
@@ -260,18 +262,29 @@ def canon(a):
 
 
 def parse_trace(text):
-    """-> list of (name, canonical text) for every syscall line, and the lines that are not syscalls."""
-    calls, other = [], []
+    """-> list of (name, canonical text) for every syscall line, and the lines that are not syscalls.
+    strace 6.8 prints FICLONE as "BTRFS_IOC_CLONE or FICLONE" (one ioctl number) with its source fd as a bare
+    integer (run 37245436013), so the source is resolved to its path from the fd that an earlier call returned."""
+    calls, other, fds = [], [], {}
     for line in text.splitlines():
         m = LINE.match(line)
         if not m:
             other.append(line)
             continue
         name, args, ret = m.group(1), split_args(m.group(2)), canon(m.group(3))
+        r = FD.match(m.group(3))
+        if r:
+            fds[m.group(3).split("<", 1)[0]] = r.group(1)
         if name == "pwrite64" and len(args) == 4:
             t = "pwrite64 %s %s %s = %s" % (canon(args[0]), args[2].strip(), args[3].strip(), ret)
         elif name == "clock_gettime":
             t = "clock_gettime %s = %s" % (args[0].strip() if args else "", ret)
+        elif name == "ioctl" and len(args) == 3:
+            cmd = args[1].strip()
+            cmd = "FICLONE" if "FICLONE" in cmd.split(" or ") else cmd
+            src = args[2].strip()
+            src = "<%s>" % fds[src] if re.fullmatch(r"\d+", src) and src in fds else canon(src)
+            t = "ioctl %s %s %s = %s" % (canon(args[0]), cmd, src, ret)
         else:
             t = name + " " + " ".join(canon(x) for x in args) + " = " + ret
         calls.append((name, t))
@@ -349,9 +362,11 @@ def round_orders(calls, arms, n):
 def plants(calls):
     """Planted breaches of a real trace: (name, mutated calls). Each must be rejected by sequence_problems."""
     out = []
+    clocks = [j for j, (name, _) in enumerate(calls) if name == "clock_gettime"]
+    lo, hi = (clocks[0], clocks[-1]) if clocks else (0, -1)
 
-    def find(pred):
-        return next((k for k, (_, t) in enumerate(calls) if pred(t)), None)
+    def find(pred):  # inside the loop only: a planted breach in setup or teardown is outside what the check covers
+        return next((k for k in range(lo, hi) if pred(calls[k][1])), None)
 
     def with_text(k, t):
         c = list(calls)
@@ -370,8 +385,8 @@ def plants(calls):
     k = find(lambda t: t.startswith("pwrite64 <%s/ow4k> 4096 " % W))
     if k is not None:
         out.append(("ow4k writes 25 B", with_text(k, calls[k][1].replace(" 4096 ", " 25 ", 1).replace("= 4096", "= 25"))))
-    hits = [j for j, (_, t) in enumerate(calls) if t.startswith("pwrite64 <%s/ow1m> 1048576 %d " % (W, 2 << 20))]
-    if len(hits) >= 2:  # i=2 and, after the wrap at 128 MiB, i=130 both write at 2 MiB
+    hits = [j for j in range(lo, hi) if calls[j][1].startswith("pwrite64 <%s/ow1m> 1048576 %d " % (W, 2 << 20))]
+    if len(hits) >= 2:  # in the loop, i=2 and, after the wrap at 128 MiB, i=130 both write at 2 MiB
         out.append(("ow1m does not wrap at 128 MiB", with_text(hits[1], calls[hits[1]][1].replace(
             " %d = " % (2 << 20), " %d = " % (130 << 20)))))
     k = find(lambda t: t.startswith("fdatasync <%s/fdatasync4k>" % W))
@@ -382,7 +397,6 @@ def plants(calls):
         c = list(calls)
         c.insert(k + 1, ("fsync", "fsync <%s/nosync25> = 0" % W))
         out.append(("nosync25 gains a flush", c))
-    clocks = [j for j, (name, _) in enumerate(calls) if name == "clock_gettime"]
     if len(clocks) >= 4:
         c = list(calls)
         c.insert(clocks[1] + 1, ("getpid", "getpid = 4242"))
