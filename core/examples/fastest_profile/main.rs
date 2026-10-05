@@ -31,6 +31,10 @@
 //! The per-op phase functions are `#[no_mangle]` (`fastest_phase_create`, `_connect`, `_write`,
 //! `_delete`) so callgrind's `--toggle-collect` can count the calling thread's instructions in each.
 //!
+//! Fire-check plant (inert unless set): `FASTEST_PROFILE_PLANT=ir:N,syscall:M` makes every create also
+//! spin N iterations of a black-boxed loop and make M getppid(2) calls, so the profiling job can show
+//! its instruction and syscall gates fail on a real run (workflow input `plant`, head side only).
+//!
 //! Output (`--out`): `ops.tsv` (client, op, phase, ns) and `summary.json` (per phase: ops,
 //! p50/p90/p99/max/mean ns, window seconds, ops/s, and the engine's own sync counter delta over
 //! the window). Any failed operation prints `NOT A RESULT` and exits 1; `--class async` exits 4
@@ -278,10 +282,39 @@ fn retry<T>(phase: usize, what: &str, mut f: impl FnMut() -> turso_core::Result<
     }
 }
 
+/// The fire-check plant, read once: (spin iterations, getppid calls) added to every create.
+fn plant() -> (u64, u64) {
+    static PLANT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *PLANT.get_or_init(|| {
+        let mut p = (0, 0);
+        for kv in std::env::var("FASTEST_PROFILE_PLANT").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
+            match kv.split_once(':').map(|(k, v)| (k, v.parse::<u64>())) {
+                Some(("ir", Ok(n))) => p.0 = n,
+                Some(("syscall", Ok(n))) => p.1 = n,
+                _ => not_a_result(&format!("FASTEST_PROFILE_PLANT: bad item {kv}")),
+            }
+        }
+        if p != (0, 0) {
+            eprintln!("note: FASTEST_PROFILE_PLANT active: {} spin iterations and {} getppid per create", p.0, p.1);
+        }
+        p
+    })
+}
+
 #[no_mangle]
 #[inline(never)]
 pub fn fastest_phase_create(trunk: &Arc<Connection>, name: &str) {
     retry(0, &format!("create {name}"), || trunk.create_branch(name));
+    let (spin, calls) = plant();
+    let mut x = 0u64;
+    for i in 0..spin {
+        x = std::hint::black_box(x.wrapping_add(i));
+    }
+    std::hint::black_box(x);
+    for _ in 0..calls {
+        // SAFETY: getppid has no preconditions.
+        unsafe { libc::getppid() };
+    }
 }
 
 #[no_mangle]

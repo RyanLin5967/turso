@@ -19,11 +19,15 @@ on:
       rebaseline:
         description: "true: upload this run's head as the baseline even if a gate fails"
         default: "false"
+      plant:
+        description: "fire-check: FASTEST_PROFILE_PLANT for the HEAD side only (e.g. ir:3000,syscall:1); the gates must FAIL"
+        default: ""
   push:
     branches: [fastest-branching]
 
 concurrency:
-  group: fastest-profile-${{ github.ref }}
+  # a planted fire-check run has its own group, so it never cancels (or is cancelled by) a real run
+  group: fastest-profile-${{ github.ref }}-${{ inputs.plant || 'real' }}
   cancel-in-progress: true
 
 permissions:
@@ -135,7 +139,9 @@ jobs:
       - name: Profile head
         run: |
           rc=0
-          FLAMEGRAPH_DIR="$RUNNER_TEMP/FlameGraph" bash fastest/linux/profile/profile.sh dist/head/fastest_profile head "$RAW" "$MNT/work" || rc=$?
+          echo "plant=[${{ inputs.plant }}]" >> "$RAW/run-info.txt"
+          FASTEST_PROFILE_PLANT="${{ inputs.plant }}" FLAMEGRAPH_DIR="$RUNNER_TEMP/FlameGraph" \
+            bash fastest/linux/profile/profile.sh dist/head/fastest_profile head "$RAW" "$MNT/work" || rc=$?
           echo $rc > "$RAW/head.rc"
       - name: Profile base
         if: hashFiles('dist/base/fastest_profile') != ''
@@ -164,8 +170,8 @@ jobs:
           name: profile-raw-${{ matrix.runner }}
           path: profile-raw/
           retention-days: 90
-      - name: Upload the baseline (green runs, or an explicit rebaseline)
-        if: steps.gate.outputs.green == '1' || inputs.rebaseline == 'true'
+      - name: Upload the baseline (green runs, or an explicit rebaseline; never a planted run)
+        if: (steps.gate.outputs.green == '1' || inputs.rebaseline == 'true') && inputs.plant == ''
         uses: actions/upload-artifact@v4
         with:
           name: profile-baseline-${{ matrix.runner }}
