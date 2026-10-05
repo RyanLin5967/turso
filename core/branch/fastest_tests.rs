@@ -2741,3 +2741,117 @@ fn an_arena_sync_failure_in_a_compaction_or_checkpoint_fail_stops() {
         }
     }
 }
+
+// ---- review 3 #7: the name filter is bounded, sharded, built off the mutex and retried ----
+
+/// Review 3 #7 (a): under churn of unique names (each created and dropped again), the name filter
+/// never stalls one create with a rehash of every name it holds, and it holds about the names
+/// held, not every name ever held. Over `n` cycles the most entries one insert moved stays within a
+/// small multiple of n/256 (256 shards), and the filter ends under n/2 entries (a rebuild keeps it
+/// near twice the larger of the live names and its rebuild floor). Before: one insert moved half
+/// of all the names ever created, and the filter held all n.
+#[test]
+fn the_name_filter_stays_bounded_under_churn() {
+    let _s = serial();
+    let n = std::env::var("FE_NAME_CHURN").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000u64);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("name-churn.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for i in 0..n {
+        let name = format!("churn-{i}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+    }
+    db.branch_wait_name_filter();
+    let (built, entries, moved, _, _) = db.branch_name_filter_stats();
+    assert!(built, "premise: the name filter is built");
+    assert!(
+        moved <= 4 * n / 256 + 64,
+        "one insert into the name filter moved {moved} entries ({n} names created)"
+    );
+    assert!(entries < n / 2, "the name filter holds {entries} entries after {n} create-and-drop cycles");
+}
+
+/// Review 3 #7 (d): a name filter whose catalog scan fails once is built by a retry, and the
+/// failure is counted. Before, it stayed unbuilt for the life of the process, and every named
+/// create went back to one catalog query under the store mutex.
+#[test]
+fn a_failed_name_scan_is_retried() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("name-retry.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("held").unwrap();
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    super::store::NAME_SCAN_FAILS.store(true, std::sync::atomic::Ordering::Release);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    db.branch_wait_name_filter();
+    let consumed = !super::store::NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
+    assert!(consumed, "premise: the open's build met the failing scan");
+    let (built, _, _, builds, failed) = db.branch_name_filter_stats();
+    assert_eq!(failed, 1, "the failed scan was not counted");
+    assert!(built && builds == 1, "the name filter was not built after its scan failed once");
+    assert!(db.connect().unwrap().create_branch("held").is_err(), "a held name was given again");
+}
+
+/// Review 3 #7 (e): each way a held name reaches the filter is load-bearing once the name's state
+/// is evicted (resident cap 0) and only the filter stands between a create and the catalog: a name
+/// created after the build (`note` into the built set), one created while the build ran (`note`
+/// into `pending`, merged at the install), and one created before the build but not yet
+/// checkpointed (the build's seed). Each must still be refused after a checkpoint evicted it.
+/// Mutants `no_note_built`, `no_note_pending`, `no_pending_merge` and `no_seed` must fail it.
+#[test]
+fn every_held_name_reaches_the_name_filter() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for arm in ["built", "pending", "seeded"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("name-inputs.db");
+        let incarnation = {
+            let db = open_at(&path, opts(true, SyncClass::Off));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.create_branch("old").unwrap();
+            db.branch_compact_now().unwrap();
+            if arm == "built" {
+                db.branch_set_resident_cap(Some(0));
+                trunk.create_branch("x").unwrap();
+                db.branch_compact_now().unwrap();
+                assert!(trunk.create_branch("x").is_err(), "{arm}: an evicted held name was given again");
+                continue;
+            }
+            if arm == "seeded" {
+                // In the log only: replayed at the reopen, before the filter's build starts.
+                trunk.create_branch("x").unwrap();
+            }
+            db.incarnation
+        };
+        super::store::NAME_SCAN_HOLD.store(1, O::Release);
+        let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+        let t = std::time::Instant::now();
+        while super::store::NAME_SCAN_HOLD.load(O::Acquire) != 1 | super::store::HOLD_ARRIVED {
+            if t.elapsed() > std::time::Duration::from_secs(10) {
+                super::store::NAME_SCAN_HOLD.store(0, O::Release);
+                panic!("{arm}: the name filter's build never reached its scan");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let trunk = db.connect().unwrap();
+        if arm == "pending" {
+            trunk.create_branch("x").unwrap();
+        }
+        super::store::NAME_SCAN_HOLD.store(0, O::Release);
+        db.branch_wait_name_filter();
+        assert!(db.branch_name_filter_stats().0, "{arm}: premise: the name filter is built");
+        db.branch_set_resident_cap(Some(0));
+        db.branch_compact_now().unwrap();
+        assert!(trunk.create_branch("x").is_err(), "{arm}: an evicted held name was given again");
+        assert!(trunk.create_branch("old").is_err(), "{arm}: a checkpointed name was given again");
+    }
+}

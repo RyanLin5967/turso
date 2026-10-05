@@ -1167,6 +1167,13 @@ impl Database {
         self.branches.wait_name_filter();
     }
 
+    /// The name filter (observation, review 3 #7): `(built, entries, the most entries one insert
+    /// moved, builds installed, failed catalog scans)`.
+    #[doc(hidden)]
+    pub fn branch_name_filter_stats(&self) -> (bool, u64, u64, u64, u64) {
+        self.branches.name_filter_stats()
+    }
+
     /// What this open's prewarm did (r12-catload instrument, `R12_PREWARM`): `(mode, files warmed in
     /// the OS page cache, bytes read, bytes whose read-ahead was requested, catalog pages read
     /// through its page cache, interior pages among them, catalog page cache capacity after it,

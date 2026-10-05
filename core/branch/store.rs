@@ -1090,6 +1090,30 @@ pub(crate) const HOLD_TRUNK_BARRIER_DONE: u8 = 6;
 /// fork waits here, its read snapshot taken, before it registers.
 #[cfg(test)]
 pub(crate) const HOLD_FORK_REGISTERING: u8 = 7;
+/// Test builds: the next build of a name filter finds its first catalog scan failing, as an I/O
+/// error would (review 3 #7). Set before the open that starts the build.
+#[cfg(test)]
+pub(crate) static NAME_SCAN_FAILS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Test builds: while it holds 1, a name filter's builder waits before its catalog scan, having
+/// marked its arrival (`| HOLD_ARRIVED`); stored 0 to release it (review 3 #7). Process-wide, so a
+/// test can set it before the open that starts the build.
+#[cfg(test)]
+pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
+fn pause_name_scan() {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering as O;
+        let arrived = 1 | HOLD_ARRIVED;
+        if NAME_SCAN_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+            while NAME_SCAN_HOLD.load(O::Acquire) == arrived {
+                crate::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
 
 /// How long a waiter an ordered flight covers waits for the trunk commit's WAL flush before it
 /// leads an upgrade flight of its own (liveness, should that commit stall: its caller may be the
@@ -1443,6 +1467,11 @@ struct NameFilter {
     hasher: std::collections::hash_map::RandomState,
     built: Option<HashSet<u64, BuildIdHasher>>,
     pending: Option<HashSet<u64, BuildIdHasher>>,
+    /// Observation (review 3 #7): the most entries one insert moved (a resize), builds installed,
+    /// and catalog scans that failed.
+    moved_max: u64,
+    builds: u64,
+    failed_scans: u64,
 }
 
 impl NameFilter {
@@ -1458,6 +1487,9 @@ impl NameFilter {
         }
         let h = self.hash(name);
         if let Some(built) = self.built.as_mut() {
+            if built.len() == built.capacity() {
+                self.moved_max = self.moved_max.max(built.len() as u64);
+            }
             built.insert(h);
         }
         if let Some(pending) = self.pending.as_mut() {
@@ -5279,6 +5311,20 @@ impl BranchStore {
     }
 
     /// See `Database::branch_wait_name_filter`.
+    /// The name filter (observation, review 3 #7): `(built, entries, the most entries one insert
+    /// moved, builds installed, failed catalog scans)`.
+    pub(crate) fn name_filter_stats(&self) -> (bool, u64, u64, u64, u64) {
+        let inner = self.inner.lock();
+        let f = &inner.names.filter;
+        (
+            f.built.is_some(),
+            f.built.as_ref().map_or(0, |b| b.len() as u64),
+            f.moved_max,
+            f.builds,
+            f.failed_scans,
+        )
+    }
+
     pub(crate) fn wait_name_filter(&self) {
         if let Some(build) = self.name_filter_build.lock().take() {
             let _ = build.join();
@@ -5315,14 +5361,23 @@ impl BranchStore {
             reader
         };
         let hasher = self.inner.lock().names.filter.hasher.clone();
+        #[cfg(test)]
+        let fail_scan = NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(not(test))]
+        let fail_scan = false;
         let shared = self.inner.clone();
         let stop = self.name_filter_stop.clone();
         let spawned = crate::thread::Builder::new()
             .name("branch-name-filter".to_string())
             .spawn(move || {
                 use std::hash::BuildHasher;
+                pause_name_scan();
                 let mut reader = reader;
-                let scanned = reader.name_hashes(|name| hasher.hash_one(name), &stop);
+                let scanned = if fail_scan {
+                    Err(LimboError::InternalError("failpoint: the name scan failed".to_string()))
+                } else {
+                    reader.name_hashes(|name| hasher.hash_one(name), &stop)
+                };
                 let mut inner = shared.lock();
                 let filter = &mut inner.names.filter;
                 let pending = filter.pending.take().unwrap_or_default();
@@ -5331,8 +5386,12 @@ impl BranchStore {
                         let mut built: HashSet<u64, BuildIdHasher> = hashes.into_iter().collect();
                         built.extend(pending);
                         filter.built = Some(built);
+                        filter.builds += 1;
                     }
-                    Err(e) => tracing::debug!("branch name filter not built: {e}"),
+                    Err(e) => {
+                        filter.failed_scans += 1;
+                        tracing::debug!("branch name filter not built: {e}")
+                    }
                 }
             });
         match spawned {
