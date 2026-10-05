@@ -1,0 +1,159 @@
+name: fastest-competitors
+# Lane fastest-linux-comp: the FASTEST competitors on Linux -- PostgreSQL 18 (PGDG; STRATEGY=FILE_COPY with
+# file_copy_method=clone and STRATEGY=WAL_LOG, each at D2 = pg18-d2 and at defaults = pg18-defaults, amendment 14),
+# Dolt 2.3.5 and Doltgres 1.3.3 (release binaries at the Mac's versions, sha256-checked, telemetry off; amendment 14
+# variants (a), (b), (c)), and the B1 file-copy baseline (FICLONE of a stock-SQLite db + fsync(clone) + fsync(dir),
+# and its D0 no-flush row) -- on ubuntu x86_64 and arm64, each on XFS and btrfs loop filesystems.
+# Every job records its hardware (fastest/linux/hw/record.sh) and fire-checks the flush counter before using it.
+# Per cell (system x spec x C in {1, 4}): the SMOKE.md functional checks and flushes per op counted by strace -f -C,
+# raw and with an idle control subtracted, split by process role. SMOKE ONLY: nothing timed here is credited before
+# the PREREG is registered. Raw output is uploaded per job (artifact competitors-<system>-<runner>-<fs>).
+
+on:
+  workflow_dispatch:
+    inputs:
+      n1:
+        description: "ops per cell at C=1"
+        default: "200"
+      n4:
+        description: "ops per cell at C=4"
+        default: "200"
+      rows:
+        description: "parent table rows"
+        default: "10000"
+      idle_s:
+        description: "seconds of the idle control per cell"
+        default: "30"
+  push:
+    branches: [fastest-branching, fastest-linux-comp]
+    paths:
+      - "fastest/linux/competitors/**"
+      - "fastest/linux/hw/**"
+      - "fastest/linux/fs/**"
+      - ".github/workflows/fastest-competitors.yml"
+
+concurrency:
+  group: fastest-competitors-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Every run step under bash -eo pipefail (GitHub's `shell: bash`). The implicit default is `bash -e {0}` with NO
+# pipefail, so `mkloop.sh ... | tee` succeeded when mkloop failed and the steps.fs guard below could never trip
+# (review finding 7, run 37175962413).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build tools (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages (PGDG libpq 18, MariaDB connector, clang, cmake, fio)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -q libpq-dev libmariadb-dev clang cmake pkg-config fio
+      - name: Hardware record
+        run: bash fastest/linux/hw/record.sh "$RUNNER_TEMP/build-hw" "$RUNNER_TEMP/hw-target" 15
+      - name: Build bbload, clonebench, sqlite3 (BB_HOOKS=0)
+        run: timeout 1500 bash fastest/linux/competitors/build.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: competitor-tools-${{ matrix.runner }}
+          path: dist/
+          retention-days: 30
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-hw-${{ matrix.runner }}
+          path: ${{ runner.temp }}/build-hw/
+          retention-days: 90
+
+  run:
+    name: ${{ matrix.system }} (${{ matrix.runner }}, ${{ matrix.fs }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        fs: [xfs, btrfs]
+        system: [pg18-d2, pg18-defaults, dolt, doltgres, b1]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    env:
+      MNT: /mnt/fastest-${{ matrix.fs }}
+      RAW: ${{ github.workspace }}/fastest-raw
+      FT_N1: ${{ inputs.n1 || '200' }}
+      FT_N4: ${{ inputs.n4 || '200' }}
+      FT_ROWS: ${{ inputs.rows || '10000' }}
+      FT_IDLE_S: ${{ inputs.idle_s || '30' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: competitor-tools-${{ matrix.runner }}
+          path: dist
+      - name: Packages (PGDG postgresql-18 without a default cluster, MariaDB client, strace, fs tools, fio)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-common
+          echo 'create_main_cluster = false' | sudo tee -a /etc/postgresql-common/createcluster.conf
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -q postgresql-18 libpq5 mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
+          sudo systemctl stop postgresql || true
+          pg_lsclusters || true
+      - name: Run info
+        run: |
+          mkdir -p "$RAW"
+          chmod +x dist/bbload dist/clonebench dist/sqlite3
+          { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
+            echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
+            echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S";
+            cat dist/build-info.txt; strace -V | sed -n 1p; /usr/lib/postgresql/18/bin/postgres --version;
+            mariadb --version; pg_lsclusters 2>&1 || true; } | tee "$RAW/run-info.txt"
+      - name: Dolt and Doltgres release binaries
+        if: matrix.system == 'dolt' || matrix.system == 'doltgres'
+        run: bash fastest/linux/competitors/fetch_dolt.sh "$HOME/fastest-bin" "$RAW/dolt-fetch.txt"
+      - name: Filesystem under test
+        id: fs
+        # 40G sparse: 200 ops x ~16 cells, WAL_LOG and the copy control writing ~9 MB per created database
+        run: bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 40G 2>&1 | tee "$RAW/mkloop.txt"
+      - name: Hardware record (fio on the filesystem under test)
+        run: bash fastest/linux/hw/record.sh "$RAW/hw" "$MNT/hw" 15
+      - name: Allow strace to attach to the servers (ptrace_scope 0)
+        if: ${{ !cancelled() && steps.fs.outcome == 'success' }}
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
+      - name: Flush counter fire-check
+        id: fc
+        if: ${{ !cancelled() && steps.fs.outcome == 'success' }}
+        run: timeout 600 bash fastest/linux/competitors/firecheck_strace.sh "$RAW/firecheck" "$MNT/firecheck.noindex"
+      # Only after the counter's fire-check passed on this runner and filesystem (review finding 8: the run used to
+      # proceed after a failed fire-check and its cells still said ok). run_system.sh re-checks the verdict file.
+      - name: Run ${{ matrix.system }}
+        if: ${{ !cancelled() && steps.fs.outcome == 'success' && steps.fc.outcome == 'success' }}
+        env:
+          FT_BBLOAD: ${{ github.workspace }}/dist/bbload
+          FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
+          FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
+          FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
+        run: timeout 12600 bash fastest/linux/competitors/run_system.sh ${{ matrix.system }} "$MNT" "$RAW/run"
+      - name: Compress traces
+        if: always()
+        run: find "$RAW" -name '*.strace' -exec gzip -9 {} + || true
+      - name: Upload raw
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: competitors-${{ matrix.system }}-${{ matrix.runner }}-${{ matrix.fs }}
+          path: fastest-raw/
+          retention-days: 90
