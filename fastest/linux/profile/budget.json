@@ -1,0 +1,28 @@
+{
+  "source": "lead message to fastest-linux, 2026-10-04T22:5xZ, relaying Ryan: 'bugs, especially ones that make the branching slow, cannot exist'. Changing a number here is an append-only decision recorded in frontier/fastest/DECISIONS.md, never a fix for a red job.",
+  "flush_syscalls": "fsync, fdatasync, syncfs, sync; msync with MS_SYNC; sync_file_range with a SYNC_FILE_RANGE_WAIT flag",
+  "classes": {
+    "full": {
+      "meaning": "D2: one F_FULLFSYNC-equivalent flush per flight (on Linux the engine's FullFsync class is fsync(2))",
+      "create_flushes_per_op_c1": [1.0, 1.01],
+      "create_flushes_per_op_cn": ["1/C", 1.01],
+      "create_flush_files_allowed": ["-branch-log"],
+      "note": "lower bounds keep a counter that reads zero from passing: at C=1 every create is its own flight; at C>1 a flight carries at most C creates, so at least one flush per C creates"
+    },
+    "async": {
+      "meaning": "async-durable create: no flush on the create path",
+      "create_flushes_per_op_c1": [0.0, 0.0],
+      "create_flushes_per_op_cn": [0.0, 0.0],
+      "create_flush_files_allowed": []
+    }
+  },
+  "instructions": {
+    "metric": "callgrind inclusive Ir of fastest_phase_create per op, C=1, class full, snapshot store; (Ir at 2N ops - Ir at N ops) / N",
+    "create_growth_max": 0.05
+  },
+  "syscalls_vs_base": {
+    "window": "create",
+    "per_op_slack": 0.05,
+    "timing_dependent_excluded": ["futex", "sched_yield", "nanosleep", "clock_nanosleep", "restart_syscall", "rt_sigreturn"]
+  }
+}

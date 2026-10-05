@@ -1,0 +1,80 @@
+name: fastest-v3
+# Lane fastest-linux: fire-check the Linux V3 device-floor probe (fastest/linux/v3/v3floor.c) on ubuntu x86_64 and
+# arm64, each on ext4 (the runner's own disk), ext4, XFS and btrfs on loop devices (fastest/linux/fs/mkloop.sh):
+# F1 per-op syscall counts under strace -f -c and F1b the exact per-window sequence under strace -f -y equal each
+# arm's definition; F2 --mutant-nosync fails the flush control; F3 a real n=200 run (the control's verdict is
+# recorded, either way); F4 the refusals, including a barrier switched off on the flush path, and run.sh's binding.
+# The runners' root ext4 is mounted nobarrier (run 37243798049); the probe refuses that, so the job remounts it with
+# barrier first and keeps a nobarrier fixture (mkfixtures.sh) for the refusal checks.
+# Smoke only; nothing here is a credited latency. Raw output is uploaded per job (artifact v3-<runner>-<fs>).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fastest-linux-v3, fastest-branching]
+    paths:
+      - "fastest/linux/v3/**"
+      - "fastest/linux/fs/**"
+      - "fastest/linux/hw/**"
+      - ".github/workflows/fastest-v3.yml"
+
+# A fire-check run is evidence: a newer push queues behind an in-flight run and never cancels it.
+concurrency:
+  group: fastest-v3-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  firecheck:
+    name: v3 fire-check (${{ matrix.runner }}, ${{ matrix.fs }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        fs: [ext4, ext4loop, xfs, btrfs]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      MNT: /mnt/fastest-v3-${{ matrix.fs }}
+      RAW: ${{ github.workspace }}/v3-raw
+      V3_FX: /mnt/v3fx
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q xfsprogs btrfs-progs strace fio gcc
+      - name: Build v3floor
+        run: |
+          mkdir -p "$RAW" dist
+          gcc -O2 -std=gnu11 -Wall -Wextra -Werror -o dist/v3floor fastest/linux/v3/v3floor.c 2>&1 | tee "$RAW/build.txt"
+          { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }}";
+            echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
+            gcc --version | head -1; sha256sum dist/v3floor; strace -V | head -1; uname -a; } | tee "$RAW/run-info.txt"
+      - name: Barrier on the root filesystem (the image mounts it nobarrier)
+        run: |
+          echo "before: $(findmnt -n -o SOURCE,FSTYPE,OPTIONS /)" | tee "$RAW/root-barrier.txt"
+          sudo mount -o remount,barrier /
+          echo "after:  $(findmnt -n -o SOURCE,FSTYPE,OPTIONS /)" | tee -a "$RAW/root-barrier.txt"
+          if findmnt -n -o OPTIONS / | tr , '\n' | grep -qx nobarrier; then echo "root is still nobarrier"; exit 1; fi
+      - name: Filesystem under test
+        run: bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 8G 2>&1 | tee "$RAW/mkloop.txt"
+      - name: Refusal fixtures (nobarrier at the top layer and one layer down)
+        run: bash fastest/linux/v3/mkfixtures.sh "$V3_FX" 2>&1 | tee "$RAW/fixtures.txt"
+      - name: Hardware record (fio on the filesystem under test)
+        run: bash fastest/linux/hw/record.sh "$RAW/hw" "$MNT/hw" 5
+      - name: Fire-check
+        run: timeout 2700 bash fastest/linux/v3/firecheck.sh dist/v3floor ${{ matrix.fs }} "$MNT/work" "$RAW/firecheck" 2>&1 | tee "$RAW/firecheck.log"
+      - name: Upload raw
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v3-${{ matrix.runner }}-${{ matrix.fs }}
+          path: v3-raw/
+          retention-days: 90
