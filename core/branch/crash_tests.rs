@@ -1222,6 +1222,14 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
         .take(2)
         .collect::<Vec<_>>()
         .join(" | ");
+    // `FE_C1_KEEP=<dir>` (lead, Linux I2): the crash image as the child left it, copied before any
+    // recovery touches it, kept when the trial found a violation or the child logged an error.
+    let image = std::env::var_os("FE_C1_KEEP").map(|keep| {
+        let to = Path::new(&keep).join(format!("s{seed}-{}", point.replace(['.', ':'], "_")));
+        let _ = std::fs::remove_dir_all(&to);
+        copy_dir(dir.path(), &to.join("crash"));
+        to
+    });
     if let Some(m) = recover_kill {
         // Phase 8: a second kill inside recovery's replay, then the parent's own recovery.
         let mut rec = spawn(format!("recover.replay:{m}"), true);
@@ -1238,7 +1246,30 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
     if !child_panic.is_empty() {
         bad.push(format!("the child panicked: {child_panic}"));
     }
+    if let Some(to) = image {
+        let errs = text.lines().filter(|l| l.starts_with("ERR ")).count();
+        if bad.is_empty() && errs == 0 {
+            let _ = std::fs::remove_dir_all(&to);
+        } else {
+            // The recovered state too, and what was wrong with it.
+            copy_dir(dir.path(), &to.join("recovered"));
+            let _ = std::fs::write(to.join("violations.txt"), format!("{what}\n{}\n", bad.join("\n")));
+        }
+    }
     (landed, bad, what)
+}
+
+/// A recursive copy of `from` into `to` (created), for the kept crash images; best effort.
+fn copy_dir(from: &Path, to: &Path) {
+    let _ = std::fs::create_dir_all(to);
+    for entry in std::fs::read_dir(from).into_iter().flatten().flatten() {
+        let target = to.join(entry.file_name());
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            copy_dir(&entry.path(), &target);
+        } else {
+            let _ = std::fs::copy(entry.path(), &target);
+        }
+    }
 }
 
 /// C1: SIGKILLs aimed at every kill point, the database recovered and checked after each. Size
