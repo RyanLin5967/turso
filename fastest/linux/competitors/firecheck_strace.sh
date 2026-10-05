@@ -212,7 +212,7 @@ count() { python3 "$SC" count "$OUT/$1.strace" --extra "$OUT/$1.strace.err" --ro
 # start_probe2 MODE -> PP2: the detached probe's pid, once it wrote MODE.ready (exit 1 if it never did)
 start_probe2() {
   local mode=$1 i
-  rm -f "$DIR/fc/$mode".* "$DIR/fc/go-$mode"
+  rm -f "$DIR/fc/$mode".* "$DIR/fc/go-$mode" "$DIR/fc/go-$mode".*  # every trigger of the mode, incl. .stop and .2
   ( exec /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die' -- python3 -B "$OUT/probe2.py" "$mode" "$DIR/fc" "$DIR/fc/go-$mode" ) \
     </dev/null >"$OUT/probe2-$mode.log.txt" 2>&1 &
   PP2=$!
