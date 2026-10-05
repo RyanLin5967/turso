@@ -136,6 +136,11 @@ deps() {
     smartmontools dmidecode xfsprogs btrfs-progs libpq-dev libmariadb-dev mariadb-client libmariadb3 \
     postgresql-18 libpq5 || return 1
   sudo systemctl stop postgresql 2>/dev/null || true
+  # The competitor servers listen on fixed ports inside Linux's ephemeral range (32768-60999); a client
+  # socket that drew one as its source port made PG's bind fail with EADDRINUSE after the listener-only
+  # free-port check passed (dry run 37256446468, pg18-defaults on btrfs). Reserved ports are never handed
+  # out as ephemeral ones. Ports: competitors/run_system.sh (PG 55432, Doltgres 55433, Dolt 53306).
+  sudo sysctl -w net.ipv4.ip_local_reserved_ports=53306,55432-55433 || return 1
   if ! command -v rustup >/dev/null && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
     curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none || return 1
   fi
@@ -245,6 +250,11 @@ run_cell() {
     wait "$sampler"
     python3 -B "$L/t3/foreign_cpu.py" decide "$d/foreign.tsv" --json "$d/void.json" > /dev/null
     v=$?
+    # A refused class (rc 4, NOT AVAILABLE) measured nothing: no void decision applies and nothing is re-run.
+    if [ $rc = 4 ] && grep -q '^NOT AVAILABLE' "$d/adapter.txt" 2>/dev/null; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fs" "$cell" "$system" "$clients" "$attempt" "$rc" "N/A" >> "$OUT/cells.tsv"
+      break
+    fi
     rm -rf "$mnt/work-$id"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$fs" "$cell" "$system" "$clients" "$attempt" "$rc" \
       "$([ $v = 0 ] && echo VALID || echo VOID)" >> "$OUT/cells.tsv"

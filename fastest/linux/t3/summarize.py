@@ -5,7 +5,9 @@ Prints summary.json to stdout: the sha, mode, manifest and its sha256, every sta
 wall time, and per planned run: its attempts, adapter rc, void verdict and whether its result exists.
 A planned run is COMPLETE when its last attempt is VALID and its result is on disk (ours:
 result/summary.json; a competitor: result/functional.txt ending in a VERDICT line), or when the engine
-refused the class (adapter rc 4, 'NOT AVAILABLE' -- a recorded absence, not a result). Exit 1 if any
+refused the class (adapter rc 4, 'NOT AVAILABLE' -- a recorded absence, not a result). A complete
+competitor run whose VERDICT is not PASS is listed in failed_checks (complete raws of a failed cell;
+the dry-run workflow fails on any). Exit 1 if any
 planned run is not complete, if a stage failed, or if nothing was planned: a run that collected nothing
 has not passed.
 """
@@ -36,7 +38,7 @@ def main(out, sha, dry, manifest):
         for line in open(plan).read().splitlines():
             cell, system = line.split("\t")[:2]
             planned.append((fs, cell, system))
-    runs, incomplete = [], []
+    runs, incomplete, failed_checks = [], [], []
     for fs, cell, system in planned:
         a = attempts.get((fs, cell), [])
         last = a[-1] if a else None
@@ -57,6 +59,9 @@ def main(out, sha, dry, manifest):
                 result = "VERDICT" in text
                 why = (text.strip().splitlines() or ["no functional.txt"])[-1] if result else \
                     f"no functional VERDICT (adapter rc {last['adapter_rc']})"
+                if result and "VERDICT PASS" not in text:
+                    failed_checks.append(f"{fs}/{cell}: " + "; ".join(
+                        l for l in text.splitlines() if l.startswith("FAIL ")))
         runs.append({"fs": fs, "cell": cell, "system": system, "attempts": a, "complete": result, "note": why})
         if not result:
             incomplete.append(f"{fs}/{cell}: {why}")
@@ -67,12 +72,13 @@ def main(out, sha, dry, manifest):
     summary = {"sha": sha, "dry_run": dry == "1", "manifest": manifest, "manifest_sha256": msha,
                "wall_seconds": total, "stages": stages, "planned_runs": len(planned),
                "complete_runs": sum(r["complete"] for r in runs), "incomplete": incomplete,
+               "failed_checks": failed_checks,
                "failed_stages": failed, "runs": runs}
     json.dump(summary, sys.stdout, indent=1)
     print()
     ok = planned and not incomplete and not failed
     print(f"summarize: planned={len(planned)} complete={summary['complete_runs']} failed_stages={failed} "
-          f"wall_s={total}", file=sys.stderr)
+          f"failed_checks={len(failed_checks)} wall_s={total}", file=sys.stderr)
     return 0 if ok else 1
 
 

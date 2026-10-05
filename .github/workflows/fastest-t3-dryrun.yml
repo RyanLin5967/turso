@@ -50,8 +50,16 @@ jobs:
         run: |
           cat "$HOME/t3-wall.txt" 2>/dev/null
           cat "$HOME/t3-out/stages.tsv" 2>/dev/null
-          python3 -c "import json; s=json.load(open('$HOME/t3-out/summary.json')); print(s['planned_runs'], s['complete_runs'], s['incomplete'], s['failed_stages'])" 2>&1 || true
           { echo '```'; cat "$HOME/t3-out/stages.tsv" 2>/dev/null; cat "$HOME/t3-wall.txt" 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          # Complete raws are the runner's exit criterion; a dry run also fails on any failed cell check,
+          # because a harness defect found here is one the rental would pay for.
+          python3 - "$HOME/t3-out/summary.json" <<'PY'
+          import json, sys
+          s = json.load(open(sys.argv[1]))
+          print("planned", s["planned_runs"], "complete", s["complete_runs"], "incomplete", s["incomplete"],
+                "failed_stages", s["failed_stages"], "failed_checks", s.get("failed_checks"))
+          sys.exit(1 if (s["incomplete"] or s["failed_stages"] or s.get("failed_checks") or not s["planned_runs"]) else 0)
+          PY
       - name: Upload the package
         if: always()
         uses: actions/upload-artifact@v4
