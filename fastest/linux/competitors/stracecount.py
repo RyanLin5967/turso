@@ -196,9 +196,20 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     stray = []  # strace's own stderr, minus a summary table: attach/ptrace errors and warnings land here
     win = open(window).read() if window and os.path.exists(window) else ""
     attached = "attached_after_polls=" in win
+    launched = re.search(r"^cmd=", win, re.M) is not None
+    if attached == launched:
+        problems.append("window record missing or unrecognized (neither a proven attach nor a launch)")
     mm = re.search(r"^main=(\d+) ", win, re.M)
     main = mm.group(1) if mm else None
     detach = {k: v for k, v in re.findall(r"\b(strace_alive_at_detach|main_alive_at_detach)=(\d)", win)}
+    rc = re.search(r"\bstrace_rc=(\d+)", win)
+    # strace exits 130 when the SIGINT detach ends an attach (616 of 616 attach windows, runs 37242277040 and
+    # 37244177784); a launch window's strace exits with its command's status, which must be 0 (second review, 7).
+    want_rc = "130" if attached else "0"
+    if rc is None:
+        problems.append("window has no strace_rc")
+    elif rc.group(1) != want_rc:
+        problems.append(f"strace_rc={rc.group(1)}, want {want_rc} for {'an attach' if attached else 'a launch'} window")
     tsplit = None
     if part is not None:
         sm = re.search(r"\btsplit=(\d+\.\d+)", win)
@@ -211,7 +222,7 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
 
     def benign(ln):
         b = BENIGN.search(ln)
-        return bool(b) and main is not None and b.group(1) != main
+        return attached and bool(b) and main is not None and b.group(1) != main
 
     desync = {}  # tid -> [(entering|exiting, op)] from strace's state-mismatch messages (see DESYNC)
     for e in extras:
@@ -221,14 +232,12 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
             etext = f.read()
         if summary is None:
             summary = parse_summary(etext)
-        if attached:
-            for ln in etext.splitlines():
-                d = DESYNC.search(ln)
-                if d:
-                    desync.setdefault(d.group(1), []).append((d.group(2), d.group(3)))
-                elif ln.strip() and not ln.startswith(("% time", "------")) and not SUMROW.match(ln) \
-                        and not benign(ln):
-                    stray.append(ln)
+        for ln in etext.splitlines():
+            d = DESYNC.search(ln)
+            if d:
+                desync.setdefault(d.group(1), []).append((d.group(2), d.group(3)))
+            elif ln.strip() and not ln.startswith(("% time", "------")) and not SUMROW.match(ln) and not benign(ln):
+                stray.append(ln)
     lines, done_by_name = {}, {}
     pending = {}  # tid -> (name, rest, ts): started, not (yet) returned
     calls = []  # (tid, name, args_and_rest, ts, completed)
@@ -403,7 +412,7 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     if summary is None:
         problems.append("no -c summary table found")
     if stray:
-        problems.append(f"strace stderr in an attach window: {stray[0][:200]}")
+        problems.append(f"strace stderr: {stray[0][:200]}")
     if not lines and summary:
         problems.append("summary present but zero call lines (was -C used?)")
     if summary is not None:
