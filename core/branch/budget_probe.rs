@@ -4,7 +4,7 @@
 //!
 //! * **Allocations**: a counting global allocator over `System` — every `alloc`, `alloc_zeroed` and
 //!   `realloc` call and its requested bytes, per thread and process-wide, and separately those made
-//!   while the calling thread holds a branch store's mutex.
+//!   while the calling thread holds a branch store's mutex; and every `dealloc` (reported only).
 //! * **Store-mutex acquisitions**: `StoreMutex::lock` calls [`store_locked`] and its guard's drop
 //!   [`store_unlocked`] (the only two edits to the engine's files), per thread and process-wide.
 //! * **Unix syscalls** (Apple only): the kernel's own count for this task (`task_info`
@@ -33,6 +33,7 @@ static ALLOCATOR: Counting = Counting;
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static FREES: AtomicU64 = AtomicU64::new(0);
 static LOCKS: AtomicU64 = AtomicU64::new(0);
 static HELD_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -40,6 +41,8 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 thread_local! {
     static T_ALLOCS: Cell<u64> = const { Cell::new(0) };
     static T_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
+    static T_FREES: Cell<u64> = const { Cell::new(0) };
+    static T_FREE_BYTES: Cell<u64> = const { Cell::new(0) };
     static T_HELD_ALLOCS: Cell<u64> = const { Cell::new(0) };
     static T_HELD_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
     static T_LOCKS: Cell<u64> = const { Cell::new(0) };
@@ -87,6 +90,9 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        FREES.fetch_add(1, Relaxed);
+        bump(&T_FREES, 1);
+        bump(&T_FREE_BYTES, layout.size() as u64);
         // SAFETY: the caller's contract, forwarded.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -136,6 +142,9 @@ pub(crate) struct Snapshot {
     pub(crate) alloc_bytes: u64,
     pub(crate) t_allocs: u64,
     pub(crate) t_alloc_bytes: u64,
+    pub(crate) frees: u64,
+    pub(crate) t_frees: u64,
+    pub(crate) t_free_bytes: u64,
     pub(crate) t_held_allocs: u64,
     pub(crate) t_held_alloc_bytes: u64,
     pub(crate) locks: u64,
@@ -182,6 +191,9 @@ fn user_counts() -> Snapshot {
         alloc_bytes: ALLOC_BYTES.load(Relaxed),
         t_allocs: get(&T_ALLOCS),
         t_alloc_bytes: get(&T_ALLOC_BYTES),
+        frees: FREES.load(Relaxed),
+        t_frees: get(&T_FREES),
+        t_free_bytes: get(&T_FREE_BYTES),
         t_held_allocs: get(&T_HELD_ALLOCS),
         t_held_alloc_bytes: get(&T_HELD_ALLOC_BYTES),
         locks: LOCKS.load(Relaxed),

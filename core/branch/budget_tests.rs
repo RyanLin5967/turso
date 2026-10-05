@@ -59,9 +59,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// D2, except in a `*_d0` cell (the instruction arm: no device flush, whose kernel work makes an
+/// operation's instruction count vary by ~15% from one process to the next).
 fn opts() -> DatabaseOpts {
+    let d0 = std::env::var("FE_BUDGET_CHILD").is_ok_and(|s| s.ends_with("_d0"));
+    let sync = if d0 { SyncClass::Off } else { SyncClass::FullFsync };
     DatabaseOpts::new()
-        .with_branch_durability(BranchDurability::Catalog { sync: SyncClass::FullFsync })
+        .with_branch_durability(BranchDurability::Catalog { sync })
         .with_branch_checkpoint(BranchCheckpoint::Fuzzy)
 }
 
@@ -219,6 +223,10 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("allocs", delta(s0.t_allocs, s1.t_allocs));
     s.insert("alloc_bytes", delta(s0.t_alloc_bytes, s1.t_alloc_bytes));
     s.insert("allocs_process", delta(s0.allocs, s1.allocs));
+    // Reported, not budgeted: frees land wherever a value's last owner drops it.
+    s.insert("frees", delta(s0.t_frees, s1.t_frees));
+    s.insert("free_bytes", delta(s0.t_free_bytes, s1.t_free_bytes));
+    s.insert("frees_process", delta(s0.frees, s1.frees));
     s.insert("held_allocs", delta(s0.t_held_allocs, s1.t_held_allocs));
     s.insert("held_alloc_bytes", delta(s0.t_held_alloc_bytes, s1.t_held_alloc_bytes));
     s.insert("locks", delta(s0.t_locks, s1.t_locks));
@@ -460,29 +468,6 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
     super::journal::set_compact_threshold(0);
 }
 
-/// Exploratory (not a budget): the instructions a trunk connect and disconnect cost — code that
-/// runs nothing of the branch store — before and after the heap grows by a ballast of 400,000 small
-/// blocks and a 100,000-entry hash set, at 10 live branches.
-fn heap_probe(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut String) {
-    let pass = |label: &str, out: &mut String| {
-        for i in 0..WARMUP + k {
-            let (tc, s_connect) = measure(db, base, || db.connect().unwrap());
-            let (_, s_disc) = measure(db, base, || drop(tc));
-            let (_, s_noop) = measure(db, base, || ());
-            if i >= WARMUP {
-                line(out, cell, &format!("{label}_connect_trunk"), i - WARMUP, &s_connect);
-                line(out, cell, &format!("{label}_disconnect_trunk"), i - WARMUP, &s_disc);
-                line(out, cell, &format!("{label}_noop"), i - WARMUP, &s_noop);
-            }
-        }
-    };
-    pass("before", out);
-    let ballast: Vec<Box<[u64; 6]>> = (0..400_000u64).map(|i| Box::new([i; 6])).collect();
-    let set: std::collections::HashSet<u64> = (0..100_000u64).collect();
-    pass("after", out);
-    std::hint::black_box((ballast.len(), set.len()));
-}
-
 /// The instruments' fire-checks, in the child (nothing else runs there): each counter moves by
 /// exactly what was done, and by nothing when nothing was.
 fn run_instruments(cell: &str) -> String {
@@ -610,21 +595,26 @@ fn budget_child() {
     if spec == "instruments" {
         text = run_instruments(&spec);
     } else {
+        // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "n10_small" | "ckpt_n10" | "heap_probe" => (10, false, true),
-            "n1e4_small" | "growth_n1e4" | "ckpt_n1e4" => (N_LARGE, false, true),
-            "n10_large" => (10, true, true),
-            "n10_small_unnamed" => (10, false, false),
-            "n1e4_small_unnamed" => (N_LARGE, false, false),
-            other => panic!("unknown budget cell {other:?}"),
+            "ckpt_n10" => (10, false, true),
+            "growth_n1e4" | "ckpt_n1e4" => (N_LARGE, false, true),
+            cell => {
+                let n = if cell.starts_with("n10_") {
+                    10
+                } else if cell.starts_with("n1e4_") {
+                    N_LARGE
+                } else {
+                    panic!("unknown budget cell {cell:?}")
+                };
+                (n, cell.contains("_large"), !cell.contains("_unnamed"))
+            }
         };
         let mut built = build(&spec, n, large, named);
         probe::arm(true);
         let opens = if spec.starts_with("n") { 5 } else { 1 };
         let (db, base) = recover(&spec, &mut built, opens, &mut text);
-        if spec == "heap_probe" {
-            heap_probe(&spec, &db, base, k, &mut text);
-        } else if spec.starts_with("growth") {
+        if spec.starts_with("growth") {
             growth(&spec, &db, &mut text);
         } else if spec.starts_with("ckpt") {
             checkpoints(&spec, &db, base, &mut text);
@@ -699,23 +689,6 @@ fn cell(spec: &str) -> Arc<CellData> {
 /// children of their own).
 fn in_child() -> bool {
     std::env::var_os("FE_BUDGET_CHILD").is_some()
-}
-
-/// Exploratory: runs the heap probe cell, so its raw file is banked (`FE_BUDGET_RAW_DIR`).
-#[test]
-fn heap_probe_report() {
-    if in_child() {
-        return;
-    }
-    let c = cell("heap_probe");
-    let min = |op: &str| c.ops[op].iter().filter_map(|s| s.get("instructions")).min().copied();
-    for op in ["connect_trunk", "disconnect_trunk", "noop"] {
-        println!(
-            "heap probe: {op} instructions before {:?}, after the ballast {:?}",
-            min(&format!("before_{op}")),
-            min(&format!("after_{op}"))
-        );
-    }
 }
 
 /// The cells every per-operation budget is checked at: 10 live branches in a small database (the
@@ -871,8 +844,12 @@ const EXACT: [&str; 13] = [
 /// Allocation counters: compared by their steady (smallest) value, since a table's amortized
 /// growth lands on whichever operation crosses its capacity.
 const ALLOC: [&str; 4] = ["allocs", "alloc_bytes", "held_allocs", "held_alloc_bytes"];
-/// Instructions retired vary by a few percent run to run (interrupts, faults); compared by their
-/// steady value within this factor. A cost that grows with what is compared shows far above it.
+/// Instructions retired: the one counter that sees CPU work which allocates, locks and syscalls
+/// nothing (an O(N) walk). Compared only between D0 cells: at D2 an operation's device flush puts
+/// kernel work in its count that varied by up to 14% between processes (base1-base3, create
+/// 338k-386k at the same cell), while without one the steady value of every operation varied by
+/// under 4% (connect_named 822.8k-826.9k across cells and runs). Compared by the steady value
+/// within this factor; an O(N) term at N = 10^4 shows far above it.
 const INSTRUCTION_SLACK: f64 = 1.10;
 
 /// `op` costs the same at `a` and at `b`: every exact counter's (min, max), every allocation
@@ -905,7 +882,9 @@ fn assert_same(op: &str, a: &str, b: &str, skip: &[&str]) {
             let _ = writeln!(failures, "  {op}.{k} (steady): {a} {x}, {b} {y}");
         }
     }
-    if !skip.contains(&"instructions") && present(&sa, "instructions") {
+    // Instructions only between D0 cells (see `opts`).
+    let d0 = a.ends_with("_d0") && b.ends_with("_d0");
+    if d0 && !skip.contains(&"instructions") && present(&sa, "instructions") {
         let (x, y) = (range(&ca, &sa, "instructions").0, range(&cb, &sb, "instructions").0);
         let ratio = y as f64 / x.max(1) as f64;
         if !(1.0 / INSTRUCTION_SLACK..=INSTRUCTION_SLACK).contains(&ratio) {
@@ -962,6 +941,9 @@ fn the_budget_counters_count_exactly_what_was_done() {
         assert_eq!(get("fc_nothing", k), 0, "an empty window moved {k}");
     }
     assert_eq!(get("fc_box_23", "allocs"), 23, "23 boxes");
+    assert_eq!(get("fc_box_23", "frees"), 23, "23 boxes dropped");
+    assert_eq!(get("fc_box_23", "free_bytes"), 23 * 8, "23 boxes of a u64 dropped");
+    assert_eq!(get("fc_nothing", "frees"), 0, "an empty window freed");
     assert_eq!(get("fc_box_23", "alloc_bytes"), 23 * 8, "23 boxes of a u64");
     assert_eq!(get("fc_box_23", "held_allocs"), 0, "allocations outside a store mutex counted as held");
     assert_eq!(get("fc_held_5_syscalls_3_allocs", "locks"), 1, "one hold");
@@ -1293,7 +1275,8 @@ fn assert_recovery_same(a: &str, b: &str, keys: &[&str], instructions: bool) {
         }
     }
     let mut steady = keys.to_vec();
-    if instructions && sa[0].contains_key("instructions") {
+    let d0 = a.ends_with("_d0") && b.ends_with("_d0");
+    if instructions && d0 && sa[0].contains_key("instructions") {
         steady.push("instructions");
     }
     for k in steady {
@@ -1444,4 +1427,92 @@ fn a_checkpoint_costs_the_same_at_10_and_at_10_000_live_branches() {
     let (nb, b) = checkpoint_excess("ckpt_n1e4");
     assert_eq!(na, nb, "premise: as many checkpoints at both N");
     assert_eq!(a, b, "a checkpoint's cost beyond its operation's, summed over {na} checkpoints");
+}
+
+// ---- instructions: CPU work no other counter sees, at D0 (no device flush in the count) ----
+
+/// `op`'s steady instruction count at 10^4 live branches and in the large database, against 10 in
+/// the small one, all at D0.
+#[cfg(target_vendor = "apple")]
+fn assert_instructions(op: &str) {
+    if in_child() {
+        return;
+    }
+    let mut failures = Vec::new();
+    for b in ["n1e4_small_d0", "n10_large_d0"] {
+        if let Err(e) = std::panic::catch_unwind(|| assert_same(op, "n10_small_d0", b, &EXACT_AND_ALLOC)) {
+            failures.push(e.downcast_ref::<String>().cloned().unwrap_or_default());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Every counter but instructions (what `assert_instructions` skips: the D2 cells check them).
+#[cfg(target_vendor = "apple")]
+const EXACT_AND_ALLOC: [&str; 17] = [
+    "syscalls",
+    "fsync",
+    "full_fsync",
+    "barrier",
+    "held_syscalls",
+    "locks",
+    "catalog_queries",
+    "catalog_rows",
+    "catalog_loads",
+    "resolves",
+    "slot_reads",
+    "log_bytes",
+    "ckpt_started",
+    "allocs",
+    "alloc_bytes",
+    "held_allocs",
+    "held_alloc_bytes",
+];
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn create_instructions_are_independent_of_live_branches_and_size() {
+    assert_instructions("create");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn connect_named_instructions_are_independent_of_live_branches_and_size() {
+    assert_instructions("connect_named");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn first_write_instructions_are_independent_of_live_branches_and_size() {
+    assert_instructions("first_write");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn disconnect_instructions_are_independent_of_live_branches_and_size() {
+    assert_instructions("disconnect");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn delete_instructions_are_independent_of_live_branches_and_size() {
+    assert_instructions("delete");
+}
+
+/// Recovery's steady instructions over the reopens: unnamed populations for the live branches
+/// (instructions are process-wide, and the name filter's build is Θ(names) by design), named ones
+/// (10 names each) for the size.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn recovery_instructions_are_independent_of_live_branches_and_size() {
+    if in_child() {
+        return;
+    }
+    let mut failures = Vec::new();
+    for (a, b) in [("n10_small_unnamed_d0", "n1e4_small_unnamed_d0"), ("n10_small_d0", "n10_large_d0")] {
+        if let Err(e) = std::panic::catch_unwind(|| assert_recovery_same(a, b, &[], true)) {
+            failures.push(e.downcast_ref::<String>().cloned().unwrap_or_default());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
