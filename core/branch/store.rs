@@ -6098,13 +6098,20 @@ impl StoreInner {
 
     /// Catalog stores: make the trunk's `written` epoch of `page` at least the `died` of the page's
     /// last catalog version, as an eager recovery rebuilds it (the largest `died`), by ONE probe per
-    /// page per process. The page's other versions are not read (C-P).
+    /// page per process. The page's other versions are not read (C-P). The page counts as known
+    /// only once its probe has answered: a probe refused (`Busy`, an I/O error) is made again by the
+    /// next caller, never taken as "no catalog version" (review 3 #2).
     fn trunk_written_known(&mut self, page: u32) -> Result<()> {
         let Some(cat) = self.cat.as_mut() else {
             return Ok(());
         };
-        if !cat.trunk_known.insert(page) {
+        if cat.trunk_known.contains(&page) {
             return Ok(());
+        }
+        // Mutant `probe_marked_first` (test builds only): as before review 3 #2, the page is known
+        // before its probe answers.
+        if fe_mutant("probe_marked_first") {
+            cat.trunk_known.insert(page);
         }
         if self.failpoint == Some(BranchFailpoint::TrunkProbeBusy) {
             self.failpoint = None;
@@ -6128,6 +6135,7 @@ impl StoreInner {
             let written = self.trunk.written.entry(page).or_insert(0);
             *written = (*written).max(died);
         }
+        cat.trunk_known.insert(page);
         Ok(())
     }
 
