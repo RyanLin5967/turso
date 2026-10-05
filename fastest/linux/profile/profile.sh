@@ -82,22 +82,33 @@ for arm in $arms; do
 
   # 4. perf record of the create window -> flame graph (D2 only)
   if [ "$class" = full ]; then
+    # The flame graph needs on-CPU samples: a create is ~15k instructions and mostly waits in fsync,
+    # so 200 creates at 2 kHz gave none (run 37256052378). Its own run: creates only (--phases 1, no
+    # connections held), 25x the ops, 15 kHz.
     ctl="$work/ctl-r-$k.fifo" ack="$work/ack-r-$k.fifo"
     rm -f "$ctl" "$ack"
     mkfifo "$ctl" "$ack"
     fresh
-    timeout 1800 perf record -F 1999 -g --call-graph dwarf,16384 -D -1 --control "fifo:$ctl,$ack" \
-      -o "$work/perf-$arm.data" -- "$drv" --dir "$DB" "${args[@]}" --perf-ctl "$ctl,$ack" \
+    fargs=(--class "$class" --clients "$c" --phases 1)
+    [ "$store" = cat ] && fargs+=(--catalog)
+    if [ "$c" = 1 ]; then fargs+=(--ops $((25 * ops1)) --warmup 20); else fargs+=(--ops $((25 * opsn)) --warmup 2); fi
+    timeout 1800 perf record -F 15000 -g --call-graph dwarf,16384 -D -1 --control "fifo:$ctl,$ack" \
+      -o "$work/perf-$arm.data" -- "$drv" --dir "$DB" "${fargs[@]}" --perf-ctl "$ctl,$ack" \
       --perf-only create > "$d/perfrecord.stdout" 2>&1
     record "$arm" perf-record $?
     rm -f "$ctl" "$ack"
     timeout 1800 perf script -i "$work/perf-$arm.data" > "$work/perf-$arm.script" 2> "$d/perfscript.stderr"
     record "$arm" perf-script $?
     if [ -n "$flame" ]; then
-      "$flame/stackcollapse-perf.pl" "$work/perf-$arm.script" > "$d/perf-create.folded" 2>/dev/null &&
-        "$flame/flamegraph.pl" --title "fastest_profile $side $arm: create window" \
+      "$flame/stackcollapse-perf.pl" "$work/perf-$arm.script" > "$d/perf-create.folded" 2>/dev/null
+      if [ -s "$d/perf-create.folded" ]; then
+        "$flame/flamegraph.pl" --title "fastest_profile $side $arm: create window (on-CPU)" \
           "$d/perf-create.folded" > "$d/flame-create.svg"
-      record "$arm" flamegraph $?
+        record "$arm" flamegraph $?
+      else
+        # No sample is a fact about the window (nothing on CPU long enough), recorded, never a pass.
+        printf '%s\t%s\t%s\n' "$arm" flamegraph NO-SAMPLES >> "$runs"
+      fi
     fi
   fi
 
