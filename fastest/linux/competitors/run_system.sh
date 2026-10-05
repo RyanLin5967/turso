@@ -197,8 +197,9 @@ run_server_cell() { # run_server_cell SPEC C
   strace_attach "$d/load" "$(server_pid)" || { fail "$spec-c$c load attach"; return; }
   rc=0
   bbload "$spec" "$c" "$n" "$d/bb" || rc=$?
+  # Nothing but a stat between the ops and the window's end (tsplit for PG, the detach otherwise): fsused's
+  # `sync -f` and df ran inside the window and stretched load_s (third review, finding 5); it now runs after it.
   log1=$(stat -c %s "$DATA.log")
-  used1=$(fsused)
   local defer=() tw=()
   if [ "$KIND" = pg ]; then
     # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost). It runs INSIDE the load
@@ -210,6 +211,7 @@ run_server_cell() { # run_server_cell SPEC C
     sqlq "CHECKPOINT" >"$d/deferred.checkpoint.txt" 2>&1 || fail "$spec-c$c deferred CHECKPOINT rc=$? ($(tail -1 "$d/deferred.checkpoint.txt"))"
   fi
   strace_detach "$d/load"
+  used1=$(fsused)  # PG: after the CHECKPOINT
   echo "fs_used_before=$used0 fs_used_after=$used1 delta=$((used1 - used0))" >"$d/space.txt"
   [ $rc -eq 0 ] || fail "$spec-c$c bbload rc=$rc ($(tail -1 "$d/bb.txt"))"
   # The server log written during the load window. PG (amendment 14 section 6): a CREATE DATABASE that found a backend
