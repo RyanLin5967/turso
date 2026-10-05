@@ -1564,6 +1564,12 @@ mod fastest_tests;
 mod crash_tests;
 
 #[cfg(test)]
+pub(crate) mod budget_probe;
+
+#[cfg(all(test, feature = "fs"))]
+mod budget_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
