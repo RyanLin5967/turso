@@ -2109,3 +2109,114 @@ fn a_failed_checkpoint_is_not_retried_by_the_next_create() {
         "the creates right after a failed checkpoint started another"
     );
 }
+
+// ---- lead ruling 85a032f01 (review 1 item 1, revised): the arena is plain-fsynced, and recovery
+// checks the last flight's slots ----
+
+/// Ruling 85a032f01: a D2 first write is exactly one F_FULLFSYNC (the log's) and one plain
+/// fsync(2) (the arena's), and no barrier: the log's device-wide flush makes the arena durable too.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_first_write_is_one_full_fsync_and_one_plain_fsync() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("d2pf.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        let before = sync_counts();
+        write_v(&bc, 3, "mine");
+        let after = sync_counts();
+        assert_eq!(
+            (
+                after.fsync - before.fsync,
+                after.full_fsync - before.full_fsync,
+                after.barrier - before.barrier
+            ),
+            (1, 1, 0),
+            "catalog={catalog}: a D2 first write's (fsync, F_FULLFSYNC, barrier)"
+        );
+    }
+}
+
+/// Ruling 85a032f01: with the arena only plain-fsynced, a power cut can keep the last flight's log
+/// record and lose the slot it names. Recovery checks every slot the LAST flight names and drops
+/// the flight if one fails: the branch reads its previous version, with no error. (A slot named by
+/// an older flight may have been reused since; only the last flight's are checked.)
+#[test]
+fn a_last_flight_whose_slot_never_reached_the_disk_is_dropped() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("lostslot.db");
+        let (id, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            let bc = b.connect().unwrap();
+            write_v(&bc, 3, "durable");
+            let before: std::collections::HashSet<u32> = b.owned_slots().into_iter().collect();
+            write_v(&bc, 3, "lost");
+            let fresh: Vec<u32> = b.owned_slots().into_iter().filter(|s| !before.contains(s)).collect();
+            assert_eq!(fresh.len(), 1, "catalog={catalog}: premise: the last write took one fresh slot");
+            drop(bc);
+            let arena = arena_path(&db);
+            let id = b.into_id();
+            let incarnation = db.incarnation;
+            drop(trunk);
+            drop(db);
+            // The slot's bytes never reached the disk.
+            let f = std::fs::OpenOptions::new().write(true).open(&arena).unwrap();
+            use std::os::unix::fs::FileExt;
+            f.write_all_at(&vec![0u8; 4096], fresh[0] as u64 * 4096).unwrap();
+            (id, incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let b = db.branch(id).unwrap();
+        let got = b.connect().and_then(|c| c.prepare("SELECT v FROM t WHERE id = 3").and_then(|mut s| s.run_collect_rows()));
+        match got {
+            Ok(rows) => assert_eq!(
+                rows[0][0],
+                crate::Value::from_text("durable"),
+                "catalog={catalog}: the dropped flight's write was read"
+            ),
+            Err(e) => panic!("catalog={catalog}: the last flight's lost slot was not dropped at recovery: {e}"),
+        }
+    }
+}
+
+/// Review 2 #12: a catalog store's refusals name the files it really has (`-branch-cat`, not a
+/// snapshot), and a catalog store whose log and arena were moved aside is refused at open instead
+/// of opening with every branch's slots gone.
+#[test]
+fn a_catalog_store_names_its_catalog_and_refuses_a_missing_arena() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("catfiles.db");
+    {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        write_v(&b.connect().unwrap(), 3, "x");
+        db.branch_compact_now().unwrap();
+        let _ = b.into_id();
+    }
+    let base = path.to_str().unwrap();
+    for suffix in ["-branch-log", "-branch-arena"] {
+        std::fs::rename(format!("{base}{suffix}"), format!("{base}{suffix}.aside")).unwrap();
+    }
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let opened = Database::open_file_with_flags(
+        io,
+        base,
+        OpenFlags::Create,
+        opts(true, SyncClass::Fsync),
+        None,
+        Arc::new(SqliteDialect),
+    );
+    assert!(opened.is_err(), "a catalog store opened with its log and arena gone");
+}

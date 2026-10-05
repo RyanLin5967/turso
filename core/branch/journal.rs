@@ -980,7 +980,7 @@ impl Journal {
                         damage = Some("a short frame");
                         break;
                     };
-                    if crc32c::crc32c(payload) != crc {
+                    if scan_crc(payload) != crc {
                         damage = Some("a damaged frame");
                         break;
                     }
@@ -999,7 +999,7 @@ impl Journal {
                         let ends_whole = from == whole.0 as u64
                             && bytes
                                 .get(whole.0..pos)
-                                .is_some_and(|flight| crc32c::crc32c(flight) == flight_crc);
+                                .is_some_and(|flight| scan_crc(flight) == flight_crc);
                         if !ends_whole {
                             damage = Some("a flight whose end frame does not match it");
                             break;
@@ -1999,10 +1999,21 @@ fn first_whole_frame_after(bytes: &[u8], from: usize) -> Option<usize> {
         let start = at + FRAME_HEADER_LEN;
         len > 0
             && bytes.get(start..start.saturating_add(len)).is_some_and(|payload| {
-                crc32c::crc32c(payload) == crc && Record::decode(payload).is_some()
+                scan_crc(payload) == crc && Record::decode(payload).is_some()
             })
     })
 }
+
+/// crc32c of what a recovery scan checks, counted in test builds (review 2 #7's instrument: the
+/// scan's CRC work must stay linear in the log).
+fn scan_crc(data: &[u8]) -> u32 {
+    #[cfg(test)]
+    SCAN_CRC_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
+    crc32c::crc32c(data)
+}
+
+#[cfg(test)]
+pub(crate) static SCAN_CRC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The end frame of a flight that began at `start`, written when every byte below `synced` had
 /// been synced, and holding the frames `flight`.
@@ -3178,5 +3189,166 @@ mod flight_tests {
         assert_eq!(forks(&recovered.records), vec![3, 4], "the cut log lost a kept record");
         let clocks = recovered.records.iter().filter(|r| matches!(r, Record::Clock { .. })).count();
         assert_eq!(clocks, 2, "flight 2's kept Clock and flight 3's");
+    }
+}
+
+/// Review 2's format bump (11/12), red first against 675adbfb3: a log incarnation that recovery can
+/// tell from an older one, an end frame that says whether its flight was synced, a cut that keeps
+/// every flight's boundary, a recovery scan linear in the log, and a 17-byte end frame.
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    fn flights(files: &BranchFiles, generation: u64, shapes: &[usize], class: SyncClass) -> Vec<u64> {
+        let mut journal = Journal::create(files, 512, class).unwrap();
+        if generation > 0 {
+            journal.rewrite_from(journal.len, generation).unwrap();
+        }
+        let mut arena = Arena::new(512);
+        let mut starts = Vec::new();
+        for (i, &records) in shapes.iter().enumerate() {
+            for j in 0..records {
+                journal
+                    .buffer(&Record::Fork { child: 1000 * generation + 10 * i as u64 + j as u64 + 1, parent: 0 })
+                    .unwrap();
+            }
+            starts.push(std::fs::metadata(&files.log).unwrap().len());
+            journal.take_flight(&mut arena, class, false).unwrap().write().unwrap();
+        }
+        starts
+    }
+
+    fn forks(records: &[Record]) -> Vec<u64> {
+        records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Fork { child, .. } => Some(*child),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn overwrite(path: &Path, at: u64, bytes: &[u8]) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = OpenOptions::new().write(true).open(path).unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
+    /// Review 2 #1 (HIGH): a log reset in place whose truncation never reached the disk leaves the
+    /// new incarnation's header and flights over the old one's bytes. Recovery returns exactly the
+    /// new flights — none of the old ones, however their sizes line up — and a control with the
+    /// truncation persisted returns the same.
+    #[test]
+    fn an_older_incarnations_tail_is_never_replayed() {
+        for (k, shapes) in [(0usize, vec![]), (1, vec![1]), (2, vec![1, 1]), (1, vec![3]), (2, vec![2, 1])] {
+            for truncated in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let old = BranchFiles::for_db(dir.path().join("old").to_str().unwrap());
+                flights(&old, 0, &[1; 40], SyncClass::Fsync);
+                let new = BranchFiles::for_db(dir.path().join("new").to_str().unwrap());
+                flights(&new, 1, &shapes, SyncClass::Fsync);
+                let image = std::fs::read(&new.log).unwrap();
+                if truncated {
+                    std::fs::write(&old.log, &image).unwrap();
+                } else {
+                    overwrite(&old.log, 0, &image);
+                }
+                let recovered =
+                    Journal::recover_catalog_as(&old, SyncClass::Off, Some((512, 1)), FORMAT_VERSION)
+                        .unwrap_or_else(|e| panic!("k={k} {shapes:?} truncated={truncated}: refused: {e}"))
+                        .expect("state");
+                let want: Vec<u64> = shapes
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, &n)| (0..n).map(move |j| 1000 + 10 * i as u64 + j as u64 + 1))
+                    .collect();
+                assert_eq!(forks(&recovered.records), want, "k={k} {shapes:?} truncated={truncated}");
+            }
+        }
+    }
+
+    /// Review 2 #2: flight 2 lost a block while its own end frame survived, and flight 3 was torn
+    /// at its end: flight 3's surviving frames prove flight 2's sync had returned, so this is not a
+    /// torn tail. Refused, and the log left byte-identical.
+    #[test]
+    fn a_damaged_synced_flight_with_a_later_flights_frames_after_it_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[2, 2, 2], SyncClass::Fsync);
+        overwrite(&files.log, starts[1], &[0u8; 12]);
+        let len = std::fs::metadata(&files.log).unwrap().len();
+        OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
+        let before = std::fs::read(&files.log).unwrap();
+        assert!(Journal::recover(&files, SyncClass::Off).is_err(), "an acknowledged flight was cut");
+        assert_eq!(std::fs::read(&files.log).unwrap(), before, "the refused recovery changed the log");
+    }
+
+    /// Review 2 #3: a cut keeps each kept flight's boundary, so damage to an early kept flight with
+    /// later kept flights whole after it — all of them synced by the cut — is refused, not cut.
+    #[test]
+    fn a_cut_log_keeps_its_flights_apart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[2, 2, 2], SyncClass::Fsync);
+        let mut journal = Journal::recover(&files, SyncClass::Fsync).unwrap().expect("state").journal;
+        // Mid flight 1: after its first frame.
+        let first_frame = {
+            let bytes = std::fs::read(&files.log).unwrap();
+            let at = starts[0] as usize;
+            FRAME_HEADER_LEN + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+        };
+        journal.rewrite_from(starts[0] + first_frame as u64, 1).unwrap();
+        drop(journal);
+        // The first kept frame, just past the header, is lost.
+        overwrite(&files.log, LOG_HEADER_LEN as u64, &[0u8; 12]);
+        assert!(
+            Journal::recover_catalog_as(&files, SyncClass::Off, Some((512, 1)), FORMAT_VERSION).is_err(),
+            "damage to a synced kept flight under later whole flights was cut"
+        );
+    }
+
+    /// Review 2 #7: recovery's CRC work stays linear in the log: a 10k-page Commit torn at its start
+    /// costs at most four times the tail's bytes in CRC, not a CRC at every offset.
+    #[test]
+    fn a_torn_large_commit_costs_a_linear_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut journal = Journal::create(&files, 512, SyncClass::Fsync).unwrap();
+        let mut arena = Arena::new(512);
+        journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+        let at = std::fs::metadata(&files.log).unwrap().len();
+        let pages: Vec<(u32, Slot, u32)> = (0..10_000u32).map(|i| (i, i, i.wrapping_mul(2_654_435_761))).collect();
+        journal.buffer(&Record::Commit { branch: 1, pages }).unwrap();
+        journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+        drop(journal);
+        overwrite(&files.log, at, &[0u8; 8]);
+        let tail = std::fs::metadata(&files.log).unwrap().len() - at;
+        let before = SCAN_CRC_BYTES.load(Ordering::Relaxed);
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        let crc = SCAN_CRC_BYTES.load(Ordering::Relaxed) - before;
+        assert_eq!(forks(&recovered.records), vec![1]);
+        assert!(crc <= 4 * tail, "recovery computed {crc} CRC bytes over a {tail}-byte tail");
+    }
+
+    /// Review 2 #8: a flight's end frame is 17 bytes — a 9-byte payload: a tag that says whether the
+    /// flight was synced, the flight's length, and its crc32c seeded with the log's nonce.
+    #[test]
+    fn an_end_frame_is_seventeen_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1], SyncClass::Fsync);
+        let bytes = std::fs::read(&files.log).unwrap();
+        let at = starts[0] as usize;
+        let fork_len = FRAME_HEADER_LEN + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        assert_eq!(bytes.len() - at - fork_len, 17, "the end frame's length");
+        let end = &bytes[at + fork_len..];
+        assert_eq!(u32::from_le_bytes(end[0..4].try_into().unwrap()), 9, "the end frame's payload length");
+        assert_eq!(
+            u32::from_le_bytes(end[9..13].try_into().unwrap()) as usize,
+            fork_len,
+            "the end frame names its flight's length"
+        );
     }
 }
