@@ -1963,10 +1963,12 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
             "failpoint: the catalog checkpoint's write failed before its commit".to_string(),
         ));
     }
-    // Every slot the catalog is about to name is ordered before its commit, whose sync makes them
-    // durable with it (lead review 1 item 1).
+    // Every slot the catalog is about to name reaches the device before its commit, whose flush
+    // makes them durable with it (ruling 85a032f01: a plain fsync).
     if let Some(file) = cap.arena.as_ref() {
-        super::journal::barrier_file(file, cap.arena_sync)?;
+        if cap.arena_sync.syncs() {
+            super::journal::fsync_file(file, SyncClass::Fsync)?;
+        }
     }
     // And the commit as durable as any record it replaces (review B-F3).
     catalog.raise_sync(cap.arena_sync)?;
@@ -2655,6 +2657,7 @@ impl BranchStore {
                         stats.arena_ns = ns(t);
                         stats.arena_high_water = arena.in_use() as u64 + arena.free_count() as u64;
                         stats.arena_free = arena.free_count() as u64;
+                        super::journal::one_device(recovered.journal.device(), arena.device())?;
                         let mut arena = arena;
                         if closed {
                             recovered.journal.flush(&mut arena)?;
@@ -2796,12 +2799,34 @@ impl BranchStore {
         let format = super::journal::format_version(inner.splice);
         if let Some(m) = meta.filter(|m| m.format != format) {
             return Err(LimboError::Corrupt(format!(
-                "branch catalog {}: format version {}; this store reads version {format} (6 is the \
-                 F7 splice arm's: open with the same DatabaseOpts::with_branch_splice; 0 was written \
-                 before the catalog carried the key)",
+                "branch catalog {}: format version {}; this store reads version {format}{}",
                 files.cat.display(),
-                m.format
+                m.format,
+                if m.format == 0 {
+                    " (0 was written before the catalog carried the key)".to_string()
+                } else {
+                    super::journal::version_hint(m.format, format)
+                }
             )));
+        }
+        // A catalog that names branch state is never opened over a missing log or arena (review 2
+        // #12): it would open with every branch's slots gone, and say nothing.
+        if let Some(m) = meta.filter(|m| m.in_use > 0 || m.states > 0) {
+            for (what, path) in [("log", &files.log), ("arena", &files.arena)] {
+                if !path.exists() {
+                    return Err(LimboError::Corrupt(format!(
+                        "branch catalog {} names {} branch states, but the branch {what} {} is \
+                         missing: the branch files were moved apart; put all three back together \
+                         ({}, {}, {})",
+                        files.cat.display(),
+                        m.states,
+                        path.display(),
+                        files.log.display(),
+                        files.arena.display(),
+                        files.cat.display()
+                    )));
+                }
+            }
         }
         // r12-catload: the catalog's prewarm, before the replay reads: its pages (`interior`,
         // `buffer`), or its files unless `R12_PREWARM_FILES` leaves the catalog out.
@@ -2940,6 +2965,7 @@ impl BranchStore {
         let in_use = u64::try_from(in_use)
             .map_err(|_| LimboError::Corrupt("branch catalog: negative arena use".into()))?;
         let mut arena = Arena::open_file_catalog(&files.arena, page_size, high_water, in_use, free_mem)?;
+        super::journal::one_device(recovered.journal.device(), arena.device())?;
         if closed {
             recovered.journal.flush(&mut arena)?;
         }
@@ -3622,7 +3648,8 @@ impl BranchStore {
         self.mature(inner);
         let t = Instant::now();
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
-        let cap = match inner.checkpoint_capture_mode(false, true) {
+        let flight_in_air = self.group.lock().flushing;
+        let cap = match inner.checkpoint_capture_mode(false, true, flight_in_air) {
             Ok(cap) => cap,
             Err(e) => {
                 tracing::warn!("branch catalog checkpoint not started: {e}");
@@ -5449,7 +5476,7 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn capture_fuzzy_for_test(&self) -> Result<()> {
         let mut inner = self.inner.lock();
-        let cap = inner.checkpoint_capture_mode(false, true)?;
+        let cap = inner.checkpoint_capture_mode(false, true, true)?;
         let cat = inner.cat.as_mut().expect("captured");
         cat.catalog.end_read_snapshot();
         cat.flight = false;
@@ -6337,6 +6364,10 @@ impl StoreInner {
                     }
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
+                super::journal::one_device(
+                    self.journal.as_ref().and_then(Journal::device),
+                    arena.device(),
+                )?;
                 // The journal's create synced the directory before the arena file existed.
                 if self.sync.syncs() {
                     super::journal::fsync_dir_of(&files.arena, self.sync)?;
@@ -6468,7 +6499,8 @@ impl StoreInner {
     /// every other in-memory set stays as it is until the install, so between now and then the
     /// store reads exactly as it does between checkpoints.
     fn checkpoint_capture(&mut self, fail_after_commit: bool) -> Result<Box<Captured>> {
-        self.checkpoint_capture_mode(fail_after_commit, false)
+        // The sharp path quiesced first: no flight is in the air.
+        self.checkpoint_capture_mode(fail_after_commit, false, false)
     }
 
     /// G-c (r13-compose A2.R4a): the capture knows whether it serves a fuzzy checkpoint, and a fuzzy
@@ -6478,6 +6510,7 @@ impl StoreInner {
         &mut self,
         fail_after_commit: bool,
         fuzzy: bool,
+        flight_in_air: bool,
     ) -> Result<Box<Captured>> {
         #[cfg(test)]
         CAPTURE_ENTERED.with(|c| c.set(c.get() + 1));
@@ -6610,7 +6643,11 @@ impl StoreInner {
                 arena.in_use()
             );
         }
-        let arena_file = if self.sync.syncs() {
+        // The arena is synced before the catalog commit only if a slot was written since its last
+        // sync, or a flight that took its last unsynced writes may not have synced them yet (lead
+        // review 1 item 7(4)): a clean arena costs the checkpoint no sync.
+        let rewrite_syncs = journal.rewrite_class().syncs();
+        let arena_file = if rewrite_syncs && (arena.is_dirty() || flight_in_air) {
             match arena.sync_handle() {
                 Ok(f) => f,
                 Err(e) => {
@@ -7647,10 +7684,6 @@ impl StoreInner {
             // A checkpoint that did not commit (or did, and this is the log recovery cut after
             // it): nothing to redo (F-FZ).
             Record::Checkpoint { .. } => Ok(()),
-            // Recovery's scan consumes every end frame; one here is a scan defect.
-            Record::FlightEnd { .. } => Err(LimboError::InternalError(
-                "a branch log flight's end frame reached replay".to_string(),
-            )),
         }
     }
 

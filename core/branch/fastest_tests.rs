@@ -122,8 +122,11 @@ fn a_d2_trunk_commit_syncs_its_wal_with_full_fsync() {
     }
 }
 
-/// D2: a branch's first write is synced with F_FULLFSYNC only (arena, then log: two barriers until
-/// M2's no-force page images).
+/// D2: a branch's first write flushes its log with F_FULLFSYNC, its arena slots reaching the device
+/// first by one plain fsync(2) (ruling 85a032f01).
+///
+/// FLAGGED TEST EDIT (lead ruling 85a032f01, a registered law change): it asserted no fsync(2)
+/// (the arena was F_FULLFSYNC'd, then barriered); it pins the ruling's (1 fsync, 1 F_FULLFSYNC).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_d2_branch_commit_syncs_only_with_full_fsync() {
@@ -138,8 +141,7 @@ fn a_d2_branch_commit_syncs_only_with_full_fsync() {
         let counted = syncs_of(|| {
             bc.execute("UPDATE t SET v = 'mine' WHERE id = 3").unwrap();
         });
-        assert_eq!(counted.0, 0, "catalog={catalog}: a D2 branch commit issued fsync(2): {counted:?}");
-        assert!(counted.1 >= 1, "catalog={catalog}: a D2 branch commit issued no F_FULLFSYNC");
+        assert_eq!(counted, (1, 1), "catalog={catalog}: a D2 branch commit's (fsync, F_FULLFSYNC)");
     }
 }
 
@@ -1545,10 +1547,12 @@ fn a_flight_that_fails_to_write_fail_stops_every_later_write() {
 
 // ---- lead review 1 item 1: one full flush per flight (the arena ordered by a barrier) ----
 
-/// Lead review 1 item 1: a D2 branch's first write is exactly ONE F_FULLFSYNC and no fsync(2). Its
-/// slots need only be ORDERED before the log record that names them (F_BARRIERFSYNC on Apple); the
-/// log's F_FULLFSYNC then drains the device's cache, slots included. Two full flushes (arena, then
-/// log) were the shape before.
+/// Lead review 1 item 1: a D2 branch's first write is exactly ONE F_FULLFSYNC: its slots only reach
+/// the device first (one plain fsync, ruling 85a032f01), and the log's F_FULLFSYNC drains the
+/// device's cache, slots included. Two full flushes (arena, then log) were the shape before.
+///
+/// FLAGGED TEST EDIT (lead ruling 85a032f01): it pinned (fsync 0, F_FULLFSYNC 1) for the barrier
+/// design; the ruling's design is (1, 1).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_d2_first_write_is_exactly_one_full_fsync() {
@@ -1561,7 +1565,7 @@ fn a_d2_first_write_is_exactly_one_full_fsync() {
         let b = trunk.fork_branch().unwrap();
         let bc = b.connect().unwrap();
         let counted = syncs_of(|| write_v(&bc, 3, "mine"));
-        assert_eq!(counted, (0, 1), "catalog={catalog}: a D2 first write's (fsync, F_FULLFSYNC)");
+        assert_eq!(counted, (1, 1), "catalog={catalog}: a D2 first write's (fsync, F_FULLFSYNC)");
     }
 }
 
@@ -1588,7 +1592,9 @@ fn v1_in_process_create_then_first_write_is_two_full_fsyncs_at_c1() {
             }
         });
         let per_pair = counted.1 as f64 / pairs as f64;
-        assert_eq!(counted.0, 0, "catalog={catalog}: fsync(2) issued during D2 CFW: {counted:?}");
+        // FLAGGED TEST EDIT (lead ruling 85a032f01): each first write's arena takes one plain
+        // fsync(2) ahead of its log's F_FULLFSYNC; it asserted none (the barrier design).
+        assert_eq!(counted.0, pairs, "catalog={catalog}: fsync(2) issued during D2 CFW: {counted:?}");
         assert!(
             (2.0..=2.01).contains(&per_pair),
             "catalog={catalog}: {} F_FULLFSYNC over {pairs} create+first-write pairs = {per_pair:.4} per pair",
@@ -1617,8 +1623,11 @@ fn the_sync_counter_counts_a_barrier_under_its_own_primitive() {
     assert_eq!(counted(SyncClass::FullFsync), (0, 0, 1), "a D2 barrier is one F_BARRIERFSYNC");
 }
 
-/// Lead review 1 item 1, the other half: a D2 first write still ORDERS its slots before its record
-/// — exactly one F_BARRIERFSYNC beside its one F_FULLFSYNC. Mutant `no_arena_barrier` must fail it.
+/// Lead review 1 item 1, the other half: a D2 first write still sends its slots to the device before
+/// its record's flush — exactly one plain fsync(2) beside its one F_FULLFSYNC, and no barrier.
+/// Mutant `no_arena_sync` must fail it.
+///
+/// FLAGGED TEST EDIT (lead ruling 85a032f01): it pinned one F_BARRIERFSYNC (the barrier design).
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_d2_first_write_orders_its_slots_with_one_barrier() {
@@ -1633,7 +1642,8 @@ fn a_d2_first_write_orders_its_slots_with_one_barrier() {
         let before = sync_counts();
         write_v(&bc, 3, "mine");
         let after = sync_counts();
-        assert_eq!(after.barrier - before.barrier, 1, "catalog={catalog}: the slots were not ordered");
+        assert_eq!(after.fsync - before.fsync, 1, "catalog={catalog}: the slots were not synced");
+        assert_eq!(after.barrier - before.barrier, 0, "catalog={catalog}");
         assert_eq!(after.full_fsync - before.full_fsync, 1, "catalog={catalog}");
     }
 }
@@ -1982,7 +1992,9 @@ impl Drop for Threshold {
 #[test]
 fn a_checkpoint_issues_no_sync_inside_the_store_mutex() {
     let _s = serial();
-    let pairs = std::env::var("FE_CKPT_FORKS").ok().and_then(|v| v.parse().ok()).unwrap_or(400u64);
+    // FLAGGED TEST EDIT (own test, premise only): 800 pairs, not 400, since end frames no longer
+    // count toward the threshold (review 2 #8) and 400 ran two checkpoints.
+    let pairs = std::env::var("FE_CKPT_FORKS").ok().and_then(|v| v.parse().ok()).unwrap_or(800u64);
     for class in [SyncClass::Fsync, SyncClass::FullFsync] {
         let dir = tempfile::TempDir::new().unwrap();
         let db = open_at(&dir.path().join("ckpt-nosync.db"), opts(true, class));
