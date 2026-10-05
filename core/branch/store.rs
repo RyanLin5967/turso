@@ -3153,9 +3153,11 @@ impl BranchStore {
             }
             // A Release flushed here, in the store's class, must still be covered by the next trunk
             // commit's barrier in the trunk's (skill review 2 #3).
+            // Mutant `log_all_no_floor` (test builds only): as at 5f7f68120, it does not.
             if records
                 .iter()
                 .any(|r| matches!(r, Record::Release { .. } | Record::ReleaseOpen { .. }))
+                && !fe_mutant("log_all_no_floor")
             {
                 self.last_release_lsn.fetch_max(journal.lsn(), Ordering::AcqRel);
             }
@@ -6103,6 +6105,10 @@ impl StoreInner {
         };
         if !cat.trunk_known.insert(page) {
             return Ok(());
+        }
+        if self.failpoint == Some(BranchFailpoint::TrunkProbeBusy) {
+            self.failpoint = None;
+            return Err(LimboError::Busy);
         }
         cat.trunk_probes += 1;
         cat.twk_probes += 1;

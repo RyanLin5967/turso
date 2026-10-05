@@ -474,6 +474,9 @@ pub enum BranchFailpoint {
     /// catalog read refused by the catalog's lock would; the statement retries the commit
     /// (fastest-engine review A-F2).
     TrunkDecisionBusy,
+    /// The next catalog probe that dates a trunk page's last write (`trunk_written_known`) returns
+    /// `Busy`, as a catalog read refused by the catalog's lock would (review 3 #2).
+    TrunkProbeBusy,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.

@@ -2288,3 +2288,164 @@ fn a_pre_image_kept_by_a_refused_decision_pass_is_durable_before_the_commit() {
         }
     }
 }
+
+// ---- review 3 #2: a catalog probe refused part-way is made again, not skipped for the process ----
+
+/// Review 3 #2: the once-per-page catalog probe that dates a trunk page's last write
+/// (`trunk_written_known`) is refused (`Busy`, as the catalog's lock would refuse it). The page must
+/// not be taken as dated: when the probe was skipped for the rest of the process, the retried trunk
+/// commit dated the page's last write at 0 and kept its pre-image for EVERY child back to 0, so a
+/// child forked before the page's checkpointed version read the newer row. Arms: the refused probe
+/// is the trunk commit's own (retried by its statement), or a branch read's before the commit.
+#[test]
+fn a_refused_catalog_probe_is_made_again() {
+    let _s = serial();
+    for refused_by_read in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("probe-busy.db");
+        let (old, incarnation) = {
+            let db = open_at(&path, opts(true, SyncClass::Fsync));
+            let a = db.connect().unwrap();
+            seed_wide(&a);
+            let old = a.fork_branch().unwrap();
+            write_v(&a, 3, "mid");
+            // The pre-image kept for `old` (trunk-3) goes to the catalog; the reopen forgets every
+            // page's written epoch.
+            db.branch_compact_now().unwrap();
+            (old.into_id(), db.incarnation)
+        };
+        let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+        let a = db.connect().unwrap();
+        let young = a.fork_branch().unwrap();
+        let y = young.connect().unwrap();
+        // Every page the reads below touch but row 3's leaf is probed here, so the failpoint's
+        // probe is that leaf's.
+        assert_eq!(read_wide(&y, 50), "trunk-50", "premise");
+        let probes = db.branch_twk_counters().0;
+        db.branch_failpoint(Some(BranchFailpoint::TrunkProbeBusy));
+        if refused_by_read {
+            let seen = y.prepare("SELECT v FROM t WHERE id = 3").unwrap().run_collect_rows();
+            assert!(matches!(seen, Err(LimboError::Busy)), "premise: the read's probe was refused: {seen:?}");
+            write_v(&a, 3, "new");
+        } else {
+            let mut stmt = a.prepare("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+            let first = stmt.run_ignore_rows();
+            assert!(matches!(first, Err(LimboError::Busy)), "premise: the decision's probe was refused: {first:?}");
+            stmt.run_ignore_rows().unwrap();
+        }
+        assert!(
+            db.branch_twk_counters().0 > probes,
+            "refused_by_read={refused_by_read}: the refused probe was not made again"
+        );
+        assert_eq!(read_wide(&y, 3), "mid", "refused_by_read={refused_by_read}: the young child");
+        let b = db.branch(old).unwrap();
+        assert_eq!(
+            read_wide(&b.connect().unwrap(), 3),
+            "trunk-3",
+            "refused_by_read={refused_by_read}: the old child reads a row the trunk wrote after its fork"
+        );
+    }
+}
+
+// ---- review 4 #1 (= skill 2 #2): a fuzzy checkpoint commits nothing a failed flight carried ----
+
+/// Review 4 #1 (= skill 2 #2): a fuzzy checkpoint captured while an operation's flight is in the
+/// air commits the catalog only once everything it captured is durable. When that flight FAILS the
+/// commit is refused, so an operation whose caller was told it failed never becomes durable through
+/// the catalog. Release arm: the released branch's slots stay out of the allocator, and the branch
+/// is back after a reopen. Fork arm: the fork whose flight failed is not a live branch after a
+/// reopen.
+#[test]
+fn a_fuzzy_checkpoint_never_commits_what_a_failed_flight_carried() {
+    let _s = serial();
+    for fork in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ckpt-failed-flight.db");
+        let (x_id, live, incarnation) = {
+            let db = open_at(&path, opts(true, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let _anchor = trunk.fork_branch().unwrap().into_id();
+            let x = trunk.fork_branch().unwrap();
+            write_v(&x.connect().unwrap(), 3, "x");
+            let owned = x.owned_slots();
+            assert!(!owned.is_empty(), "premise: the branch owns a slot");
+            let live = db.branch_stats().unwrap().live_branches;
+            let hold = db.branches.trunk_commit_hold.clone();
+            db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+            hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+            let (x_id, op) = if fork {
+                let x_id = x.into_id();
+                let db = db.clone();
+                (x_id, std::thread::spawn(move || db.connect()?.fork_branch().map(|b| drop(b.into_id()))))
+            } else {
+                (x.id(), std::thread::spawn(move || x.reap().map(|_| ())))
+            };
+            wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+            let started = db.branch_checkpoint_fuzzy_now();
+            hold.store(0, std::sync::atomic::Ordering::Release);
+            assert!(started.unwrap(), "fork={fork}: premise: a fuzzy checkpoint started");
+            assert!(op.join().unwrap().is_err(), "fork={fork}: premise: the operation's flight failed");
+            db.branch_checkpoint_wait();
+            if !fork {
+                for slot in &owned {
+                    assert!(
+                        !db.branch_slot_is_free(*slot),
+                        "slot {slot} was freed by a checkpoint though the release that frees it failed"
+                    );
+                }
+            }
+            (x_id, live, db.incarnation)
+        };
+        let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+        assert_eq!(
+            db.branch_stats().unwrap().live_branches,
+            live,
+            "fork={fork}: the failed operation became durable through the checkpoint"
+        );
+        let x = db.branch(x_id).expect("the branch is there after a reopen");
+        assert_eq!(read_v(&x.connect().unwrap(), 3), "x", "fork={fork}");
+    }
+}
+
+// ---- skill review 2 #3: a logged Release raises the trunk's barrier floor ----
+
+/// Skill review 2 #3: a Release logged in the store's class (a lease expiry's, through `log_all`)
+/// rather than early-released is still durable in the trunk's class before the next trunk commit's
+/// frames, so the commit's barrier covers it: the first trunk commit after the expiry syncs the
+/// branch log (a barrier, or a flush) on top of its WAL's own sync, and the next one does not.
+/// Arms: a D1 store under a fullfsync trunk, and a D0 store under a synchronous trunk, in which the
+/// Release is only written. Mutant `log_all_no_floor` (the raise left out) must fail it.
+#[test]
+fn a_logged_release_is_durable_in_the_trunks_class_before_the_next_trunk_commit() {
+    let _s = serial();
+    let all = |c: SyncCounts| c.fsync + c.full_fsync + c.barrier;
+    for catalog in [false, true] {
+        for (store, pragma) in [
+            (SyncClass::Fsync, "PRAGMA fullfsync = ON"),
+            (SyncClass::Off, "PRAGMA synchronous = FULL"),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let lease = Some(std::time::Duration::from_secs(1));
+            let db = open_at(&dir.path().join("logged-release.db"), opts(catalog, store).with_branch_lease(lease));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.execute(pragma).unwrap();
+            let x = trunk.fork_branch().unwrap().into_id();
+            db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
+            assert!(db.expire_branches().unwrap().reaped.contains(&x), "premise: the lease expired");
+            let before = all(sync_counts());
+            write_v(&trunk, 7, "new");
+            let first = all(sync_counts()) - before;
+            let before = all(sync_counts());
+            write_v(&trunk, 8, "new");
+            let second = all(sync_counts()) - before;
+            assert!(second >= 1, "catalog={catalog} store={store:?}: premise: the trunk commit synced its WAL");
+            assert!(
+                first > second,
+                "catalog={catalog} store={store:?}: the first trunk commit after a logged Release made \
+                 it no more durable than the store's class ({first} syncs, then {second})"
+            );
+        }
+    }
+}
