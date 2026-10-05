@@ -17,6 +17,8 @@
 #   F5 blind spot: fio --ioengine=io_uring --fsync=1. Expect verdict INCOMPLETE (io_uring), never ok.
 #   F6 blind spot BEFORE the attach: a probe opens a file O_DSYNC, is attached, then writes it twice. The openat is
 #      not in the trace, so only the pre-attach fd scan can see it. Expect INCOMPLETE with one O_DSYNC fd at attach.
+#   F6b the same with the O_DSYNC fd held by a CHILD of the attached pid: expect INCOMPLETE, the one fd at attach in
+#      the child, and every roster process scanned.
 #   F7 threads that exist BEFORE the attach: a probe starts a thread, is attached, then the thread fsyncs x3 and the
 #      main thread x2. Expect exactly 5 fsyncs, verdict ok.
 #   F8 blind spot: pwritev2 with RWF_DSYNC (launch mode). Expect INCOMPLETE (rwf_sync_writes >= 1).
@@ -25,14 +27,14 @@
 #      enumeration) is attached; untraced_tasks must name the child (the condition strace_attach retries on).
 #   F10b the same tree attached by strace_attach: it must list the pre-existing child, complete on try 1, and count
 #      the parent's fsync x1 and the child's fsync x2 = 3, verdict ok.
-# Exit 0 only if all twelve pass; the verdict line is the last line of OUT/firecheck.txt.
+# Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
 OUT=${1:?usage: firecheck_strace.sh OUT DIR}
 DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=12
+NCHECK=13
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -104,6 +106,22 @@ if mode == "dsync-pre":
     ready(); wait()
     os.write(fd, b"x" * 4096)
     os.write(fd, b"y" * 4096)
+    done_and_stay()
+if mode == "dsync-child-pre":
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        fd = os.open(f"{d}/dsync-child-pre.dat", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DSYNC, 0o644)
+        os.write(w, b"o"); os.close(w)
+        wait()
+        os.write(fd, b"x" * 4096)
+        os.write(fd, b"y" * 4096)
+        os._exit(0)
+    os.close(w)
+    os.read(r, 1)  # the child holds its O_DSYNC fd now
+    ready(); wait()
+    os.waitpid(pid, 0)
     done_and_stay()
 if mode == "thread-pre":
     fd = os.open(f"{d}/thread-pre.dat", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -226,6 +244,16 @@ else
   log "FAIL F6-osync-before-attach-refused: the probe or its attach failed"; fails=$((fails + 1))
 fi
 stop_probe2 dsync-pre
+
+# F6b: the same, but the O_DSYNC fd is held by a CHILD of the attached pid (second review, finding 1: only the main
+# pid's scan was required, and 11 live PG processes went unscanned).
+if start_probe2 dsync-child-pre && run_probe2 f6b dsync-child-pre; then
+  check F6b-osync-in-a-descendant-refused "$OUT/f6b.json" \
+    'r["verdict"].startswith("INCOMPLETE") and len(r["osync_fds_at_attach"])==1 and not r["osync_fds_at_attach"][0].startswith("pid "+r["main_pid"]+" ") and not r["fdsync_unscanned"]'
+else
+  log "FAIL F6b-osync-in-a-descendant-refused: the probe or its attach failed"; fails=$((fails + 1))
+fi
+stop_probe2 dsync-child-pre
 
 # F7
 if start_probe2 thread-pre && run_probe2 f7 thread-pre; then

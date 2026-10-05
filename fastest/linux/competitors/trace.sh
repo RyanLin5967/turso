@@ -49,26 +49,29 @@ untraced_tasks() { # untraced_tasks STRACEPID PID... -> each live task "<pid>/ta
 # "scanned PID NFDS" line per PID. Run once the attach is proven: an fd opened BEFORE the attach with O_SYNC/O_DSYNC
 # makes each of its writes a flush that strace cannot see (writes are not traced), and its openat happened before
 # the trace began (review finding 3). Blind spot left: such an fd written and closed between the attach and this
-# scan (milliseconds).
+# scan (milliseconds). A PID already gone writes "gone PID". Every fd is read with bash builtins, one at a time, and
+# an fd that closes mid-scan is skipped: the first version ran awk over the whole fdinfo glob, and when an fd vanished
+# between the glob and awk opening it, awk exited without its END line -- 11 live PG processes (9 checkpointers, 2
+# bgwriters) of run 37242277040 have no scan line at all (second review, finding 1). stracecount now requires a
+# "scanned" line with at least one fd for every process in the attach roster.
 fdsync_scan() {
-  local out=$1 p
+  local out=$1 p f k v fl n
   shift
   : >"$out.fdsync"
   for p in "$@"; do
-    [ -d "/proc/$p/fdinfo" ] || continue
-    awk -v pid="$p" '
-      /^flags:/ {
-        n++; f = $2; v = 0
-        for (i = 1; i <= length(f); i++) v = v * 8 + substr(f, i, 1)
-        if (int(v / 4096) % 2 == 1 || int(v / 1048576) % 2 == 1) { fd = FILENAME; sub(/.*\//, "", fd); print "hit", pid, fd, f }
-      }
-      END { print "scanned", pid, n + 0 }' /proc/"$p"/fdinfo/* 2>/dev/null >>"$out.fdsync.tmp"
+    if [ ! -d "/proc/$p/fdinfo" ]; then echo "gone $p" >>"$out.fdsync"; continue; fi
+    n=0
+    for f in /proc/"$p"/fdinfo/*; do
+      fl=
+      { while read -r k v _; do [ "$k" = "flags:" ] && { fl=$v; break; }; done; } 2>/dev/null <"$f" || continue
+      [ -n "$fl" ] || continue
+      n=$((n + 1))
+      if (((8#$fl & 8#04010000) != 0)); then
+        echo "hit $p ${f##*/} $fl $(readlink "/proc/$p/fd/${f##*/}" 2>/dev/null)" >>"$out.fdsync"
+      fi
+    done
+    echo "scanned $p $n" >>"$out.fdsync"
   done
-  local w p2 fd fl
-  while read -r w p2 fd fl; do
-    if [ "$w" = hit ]; then echo "hit $p2 $fd $fl $(readlink "/proc/$p2/fd/$fd" 2>/dev/null)"; else echo "$w $p2 $fd"; fi
-  done <"$out.fdsync.tmp" >"$out.fdsync"
-  rm -f "$out.fdsync.tmp"
 }
 
 # pid_roster OUT PID... -- OUT.pids: one line per live task "<tid> <pid> <cmdline>" of each PID at the attach (the
