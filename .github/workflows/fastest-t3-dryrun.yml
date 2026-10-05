@@ -15,7 +15,9 @@ on:
         description: "ubuntu-24.04 or ubuntu-24.04-arm"
         default: "ubuntu-24.04"
   push:
-    branches: [fastest-branching, fastest-linux-t3]
+    # fastest-linux-t3 carries the competitor and V3 sub-lanes the runner calls; fastest-branching joins
+    # once those are merged there.
+    branches: [fastest-linux-t3]
     paths:
       - "fastest/linux/t3/**"
       - ".github/workflows/fastest-t3-dryrun.yml"

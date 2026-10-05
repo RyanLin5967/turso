@@ -117,6 +117,7 @@ preflight() {
     [ -n "$DEVICE" ] && [ "$DEVICE" = "$DESTROY" ] ||
       { echo "REFUSED: a real run needs --device D --destroy D naming the same device"; return 2; }
     [ -b "$DEVICE" ] || { echo "REFUSED: $DEVICE is not a block device"; return 2; }
+    case $(basename "$DEVICE") in loop*|ram*|zram*) echo "REFUSED: $DEVICE is not a physical device"; return 2 ;; esac
     if lsblk -n -o MOUNTPOINTS "$DEVICE" | grep -q .; then echo "REFUSED: $DEVICE (or a partition) is mounted"; return 2; fi
     local rootdisk; rootdisk=$(lsblk -n -o PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null)
     [ "/dev/$rootdisk" != "$DEVICE" ] || { echo "REFUSED: $DEVICE holds the root filesystem"; return 2; }
@@ -253,6 +254,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 stage build build
 stage hwid hwid
 stage v3fixtures v3fixtures
+selftests() { python3 -B "$L/t3/foreign_cpu.py" self-test > "$OUT/foreign_cpu-selftest.txt" 2>&1; }
+stage selftests selftests
 if [ $DRY = 1 ]; then
   echo "dry run: the runner image mounts / nobarrier; remount with barrier as a T3 box has it"
   sudo mount -o remount,barrier / && findmnt -n -o OPTIONS / | tee "$OUT/root-mount.txt"
