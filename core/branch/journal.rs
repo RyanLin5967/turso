@@ -1754,12 +1754,22 @@ impl Journal {
         // The snapshot names slots that buffered-but-unwritten records also name; they reach the
         // device before it, and its flush below makes them durable with it (ruling 85a032f01).
         if class.syncs() {
-            if std::mem::take(&mut self.fail_next_arena_sync) {
-                return Err(LimboError::InternalError(
+            let synced = if std::mem::take(&mut self.fail_next_arena_sync) {
+                Err(LimboError::InternalError(
                     "failpoint: the compaction's arena sync failed".to_string(),
-                ));
+                ))
+            } else {
+                arena.sync(SyncClass::Fsync)
+            };
+            if let Err(e) = synced {
+                // A later sync of the arena may report success for pages this one lost, so nothing
+                // more may be acknowledged (review 3 #5). Mutant `compaction_sync_error_kept` (test
+                // builds only): as before, the store goes on.
+                if !super::store::fe_mutant("compaction_sync_error_kept") {
+                    self.set_poisoned();
+                }
+                return Err(e);
             }
-            arena.sync(SyncClass::Fsync)?;
         }
         let generation = self.generation + 1;
         let mut out = Vec::with_capacity(64);
@@ -2740,7 +2750,23 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
             crate::io::count_barrier();
             return Ok(());
         }
-        return fsync_file(file, class);
+        let e = match injected {
+            0 => std::io::Error::last_os_error(),
+            errno => std::io::Error::from_raw_os_error(errno),
+        };
+        // Only a barrier the file system does not offer falls back to the full flush, which orders
+        // the writes too. Any other failure is the sync's own (review 3 #4): retried, a later sync
+        // of the file could report success for pages this one lost. Mutant `barrier_retries_any`
+        // (test builds only): every failure falls back, as before.
+        let unsupported = matches!(
+            e.raw_os_error(),
+            Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY)
+        );
+        if unsupported || super::store::fe_mutant("barrier_retries_any") {
+            crate::io::count_barrier_fallback();
+            return fsync_file(file, class);
+        }
+        return Err(io_error(e, "F_BARRIERFSYNC branch file"));
     }
     fsync_file(file, class)
 }
