@@ -2180,10 +2180,18 @@ fn a_last_flight_whose_slot_never_reached_the_disk_is_dropped() {
             let incarnation = db.incarnation;
             drop(trunk);
             drop(db);
-            // The slot's bytes never reached the disk.
+            // The slot's bytes never reached the disk — and neither did the confirmation the flight
+            // writes, unsynced, once its flush returned (FLAGGED TEST EDIT, own test from
+            // f112173f6: the power cut it models loses that write too; a confirmed flight's bad
+            // slot is damage, refused when read, by a_corrupted_arena_slot_is_an_error_not_a_wrong_page).
             let f = std::fs::OpenOptions::new().write(true).open(&arena).unwrap();
             use std::os::unix::fs::FileExt;
             f.write_all_at(&vec![0u8; 4096], fresh[0] as u64 * 4096).unwrap();
+            let log = std::fs::OpenOptions::new()
+                .write(true)
+                .open(arena.to_str().unwrap().replace("-branch-arena", "-branch-log"))
+                .unwrap();
+            log.write_all_at(&[0u8; 4], 36).unwrap();
             (id, incarnation)
         };
         let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);

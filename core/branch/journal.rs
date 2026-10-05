@@ -672,9 +672,6 @@ pub(crate) struct Journal {
     /// This incarnation of the log's nonce (format 11): in its header, and seeding every end
     /// frame's checksums, so recovery never takes an older incarnation's flight for one of this.
     nonce: u32,
-    /// Bytes of end frames in the log: left out of the compaction threshold, so framing does not
-    /// make checkpoints more frequent (review 2 #8).
-    end_bytes: u64,
     /// The header's raised-class field must be rewritten by the next write (`raised` grew).
     header_stale: bool,
     /// Every rewrite of the log file (a reset, a cut, a compaction) moves this: a cut prepared off
@@ -711,9 +708,8 @@ pub(crate) struct CutPrep {
     upto: u64,
     rewrites: u64,
     generation: u64,
-    /// Bytes after the header, and the end frames among them.
+    /// Bytes after the header.
     written: u64,
-    end_bytes: u64,
     /// The new log's nonce, and the old one's (the delta the install copies is framed in it).
     nonce: u32,
     old_nonce: u32,
@@ -782,7 +778,6 @@ impl Journal {
             pending_class: SyncClass::Off,
             raised: SyncClass::Off,
             nonce: 0,
-            end_bytes: 0,
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
@@ -939,7 +934,6 @@ impl Journal {
             pending_class: SyncClass::Off,
             raised,
             nonce: 0,
-            end_bytes: 0,
             header_stale: false,
             rewrites: 0,
             dir_dirty: false,
@@ -964,7 +958,6 @@ impl Journal {
                 let mut whole = (LOG_HEADER_LEN, 0usize);
                 // The last whole flight that holds records: where it starts, and its first record.
                 let mut last_flight: Option<(usize, usize)> = None;
-                let mut flights = 0u64;
                 // How the scan stopped: `None` at the clean end of the file, else what it met.
                 let mut damage: Option<&str> = None;
                 loop {
@@ -1023,7 +1016,6 @@ impl Journal {
                         }
                         pos = start + len;
                         whole = (pos, records.len());
-                        flights += 1;
                         continue;
                     }
                     if !frame_ok(false) {
@@ -1069,10 +1061,18 @@ impl Journal {
                 // The last flight's slots must hold what it says (ruling 85a032f01: the arena is
                 // synced by plain fsync before the log's flush): one that does not was never
                 // acknowledged, and goes like a torn one.
+                // A last flight confirmed in the header (its sync returned) keeps its records whatever
+                // its slots hold: a slot failing then is damage, refused when read, never a
+                // silently older page.
+                let confirmed = bytes
+                    .get(HEADER_CONFIRM_AT as usize..HEADER_CONFIRM_AT as usize + 4)
+                    .map(|f| u32::from_le_bytes(f.try_into().unwrap()));
                 if let Some((start, first)) = last_flight.filter(|&(start, _)| start < whole.0) {
-                    if !last_flight_slots_hold(files, page_size, &records[first..whole.1]) {
+                    let last_crc = u32::from_le_bytes(bytes[whole.0 - 4..whole.0].try_into().unwrap());
+                    if confirmed != Some(last_crc)
+                        && !last_flight_slots_hold(files, page_size, &records[first..whole.1])
+                    {
                         whole = (start, first);
-                        flights -= 1;
                     }
                 }
                 // Only whole flights are kept: a flight is synced only after all of it is written,
@@ -1092,7 +1092,6 @@ impl Journal {
                     );
                 }
                 journal.len = pos as u64;
-                journal.end_bytes = flights * END_FRAME_LEN as u64;
                 // fastest-engine mutant `no_torn_tail_cut` (test builds only): the torn tail is
                 // left in the file, so appends no longer resume at a flight boundary.
                 if (pos as u64) < bytes.len() as u64
@@ -1224,7 +1223,7 @@ impl Journal {
         // #3); the cut can fall inside a flight, whose kept part becomes a flight of its own.
         // Every flight is in the file whole here, so each new one is too once its sync returns.
         let nonce = fresh_nonce(self.nonce);
-        let (suffix, end_bytes) = reframe(&kept, self.nonce, nonce, class.syncs())?;
+        let (suffix, last_crc) = reframe(&kept, self.nonce, nonce, class.syncs())?;
         let tmp = self.files.log_tmp();
         let written = (|| -> Result<File> {
             let f = open_rw(&tmp, true)?;
@@ -1235,6 +1234,8 @@ impl Journal {
             write_at(&f, &log_header(self.format, self.page_size, generation, nonce, self.raised), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
+                // Synced with the rest below: the kept last flight is confirmed.
+                write_at(&f, &last_crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
             }
             if class.syncs() {
                 fsync_file(&f, class)?;
@@ -1259,7 +1260,6 @@ impl Journal {
         self.generation = generation;
         self.nonce = nonce;
         self.len = LOG_HEADER_LEN as u64 + suffix.len() as u64;
-        self.end_bytes = end_bytes;
         self.header_stale = false;
         self.snapshot_len = 0;
         let drop_pending = from.saturating_sub(file_from) as usize;
@@ -1308,13 +1308,14 @@ impl Journal {
             read_at(&src.log, &mut kept, from)?;
         }
         let nonce = fresh_nonce(src.nonce);
-        let (suffix, end_bytes) = reframe(&kept, src.nonce, nonce, src.class.syncs())?;
+        let (suffix, last_crc) = reframe(&kept, src.nonce, nonce, src.class.syncs())?;
         let written = (|| -> Result<File> {
             let f = open_rw(&src.tmp, true)?;
             lock_exclusive(&f, &src.tmp)?;
             write_at(&f, &log_header(src.format, src.page_size, generation, nonce, src.raised), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
+                write_at(&f, &last_crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
             }
             if src.class.syncs() {
                 fsync_file(&f, src.class)?;
@@ -1329,7 +1330,6 @@ impl Journal {
                 rewrites: src.rewrites,
                 generation,
                 written: suffix.len() as u64,
-                end_bytes,
                 nonce,
                 old_nonce: src.nonce,
             }),
@@ -1361,18 +1361,17 @@ impl Journal {
         }
         let class = self.rewrite_class();
         let mut len = LOG_HEADER_LEN as u64 + prep.written;
-        let mut end_bytes = prep.end_bytes;
         if self.len > prep.upto {
             let mut delta = vec![0u8; (self.len - prep.upto) as usize];
             read_at(&self.file, &mut delta, prep.upto)?;
-            let (frames, ends) = reframe(&delta, self.nonce, prep.nonce, class.syncs())?;
+            let (frames, last_crc) = reframe(&delta, self.nonce, prep.nonce, class.syncs())?;
             if !frames.is_empty() {
                 write_at(&prep.file, &frames, len)?;
+                write_at(&prep.file, &last_crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
                 if class.syncs() {
                     fsync_file(&prep.file, class)?;
                 }
                 len += frames.len() as u64;
-                end_bytes += ends;
             }
         }
         if let Err(e) = std::fs::rename(self.files.log_tmp(), &self.files.log) {
@@ -1386,7 +1385,6 @@ impl Journal {
         self.generation = generation;
         self.nonce = prep.nonce;
         self.len = len;
-        self.end_bytes = end_bytes;
         self.header_stale = false;
         self.snapshot_len = 0;
         self.dir_dirty = class.syncs();
@@ -1520,7 +1518,6 @@ impl Journal {
         match written {
             Ok(()) => {
                 self.len += frames.len() as u64;
-                self.end_bytes += END_FRAME_LEN as u64;
                 self.pending.clear();
                 self.pending_slots.clear();
                 self.pending_class = SyncClass::Off;
@@ -1565,6 +1562,10 @@ impl Journal {
         }
         if class.syncs() {
             fsync_file(&self.file, class)?;
+            if !super::store::fe_mutant("no_flight_confirm") {
+                let crc = end_frame_crc(frames[frames.len() - END_FRAME_LEN..].try_into().unwrap());
+                write_at(&self.file, &crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
+            }
         }
         Ok(())
     }
@@ -1678,7 +1679,6 @@ impl Journal {
         if !bytes.is_empty() {
             bytes.reserve_exact(END_FRAME_LEN);
             self.len += END_FRAME_LEN as u64;
-            self.end_bytes += END_FRAME_LEN as u64;
         }
         self.len += bytes.len() as u64;
         Ok(Flight {
@@ -1713,8 +1713,7 @@ impl Journal {
     pub(crate) fn wants_compaction(&self) -> bool {
         // fastest-engine mutant `no_compaction_backoff` (test builds only).
         let backed_off = self.len <= self.compact_after && !super::store::fe_mutant("no_compaction_backoff");
-        // End frames are framing, not log: they do not bring the next checkpoint closer.
-        self.len - self.end_bytes > compact_min_log_bytes().max(2 * self.snapshot_len) && !backed_off
+        self.len > compact_min_log_bytes().max(2 * self.snapshot_len) && !backed_off
     }
 
     /// A checkpoint or compaction failed: the next is wanted only once another threshold's worth of
@@ -1728,7 +1727,7 @@ impl Journal {
     /// asynchronous one), so the log stays within twice the threshold plus the operations in
     /// flight (r11-restart-r2, F-FZ).
     pub(crate) fn past_hard_limit(&self) -> bool {
-        self.len - self.end_bytes > 2 * compact_min_log_bytes().max(2 * self.snapshot_len)
+        self.len > 2 * compact_min_log_bytes().max(2 * self.snapshot_len)
     }
 
     /// Replace the log with a snapshot of `state`. `fail_after_rename` is the crash failpoint.
@@ -1843,7 +1842,6 @@ impl Journal {
         self.generation = generation;
         self.nonce = nonce;
         self.len = LOG_HEADER_LEN as u64;
-        self.end_bytes = 0;
         self.header_stale = false;
         self.dir_dirty = false;
         Ok(())
@@ -1867,6 +1865,11 @@ const HEADER_RAISED_AT: u64 = 32;
 /// The nonce, and the header checksum after it (over every byte before it).
 const HEADER_NONCE_AT: usize = 24;
 const HEADER_CRC_AT: usize = 28;
+/// The checksum of the last flight whose sync RETURNED, written (not synced) right after it: its
+/// presence proves the flight was acknowledged, so a slot of it failing its CRC at recovery is
+/// damage, not a slot that never reached the disk (`last_flight_slots_hold`). Outside the header
+/// checksum; 0 when no flight is confirmed.
+const HEADER_CONFIRM_AT: u64 = 36;
 
 fn class_code(class: SyncClass) -> u32 {
     match class {
@@ -2033,6 +2036,12 @@ impl Flight {
         }
         if syncs && !self.ordered {
             fsync_file(&log, self.class)?;
+            // The flush returned: confirm the flight (`HEADER_CONFIRM_AT`; not synced: its absence
+            // proves nothing, its presence that this sync returned). Mutant `no_flight_confirm`.
+            if !self.bytes.is_empty() && !super::store::fe_mutant("no_flight_confirm") {
+                let crc = end_frame_crc(self.bytes[self.bytes.len() - END_FRAME_LEN..].try_into().unwrap());
+                write_at(&log, &crc.to_le_bytes(), HEADER_CONFIRM_AT)?;
+            }
         }
         // Mutant M-j (PREREG v1 amendment 36; test builds only): the barrier between the branch
         // log and the trunk's WAL removed. Caught by C1b.
@@ -2207,11 +2216,11 @@ fn synced_flight_over(bytes: &[u8], damage: usize, nonce: u32) -> Option<usize> 
 /// or a mark inside a flight, to a flight boundary) framed again for an incarnation of nonce `new`:
 /// one end frame per kept flight, so every flight's boundary is kept (review 2 #3), and none for a
 /// flight with no kept record. A frame that is not whole is refused: the region was written whole
-/// before it was read. Returns the bytes and how many of them are end frames.
-fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u64)> {
+/// before it was read. Returns the bytes and the last flight's checksum (for `HEADER_CONFIRM_AT`).
+fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u32)> {
     let mut out = Vec::with_capacity(kept.len());
     let mut flight_at = 0;
-    let mut ends = 0;
+    let mut last_crc = 0;
     let mut pos = 0;
     while pos < kept.len() {
         let whole = kept.get(pos..pos + FRAME_HEADER_LEN).and_then(|head| {
@@ -2236,18 +2245,24 @@ fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u6
             out.extend_from_slice(&kept[pos..next]);
         } else if out.len() > flight_at {
             let frame = end_frame(new, synced, &out[flight_at..]);
+            last_crc = end_frame_crc(&frame);
             out.extend_from_slice(&frame);
-            ends += 1;
             flight_at = out.len();
         }
         pos = next;
     }
     if out.len() > flight_at {
         let frame = end_frame(new, synced, &out[flight_at..]);
+        last_crc = end_frame_crc(&frame);
         out.extend_from_slice(&frame);
-        ends += 1;
     }
-    Ok((out, ends * END_FRAME_LEN as u64))
+    Ok((out, last_crc))
+}
+
+/// The flight checksum an end frame carries.
+fn end_frame_crc(frame: &[u8; END_FRAME_LEN]) -> u32 {
+    let p = FRAME_HEADER_LEN;
+    u32::from_le_bytes(frame[p + 5..p + 9].try_into().unwrap())
 }
 
 /// Whether every arena slot the records of the log's LAST flight name holds what they say (ruling
