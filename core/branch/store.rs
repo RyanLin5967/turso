@@ -8032,6 +8032,31 @@ mod tests {
         assert_eq!(recovered.records, vec![Record::Release { branch: 9 }]);
     }
 
+    /// Skill review 1 (f): an empty store's page-size restart drops the deferred frees of a release
+    /// whose flight had not landed (here: one under a sequence number nothing has reached). Their
+    /// slots are the truncated arena's: matured into the new arena's free list, each would be
+    /// handed out twice, from the list and from the high-water mark.
+    #[test]
+    fn a_page_size_restart_drops_the_old_arenas_deferred_frees() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Durable { sync: crate::branch::SyncClass::Off }, None, path).unwrap();
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(512).unwrap();
+        let far = inner.journal.as_ref().unwrap().lsn() + 1;
+        inner.pending_free.push_back((far, vec![1, 2]));
+        inner.ensure_backing(1024).expect("an empty store refused the database's new page size");
+        store.group.mark_durable(far, SyncClass::Off);
+        store.mature(&mut inner);
+        let arena = inner.arena.as_mut().unwrap();
+        let mut seen = HashSet::new();
+        for _ in 0..4 {
+            let slot = arena.alloc();
+            assert!(seen.insert(slot), "slot {slot} handed out twice after a page-size restart");
+        }
+    }
+
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
     /// a page-size change, and must keep refusing it.
     #[test]
