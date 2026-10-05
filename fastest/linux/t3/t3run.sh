@@ -188,6 +188,7 @@ fs_block() {
   V3_FX=$V3FX timeout 3600 bash "$L/v3/firecheck.sh" "$DIST/v3floor" "$fs" "$mnt/v3fc" "$o/v3-firecheck" \
     > "$o/v3-firecheck.txt" 2>&1 || { echo "V3 fire-check failed on $fs"; return 1; }
   local verdict; verdict=$(ls "$o"/v3-firecheck/verdict.json 2>/dev/null)
+  mkdir -p "$mnt/v3b" "$mnt/v3a"
   V3_FIRECHECK_VERDICT=$verdict bash "$L/v3/run.sh" "$DIST/v3floor" "$mnt/v3b" "$o/v3-before" 200 > "$o/v3-before.txt" 2>&1
   echo "v3 before rc=$?" >> "$o/v3.rc"
   # flush counter fire-check for the competitor cells on this filesystem (run_system.sh requires its verdict)
@@ -230,9 +231,12 @@ run_cell() {
         timeout 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" --clients "$clients" \
           --ops "$ops" --warmup 20 --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
       pg18-d2|pg18-defaults|dolt|doltgres|b1)
+        # Each attempt gets its own directory on the filesystem under test (run_system.sh keeps its
+        # servers' data under MNT/<system>.noindex, which a replacement run must not find in place).
+        mkdir -p "$mnt/work-$id"
         FT_CLIENTS=$clients FT_N1=$ops FT_N4=$ops FT_BBLOAD=$DIST/bbload FT_CLONEBENCH=$DIST/clonebench \
           FT_SQLITE3=$DIST/sqlite3 FT_FIRECHECK=$o/strace-firecheck/firecheck.txt FT_BIN=$DIST/dolt-bin \
-          timeout 10800 bash "$L/competitors/run_system.sh" "$system" "$mnt" "$d/result" > "$d/adapter.txt" 2>&1 ;;
+          timeout 10800 bash "$L/competitors/run_system.sh" "$system" "$mnt/work-$id" "$d/result" > "$d/adapter.txt" 2>&1 ;;
       *) echo "unknown system $system" > "$d/adapter.txt"; false ;;
     esac
     rc=$?

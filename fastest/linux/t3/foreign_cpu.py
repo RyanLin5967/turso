@@ -158,7 +158,8 @@ def self_test():
     d = tempfile.mkdtemp()
 
     def window(label, burners, secs=20):
-        """burners: list of (sut?, start_s, dur_s); returns the verdict."""
+        """burners: list of (sut?, start_s, dur_s[, duty]); duty < 1 busy-loops that share of every 10 ms.
+        Returns the verdict."""
         out = os.path.join(d, f"{label}.tsv")
         stop = os.path.join(d, f"{label}.stop")
         s = subprocess.Popen([sys.executable, "-B", __file__, "sample", out, "--cell", "ST", "--stop-file", stop])
@@ -168,11 +169,16 @@ def self_test():
         while time.monotonic() - t0 < secs:
             el = time.monotonic() - t0
             while pending and pending[0][1] <= el:
-                sut, _, dur = pending.pop(0)
+                b = pending.pop(0)
+                sut, dur = b[0], b[2]
+                duty = b[3] if len(b) > 3 else 1.0
                 env = dict(os.environ)
                 if sut:
                     env["FASTEST_CELL"] = "ST"
-                code = f"import time\nt=time.monotonic()\nwhile time.monotonic()-t<{dur}: pass"
+                code = ("import time\nt=time.monotonic()\n"
+                        f"while time.monotonic()-t<{dur}:\n"
+                        f"    u=time.monotonic()\n    while time.monotonic()-u<{0.01 * duty}: pass\n"
+                        f"    time.sleep({0.01 * (1 - duty)})\n")
                 procs.append(subprocess.Popen([sys.executable, "-c", code], env=env))
             time.sleep(0.05)
         for p in procs:
@@ -185,8 +191,12 @@ def self_test():
     cases = [
         ("quiet window", [], "VALID"),
         ("SUT burners only (2 cores, whole window)", [(True, 1, 17), (True, 1, 17)], "VALID"),
-        ("one foreign burner for 8 s", [(False, 3, 8)], "VOID"),
-        ("one foreign burner for 3 s (below 5 s, one core)", [(False, 3, 3)], "VALID"),
+        # A 70% burner stays under the one-core rule even with the box's own background on top, so these
+        # two isolate the single-process rule (> 50% for >= 5 s). A full-core burner cannot: run
+        # 37255216397 voided a 3 s one by the one-core rule, correctly, once the runner's background
+        # pushed its ticks over 100%.
+        ("one foreign 70% burner for 9 s", [(False, 3, 9, 0.7)], "VOID"),
+        ("one foreign 70% burner for 3 s (below 5 s)", [(False, 3, 3, 0.7)], "VALID"),
     ]
     if ncpu >= 3:
         cases.append(("three foreign burners for 3 s each (> 100% in > 5% of ticks)",
