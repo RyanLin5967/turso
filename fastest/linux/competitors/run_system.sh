@@ -10,8 +10,9 @@
 #   conncheck : C+16 connections opened at once and a SELECT 1 on each (amendment 27 (1)); untraced
 #   idle      : strace -f -C attached to every server process for FT_IDLE_S seconds with no client (the control)
 #   load      : the same attach around one bbload run of exactly N ops (FT_N1 at C=1, FT_N4 otherwise)
-#   deferred  : PG only -- the same attach around one CHECKPOINT: the flushes the ops left for later (WAL_LOG's
-#               data files, every op's dirty pages), reported apart from the window and never added to it
+#   deferred  : PG only -- one CHECKPOINT after the ops, in the LOAD window's own attach after a tsplit stamp
+#               (counted as the trace's "post" part): the flushes the ops left for later (WAL_LOG's data files, every
+#               op's dirty pages), reported apart from the window and never added to it
 #   cell.json : stracecount.py cell: flushes per op = (load - idle x load_s/idle_s) / ops, the raw count, and the
 #               split by process role (foreground: main, the load generator's backends, PG checkpointer/walwriter/
 #               bgwriter/io workers; background: everything else); background_free when the idle control and the
@@ -154,12 +155,13 @@ bbload() { # bbload SPEC C N OUT -> bbload's rc
 
 # count OUT -- stracecount over one window. A refused or crashed count FAILS the job (review finding 1: it used to
 # end in `|| true`, so a REFUSED window still left the job green); the cell carries the verdict too.
-count() {
-  local rc=0
-  local cl=()
+count() { # count OUT [CLIENTS [PART JSON]] -- PART pre|post counts one side of OUT's tsplit stamp into JSON
+  local rc=0 cl=() pt=() js="$1.json"
   [ -n "${2:-}" ] && cl=(--clients "$2")
-  python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" ${cl[@]+"${cl[@]}"} >"$1.json" || rc=$?
-  [ $rc -eq 0 ] || fail "count $1: stracecount rc=$rc ($(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$1.json" 2>&1 | tail -1))"
+  [ -n "${3:-}" ] && { pt=(--part "$3"); js=$4; }
+  python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" ${cl[@]+"${cl[@]}"} \
+    ${pt[@]+"${pt[@]}"} >"$js" || rc=$?
+  [ $rc -eq 0 ] || fail "count $js: stracecount rc=$rc ($(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$js" 2>&1 | tail -1))"
 }
 # ops_of BBOUT CELLDIR -- "<total> <ok> <created>" into CELLDIR/ops.txt. A reader failure FAILS the job and writes
 # zero ops, which the cell then refuses (it used to turn silently into "0 0 0"). Called in the driver's own shell,
@@ -195,9 +197,19 @@ run_server_cell() { # run_server_cell SPEC C
   strace_attach "$d/load" "$(server_pid)" || { fail "$spec-c$c load attach"; return; }
   rc=0
   bbload "$spec" "$c" "$n" "$d/bb" || rc=$?
-  strace_detach "$d/load"
   log1=$(stat -c %s "$DATA.log")
   used1=$(fsused)
+  local defer=()
+  if [ "$KIND" = pg ]; then
+    # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost). It runs INSIDE the load
+    # window's attach, after a tsplit stamp, and is counted as that trace's "post" part (second review, finding 2:
+    # every strace state-mismatch message came from a separate second attach to a server it had just loaded). A failed
+    # CHECKPOINT FAILS the job, and the cell refuses without the deferred count (review finding 6).
+    defer=(--deferred "$d/deferred.json")
+    strace_mark "$d/load" tsplit
+    sqlq "CHECKPOINT" >"$d/deferred.checkpoint.txt" 2>&1 || fail "$spec-c$c deferred CHECKPOINT rc=$? ($(tail -1 "$d/deferred.checkpoint.txt"))"
+  fi
+  strace_detach "$d/load"
   echo "fs_used_before=$used0 fs_used_after=$used1 delta=$((used1 - used0))" >"$d/space.txt"
   [ $rc -eq 0 ] || fail "$spec-c$c bbload rc=$rc ($(tail -1 "$d/bb.txt"))"
   # The server log written during the load window. PG (amendment 14 section 6): a CREATE DATABASE that found a backend
@@ -212,21 +224,13 @@ run_server_cell() { # run_server_cell SPEC C
     echo "autovacuum_terminated_in_window=$av template_busy_errors=$busy" >"$d/template_waits.txt"
     [ "$av" = 0 ] && [ "$busy" = 0 ] || fun "FLAG $spec-c$c: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $av, busy-template errors $busy"
   fi
-  local defer=()
-  if [ "$KIND" = pg ]; then
-    # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost): a failed attach or a failed
-    # CHECKPOINT FAILS the job, and the cell refuses without it (review finding 6: both used to drop it silently).
-    defer=(--deferred "$d/deferred.json")
-    if strace_attach "$d/deferred" "$(server_pid)"; then
-      sqlq "CHECKPOINT" >"$d/deferred.checkpoint.txt" 2>&1 || fail "$spec-c$c deferred CHECKPOINT rc=$? ($(tail -1 "$d/deferred.checkpoint.txt"))"
-      strace_detach "$d/deferred"
-      count "$d/deferred"
-    else
-      fail "$spec-c$c deferred attach"
-    fi
-  fi
   count "$d/idle"
-  count "$d/load" "$d/bb/backends.tsv"
+  if [ "$KIND" = pg ]; then
+    count "$d/load" "$d/bb/backends.tsv" pre "$d/load.json"
+    count "$d/load" "$d/bb/backends.tsv" post "$d/deferred.json"
+  else
+    count "$d/load" "$d/bb/backends.tsv"
+  fi
   ops_of "$d/bb" "$d"
   read -r total ok created <"$d/ops.txt"
   python3 "$SC" cell --name "$SYSTEM/$spec-c$c" --load "$d/load.json" --idle "$d/idle.json" \

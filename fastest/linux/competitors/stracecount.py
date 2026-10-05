@@ -51,9 +51,10 @@ def sync_flag(rest):
     """True if the call's arguments (strings and fd paths removed) carry O_SYNC or O_DSYNC."""
     args = ANNOT.sub("", QUOTED.sub('""', rest))
     return re.search(r"\bO_D?SYNC\b", args) is not None
-# strace -f -o FILE prefixes every line with the pid ("%-5d "); stderr output uses "[pid N] "; accept both, and none.
-START = re.compile(r"^(?:(?:\[pid\s+)?(\d+)\]?\s+)?([a-z_0-9]+)\((.*)$")
-RESUMED = re.compile(r"^(?:(?:\[pid\s+)?(\d+)\]?\s+)?<\.\.\. ([a-z_0-9]+) resumed>(.*)$")
+# strace -f -o FILE prefixes every line with the pid ("%-5d "); stderr output uses "[pid N] "; accept both, and none;
+# then -ttt's CLOCK_REALTIME stamp (seconds.microseconds), which a split window (--part) needs on every call line.
+START = re.compile(r"^(?:(?:\[pid\s+)?(\d+)\]?\s+)?(?:(\d+\.\d+)\s+)?([a-z_0-9]+)\((.*)$")
+RESUMED = re.compile(r"^(?:(?:\[pid\s+)?(\d+)\]?\s+)?(?:(\d+\.\d+)\s+)?<\.\.\. ([a-z_0-9]+) resumed>(.*)$")
 SUMROW = re.compile(r"^\s*([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(?:(\d+)\s+)?([a-z_0-9]+)\s*$")
 RET = re.compile(r"\)\s+=\s+(-?\d+|\?)")
 FDPATH = re.compile(r"^\s*-?\d+<([^>]*)>")
@@ -62,37 +63,13 @@ FDPATH = re.compile(r"^\s*-?\d+<([^>]*)>")
 # (MAIN), whose loss is never benign (review finding 5).
 BENIGN = re.compile(r"attach: ptrace\(PTRACE_SEIZE, (\d+)\): (?:No such process|Operation not permitted)")
 # strace's entering/exiting state for a task disagreed with the kernel's PTRACE_GET_SYSCALL_INFO (strace 6.8 src/
-# syscall.c strace_get_syscall_info, "TODO: handle this" -- unhandled in master too). Run 37225919842 printed it 7
-# times, x86_64 and arm64, all in PG deferred windows, each for a PG process blocked in a syscall at the attach (io
-# worker, walwriter, bgwriter, logical replication launcher, postmaster): that syscall's EXIT stop arrived while strace
-# expected an entry, and strace decoded it as one (number = the syscall's return value, args stale). That one stop is
-# the only misread one unless the state stays inverted -- and an inverted task prints this message again at its next
-# real exit stop (strace fetches the info at every stop it takes for an entry, traced or not), so a single message
-# means every later stop of the task was read right (the postmaster's 124 later clone lines in one such window pair
-# up and return real child pids). The misread stop can at most print one PHANTOM line, and only as the task's FIRST
-# line. A window is therefore counted with such a task ONLY when it has exactly one "entering, op == 2" message, it
-# was in the attach roster (its syscall began before the attach), and its first line is not a phantom candidate
-# (phantom_candidate); anything else is REFUSED.
+# syscall.c strace_get_syscall_info, "TODO: handle this" -- unhandled in master too). It appeared 10 times in 1,944
+# windows of runs 37225919842..37244177784, every time in a PG deferred window, i.e. a SECOND attach right after a
+# load window, to a process busy in a syscall. Its mechanism is not established (the second review showed the
+# "one misread stop, then clean" reading contradicts strace's own state machine), so ANY such message REFUSES the
+# window, in attach and launch windows alike (second review, findings 2 and 6). The deferred CHECKPOINT now runs
+# inside the load window's own attach (run_system.sh), so no window attaches to a server it just loaded.
 DESYNC = re.compile(r"pid (\d+): (entering|exiting), ptrace_syscall_info\.op == (\d+)")
-FD_FIRST = ("fsync", "fdatasync", "syncfs", "sync_file_range", "copy_file_range", "ioctl", "fcntl",
-            "pwritev2", "io_submit")
-
-
-def phantom_candidate(first):
-    """True if a task's first call line could be the phantom of a misread exit stop. A phantom's first argument is
-    the kernel's 1-byte is_error over stale bytes, so an fd-first call shows fd 0/1 or a huge number, never a real
-    file; sync() has no argument to tell by, msync's address would be 0/1. A count-relevant call (flush, clone
-    evidence, blind spot) that cannot be told apart is a candidate; any other call, or an fd naming a real file,
-    is not."""
-    if first is None:
-        return False
-    name, rest = first
-    if name in ("sync", "msync"):
-        return True
-    if name in FD_FIRST:
-        pm = FDPATH.match(rest)
-        return not (pm and pm.group(1).startswith("/") and pm.group(1) != "/dev/null")
-    return False
 
 
 def parse_summary(text):
@@ -208,16 +185,29 @@ def attribute(by_tid, spawned, window, main, clients, attached):
             "top_processes": sorted(([p, e["role"], e["flushes"]] for p, e in by_proc.items()), key=lambda x: -x[2])[:20]}
 
 
-def count(trace, extras, root, window=None, clients=frozenset()):
+def count(trace, extras, root, window=None, clients=frozenset(), part=None):
+    """Count one strace window. part=None counts the whole trace; part="pre"/"post" counts only the calls that
+    STARTED before/after the window's tsplit stamp (strace_mark), so one attach can hold a load window and the
+    CHECKPOINT after it (second review, finding 2). The table-vs-lines check always covers the whole trace."""
     with open(trace, errors="replace") as f:
         text = f.read()
     summary = parse_summary(text)
-    stray = []  # strace's own stderr, minus a summary table, in an ATTACH window: attach/ptrace errors land here
+    problems, blind = [], []
+    stray = []  # strace's own stderr, minus a summary table: attach/ptrace errors and warnings land here
     win = open(window).read() if window and os.path.exists(window) else ""
     attached = "attached_after_polls=" in win
     mm = re.search(r"^main=(\d+) ", win, re.M)
     main = mm.group(1) if mm else None
     detach = {k: v for k, v in re.findall(r"\b(strace_alive_at_detach|main_alive_at_detach)=(\d)", win)}
+    tsplit = None
+    if part is not None:
+        sm = re.search(r"\btsplit=(\d+\.\d+)", win)
+        if part not in ("pre", "post"):
+            problems.append(f"unknown part {part}")
+        elif sm is None:
+            problems.append("a split count was asked for but the window has no tsplit stamp")
+        else:
+            tsplit = float(sm.group(1))
 
     def benign(ln):
         b = BENIGN.search(ln)
@@ -239,58 +229,77 @@ def count(trace, extras, root, window=None, clients=frozenset()):
                 elif ln.strip() and not ln.startswith(("% time", "------")) and not SUMROW.match(ln) \
                         and not benign(ln):
                     stray.append(ln)
-    lines = {}
-    lines_by_tid, first_by_tid = {}, {}
-    pending = {}
-    calls = []  # (tid, name, args_and_rest)
+    lines, done_by_name = {}, {}
+    pending = {}  # tid -> (name, rest, ts): started, not (yet) returned
+    calls = []  # (tid, name, args_and_rest, ts, completed)
+    orphan_resumed, unstamped = 0, 0
     for line in text.splitlines():
         m = RESUMED.match(line)
         if m:
-            pid, name, rest = m.groups()
+            pid, _, name, rest = m.groups()
             if pid in pending and pending[pid][0] == name:
-                calls.append((pid, name, pending.pop(pid)[1] + rest))
+                pn, pr, pts = pending.pop(pid)
+                calls.append((pid, name, pr + rest, pts, True))
+                done_by_name[name] = done_by_name.get(name, 0) + 1
+            else:
+                orphan_resumed += 1  # entered before the attach; strace saw only its return
             continue
         m = START.match(line)
         if not m:
             continue
-        pid, name, rest = m.groups()
+        pid, ts, name, rest = m.groups()
+        if ts is None:
+            unstamped += 1
+        tsf = float(ts) if ts else None
         lines[name] = lines.get(name, 0) + 1
-        lines_by_tid[pid] = lines_by_tid.get(pid, 0) + 1
-        first_by_tid.setdefault(pid, (name, rest))
         if rest.endswith("<unfinished ...>"):
-            pending[pid] = (name, rest[: -len("<unfinished ...>")])
+            pending[pid] = (name, rest[: -len("<unfinished ...>")], tsf)
         elif rest.endswith("<detached ...>"):
             # In flight when the detach came: it never returns in this trace and strace's -c table does not count it
             # (run 37225130145, pg18-default x86_64 XFS pg18-m1-wal-c4: table 485 sync_file_range, lines 486, the
             # extra one "<detached ...>"). It is an unfinished call, never a completed one.
-            pending[pid] = (name, rest[: -len("<detached ...>")])
+            pending[pid] = (name, rest[: -len("<detached ...>")], tsf)
         else:
-            calls.append((pid, name, rest))
+            calls.append((pid, name, rest, tsf, True))
+            done_by_name[name] = done_by_name.get(name, 0) + 1
+    for pid, (name, rest, tsf) in pending.items():
+        calls.append((pid, name, rest, tsf, False))
+    if part is not None and unstamped:
+        problems.append(f"{unstamped} call line(s) without a -ttt stamp: the split cannot place them")
     # strace allocates its -c counters at the first counted call, so a window in which no traced syscall happened
     # prints NO table. That is a true zero only when the attach was proven (trace.sh's TracerPid check wrote
     # attached_after_polls= into the window file) and strace said nothing on stderr; otherwise it stays refused.
-    empty_window = summary is None and not lines and attached and not stray
+    empty_window = summary is None and not lines and attached and not stray and not desync
     if empty_window:
         summary = {}
-    out = {"trace": trace, "root": root, "summary_found": summary is not None, "summary": summary or {},
-           "lines": lines, "unfinished_at_end": len(pending), "attached_proven": attached,
-           "empty_window": empty_window, "strace_stderr": stray[:20]}
+    out = {"trace": trace, "root": root, "part": part, "tsplit": tsplit, "summary_found": summary is not None,
+           "summary": summary or {}, "lines": lines, "completed": done_by_name, "unfinished_at_end": len(pending),
+           "orphan_resumed": orphan_resumed, "attached_proven": attached, "empty_window": empty_window,
+           "strace_stderr": stray[:20]}
+
+    def selected(ts):
+        if tsplit is None or ts is None:
+            return part is None
+        return ts < tsplit if part == "pre" else ts >= tsplit
+
     flush = {k: 0 for k in FLUSH}
     flush["msync_sync"] = 0
     other = {"sync_file_range": 0, "msync_nosync": 0, "copy_file_range_calls": 0, "copy_file_range_bytes": 0,
              "ficlone": 0, "osync_opens": 0, "osync_fcntl": 0, "rwf_sync_writes": 0, "io_uring": 0, "io_submit": 0}
     by_class, by_path, by_tid = {}, {}, {}
-    spawned = []  # (creator tid, new tid, is a thread) from clone/clone3/fork/vfork lines
+    spawned = []  # (creator tid, new tid, is a thread) from clone/clone3/fork/vfork lines -- of the WHOLE trace
     # Calls still unfinished at the detach are not counted as flushes (strace's -c table counts a call when it
     # returns), but their arguments are still searched for blind spots: an O_DSYNC open in flight is still one.
-    for done, (tid, name, rest) in [(True, c) for c in calls] + [(False, (p, n, r)) for p, (n, r) in pending.items()]:
+    for tid, name, rest, ts, done in calls:
         rm = RET.search(rest)
         ret = rm.group(1) if rm else "?"
-        if not done and (name in FLUSH or name in ("msync", "sync_file_range", "copy_file_range", "ioctl")):
-            continue
         if name in SPAWN:
             if done and ret.isdigit() and int(ret) > 0:
                 spawned.append((tid, ret, name.startswith("clone") and "CLONE_THREAD" in rest))
+            continue
+        if not selected(ts):
+            continue
+        if not done and (name in FLUSH or name in ("msync", "sync_file_range", "copy_file_range", "ioctl")):
             continue
         if name in FLUSH or name == "msync":
             if name == "msync":
@@ -339,7 +348,6 @@ def count(trace, extras, root, window=None, clients=frozenset()):
     out["by_class"] = by_class
     out["top_paths"] = sorted(by_path.items(), key=lambda kv: -kv[1])[:15]
     out.update(attribute(by_tid, spawned, window, main, clients, attached))
-    problems, blind = [], []
     out["main_pid"], out["detach"] = main, detach
     # The pre-attach fd scan (trace.sh fdsync_scan): fds already open with O_SYNC/O_DSYNC when the attach completed.
     fds_path = window[: -len(".window")] + ".fdsync" if window and window.endswith(".window") else None
@@ -355,25 +363,19 @@ def count(trace, extras, root, window=None, clients=frozenset()):
                 if target.startswith("/") or not target:
                     pre_sync.append(f"pid {f[1]} fd {f[2]} flags {f[3]} {target or '(target unreadable)'}")
     out["fdsync_scanned"], out["osync_fds_at_attach"] = scanned, pre_sync
-    roster_tids, roster_pids = set(), set()
+    roster_pids = set()
     rp = window[: -len(".window")] + ".pids" if window and window.endswith(".window") else None
     if rp and os.path.exists(rp):
         for ln in open(rp, errors="replace"):
             f = ln.split(" ", 2)
             if len(f) >= 2:
-                roster_tids.add(f[0])
                 roster_pids.add(f[1])
     # The roster is written right AFTER the scan, so a process in it was alive when the scan ran: it must have a
     # "scanned" line with at least one fd (second review, finding 1: 11 live PG processes had none, windows ok).
     out["fdsync_unscanned"] = sorted(p for p in roster_pids if not scanned.get(p, 0))
-    out["desync"] = {t: {"messages": m, "lines": lines_by_tid.get(t, 0), "at_attach": t in roster_tids,
-                         "first_line": " ".join(first_by_tid[t])[:160] if t in first_by_tid else None,
-                         "first_line_phantom_candidate": phantom_candidate(first_by_tid.get(t))}
-                     for t, m in desync.items()}
-    for t, d in out["desync"].items():
-        if not (d["messages"] == [("entering", "2")] and d["at_attach"] and not d["first_line_phantom_candidate"]):
-            problems.append(f"strace lost the syscall state of task {t} ({d['messages'][:3]}, at attach:"
-                            f" {d['at_attach']}, first line: {d['first_line']}): its calls cannot be counted")
+    out["desync"] = desync
+    for t, msgs in desync.items():
+        problems.append(f"strace lost the syscall state of task {t} ({msgs[:3]}): its calls cannot be counted")
     if attached:
         if not out["roster_found"]:
             problems.append("attach window has no pid roster (OUT.pids): its flushes cannot be attributed")
@@ -383,7 +385,6 @@ def count(trace, extras, root, window=None, clients=frozenset()):
             problems.append(f"no pre-attach O_SYNC/O_DSYNC fd scan of roster process(es) {out['fdsync_unscanned'][:5]}")
         if pre_sync:
             blind.append(f"O_SYNC/O_DSYNC fd open before the attach x{len(pre_sync)} ({pre_sync[0][:120]})")
-    if attached:
         # An attach window is a count of a LIVE server: its main pid must be named, and both the strace and the server
         # must still have been running when the detach was requested (else every tracee died and an empty window
         # would read as a clean zero -- review finding 5).
@@ -409,10 +410,6 @@ def count(trace, extras, root, window=None, clients=frozenset()):
             # A call interrupted by the detach can be in one half only.
             if abs(s - n) > out["unfinished_at_end"]:
                 problems.append(f"{name}: summary {s} calls vs {n} lines")
-        sflush = sum(summary.get(k, {}).get("calls", 0) for k in FLUSH)
-        lflush = sum(flush[k] for k in FLUSH)
-        if abs(sflush - lflush) > out["unfinished_at_end"]:
-            problems.append(f"flush syscalls: summary {sflush} vs lines {lflush}")
     for k, why in (("osync_opens", "O_SYNC/O_DSYNC open"), ("osync_fcntl", "F_SETFL O_SYNC/O_DSYNC"),
                    ("rwf_sync_writes", "pwritev2 RWF_(D)SYNC"), ("io_uring", "io_uring in use"),
                    ("io_submit", "Linux AIO io_submit")):
@@ -560,7 +557,8 @@ def main():
     cmd = sys.argv[1]
     if cmd == "count" and len(sys.argv) >= 3:
         a = kv(sys.argv[3:])
-        r = count(sys.argv[2], a.get("extra", []), a.get("root"), a.get("window"), clients_of(a.get("clients")))
+        r = count(sys.argv[2], a.get("extra", []), a.get("root"), a.get("window"), clients_of(a.get("clients")),
+                  a.get("part"))
         print(json.dumps(r, indent=1))
         sys.exit(0 if not r["verdict"].startswith("REFUSED") else 3)
     if cmd == "cell":

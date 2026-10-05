@@ -27,6 +27,7 @@
 #      enumeration) is attached; untraced_tasks must name the child (the condition strace_attach retries on).
 #   F10b the same tree attached by strace_attach: it must list the pre-existing child, complete on try 1, and count
 #      the parent's fsync x1 and the child's fsync x2 = 3, verdict ok.
+#   F11 one attach split by strace_mark: fsync x2, tsplit, fsync x3 -> --part pre counts 2 and --part post 3.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
 OUT=${1:?usage: firecheck_strace.sh OUT DIR}
@@ -34,7 +35,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=13
+NCHECK=15
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -106,6 +107,18 @@ if mode == "dsync-pre":
     ready(); wait()
     os.write(fd, b"x" * 4096)
     os.write(fd, b"y" * 4096)
+    done_and_stay()
+if mode == "split":
+    fd = os.open(f"{d}/split.dat", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.write(fd, b"x" * 4096)
+    ready(); wait()
+    for _ in range(2):
+        os.fsync(fd)
+    open(f"{d}/split.half", "w").close()
+    while not os.path.exists(trig + ".2"):
+        time.sleep(0.02)
+    for _ in range(3):
+        os.fsync(fd)
     done_and_stay()
 if mode == "dsync-child-pre":
     r, w = os.pipe()
@@ -300,6 +313,27 @@ else
   log "FAIL F10a/F10b: the fork-pre probe never became ready"; fails=$((fails + 2))
 fi
 stop_probe2 fork-pre
+
+# F11: one attach split by strace_mark: fsync x2, the tsplit stamp, fsync x3 -> --part pre counts 2, post counts 3,
+# and the whole trace 5 (second review, finding 2: the load window and its CHECKPOINT share one attach).
+if start_probe2 split && strace_attach "$OUT/f11" "$PP2"; then
+  touch "$DIR/fc/go-split"
+  for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/split.half" ] && break; sleep 0.05; done
+  sleep 0.1
+  strace_mark "$OUT/f11" tsplit
+  touch "$DIR/fc/go-split.2"
+  for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/split.done" ] && break; sleep 0.05; done
+  sleep 0.2
+  strace_detach "$OUT/f11"
+  count f11
+  python3 "$SC" count "$OUT/f11.strace" --extra "$OUT/f11.strace.err" --root "$DIR" --window "$OUT/f11.window" --part pre >"$OUT/f11pre.json"
+  python3 "$SC" count "$OUT/f11.strace" --extra "$OUT/f11.strace.err" --root "$DIR" --window "$OUT/f11.window" --part post >"$OUT/f11post.json"
+  check F11-split-pre "$OUT/f11pre.json" 'r["verdict"]=="ok" and r["flush_by_syscall"]["fsync"]==2 and r["flushes"]==2'
+  check F11-split-post "$OUT/f11post.json" 'r["verdict"]=="ok" and r["flush_by_syscall"]["fsync"]==3 and r["flushes"]==3'
+else
+  log "FAIL F11-split: the probe or its attach failed"; fails=$((fails + 2))
+fi
+stop_probe2 split
 
 rm -rf "$DIR/fc"
 if [ $fails -eq 0 ]; then log "VERDICT PASS $NCHECK/$NCHECK"; exit 0; fi

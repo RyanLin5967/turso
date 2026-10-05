@@ -11,9 +11,12 @@
 #   strace_detach OUT          SIGINT to that strace (it detaches and writes the -c table), wait for it to exit.
 #                              Records whether the strace and MAIN were still alive when the detach was requested:
 #                              stracecount refuses the window if either was not (review finding 5).
+#   strace_mark OUT NAME       stamp NAME=<CLOCK_REALTIME now> into OUT.window inside an attach: stracecount --part
+#                              pre|post splits the trace there by each call's -ttt start stamp (the same clock), so
+#                              one attach holds the load window and the CHECKPOINT after it (second review, 2).
 #   strace_run OUT CMD...      run CMD under the same strace from its first instruction.
-# Each window writes OUT.strace (per-call lines, then the -c table), OUT.strace.err and OUT.window (the window's
-# CLOCK_REALTIME bounds, from `date +%s.%N`: attach-complete to detach-request, and strace's rc).
+# Each window writes OUT.strace (per-call lines stamped -ttt, then the -c table), OUT.strace.err and OUT.window (the
+# window's CLOCK_REALTIME bounds, from `date +%s.%N`: attach-complete to detach-request, and strace's rc).
 # kernel.yama.ptrace_scope must be 0 (the workflow sets it): the servers are not strace's descendants.
 TRACESET=fsync,fdatasync,sync_file_range,syncfs,sync,msync,copy_file_range,ioctl,openat,openat2,fcntl,pwritev2
 TRACESET=$TRACESET,io_submit,io_uring_setup,io_uring_enter,io_uring_register
@@ -21,7 +24,7 @@ TRACESET=$TRACESET,io_submit,io_uring_setup,io_uring_enter,io_uring_register
 # clone/clone3 everywhere; x86_64 also has the legacy fork/vfork, open and creat entry points (aarch64 has none).
 TRACESET=$TRACESET,clone,clone3
 [ "$(uname -m)" = x86_64 ] && TRACESET=$TRACESET,open,creat,fork,vfork
-STRACE_OPTS=(-f -C -y -qq -s 160 -e signal=none -e "trace=$TRACESET")
+STRACE_OPTS=(-f -C -y -ttt -qq -s 160 -e signal=none -e "trace=$TRACESET")
 ST_PID=
 
 descendants() { # descendants PID -> every live, non-zombie descendant pid of PID, one per line (children of children too)
@@ -168,7 +171,12 @@ strace_run() {
   return $rc
 }
 
-window_s() { # window_s OUT -> seconds between t0 and t1
-  awk -F'[= ]' '{for (i = 1; i < NF; i++) { if ($i == "t0") a = $(i + 1); if ($i == "t1") b = $(i + 1) }}
-    END { printf "%.6f\n", b - a }' "$1.window"
+strace_mark() { # strace_mark OUT NAME -- NAME=<now> into the open window's record
+  echo "$2=$(date +%s.%N)" >>"$1.window"
+}
+
+window_s() { # window_s OUT -> seconds between t0 and tsplit when the window was split, else t0 and t1
+  awk -F'[= ]' '{for (i = 1; i < NF; i++) { if ($i == "t0") a = $(i + 1); if ($i == "t1") b = $(i + 1);
+                 if ($i == "tsplit") s = $(i + 1) }}
+    END { if (s != "") b = s; printf "%.6f\n", b - a }' "$1.window"
 }
