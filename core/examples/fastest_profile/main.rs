@@ -390,6 +390,20 @@ fn scalar(conn: &Arc<Connection>, sql: &str) -> i64 {
         .unwrap_or_else(|| not_a_result(&format!("{sql}: no integer")))
 }
 
+/// The engine's in-process sync counters (`turso_core::branch::sync_counts`), every field by name,
+/// read from the struct's Debug form so the driver builds against engine shas whose `SyncCounts`
+/// has a different field set (88dfe324f: fsync, full_fsync; later: + barrier).
+fn engine_syncs() -> Vec<(String, u64)> {
+    let text = format!("{:?}", sync_counts());
+    let body = text.split_once('{').map(|(_, b)| b).unwrap_or("").trim_end_matches('}');
+    body.split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once(':')?;
+            Some((k.trim().to_string(), v.trim().parse().ok()?))
+        })
+        .collect()
+}
+
 fn pct(sorted: &[u64], q: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -414,8 +428,8 @@ fn main() {
         Mode::Cycle => vec!["cycle"],
     };
     let gate = Barrier::new(a.clients + 1);
-    // (window, secs, fsync, full_fsync, busy retries in the window, all phases)
-    let mut windows: Vec<(String, f64, u64, u64, u64)> = Vec::new();
+    // (window, secs, engine sync counter deltas by field, busy retries in the window, all phases)
+    let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64)> = Vec::new();
     let retries = || RETRIES.iter().map(|r| r.load(Ordering::Relaxed)).sum::<u64>();
     let per_client: Vec<[Vec<u64>; 4]> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..a.clients)
@@ -429,7 +443,7 @@ fn main() {
         gate.wait(); // warm-up done
         fence.marker("FASTEST_PHASE warmup end");
         for w in &windows_wanted {
-            let s0 = sync_counts();
+            let s0 = engine_syncs();
             let r0 = retries();
             fence.begin(w);
             let t = Instant::now();
@@ -437,8 +451,12 @@ fn main() {
             gate.wait(); // every client has finished it
             let secs = t.elapsed().as_secs_f64();
             fence.end(w);
-            let s1 = sync_counts();
-            windows.push((w.to_string(), secs, s1.fsync - s0.fsync, s1.full_fsync - s0.full_fsync, retries() - r0));
+            let s1 = engine_syncs();
+            if s1.is_empty() || s1.len() != s0.len() {
+                not_a_result(&format!("engine sync counters unreadable: {:?}", sync_counts()));
+            }
+            let delta = s1.iter().zip(&s0).map(|((k, b), (_, a))| (k.clone(), b - a)).collect();
+            windows.push((w.to_string(), secs, delta, retries() - r0));
         }
         handles
             .into_iter()
@@ -469,10 +487,13 @@ fn main() {
         a.rows,
         if a.mode == Mode::Phases { "phases" } else { "cycle" }
     );
-    for (k, (name, secs, fs, ffs, busy)) in windows.iter().enumerate() {
+    for (k, (name, secs, syncs, busy)) in windows.iter().enumerate() {
+        let fields: Vec<String> = syncs.iter().map(|(f, v)| format!("\"{f}\":{v}")).collect();
+        let total: u64 = syncs.iter().map(|(_, v)| v).sum();
         json.push_str(&format!(
-            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_fsync\":{fs},\"engine_full_fsync\":{ffs},\"busy_retries\":{busy},\"ops\":{ops_total}}}",
-            if k > 0 { "," } else { "" }
+            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_syncs\":{{{}}},\"engine_syncs_total\":{total},\"busy_retries\":{busy},\"ops\":{ops_total}}}",
+            if k > 0 { "," } else { "" },
+            fields.join(",")
         ));
     }
     json.push_str("],\"phases\":{");

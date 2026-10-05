@@ -151,7 +151,7 @@ def analyze_arm(d, arm):
         opener = gzip.open if st.endswith(".gz") else open
         with opener(st, "rt", errors="replace") as fh:
             win, refusals = parse_strace(fh)
-        engine = {w["window"]: w["engine_fsync"] + w["engine_full_fsync"] for w in s["windows"]}
+        engine = {w["window"]: w["engine_syncs_total"] for w in s["windows"]}
         r["strace"] = {"ops": ops, "refusals": refusals, "windows": {}}
         for w in WINDOWS:
             if w not in win:
