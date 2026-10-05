@@ -2334,16 +2334,16 @@ fn a_refused_catalog_probe_is_made_again() {
             assert!(matches!(first, Err(LimboError::Busy)), "premise: the decision's probe was refused: {first:?}");
             stmt.run_ignore_rows().unwrap();
         }
-        assert!(
-            db.branch_twk_counters().0 > probes,
-            "refused_by_read={refused_by_read}: the refused probe was not made again"
-        );
         assert_eq!(read_wide(&y, 3), "mid", "refused_by_read={refused_by_read}: the young child");
         let b = db.branch(old).unwrap();
         assert_eq!(
             read_wide(&b.connect().unwrap(), 3),
             "trunk-3",
             "refused_by_read={refused_by_read}: the old child reads a row the trunk wrote after its fork"
+        );
+        assert!(
+            db.branch_twk_counters().0 > probes,
+            "refused_by_read={refused_by_read}: the refused probe was not made again"
         );
     }
 }
@@ -2423,6 +2423,47 @@ fn a_fuzzy_checkpoint_never_commits_a_fork_whose_flight_failed() {
     let path = dir.path().join("ckpt-failed-fork.db");
     let kept = checkpoint_over_a_failed_flight(&path, true);
     after_the_reopen(&path, true, kept);
+}
+
+/// Review 4 #1: a fuzzy checkpoint whose store fail-stops after its wait and before its commit
+/// commits nothing: a fail-stopped store writes nothing more (B-F1), the catalog included, so no
+/// install is counted, and after a reopen the branch whose release failed is back. Mutant
+/// `commit_poisoned` (the check before the commit left out) must fail it.
+#[test]
+fn a_fuzzy_checkpoint_commits_nothing_after_a_fail_stop() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ckpt-after-fail-stop.db");
+    let (id, incarnation) = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let x = trunk.fork_branch().unwrap();
+        write_v(&x.connect().unwrap(), 3, "x");
+        let id = x.id();
+        let installed = db.branch_checkpoint_counters()[0];
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the checkpoint never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(x.reap().is_err(), "premise: the release's flight failed");
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        assert_eq!(
+            db.branch_checkpoint_counters()[0],
+            installed,
+            "a checkpoint committed and installed after the store fail-stopped"
+        );
+        (id, db.incarnation)
+    };
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    let x = db.branch(id).expect("the branch whose release failed is back after a reopen");
+    assert_eq!(read_v(&x.connect().unwrap(), 3), "x");
 }
 
 // ---- skill review 2 #3: a logged Release raises the trunk's barrier floor ----
