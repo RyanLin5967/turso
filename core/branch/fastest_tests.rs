@@ -195,7 +195,11 @@ fn d1_syncs_with_fsync_and_never_full_fsync() {
 /// The ordering guard: a trunk connection that asks for a STRONGER flush than the branch store's
 /// class (`PRAGMA fullfsync` on a D1 store) has the pre-image barrier raised to match, so the trunk
 /// commit that overwrites a page a branch reads is never more durable than the pre-image kept for
-/// it. Every sync of that commit, branch files and WAL, is F_FULLFSYNC.
+/// it. No sync of that commit is fsync(2).
+///
+/// FLAGGED TEST EDIT (lead review 1 item 6, a registered law change): the pre-image is now ORDERED
+/// before the commit's frames (F_BARRIERFSYNC) and made durable by the WAL's own F_FULLFSYNC, so
+/// the commit issues one F_FULLFSYNC and at least one barrier, where it issued two F_FULLFSYNC.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_full_fsync_trunk_connection_raises_the_pre_image_barrier() {
@@ -207,14 +211,20 @@ fn a_full_fsync_trunk_connection_raises_the_pre_image_barrier() {
         seed(&trunk);
         let b = trunk.fork_branch().unwrap();
         trunk.execute("PRAGMA fullfsync = ON").unwrap();
-        let counted = syncs_of(|| {
-            trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
-        });
+        let before = sync_counts();
+        trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
+        let after = sync_counts();
+        let counted = (
+            after.fsync - before.fsync,
+            after.full_fsync - before.full_fsync,
+            after.barrier - before.barrier,
+        );
         assert_eq!(
             counted.0, 0,
             "catalog={catalog}: a pre-image barrier under a fullfsync trunk issued fsync(2): {counted:?}"
         );
-        assert!(counted.1 >= 2, "catalog={catalog}: barrier and WAL: {counted:?}");
+        assert_eq!(counted.1, 1, "catalog={catalog}: the WAL's F_FULLFSYNC: {counted:?}");
+        assert!(counted.2 >= 1, "catalog={catalog}: the pre-image's barrier: {counted:?}");
         let bc = b.connect().unwrap();
         let v = bc
             .prepare("SELECT v FROM t WHERE id = 7")
@@ -1105,4 +1115,997 @@ fn v1_in_process_one_full_fsync_per_create_at_c1() {
             counted.1
         );
     }
+}
+
+// ---- the M1 review (four fresh-context readers of ad9829f3b..88dfe324f): each block names the
+// finding it pins; written failing-first ----
+
+fn wait_hold(hold: &std::sync::atomic::AtomicU8, stage: u8) {
+    let t = std::time::Instant::now();
+    while hold.load(std::sync::atomic::Ordering::Acquire) != stage | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the hook never reached stage {stage}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn arena_path(db: &Arc<Database>) -> std::path::PathBuf {
+    let log = db.branch_log_path().expect("a durable store");
+    std::path::PathBuf::from(log.to_str().unwrap().replace("-branch-log", "-branch-arena"))
+}
+
+/// Review A-F3 (E4): a branch forked while a trunk commit is inside its commit gate forks AFTER that
+/// commit, so nothing reads it before the commit is published — not its creator, and not another
+/// connection that finds it by name meanwhile. A hook holds a commit inside its gate; a named branch
+/// is created, and another thread looks it up and connects to it at once. Nothing retained the
+/// overwritten page for the child (its epoch is past the commit's decisions), so a read before the
+/// publication would see the trunk's old page and, after it, the new one.
+#[test]
+fn a_branch_forked_inside_a_commit_gate_is_opened_by_name_only_after_the_commit() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("gate-named.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        // The trunk's first child: later forks take no WAL write lock.
+        let first = a.fork_branch().unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_TRUNK_DECIDED, std::sync::atomic::Ordering::Release);
+        let writer = {
+            let a = a.clone();
+            std::thread::spawn(move || write_v(&a, 7, "c1"))
+        };
+        wait_hold(&hold, super::store::HOLD_TRUNK_DECIDED);
+        let creator = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect().unwrap().create_branch("feat").unwrap())
+        };
+        let reader = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                let id = loop {
+                    if let Some(id) = db.branch_named("feat").unwrap() {
+                        break id;
+                    }
+                    assert!(t.elapsed() < std::time::Duration::from_secs(10), "the name never appeared");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                let c = db.connect_named("feat").unwrap();
+                (id, read_wide(&c, 7))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        writer.join().unwrap();
+        let created = creator.join().unwrap();
+        let (found, first_read) = reader.join().unwrap();
+        assert_eq!(found, created, "catalog={catalog}");
+        assert_eq!(
+            first_read, "c1",
+            "catalog={catalog}: a branch forked after a trunk commit was read before that commit was published"
+        );
+        drop(first);
+    }
+}
+
+/// Review C-F4: a named branch is found by name only once its fork is durable. A hook holds the
+/// create's flight after it is taken from the buffer; a lookup made meanwhile must wait for the
+/// flight, not return a branch a crash would lose.
+#[test]
+fn a_named_branch_is_found_by_name_only_once_its_fork_is_durable() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("named-durable.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let creator = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect().unwrap().create_branch("n").unwrap())
+        };
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let lookup = {
+            let db = db.clone();
+            std::thread::spawn(move || db.branch_named("n").unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let early = lookup.is_finished();
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        let created = creator.join().unwrap();
+        let found = lookup.join().unwrap();
+        assert!(!early, "catalog={catalog}: the name was found while its fork's records were in the air");
+        assert_eq!(found, Some(created), "catalog={catalog}");
+    }
+}
+
+/// Review B-F1: a flight that cannot even be taken (its descriptor's duplication failed, as EMFILE
+/// would) fail-stops the WHOLE store at once: no later commit writes an arena slot, and the close
+/// of a branch whose release it carried frees nothing — its Release is not durable, and after a
+/// restart the branch is back and names those slots.
+#[test]
+fn a_flight_that_cannot_be_taken_fail_stops_every_later_write() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("take.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let x = trunk.fork_branch().unwrap();
+        let xc = x.connect().unwrap();
+        write_v(&xc, 3, "x");
+        let y = trunk.fork_branch().unwrap();
+        let yc = y.connect().unwrap();
+        write_v(&yc, 4, "y");
+        let owned = x.owned_slots();
+        assert!(!owned.is_empty(), "premise: the branch owns a slot");
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightTakeFails));
+        assert!(x.reap().is_err(), "catalog={catalog}: premise: the release's flight was not taken");
+        let arena = arena_path(&db);
+        let before = std::fs::read(&arena).unwrap();
+        assert!(
+            yc.execute("UPDATE t SET v = 'y2' WHERE id = 9").is_err(),
+            "catalog={catalog}: a branch committed after the store fail-stopped"
+        );
+        assert!(
+            std::fs::read(&arena).unwrap() == before,
+            "catalog={catalog}: an arena slot was written after the store fail-stopped"
+        );
+        drop(xc);
+        for slot in &owned {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "catalog={catalog}: slot {slot} was freed though its Release is not durable"
+            );
+        }
+        drop(yc);
+        let _ = y.into_id();
+    }
+}
+
+/// Review B-F2: a release of a branch that is already released — two drops of one name racing —
+/// returns only once that release is durable. A hook holds the first release's flight; the second
+/// release must wait for it, not acknowledge a Release a crash would lose.
+#[test]
+fn a_second_release_returns_only_once_the_first_is_durable() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("rerelease.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let id = trunk.create_branch("n").unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let first = {
+            let db = db.clone();
+            std::thread::spawn(move || db.branches.release_handle(id))
+        };
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let second = {
+            let db = db.clone();
+            std::thread::spawn(move || db.branches.release_handle(id))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let early = second.is_finished();
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert!(
+            !early,
+            "catalog={catalog}: a second release returned while the first one's Release was in the air"
+        );
+    }
+}
+
+/// Review B-F3: a pre-image whose barrier was raised to a stronger trunk class (`PRAGMA fullfsync`
+/// on a D1 store) is re-saved in that class by every rewrite that replaces the record holding it — a
+/// snapshot compaction or a catalog checkpoint and its log cut — in this process and after a
+/// restart, or a power cut can keep the rewrite's cut and lose the copy while the trunk commit that
+/// relied on it survives.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_raised_pre_image_is_rewritten_in_the_raised_class() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("raised.db");
+        let incarnation = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
+            let counted = syncs_of(|| db.branch_compact_now().unwrap());
+            assert_eq!(
+                counted.0, 0,
+                "catalog={catalog}: a rewrite re-saved a raised pre-image with fsync(2): {counted:?}"
+            );
+            assert!(counted.1 >= 1, "catalog={catalog}: premise: the rewrite synced: {counted:?}");
+            let _ = b.into_id();
+            db.incarnation
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let counted = syncs_of(|| db.branch_compact_now().unwrap());
+        assert_eq!(
+            counted.0, 0,
+            "catalog={catalog}: after a restart a rewrite re-saved a raised pre-image with fsync(2): {counted:?}"
+        );
+    }
+}
+
+/// Review C-F1 and C-F2: a name released before a fuzzy checkpoint's capture is free while the
+/// checkpoint is in flight — it resolves to nothing and can be given again — and the new branch
+/// keeps it after the install and after a reopen. (The store here is never a splice store:
+/// `R11_SPLICE` steers only the store's model tests.)
+#[test]
+fn a_released_name_is_free_while_a_fuzzy_checkpoint_is_in_flight() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("fuzzy-name.db");
+    let (b, incarnation) = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let a = trunk.create_branch("x").unwrap();
+        db.branch_compact_now().unwrap();
+        db.drop_branch("x").unwrap();
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the checkpoint never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            db.branch_named("x").unwrap(),
+            None,
+            "a released name resolved while a checkpoint was in flight"
+        );
+        let b = trunk
+            .create_branch("x")
+            .expect("a released name was taken while a checkpoint was in flight");
+        assert_ne!(a, b);
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        assert_eq!(db.branch_named("x").unwrap(), Some(b), "after the install");
+        (b, db.incarnation)
+    };
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    assert_eq!(db.branch_named("x").unwrap(), Some(b), "after a reopen");
+}
+
+/// Review C-F3: a named server branch takes no `Branch` handle — a handle's drop would release it
+/// and a handle could lease it, and nothing but `Database::drop_branch` may end a named branch.
+#[test]
+fn a_named_branch_takes_no_handle() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nohandle.db");
+        let (id, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let id = trunk.create_branch("srv").unwrap();
+            assert!(db.branch(id).is_err(), "catalog={catalog}: a named branch was given a handle");
+            assert_eq!(db.branch_named("srv").unwrap(), Some(id), "catalog={catalog}");
+            (id, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        assert!(db.branch(id).is_err(), "catalog={catalog}: after a reopen");
+        assert_eq!(db.branch_named("srv").unwrap(), Some(id), "catalog={catalog}: after a reopen");
+    }
+}
+
+/// Review A-F2: a trunk commit whose copy-decision pass is refused part-way (`Busy`, as a catalog
+/// read the catalog's lock refused would be) and retried by its statement decides EVERY page on the
+/// retry, so a live child keeps reading its fork-point version of each page the commit wrote.
+#[test]
+fn a_trunk_commit_retried_after_a_busy_decision_pass_retains_every_page() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("busy-decide.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let child = a.fork_branch().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+        let mut stmt = a.prepare("UPDATE t SET v = 'new' WHERE id IN (3, 40, 50)").unwrap();
+        let first = stmt.run_ignore_rows();
+        assert!(
+            matches!(first, Err(LimboError::Busy)),
+            "catalog={catalog}: premise: the decision pass was refused: {first:?}"
+        );
+        stmt.run_ignore_rows().unwrap();
+        drop(stmt);
+        let c = child.connect().unwrap();
+        for id in [3, 40, 50] {
+            assert_eq!(
+                read_wide(&c, id),
+                format!("trunk-{id}"),
+                "catalog={catalog}: the child reads a page the retried commit wrote"
+            );
+        }
+    }
+}
+
+/// Review A-F1: a raw WAL session's commit (`wal_insert_end(true)`) closes the commit gate it opens,
+/// so the next trunk commit takes its own copy decisions and no fork waits on a gate nobody holds.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_raw_wal_session_closes_the_commit_gate() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("raw.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let child = a.fork_branch().unwrap();
+        a.wal_insert_begin().unwrap();
+        a.execute("UPDATE t SET v = 'raw' WHERE id = 3").unwrap();
+        a.wal_insert_end(true).unwrap();
+        assert_eq!(
+            db.branches.trunk_commit_seq() % 2,
+            0,
+            "catalog={catalog}: the raw session left the commit gate open"
+        );
+        write_v(&a, 40, "after");
+        let c = child.connect().unwrap();
+        assert_eq!(read_wide(&c, 3), "trunk-3", "catalog={catalog}");
+        assert_eq!(read_wide(&c, 40), "trunk-40", "catalog={catalog}: the next commit took no decisions");
+    }
+}
+
+/// Review A-F1: a raw WAL session is the trunk's alone. On a branch connection it would write the
+/// branch's pages into the trunk's WAL and open the trunk's commit gate without its write lock.
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn a_raw_wal_session_is_refused_on_a_branch() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("rawb.db"), opts(false, SyncClass::Fsync));
+    let a = db.connect().unwrap();
+    seed(&a);
+    let b = a.fork_branch().unwrap();
+    let bc = b.connect().unwrap();
+    assert!(bc.wal_insert_begin().is_err(), "a raw WAL session began on a branch");
+}
+
+/// Review A-F1, lead review 1 item 5 (b): a raw WAL session that commits nothing still leaves the
+/// commit gate closed, and a commit from another trunk connection afterwards goes through (an open
+/// gate makes it panic on "two trunk commits inside the commit gate at once").
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn an_empty_raw_wal_session_leaves_the_gate_closed_for_another_connection() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("raw0.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let child = a.fork_branch().unwrap();
+        a.wal_insert_begin().unwrap();
+        a.wal_insert_end(true).unwrap();
+        assert_eq!(db.branches.trunk_commit_seq() % 2, 0, "catalog={catalog}: the gate was left open");
+        let other = db.connect().unwrap();
+        write_v(&other, 3, "other");
+        let c = child.connect().unwrap();
+        assert_eq!(read_wide(&c, 3), "trunk-3", "catalog={catalog}");
+    }
+}
+
+/// Review B-F1's other door (a guard, green before the fix: the failed flight's leader poisoned the
+/// journal itself then): a flight that fails to WRITE fail-stops the whole store as one taken-and-
+/// failed does — no later commit writes an arena slot, and the close of the branch whose release it
+/// carried frees nothing. Mutant `split_fail_stop` must fail it.
+#[test]
+fn a_flight_that_fails_to_write_fail_stops_every_later_write() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("write-fail.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let x = trunk.fork_branch().unwrap();
+        let xc = x.connect().unwrap();
+        write_v(&xc, 3, "x");
+        let y = trunk.fork_branch().unwrap();
+        let yc = y.connect().unwrap();
+        write_v(&yc, 4, "y");
+        let owned = x.owned_slots();
+        assert!(!owned.is_empty(), "premise: the branch owns a slot");
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(x.reap().is_err(), "catalog={catalog}: premise: the release's flight failed");
+        let arena = arena_path(&db);
+        let before = std::fs::read(&arena).unwrap();
+        assert!(
+            yc.execute("UPDATE t SET v = 'y2' WHERE id = 9").is_err(),
+            "catalog={catalog}: a branch committed after the store fail-stopped"
+        );
+        assert!(
+            std::fs::read(&arena).unwrap() == before,
+            "catalog={catalog}: an arena slot was written after the store fail-stopped"
+        );
+        drop(xc);
+        for slot in &owned {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "catalog={catalog}: slot {slot} was freed though its Release is not durable"
+            );
+        }
+        drop(yc);
+        let _ = y.into_id();
+    }
+}
+
+// ---- lead review 1 item 1: one full flush per flight (the arena ordered by a barrier) ----
+
+/// Lead review 1 item 1: a D2 branch's first write is exactly ONE F_FULLFSYNC and no fsync(2). Its
+/// slots need only be ORDERED before the log record that names them (F_BARRIERFSYNC on Apple); the
+/// log's F_FULLFSYNC then drains the device's cache, slots included. Two full flushes (arena, then
+/// log) were the shape before.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_first_write_is_exactly_one_full_fsync() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("d2fw.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        let counted = syncs_of(|| write_v(&bc, 3, "mine"));
+        assert_eq!(counted, (0, 1), "catalog={catalog}: a D2 first write's (fsync, F_FULLFSYNC)");
+    }
+}
+
+/// Lead review 1 item 1 (V1 in-process, the CFW arm): `FE_V1_CREATES` (default 200) create-then-
+/// first-write pairs at C=1, D2, issue exactly 2.00 to 2.01 F_FULLFSYNC per pair (the create's one
+/// and the first write's one) and no fsync(2).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn v1_in_process_create_then_first_write_is_two_full_fsyncs_at_c1() {
+    let _s = serial();
+    let pairs = std::env::var("FE_V1_CREATES").ok().and_then(|v| v.parse().ok()).unwrap_or(200u64);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("v1cfw.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let counted = syncs_of(|| {
+            for i in 0..pairs {
+                let name = format!("cfw-{i}");
+                trunk.create_branch(&name).unwrap();
+                let c = db.connect_named(&name).unwrap();
+                write_v(&c, 1 + (i as i64 % 50), "cfw");
+            }
+        });
+        let per_pair = counted.1 as f64 / pairs as f64;
+        assert_eq!(counted.0, 0, "catalog={catalog}: fsync(2) issued during D2 CFW: {counted:?}");
+        assert!(
+            (2.0..=2.01).contains(&per_pair),
+            "catalog={catalog}: {} F_FULLFSYNC over {pairs} create+first-write pairs = {per_pair:.4} per pair",
+            counted.1
+        );
+    }
+}
+
+/// The barrier counter (lead review 1 item 1): `barrier_file` is one F_BARRIERFSYNC at D2, one
+/// fsync(2) at D1 and nothing at D0, each counted under its own primitive. Forced to fire each way.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_sync_counter_counts_a_barrier_under_its_own_primitive() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = super::journal::open_rw(&dir.path().join("f"), true).unwrap();
+    super::journal::write_at(&file, b"x", 0).unwrap();
+    let counted = |class| {
+        let before = sync_counts();
+        super::journal::barrier_file(&file, class).unwrap();
+        let after = sync_counts();
+        (after.fsync - before.fsync, after.full_fsync - before.full_fsync, after.barrier - before.barrier)
+    };
+    assert_eq!(counted(SyncClass::Off), (0, 0, 0), "D0 ordered a branch file");
+    assert_eq!(counted(SyncClass::Fsync), (1, 0, 0), "a D1 barrier is one fsync(2)");
+    assert_eq!(counted(SyncClass::FullFsync), (0, 0, 1), "a D2 barrier is one F_BARRIERFSYNC");
+}
+
+/// Lead review 1 item 1, the other half: a D2 first write still ORDERS its slots before its record
+/// — exactly one F_BARRIERFSYNC beside its one F_FULLFSYNC. Mutant `no_arena_barrier` must fail it.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_first_write_orders_its_slots_with_one_barrier() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("d2fwb.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let bc = b.connect().unwrap();
+        let before = sync_counts();
+        write_v(&bc, 3, "mine");
+        let after = sync_counts();
+        assert_eq!(after.barrier - before.barrier, 1, "catalog={catalog}: the slots were not ordered");
+        assert_eq!(after.full_fsync - before.full_fsync, 1, "catalog={catalog}");
+    }
+}
+
+// ---- lead review 1 item 11: an early-released operation whose wait fails is undone or fenced ----
+
+/// Lead review 1 item 11: a fork whose flight fails is not handed out, and it is released, so it is
+/// not listed. (The release landed in 22434231a; mutant `fork_failure_kept` restores the leak.)
+#[test]
+fn a_fork_whose_flight_fails_is_released_not_leaked() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("fork-fail.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let first = trunk.fork_branch().unwrap();
+        let before = db.branch_ids().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(trunk.create_branch("lost").is_err(), "catalog={catalog}: premise: the fork's flight failed");
+        assert_eq!(db.branch_ids().unwrap(), before, "catalog={catalog}: a fork that was not handed out is listed");
+        drop(first);
+    }
+}
+
+/// Lead review 1 item 11: a branch commit whose flight fails returned an error, so nothing reads it
+/// afterwards — the branch is refused (its state is in doubt until a reopen recovers it from disk),
+/// never shown with the failed commit's write. After a reopen it reads its last durable commit.
+#[test]
+fn a_branch_commit_whose_flight_fails_is_never_read() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("commit-fail.db");
+        let (id, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            {
+                let bc = b.connect().unwrap();
+                write_v(&bc, 3, "durable");
+                db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+                assert!(
+                    bc.execute("UPDATE t SET v = 'failed' WHERE id = 3").is_err(),
+                    "catalog={catalog}: premise: the commit's flight failed"
+                );
+                let seen = bc.prepare("SELECT v FROM t WHERE id = 3").and_then(|mut s| s.run_collect_rows());
+                if let Ok(rows) = seen {
+                    assert_eq!(
+                        rows[0][0],
+                        crate::Value::from_text("durable"),
+                        "catalog={catalog}: the failed commit's write was read on its own connection"
+                    );
+                }
+            }
+            let reopened = b.connect().and_then(|c| {
+                c.prepare("SELECT v FROM t WHERE id = 3").and_then(|mut s| s.run_collect_rows())
+            });
+            if let Ok(rows) = reopened {
+                assert_eq!(
+                    rows[0][0],
+                    crate::Value::from_text("durable"),
+                    "catalog={catalog}: the failed commit's write was read on a new connection"
+                );
+            }
+            (b.into_id(), db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let b = db.branch(id).unwrap();
+        assert_eq!(read_v(&b.connect().unwrap(), 3), "durable", "catalog={catalog}: after a reopen");
+    }
+}
+
+/// Lead review 1 item 11: a lock-free fork that times out waiting for the trunk commit it forks
+/// after is `Busy`, not handed out, and released: it is not listed, and after a reopen it is gone.
+/// The publication wait is shortened for the test (`BranchStore::set_publish_wait`).
+#[test]
+fn a_fork_that_times_out_on_a_trunk_commit_is_busy_and_released() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("publish-timeout.db");
+        let incarnation = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let a = db.connect().unwrap();
+            seed_wide(&a);
+            let first = a.fork_branch().unwrap().into_id();
+            db.branches.set_publish_wait(std::time::Duration::from_millis(200));
+            let hold = db.branches.trunk_commit_hold.clone();
+            hold.store(super::store::HOLD_TRUNK_DECIDED, std::sync::atomic::Ordering::Release);
+            let writer = {
+                let a = a.clone();
+                std::thread::spawn(move || write_v(&a, 7, "c1"))
+            };
+            wait_hold(&hold, super::store::HOLD_TRUNK_DECIDED);
+            let forked = db.connect().unwrap().create_branch("late");
+            hold.store(0, std::sync::atomic::Ordering::Release);
+            writer.join().unwrap();
+            assert!(
+                matches!(forked, Err(LimboError::Busy)),
+                "catalog={catalog}: a fork past its publication wait: {forked:?}"
+            );
+            assert_eq!(db.branch_ids().unwrap(), vec![first], "catalog={catalog}: the timed-out fork is listed");
+            assert_eq!(db.branch_named("late").unwrap(), None, "catalog={catalog}");
+            db.incarnation
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        assert_eq!(db.branch_ids().unwrap().len(), 1, "catalog={catalog}: after a reopen");
+        assert_eq!(db.branch_named("late").unwrap(), None, "catalog={catalog}: after a reopen");
+    }
+}
+
+// ---- lead review 1 item 2: a named create runs no catalog query under the store mutex ----
+
+/// Lead review 1 item 2: in a catalog store, a create of a NEW name — every successful server
+/// create — asks the catalog nothing: the name filter (every name the store ever held, insert-only)
+/// says no branch has it. Measured after a checkpoint, an eviction-free reopen and the filter's
+/// build, over `FE_NAMED_CREATES` (default 300) creates: 0 catalog queries. A taken name is still
+/// refused, before and after the reopen.
+#[test]
+fn a_named_create_of_a_new_name_asks_the_catalog_nothing() {
+    let _s = serial();
+    let creates = std::env::var("FE_NAMED_CREATES").ok().and_then(|v| v.parse().ok()).unwrap_or(300u64);
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("filter.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..50 {
+            trunk.create_branch(&format!("old-{i}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    assert!(trunk.create_branch("old-7").is_err(), "a name held before the reopen was given again");
+    let before = db.branch_catalog_counters().2;
+    for i in 0..creates {
+        trunk.create_branch(&format!("new-{i}")).unwrap();
+    }
+    let queries = db.branch_catalog_counters().2 - before;
+    assert_eq!(queries, 0, "{creates} named creates of new names made {queries} catalog queries");
+    assert!(trunk.create_branch("new-3").is_err(), "a name created since the reopen was given again");
+}
+
+// ---- lead review 1 item 6: a retaining trunk commit is one full flush, and forks inside its gate
+// ride it ----
+
+/// Lead review 1 item 6: a D2 trunk commit that retains a pre-image for a live child is exactly
+/// ONE F_FULLFSYNC (its WAL's) and no fsync(2): the pre-image is ORDERED before the commit's frames
+/// (F_BARRIERFSYNC on the branch files), and the WAL's F_FULLFSYNC makes it durable with them.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_d2_retaining_trunk_commit_is_one_full_fsync() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("d2rt.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        let before = db.branch_trunk_retained();
+        let counted = syncs_of(|| write_v(&trunk, 7, "new"));
+        assert!(db.branch_trunk_retained() > before, "catalog={catalog}: premise: the commit retained");
+        assert_eq!(counted, (0, 1), "catalog={catalog}: a retaining D2 trunk commit's (fsync, F_FULLFSYNC)");
+        assert_eq!(read_v(&b.connect().unwrap(), 7), "trunk-7", "catalog={catalog}");
+    }
+}
+
+/// Lead review 1 item 6: forks registered while a D2 trunk commit is inside its gate — before its
+/// pre-image barrier, or after it and before its WAL flush — are made durable by that commit's
+/// WAL F_FULLFSYNC: the commit and the forks together issue ONE F_FULLFSYNC.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn forks_inside_a_d2_commit_gate_ride_its_wal_flush() {
+    let _s = serial();
+    for stage in [super::store::HOLD_TRUNK_DECIDED, super::store::HOLD_TRUNK_BARRIER_DONE] {
+        for catalog in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = open_at(&dir.path().join("ride.db"), opts(catalog, SyncClass::FullFsync));
+            let a = db.connect().unwrap();
+            seed_wide(&a);
+            let _first = a.fork_branch().unwrap().into_id();
+            let hold = db.branches.trunk_commit_hold.clone();
+            let forks_before = db.branch_stats().unwrap().work.trunk_forks;
+            let counted = syncs_of(|| {
+                hold.store(stage, std::sync::atomic::Ordering::Release);
+                let writer = {
+                    let a = a.clone();
+                    std::thread::spawn(move || write_v(&a, 7, "c1"))
+                };
+                wait_hold(&hold, stage);
+                let forkers: Vec<_> = (0..3)
+                    .map(|i| {
+                        let db = db.clone();
+                        std::thread::spawn(move || db.connect().unwrap().create_branch(&format!("ride-{i}")).unwrap())
+                    })
+                    .collect();
+                // The forks have registered before the commit goes on.
+                let t = std::time::Instant::now();
+                while db.branch_stats().unwrap().work.trunk_forks < forks_before + 3 {
+                    assert!(t.elapsed() < std::time::Duration::from_secs(10), "the forks never registered");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                hold.store(0, std::sync::atomic::Ordering::Release);
+                writer.join().unwrap();
+                for f in forkers {
+                    f.join().unwrap();
+                }
+            });
+            assert_eq!(
+                counted,
+                (0, 1),
+                "stage={stage} catalog={catalog}: a D2 trunk commit and three forks inside its gate"
+            );
+        }
+    }
+}
+
+/// Lead review 1 item 6, the count half of M-j (the ordering itself is C1b's): a retaining D2
+/// trunk commit barriers the arena (the pre-image's slot) AND the log (its `TrunkRetain` record)
+/// before its frames — two F_BARRIERFSYNC. Mutant `no_log_barrier` must fail it.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_retaining_d2_trunk_commit_barriers_its_slot_and_its_record() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("d2rb.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _b = trunk.fork_branch().unwrap();
+        let before = sync_counts();
+        write_v(&trunk, 7, "new");
+        let after = sync_counts();
+        assert_eq!(after.barrier - before.barrier, 2, "catalog={catalog}: the slot's and the record's barriers");
+    }
+}
+
+// ---- lead review 1 item 10: the trunk commit path pays nothing it does not need ----
+
+/// Lead review 1 item 10: a trunk commit on a store whose trunk has no live child opens no commit
+/// gate (nothing can fork lock-free while it is in flight: the first child needs its WAL write
+/// lock) and takes no copy decision.
+#[test]
+fn a_trunk_commit_with_no_child_opens_no_commit_gate() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("nogate.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        drop(trunk.fork_branch().unwrap());
+        let before = db.branches.trunk_commit_seq();
+        write_v(&trunk, 7, "new");
+        assert_eq!(db.branches.trunk_commit_seq(), before, "catalog={catalog}: a childless commit opened the gate");
+    }
+}
+
+/// Lead review 1 item 10: a trunk commit that retained nothing and relies on no release still in
+/// the air takes no store mutex for its barrier: nothing is to be made durable.
+#[test]
+fn a_trunk_commit_with_nothing_to_make_durable_takes_no_store_mutex() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("nolock.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _b = trunk.fork_branch().unwrap();
+        // The first write after the fork retains; the second, with no fork since, does not.
+        write_v(&trunk, 7, "first");
+        let before = db.branches.barrier_locks();
+        write_v(&trunk, 7, "second");
+        assert_eq!(db.branches.barrier_locks(), before, "catalog={catalog}: the barrier took the store mutex");
+    }
+}
+
+/// Lead review 1 item 10's guard (mutant M-f's schema hazard, which a commit that opens no gate
+/// would reopen): a lock-free fork whose read snapshot predates a DDL commit made while the trunk
+/// had no child — so no gate moved — and which registers after the trunk's first child was forked
+/// under the WAL write lock, still sees the DDL: that locked fork moves the gate's count. Green
+/// before the gate skip (the DDL commit moved it); mutant `no_locked_fork_bump` must fail it after.
+#[test]
+fn a_lock_free_fork_sees_ddl_committed_while_the_trunk_had_no_child() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("ddl0.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        drop(trunk.fork_branch().unwrap());
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FORK_REGISTERING, std::sync::atomic::Ordering::Release);
+        // F's lock-free attempt holds at the hook with its snapshot taken while the trunk had no
+        // child.
+        let f = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect().unwrap().create_branch("f").unwrap())
+        };
+        wait_hold(&hold, super::store::HOLD_FORK_REGISTERING);
+        trunk.execute("CREATE TABLE u(x)").unwrap();
+        trunk.execute("INSERT INTO u VALUES (1)").unwrap();
+        // The trunk's first child, under the WAL write lock (its own lock-free attempt passes the
+        // hook, which F holds).
+        let g = trunk.fork_branch().unwrap();
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        f.join().unwrap();
+        let c = db.connect_named("f").unwrap();
+        let n = c
+            .prepare("SELECT count(*) FROM u")
+            .and_then(|mut s| s.run_collect_rows())
+            .unwrap_or_else(|e| panic!("catalog={catalog}: the fork missed a DDL commit: {e}"));
+        assert_eq!(n[0][0].as_int(), Some(1), "catalog={catalog}");
+        drop(g);
+    }
+}
+
+// ---- lead review 1 item 7: a checkpoint never flushes inside the store mutex ----
+
+/// Puts the compaction threshold back when a test that lowered it ends, however it ends.
+struct Threshold;
+
+impl Threshold {
+    fn set(bytes: u64) -> Self {
+        super::journal::set_compact_threshold(bytes);
+        Threshold
+    }
+}
+
+impl Drop for Threshold {
+    fn drop(&mut self) {
+        super::journal::set_compact_threshold(0);
+    }
+}
+
+/// Lead review 1 item 7: a catalog store's checkpoints — started by the create or first write that
+/// crossed the threshold, at the default (fuzzy) mode — issue NO sync while any thread holds the
+/// store mutex: neither the settling of what is buffered, nor the log's cut at the install. With
+/// the threshold lowered so `FE_CKPT_FORKS` (default 400) create-then-first-write pairs run at least
+/// three checkpoints, the syncs under the store mutex do not move.
+#[test]
+fn a_checkpoint_issues_no_sync_inside_the_store_mutex() {
+    let _s = serial();
+    let pairs = std::env::var("FE_CKPT_FORKS").ok().and_then(|v| v.parse().ok()).unwrap_or(400u64);
+    for class in [SyncClass::Fsync, SyncClass::FullFsync] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("ckpt-nosync.db"), opts(true, class));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let _t = Threshold::set(8 << 10);
+        let installed = db.branch_checkpoint_counters()[0];
+        let before = super::store::syncs_under_store_mutex();
+        for i in 0..pairs {
+            let b = trunk.fork_branch().unwrap();
+            write_v(&b.connect().unwrap(), 1 + (i as i64 % 50), "w");
+            let _ = b.into_id();
+        }
+        db.branch_checkpoint_wait();
+        let under = super::store::syncs_under_store_mutex() - before;
+        let ran = db.branch_checkpoint_counters()[0] - installed;
+        assert!(ran >= 3, "class={class:?}: premise: at least three checkpoints ran ({ran})");
+        assert_eq!(under, 0, "class={class:?}: {ran} checkpoints issued {under} syncs inside the store mutex");
+    }
+}
+
+/// Lead review 1 item 7, rule 2 under the new capture: a fuzzy checkpoint captured while a release's
+/// flight is still in the air neither waits for that flight nor frees what the release frees: the
+/// slots stay out of the allocator until the release is durable, and then are free exactly once —
+/// not in use, after the install and after a reopen. Mutant `deferred_matured_at_capture` must
+/// fail it; at the head before item 7 the capture waited for the flight.
+#[test]
+fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("deferred.db");
+    let (owned, incarnation) = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let x = trunk.fork_branch().unwrap();
+        write_v(&x.connect().unwrap(), 3, "x");
+        let owned = x.owned_slots();
+        assert!(!owned.is_empty(), "premise: the branch owns a slot");
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let release = std::thread::spawn(move || x.reap().map(|_| ()));
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let starter = {
+            let db = db.clone();
+            std::thread::spawn(move || db.branch_checkpoint_fuzzy_now())
+        };
+        let t = std::time::Instant::now();
+        while !starter.is_finished() && t.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !starter.is_finished() {
+            // The capture is waiting for the flight, holding the store mutex: let it go first.
+            hold.store(0, std::sync::atomic::Ordering::Release);
+            let _ = release.join();
+            let _ = starter.join();
+            panic!("the capture waited for a flight in the air");
+        }
+        for slot in &owned {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "slot {slot} was freed before the release that frees it was durable"
+            );
+        }
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        release.join().unwrap().unwrap();
+        assert!(starter.join().unwrap().unwrap(), "premise: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        let in_use = db.branch_slots_in_use();
+        for slot in &owned {
+            assert!(!in_use.contains(slot), "slot {slot} is still in use after its release");
+        }
+        (owned, db.incarnation)
+    };
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    let in_use = db.branch_slots_in_use();
+    for slot in &owned {
+        assert!(!in_use.contains(slot), "slot {slot} is in use after a reopen");
+    }
+    // Free exactly once: reused by new branches without two of them sharing it.
+    let trunk = db.connect().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..8 {
+        let b = trunk.fork_branch().unwrap();
+        write_v(&b.connect().unwrap(), 1 + i, "y");
+        for s in b.owned_slots() {
+            assert!(seen.insert(s), "slot {s} handed to two live branches");
+        }
+        let _ = b.into_id();
+    }
+}
+
+/// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
+/// past the threshold still, so without a back-off every create would start (and pay for) another
+/// one: it waits for another threshold's worth of log.
+#[test]
+fn a_failed_checkpoint_is_not_retried_by_the_next_create() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("ckpt-backoff.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _first = trunk.fork_branch().unwrap().into_id();
+    let _t = Threshold::set(8 << 10);
+    db.branch_failpoint(Some(BranchFailpoint::CheckpointWriteFails));
+    // Forks until a checkpoint has started and failed.
+    let started = db.branch_checkpoint_counters()[1];
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_counters()[1] == started {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "no checkpoint started");
+    }
+    db.branch_checkpoint_wait();
+    let after_failure = db.branch_checkpoint_counters()[1];
+    for _ in 0..5 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    db.branch_checkpoint_wait();
+    assert_eq!(
+        db.branch_checkpoint_counters()[1],
+        after_failure,
+        "the creates right after a failed checkpoint started another"
+    );
 }

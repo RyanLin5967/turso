@@ -123,17 +123,28 @@ pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
     Ok(FileId::from_path_hash(path))
 }
 
-/// Syncs issued process-wide, `[fsync(2), fcntl(F_FULLFSYNC)]`, by the unix backend and the branch
-/// store's own files (fastest-engine instrument; observing only, read by `branch::sync_counts`).
+/// Syncs issued process-wide, `[fsync(2), fcntl(F_FULLFSYNC), fcntl(F_BARRIERFSYNC)]`, by the unix
+/// backend and the branch store's own files (fastest-engine instrument; observing only, read by
+/// `branch::sync_counts`).
 #[doc(hidden)]
-pub static SYNC_COUNTS: [crate::sync::atomic::AtomicU64; 2] = [
+pub static SYNC_COUNTS: [crate::sync::atomic::AtomicU64; 3] = [
+    crate::sync::atomic::AtomicU64::new(0),
     crate::sync::atomic::AtomicU64::new(0),
     crate::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Count one `fcntl(F_BARRIERFSYNC)`.
+pub(crate) fn count_barrier() {
+    SYNC_COUNTS[2].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    crate::branch::store::note_sync();
+}
+
 /// Count one sync: `full` for `fcntl(F_FULLFSYNC)`, else `fsync(2)`.
 pub(crate) fn count_sync(full: bool) {
     SYNC_COUNTS[usize::from(full)].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    crate::branch::store::note_sync();
 }
 
 /// Controls which sync mechanism to use for durability.
