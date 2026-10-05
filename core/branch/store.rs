@@ -305,8 +305,12 @@ pub(crate) struct BranchStore {
     /// Test hook: the publication wait in milliseconds, in place of `PUBLISH_WAIT` (0: unset).
     #[cfg(test)]
     publish_wait_ms: AtomicU64,
-    /// The trunk's WAL is on the branch files' device (`note_trunk_wal`, `ordered_trunk`).
+    /// The trunk's WAL flush is an F_FULLFSYNC of the branch files' device (`note_trunk_wal`,
+    /// `ordered_trunk`).
     trunk_same_device: AtomicBool,
+    /// The device the branch log and arena were opened on (`StoreInner::files_device`), shared
+    /// with the store's inner state; `NO_DEVICE` until they are.
+    files_dev: Arc<AtomicU64>,
     /// Trunk commit barriers that took the store mutex (observation only; lead review 1 item 10).
     barrier_locks: AtomicU64,
     /// A catalog store's checkpoints are fuzzy (`BranchCheckpoint`; lead review 1 item 7).
@@ -770,6 +774,9 @@ struct StoreInner {
     /// The store's fail-stop flag, shared by its journal and its group: set once, by whichever fails
     /// first, and read by every write path through `Journal::check_live` (review B-F1).
     fail_stop: Arc<AtomicBool>,
+    /// The device the branch log and arena are on (`files_device`), `NO_DEVICE` until both are
+    /// open; shared with `BranchStore::files_dev`.
+    files_dev: Arc<AtomicU64>,
     /// The log sequence number that makes the newest fork durable: a listing waits for it, so no
     /// branch is listed before its fork is durable (review C-F4).
     last_fork_lsn: u64,
@@ -1088,6 +1095,9 @@ pub(crate) const HOLD_FORK_REGISTERING: u8 = 7;
 /// leads an upgrade flight of its own (liveness, should that commit stall: its caller may be the
 /// thread that drives it).
 const PENDING_FULL_WAIT: Duration = Duration::from_millis(100);
+
+/// `files_dev` before the branch files are open, or when their device could not be read.
+const NO_DEVICE: u64 = u64::MAX;
 
 /// If the hook is at `stage`, mark the arrival and wait until it is moved (tests and the harness
 /// release it by storing 0).
@@ -2514,6 +2524,7 @@ impl BranchStore {
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
+            files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
@@ -2674,7 +2685,7 @@ impl BranchStore {
                         stats.arena_ns = ns(t);
                         stats.arena_high_water = arena.in_use() as u64 + arena.free_count() as u64;
                         stats.arena_free = arena.free_count() as u64;
-                        super::journal::one_device(recovered.journal.device(), arena.device())?;
+                        inner.files_device(recovered.journal.device(), arena.device())?;
                         let mut arena = arena;
                         if closed {
                             recovered.journal.flush(&mut arena)?;
@@ -2720,6 +2731,7 @@ impl BranchStore {
             #[cfg(test)]
             publish_wait_ms: AtomicU64::new(0),
             trunk_same_device: AtomicBool::new(false),
+            files_dev: inner.files_dev.clone(),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
@@ -2983,7 +2995,7 @@ impl BranchStore {
         let in_use = u64::try_from(in_use)
             .map_err(|_| LimboError::Corrupt("branch catalog: negative arena use".into()))?;
         let mut arena = Arena::open_file_catalog(&files.arena, page_size, high_water, in_use, free_mem)?;
-        super::journal::one_device(recovered.journal.device(), arena.device())?;
+        inner.files_device(recovered.journal.device(), arena.device())?;
         if closed {
             recovered.journal.flush(&mut arena)?;
         }
@@ -3251,7 +3263,11 @@ impl BranchStore {
     /// is in the air: an ordinary one if anything is buffered, an UPGRADE one if the bytes were made
     /// durable only in a weaker class (see [`Group`]). Called WITHOUT the store mutex.
     pub(crate) fn wait_durable(&self, lsn: u64, class: SyncClass) -> Result<()> {
-        Self::wait_durable_on(&self.inner, &self.group, Some(&*self.trunk_commit_hold), lsn, class)
+        #[cfg(test)]
+        let hold = Some(&*self.trunk_commit_hold);
+        #[cfg(not(test))]
+        let hold = None;
+        Self::wait_durable_on(&self.inner, &self.group, hold, lsn, class)
     }
 
     /// `wait_durable` for a caller holding only the store's shared parts: a fuzzy checkpoint's
@@ -4808,28 +4824,20 @@ impl BranchStore {
             && !fe_mutant("trunk_unordered")
     }
 
-    /// Record whether the trunk's WAL at `wal_path` is on the branch files' device (see
-    /// `ordered_trunk`): their directories' `st_dev`. Anything unknown reads as "not".
-    pub(crate) fn note_trunk_wal(&self, wal_path: &str) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let dev = |path: &std::path::Path| {
-                let dir = match path.parent() {
-                    Some(dir) if !dir.as_os_str().is_empty() => dir,
-                    _ => std::path::Path::new("."),
-                };
-                std::fs::metadata(dir).ok().map(|m| m.dev())
-            };
-            let log = self.inner.lock().files.as_ref().map(|f| f.log.clone());
-            let same = log.is_some_and(|log| {
-                let ours = dev(&log);
-                ours.is_some() && ours == dev(std::path::Path::new(wal_path))
-            });
+    /// Record whether this trunk commit's WAL flush drains the branch files' device (see
+    /// `ordered_trunk`): `wal_device` is what the WAL file being synced reports
+    /// (`Wal::full_fsync_device`: `Some` only for an F_FULLFSYNC on its own descriptor), and it must
+    /// be the device the branch log and arena were opened on, read from their descriptors
+    /// (`files_device`). Anything unknown reads as "not" (review 3 #3). Called by every trunk
+    /// commit that syncs its WAL in FullFsync, before its barrier.
+    pub(crate) fn note_trunk_wal(&self, wal_device: Option<u64>) {
+        let files = self.files_dev.load(Ordering::Acquire);
+        // Mutant `trust_any_wal` (test builds only): as before review 3 #3, any WAL flush counts
+        // once the branch files' device is known.
+        let same = files != NO_DEVICE && (wal_device == Some(files) || fe_mutant("trust_any_wal"));
+        if self.trunk_same_device.load(Ordering::Relaxed) != same {
             self.trunk_same_device.store(same, Ordering::Release);
         }
-        #[cfg(not(unix))]
-        let _ = wal_path;
     }
 
     /// Make the journal's first `lsn` bytes ORDERED ahead of a trunk commit's frames, leading an
@@ -5679,8 +5687,17 @@ impl StoreInner {
             names: NameIndex::default(),
             trunk_commit_epoch: 0,
             fail_stop: Arc::new(AtomicBool::new(false)),
+            files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             last_fork_lsn: 0,
         }
+    }
+
+    /// Ruling 85a032f01's guard over the branch log and arena as opened (`one_device`), recording
+    /// their device for `BranchStore::note_trunk_wal` (review 3 #3).
+    fn files_device(&self, log: Option<u64>, arena: Option<u64>) -> Result<()> {
+        super::journal::one_device(log, arena)?;
+        self.files_dev.store(log.unwrap_or(NO_DEVICE), Ordering::Release);
+        Ok(())
     }
 
     /// F-W1: the live-id set as the listing before it computed the list: every resident state that
@@ -6430,10 +6447,7 @@ impl StoreInner {
                     }
                 }
                 let arena = Arena::open_file(&files.arena, page_size, true, &[])?;
-                super::journal::one_device(
-                    self.journal.as_ref().and_then(Journal::device),
-                    arena.device(),
-                )?;
+                self.files_device(self.journal.as_ref().and_then(Journal::device), arena.device())?;
                 // The journal's create synced the directory before the arena file existed.
                 if self.sync.syncs() {
                     super::journal::fsync_dir_of(&files.arena, self.sync)?;

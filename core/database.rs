@@ -966,9 +966,6 @@ impl Database {
             branch_base,
             flags.contains(OpenFlags::ReadOnly),
         )?);
-        // fastest-engine (lead review 1 item 6): whether a trunk WAL flush also drains the branch
-        // files' device.
-        branches.note_trunk_wal(&wal_path);
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
