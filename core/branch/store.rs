@@ -6483,7 +6483,7 @@ impl StoreInner {
     /// `Arena::open_file` counts whole slots of the recovered page size.
     fn restart_empty(&mut self, page_size: usize) -> Result<()> {
         let Some(files) = self.files.clone() else {
-            self.arena = Some(Arena::new(page_size));
+            self.restarted_arena(Arena::new(page_size));
             return Ok(());
         };
         if self.cat.is_some() {
@@ -6500,7 +6500,7 @@ impl StoreInner {
                 return Err(e);
             }
             match Arena::open_file(&files.arena, page_size, true, &[]) {
-                Ok(arena) => self.arena = Some(arena),
+                Ok(arena) => self.restarted_arena(arena),
                 Err(e) => {
                     if let Some(journal) = self.journal.as_mut() {
                         journal.poison();
@@ -6526,7 +6526,7 @@ impl StoreInner {
         self.lease.queued(snapshot.lease_now_ms);
         self.lease.flushed();
         match Arena::open_file(&files.arena, page_size, true, &[]) {
-            Ok(arena) => self.arena = Some(arena),
+            Ok(arena) => self.restarted_arena(arena),
             Err(e) => {
                 // The snapshot and the log header already say the new page size; the arena in
                 // memory still has the old one. Fail-stop rather than run on with the two
@@ -6538,6 +6538,17 @@ impl StoreInner {
             }
         }
         Ok(())
+    }
+
+    /// The restarted empty store's arena replaces the old one, and with it go the frees deferred
+    /// for releases whose flights had not landed (skill review 1 (f)): their slots were the old
+    /// arena's, and the empty state the restart wrote made those releases durable. Mutant
+    /// `restart_keeps_deferred` (test builds only).
+    fn restarted_arena(&mut self, arena: Arena) {
+        self.arena = Some(arena);
+        if !fe_mutant("restart_keeps_deferred") {
+            self.pending_free.clear();
+        }
     }
 
     /// Catalog mode's compaction, an incremental checkpoint: every branch and trunk page changed
