@@ -27,7 +27,7 @@
 #      enumeration) is attached; untraced_tasks must name the child (the condition strace_attach retries on).
 #   F10b the same tree attached by strace_attach: it must list the pre-existing child, complete on try 1, and count
 #      the parent's fsync x1 and the child's fsync x2 = 3, verdict ok.
-#   F10c a fork storm (a child every ~2 ms, each fsyncs once ~50 ms later and logs whether it was traced) attached by
+#   F10c a fork storm (a child every ~10 ms, each fsyncs once ~500 ms later and logs whether it was traced) attached by
 #      a parent-only strace: the control MUST log untraced child fsyncs after t0, or the storm proves nothing.
 #   F10d the same storm attached by strace_attach (freeze, enumeration, completeness): no untraced child fsync after
 #      t0, frozen=1, and at least as many fsyncs counted as traced children logged.
@@ -113,7 +113,7 @@ if mode == "dsync-pre":
     os.write(fd, b"y" * 4096)
     done_and_stay()
 if mode == "forkstorm":
-    # A child every ~2 ms; each sleeps 50 ms, reads its own TracerPid, fsyncs once and logs "pid tracerpid time".
+    # A child every ~10 ms; each sleeps 500 ms (~50 alive at any time, so many are still waiting when the window opens), reads its own TracerPid, fsyncs once and logs "pid tracerpid time".
     # A child whose fsync came after the window opened but that was never traced is a missed flush (F10c/F10d).
     fd = os.open(f"{d}/forkstorm.dat", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     os.write(fd, b"x" * 4096)
@@ -121,7 +121,7 @@ if mode == "forkstorm":
     ready()
     while not os.path.exists(stop):
         if os.fork() == 0:
-            time.sleep(0.05)
+            time.sleep(0.5)
             tp = [ln.split()[1] for ln in open("/proc/self/status") if ln.startswith("TracerPid:")][0]
             os.fsync(fd)
             t = time.time()
@@ -133,7 +133,7 @@ if mode == "forkstorm":
                 pass
         except ChildProcessError:
             pass
-        time.sleep(0.002)
+        time.sleep(0.01)
     try:
         while True:
             os.waitpid(-1, 0)
@@ -364,13 +364,15 @@ if start_probe2 forkstorm; then
   strace -f -qq -e trace=fsync -o "$OUT/f10c.strace" -p "$PP2" 2>"$OUT/f10c.strace.err" &
   sp=$!
   for ((i = 0; i < 400; i++)); do traced_all "$sp" "$PP2" && break; sleep 0.05; done
+  ctl_attached=0; [ $i -lt 400 ] && ctl_attached=1
+  [ $ctl_attached = 1 ] || log "F10c note: the control strace never attached (it then cannot miss for the right reason)"
   t0=$(date +%s.%N)
   sleep 0.5
   touch "$DIR/fc/go-forkstorm.stop"
   for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/forkstorm.done" ] && break; sleep 0.05; done
   kill -INT "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
   read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0")
-  if [ "${miss:-0}" -ge 1 ]; then
+  if [ $ctl_attached = 1 ] && [ "${miss:-0}" -ge 1 ]; then
     log "PASS F10c-storm-control-misses: a parent-only attach missed $miss untraced child fsync(s) after t0 ($traced traced)"
   else
     log "FAIL F10c-storm-control-misses: the control missed nothing (miss=$miss traced=$traced): the storm did not exercise the race"
