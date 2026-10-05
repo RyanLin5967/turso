@@ -153,6 +153,31 @@ static uint64_t self_pidns(void) {
     struct stat st;
     return stat("/proc/self/ns/pid", &st) == 0 ? (uint64_t)st.st_ino : 0;
 }
+/* Can the liveness check trust /proc? It reads pids through the /proc MOUNT, which belongs to the namespace that
+ * mounted it, not necessarily to this process's (nsenter -p without -m, unshare --pid without --mount-proc), and
+ * which can hide other users' processes (hidepid). Returns NULL if it can, else why not. */
+static const char *proc_untrusted(void) {
+    char buf[32];
+    ssize_t n = readlink("/proc/self", buf, sizeof buf - 1);
+    if (n <= 0) return "/proc/self is unreadable";
+    buf[n] = 0;
+    if (strtol(buf, NULL, 10) != (long)getpid()) return "/proc is another pid namespace's mount";
+    if (geteuid() == 0) return NULL; /* root sees every process whatever hidepid says */
+    FILE *f = fopen("/proc/self/mountinfo", "re");
+    if (!f) return "/proc/self/mountinfo is unreadable";
+    char line[4096];
+    const char *why = NULL;
+    while (!why && fgets(line, sizeof line, f)) {
+        /* "id parent maj:min root mountpoint opts ... - fstype source superopts" */
+        char mp[1024];
+        if (sscanf(line, "%*s %*s %*s %*s %1023s", mp) != 1 || strcmp(mp, "/proc") != 0) continue;
+        const char *h = strstr(line, "hidepid=");
+        if (h && strncmp(h, "hidepid=0", 9) != 0 && strncmp(h, "hidepid=off", 11) != 0)
+            why = "/proc hides other users' processes (hidepid)";
+    }
+    fclose(f);
+    return why;
+}
 
 static void json_str(const char *s) {
     putchar('"');
@@ -230,6 +255,9 @@ static int cmd_report(const char *run, int argc, char **argv) {
         async_io += sl[i].async_io;
         inflight += sl[i].inflight;
     }
+    /* a slot claimed while the scan ran (a fork child of a process just read as dead) makes the snapshot stale */
+    if (used_slots(h) != nslot) claiming++;
+    const char *proc_bad = proc_untrusted();
     uint64_t unattached = 0, unwritten = 0;
     for (uint64_t i = 0; i < nx; i++) {
         int st = __atomic_load_n(&xs[i].state, __ATOMIC_ACQUIRE);
@@ -257,6 +285,9 @@ static int cmd_report(const char *run, int argc, char **argv) {
     V1_CHECK(foreign, 0, 12,
              "FOREIGN: slots from another pid namespace; their pids and liveness mean nothing here (report from inside "
              "that namespace)", "")
+    V1_CHECK(proc_bad != NULL, 0, 12,
+             "FOREIGN: the /proc this report reads cannot show the counted processes (another pid namespace's mount, "
+             "or hidepid); liveness would be read from the wrong processes", "")
     V1_CHECK(live || claiming, allow_live, 10,
              "LIVE: a counted process is still running (or a slot claim never finished); the counts can still grow",
              "live")
@@ -296,13 +327,14 @@ static int cmd_report(const char *run, int argc, char **argv) {
         printf(",\"waived\":[");
         for (int i = 0; i < nw; i++) { printf("%s", i ? "," : ""); json_str(waived[i]); }
         printf("],\"rc\":%d,\"root_pid\":%d,\"root_attached\":%s,\"attached\":%d,\"live\":%d,\"claiming\":%d"
-               ",\"foreign_ns\":%d,\"go_slots\":%d"
+               ",\"foreign_ns\":%d,\"proc_untrusted\":%s,\"go_slots\":%d"
                ",\"slot_overflow\":%" PRIu64 ",\"events_claimed\":%" PRIu64 ",\"events_dropped\":%" PRIu64
                ",\"events_incomplete\":%" PRIu64 ",\"inflight\":%" PRIu64 ",\"execs_claimed\":%" PRIu64
                ",\"execs_dropped\":%" PRIu64 ",\"execs_unwritten\":%" PRIu64 ",\"execs_unattached\":%" PRIu64
                ",\"fd_untracked\":%" PRIu64 ",\"unresolved_mask\":%" PRIu64 ",\"async_io\":%" PRIu64
                ",\"mark\":%" PRIu64,
-               rc, h->root_pid, root_seen ? "true" : "false", attached, live, claiming, foreign, go_slots, overflow,
+               rc, h->root_pid, root_seen ? "true" : "false", attached, live, claiming, foreign,
+               proc_bad ? "true" : "false", go_slots, overflow,
                h->ev_next, dropped, incomplete, inflight, exec_next, exec_dropped, unwritten, unattached, fd_untracked,
                unresolved, async_io, h->mark);
         printf(",\"classes\":{\"flush\":%" PRIu64 ",\"writeback\":%" PRIu64 ",\"clone\":%" PRIu64 "}",

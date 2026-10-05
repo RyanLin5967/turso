@@ -81,6 +81,8 @@ jobs:
           # The bigfd arm writes on fd 1048600 (beyond the shim's 2^20-fd tracker): raise the kernel's per-process
           # cap and this shell's NOFILE hard limit, which the fire-check and its probes inherit.
           sudo sysctl -w fs.nr_open=2097152
+          # the liburing init_mem arm hands io_uring a 2 MiB huge-page buffer
+          sudo sysctl -w vm.nr_hugepages=8
           sudo prlimit --pid $$ --nofile=2097152:2097152
           echo "nofile soft=$(ulimit -Sn) hard=$(ulimit -Hn)" | tee -a "$RAW/run-info.txt"
           timeout 1800 python3 -B fastest/linux/flush/firecheck.py --build "$RAW/build" --work "$MNT/fc" \

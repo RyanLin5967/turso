@@ -16,8 +16,9 @@
  *                 K pwrite64 on an fd opened O_DSYNC by syscall(SYS_openat), K write on one opened O_SYNC by
  *                 syscall(SYS_openat2), K write on an O_DSYNC fd dup'd by syscall(SYS_dup)
  *     uring       K fsync, then io_uring_setup and io_setup through syscall(2): the report must refuse (async I/O)
- *     threads     _Fork (no fork handler runs), then 8 threads in the child race their first counted calls: each makes
- *                 K fsync and K writes on its own O_DSYNC fd; the child must hold exactly one slot
+ *     threads     a raw-instruction clone (no fork handler, no wrapper: no slot at birth), then 8 threads in the child
+ *                 race their first counted calls: each makes K fsync and K writes on its own O_DSYNC fd; the child
+ *                 must hold exactly one slot
  *     sqlite      one commit through the system libsqlite3.so.0 (journal_mode=DELETE, synchronous=FULL)
  *     killme      K fsync, print "ready pid=N", then wait to be SIGKILLed
  *     killmid     K fsync, print "ready pid=N", then block INSIDE a counted call (a write on a full O_DSYNC FIFO)
@@ -106,11 +107,27 @@ static long rawsys1(long n, long a) {
     __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a) : "rcx", "r11", "memory");
     return r;
 }
+/* A fork-like clone(SIGCHLD) as a raw instruction: no libc, no fork handler, no shim wrapper sees it. */
+static long rawclone(void) {
+    long r;
+    register long r10 __asm__("r10") = 0;
+    register long r8 __asm__("r8") = 0;
+    __asm__ volatile("syscall" : "=a"(r) : "a"((long)SYS_clone), "D"((long)SIGCHLD), "S"(0L), "d"(0L), "r"(r10),
+                     "r"(r8) : "rcx", "r11", "memory");
+    return r;
+}
 #elif defined(__aarch64__)
 static long rawsys1(long n, long a) {
     register long x8 __asm__("x8") = n;
     register long x0 __asm__("x0") = a;
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+    return x0;
+}
+static long rawclone(void) {
+    register long x8 __asm__("x8") = SYS_clone;
+    register long x0 __asm__("x0") = SIGCHLD;
+    register long x1 __asm__("x1") = 0, x2 __asm__("x2") = 0, x3 __asm__("x3") = 0, x4 __asm__("x4") = 0;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4) : "memory");
     return x0;
 }
 #else
@@ -669,6 +686,14 @@ static void *le_worker(void *arg) {
     char b[512] = {0};
     if (write(fd, b, sizeof b) != (ssize_t)sizeof b) _exit(6);
     for (int i = 0; i < g_le_k; i++) if (fsync(fd) != 0) _exit(7);
+    /* the leader is a zombie now: the shim must still read openat2's struct open_how (it copies it on this thread) */
+    char p[4096];
+    pathof("leader_dsync", p, sizeof p);
+    struct probe_open_how how = {O_WRONLY | O_CREAT | O_TRUNC | O_DSYNC, 0644, 0};
+    int d = (int)syscall(SYS_openat2, AT_FDCWD, p, &how, sizeof how);
+    if (d < 0) _exit(8);
+    for (int i = 0; i < g_le_k; i++) if (write(d, b, sizeof b) != (ssize_t)sizeof b) _exit(9);
+    close(d);
     close(fd);
     return NULL; /* the last thread: the process exits 0 */
 }
@@ -721,8 +746,10 @@ static void *thr_main(void *arg) {
 static int run_threads(int K) {
     g_tk = K;
     mark(1);
-    pid_t c = _Fork();
-    if (c < 0) die("_Fork");
+    /* a raw-instruction clone: no fork handler and no _Fork wrapper runs, so the child has no slot at birth and its
+     * 8 threads race the first claim */
+    pid_t c = (pid_t)rawclone();
+    if (c < 0) { errno = (int)-c; die("raw clone"); }
     if (c == 0) {
         pthread_t t[NTHREADS];
         if (pthread_barrier_init(&g_bar, NULL, NTHREADS)) _exit(2);
@@ -731,7 +758,7 @@ static int run_threads(int K) {
         for (int i = 0; i < NTHREADS; i++) pthread_join(t[i], NULL);
         _exit(0);
     }
-    wait_ok(c, "_Fork child with racing threads");
+    wait_ok(c, "raw-clone child with racing threads");
     mark(0);
     printf("probe_c threads K=%d root=%d child=%d nthreads=%d\n", K, (int)getpid(), (int)c, NTHREADS);
     return 0;

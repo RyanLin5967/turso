@@ -6,7 +6,8 @@
 #   syncshim_mut_<name>.so       fire-check mutants: three each missing one interpose (pwrite64, __open_2, fdatasync)
 #                                and three each breaking one piece of logic (no_fork_claim: a fork child gets no slot
 #                                at birth; syscall_no_fcntl: fcntl through syscall(2) is not tracked; pwritev2_a4: raw
-#                                pwritev2's flags are read from the wrong argument)
+#                                pwritev2's flags are read from the wrong argument; no_recheck: a slow slot claim whose
+#                                waiters claim again without re-checking)
 #   v1ctl, v1run                 run control and launcher
 #   probe_c, probe_c_static      the C probe, and a static build of its "spawned" mode (never loads the shim)
 #   probe_uring                  a C probe linked against liburing.so (io_uring_queue_init + IORING_OP_FSYNC)
@@ -25,7 +26,7 @@ CC=${CC:-gcc}
 # symbols, and the shim would define one symbol twice.
 CF=(-O2 -g -Wall -Wextra -Werror -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -U_FILE_OFFSET_BITS)
 DROP_MUTANTS="pwrite64 open_2 fdatasync"
-LOGIC_MUTANTS="no_fork_claim syscall_no_fcntl pwritev2_a4"
+LOGIC_MUTANTS="no_fork_claim syscall_no_fcntl pwritev2_a4 no_recheck"
 
 # Every unit is attempted, so one run reports every compile error; any failure fails the build at the end.
 broken=()
@@ -56,7 +57,7 @@ WRAPPERS="fsync fdatasync sync_file_range syncfs sync msync ioctl copy_file_rang
   __pwrite64 writev pwritev pwritev64 pwritev2 pwritev64v2 sendfile sendfile64 splice syscall open open64 __open
   __open64 openat openat64 __open_2 __open64_2 __openat_2 __openat64_2 creat creat64 open_by_handle_at fcntl fcntl64
   __fcntl dup dup2 __dup2 dup3 close __close execve execv execvp execvpe execl execle execlp fexecve execveat
-  posix_spawn posix_spawnp _Fork io_uring_queue_init io_uring_queue_init_params io_uring_setup"
+  posix_spawn posix_spawnp _Fork io_uring_queue_init io_uring_queue_init_params io_uring_queue_init_mem io_uring_setup"
 exports() { nm -D --defined-only "$1" | awk '$2 == "T" || $2 == "W" {print $3}' | sort -u; }
 shim_exp=$(exports "$OUT/syncshim.so")
 for w in $WRAPPERS; do grep -qx -- "$w" <<<"$shim_exp" || fail "syncshim.so does not export $w"; done
