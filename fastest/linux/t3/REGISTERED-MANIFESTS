@@ -1,0 +1,2 @@
+# sha256 of every REGISTERED T3 cell manifest, one per line, appended only by the commit that registers it.
+# Empty: no T3 registration exists yet, so t3run.sh refuses every non-dry run.

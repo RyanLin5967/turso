@@ -1,0 +1,65 @@
+name: fastest-t3-dryrun
+# Lane fastest-linux, T3-READY gate item 6: dry-run the one-command T3 runner end to end on a hosted
+# runner, exactly as a rented box would get it -- the script fetched by URL at this commit and piped to
+# bash, which clones the fork at this commit and runs everything from there. The job must finish with
+# complete raws (summarize.py exit 0) and records its wall time. Numbers from a hosted runner are never
+# credited: its disk is not T3 hardware (frontier/fastest/linux/GATES.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: "cell manifest path in the repo"
+        default: "fastest/linux/t3/cells-smoke.tsv"
+      runner:
+        description: "ubuntu-24.04 or ubuntu-24.04-arm"
+        default: "ubuntu-24.04"
+  push:
+    branches: [fastest-branching, fastest-linux-t3]
+    paths:
+      - "fastest/linux/t3/**"
+      - ".github/workflows/fastest-t3-dryrun.yml"
+
+concurrency:
+  group: fastest-t3-dryrun-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dryrun:
+    name: t3 dry run (${{ inputs.runner || 'ubuntu-24.04' }})
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 350
+    steps:
+      - name: The one command, as on a rented box
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          curl -sSfL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/fastest/linux/t3/t3run.sh" \
+            | bash -s -- --sha "$GITHUB_SHA" --out "$HOME/t3-out" --dry-run \
+                --manifest "${{ inputs.manifest || 'fastest/linux/t3/cells-smoke.tsv' }}"
+          rc=$?
+          echo "one-command wall seconds: $(( $(date +%s) - start )) rc=$rc" | tee "$HOME/t3-wall.txt"
+          exit $rc
+      - name: Summary
+        if: always()
+        run: |
+          cat "$HOME/t3-wall.txt" 2>/dev/null
+          cat "$HOME/t3-out/stages.tsv" 2>/dev/null
+          python3 -c "import json; s=json.load(open('$HOME/t3-out/summary.json')); print(s['planned_runs'], s['complete_runs'], s['incomplete'], s['failed_stages'])" 2>&1 || true
+          { echo '```'; cat "$HOME/t3-out/stages.tsv" 2>/dev/null; cat "$HOME/t3-wall.txt" 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-dryrun-${{ inputs.runner || 'ubuntu-24.04' }}
+          path: |
+            ~/t3-out.tar.gz
+            ~/t3-out.tar.gz.sha256
+            ~/t3-out/summary.json
+            ~/t3-out/stages.tsv
+            ~/t3-out/t3run.log
+            ~/t3-wall.txt
+          retention-days: 90
