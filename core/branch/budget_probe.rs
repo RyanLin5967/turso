@@ -151,6 +151,10 @@ pub(crate) struct Snapshot {
     pub(crate) t_locks: u64,
     pub(crate) held_syscalls: u64,
     pub(crate) t_held_syscalls: u64,
+    /// Syncs issued by a thread while it held a store mutex (the engine's own
+    /// `store::syncs_under_store_mutex`: attributed to the holder, so exact with other threads
+    /// running, unlike `held_syscalls`).
+    pub(crate) held_syncs: u64,
     pub(crate) fsync: u64,
     pub(crate) full_fsync: u64,
     pub(crate) barrier: u64,
@@ -200,6 +204,7 @@ fn user_counts() -> Snapshot {
         t_locks: get(&T_LOCKS),
         held_syscalls: HELD_SYSCALLS.load(Relaxed),
         t_held_syscalls: get(&T_HELD_SYSCALLS),
+        held_syncs: crate::branch::store::syncs_under_store_mutex(),
         fsync: syncs.fsync,
         full_fsync: syncs.full_fsync,
         barrier: syncs.barrier,
