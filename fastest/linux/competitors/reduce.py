@@ -7,12 +7,17 @@ What SHOULD be there is never taken from what is there (review finding 11):
     AT THE RUN'S OWN COMMIT (git_sha from the jobs' run-info.txt, read with `git show` in --repo, default: the
     repository holding this file); a job whose artifact is absent is a MISSING row;
   - the expected cells of a job are the ones run_system.sh listed in run/expected-cells.txt before it ran any; a
-    listed cell without a cell.json, or a job without the list, is a MISSING row.
+    listed cell without a cell.json, or a job without the list, is a MISSING row;
+  - and, independently of run_system.sh, PINNED below: amendment 14's registered cells per system at C in {1, 4}. A
+    pinned cell the job did not list is MISSING too, so a spec dropped from run_system.sh's SPECLIST cannot vanish
+    (second review, finding 4). A system with no pin is MISSING (no expectation), never skipped.
+A matrix with include:/exclude: entries is refused (this parser reads only the runner, fs and system lists).
 Prints, tab-separated:
   JOBS   artifact, firecheck verdict, functional verdict, failed functional lines
   CELLS  artifact, cell, then stracecount.py's table columns (TABLE_COLS)
-Exit 0 only if every expected job and cell is present and readable; 1 otherwise (after printing everything);
-2 if the expectation itself cannot be determined.
+Exit 0 only if every expected job and cell is present and readable, every fire-check and functional verdict is a
+PASS and every cell verdict is ok; 1 otherwise (after printing everything); 2 if the expectation itself cannot be
+determined.
 """
 import glob
 import json
@@ -26,6 +31,16 @@ sys.path.insert(0, HERE)
 import stracecount  # noqa: E402  (the same table columns as each job's own flushes.tsv)
 
 WORKFLOW = ".github/workflows/fastest-competitors.yml"
+_PG = ["pg18-select1", "pg18-create", "pg18-m1c", "pg18-m1", "pg18-create-wal", "pg18-m1c-wal", "pg18-m1-wal"]
+_DV = ["create", "a-m1c", "a-m1", "b-m1c", "b-m1", "c-m1c", "c-m1"]
+PINNED_SPECS = {
+    "pg18-d2": _PG,
+    "pg18-defaults": _PG + ["pg18-create-copy"],
+    "dolt": ["dolt-select1"] + [f"dolt-{v}" for v in _DV],
+    "doltgres": ["doltgres-select1"] + [f"doltgres-{v}" for v in _DV],
+    "b1": [f"b1-{s}" for s in ("m1c-d2", "m1-d2", "m1c-d0", "m1-d0")],
+}
+PINNED_CLIENTS = ("1", "4")
 
 
 def last_line(path, prefix):
@@ -54,6 +69,9 @@ def expected_jobs(d, repo):
     job = re.search(r"^  run:\n(.*?)(?=^  \S|\Z)", jobs.group(1), re.M | re.S) if jobs else None
     if not job:
         sys.exit(f"reduce: REFUSED: no `run` job in {WORKFLOW} at {sha}")
+    if re.search(r"^\s+(include|exclude):", job.group(1), re.M):
+        sys.exit(f"reduce: REFUSED: the run job's matrix at {sha} has include:/exclude: entries, which this parser does"
+                 " not read")
     axes = {}
     for k in ("runner", "fs", "system"):
         m = re.search(rf"^\s+{k}: \[([^\]]*)\]", job.group(1), re.M)
@@ -75,7 +93,7 @@ def main(argv):
         sys.exit(__doc__)
     sha, axes, names = expected_jobs(d, repo)
     present = {os.path.basename(p) for p in glob.glob(os.path.join(d, "competitors-*")) if os.path.isdir(p)}
-    missing = 0
+    missing, bad = 0, 0
     print(f"# run dir {d}: workflow at {sha}: {len(names)} expected jobs "
           f"({len(axes['system'])} systems x {len(axes['runner'])} runners x {len(axes['fs'])} fs)")
     extra = sorted(present - set(names))
@@ -95,12 +113,24 @@ def main(argv):
         fn = last_line(fpath, "VERDICT")
         fails = [l.strip() for l in open(fpath) if l.startswith(("FAIL", "REFUSED"))] if os.path.exists(fpath) else []
         print(f"JOBS\t{name}\t{fc}\t{fn}\t{' || '.join(fails)}")
+        if not fc.startswith("VERDICT PASS") or not fn.startswith("VERDICT PASS"):
+            bad += 1
         exp_path = os.path.join(a, "run", "expected-cells.txt")
         if not os.path.exists(exp_path):
             cells.append((name, "MISSING (no expected-cells.txt)", None))
             missing += 1
             continue
-        for cell in [l.strip() for l in open(exp_path) if l.strip()]:
+        listed = [l.strip() for l in open(exp_path) if l.strip()]
+        system = next((s for s in axes["system"] if name.startswith(f"competitors-{s}-")), None)
+        if system not in PINNED_SPECS:
+            cells.append((name, f"MISSING (no pinned expectation for system {system})", None))
+            missing += 1
+        else:
+            for pinned in [f"{s}-c{c}" for s in PINNED_SPECS[system] for c in PINNED_CLIENTS]:
+                if pinned not in listed:
+                    cells.append((name, f"{pinned} MISSING (pinned, not listed by run_system.sh)", None))
+                    missing += 1
+        for cell in listed:
             cj_path = os.path.join(a, "run", "cells", cell, "cell.json")
             try:
                 cells.append((name, cell, json.load(open(cj_path))))
@@ -113,8 +143,11 @@ def main(argv):
             print(f"CELLS\t{name}\t{cell}" + "\tMISSING" * len(stracecount.TABLE_COLS))
             continue
         print("CELLS\t" + "\t".join([name, cell] + [str(x) for x in stracecount.table_row(c)]))
-    if missing:
-        print(f"# {missing} expected job(s) or cell(s) MISSING", file=sys.stderr)
+        if c.get("verdict") != "ok":
+            bad += 1
+    if missing or bad:
+        print(f"# {missing} expected job(s) or cell(s) MISSING; {bad} job verdict(s) not PASS or cell verdict(s) not ok",
+              file=sys.stderr)
         sys.exit(1)
 
 
