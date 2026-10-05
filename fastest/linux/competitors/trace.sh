@@ -37,12 +37,21 @@ descendants() { # descendants PID -> every live, non-zombie descendant pid of PI
   done
 }
 
+# task_state STAT_FILE -> the one-letter state of /proc/<pid>[/task/<tid>]/stat (parsed after the last ')': the comm
+# field may hold spaces); empty when the task is gone.
+task_state() { awk '{ s = $0; sub(/.*\) /, "", s); split(s, a, " "); print a[1] }' "$1" 2>/dev/null; }
+# dead_task TASKDIR -> 0 for a zombie, a dead task, or one gone: it can no longer issue a syscall, so it needs no
+# tracer. A child that exits while the postmaster is frozen stays a zombie (only the postmaster reaps it) and reads
+# TracerPid 0 (third review, finding 2: under the freeze it stalled the attach for 20 s, then failed it).
+dead_task() { case $(task_state "$1/stat") in Z|X|x|"") return 0 ;; esac; return 1; }
+
 untraced_tasks() { # untraced_tasks STRACEPID PID... -> each live task "<pid>/task/<tid>" of PID... not traced by STRACEPID
   local st=$1 p t tp
   shift
   for p in "$@"; do
     for t in /proc/"$p"/task/*; do
       [ -e "$t/status" ] || continue
+      dead_task "$t" && continue
       tp=$(awk '/^TracerPid:/{print $2}' "$t/status" 2>/dev/null)
       [ -z "$tp" ] || [ "$tp" = "$st" ] || echo "${t#/proc/}"
     done
@@ -101,6 +110,7 @@ traced_all() { # traced_all STRACEPID MAIN [PID...] -> 0 when MAIN is alive and 
     [ -d "/proc/$p" ] || continue  # a descendant that exited between enumeration and attach: nothing left to trace
     for t in /proc/"$p"/task/*; do
       [ -e "$t/status" ] || continue
+      dead_task "$t" && continue
       tp=$(awk '/^TracerPid:/{print $2}' "$t/status" 2>/dev/null) || return 1
       [ -z "$tp" ] && continue  # the task exited while we read it
       [ "$tp" = "$st" ] || return 1
@@ -108,7 +118,7 @@ traced_all() { # traced_all STRACEPID MAIN [PID...] -> 0 when MAIN is alive and 
   done
 }
 
-proc_state() { awk '{print $3}' "/proc/$1/stat" 2>/dev/null; }  # R S D T t Z ...
+proc_state() { task_state "/proc/$1/stat"; }  # R S D T t Z ...
 
 # freeze MAIN / thaw MAIN: SIGSTOP the server's main process for the enumeration and the seize, so it cannot fork a
 # child in between (second review, finding 3: a child forked in that gap and gone before the completeness check was
