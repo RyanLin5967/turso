@@ -294,7 +294,8 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     flush = {k: 0 for k in FLUSH}
     flush["msync_sync"] = 0
     other = {"sync_file_range": 0, "msync_nosync": 0, "copy_file_range_calls": 0, "copy_file_range_bytes": 0,
-             "ficlone": 0, "osync_opens": 0, "osync_fcntl": 0, "rwf_sync_writes": 0, "io_uring": 0, "io_submit": 0}
+             "copy_file_range_failed": 0, "ficlone": 0, "ficlone_failed": 0, "osync_opens": 0, "osync_fcntl": 0,
+             "rwf_sync_writes": 0, "io_uring": 0, "io_submit": 0}
     by_class, by_path, by_tid = {}, {}, {}
     spawned = []  # (creator tid, new tid, is a thread) from clone/clone3/fork/vfork lines -- of the WHOLE trace
     # Calls still unfinished at the detach are not counted as flushes (strace's -c table counts a call when it
@@ -332,12 +333,19 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
         elif name == "sync_file_range":
             other["sync_file_range"] += 1
         elif name == "copy_file_range":
-            other["copy_file_range_calls"] += 1
-            if ret not in ("?",) and not ret.startswith("-"):
+            # Only a call that returned bytes is clone evidence (second review, finding 8); a failed one is counted
+            # apart. A silent in-kernel byte copy is invisible here: the filefrag proof is what tells clone from copy.
+            if ret.isdigit():
+                other["copy_file_range_calls"] += 1
                 other["copy_file_range_bytes"] += int(ret)
+            else:
+                other["copy_file_range_failed"] += 1
         elif name == "ioctl":
             if "FICLONE" in rest or "BTRFS_IOC_CLONE" in rest:
-                other["ficlone"] += 1
+                if ret == "0":
+                    other["ficlone"] += 1
+                else:
+                    other["ficlone_failed"] += 1
         elif name in OPENS:  # open/openat/openat2 (review finding 10: open and openat2 were not inspected)
             if sync_flag(rest):
                 other["osync_opens"] += 1

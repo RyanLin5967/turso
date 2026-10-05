@@ -385,10 +385,16 @@ b1_main() {
   else
     fail "clone proof: no m1c-d2 C=1 branch"
   fi
-  local fic
+  local fic created1
   fic=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['ficlone'])" "$RAW/cells/b1-m1c-d2-c1/load.json" 2>/dev/null)
-  expect "clone proof (strace): FICLONE calls in the m1c-d2 C=1 window = creates" "$fic" \
-    "$(cut -d' ' -f3 "$RAW/cells/b1-m1c-d2-c1/ops.txt" 2>/dev/null)"
+  created1=$(cut -d' ' -f3 "$RAW/cells/b1-m1c-d2-c1/ops.txt" 2>/dev/null)
+  # Both sides must exist and be positive: two empty strings used to compare equal and pass (second review, finding
+  # 8, e.g. FT_CLIENTS without 1). FICLONE counts only calls that returned 0.
+  if [ -n "$fic" ] && [ -n "$created1" ] && [ "$created1" -gt 0 ] 2>/dev/null; then
+    expect "clone proof (strace): successful FICLONE calls in the m1c-d2 C=1 window = creates" "$fic" "$created1"
+  else
+    fail "clone proof (strace): no m1c-d2 C=1 window to read (ficlone=[$fic], created=[$created1])"
+  fi
 }
 
 if [ "$KIND" = b1 ]; then b1_main; else server_main; fi
