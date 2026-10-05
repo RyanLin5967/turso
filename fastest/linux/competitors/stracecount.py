@@ -355,10 +355,17 @@ def count(trace, extras, root, window=None, clients=frozenset()):
                 if target.startswith("/") or not target:
                     pre_sync.append(f"pid {f[1]} fd {f[2]} flags {f[3]} {target or '(target unreadable)'}")
     out["fdsync_scanned"], out["osync_fds_at_attach"] = scanned, pre_sync
-    roster_tids = set()
+    roster_tids, roster_pids = set(), set()
     rp = window[: -len(".window")] + ".pids" if window and window.endswith(".window") else None
     if rp and os.path.exists(rp):
-        roster_tids = {ln.split(" ", 1)[0] for ln in open(rp, errors="replace") if ln.strip()}
+        for ln in open(rp, errors="replace"):
+            f = ln.split(" ", 2)
+            if len(f) >= 2:
+                roster_tids.add(f[0])
+                roster_pids.add(f[1])
+    # The roster is written right AFTER the scan, so a process in it was alive when the scan ran: it must have a
+    # "scanned" line with at least one fd (second review, finding 1: 11 live PG processes had none, windows ok).
+    out["fdsync_unscanned"] = sorted(p for p in roster_pids if not scanned.get(p, 0))
     out["desync"] = {t: {"messages": m, "lines": lines_by_tid.get(t, 0), "at_attach": t in roster_tids,
                          "first_line": " ".join(first_by_tid[t])[:160] if t in first_by_tid else None,
                          "first_line_phantom_candidate": phantom_candidate(first_by_tid.get(t))}
@@ -372,6 +379,8 @@ def count(trace, extras, root, window=None, clients=frozenset()):
             problems.append("attach window has no pid roster (OUT.pids): its flushes cannot be attributed")
         if not scanned.get(main or "", 0):
             problems.append(f"no pre-attach O_SYNC/O_DSYNC fd scan of the main pid {main}")
+        if out["fdsync_unscanned"]:
+            problems.append(f"no pre-attach O_SYNC/O_DSYNC fd scan of roster process(es) {out['fdsync_unscanned'][:5]}")
         if pre_sync:
             blind.append(f"O_SYNC/O_DSYNC fd open before the attach x{len(pre_sync)} ({pre_sync[0][:120]})")
     if attached:
