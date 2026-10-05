@@ -31,9 +31,10 @@
 //! The per-op phase functions are `#[no_mangle]` (`fastest_phase_create`, `_connect`, `_write`,
 //! `_delete`) so callgrind's `--toggle-collect` can count the calling thread's instructions in each.
 //!
-//! Fire-check plant (inert unless set): `FASTEST_PROFILE_PLANT=ir:N,syscall:M` makes every create also
-//! spin N iterations of a black-boxed loop and make M getppid(2) calls, so the profiling job can show
-//! its instruction and syscall gates fail on a real run (workflow input `plant`, head side only).
+//! Fire-check plant (inert unless set): `FASTEST_PROFILE_PLANT=ir:N,syscall:M,fsync:K` makes every
+//! create also spin N iterations of a black-boxed loop, make M getppid(2) calls and K fsync(2)s of a
+//! scratch file, so the profiling job can show its instruction, syscall and flush gates fail on a
+//! real run (workflow input `plant`, head side only).
 //!
 //! Output (`--out`): `ops.tsv` (client, op, phase, ns) and `summary.json` (per phase: ops,
 //! p50/p90/p99/max/mean ns, window seconds, ops/s, and the engine's own sync counter delta over
@@ -282,20 +283,24 @@ fn retry<T>(phase: usize, what: &str, mut f: impl FnMut() -> turso_core::Result<
     }
 }
 
-/// The fire-check plant, read once: (spin iterations, getppid calls) added to every create.
-fn plant() -> (u64, u64) {
-    static PLANT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+/// The fire-check plant, read once: (spin iterations, getppid calls, fsyncs) added to every create.
+fn plant() -> (u64, u64, u64) {
+    static PLANT: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
     *PLANT.get_or_init(|| {
-        let mut p = (0, 0);
+        let mut p = (0, 0, 0);
         for kv in std::env::var("FASTEST_PROFILE_PLANT").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
             match kv.split_once(':').map(|(k, v)| (k, v.parse::<u64>())) {
                 Some(("ir", Ok(n))) => p.0 = n,
                 Some(("syscall", Ok(n))) => p.1 = n,
+                Some(("fsync", Ok(n))) => p.2 = n,
                 _ => not_a_result(&format!("FASTEST_PROFILE_PLANT: bad item {kv}")),
             }
         }
-        if p != (0, 0) {
-            eprintln!("note: FASTEST_PROFILE_PLANT active: {} spin iterations and {} getppid per create", p.0, p.1);
+        if p != (0, 0, 0) {
+            eprintln!(
+                "note: FASTEST_PROFILE_PLANT active: {} spin iterations, {} getppid and {} fsync per create",
+                p.0, p.1, p.2
+            );
         }
         p
     })
@@ -305,7 +310,7 @@ fn plant() -> (u64, u64) {
 #[inline(never)]
 pub fn fastest_phase_create(trunk: &Arc<Connection>, name: &str) {
     retry(0, &format!("create {name}"), || trunk.create_branch(name));
-    let (spin, calls) = plant();
+    let (spin, calls, syncs) = plant();
     let mut x = 0u64;
     for i in 0..spin {
         x = std::hint::black_box(x.wrapping_add(i));
@@ -314,6 +319,16 @@ pub fn fastest_phase_create(trunk: &Arc<Connection>, name: &str) {
     for _ in 0..calls {
         // SAFETY: getppid has no preconditions.
         unsafe { libc::getppid() };
+    }
+    if syncs > 0 {
+        static SCRATCH: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+        let f = SCRATCH.get_or_init(|| {
+            let path = std::env::temp_dir().join(format!("fastest-plant-{}", std::process::id()));
+            std::fs::File::create(&path).unwrap_or_else(|e| not_a_result(&format!("plant scratch file: {e}")))
+        });
+        for _ in 0..syncs {
+            f.sync_all().unwrap_or_else(|e| not_a_result(&format!("plant fsync: {e}")));
+        }
     }
 }
 
