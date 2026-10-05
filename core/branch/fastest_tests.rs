@@ -2507,3 +2507,138 @@ fn a_logged_release_is_durable_in_the_trunks_class_before_the_next_trunk_commit(
         }
     }
 }
+
+// ---- review 3 #3: ordered trunk mode trusts only a real F_FULLFSYNC of the branch files' device ----
+
+/// An IO over the platform's whose files report, as `File::full_fsync_device`, what `device` says
+/// (`None`: the file cannot say; `Some(d)`: d), and whose sync is a no-op when `noop_sync` is set.
+struct DeviceIo {
+    inner: Arc<dyn IO>,
+    noop_sync: bool,
+    device: fn(&dyn crate::io::File) -> Option<u64>,
+}
+
+struct DeviceFile {
+    inner: Arc<dyn crate::io::File>,
+    noop_sync: bool,
+    device: fn(&dyn crate::io::File) -> Option<u64>,
+}
+
+impl crate::io::Clock for DeviceIo {
+    fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for DeviceIo {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> crate::Result<Arc<dyn crate::io::File>> {
+        Ok(Arc::new(DeviceFile {
+            inner: self.inner.open_file(path, flags, direct)?,
+            noop_sync: self.noop_sync,
+            device: self.device,
+        }))
+    }
+    fn remove_file(&self, path: &str) -> crate::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn step(&self) -> crate::Result<()> {
+        self.inner.step()
+    }
+    fn file_id(&self, path: &str) -> crate::Result<crate::io::FileId> {
+        self.inner.file_id(path)
+    }
+}
+
+impl crate::io::File for DeviceFile {
+    fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> crate::Result<()> {
+        self.inner.unlock_file()
+    }
+    fn pread(&self, pos: u64, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.pread(pos, c)
+    }
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<crate::Buffer>>, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.pwritev(pos, buffers, c)
+    }
+    fn sync(&self, c: crate::Completion, sync_type: crate::io::FileSyncType) -> crate::Result<crate::Completion> {
+        if self.noop_sync {
+            c.complete(0);
+            return Ok(c);
+        }
+        self.inner.sync(c, sync_type)
+    }
+    fn size(&self) -> crate::Result<u64> {
+        self.inner.size()
+    }
+    fn truncate(&self, len: u64, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.truncate(len, c)
+    }
+    fn full_fsync_device(&self) -> Option<u64> {
+        (self.device)(&*self.inner)
+    }
+}
+
+/// Review 3 #3: a trunk commit under a fullfsync trunk lets its WAL F_FULLFSYNC make a kept
+/// pre-image durable (ordered mode: the pre-image is only barriered) only when that flush is a real
+/// F_FULLFSYNC of the branch files' own device, as the opened WAL file itself reports. A WAL whose
+/// sync does nothing (any IO that is not the platform's), or one on another device (a symlinked
+/// `-wal` on another volume), must cost the pre-image its own F_FULLFSYNC. Control: the platform's
+/// file, reporting its own device, stays ordered.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn ordered_trunk_mode_trusts_only_a_full_fsync_of_the_branch_files_device() {
+    let _s = serial();
+    let other = |f: &dyn crate::io::File| -> Option<u64> { Some(f.full_fsync_device().map_or(1, |d| d ^ 1)) };
+    let arms: [(&str, bool, fn(&dyn crate::io::File) -> Option<u64>); 3] = [
+        ("no-op sync", true, |_| None),
+        ("another device", false, other),
+        ("control", false, |f| f.full_fsync_device()),
+    ];
+    for catalog in [false, true] {
+        for (arm, noop_sync, device) in arms {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("ordered.db");
+            let io: Arc<dyn IO> = Arc::new(DeviceIo {
+                inner: Arc::new(PlatformIO::new().unwrap()),
+                noop_sync,
+                device,
+            });
+            let db = Database::open_file_with_flags(
+                io,
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                opts(catalog, SyncClass::Fsync),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            let before = sync_counts();
+            trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
+            let after = sync_counts();
+            let (full, barrier) = (after.full_fsync - before.full_fsync, after.barrier - before.barrier);
+            let wal = u64::from(!noop_sync);
+            if arm == "control" {
+                assert!(barrier >= 1 && full == wal, "catalog={catalog} {arm}: not ordered: full={full} barrier={barrier}");
+            } else {
+                assert!(
+                    full > wal && barrier == 0,
+                    "catalog={catalog} {arm}: the pre-image counted on a WAL flush that cannot carry it: \
+                     full={full} (the WAL's own: {wal}) barrier={barrier}"
+                );
+            }
+            assert_eq!(read_v(&b.connect().unwrap(), 7), "trunk-7", "catalog={catalog} {arm}");
+        }
+    }
+}

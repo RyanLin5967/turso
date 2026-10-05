@@ -223,6 +223,15 @@ pub trait File: Send + Sync {
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
 
+    /// The device (`st_dev`) whose whole write cache `sync(FileSyncType::FullFsync)` drains, if
+    /// that is what it does here: `fcntl(F_FULLFSYNC)` on this file's own OS descriptor. Every
+    /// backend that cannot say so (memory, VFS extensions, wrappers) answers `None`, and then
+    /// nothing may count on this file's flush to make another file durable (fastest-engine
+    /// review 3 #3: a trunk WAL flush carrying the branch files).
+    fn full_fsync_device(&self) -> Option<u64> {
+        None
+    }
+
     /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
     /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code
     ///
