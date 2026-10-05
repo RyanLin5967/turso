@@ -27,6 +27,10 @@
 #      enumeration) is attached; untraced_tasks must name the child (the condition strace_attach retries on).
 #   F10b the same tree attached by strace_attach: it must list the pre-existing child, complete on try 1, and count
 #      the parent's fsync x1 and the child's fsync x2 = 3, verdict ok.
+#   F10c a fork storm (a child every ~2 ms, each fsyncs once ~50 ms later and logs whether it was traced) attached by
+#      a parent-only strace: the control MUST log untraced child fsyncs after t0, or the storm proves nothing.
+#   F10d the same storm attached by strace_attach (freeze, enumeration, completeness): no untraced child fsync after
+#      t0, frozen=1, and at least as many fsyncs counted as traced children logged.
 #   F11 one attach split by strace_mark: fsync x2, tsplit, fsync x3 -> --part pre counts 2 and --part post 3.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
@@ -35,7 +39,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=15
+NCHECK=17
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -107,6 +111,34 @@ if mode == "dsync-pre":
     ready(); wait()
     os.write(fd, b"x" * 4096)
     os.write(fd, b"y" * 4096)
+    done_and_stay()
+if mode == "forkstorm":
+    # A child every ~2 ms; each sleeps 50 ms, reads its own TracerPid, fsyncs once and logs "pid tracerpid time".
+    # A child whose fsync came after the window opened but that was never traced is a missed flush (F10c/F10d).
+    fd = os.open(f"{d}/forkstorm.dat", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.write(fd, b"x" * 4096)
+    stop = trig + ".stop"
+    ready()
+    while not os.path.exists(stop):
+        if os.fork() == 0:
+            time.sleep(0.05)
+            tp = [ln.split()[1] for ln in open("/proc/self/status") if ln.startswith("TracerPid:")][0]
+            os.fsync(fd)
+            t = time.time()
+            with open(f"{d}/forkstorm.log", "a") as f:
+                f.write(f"{os.getpid()} {tp} {t:.6f}\n")
+            os._exit(0)
+        try:
+            while os.waitpid(-1, os.WNOHANG)[0]:
+                pass
+        except ChildProcessError:
+            pass
+        time.sleep(0.002)
+    try:
+        while True:
+            os.waitpid(-1, 0)
+    except ChildProcessError:
+        pass
     done_and_stay()
 if mode == "split":
     fd = os.open(f"{d}/split.dat", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
@@ -313,6 +345,68 @@ else
   log "FAIL F10a/F10b: the fork-pre probe never became ready"; fails=$((fails + 2))
 fi
 stop_probe2 fork-pre
+
+# misses LOG T0 -> how many fork-storm children fsynced after T0 while untraced (TracerPid 0), then how many traced
+storm_misses() {
+  python3 -c "
+import sys
+t0 = float(sys.argv[2]); miss = traced = 0
+for ln in open(sys.argv[1]):
+    pid, tp, t = ln.split()
+    if tp == '0' and float(t) > t0: miss += 1
+    if tp != '0': traced += 1
+print(miss, traced)" "$1" "$2"
+}
+# F10c, the negative control: a parent-only attach (no enumeration, no freeze) to a fork storm MUST miss children
+# that were alive at the seize and fsync after it -- or the storm does not exercise the race and F10d proves nothing.
+if start_probe2 forkstorm; then
+  sleep 0.3
+  strace -f -qq -e trace=fsync -o "$OUT/f10c.strace" -p "$PP2" 2>"$OUT/f10c.strace.err" &
+  sp=$!
+  for ((i = 0; i < 400; i++)); do traced_all "$sp" "$PP2" && break; sleep 0.05; done
+  t0=$(date +%s.%N)
+  sleep 0.5
+  touch "$DIR/fc/go-forkstorm.stop"
+  for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/forkstorm.done" ] && break; sleep 0.05; done
+  kill -INT "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+  read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0")
+  if [ "${miss:-0}" -ge 1 ]; then
+    log "PASS F10c-storm-control-misses: a parent-only attach missed $miss untraced child fsync(s) after t0 ($traced traced)"
+  else
+    log "FAIL F10c-storm-control-misses: the control missed nothing (miss=$miss traced=$traced): the storm did not exercise the race"
+    fails=$((fails + 1))
+  fi
+else
+  log "FAIL F10c-storm-control-misses: the fork-storm probe never became ready"; fails=$((fails + 1))
+fi
+stop_probe2 forkstorm
+# F10d: the same storm attached by strace_attach (freeze + enumeration + completeness) must miss NO child fsync after
+# its t0, record frozen=1, and count at least every fsync a traced child reported.
+if start_probe2 forkstorm; then
+  sleep 0.3
+  if strace_attach "$OUT/f10d" "$PP2"; then
+    t0=$(sed -n 's/.* t0=\([0-9.]*\).*/\1/p' "$OUT/f10d.window")
+    sleep 0.5
+    touch "$DIR/fc/go-forkstorm.stop"
+    for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/forkstorm.done" ] && break; sleep 0.05; done
+    sleep 0.2
+    strace_detach "$OUT/f10d"
+    count f10d
+    read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0")
+    if [ "$miss" = 0 ] && grep -q ' frozen=1 ' "$OUT/f10d.window" &&
+      python3 -c "import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r['verdict']=='ok' and r['flush_by_syscall']['fsync'] >= int(sys.argv[2]) > 0 else 1)" "$OUT/f10d.json" "$traced"; then
+      log "PASS F10d-storm-attach-complete: 0 untraced child fsyncs after t0, frozen=1, $traced traced children, trace fsyncs $(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['flush_by_syscall']['fsync'])" "$OUT/f10d.json")"
+    else
+      log "FAIL F10d-storm-attach-complete: miss=$miss traced=$traced window=[$(head -1 "$OUT/f10d.window" | cut -c1-200)] verdict=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(r['verdict'][:200], r['flush_by_syscall'])" "$OUT/f10d.json" 2>&1)"
+      fails=$((fails + 1))
+    fi
+  else
+    log "FAIL F10d-storm-attach-complete: strace_attach failed"; fails=$((fails + 1))
+  fi
+else
+  log "FAIL F10d-storm-attach-complete: the fork-storm probe never became ready"; fails=$((fails + 1))
+fi
+stop_probe2 forkstorm
 
 # F11: one attach split by strace_mark: fsync x2, the tsplit stamp, fsync x3 -> --part pre counts 2, post counts 3,
 # and the whole trace 5 (second review, finding 2: the load window and its CHECKPOINT share one attach).

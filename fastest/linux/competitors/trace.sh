@@ -7,7 +7,9 @@
 #                              COMPLETE only if, once it is proven, no descendant of MAIN is untraced: a child forked
 #                              between the enumeration and the seize of MAIN is neither listed nor followed, so the
 #                              attach is redone (up to 5 tries, the incomplete ones kept as OUT.try<k>.*) and refuses
-#                              if it never completes (review finding 4).
+#                              if it never completes (review finding 4). MAIN is SIGSTOPped from before the enumeration
+#                              until the seize is proven (freeze/thaw; window field frozen=1), so it cannot fork into
+#                              that gap at all (second review, finding 3).
 #   strace_detach OUT          SIGINT to that strace (it detaches and writes the -c table), wait for it to exit.
 #                              Records whether the strace and MAIN were still alive when the detach was requested:
 #                              stracecount refuses the window if either was not (review finding 5).
@@ -106,11 +108,31 @@ traced_all() { # traced_all STRACEPID MAIN [PID...] -> 0 when MAIN is alive and 
   done
 }
 
+proc_state() { awk '{print $3}' "/proc/$1/stat" 2>/dev/null; }  # R S D T t Z ...
+
+# freeze MAIN / thaw MAIN: SIGSTOP the server's main process for the enumeration and the seize, so it cannot fork a
+# child in between (second review, finding 3: a child forked in that gap and gone before the completeness check was
+# never seen). freeze succeeds only once /proc shows MAIN stopped (state T or t); thaw always sends SIGCONT. The
+# main's children keep running; PG's backends and auxiliaries do not fork.
+freeze() {
+  local i st
+  kill -STOP "$1" 2>/dev/null || return 1
+  for ((i = 0; i < 200; i++)); do
+    st=$(proc_state "$1")
+    case $st in T|t) return 0 ;; esac
+    sleep 0.005
+  done
+  return 1
+}
+thaw() { kill -CONT "$1" 2>/dev/null; }
+
 strace_attach() {
-  local out=$1 main=$2 try i p miss pids
+  local out=$1 main=$2 try i p miss pids frozen
   [ -n "$main" ] || { echo "strace_attach: no main pid" >&2; return 2; }
   [ -d "/proc/$main" ] || { echo "strace_attach: main pid $main is not running" >&2; return 2; }
   for ((try = 1; try <= 5; try++)); do
+    frozen=0
+    freeze "$main" && frozen=1
     pids="$main $(descendants "$main" | tr '\n' ' ')"
     local args=()
     for p in $pids; do args+=(-p "$p"); done
@@ -118,9 +140,10 @@ strace_attach() {
     ST_PID=$!
     for ((i = 0; i < 400; i++)); do
       traced_all "$ST_PID" $pids && break
-      kill -0 "$ST_PID" 2>/dev/null || { echo "strace exited before attaching: $(cat "$out.strace.err")" >&2; ST_PID=; return 3; }
+      kill -0 "$ST_PID" 2>/dev/null || { thaw "$main"; echo "strace exited before attaching: $(cat "$out.strace.err")" >&2; ST_PID=; return 3; }
       sleep 0.05
     done
+    thaw "$main"
     if [ $i -ge 400 ]; then
       echo "strace did not attach to every task of [$pids] within 20 s" >&2
       kill -INT "$ST_PID" 2>/dev/null
@@ -135,7 +158,7 @@ strace_attach() {
       pids=$(printf '%s\n' $pids $(descendants "$main") | sort -un | tr '\n' ' ')
       fdsync_scan "$out" $pids
       pid_roster "$out" $pids
-      echo "main=$main pids=$pids strace_pid=$ST_PID attach_tries=$try attached_after_polls=$i t0=$(date +%s.%N)" >"$out.window"
+      echo "main=$main pids=$pids strace_pid=$ST_PID attach_tries=$try frozen=$frozen attached_after_polls=$i t0=$(date +%s.%N)" >"$out.window"
       return 0
     fi
     echo "strace_attach: try $try incomplete, untraced descendants of $main: $miss" >&2

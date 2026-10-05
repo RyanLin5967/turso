@@ -377,6 +377,9 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     for t, msgs in desync.items():
         problems.append(f"strace lost the syscall state of task {t} ({msgs[:3]}): its calls cannot be counted")
     if attached:
+        if not re.search(r"\bfrozen=1\b", win):
+            problems.append("the attach did not freeze the main pid (frozen=1): a child forked between the enumeration"
+                            " and the seize could have escaped the trace")
         if not out["roster_found"]:
             problems.append("attach window has no pid roster (OUT.pids): its flushes cannot be attributed")
         if not scanned.get(main or "", 0):
