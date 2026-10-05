@@ -5,7 +5,7 @@
 //!
 //!   fastest_profile --dir DIR [--class full|fsync|off|async] [--catalog] [--clients C]
 //!       [--ops N] [--warmup W] [--rows R] [--mode phases|cycle] [--out DIR]
-//!       [--perf-ctl CTL_FIFO,ACK_FIFO [--perf-only WINDOW]] [--mark]
+//!       [--perf-ctl CTL_FIFO,ACK_FIFO [--perf-only WINDOW]] [--mark] [--phases K]
 //!
 //! One op per client is the cycle: `trunk.create_branch(name)` (create), `db.connect_named(name)`
 //! (connect), one autocommit UPDATE of a random existing row of `t` (first write: it copies a
@@ -16,6 +16,10 @@
 //!   whole process that an outside instrument can count over. Its connections live from the
 //!   connect phase to the delete phase (C x N of them at once).
 //! * `--mode cycle`: every client loops whole cycles; one window for the four phases together.
+//! * `--phases K` (phases mode, 1-4, default 4): only the first K phases, so an instruction counter can
+//!   take a phase's cost as the difference between runs (callgrind's per-function inclusive cost is not
+//!   trustworthy where it reports false recursion: arm64, run 37255309860). With K < 4 the branches are
+//!   left live and the every-branch-deleted check is skipped (and says so).
 //!
 //! Windows are fenced for outside instruments, each fence after every client has finished the
 //! previous phase and before any starts the next:
@@ -67,6 +71,7 @@ struct Args {
     perf_ctl: Option<(String, String)>,
     perf_only: Option<String>,
     mark: bool,
+    phases: usize,
 }
 
 fn not_a_result(msg: &str) -> ! {
@@ -89,6 +94,7 @@ fn parse_args() -> Args {
         perf_ctl: None,
         perf_only: None,
         mark: false,
+        phases: 4,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -138,6 +144,7 @@ fn parse_args() -> Args {
             }
             "--perf-only" => a.perf_only = Some(val(&mut i)),
             "--mark" => a.mark = true,
+            "--phases" => a.phases = num(val(&mut i), "--phases"),
             x => not_a_result(&format!("unknown argument {x}")),
         }
         i += 1;
@@ -153,6 +160,9 @@ fn parse_args() -> Args {
         if a.perf_ctl.is_none() || !known {
             not_a_result(&format!("--perf-only {w}: needs --perf-ctl and a window name"));
         }
+    }
+    if !(1..=4).contains(&a.phases) || (a.phases < 4 && a.mode == Mode::Cycle) {
+        not_a_result("--phases is 1-4, and below 4 only in phases mode");
     }
     if a.clients == 0 || a.ops == 0 || a.rows < 1 {
         not_a_result("--clients, --ops and --rows must be at least 1");
@@ -339,7 +349,7 @@ fn client(id: usize, db: Arc<Database>, a: &Args, gate: &Barrier) -> [Vec<u64>; 
         }
         Mode::Phases => {
             let mut conns: Vec<Arc<Connection>> = Vec::with_capacity(a.ops);
-            for p in 0..4 {
+            for p in 0..a.phases {
                 gate.wait();
                 for i in 0..a.ops {
                     let name = name("m", i);
@@ -424,7 +434,7 @@ fn main() {
     let mut fence = Fence::open(&a);
 
     let windows_wanted: Vec<&str> = match a.mode {
-        Mode::Phases => PHASES.to_vec(),
+        Mode::Phases => PHASES[..a.phases].to_vec(),
         Mode::Cycle => vec!["cycle"],
     };
     let gate = Barrier::new(a.clients + 1);
@@ -467,8 +477,11 @@ fn main() {
     // What the run must have left: every branch deleted, the trunk's rows all there and untouched
     // by any branch's first write.
     let live = db.branch_ids().unwrap_or_else(|e| not_a_result(&format!("branch_ids: {e}")));
-    if !live.is_empty() {
+    if a.phases == 4 && !live.is_empty() {
         not_a_result(&format!("{} branches still live after every delete", live.len()));
+    }
+    if a.phases < 4 {
+        eprintln!("note: --phases {}: {} branches left live by design; the delete check was skipped", a.phases, live.len());
     }
     if scalar(&trunk, "SELECT count(*) FROM t") != a.rows
         || scalar(&trunk, "SELECT count(*) FROM t WHERE v LIKE 'w-%'") != 0
@@ -478,13 +491,14 @@ fn main() {
 
     let ops_total = a.clients * a.ops;
     let mut json = format!(
-        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"warmup_per_client\":{},\"rows\":{},\"mode\":\"{}\",\"windows\":[",
+        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"warmup_per_client\":{},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"windows\":[",
         a.class_name,
         a.catalog,
         a.clients,
         a.ops,
         a.warmup,
         a.rows,
+        a.phases,
         if a.mode == Mode::Phases { "phases" } else { "cycle" }
     );
     for (k, (name, secs, syncs, busy)) in windows.iter().enumerate() {
@@ -498,7 +512,8 @@ fn main() {
     }
     json.push_str("],\"phases\":{");
     let mut tsv = String::from("client\top\tphase\tns\n");
-    for (p, name) in PHASES.iter().enumerate() {
+    let reported = if a.mode == Mode::Cycle { 4 } else { a.phases };
+    for (p, name) in PHASES[..reported].iter().enumerate() {
         let mut all: Vec<u64> = Vec::with_capacity(ops_total);
         for (c, ns) in per_client.iter().enumerate() {
             for (i, v) in ns[p].iter().enumerate() {

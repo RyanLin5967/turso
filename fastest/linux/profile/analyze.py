@@ -20,8 +20,9 @@ Instruments and what each can miss (stated, not hidden):
                  must equal strace's fsync+fdatasync count in the same window, or the window FAILs.
   perf stat      per window via perf's control FIFO; hardware events may read <not supported> on
                  a hosted VM, which is recorded as such and never as zero.
-  callgrind      inclusive Ir of the driver's #[no_mangle] phase functions, (Ir(2N) - Ir(N)) / N,
-                 so the one setup call cancels; counts the CALLING thread only.
+  callgrind      whole-program Ir of runs doing only the first K phases (K = 1..4) at N and 2N ops:
+                 per op, (Ir(K, 2N) - Ir(K, N)) / N is the first K phases' cost, all threads, setup
+                 cancelled; a phase is the difference of two such costs.
 """
 import gzip
 import json
@@ -99,28 +100,6 @@ def parse_perfstat(path):
     return out
 
 
-IR_LINE = re.compile(r"^\s*([\d,]+)\s*(?:\([^)]*\))?\s+(.*)$")
-
-
-def parse_callgrind_annotate(path):
-    """Inclusive Ir of each phase function and the program total."""
-    if not os.path.exists(path):
-        return None
-    got = {}
-    for line in open(path):
-        m = IR_LINE.match(line)
-        if not m:
-            continue
-        ir, rest = int(m.group(1).replace(",", "")), m.group(2)
-        if "PROGRAM TOTALS" in rest:
-            got["total"] = ir
-            continue
-        fm = re.search(r"\bfastest_phase_(create|connect|write|delete)\b", rest)
-        if fm:
-            got[fm.group(1)] = max(got.get(fm.group(1), 0), ir)
-    return got
-
-
 def lower_bound(spec, clients):
     lo, hi = spec
     if lo == "1/C":
@@ -172,12 +151,22 @@ def analyze_arm(d, arm):
             r.setdefault("perf_per_op", {})[w] = {
                 k: (None if v is None else round(v / r["ops"], 2)) for k, v in ps.items()
             }
-    cg1 = parse_callgrind_annotate(os.path.join(d, "cg-n.txt"))
-    cg2 = parse_callgrind_annotate(os.path.join(d, "cg-2n.txt"))
     cgn = os.path.join(d, "cg-n.ops")
-    if cg1 and cg2 and os.path.exists(cgn):
+    if os.path.exists(cgn):
         n = int(open(cgn).read().strip())
-        r["ir_per_op"] = {k: round((cg2[k] - cg1[k]) / n, 1) for k in WINDOWS + ["total"] if k in cg1 and k in cg2}
+        tot = {}
+        for k in range(1, 5):
+            for tag in ("n", "2n"):
+                f = os.path.join(d, f"cg-k{k}-{tag}.total")
+                if os.path.exists(f) and open(f).read().strip().isdigit():
+                    tot[(k, tag)] = int(open(f).read().strip())
+        cum = {k: (tot[(k, "2n")] - tot[(k, "n")]) / n for k in range(1, 5) if (k, "n") in tot and (k, "2n") in tot}
+        if len(cum) == 4:
+            r["ir_per_op"] = {"create": round(cum[1], 1), "connect": round(cum[2] - cum[1], 1),
+                              "write": round(cum[3] - cum[2], 1), "delete": round(cum[4] - cum[3], 1),
+                              "cycle": round(cum[4], 1)}
+        else:
+            r["ir_missing"] = sorted(f"k{k}-{t}" for k in range(1, 5) for t in ("n", "2n") if (k, t) not in tot)
     return r
 
 
