@@ -976,22 +976,42 @@ fn the_budget_counters_count_exactly_what_was_done() {
 /// #2 (no catalog query), LOW 25 (one allocation under the mutex: the name's Arc); review 2 #8 (a
 /// 17 B flight end).
 #[test]
-fn create_is_within_its_sync_lock_catalog_and_log_budgets() {
+fn create_flushes_once() {
     assert_budgets(
         "create",
         &[
             every(FULL, Want::Exactly(1), "DESIGN §3, PREREG §9: one flush per create"),
             every(NOT_FULL, Want::Exactly(0), "DESIGN §3: no other flush"),
             every("barrier", Want::Exactly(0), "DESIGN §3: no barrier"),
-            every("locks", Want::AtMost(2), "DESIGN §3: the fork's hold + the flight leader's take"),
+        ],
+    );
+}
+
+#[test]
+fn create_takes_the_store_mutex_at_most_twice() {
+    assert_budgets("create", &[every("locks", Want::AtMost(2), "DESIGN §3: the fork's hold + the flight leader's take")]);
+}
+
+#[test]
+fn create_asks_the_catalog_nothing() {
+    assert_budgets(
+        "create",
+        &[
             every("catalog_queries", Want::Exactly(0), "review 1 #2: no catalog probe for a new name"),
             every("catalog_loads", Want::Exactly(0), "DESIGN §3: nothing read to fork the trunk"),
-            every(
-                "log_bytes",
-                Want::Exactly(FORK_NAMED_FRAME + FLIGHT_END_NOW),
-                "journal.rs format: its own ForkNamed and one flight end",
-            ),
         ],
+    );
+}
+
+#[test]
+fn create_logs_its_record_and_one_flight_end() {
+    assert_budgets(
+        "create",
+        &[every(
+            "log_bytes",
+            Want::Exactly(FORK_NAMED_FRAME + FLIGHT_END_NOW),
+            "journal.rs format: its own ForkNamed and one flight end",
+        )],
     );
 }
 
@@ -1058,7 +1078,7 @@ fn create_allocates_no_table_of_every_branch_under_the_store_mutex() {
 /// writes and syncs nothing, takes the store mutex to resolve the name and to mark the branch
 /// open, and costs no syscall a trunk connect does not.
 #[test]
-fn connect_named_is_within_its_sync_lock_catalog_and_log_budgets() {
+fn connect_named_makes_nothing_durable() {
     assert_budgets(
         "connect_named",
         &[
@@ -1066,11 +1086,24 @@ fn connect_named_is_within_its_sync_lock_catalog_and_log_budgets() {
             every(NOT_FULL, Want::Exactly(0), "nothing to make durable"),
             every("barrier", Want::Exactly(0), "nothing to order"),
             every("log_bytes", Want::Exactly(0), "nothing to log"),
-            every("catalog_queries", Want::Exactly(0), "a resident branch: nothing to read"),
-            every("catalog_loads", Want::Exactly(0), "a resident branch: nothing to load"),
-            every("locks", Want::AtMost(2), "the name's lookup + open_conn"),
         ],
     );
+}
+
+#[test]
+fn connect_named_asks_the_catalog_nothing() {
+    assert_budgets(
+        "connect_named",
+        &[
+            every("catalog_queries", Want::Exactly(0), "a resident branch: nothing to read"),
+            every("catalog_loads", Want::Exactly(0), "a resident branch: nothing to load"),
+        ],
+    );
+}
+
+#[test]
+fn connect_named_takes_the_store_mutex_at_most_twice() {
+    assert_budgets("connect_named", &[every("locks", Want::AtMost(2), "the name's lookup + open_conn")]);
 }
 
 #[cfg(target_vendor = "apple")]
@@ -1088,12 +1121,14 @@ fn connect_named_issues_no_syscall_a_trunk_connect_does_not() {
         if b > t {
             let _ = writeln!(failures, "  {spec}: connect_named {b} syscalls, trunk connect {t}");
         }
-        let held = *values(&c, "connect_named", &quiet(&c, "connect_named"), "held_syscalls").iter().max().unwrap();
-        if held > 0 {
-            let _ = writeln!(failures, "  {spec}: connect_named {held} syscalls under the store mutex");
-        }
     }
     assert!(failures.is_empty(), "connect_named is over budget:\n{failures}");
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn connect_named_issues_no_syscall_under_the_store_mutex() {
+    assert_budgets("connect_named", &[every("held_syscalls", Want::Exactly(0), "nothing to read or write under the mutex")]);
 }
 
 #[test]
@@ -1114,26 +1149,39 @@ fn connect_named_is_independent_of_database_size() {
 /// DESIGN §3 (a slot, the records, one barrier: no catalog read); the journal format (one
 /// one-page Commit, one flight end).
 #[test]
-fn first_write_is_within_its_sync_catalog_and_log_budgets() {
+fn first_write_flushes_once_and_orders_the_arena_once() {
     #[cfg(target_vendor = "apple")]
-    let order = every("barrier", Want::AtMost(1), "ruling 85a032f01: one ordering sync of the arena");
+    let order = [
+        every("barrier", Want::AtMost(1), "ruling 85a032f01: one ordering sync of the arena"),
+        every(NOT_FULL, Want::AtMost(1), "ruling 85a032f01: the arena's plain fsync, if not a barrier"),
+    ];
     #[cfg(not(target_vendor = "apple"))]
-    let order = every("barrier", Want::Exactly(0), "no barrier off Apple");
+    let order = [
+        every("barrier", Want::Exactly(0), "no barrier off Apple"),
+        every(NOT_FULL, Want::Exactly(0), "no F_FULLFSYNC off Apple"),
+    ];
+    let [a, b] = order;
+    assert_budgets("first_write", &[every(FULL, Want::Exactly(1), "PREREG §5, review 1 #1: one full flush"), a, b]);
+}
+
+#[test]
+fn first_write_asks_the_catalog_nothing() {
+    assert_budgets("first_write", &[every("catalog_queries", Want::Exactly(0), "DESIGN §3: a slot and two records")]);
+}
+
+#[test]
+fn first_write_logs_one_commit_and_one_flight_end() {
     assert_budgets(
         "first_write",
-        &[
-            every(FULL, Want::Exactly(1), "PREREG §5, review 1 #1: one full flush"),
-            order,
-            every("catalog_queries", Want::Exactly(0), "DESIGN §3: a slot and two records"),
-            every("log_bytes", Want::Exactly(COMMIT_1_FRAME + FLIGHT_END_NOW), "journal.rs: one Commit, one flight end"),
-            every("locks", Want::AtMostPlus("resolves", 2), "one hold per page resolved + commit_pages + the flight leader"),
-        ],
+        &[every("log_bytes", Want::Exactly(COMMIT_1_FRAME + FLIGHT_END_NOW), "journal.rs: one Commit, one flight end")],
     );
-    // The arena's ordering sync and the log's flush, and no other: exactly two syncs.
-    #[cfg(target_vendor = "apple")]
+}
+
+#[test]
+fn first_write_takes_the_store_mutex_once_per_page_and_twice_more() {
     assert_budgets(
         "first_write",
-        &[every(NOT_FULL, Want::AtMost(1), "ruling 85a032f01: the arena's plain fsync, if not a barrier")],
+        &[every("locks", Want::AtMostPlus("resolves", 2), "one hold per page resolved + commit_pages + the flight leader")],
     );
 }
 
@@ -1175,7 +1223,7 @@ fn first_write_is_independent_of_database_size() {
 /// Closing a branch connection that wrote touches no file: no sync, no syscall, no log record, no
 /// catalog query, one store-mutex hold (`close`).
 #[test]
-fn disconnect_is_within_its_budgets() {
+fn disconnect_makes_nothing_durable_and_reads_nothing() {
     assert_budgets(
         "disconnect",
         &[
@@ -1183,10 +1231,18 @@ fn disconnect_is_within_its_budgets() {
             every(NOT_FULL, Want::Exactly(0), "nothing to make durable"),
             every("log_bytes", Want::Exactly(0), "nothing to log for an unreleased branch"),
             every("catalog_queries", Want::Exactly(0), "nothing to read"),
-            every("locks", Want::AtMost(1), "close's one hold"),
         ],
     );
-    #[cfg(target_vendor = "apple")]
+}
+
+#[test]
+fn disconnect_takes_the_store_mutex_at_most_once() {
+    assert_budgets("disconnect", &[every("locks", Want::AtMost(1), "close's one hold")]);
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn disconnect_issues_no_syscall() {
     assert_budgets("disconnect", &[every("syscalls", Want::Exactly(0), "nothing to read or write")]);
 }
 
@@ -1206,17 +1262,32 @@ fn disconnect_is_independent_of_database_size() {
 /// O(1) amortised); review 1 #37 (lookup and release in one hold) and #14 (the per-flight
 /// syscalls); review 2 #8 (a 17 B flight end).
 #[test]
-fn delete_is_within_its_sync_lock_catalog_and_log_budgets() {
+fn delete_flushes_once() {
     assert_budgets(
         "delete",
         &[
             every(FULL, Want::Exactly(1), "DESIGN §3: the Release rides one flight"),
             every(NOT_FULL, Want::Exactly(0), "DESIGN §3: no other flush"),
             every("barrier", Want::Exactly(0), "no arena write to order"),
-            every("locks", Want::AtMost(2), "review 1 #37: lookup + release in one hold, + the flight leader"),
-            every("catalog_queries", Want::Exactly(0), "a resident branch: nothing to read"),
-            every("log_bytes", Want::Exactly(RELEASE_FRAME + FLIGHT_END_NOW), "DESIGN §3: one Release, one flight end"),
         ],
+    );
+}
+
+#[test]
+fn delete_takes_the_store_mutex_at_most_twice() {
+    assert_budgets("delete", &[every("locks", Want::AtMost(2), "review 1 #37: lookup + release in one hold, + the flight leader")]);
+}
+
+#[test]
+fn delete_asks_the_catalog_nothing() {
+    assert_budgets("delete", &[every("catalog_queries", Want::Exactly(0), "a resident branch: nothing to read")]);
+}
+
+#[test]
+fn delete_logs_its_release_and_one_flight_end() {
+    assert_budgets(
+        "delete",
+        &[every("log_bytes", Want::Exactly(RELEASE_FRAME + FLIGHT_END_NOW), "DESIGN §3: one Release, one flight end")],
     );
 }
 
