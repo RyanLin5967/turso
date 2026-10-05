@@ -353,6 +353,9 @@ pub struct SyncCounts {
     pub fsync: u64,
     pub full_fsync: u64,
     pub barrier: u64,
+    /// `fcntl(F_BARRIERFSYNC)` calls the file system refused as unsupported, each replaced by a
+    /// full sync (counted in `full_fsync` too; review 3 #4).
+    pub barrier_fallback: u64,
 }
 
 /// A distribution of lock holds, in nanoseconds (fastest-engine M1 item 5; observing only): the
@@ -435,6 +438,7 @@ pub fn sync_counts() -> SyncCounts {
         fsync: crate::io::SYNC_COUNTS[0].load(Relaxed),
         full_fsync: crate::io::SYNC_COUNTS[1].load(Relaxed),
         barrier: crate::io::SYNC_COUNTS[2].load(Relaxed),
+        barrier_fallback: crate::io::SYNC_COUNTS[3].load(Relaxed),
     }
 }
 
@@ -477,6 +481,9 @@ pub enum BranchFailpoint {
     /// The next catalog probe that dates a trunk page's last write (`trunk_written_known`) returns
     /// `Busy`, as a catalog read refused by the catalog's lock would (review 3 #2).
     TrunkProbeBusy,
+    /// The next arena sync a compaction (snapshot store) or a catalog checkpoint makes fails as an
+    /// I/O error would (review 3 #5).
+    ArenaSyncFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.

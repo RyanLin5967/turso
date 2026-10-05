@@ -2508,6 +2508,50 @@ fn a_logged_release_is_durable_in_the_trunks_class_before_the_next_trunk_commit(
     }
 }
 
+// ---- review 3 #4: a failed barrier fail-stops; only an unsupported one falls back ----
+
+/// Review 3 #4: an ordered flight's `F_BARRIERFSYNC` that fails as an I/O error does (EIO) is not
+/// retried as an F_FULLFSYNC that may report success for pages the failed call lost: the flight
+/// fails, the trunk commit relying on it is refused, and the store fail-stops (the next branch
+/// commit is refused). Only a barrier the file system does not support (ENOTSUP) falls back to the
+/// full sync, and the fallback is counted.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_barrier_fail_stops_and_only_an_unsupported_one_falls_back() {
+    let _s = serial();
+    for catalog in [false, true] {
+        for (errno, name) in [(libc::EIO, "EIO"), (libc::ENOTSUP, "ENOTSUP")] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = open_at(&dir.path().join("barrier-errno.db"), opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            super::journal::fail_next_barrier(errno);
+            let before = sync_counts();
+            let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+            let after = sync_counts();
+            let fallbacks = after.barrier_fallback - before.barrier_fallback;
+            if errno == libc::ENOTSUP {
+                committed.unwrap();
+                assert_eq!(fallbacks, 1, "catalog={catalog} {name}: the fallback was not counted");
+                assert_eq!(read_v(&b.connect().unwrap(), 7), "trunk-7", "catalog={catalog} {name}");
+                continue;
+            }
+            assert_eq!(fallbacks, 0, "catalog={catalog} {name}: a failed barrier fell back");
+            assert!(
+                committed.is_err(),
+                "catalog={catalog} {name}: a trunk commit relied on a barrier that failed"
+            );
+            let mine = b.connect().and_then(|bc| bc.execute("UPDATE t SET v = 'mine' WHERE id = 3"));
+            assert!(
+                mine.is_err(),
+                "catalog={catalog} {name}: the store did not fail-stop after a failed barrier"
+            );
+        }
+    }
+}
+
 // ---- review 3 #3: ordered trunk mode trusts only a real F_FULLFSYNC of the branch files' device ----
 
 /// An IO over the platform's whose files report, as `File::full_fsync_device`, what `device` says
@@ -2639,6 +2683,61 @@ fn ordered_trunk_mode_trusts_only_a_full_fsync_of_the_branch_files_device() {
                 );
             }
             assert_eq!(read_v(&b.connect().unwrap(), 7), "trunk-7", "catalog={catalog} {arm}");
+        }
+    }
+}
+
+// ---- review 3 #5: an arena sync failure in a compaction or a checkpoint fail-stops ----
+
+/// Review 3 #5: an arena sync that fails during a compaction (snapshot store) or a catalog
+/// checkpoint (here a fuzzy one, captured while a branch commit's flight is in the air, so it syncs
+/// the arena) fail-stops the store: a later sync of the same file may report success for pages the
+/// failed one lost, so nothing more may be acknowledged. The next branch commit is refused, and a
+/// branch released afterwards frees nothing. Mutant `checkpoint_sync_error_kept` (the checkpoint's
+/// fail-stop left out) must fail the catalog arm.
+#[test]
+fn an_arena_sync_failure_in_a_compaction_or_checkpoint_fail_stops() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("arena-sync-fails.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let x = trunk.fork_branch().unwrap();
+        write_v(&x.connect().unwrap(), 3, "x");
+        let owned = x.owned_slots();
+        if catalog {
+            let y = trunk.fork_branch().unwrap();
+            let hold = db.branches.trunk_commit_hold.clone();
+            hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+            let writer = std::thread::spawn(move || {
+                let r = y.connect()?.execute("UPDATE t SET v = 'y' WHERE id = 5");
+                drop(y.into_id());
+                r
+            });
+            wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+            db.branch_failpoint(Some(BranchFailpoint::ArenaSyncFails));
+            let started = db.branch_checkpoint_fuzzy_now();
+            hold.store(0, std::sync::atomic::Ordering::Release);
+            assert!(started.unwrap(), "premise: a fuzzy checkpoint started");
+            writer.join().unwrap().unwrap();
+            db.branch_checkpoint_wait();
+        } else {
+            db.branch_failpoint(Some(BranchFailpoint::ArenaSyncFails));
+            assert!(db.branch_compact_now().is_err(), "premise: the compaction's arena sync failed");
+        }
+        let committed = x.connect().and_then(|xc| xc.execute("UPDATE t SET v = 'after' WHERE id = 4"));
+        assert!(
+            committed.is_err(),
+            "catalog={catalog}: a branch commit was acknowledged after an arena sync failed"
+        );
+        let _ = x.reap();
+        for slot in &owned {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "catalog={catalog}: slot {slot} was freed after the store should have fail-stopped"
+            );
         }
     }
 }

@@ -1967,6 +1967,8 @@ struct Captured {
     /// BranchFailpoint::CheckpointWriteFails, taken at the capture: the write fails before its
     /// catalog commit, on the sharp path and on a fuzzy flight alike (D-T2's failed-write order).
     fail_write: bool,
+    /// BranchFailpoint::ArenaSyncFails, taken at a capture that syncs the arena: that sync fails.
+    fail_arena_sync: bool,
     /// githost-shape instrument (observing only; r13-compose S-1): when the capture began, and the
     /// rows, trunk versions inserted and trunk versions deleted it captured. Counted at the install.
     shape_started: Instant,
@@ -1991,8 +1993,19 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
     // store (review 3 #5): a later sync of the same file may report success for pages it lost.
     if let Some(file) = cap.arena.as_ref() {
         if cap.arena_sync.syncs() {
-            if let Err(e) = super::journal::fsync_file(file, SyncClass::Fsync) {
-                cap.fail_stop.store(true, Ordering::Release);
+            let synced = if cap.fail_arena_sync {
+                Err(LimboError::InternalError(
+                    "failpoint: the checkpoint's arena sync failed".to_string(),
+                ))
+            } else {
+                super::journal::fsync_file(file, SyncClass::Fsync)
+            };
+            if let Err(e) = synced {
+                // Mutant `checkpoint_sync_error_kept` (test builds only): as before, the store
+                // goes on.
+                if !fe_mutant("checkpoint_sync_error_kept") {
+                    cap.fail_stop.store(true, Ordering::Release);
+                }
                 return Err(e);
             }
         }
@@ -5503,6 +5516,11 @@ impl BranchStore {
         if fail {
             inner.failpoint = None;
         }
+        if inner.cat.is_none() && inner.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some() {
+            if let Some(journal) = inner.journal.as_mut() {
+                journal.fail_next_arena_sync();
+            }
+        }
         self.compact(&mut inner, fail)
     }
 
@@ -6779,6 +6797,8 @@ impl StoreInner {
                 .failpoint
                 .take_if(|f| *f == BranchFailpoint::CheckpointWriteFails)
                 .is_some(),
+            fail_arena_sync: arena_file.is_some()
+                && self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some(),
             shape_started: started,
             shape_rows: n_rows,
             shape_trunk_new: n_trunk_new,

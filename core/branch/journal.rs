@@ -653,6 +653,8 @@ pub(crate) struct Journal {
     pid: u32,
     /// See [`Journal::fail_next_write`].
     fail_next_write: bool,
+    /// See [`Journal::fail_next_arena_sync`].
+    fail_next_arena_sync: bool,
     /// See [`Journal::fail_next_take`].
     fail_next_take: bool,
     /// The format version this journal writes and was read at (`format_version`).
@@ -772,6 +774,7 @@ impl Journal {
             poisoned: Arc::new(AtomicBool::new(false)),
             pid: std::process::id(),
             fail_next_write: false,
+            fail_next_arena_sync: false,
             fail_next_take: false,
             format: FORMAT_VERSION,
             lsn: 0,
@@ -928,6 +931,7 @@ impl Journal {
             poisoned: Arc::new(AtomicBool::new(false)),
             pid: std::process::id(),
             fail_next_write: false,
+            fail_next_arena_sync: false,
             fail_next_take: false,
             format,
             lsn: 0,
@@ -1171,6 +1175,12 @@ impl Journal {
     /// INSIDE `flush`, so the poisoning a test then observes is `flush`'s own (review 4 C7).
     pub(crate) fn fail_next_write(&mut self) {
         self.fail_next_write = true;
+    }
+
+    /// Fail the arena sync of the next compaction as an I/O error would (the `ArenaSyncFails`
+    /// failpoint, snapshot stores).
+    pub(crate) fn fail_next_arena_sync(&mut self) {
+        self.fail_next_arena_sync = true;
     }
 
     pub(crate) fn page_size(&self) -> usize {
@@ -1744,6 +1754,11 @@ impl Journal {
         // The snapshot names slots that buffered-but-unwritten records also name; they reach the
         // device before it, and its flush below makes them durable with it (ruling 85a032f01).
         if class.syncs() {
+            if std::mem::take(&mut self.fail_next_arena_sync) {
+                return Err(LimboError::InternalError(
+                    "failpoint: the compaction's arena sync failed".to_string(),
+                ));
+            }
             arena.sync(SyncClass::Fsync)?;
         }
         let generation = self.generation + 1;
@@ -2716,14 +2731,28 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
         // acknowledgement resting on a barrier alone is C1b's to catch, not C1's).
         #[cfg(test)]
         lose_unsynced::apply(file)?;
+        #[cfg(test)]
+        let injected = BARRIER_ERRNO.swap(0, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(not(test))]
+        let injected = 0;
         // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
+        if injected == 0 && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
             crate::io::count_barrier();
             return Ok(());
         }
         return fsync_file(file, class);
     }
     fsync_file(file, class)
+}
+
+/// Test builds: the next `F_BARRIERFSYNC` fails with this errno (0: none), as the fcntl would.
+#[cfg(test)]
+static BARRIER_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Test builds: make the next `F_BARRIERFSYNC` (`barrier_file`) fail with `errno`.
+#[cfg(test)]
+pub(crate) fn fail_next_barrier(errno: i32) {
+    BARRIER_ERRNO.store(errno, std::sync::atomic::Ordering::Release);
 }
 
 /// Make a file's creation or rename durable: on POSIX that is a sync of its directory, in `class`.

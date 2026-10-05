@@ -127,7 +127,8 @@ pub fn get_file_id(path: &str) -> Result<FileId, std::io::Error> {
 /// backend and the branch store's own files (fastest-engine instrument; observing only, read by
 /// `branch::sync_counts`).
 #[doc(hidden)]
-pub static SYNC_COUNTS: [crate::sync::atomic::AtomicU64; 3] = [
+pub static SYNC_COUNTS: [crate::sync::atomic::AtomicU64; 4] = [
+    crate::sync::atomic::AtomicU64::new(0),
     crate::sync::atomic::AtomicU64::new(0),
     crate::sync::atomic::AtomicU64::new(0),
     crate::sync::atomic::AtomicU64::new(0),
@@ -138,6 +139,12 @@ pub(crate) fn count_barrier() {
     SYNC_COUNTS[2].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     crate::branch::store::note_sync();
+}
+
+/// Count one `fcntl(F_BARRIERFSYNC)` the file system refused as unsupported, replaced by a full
+/// sync (counted as that sync too).
+pub(crate) fn count_barrier_fallback() {
+    SYNC_COUNTS[3].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
 }
 
 /// Count one sync: `full` for `fcntl(F_FULLFSYNC)`, else `fsync(2)`.
