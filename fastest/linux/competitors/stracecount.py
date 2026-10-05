@@ -407,12 +407,18 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     if not lines and summary:
         problems.append("summary present but zero call lines (was -C used?)")
     if summary is not None:
+        # The -c table counts a call when it RETURNS: per syscall it must equal the completed lines exactly, and the
+        # lines may exceed it only by that syscall's own unfinished/detached calls (second review, finding 5: the
+        # tolerance was unsigned and shared across names).
+        unfinished_by_name = {}
+        for _, (n, _, _) in pending.items():
+            unfinished_by_name[n] = unfinished_by_name.get(n, 0) + 1
         for name in set(summary) | set(lines):
             s = summary.get(name, {}).get("calls", 0)
-            n = lines.get(name, 0)
-            # A call interrupted by the detach can be in one half only.
-            if abs(s - n) > out["unfinished_at_end"]:
-                problems.append(f"{name}: summary {s} calls vs {n} lines")
+            c = done_by_name.get(name, 0)
+            if s != c:
+                problems.append(f"{name}: summary {s} calls vs {c} completed lines "
+                                f"({lines.get(name, 0)} lines, {unfinished_by_name.get(name, 0)} unfinished)")
     for k, why in (("osync_opens", "O_SYNC/O_DSYNC open"), ("osync_fcntl", "F_SETFL O_SYNC/O_DSYNC"),
                    ("rwf_sync_writes", "pwritev2 RWF_(D)SYNC"), ("io_uring", "io_uring in use"),
                    ("io_submit", "Linux AIO io_submit")):
