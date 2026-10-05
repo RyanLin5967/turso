@@ -311,10 +311,15 @@ pub(crate) struct BranchStore {
     barrier_locks: AtomicU64,
     /// A catalog store's checkpoints are fuzzy (`BranchCheckpoint`; lead review 1 item 7).
     fuzzy: bool,
-    /// The log sequence number that makes the newest early-released Release durable: every trunk
-    /// commit's barrier covers it, since a commit retains nothing for a child released before its
-    /// decisions (gc3's N1; lead review 1 item 10).
+    /// The log sequence number that makes the newest Release durable (early-released or logged):
+    /// every trunk commit's barrier covers it, since a commit retains nothing for a child released
+    /// before its decisions (gc3's N1; lead review 1 item 10; skill review 2 #3).
     last_release_lsn: AtomicU64,
+    /// The log sequence number that makes the newest TrunkRetain durable: every trunk commit's
+    /// barrier covers it too, since a pre-image kept by a decision pass that was then refused (or
+    /// rolled back) is not decided again by the retry — the page's written epoch already is the
+    /// commit's own — yet the commit overwrites what it kept (review 3 #1).
+    retain_floor: AtomicU64,
 }
 
 /// Group commit with the flush OUTSIDE the store mutex (fastest-engine M1 item 2: gc 389b474b4,
@@ -2500,6 +2505,7 @@ impl BranchStore {
             trunk_same_device: AtomicBool::new(false),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
+            retain_floor: AtomicU64::new(0),
             fuzzy: false,
         }
     }
@@ -2705,6 +2711,7 @@ impl BranchStore {
             trunk_same_device: AtomicBool::new(false),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
+            retain_floor: AtomicU64::new(0),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
@@ -3143,6 +3150,14 @@ impl BranchStore {
             injected_flush_failure(failpoint, journal)?;
             for record in &records {
                 journal.buffer(record)?;
+            }
+            // A Release flushed here, in the store's class, must still be covered by the next trunk
+            // commit's barrier in the trunk's (skill review 2 #3).
+            if records
+                .iter()
+                .any(|r| matches!(r, Record::Release { .. } | Record::ReleaseOpen { .. }))
+            {
+                self.last_release_lsn.fetch_max(journal.lsn(), Ordering::AcqRel);
             }
         }
         self.flush_locked(inner, SyncClass::Off)?;
@@ -4481,16 +4496,21 @@ impl BranchStore {
         kill_point("trunk.decided");
         #[cfg(test)]
         pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_DECIDED);
-        Ok(retained_end.max(self.release_floor()))
+        if fe_mutant("barrier_own_only") {
+            return Ok(retained_end);
+        }
+        Ok(retained_end.max(self.barrier_floor()))
     }
 
-    /// What a trunk commit that took no copy decision — its trunk had no live child — must still
-    /// make durable before its first frame: every early-released Release (gc3's N1).
-    pub(crate) fn release_floor(&self) -> u64 {
+    /// What every trunk commit — one that took no copy decision too — must make durable before its
+    /// first frame: every Release (gc3's N1) and every pre-image kept (review 3 #1) so far.
+    pub(crate) fn barrier_floor(&self) -> u64 {
         if fe_mutant("barrier_own_only") {
             return 0;
         }
-        self.last_release_lsn.load(Ordering::Acquire)
+        self.last_release_lsn
+            .load(Ordering::Acquire)
+            .max(self.retain_floor.load(Ordering::Acquire))
     }
 
     /// `begin_trunk_commit`'s decisions, one per page the commit writes, at `epoch`.
@@ -4626,6 +4646,10 @@ impl BranchStore {
                     crc,
                 })?;
                 self.unsynced.store(true, Ordering::Release);
+                // fastest-engine mutant `no_retain_floor` (test builds only).
+                if !fe_mutant("no_retain_floor") {
+                    self.retain_floor.fetch_max(journal.lsn(), Ordering::AcqRel);
+                }
             }
         }
         trunk.written.insert(page, epoch);

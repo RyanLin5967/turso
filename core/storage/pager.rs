@@ -4591,7 +4591,7 @@ impl Pager {
                 && self.trunk_pre_images.lock().is_empty()
                 && !crate::branch::store::fe_mutant("childless_commit_gated");
             if childless {
-                self.trunk_required.store(store.release_floor(), Ordering::Release);
+                self.trunk_required.store(store.barrier_floor(), Ordering::Release);
             } else if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
                 let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
                 let decided = {
