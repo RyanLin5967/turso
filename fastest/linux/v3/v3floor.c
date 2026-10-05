@@ -41,11 +41,12 @@
  * Flush control (D0, per arm, tools review 1 item 6): for EVERY selected M0 flushed arm (append25, ow4k, ow64k, ow1m,
  *   clone1b, clone2b), p50(arm) / p50(nosync25) must be > 10, else the run is void (rc 3). The fdatasync4k and
  *   clean ratios are reported, never gated. flush_d0_p50_ratio keeps the Mac's headline (append25 / nosync25).
- *   What the control can and cannot see: run 37243798049's no-flush mutant read <= 5.9 for append25, ow4k and
- *   fdatasync4k on every cell, but 2.8-14.7 for ow64k, 28-237 for ow1m and 10-24 for the clones, so for those arms a
- *   missing flush can pass it. It shows that a flush cost something, never that it reached the device: it passed at
- *   46-106x on hosted disks that report write-through, where the block layer sends the device no flush at all. The
- *   per-arm flush identity is firecheck.sh's strace check, which must pass on the same binary (run.sh enforces it).
+ *   What the control can and cannot see (run 37245757924, 8 cells): the no-flush mutant read <= 5.1 for append25,
+ *   ow4k and fdatasync4k on every cell, but 2.7-12.2 for ow64k, 25-197 for ow1m and 8.8-24.3 for the clones, so for
+ *   those arms a missing flush can pass it. It shows that a flush cost something, never that it reached the device:
+ *   append25 passed at 45-87x on the six cells whose disk reports write-through, where the block layer sends the
+ *   device no flush at all (0 flushes in /proc/diskstats). The per-arm flush identity is firecheck.sh's strace
+ *   check, which must pass on the same binary (run.sh enforces it).
  * Reported, NOT a gate: the drafted M0 exit-1 ratio p50(append25) / p50(clean) > 10, and clean_fast_frac, the share
  *   of clean samples under 100 us (the Mac record found that ratio does not discriminate: tools/v3/FIRECHECK.md).
  *
