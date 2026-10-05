@@ -355,7 +355,7 @@ b1_main() {
       strace_run "$d/load" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" --dir "$bdir" \
         --clients "$c" --max-ops "$n" --rows "$ROWS" --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
       cat "$d/bb.txt"
-      [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"))"
+      [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"); stderr: $(tail -1 "$d/load.cmd.err" 2>/dev/null))"
       count "$d/load"
       ops_of "$d/bb" "$d"
       read -r total ok created <"$d/ops.txt"
