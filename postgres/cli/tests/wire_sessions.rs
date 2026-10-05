@@ -136,6 +136,8 @@ struct WireError {
 #[derive(Debug, Default)]
 struct Reply {
     rows: Vec<Vec<Option<String>>>,
+    /// The type OIDs of the last RowDescription, if one came.
+    oids: Option<Vec<u32>>,
     tags: Vec<String>,
     error: Option<WireError>,
     /// The ReadyForQuery transaction status byte: b'I' idle, b'T' in a transaction, b'E' failed.
@@ -254,6 +256,22 @@ impl Wire {
             let mut body = vec![0u8; i32::from_be_bytes(len) as usize - 4];
             self.s.read_exact(&mut body).unwrap();
             match tag[0] {
+                b'T' => {
+                    let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                    let mut p = 2;
+                    let mut oids = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        p += body[p..].iter().position(|&c| c == 0).unwrap() + 1;
+                        oids.push(u32::from_be_bytes([
+                            body[p + 6],
+                            body[p + 7],
+                            body[p + 8],
+                            body[p + 9],
+                        ]));
+                        p += 18;
+                    }
+                    r.oids = Some(oids);
+                }
                 b'D' => {
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
                     let mut p = 2;
@@ -832,4 +850,111 @@ fn a_branch_survives_a_server_kill_and_restart() {
     assert_eq!(b.q("SELECT v FROM t WHERE id = 3").single("b3's row"), "b3");
     let mut m = server.connect();
     assert_eq!(m.q("SELECT count(*) FROM t").single("trunk"), "1");
+}
+
+// ---------------------------------------------------------------------------
+// E5' findings (the benchmark's statements, compared with PostgreSQL 18)
+// ---------------------------------------------------------------------------
+
+/// Aggregates report a numeric type, as PostgreSQL does (count and sum of integers: bigint; avg: numeric). A
+/// driver converts by the type OID, so a count reported as text reaches the client as a string.
+#[test]
+fn aggregates_report_numeric_types() {
+    let dir = Scratch::new("aggtypes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("INSERT INTO t VALUES (2, 'x')").ok("insert");
+    let r = a
+        .q("SELECT count(*), sum(id), min(id), max(id), avg(id) FROM t")
+        .ok("aggregates");
+    let oids = r.oids.clone().expect("no RowDescription");
+    let int = [20u32, 21, 23];
+    let number = [700u32, 701, 1700];
+    assert_eq!(oids[0], 20, "count(*) is bigint: {oids:?}");
+    assert_eq!(oids[1], 20, "sum(int) is bigint: {oids:?}");
+    assert!(
+        int.contains(&oids[2]) && int.contains(&oids[3]),
+        "min/max(int): {oids:?}"
+    );
+    assert!(number.contains(&oids[4]), "avg(int): {oids:?}");
+    assert_eq!(
+        r.rows,
+        vec![vec![
+            Some("2".to_string()),
+            Some("3".to_string()),
+            Some("1".to_string()),
+            Some("2".to_string()),
+            Some("1.5".to_string())
+        ]]
+    );
+}
+
+/// CHECKPOINT is accepted, as PostgreSQL's post-load maintenance runs it (PREREG §7 S), on the trunk and on a
+/// branch.
+#[test]
+fn checkpoint_is_accepted() {
+    let dir = Scratch::new("checkpoint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let r = a.q("CHECKPOINT").ok("checkpoint on the trunk");
+    assert_eq!(r.tags, vec!["CHECKPOINT".to_string()]);
+    assert!(r.oids.is_none(), "CHECKPOINT returned a row set");
+    a.q("SELECT turso_branch_create('c')").ok("create");
+    a.q("SELECT turso_branch_switch('c')").ok("switch");
+    a.q("UPDATE t SET v = 'c' WHERE id = 1").ok("write");
+    let r = a.q("CHECKPOINT").ok("checkpoint on a branch");
+    assert_eq!(r.tags, vec!["CHECKPOINT".to_string()]);
+    assert_eq!(a.q("SELECT v FROM t WHERE id = 1").single("after"), "c");
+}
+
+/// SET and TRUNCATE complete with PostgreSQL's command tags and no row set.
+#[test]
+fn set_and_truncate_report_their_command_tags() {
+    let dir = Scratch::new("tags");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let r = a.q("SET search_path TO public").ok("set");
+    assert_eq!(r.tags, vec!["SET".to_string()]);
+    assert!(r.oids.is_none(), "SET returned a row set");
+    let r = a.q("TRUNCATE t").ok("truncate");
+    assert_eq!(r.tags, vec!["TRUNCATE TABLE".to_string()]);
+    assert_eq!(a.q("SELECT count(*) FROM t").single("count"), "0");
+}
+
+/// A session cannot delete the branch it is on (PostgreSQL: "cannot drop the currently open database", 55006).
+#[test]
+fn deleting_the_sessions_own_branch_is_refused_with_55006() {
+    let dir = Scratch::new("ownbranch");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('own')").ok("create");
+    a.q("SELECT turso_branch_switch('own')").ok("switch");
+    let e = a
+        .q("SELECT turso_branch_delete('own')")
+        .err("delete own branch");
+    assert_eq!(e.code, "55006", "{e:?}");
+    a.q("UPDATE t SET v = 'own' WHERE id = 1")
+        .ok("the branch is still there");
+    a.q("SELECT turso_branch_switch('main')").ok("leave");
+    a.q("SELECT turso_branch_delete('own')")
+        .ok("delete from elsewhere");
+}
+
+/// A branch another session holds is refused with 55006 (object_in_use), naming the branch, at a switch and at
+/// startup.
+#[test]
+fn a_branch_held_by_another_session_is_refused_with_55006() {
+    let dir = Scratch::new("held");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('h')").ok("create");
+    let _b = server.connect_to("postgres/h").expect("b on h");
+    let e = a.q("SELECT turso_branch_switch('h')").err("switch to held");
+    assert_eq!(e.code, "55006", "{e:?}");
+    assert!(e.message.contains("\"h\""), "{e:?}");
+    let e = server
+        .connect_to("postgres/h")
+        .err()
+        .expect("admitted on held");
+    assert_eq!(e.code, "55006", "{e:?}");
 }
