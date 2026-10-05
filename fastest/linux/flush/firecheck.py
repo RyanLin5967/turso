@@ -48,8 +48,9 @@ Arms (each must hold; the run exits 1 on any failure, 2 on a refused setup, and 
                        other thread still runs is LIVE
   foreign, foreign /proc  slots claimed in another pid namespace (sudo unshare --pid): rc 12, live or not; a report
                        inside the namespace that reads the host's /proc (no --mount-proc): rc 12
-  hidepid              /proc with hidepid=invisible: root without CAP_SYS_PTRACE still reads the hidden live process as
-                       LIVE (kill(pid, 0)), the user's report refuses (rc 12)
+  hidepid              /proc with hidepid=invisible: a root reader without CAP_SYS_PTRACE and outside group 0, proven
+                       unable to see the probe in /proc, still reads it LIVE (kill(pid, 0)); a v1ctl mutant that
+                       trusts ENOENT reads it dead (rc 0) and is caught; the user's report refuses (rc 12)
   vforkrace            a counting thread races K vfork children that each fsync once: every count under its own pid;
                        mutant split_publish (pid and slot published apart) misattributes and is caught
   create               a run larger than /dev/shm is refused at create (posix_fallocate), never a SIGBUS later
@@ -1002,9 +1003,11 @@ def sec_vforkrace():
 
 
 def sec_hidepid():
-    """/proc mounted with hidepid=invisible (in a private mount namespace). A report as root WITHOUT CAP_SYS_PTRACE
-    cannot see the runner-owned probe in /proc, and must still read it LIVE (rc 10), never dead (rc 0). A report as
-    the user refuses outright (rc 12): its /proc hides other users."""
+    """/proc mounted with hidepid=invisible (in a private mount namespace). A root reader without CAP_SYS_PTRACE and
+    OUT of group 0 (hidepid exempts any reader in its gid=, which defaults to 0) cannot see the runner-owned probe in
+    /proc -- the arm first proves it cannot -- and must still read it LIVE (rc 10), never dead (rc 0). The mutant
+    v1ctl that trusts /proc's ENOENT must read it dead (rc 0): the arm is red without kill(pid, 0). A report as the
+    user refuses outright (rc 12): its /proc hides other users."""
     import pwd
     user = pwd.getpwuid(os.getuid()).pw_name
     run = new_run("p")
@@ -1017,23 +1020,37 @@ def sec_hidepid():
                           stderr=subprocess.PIPE, text=True)
     pid, line = ready_pid(pr)
     mnt = 'mount -t proc -o hidepid=invisible proc /proc && exec "$@"'
-    r_root = sh(["sudo", "-n", "unshare", "-m", "sh", "-c", mnt, "sh", "setpriv", "--bounding-set=-sys_ptrace",
-                 B + "/v1ctl", "report", run, "--json"], timeout=60)
+    # blind root: no CAP_SYS_PTRACE, gid 65534 and no groups; it first reports whether it can see the probe
+    see = 'if test -e /proc/"$0"; then echo VISIBLE; else echo HIDDEN; fi; exec "$@"'
+    blind = ["setpriv", "--bounding-set=-sys_ptrace", "--regid=65534", "--clear-groups", "sh", "-c", see, str(pid)]
+
+    def blind_report(v1ctl):
+        r = sh(["sudo", "-n", "unshare", "-m", "sh", "-c", mnt, "sh"] + blind + [v1ctl, "report", run, "--json"],
+               timeout=60)
+        first, _, rest = r.stdout.partition("\n")
+        j = json.loads(rest) if rest.strip().startswith("{") else None
+        return r, first.strip(), j
+
+    r_root, seen_root, jr = blind_report(B + "/v1ctl")
+    r_mut, seen_mut, jm = blind_report(B + "/v1ctl_mut_no_kill_check")
     r_user = sh(["sudo", "-n", "unshare", "-m", "sh", "-c", mnt, "sh", "setpriv", "--reuid=" + user, "--regid=" + user,
                  "--init-groups", B + "/v1ctl", "report", run, "--json"], timeout=60)
     open(flag, "w").close()
     rcp = pr.wait(timeout=60)
     rc_final, rep_final = report(run)
     rm(run)
-    save(run + ".hidepid.txt", "root rc=%d\n%s\n%s\nuser rc=%d\n%s\n%s\n" % (
-        r_root.returncode, r_root.stdout, r_root.stderr, r_user.returncode, r_user.stdout, r_user.stderr))
-    jr = json.loads(r_root.stdout) if r_root.stdout.strip().startswith("{") else None
+    save(run + ".hidepid.txt", "root rc=%d\n%s\n%s\nmutant rc=%d\n%s\n%s\nuser rc=%d\n%s\n%s\n" % (
+        r_root.returncode, r_root.stdout, r_root.stderr, r_mut.returncode, r_mut.stdout, r_mut.stderr,
+        r_user.returncode, r_user.stdout, r_user.stderr))
     ju = json.loads(r_user.stdout) if r_user.stdout.strip().startswith("{") else None
     arm("hidepid: root without CAP_SYS_PTRACE reads the hidden process LIVE; the user's report refuses",
-        pid is not None and r_root.returncode == 10 and jr is not None and jr["live"] >= 1
+        pid is not None and seen_root == "HIDDEN" and r_root.returncode == 10 and jr is not None and jr["live"] >= 1
+        and seen_mut == "HIDDEN" and r_mut.returncode == 0 and jm is not None and jm["live"] == 0
         and r_user.returncode == 12 and ju is not None and ju["proc_untrusted"] is True and rcp == 0
         and rc_final == 0 and rep_final["totals"] == counts(fsync=3),
-        {"line": line, "rc_root_no_ptrace": r_root.returncode, "live_root": jr and jr["live"],
+        {"line": line, "probe_seen_by_blind_root": seen_root, "rc_root_blind": r_root.returncode,
+         "live_root": jr and jr["live"], "mutant_no_kill_check": {"seen": seen_mut, "rc": r_mut.returncode,
+                                                                  "live": jm and jm["live"]},
          "rc_user": r_user.returncode, "proc_untrusted_user": ju and ju["proc_untrusted"], "probe_rc": rcp,
          "rc_final": rc_final, "stderr_root": r_root.stderr[-200:], "stderr_user": r_user.stderr[-200:]})
 

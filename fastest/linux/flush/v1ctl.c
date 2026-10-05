@@ -133,7 +133,9 @@ static int slot_alive(const v1_slot *s) {
     if (got == 0) {
         /* /proc says no such process -- but hidepid hides other users' processes from a reader without
          * CAP_SYS_PTRACE (even euid 0), and kill(pid, 0) is not filtered by it: dead only if kill says ESRCH. */
+#ifndef V1_MUTANT_NO_KILL_CHECK /* fire-check mutant: the hidepid arm must catch a report that trusts ENOENT */
         if (kill(s->pid, 0) == 0 || errno == EPERM) return 1;
+#endif
         return 0;
     }
     if (got < 0) return 1;

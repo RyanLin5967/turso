@@ -10,6 +10,7 @@
 #                                waiters claim again without re-checking; split_publish: a slot claim that publishes
 #                                the slot and the pid apart, with a window between)
 #   v1ctl, v1run                 run control and launcher
+#   v1ctl_mut_no_kill_check      a v1ctl mutant that trusts /proc's ENOENT (the hidepid arm must catch it)
 #   probe_c, probe_c_static      the C probe, and a static build of its "spawned" mode (never loads the shim)
 #   probe_uring                  a C probe linked against liburing.so (io_uring_queue_init + IORING_OP_FSYNC)
 #   probe_go_nocgo, probe_go_cgo the Go probe built CGO_ENABLED=0 (static) and =1 (dynamic, like Dolt)
@@ -44,6 +45,8 @@ for m in $LOGIC_MUTANTS; do
     "$HERE/syncshim.c" -ldl -lpthread
 done
 unit v1ctl $CC "${CF[@]}" -o "$OUT/v1ctl" "$HERE/v1ctl.c" -lrt
+unit v1ctl_mut_no_kill_check $CC "${CF[@]}" -DV1_MUTANT_NO_KILL_CHECK -o "$OUT/v1ctl_mut_no_kill_check" \
+  "$HERE/v1ctl.c" -lrt
 unit v1run $CC "${CF[@]}" -o "$OUT/v1run" "$HERE/v1run.c" -lrt
 unit probe_c $CC "${CF[@]}" -o "$OUT/probe_c" "$HERE/probe_c.c" -ldl -lrt -lpthread
 unit probe_c_static $CC "${CF[@]}" -static -DPROBE_STATIC -o "$OUT/probe_c_static" "$HERE/probe_c.c"
@@ -85,7 +88,8 @@ file -L "$OUT/probe_c" | grep -q 'dynamically linked' || fail "probe_c is not dy
 ldd "$OUT/probe_uring" | grep -q 'liburing\.so' || fail "probe_uring does not link liburing.so dynamically"
 LIBC=$(ldd "$OUT/probe_c" | awk '$1 ~ /^libc\.so/ {print $3}')
 [ -n "$LIBC" ] && [ -e "$LIBC" ] || fail "cannot find the libc probe_c links"
-BINS="syncshim.so syncshim_mut_*.so v1ctl v1run probe_c probe_c_static probe_uring probe_go_nocgo probe_go_cgo"
+BINS="syncshim.so syncshim_mut_*.so v1ctl v1ctl_mut_no_kill_check v1run probe_c probe_c_static probe_uring probe_go_nocgo
+  probe_go_cgo"
 {
   echo "built_utc=$(date -u +%FT%TZ) uname=$(uname -srm)"
   echo "cc=$($CC --version | head -1)"
