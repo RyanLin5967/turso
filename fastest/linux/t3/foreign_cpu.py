@@ -187,23 +187,48 @@ def self_test():
         s.wait()
         return decide(out)["verdict"]
 
-    ncpu = os.cpu_count() or 1
-    cases = [
-        ("quiet window", [], "VALID"),
-        ("SUT burners only (2 cores, whole window)", [(True, 1, 17), (True, 1, 17)], "VALID"),
-        # A 70% burner stays under the one-core rule even with the box's own background on top, so these
-        # two isolate the single-process rule (> 50% for >= 5 s). A full-core burner cannot: run
-        # 37255216397 voided a 3 s one by the one-core rule, correctly, once the runner's background
-        # pushed its ticks over 100%.
-        ("one foreign 70% burner for 9 s", [(False, 3, 9, 0.7)], "VOID"),
-        ("one foreign 70% burner for 3 s (below 5 s)", [(False, 3, 3, 0.7)], "VALID"),
+    # Live: the sampler sees real processes and classifies them (marker -> sut, none -> foreign).
+    live = [
+        ("live: quiet window", [], "VALID"),
+        ("live: SUT burners only (2 cores, whole window)", [(True, 1, 17), (True, 1, 17)], "VALID"),
+        ("live: one foreign full-core burner for 9 s", [(False, 3, 9)], "VOID"),
     ]
-    if ncpu >= 3:
-        cases.append(("three foreign burners for 3 s each (> 100% in > 5% of ticks)",
-                      [(False, 5, 3), (False, 5, 3), (False, 5, 3)], "VOID"))
     bad = 0
-    for label, burners, want in cases:
-        got = window(label.replace(" ", "_")[:24], burners)
+    for label, burners, want in live:
+        out = window(label.split(": ")[1].replace(" ", "_")[:24], burners)
+        ok = out == want
+        bad += not ok
+        print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {out}")
+
+    # Synthetic: each rule alone, on records whose every number is chosen here (a live box's own
+    # background cannot be held still: runs 37255216397 and 37255904818 voided a 3 s burner by the
+    # one-core rule once the runner's background was added to it).
+    def synth(label, ticks, procs=(), stopped=True, gap_at=None):
+        f = os.path.join(d, f"synth-{label}.tsv")
+        with open(f, "w") as o:
+            o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
+            t = 0.0
+            for i, foreign in enumerate(ticks):
+                t += 4.0 if gap_at == i else 1.0
+                for pid, start, n, pct in procs:
+                    if start <= i < start + n:
+                        o.write(f"{t:.3f}\t{pid}\tburn\t{pct}\tforeign\n")
+                o.write(f"#tick\t{t:.3f}\t{foreign}\t0.0\t50.0\n")
+            if stopped:
+                o.write(f"#stop\t{t:.3f}\tstop-file\tload=()\n")
+        return decide(f)["verdict"]
+
+    synthetic = [
+        ("rule 1: foreign 150% in 2 of 20 ticks (10% > 5%)", synth("r1v", [10] * 18 + [150, 150]), "VOID"),
+        ("rule 1: foreign 150% in 1 of 20 ticks (5%, not above)", synth("r1ok", [10] * 19 + [150]), "VALID"),
+        ("rule 2: one process at 60% for 6 consecutive s", synth("r2v", [60] * 20, [(7, 3, 6, 60.0)]), "VOID"),
+        ("rule 2: one process at 60% for 4 consecutive s", synth("r2ok", [60] * 20, [(7, 3, 4, 60.0)]), "VALID"),
+        ("rule 2: at 60% twice for 3 s, a gap between", synth("r2gap", [60] * 20, [(7, 2, 3, 60.0), (7, 7, 3, 60.0)]), "VALID"),
+        ("unusable: the sampler never stopped", synth("nostop", [10] * 20, stopped=False), "VOID"),
+        ("unusable: 2 ticks", synth("short", [10, 10]), "VOID"),
+        ("unusable: a 4 s gap", synth("gap", [10] * 20, gap_at=10), "VOID"),
+    ]
+    for label, got, want in synthetic:
         ok = got == want
         bad += not ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {got}")

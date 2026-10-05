@@ -9,7 +9,8 @@
 #   strace.txt      strace -f -y of a second run with FASTEST_PHASE markers (+ strace-run/)
 #   perfstat-W.csv  perf stat over window W only (perf --control), one run per window
 #   flame-create.svg, perf-create.data.txt  perf record of the create window (class full only)
-#   cg-n.txt, cg-2n.txt, cg-n.ops  callgrind_annotate --inclusive of runs at N and 2N ops (C=1 only)
+#   cg-kK-n.total, cg-kK-2n.total, cg-n.ops  callgrind total Ir of runs doing the first K phases at N
+#                   and 2N ops (C=1 only), plus cg-k4-n.annotate.txt for reading
 #   status          "NOT AVAILABLE: ..." when the driver refuses the class (rc 4); every other
 #                   failure is recorded in <raw-dir>/<side>/runs.tsv and fails the script.
 # Sizes: PROFILE_OPS_C1 (200), PROFILE_OPS_CN (20 per client), PROFILE_CG_OPS (100).
@@ -100,20 +101,28 @@ for arm in $arms; do
     fi
   fi
 
-  # 5. callgrind at N and 2N ops (C=1): inclusive Ir per phase function; the setup call cancels
+  # 5. callgrind, C=1: whole-program Ir of runs doing only the first K phases (K = 1..4) at N and 2N ops;
+  # a phase's Ir per op is a difference of differences, so the setup cancels and no per-function
+  # attribution is trusted (callgrind reported false recursion and >100% inclusive costs on arm64,
+  # run 37255309860).
   if [ "$c" = 1 ]; then
     echo "$cgops" > "$d/cg-n.ops"
-    for n in "$cgops" $((2 * cgops)); do
-      tag=n; [ "$n" != "$cgops" ] && tag=2n
-      cargs=(--class "$class" --clients 1 --ops "$n" --warmup 0)
-      [ "$store" = cat ] && cargs+=(--catalog)
-      fresh
-      timeout 3600 valgrind --tool=callgrind --fair-sched=yes --callgrind-out-file="$work/cg-$arm-$tag.out" \
-        "$drv" --dir "$DB" "${cargs[@]}" > "$d/cg-$tag.stdout" 2> "$d/cg-$tag.stderr"
-      record "$arm" "callgrind-$tag" $?
-      callgrind_annotate --inclusive=yes --threshold=100 "$work/cg-$arm-$tag.out" > "$d/cg-$tag.txt" 2>&1
-      record "$arm" "callgrind-annotate-$tag" $?
+    for kph in 1 2 3 4; do
+      for n in "$cgops" $((2 * cgops)); do
+        tag=n; [ "$n" != "$cgops" ] && tag=2n
+        cargs=(--class "$class" --clients 1 --ops "$n" --warmup 0 --phases "$kph")
+        [ "$store" = cat ] && cargs+=(--catalog)
+        fresh
+        timeout 3600 valgrind --tool=callgrind --fair-sched=yes --callgrind-out-file="$work/cg-$arm-k$kph-$tag.out" \
+          "$drv" --dir "$DB" "${cargs[@]}" > "$d/cg-k$kph-$tag.stdout" 2> "$d/cg-k$kph-$tag.stderr"
+        record "$arm" "callgrind-k$kph-$tag" $?
+        # the run's total Ir: the 'totals:' (or older 'summary:') line of the callgrind output file
+        sed -nE 's/^(totals|summary): *([0-9]+).*/\2/p' "$work/cg-$arm-k$kph-$tag.out" | tail -1 > "$d/cg-k$kph-$tag.total"
+        [ -s "$d/cg-k$kph-$tag.total" ]
+        record "$arm" "callgrind-total-k$kph-$tag" $?
+      done
     done
+    callgrind_annotate --inclusive=yes --threshold=99 "$work/cg-$arm-k4-n.out" > "$d/cg-k4-n.annotate.txt" 2>&1
   fi
   gzip -f "$d/strace.txt"
 done
