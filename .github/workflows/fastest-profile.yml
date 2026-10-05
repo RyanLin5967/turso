@@ -90,9 +90,11 @@ jobs:
           base="${{ inputs.base_sha }}"
           prev=""
           if [ -z "$base" ]; then
+            # No green run yet prints nothing (run 37242461472 read "null null" and tried to check out "null").
             row=$(gh run list -R "$GITHUB_REPOSITORY" --workflow fastest-profile.yml --branch fastest-branching \
-                    --status success -L 1 --json databaseId,headSha -q '.[0] | "\(.databaseId) \(.headSha)"' || true)
-            prev=${row%% *}; base=${row#* }
+                    --status success -L 1 --json databaseId,headSha \
+                    -q 'if length == 0 then "" else (.[0] | "\(.databaseId) \(.headSha)") end' || true)
+            if [ -n "$row" ]; then prev=${row%% *}; base=${row#* }; fi
           fi
           mkdir -p prev
           if [ -n "$prev" ]; then
@@ -113,11 +115,11 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p dist/base
-          git worktree add -q --detach "$RUNNER_TEMP/base" "${{ steps.base.outputs.sha }}"
-          mkdir -p "$RUNNER_TEMP/base/core/examples/fastest_profile"
-          cp core/examples/fastest_profile/main.rs "$RUNNER_TEMP/base/core/examples/fastest_profile/main.rs"
-          if (cd "$RUNNER_TEMP/base" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-base" timeout 6000 \
-                cargo build --release --locked -p turso_core --example fastest_profile) 2> dist/base/build.stderr; then
+          if git worktree add -q --detach "$RUNNER_TEMP/base" "${{ steps.base.outputs.sha }}" 2> dist/base/build.stderr &&
+             mkdir -p "$RUNNER_TEMP/base/core/examples/fastest_profile" &&
+             cp core/examples/fastest_profile/main.rs "$RUNNER_TEMP/base/core/examples/fastest_profile/main.rs" &&
+             (cd "$RUNNER_TEMP/base" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-base" timeout 6000 \
+                cargo build --release --locked -p turso_core --example fastest_profile) 2>> dist/base/build.stderr; then
             cp target-base/release/examples/fastest_profile dist/base/
             sha256sum dist/base/fastest_profile | tee -a "$RAW/run-info.txt"
           else
