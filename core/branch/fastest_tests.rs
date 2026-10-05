@@ -2318,9 +2318,10 @@ fn a_refused_catalog_probe_is_made_again() {
         let a = db.connect().unwrap();
         let young = a.fork_branch().unwrap();
         let y = young.connect().unwrap();
-        // Every page the reads below touch but row 3's leaf is probed here, so the failpoint's
-        // probe is that leaf's.
-        assert_eq!(read_wide(&y, 50), "trunk-50", "premise");
+        // A point read (`read_wide` scans the table): every page the operations below touch but
+        // row 3's leaf is probed here, so the failpoint's probe is that leaf's.
+        let r50 = y.prepare("SELECT v FROM t WHERE id = 50").unwrap().run_collect_rows().unwrap();
+        assert!(r50[0][0].to_string().starts_with("trunk-50-"), "premise: {:?}", r50[0][0]);
         let probes = db.branch_twk_counters().0;
         db.branch_failpoint(Some(BranchFailpoint::TrunkProbeBusy));
         if refused_by_read {
@@ -2352,60 +2353,76 @@ fn a_refused_catalog_probe_is_made_again() {
 /// Review 4 #1 (= skill 2 #2): a fuzzy checkpoint captured while an operation's flight is in the
 /// air commits the catalog only once everything it captured is durable. When that flight FAILS the
 /// commit is refused, so an operation whose caller was told it failed never becomes durable through
-/// the catalog. Release arm: the released branch's slots stay out of the allocator, and the branch
-/// is back after a reopen. Fork arm: the fork whose flight failed is not a live branch after a
-/// reopen.
-#[test]
-fn a_fuzzy_checkpoint_never_commits_what_a_failed_flight_carried() {
-    let _s = serial();
-    for fork in [false, true] {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("ckpt-failed-flight.db");
-        let (x_id, live, incarnation) = {
-            let db = open_at(&path, opts(true, SyncClass::Fsync));
-            let trunk = db.connect().unwrap();
-            seed(&trunk);
-            let _anchor = trunk.fork_branch().unwrap().into_id();
-            let x = trunk.fork_branch().unwrap();
-            write_v(&x.connect().unwrap(), 3, "x");
-            let owned = x.owned_slots();
-            assert!(!owned.is_empty(), "premise: the branch owns a slot");
-            let live = db.branch_stats().unwrap().live_branches;
-            let hold = db.branches.trunk_commit_hold.clone();
-            db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
-            hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
-            let (x_id, op) = if fork {
-                let x_id = x.into_id();
-                let db = db.clone();
-                (x_id, std::thread::spawn(move || db.connect()?.fork_branch().map(|b| drop(b.into_id()))))
-            } else {
-                (x.id(), std::thread::spawn(move || x.reap().map(|_| ())))
-            };
-            wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
-            let started = db.branch_checkpoint_fuzzy_now();
-            hold.store(0, std::sync::atomic::Ordering::Release);
-            assert!(started.unwrap(), "fork={fork}: premise: a fuzzy checkpoint started");
-            assert!(op.join().unwrap().is_err(), "fork={fork}: premise: the operation's flight failed");
-            db.branch_checkpoint_wait();
-            if !fork {
-                for slot in &owned {
-                    assert!(
-                        !db.branch_slot_is_free(*slot),
-                        "slot {slot} was freed by a checkpoint though the release that frees it failed"
-                    );
-                }
-            }
-            (x_id, live, db.incarnation)
-        };
-        let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
-        assert_eq!(
-            db.branch_stats().unwrap().live_branches,
-            live,
-            "fork={fork}: the failed operation became durable through the checkpoint"
-        );
-        let x = db.branch(x_id).expect("the branch is there after a reopen");
-        assert_eq!(read_v(&x.connect().unwrap(), 3), "x", "fork={fork}");
+/// the catalog. `fork`: the operation is a fork, else the release of a branch that wrote a page.
+/// Returns the branch that must be there after a reopen, the live count it must show, and the
+/// incarnation.
+fn checkpoint_over_a_failed_flight(path: &Path, fork: bool) -> (BranchId, usize, u64) {
+    let db = open_at(path, opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _anchor = trunk.fork_branch().unwrap().into_id();
+    let x = trunk.fork_branch().unwrap();
+    write_v(&x.connect().unwrap(), 3, "x");
+    let owned = x.owned_slots();
+    assert!(!owned.is_empty(), "premise: the branch owns a slot");
+    let live = db.branch_stats().unwrap().live_branches;
+    let hold = db.branches.trunk_commit_hold.clone();
+    db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+    hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+    let (x_id, op) = if fork {
+        let x_id = x.into_id();
+        let db = db.clone();
+        (x_id, std::thread::spawn(move || db.connect()?.fork_branch().map(|b| drop(b.into_id()))))
+    } else {
+        (x.id(), std::thread::spawn(move || x.reap().map(|_| ())))
+    };
+    wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+    let started = db.branch_checkpoint_fuzzy_now();
+    hold.store(0, std::sync::atomic::Ordering::Release);
+    assert!(started.unwrap(), "fork={fork}: premise: a fuzzy checkpoint started");
+    assert!(op.join().unwrap().is_err(), "fork={fork}: premise: the operation's flight failed");
+    db.branch_checkpoint_wait();
+    if !fork {
+        for slot in &owned {
+            assert!(
+                !db.branch_slot_is_free(*slot),
+                "slot {slot} was freed by a checkpoint though the release that frees it failed"
+            );
+        }
     }
+    (x_id, live, db.incarnation)
+}
+
+fn after_the_reopen(path: &Path, fork: bool, (x_id, live, incarnation): (BranchId, usize, u64)) {
+    let db = reopen(path, opts(true, SyncClass::Fsync), incarnation);
+    assert_eq!(
+        db.branch_stats().unwrap().live_branches,
+        live,
+        "fork={fork}: the failed operation became durable through the checkpoint"
+    );
+    let x = db.branch(x_id).expect("the branch is there after a reopen");
+    assert_eq!(read_v(&x.connect().unwrap(), 3), "x", "fork={fork}");
+}
+
+/// Review 4 #1, release arm: the released branch's slots stay out of the allocator, and the branch
+/// is back after a reopen.
+#[test]
+fn a_fuzzy_checkpoint_never_commits_a_release_whose_flight_failed() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ckpt-failed-release.db");
+    let kept = checkpoint_over_a_failed_flight(&path, false);
+    after_the_reopen(&path, false, kept);
+}
+
+/// Review 4 #1, fork arm: the fork whose flight failed is not a live branch after a reopen.
+#[test]
+fn a_fuzzy_checkpoint_never_commits_a_fork_whose_flight_failed() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ckpt-failed-fork.db");
+    let kept = checkpoint_over_a_failed_flight(&path, true);
+    after_the_reopen(&path, true, kept);
 }
 
 // ---- skill review 2 #3: a logged Release raises the trunk's barrier floor ----
