@@ -199,7 +199,7 @@ run_server_cell() { # run_server_cell SPEC C
   bbload "$spec" "$c" "$n" "$d/bb" || rc=$?
   log1=$(stat -c %s "$DATA.log")
   used1=$(fsused)
-  local defer=()
+  local defer=() tw=()
   if [ "$KIND" = pg ]; then
     # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost). It runs INSIDE the load
     # window's attach, after a tsplit stamp, and is counted as that trace's "post" part (second review, finding 2:
@@ -222,6 +222,7 @@ run_server_cell() { # run_server_cell SPEC C
     av=$(grep -c 'terminating autovacuum process due to administrator command' "$d/server_log_load.txt")
     busy=$(grep -c 'is being accessed by other users' "$d/server_log_load.txt")
     echo "autovacuum_terminated_in_window=$av template_busy_errors=$busy" >"$d/template_waits.txt"
+    tw=(--template-waits "$d/template_waits.txt")
     [ "$av" = 0 ] && [ "$busy" = 0 ] || fun "FLAG $spec-c$c: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $av, busy-template errors $busy"
   fi
   count "$d/idle"
@@ -235,7 +236,7 @@ run_server_cell() { # run_server_cell SPEC C
   read -r total ok created <"$d/ops.txt"
   python3 "$SC" cell --name "$SYSTEM/$spec-c$c" --load "$d/load.json" --idle "$d/idle.json" \
     --load-s "$(window_s "$d/load")" --idle-s "$(window_s "$d/idle")" --ops "$total" --ops-ok "$ok" \
-    ${defer[@]+"${defer[@]}"} >"$d/cell.json"
+    ${defer[@]+"${defer[@]}"} ${tw[@]+"${tw[@]}"} >"$d/cell.json"
   judge_cell "$d"
   python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'raw/op', p.get('flushes_raw'), 'foreground/op', p.get('foreground'), 'background/op', p.get('background'), 'background_free', c.get('background_free'), 'deferred/op', c.get('deferred',{}).get('per_op'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
 }
@@ -265,7 +266,9 @@ server_main() {
     expect "server wal_sync_method" "$(awk -F'\t' '$1 == "wal_sync_method" {print $2}' "$RAW/pg_settings.tsv")" fdatasync
     expect "server file_copy_method" "$(awk -F'\t' '$1 == "file_copy_method" {print $2}' "$RAW/pg_settings.tsv")" clone
   fi
-  [ "$KIND" = pg ] && sqlq "CHECKPOINT"
+  if [ "$KIND" = pg ]; then  # the seed's own checkpoint; a failure FAILS the job (second review, finding 9)
+    sqlq "CHECKPOINT" >"$RAW/seed-checkpoint.txt" 2>&1 || fail "pre-cell CHECKPOINT rc=$? ($(tail -1 "$RAW/seed-checkpoint.txt"))"
+  fi
   [ "$KIND" = pg ] || dolt_quiet_root "$ROOT/vroot"  # the version commands below run with metrics/version check off too
   case $KIND in
     pg) { "$FT_PG18/postgres" --version; sha256sum "$FT_PG18/postgres"; dpkg-query -W 'postgresql-18*' 'libpq5' 2>/dev/null; } >"$RAW/version.txt" ;;

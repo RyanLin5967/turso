@@ -511,6 +511,13 @@ def cell(a):
         notes.append(f"idle-subtracted estimate below zero ({per['flushes']}): the scaled idle control "
                      f"({res['idle']['flushes']} x {scale:.4f}) exceeds the window's {res['load']['flushes']} flushes;"
                      " read flushes_raw")
+    if a.get("template-waits"):
+        # PG: creates that waited on the template in CountOtherDBBackends during the window (run_system.sh reads them
+        # from the server log). Recorded in the cell and marked in the tables, never dropped (second review, 9).
+        tw = dict(re.findall(r"(\w+)=(\d+)", open(a["template-waits"]).read()))
+        res["template_waits"] = {k: int(v) for k, v in tw.items()}
+        if any(int(v) for v in tw.values()):
+            notes.append(f"creates waited on the template (CountOtherDBBackends): {res['template_waits']}")
     res["notes"] = notes
     res["load_by_class"] = load["by_class"]
     res["idle_by_class"] = idle["by_class"]
