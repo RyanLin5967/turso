@@ -28,7 +28,9 @@ runs="$raw/runs.tsv"
 : > "$runs"
 k=0
 bad=0
-fresh() { k=$((k + 1)); echo "$work/db-$k"; }
+# fresh: a new database directory in $DB. Never call it as $(fresh): a command substitution is a subshell,
+# so k would never advance and every run would reuse db-1 (run 37254757721: every run after the first refused).
+fresh() { k=$((k + 1)); DB="$work/db-$k"; }
 
 # record <arm> <what> <rc>: rc 0 is ok; anything else fails the script (rc 4 is handled by the caller)
 record() {
@@ -48,7 +50,8 @@ for arm in $arms; do
   if [ "$c" = 1 ]; then args+=(--ops "$ops1" --warmup 20); else args+=(--ops "$opsn" --warmup 2); fi
 
   # 1. plain
-  timeout 1800 "$drv" --dir "$(fresh)" "${args[@]}" --out "$d/plain" > "$d/plain.stdout" 2>&1
+  fresh
+  timeout 1800 "$drv" --dir "$DB" "${args[@]}" --out "$d/plain" > "$d/plain.stdout" 2>&1
   rc=$?
   if [ $rc = 4 ] && grep -q '^NOT AVAILABLE' "$d/plain.stdout"; then
     head -1 "$d/plain.stdout" > "$d/status"
@@ -58,7 +61,8 @@ for arm in $arms; do
   record "$arm" plain $rc
 
   # 2. strace, every thread, fds shown as paths
-  timeout 3600 strace -f -qq -y -o "$d/strace.txt" "$drv" --dir "$(fresh)" "${args[@]}" --mark \
+  fresh
+  timeout 3600 strace -f -qq -y -o "$d/strace.txt" "$drv" --dir "$DB" "${args[@]}" --mark \
     --out "$d/strace-run" > "$d/strace.stdout" 2>&1
   record "$arm" strace $?
 
@@ -67,9 +71,10 @@ for arm in $arms; do
     ctl="$work/ctl-$k.fifo" ack="$work/ack-$k.fifo"
     rm -f "$ctl" "$ack"
     mkfifo "$ctl" "$ack"
+    fresh
     timeout 1800 perf stat -D -1 --control "fifo:$ctl,$ack" -x, -o "$d/perfstat-$w.csv" \
       -e task-clock,context-switches,cpu-migrations,page-faults,instructions:u,cycles:u,instructions:k,cycles:k \
-      -- "$drv" --dir "$(fresh)" "${args[@]}" --perf-ctl "$ctl,$ack" --perf-only "$w" > "$d/perfstat-$w.stdout" 2>&1
+      -- "$drv" --dir "$DB" "${args[@]}" --perf-ctl "$ctl,$ack" --perf-only "$w" > "$d/perfstat-$w.stdout" 2>&1
     record "$arm" "perfstat-$w" $?
     rm -f "$ctl" "$ack"
   done
@@ -79,8 +84,9 @@ for arm in $arms; do
     ctl="$work/ctl-r-$k.fifo" ack="$work/ack-r-$k.fifo"
     rm -f "$ctl" "$ack"
     mkfifo "$ctl" "$ack"
+    fresh
     timeout 1800 perf record -F 1999 -g --call-graph dwarf,16384 -D -1 --control "fifo:$ctl,$ack" \
-      -o "$work/perf-$arm.data" -- "$drv" --dir "$(fresh)" "${args[@]}" --perf-ctl "$ctl,$ack" \
+      -o "$work/perf-$arm.data" -- "$drv" --dir "$DB" "${args[@]}" --perf-ctl "$ctl,$ack" \
       --perf-only create > "$d/perfrecord.stdout" 2>&1
     record "$arm" perf-record $?
     rm -f "$ctl" "$ack"
@@ -101,8 +107,9 @@ for arm in $arms; do
       tag=n; [ "$n" != "$cgops" ] && tag=2n
       cargs=(--class "$class" --clients 1 --ops "$n" --warmup 0)
       [ "$store" = cat ] && cargs+=(--catalog)
+      fresh
       timeout 3600 valgrind --tool=callgrind --fair-sched=yes --callgrind-out-file="$work/cg-$arm-$tag.out" \
-        "$drv" --dir "$(fresh)" "${cargs[@]}" > "$d/cg-$tag.stdout" 2> "$d/cg-$tag.stderr"
+        "$drv" --dir "$DB" "${cargs[@]}" > "$d/cg-$tag.stdout" 2> "$d/cg-$tag.stderr"
       record "$arm" "callgrind-$tag" $?
       callgrind_annotate --inclusive=yes --threshold=100 "$work/cg-$arm-$tag.out" > "$d/cg-$tag.txt" 2>&1
       record "$arm" "callgrind-annotate-$tag" $?
