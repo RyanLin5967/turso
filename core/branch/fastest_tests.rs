@@ -2232,3 +2232,51 @@ fn a_catalog_store_names_its_catalog_and_refuses_a_missing_arena() {
     );
     assert!(opened.is_err(), "a catalog store opened with its log and arena gone");
 }
+
+// ---- review 3 #1 (= skill 2 #1): a pre-image kept by a refused decision pass is still made durable
+// before the commit's frames ----
+
+/// Review 3 #1: a trunk commit whose decision pass is refused after it kept page P's pre-image, and
+/// retried, takes no decision for P again (P's written epoch is the commit's own). The pre-image's
+/// record must still be durable before the commit's frames: when the process then dies with nothing
+/// else flushed, the live child reads its fork-point row after the reopen. Second arm: the refused
+/// transaction rolls back, and a later one rewrites the same page.
+#[test]
+fn a_pre_image_kept_by_a_refused_decision_pass_is_durable_before_the_commit() {
+    let _s = serial();
+    for catalog in [false, true] {
+        for rollback in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("retain-floor.db");
+            let (child, incarnation) = {
+                let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+                let a = db.connect().unwrap();
+                seed_wide(&a);
+                let child = a.fork_branch().unwrap();
+                db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+                if rollback {
+                    a.execute("BEGIN").unwrap();
+                    a.execute("UPDATE t SET v = 'refused' WHERE id = 3").unwrap();
+                    let refused = a.execute("COMMIT");
+                    assert!(matches!(refused, Err(LimboError::Busy)), "premise: {refused:?}");
+                    let _ = a.execute("ROLLBACK");
+                    write_v(&a, 3, "new");
+                } else {
+                    let mut stmt = a.prepare("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+                    assert!(matches!(stmt.run_ignore_rows(), Err(LimboError::Busy)), "premise");
+                    stmt.run_ignore_rows().unwrap();
+                }
+                let id = child.into_id();
+                // The process ends here: nothing else is flushed.
+                (id, db.incarnation)
+            };
+            let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+            let b = db.branch(child).unwrap();
+            assert_eq!(
+                read_wide(&b.connect().unwrap(), 3),
+                "trunk-3",
+                "catalog={catalog} rollback={rollback}: the child reads the trunk's new row after a crash"
+            );
+        }
+    }
+}
