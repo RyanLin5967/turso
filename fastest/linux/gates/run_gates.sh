@@ -4,9 +4,12 @@
 # (frontier/fastest/lanes/engine/gate.sh and c1_firechecks.sh), not re-derived here.
 #
 # usage: run_gates.sh <test-binary> <out-dir> <core-dir>      (TMPDIR must already be set)
+# GATE_BIN_RAW: the same lib tests built with --features conn_raw_api; the "all" suite arm runs it, as
+# the engine lane's suite_arms.sh does (unset: the all arm runs <test-binary> and says so).
 # Sizes (smoke defaults; the registered sizes are the lead's to set after registration):
 #   GATE_C0_OPS=20000  GATE_C0_MIN_BRANCHES=100  GATE_E3_TRIALS=100  GATE_FC_SCALE=1
-#   GATE_STEPS="list scope suite fc e3 c0"   (subset to run, in this order)
+#   GATE_POWER_SCALE=1 (an extra multiplier on the power-loss control's 18 trials, for the I2 re-runs)
+#   GATE_STEPS="list scope suite fc e3 c0 libfull"   (subset to run, in this order)
 #
 # One raw file per step, banked before anything reads it: <out>/<step>.txt, opening with a header
 # (binary sha256, TMPDIR and its fstype, env, command, start) and closing with "# end ... rc=N".
@@ -18,14 +21,20 @@ bin=${1:?usage: run_gates.sh <test-binary> <out-dir> <core-dir>}
 out=${2:?out dir}
 core=${3:?core dir}
 : "${TMPDIR:?TMPDIR must name a directory on the filesystem under test}"
-steps=${GATE_STEPS:-list scope suite fc e3 c0}
+steps=${GATE_STEPS:-list scope suite fc e3 c0 libfull}
 c0_ops=${GATE_C0_OPS:-20000}
 c0_min=${GATE_C0_MIN_BRANCHES:-100}
 e3_trials=${GATE_E3_TRIALS:-100}
 scale=${GATE_FC_SCALE:-1}
+pscale=${GATE_POWER_SCALE:-1}
+bin_raw=${GATE_BIN_RAW:-}
 mkdir -p "$out" "$TMPDIR" || exit 1
 bin=$(readlink -f "$bin")
 bin_sha=$(sha256sum "$bin" | cut -c1-64)
+if [ -n "$bin_raw" ]; then
+  bin_raw=$(readlink -f "$bin_raw")
+  bin_raw_sha=$(sha256sum "$bin_raw" | cut -c1-64)
+fi
 fstype=$(findmnt -n -o FSTYPE -T "$TMPDIR")
 verdict="$out/verdict.tsv"
 : > "$verdict"
@@ -34,19 +43,21 @@ export RUST_BACKTRACE=1
 
 row() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" | tee -a "$verdict"; }
 
-# step <label> <timeout-s> <env assignments...> -- <test args...>
+# step <label> <timeout-s> <env assignments...> -- <test args...>   (STEP_BIN overrides the binary)
 step() {
   local label=$1 t=$2; shift 2
+  local b=${STEP_BIN:-$bin} bsha=$bin_sha
+  [ "$b" != "$bin" ] && bsha=$bin_raw_sha
   local envs=()
   while [ "$1" != "--" ]; do envs+=("$1"); shift; done
   shift
   local f="$out/$label.txt"
   {
-    echo "# fastest-linux gate label=$label bin_sha256=$bin_sha tmpdir=$TMPDIR fstype=$fstype start=$(date -u +%FT%TZ)"
+    echo "# fastest-linux gate label=$label bin_sha256=$bsha tmpdir=$TMPDIR fstype=$fstype start=$(date -u +%FT%TZ)"
     for e in "${envs[@]+"${envs[@]}"}"; do echo "# env $e"; done
-    echo "# cmd=[$bin $*] cwd=$core"
+    echo "# cmd=[$b $*] cwd=$core"
   } > "$f"
-  ( cd "$core" && env "${envs[@]+"${envs[@]}"}" timeout "$t" "$bin" "$@" ) >> "$f" 2>&1
+  ( cd "$core" && env "${envs[@]+"${envs[@]}"}" timeout "$t" "$b" "$@" ) >> "$f" 2>&1
   local rc=$?
   echo "# end=$(date -u +%FT%TZ) rc=$rc" >> "$f"
   return 0
@@ -75,20 +86,35 @@ for s in $steps; do
     if [ "$inside" -gt 0 ] && [ "$outside" -eq 0 ]; then v=PASS; else v=FAIL; fi
     row scope "tempdirs under TMPDIR>0, elsewhere=0" "inside=$inside outside=$outside" $v ;;
   suite)
-    for arm in all splice cat catdur; do
+    # The engine lane's arms (lanes/engine/suite_arms.sh): all (conn_raw_api build), splice, cat,
+    # catdur, catsharp.
+    for arm in all splice cat catdur catsharp; do
       envs=()
+      sb=$bin
       case $arm in
+        all) [ -n "$bin_raw" ] && sb=$bin_raw ;;
         splice) envs=(R11_SPLICE=1) ;;
         cat) envs=(R11_BRANCH_CATALOG=1) ;;
         catdur) envs=(R11_BRANCH_CATALOG=1 R11_SPLICE=1) ;;
+        catsharp) envs=(R11_BRANCH_CATALOG=1 R11_CKPT=sharp) ;;
       esac
-      step "suite-$arm" 5400 "${envs[@]+"${envs[@]}"}" -- branch:: --test-threads=1
+      STEP_BIN=$sb step "suite-$arm" 5400 "${envs[@]+"${envs[@]}"}" -- branch:: --test-threads=1
       f="$out/suite-$arm.txt"
       p=$(tests_passed "$f"); fl=$(tests_failed "$f")
       failed=$(grep -E '\.\.\. FAILED$' "$f" | sed 's/^test //; s/ \.\.\. FAILED$//' | sort -u | tr '\n' ' ')
       if [ "${p:-0}" -gt 0 ] && [ "${fl:-1}" -eq 0 ]; then v=PASS; else v=FAIL; fi
-      row "suite-$arm" "passed>0 failed=0" "passed=${p:-none} failed=${fl:-none} ${failed}" $v
+      what="passed>0 failed=0"
+      [ $arm = all ] && { [ -n "$bin_raw" ] && what="$what (conn_raw_api build)" || what="$what (NO conn_raw_api build given)"; }
+      row "suite-$arm" "$what" "passed=${p:-none} failed=${fl:-none} ${failed}" $v
     done ;;
+  libfull)
+    # The engine lane's libfull: every lib test outside branch::, the regression check on the rest.
+    step libfull 5400 -- --skip branch::
+    f="$out/libfull.txt"
+    p=$(tests_passed "$f"); fl=$(tests_failed "$f")
+    failed=$(grep -E '\.\.\. FAILED$' "$f" | sed 's/^test //; s/ \.\.\. FAILED$//' | sort -u | tr '\n' ' ')
+    if [ "${p:-0}" -gt 0 ] && [ "${fl:-1}" -eq 0 ]; then v=PASS; else v=FAIL; fi
+    row libfull "passed>0 failed=0" "passed=${p:-none} failed=${fl:-none} ${failed}" $v ;;
   fc)
     # The engine lane's C1 fire-checks (c1_firechecks.sh), same env, same expectations; the verdict
     # reads the C1 summary line, never the rc (a VIOLATIONS run fails its test by design).
@@ -108,15 +134,15 @@ for s in $steps; do
     }
     fc c1fc-mc-ack_before_pwrite VIOLATIONS FE_MUTANT=ack_before_pwrite FE_C1_TRIALS=$((6 * scale))
     fc c1fc-md-fork_without_parent VIOLATIONS FE_MUTANT=fork_without_parent FE_C1_TRIALS=$((6 * scale))
-    fc c1fc-power-control CLEAN FE_C1_POWER=1 FE_C1_CLASS=full FE_C1_TRIALS=$((18 * scale))
+    fc c1fc-power-control CLEAN FE_C1_POWER=1 FE_C1_CLASS=full FE_C1_TRIALS=$((18 * scale * pscale))
     fc c1fc-d0-control VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=off FE_C1_TRIALS=$((20 * scale))
     fc c1fc-ma-no_flight_sync VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=no_flight_sync FE_C1_TRIALS=$((6 * scale))
     fc c1fc-mb-ack_before_sync VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=5 FE_C1_TRIALS=$((6 * scale))
-    # Linux arm (run 37174637886: at 5 ms the registered row caught 0-13 violations against 68 on the
-    # Mac, and missed on x86_64 XFS): the same mutant killed with no delay, a gating row; and 1 and
-    # 2 ms, exploratory rows (INFO: recorded, never a verdict) that show how the catch varies with
-    # the delay on a sub-millisecond fsync.
-    fc c1fc-mb-ack_before_sync-delay0 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=0 FE_C1_TRIALS=$((6 * scale))
+    # Linux delay arms, INFO (recorded, never a verdict). Runs 37242035491 and 37242461392 measured
+    # them: delay 0 caught nothing in 10 of 12 cells (the kill lands before an early-acked waiter has
+    # logged its ACK line), 1 and 2 ms caught 0 to 100. No delay makes M-b's catch reliable on a
+    # sub-millisecond fsync; the registered 5 ms row above stays the gate.
+    FC_EXPLORE=1 fc c1fc-mb-ack_before_sync-delay0 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=0 FE_C1_TRIALS=$((6 * scale))
     FC_EXPLORE=1 fc c1fc-mb-ack_before_sync-delay1 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=1 FE_C1_TRIALS=$((6 * scale))
     FC_EXPLORE=1 fc c1fc-mb-ack_before_sync-delay2 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=2 FE_C1_TRIALS=$((6 * scale))
     fc c1fc-catalog CLEAN FE_C1_CATALOG=1 FE_C1_TRIALS=$((18 * scale))

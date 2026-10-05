@@ -10,7 +10,7 @@ on:
     inputs:
       steps:
         description: "run_gates.sh steps, in order"
-        default: "list scope suite fc e3 c0"
+        default: "list scope suite fc e3 c0 libfull"
       c0_ops:
         default: "20000"
       e3_trials:
@@ -18,6 +18,12 @@ on:
       fc_scale:
         description: "multiplier on every C1 fire-check's trial count"
         default: "1"
+      power_scale:
+        description: "extra multiplier on the power-loss control's trials (I2 re-runs)"
+        default: "1"
+      profiles:
+        description: "JSON list of cargo profiles to build and gate: debug, release"
+        default: '["debug","release"]'
   push:
     branches: [fastest-branching]
     paths:
@@ -44,11 +50,12 @@ env:
 
 jobs:
   build:
-    name: build (${{ matrix.runner }})
+    name: build (${{ matrix.runner }}, ${{ matrix.profile }})
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        profile: ${{ fromJSON(inputs.profiles || '["debug"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
@@ -65,25 +72,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: fastest-gates-v1
-          shared-key: ${{ matrix.runner }}
+          shared-key: ${{ matrix.runner }}-${{ matrix.profile }}
           cache-on-failure: true
-      - name: Build the turso_core lib test binary (debug, as the engine lane runs its gates)
+      - name: Build the turso_core lib test binaries (default features, and conn_raw_api for the all arm)
         run: |
           set -o pipefail
           mkdir -p dist
-          timeout 6000 cargo test -p turso_core --lib --no-run --locked --message-format=json \
-            > dist/build.json 2> dist/build.stderr || { tail -50 dist/build.stderr; exit 1; }
-          exe=$(python3 fastest/linux/gates/find_test_exe.py dist/build.json) || exit 1
-          cp "$exe" dist/turso_core-lib-test
-          { echo "git_sha=$GITHUB_SHA"; echo "runner=${{ matrix.runner }}"; echo "image=${ImageOS:-?} ${ImageVersion:-?}";
-            rustc -V; sha256sum dist/turso_core-lib-test; } | tee dist/build-info.txt
+          rel=""; [ "${{ matrix.profile }}" = release ] && rel=--release
+          for v in default raw; do
+            feat=""; [ $v = raw ] && feat="--features conn_raw_api"
+            timeout 6000 cargo test $rel -p turso_core --lib $feat --no-run --locked --message-format=json \
+              > dist/build-$v.json 2> dist/build-$v.stderr || { tail -50 dist/build-$v.stderr; exit 1; }
+            exe=$(python3 fastest/linux/gates/find_test_exe.py dist/build-$v.json) || exit 1
+            cp "$exe" dist/turso_core-lib-test-$v
+          done
+          { echo "git_sha=$GITHUB_SHA"; echo "runner=${{ matrix.runner }} profile=${{ matrix.profile }}";
+            echo "image=${ImageOS:-?} ${ImageVersion:-?}"; rustc -V;
+            sha256sum dist/turso_core-lib-test-default dist/turso_core-lib-test-raw; } | tee dist/build-info.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: turso-core-lib-test-${{ matrix.runner }}
+          name: turso-core-lib-test-${{ matrix.runner }}-${{ matrix.profile }}
           path: |
-            dist/turso_core-lib-test
+            dist/turso_core-lib-test-default
+            dist/turso_core-lib-test-raw
             dist/build-info.txt
-            dist/build.stderr
+            dist/build-default.stderr
+            dist/build-raw.stderr
           retention-days: 30
 
   release:
@@ -139,13 +153,14 @@ jobs:
           retention-days: 30
 
   gates:
-    name: gates (${{ matrix.runner }}, ${{ matrix.fs }})
+    name: gates (${{ matrix.runner }}, ${{ matrix.fs }}, ${{ matrix.profile }})
     needs: build
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
         fs: [ext4, xfs, btrfs]
+        profile: ${{ fromJSON(inputs.profiles || '["debug"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 330
     env:
@@ -155,7 +170,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: turso-core-lib-test-${{ matrix.runner }}
+          name: turso-core-lib-test-${{ matrix.runner }}-${{ matrix.profile }}
           path: dist
       - name: Packages
         run: |
@@ -164,7 +179,7 @@ jobs:
       - name: Filesystem under test
         run: |
           mkdir -p "$RAW"
-          { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }}";
+          { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} profile=${{ matrix.profile }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME"; cat dist/build-info.txt; } > "$RAW/run-info.txt"
           bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 16G 2>&1 | tee "$RAW/mkloop.txt"
       - name: Hardware record (fio on the filesystem under test)
@@ -172,17 +187,22 @@ jobs:
       - name: Gates
         env:
           TMPDIR: /mnt/fastest-${{ matrix.fs }}/tmp
-          GATE_STEPS: ${{ inputs.steps || 'list scope suite fc e3 c0' }}
           GATE_C0_OPS: ${{ inputs.c0_ops || '20000' }}
           GATE_E3_TRIALS: ${{ inputs.e3_trials || '100' }}
           GATE_FC_SCALE: ${{ inputs.fc_scale || '1' }}
+          GATE_POWER_SCALE: ${{ inputs.power_scale || '1' }}
+          GATE_BIN_RAW: dist/turso_core-lib-test-raw
         run: |
-          chmod +x dist/turso_core-lib-test
-          bash fastest/linux/gates/run_gates.sh dist/turso_core-lib-test "$RAW/gates" core
+          chmod +x dist/turso_core-lib-test-default dist/turso_core-lib-test-raw
+          # libfull (the lib suite outside branch::) does not depend on the filesystem: ext4 cells only.
+          GATE_STEPS="${{ inputs.steps || 'list scope suite fc e3 c0 libfull' }}"
+          [ "${{ matrix.fs }}" = ext4 ] || GATE_STEPS=${GATE_STEPS/libfull/}
+          export GATE_STEPS
+          bash fastest/linux/gates/run_gates.sh dist/turso_core-lib-test-default "$RAW/gates" core
       - name: Upload raw
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gates-${{ matrix.runner }}-${{ matrix.fs }}
+          name: gates-${{ matrix.runner }}-${{ matrix.fs }}-${{ matrix.profile }}
           path: fastest-raw/
           retention-days: 90
