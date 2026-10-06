@@ -3515,6 +3515,159 @@ fn a_d0_release_of_a_slot_a_synced_record_names_waits_for_a_sync() {
     }
 }
 
+// ---- engine review 8 #5-#8: every D0 free in a raised log waits for a sync, and none is lost ----
+
+/// A D0 store whose trunk is synchronous (engine review 8 #5-#8, after review 5 #18): a child x,
+/// with its own commit to row 40 first when `x_writes` (its slot S), and a trunk commit to row 3
+/// that keeps x a pre-image (slot T) in a raised, synced flight. Returns the database, its trunk,
+/// x, and the slots x's release will free (T, and S when x wrote).
+fn raised_d0_with_a_kept_pre_image(path: &Path, catalog: bool, x_writes: bool) -> (Arc<Database>, Arc<Connection>, Branch, Vec<u32>) {
+    let db = open_at(path, opts(catalog, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed_wide(&trunk);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    let x = trunk.fork_branch().unwrap();
+    let mut slots = Vec::new();
+    if x_writes {
+        write_v(&x.connect().unwrap(), 40, "x");
+        slots = x.owned_slots();
+        assert_eq!(slots.len(), 1, "catalog={catalog}: premise: x's commit took one slot");
+    }
+    let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+    write_v(&trunk, 3, "new");
+    let kept: Vec<u32> = db.branch_slots_in_use().into_iter().filter(|s| !before.contains(s)).collect();
+    assert_eq!(kept.len(), 1, "catalog={catalog}: premise: the trunk commit kept one pre-image");
+    assert!(db.branches.rewrite_class_for_test().syncs(), "catalog={catalog}: premise: the trunk commit raised the log");
+    slots.extend(kept);
+    (db, trunk, x, slots)
+}
+
+/// The slots of `slots` a new branch's write takes (freed slots are handed out last in, first out).
+fn reused_by_a_new_branch(trunk: &Arc<Connection>, slots: &[u32]) -> Vec<u32> {
+    let y = trunk.fork_branch().unwrap();
+    let before: std::collections::HashSet<u32> = y.owned_slots().into_iter().collect();
+    write_v(&y.connect().unwrap(), 50, "y");
+    let took: Vec<u32> = y.owned_slots().into_iter().filter(|s| !before.contains(s) && slots.contains(s)).collect();
+    let _ = y.into_id();
+    took
+}
+
+/// Engine review 8 #5 (i): a raised flight's sync makes the WHOLE log durable, so an earlier D0
+/// commit's slot S is named by a synced record too, yet only the raised take's own slots were
+/// marked: S went back to the allocator at x's unsynced Release. Neither S nor T may be reused
+/// before a sync covers that Release. Mutant `d0_frees_at_written`.
+#[test]
+fn a_d0_release_in_a_raised_log_holds_every_slot_until_a_sync() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("hold-all.db"), catalog, true);
+        x.reap().unwrap();
+        let took = reused_by_a_new_branch(&trunk, &slots);
+        assert!(took.is_empty(), "catalog={catalog}: slots {took:?} were reused before a sync covered the Release that freed them");
+        drop(db);
+    }
+}
+
+/// Engine review 8 #5 (iv): the marks of synced records started empty at every open, so a slot a
+/// durable record named before a close was freed at once after it. A reopened raised log still
+/// holds the frees. Mutant `d0_frees_at_written`.
+#[test]
+fn a_d0_release_in_a_raised_log_holds_its_slots_after_a_reopen() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("hold-reopen.db");
+        let (x_id, slots, incarnation) = {
+            let (db, _trunk, x, slots) = raised_d0_with_a_kept_pre_image(&path, catalog, false);
+            (x.into_id(), slots, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Off), incarnation);
+        assert!(db.branches.rewrite_class_for_test().syncs(), "catalog={catalog}: premise: the reopened log is raised");
+        let trunk = db.connect().unwrap();
+        db.branch(x_id).unwrap().reap().unwrap();
+        let took = reused_by_a_new_branch(&trunk, &slots);
+        assert!(took.is_empty(), "catalog={catalog}: slots {took:?} were reused after a reopen before a sync covered the Release");
+    }
+}
+
+/// Engine review 8 #6 (and #5 (iii)): a compaction or checkpoint syncs its rewrite in the log's
+/// rewrite class, which makes every Release it covers durable, yet it reported durability in the
+/// store's class (Off in D0), so a held free never matured on it. After x's release and a sharp
+/// checkpoint or compaction, x's slot is free. Mutant `rewrite_marks_store_class`.
+#[test]
+fn a_rewrite_of_a_raised_d0_log_matures_the_frees_it_covers() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, _trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("rewrite-matures.db"), catalog, false);
+        x.reap().unwrap();
+        db.branch_compact_now().unwrap();
+        for &slot in &slots {
+            assert!(db.branch_slot_is_free(slot), "catalog={catalog}: slot {slot} is still held after a rewrite synced its Release");
+        }
+    }
+}
+
+/// Engine review 8 #7: in a catalog store, a held free (above) was in no list a checkpoint writes:
+/// the capture took only `pending_free` as deferred, so the slot stayed counted in use, no free
+/// table row named it, and the cut dropped its Release. A catalog open has no reachability sweep,
+/// so after a close and a reopen the slot was lost for good. Mutant `capture_skips_held`.
+#[test]
+fn a_held_free_survives_a_checkpoint_and_a_reopen_in_a_raised_d0_catalog_store() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("held-checkpoint.db");
+    let (slots, incarnation) = {
+        let (db, _trunk, x, slots) = raised_d0_with_a_kept_pre_image(&path, true, false);
+        x.reap().unwrap();
+        db.branch_compact_now().unwrap();
+        (slots, db.incarnation)
+    };
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    for &slot in &slots {
+        assert!(db.branch_slot_is_free(slot), "slot {slot}, freed by x's release, is lost after a checkpoint and a reopen");
+    }
+    let in_use = db.branch_slots_in_use();
+    assert_eq!(
+        db.branch_stats().unwrap().arena_slots_in_use as usize,
+        in_use.len(),
+        "after the reopen: the in-use count disagrees with the slots in use"
+    );
+}
+
+/// Engine review 8 #8: three free paths skipped the hold: a lease's expiry (every fork's expiry
+/// pass), `reap_if_due`, and a close's collection of a branch released while a connection was
+/// open. They logged the Release with a write only, then freed at once. Here a lease runs out and
+/// the next fork's expiry pass reaps x; and x is released with a connection open, freed when that
+/// connection closes. Neither frees a slot before a sync covers its Release. Mutant
+/// `expiry_frees_at_once`.
+#[test]
+fn an_expiry_or_a_close_in_a_raised_d0_log_holds_its_slots_until_a_sync() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("expiry-hold.db"), catalog, false);
+        x.lease(std::time::Duration::from_millis(1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let _z = trunk.fork_branch().unwrap().into_id();
+        assert!(db.branch(x.id()).is_err(), "catalog={catalog}: premise: the fork's expiry pass reaped x");
+        let took = reused_by_a_new_branch(&trunk, &slots);
+        assert!(took.is_empty(), "catalog={catalog}: slots {took:?} an expired lease freed were reused before a sync");
+        drop(x);
+        drop(db);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("close-hold.db"), catalog, false);
+        let xc = x.connect().unwrap();
+        x.reap().unwrap();
+        drop(xc);
+        let took = reused_by_a_new_branch(&trunk, &slots);
+        assert!(took.is_empty(), "catalog={catalog}: slots {took:?} a close collected were reused before a sync");
+        drop(db);
+    }
+}
+
 /// Review 4 #2: a fuzzy checkpoint that cannot start — its capture fails, or its thread cannot be
 /// spawned — backs off as a failed write does, instead of being retried by every later operation
 /// (each retry a capture under the store mutex, O(branches dirty since the last checkpoint): N
