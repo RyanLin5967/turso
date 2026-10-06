@@ -1439,3 +1439,46 @@ fn ddl_statements_report_their_command_tags() {
         assert_eq!(a.q(sql).ok(sql).tags, vec![tag.to_string()], "{sql}");
     }
 }
+
+/// turso_branch_stats() reports the server process's own counters — unix system calls, mach
+/// traps, instructions retired, cycles — for the wire-versus-embedded budgets: one row of four
+/// int8 columns that never decrease, where a branch create between two reads costs system calls.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn branch_stats_reports_the_servers_counters() {
+    let dir = Scratch::new("stats");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let read = |a: &mut Wire| -> Vec<i64> {
+        let r = a.q("SELECT turso_branch_stats()").ok("stats");
+        assert_eq!(r.oids, Some(vec![20, 20, 20, 20]), "four int8 columns");
+        assert_eq!(r.rows.len(), 1);
+        r.rows[0]
+            .iter()
+            .map(|v| {
+                v.as_deref()
+                    .expect("a counter is never NULL here")
+                    .parse()
+                    .unwrap()
+            })
+            .collect()
+    };
+    let before = read(&mut a);
+    a.q("SELECT turso_branch_create('st')").ok("create");
+    let after = read(&mut a);
+    for (i, (b, c)) in before.iter().zip(&after).enumerate() {
+        assert!(c >= b, "counter {i} went down: {before:?} -> {after:?}");
+    }
+    assert!(
+        after[0] > before[0],
+        "a create made no system call: {before:?} -> {after:?}"
+    );
+    assert!(
+        after[2] > before[2],
+        "a create retired no instruction: {before:?} -> {after:?}"
+    );
+    // Inside a transaction too: it reads, it changes nothing.
+    a.q("BEGIN").ok("begin");
+    read(&mut a);
+    a.q("COMMIT").ok("commit");
+}
