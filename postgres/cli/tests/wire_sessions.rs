@@ -1105,3 +1105,239 @@ fn row_value_comparisons_work() {
         .ok("update by row value");
     assert_eq!(r.tags, vec!["UPDATE 2".to_string()]);
 }
+
+fn constraint_fixture(a: &mut Wire) {
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, name TEXT)")
+        .ok("parent");
+    a.q(
+        "CREATE TABLE c(id INT NOT NULL, pid INT, v VARCHAR(10), n NUMERIC(8, 2), \
+         b BOOLEAN, ts TIMESTAMP, ch CHAR(3))",
+    )
+    .ok("child");
+    a.q("CREATE INDEX c_v ON c(v)").ok("index");
+    a.q("INSERT INTO p VALUES (1, 'one'), (2, 'two')")
+        .ok("parents");
+    a.q(
+        "INSERT INTO c VALUES (10, 1, 'x', 12.50, true, '2026-10-06 01:02:03', 'ab'), \
+         (11, 2, 'y', -0.01, false, NULL, NULL), (12, NULL, NULL, NULL, NULL, NULL, NULL)",
+    )
+    .ok("children");
+}
+
+const C_ROWS: &str = "SELECT id, pid, v, n, b, ts, ch FROM c ORDER BY id";
+
+/// ALTER TABLE ... ADD PRIMARY KEY / FOREIGN KEY ... ON DELETE CASCADE / UNIQUE take effect, as in
+/// PostgreSQL (pgbench -I p adds its primary keys this way; BranchBench's dump adds 13 foreign
+/// keys), and keep the table's rows, values and types exactly, on the trunk and on a branch.
+#[test]
+fn alter_table_add_constraint_takes_effect_and_keeps_the_rows() {
+    let dir = Scratch::new("addconstraint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    constraint_fixture(&mut a);
+    let before = a.q(C_ROWS).ok("rows before");
+    a.q("SELECT turso_branch_create('ac')").ok("create");
+    for on in ["main", "ac"] {
+        a.q(&format!("SELECT turso_branch_switch('{on}')"))
+            .ok("switch");
+        let r = a
+            .q("ALTER TABLE c ADD PRIMARY KEY (id)")
+            .ok("add primary key");
+        assert_eq!(r.tags, vec!["ALTER TABLE".to_string()], "{on}");
+        a.q("ALTER TABLE c ADD CONSTRAINT c_pid_fkey FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE")
+            .ok("add foreign key");
+        a.q("ALTER TABLE c ADD UNIQUE (v)").ok("add unique");
+        let after = a.q(C_ROWS).ok("rows after");
+        assert_eq!(
+            after.rows, before.rows,
+            "{on}: the rebuild changed the rows"
+        );
+        assert_eq!(
+            after.oids, before.oids,
+            "{on}: the rebuild changed the column types"
+        );
+        assert!(
+            a.q("INSERT INTO c (id) VALUES (10)").error.is_some(),
+            "{on}: duplicate key accepted"
+        );
+        assert!(
+            a.q("INSERT INTO c (id) VALUES (NULL)").error.is_some(),
+            "{on}: NULL key accepted"
+        );
+        assert!(
+            a.q("INSERT INTO c (id, pid) VALUES (20, 99)")
+                .error
+                .is_some(),
+            "{on}: a child with no parent accepted"
+        );
+        assert!(
+            a.q("INSERT INTO c (id, v) VALUES (21, 'x')")
+                .error
+                .is_some(),
+            "{on}: duplicate unique"
+        );
+        a.q("DELETE FROM p WHERE id = 1").ok("delete parent");
+        assert_eq!(
+            a.q("SELECT count(*) FROM c WHERE pid = 1")
+                .single("cascade"),
+            "0",
+            "{on}: ON DELETE CASCADE did not take"
+        );
+        assert_eq!(a.q("SELECT count(*) FROM c").single("left"), "2", "{on}");
+    }
+    a.q("SELECT turso_branch_switch('main')").ok("main");
+}
+
+/// An ADD CONSTRAINT the existing rows break fails, as PostgreSQL's validation does, and leaves
+/// the table as it was; inside a transaction it rolls back with the transaction.
+#[test]
+fn alter_table_add_constraint_is_validated_and_atomic() {
+    let dir = Scratch::new("addconstraint2");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    constraint_fixture(&mut a);
+    a.q("INSERT INTO c (id, pid) VALUES (13, 77)").ok("orphan");
+    let before = a.q(C_ROWS).ok("before");
+    assert!(
+        a.q("ALTER TABLE c ADD FOREIGN KEY (pid) REFERENCES p (id)")
+            .error
+            .is_some(),
+        "an orphan row did not fail the new foreign key"
+    );
+    a.q("ALTER TABLE c ADD UNIQUE (pid)")
+        .ok("unique on distinct values");
+    assert_eq!(
+        a.q(C_ROWS).ok("after").rows,
+        before.rows,
+        "a failed ALTER changed the table"
+    );
+    a.q("DELETE FROM c WHERE id = 13").ok("remove the orphan");
+    a.q("BEGIN").ok("begin");
+    a.q("ALTER TABLE c ADD FOREIGN KEY (pid) REFERENCES p (id)")
+        .ok("add in a transaction");
+    a.q("ROLLBACK").ok("rollback");
+    a.q("INSERT INTO c (id, pid) VALUES (30, 99)")
+        .ok("the rolled-back foreign key is gone");
+    a.q("SELECT count(*) FROM c WHERE v = 'x'")
+        .ok("the index still answers");
+}
+
+/// information_schema answers the introspection clients run (BranchBench reads a table's columns
+/// and its primary key this way), with PostgreSQL's names and values.
+#[test]
+fn information_schema_describes_tables_columns_and_keys() {
+    let dir = Scratch::new("infoschema");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE w(w_id INT PRIMARY KEY, name VARCHAR(10))")
+        .ok("w");
+    a.q(
+        "CREATE TABLE s(s_i_id INT NOT NULL, s_w_id SMALLINT NOT NULL, \
+         s_ytd NUMERIC(8, 2), s_data VARCHAR(50), PRIMARY KEY (s_w_id, s_i_id), \
+         FOREIGN KEY (s_w_id) REFERENCES w (w_id))",
+    )
+    .ok("s");
+    let r = a
+        .q(
+            "SELECT column_name, udt_name, is_nullable, character_maximum_length, \
+            numeric_precision, numeric_scale FROM information_schema.columns \
+            WHERE table_name = 's' ORDER BY ordinal_position",
+        )
+        .ok("columns");
+    let row = |v: [&str; 6]| -> Vec<Option<String>> {
+        v.iter()
+            .map(|x| (!x.is_empty()).then(|| x.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        r.rows,
+        vec![
+            row(["s_i_id", "int4", "NO", "", "32", "0"]),
+            row(["s_w_id", "int2", "NO", "", "16", "0"]),
+            row(["s_ytd", "numeric", "YES", "", "8", "2"]),
+            row(["s_data", "varchar", "YES", "50", "", ""]),
+        ]
+    );
+    let r = a
+        .q(
+            "SELECT column_name, ordinal_position FROM information_schema.key_column_usage \
+            WHERE table_schema = 'public' AND table_name = 's' AND constraint_name = \
+            (SELECT constraint_name FROM information_schema.table_constraints \
+             WHERE table_schema = 'public' AND table_name = 's' \
+             AND constraint_type = 'PRIMARY KEY') ORDER BY ordinal_position DESC",
+        )
+        .ok("primary key columns");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Some("s_i_id".into()), Some("2".into())],
+            vec![Some("s_w_id".into()), Some("1".into())],
+        ]
+    );
+    let r = a
+        .q(
+            "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' \
+            AND table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_name",
+        )
+        .ok("tables");
+    assert_eq!(r.rows, vec![vec![Some("s".into())], vec![Some("w".into())]]);
+    let r = a
+        .q(
+            "SELECT constraint_type FROM information_schema.table_constraints \
+            WHERE table_name = 's' ORDER BY constraint_type",
+        )
+        .ok("constraint types");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Some("FOREIGN KEY".into())],
+            vec![Some("PRIMARY KEY".into())]
+        ]
+    );
+    // A user table named like a view is still the user's.
+    a.q("CREATE TABLE columns(x INT)")
+        .ok("a table named columns");
+    a.q("INSERT INTO columns VALUES (7)").ok("insert");
+    assert_eq!(a.q("SELECT x FROM columns").single("user table"), "7");
+}
+
+/// CHAR(n) is PostgreSQL's blank-padded character type: a value reads back padded to n characters
+/// with type bpchar (1042), trailing spaces do not count in comparisons or length, and a value
+/// longer than n is refused (BranchBench's stock rows: 1001 of 1256 rows differed).
+#[test]
+fn char_n_is_blank_padded_as_in_postgres() {
+    let dir = Scratch::new("bpchar");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ch(id INT PRIMARY KEY, c CHAR(6), one CHAR, v VARCHAR(6))")
+        .ok("create");
+    a.q("INSERT INTO ch VALUES (1, 'ab', 'x', 'ab'), (2, 'abc   ', NULL, 'ab  ')")
+        .ok("insert");
+    let r = a.q("SELECT c, one, v FROM ch ORDER BY id").ok("select");
+    assert_eq!(r.oids, Some(vec![1042, 1042, 1043]));
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Some("ab    ".into()), Some("x".into()), Some("ab".into())],
+            vec![Some("abc   ".into()), None, Some("ab  ".into())],
+        ]
+    );
+    assert_eq!(
+        a.q("SELECT id FROM ch WHERE c = 'ab'")
+            .single("comparison ignores padding"),
+        "1"
+    );
+    assert_eq!(
+        a.q("SELECT length(c) FROM ch WHERE id = 2")
+            .single("length"),
+        "3"
+    );
+    assert!(
+        a.q("INSERT INTO ch VALUES (3, 'abcdefg', NULL, NULL)")
+            .error
+            .is_some(),
+        "a value longer than CHAR(6) was accepted"
+    );
+    a.q("INSERT INTO ch VALUES (4, 'abcdef    ', NULL, NULL)")
+        .ok("trailing spaces beyond n are dropped, as PostgreSQL does");
+}
