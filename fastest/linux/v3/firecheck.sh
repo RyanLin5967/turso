@@ -60,11 +60,11 @@ ROOTSRC=$(findmnt -n -o SOURCE /)
 ROOTDISK=$(lsblk -no PKNAME "$ROOTSRC" 2>/dev/null | head -1)
 [ -n "$ROOTDISK" ] || ROOTDISK=$(basename "$ROOTSRC")
 
-# The probe reads LOOP_GET_STATUS64 on every loop of a flush path and NVMe Identify on the leaf's controller, as
-# the calling user: grant read access (an ACL) to every loop device and NVMe controller node.
+# The probe reads LOOP_GET_STATUS64 on every loop of a flush path, NVMe Identify on the leaf's controller and SCSI
+# MODE SENSE on an sd leaf, as the calling user: grant read access (an ACL) to those nodes.
 grant() {
   local d
-  for d in /dev/loop[0-9]* /dev/nvme[0-9]; do
+  for d in /dev/loop[0-9]* /dev/nvme[0-9] /dev/sd[a-z] /dev/vd[a-z]; do
     [ -e "$d" ] || continue
     sudo setfacl -m "u:$ME:r" "$d" 2>/dev/null || sudo chmod o+r "$d"
   done
@@ -94,7 +94,8 @@ grant
   # setarch -R: the traced runs have no ASLR (run 37243578945: arm64 munmap varied +-1 between runs without it).
   echo "personality_under_setarch_R=$(setarch "$ARCH" -R cat /proc/self/personality)"
   for d in /sys/block/*; do echo "block ${d##*/} write_cache=[$(cat "$d/queue/write_cache" 2>/dev/null)] fua=[$(cat "$d/queue/fua" 2>/dev/null)]"; done
-  for d in /dev/loop[0-9]* /dev/nvme[0-9]; do [ -e "$d" ] && echo "acl $d $(getfacl -cp "$d" 2>/dev/null | grep "^user:$ME" | xargs)"; done
+  for d in /dev/loop[0-9]* /dev/nvme[0-9] /dev/sd[a-z]; do [ -e "$d" ] && echo "acl $d $(getfacl -cp "$d" 2>/dev/null | grep "^user:$ME" | xargs)"; done
+  echo "harness_sha256=$(cd "$HERE" && sha256sum run.sh batchgate.py check.py blkflush.py stamp.py v3cell.py | sha256sum | cut -d' ' -f1)"
 } > "$OUT/info.txt" 2>&1
 cat "$OUT/info.txt"
 
@@ -155,6 +156,9 @@ fi
 echo "== B: blkflush.py's own fire-check"
 B=$OUT/B
 python3 -B "$BLK" self-test > "$B/selftest.txt" 2>&1
+echo $? > "$B/selftest.rc"
+python3 -B "$GATE" self-test "$HERE/testdata" > "$B/batchgate-selftest.txt" 2>&1
+echo $? > "$B/batchgate-selftest.rc"
 img=/var/tmp/v3blk-$$.img
 sudo rm -f "$img"; sudo truncate -s 64M "$img"
 bdev=$(sudo losetup --find --show "$img")
@@ -246,10 +250,18 @@ fx R_brd brd env -u V3FLOOR_BRD
 fx R_driver dm
 fx P_nest3 n3
 if [ -n "${V3_SHIM:-}" ] && [ -f "$V3_SHIM" ]; then
-  refuse R_statfs_shim env LD_PRELOAD="$(readlink -f "$V3_SHIM")" "$V3" --dir "$W" --out "$(o R_statfs_shim)" --n 5 --arms append25,nosync25
+  # the shim is a fire-check tool, so the probe's own LD_PRELOAD refusal is lifted for it (V3FLOOR_FIRECHECK=1) ...
+  refuse R_statfs_shim env V3FLOOR_FIRECHECK=1 LD_PRELOAD="$(readlink -f "$V3_SHIM")" "$V3" --dir "$W" --out "$(o R_statfs_shim)" --n 5 --arms append25,nosync25
+  # ... and without it the preload itself refuses (fresh review: an interposer under an unchanged exe_sha256)
+  refuse R_ldpreload env -u V3FLOOR_FIRECHECK LD_PRELOAD="$(readlink -f "$V3_SHIM")" "$V3" --dir "$W" --out "$(o R_ldpreload)" --n 5 --arms append25,nosync25
 else
-  echo "V3_SHIM missing" > "$OUT/F4/R_statfs_shim.txt"; echo missing > "$OUT/F4/R_statfs_shim.rc"
+  for t in R_statfs_shim R_ldpreload; do echo "V3_SHIM missing" > "$OUT/F4/$t.txt"; echo missing > "$OUT/F4/$t.rc"; done
 fi
+# fresh review M4: a per-file sync attribute on D (chattr +S) changes what every fsync does, invisibly to mount options
+CD="$(dirname "$W")/v3chattr-work"
+mkdir -p "$CD" && sudo chattr +S "$CD"
+echo "chattr_dir=$CD $(lsattr -d "$CD" 2>&1)" >> "$OUT/info.txt"
+refuse R_chattr "$V3" --dir "$CD" --out "$(o R_chattr)" --n 5 --arms append25,nosync25
 if [ "$KIND" = ext4 ]; then
   # item 12(c): strace makes the trial FICLONE succeed; it is the K-th ioctl of an identical run
   timeout 300 setarch "$ARCH" -R strace -f -e trace=ioctl -o "$OUT/F4/ficlone_count.strace" "$V3" --dir "$W" \
@@ -272,20 +284,30 @@ mkdir "$W/clone1b.clones"
 refuse R_leftover "$V3" --dir "$W" --out "$(o R_leftover)" --n 5 --arms clone1b,nosync25
 rmdir "$W/clone1b.clones"
 ROOTW=$(cat "$FX/root.dir" 2>/dev/null || echo /var/tmp/v3fx-root/w)
-# item 1(b): the kernel's write_cache overridden against the drive, on the root disk (plantable only on write-back)
-flip() { # tag cmd... -- run cmd with the root disk's queue/write_cache flipped to write through, then restore
-  local tag=$1 wc="/sys/block/$ROOTDISK/queue/write_cache" before after
+# item 1(b): the kernel's view of the root disk's cache made to disagree with the drive, then restored. A write-back
+# disk: queue/write_cache set to write through. A write-through sd disk (the hosted runners' sda): sd's
+# "temporary write back", which moves sd's cache_type and queue/write_cache together and sends the drive nothing --
+# the override the old cache_type comparison could not see (fresh review H2); MODE SENSE still reads the drive.
+flip() { # tag cmd...
+  local tag=$1 wc="/sys/block/$ROOTDISK/queue/write_cache" before during after ct=""
   shift
   before=$(cat "$wc" 2>/dev/null)
-  if [ "$before" != "write back" ]; then
-    echo "not planted: the root disk $ROOTDISK reads '$before' (kernel 6.17's queue/write_cache can only disable a cache)" > "$tag.na"
+  ct=$(ls /sys/block/"$ROOTDISK"/device/scsi_disk/*/cache_type 2>/dev/null | head -1)
+  if [ "$before" = "write back" ]; then
+    echo "write through" | sudo tee "$wc" > /dev/null
+  elif [ -n "$ct" ]; then
+    echo "temporary write back" | sudo tee "$ct" > /dev/null
+  else
+    echo "not planted: the root disk $ROOTDISK reads '$before' and is not sd" > "$tag.na"
     return
   fi
-  echo "write through" | sudo tee "$wc" > /dev/null
+  during=$(cat "$wc")
+  [ "$during" != "$before" ] && echo "changed=1 $ROOTDISK write_cache '$before' -> '$during'" > "$tag.state"
   "$@"
-  echo "write back" | sudo tee "$wc" > /dev/null
+  if [ "$before" = "write back" ]; then echo "write back" | sudo tee "$wc" > /dev/null
+  else echo "temporary write through" | sudo tee "$ct" > /dev/null; fi
   after=$(cat "$wc")
-  echo "$ROOTDISK write_cache: before '$before', during 'write through', after '$after'" >> "$tag.flip"
+  echo "$ROOTDISK write_cache: before '$before', during '$during', after '$after'" >> "$tag.flip"
 }
 flip "$OUT/F4/R_leaf_flip" refuse R_leaf_flip "$V3" --dir "$ROOTW" --out "$(o R_leaf_flip)" --n 5 --arms append25,nosync25
 # item 16: a clocksource other than tsc/arch_sys_counter, then restored
@@ -296,6 +318,7 @@ csalt() { # tag cmd...
   alt=$(tr ' ' '\n' < $CS/available_clocksource | grep -v -x -e "$cur" -e tsc -e arch_sys_counter -e '' | head -1)
   if [ -z "$alt" ]; then echo "not planted: no clocksource other than $cur available" > "$tag.na"; return; fi
   echo "$alt" | sudo tee $CS/current_clocksource > /dev/null
+  [ "$(cat $CS/current_clocksource)" = "$alt" ] && echo "changed=1 clocksource $cur -> $alt" > "$tag.state"
   "$@"
   echo "$cur" | sudo tee $CS/current_clocksource > /dev/null
   echo "clocksource: $cur -> $alt -> $(cat $CS/current_clocksource)" >> "$tag.cs"
@@ -334,22 +357,40 @@ refuse R_runsh_badcell env V3_CELL=bogus V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R
 # "performance" (run 37475543956), where the rule holds: there it is shown accepting (P_runsh_t3, recorded) and then
 # made false for the plant by moving cpu0 to another governor, restored after.
 GOV0=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
-if python3 -B "$GATE" t3pre > "$OUT/F4/t3pre.json" 2>&1; then
-  echo "t3_rule_holds=1" >> "$OUT/info.txt"
-  refuse P_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$RS" "$V3" "$W" "$(o P_runsh_t3)" 5 --arms append25,nosync25
+T3HOLDS=0
+python3 -B "$GATE" t3pre > "$OUT/F4/t3pre.json" 2>&1 && T3HOLDS=1
+echo "t3_rule_holds=$T3HOLDS" >> "$OUT/info.txt"
+t3false() { # tag cmd... -- run cmd while the T3 rule is false (moving cpu0 off "performance" when it holds)
+  local tag=$1 alt
+  shift
+  if [ "$T3HOLDS" = 0 ]; then "$@"; return; fi
   alt=$(tr ' ' '\n' < "${GOV0%/*}/scaling_available_governors" | grep -v -x -e performance -e '' | head -1)
-  if [ -n "$alt" ]; then
-    echo "$alt" | sudo tee "$GOV0" > /dev/null
-    refuse R_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$RS" "$V3" "$W" "$(o R_runsh_t3)" 5 --arms append25,nosync25
-    echo performance | sudo tee "$GOV0" > /dev/null
-    echo "cpu0 governor: performance -> $alt -> $(cat "$GOV0")" > "$OUT/F4/R_runsh_t3.gov"
-  else
-    echo "only 'performance' is available: the T3 rule cannot be made false here" > "$OUT/F4/R_runsh_t3.txt"; echo missing > "$OUT/F4/R_runsh_t3.rc"
-  fi
+  if [ -z "$alt" ]; then echo "only 'performance' is available: the T3 rule cannot be made false here" > "$tag.na"; return; fi
+  echo "$alt" | sudo tee "$GOV0" > /dev/null
+  "$@"
+  echo performance | sudo tee "$GOV0" > /dev/null
+  echo "cpu0 governor: performance -> $alt -> $(cat "$GOV0")" > "$tag.gov"
+}
+[ "$T3HOLDS" = 1 ] && refuse P_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$RS" "$V3" "$W" "$(o P_runsh_t3)" 5 --arms append25,nosync25
+t3false "$OUT/F4/R_runsh_t3" refuse R_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$RS" "$V3" "$W" "$(o R_runsh_t3)" 5 --arms append25,nosync25
+[ -f "$OUT/F4/R_runsh_t3.na" ] && { cp "$OUT/F4/R_runsh_t3.na" "$OUT/F4/R_runsh_t3.txt"; echo missing > "$OUT/F4/R_runsh_t3.rc"; }
+# fresh review I-H2 and I-M2: a stale harness, a library preload, no gated arm
+refuse R_runsh_harness "${NB[@]}" V3_FIRECHECK_VERDICT="$(fixture harness harness)" bash "$RS" "$V3" "$W" "$(o R_runsh_harness)" 5 --arms append25,nosync25
+if [ -n "${V3_SHIM:-}" ] && [ -f "$V3_SHIM" ]; then
+  refuse R_runsh_ldpreload env V3_SMOKE=1 LD_PRELOAD="$(readlink -f "$V3_SHIM")" bash "$RS" "$V3" "$W" "$(o R_runsh_ldpreload)" 5 --arms append25,nosync25
 else
-  echo "t3_rule_holds=0" >> "$OUT/info.txt"
-  refuse R_runsh_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$RS" "$V3" "$W" "$(o R_runsh_t3)" 5 --arms append25,nosync25
+  echo "V3_SHIM missing" > "$OUT/F4/R_runsh_ldpreload.txt"; echo missing > "$OUT/F4/R_runsh_ldpreload.rc"
 fi
+refuse R_runsh_nogated env V3_SMOKE=1 bash "$RS" "$V3" "$W" "$(o R_runsh_nogated)" 5 --arms fdatasync4k,nosync25
+# fresh review I-H1: a batch gate that fails (here a stub batchgate.py in a copy of the harness exiting 1) is a
+# refusal, never the probe's rc 0
+GH="$OUT/F4/gatecrash-harness"
+cp -r "$HERE" "$GH" && printf 'import sys\nsys.exit(1 if sys.argv[1:2] == ["post"] else 2)\n' > "$GH/batchgate.py"
+refuse R_runsh_gatecrash env V3_SMOKE=1 bash "$GH/run.sh" "$V3" "$W" "$(o R_runsh_gatecrash)" 5 --arms append25,nosync25
+# fresh review I-M5: batchgate.py post on copies of the F3 batch, each with one field planted (bound mode)
+for p in traceclock cell leaf brd; do
+  refuse "R_post_$p" python3 -B "$HERE/postplant.py" "$OUT/F3" "$OUT/F4/R_post_$p" "$CELL" "$SHA" "$p"
+done
 # after the run: a wrapper "binary" that runs the real probe with the mutant (summary names another binary)
 printf '#!/bin/sh\nV3FLOOR_FIRECHECK=1 exec "%s" "$@" --mutant-nosync\n' "$V3" > "$OUT/F4/wrapper.sh"
 chmod +x "$OUT/F4/wrapper.sh"
@@ -387,6 +428,7 @@ if [ -n "${V3_BASE:-}" ] && [ -x "${V3_BASE}/v3floor" ]; then
   rfx red_10a_hidden_tmpfs ht
   rfx red_10b_hidden_nobarrier hn
   rfx red_10c_lazy lz
+  cp "$FX/lz.decoy" "$R/red_10c_lazy.decoy" 2>/dev/null
   red red_11_append64 "$BB" --dir "$WR" --out "$R/red_11_append64.out" --n 5 --arms append64,nosync25
   rfx red_12a_deleted del
   rfx red_12b_nest4 n4
@@ -414,7 +456,8 @@ if [ -n "${V3_BASE:-}" ] && [ -x "${V3_BASE}/v3floor" ]; then
   else
     echo "arm64: no clocksource other than arch_sys_counter" > "$R/red_16_clocksource.na"
   fi
-  red red_17_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$BR" "$BB" "$WR" "$R/red_17_t3.out" 5 --arms append25,nosync25
+  red red_15_chattr "$BB" --dir "$CD" --out "$R/red_15_chattr.out" --n 5 --arms append25,nosync25
+  t3false "$R/red_17_t3" red red_17_t3 env V3_SMOKE=1 V3_REQUIRE_T3=1 bash "$BR" "$BB" "$WR" "$R/red_17_t3.out" 5 --arms append25,nosync25
   # the base binary's own trace (item 14's input for red.py)
   timeout 900 setarch "$ARCH" -R strace -f -y -s 1 -o "$R/base-trace" "$BB" --dir "$WR" --out "$R/base-trace.out" --n 40 \
     --arms append25,ow4k,ow64k,ow1m,clone1b,clone2b,clean,fdatasync4k,nosync25 --seed 5 --trace-clock > "$R/base-trace.txt" 2>&1
@@ -424,6 +467,7 @@ if [ -n "${V3_BASE:-}" ] && [ -x "${V3_BASE}/v3floor" ]; then
   python3 -B "$HERE/red.py" offline "$V3_BASE/check.py" "$R/base-trace.gz" "$WR" "$CELL" "$R/offline.json" > "$R/offline.txt" 2>&1
 fi
 
+sudo chattr -S "$CD" 2>/dev/null; rmdir "$CD" 2>/dev/null
 ls -A "$W" > "$OUT/work-leftover.txt"
 python3 -B "$HERE/check.py" "$OUT" "$CELL"
 crc=$?

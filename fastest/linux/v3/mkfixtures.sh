@@ -90,6 +90,7 @@ f_lz() {
   sudo umount -l "$base/lz/a" || return 1
   shown=$(cat "/sys/block/${d2##*/}/loop/backing_file")
   case $shown in /*) [ -e "$shown" ] || { sudo mkdir -p "$(dirname "$shown")"; sudo truncate -s 512M "$shown"; } ;; *) bad lz "sysfs shows '$shown'"; return 1 ;; esac
+  echo "$shown" | sudo tee "$base/lz.decoy" > /dev/null
   ok lz "loop ${d2##*/} backing now shown as $shown, decoy inode $(stat -c '%d:%i' "$shown")"
 }
 f_del() {

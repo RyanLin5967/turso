@@ -123,7 +123,7 @@ RUNSH_POST = {"R_runsh_post": ["exe_sha256: the probe that ran", "mutant_nosync=
 POST_PLANTS = {"R_post_traceclock": "trace_clock=1 in the summary", "R_post_cell": "layout:",
                "R_post_leaf": "leaf class: the batch's leaf is", "R_post_brd": "leaf brd:"}
 HARNESS = ["run.sh", "batchgate.py", "check.py", "blkflush.py", "stamp.py", "v3cell.py", "firecheck.sh", "crash.sh",
-           "mkfixtures.sh", "mkbrd.sh", "red.py"]
+           "mkfixtures.sh", "mkbrd.sh", "red.py", "postplant.py"]
 
 
 def harness_sha256(here=HERE):
