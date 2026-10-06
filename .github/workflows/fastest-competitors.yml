@@ -191,6 +191,11 @@ jobs:
           grep '^JOBS' "$RUNNER_TEMP/reduce/reduce.tsv" | cut -f2-5 || true
           echo "CELLS rows: $(grep '^CELLS' "$RUNNER_TEMP/reduce/reduce.tsv" | awk 'END {print NR - 1}')"
           cat "$RUNNER_TEMP/reduce/reduce.err"
+          # SMOKE.md's tables, generated here from the same raw (smoke_table.py, C=1 and C=4)
+          for c in 1 4; do
+            timeout 600 python3 -B fastest/linux/competitors/smoke_table.py "$RUNNER_TEMP/runs" "$c" \
+              >"$RUNNER_TEMP/reduce/smoke-c$c.md" 2>"$RUNNER_TEMP/reduce/smoke-c$c.err" || rc=$(( rc == 0 ? 3 : rc ))
+          done
           exit $rc
       - if: always()
         uses: actions/upload-artifact@v4
