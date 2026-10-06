@@ -45,8 +45,11 @@ require_port_free() {
   # workflow also reserves these ports (net.ipv4.ip_local_reserved_ports). TIME-WAIT is left out: PG and Go set
   # SO_REUSEADDR on their listeners, so it does not block them.
   if command -v ss >/dev/null 2>&1; then
+    # Callers run under set -euo pipefail: a filter that matches nothing must not fail the assignment (grep -v did,
+    # and killed every server start of run 37399197723 without a message), and an ss that fails must refuse.
     local s
-    s=$(ss -Htan "( sport = :$1 )" 2>/dev/null | grep -v '^TIME-WAIT')
+    s=$(ss -Htan "( sport = :$1 )" 2>&1) || die "REFUSED: ss could not check port $1: $s"
+    s=$(printf '%s\n' "$s" | awk 'NF && $1 != "TIME-WAIT"')
     [ -z "$s" ] || die "REFUSED: port $1 is bound by another socket: $(printf '%s\n' "$s" | head -1)"
   fi
 }
