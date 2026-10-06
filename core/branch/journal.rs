@@ -1638,7 +1638,7 @@ impl Journal {
                 return Err(e);
             }
         };
-        if let Err(e) = std::fs::rename(&tmp, &self.files.log) {
+        if let Err(e) = rename_file(&tmp, &self.files.log) {
             let _ = std::fs::remove_file(&tmp);
             return Err(io_error(e, "rename branch log rewrite"));
         }
@@ -1784,7 +1784,7 @@ impl Journal {
                 len += frames.len() as u64;
             }
         }
-        if let Err(e) = std::fs::rename(self.files.log_tmp(), &self.files.log) {
+        if let Err(e) = rename_file(&self.files.log_tmp(), &self.files.log) {
             let _ = std::fs::remove_file(self.files.log_tmp());
             return Err(io_error(e, "rename branch log rewrite"));
         }
@@ -1972,7 +1972,7 @@ impl Journal {
         }
         write_at(&self.file, frames, self.len)?;
         if let Some(dir) = dir {
-            fsync_file(dir, SyncClass::Fsync)?;
+            fsync_dir(dir, SyncClass::Fsync)?;
             super::store::kill_point("cut.dir_synced");
         }
         if class.syncs() {
@@ -2211,7 +2211,7 @@ impl Journal {
                 sync_replacement(&f, class, self.take_replacement_sync_failure(), &self.poisoned)?;
             }
         }
-        std::fs::rename(&tmp, &self.files.snap).map_err(|e| {
+        rename_file(&tmp, &self.files.snap).map_err(|e| {
             self.set_poisoned();
             io_error(e, "rename branch snapshot")
         })?;
@@ -2271,7 +2271,7 @@ impl Journal {
                     return Err(e);
                 }
             };
-            if let Err(e) = std::fs::rename(&tmp, &self.files.log) {
+            if let Err(e) = rename_file(&tmp, &self.files.log) {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(io_error(e, "rename branch log reset"));
             }
@@ -2556,7 +2556,7 @@ impl Flight {
         // After mutant M-b's early acknowledgement, before the log's sync.
         super::store::kill_point("flight.before_log_sync");
         if let Some(dir) = &self.dir {
-            fsync_file(dir, SyncClass::Fsync)?;
+            fsync_dir(dir, SyncClass::Fsync)?;
             super::store::kill_point("cut.dir_synced");
         }
         let mut confirm = None;
@@ -3285,6 +3285,81 @@ mod lose_unsynced {
             });
         }
     }
+
+    /// Renames not yet made durable, per directory `(dev, ino)`, in order: each as (where the file
+    /// waits, where it goes).
+    fn renames() -> &'static Mutex<HashMap<(u64, u64), Vec<(PathBuf, PathBuf)>>> {
+        static RENAMES: OnceLock<Mutex<HashMap<(u64, u64), Vec<(PathBuf, PathBuf)>>>> = OnceLock::new();
+        RENAMES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Hold the rename of `from` over `to` until `to`'s directory is synced (engine review 7 #6):
+    /// a power cut before that loses it, as a file system may, leaving the old file at `to`. The
+    /// file moves at once to a name of its own beside `to` (so `from` is free again, as after a real
+    /// rename), and reaches `to` at the directory's sync (`apply`). `Ok(false)` when not armed (the
+    /// caller renames).
+    pub(super) fn hold_rename(from: &Path, to: &Path) -> Result<bool> {
+        if !armed() {
+            return Ok(false);
+        }
+        let dir = match to.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let meta = std::fs::metadata(dir).map_err(|e| io_error(e, "stat branch directory"))?;
+        let mut renames = renames().lock().unwrap();
+        let held = renames.entry((meta.dev(), meta.ino())).or_default();
+        let waits = PathBuf::from(format!("{}.held-rename-{}", to.display(), held.len()));
+        std::fs::rename(from, &waits).map_err(|e| io_error(e, "hold branch file rename"))?;
+        held.push((waits, to.to_path_buf()));
+        Ok(true)
+    }
+
+    /// A directory's sync: the renames held for it reach their names, in order.
+    pub(super) fn apply_renames(dir: &File) -> Result<()> {
+        if !armed() {
+            return Ok(());
+        }
+        let Some(k) = key(dir) else {
+            return Ok(());
+        };
+        let held = renames().lock().unwrap().remove(&k).unwrap_or_default();
+        for (waits, to) in held {
+            std::fs::rename(&waits, &to).map_err(|e| io_error(e, "apply branch file rename"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Rename `from` over `to` (a temp file taking a branch file's place). In test builds under the
+/// power-loss simulation (`FE_LOSE_UNSYNCED`), the rename reaches `to` only when `to`'s directory is
+/// synced, so a crash model can see a rename that was never made durable (engine review 7 #6).
+fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(all(test, unix))]
+    match lose_unsynced::hold_rename(from, to) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => return Err(std::io::Error::other(e.to_string())),
+    }
+    std::fs::rename(from, to)
+}
+
+/// Test builds: directory syncs made on this thread (engine review 7 #6: a cut's rename made
+/// durable once before the next acknowledgement, never once per flight).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DIR_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Sync `dir`, a directory, in `class`, counted (test builds) and applying the renames the power-loss
+/// simulation held for it.
+fn fsync_dir(dir: &File, class: SyncClass) -> Result<()> {
+    #[cfg(all(test, unix))]
+    lose_unsynced::apply_renames(dir)?;
+    fsync_file(dir, class)?;
+    #[cfg(test)]
+    DIR_SYNCS.with(|c| c.set(c.get() + 1));
+    Ok(())
 }
 
 /// The device an open file lives on (`fstat`'s `st_dev`); `None` where it cannot be read or off
@@ -3488,7 +3563,7 @@ pub(crate) fn fsync_dir_of(path: &Path, class: SyncClass) -> Result<()> {
             _ => Path::new("."),
         };
         let d = File::open(dir).map_err(|e| io_error(e, "open branch directory"))?;
-        fsync_file(&d, class)
+        fsync_dir(&d, class)
     }
     #[cfg(not(unix))]
     {

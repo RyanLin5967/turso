@@ -4106,3 +4106,40 @@ fn a_stopped_store_lists_and_finds_a_branch_whose_release_failed() {
         assert_eq!(db.branch_named("goes-away").unwrap(), Some(named), "catalog={catalog}: premise");
     }
 }
+
+// ---- engine review 7 #6: a detector for the cut's directory sync ----
+
+/// Engine review 7 #6: a cut's rename is made durable by exactly one directory sync, before the
+/// first acknowledgement after it, and never by one per flight. A fuzzy checkpoint's cut
+/// (`finish_cut`) leaves it to the next flight; a sharp one (`rewrite_from`) syncs the directory
+/// itself. Mutant `no_cut_dir_sync` (the next flight syncs no directory) must fail the fuzzy arm.
+/// Counted on this thread, which runs the sharp cut and leads the flights after it.
+#[test]
+fn a_cut_syncs_its_directory_once_before_the_next_acknowledgement() {
+    let _s = serial();
+    for (fuzzy, mode) in [(true, super::BranchCheckpoint::Fuzzy), (false, super::BranchCheckpoint::Sharp)] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("cutdir.db"), opts(true, SyncClass::Fsync).with_branch_checkpoint(mode));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _a = trunk.fork_branch().unwrap().into_id();
+        let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
+        let installed = db.branch_checkpoint_counters()[0];
+        let before = dirs();
+        if fuzzy {
+            assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+            db.branch_checkpoint_wait();
+        } else {
+            db.branch_compact_now().unwrap();
+        }
+        assert_eq!(db.branch_checkpoint_counters()[0], installed + 1, "fuzzy={fuzzy}: premise: the checkpoint installed");
+        let _b = trunk.fork_branch().unwrap().into_id();
+        assert_eq!(
+            dirs() - before,
+            1,
+            "fuzzy={fuzzy}: the cut's rename was not made durable by exactly one directory sync before the next acknowledgement"
+        );
+        let _c = trunk.fork_branch().unwrap().into_id();
+        assert_eq!(dirs() - before, 1, "fuzzy={fuzzy}: a directory sync per flight");
+    }
+}
