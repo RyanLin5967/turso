@@ -399,7 +399,7 @@ async fn serve_session(
     tokio::pin!(startup_timeout);
     let socket = tokio::select! {
         _ = &mut startup_timeout => return Ok(()),
-        socket = pgwire::tokio::server::negotiate_tls::<String>(socket, None) => socket?,
+        socket = pgwire::tokio::server::negotiate_tls(socket, None) => socket?,
     };
     let Some(mut socket) = socket else {
         return Ok(());
@@ -1957,7 +1957,7 @@ impl ExtendedQueryHandler for Session {
         let mut state = state.lock().await;
         match &mut *state {
             PortalExecutionState::Initial => {
-                match self.do_query(client, &portal, max_rows).await? {
+                match ExtendedQueryHandler::do_query(self, client, &portal, max_rows).await? {
                     Response::Query(mut results) => {
                         *state = if feed_rows(client, &mut results, max_rows).await? {
                             PortalExecutionState::Suspended(results)
