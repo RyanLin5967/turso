@@ -3931,12 +3931,9 @@ impl Pager {
     /// Close the branch store's commit gate if this pager's commit holds it open (F-L): once the
     /// commit's frames are published, or when the write lock is released after a failed commit.
     pub(crate) fn close_trunk_gate(&self) {
-        // A WAL sync of this commit that failed after it yielded, which the statement reported
-        // without coming back to the commit: seen here, before the verdicts below are cleared.
-        let sync = self.trunk_wal_sync.lock().take();
-        if sync.is_some_and(|c| c.finished() && !c.succeeded()) {
-            self.trunk_wal_sync_failed();
-        }
+        // A trunk file's sync that failed after it yielded, which the statement reported without
+        // coming back to the commit: seen here, before the verdicts below are cleared.
+        self.check_noted_syncs();
         self.trunk_sync_frontier.store(0, Ordering::Release);
         let ordered = self.trunk_ordered.swap(false, Ordering::AcqRel);
         if self.trunk_gate_open.swap(false, Ordering::AcqRel) {
@@ -3953,25 +3950,49 @@ impl Pager {
         }
     }
 
-    /// Keep the WAL sync this trunk commit just issued, for `close_trunk_gate` (review 6 #2). Only
-    /// with a branch store: nothing else reads it.
+    /// Keep a sync of a trunk file this pager just issued — a commit's WAL sync, a WAL header's (a
+    /// commit's, a cache flush's, a spill's), a checkpoint's database file — for
+    /// `check_noted_syncs`: one that fails after it yielded is reported to the statement without
+    /// coming back here (review 6 #2, engine review 9 #2). Only with a branch store. A noted sync
+    /// that already failed is acted on before it is replaced.
     fn note_trunk_wal_sync(&self, c: &Completion) {
         if self.branch_store.get().is_some() {
-            *self.trunk_wal_sync.lock() = Some(c.clone());
+            let previous = self.trunk_wal_sync.lock().replace(c.clone());
+            if previous.is_some_and(|p| p.finished() && !p.succeeded()) {
+                self.trunk_wal_sync_failed();
+            }
         }
     }
 
-    /// This trunk commit's WAL sync failed (review 6 #2). If branch records relied on it — its
-    /// barrier ORDERED them ahead of it (`trunk_ordered`), or riders were noted to it
-    /// (`trunk_sync_frontier`, read here before anything zeroes it) — what the device's drain
-    /// covered may be lost, and the branch store fail-stops. A sync nothing relied on (each branch
-    /// flight synced itself) stops nothing.
-    fn trunk_wal_sync_failed(&self) {
-        let frontier = self.trunk_sync_frontier.swap(0, Ordering::AcqRel);
-        if frontier > 0 || self.trunk_ordered.load(Ordering::Acquire) {
-            if let Some(store) = self.branch_store.get() {
-                store.trunk_wal_sync_failed();
+    /// Act on the noted sync if it finished and failed (`trunk_wal_sync_failed`); one still in
+    /// flight stays noted. Where the next trunk commit begins (before anything it does could
+    /// promote branch records over the failed drain), where every trunk write ends, and after a
+    /// failed checkpoint.
+    fn check_noted_syncs(&self) {
+        let failed = {
+            let mut noted = self.trunk_wal_sync.lock();
+            match noted.as_ref() {
+                Some(c) if c.finished() => noted.take().is_some_and(|c| !c.succeeded()),
+                _ => false,
             }
+        };
+        if failed {
+            self.trunk_wal_sync_failed();
+        }
+    }
+
+    /// A sync of a trunk file failed (review 6 #2, engine review 9 #2 and #5). On the branch
+    /// files' device it can be a failed DRAIN of that device — an F_FULLFSYNC on Apple, any sync
+    /// elsewhere — and branch records written and not yet drained may be lost with it, while a
+    /// later successful flush would report them durable. The store decides from its own state
+    /// whether any are (`BranchStore::trunk_wal_sync_failed`), and fail-stops only then. Blind
+    /// spot: the trunk files are assumed to share the branch files' device (a failure on another
+    /// device fail-stops a store with undrained records needlessly, never the reverse).
+    fn trunk_wal_sync_failed(&self) {
+        self.trunk_sync_frontier.store(0, Ordering::Release);
+        let drains = !cfg!(target_vendor = "apple") || self.get_sync_type() == FileSyncType::FullFsync;
+        if let Some(store) = self.branch_store.get() {
+            store.trunk_wal_sync_failed(drains);
         }
     }
 
@@ -4107,8 +4128,12 @@ impl Pager {
                 IOCompletions(completion),
             )),
             None => {
-                // No async prep needed, go straight to finish
-                let completion = wal.prepare_wal_finish(self.get_sync_type())?;
+                // No async prep needed, go straight to finish. The header's sync is a trunk sync
+                // like a commit's (engine review 9 #2).
+                let completion = wal
+                    .prepare_wal_finish(self.get_sync_type())
+                    .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                self.note_trunk_wal_sync(&completion);
                 Ok(CacheFlushStep::Yield(
                     CacheFlushState::WalPrepareFinish {
                         dirty_ids,
@@ -4138,7 +4163,10 @@ impl Pager {
             ));
         }
 
-        let finish_completion = wal.prepare_wal_finish(self.get_sync_type())?;
+        let finish_completion = wal
+            .prepare_wal_finish(self.get_sync_type())
+            .inspect_err(|_| self.trunk_wal_sync_failed())?;
+        self.note_trunk_wal_sync(&finish_completion);
         Ok(CacheFlushStep::Yield(
             CacheFlushState::WalPrepareFinish {
                 dirty_ids,
@@ -4400,7 +4428,11 @@ impl Pager {
                     // Header (and any truncate) durable — issue the fsync that
                     // marks the WAL initialized.
                     let wal = self.wal.as_ref().expect("PreparingWalStart requires a WAL");
-                    let finish_c = wal.prepare_wal_finish(self.get_sync_type())?;
+                    // A trunk sync like a commit's (engine review 9 #2).
+                    let finish_c = wal
+                        .prepare_wal_finish(self.get_sync_type())
+                        .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                    self.note_trunk_wal_sync(&finish_c);
                     *self.spill_state.write() = SpillState::PreparingWalFinish {
                         pages,
                         completion: finish_c,
@@ -4679,6 +4711,10 @@ impl Pager {
         // durable before the commit that overwrites its page can be, or a crash after this commit
         // leaves the branch reading the NEW page. Idempotent across IO re-entry.
         if let Some(store) = self.branch_store.get() {
+            // A trunk sync since the last commit that failed after it yielded (a cache flush's, a
+            // spill's, a checkpoint's) is acted on before this commit's barrier and its flush could
+            // promote branch records over that failed drain (engine review 9 #2).
+            self.check_noted_syncs();
             let trunk = crate::branch::SyncClass::of_trunk(sync_mode, self.get_sync_type());
             // Whether this commit's WAL flush carries the branch files (ordered mode) is read from
             // the WAL file it syncs, each time (review 3 #3).
@@ -4993,7 +5029,9 @@ impl Pager {
                             commit_info.completions.clear();
                             commit_info.prepared_frames.clear();
                             // Before the panic below too: a caught panic must not leave the branch
-                            // store acknowledging over the failed drain (review 6 #2).
+                            // store acknowledging over the failed drain (review 6 #2). Acted on
+                            // here, so the noted copy is dropped (engine review 9 #10: once).
+                            self.trunk_wal_sync.lock().take();
                             self.trunk_wal_sync_failed();
 
                             if !data_sync_retry {
@@ -5196,6 +5234,8 @@ impl Pager {
     }
 
     pub fn cleanup_after_checkpoint_failure(&self) {
+        // A database-file sync that failed after it yielded (engine review 9 #2).
+        self.check_noted_syncs();
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
@@ -5442,11 +5482,15 @@ impl Pager {
                         continue;
                     }
 
+                    // The database file's sync is a trunk sync on the branch files' device too
+                    // (engine review 9 #2).
                     let c = sqlite3_ondisk::begin_sync(
                         self.db_file.as_ref(),
                         self.syncing.clone(),
                         self.get_sync_type(),
-                    )?;
+                    )
+                    .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                    self.note_trunk_wal_sync(&c);
                     self.checkpoint_state
                         .write()
                         .result

@@ -5123,18 +5123,36 @@ impl BranchStore {
         }
     }
 
-    /// A trunk commit's WAL sync failed after branch records relied on it (review 6 #2): ordered
-    /// ahead of it by its barrier, or noted to ride it (`order_riders`). What the device's drain
-    /// covered may be lost, and a later flush may report success over the loss, so the store
-    /// fail-stops as after a failed flight, and every waiter — the riders the flush would have
-    /// made durable among them — gets the error. Mutant `no_wal_fail_stop` (test builds only): the
-    /// store goes on, as before.
-    pub(crate) fn trunk_wal_sync_failed(&self) {
+    /// A sync of a trunk file failed (review 6 #2, engine review 9 #2 and #5); `drains`: it was a
+    /// drain of the device (an F_FULLFSYNC on Apple, any sync elsewhere). What that drain covered
+    /// may be lost, and a later successful flush would report it durable. So the store fail-stops,
+    /// as after a failed flight — every waiter, the riders the flush would have made durable among
+    /// them, gets the error — exactly when it holds records the drain could have lost: written and
+    /// not yet drained by a full flush in a class that claims durability (on Apple fsync(2) drains
+    /// nothing, elsewhere it does), an ordered flight, one waiting for this very flush
+    /// (`pending_full`), or a flight in the air. With nothing at risk (a D2 store whose every
+    /// flight was F_FULLFSYNCed), it goes on. Mutants (test builds only): `no_wal_fail_stop` (it
+    /// never stops, as before review 6 #2) and `drain_failure_ignores_risk` (it always stops, as
+    /// before engine review 9 #5 in D2).
+    pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
         if fe_mutant("no_wal_fail_stop") {
             return;
         }
-        tracing::warn!("branch store fail-stopped: a trunk WAL sync its records relied on failed");
         let mut g = self.group.lock();
+        let full = g.durable[class_index(SyncClass::FullFsync)];
+        let drained = if cfg!(target_vendor = "apple") {
+            full
+        } else {
+            g.durable[class_index(SyncClass::Fsync)].max(full)
+        };
+        let at_risk = (self.class.syncs() && g.durable[0] > drained)
+            || g.ordered > full
+            || g.pending_full.is_some()
+            || g.flushing;
+        if !(drains && at_risk) && !fe_mutant("drain_failure_ignores_risk") {
+            return;
+        }
+        tracing::warn!("branch store fail-stopped: a trunk file's sync failed with branch records not yet drained");
         g.pending_full = None;
         self.group.fail(&mut g);
     }
@@ -5465,8 +5483,16 @@ impl BranchStore {
                 tracing::warn!("branch records not ordered ahead of a trunk WAL flush: {e}");
             }
         }
+        // 0 when everything ordered or fsynced is F_FULLFSYNC-durable already (engine review 9 #5):
+        // nothing rides, so `trunk_wal_synced` has nothing to promote and skips its lock and its
+        // broadcast.
         let g = self.group.lock();
-        g.ordered.max(g.durable[class_index(SyncClass::Fsync)])
+        let frontier = g.ordered.max(g.durable[class_index(SyncClass::Fsync)]);
+        if frontier > g.durable[class_index(SyncClass::FullFsync)] {
+            frontier
+        } else {
+            0
+        }
     }
 
     /// The trunk commit's WAL F_FULLFSYNC returned: every journal byte below `frontier` (read by
