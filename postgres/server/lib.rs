@@ -42,20 +42,24 @@ use turso_pg::{
 
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::auth::StartupHandler;
-use pgwire::api::portal::{Format, Portal};
+use pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use pgwire::api::query::{send_ready_for_query, ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, PgWireConnectionState, PgWireServerHandlers, Type,
+    ClientInfo, ClientPortalStore, PgWireConnectionState, PgWireServerHandlers, Type, DEFAULT_NAME,
     METADATA_DATABASE,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::data::{DataRow, RowDescription};
-use pgwire::messages::extendedquery::Sync as PgSync;
+use pgwire::messages::data::{DataRow, NoData, ParameterDescription, RowDescription};
+use pgwire::messages::extendedquery::{
+    Bind, BindComplete, Close, CloseComplete, Describe, Execute, Parse, ParseComplete,
+    PortalSuspended, Sync as PgSync, TARGET_TYPE_BYTE_PORTAL, TARGET_TYPE_BYTE_STATEMENT,
+};
 use pgwire::messages::response::{
     EmptyQueryResponse, NoticeResponse, ReadyForQuery, TransactionStatus,
 };
@@ -419,9 +423,19 @@ struct SessionState {
     /// multi-statement query, or a pipeline up to Sync, in: an engine BEGIN the client did not send
     /// (see [`Session::begin_implicit`]).
     implicit: bool,
+    /// The statement the last Describe prepared, for the Execute that follows it to run instead of
+    /// preparing it again (see [`Session::describe_prepare`]); cleared at Sync.
+    described: Option<Described>,
     /// Notices the session's statements raised and the client has not been sent yet: the simple
     /// protocol sends each before its statement's result, the extended one before ReadyForQuery.
     notices: Vec<Box<ErrorInfo>>,
+}
+
+/// A statement Describe prepared: on which engine connection, from which text.
+struct Described {
+    conn: Arc<turso_core::Connection>,
+    sql: String,
+    stmt: turso_core::Statement,
 }
 
 /// CHECKPOINTs skipped inside a block because the WAL was busy (see [`Session::checkpoint`]),
@@ -771,20 +785,58 @@ impl Session {
     /// Describe's prepare. In the extended protocol Describe is where a statement first meets the
     /// engine, so a statement that fails to prepare inside a block aborts the block, as its
     /// execution would (wire review 1 item 2).
-    fn describe_prepare(&self, sql: &str) -> PgWireResult<turso_core::Statement> {
+    ///
+    /// The prepared statement is kept for the Execute that follows (wire review 1 item 12: one
+    /// parse, translation and compile per extended statement, not two): read its columns with
+    /// [`Session::described_fields`]. A Describe of the statement already kept prepares nothing.
+    fn describe_prepare(&self, sql: &str) -> PgWireResult<()> {
         let conn = self
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
-        let in_tx = !conn.inner().get_auto_commit();
-        let stmt = conn.prepare(sql);
-        if stmt.is_err() {
-            if in_tx {
-                self.state().aborted = true;
-            }
-            // In a pipeline's implicit block the failure rolls the whole pipeline back.
-            self.after_implicit(sql, true);
+        if self
+            .state()
+            .described
+            .as_ref()
+            .is_some_and(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn.inner()))
+        {
+            return Ok(());
         }
-        stmt.map_err(engine_error)
+        let in_tx = !conn.inner().get_auto_commit();
+        match conn.prepare(sql) {
+            Ok(stmt) => {
+                self.state().described = Some(Described {
+                    conn: conn.inner().clone(),
+                    sql: sql.to_string(),
+                    stmt,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                if in_tx {
+                    self.state().aborted = true;
+                }
+                // In a pipeline's implicit block the failure rolls the whole pipeline back.
+                self.after_implicit(sql, true);
+                Err(engine_error(e))
+            }
+        }
+    }
+
+    /// The result columns of the statement [`Session::describe_prepare`] kept.
+    fn described_fields(&self, format: &Format) -> Vec<FieldInfo> {
+        self.state()
+            .described
+            .as_ref()
+            .map_or_else(Vec::new, |d| build_field_info(&d.stmt, format))
+    }
+
+    /// The statement a Describe prepared for this Execute, if it is this text on this connection.
+    fn take_described(&self, conn: &PgConnection, sql: &str) -> Option<turso_core::Statement> {
+        let mut st = self.state();
+        match st.described.take() {
+            Some(d) if d.sql == sql && Arc::ptr_eq(&d.conn, conn.inner()) => Some(d.stmt),
+            _ => None,
+        }
     }
 
     fn engine_statement(
@@ -794,7 +846,11 @@ impl Session {
         portal: Option<&Portal<String>>,
         format: &Format,
     ) -> SqlResult<Response> {
-        let mut stmt = conn.prepare(sql).map_err(|e| engine_info(&e))?;
+        let described = portal.and_then(|_| self.take_described(conn, sql));
+        let mut stmt = match described {
+            Some(stmt) => stmt,
+            None => conn.prepare(sql).map_err(|e| engine_info(&e))?,
+        };
         self.shared.cleanup_dropped_schema_file(sql);
         if let Some(portal) = portal {
             bind_portal_parameters(&mut stmt, portal).map_err(wire_info)?;
@@ -1486,6 +1542,192 @@ impl ExtendedQueryHandler for Session {
         self.query_parser.clone()
     }
 
+    // pgwire's default Parse, Bind, Describe, Execute and Close handlers each flush their reply: an
+    // extended round of five messages cost five socket writes against one for a simple Query. The
+    // overrides below are the same handlers with every reply fed, so a round's replies go out
+    // together when the client asks: at Sync (`on_sync`) or Flush (pgwire's `on_flush`); an error
+    // is still flushed at once by pgwire (wire review 1 item 12).
+
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // NoopQueryParser keeps the text as it is; so does this.
+        let types = message
+            .type_oids
+            .iter()
+            .map(|o| Type::from_oid(*o))
+            .collect();
+        let id = message.name.unwrap_or_else(|| DEFAULT_NAME.to_owned());
+        client
+            .portal_store()
+            .put_statement(Arc::new(StoredStatement::new(id, message.query, types)));
+        client
+            .feed(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.statement_name.as_deref().unwrap_or(DEFAULT_NAME);
+        let Some(statement) = client.portal_store().get_statement(name) else {
+            return Err(PgWireError::StatementNotFound(name.to_owned()));
+        };
+        let portal = Portal::try_new(&message, statement)?;
+        client.portal_store().put_portal(Arc::new(portal));
+        client
+            .feed(PgWireBackendMessage::BindComplete(BindComplete::new()))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+        let (parameters, fields) = match message.target_type {
+            TARGET_TYPE_BYTE_STATEMENT => {
+                let Some(statement) = client.portal_store().get_statement(name) else {
+                    return Err(PgWireError::StatementNotFound(name.to_owned()));
+                };
+                let r = self.do_describe_statement(client, &statement).await?;
+                (Some(r.parameters), r.fields)
+            }
+            TARGET_TYPE_BYTE_PORTAL => {
+                let Some(portal) = client.portal_store().get_portal(name) else {
+                    return Err(PgWireError::PortalNotFound(name.to_owned()));
+                };
+                (None, self.do_describe_portal(client, &portal).await?.fields)
+            }
+            other => return Err(PgWireError::InvalidTargetType(other)),
+        };
+        if let Some(parameters) = parameters {
+            client
+                .feed(PgWireBackendMessage::ParameterDescription(
+                    ParameterDescription::new(parameters.iter().map(|t| t.oid()).collect()),
+                ))
+                .await?;
+        }
+        // NoData whenever there are no columns (pgwire's helper sends an empty RowDescription
+        // for a statement with parameters and no columns).
+        let reply = if fields.is_empty() {
+            PgWireBackendMessage::NoData(NoData::new())
+        } else {
+            PgWireBackendMessage::RowDescription(RowDescription::new(
+                fields.iter().map(Into::into).collect(),
+            ))
+        };
+        client.feed(reply).await?;
+        Ok(())
+    }
+
+    async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+        let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+        let Some(portal) = client.portal_store().get_portal(name) else {
+            return Err(PgWireError::PortalNotFound(name.to_owned()));
+        };
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let max_rows = message.max_rows.max(0) as usize;
+        let state = portal.state();
+        let mut state = state.lock().await;
+        match &mut *state {
+            PortalExecutionState::Initial => {
+                match self.do_query(client, &portal, max_rows).await? {
+                    Response::Query(mut results) => {
+                        *state = if feed_rows(client, &mut results, max_rows).await? {
+                            PortalExecutionState::Suspended(results)
+                        } else {
+                            PortalExecutionState::Finished
+                        };
+                    }
+                    Response::Execution(tag)
+                    | Response::TransactionStart(tag)
+                    | Response::TransactionEnd(tag) => {
+                        client
+                            .feed(PgWireBackendMessage::CommandComplete(tag.into()))
+                            .await?;
+                    }
+                    Response::EmptyQuery => {
+                        client
+                            .feed(PgWireBackendMessage::EmptyQueryResponse(
+                                EmptyQueryResponse::new(),
+                            ))
+                            .await?;
+                    }
+                    Response::Error(e) => {
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
+                            .await?;
+                    }
+                    // This server answers COPY FROM a file itself and never streams COPY.
+                    Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
+                        return Err(PgWireError::UserError(error(
+                            "0A000",
+                            "COPY over the protocol is not supported".to_string(),
+                        )));
+                    }
+                }
+            }
+            PortalExecutionState::Suspended(results) => {
+                if !feed_rows(client, results, max_rows).await? {
+                    *state = PortalExecutionState::Finished;
+                }
+            }
+            PortalExecutionState::Finished => {
+                client
+                    .feed(PgWireBackendMessage::NoData(NoData::new()))
+                    .await?;
+            }
+        }
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        // As pgwire does: the unnamed portal goes with its execution.
+        if name == DEFAULT_NAME {
+            client.portal_store().rm_portal(name);
+        }
+        Ok(())
+    }
+
+    async fn on_close<C>(&self, client: &mut C, message: Close) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+        match message.target_type {
+            TARGET_TYPE_BYTE_STATEMENT => client.portal_store().rm_statement(name),
+            TARGET_TYPE_BYTE_PORTAL => client.portal_store().rm_portal(name),
+            _ => {}
+        }
+        client
+            .feed(PgWireBackendMessage::CloseComplete(CloseComplete::new()))
+            .await?;
+        Ok(())
+    }
+
     async fn do_query<C>(
         &self,
         _client: &mut C,
@@ -1523,11 +1765,13 @@ impl ExtendedQueryHandler for Session {
             let fields = branch_call_fields(&call, &Format::UnifiedText);
             return Ok(DescribeStatementResponse::new(param_types, fields));
         }
-        if is_checkpoint(&target.statement) {
+        // The special statements return no rows, and preparing one runs it (COPY FROM loads its
+        // file at prepare): Describe answers them from the text alone (wire review 1 item 12).
+        if is_pg_non_query(&target.statement) {
             return Ok(DescribeStatementResponse::new(param_types, vec![]));
         }
-        let stmt = self.describe_prepare(&target.statement)?;
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        self.describe_prepare(&target.statement)?;
+        let fields = self.described_fields(&Format::UnifiedText);
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -1544,11 +1788,11 @@ impl ExtendedQueryHandler for Session {
             let fields = branch_call_fields(&call, &portal.result_column_format);
             return Ok(DescribePortalResponse::new(fields));
         }
-        if is_checkpoint(&portal.statement.statement) {
+        if is_pg_non_query(&portal.statement.statement) {
             return Ok(DescribePortalResponse::new(vec![]));
         }
-        let stmt = self.describe_prepare(&portal.statement.statement)?;
-        let fields = build_field_info(&stmt, &portal.result_column_format);
+        self.describe_prepare(&portal.statement.statement)?;
+        let fields = self.described_fields(&portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
     }
 
@@ -1566,8 +1810,13 @@ impl ExtendedQueryHandler for Session {
                 .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
                 .await?;
         }
-        // The extended protocol's results went out as each Execute ran; its notices go out here.
-        let notices = std::mem::take(&mut self.state().notices);
+        // The extended protocol's results were fed as each Execute ran; its notices go out here, and
+        // a statement a Describe kept but no Execute ran is dropped.
+        let notices = {
+            let mut st = self.state();
+            st.described = None;
+            std::mem::take(&mut st.notices)
+        };
         for notice in notices {
             client
                 .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
@@ -1580,6 +1829,43 @@ impl ExtendedQueryHandler for Session {
         send_ready_for_query(client, status).await?;
         Ok(())
     }
+}
+
+/// pgwire's send_partial_query_response with every message fed: up to `max_rows` rows (0: all),
+/// then CommandComplete, or PortalSuspended when the limit was reached. True when suspended.
+async fn feed_rows<C>(
+    client: &mut C,
+    results: &mut QueryResponse,
+    max_rows: usize,
+) -> PgWireResult<bool>
+where
+    C: Sink<PgWireBackendMessage> + Unpin,
+    C::Error: std::fmt::Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let tag = results.command_tag().to_owned();
+    let data = results.data_rows();
+    let mut rows = 0;
+    while max_rows == 0 || rows < max_rows {
+        match data.next().await {
+            Some(row) => {
+                client.feed(PgWireBackendMessage::DataRow(row?)).await?;
+                rows += 1;
+            }
+            None => {
+                client
+                    .feed(PgWireBackendMessage::CommandComplete(
+                        Tag::new(&tag).with_rows(rows).into(),
+                    ))
+                    .await?;
+                return Ok(false);
+            }
+        }
+    }
+    client
+        .feed(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
+        .await?;
+    Ok(true)
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.
