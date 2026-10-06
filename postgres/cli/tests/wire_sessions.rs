@@ -2604,3 +2604,27 @@ fn describe_never_performs_a_statement_behind_a_comment() {
         .ok("extended COPY behind a comment");
     assert_eq!(a.q("SELECT count(*) FROM e5").single("rows"), "2");
 }
+
+/// A Terminate ends the session: the server closes the socket (the client reads EOF promptly,
+/// though it keeps its own end open, as bbload's synchronous close does with a dup of the
+/// socket), and the branch the session was on is free by then, so a delete right after succeeds
+/// with no retry. At 15e96b3a9 pgwire dropped the Terminate and served on until the client's EOF,
+/// so that close waited out its 5 s and failed (wire review 3 item 3).
+#[test]
+fn terminate_ends_the_session_and_frees_its_branch_first() {
+    let dir = Scratch::new("terminate");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('y')").ok("create");
+    let mut c = server.connect_to("postgres/y").expect("startup on y");
+    c.send(b'X', &[]);
+    c.s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 1];
+    let read = c.s.read(&mut buf);
+    assert!(
+        matches!(read, Ok(0)),
+        "after Terminate the server did not close within 2 s: {read:?}"
+    );
+    a.q("SELECT turso_branch_delete('y')")
+        .ok("a delete right after the close, first try");
+}
