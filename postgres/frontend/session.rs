@@ -659,6 +659,9 @@ fn handle_pg_add_constraints(
     })?;
     let mut parsed =
         turso_pg_parser::parse(pg_definition).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    // Taken before the definition is edited below (a clone made while `create` borrows it would
+    // not compile).
+    let mut aside_tree = parsed.protobuf.clone();
     let create = parsed
         .protobuf
         .stmts
@@ -672,15 +675,31 @@ fn handle_pg_add_constraints(
         )));
     };
     create.if_not_exists = false;
+    // The rows wait in a table of the same columns and types, so each value is decoded and
+    // encoded by its own type both ways and reaches the rebuilt table as it was stored. (A copy
+    // made by CREATE TABLE AS would take its column types from the decoded values.) The name is
+    // not under the engine's reserved prefixes, which a client statement may not create.
+    let aside_name = format!("{table}__turso_rebuild");
+    if let Some(turso_pg_parser::pg_query::protobuf::node::Node::CreateStmt(c)) = aside_tree
+        .stmts
+        .first_mut()
+        .and_then(|raw| raw.stmt.as_mut())
+        .and_then(|s| s.node.as_mut())
+    {
+        c.if_not_exists = false;
+        if let Some(relation) = c.relation.as_mut() {
+            relation.relname = aside_name.clone();
+            relation.schemaname.clear();
+        }
+    }
+    let aside_def =
+        turso_pg_parser::deparse(&aside_tree).map_err(|e| LimboError::ParseError(e.to_string()))?;
     create.table_elts.extend(add.constraints.iter().cloned());
     let rebuilt = turso_pg_parser::deparse(&parsed.protobuf)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
 
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-    let aside = format!(
-        "\"__turso_internal_rebuild_{}\"",
-        table.replace('"', "\"\"")
-    );
+    let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));
     let in_tx = !conn.get_auto_commit();
     execute_root(
         conn,
@@ -691,17 +710,16 @@ fn handle_pg_add_constraints(
         },
     )?;
     let enforced = conn.foreign_keys_enabled();
+    // Every step is a root statement: an internal helper statement opens no transaction of its
+    // own (DDL through one panicked the engine at SetCookie) and skips foreign key checks.
     let rebuild = (|| {
         conn.set_foreign_keys_enabled(false);
-        execute_root(
-            conn,
-            format!("CREATE TABLE {aside} AS SELECT * FROM {quoted}"),
-        )?;
+        run_pg_statement(pg_conn, &aside_def)?;
+        execute_root(conn, format!("INSERT INTO {aside} SELECT * FROM {quoted}"))?;
         execute_root(conn, format!("DROP TABLE {quoted}"))?;
         run_pg_statement(pg_conn, &rebuilt)?;
-        // Every step is a root statement: an internal helper statement opens no transaction of its
-        // own (DDL through one panics the engine at SetCookie) and skips foreign key checks. With
-        // foreign keys enforced, the copy back checks every row against the new constraints.
+        // With foreign keys enforced, the copy back checks every row against the new
+        // constraints, as PostgreSQL validates an added constraint.
         conn.set_foreign_keys_enabled(true);
         execute_root(conn, format!("INSERT INTO {quoted} SELECT * FROM {aside}"))?;
         conn.set_foreign_keys_enabled(false);

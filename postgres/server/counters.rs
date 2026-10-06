@@ -15,9 +15,11 @@ pub struct ProcessCounters {
 
 #[cfg(target_vendor = "apple")]
 mod apple {
-    /// `struct task_events_info` (mach/task_info.h): eight `integer_t`.
+    /// `struct task_events_info` (mach/task_info.h): eight `integer_t`; the kernel fills all of
+    /// them, two are read.
     #[repr(C)]
     #[derive(Default)]
+    #[allow(dead_code)]
     pub(super) struct TaskEventsInfo {
         pub faults: i32,
         pub pageins: i32,
