@@ -4231,3 +4231,48 @@ fn the_install_forgets_a_captured_deferred_free_exactly_once() {
     );
     let _ = (anchor, z.into_id());
 }
+
+// ---- engine review 7 #12: the release half of the listing's durability wait ----
+
+/// Engine review 7 #12 (review 3 #17's release half): a listing never omits a branch whose Release
+/// is still in the air: it waits for that Release to be durable (or lists the branch). A crash
+/// before the flight lands brings the branch back, so a listing that omitted it would report
+/// state a crash undoes. Mutant `list_no_release_wait` (the listing waits for forks only) must
+/// fail it: its listing returns at once, without the branch.
+#[test]
+fn a_listing_waits_out_a_release_in_the_air() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("listrel.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let x = trunk.fork_branch().unwrap();
+        let id = x.id();
+        assert!(db.branch_ids().unwrap().contains(&id), "catalog={catalog}: premise: x is listed");
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, O::Release);
+        let release = std::thread::spawn(move || x.reap().map(|_| ()));
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let lister = {
+            let db = db.clone();
+            std::thread::spawn(move || db.branch_ids())
+        };
+        let t = std::time::Instant::now();
+        while !lister.is_finished() && t.elapsed() < std::time::Duration::from_millis(300) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let early = lister.is_finished();
+        hold.store(0, O::Release);
+        release.join().unwrap().unwrap();
+        let listed = lister.join().unwrap().unwrap();
+        if early {
+            assert!(
+                listed.contains(&id),
+                "catalog={catalog}: a listing taken while x's Release was in the air omitted x"
+            );
+        }
+    }
+}
