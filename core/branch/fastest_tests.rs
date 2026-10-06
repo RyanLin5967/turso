@@ -2823,17 +2823,23 @@ fn ordered_trunk_mode_trusts_only_a_full_fsync_of_the_branch_files_device() {
 // ---- review 3 #5: an arena sync failure in a compaction or a checkpoint fail-stops ----
 
 /// Review 3 #5: an arena sync that fails during a compaction (snapshot store) or a catalog
-/// checkpoint (here a fuzzy one, captured while a branch commit's flight is in the air, so it syncs
-/// the arena) fail-stops the store: a later sync of the same file may report success for pages the
+/// checkpoint fail-stops the store: a later sync of the same file may report success for pages the
 /// failed one lost, so nothing more may be acknowledged. The next branch commit is refused, and a
 /// branch released afterwards frees nothing. Mutant `checkpoint_sync_error_kept` (the checkpoint's
 /// fail-stop left out) must fail the catalog arm.
+///
+/// FLAGGED TEST EDIT (own test, review 3 #5; review 6 #3 (b)): the catalog arm was a D1 fuzzy
+/// checkpoint captured with a flight in the air. Review 6 #3 (b) takes that checkpoint's own arena
+/// sync away (its wait for the group's flights covers its slots), so the arm would fail no sync. The
+/// one checkpoint that still syncs the arena itself is a sharp one over writes no flight synced: a
+/// D0 store whose log was raised, here by a trunk commit under a synchronous trunk.
 #[test]
 fn an_arena_sync_failure_in_a_compaction_or_checkpoint_fail_stops() {
     let _s = serial();
     for catalog in [false, true] {
         let dir = tempfile::TempDir::new().unwrap();
-        let db = open_at(&dir.path().join("arena-sync-fails.db"), opts(catalog, SyncClass::Fsync));
+        let class = if catalog { SyncClass::Off } else { SyncClass::Fsync };
+        let db = open_at(&dir.path().join("arena-sync-fails.db"), opts(catalog, class));
         let trunk = db.connect().unwrap();
         seed(&trunk);
         let _anchor = trunk.fork_branch().unwrap().into_id();
@@ -2841,21 +2847,15 @@ fn an_arena_sync_failure_in_a_compaction_or_checkpoint_fail_stops() {
         write_v(&x.connect().unwrap(), 3, "x");
         let owned = x.owned_slots();
         if catalog {
-            let y = trunk.fork_branch().unwrap();
-            let hold = db.branches.trunk_commit_hold.clone();
-            hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
-            let writer = std::thread::spawn(move || {
-                let r = y.connect()?.execute("UPDATE t SET v = 'y' WHERE id = 5");
-                let _ = y.into_id();
-                r
-            });
-            wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+            trunk.execute("UPDATE t SET v = 'trunk-new' WHERE id = 9").unwrap();
+            assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the D0 log");
+            // Another branch's write, so x's slots stay as they were.
+            let z = trunk.fork_branch().unwrap();
+            write_v(&z.connect().unwrap(), 5, "unsynced");
+            let _ = z.into_id();
+            assert!(db.branches.arena_dirty(), "premise: the D0 commit left its slot unsynced");
             db.branch_failpoint(Some(BranchFailpoint::ArenaSyncFails));
-            let started = db.branch_checkpoint_fuzzy_now();
-            hold.store(0, std::sync::atomic::Ordering::Release);
-            assert!(started.unwrap(), "premise: a fuzzy checkpoint started");
-            writer.join().unwrap().unwrap();
-            db.branch_checkpoint_wait();
+            assert!(db.branch_compact_now().is_err(), "premise: the sharp checkpoint's arena sync failed");
         } else {
             db.branch_failpoint(Some(BranchFailpoint::ArenaSyncFails));
             assert!(db.branch_compact_now().is_err(), "premise: the compaction's arena sync failed");
