@@ -9451,7 +9451,12 @@ mod tests {
                 "the restart committed the old arena's high-water mark or in-use count"
             );
             // Two slots held across a checkpoint, whose install re-arms the refill from the table.
+            // Written, as a branch's slots are: an open refuses a catalog that counts slots the
+            // arena file does not hold.
             let held: Vec<Slot> = (0..2).map(|_| inner.alloc_slot().unwrap()).collect();
+            for &slot in &held {
+                inner.arena.as_mut().unwrap().write_slot(slot, &[0u8; 1024]).unwrap();
+            }
             inner.checkpoint_catalog(false).unwrap();
             let mut seen: HashSet<Slot> = held.iter().copied().collect();
             for _ in 0..8 {

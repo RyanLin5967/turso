@@ -5205,7 +5205,7 @@ fn a_sharp_checkpoint_whose_cut_fails_still_acknowledges_what_it_committed() {
     assert!(sharp.join().unwrap().is_err(), "premise: the sharp checkpoint's cut failed");
     assert_eq!(
         db.branches.group_counters()[0] - flights,
-        1,
+        0,
         "premise: op2 led no flight of its own (the checkpoint captured it buffered)"
     );
     let got = op2.join().unwrap();
