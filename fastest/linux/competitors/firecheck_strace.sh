@@ -660,11 +660,25 @@ stop_probe2 split
 #       [tseize, tend];
 #   (f) the t1 line repeated -> refused for a repeated stamp; (g) the t1 line moved after strace_rc -> refused for
 #       the stamps' order (second re-review, finding 5);
-#   (c) the unmodified copy -> ok with F2's exact 10 flushes, so the others fail for their edit.
+#   (h) the fsync row removed from the -c table, (i) its count raised by one -> refused by the table-vs-lines check
+#       (third re-review, finding 1: an attach window had none that fired);
+#   (j) t1_err raised to 0.8 ms -> refused for a loose clock pair; (k) tend's realtime moved +1.2 ms -> refused, and
+#       (l) the same with tend_err 0.4 ms -> ok with 10 flushes: the tolerance is 1 ms plus both pairs' err
+#       (third re-review, finding 4);
+#   (c) the unmodified copy -> ok with F2's exact 10 flushes, so the others fail for their edit;
+#   and F2's own window stamps were all served by the stamper coproc (clock_src; third re-review, finding 3).
 if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
-  for k in a b c d e f g; do
+  for k in a b c d e f g h i j k l; do
     for x in strace strace.err window fdsync pids; do cp "$OUT/f2.$x" "$OUT/f13$k.$x" 2>/dev/null; done
   done
+  awk '!($NF == "fsync" && $1 ~ /^[0-9.]+$/ && NF >= 5) { print }' "$OUT/f2.strace" >"$OUT/f13h.strace"
+  awk '$NF == "fsync" && $1 ~ /^[0-9.]+$/ && NF >= 5 { $4 = $4 + 1 } { print }' "$OUT/f2.strace" >"$OUT/f13i.strace"
+  awk '/^t1=/ { for (i = 1; i <= NF; i++) if ($i ~ /^t1_err=/) $i = "t1_err=0.000800000" } { print }' \
+    "$OUT/f2.window" >"$OUT/f13j.window"
+  awk '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + 0.0012) } { print }' "$OUT/f2.window" >"$OUT/f13k.window"
+  awk '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + 0.0012)
+                  for (i = 2; i <= NF; i++) if ($i ~ /^tend_err=/) $i = "tend_err=0.000400000" } { print }' \
+    "$OUT/f2.window" >"$OUT/f13l.window"
   awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { n++; if (n == 2) $2 = sprintf("%.6f", prev - 2.0); prev = $2 + 0 } { print }' \
     "$OUT/f2.strace" >"$OUT/f13a.strace"
   awk -v D=0.1 '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + D) } { print }' "$OUT/f2.window" >"$OUT/f13b.window"
@@ -672,24 +686,28 @@ if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
   awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { $2 = sprintf("%.6f", $2 + 5.0) } { print }' "$OUT/f2.strace" >"$OUT/f13d.strace"
   awk '{ print } /^t1=/ { dup = $0 } END { print dup }' "$OUT/f2.window" >"$OUT/f13f.window"
   awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f2.window" >"$OUT/f13g.window"
-  for k in a b c d e f g; do count "f13$k"; done
+  for k in a b c d e f g h i j k l; do count "f13$k"; done
   if python3 -c "
 import json, sys
-a, b, c, d, e, f, g = (json.load(open(p))['verdict'] for p in sys.argv[1:8])
-cf = json.load(open(sys.argv[3]))['flushes']
+o = sys.argv[1]
+J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijkl'}
+v = {k: r['verdict'] for k, r in J.items()}
+src = json.load(open(f'{o}/f2.json')).get('clock_src')
 BACK, STEP, OUTSIDE = 'stepped back', 'CLOCK_REALTIME stepped', 'outside the window'
-ok = (a.startswith('REFUSED') and BACK in a and
-      b.startswith('REFUSED') and STEP in b and e.startswith('REFUSED') and STEP in e and
-      d.startswith('REFUSED') and OUTSIDE in d and BACK not in d and STEP not in d and
-      f.startswith('REFUSED') and 'repeated stamp' in f and g.startswith('REFUSED') and 'out of order' in g and
-      c == 'ok' and cf == 10)
-print('(a)', a[:100], '| (b)', b[:100], '| (e)', e[:100], '| (d)', d[:100], '| (f)', f[:100], '| (g)', g[:100],
-      '| (c)', c[:20], cf)
-sys.exit(0 if ok else 1)" "$OUT/f13a.json" "$OUT/f13b.json" "$OUT/f13c.json" "$OUT/f13d.json" "$OUT/f13e.json" \
-    "$OUT/f13f.json" "$OUT/f13g.json" >"$OUT/f13.txt" 2>&1; then
-    log "PASS F13-clock-step-refused: $(head -c 1200 "$OUT/f13.txt")"
+def refused(k, why, *nots):
+    return v[k].startswith('REFUSED') and why in v[k] and not any(n in v[k] for n in nots)
+ok = (refused('a', BACK) and refused('b', STEP) and refused('e', STEP) and
+      refused('d', OUTSIDE, BACK, STEP) and refused('f', 'repeated stamp') and refused('g', 'out of order') and
+      refused('h', 'fsync: summary 0 calls vs 6 completed') and refused('i', 'fsync: summary 7 calls vs 6 completed') and
+      refused('j', 'more than 0.5 ms', STEP) and refused('k', STEP) and
+      v['l'] == 'ok' and J['l']['flushes'] == 10 and v['c'] == 'ok' and J['c']['flushes'] == 10 and
+      src == {'tseize': 'coproc', 't0': 'coproc', 't1': 'coproc', 'tend': 'coproc'})
+print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijk'), '| (l)', v['l'][:20], J['l']['flushes'], '| (c)', v['c'][:20],
+      J['c']['flushes'], '| F2 clock_src', src)
+sys.exit(0 if ok else 1)" "$OUT" >"$OUT/f13.txt" 2>&1; then
+    log "PASS F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"
   else
-    log "FAIL F13-clock-step-refused: $(head -c 1200 "$OUT/f13.txt")"; fails=$((fails + 1))
+    log "FAIL F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"; fails=$((fails + 1))
   fi
 else
   log "FAIL F13-clock-step-refused: no F2 window to copy"; fails=$((fails + 1))
