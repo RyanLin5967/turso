@@ -1485,7 +1485,7 @@ fn branch_stats_reports_the_servers_counters() {
     let mut a = seeded(&server);
     let read = |a: &mut Wire| -> Vec<i64> {
         let r = a.q("SELECT turso_branch_stats()").ok("stats");
-        assert_eq!(r.oids, Some(vec![20, 20, 20, 20]), "four int8 columns");
+        assert_eq!(r.oids, Some(vec![20, 20, 20, 20, 20]), "five int8 columns");
         assert_eq!(r.rows.len(), 1);
         r.rows[0]
             .iter()
