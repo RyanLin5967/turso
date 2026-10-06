@@ -991,6 +991,8 @@ pub(crate) struct CutSource {
     nonce: u32,
     /// The `ReplacementSyncFails` failpoint, taken when the source was.
     fail_sync: bool,
+    /// The journal's fail-stop flag: a failed sync of the prepared log sets it (review 6 #2).
+    poisoned: Arc<AtomicBool>,
 }
 
 /// A cut prepared off the store mutex (`Journal::prepare_cut`): the new log, as a temp file holding
@@ -1590,7 +1592,7 @@ impl Journal {
                 }
             }
             if class.syncs() {
-                sync_replacement(&f, class, self.take_replacement_sync_failure())?;
+                sync_replacement(&f, class, self.take_replacement_sync_failure(), &self.poisoned)?;
             }
             Ok(f)
         })();
@@ -1649,6 +1651,7 @@ impl Journal {
             tmp: self.files.log_tmp(),
             nonce: self.nonce,
             fail_sync: self.take_replacement_sync_failure(),
+            poisoned: self.poisoned.clone(),
         }))
     }
 
@@ -1674,7 +1677,7 @@ impl Journal {
                 }
             }
             if src.class.syncs() {
-                sync_replacement(&f, src.class, src.fail_sync)?;
+                sync_replacement(&f, src.class, src.fail_sync, &src.poisoned)?;
             }
             Ok(f)
         })();
@@ -1735,7 +1738,7 @@ impl Journal {
                     write_at(&prep.file, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
                 }
                 if class.syncs() {
-                    sync_replacement(&prep.file, class, self.take_replacement_sync_failure())?;
+                    sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
                 }
                 len += frames.len() as u64;
             }
@@ -2161,7 +2164,7 @@ impl Journal {
             let f = open_rw(&tmp, true)?;
             write_at(&f, &out, 0)?;
             if class.syncs() {
-                sync_replacement(&f, class, self.take_replacement_sync_failure())?;
+                sync_replacement(&f, class, self.take_replacement_sync_failure(), &self.poisoned)?;
             }
         }
         std::fs::rename(&tmp, &self.files.snap).map_err(|e| {
@@ -2213,7 +2216,7 @@ impl Journal {
                 lock_exclusive(&f, &tmp)?;
                 write_at(&f, &header, 0)?;
                 if class.syncs() {
-                    sync_replacement(&f, class, self.take_replacement_sync_failure())?;
+                    sync_replacement(&f, class, self.take_replacement_sync_failure(), &self.poisoned)?;
                 }
                 Ok(f)
             })();
@@ -2764,14 +2767,23 @@ fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u3
 }
 
 /// Sync a temp file that is to replace a branch file, in `class`; `fail` is the
-/// `ReplacementSyncFails` failpoint (review 6 #2).
-fn sync_replacement(file: &File, class: SyncClass, fail: bool) -> Result<()> {
-    if fail {
-        return Err(LimboError::InternalError(
+/// `ReplacementSyncFails` failpoint. A failed sync fail-stops the journal (`poisoned`; review 6
+/// #2): on Apple a failed F_FULLFSYNC is a failed drain of the whole device, which may have lost
+/// what earlier flights only barriered or plain-fsynced, and a later sync would report success over
+/// the loss (PostgreSQL panics on any fsync failure for the same reason). Mutant
+/// `replacement_sync_error_kept` (test builds only): the old file stays and the store goes on.
+fn sync_replacement(file: &File, class: SyncClass, fail: bool, poisoned: &AtomicBool) -> Result<()> {
+    let synced = if fail {
+        Err(LimboError::InternalError(
             "failpoint: a branch file's replacement failed to sync".to_string(),
-        ));
+        ))
+    } else {
+        fsync_file(file, class)
+    };
+    if synced.is_err() && !super::store::fe_mutant("replacement_sync_error_kept") {
+        poisoned.store(true, Ordering::Release);
     }
-    fsync_file(file, class)
+    synced
 }
 
 /// The flight checksum an end frame carries.

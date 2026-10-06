@@ -1547,6 +1547,10 @@ pub struct Pager {
     /// for it): cleared, with the store's `pending_full`, when the commit ends however it ends
     /// (`close_trunk_gate`; review 3 #9).
     trunk_ordered: AtomicBool,
+    /// The WAL sync this trunk commit issued last (its header's, or its frames'), when a branch
+    /// store is attached: a failure the statement reports without coming back here (a completion
+    /// that fails after it yielded) is seen when the commit ends (`close_trunk_gate`; review 6 #2).
+    trunk_wal_sync: Mutex<Option<Completion>>,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1842,6 +1846,7 @@ impl Pager {
             trunk_sync_frontier: AtomicU64::new(0),
             trunk_required: AtomicU64::new(0),
             trunk_ordered: AtomicBool::new(false),
+            trunk_wal_sync: Mutex::new(None),
         })
     }
 
@@ -3926,6 +3931,13 @@ impl Pager {
     /// Close the branch store's commit gate if this pager's commit holds it open (F-L): once the
     /// commit's frames are published, or when the write lock is released after a failed commit.
     pub(crate) fn close_trunk_gate(&self) {
+        // A WAL sync of this commit that failed after it yielded, which the statement reported
+        // without coming back to the commit: seen here, before the verdicts below are cleared.
+        let sync = self.trunk_wal_sync.lock().take();
+        if sync.is_some_and(|c| c.finished() && !c.succeeded()) {
+            self.trunk_wal_sync_failed();
+        }
+        self.trunk_sync_frontier.store(0, Ordering::Release);
         let ordered = self.trunk_ordered.swap(false, Ordering::AcqRel);
         if self.trunk_gate_open.swap(false, Ordering::AcqRel) {
             if let Some(store) = self.branch_store.get() {
@@ -3937,6 +3949,28 @@ impl Pager {
             // only).
             if let Some(store) = self.branch_store.get() {
                 store.release_pending_full();
+            }
+        }
+    }
+
+    /// Keep the WAL sync this trunk commit just issued, for `close_trunk_gate` (review 6 #2). Only
+    /// with a branch store: nothing else reads it.
+    fn note_trunk_wal_sync(&self, c: &Completion) {
+        if self.branch_store.get().is_some() {
+            *self.trunk_wal_sync.lock() = Some(c.clone());
+        }
+    }
+
+    /// This trunk commit's WAL sync failed (review 6 #2). If branch records relied on it — its
+    /// barrier ORDERED them ahead of it (`trunk_ordered`), or riders were noted to it
+    /// (`trunk_sync_frontier`, read here before anything zeroes it) — what the device's drain
+    /// covered may be lost, and the branch store fail-stops. A sync nothing relied on (each branch
+    /// flight synced itself) stops nothing.
+    fn trunk_wal_sync_failed(&self) {
+        let frontier = self.trunk_sync_frontier.swap(0, Ordering::AcqRel);
+        if frontier > 0 || self.trunk_ordered.load(Ordering::Acquire) {
+            if let Some(store) = self.branch_store.get() {
+                store.trunk_wal_sync_failed();
             }
         }
     }
@@ -4705,7 +4739,10 @@ impl Pager {
                     }
                 }
                 CommitState::PrepareWalSync => {
-                    let c = wal.prepare_wal_finish(self.get_sync_type())?;
+                    let c = wal
+                        .prepare_wal_finish(self.get_sync_type())
+                        .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                    self.note_trunk_wal_sync(&c);
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
                         io_yield_one!(c);
@@ -4936,7 +4973,10 @@ impl Pager {
                                 ));
                                 self.trunk_sync_frontier.store(frontier, Ordering::Release);
                             }
-                            let sync_c = wal.sync(self.get_sync_type())?;
+                            let sync_c = wal
+                                .sync(self.get_sync_type())
+                                .inspect_err(|_| self.trunk_wal_sync_failed())?;
+                            self.note_trunk_wal_sync(&sync_c);
                             self.commit_info.write().completions.push(sync_c.clone());
                             Some(sync_c)
                         }
@@ -4952,6 +4992,9 @@ impl Pager {
                         if !sync_c.succeeded() {
                             commit_info.completions.clear();
                             commit_info.prepared_frames.clear();
+                            // Before the panic below too: a caught panic must not leave the branch
+                            // store acknowledging over the failed drain (review 6 #2).
+                            self.trunk_wal_sync_failed();
 
                             if !data_sync_retry {
                                 panic!(
@@ -4959,7 +5002,6 @@ impl Pager {
                                     sync_c.get_error()
                                 );
                             }
-                            self.trunk_sync_frontier.store(0, Ordering::Release);
                             return Err(LimboError::CompletionError(CompletionError::IOError(
                                 std::io::ErrorKind::Other,
                                 "sync",

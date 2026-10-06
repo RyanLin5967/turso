@@ -5016,6 +5016,22 @@ impl BranchStore {
         }
     }
 
+    /// A trunk commit's WAL sync failed after branch records relied on it (review 6 #2): ordered
+    /// ahead of it by its barrier, or noted to ride it (`order_riders`). What the device's drain
+    /// covered may be lost, and a later flush may report success over the loss, so the store
+    /// fail-stops as after a failed flight, and every waiter — the riders the flush would have
+    /// made durable among them — gets the error. Mutant `no_wal_fail_stop` (test builds only): the
+    /// store goes on, as before.
+    pub(crate) fn trunk_wal_sync_failed(&self) {
+        if fe_mutant("no_wal_fail_stop") {
+            return;
+        }
+        tracing::warn!("branch store fail-stopped: a trunk WAL sync its records relied on failed");
+        let mut g = self.group.lock();
+        g.pending_full = None;
+        self.group.fail(&mut g);
+    }
+
     pub(crate) fn end_trunk_commit(&self) {
         // The WAL flush that would have made an ordered flight durable did not come, or came and
         // said so already: either way nothing waits on it any more.
