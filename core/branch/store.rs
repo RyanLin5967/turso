@@ -8896,6 +8896,39 @@ mod tests {
         }
     }
 
+    /// Engine review 9 #4: a catalog page-size restart whose catalog commit landed and whose log
+    /// rewrite then failed leaves the files a crash between the two leaves too: the catalog at the
+    /// new page size and generation, the old log, at the old page size, behind it. A reopen must
+    /// accept them (nothing follows the new generation's marker in the old log, and the open
+    /// rewrites it at the new page size), and the failed restart must fail-stop, not revert to
+    /// the old page size: the catalog already moved. Before, the open refused them for good ("log
+    /// and catalog disagree on the page size").
+    #[test]
+    fn a_page_size_restart_cut_short_after_its_catalog_commit_reopens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        {
+            let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Fsync }, None, path).unwrap();
+            store.inner.lock().ensure_backing(512).unwrap();
+            store.set_failpoint(Some(BranchFailpoint::ReplacementSyncFails));
+            let mut inner = store.inner.lock();
+            assert!(inner.ensure_backing(1024).is_err(), "premise: the restart's log rewrite failed");
+            assert!(inner.poisoned(), "a restart whose catalog commit landed went on");
+            assert_eq!(
+                inner.journal.as_ref().map(Journal::page_size),
+                Some(1024),
+                "the restart reverted to the old page size though the catalog had moved"
+            );
+        }
+        let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Fsync }, None, path)
+            .expect("the files a restart cut short after its catalog commit left behind were refused at open");
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(1024).expect("the reopened store is not at the new page size");
+        assert_eq!(inner.journal.as_ref().map(Journal::page_size), Some(1024));
+        assert_eq!(inner.alloc_slot().unwrap(), 0, "the reopened arena does not start empty");
+    }
+
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
     /// a page-size change, and must keep refusing it.
     #[test]
