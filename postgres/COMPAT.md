@@ -182,7 +182,7 @@ INTEGER. Unknown type names pass through as custom types.
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES silently ignored |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
 | INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *` and UPDATE ... FROM ... RETURNING |
-| LATERAL clause | 🟡 Partial | `CROSS JOIN LATERAL (SELECT e1, ...) AS o(n1, ...)` (one row of expressions over the outer row) is inlined; every other LATERAL is rejected with an error |
+| LATERAL clause | 🟡 Partial | `CROSS JOIN LATERAL (SELECT e1, ...) AS o(n1, ...)` (one row of expressions over the outer row) is inlined when every `ei` is a scalar expression (no aggregate, window, volatile or set-returning function, or subquery) and its columns are read as `o.ni` (`*`, `o.*` and an unqualified `ni` are rejected); a LATERAL join with ON, USING or NATURAL, LEFT JOIN LATERAL, a comma LATERAL and every other LATERAL are rejected with an error |
 | MERGE | ❌ Not supported | |
 | MERGE ... RETURNING | ❌ Not supported | |
 | Multirow VALUES | ✅ Supported | In INSERT and as standalone VALUES lists |
