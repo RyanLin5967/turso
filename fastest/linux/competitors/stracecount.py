@@ -321,6 +321,9 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     for name, sfx, val in re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)(_mono|_err)?=(\d+\.\d+)", win, re.M):
         clock.setdefault(name + sfx, float(val))
         seen[name + sfx] = seen.get(name + sfx, 0) + 1
+    # Which path served each stamp (trace.sh clock_pair: the long-lived coproc, or a one-shot python3), recorded, never
+    # a verdict: a one-shot stamp is as correct, it only costs an interpreter start at the window's edge.
+    out_src = dict(re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)_src=(\w+)", win, re.M))
     out_clock = None
     if attached:
         chain = ["tseize", "t0"] + (["tsplit"] if "tsplit" in clock else []) + ["t1", "tend"]
@@ -448,6 +451,7 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     out["t0"], out["calls_before_t0"], out["t1"], out["calls_after_t1"] = t0, before_t0, t1, after_t1
     out["clock_back_steps"], out["clock_max_back_s"] = back_steps, round(max_back, 6)
     out["clock_pairs"] = out_clock  # [from, to, realtime minus monotonic delta in s] per consecutive pair (attach)
+    out["clock_src"] = out_src  # stamp name -> coproc | oneshot
     # A launch window's command stderr (strace_run's OUT.cmd.err): recorded, never a verdict -- a command may warn and
     # still succeed, and its exit status is checked through strace_rc (fourth review, finding 6: it was looked at by
     # nothing).
