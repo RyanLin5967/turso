@@ -2104,3 +2104,25 @@ fn a_pipeline_up_to_sync_is_one_implicit_transaction() {
     );
     assert!(!branch_exists(&mut a, "p2"));
 }
+
+/// A CHECKPOINT over the extended protocol, in no block, is the full one: it empties the trunk
+/// WAL. The pipeline's implicit block (item 8) must not turn it into the in-block passive attempt
+/// (item 4), which never truncates.
+#[test]
+fn an_extended_checkpoint_outside_a_block_empties_the_wal() {
+    let dir = Scratch::new("ckptext");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    assert!(
+        wal_bytes(&dir.db()) > 0,
+        "premise: the trunk WAL holds frames"
+    );
+    let r = a.x("CHECKPOINT", &[]).ok("extended checkpoint");
+    assert_eq!(r.tags, vec!["CHECKPOINT".to_string()]);
+    assert!(r.notices.is_empty(), "notices {:?}", r.notices);
+    assert_eq!(
+        wal_bytes(&dir.db()),
+        0,
+        "the extended CHECKPOINT left the WAL"
+    );
+}
