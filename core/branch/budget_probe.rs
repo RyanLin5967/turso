@@ -5,8 +5,11 @@
 //! * **Allocations**: a counting global allocator over `System` — every `alloc`, `alloc_zeroed` and
 //!   `realloc` call and its requested bytes, per thread and process-wide, and separately those made
 //!   while the calling thread holds a branch store's mutex; and every `dealloc` (reported only).
-//! * **Catalog statements** and the writes among them, per thread and process-wide, on every
-//!   catalog connection: three `cfg(test)` hook lines in `catalog::Stmt` (`catalog_statement`).
+//! * **Catalog statements**, the writes among them and the rows they touch, per thread and
+//!   process-wide, on every catalog connection: three `cfg(test)` hook lines in `catalog::Stmt`
+//!   (`catalog_statement`).
+//! * **Live heap bytes** (requested sizes of every live allocation), and the largest allocation
+//!   and catalog-row count inside one store-mutex hold (`take_hold_maxima`).
 //! * **Store-mutex acquisitions**: `StoreMutex::lock` calls [`store_locked`] and its guard's drop
 //!   [`store_unlocked`] (the only two edits to the engine's files), per thread and process-wide.
 //! * **Unix syscalls** (Apple only): the kernel's own count for this task (`task_info`
@@ -25,7 +28,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 
 /// The counting allocator (test builds of this crate only).
 pub(crate) struct Counting;
@@ -38,6 +41,13 @@ static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static FREES: AtomicU64 = AtomicU64::new(0);
 static CAT_STMTS: AtomicU64 = AtomicU64::new(0);
 static CAT_WRITES: AtomicU64 = AtomicU64::new(0);
+static CAT_ROWS: AtomicU64 = AtomicU64::new(0);
+/// Bytes requested by every live allocation: + at alloc, - at dealloc, the difference at realloc.
+static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
+/// The most allocated, and the most catalog rows touched, inside ONE store-mutex hold (outermost
+/// lock to unlock, any thread) since `take_hold_maxima`.
+static MAX_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+static MAX_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 static LOCKS: AtomicU64 = AtomicU64::new(0);
 static HELD_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -48,6 +58,9 @@ thread_local! {
     static T_FREES: Cell<u64> = const { Cell::new(0) };
     static T_CAT_STMTS: Cell<u64> = const { Cell::new(0) };
     static T_CAT_WRITES: Cell<u64> = const { Cell::new(0) };
+    static T_CAT_ROWS: Cell<u64> = const { Cell::new(0) };
+    /// `(held allocation bytes, catalog rows)` of this thread when it took its outermost store mutex.
+    static HOLD_START: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     static T_FREE_BYTES: Cell<u64> = const { Cell::new(0) };
     static T_HELD_ALLOCS: Cell<u64> = const { Cell::new(0) };
     static T_HELD_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -79,24 +92,28 @@ fn note_alloc(bytes: usize) {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         note_alloc(layout.size());
+        LIVE_BYTES.fetch_add(layout.size() as i64, Relaxed);
         // SAFETY: the caller's contract, forwarded.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         note_alloc(layout.size());
+        LIVE_BYTES.fetch_add(layout.size() as i64, Relaxed);
         // SAFETY: the caller's contract, forwarded.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         note_alloc(new_size);
+        LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Relaxed);
         // SAFETY: the caller's contract, forwarded.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         FREES.fetch_add(1, Relaxed);
+        LIVE_BYTES.fetch_sub(layout.size() as i64, Relaxed);
         bump(&T_FREES, 1);
         bump(&T_FREE_BYTES, layout.size() as u64);
         // SAFETY: the caller's contract, forwarded.
@@ -112,8 +129,12 @@ pub(crate) fn store_locked() {
         d.set(d.get() + 1);
         d.get()
     });
-    if depth == 1 && ARMED.load(Relaxed) {
-        HELD_SINCE.with(|s| s.set(unix_syscalls()));
+    if depth == 1 {
+        let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
+        HOLD_START.with(|h| h.set((get(&T_HELD_ALLOC_BYTES), get(&T_CAT_ROWS))));
+        if ARMED.load(Relaxed) {
+            HELD_SINCE.with(|s| s.set(unix_syscalls()));
+        }
     }
 }
 
@@ -124,6 +145,10 @@ pub(crate) fn store_unlocked() {
         d.get()
     });
     if depth == 0 {
+        let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
+        let (bytes0, rows0) = HOLD_START.with(|h| h.get());
+        MAX_HOLD_ALLOC_BYTES.fetch_max(get(&T_HELD_ALLOC_BYTES).wrapping_sub(bytes0), Relaxed);
+        MAX_HOLD_CAT_ROWS.fetch_max(get(&T_CAT_ROWS).wrapping_sub(rows0), Relaxed);
         if let (Some(since), Some(now)) = (HELD_SINCE.with(|s| s.take()), unix_syscalls()) {
             let held = now.wrapping_sub(since) & u64::from(u32::MAX);
             HELD_SYSCALLS.fetch_add(held, Relaxed);
@@ -133,17 +158,31 @@ pub(crate) fn store_unlocked() {
 }
 
 /// A catalog statement ran on this thread (`catalog::Stmt::{rows, each_row, exec}`; `write` for
-/// `exec`), on ANY of the store's catalog connections — the store's own, the checkpoint writer's,
-/// the name filter's reader — unlike the catalog's own counters, which see one connection each.
-/// BLIND SPOT: transaction control and pragmas (`conn.execute("BEGIN")`, `wal_checkpoint`) are not
-/// statements of `Stmt` and are not counted.
-pub(crate) fn catalog_statement(write: bool) {
+/// `exec`), touching `rows` rows (read, or 1 written), on ANY of the store's catalog connections —
+/// the store's own, the checkpoint writer's, the name filter's reader — unlike the catalog's own
+/// counters, which see one connection each. BLIND SPOT: transaction control and pragmas
+/// (`conn.execute("BEGIN")`, `wal_checkpoint`) are not statements of `Stmt` and are not counted.
+pub(crate) fn catalog_statement(write: bool, rows: u64) {
     CAT_STMTS.fetch_add(1, Relaxed);
+    CAT_ROWS.fetch_add(rows, Relaxed);
     bump(&T_CAT_STMTS, 1);
+    bump(&T_CAT_ROWS, rows);
     if write {
         CAT_WRITES.fetch_add(1, Relaxed);
         bump(&T_CAT_WRITES, 1);
     }
+}
+
+/// Bytes requested by every allocation alive now, process-wide (the counting allocator's own
+/// arithmetic: requested sizes, not the allocator's rounding or its caches).
+pub(crate) fn live_heap_bytes() -> i64 {
+    LIVE_BYTES.load(Relaxed)
+}
+
+/// `(bytes allocated, catalog rows touched)` in the largest single store-mutex hold since the last
+/// call, by any thread, and start again from zero.
+pub(crate) fn take_hold_maxima() -> (u64, u64) {
+    (MAX_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_HOLD_CAT_ROWS.swap(0, Relaxed))
 }
 
 /// Sample the syscall count around store-mutex holds from now on (off by default: two Mach traps
@@ -167,6 +206,8 @@ pub(crate) struct Snapshot {
     pub(crate) t_cat_stmts: u64,
     pub(crate) cat_writes: u64,
     pub(crate) t_cat_writes: u64,
+    pub(crate) cat_rows: u64,
+    pub(crate) t_cat_rows: u64,
     pub(crate) t_frees: u64,
     pub(crate) t_free_bytes: u64,
     pub(crate) t_held_allocs: u64,
@@ -224,6 +265,8 @@ fn user_counts() -> Snapshot {
         t_cat_stmts: get(&T_CAT_STMTS),
         cat_writes: CAT_WRITES.load(Relaxed),
         t_cat_writes: get(&T_CAT_WRITES),
+        cat_rows: CAT_ROWS.load(Relaxed),
+        t_cat_rows: get(&T_CAT_ROWS),
         t_frees: get(&T_FREES),
         t_free_bytes: get(&T_FREE_BYTES),
         t_held_allocs: get(&T_HELD_ALLOCS),

@@ -52,8 +52,11 @@ const GROWTH: u64 = 23_040;
 /// round, so a checkpoint every ~60 rounds.
 const CKPT_THRESHOLD: u64 = 8 << 10;
 const CKPT_ROUNDS: u64 = 240;
-/// The shared-flight arm's rounds per thread.
-const SHARED_ROUNDS: u64 = 48;
+/// The shared-flight arm's client counts (lead, 2026-10-06: "creates per F_FULLFSYNC rising with C
+/// at C = 1, 8, 64, 256, 1024").
+const SHARED_CS: [u64; 5] = [1, 8, 64, 256, 1024];
+/// The memory cells' live branches: 10^4 (`N_LARGE`) and this.
+const N_HUGE: u64 = 100_000;
 /// Every measured branch name is this long (`m-0000`), so every create logs the same bytes.
 const NAME_LEN: u64 = 6;
 
@@ -248,6 +251,8 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("catalog_writes", delta(s0.t_cat_writes, s1.t_cat_writes));
     s.insert("catalog_stmts_process", delta(s0.cat_stmts, s1.cat_stmts));
     s.insert("catalog_writes_process", delta(s0.cat_writes, s1.cat_writes));
+    s.insert("catalog_rows_touched", delta(s0.t_cat_rows, s1.t_cat_rows));
+    s.insert("catalog_rows_touched_process", delta(s0.cat_rows, s1.cat_rows));
     s.insert("resolves", delta(o0.reads.0, o1.reads.0));
     s.insert("slot_reads", delta(o0.reads.1, o1.reads.1));
     s.insert("ckpt_started", delta(o0.ckpt[1], o1.ckpt[1]));
@@ -481,41 +486,78 @@ fn checkpoints(cell: &str, db: &Arc<Database>, base: Option<u64>, out: &mut Stri
     super::journal::set_compact_threshold(0);
 }
 
-/// The shared-flight arm (LEAP L3): `c` threads, released together, each making `SHARED_ROUNDS`
-/// named creates (arm `shared_create`), then each `SHARED_ROUNDS` create-then-first-write cycles
+/// The shared-flight arm (LEAP L3): `c` threads, released together, each making `shared_rounds(c)`
+/// named creates (arm `shared_create`), then, at C <= 64, as many create-then-first-write cycles
 /// (arm `shared_cfw`), closed loop. One line per arm: the durable acknowledgements (creates, plus
-/// first writes in the cfw arm) and the flushes issued meanwhile, process-wide.
+/// first writes in the cfw arm) and the flushes issued meanwhile, process-wide. Threads get 8 MiB
+/// stacks (RUST_MIN_STACK's 64 MiB times 1024 threads is 64 GiB of reservation).
 fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
+    let rounds = shared_rounds(c);
     for (arm, cfw) in [("shared_create", false), ("shared_cfw", true)] {
+        if cfw && c > 64 {
+            continue;
+        }
         let gate = std::sync::Barrier::new(c as usize + 1);
         let s0 = sync_counts();
         std::thread::scope(|s| {
             for t in 0..c {
                 let gate = &gate;
-                s.spawn(move || {
-                    let trunk = db.connect().unwrap();
-                    gate.wait();
-                    for i in 0..SHARED_ROUNDS {
-                        let name = format!("{arm}-{t}-{i:04}");
-                        fork_one(&trunk, Some(&name));
-                        if cfw {
-                            let b = db.connect_named(&name).unwrap();
-                            exec(&b, &format!("UPDATE t SET v = 's{i}' WHERE id = {}", 1 + (t * 7 + i) % 50));
+                std::thread::Builder::new()
+                    .stack_size(8 << 20)
+                    .spawn_scoped(s, move || {
+                        let trunk = db.connect().unwrap();
+                        gate.wait();
+                        for i in 0..rounds {
+                            let name = format!("{arm}-{t}-{i:04}");
+                            fork_one(&trunk, Some(&name));
+                            if cfw {
+                                let b = db.connect_named(&name).unwrap();
+                                exec(&b, &format!("UPDATE t SET v = 's{i}' WHERE id = {}", 1 + (t * 7 + i) % 50));
+                            }
                         }
-                    }
-                });
+                    })
+                    .unwrap();
             }
             gate.wait();
         });
         let s1 = sync_counts();
         let mut m = Sample::new();
         m.insert("threads", c);
-        m.insert("acks", c * SHARED_ROUNDS * if cfw { 2 } else { 1 });
+        m.insert("acks", c * rounds * if cfw { 2 } else { 1 });
         m.insert("full_fsync", s1.full_fsync - s0.full_fsync);
         m.insert("fsync", s1.fsync - s0.fsync);
         m.insert("barrier", s1.barrier - s0.barrier);
         line(out, cell, arm, 0, &m);
     }
+}
+
+/// Rounds per thread in the shared-flight arm: 48, down to 4 at C = 1024, so every cell makes at
+/// most 3,072 creates per arm (C·rounds: 48, 384, 3,072, 3,072, 4,096).
+fn shared_rounds(c: u64) -> u64 {
+    (3_072 / c).clamp(4, 48)
+}
+
+/// The memory arm (the L4 memory ruling, DECISIONS.md 2026-10-06T02:55Z (i)): one open of the built
+/// database, its background work (the name filter's build; under L4, the name map's) waited out.
+/// One line: the heap bytes that stayed resident from before the open to after it settled, and the
+/// largest single store-mutex hold meanwhile (allocated bytes, catalog rows), by any thread.
+fn memory(cell: &str, built: &mut Built, out: &mut String) {
+    let base = probe::threads();
+    let _ = probe::take_hold_maxima();
+    let before = probe::live_heap_bytes();
+    let db = open_at(&built.path);
+    assert_ne!(db.incarnation, built.incarnation, "{cell}: the registry returned the old Database: not a reopen");
+    built.incarnation = db.incarnation;
+    db.branch_wait_name_filter();
+    let settled = quiesce(&db, base);
+    let after = probe::live_heap_bytes();
+    let (hold_bytes, hold_rows) = probe::take_hold_maxima();
+    let mut s = Sample::new();
+    s.insert("resident_bytes", u64::try_from(after - before).unwrap_or(0));
+    s.insert("max_hold_alloc_bytes", hold_bytes);
+    s.insert("max_hold_catalog_rows", hold_rows);
+    s.insert("quiet", u64::from(settled));
+    line(out, cell, "memory", 0, &s);
 }
 
 /// A named create on `db`, so a checkpoint has a dirty branch to write.
@@ -576,6 +618,29 @@ fn run_instruments(cell: &str) -> String {
             probe::arm(false);
         }),
     );
+    // Live heap bytes: a 1 MiB buffer is resident while it lives, and not after; and the largest
+    // single hold sees exactly what one hold allocated.
+    let mut s = Sample::new();
+    let l0 = probe::live_heap_bytes();
+    let v: Vec<u8> = Vec::with_capacity(1 << 20);
+    let l1 = probe::live_heap_bytes();
+    drop(std::hint::black_box(v));
+    let l2 = probe::live_heap_bytes();
+    s.insert("live_while", u64::try_from(l1 - l0).unwrap_or(u64::MAX));
+    s.insert("live_after", u64::try_from(l2 - l0).unwrap_or(u64::MAX));
+    let _ = probe::take_hold_maxima();
+    probe::store_locked();
+    for i in 0..3u64 {
+        std::hint::black_box(Box::new(i));
+    }
+    probe::store_unlocked();
+    probe::store_locked();
+    std::hint::black_box(Box::new(0u64));
+    probe::store_unlocked();
+    let (hold_bytes, hold_rows) = probe::take_hold_maxima();
+    s.insert("max_hold_alloc_bytes", hold_bytes);
+    s.insert("max_hold_catalog_rows", hold_rows);
+    put("fc_live_and_hold", &s);
     // The thread count sees a thread that is alive, and stops seeing it once it has exited.
     let base = probe::threads();
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -657,8 +722,9 @@ fn budget_child() {
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "shared_c4" | "shared_c16" | "shared_c64" => (10, false, true),
-            "growth_n1e4" | "ckpt_n1e4" => (N_LARGE, false, true),
+            "ckpt_n10" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => (10, false, true),
+            "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" => (N_LARGE, false, true),
+            "mem_n1e5" => (N_HUGE, false, true),
             cell => {
                 let n = if cell.starts_with("n10_") {
                     10
@@ -673,6 +739,12 @@ fn budget_child() {
         let mut built = build(&spec, n, large, named);
         probe::arm(true);
         let opens = if spec.starts_with("n") { 5 } else { 1 };
+        if spec.starts_with("mem_") {
+            memory(&spec, &mut built, &mut text);
+            probe::arm(false);
+            std::fs::write(&out, format!("{text}done cell={spec}\n")).unwrap();
+            return;
+        }
         let (db, base) = recover(&spec, &mut built, opens, &mut text);
         if let Some(c) = spec.strip_prefix("shared_c") {
             shared(&spec, &db, c.parse().unwrap(), &mut text);
@@ -1023,6 +1095,10 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_lookup_cataloged", "catalog_writes"), 0, "a lookup wrote the catalog");
     assert!(get("fc_checkpoint_writes", "catalog_writes") >= 1, "a sharp checkpoint of a dirty store wrote no catalog row");
     assert_eq!(get("fc_thread_count", "with"), get("fc_thread_count", "base") + 1, "a live thread uncounted");
+    assert_eq!(get("fc_live_and_hold", "live_while"), 1 << 20, "a live 1 MiB buffer");
+    assert_eq!(get("fc_live_and_hold", "live_after"), 0, "a freed buffer still counted live");
+    assert_eq!(get("fc_live_and_hold", "max_hold_alloc_bytes"), 24, "the larger of two holds (3 boxes of a u64, then 1)");
+    assert_eq!(get("fc_live_and_hold", "max_hold_catalog_rows"), 0, "catalog rows in a hold that read none");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
     {
@@ -1731,25 +1807,44 @@ fn shared_ratio(spec: &str) -> Vec<(String, u64, u64, u64)> {
 }
 
 /// LEAP L3, creates and first writes always ride shared flights: one F_FULLFSYNC carries every
-/// acknowledgement in flight, so at C clients in a closed loop each flush carries at least 0.9·C
-/// (PREREG §11 M2 exit 1: "(creates + deletes) per sync >= 0.9·C"; DESIGN §2: one flight in the
-/// air, an adaptive hold), for creates alone and for create-then-first-write cycles, at C = 4 and
-/// C = 16. (Alternating cohorts, review 1 #9, give about C/2.) C = 64 is run and reported, not
-/// held: on this shared box 64 runnable threads may not all be on a core inside one flight.
+/// acknowledgement in flight. At C clients in a closed loop:
+/// - each flush carries at least 0.9·C acknowledgements up to C = 64, for creates and for
+///   create-then-first-write cycles (PREREG §11 M2 exit 1: "(creates + deletes) per sync >= 0.9·C";
+///   DESIGN §2: one flight in the air, an adaptive hold);
+/// - creates per flush RISE with C at every step 1, 8, 64, 256, 1024 (lead, 2026-10-06), "near-linear
+///   until CPU-bound" (DECISIONS L3): past 64 the serial section, not the flush, may bound it, so only
+///   the rise is held there.
+/// Alternating cohorts (review 1 #9) give about C/2 per flush.
 #[test]
-fn leap_l3_every_flush_carries_nine_tenths_of_the_clients() {
+fn leap_l3_creates_per_flush_rise_with_the_clients() {
     if in_child() {
         return;
     }
     let mut failures = String::new();
     let mut seen = String::new();
-    for spec in ["shared_c4", "shared_c16", "shared_c64"] {
-        for (arm, c, acks, flushes) in shared_ratio(spec) {
+    let mut last: Option<(u64, f64)> = None;
+    for c in SHARED_CS {
+        let spec = format!("shared_c{c}");
+        let data = cell(&spec);
+        for arm in ["shared_create", "shared_cfw"] {
+            let Some(s) = data.ops.get(arm).and_then(|v| v.first()) else {
+                assert!(arm == "shared_cfw" && c > 64, "{spec}: no {arm} line");
+                continue;
+            };
+            let (acks, flushes) = (s["acks"], s[FULL]);
             assert!(flushes > 0, "{spec}: {arm}: no flush counted: the instrument saw nothing");
             let per = acks as f64 / flushes as f64;
-            let _ = write!(seen, " {spec}/{arm} {per:.2} ({acks}/{flushes});");
-            if c <= 16 && per < 0.9 * c as f64 {
-                let _ = writeln!(failures, "  {spec}: {arm}: {acks} acknowledgements over {flushes} flushes = {per:.2} per flush, budget >= {:.1}", 0.9 * c as f64);
+            let _ = write!(seen, " C={c}/{arm} {per:.2} ({acks}/{flushes});");
+            if c <= 64 && per < 0.9 * c as f64 {
+                let _ = writeln!(failures, "  C={c}: {arm}: {acks} acknowledgements over {flushes} flushes = {per:.2} per flush, budget >= {:.1}", 0.9 * c as f64);
+            }
+            if arm == "shared_create" {
+                if let Some((lc, lper)) = last {
+                    if per <= lper {
+                        let _ = writeln!(failures, "  creates per flush did not rise from C={lc} ({lper:.2}) to C={c} ({per:.2})");
+                    }
+                }
+                last = Some((c, per));
             }
         }
     }
@@ -1795,4 +1890,47 @@ fn leap_l4_an_open_reads_only_the_catalog_meta_row() {
         }
     }
     assert!(failures.is_empty(), "LEAP L4 not reached at open (budget: 1 query, the meta row):\n{failures}");
+}
+
+/// The L4 memory ruling (DECISIONS.md 2026-10-06T02:55Z (i): "about 50-100 MB at 10^6 live branches
+/// ... a budget test measures resident bytes per live branch at 10^4 and 10^5 and asserts the
+/// slope"): the heap an open leaves resident once its background work has settled grows by at most
+/// 100 B per live branch between 10^4 and 10^5 named branches. Fixed costs cancel in the slope; a
+/// catalog page cache's fill counts (it is resident), its cap bounds it. Memory is reported, not a
+/// won metric: this is a guard on L4, green before it and required after it.
+#[test]
+fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
+    if in_child() {
+        return;
+    }
+    let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
+    let (sa, sb) = (&a.ops["memory"][0], &b.ops["memory"][0]);
+    assert!(sa["quiet"] == 1 && sb["quiet"] == 1, "a background thread outlived the wait: the heap was still moving");
+    let (ra, rb) = (sa["resident_bytes"], sb["resident_bytes"]);
+    let slope = (rb as f64 - ra as f64) / (N_HUGE - N_LARGE) as f64;
+    assert!(
+        slope <= 100.0,
+        "an open keeps {slope:.1} B resident per live branch ({ra} B at {N_LARGE}, {rb} B at {N_HUGE}); budget 100 B [L4 memory ruling]"
+    );
+}
+
+/// The L4 build ruling (the same entry: "the build holds no store mutex for O(N)"): during an open
+/// and its background work, no single store-mutex hold, by any thread, allocates more than 64 KiB
+/// or touches more than 1,024 catalog rows, at 10^4 and at 10^5 live branches, and the largest at
+/// 10^5 is at most twice the largest at 10^4. An O(N) hold at 10^5 is ten times either bound.
+#[test]
+fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
+    if in_child() {
+        return;
+    }
+    let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
+    let (sa, sb) = (&a.ops["memory"][0], &b.ops["memory"][0]);
+    let mut failures = String::new();
+    for (k, most) in [("max_hold_alloc_bytes", 64u64 << 10), ("max_hold_catalog_rows", 1024)] {
+        let (x, y) = (sa[k], sb[k]);
+        if x > most || y > most || y > 2 * x.max(1) {
+            let _ = writeln!(failures, "  {k}: {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {most} and <= 2x the 10^4 value");
+        }
+    }
+    assert!(failures.is_empty(), "an open's largest store-mutex hold grows with the live branches:\n{failures}");
 }
