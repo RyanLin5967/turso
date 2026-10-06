@@ -26,7 +26,7 @@ pub mod counters;
 
 use std::num::NonZero;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex, MutexGuard,
 };
 
@@ -56,7 +56,9 @@ use pgwire::api::{
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::{DataRow, RowDescription};
 use pgwire::messages::extendedquery::Sync as PgSync;
-use pgwire::messages::response::{EmptyQueryResponse, ReadyForQuery, TransactionStatus};
+use pgwire::messages::response::{
+    EmptyQueryResponse, NoticeResponse, ReadyForQuery, TransactionStatus,
+};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
@@ -413,7 +415,14 @@ struct SessionState {
     aborted: bool,
     /// The branch a switch just left, released in [`Shared`]'s map when the switch's statement ends.
     left: Option<String>,
+    /// Notices the session's statements raised and the client has not been sent yet: the simple
+    /// protocol sends each before its statement's result, the extended one before ReadyForQuery.
+    notices: Vec<Box<ErrorInfo>>,
 }
+
+/// CHECKPOINTs skipped inside a block because the WAL was busy (see [`Session::checkpoint`]),
+/// since the server started: turso_branch_stats' `checkpoints_skipped`.
+static CHECKPOINTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// pgwire's handler set for one session: every handler is the session itself.
 struct SessionHandlers(Arc<Session>);
@@ -508,22 +517,32 @@ impl Session {
     /// Every statement of one simple-protocol query, in order, up to and including the first that
     /// fails.
     fn simple(&self, query: &str) -> Vec<Response> {
+        self.simple_with_notices(query)
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect()
+    }
+
+    /// [`Session::simple`], each result with the notices its statement raised.
+    fn simple_with_notices(&self, query: &str) -> Vec<(Vec<Box<ErrorInfo>>, Response)> {
+        let with_notices = |r: Response| (std::mem::take(&mut self.state().notices), r);
         // A query that is one branch call goes straight to the engine: no split, no parse (L5).
         if let Some(call) = branch_call(query) {
-            return vec![self
-                .run(query, Some(call), None, &Format::UnifiedText)
-                .unwrap_or_else(Response::Error)];
+            return vec![with_notices(
+                self.run(query, Some(call), None, &Format::UnifiedText)
+                    .unwrap_or_else(Response::Error),
+            )];
         }
         let statements = match split_statements(query) {
             Ok(s) => s,
-            Err(e) => return vec![Response::Error(engine_info(&e))],
+            Err(e) => return vec![(Vec::new(), Response::Error(engine_info(&e)))],
         };
         let mut responses = Vec::with_capacity(statements.len());
         for sql in &statements {
             match self.statement(sql, None, &Format::UnifiedText) {
-                Ok(r) => responses.push(r),
+                Ok(r) => responses.push(with_notices(r)),
                 Err(e) => {
-                    responses.push(Response::Error(e));
+                    responses.push(with_notices(Response::Error(e)));
                     break;
                 }
             }
@@ -620,18 +639,32 @@ impl Session {
     /// on its trunk connection. Outside a block it is a TRUNCATE checkpoint that waits for writers
     /// and readers within the lock timeout and fails with 55P03 after it. Inside a block the
     /// session's own transaction may hold the very locks a TRUNCATE waits for, so it is a PASSIVE
-    /// checkpoint on a connection of its own, which never waits: it backfills what no reader pins,
-    /// and a busy answer leaves the rest to the next checkpoint (committed data is durable in the
-    /// WAL either way). Any other failure is the statement's (wire review 1 item 4).
+    /// checkpoint on a connection of its own, which never waits: it backfills what no reader pins.
+    /// A busy answer there skips the checkpoint, and says so: a NOTICE, one more in
+    /// turso_branch_stats' `checkpoints_skipped`, then the tag (lead ruling 2026-10-06T13:47Z; a
+    /// tag alone would claim a checkpoint that did not run). Committed data is durable in the WAL
+    /// either way. Any other failure is the statement's (wire review 1 item 4).
     fn checkpoint(&self, st: &mut SessionState, in_tx: bool) -> SqlResult<Response> {
         if in_tx {
             let conn = self.shared.db.connect().map_err(|e| engine_info(&e))?;
-            return match conn.checkpoint(CheckpointMode::Passive {
+            match conn.checkpoint(CheckpointMode::Passive {
                 upper_bound_inclusive: None,
             }) {
-                Ok(_) | Err(LimboError::Busy) => Ok(Response::Execution(Tag::new("CHECKPOINT"))),
-                Err(e) => Err(engine_info(&e)),
-            };
+                Ok(_) => {}
+                Err(LimboError::Busy) => {
+                    CHECKPOINTS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    st.notices.push(Box::new(ErrorInfo::new(
+                        "NOTICE".to_string(),
+                        "00000".to_string(),
+                        "checkpoint skipped: the WAL is busy, and inside a transaction block \
+                         CHECKPOINT does not wait (this block may hold the lock it needs); run it \
+                         outside the block"
+                            .to_string(),
+                    )));
+                }
+                Err(e) => return Err(engine_info(&e)),
+            }
+            return Ok(Response::Execution(Tag::new("CHECKPOINT")));
         }
         if st.trunk.is_none() {
             st.trunk = Some(self.open_trunk()?);
@@ -1063,17 +1096,26 @@ fn one_int8(f: &str, value: i64, format: &Format) -> Response {
     one_row(f, Type::INT8, format, |e| e.encode_field(&value))
 }
 
-const STATS_COLUMNS: [&str; 4] = ["unix_syscalls", "mach_syscalls", "instructions", "cycles"];
+const STATS_COLUMNS: [&str; 5] = [
+    "unix_syscalls",
+    "mach_syscalls",
+    "instructions",
+    "cycles",
+    "checkpoints_skipped",
+];
 
 /// turso_branch_stats(): the server process's counters ([`counters::process_counters`]), read as
-/// the call runs; NULLs where the platform does not count them.
+/// the call runs, NULLs where the platform does not count them; then the server's own count of
+/// skipped CHECKPOINTs ([`CHECKPOINTS_SKIPPED`]).
 fn stats_row(format: &Format) -> Response {
     let header = Arc::new(stats_fields(format));
     let mut encoder = DataRowEncoder::new(header.clone());
     let values = counters::process_counters()
         .map(|c| [c.unix_syscalls, c.mach_syscalls, c.instructions, c.cycles].map(|v| v as i64));
-    let row = (0..STATS_COLUMNS.len())
+    let skipped = CHECKPOINTS_SKIPPED.load(Ordering::Relaxed) as i64;
+    let row = (0..4)
         .try_for_each(|i| encoder.encode_field(&values.map(|v| v[i])))
+        .and_then(|()| encoder.encode_field(&skipped))
         .and_then(|()| encoder.finish());
     Response::Query(QueryResponse::new(header, stream::iter(vec![row])))
 }
@@ -1204,11 +1246,18 @@ impl SimpleQueryHandler for Session {
         client.set_state(PgWireConnectionState::QueryInProgress);
         let trimmed = query.query.trim();
         let responses = if trimmed.is_empty() || trimmed == ";" {
-            vec![Response::EmptyQuery]
+            vec![(Vec::new(), Response::EmptyQuery)]
         } else {
-            self.simple(&query.query)
+            self.simple_with_notices(&query.query)
         };
-        for response in responses {
+        for (notices, response) in responses {
+            for notice in notices {
+                client
+                    .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                        *notice,
+                    )))
+                    .await?;
+            }
             match response {
                 Response::Query(mut results) => {
                     let fields = results.row_schema().iter().map(Into::into).collect();
@@ -1358,6 +1407,15 @@ impl ExtendedQueryHandler for Session {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // The extended protocol's results went out as each Execute ran; its notices go out here.
+        let notices = std::mem::take(&mut self.state().notices);
+        for notice in notices {
+            client
+                .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
+                    *notice,
+                )))
+                .await?;
+        }
         let status = self.transaction_status();
         client.set_transaction_status(status);
         send_ready_for_query(client, status).await?;
