@@ -77,6 +77,9 @@ esac
 for spec in $SPECLIST; do  # a missing spec file is a harness defect, found before anything runs
   [ "$KIND" = b1 ] || [ -f "$SPECS/$spec.spec" ] || { echo "REFUSED: no spec $SPECS/$spec.spec" >&2; exit 2; }
 done
+# FDSYNC_SCAN_HOOK is the fire-check's fault injector (F6d/F6e make the pre-attach fd scan lose its task): a run
+# with it set would count windows whose scans were sabotaged (third re-review, finding 4).
+[ -z "${FDSYNC_SCAN_HOOK:-}" ] || { echo "REFUSED: FDSYNC_SCAN_HOOK is set ($FDSYNC_SCAN_HOOK); it is for firecheck_strace.sh only" >&2; exit 2; }
 # The flush counter must have passed its fire-check on this runner and filesystem first (review finding 8).
 FC=${FT_FIRECHECK:?FT_FIRECHECK: the fire-check verdict file (firecheck_strace.sh OUT/firecheck.txt)}
 # ALL of this tree's fire-check passed, not a verdict that merely starts with PASS (fifth review, finding 4): the last

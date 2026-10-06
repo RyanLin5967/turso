@@ -21,7 +21,10 @@
 #      the child, and every roster process scanned.
 #   F6c the fd scan alone on a process whose leader called pthread_exit (workers hold the fds): the O_DSYNC fd is
 #      found through a live worker, "scanned" with >= 200 fds.
-#   F6d the same scan with every task it reads through made to exit after its first fd: "unscanned", never "scanned".
+#   F6e the same scan with the task it reads through made to exit after its first fd on the first try only: the
+#      rescan succeeds ("scanned", >= 200 fds, the hit), two hook calls.
+#   F6d the same scan with every task it reads through made to exit after its first fd: three tries, then
+#      "unscanned", never "scanned".
 #   F7 threads that exist BEFORE the attach: a probe starts a thread, is attached, then the thread fsyncs x3 and the
 #      main thread x2. Expect exactly 5 fsyncs, verdict ok.
 #   F8 blind spot: pwritev2 with RWF_DSYNC (launch mode). Expect INCOMPLETE (rwf_sync_writes >= 1).
@@ -52,7 +55,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=21
+NCHECK=22
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -361,14 +364,21 @@ stop_probe2 dsync-child-pre
 # while five worker threads hold its fds (second re-review, finding 6: neither new path had ever run).
 #   F6c: the scan must read the table through a live worker: a "hit" on the O_DSYNC file and "scanned PID n" with
 #        n >= 200, though /proc/PID/task/PID/fdinfo is empty.
-#   F6d: FDSYNC_SCAN_HOOK makes the task being read exit after its first fd, on every try: three tries lose their
-#        task, two workers still live, so the process must be written "unscanned" (refused downstream), never
-#        "scanned" with the fds after the first silently skipped.
-f6d_hook() {
+#   F6e: FDSYNC_SCAN_HOOK makes the task being read exit after its first fd on the FIRST try only: the rescan through
+#        another live worker must then succeed, "scanned PID n" with n >= 200 and the hit, the hook called exactly
+#        twice (once per try) -- the retry works, not merely refuses (third re-review, finding 4).
+#   F6d: the hook makes the task being read exit after its first fd on EVERY try: exactly three tries (three hook
+#        calls), each losing its task, with workers still live, so the process must be written "unscanned" (refused
+#        downstream), never "scanned" with the fds after the first silently skipped.
+# The hooks log each call to DIR/fc/<name>.calls. FDSYNC_SCAN_HOOK exists for these checks only: run_system.sh refuses
+# to run with it set.
+lose_task() { # lose_task FDINFO_DIR -- make the worker owning it exit, and wait until its task dir is gone
   local task=${1%/fdinfo} j
   touch "$DIR/fc/leader-exit.exit.${task##*/}"
   for ((j = 0; j < 200; j++)); do [ -d "$task" ] || return 0; sleep 0.01; done
 }
+f6e_hook() { echo "$1" >>"$DIR/fc/f6e.calls"; [ "$(awk 'END {print NR}' "$DIR/fc/f6e.calls")" = 1 ] && lose_task "$1"; return 0; }
+f6d_hook() { echo "$1" >>"$DIR/fc/f6d.calls"; lose_task "$1"; }
 if start_probe2 leader-exit; then
   for ((i = 0; i < 300; i++)); do [ "$(task_state "/proc/$PP2/task/$PP2/stat")" = Z ] && break; sleep 0.01; done
   lz=$(task_state "/proc/$PP2/task/$PP2/stat")
@@ -380,16 +390,29 @@ if start_probe2 leader-exit; then
     log "FAIL F6c-dead-leader-scanned: leader state [$lz]; scan [$(tr '\n' ' ' <"$OUT/f6c.fdsync" | cut -c1-300)]"
     fails=$((fails + 1))
   fi
-  FDSYNC_SCAN_HOOK=f6d_hook fdsync_scan "$OUT/f6d" "$PP2"
-  left=$(ls -d /proc/"$PP2"/task/* 2>/dev/null | awk 'END {print NR}')
-  if grep -q "^unscanned $PP2 " "$OUT/f6d.fdsync" && ! grep -q "^scanned $PP2 " "$OUT/f6d.fdsync" && ! dead_proc "$PP2"; then
-    log "PASS F6d-scan-task-lost-unscanned: $(tr '\n' ' ' <"$OUT/f6d.fdsync" | cut -c1-200); $left task(s) left"
+  : >"$DIR/fc/f6e.calls"
+  FDSYNC_SCAN_HOOK=f6e_hook fdsync_scan "$OUT/f6e" "$PP2"
+  ecalls=$(awk 'END {print NR}' "$DIR/fc/f6e.calls")
+  if [ "$ecalls" = 2 ] && grep -q "^hit $PP2 [0-9]* [0-7]* .*leader-exit\.dat$" "$OUT/f6e.fdsync" &&
+    awk -v p="$PP2" '$1 == "scanned" && $2 == p && $3 + 0 >= 200 { f = 1 } END { exit !f }' "$OUT/f6e.fdsync"; then
+    log "PASS F6e-scan-task-lost-rescanned: $ecalls hook calls (one per try); $(tr '\n' ' ' <"$OUT/f6e.fdsync" | cut -c1-200)"
   else
-    log "FAIL F6d-scan-task-lost-unscanned: scan [$(tr '\n' ' ' <"$OUT/f6d.fdsync" | cut -c1-300)]; $left task(s) left"
+    log "FAIL F6e-scan-task-lost-rescanned: $ecalls hook calls; scan [$(tr '\n' ' ' <"$OUT/f6e.fdsync" | cut -c1-300)]"
+    fails=$((fails + 1))
+  fi
+  : >"$DIR/fc/f6d.calls"
+  FDSYNC_SCAN_HOOK=f6d_hook fdsync_scan "$OUT/f6d" "$PP2"
+  dcalls=$(awk 'END {print NR}' "$DIR/fc/f6d.calls")
+  left=$(ls -d /proc/"$PP2"/task/* 2>/dev/null | awk 'END {print NR}')
+  if [ "$dcalls" = 3 ] && grep -q "^unscanned $PP2 " "$OUT/f6d.fdsync" && ! grep -q "^scanned $PP2 " "$OUT/f6d.fdsync" &&
+    ! dead_proc "$PP2"; then
+    log "PASS F6d-scan-task-lost-unscanned: $dcalls hook calls (3 tries); $(tr '\n' ' ' <"$OUT/f6d.fdsync" | cut -c1-200); $left task(s) left"
+  else
+    log "FAIL F6d-scan-task-lost-unscanned: $dcalls hook calls; scan [$(tr '\n' ' ' <"$OUT/f6d.fdsync" | cut -c1-300)]; $left task(s) left"
     fails=$((fails + 1))
   fi
 else
-  log "FAIL F6c/F6d: the leader-exit probe never became ready"; fails=$((fails + 2))
+  log "FAIL F6c/F6e/F6d: the leader-exit probe never became ready"; fails=$((fails + 3))
 fi
 stop_probe2 leader-exit
 
