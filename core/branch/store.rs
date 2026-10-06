@@ -7029,7 +7029,7 @@ impl StoreInner {
             if let Some(journal) = self.journal.as_mut() {
                 journal.set_page_size(page_size);
             }
-            if let Err(e) = self.checkpoint_catalog(false) {
+            if let Err(e) = self.checkpoint_catalog_as(false, true) {
                 if let (Some(journal), Some(old)) = (self.journal.as_mut(), old) {
                     journal.set_page_size(old);
                 }
@@ -7097,6 +7097,13 @@ impl StoreInner {
             self.pending_free.clear();
             self.held_synced_free.clear();
         }
+        // The restart's checkpoint emptied the catalog's free table (`checkpoint_catalog_as`):
+        // nothing to read from it, and nothing of the old arena is taken (review 6 #4).
+        if let Some(cat) = self.cat.as_mut().filter(|_| !fe_mutant("restart_keeps_free_table")) {
+            cat.free_cursor = None;
+            cat.free_exhausted = true;
+            cat.taken.clear();
+        }
     }
 
     /// Catalog mode's compaction, an incremental checkpoint: every branch and trunk page changed
@@ -7111,6 +7118,16 @@ impl StoreInner {
     /// runs the same three steps as a fuzzy checkpoint instead, with the write on its own thread
     /// and no store mutex held across it (F-FZ).
     fn checkpoint_catalog(&mut self, fail_after_commit: bool) -> Result<()> {
+        self.checkpoint_catalog_as(fail_after_commit, false)
+    }
+
+    /// `checkpoint_catalog`; with `fresh_arena`, for an empty store's page-size restart, whose arena
+    /// is replaced by an empty one at the new page size once this commits (review 6 #4): no slot of
+    /// the old arena may reach the new one, so the checkpoint commits an empty free table (every
+    /// row deleted, none written) and a high-water mark and in-use count of 0 — exact, since an
+    /// empty store references no slot. Mutant `restart_keeps_free_table` (test builds only): the
+    /// old arena's free slots and high-water mark, as before.
+    fn checkpoint_catalog_as(&mut self, fail_after_commit: bool, fresh_arena: bool) -> Result<()> {
         // The catalog must hold the state the log describes: parked Commits first (C-R).
         self.settle()?;
         if self.journal.is_none() || self.arena.is_none() {
@@ -7127,6 +7144,15 @@ impl StoreInner {
         let writer = cat.writer.clone();
         let q0 = cat.catalog.counters.queries;
         let mut cap = self.checkpoint_capture(fail_after_commit)?;
+        if fresh_arena && !fe_mutant("restart_keeps_free_table") {
+            cap.free_cursor = Some(Slot::MAX);
+            cap.taken.clear();
+            cap.free_list.clear();
+            cap.reserved.clear();
+            cap.deferred.clear();
+            cap.meta.arena_hw = 0;
+            cap.meta.in_use = 0;
+        }
         kill_point("ckpt.captured");
         let mut w = writer.lock();
         let w0 = w.counters.queries;
