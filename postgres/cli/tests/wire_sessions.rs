@@ -2651,3 +2651,61 @@ fn a_delete_right_after_a_close_waits_for_the_release() {
             .ok("a delete right after the close, first try");
     }
 }
+
+/// char(n) compares with trailing blanks insignificant, as PostgreSQL's bpchar does, whether the
+/// row is reached by a scan or an index seek and whether the operand is a literal or a bound
+/// parameter. Values are stored without their padding; at 15e96b3a9 `=` and `<` compared them as
+/// plain text, so a padded value a client had read and sent back matched by seek (the seek key is
+/// encoded) and not by scan (wire review 2 item 3). Expected values are PostgreSQL's bpchar
+/// semantics (docs, "Character Types": trailing spaces are treated as semantically insignificant
+/// and disregarded when comparing two values of type character).
+#[test]
+fn char_n_compares_without_its_padding_by_scan_and_by_seek() {
+    let dir = Scratch::new("bpcharcmp");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (t, index) in [("s", false), ("k", true)] {
+        a.q(&format!(
+            "CREATE TABLE {t}(id INT PRIMARY KEY, code CHAR(5))"
+        ))
+        .ok("create");
+        if index {
+            a.q(&format!("CREATE INDEX {t}_code ON {t}(code)"))
+                .ok("index");
+        }
+        a.q(&format!("INSERT INTO {t} VALUES (1, 'ab')"))
+            .ok("insert");
+        let read_back = a
+            .q(&format!("SELECT code FROM {t} WHERE id = 1"))
+            .single("the padded value");
+        assert_eq!(read_back, "ab   ");
+        for (sql, want) in [
+            (
+                format!("SELECT count(*) FROM {t} WHERE code = 'ab   '"),
+                "1",
+            ),
+            (
+                format!("SELECT count(*) FROM {t} WHERE code = '{read_back}'"),
+                "1",
+            ),
+            (format!("SELECT count(*) FROM {t} WHERE code = 'ab'"), "1"),
+            (format!("SELECT count(*) FROM {t} WHERE code < 'ab '"), "0"),
+            (
+                format!("SELECT count(*) FROM {t} WHERE code > 'aa   '"),
+                "1",
+            ),
+            (
+                format!("SELECT count(*) FROM {t} WHERE code <> 'ab  '"),
+                "0",
+            ),
+        ] {
+            assert_eq!(a.q(&sql).single(&sql), want, "{sql} (index: {index})");
+        }
+        let sql = format!("SELECT count(*) FROM {t} WHERE code = $1");
+        assert_eq!(
+            a.x(&sql, &["ab   "]).single("parameter"),
+            "1",
+            "{sql} with 'ab   ' (index: {index})"
+        );
+    }
+}
