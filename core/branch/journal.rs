@@ -2840,7 +2840,8 @@ fn synced_flight_over(
 /// so AND the rewrite syncs (engine review 7 #1): a flight written unsynced named slots no sync
 /// covered, and its tag is what tells a later open the arena may hold such writes (review 5 #10).
 /// Mutant `reframe_retags_by_class` (test builds only): every flight tagged by the rewrite's class
-/// alone, as before.
+/// alone, as before. Test builds only: every production rewrite calls `reframe_tagged`.
+#[cfg(test)]
 fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u32)> {
     reframe_tagged(kept, old, new, synced).map(|(out, last_crc, _)| (out, last_crc))
 }
@@ -3440,10 +3441,10 @@ fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
 
-/// Test builds: directory syncs made on this thread (engine review 7 #6: a cut's rename made
-/// durable once before the next acknowledgement, never once per flight).
 #[cfg(test)]
 thread_local! {
+    /// Test builds: directory syncs made on this thread (engine review 7 #6: a cut's rename made
+    /// durable once before the next acknowledgement, never once per flight).
     pub(crate) static DIR_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
