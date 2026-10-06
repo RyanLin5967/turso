@@ -245,6 +245,29 @@ impl Wire {
         self.read_reply()
     }
 
+    /// A pipeline: Parse, Bind, Describe portal and Execute for each statement (no parameters),
+    /// then one Sync, as pgjdbc's batches and libpq's pipeline mode send them.
+    fn pipeline(&mut self, sqls: &[&str]) -> Reply {
+        for sql in sqls {
+            let mut parse = vec![0u8];
+            parse.extend_from_slice(sql.as_bytes());
+            parse.push(0);
+            parse.extend_from_slice(&0i16.to_be_bytes());
+            self.send(b'P', &parse);
+            let mut bind = vec![0u8, 0u8];
+            bind.extend_from_slice(&0i16.to_be_bytes());
+            bind.extend_from_slice(&0i16.to_be_bytes());
+            bind.extend_from_slice(&0i16.to_be_bytes());
+            self.send(b'B', &bind);
+            self.send(b'D', b"P\0");
+            let mut exec = vec![0u8];
+            exec.extend_from_slice(&0i32.to_be_bytes());
+            self.send(b'E', &exec);
+        }
+        self.send(b'S', &[]);
+        self.read_reply()
+    }
+
     /// [`Wire::x`] with each parameter's declared type OID (0: unspecified), format code (0 text,
     /// 1 binary) and bytes.
     fn xt(&mut self, sql: &str, params: &[(u32, i16, &[u8])]) -> Reply {
@@ -1956,4 +1979,128 @@ fn engine_errors_carry_postgres_sqlstates() {
         "1",
         "a refused insert left a row"
     );
+}
+
+/// Whether a session can switch to branch `name`, i.e. whether it exists (and nobody holds it).
+fn branch_exists(a: &mut Wire, name: &str) -> bool {
+    let exists = a
+        .q(&format!("SELECT turso_branch_switch('{name}')"))
+        .error
+        .is_none();
+    if exists {
+        a.q("SELECT turso_branch_switch('main')").ok("back to main");
+    }
+    exists
+}
+
+/// A multi-statement simple query runs as one implicit transaction, as in PostgreSQL: the first
+/// error rolls back every statement of the string before it, an explicit COMMIT inside it commits
+/// what came before and starts a new one, and a branch call inside it is refused with 25001 (as
+/// PostgreSQL refuses CREATE DATABASE there). At 472023b72 each statement autocommitted (wire
+/// review 1 item 8).
+#[test]
+fn a_multi_statement_query_is_one_implicit_transaction() {
+    let dir = Scratch::new("implicit");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let ids = |a: &mut Wire| -> Vec<String> {
+        a.q("SELECT id FROM t ORDER BY id")
+            .ok("ids")
+            .rows
+            .into_iter()
+            .map(|r| r[0].clone().unwrap())
+            .collect()
+    };
+    let r = a.q("INSERT INTO t VALUES (2, 'two'); INSERT INTO t VALUES (1, 'dup')");
+    assert_eq!(r.err("insert, then a duplicate").code, "23505");
+    assert_eq!(
+        r.status, b'I',
+        "an implicit block's failure leaves the session idle"
+    );
+    assert_eq!(
+        ids(&mut a),
+        vec!["1"],
+        "the first insert outlived the failed string"
+    );
+    let r = a.q("INSERT INTO t VALUES (3, 'three'); SELECT turso_branch_create('b')");
+    assert_eq!(r.err("insert, then a branch call").code, "25001");
+    assert_eq!(
+        ids(&mut a),
+        vec!["1"],
+        "the insert outlived the refused branch call"
+    );
+    assert!(
+        !branch_exists(&mut a, "b"),
+        "the branch call ran in a multi-statement string"
+    );
+    let r = a.q(
+        "INSERT INTO t VALUES (7, 'seven'); COMMIT; INSERT INTO t VALUES (8, 'eight'); \
+         INSERT INTO t VALUES (1, 'dup')",
+    );
+    assert_eq!(r.err("commit inside the string").code, "23505");
+    assert_eq!(
+        ids(&mut a),
+        vec!["1", "7"],
+        "the explicit COMMIT keeps 7, the failure drops 8"
+    );
+    let r = a
+        .q("INSERT INTO t VALUES (9, 'nine'); INSERT INTO t VALUES (10, 'ten')")
+        .ok("two inserts");
+    assert_eq!(r.status, b'I');
+    assert_eq!(ids(&mut a), vec!["1", "7", "9", "10"]);
+}
+
+/// Extended-protocol Executes up to a Sync run as one implicit transaction, as in PostgreSQL: a
+/// failure rolls back the pipeline's earlier statements, success commits them all at the Sync. A
+/// branch call may open a pipeline (it commits at once, as CREATE DATABASE does) but is refused
+/// with 25001 inside one (wire review 1 item 8).
+#[test]
+fn a_pipeline_up_to_sync_is_one_implicit_transaction() {
+    let dir = Scratch::new("pipeline");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let count = |a: &mut Wire, id: i64| {
+        a.q(&format!("SELECT count(*) FROM t WHERE id = {id}"))
+            .single("count")
+    };
+    let r = a.pipeline(&[
+        "INSERT INTO t VALUES (4, 'four')",
+        "INSERT INTO t VALUES (1, 'dup')",
+    ]);
+    assert_eq!(r.err("pipeline with a duplicate").code, "23505");
+    assert_eq!(r.status, b'I');
+    assert_eq!(
+        count(&mut a, 4),
+        "0",
+        "the pipeline's first insert outlived its failure"
+    );
+    let r = a
+        .pipeline(&[
+            "INSERT INTO t VALUES (5, 'five')",
+            "INSERT INTO t VALUES (6, 'six')",
+        ])
+        .ok("pipeline of two inserts");
+    assert_eq!(r.status, b'I', "the pipeline committed at its Sync");
+    assert_eq!(count(&mut a, 5), "1");
+    assert_eq!(count(&mut a, 6), "1");
+    let r = a
+        .pipeline(&[
+            "SELECT turso_branch_create('p1')",
+            "INSERT INTO t VALUES (11, 'eleven')",
+        ])
+        .ok("a branch call opening a pipeline");
+    assert_eq!(r.status, b'I');
+    assert!(branch_exists(&mut a, "p1"));
+    assert_eq!(count(&mut a, 11), "1");
+    let r = a.pipeline(&[
+        "INSERT INTO t VALUES (12, 'twelve')",
+        "SELECT turso_branch_create('p2')",
+    ]);
+    assert_eq!(r.err("a branch call inside a pipeline").code, "25001");
+    assert_eq!(
+        count(&mut a, 12),
+        "0",
+        "the insert outlived the refused branch call"
+    );
+    assert!(!branch_exists(&mut a, "p2"));
 }
