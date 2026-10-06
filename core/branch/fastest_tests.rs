@@ -4447,3 +4447,58 @@ fn a_failed_wal_sync_with_nothing_undrained_leaves_a_d2_store_running() {
             .unwrap_or_else(|e| panic!("catalog={catalog}: one WAL sync error with nothing at risk refused the next create: {e}"));
     }
 }
+
+// ---- engine review 9 #3: a flush under the store mutex honours a refused landing ----
+
+/// Engine review 9 #3: a flush made under the store mutex (`flush_locked`: a lease, an expiry, a
+/// reap) whose flight is in the air when another path fail-stops the store lands refused, and its
+/// caller gets the error: nothing it would apply on success (the lease, freed slots) is applied.
+/// Before, `land` refused the landing but `flush_locked` returned Ok and the lease was set. Mutant
+/// `locked_flush_ignores_refusal` (as before) must fail it.
+#[test]
+fn a_locked_flush_refused_at_its_landing_fails_its_operation() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("lockedflush.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let x = trunk.fork_branch().unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_LOCKED_FLUSH, O::Release);
+        let leasing = std::thread::spawn(move || x.lease(std::time::Duration::from_secs(3600)).map(|()| x));
+        wait_hold(&hold, super::store::HOLD_LOCKED_FLUSH);
+        // Raised outside the flight, as a failed drain of the device raises it.
+        db.branches.trunk_wal_sync_failed(true);
+        hold.store(0, O::Release);
+        let got = leasing.join().unwrap();
+        assert!(got.is_err(), "catalog={catalog}: a lease whose flush landed refused was acknowledged");
+    }
+}
+
+/// Engine review 9 #3, the end-to-end arm review 6 #3 asked for: a branch commit whose group flight
+/// is in the air when the store fail-stops outside it is refused (its flight's landing is refused).
+#[test]
+fn a_commit_whose_flight_lands_after_a_fail_stop_is_refused() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("inair.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let y = trunk.fork_branch().unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, O::Release);
+        let writer = std::thread::spawn(move || {
+            let r = y.connect()?.execute("UPDATE t SET v = 'y' WHERE id = 5");
+            let _ = y.into_id();
+            r
+        });
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        db.branches.trunk_wal_sync_failed(true);
+        hold.store(0, O::Release);
+        assert!(writer.join().unwrap().is_err(), "catalog={catalog}: a commit whose flight landed after a fail-stop was acknowledged");
+    }
+}

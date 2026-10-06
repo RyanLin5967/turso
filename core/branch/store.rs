@@ -1233,6 +1233,12 @@ pub(crate) const HOLD_TRUNK_BARRIER_DONE: u8 = 6;
 /// fork waits here, its read snapshot taken, before it registers.
 #[cfg(test)]
 pub(crate) const HOLD_FORK_REGISTERING: u8 = 7;
+
+/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a flush made under
+/// the store mutex (`flush_locked`) waits here, its flight taken and in the air, before it writes
+/// (engine review 9 #3).
+#[cfg(test)]
+pub(crate) const HOLD_LOCKED_FLUSH: u8 = 8;
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -3631,6 +3637,8 @@ impl BranchStore {
         g.flushing = true;
         g.locked_flushes += 1;
         drop(g);
+        #[cfg(test)]
+        pause_at(Some(&*self.trunk_commit_hold), HOLD_LOCKED_FLUSH);
         let (end, class) = (flight.end_lsn, flight.class);
         let (written, confirm) = split_confirm(flight.write());
         if written.is_err() {
