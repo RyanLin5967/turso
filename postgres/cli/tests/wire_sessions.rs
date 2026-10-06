@@ -1341,3 +1341,37 @@ fn char_n_is_blank_padded_as_in_postgres() {
     a.q("INSERT INTO ch VALUES (4, 'abcdef    ', NULL, NULL)")
         .ok("trailing spaces beyond n are dropped, as PostgreSQL does");
 }
+
+/// pg_indexes lists a table's indexes under PostgreSQL's names (the primary key's as <t>_pkey, a
+/// UNIQUE column's as <t>_<col>_key), and pg_database_size answers in bytes (BranchBench reads
+/// both).
+#[test]
+fn pg_indexes_and_pg_database_size_answer() {
+    let dir = Scratch::new("pgindexes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ix(id INT PRIMARY KEY, a INT, b TEXT UNIQUE)")
+        .ok("create");
+    a.q("CREATE INDEX ix_a ON ix(a)").ok("index");
+    let r = a
+        .q("SELECT indexname FROM pg_indexes WHERE tablename = 'ix' ORDER BY indexname")
+        .ok("pg_indexes");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Some("ix_a".into())],
+            vec![Some("ix_b_key".into())],
+            vec![Some("ix_pkey".into())]
+        ]
+    );
+    let r = a
+        .q("SELECT indexname FROM pg_indexes WHERE tablename = 'ix' AND indexname NOT LIKE '%_pkey' ORDER BY 1")
+        .ok("BranchBench's query");
+    assert_eq!(r.rows.len(), 2);
+    let size: i64 = a
+        .q("SELECT pg_database_size(current_database())")
+        .single("size")
+        .parse()
+        .expect("a size in bytes");
+    assert!(size > 0, "pg_database_size = {size}");
+}
