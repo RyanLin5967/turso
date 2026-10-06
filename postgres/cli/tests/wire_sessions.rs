@@ -2393,3 +2393,33 @@ fn branch_creates_racing_trunk_ddl_all_succeed() {
         failures.len()
     );
 }
+
+/// The claim is single-schema (PREREG §1): in server mode CREATE SCHEMA and DROP SCHEMA of any
+/// schema but public are refused with 0A000, so no session's attached schemas can differ from
+/// another's. At 472023b72 a schema created in one session was left unbranched by sessions opened
+/// before it (the E2 scope rule), DROP SCHEMA unlinked a file other sessions had attached, and once
+/// a schema existed every create in a session that had it attached failed XX000 (wire review 1
+/// item 16).
+#[test]
+fn schema_ddl_is_refused_in_server_mode() {
+    let dir = Scratch::new("schemaddl");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE SCHEMA IF NOT EXISTS s",
+        "DROP SCHEMA IF EXISTS s",
+        "drop schema s cascade",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    assert!(
+        !dir.0.join("turso-postgres-schema-s.db").exists(),
+        "a refused CREATE SCHEMA left its file"
+    );
+    b.q("SELECT turso_branch_create('afterschema')")
+        .ok("a create in another session");
+    a.q("SELECT turso_branch_create('afterschema2')")
+        .ok("a create in the session that asked");
+}
