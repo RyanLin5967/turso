@@ -165,8 +165,9 @@ impl Reply {
             .unwrap_or_else(|| panic!("{sql}: NULL"))
     }
 
-    fn err(self, sql: &str) -> WireError {
+    fn err(&self, sql: &str) -> WireError {
         self.error
+            .clone()
             .unwrap_or_else(|| panic!("{sql}: expected an error, got rows {:?}", self.rows))
     }
 }
