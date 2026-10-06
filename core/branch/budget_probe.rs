@@ -388,12 +388,19 @@ pub(crate) fn phys_footprint() -> Option<u64> {
     }
 }
 
-/// The threads this process has now: `task_threads` on Apple — Mach traps only (the list's ports
-/// and memory are given back with `mach_port_deallocate` and `vm_deallocate`), so it can be read
-/// inside a measured window without moving the syscall count — and `/proc/self/stat` on Linux;
-/// `None` elsewhere.
+/// Threads a branch store keeps for its whole life, by name: not counted by [`threads`], since a
+/// window cannot wait for them to exit. An allowlist on purpose: an unknown long-lived thread is
+/// counted, so the windows never settle and the cell refuses, rather than its work being ignored.
+pub(crate) const PERSISTENT_THREADS: &[&str] = &["branch-confirm"];
+
+/// The threads of this process, each as `(is_self, blocked, persistent)`, given to `each`;
+/// `None` when they cannot be listed (off Apple). Mach traps and userspace only (the port list is
+/// given back with `mach_port_deallocate` and `vm_deallocate`; a thread's name is read from its
+/// pthread), so it can run inside a measured window without moving the syscall count. `blocked` is
+/// `TH_STATE_WAITING`: a thread in a blocking wait or syscall. A thread woken (by a notify) is
+/// runnable at once, before it runs, so a woken thread never reads blocked.
 #[allow(deprecated)]
-pub(crate) fn threads() -> Option<u64> {
+fn each_thread(mut each: impl FnMut(bool, bool, bool)) -> Option<()> {
     #[cfg(target_vendor = "apple")]
     {
         extern "C" {
@@ -402,15 +409,43 @@ pub(crate) fn threads() -> Option<u64> {
         let mut list: libc::thread_act_array_t = std::ptr::null_mut();
         let mut count: libc::mach_msg_type_number_t = 0;
         // SAFETY: this task's own port; on success `list` holds `count` thread ports in memory the
-        // kernel mapped for us, both given back below.
+        // kernel mapped for us, all given back below.
         let task = unsafe { libc::mach_task_self() };
         // SAFETY: as above.
         if unsafe { libc::task_threads(task, &mut list, &mut count) } != 0 {
             return None;
         }
+        // SAFETY: the calling thread's own pthread; no new port right is made.
+        let me = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
         for i in 0..count as usize {
+            // SAFETY: `list` holds `count` ports.
+            let port = unsafe { *list.add(i) };
+            // SAFETY: zeroes are a valid `thread_basic_info`; the count is its size in integers.
+            let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+            let mut n = libc::THREAD_BASIC_INFO_COUNT;
+            // SAFETY: a thread port of this task, the flavor's buffer and its size.
+            let kr = unsafe {
+                libc::thread_info(
+                    port,
+                    libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                    (&mut info as *mut libc::thread_basic_info).cast(),
+                    &mut n,
+                )
+            };
+            let blocked = kr == 0 && info.run_state == libc::TH_STATE_WAITING;
+            let mut name = [0 as libc::c_char; 64];
+            // SAFETY: a thread port of this task; a thread that has exited gives a null pthread.
+            let pt = unsafe { libc::pthread_from_mach_thread_np(port) };
+            let persistent = pt != 0
+                // SAFETY: a live pthread of this process and a buffer of the length given.
+                && unsafe { libc::pthread_getname_np(pt, name.as_mut_ptr(), name.len()) } == 0
+                // SAFETY: NUL-terminated by pthread_getname_np.
+                && unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+                    .to_str()
+                    .is_ok_and(|n| PERSISTENT_THREADS.contains(&n));
+            each(port == me, blocked, persistent);
             // SAFETY: `list` holds `count` send rights, each released once.
-            unsafe { mach_port_deallocate(task, *list.add(i)) };
+            unsafe { mach_port_deallocate(task, port) };
         }
         // SAFETY: the array the kernel mapped, of exactly this size.
         unsafe {
@@ -420,8 +455,35 @@ pub(crate) fn threads() -> Option<u64> {
                 count as libc::vm_size_t * std::mem::size_of::<libc::thread_act_t>() as libc::vm_size_t,
             )
         };
-        Some(u64::from(count))
+        Some(())
     }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = &mut each;
+        None
+    }
+}
+
+/// The threads this process has now, persistent ones (`PERSISTENT_THREADS`) left out: through
+/// [`each_thread`] on Apple (so it can be read inside a measured window), `/proc/self/stat` on Linux
+/// (persistent ones included there); `None` elsewhere.
+pub(crate) fn threads() -> Option<u64> {
+    let mut n = 0u64;
+    if each_thread(|_, _, persistent| n += u64::from(!persistent)).is_some() {
+        return Some(n);
+    }
+    linux_threads()
+}
+
+/// Whether every thread but the caller is blocked (see [`each_thread`]): the work a notify woke has
+/// run and parked again. `None` off Apple.
+pub(crate) fn others_blocked() -> Option<bool> {
+    let mut all = true;
+    each_thread(|me, blocked, _| all &= me || blocked)?;
+    Some(all)
+}
+
+fn linux_threads() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         // Field 20 of /proc/self/stat, read into a stack buffer: no allocation, so it can be read
@@ -441,7 +503,7 @@ pub(crate) fn threads() -> Option<u64> {
         let rest = &text[text.rfind(')')? + 1..];
         rest.split_ascii_whitespace().nth(17)?.parse().ok()
     }
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         None
     }

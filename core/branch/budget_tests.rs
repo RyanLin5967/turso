@@ -55,6 +55,8 @@ const CKPT_ROUNDS: u64 = 240;
 /// The shared-flight arm's client counts (lead, 2026-10-06: "creates per F_FULLFSYNC rising with C
 /// at C = 1, 8, 64, 256, 1024").
 const SHARED_CS: [u64; 5] = [1, 8, 64, 256, 1024];
+/// "Hold the confirmation word back": a quiet period no run reaches (about 31.7 years).
+const CONFIRM_HELD_MS: u64 = 1 << 40;
 /// The memory cells' live branches: 10^4 (`N_LARGE`) and this.
 const N_HUGE: u64 = 100_000;
 /// Every measured branch name is this long (`m-0000`), so every create logs the same bytes.
@@ -265,13 +267,32 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s
 }
 
-/// Wait out every background thread: the checkpoint threads joined, and the thread count back at
-/// `base` (a joined thread can still be exiting). `false` if it never came back.
+/// Settled: the thread count (persistent store threads left out) is back at `base`, and every
+/// other thread is blocked, so what the work woke (the confirmation writer, at a flight's landing)
+/// has run and parked again. Mach traps and userspace only.
+fn settled(base: Option<u64>) -> bool {
+    probe::threads() == base && probe::others_blocked().unwrap_or(true)
+}
+
+/// Spin, with no syscall, until `settled(base)` or the deadline; whether it settled.
+fn spin_settled(base: Option<u64>, deadline: std::time::Duration) -> bool {
+    let t = std::time::Instant::now();
+    while !settled(base) {
+        if t.elapsed() > deadline {
+            return false;
+        }
+        std::hint::spin_loop();
+    }
+    true
+}
+
+/// Wait out every background thread before a window: the checkpoint threads joined, then settled
+/// (a joined thread can still be exiting). `false` if it never settled.
 fn quiesce(db: &Arc<Database>, base: Option<u64>) -> bool {
     db.branch_checkpoint_wait();
     let t = std::time::Instant::now();
     loop {
-        if probe::threads() == base {
+        if settled(base) {
             return true;
         }
         if t.elapsed() > std::time::Duration::from_secs(5) {
@@ -292,12 +313,8 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     let s0 = probe::begin();
     let r = f();
     let left = probe::threads() != base;
-    let t = std::time::Instant::now();
-    while probe::threads() != base && t.elapsed() < std::time::Duration::from_secs(30) {
-        std::hint::spin_loop();
-    }
+    let back = spin_settled(base, std::time::Duration::from_secs(30));
     let s1 = probe::end();
-    let back = probe::threads() == base;
     let o1 = Outside::read(db);
     let mut s = sample_of(&s0, &s1, &o0, &o1);
     let quiet = settled && back && (left || s["allocs_process"] == s["allocs"]);
@@ -366,14 +383,10 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
             "{cell}: the registry returned the old Database: not a reopen"
         );
         built.incarnation = opened.incarnation;
-        // The background threads are waited out by spinning on the thread count (no syscall), not by
-        // joining them: a join that blocks issues syscalls of its own, as many as the timing makes.
-        let t = std::time::Instant::now();
-        while probe::threads() != base && t.elapsed() < std::time::Duration::from_secs(30) {
-            std::hint::spin_loop();
-        }
+        // The background threads are waited out by spinning (no syscall), not by joining them: a
+        // join that blocks issues syscalls of its own, as many as the timing makes.
+        let settled = spin_settled(base, std::time::Duration::from_secs(30));
         let s_all = probe::end();
-        let settled = probe::threads() == base;
         opened.branch_wait_name_filter();
         let settled = settled && quiesce(&opened, base);
         let o1 = Outside::read(&opened);
@@ -577,6 +590,45 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     line(out, cell, "memory", 0, &s);
 }
 
+/// The confirmation arm (review 6 #1's fix: the word leaves the create path for a background
+/// writer): `k` rounds of a create with the word held back (`confirm_held`), then a create with the
+/// word released (`confirm_written`), whose window stays open until the writer's quiet period has
+/// passed, the word is written and every thread is parked again. The difference is the word's
+/// cost. A `confirm_written` sample in which no word was written is not quiet.
+fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut String) {
+    use std::sync::atomic::Ordering::Release;
+    let trunk = db.connect().unwrap();
+    for i in 0..WARMUP + k {
+        super::store::CONFIRM_QUIET_MS.store(CONFIRM_HELD_MS, Release);
+        let held = format!("h-{i:04}");
+        let (_, s_held) = measure(db, base, || trunk.create_branch(&held).unwrap());
+        // Release the word: the held one is written at the next landing's quiet period.
+        super::store::CONFIRM_QUIET_MS.store(0, Release);
+        let w0 = db.branch_confirm_counts();
+        let name = format!("w-{i:04}");
+        let (_, mut s_written) = measure(db, base, || {
+            trunk.create_branch(&name).unwrap();
+            // The writer waits `confirm_quiet()` (5 ms) of idle, then writes: wait it out with no
+            // syscall, then `measure` waits for every thread to park.
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_millis(50) {
+                std::hint::spin_loop();
+            }
+        });
+        let w1 = db.branch_confirm_counts();
+        let wrote = w1[0] - w0[0];
+        s_written.insert("confirms_written", wrote);
+        if wrote != 1 || w1[1] != w0[1] {
+            s_written.insert("quiet", 0);
+        }
+        if i >= WARMUP {
+            line(out, cell, "confirm_held", i - WARMUP, &s_held);
+            line(out, cell, "confirm_written", i - WARMUP, &s_written);
+        }
+    }
+    super::store::CONFIRM_QUIET_MS.store(CONFIRM_HELD_MS, Release);
+}
+
 /// A named create on `db`, so a checkpoint has a dirty branch to write.
 fn trunk_for_fc(db: &Arc<Database>) {
     db.connect().unwrap().create_branch("fc-dirty").unwrap();
@@ -688,6 +740,38 @@ fn run_instruments(cell: &str) -> String {
     s.insert("base", base.unwrap_or(0));
     s.insert("with", with.unwrap_or(0));
     s.insert("after", after.unwrap_or(0));
+    // A parked thread named as a persistent store thread is not counted, and a parked thread is
+    // blocked; a spinning one is not.
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let named = std::thread::Builder::new()
+        .name(probe::PERSISTENT_THREADS[0].to_string())
+        .spawn(move || rx.recv())
+        .unwrap();
+    let t = std::time::Instant::now();
+    while probe::others_blocked() != Some(true) && t.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    s.insert("with_persistent", probe::threads().unwrap_or(0));
+    s.insert("parked_blocked", u64::from(probe::others_blocked() == Some(true)));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spinning = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        })
+    };
+    let t = std::time::Instant::now();
+    let mut seen_running = false;
+    while t.elapsed() < std::time::Duration::from_millis(500) && !seen_running {
+        seen_running = probe::others_blocked() == Some(false);
+    }
+    s.insert("spinning_seen_running", u64::from(seen_running));
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let _ = spinning.join();
+    tx.send(()).unwrap();
+    let _ = named.join();
     put("fc_thread_count", &s);
     // A store API that takes the store mutex exactly once (`BranchStore::catalog_counters`); one
     // that reads every catalog page under it (`catalog_shape`); and the catalog's query counter
@@ -748,13 +832,23 @@ fn budget_child() {
         return;
     };
     let k = env_u64("FE_BUDGET_K", 24);
+    // The flight confirmation word (review 6 #1) is written by the store's confirmation thread once
+    // the group has been idle `confirm_quiet()`: a timed write that would land in whichever window
+    // is open then. Every cell but `confirm_n10` holds it back (the engine's test knob), so each
+    // window counts its operation; `confirm_n10` measures the word's own cost.
+    super::store::CONFIRM_QUIET_MS.store(
+        if spec == "confirm_n10" { 0 } else { CONFIRM_HELD_MS },
+        std::sync::atomic::Ordering::Release,
+    );
     let mut text = String::new();
     if spec == "instruments" {
         text = run_instruments(&spec);
     } else {
         // `n10_*` / `n1e4_*` cells: `_small` or `_large`, then `_unnamed` (recovery only) and `_d0`.
         let (n, large, named) = match spec.as_str() {
-            "ckpt_n10" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => (10, false, true),
+            "ckpt_n10" | "confirm_n10" | "shared_c1" | "shared_c8" | "shared_c64" | "shared_c256" | "shared_c1024" => {
+                (10, false, true)
+            }
             "growth_n1e4" | "ckpt_n1e4" | "mem_n1e4" => (N_LARGE, false, true),
             "mem_n1e5" => (N_HUGE, false, true),
             cell => {
@@ -778,7 +872,9 @@ fn budget_child() {
             return;
         }
         let (db, base) = recover(&spec, &mut built, opens, &mut text);
-        if let Some(c) = spec.strip_prefix("shared_c") {
+        if spec == "confirm_n10" {
+            confirm(&spec, &db, base, k, &mut text);
+        } else if let Some(c) = spec.strip_prefix("shared_c") {
             shared(&spec, &db, c.parse().unwrap(), &mut text);
         } else if spec.starts_with("growth") {
             growth(&spec, &db, &mut text);
@@ -1160,6 +1256,12 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_live_and_hold", "max_hold_alloc_bytes"), 24, "the largest of two holds (3 boxes of a u64; then a nested hold of 2)");
     assert_eq!(get("fc_live_and_hold", "max_hold_catalog_rows"), 0, "catalog rows in a hold that read none");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
+    #[cfg(target_vendor = "apple")]
+    {
+        assert_eq!(get("fc_thread_count", "with_persistent"), get("fc_thread_count", "base"), "a persistent store thread counted");
+        assert_eq!(get("fc_thread_count", "parked_blocked"), 1, "a parked thread not read as blocked");
+        assert_eq!(get("fc_thread_count", "spinning_seen_running"), 1, "a spinning thread read as blocked");
+    }
     #[cfg(target_vendor = "apple")]
     {
         assert_eq!(get("fc_nothing", "syscalls"), 0, "an empty window moved the syscall count");
@@ -2002,4 +2104,27 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
         }
     }
     assert!(failures.is_empty(), "an open's largest store-mutex hold grows with the live branches:\n{failures}");
+}
+
+/// Review 6 #1's ruling: the flight's confirmation word leaves the create path for a background
+/// writer, written with ONE unsynced pwrite once the group is idle, under no store mutex. A create
+/// with the word released costs, beyond the same create with it held back, exactly one syscall and
+/// no sync, no store-mutex acquisition and no syscall under it, on any thread.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
+    if in_child() {
+        return;
+    }
+    let c = cell("confirm_n10");
+    let (held, written) = (quiet(&c, "confirm_held"), quiet(&c, "confirm_written"));
+    let min = |v: &[&Map], k: &str| values(&c, "confirm", v, k).into_iter().min().unwrap();
+    let mut failures = String::new();
+    for (k, extra) in [("syscalls", 1u64), ("full_fsync", 0), ("fsync", 0), ("barrier", 0), ("locks_process", 0), ("held_syscalls", 0)] {
+        let (h, w) = (min(&held, k), min(&written, k));
+        if w != h + extra {
+            let _ = writeln!(failures, "  {k}: held {h}, written {w}; budget held + {extra}");
+        }
+    }
+    assert!(failures.is_empty(), "the confirmation word's cost [review 6 #1]:\n{failures}");
 }
