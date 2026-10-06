@@ -5239,9 +5239,10 @@ pub struct PgBranchCall {
 }
 
 /// Recognise a branch function call (see [`PgBranchCall`]). Arguments may be string, boolean or
-/// NULL literals or `$n` parameters, each optionally cast (`'b'::text`, `$1::text`). Anything else
-/// — another target, a FROM or WHERE clause, a schema-qualified name, an expression argument — is
-/// not a branch call, and reaches the engine, which reports the function as unknown.
+/// NULL literals or `$n` parameters, each optionally cast to text (`'b'::text`, `$1::varchar`).
+/// Anything else — another target, a FROM or WHERE clause, a schema-qualified or quoted uppercase
+/// name, an expression argument, a cast to any other type — is not a branch call, and reaches the
+/// engine, which fails it.
 pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCall> {
     use pg_query::protobuf::{a_const::Val, node::Node};
 
@@ -5303,8 +5304,11 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
     let Some(Node::String(name)) = name.node.as_ref() else {
         return None;
     };
-    let function = name.sval.to_ascii_lowercase();
+    // An unquoted name arrives lower-cased; a quoted one keeps its case, and PostgreSQL would look
+    // up exactly that name, which no branch function has.
+    let function = name.sval.clone();
     if !function.starts_with(BRANCH_FUNCTION_PREFIX)
+        || function.bytes().any(|c| c.is_ascii_uppercase())
         || call.agg_star
         || call.agg_distinct
         || call.func_variadic
@@ -5324,9 +5328,34 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
                 _ => None,
             },
             Node::ParamRef(p) if p.number > 0 => Some(PgBranchArg::Param(p.number as usize)),
-            Node::TypeCast(cast) => arg(cast.arg.as_deref()?),
+            Node::TypeCast(cast) if to_text(cast.type_name.as_ref()?) => {
+                match arg(cast.arg.as_deref()?)? {
+                    PgBranchArg::Bool(b) => Some(PgBranchArg::Text(b.to_string())),
+                    other => Some(other),
+                }
+            }
             _ => None,
         }
+    }
+    // A cast that changes nothing: to text, or to varchar with no length, unqualified or in
+    // pg_catalog (`varchar` and `character varying` arrive as pg_catalog.varchar). Any other cast
+    // can change the value (`::char`, `::varchar(2)`) or is no text at all, so the statement is
+    // not a branch call and reaches the engine.
+    fn to_text(t: &pg_query::protobuf::TypeName) -> bool {
+        let name = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        };
+        let ty = match t.names.as_slice() {
+            [ty] => name(ty),
+            [schema, ty] if name(schema) == Some("pg_catalog") => name(ty),
+            _ => None,
+        };
+        matches!(ty, Some("text" | "varchar"))
+            && t.typmods.is_empty()
+            && t.array_bounds.is_empty()
+            && !t.setof
+            && !t.pct_type
     }
     let args = call.args.iter().map(arg).collect::<Option<Vec<_>>>()?;
     Some(PgBranchCall { function, args })

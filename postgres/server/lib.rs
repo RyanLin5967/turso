@@ -954,8 +954,22 @@ fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<String>>) -> SqlResult<Str
         PgBranchArg::Null => Err(error("22004", "a branch name must not be null".to_string())),
         PgBranchArg::Bool(_) => Err(error("42804", "a branch name is text".to_string())),
         PgBranchArg::Param(n) => {
+            let portal =
+                portal.ok_or_else(|| error("08P01", format!("parameter ${n} is not bound")))?;
+            // A parameter declared as another type is not a name, whatever its bytes spell. A text
+            // or varchar value (or one of unspecified type, which PostgreSQL resolves to the
+            // function's text) is its bytes in either format: textrecv reads binary text as is.
+            if let Some(Some(ty)) = portal.statement.parameter_types.get(n - 1) {
+                if *ty != Type::TEXT && *ty != Type::VARCHAR {
+                    return Err(error(
+                        "42804",
+                        format!("a branch name is text, and parameter ${n} is {ty}"),
+                    ));
+                }
+            }
             let bytes = portal
-                .and_then(|p| p.parameters.get(n - 1))
+                .parameters
+                .get(n - 1)
                 .ok_or_else(|| error("08P01", format!("parameter ${n} is not bound")))?;
             let Some(bytes) = bytes else {
                 return Err(error("22004", "a branch name must not be null".to_string()));

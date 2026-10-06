@@ -161,8 +161,9 @@ pub fn branch_call(sql: &str) -> Option<PgBranchCall> {
 /// The common forms of a branch call, read byte by byte with no allocation but the call itself:
 /// `SELECT turso_branch_<op>(<arg>?)` with an optional trailing `;`, where `<arg>` is a standard
 /// string literal (`''` for a quote; a backslash is an ordinary character, as PostgreSQL reads one
-/// with standard_conforming_strings on) or a `$n` parameter, either optionally cast with
-/// `::<type>` (the cast is ignored, as [`try_extract_branch_call`] ignores it). Keywords and the
+/// with standard_conforming_strings on) or a `$n` parameter, either optionally cast to `text`,
+/// `varchar` or `character varying` with no length (a cast that changes nothing; any other cast
+/// is read by libpg_query, and [`try_extract_branch_call`] refuses it). Keywords and the
 /// function name in any case; PostgreSQL's whitespace (space, tab, newline, carriage return, form
 /// feed, vertical tab) anywhere a token boundary allows it. `None` means only "not one of these
 /// forms": the caller asks libpg_query. Whatever this returns, [`try_extract_branch_call`] returns
@@ -251,7 +252,18 @@ fn fast_branch_call(sql: &str) -> Option<PgBranchCall> {
         if b[i..].starts_with(b"::") {
             i += 2;
             ws(&mut i);
-            word(&mut i)?;
+            // Only a cast that changes nothing: to text, or to varchar with no length. A length,
+            // array bounds, a qualified name or any other type ends the fast path here.
+            let ty = &b[word(&mut i)?];
+            if ty.eq_ignore_ascii_case(b"character") {
+                let before = i;
+                ws(&mut i);
+                if i == before || !b[word(&mut i)?].eq_ignore_ascii_case(b"varying") {
+                    return None;
+                }
+            } else if !(ty.eq_ignore_ascii_case(b"text") || ty.eq_ignore_ascii_case(b"varchar")) {
+                return None;
+            }
             ws(&mut i);
         }
         args.push(arg);
