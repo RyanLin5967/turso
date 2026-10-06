@@ -7518,10 +7518,12 @@ dependencies = [
  "futures",
  "libc",
  "pgwire",
+ "tempfile",
  "tokio",
  "tracing",
  "turso_core",
  "turso_pg",
+ "turso_pg_parser",
 ]
 
 [[package]]

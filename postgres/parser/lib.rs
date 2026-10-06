@@ -9,8 +9,24 @@ pub enum ParseError {
     ParseError(String),
 }
 
+thread_local! {
+    static LIBPG_QUERY_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Calls into libpg_query (parse, split, scan, normalize, fingerprint) made by this thread, for
+/// per-statement work budgets: a wire session runs on one thread, so the difference across a
+/// statement is that statement's count. Observation only.
+pub fn libpg_query_calls() -> u64 {
+    LIBPG_QUERY_CALLS.with(|c| c.get())
+}
+
+fn count_libpg_query_call() {
+    LIBPG_QUERY_CALLS.with(|c| c.set(c.get() + 1));
+}
+
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
+    count_libpg_query_call();
     pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
@@ -19,6 +35,7 @@ pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
 /// string literals, comments, and dollar-quoted strings.
 /// Returns the individual statement strings (without trailing semicolons).
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
+    count_libpg_query_call();
     let parts =
         pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
     Ok(parts
@@ -36,11 +53,13 @@ pub fn get_tables(sql: &str) -> Result<Vec<String>, ParseError> {
 
 /// Normalize a query (replace constants with $1, $2, etc.)
 pub fn normalize(sql: &str) -> Result<String, ParseError> {
+    count_libpg_query_call();
     pg_query::normalize(sql).map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
 /// Get a fingerprint for a query (for caching/deduplication)
 pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
+    count_libpg_query_call();
     pg_query::fingerprint(sql)
         .map(|fp| fp.hex)
         .map_err(|e| ParseError::ParseError(e.to_string()))
@@ -67,6 +86,7 @@ pub fn quote_identifier(ident: &str) -> String {
 /// keyword classification matches server-side quote_identifier().
 fn keyword_requires_quoting(ident: &str) -> bool {
     use pg_query::protobuf::KeywordKind;
+    count_libpg_query_call();
     let scan =
         pg_query::scan(ident).expect("scanning a bare lower-case ASCII identifier cannot fail");
     match scan.tokens.as_slice() {

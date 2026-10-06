@@ -1638,6 +1638,68 @@ fn error_info(message: &str) -> ErrorInfo {
 mod tests {
     use super::*;
 
+    /// A session on a fresh database of its own (catalog branch store, D0: no flush slows the test).
+    fn session(dir: &tempfile::TempDir) -> Session {
+        let path = dir.path().join("w.db").to_string_lossy().into_owned();
+        let opts = database_opts(turso_core::branch::BranchDurability::Catalog {
+            sync: turso_core::branch::SyncClass::Off,
+        });
+        let (_io, db) =
+            turso_pg::open_database(&path, None, turso_core::OpenFlags::default(), opts).unwrap();
+        Session::new(Arc::new(Shared {
+            db,
+            db_file: path,
+            max_connections: 1,
+            live: AtomicUsize::new(0),
+        }))
+    }
+
+    fn ok(session: &Session, sql: &str) {
+        for r in session.simple(sql) {
+            if let Response::Error(e) = r {
+                panic!("{sql}: {} {}", e.code, e.message);
+            }
+        }
+    }
+
+    /// PREREG/DECISIONS L5: a branch call goes from the wire to the engine's named-branch API with no
+    /// statement parse — no libpg_query call at all (split, parse or scan) — in every form a client
+    /// sends: any case, spacing, a trailing semicolon, a cast on the name.
+    #[test]
+    fn a_branch_call_makes_no_libpg_query_call() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY)");
+        ok(&s, "INSERT INTO t VALUES (1)");
+        for sql in [
+            "SELECT turso_branch_create('b1')",
+            "select turso_branch_switch('b1');",
+            "SELECT turso_branch_current()",
+            "  SELECT  TURSO_BRANCH_SWITCH ( 'main' ) ;  ",
+            "SELECT turso_branch_create('it''s'::text)",
+            "SELECT turso_branch_delete(\n'b1'\n)",
+            "SELECT turso_branch_delete('it''s')",
+        ] {
+            let before = turso_pg_parser::libpg_query_calls();
+            ok(&s, sql);
+            assert_eq!(
+                turso_pg_parser::libpg_query_calls() - before,
+                0,
+                "libpg_query calls for {sql:?}"
+            );
+        }
+    }
+
+    /// The instrument above counts: an ordinary statement does call libpg_query.
+    #[test]
+    fn an_ordinary_statement_calls_libpg_query() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        let before = turso_pg_parser::libpg_query_calls();
+        ok(&s, "SELECT 1");
+        assert!(turso_pg_parser::libpg_query_calls() > before);
+    }
+
     #[test]
     fn test_pg_bytes_to_value_integer() {
         let val = pg_bytes_to_value(b"42", &Type::INT4).unwrap();
