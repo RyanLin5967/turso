@@ -140,6 +140,8 @@ struct Reply {
     oids: Option<Vec<u32>>,
     tags: Vec<String>,
     error: Option<WireError>,
+    /// The parameter type OIDs of the last ParameterDescription, if one came.
+    params: Option<Vec<u32>>,
     /// Every NoticeResponse of the reply, in order.
     notices: Vec<WireError>,
     /// The ReadyForQuery transaction status byte: b'I' idle, b'T' in a transaction, b'E' failed.
@@ -266,6 +268,18 @@ impl Wire {
         self.read_reply()
     }
 
+    /// Parse with no declared parameter types, Describe the statement, Sync: what asyncpg,
+    /// tokio-postgres and pgx send to learn a statement's parameters.
+    fn describe_statement(&mut self, sql: &str) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        self.send(b'P', &parse);
+        self.send(b'D', b"S\0");
+        self.send(b'S', &[]);
+        self.read_reply()
+    }
+
     /// A pipeline: Parse, Bind, Describe portal and Execute for each statement (no parameters),
     /// then one Sync, as pgjdbc's batches and libpq's pipeline mode send them.
     fn pipeline(&mut self, sqls: &[&str]) -> Reply {
@@ -369,6 +383,17 @@ impl Wire {
                 }
                 b'C' => r.tags.push(cstr(&body)),
                 b'N' => r.notices.push(error_fields(&body)),
+                b't' => {
+                    let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                    r.params = Some(
+                        (0..n)
+                            .map(|i| {
+                                let p = 2 + 4 * i;
+                                u32::from_be_bytes([body[p], body[p + 1], body[p + 2], body[p + 3]])
+                            })
+                            .collect(),
+                    );
+                }
                 b'E' => {
                     // Only the first error of a reply is kept.
                     if r.error.is_none() {
@@ -2203,4 +2228,25 @@ fn an_extended_round_costs_no_system_call_more_than_a_simple_one() {
         e <= s,
         "extended {e} system calls against simple {s} (all rounds: {extended:?} vs {simple:?})"
     );
+}
+
+/// Describe of a statement whose parameters the client did not declare reports them all, $1 up to
+/// the highest $n used, as text, as PostgreSQL reports every parameter it infers. At 472023b72 it
+/// reported only the declared ones, so asyncpg, tokio-postgres and pgx (which declare none) saw no
+/// parameter and refused to bind (wire review 1 item 13).
+#[test]
+fn describe_statement_reports_undeclared_parameters() {
+    let dir = Scratch::new("describeparams");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    const TEXT: u32 = 25;
+    for (sql, want) in [
+        ("SELECT turso_branch_create($1)", vec![TEXT]),
+        ("SELECT v FROM t WHERE id = $1", vec![TEXT]),
+        ("SELECT v FROM t WHERE id = $2", vec![TEXT, TEXT]),
+        ("SELECT v FROM t", vec![]),
+    ] {
+        let r = a.describe_statement(sql).ok(sql);
+        assert_eq!(r.params, Some(want), "{sql}");
+    }
 }
