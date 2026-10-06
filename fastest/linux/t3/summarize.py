@@ -40,7 +40,7 @@ def read_rcs(path):
     return rcs
 
 
-def v3_batch(fsdir, when, rc):
+def v3_batch(fsdir, when, rc, block=None):
     d = os.path.join(fsdir, f"v3-{when}")
     rec = {"rc": rc, "summary": os.path.exists(os.path.join(d, "summary.json")),
            "raw": os.path.exists(os.path.join(d, "raw.tsv"))}
@@ -59,7 +59,11 @@ def v3_batch(fsdir, when, rc):
     b = os.path.join(d, "binary.txt")
     if os.path.exists(b):
         rec["bound"] = next((l[6:] for l in open(b).read().splitlines() if l.startswith("bound=")), None)
-    rec["ok"] = rc == 0 and rec["summary"] and rec["raw"] and "summary_error" not in rec
+    complete = rec["summary"] and rec["raw"] and "summary_error" not in rec
+    # brd (dry runs only): a VOID batch with complete raws is recorded; brd has no drive, so the probe's timing
+    # control cannot discriminate there (t3run.sh v3batch). Every other block keeps rc 0.
+    rec["brd_void_recorded"] = rc == 3 and block == "brd" and bool(complete)
+    rec["ok"] = bool(complete) and (rc == 0 or rec["brd_void_recorded"])
     return rec
 
 
@@ -78,7 +82,7 @@ def block_record(out, fs):
             rec["v3"][when] = {"rc": None, "ok": False}
             rec["why"].append(f"V3 {when}: no batch ran")
             continue
-        r = v3_batch(fsdir, when, rcs[when])
+        r = v3_batch(fsdir, when, rcs[when], meta.get("block"))
         rec["v3"][when] = r
         if not r["ok"]:
             rec["why"].append(f"V3 {when}: rc {r['rc']}, summary.json {'present' if r['summary'] else 'MISSING'}, "
@@ -187,7 +191,7 @@ def self_test():
                            "published": {"fsync_p50_us": 10.0, "fsync_over_control_write_p50": 5.0},
                            "arms": {"fsync": {"timed": {"fsync_bins_ns": {"10000": 5}}}}})
 
-    def make(root, before_rc=0, before_v3l="VALID", after_v3l="VALID", drop=None, fslist="xfs"):
+    def make(root, before_rc=0, before_v3l="VALID", after_v3l="VALID", drop=None, fslist="xfs", block="loop"):
         out = os.path.join(root, "out")
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
         w(f"{out}/cells.tsv", "fs\tcell\tsystem\tclients\tattempt\tadapter_rc\tvoid\nxfs\tours-full-c1\tours\t1\t1\t0\tVALID\n")
@@ -197,7 +201,7 @@ def self_test():
         w(f"{f}/plan.tsv", "ours-full-c1\tours\t1\t200\t1\tfull\n")
         w(f"{f}/cells/ours-full-c1/a1/result/summary.json", "{}")
         w(f"{f}/cells/ours-full-c1/a1/adapter.txt", "")
-        w(f"{f}/block.txt", "cell=xfsloop\nblock=loop\n")
+        w(f"{f}/block.txt", f"cell={'xfs' if block == 'brd' else 'xfsloop'}\nblock={block}\n")
         w(f"{f}/v3.rc", f"before rc={before_rc}\nafter rc=0\n")
         for when in ("before", "after"):
             if not (when == "before" and before_rc == 2):  # a refused batch leaves no out dir
@@ -222,6 +226,9 @@ def self_test():
          {"before_v3l": "VOID", "after_v3l": None}, False),
         ("a block named in fslist.txt that never ran fails the package", {"fslist": "xfs btrfs"}, False),
         ("an empty fslist.txt fails the package", {"fslist": ""}, False),
+        ("a VOID (rc 3) V3 batch with complete raws fails a loop block", {"before_rc": 3}, False),
+        ("a VOID (rc 3) V3 batch with complete raws is recorded on a brd block", {"before_rc": 3, "block": "brd"}, True),
+        ("a refused (rc 2) V3 batch fails a brd block too", {"before_rc": 2, "block": "brd"}, False),
     ]:
         root = tempfile.mkdtemp(prefix="summarize-st-")
         try:

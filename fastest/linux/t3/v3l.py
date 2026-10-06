@@ -9,7 +9,11 @@
   v3l.py self-test              the parsers and the gates on planted inputs; exit 0 iff every case passes
 
 As registered: fio `--rw=write --bs=4k --ioengine=sync --fsync=1`, exactly 10,000 writes (`--number_ios=10000`),
-and a D0 control without `--fsync`, each on a fresh file in DIR. Each arm runs TWICE, with identical fio commands:
+and a D0 control without `--fsync`, each on a fresh file in DIR. PLUS `--end_fsync=1` on the fsync arm: measured on
+fio 3.36 (dry run 37517239631, xfs on a loop), `--fsync=1 --number_ios=10000` makes 9,999 fsyncs, because fio queues
+a write's fsync at the start of its next I/O and the job ends at its 10,000th; V1L then reads 9,999, not "1 fsync per
+write", and every block VOIDs. end_fsync supplies the last one. The registered command line does not name the flag
+(reported to the lead: PREREG line 180 needs it, or its gate needs restating). Each arm runs TWICE, with identical fio commands:
   labelling  under V1L, the registered strace (`-f -y -ttt -e trace=%file,%desc,ioctl,copy_file_range,
              sync_file_range,syncfs,msync,fallocate`): the syscall gate only, because tracing changes the timing
              (line 173: timed T3 runs carry no tracer);
@@ -19,7 +23,8 @@ Gates (any failure makes the measurement VOID, and the block with it):
   - V1L: exactly 10,000 writes to the data file on each arm; 10,000 fsync of the data file on the fsync arm and no
     fsync on the control; no fdatasync, sync_file_range, syncfs or msync on either; no failed write or fsync; no
     io_uring_setup (line 173 refuses such a labelling run);
-  - fio reports exactly 10,000 writes on every run, and 10,000 syncs on the fsync arm's;
+  - fio reports exactly 10,000 writes on every run, no sync on the control's, and on the fsync arm the same sync count
+    in the timed run as in the V1L-checked labelling run (the timed run has no tracer; this ties it to the checked one);
   - the drive's queue/write_cache reads "write back" or "write through" (anything else VOIDs); on "write back" the flush
     counter rises by at least 10,000 across the timed fsync run (a lower bound: another process's flushes can pad
     it, never shrink it).
@@ -135,6 +140,7 @@ def fio_cmd(name, path, fsync, out_json):
         # V3L_PLANT=fsync2 (t3run.sh --plant v3l-fsync-half, dry runs only) syncs every 2nd write: the V1L and fio
         # gates must VOID it. Inert unless set; recorded in v3l.json.
         c.append("--fsync=2" if os.environ.get("V3L_PLANT") == "fsync2" else "--fsync=1")
+        c.append("--end_fsync=1")
     return c
 
 
@@ -185,8 +191,13 @@ def gates(rec):
                 bad.append(f"fio {arm}/{run}: error {f['fio_error']}")
             if f.get("writes") != N:
                 bad.append(f"fio {arm}/{run}: {f.get('writes')} writes, registered exactly {N}")
-            if f.get("syncs", 0) != want:
-                bad.append(f"fio {arm}/{run}: {f.get('syncs', 0)} syncs, registered {want}")
+        if arm == "control":
+            for run in ("labelling_fio", "timed"):
+                if a[run].get("syncs", 0):
+                    bad.append(f"fio control/{run}: {a[run]['syncs']} syncs, registered 0")
+        elif a["timed"].get("syncs") != a["labelling_fio"].get("syncs"):
+            bad.append(f"fio fsync: the timed run made {a['timed'].get('syncs')} syncs, the V1L-checked labelling run "
+                       f"{a['labelling_fio'].get('syncs')} (one command; they must agree)")
     wc = rec["leaf"]["write_cache"]
     if wc == "write back":
         d = rec["arms"]["fsync"]["timed"].get("flush_ios_delta")
@@ -326,12 +337,15 @@ def self_test():
     cases.append(("V1L parse: failed fsyncs counted on the start line and the resumed line; io_uring_setup seen",
                   c2["failed"] == 2 and c2["data_fsyncs"] == 2 and c2["io_uring_setup"] == 1))
 
-    def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N):
-        def arm(fc, syncs):
+    def rec(fsyncs=N, ctl_fsyncs=0, wc="write back", delta=N + 3, writes=N, other=0, failed=0, uring=0, fio_w=N,
+            timed_syncs=N - 1, ctl_fio_syncs=0):
+        def arm(fc, syncs, tsyncs):
             v = {"data_writes": writes, "data_fsyncs": fc, "other_fsyncs": other, "failed": failed,
                  "io_uring_setup": uring, "fdatasync": 0, "sync_file_range": 0, "syncfs": 0, "msync": 0}
-            return {"v1l": v, "labelling_fio": {"writes": fio_w, "syncs": syncs}, "timed": {"writes": fio_w, "syncs": syncs}}
-        r = {"leaf": {"disk": "nvme1n1", "write_cache": wc}, "arms": {"fsync": arm(fsyncs, N), "control": arm(ctl_fsyncs, 0)}}
+            return {"v1l": v, "labelling_fio": {"writes": fio_w, "syncs": syncs}, "timed": {"writes": fio_w, "syncs": tsyncs}}
+        # fio's own sync count is whatever it reports (9,999 or 10,000 with end_fsync); only agreement is gated
+        r = {"leaf": {"disk": "nvme1n1", "write_cache": wc},
+             "arms": {"fsync": arm(fsyncs, N - 1, timed_syncs), "control": arm(ctl_fsyncs, ctl_fio_syncs, ctl_fio_syncs)}}
         r["arms"]["fsync"]["timed"]["flush_ios_delta"] = delta
         return r
 
@@ -345,6 +359,8 @@ def self_test():
         ("io_uring_setup VOIDs", gates(rec(uring=1)) != []),
         ("10,001 data writes VOIDs", gates(rec(writes=N + 1)) != []),
         ("fio reporting 9,999 writes VOIDs", gates(rec(fio_w=N - 1)) != []),
+        ("a timed run whose fio sync count differs from the labelling run's VOIDs", gates(rec(timed_syncs=N - 2)) != []),
+        ("a control run where fio reports a sync VOIDs", gates(rec(ctl_fio_syncs=1)) != []),
         ("write-back with 9,999 flushes VOIDs", gates(rec(delta=N - 1)) != []),
         ("write-back with no counter reading VOIDs", gates(rec(delta=None)) != []),
         ("an unreadable write_cache VOIDs", gates(rec(wc=None)) != []),

@@ -4,15 +4,29 @@
   "classes": {
     "full": {
       "meaning": "D2: one F_FULLFSYNC-equivalent flush per flight (on Linux the engine's FullFsync class is fsync(2))",
-      "create_flushes_per_op_c1": [1.0, 1.01],
-      "create_flushes_per_op_cn": ["1/C", 1.01],
-      "create_flush_files_allowed": ["-branch-log"],
+      "create_flushes_per_op_c1": [
+        1.0,
+        1.01
+      ],
+      "create_flushes_per_op_cn": [
+        "1/C",
+        1.01
+      ],
+      "create_flush_files_allowed": [
+        "-branch-log"
+      ],
       "note": "lower bounds keep a counter that reads zero from passing: at C=1 every create is its own flight; at C>1 a flight carries at most C creates, so at least one flush per C creates"
     },
     "async": {
       "meaning": "async-durable create: no flush on the create path",
-      "create_flushes_per_op_c1": [0.0, 0.0],
-      "create_flushes_per_op_cn": [0.0, 0.0],
+      "create_flushes_per_op_c1": [
+        0.0,
+        0.0
+      ],
+      "create_flushes_per_op_cn": [
+        0.0,
+        0.0
+      ],
       "create_flush_files_allowed": []
     }
   },
@@ -24,6 +38,20 @@
     "window": "create",
     "binds_at": "C=1 only; C>1 rows are INFO (run 37400090036: same engine both sides, arm64 C=64 getpid/create 3.21 vs 3.28)",
     "per_op_slack": 0.05,
-    "timing_dependent_excluded": ["futex", "sched_yield", "nanosleep", "clock_nanosleep", "restart_syscall", "rt_sigreturn"]
+    "timing_dependent_excluded": [
+      "futex",
+      "sched_yield",
+      "nanosleep",
+      "clock_nanosleep",
+      "restart_syscall",
+      "rt_sigreturn"
+    ]
+  },
+  "syscalls_per_create": {
+    "max": 3,
+    "source": "frontier/fastest/DECISIONS.md 2026-10-05T02:54:27Z: the syscalls-per-create budget is ABSOLUTE on both platforms (at most 3 per create); the Linux profile job asserts the same",
+    "counts": "every syscall strace -f sees in the create window (all threads), per create, averaged over the window; the phase markers are not counted",
+    "binds_at": "C=1; C>1 rows are INFO",
+    "known_red": "675adbfb3 makes 10 per create (run 37400090036); the job is red until the engine meets it, and the baseline advances on regression-green runs (analyze.py regression_green)"
   }
 }

@@ -8,7 +8,7 @@
 # the engine lane's suite_arms.sh does (unset: the all arm runs <test-binary> and says so).
 # Sizes (smoke defaults; the registered sizes are the lead's to set after registration):
 #   GATE_C0_OPS=20000  GATE_C0_MIN_BRANCHES=100  GATE_E3_TRIALS=100  GATE_FC_SCALE=1
-#   GATE_POWER_SCALE=1 (an extra multiplier on the power-loss control's 18 trials, for the I2 re-runs)
+#   GATE_POWER_SCALE=1 (an extra multiplier on the power-loss control's 30 trials, for the I2 re-runs)
 #   GATE_STEPS="list scope suite fc e3 c0 libfull"   (subset to run, in this order)
 #
 # One raw file per step, banked before anything reads it: <out>/<step>.txt, opening with a header
@@ -127,16 +127,28 @@ for s in $steps; do
       v=$(echo "$line" | sed -n 's/.*violations=\([0-9]*\).*/\1/p')
       got=CLEAN; [ "${v:-0}" -gt 0 ] && got=VIOLATIONS
       [ -z "$line" ] && got=NO-RESULT
+      # A CLEAN summary line is not a clean run: the test prints it BEFORE its last asserts (C1 COVERAGE from
+      # engine de5650e28, "no kill landed"), so a refused run read CLEAN here and PASSed. A CLEAN arm must
+      # also pass its test. (A VIOLATIONS arm fails at the violations assert, before either.)
+      if [ "$got" = CLEAN ]; then
+        if grep -q 'C1 COVERAGE' "$f"; then got=COVERAGE-REFUSED
+        elif [ "$(tests_passed "$f")" != 1 ] || [ "$(tests_failed "$f")" != 0 ]; then got=CLEAN-LINE-BUT-TEST-FAILED; fi
+      fi
       local pass=PASS fail=FAIL
       [ -n "${FC_EXPLORE:-}" ] && { pass=INFO; fail=INFO; }
       [ "$got" = "$expect" ] && row "$label" "$expect" "$got :: ${line#C1 }" $pass \
                              || row "$label" "$expect" "$got :: ${line#C1 }" $fail
     }
-    fc c1fc-mc-ack_before_pwrite VIOLATIONS FE_MUTANT=ack_before_pwrite FE_C1_TRIALS=$((6 * scale))
-    fc c1fc-md-fork_without_parent VIOLATIONS FE_MUTANT=fork_without_parent FE_C1_TRIALS=$((6 * scale))
-    fc c1fc-power-control CLEAN FE_C1_POWER=1 FE_C1_CLASS=full FE_C1_TRIALS=$((18 * scale * pscale))
-    fc c1fc-d0-control VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=off FE_C1_TRIALS=$((20 * scale))
-    fc c1fc-ma-no_flight_sync VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=no_flight_sync FE_C1_TRIALS=$((6 * scale))
+    # Trial counts: from engine de5650e28 (review 7 #8) a C1 run cycles the points its mode can reach and refuses
+    # unless every aimed point landed at least once (C1 COVERAGE). So an unaimed arm runs at least 2x its mode's
+    # reachable points (snapshot 15 -> 30, catalog with fuzzy checkpoints 20 -> 40; recover-kill given 30 as
+    # well); the mb arms aim one point (FE_C1_POINT) and keep 6. Before de5650e28 the extra trials are only more
+    # trials. A coverage refusal prints the summary line first; fc reads it as COVERAGE-REFUSED and FAILs.
+    fc c1fc-mc-ack_before_pwrite VIOLATIONS FE_MUTANT=ack_before_pwrite FE_C1_TRIALS=$((30 * scale))
+    fc c1fc-md-fork_without_parent VIOLATIONS FE_MUTANT=fork_without_parent FE_C1_TRIALS=$((30 * scale))
+    fc c1fc-power-control CLEAN FE_C1_POWER=1 FE_C1_CLASS=full FE_C1_TRIALS=$((30 * scale * pscale))
+    fc c1fc-d0-control VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=off FE_C1_TRIALS=$((30 * scale))
+    fc c1fc-ma-no_flight_sync VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=no_flight_sync FE_C1_TRIALS=$((30 * scale))
     fc c1fc-mb-ack_before_sync VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=5 FE_C1_TRIALS=$((6 * scale))
     # Linux delay arms, INFO (recorded, never a verdict). Runs 37242035491 and 37242461392 measured
     # them: delay 0 caught nothing in 10 of 12 cells (the kill lands before an early-acked waiter has
@@ -145,8 +157,8 @@ for s in $steps; do
     FC_EXPLORE=1 fc c1fc-mb-ack_before_sync-delay0 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=0 FE_C1_TRIALS=$((6 * scale))
     FC_EXPLORE=1 fc c1fc-mb-ack_before_sync-delay1 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=1 FE_C1_TRIALS=$((6 * scale))
     FC_EXPLORE=1 fc c1fc-mb-ack_before_sync-delay2 VIOLATIONS FE_C1_POWER=1 FE_C1_CLASS=full FE_MUTANT=ack_before_sync FE_C1_POINT=flight.before_log_sync FE_KILL_DELAY_MS=2 FE_C1_TRIALS=$((6 * scale))
-    fc c1fc-catalog CLEAN FE_C1_CATALOG=1 FE_C1_TRIALS=$((18 * scale))
-    fc c1fc-recover-kill CLEAN FE_C1_RECOVER_KILL=1 FE_C1_TRIALS=$((9 * scale)) ;;
+    fc c1fc-catalog CLEAN FE_C1_CATALOG=1 FE_C1_TRIALS=$((40 * scale))
+    fc c1fc-recover-kill CLEAN FE_C1_RECOVER_KILL=1 FE_C1_TRIALS=$((30 * scale)) ;;
   e3)
     for cat in 0 1; do
       envs=(FE_E3_TRIALS=$e3_trials FE_C1_CLASS=full)

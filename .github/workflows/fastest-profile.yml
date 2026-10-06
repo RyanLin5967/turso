@@ -7,7 +7,10 @@ name: fastest-profile
 #   - async: 0 flushes on the create path (NOT-RUN while the engine has no async class);
 #   - instructions per create (callgrind) <= 1.05 x the previous green run's sha, rebuilt and run on
 #     the same runner in the same job (its stored baseline artifact is the fallback);
-#   - no create-window syscall above the base's + 0.05 per op.
+#   - no create-window syscall above the base's + 0.05 per op;
+#   - at most 3 syscalls per create, absolute (DECISIONS 2026-10-05T02:54:27Z). Red at 675adbfb3 (10 per create),
+#     so the job is red until the engine meets it; the BASELINE still advances on a regression-green run (every
+#     gate but this one passes), and the base is the newest run that uploaded a baseline, not the newest green one.
 # Smoke sizes; nothing here is a credited latency.
 
 on:
@@ -88,16 +91,19 @@ jobs:
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
             echo "flamegraph_sha=$(git -C "$RUNNER_TEMP/FlameGraph" rev-parse HEAD)";
             perf --version; valgrind --version; strace -V | head -1; rustc -V; } | tee "$RAW/run-info.txt"
-      - name: Find the base (previous green run of this workflow on this branch)
+      - name: Find the base (the newest regression-green run of this workflow on this branch, this runner)
         id: base
         run: |
           base="${{ inputs.base_sha }}"
           prev=""
           if [ -z "$base" ]; then
-            # No green run yet prints nothing (run 37242461472 read "null null" and tried to check out "null").
-            row=$(gh run list -R "$GITHUB_REPOSITORY" --workflow fastest-profile.yml --branch fastest-branching \
-                    --status success -L 1 --json databaseId,headSha \
-                    -q 'if length == 0 then "" else (.[0] | "\(.databaseId) \(.headSha)") end' || true)
+            # The newest unexpired baseline artifact for this runner from fastest-branching: only a regression-green,
+            # unplanted run (or an explicit rebaseline) uploads one. Nothing found prints nothing (run 37242461472
+            # read "null null" and tried to check out "null").
+            row=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/artifacts" -f name="profile-baseline-${{ matrix.runner }}" \
+                    -f per_page=100 -q '[.artifacts[] | select(.expired == false and .workflow_run.head_branch == "fastest-branching")]
+                      | sort_by(.created_at) | reverse
+                      | if length == 0 then "" else (.[0] | "\(.workflow_run.id) \(.workflow_run.head_sha)") end' || true)
             if [ -n "$row" ]; then prev=${row%% *}; base=${row#* }; fi
           fi
           mkdir -p prev
@@ -159,8 +165,10 @@ jobs:
           rc=$?
           cat "$RAW/analysis/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # green for the BASELINE means regression-green: every gate but the absolute syscall budget passed
           green=0
-          [ $rc = 0 ] && [ "$(cat "$RAW/head.rc" 2>/dev/null)" = 0 ] && { [ ! -f "$RAW/base.rc" ] || [ "$(cat "$RAW/base.rc")" = 0 ]; } && green=1
+          [ "$(cat "$RAW/analysis/regression_green" 2>/dev/null)" = 1 ] && [ "$(cat "$RAW/head.rc" 2>/dev/null)" = 0 ] &&
+            { [ ! -f "$RAW/base.rc" ] || [ "$(cat "$RAW/base.rc")" = 0 ]; } && green=1
           echo "green=$green" >> "$GITHUB_OUTPUT"
           exit 0
       - name: Upload raw
@@ -170,7 +178,7 @@ jobs:
           name: profile-raw-${{ matrix.runner }}
           path: profile-raw/
           retention-days: 90
-      - name: Upload the baseline (green runs, or an explicit rebaseline; never a planted run)
+      - name: Upload the baseline (regression-green runs, or an explicit rebaseline; never a planted run)
         if: (steps.gate.outputs.green == '1' || inputs.rebaseline == 'true') && inputs.plant == ''
         uses: actions/upload-artifact@v4
         with:
