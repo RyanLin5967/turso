@@ -2323,3 +2323,38 @@ fn binary_results_are_encoded_as_their_described_type() {
     let r = a.x_binary("SELECT avg(id) FROM t");
     assert_eq!(r.err("binary numeric").code, "0A000");
 }
+
+/// Two sessions running pgbench-shaped transactions on the same row both commit: the second one's
+/// write waits for the first's commit, within the lock timeout, as PostgreSQL's row lock waits. At
+/// 472023b72 ordinary statements had no busy timeout, so the second write failed at once with
+/// 55P03 and pgbench at -c 2 aborted its clients (wire review 1 item 9).
+#[test]
+fn a_write_waits_for_another_sessions_commit() {
+    let dir = Scratch::new("busywrite");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "20000"]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    a.q("UPDATE t SET v = '0' WHERE id = 1").ok("reset");
+    a.q("BEGIN").ok("a begin");
+    a.q("UPDATE t SET v = v || 'a' WHERE id = 1").ok("a write");
+    let committer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        a.q("COMMIT").ok("a commit");
+        a
+    });
+    b.q("BEGIN").ok("b begin");
+    let t0 = Instant::now();
+    let r = b.q("UPDATE t SET v = v || 'b' WHERE id = 1");
+    let waited = t0.elapsed();
+    let mut a = committer.join().unwrap();
+    r.ok("b write, after a's commit");
+    assert!(
+        waited >= Duration::from_millis(250),
+        "b's write did not wait ({waited:?})"
+    );
+    b.q("COMMIT").ok("b commit");
+    assert_eq!(
+        a.q("SELECT v FROM t WHERE id = 1").single("both writes"),
+        "0ab"
+    );
+}
