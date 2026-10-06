@@ -76,7 +76,10 @@ STAMPER_SHELL=$BASHPID
 STAMP_SEQ=0
 stamper_fds_ok() { # the coproc's two fds are open in THIS shell and, where /proc says so, are the coproc's own pipes
   local f
-  for f in "${STAMPER[0]}" "${STAMPER[1]}"; do
+  for f in "${STAMPER[0]:-}" "${STAMPER[1]:-}"; do
+    # A number first: `>&word` with a non-numeric word (bash sets a closed coproc fd to -1) is `&>word`, which would
+    # create a file named after it (fifth re-review, finding 2).
+    [[ $f =~ ^[0-9]+$ ]] || return 1
     { true >&"$f"; } 2>/dev/null || { true <&"$f"; } 2>/dev/null || return 1
     if [ -d "/proc/$STAMPER_SHELL/fd" ]; then [ "/proc/$BASHPID/fd/$f" -ef "/proc/$STAMPER_SHELL/fd/$f" ] || return 1; fi
   done
@@ -92,9 +95,15 @@ clock_pair() {
     # SIGPIPE, not the caller. Replies with another nonce (a late answer to an earlier, timed-out call) are skipped.
     line=$( {
       printf '%s %s\n' "$nonce" "$name" >&"${STAMPER[1]}" || exit 1
+      # The whole reply must have the stamper's exact shape, not just this call's nonce: bash reads a pipe a byte at a
+      # time, so a concurrent reader (a process substitution runs beside its parent) could splice two replies; a
+      # spliced line fails the shape and the call falls back to one-shot (fifth re-review, finding 3). Callers must
+      # not stamp concurrently in any case.
+      d='[0-9]+\.[0-9]{9}'
+      want="^$nonce $name=$d ${name}_mono=$d ${name}_err=$d\$"
       for ((k = 0; k < 8; k++)); do
         IFS= read -r -t 2 l <&"${STAMPER[0]}" || exit 1
-        case $l in "$nonce $name="*) printf '%s' "${l#"$nonce "}"; exit 0 ;; esac
+        case $l in "$nonce "*) [[ $l =~ $want ]] && { printf '%s' "${l#"$nonce "}"; exit 0; }; exit 1 ;; esac
       done
       exit 1
     } 2>/dev/null )
