@@ -2310,6 +2310,74 @@ fn a_registry_hit_of_another_lease_setting_is_refused() {
     open_at(&path, DatabaseOpts::new()).expect("with the leased handle closed, the open works");
 }
 
+/// Review 4 #8: a registry hit must not hand an open that asks for one checkpoint mode a catalog
+/// instance running the other (an explicit Sharp would silently receive fuzzy checkpoints). Both
+/// directions, and the open works once the other handle is closed.
+#[test]
+fn a_registry_hit_of_another_checkpoint_mode_is_refused() {
+    use crate::branch::BranchCheckpoint;
+    let catalog = || {
+        DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: crate::branch::SyncClass::Fsync })
+    };
+    for (held, asked) in [(BranchCheckpoint::Fuzzy, BranchCheckpoint::Sharp), (BranchCheckpoint::Sharp, BranchCheckpoint::Fuzzy)] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ckpt-mode.db");
+        let first = open_at(&path, catalog().with_branch_checkpoint(held)).unwrap();
+        seed(&first.connect().unwrap(), 3);
+        let err = match open_at(&path, catalog().with_branch_checkpoint(asked)) {
+            Ok(_) => panic!("an open asking for {asked:?} received the {held:?} instance"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("checkpoint"), "refused for another reason: {err}");
+        drop(first);
+        open_at(&path, catalog().with_branch_checkpoint(asked)).expect("with the other handle closed, the open works");
+    }
+}
+
+/// Review 4 #8: `R11_CKPT` names the mode exactly ("fuzzy" or "sharp"); anything else refuses the
+/// open, where it silently meant fuzzy. A guard restores the variable.
+#[test]
+fn an_unknown_checkpoint_mode_in_the_environment_refuses_the_open() {
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("R11_CKPT", v),
+                None => std::env::remove_var("R11_CKPT"),
+            }
+        }
+    }
+    let _restore = Restore(std::env::var_os("R11_CKPT"));
+    std::env::set_var("R11_CKPT", "Sharp");
+    let dir = tempfile::TempDir::new().unwrap();
+    let opened = open_at(
+        &dir.path().join("ckpt-env.db"),
+        DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: crate::branch::SyncClass::Fsync }),
+    );
+    match opened {
+        Ok(_) => panic!("R11_CKPT=Sharp opened (as fuzzy)"),
+        Err(e) => assert!(matches!(e, LimboError::InvalidArgument(_)), "refused for another reason: {e}"),
+    }
+}
+
+/// Review 4 #8: S-12's refusal (the F7 splice arm and fuzzy checkpoints together) holds for a
+/// durable store, and a volatile one, which checkpoints nothing, opens.
+#[test]
+fn the_splice_arm_refuses_fuzzy_checkpoints_on_a_durable_store_only() {
+    use crate::branch::BranchCheckpoint;
+    let dir = tempfile::TempDir::new().unwrap();
+    let catalog = DatabaseOpts::new()
+        .with_branch_durability(BranchDurability::Catalog { sync: crate::branch::SyncClass::Fsync })
+        .with_branch_splice(true)
+        .with_branch_checkpoint(BranchCheckpoint::Fuzzy);
+    match open_at(&dir.path().join("splice-fuzzy.db"), catalog) {
+        Ok(_) => panic!("a catalog store opened with the splice arm and fuzzy checkpoints"),
+        Err(e) => assert!(e.to_string().contains("refused together"), "refused for another reason: {e}"),
+    }
+    let volatile = DatabaseOpts::new().with_branch_splice(true).with_branch_checkpoint(BranchCheckpoint::Fuzzy);
+    open_at(&dir.path().join("splice-volatile.db"), volatile).expect("a volatile splice store with fuzzy asked opens");
+}
+
 /// Open through `Database::open_async`, the registry's second hit path, driving its IO loop.
 fn open_async_at(path: &Path, opts: DatabaseOpts) -> Result<Arc<Database>> {
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
