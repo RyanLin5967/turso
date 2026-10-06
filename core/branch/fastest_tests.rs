@@ -4502,3 +4502,54 @@ fn a_commit_whose_flight_lands_after_a_fail_stop_is_refused() {
         assert!(writer.join().unwrap().is_err(), "catalog={catalog}: a commit whose flight landed after a fail-stop was acknowledged");
     }
 }
+
+// ---- engine review 9 #6: a sharp checkpoint's commit makes what it captured durable ----
+
+/// Engine review 9 #6: a sharp catalog checkpoint captures a fork still buffered (its waiter could
+/// not lead a flight: the checkpoint holds the store mutex), and its catalog commit makes that fork
+/// durable. A failure of the cut after the commit fail-stops the store, but the fork was durable
+/// before it: its waiter is told so, and a reopen has it. Before, the cut's failure reached the
+/// waiter as the fail-stop error, for a fork the next open brings back.
+#[test]
+fn a_sharp_checkpoint_whose_cut_fails_still_acknowledges_what_it_committed() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("sharpcut.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _anchor = trunk.fork_branch().unwrap().into_id();
+    // op1's flight in the air; op2 buffered behind it, its waiter waiting.
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_FLIGHT_TAKEN, O::Release);
+    let op1 = {
+        let db = db.clone();
+        std::thread::spawn(move || db.connect().and_then(|c| c.fork_branch()).map(|b| b.into_id()))
+    };
+    wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+    let flights = db.branches.group_counters()[0];
+    let lsn = db.branches.log_lsn_for_test();
+    let op2 = {
+        let db = db.clone();
+        std::thread::spawn(move || db.connect().and_then(|c| c.fork_branch()).map(|b| b.into_id()))
+    };
+    eventually("premise: op2 never buffered its fork", || db.branches.log_lsn_for_test() > lsn);
+    db.branch_failpoint(Some(BranchFailpoint::ReplacementSyncFails));
+    let sharp = {
+        let db = db.clone();
+        std::thread::spawn(move || db.branch_compact_now())
+    };
+    // The sharp checkpoint takes the store mutex and waits out op1's flight before it captures.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    hold.store(0, O::Release);
+    op1.join().unwrap().unwrap();
+    assert!(sharp.join().unwrap().is_err(), "premise: the sharp checkpoint's cut failed");
+    assert_eq!(
+        db.branches.group_counters()[0] - flights,
+        1,
+        "premise: op2 led no flight of its own (the checkpoint captured it buffered)"
+    );
+    let got = op2.join().unwrap();
+    assert!(got.is_ok(), "a fork the checkpoint's catalog commit made durable was reported failed: {:?}", got.err());
+    assert_fail_stopped(trunk.fork_branch().map(|x| x.into_id()), "the next fork after the failed cut");
+}
