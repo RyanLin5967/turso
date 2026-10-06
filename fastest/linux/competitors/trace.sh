@@ -84,7 +84,9 @@ fdsync_scan() {
         echo "hit $p ${f##*/} $fl $(readlink "/proc/$p/fd/${f##*/}" 2>/dev/null)" >>"$out.fdsync"
       fi
     done
-    echo "scanned $p $n" >>"$out.fdsync"
+    # A process caught exiting (zombie or dead, its files already closed) holds no fd and can write nothing: it is
+    # recorded as exiting, not as a scan of zero fds, and pid_roster leaves it out (third review, finding 8).
+    if [ "$n" = 0 ] && dead_task "/proc/$p"; then echo "exiting $p" >>"$out.fdsync"; else echo "scanned $p $n" >>"$out.fdsync"; fi
   done
 }
 
@@ -95,6 +97,7 @@ pid_roster() {
   local out=$1 p t cl
   shift
   for p in "$@"; do
+    dead_task "/proc/$p" && continue  # exiting: no syscall left to attribute
     cl=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) || continue
     for t in /proc/"$p"/task/*; do
       [ -e "$t" ] && echo "${t##*/} $p $cl"
