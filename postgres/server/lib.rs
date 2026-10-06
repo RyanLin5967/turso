@@ -565,14 +565,7 @@ impl Session {
                     return Ok(Response::Execution(Tag::new("ROLLBACK")));
                 }
                 TxVerb::RollbackTo => {}
-                _ => {
-                    return Err(error(
-                        "25P02",
-                        "current transaction is aborted, commands ignored until end of \
-                         transaction block"
-                            .to_string(),
-                    ))
-                }
+                _ => return Err(aborted_error()),
             }
         }
         match verb {
@@ -620,6 +613,29 @@ impl Session {
             st.aborted = false;
         }
         result
+    }
+
+    /// As in PostgreSQL, a failed block refuses to describe anything but its own end (25P02).
+    fn refuse_describe_if_aborted(&self, sql: &str) -> PgWireResult<()> {
+        if self.state().aborted && !TxVerb::of(sql).ends_block() {
+            return Err(PgWireError::UserError(aborted_error()));
+        }
+        Ok(())
+    }
+
+    /// Describe's prepare. In the extended protocol Describe is where a statement first meets the
+    /// engine, so a statement that fails to prepare inside a block aborts the block, as its
+    /// execution would (wire review 1 item 2).
+    fn describe_prepare(&self, sql: &str) -> PgWireResult<turso_core::Statement> {
+        let conn = self
+            .current(&mut self.state())
+            .map_err(PgWireError::UserError)?;
+        let in_tx = !conn.inner().get_auto_commit();
+        let stmt = conn.prepare(sql);
+        if stmt.is_err() && in_tx {
+            self.state().aborted = true;
+        }
+        stmt.map_err(engine_error)
     }
 
     fn engine_statement(
@@ -909,6 +925,11 @@ impl TxVerb {
             TxVerb::Other
         }
     }
+
+    /// The statements a failed block still accepts.
+    fn ends_block(self) -> bool {
+        matches!(self, TxVerb::Commit | TxVerb::Rollback | TxVerb::RollbackTo)
+    }
 }
 
 fn arity(call: &PgBranchCall, n: usize) -> SqlResult<()> {
@@ -1030,6 +1051,14 @@ fn error(code: &str, message: String) -> Box<ErrorInfo> {
         code.to_string(),
         message,
     ))
+}
+
+fn aborted_error() -> Box<ErrorInfo> {
+    error(
+        "25P02",
+        "current transaction is aborted, commands ignored until end of transaction block"
+            .to_string(),
+    )
 }
 
 fn fatal(code: &str, message: &str) -> PgWireError {
@@ -1217,14 +1246,12 @@ impl ExtendedQueryHandler for Session {
             .iter()
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
+        self.refuse_describe_if_aborted(&target.statement)?;
         if let Some(call) = branch_call(&target.statement) {
             let fields = branch_call_fields(&call, &Format::UnifiedText);
             return Ok(DescribeStatementResponse::new(param_types, fields));
         }
-        let conn = self
-            .current(&mut self.state())
-            .map_err(PgWireError::UserError)?;
-        let stmt = conn.prepare(&target.statement).map_err(engine_error)?;
+        let stmt = self.describe_prepare(&target.statement)?;
         let fields = build_field_info(&stmt, &Format::UnifiedText);
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
@@ -1237,16 +1264,12 @@ impl ExtendedQueryHandler for Session {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        self.refuse_describe_if_aborted(&portal.statement.statement)?;
         if let Some(call) = branch_call(&portal.statement.statement) {
             let fields = branch_call_fields(&call, &portal.result_column_format);
             return Ok(DescribePortalResponse::new(fields));
         }
-        let conn = self
-            .current(&mut self.state())
-            .map_err(PgWireError::UserError)?;
-        let stmt = conn
-            .prepare(&portal.statement.statement)
-            .map_err(engine_error)?;
+        let stmt = self.describe_prepare(&portal.statement.statement)?;
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
     }
