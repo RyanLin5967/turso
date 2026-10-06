@@ -3209,3 +3209,42 @@ fn a_correlated_generate_series_column_is_scoped_to_its_select() {
         "42702"
     );
 }
+
+/// COPY FROM runs inside whatever block it is in, as PostgreSQL's does: a multi-statement query's
+/// implicit block, a pipeline's, a client's BEGIN (whose ROLLBACK undoes it and COMMIT keeps it).
+/// A failed COPY in a block undoes its own rows and fails the block. Its own BEGIN was refused
+/// inside any open transaction ("cannot start a transaction within a transaction"), so COPY failed
+/// in every implicit block since 7bc7dab70, and in every client block (wire review 4 item 2).
+#[test]
+fn copy_from_runs_inside_the_block_it_is_in() {
+    let dir = Scratch::new("copyblock");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE cp(id INT, v TEXT)").ok("cp");
+    let good = dir.0.join("good.tsv");
+    std::fs::write(&good, "1\tone\n2\ttwo\n").unwrap();
+    let bad = dir.0.join("bad.tsv");
+    std::fs::write(&bad, "5\tfive\nnot-a-number\tx\n").unwrap();
+    let copy = format!("COPY cp FROM '{}'", good.display());
+    let count = |a: &mut Wire| a.q("SELECT count(*) FROM cp").single("count");
+    a.q(&format!("{copy}; SELECT 1"))
+        .ok("COPY in a multi-statement query");
+    assert_eq!(count(&mut a), "2");
+    a.q("BEGIN").ok("begin");
+    let r = a.q(&copy).ok("COPY in a block");
+    assert_eq!(r.status, b'T');
+    a.q("ROLLBACK").ok("rollback");
+    assert_eq!(count(&mut a), "2", "ROLLBACK kept the block's COPY");
+    a.q("BEGIN").ok("begin");
+    a.q(&copy).ok("COPY in a block");
+    a.q("COMMIT").ok("commit");
+    assert_eq!(count(&mut a), "4", "COMMIT lost the block's COPY");
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO cp VALUES (9, 'nine')").ok("insert");
+    let r = a.q(&format!("COPY cp FROM '{}'", bad.display()));
+    assert!(r.error.is_some(), "a COPY with a bad row loaded it");
+    assert_eq!(r.status, b'E', "the failed COPY did not fail the block");
+    let r = a.q("COMMIT").ok("the block's end");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(count(&mut a), "4", "the failed block kept rows");
+}
