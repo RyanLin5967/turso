@@ -109,32 +109,52 @@ untraced_tasks() { # untraced_tasks STRACEPID PID... -> each live task "<pid>/ta
 # bgwriters) of run 37242277040 have no scan line at all (second review, finding 1). stracecount now requires a
 # "scanned" line with at least one fd for every process in the attach roster.
 fdsync_scan() {
-  local out=$1 p f k v fl n
+  local out=$1 p f k v fl n fdd t try ok hits
   shift
   : >"$out.fdsync"
-  local fdd t
   for p in "$@"; do
     if [ ! -d "/proc/$p" ]; then echo "gone $p" >>"$out.fdsync"; continue; fi
-    # The fd table is shared by the threads: read it through a LIVE task, since a leader that called pthread_exit
-    # shows an empty /proc/PID/fdinfo while its other threads still hold every fd (fifth review, finding 5).
-    fdd="/proc/$p/fdinfo"
-    for t in /proc/"$p"/task/*; do
-      [ -e "$t" ] || continue
-      dead_task "$t" || { fdd="$t/fdinfo"; break; }
-    done
-    n=0
-    for f in "$fdd"/*; do
-      fl=
-      { while read -r k v _; do [ "$k" = "flags:" ] && { fl=$v; break; }; done; } 2>/dev/null <"$f" || continue
-      [ -n "$fl" ] || continue
-      n=$((n + 1))
-      if (((8#$fl & 8#04010000) != 0)); then
-        echo "hit $p ${f##*/} $fl $(readlink "${fdd%/fdinfo}/fd/${f##*/}" 2>/dev/null)" >>"$out.fdsync"
+    ok=0
+    for ((try = 1; try <= 3; try++)); do
+      # The fd table is shared by the threads: read it through the LEADER while it lives, else through another live
+      # task, since a leader that called pthread_exit shows an empty fdinfo while its other threads still hold every
+      # fd (fifth review, finding 5). The first live task in glob order could be a short-lived thread (re-review,
+      # finding 4).
+      fdd=
+      if ! dead_task "/proc/$p/task/$p"; then
+        fdd="/proc/$p/task/$p/fdinfo"
+      else
+        for t in /proc/"$p"/task/*; do
+          [ -e "$t" ] || continue
+          dead_task "$t" || { fdd="$t/fdinfo"; break; }
+        done
       fi
+      [ -n "$fdd" ] || break  # no live task left: exiting
+      n=0 hits=
+      for f in "$fdd"/*; do
+        fl=
+        { while read -r k v _; do [ "$k" = "flags:" ] && { fl=$v; break; }; done; } 2>/dev/null <"$f" || continue
+        [ -n "$fl" ] || continue
+        n=$((n + 1))
+        if (((8#$fl & 8#04010000) != 0)); then
+          hits+="hit $p ${f##*/} $fl $(readlink "${fdd%/fdinfo}/fd/${f##*/}" 2>/dev/null)"$'\n'
+        fi
+      done
+      # The scan holds only if the task it read through is still alive afterwards: one that exited mid-scan made
+      # every later fd read fail and be skipped as "closed" (re-review, finding 4). Then rescan through another.
+      if [ -d "$fdd" ] && ! dead_task "${fdd%/fdinfo}"; then ok=1; break; fi
     done
     # A process caught exiting (zombie or dead, its files already closed) holds no fd and can write nothing: it is
-    # recorded as exiting, not as a scan of zero fds, and pid_roster leaves it out (third review, finding 8).
-    if [ "$n" = 0 ] && dead_proc "$p"; then echo "exiting $p" >>"$out.fdsync"; else echo "scanned $p $n" >>"$out.fdsync"; fi
+    # recorded as exiting, not as a scan of zero fds, and pid_roster leaves it out (third review, finding 8). A live
+    # process whose every scan lost its task is "unscanned", which stracecount refuses (no "scanned" line).
+    if [ $ok = 1 ]; then
+      printf '%s' "$hits" >>"$out.fdsync"
+      if [ "$n" = 0 ] && dead_proc "$p"; then echo "exiting $p"; else echo "scanned $p $n"; fi >>"$out.fdsync"
+    elif dead_proc "$p"; then
+      echo "exiting $p" >>"$out.fdsync"
+    else
+      echo "unscanned $p (the task read through exited mid-scan, 3 tries)" >>"$out.fdsync"
+    fi
   done
 }
 
