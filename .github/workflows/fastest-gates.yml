@@ -18,6 +18,9 @@ on:
       fc_scale:
         description: "multiplier on every C1 fire-check's trial count"
         default: "1"
+      c0_reps:
+        description: "c0rep step: repetitions of the C0 test per arm"
+        default: "40"
       power_scale:
         description: "extra multiplier on the power-loss control's trials (I2 re-runs)"
         default: "1"
@@ -191,6 +194,7 @@ jobs:
           GATE_E3_TRIALS: ${{ inputs.e3_trials || '100' }}
           GATE_FC_SCALE: ${{ inputs.fc_scale || '1' }}
           GATE_POWER_SCALE: ${{ inputs.power_scale || '1' }}
+          GATE_C0_REPS: ${{ inputs.c0_reps || '40' }}
           GATE_BIN_RAW: dist/turso_core-lib-test-raw
         run: |
           chmod +x dist/turso_core-lib-test-default dist/turso_core-lib-test-raw

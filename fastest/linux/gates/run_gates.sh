@@ -166,6 +166,36 @@ for s in $steps; do
     p=$(tests_passed "$f"); fl=$(tests_failed "$f")
     if [ "${p:-0}" -eq 2 ] && [ "${fl:-1}" -eq 0 ]; then v=PASS; else v=FAIL; fi
     row c0-d2 "2 passed (snapshot+catalog)" "passed=${p:-none} failed=${fl:-none} $(grep -o 'C0 catalog=.*mismatches=[0-9]*' "$f" | tr '\n' ' ')" $v ;;
+  c0rep)
+    # The C0 differential test repeated (GATE_C0_REPS per arm, default 40; seed varied per rep) in the
+    # arms where it escaped on arm64 (runs 37242035491, 37242461392, 37254760726: "driver N: Database
+    # schema changed", mismatches=1, about 1 in 200 executions): the rate per arch and arm, with every
+    # failing rep's whole output kept. Default size (FE_C0_OPS 3000, class fsync), as in the suite arms.
+    reps=${GATE_C0_REPS:-40}
+    for arm in all splice cat; do
+      envs=()
+      case $arm in splice) envs=(R11_SPLICE=1) ;; cat) envs=(R11_BRANCH_CATALOG=1) ;; esac
+      f="$out/c0rep-$arm.txt"
+      : > "$f"
+      fails=0 escapes=0 runs=0
+      for i in $(seq 1 "$reps"); do
+        r="$out/c0rep-$arm-$i.tmp"
+        ( cd "$core" && env "${envs[@]+"${envs[@]}"}" FE_C0_SEED=$((0xC0FFEE + i)) timeout 900 "$bin" \
+            branch::crash_tests::c0_differential_model --test-threads=1 --nocapture ) > "$r" 2>&1
+        rc=$?
+        runs=$((runs + 1))
+        p=$(tests_passed "$r"); fl=$(tests_failed "$r")
+        printf '# rep %s seed %s rc=%s passed=%s failed=%s %s\n' "$i" $((0xC0FFEE + i)) $rc "${p:-none}" "${fl:-none}" \
+          "$(grep -o 'C0 catalog=[a-z]* .*mismatches=[0-9]*' "$r" | sed 's/ ops=.*mismatches=/ mismatches=/' | tr '\n' ' ')" >> "$f"
+        if [ "${p:-0}" != 2 ] || [ "${fl:-1}" != 0 ]; then
+          fails=$((fails + 1))
+          grep -q 'Database schema changed' "$r" && escapes=$((escapes + 1))
+          { echo "## rep $i full output"; cat "$r"; } >> "$out/c0rep-$arm-failures.txt"
+        fi
+        rm -f "$r"
+      done
+      row "c0rep-$arm" "0 failures in $runs reps (2 C0 tests each)" "failures=$fails schema_changed=$escapes runs=$runs" INFO
+    done ;;
   *) row "$s" known-step unknown FAIL ;;
   esac
 done
