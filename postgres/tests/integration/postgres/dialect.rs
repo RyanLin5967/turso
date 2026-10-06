@@ -2161,7 +2161,9 @@ fn test_postgres_generate_series(db: TempDatabase) {
         .unwrap();
 
     let mut stmt = conn
-        .prepare("SELECT items.name, gs FROM items, generate_series(1, 2) AS gs ORDER BY items.id, gs")
+        .prepare(
+            "SELECT items.name, gs FROM items, generate_series(1, 2) AS gs ORDER BY items.id, gs",
+        )
         .unwrap();
     let mut results: Vec<String> = Vec::new();
     loop {
