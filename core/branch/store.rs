@@ -2170,10 +2170,9 @@ struct Captured {
     /// record the capture covers lies below it. A fuzzy checkpoint commits only once all of it is
     /// durable in `settle_class` (review 4 #1, review 6 #3 (b)); the deferred frees mature at it.
     deferred_lsn: u64,
-    /// The journal's own class: what an operation the capture covers was acknowledged in.
-    log_class: SyncClass,
     /// The class a fuzzy checkpoint waits for `deferred_lsn` in before its commit (review 6 #3 (b)):
-    /// `log_class`, raised to Fsync when the log's rewrites sync, so a flight of the group (an
+    /// the journal's own class (what an operation the capture covers was acknowledged in), raised
+    /// to Fsync when the log's rewrites sync, so a flight of the group (an
     /// upgrade one when nothing is buffered, which takes the dirty arena) syncs every slot a D0
     /// flight left unsynced before the catalog names it.
     settle_class: SyncClass,
@@ -7407,7 +7406,6 @@ impl StoreInner {
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: self.journal.as_ref().map_or(self.sync, Journal::rewrite_class),
-            log_class: self.journal.as_ref().map_or(self.sync, Journal::sync_class),
             settle_class,
             fail_stop: self.fail_stop.clone(),
             // fastest-engine mutant `names_taken_at_capture` (test builds only): as before review
