@@ -42,15 +42,18 @@ require_port_free() {
   # Linux: ANY socket bound to the port blocks the server's bind, not only a listener -- e.g. a client that drew it as
   # its ephemeral source port (55432, 55433 and 53306 sit inside 32768-60999). Lane fastest-linux's T3 dry run
   # 37256446468 failed "could not bind ... Address already in use" 80 ms after the listener-only check passed. The
-  # workflow also reserves these ports (net.ipv4.ip_local_reserved_ports). TIME-WAIT is left out: PG and Go set
-  # SO_REUSEADDR on their listeners, so it does not block them.
+  # workflow also reserves these ports (net.ipv4.ip_local_reserved_ports). Every state counts, TIME-WAIT included
+  # (whether SO_REUSEADDR on only the new socket gets past one is not established here: refusing costs a loud
+  # failure, never a wrong count -- fourth review, finding 5). On Linux a missing ss refuses; the Mac has no ss.
   if command -v ss >/dev/null 2>&1; then
     # Callers run under set -euo pipefail: a filter that matches nothing must not fail the assignment (grep -v did,
     # and killed every server start of run 37399197723 without a message), and an ss that fails must refuse.
     local s
     s=$(ss -Htan "( sport = :$1 )" 2>&1) || die "REFUSED: ss could not check port $1: $s"
-    s=$(printf '%s\n' "$s" | awk 'NF && $1 != "TIME-WAIT"')
+    s=$(printf '%s\n' "$s" | awk 'NF')
     [ -z "$s" ] || die "REFUSED: port $1 is bound by another socket: $(printf '%s\n' "$s" | head -1)"
+  elif [ "$(uname -s)" = Linux ]; then
+    die "REFUSED: no ss to check port $1 for bound sockets"
   fi
 }
 

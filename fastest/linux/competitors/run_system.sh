@@ -261,7 +261,7 @@ server_main() {
       pass "Linux PG refuses wal_sync_method=fsync_writethrough ($(grep -m1 'invalid value' "$RAW/fsync_writethrough-probe.txt" | cut -c1-160); $(tail -1 "$RAW/fsync_writethrough-probe.txt"))"
     fi
   fi
-  srv start "$DATA" | tee "$RAW/server-start.txt" || { fail "server start"; return; }
+  srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
   srv seed "$DATA" "$ROWS" | tee "$RAW/seed.txt" || { fail "seed"; return; }
   if [ "$KIND" = pg ]; then
     srv settings "$DATA" >"$RAW/pg_settings.tsv" || fail "pg_settings dump"
