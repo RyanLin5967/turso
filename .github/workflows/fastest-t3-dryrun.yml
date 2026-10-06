@@ -54,12 +54,14 @@ jobs:
     steps:
       - name: The one command, as on a rented box
         run: |
+          # the step shell is bash -e: a failing pipeline must be caught with ||, or the rc and the wall time are
+          # lost (run 37517239631: every failed job ended before rc=$?, so no t3-wall.txt)
           set -o pipefail
           start=$(date +%s)
+          rc=0
           curl -sSfL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/fastest/linux/t3/t3run.sh" \
             | bash -s -- --sha "$GITHUB_SHA" --out "$HOME/t3-out" --dry-run --block "${{ matrix.block }}" \
-                ${PLANT:+--plant "$PLANT"} --manifest "${{ inputs.manifest || 'fastest/linux/t3/cells-smoke.tsv' }}"
-          rc=$?
+                ${PLANT:+--plant "$PLANT"} --manifest "${{ inputs.manifest || 'fastest/linux/t3/cells-smoke.tsv' }}" || rc=$?
           echo "one-command wall seconds: $(( $(date +%s) - start )) rc=$rc block=${{ matrix.block }} plant=${PLANT:-none}" | tee "$HOME/t3-wall.txt"
           echo "$rc" > "$HOME/t3-rc.txt"
           # a planted run must fail (rc 1); the Summary step checks it failed for the planted reason
@@ -67,9 +69,9 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          cat "$HOME/t3-wall.txt" 2>/dev/null
-          cat "$HOME/t3-out/stages.tsv" 2>/dev/null
-          { echo '```'; cat "$HOME/t3-out/stages.tsv" 2>/dev/null; cat "$HOME/t3-wall.txt" 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat "$HOME/t3-wall.txt" 2>/dev/null || echo "no t3-wall.txt"
+          cat "$HOME/t3-out/stages.tsv" 2>/dev/null || echo "no stages.tsv"
+          { echo '```'; cat "$HOME/t3-out/stages.tsv" "$HOME/t3-wall.txt" 2>/dev/null || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           # Complete raws are the runner's exit criterion; a dry run also fails on any failed cell check,
           # because a harness defect found here is one the rental would pay for.
           python3 - "$HOME/t3-out/summary.json" <<'PY'

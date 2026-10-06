@@ -238,6 +238,13 @@ v3batch() { # v3batch before|after DIR
   env "${env[@]}" timeout 1800 bash "$L/v3/run.sh" "$DIST/v3floor" "$dir" "$o/v3-$when" 200 > "$o/v3-$when.txt" 2>&1
   rc=$?
   echo "$when rc=$rc" >> "$o/v3.rc"
+  # brd only (dry runs): a VOID batch with complete raws is recorded, not a failed stage. brd has no drive, so the
+  # probe's timing control (fsync vs no-sync p50 ratio) cannot discriminate there: dry run 37517239631 read ow4k
+  # 9.5 against its threshold of 10 on xfs/brd. Every other block, and any other rc, keeps item 5's rule.
+  if [ $rc = 3 ] && [ "$BLOCK" = brd ] && [ -f "$o/v3-$when/summary.json" ] && [ -f "$o/v3-$when/raw.tsv" ]; then
+    echo "V3 $when batch on $V3CELL (brd): VOID recorded, not a stage failure (smoke; no drive behind brd)"
+    return 0
+  fi
   [ $rc = 0 ] || { echo "V3 $when batch on $V3CELL: rc $rc (run.sh: $(tail -1 "$o/v3-$when.txt"))"; return 1; }
   [ -f "$o/v3-$when/summary.json" ] && [ -f "$o/v3-$when/raw.tsv" ] ||
     { echo "V3 $when batch on $V3CELL: rc 0 but no summary.json or raw.tsv"; return 1; }
