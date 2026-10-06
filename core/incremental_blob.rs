@@ -52,7 +52,10 @@ fn pump_step(stmt: &mut Statement, pager: &Pager) -> Result<StepOutcome> {
         match stmt.step()? {
             StepResult::Row => return Ok(StepOutcome::Row),
             StepResult::Done => return Ok(StepOutcome::Done),
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => pager.io.step()?,
+            StepResult::IO | StepResult::Yield => pager.io.step()?,
+            StepResult::Sleep { duration } => {
+                crate::statement::wait_out_busy(&*pager.io, duration)?
+            }
             StepResult::Interrupt | StepResult::Busy => return Err(LimboError::Busy),
         }
     }

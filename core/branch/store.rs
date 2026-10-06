@@ -9604,7 +9604,7 @@ impl BranchStore {
 /// retained versions and indexes.
 #[cfg(test)]
 mod sota_index_tests {
-    use super::sota_helpers::{crash_image, image, open_store, Mode, Rng, MODES, PAGE};
+    use super::sota_helpers::{crash_image, image, open_store, splice_arm, Mode, Rng, MODES, PAGE};
     use super::*;
     use std::collections::HashSet;
 
@@ -9825,7 +9825,7 @@ mod sota_index_tests {
 /// branch must read every page as before, from the same slot set, with consistent indexes.
 #[cfg(test)]
 mod sota_tree_tests {
-    use super::sota_helpers::{crash_image, image, open_store, Mode, Rng, MODES, PAGE};
+    use super::sota_helpers::{crash_image, image, open_store, splice_arm, Mode, Rng, MODES, PAGE};
     use super::*;
 
     const PAGES: u32 = 6;
