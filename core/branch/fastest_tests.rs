@@ -2250,49 +2250,165 @@ fn a_catalog_store_names_its_catalog_and_refuses_a_missing_arena() {
 // ---- review 3 #1 (= skill 2 #1): a pre-image kept by a refused decision pass is still made durable
 // before the commit's frames ----
 
-/// Review 3 #1: a trunk commit whose decision pass is refused after it kept page P's pre-image, and
-/// retried, takes no decision for P again (P's written epoch is the commit's own). The pre-image's
-/// record must still be durable before the commit's frames: when the process then dies with nothing
-/// else flushed, the live child reads its fork-point row after the reopen. Second arm: the refused
-/// transaction rolls back, and a later one rewrites the same page.
-#[test]
-fn a_pre_image_kept_by_a_refused_decision_pass_is_durable_before_the_commit() {
-    let _s = serial();
-    for catalog in [false, true] {
-        for rollback in [false, true] {
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = dir.path().join("retain-floor.db");
-            let (child, incarnation) = {
-                let db = open_at(&path, opts(catalog, SyncClass::Fsync));
-                let a = db.connect().unwrap();
-                seed_wide(&a);
-                let child = a.fork_branch().unwrap();
-                db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
-                if rollback {
-                    a.execute("BEGIN").unwrap();
-                    a.execute("UPDATE t SET v = 'refused' WHERE id = 3").unwrap();
-                    let refused = a.execute("COMMIT");
-                    assert!(matches!(refused, Err(LimboError::Busy)), "premise: {refused:?}");
-                    let _ = a.execute("ROLLBACK");
-                    write_v(&a, 3, "new");
-                } else {
-                    let mut stmt = a.prepare("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
-                    assert!(matches!(stmt.run_ignore_rows(), Err(LimboError::Busy)), "premise");
-                    stmt.run_ignore_rows().unwrap();
-                }
-                let id = child.into_id();
-                // The process ends here: nothing else is flushed.
-                (id, db.incarnation)
-            };
-            let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
-            let b = db.branch(child).unwrap();
-            assert_eq!(
-                read_wide(&b.connect().unwrap(), 3),
-                "trunk-3",
-                "catalog={catalog} rollback={rollback}: the child reads the trunk's new row after a crash"
-            );
+/// Review 3 #1, hardened by review 5 #3: a trunk commit whose decision pass is refused after it kept
+/// page P's pre-image, and is retried, takes no decision for P again (P's written epoch is the
+/// commit's own). The pre-image's record must still be durable before the commit's frames: the
+/// process is then killed (forked child, `_exit`: nothing more flushed, no destructor runs), and
+/// after the reopen the live child reads its fork-point row. Premises: the refused pass kept exactly
+/// one pre-image, the retry none (or, in the refused-probe arm, only the page it had not reached),
+/// and the trunk read the new row before the kill. Arms: the statement retried; the refused
+/// transaction rolled back and a later one rewriting the page; and (catalog) the refusal a catalog
+/// probe of the commit's SECOND page makes after its first page was kept. Mutant `no_retain_floor`
+/// must fail every arm.
+///
+/// FLAGGED TEST EDIT (lead-directed, review 5 #3): this replaces the single four-arm test (whose
+/// first failing arm hid the others), ending its process by a kill instead of a drop, with the
+/// premise asserts above and the refused-probe arm added.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Refusal {
+    Retry,
+    Rollback,
+    SecondPageProbe,
+}
+
+fn a_refused_decision_pass_survives_a_kill(name: &str, catalog: bool, refusal: Refusal) {
+    use crate::branch::fork_driver;
+    let Some(sentinel) = fork_driver::alone(name) else {
+        return;
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("retain-floor.db");
+    let id_file = dir.path().join("child-id");
+    // SAFETY: the child runs the workload and `_exit`s; it never returns into the harness.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let id = refused_pass_workload(&path, catalog, refusal);
+            std::fs::write(&id_file, id.0.to_string()).unwrap();
+        }))
+        .map_or(100, |()| 0);
+        // SAFETY: ends the child as a kill would: nothing more is flushed, no destructor runs.
+        unsafe { libc::_exit(code) };
+    }
+    let code = fork_driver::exit_code(pid);
+    assert_eq!(code, 0, "catalog={catalog} {refusal:?}: the workload failed in the child (100: a panic)");
+    let child = BranchId(std::fs::read_to_string(&id_file).unwrap().parse().unwrap());
+    let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+    let c = db.branch(child).unwrap().connect().unwrap();
+    assert_eq!(read_wide(&c, 3), "trunk-3", "catalog={catalog} {refusal:?}: the child reads the trunk's new row after a kill");
+    if refusal == Refusal::SecondPageProbe {
+        assert_eq!(read_wide(&c, 40), "trunk-40", "catalog={catalog} {refusal:?}: row 40");
+    }
+    fork_driver::finished(&sentinel);
+}
+
+/// The forked child's part: the refused pass and its retry, then nothing more. Returns the child.
+fn refused_pass_workload(path: &Path, catalog: bool, refusal: Refusal) -> BranchId {
+    let retained = |db: &Arc<Database>| db.branch_stats().unwrap().work.trunk_pre_images_retained;
+    let mut db = open_at(path, opts(catalog, SyncClass::Fsync));
+    let a = db.connect().unwrap();
+    seed_wide(&a);
+    let child = a.fork_branch().unwrap().into_id();
+    let mut a = a;
+    if refusal == Refusal::SecondPageProbe {
+        // Reopened, so no page's written epoch is known; the child's point read of row 3 dates
+        // row 3's page (and every page above it), and leaves row 40's leaf to the commit's probe.
+        db.branch_compact_now().unwrap();
+        let incarnation = db.incarnation;
+        drop(a);
+        drop(db);
+        db = reopen(path, opts(catalog, SyncClass::Fsync), incarnation);
+        // The handle is kept, and detached again after the read: dropped, it would release the child.
+        let b = db.branch(child).unwrap();
+        let c = b.connect().unwrap();
+        c.prepare("SELECT v FROM t WHERE id = 3").unwrap().run_collect_rows().unwrap();
+        drop(c);
+        let _ = b.into_id();
+        a = db.connect().unwrap();
+    }
+    let before = retained(&db);
+    match refusal {
+        Refusal::Retry => {
+            db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+            let mut stmt = a.prepare("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+            assert!(matches!(stmt.run_ignore_rows(), Err(LimboError::Busy)), "premise: the pass was refused");
+            assert_eq!(retained(&db) - before, 1, "premise: the refused pass kept the pre-image");
+            stmt.run_ignore_rows().unwrap();
+            assert_eq!(retained(&db) - before, 1, "premise: the retry kept nothing more");
+        }
+        Refusal::Rollback => {
+            db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+            a.execute("BEGIN").unwrap();
+            a.execute("UPDATE t SET v = 'refused' WHERE id = 3").unwrap();
+            assert!(matches!(a.execute("COMMIT"), Err(LimboError::Busy)), "premise: the pass was refused");
+            assert_eq!(retained(&db) - before, 1, "premise: the refused pass kept the pre-image");
+            let _ = a.execute("ROLLBACK");
+            write_v(&a, 3, "new");
+        }
+        Refusal::SecondPageProbe => {
+            db.branch_failpoint(Some(BranchFailpoint::TrunkProbeBusy));
+            let mut stmt = a.prepare("UPDATE t SET v = 'new' WHERE id IN (3, 40)").unwrap();
+            assert!(matches!(stmt.run_ignore_rows(), Err(LimboError::Busy)), "premise: the probe was refused");
+            assert_eq!(retained(&db) - before, 1, "premise: the first page was kept before the refusal");
+            stmt.run_ignore_rows().unwrap();
+            assert_eq!(retained(&db) - before, 2, "premise: the retry kept only the second page");
+            assert_eq!(read_wide(&a, 40), "new", "premise: the trunk reads row 40's new value");
         }
     }
+    assert_eq!(read_wide(&a, 3), "new", "premise: the trunk reads the new row");
+    // The process ends here, with nothing else flushed.
+    child
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_decision_pass_survives_a_kill_snapshot_retry() {
+    a_refused_decision_pass_survives_a_kill(
+        "branch::fastest_tests::a_refused_decision_pass_survives_a_kill_snapshot_retry",
+        false,
+        Refusal::Retry,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_decision_pass_survives_a_kill_snapshot_rollback() {
+    a_refused_decision_pass_survives_a_kill(
+        "branch::fastest_tests::a_refused_decision_pass_survives_a_kill_snapshot_rollback",
+        false,
+        Refusal::Rollback,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_decision_pass_survives_a_kill_catalog_retry() {
+    a_refused_decision_pass_survives_a_kill(
+        "branch::fastest_tests::a_refused_decision_pass_survives_a_kill_catalog_retry",
+        true,
+        Refusal::Retry,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_decision_pass_survives_a_kill_catalog_rollback() {
+    a_refused_decision_pass_survives_a_kill(
+        "branch::fastest_tests::a_refused_decision_pass_survives_a_kill_catalog_rollback",
+        true,
+        Refusal::Rollback,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_decision_pass_survives_a_kill_catalog_second_page_probe() {
+    a_refused_decision_pass_survives_a_kill(
+        "branch::fastest_tests::a_refused_decision_pass_survives_a_kill_catalog_second_page_probe",
+        true,
+        Refusal::SecondPageProbe,
+    );
 }
 
 // ---- review 3 #2: a catalog probe refused part-way is made again, not skipped for the process ----

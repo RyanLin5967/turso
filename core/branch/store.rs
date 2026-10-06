@@ -4728,12 +4728,15 @@ impl BranchStore {
     }
 
     /// The copy decision for one model-test page write, as a one-page trunk commit decided at once:
-    /// for the store's model tests, which drive the store without a pager.
+    /// for the store's model tests, which drive the store without a pager. Returns what the commit's
+    /// barrier must make durable (`begin_trunk_commit`), as the pager's commit is handed it (review
+    /// 5 #3: a barrier that flushes everything buffered hides a decision that leaves its pre-image
+    /// out).
     #[cfg(test)]
-    pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) -> Result<()> {
+    pub(crate) fn first_write_trunk(&self, page: u32, pre_image: &[u8]) -> Result<u64> {
         let decided = self.begin_trunk_commit([(page, Some(pre_image))]);
         self.end_trunk_commit();
-        decided.map(|_| ())
+        decided
     }
 
     /// One captured page's decision at `epoch` (see `begin_trunk_commit`): if a live child forked
@@ -4812,13 +4815,6 @@ impl BranchStore {
         }
         trunk.written.insert(page, epoch);
         Ok(())
-    }
-
-    /// The barrier as the store's model tests drive it, with no pager: everything buffered so far.
-    #[cfg(test)]
-    pub(crate) fn durability_barrier(&self, trunk: SyncClass) -> Result<()> {
-        let required = self.inner.lock().journal.as_ref().map_or(0, Journal::lsn);
-        self.durability_barrier_to(trunk, required)
     }
 
     /// Make what a trunk commit relies on durable (`required`, from `begin_trunk_commit`).
@@ -8607,6 +8603,8 @@ mod sota_index_tests {
                     epoch += 1;
                 }
                 0..=5 => {
+                    // What the commit's barrier must cover, as the pager's commit is handed it.
+                    let mut required = store.barrier_floor();
                     for _ in 0..=rng.below(3) {
                         let page = rng.below(PAGES as u64) as u32;
                         if store.trunk_has_children() {
@@ -8617,13 +8615,13 @@ mod sota_index_tests {
                                 }
                                 written.insert(page, epoch);
                             }
-                            store.first_write_trunk(page, &image(current[&page])).unwrap();
+                            required = required.max(store.first_write_trunk(page, &image(current[&page])).unwrap());
                         }
                         generation += 1;
                         current.insert(page, generation);
                     }
                     // The trunk commit: its barrier makes the buffered pre-image records durable.
-                    store.durability_barrier(SyncClass::Off).unwrap();
+                    store.durability_barrier_to(SyncClass::Off, required).unwrap();
                 }
                 _ if !live.is_empty() => {
                     let at = match rng.below(3) {
@@ -8830,10 +8828,12 @@ mod sota_tree_tests {
                 }
                 4..=5 => {
                     let page = rng.below(u64::from(PAGES)) as u32;
-                    if store.trunk_has_children() {
-                        store.first_write_trunk(page, &image(trunk[&page])).unwrap();
-                    }
-                    store.durability_barrier(SyncClass::Off).unwrap();
+                    let required = if store.trunk_has_children() {
+                        store.first_write_trunk(page, &image(trunk[&page])).unwrap()
+                    } else {
+                        store.barrier_floor()
+                    };
+                    store.durability_barrier_to(SyncClass::Off, required).unwrap();
                     generation += 1;
                     trunk.insert(page, generation);
                 }
@@ -9007,11 +9007,13 @@ mod sota_tree_tests {
                 }
                 4..=5 => {
                     let page = rng.below(u64::from(PAGES)) as u32;
-                    if store.trunk_has_children() {
-                        store.first_write_trunk(page, &image(trunk[&page])).unwrap();
-                    }
+                    let required = if store.trunk_has_children() {
+                        store.first_write_trunk(page, &image(trunk[&page])).unwrap()
+                    } else {
+                        store.barrier_floor()
+                    };
                     arm(&store, BranchFailpoint::BarrierBeforeRecords);
-                    match store.durability_barrier(SyncClass::Off) {
+                    match store.durability_barrier_to(SyncClass::Off, required) {
                         Ok(()) => {
                             generation += 1;
                             trunk.insert(page, generation);
