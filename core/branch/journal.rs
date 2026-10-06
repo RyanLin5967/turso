@@ -1414,7 +1414,10 @@ impl Journal {
                     // #2). A flight written in a class that does not sync (D0) proves nothing, so
                     // under D0 every damage is a torn flight and cut. The flight the damage lies in
                     // was never acknowledged otherwise, whatever survived of it, and is cut below.
-                    if let Some(at) = synced_flight_over(&bytes, pos, nonce, sync.syncs()) {
+                    let confirmed = bytes
+                        .get(HEADER_CONFIRM_AT as usize..HEADER_CONFIRM_AT as usize + 4)
+                        .map(|f| u32::from_le_bytes(f.try_into().unwrap()));
+                    if let Some(at) = synced_flight_over(&bytes, pos, nonce, unsynced_end, confirmed, sync.syncs()) {
                         // No truncation is offered (review 7 item 1, the lead's decision): the
                         // flight was acknowledged.
                         let state = if catalog_store { &files.cat } else { &files.snap };
@@ -2698,7 +2701,9 @@ fn plausible_frame(bytes: &[u8], at: usize) -> Option<usize> {
 /// The first whole frame at or after `from`: `(offset, payload length, a synced end frame)`. An end
 /// frame is whole only under this incarnation's `nonce`; a record frame by its own checksum and
 /// decoding.
-fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usize, bool)> {
+/// The next whole frame of this incarnation at or after `from`: its offset, payload length, and
+/// for an end frame whether it is tagged synced (`None` for a record frame).
+fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usize, Option<bool>)> {
     let last = bytes.len().checked_sub(FRAME_HEADER_LEN + 1)?;
     (from..=last).find_map(|at| {
         let len = plausible_frame(bytes, at)?;
@@ -2707,9 +2712,9 @@ fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usi
         if is_end(len, payload[0]) {
             scan_crc_seeded(nonce, payload)
                 .eq(&crc)
-                .then_some((at, len, payload[0] == END_SYNCED_TAG))
+                .then_some((at, len, Some(payload[0] == END_SYNCED_TAG)))
         } else {
-            (scan_crc(payload) == crc && Record::decode(payload).is_some()).then_some((at, len, false))
+            (scan_crc(payload) == crc && Record::decode(payload).is_some()).then_some((at, len, None))
         }
     })
 }
@@ -2717,30 +2722,55 @@ fn next_whole_frame(bytes: &[u8], from: usize, nonce: u32) -> Option<(usize, usi
 /// Whether the damage at `damage` lies in, or before, a flight known to have been synced (review 2
 /// #2): a synced end frame of this incarnation after the damage, followed by any whole frame; or
 /// (review 5 #26) a synced end frame whose flight's own checksum holds from a frame boundary past
-/// the damage, a whole later flight — taken as proof only in a store whose class syncs (`syncs`),
-/// where every flight is synced before the next is written; under D0 an unsynced flight can be
-/// followed by a raised, synced one. A flight is written only after the one before it was synced,
+/// the damage, a whole later flight. A flight is written only after the one before it was synced,
 /// so either proves that sync returned: an acknowledged write was lost. Returns that end frame's
 /// offset.
-fn synced_flight_over(bytes: &[u8], damage: usize, nonce: u32, syncs: bool) -> Option<usize> {
+///
+/// The second form proves the damaged flight's sync returned only if its WRITER synced every
+/// flight before writing the next (engine review 7 #2), decided from the log's own evidence, not
+/// the opener's class: no whole flight of this incarnation is tagged unsynced, before the damage
+/// (`unsynced_before`) or after it — a D0 writer leaves such flights, and its unsynced flight can
+/// be followed by a raised, synced one — or the header confirms the later flight itself
+/// (`confirmed`: its sync returned, so every byte before it was durable). The writer's base class
+/// in the header, at the next format bump, makes this exact. Mutant `writer_syncs_by_opener` (test
+/// builds only): the writer taken to sync iff the opener's class does (`opener_syncs`), as before.
+fn synced_flight_over(
+    bytes: &[u8],
+    damage: usize,
+    nonce: u32,
+    unsynced_before: bool,
+    confirmed: Option<u32>,
+    opener_syncs: bool,
+) -> Option<usize> {
     // fastest-engine mutant `damage_always_torn` (test builds only): every damage is a torn flight.
     if super::store::fe_mutant("damage_always_torn") {
         return None;
     }
+    let by_opener = super::store::fe_mutant("writer_syncs_by_opener");
+    let mut unsynced_seen = unsynced_before;
     // From the damage itself: an end frame whose own checksum holds but whose flight's does not
     // is where the scan stopped, and it is a synced flight covering the damage.
     let mut at = damage;
     let mut synced_end = None;
-    while let Some((found, len, synced)) = next_whole_frame(bytes, at, nonce) {
+    while let Some((found, len, end)) = next_whole_frame(bytes, at, nonce) {
         if synced_end.is_some() {
             return synced_end;
         }
-        if synced {
+        if end == Some(false) {
+            unsynced_seen = true;
+        }
+        if end == Some(true) {
             // Mutant `whole_later_flight_ignored` (test builds only): as before review 5 #26.
             let payload = &bytes[found + FRAME_HEADER_LEN..found + FRAME_HEADER_LEN + len];
             let flight_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
             let flight_crc = u32::from_le_bytes(payload[5..9].try_into().unwrap());
-            let whole_later = syncs
+            let flight_end = (found + FRAME_HEADER_LEN + len) as u64;
+            let writer_syncs = if by_opener {
+                opener_syncs
+            } else {
+                !unsynced_seen || confirmed == Some(confirm_word(flight_crc, flight_end))
+            };
+            let whole_later = writer_syncs
                 && found.checked_sub(flight_len).is_some_and(|start| {
                     start > damage && scan_crc_seeded(nonce, &bytes[start..found]) == flight_crc
                 });
