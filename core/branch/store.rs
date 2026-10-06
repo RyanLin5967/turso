@@ -1146,7 +1146,13 @@ fn pause_at(hold: Option<&AtomicU8>, stage: u8) {
 #[cfg(test)]
 fn fuzzy_checkpoints() -> bool {
     static FUZZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FUZZY.get_or_init(|| std::env::var("R11_CKPT").is_ok_and(|v| v == "fuzzy"))
+    *FUZZY.get_or_init(|| match std::env::var("R11_CKPT") {
+        Ok(v) if v == "fuzzy" => true,
+        Ok(v) if v == "sharp" => false,
+        Err(std::env::VarError::NotPresent) => false,
+        // The same exact names as `BranchCheckpoint::resolve` (review 4 #8).
+        other => panic!("R11_CKPT={other:?}: the branch checkpoint mode is \"fuzzy\" or \"sharp\""),
+    })
 }
 
 impl CatState {
@@ -2537,7 +2543,7 @@ impl BranchStore {
                 )));
             }
         }
-        let fuzzy = super::BranchCheckpoint::resolve(checkpoint, splice) == super::BranchCheckpoint::Fuzzy;
+        let fuzzy = super::BranchCheckpoint::resolve(checkpoint, splice)? == super::BranchCheckpoint::Fuzzy;
         Self::open_resolved(durability, default_lease, splice, fuzzy, db_path)
     }
 
@@ -5417,6 +5423,16 @@ impl BranchStore {
             f.builds,
             f.failed_scans,
         )
+    }
+
+    /// The checkpoint mode this store resolved at open (review 4 #8): what a registry hit compares,
+    /// and what a harness reports.
+    pub(crate) fn checkpoint_mode(&self) -> super::BranchCheckpoint {
+        if self.fuzzy {
+            super::BranchCheckpoint::Fuzzy
+        } else {
+            super::BranchCheckpoint::Sharp
+        }
     }
 
     /// Test builds: whether the arena counts as holding writes no sync has covered (review 5 #10).
