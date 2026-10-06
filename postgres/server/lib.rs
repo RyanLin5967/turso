@@ -124,6 +124,9 @@ struct Shared {
     /// Threads waiting on `in_use_freed`: a release signals only when there is one, so an
     /// uncontended switch or delete wakes nobody.
     in_use_waiters: AtomicUsize,
+    /// How long a claim or a delete waits on `in_use`: IN_USE_WAIT (a field so a unit test can
+    /// shorten it).
+    in_use_wait: std::time::Duration,
 }
 
 /// How long a delete waits for the session on its branch to go, and a switch for a delete of its
@@ -153,6 +156,7 @@ impl Shared {
             in_use: Mutex::new(std::collections::HashMap::new()),
             in_use_freed: std::sync::Condvar::new(),
             in_use_waiters: AtomicUsize::new(0),
+            in_use_wait: IN_USE_WAIT,
         }
     }
 
@@ -160,7 +164,7 @@ impl Shared {
         self.in_use.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The map once `name` is in none of `states` there, or at IN_USE_WAIT: what a closing session
+    /// The map once `name` is in none of `states` there, or at the wait's end: what a closing session
     /// or a running delete leaves behind is waited out, not refused (wire review 3 item 4).
     fn wait_while<'a>(
         &'a self,
@@ -175,7 +179,7 @@ impl Shared {
             return uses;
         }
         self.in_use_waiters.fetch_add(1, Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + IN_USE_WAIT;
+        let deadline = std::time::Instant::now() + self.in_use_wait;
         while held(&uses) {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -212,7 +216,7 @@ impl Shared {
         }
     }
 
-    /// Mark `name` as being deleted. A session on it is waited for (up to IN_USE_WAIT: one that is
+    /// Mark `name` as being deleted. A session on it is waited for (up to `in_use_wait`: one that is
     /// closing releases it within that), then refused with 55006.
     fn begin_delete(&self, name: &str) -> SqlResult<()> {
         let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting]);
@@ -3190,5 +3194,93 @@ mod tests {
 
         assert!(!ends_with_with_no_data("CREATE TABLE T AS SELECT 1"));
         assert!(!ends_with_with_no_data("SELECT 'WITH NO DATA'"));
+    }
+
+    /// A server's shared state on a fresh database, its in-use map waiting `wait`.
+    fn shared(dir: &tempfile::TempDir, wait: std::time::Duration) -> Arc<Shared> {
+        let path = dir.path().join("w.db").to_string_lossy().into_owned();
+        let opts = database_opts(turso_core::branch::BranchDurability::Catalog {
+            sync: turso_core::branch::SyncClass::Off,
+        });
+        let (_io, db) =
+            turso_pg::open_database(&path, None, turso_core::OpenFlags::default(), opts).unwrap();
+        let mut shared = Shared::new(
+            db,
+            path,
+            1,
+            std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+        );
+        shared.in_use_wait = wait;
+        Arc::new(shared)
+    }
+
+    /// The in-use map refuses by state: a claim of a branch being deleted and a delete of a
+    /// branch being deleted are "being deleted", a claim or a delete of a held branch "in use",
+    /// all 55006; a release frees the name for either. No wire test reached the Deleting state,
+    /// and removing either refusal survived every test (wire review 3 item 7).
+    #[test]
+    fn the_in_use_map_refuses_by_state_and_a_release_frees_the_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = shared(&dir, std::time::Duration::from_millis(20));
+        let refused = |r: SqlResult<()>, what: &str| {
+            let e = r.expect_err(what);
+            assert_eq!(e.code, "55006", "{what}: {e:?}");
+            e.message
+        };
+        s.begin_delete("x").expect("delete of a free name");
+        let m = refused(s.claim("x", "ERROR"), "claim while deleting");
+        assert!(m.contains("being deleted"), "{m}");
+        let m = refused(s.begin_delete("x"), "delete while deleting");
+        assert!(m.contains("being deleted"), "{m}");
+        s.release("x");
+        s.claim("x", "ERROR").expect("claim once the delete ended");
+        let m = refused(s.begin_delete("x"), "delete while held");
+        assert!(m.contains("in use by another session"), "{m}");
+        let m = refused(s.claim("x", "ERROR"), "claim while held");
+        assert!(m.contains("in use by another session"), "{m}");
+        s.release("x");
+        s.begin_delete("x").expect("delete once released");
+        s.release("x");
+        s.claim("x", "ERROR").expect("claim once released");
+        assert_eq!(s.in_use_waiters.load(Ordering::SeqCst), 0);
+    }
+
+    /// A delete of a held branch waits for its release, and a claim of a branch being deleted for
+    /// the delete's end: each returns at the release, well inside the wait, and succeeds (wire
+    /// review 3 item 4's wait, which no test timed).
+    #[test]
+    fn a_waiting_delete_or_claim_returns_at_the_release() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let wait = std::time::Duration::from_secs(5);
+        let s = shared(&dir, wait);
+        for first_held in [true, false] {
+            if first_held {
+                s.claim("x", "ERROR").unwrap();
+            } else {
+                s.begin_delete("x").unwrap();
+            }
+            let start = std::time::Instant::now();
+            let releaser = {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    s.release("x");
+                })
+            };
+            let r = if first_held {
+                s.begin_delete("x")
+            } else {
+                s.claim("x", "ERROR")
+            };
+            let waited = start.elapsed();
+            releaser.join().unwrap();
+            r.unwrap_or_else(|e| panic!("first_held={first_held}: {e:?}"));
+            assert!(
+                waited >= std::time::Duration::from_millis(100) && waited < wait / 2,
+                "first_held={first_held}: waited {waited:?}"
+            );
+            s.release("x");
+            assert_eq!(s.in_use_waiters.load(Ordering::SeqCst), 0);
+        }
     }
 }
