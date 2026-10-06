@@ -36,6 +36,8 @@
 #      thaw and t0), and at least one child alive at the seize (no clone line in the trace) fsyncing after t0, seen
 #      by the probe log and attributed by the trace to a process at attach.
 #   F11 one attach split by strace_mark: fsync x2, tsplit, fsync x3 -> --part pre counts 2 and --part post 3.
+#   F12 the t1 cut: the split probe with t1 stamped between its fsync x2 and fsync x3 -> counts 2, and >= 3 calls
+#      after t1 left out.
 #   F13 the clock-step refusals forced to fire on copies of F2's window: a call stamp 2 s back in the trace, and
 #      t1_mono 2 s off in the window record, are each REFUSED; the unmodified copy counts F2's 10.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
@@ -45,7 +47,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=18
+NCHECK=19
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -504,6 +506,25 @@ if start_probe2 split && strace_attach "$OUT/f11" "$PP2"; then
   check F11-split-post "$OUT/f11post.json" 'r["verdict"]=="ok" and r["flush_by_syscall"]["fsync"]==3 and r["flushes"]==3'
 else
   log "FAIL F11-split: the probe or its attach failed"; fails=$((fails + 2))
+fi
+stop_probe2 split
+
+# F12: the t1 cut (fifth-review re-review, finding 1: no attach probe had a call after t1). One attach of the split
+# probe: fsync x2, then t1 is stamped (strace_mark OUT t1; strace_detach keeps it), then fsync x3, then the detach.
+# The count must end at t1: 2 fsyncs counted, the 3 after it (and the probe's later calls) in calls_after_t1.
+if start_probe2 split && strace_attach "$OUT/f12" "$PP2"; then
+  touch "$DIR/fc/go-split"
+  for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/split.half" ] && break; sleep 0.05; done
+  sleep 0.1
+  strace_mark "$OUT/f12" t1
+  touch "$DIR/fc/go-split.2"
+  for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/split.done" ] && break; sleep 0.05; done
+  sleep 0.2
+  strace_detach "$OUT/f12"
+  count f12
+  check F12-t1-cut "$OUT/f12.json" 'r["verdict"]=="ok" and r["flush_by_syscall"]["fsync"]==2 and r["flushes"]==2 and r["calls_after_t1"]>=3'
+else
+  log "FAIL F12-t1-cut: the probe or its attach failed"; fails=$((fails + 1))
 fi
 stop_probe2 split
 

@@ -238,7 +238,9 @@ strace_attach() {
 
 strace_detach() {
   local out=$1 rc=0 sa=1 ma=1 main
-  clock_pair t1 >>"$out.window"
+  # t1 is the detach request, unless the window already holds one (only the fire-check's F12 stamps it earlier, with
+  # strace_mark OUT t1, so that calls exist after it and the t1 cut is exercised).
+  grep -q '^t1=' "$out.window" || clock_pair t1 >>"$out.window"
   main=$(sed -n 's/^main=\([0-9][0-9]*\) .*/\1/p' "$out.window" | head -1)
   kill -0 "$ST_PID" 2>/dev/null || sa=0
   { [ -n "$main" ] && kill -0 "$main" 2>/dev/null; } || ma=0
