@@ -38,6 +38,11 @@ enum Backing {
     File { file: File, dirty: bool },
 }
 
+/// Test builds: while set, every file-backed arena reports a device other than its own (review 5
+/// #13's refusal tests).
+#[cfg(test)]
+pub(crate) static ARENA_ON_OTHER_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) struct Arena {
     page_size: usize,
     backing: Backing,
@@ -286,10 +291,15 @@ impl Arena {
 
     /// The device the arena's file lives on (`None` for the memory backing; see `file_device`).
     pub(crate) fn device(&self) -> Option<u64> {
-        match &self.backing {
+        let device = match &self.backing {
             Backing::File { file, .. } => super::journal::file_device(file),
             Backing::Memory { .. } => None,
+        };
+        #[cfg(test)]
+        if ARENA_ON_OTHER_DEVICE.load(std::sync::atomic::Ordering::Acquire) {
+            return device.map(|d| d ^ 1);
         }
+        device
     }
 
     /// Whether a slot was written since the arena's last sync (or since a flight took its writes).

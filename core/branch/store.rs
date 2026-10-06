@@ -8227,6 +8227,107 @@ mod tests {
         assert!(inner.ensure_backing(1024).is_err(), "a store holding a branch changed page size");
     }
 
+    /// Review 5 #13: the one-device guard (ruling 85a032f01: the arena is synced by a plain fsync,
+    /// made durable by the LOG's flush, so both must be on one device) holds on every path that
+    /// opens the arena: snapshot and catalog recovery, a fresh store's first backing, and an empty
+    /// store's page-size restart, which reopened the arena unchecked. Hook: every arena reports
+    /// another device.
+    #[test]
+    fn every_arena_open_refuses_another_device() {
+        use std::sync::atomic::Ordering as O;
+        struct Shifted;
+        impl Drop for Shifted {
+            fn drop(&mut self) {
+                crate::branch::arena::ARENA_ON_OTHER_DEVICE.store(false, O::Release);
+            }
+        }
+        let shift = || {
+            crate::branch::arena::ARENA_ON_OTHER_DEVICE.store(true, O::Release);
+            Shifted
+        };
+        for arm in ["recovery", "create", "restart"] {
+            for catalog in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let path = dir.path().join("db");
+                let path = path.to_str().unwrap();
+                let mode = if catalog {
+                    BranchDurability::Catalog { sync: SyncClass::Off }
+                } else {
+                    BranchDurability::Durable { sync: SyncClass::Off }
+                };
+                let refused = match arm {
+                    "create" => {
+                        let store = BranchStore::open(mode, None, path).unwrap();
+                        let _s = shift();
+                        let got = store.inner.lock().ensure_backing(512);
+                        got.is_err()
+                    }
+                    "restart" => {
+                        let store = BranchStore::open(mode, None, path).unwrap();
+                        store.inner.lock().ensure_backing(512).unwrap();
+                        let _s = shift();
+                        let got = store.inner.lock().ensure_backing(1024);
+                        got.is_err()
+                    }
+                    _ => {
+                        {
+                            let store = BranchStore::open(mode, None, path).unwrap();
+                            let mut inner = store.inner.lock();
+                            inner.ensure_backing(512).unwrap();
+                            store.log(&mut inner, Record::Clock { now_ms: 7 }).unwrap();
+                        }
+                        let _s = shift();
+                        BranchStore::open(mode, None, path).is_err()
+                    }
+                };
+                assert!(refused, "{arm} catalog={catalog}: an arena on another device than the log was taken");
+            }
+        }
+    }
+
+    /// Review 5 #13: a branch file that is a symbolic link is refused at open. A rename (a reset, a
+    /// cut, a compaction) replaces the link, not its target, so the log and the arena would drift
+    /// apart, and a link to another directory escapes the guard's premise that the sidecars share
+    /// their directory's device.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_branch_file_is_refused_at_open() {
+        for which in ["arena", "log"] {
+            for catalog in [false, true] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let path = dir.path().join("db");
+                let path = path.to_str().unwrap();
+                let mode = if catalog {
+                    BranchDurability::Catalog { sync: SyncClass::Off }
+                } else {
+                    BranchDurability::Durable { sync: SyncClass::Off }
+                };
+                {
+                    let store = BranchStore::open(mode, None, path).unwrap();
+                    let mut inner = store.inner.lock();
+                    inner.ensure_backing(512).unwrap();
+                    store.log(&mut inner, Record::Clock { now_ms: 7 }).unwrap();
+                }
+                let files = BranchFiles::for_db(path);
+                let linked = if which == "arena" { &files.arena } else { &files.log };
+                let elsewhere = dir.path().join("elsewhere");
+                std::fs::create_dir(&elsewhere).unwrap();
+                let moved = elsewhere.join("moved");
+                std::fs::rename(linked, &moved).unwrap();
+                std::os::unix::fs::symlink(&moved, linked).unwrap();
+                let got = BranchStore::open(mode, None, path);
+                let refused = match got {
+                    Ok(_) => String::new(),
+                    Err(e) => e.to_string(),
+                };
+                assert!(
+                    refused.contains(linked.to_str().unwrap()),
+                    "{which} catalog={catalog}: a symlinked branch file was not refused by name: {refused:?}"
+                );
+            }
+        }
+    }
+
     /// Review 3 F4. A journal kept from a first fork whose ARENA failed to open holds only its
     /// header, written for that attempt's page size. A retry at another page size must not append
     /// under the old one: recovery would then open the arena with the wrong page size.
