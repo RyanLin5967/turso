@@ -2519,3 +2519,63 @@ fn alter_table_add_constraint_works_in_every_transaction_state() {
         "an aside table was left behind"
     );
 }
+
+/// ALTER TABLE ADD PRIMARY KEY / UNIQUE over the extended protocol (Parse, Bind, Describe,
+/// Execute, Sync, as tokio-postgres, pgjdbc, sqlx and PQexecParams send it) adds its constraint
+/// once, in autocommit and inside a block, with Describe of the portal or of the statement. The
+/// frontend performs ALTER while preparing it, and Describe prepared: the constraint was added at
+/// Describe and again at Execute ("more than one primary key"), and inside BEGIN the error aborted
+/// the block, so COMMIT answered ROLLBACK and lost the block's writes (wire review 3 item 2).
+#[test]
+fn an_extended_alter_add_constraint_adds_it_once() {
+    let dir = Scratch::new("extalter");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let constraints = |a: &mut Wire, t: &str, kind: &str| {
+        a.q(&format!(
+            "SELECT count(*) FROM information_schema.table_constraints \
+             WHERE table_name = '{t}' AND constraint_type = '{kind}'"
+        ))
+        .single("constraints")
+    };
+    for t in ["e1", "e2", "e3", "e4"] {
+        a.q(&format!("CREATE TABLE {t}(id INT, v INT)")).ok("table");
+        a.q(&format!("INSERT INTO {t} VALUES (1, 10), (2, 20)"))
+            .ok("rows");
+    }
+    // Autocommit, Describe of the portal.
+    let r = a
+        .x("ALTER TABLE e1 ADD PRIMARY KEY (id)", &[])
+        .ok("extended ADD PRIMARY KEY");
+    assert_eq!(r.tags, vec!["ALTER TABLE".to_string()]);
+    assert_eq!(constraints(&mut a, "e1", "PRIMARY KEY"), "1");
+    assert_eq!(a.q("INSERT INTO e1 VALUES (1, 0)").err("dup").code, "23505");
+    // Inside a block that has written.
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO e2 VALUES (3, 30)")
+        .ok("write in the block");
+    let r = a
+        .x("ALTER TABLE e2 ADD PRIMARY KEY (id)", &[])
+        .ok("extended ADD PRIMARY KEY in a block");
+    assert_eq!(r.status, b'T', "the block was aborted");
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
+    assert_eq!(a.q("SELECT count(*) FROM e2").single("rows"), "3");
+    assert_eq!(constraints(&mut a, "e2", "PRIMARY KEY"), "1");
+    // ADD UNIQUE: one constraint, the rows once.
+    a.x("ALTER TABLE e3 ADD UNIQUE (v)", &[])
+        .ok("extended ADD UNIQUE");
+    assert_eq!(constraints(&mut a, "e3", "UNIQUE"), "1");
+    assert_eq!(a.q("SELECT count(*) FROM e3").single("rows"), "2");
+    // Describe of the statement before Bind (Parse, Describe S, Bind, Execute, Sync).
+    let mut parse = vec![0u8];
+    parse.extend_from_slice(b"ALTER TABLE e4 ADD PRIMARY KEY (id)");
+    parse.extend_from_slice(&[0, 0, 0]);
+    a.send(b'P', &parse);
+    a.send(b'D', b"S\0");
+    a.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+    a.send(b'E', &[0, 0, 0, 0, 0]);
+    a.send(b'S', &[]);
+    a.read_reply().ok("Describe S then Execute");
+    assert_eq!(constraints(&mut a, "e4", "PRIMARY KEY"), "1");
+}
