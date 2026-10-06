@@ -2351,6 +2351,31 @@ mod tests {
         );
     }
 
+    /// An extended-protocol statement is prepared once: Execute runs the statement its Describe
+    /// prepared, instead of parsing, translating and compiling it a second time (wire review 1
+    /// item 12). Two libpg_query calls before: Describe's and Execute's.
+    #[test]
+    fn a_described_statement_is_not_prepared_again_at_execute() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        ok(&s, "INSERT INTO t VALUES (1, 7)");
+        let sql = "SELECT v FROM t WHERE id = 1";
+        let stored = Arc::new(StoredStatement::new(String::new(), sql.to_string(), vec![]));
+        let bind = pgwire::messages::extendedquery::Bind::new(None, None, vec![], vec![], vec![]);
+        let portal = Portal::try_new(&bind, stored).unwrap();
+        let before = turso_pg_parser::libpg_query_calls();
+        s.describe_prepare(sql).unwrap();
+        assert!(s
+            .run(sql, None, Some(&portal), &Format::UnifiedText)
+            .is_ok());
+        assert_eq!(
+            turso_pg_parser::libpg_query_calls() - before,
+            1,
+            "libpg_query calls for Describe then Execute"
+        );
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {

@@ -245,6 +245,27 @@ impl Wire {
         self.read_reply()
     }
 
+    /// [`Wire::x`] with no parameters, its five messages written in ONE write, so the server reads
+    /// them in one read and its system calls per statement do not depend on how TCP split them.
+    fn x_one_write(&mut self, sql: &str) -> Reply {
+        let mut out = Vec::new();
+        let mut put = |tag: u8, body: &[u8]| {
+            out.push(tag);
+            out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+            out.extend_from_slice(body);
+        };
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        put(b'P', &parse);
+        put(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+        put(b'D', b"P\0");
+        put(b'E', &[0, 0, 0, 0, 0]);
+        put(b'S', &[]);
+        self.s.write_all(&out).unwrap();
+        self.read_reply()
+    }
+
     /// A pipeline: Parse, Bind, Describe portal and Execute for each statement (no parameters),
     /// then one Sync, as pgjdbc's batches and libpq's pipeline mode send them.
     fn pipeline(&mut self, sqls: &[&str]) -> Reply {
@@ -2124,5 +2145,62 @@ fn an_extended_checkpoint_outside_a_block_empties_the_wal() {
         wal_bytes(&dir.db()),
         0,
         "the extended CHECKPOINT left the WAL"
+    );
+}
+
+/// COPY FROM over the extended protocol loads its rows once. Describe answered by preparing the
+/// statement, and the frontend runs COPY's load at prepare, so Describe and Execute each loaded
+/// the file (wire review 1 item 12).
+#[test]
+fn an_extended_copy_from_loads_its_rows_once() {
+    let dir = Scratch::new("copyext");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let file = dir.0.join("rows.tsv");
+    std::fs::write(&file, "2\ttwo\n3\tthree\n").unwrap();
+    a.x(&format!("COPY t FROM '{}'", file.display()), &[])
+        .ok("extended COPY FROM");
+    assert_eq!(
+        a.q("SELECT count(*) FROM t").single("rows"),
+        "3",
+        "the seed row and the file's two, each once"
+    );
+}
+
+/// An extended-protocol round costs the server no system call more than the same statement over
+/// the simple protocol: its replies are written once, at Sync. pgwire's default handlers flushed
+/// after ParseComplete, BindComplete, the Describe reply, CommandComplete and ReadyForQuery, five
+/// writes against one (wire review 1 item 12). The statement is a branch call that touches no
+/// storage; the five messages arrive in one write; the least of 7 rounds per protocol is compared,
+/// counted by the server itself (turso_branch_stats' unix_syscalls).
+#[test]
+fn an_extended_round_costs_no_system_call_more_than_a_simple_one() {
+    let dir = Scratch::new("extsyscalls");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let sys = |a: &mut Wire| -> i64 {
+        a.q("SELECT turso_branch_stats()").ok("stats").rows[0][0]
+            .as_deref()
+            .expect("an Apple build counts system calls")
+            .parse()
+            .unwrap()
+    };
+    let sql = "SELECT turso_branch_current()";
+    let (mut simple, mut extended) = (Vec::new(), Vec::new());
+    for _ in 0..7 {
+        let before = sys(&mut a);
+        a.q(sql).ok("simple");
+        simple.push(sys(&mut a) - before);
+        let before = sys(&mut a);
+        a.x_one_write(sql).ok("extended");
+        extended.push(sys(&mut a) - before);
+    }
+    let (s, e) = (
+        *simple.iter().min().unwrap(),
+        *extended.iter().min().unwrap(),
+    );
+    assert!(
+        e <= s,
+        "extended {e} system calls against simple {s} (all rounds: {extended:?} vs {simple:?})"
     );
 }
