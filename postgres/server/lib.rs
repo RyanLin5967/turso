@@ -813,14 +813,21 @@ impl Session {
             return Ok(());
         }
         let in_tx = !conn.inner().get_auto_commit();
-        match conn.prepare_typed(sql) {
-            Ok((stmt, types)) => {
+        // Never the prepare that performs a statement (ALTER ADD CONSTRAINT, COPY FROM, SET,
+        // CREATE/DROP SCHEMA): the frontend declines those from the parse, they keep nothing and
+        // answer NoData, and Execute performs them once (wire review 2 item 2, review 3 item 2).
+        match conn.prepare_for_describe(sql) {
+            Ok(Some((stmt, types))) => {
                 self.state().described = Some(Described {
                     conn: conn.inner().clone(),
                     sql: sql.to_string(),
                     stmt,
                     types,
                 });
+                Ok(())
+            }
+            Ok(None) => {
+                self.state().described = None;
                 Ok(())
             }
             Err(e) => {
@@ -1895,8 +1902,9 @@ impl ExtendedQueryHandler for Session {
                 .unwrap_or(0);
             return Ok(DescribeStatementResponse::new(param_types(used), fields));
         }
-        // The special statements return no rows, and preparing one runs it (COPY FROM loads its
-        // file at prepare): Describe answers them from the text alone (wire review 1 item 12).
+        // The special statements return no rows: NoData, from the text (their prepared stand-ins
+        // have a dummy column). That their prepare is never what performs them is describe_prepare's
+        // job, from the parse, so a form this text test misses is still not performed.
         if is_pg_non_query(&target.statement) {
             return Ok(DescribeStatementResponse::new(param_types(0), vec![]));
         }

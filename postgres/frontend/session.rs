@@ -105,6 +105,19 @@ impl PgConnection {
         Ok((stmt, types))
     }
 
+    /// [`PgConnection::prepare_typed`] for a Describe, which must never perform the statement:
+    /// `None` for one that preparing would perform (SET, CREATE/DROP SCHEMA, ALTER TABLE ADD
+    /// CONSTRAINT, COPY FROM, or a statement whose prerequisites would run first). Such a statement
+    /// returns no rows; its Execute prepares and performs it, once.
+    pub fn prepare_for_describe(
+        &self,
+        sql: impl AsRef<str>,
+    ) -> Result<Option<(Statement, Vec<Option<u32>>)>> {
+        let mut types = Vec::new();
+        let stmt = prepare_statement_inner(&self.inner, sql.as_ref(), Some(&mut types), true)?;
+        Ok(stmt.map(|stmt| (stmt, types)))
+    }
+
     pub fn query(&self, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         let sql = sql.as_ref().trim();
         if sql.is_empty() {
@@ -387,6 +400,32 @@ fn prepare_statement_typed(
     sql: &str,
     types: Option<&mut Vec<Option<u32>>>,
 ) -> Result<Statement> {
+    prepare_statement_inner(pg_conn, sql, types, false)?.ok_or_else(|| {
+        LimboError::InternalError("only a Describe declines to prepare a statement".to_string())
+    })
+}
+
+/// Whether preparing this statement performs it: the special forms the frontend carries out at
+/// prepare (SET, CREATE SCHEMA, DROP SCHEMA, ALTER TABLE ADD CONSTRAINT, COPY FROM), read from the
+/// parse, never from the text's first word.
+fn performs_at_prepare(parse_result: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    try_extract_set(parse_result).is_some()
+        || try_extract_create_schema(parse_result).is_some()
+        || try_extract_drop_schema(parse_result).is_some()
+        || try_extract_add_constraints(parse_result).is_some()
+        || try_extract_copy_from(parse_result).is_some()
+}
+
+/// The prepare behind [`prepare_statement_typed`]. With `describe`, a statement that preparing
+/// would perform (see [`performs_at_prepare`]), or one that needs prerequisite statements run
+/// first (a SERIAL column's sequence), is declined with `None`: it returns no rows, and only its
+/// execution may perform it (wire review 2 item 2, review 3 item 2).
+fn prepare_statement_inner(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    types: Option<&mut Vec<Option<u32>>>,
+    describe: bool,
+) -> Result<Option<Statement>> {
     let sql = sql.trim();
     if sql.is_empty() {
         return Err(LimboError::InvalidArgument(
@@ -399,8 +438,11 @@ fn prepare_statement_typed(
     // One parse serves both the special forms and the translation (it was two).
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    if describe && performs_at_prepare(&parse_result) {
+        return Ok(None);
+    }
     if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
-        return Ok(stmt);
+        return Ok(Some(stmt));
     }
     if let Some(types) = types {
         *types =
@@ -412,6 +454,9 @@ fn prepare_statement_typed(
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    if describe && !translated.prereqs.is_empty() {
+        return Ok(None);
+    }
 
     let options = {
         let state = pg_conn.session_state.lock().unwrap();
@@ -431,6 +476,7 @@ fn prepare_statement_typed(
     pg_conn
         .conn
         .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+        .map(Some)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
