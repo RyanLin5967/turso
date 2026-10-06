@@ -2616,6 +2616,8 @@ thread_local! {
     /// Review 6 #3: captures on this thread that took an arena handle of their own, to sync the
     /// arena outside the group's flights.
     pub(crate) static CAPTURE_ARENA_HANDLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Engine review 8 #2: catalog rows captures on this thread built.
+    pub(crate) static CAPTURE_ROWS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// r13-compose's registered mutants (PREREG §5, A6): `R13_MUTANT` names one deliberate defect, so
@@ -7329,6 +7331,8 @@ impl StoreInner {
                 name: None,
             }, what))
             .collect();
+        #[cfg(test)]
+        CAPTURE_ROWS_BUILT.with(|c| c.set(c.get() + rows.len() as u64));
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();

@@ -4351,3 +4351,36 @@ fn a_retried_checkpoint_does_not_stall_every_operation() {
         assert!(!stalled, "{fp:?}: the retried checkpoint started past the hard limit");
     }
 }
+
+// ---- engine review 8 #2: a failed capture does no O(dirty) work ----
+
+/// Engine review 8 #2: a capture that fails (here at its read snapshot) has built no catalog row:
+/// its fallible steps come before it takes the dirty set. Before, it took the set, built a row
+/// for every dirty branch, then failed and threw them away, under the store mutex, at every retry:
+/// under a persistent fault N creates cost O(N^2 / threshold). Mutant `capture_rows_first` (as
+/// before) must fail it.
+#[test]
+fn a_failed_capture_builds_no_row() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("capture-rows.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..20 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let rows = || super::store::CAPTURE_ROWS_BUILT.with(|c| c.get());
+    let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+    db.branch_failpoint(Some(BranchFailpoint::CaptureFails));
+    let (rows0, entered0) = (rows(), entered());
+    assert!(!db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the capture failed");
+    assert_eq!(entered(), entered0 + 1, "premise: the capture was entered");
+    assert_eq!(rows() - rows0, 0, "a failed capture built rows for the dirty branches and threw them away");
+    // And the next one, healthy, captures those branches.
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no checkpoint started after the failed capture");
+    db.branch_checkpoint_wait();
+    assert!(rows() - rows0 >= 20, "premise: the healthy capture wrote the 20 dirty branches' rows");
+}
