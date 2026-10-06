@@ -557,7 +557,12 @@ impl Session {
         } else {
             // An extended-protocol client took the column types from Describe, which runs nothing:
             // its rows keep those types. A simple-protocol reply carries its own RowDescription.
-            execute_query(&mut stmt, format, portal.is_none())
+            execute_query(
+                &mut stmt,
+                format,
+                portal.is_none(),
+                &conn.inner().current_schema(),
+            )
         };
         r.map_err(wire_info)
     }
@@ -1260,6 +1265,7 @@ fn execute_query(
     stmt: &mut turso_core::Statement,
     format: &Format,
     infer: bool,
+    schema: &turso_core::schema::Schema,
 ) -> PgWireResult<Response> {
     let mut statics: Vec<Option<Type>> = (0..stmt.num_columns())
         .map(|i| static_pg_type(stmt, i))
@@ -1269,13 +1275,16 @@ fn execute_query(
             t.get_or_insert(Type::TEXT);
         }
     }
+    let pads: Vec<Option<usize>> = (0..stmt.num_columns())
+        .map(|i| bpchar_width(stmt, schema, i))
+        .collect();
     if statics.iter().all(Option::is_some) {
         let header = Arc::new(field_info(stmt, format, |i| {
             statics[i].clone().expect("all typed")
         }));
         let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
         stmt.run_with_row_callback(|row| {
-            rows.push(encode_row(&header, row.get_values()));
+            rows.push(encode_row(&header, &pads, row.get_values()));
             Ok(())
         })
         .map_err(engine_error)?;
@@ -1297,7 +1306,7 @@ fn execute_query(
     }));
     let rows: Vec<PgWireResult<DataRow>> = values
         .iter()
-        .map(|row| encode_row(&header, row.iter()))
+        .map(|row| encode_row(&header, &pads, row.iter()))
         .collect();
     Ok(Response::Query(QueryResponse::new(
         header,
@@ -1305,8 +1314,47 @@ fn execute_query(
     )))
 }
 
+/// The declared length n of a result column that is a `character(n)` table column: the engine
+/// stores its values without their trailing blanks, and PostgreSQL returns them padded to n.
+/// The statement says the column is a bpchar but not its length, so the length is read from the
+/// table's schema, by the result column's name; a column renamed by an alias takes the table's
+/// one bpchar length if all its bpchar columns share it, and is otherwise returned unpadded
+/// (COMPAT.md).
+fn bpchar_width(
+    stmt: &turso_core::Statement,
+    schema: &turso_core::schema::Schema,
+    idx: usize,
+) -> Option<usize> {
+    let info = stmt.get_column_type_info(idx).ok().flatten()?;
+    if !info.declared_name.trim().eq_ignore_ascii_case("bpchar") {
+        return None;
+    }
+    let table = schema.get_btree_table(&stmt.get_column_table_name(idx)?)?;
+    let width = |col: &turso_core::schema::Column| -> Option<usize> {
+        match col.ty_params.first().map(|p| p.as_ref()) {
+            Some(turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Numeric(n))) => {
+                n.parse().ok()
+            }
+            _ => None,
+        }
+    };
+    if let Some((_, col)) = table.get_column(&stmt.get_column_name(idx)) {
+        if col.ty_str.eq_ignore_ascii_case("bpchar") {
+            return width(col);
+        }
+    }
+    let mut widths = table
+        .columns()
+        .iter()
+        .filter(|c| c.ty_str.eq_ignore_ascii_case("bpchar"))
+        .map(width);
+    let first = widths.next()??;
+    widths.all(|w| w == Some(first)).then_some(first)
+}
+
 fn encode_row<'a>(
     header: &Arc<Vec<FieldInfo>>,
+    pads: &[Option<usize>],
     values: impl Iterator<Item = &'a Value>,
 ) -> PgWireResult<DataRow> {
     let mut encoder = DataRowEncoder::new(header.clone());
@@ -1315,6 +1363,15 @@ fn encode_row<'a>(
             .get(i)
             .map(|fi| fi.datatype().clone())
             .unwrap_or(Type::TEXT);
+        if let (Some(Some(width)), Value::Text(t)) = (pads.get(i), val) {
+            let chars = t.as_str().chars().count();
+            if chars < *width {
+                let padded = format!("{}{}", t.as_str(), " ".repeat(width - chars));
+                encode_value(&mut encoder, &Value::build_text(padded), &pg_type)
+                    .map_err(engine_error)?;
+                continue;
+            }
+        }
         encode_value(&mut encoder, val, &pg_type).map_err(engine_error)?;
     }
     encoder.finish()
@@ -1517,7 +1574,8 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
         "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
         | "DECIMAL" => Type::FLOAT8,
-        "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
+        "VARCHAR" | "CHARACTER VARYING" => Type::VARCHAR,
+        "TEXT" | "CHAR" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,
         "UUID" => Type::UUID,
@@ -1533,7 +1591,9 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "MACADDR8" => Type::MACADDR8,
         _ => {
             // Handle parameterized types like varchar(50), numeric(10,2)
-            if upper.starts_with("VARCHAR") || upper.starts_with("CHAR") {
+            if upper.starts_with("BPCHAR") {
+                Type::BPCHAR
+            } else if upper.starts_with("VARCHAR") || upper.starts_with("CHAR") {
                 Type::VARCHAR
             } else if upper.starts_with("NUMERIC") || upper.starts_with("DECIMAL") {
                 Type::NUMERIC
@@ -1554,6 +1614,7 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
         || upper.starts_with("CHECKPOINT")
+        || upper.starts_with("ALTER")
         || upper.starts_with("SET ")
         || upper.starts_with("RESET ")
 }

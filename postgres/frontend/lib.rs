@@ -2,6 +2,7 @@ mod aliases;
 mod catalog;
 mod copy;
 mod functions;
+mod information_schema;
 mod session;
 
 pub use session::PgConnection as Connection;

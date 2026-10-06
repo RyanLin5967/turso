@@ -15,7 +15,8 @@
 //! Before the ops it creates `t(id INT PRIMARY KEY, v INT)` with `--rows` rows and an empty `t2(id
 //! INT)`, as the wire side's seed does through the server.
 //!
-//! Output: TSV `seq phase step start_ns end_ns`, phase `warmup` or `measure`.
+//! Output: TSV `seq phase step start_ns end_ns cpu_ns`, phase `warmup` or `measure`; `cpu_ns` is the
+//! calling thread's CPU time across the step (CLOCK_THREAD_CPUTIME_ID), for cpu_cost.py.
 
 use std::io::Write;
 use turso_core::branch::{BranchDurability, SyncClass};
@@ -40,6 +41,16 @@ fn now_ns() -> u64 {
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
         ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
     }
+}
+
+/// This thread's CPU time, ns.
+fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 struct Args {
@@ -112,46 +123,46 @@ fn main() {
     run(&trunk, "COMMIT");
 
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a.out).unwrap());
-    writeln!(out, "seq\tphase\tstep\tstart_ns\tend_ns").unwrap();
-    let mut rec = |seq: u64, phase: &str, step: &str, t0: u64, t1: u64| {
-        writeln!(out, "{seq}\t{phase}\t{step}\t{t0}\t{t1}").unwrap();
+    writeln!(out, "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns").unwrap();
+    let mut rec = |seq: u64, phase: &str, step: &str, t0: u64, t1: u64, cpu: u64| {
+        writeln!(out, "{seq}\t{phase}\t{step}\t{t0}\t{t1}\t{cpu}").unwrap();
     };
     for seq in 0..a.warmup + a.ops {
         let phase = if seq < a.warmup { "warmup" } else { "measure" };
         let name = format!("b_{seq}");
         let id = 1 + (seq * 7919) % a.rows;
 
-        let t0 = now_ns();
+        let (t0, c0) = (now_ns(), thread_cpu_ns());
         trunk.inner().create_branch(&name).unwrap();
-        let t1 = now_ns();
-        rec(seq, phase, "create", t0, t1);
+        let (t1, c1) = (now_ns(), thread_cpu_ns());
+        rec(seq, phase, "create", t0, t1, c1 - c0);
 
-        let t0 = now_ns();
+        let (t0, c0) = (now_ns(), thread_cpu_ns());
         let branch = PgConnection::new(db.connect_named(&name).unwrap());
         branch.adopt_session_of(&trunk);
-        let t1 = now_ns();
-        rec(seq, phase, "switch", t0, t1);
+        let (t1, c1) = (now_ns(), thread_cpu_ns());
+        rec(seq, phase, "switch", t0, t1, c1 - c0);
 
-        let t0 = now_ns();
+        let (t0, c0) = (now_ns(), thread_cpu_ns());
         let mut stmt = branch
             .prepare(format!("UPDATE t SET v = v + 1 WHERE id = {id}"))
             .unwrap();
         stmt.run_ignore_rows().unwrap();
         assert_eq!(stmt.n_change(), 1, "the write touched no row");
         drop(stmt);
-        let t1 = now_ns();
-        rec(seq, phase, "write", t0, t1);
+        let (t1, c1) = (now_ns(), thread_cpu_ns());
+        rec(seq, phase, "write", t0, t1, c1 - c0);
 
-        let t0 = now_ns();
+        let (t0, c0) = (now_ns(), thread_cpu_ns());
         trunk.adopt_session_of(&branch);
         drop(branch);
-        let t1 = now_ns();
-        rec(seq, phase, "main", t0, t1);
+        let (t1, c1) = (now_ns(), thread_cpu_ns());
+        rec(seq, phase, "main", t0, t1, c1 - c0);
 
-        let t0 = now_ns();
+        let (t0, c0) = (now_ns(), thread_cpu_ns());
         db.drop_branch(&name).unwrap();
-        let t1 = now_ns();
-        rec(seq, phase, "delete", t0, t1);
+        let (t1, c1) = (now_ns(), thread_cpu_ns());
+        rec(seq, phase, "delete", t0, t1, c1 - c0);
     }
     out.flush().unwrap();
 }

@@ -141,6 +141,12 @@ impl Dialect for PostgresDialect {
         for vtab in pg_catalog_virtual_tables() {
             schema.add_virtual_table(vtab)?;
         }
+        for vtab in crate::information_schema::virtual_tables() {
+            schema.add_virtual_table(vtab)?;
+        }
+        if enable_custom_types {
+            register_bpchar(schema)?;
+        }
         Ok(())
     }
 
@@ -158,6 +164,37 @@ impl Dialect for PostgresDialect {
     fn requires_custom_types(&self) -> bool {
         true
     }
+}
+
+/// PostgreSQL's blank-padded `character(n)`: stored without its trailing blanks (they never count
+/// in PostgreSQL: not in comparisons, not in length, not when cast to text), so the engine's own
+/// comparisons and functions see PostgreSQL's values; a value longer than n once trailing blanks are
+/// dropped is refused. The wire server pads a bpchar column back to n characters on output.
+const BPCHAR_TYPE_SQL: &str = "CREATE TYPE bpchar(value text, maxlen integer) BASE text \
+    ENCODE CASE WHEN length(rtrim(value, ' ')) <= maxlen THEN rtrim(value, ' ') \
+    ELSE RAISE(ABORT, 'value too long for type character') END DECODE value OPERATOR '<'";
+
+fn register_bpchar(schema: &mut Schema) -> Result<()> {
+    use turso_parser::ast::{Cmd, Stmt};
+    let mut parser = turso_parser::parser::Parser::new(BPCHAR_TYPE_SQL.as_bytes());
+    let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+        type_name, body, ..
+    }))) = parser.next_cmd()
+    else {
+        return Err(LimboError::InternalError(
+            "the built-in bpchar type definition does not parse".to_string(),
+        ));
+    };
+    let def = turso_core::schema::TypeDef::from_create_type(
+        &type_name,
+        &body,
+        true,
+        BPCHAR_TYPE_SQL.to_string(),
+    )?;
+    schema
+        .type_registry
+        .insert(type_name.to_lowercase(), Arc::new(def));
+    Ok(())
 }
 
 pub fn is_catalog_table_name(name: &str) -> bool {
@@ -189,6 +226,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_input_error_info"
             | "pg_get_tabledef"
             | "pg_tables"
+            | "pg_indexes"
     )
 }
 
@@ -202,7 +240,7 @@ pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
 /// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
+pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
     let mut tables: Vec<_> = schema
         .tables
         .iter()
@@ -237,6 +275,7 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "TINYINT" | "MEDIUMINT" => 23,
         "TEXT" => 25,
         "VARCHAR" | "CHAR" | "CLOB" | "NCHAR" | "NVARCHAR" | "CHARACTER VARYING" => 1043,
+        "BPCHAR" => 1042,
         "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "FLOAT8" => 701,
         "FLOAT4" => 700,
         "BLOB" | "BYTEA" => 17,

@@ -46,7 +46,7 @@ Basics not enumerated by the official feature matrix.
 | DELETE | 🟡 Partial | `USING` clause silently dropped |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
 | CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP silently ignored; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
-| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ALTER COLUMN TYPE translates but fails at execution; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
+| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ADD [CONSTRAINT n] PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK works by rebuilding the table (validated against its rows, atomic, indexes and triggers recreated; a table created by CREATE TABLE AS or outside schema public is refused); ADD CONSTRAINT ... USING INDEX, NOT VALID or DEFERRABLE rejected; ALTER COLUMN TYPE translates but fails at execution; SET/DROP DEFAULT, SET/DROP NOT NULL rejected |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported; TEMP silently ignored |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
@@ -104,7 +104,7 @@ implemented.
 | pg_stat_io - I/O metrics view | ❌ Not supported | |
 | pg_wait_events system view | ❌ Not supported | |
 | Server statistics in shared memory | ❌ Not supported | |
-| SQL-standard information schema | ❌ Not supported | Only an `information_schema` row in pg_namespace; no views |
+| SQL-standard information schema | 🟡 Partial | `columns`, `tables`, `table_constraints` and `key_column_usage` for schema public (constraint names as PostgreSQL derives them); no other view |
 | Support for anonymous shared memory | ❌ Not supported | |
 | XML, JSON and YAML output for EXPLAIN | ❌ Not supported | |
 
@@ -177,7 +177,7 @@ INTEGER. Unknown type names pass through as custom types.
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES silently ignored |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
 | INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *` and UPDATE ... FROM ... RETURNING |
-| LATERAL clause | ❌ Not supported | Keyword accepted but silently ignored |
+| LATERAL clause | 🟡 Partial | `CROSS JOIN LATERAL (SELECT e1, ...) AS o(n1, ...)` (one row of expressions over the outer row) is inlined; every other LATERAL is rejected with an error |
 | MERGE | ❌ Not supported | |
 | MERGE ... RETURNING | ❌ Not supported | |
 | Multirow VALUES | ✅ Supported | In INSERT and as standalone VALUES lists |
@@ -188,7 +188,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
 | Return OLD and NEW values from modified rows | ❌ Not supported | |
-| Row-wise comparison | ❌ Not supported | Row constructors `(a,b) < (c,d)` fail to translate |
+| Row-wise comparison | ✅ Supported | Row constructors compare element-wise, as `(a,b) < (c,d)` does in PostgreSQL |
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |

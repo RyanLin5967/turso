@@ -23,6 +23,7 @@ turso_core = { workspace = true, default-features = true, features = [
 ] }
 turso_pg = { workspace = true }
 turso_pg_parser = { workspace = true }
+turso_parser = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

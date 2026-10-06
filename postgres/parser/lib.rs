@@ -3,6 +3,9 @@ use thiserror::Error;
 
 pub mod translator;
 
+/// libpg_query's bindings, for callers that edit a parse tree (the frontend's table rebuild).
+pub use pg_query;
+
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("{0}")]
@@ -28,6 +31,12 @@ fn count_libpg_query_call() {
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     count_libpg_query_call();
     pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+}
+
+/// Deparse a parse tree back to SQL text (libpg_query's deparser).
+pub fn deparse(protobuf: &pg_query::protobuf::ParseResult) -> Result<String, ParseError> {
+    count_libpg_query_call();
+    pg_query::deparse(protobuf).map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
 /// Split a multi-statement SQL string into individual statements.

@@ -23,7 +23,9 @@ pub struct TranslateResult {
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
-    // TODO: Add schema information, type mappings, etc.
+    /// The columns of the LATERAL subselects inlined so far (see `inline_lateral`): a reference
+    /// `alias.column` translates to the expression the subselect computes for it.
+    lateral_columns: std::cell::RefCell<std::collections::HashMap<(String, String), ast::Expr>>,
 }
 
 impl PostgreSQLTranslator {
@@ -43,6 +45,22 @@ impl PostgreSQLTranslator {
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
             .map(|a| ast::Name::from_string(&a.aliasname));
+        // information_schema's views are virtual tables named information_schema_<view>, so a
+        // user table that shares a view's name stays the user's.
+        let name = if range_var
+            .schemaname
+            .eq_ignore_ascii_case("information_schema")
+            && matches!(
+                range_var.relname.to_lowercase().as_str(),
+                "columns" | "tables" | "table_constraints" | "key_column_usage"
+            ) {
+            ast::Name::from_string(format!(
+                "information_schema_{}",
+                range_var.relname.to_lowercase()
+            ))
+        } else {
+            name
+        };
         let mut qn = if range_var.schemaname.is_empty()
             || matches!(
                 range_var.schemaname.to_lowercase().as_str(),
@@ -88,7 +106,8 @@ impl PostgreSQLTranslator {
             | "pg_publication_namespace"
             | "pg_publication_rel"
             | "pg_get_tabledef"
-            | "pg_tables" => table_name.to_string(),
+            | "pg_tables"
+            | "pg_indexes" => table_name.to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
             "information_schema.columns" => "pragma_table_info".to_string(),
             // Default: keep original name
@@ -1786,10 +1805,69 @@ impl PostgreSQLTranslator {
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
 
+    /// `CROSS JOIN LATERAL (SELECT e1, ..., ek) AS o(n1, ..., nk)`, a subselect with no FROM or any
+    /// other clause, is one row of expressions over the outer row: the join is dropped and every
+    /// later `o.ni` reads `ei` (PostgreSQL's pgbench probes its tables this way). Any other
+    /// LATERAL subquery is refused, never run as an ordinary (uncorrelated) one.
+    fn inline_lateral(
+        &self,
+        range_sub: &pg_query::protobuf::RangeSubselect,
+    ) -> Result<(), ParseError> {
+        use pg_query::protobuf::node::Node;
+        let refuse = || {
+            ParseError::ParseError(
+                "LATERAL is supported only for a subquery of expressions with no FROM clause"
+                    .into(),
+            )
+        };
+        let Some(Node::SelectStmt(select)) =
+            range_sub.subquery.as_ref().and_then(|n| n.node.as_ref())
+        else {
+            return Err(refuse());
+        };
+        let plain = select.from_clause.is_empty()
+            && select.where_clause.is_none()
+            && select.group_clause.is_empty()
+            && select.having_clause.is_none()
+            && select.window_clause.is_empty()
+            && select.values_lists.is_empty()
+            && select.sort_clause.is_empty()
+            && select.limit_offset.is_none()
+            && select.limit_count.is_none()
+            && select.with_clause.is_none()
+            && select.larg.is_none()
+            && select.distinct_clause.is_empty();
+        let alias = range_sub.alias.as_ref().ok_or_else(refuse)?;
+        if !plain || select.target_list.is_empty() {
+            return Err(refuse());
+        }
+        for (i, target) in select.target_list.iter().enumerate() {
+            let Some(Node::ResTarget(rt)) = target.node.as_ref() else {
+                return Err(refuse());
+            };
+            let expr = self.translate_expr(rt.val.as_deref().ok_or_else(refuse)?)?;
+            let name = match alias.colnames.get(i).and_then(|n| n.node.as_ref()) {
+                Some(Node::String(s)) => s.sval.clone(),
+                _ if !rt.name.is_empty() => rt.name.clone(),
+                _ => return Err(refuse()),
+            };
+            self.lateral_columns
+                .borrow_mut()
+                .insert((alias.aliasname.clone(), name), expr);
+        }
+        Ok(())
+    }
+
     fn translate_range_subselect(
         &self,
         range_sub: &pg_query::protobuf::RangeSubselect,
     ) -> Result<ast::SelectTable, ParseError> {
+        if range_sub.lateral {
+            return Err(ParseError::ParseError(
+                "LATERAL is supported only as CROSS JOIN LATERAL of a subquery of expressions"
+                    .into(),
+            ));
+        }
         let subquery_node = range_sub
             .subquery
             .as_ref()
@@ -1814,6 +1892,11 @@ impl PostgreSQLTranslator {
         &self,
         range_func: &pg_query::protobuf::RangeFunction,
     ) -> Result<ast::SelectTable, ParseError> {
+        if range_func.lateral {
+            return Err(ParseError::ParseError(
+                "LATERAL is not supported on a function in FROM".into(),
+            ));
+        }
         // RangeFunction.functions is a list of function-call items.
         // Each item is a List node whose first element is the FuncCall.
         let func_item = range_func
@@ -2037,6 +2120,19 @@ impl PostgreSQLTranslator {
                     joins.extend(right_joins);
                     right_primary
                 }
+                Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub))
+                    if range_sub.lateral =>
+                {
+                    let pg_jt =
+                        PgJoinType::try_from(join_expr.jointype).unwrap_or(PgJoinType::Undefined);
+                    if pg_jt != PgJoinType::JoinInner || join_expr.quals.is_some() {
+                        return Err(ParseError::ParseError(
+                            "LATERAL is supported only as CROSS JOIN LATERAL".into(),
+                        ));
+                    }
+                    self.inline_lateral(range_sub)?;
+                    return Ok(primary_table);
+                }
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
                 }
@@ -2193,6 +2289,16 @@ impl PostgreSQLTranslator {
                                             ast::Name::from_string(parts[1].clone()),
                                             ast::Name::from_string(parts[2].clone()),
                                         ))
+                                    }
+                                    2 if self
+                                        .lateral_columns
+                                        .borrow()
+                                        .contains_key(&(parts[0].clone(), parts[1].clone())) =>
+                                    {
+                                        let inlined = self.lateral_columns.borrow()
+                                            [&(parts[0].clone(), parts[1].clone())]
+                                            .clone();
+                                        Ok(ast::Expr::Parenthesized(vec![Box::new(inlined)]))
                                     }
                                     2 => {
                                         // table.column
@@ -4229,6 +4335,11 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
         | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" => "REAL".into(),
+        // character(n) (libpg_query's bpchar with a length; `char` alone is char(1)); an unbounded
+        // bpchar behaves as text.
+        "BPCHAR" | "CHARACTER" if !params.is_empty() => {
+            return Some(PgTypeMapping::with_params("bpchar", params.to_vec()));
+        }
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
@@ -5041,6 +5152,65 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
         .strip_prefix("Object")
         .unwrap_or(&debug)
         .to_ascii_uppercase()
+}
+
+/// `ALTER TABLE [ONLY] t ADD [CONSTRAINT n] <table constraint>[, ADD ...]`: every command adds a
+/// PRIMARY KEY, UNIQUE, FOREIGN KEY or CHECK constraint. The engine cannot add a constraint to a
+/// table, so the frontend rebuilds the table with them (`handle_pg_add_constraints`).
+#[derive(Debug, Clone)]
+pub struct PgAddConstraints {
+    pub schema: Option<String>,
+    pub table: String,
+    /// The constraint nodes, ready to join a CREATE TABLE's element list.
+    pub constraints: Vec<pg_query::protobuf::Node>,
+}
+
+/// Recognise [`PgAddConstraints`]. `USING INDEX`, `NOT VALID`, EXCLUDE and any other command keep
+/// the translator's refusal.
+pub fn try_extract_add_constraints(parse_result: &ParseResult) -> Option<PgAddConstraints> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::{AlterTableType, ConstrType};
+
+    let [raw] = parse_result.protobuf.stmts.as_slice() else {
+        return None;
+    };
+    let Some(Node::AlterTableStmt(alter)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return None;
+    };
+    let relation = alter.relation.as_ref()?;
+    if alter.cmds.is_empty() {
+        return None;
+    }
+    let mut constraints = Vec::with_capacity(alter.cmds.len());
+    for cmd in &alter.cmds {
+        let Some(Node::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
+            return None;
+        };
+        if AlterTableType::try_from(cmd.subtype).ok()? != AlterTableType::AtAddConstraint {
+            return None;
+        }
+        let def = cmd.def.as_deref()?;
+        let Some(Node::Constraint(c)) = def.node.as_ref() else {
+            return None;
+        };
+        let kind = ConstrType::try_from(c.contype).ok()?;
+        let supported = matches!(
+            kind,
+            ConstrType::ConstrPrimary
+                | ConstrType::ConstrUnique
+                | ConstrType::ConstrForeign
+                | ConstrType::ConstrCheck
+        );
+        if !supported || !c.indexname.is_empty() || c.skip_validation || c.deferrable {
+            return None;
+        }
+        constraints.push(def.clone());
+    }
+    Some(PgAddConstraints {
+        schema: (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        table: relation.relname.clone(),
+        constraints,
+    })
 }
 
 /// The prefix every branch function of the wire server shares (`turso_branch_create` and the

@@ -7,10 +7,11 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_checkpoint, is_comment_on, is_refresh_matview, try_extract_branch_call,
-    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
-    try_extract_show, PgBranchArg, PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
+    is_checkpoint, is_comment_on, is_refresh_matview, try_extract_add_constraints,
+    try_extract_branch_call, try_extract_copy_from, try_extract_create_schema,
+    try_extract_drop_schema, try_extract_set, try_extract_show, PgAddConstraints, PgBranchArg,
+    PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
+    PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -470,6 +471,11 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         ));
     }
 
+    if let Some(add) = try_extract_add_constraints(&parse_result) {
+        handle_pg_add_constraints(pg_conn, &add)?;
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
+    }
+
     if let Some(stmt) = try_extract_copy_from(&parse_result) {
         let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
@@ -592,6 +598,146 @@ fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Resul
         stmt.run_ignore_rows()?;
     }
     Ok(())
+}
+
+/// `ALTER TABLE t ADD <constraint>...` ([`PgAddConstraints`]): the engine adds no constraint to an
+/// existing table, so the table is rebuilt from its own PostgreSQL definition with the
+/// constraints appended, atomically (in the session's transaction, or in one of its own):
+/// its rows are copied aside, the table is dropped and created anew, the rows are inserted back
+/// with foreign keys enforced (so a row that breaks a new constraint fails the ALTER, as
+/// PostgreSQL validates it), and its indexes and triggers are created again. Foreign keys are not
+/// enforced while the old table is dropped, so its children are untouched. A table created by
+/// CREATE TABLE AS, or not through this frontend, has no definition to rebuild from: refused.
+fn handle_pg_add_constraints(
+    pg_conn: &Arc<PgConnectionInner>,
+    add: &PgAddConstraints,
+) -> Result<()> {
+    let conn = &pg_conn.conn;
+    if add
+        .schema
+        .as_deref()
+        .is_some_and(|s| !s.eq_ignore_ascii_case("public"))
+    {
+        return Err(LimboError::ParseError(
+            "ALTER TABLE ADD CONSTRAINT is supported only for tables in schema public".to_string(),
+        ));
+    }
+    let table = add.table.as_str();
+    let mut definition = None;
+    let mut dependents = Vec::new();
+    let mut stmt = conn.prepare_internal(
+        "SELECT type, sql FROM sqlite_schema WHERE tbl_name = ?1 AND sql IS NOT NULL \
+         ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, rowid",
+    )?;
+    stmt.bind_at(
+        NonZero::new(1).unwrap(),
+        Value::build_text(table.to_string()),
+    )?;
+    for row in stmt.run_collect_rows()? {
+        let (Some(Value::Text(kind)), Some(Value::Text(sql))) = (row.first(), row.get(1)) else {
+            continue;
+        };
+        match kind.as_str() {
+            "table" => definition = Some(sql.as_str().to_string()),
+            "index" | "trigger" => dependents.push(sql.as_str().to_string()),
+            _ => {}
+        }
+    }
+    let definition = definition
+        .ok_or_else(|| LimboError::ParseError(format!("relation \"{table}\" does not exist")))?;
+    let pg_definition = catalog::decode_stored_pg_schema_sql(&definition).ok_or_else(|| {
+        LimboError::ParseError(format!(
+            "ALTER TABLE ADD CONSTRAINT: table \"{table}\" was not created by CREATE TABLE in \
+             this frontend, so it has no definition to rebuild"
+        ))
+    })?;
+    let mut parsed =
+        turso_pg_parser::parse(pg_definition).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let create = parsed
+        .protobuf
+        .stmts
+        .first_mut()
+        .and_then(|raw| raw.stmt.as_mut())
+        .and_then(|s| s.node.as_mut());
+    let Some(turso_pg_parser::pg_query::protobuf::node::Node::CreateStmt(create)) = create else {
+        return Err(LimboError::ParseError(format!(
+            "ALTER TABLE ADD CONSTRAINT: table \"{table}\" was created by CREATE TABLE AS, so it \
+             has no column definitions to rebuild"
+        )));
+    };
+    create.if_not_exists = false;
+    create.table_elts.extend(add.constraints.iter().cloned());
+    let rebuilt = turso_pg_parser::deparse(&parsed.protobuf)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+
+    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+    let aside = format!(
+        "\"__turso_internal_rebuild_{}\"",
+        table.replace('"', "\"\"")
+    );
+    let in_tx = !conn.get_auto_commit();
+    execute_root(
+        conn,
+        if in_tx {
+            "SAVEPOINT __turso_rebuild"
+        } else {
+            "BEGIN"
+        },
+    )?;
+    let enforced = conn.foreign_keys_enabled();
+    let rebuild = (|| {
+        conn.set_foreign_keys_enabled(false);
+        execute_root(
+            conn,
+            format!("CREATE TABLE {aside} AS SELECT * FROM {quoted}"),
+        )?;
+        execute_root(conn, format!("DROP TABLE {quoted}"))?;
+        run_pg_statement(pg_conn, &rebuilt)?;
+        // Every step is a root statement: an internal helper statement opens no transaction of its
+        // own (DDL through one panics the engine at SetCookie) and skips foreign key checks. With
+        // foreign keys enforced, the copy back checks every row against the new constraints.
+        conn.set_foreign_keys_enabled(true);
+        execute_root(conn, format!("INSERT INTO {quoted} SELECT * FROM {aside}"))?;
+        conn.set_foreign_keys_enabled(false);
+        execute_root(conn, format!("DROP TABLE {aside}"))?;
+        for sql in &dependents {
+            match catalog::decode_stored_pg_schema_sql(sql) {
+                Some(pg_sql) => run_pg_statement(pg_conn, pg_sql)?,
+                None => execute_root(conn, sql)?,
+            }
+        }
+        Ok(())
+    })();
+    conn.set_foreign_keys_enabled(enforced);
+    match rebuild {
+        Ok(()) => execute_root(
+            conn,
+            if in_tx {
+                "RELEASE SAVEPOINT __turso_rebuild"
+            } else {
+                "COMMIT"
+            },
+        ),
+        Err(e) => {
+            if in_tx {
+                let _ = execute_root(conn, "ROLLBACK TO SAVEPOINT __turso_rebuild");
+                let _ = execute_root(conn, "RELEASE SAVEPOINT __turso_rebuild");
+            } else {
+                let _ = execute_root(conn, "ROLLBACK");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Run one statement as the engine runs a client's (a root statement), in SQLite text.
+fn execute_root(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+    conn.prepare_sqlite(sql)?.run_ignore_rows()
+}
+
+/// Run one PostgreSQL statement through this frontend, as a client's would be.
+fn run_pg_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<()> {
+    prepare_statement(pg_conn, sql)?.run_ignore_rows()
 }
 
 fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
