@@ -543,18 +543,28 @@ impl Group {
     }
 
     /// An ordered flight's outcome (`BranchStore::order_for_trunk`): on success every byte below
-    /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so.
+    /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so. The log's
+    /// last flight is now this one, which has no confirmation (barriered, not synced), so the
+    /// earlier flight's queued word is dropped: it could never match (engine review 8 #9). Mutant
+    /// `ordered_keeps_confirm` (test builds only): kept, as before.
     fn land_ordered(&self, end: u64, ok: bool) {
         let mut g = self.lock();
         g.flushing = false;
+        let mut stale = None;
         if ok && self.accepts() {
             self.set_durable(&mut g, 0, end);
             g.ordered = g.ordered.max(end);
+            if !fe_mutant("ordered_keeps_confirm") {
+                stale = g.confirm.take();
+            }
         } else {
             self.failed.store(true, Ordering::Release);
             g.pending_full = None;
         }
         self.cv.notify_all();
+        drop(g);
+        // The dropped confirmation's descriptor is closed holding no lock.
+        drop(stale);
     }
 
     /// Every byte below `end` is durable in `class` and every weaker one, by a rewrite of the log
