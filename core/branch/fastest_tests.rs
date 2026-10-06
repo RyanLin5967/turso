@@ -2690,6 +2690,11 @@ fn a_failed_barrier_fail_stops_and_only_an_unsupported_one_falls_back() {
             let before = sync_counts();
             let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
             let after = sync_counts();
+            assert_eq!(
+                super::journal::barrier_errno_pending(),
+                0,
+                "catalog={catalog} {name}: premise: the commit took the armed barrier"
+            );
             let fallbacks = after.barrier_fallback - before.barrier_fallback;
             if errno != libc::EIO {
                 committed.unwrap();
@@ -4214,6 +4219,10 @@ impl Drop for DarwinMajor {
 /// and the userland fallback re-issued it: the fsyncgate retry, which can report success for pages
 /// the failed call lost. On such a kernel every failed barrier fails its flight, the trunk commit
 /// relying on it is refused, and the store fail-stops; nothing falls back.
+///
+/// FLAGGED TEST EDIT (own tests, engine review 9 #19): an EIO arm here (mutant
+/// `barrier_retries_any` kills it), and in both barrier tests a premise that the commit took the
+/// armed errno, so an arm cannot pass without reaching a barrier or leak its errno onward.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_failed_barrier_on_a_kernel_that_promotes_it_fail_stops_whatever_its_errno() {
@@ -4221,6 +4230,7 @@ fn a_failed_barrier_on_a_kernel_that_promotes_it_fail_stops_whatever_its_errno()
     let _k = DarwinMajor::force(23);
     for catalog in [false, true] {
         for (errno, name) in [
+            (libc::EIO, "EIO"),
             (libc::ENOTSUP, "ENOTSUP"),
             (libc::EOPNOTSUPP, "EOPNOTSUPP"),
             (libc::EINVAL, "EINVAL"),
@@ -4236,6 +4246,11 @@ fn a_failed_barrier_on_a_kernel_that_promotes_it_fail_stops_whatever_its_errno()
             let before = sync_counts();
             let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
             let after = sync_counts();
+            assert_eq!(
+                super::journal::barrier_errno_pending(),
+                0,
+                "catalog={catalog} {name}: premise: the commit took the armed barrier"
+            );
             assert_eq!(
                 after.barrier_fallback - before.barrier_fallback,
                 0,

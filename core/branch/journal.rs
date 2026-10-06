@@ -3654,6 +3654,13 @@ pub(crate) fn fail_next_barrier(errno: i32) {
     BARRIER_ERRNO.store(errno, std::sync::atomic::Ordering::Release);
 }
 
+/// Test builds: the errno `fail_next_barrier` armed and no barrier has taken yet (0: none), so a
+/// test can assert its injection reached a barrier (engine review 9 #19).
+#[cfg(test)]
+pub(crate) fn barrier_errno_pending() -> i32 {
+    BARRIER_ERRNO.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Make a file's creation or rename durable: on POSIX that is a sync of its directory, in `class`.
 pub(crate) fn fsync_dir_of(path: &Path, class: SyncClass) -> Result<()> {
     #[cfg(unix)]
@@ -3706,7 +3713,8 @@ mod tests {
         assert!(out.status.success(), "premise: sysctl kern.osrelease succeeded");
         let release = String::from_utf8(out.stdout).expect("premise: sysctl printed UTF-8");
         let digits: String = release.trim().chars().take_while(char::is_ascii_digit).collect();
-        let expected: u32 = digits.parse().expect("premise: the release starts with its major version");
+        let expected: u32 =
+            digits.parse().expect("premise: the release starts with its major version");
         assert_eq!(
             running_darwin_major(),
             expected,
