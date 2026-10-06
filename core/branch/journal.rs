@@ -4228,15 +4228,15 @@ mod format_tests {
         std::fs::write(&files.log, &bytes).unwrap();
         let mut recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
         assert_eq!(forks(&recovered.records), vec![1], "premise: the torn flight and what followed were cut");
-        // The truncation never reached the disk: the old tail is back. Then a flight of exactly the
-        // second flight's length lands where it was.
-        let tail = &bytes[starts[1] as usize..];
-        let kept = std::fs::read(&files.log).unwrap().len();
-        let f = OpenOptions::new().write(true).open(&files.log).unwrap();
-        write_at(&f, tail, kept as u64).unwrap();
+        // A flight of exactly the second flight's length lands where it was; then the power is cut
+        // and the cut never reached the disk: the old bytes after that flight are back.
         recovered.journal.buffer(&Record::Fork { child: 4, parent: 0 }).unwrap();
         recovered.journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
         drop(recovered);
+        let now = std::fs::read(&files.log).unwrap();
+        let f = OpenOptions::new().write(true).open(&files.log).unwrap();
+        write_at(&f, &bytes[now.len()..], now.len() as u64).unwrap();
+        drop(f);
         let again = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
         assert!(!forks(&again.records).contains(&3), "a flight cut at recovery came back: {:?}", forks(&again.records));
         assert_eq!(forks(&again.records), vec![1, 4]);
