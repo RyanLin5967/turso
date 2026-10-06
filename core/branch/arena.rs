@@ -43,6 +43,10 @@ enum Backing {
 #[cfg(test)]
 pub(crate) static ARENA_ON_OTHER_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Test builds: `forget_listed` calls (engine review 7 #7: a test must show the install reached it).
+#[cfg(test)]
+pub(crate) static FORGET_LISTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) struct Arena {
     page_size: usize,
     backing: Backing,
@@ -355,6 +359,8 @@ impl Arena {
     pub(crate) fn forget_listed(&mut self, slot: Slot) {
         turso_assert!(slot < self.high_water, "a listed slot past the high-water mark");
         turso_assert!(!self.is_free(slot), "a deferred slot was already free");
+        #[cfg(test)]
+        FORGET_LISTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         // fastest-engine mutant `forget_listed_kept_in_use` (test builds only).
         if !super::store::fe_mutant("forget_listed_kept_in_use") {
             self.in_use -= 1;

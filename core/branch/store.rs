@@ -5805,6 +5805,19 @@ impl BranchStore {
         }
     }
 
+    /// Test builds: the slots deferred frees wait on, read without maturing any (engine review 7
+    /// #7: the accessors that list slots in use mature them first).
+    #[cfg(test)]
+    pub(crate) fn deferred_slots_for_test(&self) -> Vec<Slot> {
+        self.inner.lock().pending_free.iter().flat_map(|(_, s)| s.iter().copied()).collect()
+    }
+
+    /// Test builds: whether the arena's own bitmap has `slot` free, read without maturing anything.
+    #[cfg(test)]
+    pub(crate) fn arena_slot_free_for_test(&self, slot: Slot) -> bool {
+        self.inner.lock().arena.as_ref().is_some_and(|a| a.is_free(slot))
+    }
+
     /// Test builds: the class the log's rewrites sync in (the store's, or the raised one).
     #[cfg(test)]
     pub(crate) fn rewrite_class_for_test(&self) -> SyncClass {

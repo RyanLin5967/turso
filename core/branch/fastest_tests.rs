@@ -2055,8 +2055,11 @@ fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
             let db = db.clone();
             std::thread::spawn(move || db.branch_checkpoint_fuzzy_now())
         };
+        // FLAGGED TEST EDIT (engine review 7 #7; review 4 asked for it): 60 s, not 2 s. A capture
+        // that waits for the held flight never finishes, so the check still fires; a slow box no
+        // longer fails it falsely.
         let t = std::time::Instant::now();
-        while !starter.is_finished() && t.elapsed() < std::time::Duration::from_secs(2) {
+        while !starter.is_finished() && t.elapsed() < std::time::Duration::from_secs(60) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         if !starter.is_finished() {
@@ -2080,6 +2083,12 @@ fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
         for slot in &owned {
             assert!(!in_use.contains(slot), "slot {slot} is still in use after its release");
         }
+        // FLAGGED TEST EDIT (engine review 7 #7, a strengthening): the count agrees with the slots.
+        assert_eq!(
+            db.branch_stats().unwrap().arena_slots_in_use as usize,
+            in_use.len(),
+            "after the install: the in-use count disagrees with the slots in use"
+        );
         (owned, db.incarnation)
     };
     let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
@@ -2087,6 +2096,11 @@ fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
     for slot in &owned {
         assert!(!in_use.contains(slot), "slot {slot} is in use after a reopen");
     }
+    assert_eq!(
+        db.branch_stats().unwrap().arena_slots_in_use as usize,
+        in_use.len(),
+        "after a reopen: the in-use count disagrees with the slots in use"
+    );
     // Free exactly once: reused by new branches without two of them sharing it.
     let trunk = db.connect().unwrap();
     let mut seen = std::collections::HashSet::new();
@@ -4142,4 +4156,78 @@ fn a_cut_syncs_its_directory_once_before_the_next_acknowledgement() {
         let _c = trunk.fork_branch().unwrap().into_id();
         assert_eq!(dirs() - before, 1, "fuzzy={fuzzy}: a directory sync per flight");
     }
+}
+
+// ---- engine review 7 #7: the install's forget_listed, reached on purpose ----
+
+/// Engine review 7 #7 (review 4 #11): a fuzzy checkpoint captured while a release's flight is in
+/// the air lists that release's slots free in the catalog, and the install takes them out of
+/// memory once (`forget_listed`): free exactly once, in use nowhere, reused by a new branch. The
+/// release lands before the install with NO maturing call in between (every listing accessor
+/// matures first, which is why the older test never reached `forget_listed`); probes here read
+/// the deferred frees and the arena's bitmap without maturing. Mutants `forget_listed_kept_in_use`
+/// (the install leaves them counted in use) and `deferred_matured_at_capture` (the capture frees
+/// them before their release is durable) must each fail it on a claim.
+#[test]
+fn the_install_forgets_a_captured_deferred_free_exactly_once() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("forget-listed.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let anchor = trunk.fork_branch().unwrap();
+    write_v(&anchor.connect().unwrap(), 1, "anchor");
+    let anchor = anchor.into_id();
+    let x = trunk.fork_branch().unwrap();
+    write_v(&x.connect().unwrap(), 3, "x");
+    let owned_x = x.owned_slots();
+    assert!(!owned_x.is_empty(), "premise: x owns a slot");
+    // x's release is in the air at the capture.
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_FLIGHT_TAKEN, O::Release);
+    let release = std::thread::spawn(move || x.reap().map(|_| ()));
+    wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    for &slot in &owned_x {
+        assert!(
+            !db.branches.arena_slot_free_for_test(slot),
+            "slot {slot} was freed at the capture, before the release that frees it was durable"
+        );
+    }
+    hold.store(0, O::Release);
+    release.join().unwrap().unwrap();
+    eventually("the checkpoint never arrived", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+    });
+    let deferred = db.branches.deferred_slots_for_test();
+    assert!(
+        owned_x.iter().all(|s| deferred.contains(s)),
+        "premise: x's frees still wait at the install ({deferred:?}, x owned {owned_x:?})"
+    );
+    let forgotten = super::arena::FORGET_LISTED.load(O::Acquire);
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert!(
+        super::arena::FORGET_LISTED.load(O::Acquire) - forgotten >= owned_x.len() as u64,
+        "premise: the install took x's listed slots out of memory"
+    );
+    let in_use = db.branch_slots_in_use();
+    assert_eq!(
+        db.branch_stats().unwrap().arena_slots_in_use as usize,
+        in_use.len(),
+        "after the install: the in-use count disagrees with the slots in use"
+    );
+    for slot in &owned_x {
+        assert!(!in_use.contains(slot), "slot {slot} is in use after its release and the install");
+    }
+    let z = trunk.fork_branch().unwrap();
+    write_v(&z.connect().unwrap(), 5, "z");
+    assert!(
+        z.owned_slots().iter().any(|s| owned_x.contains(s)),
+        "a new branch did not reuse a slot the install listed free (z owns {:?}, x owned {owned_x:?})",
+        z.owned_slots()
+    );
+    let _ = (anchor, z.into_id());
 }
