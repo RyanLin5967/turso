@@ -3340,13 +3340,7 @@ impl Pager {
                     // were taken at) and the WAL write lock is still held (no merge validation, which
                     // runs inside a trunk write transaction, falls between the commit and its
                     // stamps). Then the gate closes.
-                    let stamped = if let Some(store) = self.branch_store.get() {
-                        let tx = std::mem::take(&mut *self.trunk_pending.lock());
-                        store.stamp_committed(tx)
-                    } else {
-                        false
-                    };
-                    self.close_trunk_gate();
+                    let stamped = self.finish_trunk_write(true);
                     crate::branch::store::kill_point("trunk.published");
 
                     wal.end_write_tx();
@@ -3896,6 +3890,16 @@ impl Pager {
         if crate::branch::store::fe_mutant("raw_gate_left_open") {
             return false;
         }
+        self.finish_trunk_write(committed)
+    }
+
+    /// The end of a trunk write transaction, still under its WAL write lock (review 3 #20): a commit
+    /// that `committed` has its merge writes stamped with the trunk's epoch while its commit gate is
+    /// open, then the gate closes; otherwise the pending writes and captures are dropped and a gate
+    /// a failed commit left open is closed. Every trunk commit path ends here: `commit_dirty_pages`,
+    /// a raw WAL session's end, and an attached pager's commit. Returns whether stamps were made,
+    /// for `prune_branch_stamps` once the lock is released.
+    pub(crate) fn finish_trunk_write(&self, committed: bool) -> bool {
         let tx = std::mem::take(&mut *self.trunk_pending.lock());
         self.trunk_pre_images.lock().clear();
         let stamped = match self.branch_store.get() {
@@ -3908,7 +3912,6 @@ impl Pager {
 
     /// Drop the merge stamps no live or future trunk child can be refused by (off the WAL write
     /// lock, as `commit_dirty_pages` does).
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub(crate) fn prune_branch_stamps(&self) {
         if let Some(store) = self.branch_store.get() {
             store.prune_stamps();
