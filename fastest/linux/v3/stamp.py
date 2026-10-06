@@ -7,18 +7,21 @@
 RECORD ONLY. The Mac stamp's void rules (battery, ~/.claude/QUIET, fan-guard SIGSTOPs, end load) describe that box;
 no void rule for a Linux batch is registered, so this stamp never voids: `end` exits 0 when every required record
 was taken and 2 when one was not (a stamp that cannot see the box cannot vouch for it). Whoever registers the T3
-rules decides what voids; the records here are what such a rule would read.
+rules decides what voids; the records here are what such a rule reads (run.sh's V3_REQUIRE_T3=1 already refuses a
+batch whose CPUs are not all on the "performance" governor, via batchgate.py t3pre).
 
 Each stamp records: UTC, a CLOCK_MONOTONIC_RAW anchor, load averages, PSI (cpu, io, memory), /proc/stat CPU jiffies,
-/proc/diskstats for every block device, the mount and free bytes under D, and the block devices' write-cache and FUA
-modes. `end` adds the deltas between the two stamps: CPU busy share of the window, and per device the reads, writes,
-discards (diskstats field 15) and FLUSH requests completed (fields 19-20, kernel >= 5.5). On a device that reports
-write-through the block layer strips REQ_PREFLUSH before a request exists, so a flush count that stays at zero there
-is consistent with no flush reaching it (the kernel source says so; this stamp does not test it).
+/proc/diskstats for every block device, the mount and free bytes under D, the block devices' write-cache and FUA
+modes, the clocksource (current and available; review 2 item 16), and per CPU the cpufreq governor, current and
+min/max frequency, and cpuidle's driver, governor and per-state disable flags (review 2 item 17; the GitHub-hosted
+VMs expose no cpufreq and no per-CPU cpuidle, recorded as such). `end` adds the deltas between the two stamps: CPU
+busy share of the window, and per device the reads, writes, discards (diskstats field 15) and FLUSH requests
+completed (fields 19-20, kernel >= 5.5). On a device that reports write-through the block layer strips REQ_PREFLUSH
+before a request exists, so a flush count that stays at zero there is consistent with no flush reaching it.
 """
 import glob, json, os, subprocess, sys, time
 
-REQUIRED = ["loadavg", "stat_cpu", "diskstats"]
+REQUIRED = ["loadavg", "stat_cpu", "diskstats", "clocksource"]
 
 
 def read(p):
@@ -27,6 +30,11 @@ def read(p):
             return f.read()
     except OSError:
         return None
+
+
+def rs(p):
+    t = read(p)
+    return t.strip() if t is not None else None
 
 
 def diskstats():
@@ -58,6 +66,29 @@ def stat_cpu():
     return {"total": sum(v), "idle": v[3] + (v[4] if len(v) > 4 else 0)}
 
 
+def cpufreq():
+    cpus = {}
+    for c in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*")):
+        b = os.path.join(c, "cpufreq")
+        cpus[os.path.basename(c)] = None if not os.path.isdir(b) else {
+            k: rs(os.path.join(b, k)) for k in ("scaling_governor", "scaling_cur_freq", "scaling_min_freq",
+                                                "scaling_max_freq", "scaling_driver")}
+    return {"present": any(v is not None for v in cpus.values()), "cpus": cpus}
+
+
+def cpuidle():
+    r = {"off": rs("/sys/module/cpuidle/parameters/off"),
+         "driver": rs("/sys/devices/system/cpu/cpuidle/current_driver"),
+         "governor": rs("/sys/devices/system/cpu/cpuidle/current_governor"), "cpus": {}}
+    for c in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*")):
+        states = sorted(glob.glob(os.path.join(c, "cpuidle", "state*")))
+        r["cpus"][os.path.basename(c)] = None if not states else {
+            os.path.basename(s): {"name": rs(os.path.join(s, "name")), "disable": rs(os.path.join(s, "disable"))}
+            for s in states}
+    r["per_cpu_present"] = any(v is not None for v in r["cpus"].values())
+    return r
+
+
 def snapshot(d):
     s = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "epoch": time.time(),
          "monotonic_raw_ns": time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW), "problems": []}
@@ -66,6 +97,10 @@ def snapshot(d):
     s["psi"] = {k: read("/proc/pressure/" + k) for k in ("cpu", "io", "memory")}
     s["stat_cpu"] = stat_cpu()
     s["diskstats"] = diskstats()
+    s["clocksource"] = rs("/sys/devices/system/clocksource/clocksource0/current_clocksource")
+    s["clocksource_available"] = rs("/sys/devices/system/clocksource/clocksource0/available_clocksource")
+    s["cpufreq"] = cpufreq()
+    s["cpuidle"] = cpuidle()
     s["block"] = {}
     for b in sorted(glob.glob("/sys/block/*")):
         s["block"][os.path.basename(b)] = {k: (read(b + "/queue/" + k) or "").strip() for k in ("write_cache", "fua")}
@@ -89,10 +124,12 @@ def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "start":
         d = sys.argv[sys.argv.index("--dir") + 1] if "--dir" in sys.argv else None
         s = snapshot(d)
-        json.dump(s, open(sys.argv[2], "w"), indent=1)
+        with open(sys.argv[2], "w") as f:
+            json.dump(s, f, indent=1)
         return 2 if s["problems"] else 0
     if len(sys.argv) == 4 and sys.argv[1] == "end":
-        a = json.load(open(sys.argv[2]))
+        with open(sys.argv[2]) as f:
+            a = json.load(f)
         b = snapshot(a.get("dir"))
         b["window_s"] = b["epoch"] - a["epoch"]
         b["void_rule"] = "none registered for Linux: record only"
@@ -103,11 +140,15 @@ def main():
         if a.get("diskstats") and b.get("diskstats"):
             b["diskstats_delta"] = {dev: {k: row[k] - a["diskstats"][dev].get(k, 0) for k in row}
                                     for dev, row in b["diskstats"].items() if dev in a["diskstats"]}
+        if a.get("clocksource") != b.get("clocksource"):
+            b["problems"].append("the clocksource changed during the batch: %r -> %r" % (a.get("clocksource"), b.get("clocksource")))
         b["problems"] = a.get("problems", []) + b["problems"]
-        json.dump(b, open(sys.argv[3], "w"), indent=1)
+        with open(sys.argv[3], "w") as f:
+            json.dump(b, f, indent=1)
         return 2 if b["problems"] else 0
     print(__doc__, file=sys.stderr)
     return 2
 
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())
