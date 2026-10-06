@@ -5206,7 +5206,7 @@ impl BranchStore {
     pub(crate) fn branch_named(&self, name: &str) -> Result<Option<BranchId>> {
         self.refuse_if_trunk_only("looking a branch up by name")?;
         check_branch_name(name)?;
-        let (found, poisoned) = {
+        let (found, poisoned, own_release) = {
             let mut inner = self.inner.lock();
             let found = inner.name_lookup(name)?;
             let poisoned = inner.poisoned();
@@ -5220,17 +5220,39 @@ impl BranchStore {
                 }
                 found => found,
             };
-            (found, poisoned)
+            // The newest Release of this very name still in the air, if any (engine review 7
+            // #11): `releases_in_air` holds every early-released Release until it is durable.
+            let own_release = if found.is_none() && !poisoned {
+                inner
+                    .releases_in_air
+                    .iter()
+                    .rev()
+                    .find(|r| r.name.as_deref() == Some(name))
+                    .map(|r| r.lsn)
+            } else {
+                None
+            };
+            (found, poisoned, own_release)
         };
         // Not before its fork is durable (review C-F4): a crash would lose a branch already found.
         if let Some(id) = found {
             self.settle(id, false)?;
         } else if !poisoned && !fe_mutant("lookup_no_release_wait") {
             // Nor reported free before the Release that freed it is durable (review 3 #17): a crash
-            // would bring the branch back under the name. Any release since the last durable one
-            // may be it; with none pending this is one compare. Mutant `lookup_no_release_wait`
-            // (test builds only).
-            self.wait_durable(self.last_release_lsn.load(Ordering::Acquire), self.class)?;
+            // would bring the branch back under the name. Only this name's own Release in the air
+            // may be it, and with none, or with it durable already (a lock-free compare), nothing
+            // is waited for (engine review 7 #11: every miss took the group's lock and waited out
+            // any Release in the air). Mutants `lookup_no_release_wait` (no wait at all) and
+            // `lookup_waits_any_release` (as before: the newest Release of any name), test
+            // builds only.
+            let lsn = if fe_mutant("lookup_waits_any_release") {
+                Some(self.last_release_lsn.load(Ordering::Acquire))
+            } else {
+                own_release
+            };
+            if let Some(lsn) = lsn.filter(|&lsn| self.group.durable(self.class) < lsn) {
+                self.wait_durable(lsn, self.class)?;
+            }
         }
         Ok(found)
     }
@@ -5330,7 +5352,11 @@ impl BranchStore {
                 (durable_at, inner.live_ids.clone().expect("built above"), failed, unreleased)
             }
         };
-        self.wait_durable(durable_at, self.class)?;
+        // A lock-free compare first: with everything durable the listing takes no group lock
+        // (engine review 7 #11).
+        if self.group.durable(self.class) < durable_at {
+            self.wait_durable(durable_at, self.class)?;
+        }
         let mut ids = Vec::with_capacity(snapshot.len() as usize);
         let mut work = IdSetWork::default();
         snapshot.for_each(&mut work, &mut |key| ids.push(BranchId(u64::from(key))));
