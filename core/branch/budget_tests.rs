@@ -153,7 +153,13 @@ fn populate(db: &Arc<Database>, prefix: &str, from: u64, n: u64, named: bool) {
         fork_one(&db.connect().unwrap(), name(0).as_deref());
     }
     let start = from.max(1);
-    let threads = (from + n).saturating_sub(start).clamp(1, 32);
+    // The D0 cells (instructions) populate on one thread: a 32-thread population leaves the
+    // allocator's per-CPU state such that a later connection's drop retires the same 71 blocks in
+    // ~72k more instructions (probe at 3befe5c31: trunk disconnect 203.7k at N=10 by 10 threads,
+    // 271.8k at N=10^4 by 32 threads; 180.7k and 180.2k both serial), a fixture effect that read as
+    // an O(N) cost.
+    let serial = std::env::var("FE_BUDGET_CHILD").is_ok_and(|s| s.ends_with("_d0"));
+    let threads = if serial { 1 } else { (from + n).saturating_sub(start).clamp(1, 32) };
     std::thread::scope(|s| {
         for t in 0..threads {
             s.spawn(move || {
