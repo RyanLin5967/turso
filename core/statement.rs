@@ -1880,4 +1880,78 @@ mod tests {
             "cumulative metrics should include root and trigger writes"
         );
     }
+
+    /// This thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`).
+    #[cfg(unix)]
+    fn thread_cpu() -> std::time::Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is plain old data that clock_gettime writes whole.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID) failed");
+        std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    /// fastest-wire (DECISIONS f8eb23bca): a blocking helper answered a busy handler's
+    /// `StepResult::Sleep` by stepping the IO backend, whose step returns at once when nothing is
+    /// in flight (UnixIO always, io_uring on an empty ring), so every blocking caller with a busy
+    /// timeout spun a core for the whole wait. Here each of the four blocking helpers waits out a
+    /// 500 ms busy timeout behind another connection's write lock, and the waiting thread's CPU
+    /// time over the wait must be a small fraction of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_timeout_wait_sleeps_rather_than_spins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("busy.db");
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let holder = db.connect().unwrap();
+        holder.execute("CREATE TABLE t(x)").unwrap();
+        holder.execute("BEGIN").unwrap();
+        holder.execute("INSERT INTO t VALUES (1)").unwrap();
+        let waiter = db.connect().unwrap();
+        waiter.set_busy_timeout(std::time::Duration::from_millis(500));
+        let insert = "INSERT INTO t VALUES (2)";
+        let helpers: [(&str, &dyn Fn() -> Result<()>); 4] = [
+            ("run_ignore_rows", &|| waiter.execute(insert)),
+            ("run_collect_rows", &|| {
+                waiter.prepare(insert)?.run_collect_rows().map(|_| ())
+            }),
+            ("run_with_row_callback", &|| {
+                waiter.prepare(insert)?.run_with_row_callback(|_| Ok(()))
+            }),
+            ("run_one_step_blocking", &|| {
+                let mut stmt = waiter.prepare(insert)?;
+                stmt.run_one_step_blocking(|| Ok(()), || Ok(())).map(|_| ())
+            }),
+        ];
+        for (name, run) in helpers {
+            let (wall, cpu) = (std::time::Instant::now(), thread_cpu());
+            let refused = run();
+            let (waited, spent) = (wall.elapsed(), thread_cpu() - cpu);
+            assert!(
+                matches!(refused, Err(LimboError::Busy)),
+                "{name}: premise: the second writer is refused busy, got {refused:?}"
+            );
+            assert!(
+                waited >= std::time::Duration::from_millis(450),
+                "{name}: premise: the busy timeout was waited out (waited {waited:?})"
+            );
+            assert!(
+                spent < std::time::Duration::from_millis(100),
+                "{name}: the busy wait spent {spent:?} of CPU over {waited:?}: it spun"
+            );
+        }
+        holder.execute("COMMIT").unwrap();
+    }
 }
