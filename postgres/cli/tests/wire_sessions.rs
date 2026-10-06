@@ -2914,8 +2914,8 @@ fn alter_add_constraint_rebuilds_long_names_and_serial_tables_cleanly() {
     );
 }
 
-/// A primary key column is NOT NULL, as in PostgreSQL and in the engine's STRICT tables (a NULL key
-/// is refused with 23502): information_schema.columns says is_nullable NO and pg_attribute's
+/// A primary key column is NOT NULL, as in PostgreSQL and in the engine's STRICT tables (a NULL in a
+/// composite key is refused with 23502): information_schema.columns says is_nullable NO and pg_attribute's
 /// attnotnull matches a NOT NULL column's for it, declared at column level, at table level, or
 /// SERIAL. Both reported a key column declared without NOT NULL as nullable, and ORM introspection
 /// made nullable key fields of it (wire review 2 item 9).
@@ -2930,7 +2930,8 @@ fn primary_key_columns_are_reported_not_null() {
         .ok("pk2");
     a.q("CREATE TABLE pk3(id SERIAL PRIMARY KEY, v INT)")
         .ok("pk3");
-    let e = a.q("INSERT INTO pk1 VALUES (NULL, 1, 1)").err("a NULL key");
+    // A composite key: an INTEGER PRIMARY KEY is the rowid, and a NULL there takes a new rowid.
+    let e = a.q("INSERT INTO pk2 VALUES (NULL, 1, 1)").err("a NULL key");
     assert_eq!(e.code, "23502", "premise: the key is NOT NULL: {e:?}");
     let r = a
         .q(
