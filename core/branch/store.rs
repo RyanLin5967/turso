@@ -452,6 +452,15 @@ impl Group {
         self.failed.load(Ordering::Acquire)
     }
 
+    /// Whether a landing or a mark may make bytes durable: not once the store is fail-stopped,
+    /// however and wherever that was raised (review 6 #3 (a)) — a flight in the air when another
+    /// path raised it may have synced over the loss that path saw. Read holding the group's lock,
+    /// which every fail-stop raised through the group takes too. Mutant `land_ignores_failed` (test
+    /// builds only): as before, it lands durable.
+    fn accepts(&self) -> bool {
+        !self.poisoned() || fe_mutant("land_ignores_failed")
+    }
+
     /// Fail-stop the store and wake every waiter (called holding the group's lock, `_g`).
     fn fail(&self, _g: &mut GroupState) {
         self.failed.store(true, Ordering::Release);
@@ -483,7 +492,7 @@ impl Group {
         let mut g = self.lock();
         g.flushing = false;
         let mut replaced = None;
-        if ok {
+        if ok && self.accepts() {
             for c in 0..=class_index(class) {
                 self.set_durable(&mut g, c, end);
             }
@@ -514,7 +523,7 @@ impl Group {
     fn land_ordered(&self, end: u64, ok: bool) {
         let mut g = self.lock();
         g.flushing = false;
-        if ok {
+        if ok && self.accepts() {
             self.set_durable(&mut g, 0, end);
             g.ordered = g.ordered.max(end);
         } else {
@@ -529,8 +538,10 @@ impl Group {
     /// catalog commit and cut log), and waiters are woken.
     fn mark_durable(&self, end: u64, class: SyncClass) {
         let mut g = self.lock();
-        for c in 0..=class_index(class) {
-            self.set_durable(&mut g, c, end);
+        if self.accepts() {
+            for c in 0..=class_index(class) {
+                self.set_durable(&mut g, c, end);
+            }
         }
         // The rewrite replaced the log, and confirmed what it kept itself (`Journal::rewrite_from`):
         // a confirmation of a flight before it names the old file.
@@ -2157,10 +2168,15 @@ struct Captured {
     deferred: Vec<Slot>,
     /// The journal's sequence number at the capture, its `Record::Checkpoint` included: every
     /// record the capture covers lies below it. A fuzzy checkpoint commits only once all of it is
-    /// durable in `log_class` (review 4 #1); the deferred frees mature at it.
+    /// durable in `settle_class` (review 4 #1, review 6 #3 (b)); the deferred frees mature at it.
     deferred_lsn: u64,
     /// The journal's own class: what an operation the capture covers was acknowledged in.
     log_class: SyncClass,
+    /// The class a fuzzy checkpoint waits for `deferred_lsn` in before its commit (review 6 #3 (b)):
+    /// `log_class`, raised to Fsync when the log's rewrites sync, so a flight of the group (an
+    /// upgrade one when nothing is buffered, which takes the dirty arena) syncs every slot a D0
+    /// flight left unsynced before the catalog names it.
+    settle_class: SyncClass,
     /// The store's fail-stop flag (shared with its journal and group): read just before the catalog
     /// commit, and set when the checkpoint's arena sync or its commit fails (review 4 #1).
     fail_stop: Arc<AtomicBool>,
@@ -2337,7 +2353,7 @@ fn run_flight(
         // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once.
         if !fe_mutant("commit_unsettled") {
             let settled =
-                BranchStore::wait_durable_on(&inner, &group, None, cap.deferred_lsn, cap.log_class);
+                BranchStore::wait_durable_on(&inner, &group, None, cap.deferred_lsn, cap.settle_class);
             if let Err(e) = settled {
                 return (Err(e), 0);
             }
@@ -4050,7 +4066,8 @@ impl BranchStore {
         self.mature(inner);
         let t = Instant::now();
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
-        let flight_in_air = self.group.lock().flushing;
+        // Read only for mutant `checkpoint_own_arena_sync`: a fuzzy capture takes no arena handle.
+        let flight_in_air = fe_mutant("checkpoint_own_arena_sync") && self.group.lock().flushing;
         let cap = match inner.checkpoint_capture_mode(false, true, flight_in_air) {
             Ok(cap) => cap,
             Err(e) => {
@@ -5372,8 +5389,10 @@ impl BranchStore {
             return;
         }
         let mut g = self.group.lock();
-        for c in 0..=class_index(SyncClass::FullFsync) {
-            self.group.set_durable(&mut g, c, frontier);
+        if self.group.accepts() {
+            for c in 0..=class_index(SyncClass::FullFsync) {
+                self.group.set_durable(&mut g, c, frontier);
+            }
         }
         if g.pending_full.is_some_and(|p| p <= frontier) {
             g.pending_full = None;
@@ -7233,11 +7252,22 @@ impl StoreInner {
         };
         // The capture's fallible steps come before its first effect on the log (review 4 #2): one
         // that fails buffers no marker and takes no generation.
-        // The arena is synced before the catalog commit only if a slot was written since its last
-        // sync, or a flight that took its last unsynced writes may not have synced them yet (lead
-        // review 1 item 7(4)): a clean arena costs the checkpoint no sync.
+        // A fuzzy checkpoint's slots are made durable by the group's own flights, which its wait
+        // before the commit waits for or leads in `settle_class` (review 6 #3 (b)): it syncs no
+        // arena outside the group, beside a flight's sync of the same file, and dups no handle
+        // under this mutex. A sharp one runs with no flight in the air and the store mutex held,
+        // so it syncs what no flight synced (D0 writes under a raised log) itself, and only if a
+        // slot was written since the arena's last sync (lead review 1 item 7(4)). Mutant
+        // `checkpoint_own_arena_sync` (test builds only): the fuzzy one takes its handle too and
+        // waits in the log's class, as before.
         let rewrite_syncs = journal.rewrite_class().syncs();
-        let arena_file = if rewrite_syncs && (arena.is_dirty() || flight_in_air) {
+        let own_sync = !fuzzy || fe_mutant("checkpoint_own_arena_sync");
+        let settle_class = if rewrite_syncs && !own_sync {
+            journal.sync_class().max(SyncClass::Fsync)
+        } else {
+            journal.sync_class()
+        };
+        let arena_file = if own_sync && rewrite_syncs && (arena.is_dirty() || flight_in_air) {
             match arena.sync_handle() {
                 Ok(f) => f,
                 Err(e) => {
@@ -7352,6 +7382,7 @@ impl StoreInner {
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: self.journal.as_ref().map_or(self.sync, Journal::rewrite_class),
             log_class: self.journal.as_ref().map_or(self.sync, Journal::sync_class),
+            settle_class,
             fail_stop: self.fail_stop.clone(),
             // fastest-engine mutant `names_taken_at_capture` (test builds only): as before review
             // C-F1, the capture takes the names out of the index.
