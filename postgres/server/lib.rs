@@ -220,9 +220,6 @@ impl Shared {
     /// closing releases it within that), then refused with 55006.
     fn begin_delete(&self, name: &str) -> SqlResult<()> {
         let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting]);
-        if let Some(u) = uses.get(name) {
-            return Err(in_use_error(name, *u));
-        }
         uses.insert(name.to_string(), BranchUse::Deleting);
         Ok(())
     }
