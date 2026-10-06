@@ -2197,7 +2197,19 @@ fn run_flight(
     }
     // The cut's copy and sync, holding no lock (lead review 1 item 7): what it keeps of the log is
     // fixed while it runs (no group flight starts), and the install below only renames it in.
-    let cut = written.as_ref().ok().and_then(|()| begin_cut(&inner, &group, &cap));
+    // Inside a panic guard too (review 4 #16): a panic in the cut must still reach the install, or
+    // `flight` would stay set. Safe to catch: the cut leads no flight, and its gate's drop, which
+    // unwinding runs, lets group flights start again. Mutant `cut_unguarded` (test builds only).
+    let cut = written.as_ref().ok().and_then(|()| {
+        if fe_mutant("cut_unguarded") {
+            return begin_cut(&inner, &group, &cap);
+        }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| begin_cut(&inner, &group, &cap)))
+            .unwrap_or_else(|_| {
+                tracing::warn!("branch log cut panicked; the install cuts under the store mutex");
+                None
+            })
+    });
     let installed = {
         let mut guard = inner.lock();
         // The install cuts the log: no group flight may be writing it (fastest-engine M1 item 2),
