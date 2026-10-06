@@ -694,6 +694,14 @@ impl Session {
         let result = match call {
             Some(call) => self.branch(&mut st, &conn, &call, portal, format),
             None if is_checkpoint(sql) => self.checkpoint(&mut st, in_tx),
+            None if schema_ddl(sql).is_some_and(|name| !name.eq_ignore_ascii_case("public")) => {
+                Err(error(
+                    "0A000",
+                    "schemas other than public are not supported by the branch server: its \
+                     branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)"
+                        .to_string(),
+                ))
+            }
             None => {
                 drop(st);
                 let r = self.engine_statement(&conn, sql, portal, format);
@@ -1252,6 +1260,31 @@ fn engine_tx(conn: &PgConnection, tx: TxStmt) -> turso_core::Result<()> {
     conn.inner()
         .prepare_translated_stmt(stmt, text)?
         .run_ignore_rows()
+}
+
+/// The schema a CREATE SCHEMA or DROP SCHEMA names (`[IF [NOT] EXISTS] name`, quotes dropped), if
+/// `sql` is one. In server mode only public passes (wire review 1 item 16): each session attaches
+/// the schema files that exist when it opens, so a schema created or dropped while others run
+/// leaves sessions that disagree about it, and a branch would not cover it.
+fn schema_ddl(sql: &str) -> Option<&str> {
+    let mut words = sql
+        .split(|c: char| c.is_ascii_whitespace() || c == ';')
+        .filter(|w| !w.is_empty());
+    let verb = words.next()?;
+    if !(verb.eq_ignore_ascii_case("CREATE") || verb.eq_ignore_ascii_case("DROP")) {
+        return None;
+    }
+    if !words.next()?.eq_ignore_ascii_case("SCHEMA") {
+        return None;
+    }
+    let mut name = words.next()?;
+    while ["IF", "NOT", "EXISTS"]
+        .iter()
+        .any(|k| name.eq_ignore_ascii_case(k))
+    {
+        name = words.next()?;
+    }
+    Some(name.trim_matches('"'))
 }
 
 /// Whether `sql` is a bare CHECKPOINT (the server runs it itself, see [`Session::checkpoint`]). A
