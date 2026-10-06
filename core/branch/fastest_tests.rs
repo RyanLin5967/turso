@@ -3753,6 +3753,43 @@ fn an_idle_logs_last_flight_is_confirmed_bound_to_where_it_ends() {
     }
 }
 
+/// Engine review 8 #10: while a flight or a cut is in the air, the confirmation writer, with a
+/// proved word pending past its quiet period, re-took the group's mutex every 100 µs (the lock the
+/// flight's leader and its riders need) for the whole flush: about 5, 30 and 220 lock cycles per
+/// flight on the internal SSD, under load and on the APFS image. It waits for the landing instead.
+/// Held at a flight's take for 70 ms with a word pending, the writer wakes a handful of times at
+/// most, not hundreds. Mutant `confirm_poll_100us`.
+#[test]
+fn the_confirmation_writer_does_not_poll_while_a_flight_is_in_the_air() {
+    let _s = serial();
+    let _q = ConfirmQuiet::set(20);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("nopoll.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let hold = db.branches.trunk_commit_hold.clone();
+    // A proved word pending, which the writer writes once the log is idle for 20 ms.
+    let _first = trunk.fork_branch().unwrap().into_id();
+    let written = db.branch_confirm_counts()[0];
+    hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+    let creator = {
+        let db = db.clone();
+        std::thread::spawn(move || db.connect().and_then(|t| t.fork_branch()).map(|x| x.into_id()))
+    };
+    wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+    let woken = db.branches.confirm_wakeups_for_test();
+    std::thread::sleep(std::time::Duration::from_millis(70));
+    let wakeups = db.branches.confirm_wakeups_for_test() - woken;
+    let still = db.branch_confirm_counts()[0];
+    hold.store(0, std::sync::atomic::Ordering::Release);
+    creator.join().unwrap().unwrap();
+    assert_eq!(still, written, "premise: the pending word was still pending while the flight was held");
+    assert!(
+        wakeups <= 11,
+        "the confirmation writer woke {wakeups} times in 70 ms while a flight was in the air"
+    );
+}
+
 /// Review 6 #1: a confirmation word that cannot be written changes no flight's outcome. The flight
 /// is durable once its sync returned; its word only lets recovery tell damage from a lost write,
 /// so a failure to write it is counted and the store goes on.

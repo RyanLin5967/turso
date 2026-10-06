@@ -427,6 +427,10 @@ struct GroupState {
     /// that step (`run_flight`).
     #[cfg(test)]
     settle_syncs: u64,
+    /// Test builds (engine review 8 #10): times the confirmation writer woke from a wait with a
+    /// proved confirmation pending and went back to waiting.
+    #[cfg(test)]
+    confirm_wakeups: u64,
 }
 
 fn class_index(class: SyncClass) -> usize {
@@ -664,6 +668,10 @@ fn run_confirm_writer(group: Arc<Group>) {
         if idle < confirm_quiet() || g.flushing || g.cutting {
             let wait = confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100));
             g = group.confirm_cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner()).0;
+            #[cfg(test)]
+            {
+                g.confirm_wakeups += 1;
+            }
             continue;
         }
         let (_, confirm) = g.confirm.take().expect("checked above");
@@ -6459,6 +6467,12 @@ impl BranchStore {
     /// Zero for a store that is not a catalog store.
     pub(crate) fn checkpoint_start_failures(&self) -> u64 {
         self.inner.lock().cat.as_ref().map_or(0, |c| c.ckpt.start_failures)
+    }
+
+    /// Test builds: the confirmation writer's wakeups with a word pending (engine review 8 #10).
+    #[cfg(test)]
+    pub(crate) fn confirm_wakeups_for_test(&self) -> u64 {
+        self.group.lock().confirm_wakeups
     }
 
     /// Confirmation words written into the log's header, and those whose write failed (review 6 #1;
