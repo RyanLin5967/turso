@@ -751,6 +751,20 @@ impl Session {
             "turso_branch_switch" => {
                 let on = st.branch.as_ref().map_or(TRUNK, |(n, _)| n.as_str());
                 if on == name {
+                    // A no-op only while the session's branch is still the one the name names: a
+                    // branch released behind the session and re-created under its name is another
+                    // branch (wire review 1 item 6). The session already holds the name's claim.
+                    let stale = st.branch.as_ref().is_some_and(|(_, c)| {
+                        c.inner().branch_id() != self.shared.db.branch_named(&name).ok().flatten()
+                    });
+                    if stale {
+                        let opened = self
+                            .waiting(|| self.shared.db.connect_named(&name))
+                            .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
+                        let next = PgConnection::new(opened);
+                        next.adopt_session_of(conn);
+                        st.branch = Some((name.clone(), next));
+                    }
                     return Ok(one_text(f, &name, format));
                 }
                 let left = if name == TRUNK {
