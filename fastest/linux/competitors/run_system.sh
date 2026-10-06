@@ -79,10 +79,18 @@ for spec in $SPECLIST; do  # a missing spec file is a harness defect, found befo
 done
 # The flush counter must have passed its fire-check on this runner and filesystem first (review finding 8).
 FC=${FT_FIRECHECK:?FT_FIRECHECK: the fire-check verdict file (firecheck_strace.sh OUT/firecheck.txt)}
-case "$(tail -1 "$FC" 2>/dev/null)" in
-  "VERDICT PASS"*) ;;
-  *) echo "REFUSED: the flush counter's fire-check did not pass: $FC ends [$(tail -1 "$FC" 2>/dev/null)]" | tee "$FUN"; exit 1 ;;
-esac
+# ALL of this tree's fire-check passed, not a verdict that merely starts with PASS (fifth review, finding 4): the last
+# line is "VERDICT PASS n/n" with n = firecheck_strace.sh's own NCHECK, n PASS lines with n distinct names, no FAIL.
+FC_N=$(sed -n 's/^NCHECK=\([0-9][0-9]*\)$/\1/p' "$HERE/firecheck_strace.sh")
+FC_LAST=$(tail -1 "$FC" 2>/dev/null) || FC_LAST=""
+FC_PASS=$(grep '^PASS ' "$FC" 2>/dev/null | cut -d: -f1 | sort | uniq | awk 'END {print NR}')
+FC_PASSL=$(grep '^PASS ' "$FC" 2>/dev/null | awk 'END {print NR}')
+FC_FAIL=$(grep '^FAIL' "$FC" 2>/dev/null | awk 'END {print NR}')
+if [ -z "$FC_N" ] || [ "$FC_LAST" != "VERDICT PASS $FC_N/$FC_N" ] || [ "$FC_PASS" != "$FC_N" ] ||
+  [ "$FC_PASSL" != "$FC_N" ] || [ "$FC_FAIL" != 0 ]; then
+  echo "REFUSED: the flush counter's fire-check did not pass all $FC_N checks: $FC ends [$FC_LAST], $FC_PASSL PASS line(s), $FC_PASS distinct, $FC_FAIL FAIL line(s)" | tee "$FUN"
+  exit 1
+fi
 # Every cell this run must produce, written BEFORE any runs: reduce.py reports a listed cell without a cell.json as
 # MISSING, so a cell that returns early cannot simply disappear (review finding 11).
 for spec in $SPECLIST; do

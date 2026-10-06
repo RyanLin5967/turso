@@ -17,8 +17,9 @@ A matrix with include:/exclude: entries is refused (this parser reads only the r
 Prints, tab-separated:
   JOBS   artifact, firecheck verdict, functional verdict, failed functional lines
   CELLS  artifact, cell, then stracecount.py's table columns (TABLE_COLS)
-Exit 0 only if every expected job and cell is present and readable, every fire-check and functional verdict is a
-PASS and every cell verdict is ok; 1 otherwise (after printing everything); 2 if the expectation itself cannot be
+Exit 0 only if every expected job and cell is present and readable, every fire-check passed each PINNED_FIRECHECK
+check (one PASS line each, no FAIL line, one "VERDICT PASS n/n" with n the pinned count), every functional verdict is
+a PASS and every cell verdict is ok; 1 otherwise (after printing everything); 2 if the expectation itself cannot be
 determined.
 """
 import glob
@@ -45,6 +46,16 @@ PINNED_SPECS = {
 PINNED_CLIENTS = ("1", "4")
 PINNED_RUNNERS = ("ubuntu-24.04", "ubuntu-24.04-arm")
 PINNED_FS = ("xfs", "btrfs")
+# The fire-check's checks, pinned (fifth review, finding 4): a job passes its fire-check only when firecheck.txt holds
+# exactly one PASS line for each of these, no FAIL line, and ends "VERDICT PASS 17/17" -- a fire-check that silently
+# lost a check (or a truncated, or an older, verdict file) cannot read as passed.
+PINNED_FIRECHECK = (
+    "F1-launch", "F2-attach", "F3-idle-attach", "F3b-unproven-empty-refused", "F4-osync-refused",
+    "F5-io_uring-refused", "F6-osync-before-attach-refused", "F6b-osync-in-a-descendant-refused",
+    "F7-threads-before-attach", "F8-rwf_dsync-refused", "F9-libaio-refused", "F10a-untraced-descendant-detected",
+    "F10b-descendants-attached", "F10c-storm-control-misses", "F10d-storm-attach-complete", "F11-split-pre",
+    "F11-split-post",
+)
 
 
 def refuse(msg):
@@ -58,6 +69,26 @@ def last_line(path, prefix):
         return "MISSING"
     lines = [l.rstrip("\n") for l in open(path) if l.startswith(prefix)]
     return lines[-1] if lines else "MISSING"
+
+
+def firecheck_problem(path):
+    """None when the fire-check at PATH passed every pinned check; otherwise why not."""
+    if not os.path.exists(path):
+        return "no firecheck.txt"
+    text = [l.rstrip("\n") for l in open(path, errors="replace")]
+    passed = sorted(l[len("PASS "):].split(":", 1)[0] for l in text if l.startswith("PASS "))
+    failed = [l.split(":", 1)[0] for l in text if l.startswith("FAIL")]
+    verdicts = [l for l in text if l.startswith("VERDICT")]
+    n = len(PINNED_FIRECHECK)
+    why = []
+    if verdicts != [f"VERDICT PASS {n}/{n}"]:
+        why.append(f"verdict lines {verdicts[-3:]} (want exactly one 'VERDICT PASS {n}/{n}')")
+    if passed != sorted(PINNED_FIRECHECK):
+        why.append(f"PASS names differ from the pinned {n}: missing {sorted(set(PINNED_FIRECHECK) - set(passed))}, "
+                   f"extra {sorted(set(passed) - set(PINNED_FIRECHECK))}, {len(passed)} PASS line(s)")
+    if failed:
+        why.append(f"FAIL lines {failed[:5]}")
+    return "; ".join(why) or None
 
 
 def expected_jobs(d, repo):
@@ -122,14 +153,18 @@ def main(argv):
             cells.append((name, "MISSING (no artifact)", None))
             missing += 1
             continue
-        fc = last_line(os.path.join(a, "firecheck", "firecheck.txt"), "VERDICT")
+        fcpath = os.path.join(a, "firecheck", "firecheck.txt")
+        fc = last_line(fcpath, "VERDICT")
+        fcwhy = firecheck_problem(fcpath)
         fpath = os.path.join(a, "run", "functional.txt")
         fn = last_line(fpath, "VERDICT")
         fails = [l.strip() for l in open(fpath) if l.startswith(("FAIL", "REFUSED"))] if os.path.exists(fpath) else []
+        if fcwhy:
+            fails = [f"FIRECHECK NOT PASSED: {fcwhy}"] + fails
         print(f"JOBS\t{name}\t{fc}\t{fn}\t{' || '.join(fails)}")
-        # the fire-check must pass ALL its checks ("VERDICT PASS n/n"), not merely start with PASS (fourth review, 8)
-        fcm = re.match(r"VERDICT PASS (\d+)/(\d+)$", fc)
-        if not (fcm and fcm.group(1) == fcm.group(2)) or not fn.startswith("VERDICT PASS"):
+        # the fire-check must pass ALL its pinned checks, not merely end in "VERDICT PASS n/n" for some n (fifth
+        # review, finding 4; fourth review, finding 8 required only n/n)
+        if fcwhy or not fn.startswith("VERDICT PASS"):
             bad += 1
         exp_path = os.path.join(a, "run", "expected-cells.txt")
         if not os.path.exists(exp_path):
