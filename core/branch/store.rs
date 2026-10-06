@@ -9116,6 +9116,70 @@ mod tests {
         }
     }
 
+    /// Engine review 9 #9 (review 6 #4's durable half): a catalog store's page-size restart COMMITS
+    /// an empty free table and a high-water mark and in-use count of 0, so no later checkpoint or
+    /// open hands an old arena's slot to the new one. The test above allocates only in memory,
+    /// where clearing the refill state there passes it alone; the next checkpoint re-arms the
+    /// refill from the free table, which would then hand back stale rows below the new high-water
+    /// mark, slots in use among them (`add_free` checks only that a slot is below it and not free).
+    /// Here the committed catalog is read, two slots are held across a checkpoint, and the store
+    /// is reopened.
+    #[test]
+    fn a_catalog_page_size_restart_commits_an_empty_free_table() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        {
+            let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Off }, None, path).unwrap();
+            let mut inner = store.inner.lock();
+            inner.ensure_backing(512).unwrap();
+            // As above: slots 0..4 in the catalog's free table, 4..6 on the in-memory list.
+            for n in [4, 2] {
+                let arena = inner.arena.as_mut().unwrap();
+                let slots: Vec<Slot> = (0..n).map(|_| arena.alloc()).collect();
+                for slot in slots {
+                    arena.release(slot);
+                }
+                if n == 4 {
+                    inner.checkpoint_catalog(false).unwrap();
+                }
+            }
+            inner.ensure_backing(1024).expect("an empty store refused the database's new page size");
+            let catalog = inner.catalog().unwrap();
+            assert_eq!(
+                catalog.free_all().unwrap(),
+                Vec::<Slot>::new(),
+                "the restart committed the old arena's free slots"
+            );
+            let meta = catalog.meta().unwrap().expect("premise: the restart committed a meta row");
+            assert_eq!(
+                (meta.arena_hw, meta.in_use),
+                (0, 0),
+                "the restart committed the old arena's high-water mark or in-use count"
+            );
+            // Two slots held across a checkpoint, whose install re-arms the refill from the table.
+            let held: Vec<Slot> = (0..2).map(|_| inner.alloc_slot().unwrap()).collect();
+            inner.checkpoint_catalog(false).unwrap();
+            let mut seen: HashSet<Slot> = held.iter().copied().collect();
+            for _ in 0..8 {
+                let slot = inner.alloc_slot().unwrap();
+                assert!(seen.insert(slot), "slot {slot} handed out twice after a restart and a checkpoint");
+            }
+            assert_eq!(
+                seen,
+                (0..10).collect::<HashSet<Slot>>(),
+                "the restarted arena handed out a slot other than its own high-water mark's"
+            );
+        }
+        // What the next open reads: the two held slots are in use in the committed state, and no
+        // stale row lists them free.
+        let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Off }, None, path).unwrap();
+        let mut inner = store.inner.lock();
+        inner.ensure_backing(1024).expect("the reopened store is not at the new page size");
+        let free = inner.catalog().unwrap().free_all().unwrap();
+        assert!(free.iter().all(|&s| s >= 2), "after a reopen the free table lists a held slot: {free:?}");
+    }
+
     /// Engine review 9 #4: a catalog page-size restart whose catalog commit landed and whose log
     /// rewrite then failed leaves the files a crash between the two leaves too: the catalog at the
     /// new page size and generation, the old log, at the old page size, behind it. A reopen must
