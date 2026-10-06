@@ -4299,4 +4299,57 @@ mod format_tests {
         assert!(got.is_err(), "a second store took the lock of the log's old inode");
         drop(first);
     }
+
+    // ---- review 5 #26, #27, #29 ----
+
+    /// Review 5 #26: damage that takes a synced flight's end frame with it, followed by exactly one
+    /// whole later flight (synced, its own flight checksum holding from a frame boundary past the
+    /// damage), lies in an acknowledged flight: that later flight was written only after the damaged
+    /// one's sync returned. Recovery refuses it. Before, the refusal needed a frame AFTER the later
+    /// flight's end, so the damaged flight and the later one were cut silently.
+    #[test]
+    fn damage_under_one_whole_later_synced_flight_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Fsync);
+        // The middle flight's end frame is lost; the last flight is whole.
+        overwrite(&files.log, starts[2] - END_FRAME_LEN as u64, &[0u8; END_FRAME_LEN]);
+        let got = Journal::recover(&files, SyncClass::Fsync);
+        assert!(
+            matches!(got, Err(LimboError::Corrupt(_))),
+            "an acknowledged flight lost under one whole later flight was cut: {:?}",
+            got.map(|r| r.map(|r| forks(&r.records)))
+        );
+    }
+
+    /// Review 5 #27: framing a kept region again requires it to end at a flight boundary; frames
+    /// after the last end frame are refused, never closed by a forged end frame of their own.
+    #[test]
+    fn reframe_refuses_a_region_that_ends_inside_a_flight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[2], SyncClass::Fsync);
+        let bytes = std::fs::read(&files.log).unwrap();
+        let nonce = tests::log_nonce(&files.log);
+        // The flight's two record frames, without its end frame.
+        let frames = &bytes[starts[0] as usize..bytes.len() - END_FRAME_LEN];
+        assert!(reframe(frames, nonce, nonce ^ 1, true).is_err(), "frames with no end were given a forged end frame");
+        assert!(reframe(&bytes[starts[0] as usize..], nonce, nonce ^ 1, true).is_ok(), "a whole flight was refused");
+    }
+
+    /// Review 5 #29: a catalog store's recovery refusals name the catalog, never a snapshot it does
+    /// not have.
+    #[test]
+    fn a_catalog_stores_refusal_names_no_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        flights(&files, 3, &[1], SyncClass::Fsync);
+        // A catalog at generation 1 under a log of generation 3: the log is ahead of it.
+        let got = Journal::recover_catalog_as(&files, SyncClass::Fsync, Some((512, 1)), FORMAT_VERSION);
+        let refused = match got {
+            Ok(_) => panic!("a log ahead of its catalog was accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(!refused.contains("snapshot"), "a catalog store's refusal names a snapshot: {refused}");
+    }
 }

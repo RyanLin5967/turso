@@ -2163,6 +2163,7 @@ fn a_d2_first_write_is_one_full_fsync_and_one_plain_fsync() {
 /// record and lose the slot it names. Recovery checks every slot the LAST flight names and drops
 /// the flight if one fails: the branch reads its previous version, with no error. (A slot named by
 /// an older flight may have been reused since; only the last flight's are checked.)
+#[cfg(unix)]
 #[test]
 fn a_last_flight_whose_slot_never_reached_the_disk_is_dropped() {
     let _s = serial();
@@ -2989,6 +2990,7 @@ fn every_held_name_reaches_the_name_filter() {
 /// returned — and nothing the replayed state references is bad, so it is kept: the released child
 /// stays released. Before, every slot the flight named was checked, the flight was dropped, and
 /// the child came back. Mutant `check_all_named_slots` (the old check) must fail it.
+#[cfg(unix)]
 #[test]
 fn a_last_flight_that_frees_a_slot_it_names_is_kept_when_the_slot_is_reused() {
     let _s = serial();

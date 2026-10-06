@@ -1347,6 +1347,7 @@ fn c1_sigkill_at_aimed_points() {
 
 /// The E3 child: create the named branch `FE_E3_NAME` from the trunk, write one row on it, record
 /// the acknowledgement, and SIGKILL itself (no destructor, flush or clean close runs).
+#[cfg(unix)]
 #[test]
 fn e3_child() {
     let Ok(path) = std::env::var("FE_E3_CHILD") else {
@@ -1374,6 +1375,7 @@ fn e3_child() {
 /// SIGKILL; then THIS process — a different one — opens the database (a recovery) and connects to
 /// the new branch by name, and to up to ten older ones, each reading its write, none carrying a
 /// lease. Every trial must pass.
+#[cfg(unix)]
 #[test]
 fn e3_kill9_restart_connect_by_name() {
     if std::env::var_os("FE_E3_CHILD").is_some() || std::env::var_os("FE_C1_CHILD").is_some() {
