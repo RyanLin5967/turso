@@ -747,9 +747,8 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    self.pager.io.step()?
-                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Sleep { duration } => wait_out_busy(&*self.pager.io, duration)?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
@@ -763,9 +762,8 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    self.pager.io.step()?
-                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Sleep { duration } => wait_out_busy(&*self.pager.io, duration)?,
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -785,9 +783,8 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    self.pager.io.step()?
-                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Sleep { duration } => wait_out_busy(&*self.pager.io, duration)?,
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -867,9 +864,14 @@ impl Statement {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
                     self.pager.io.step()?;
+                    post_io_func()?;
+                }
+                vdbe::StepResult::Sleep { duration } => {
+                    pre_io_func()?;
+                    wait_out_busy(&*self.pager.io, duration)?;
                     post_io_func()?;
                 }
                 vdbe::StepResult::Row => break Some(self.row().expect("row should be present")),
@@ -1693,6 +1695,20 @@ impl Drop for Statement {
             self.nested_guard_active = false;
         }
     }
+}
+
+/// A blocking caller's answer to `StepResult::Sleep`, a busy handler's backoff: sleep for its
+/// `duration` (`IO::sleep`), then step again. Stepping the IO backend instead returned at once
+/// whenever nothing was in flight (UnixIO always, io_uring on an empty ring), so the wait spun a
+/// core for the whole busy timeout (fastest-wire; DECISIONS f8eb23bca). The busy statement has no
+/// IO of its own in flight: `Sleep` is returned before the program steps, or after it reported
+/// Busy. Mutant `busy_sleep_spins` (test builds only): the IO step, as before.
+pub(crate) fn wait_out_busy(io: &dyn crate::io::IO, duration: Duration) -> Result<()> {
+    if crate::branch::store::fe_mutant("busy_sleep_spins") {
+        return io.step();
+    }
+    io.sleep(duration);
+    Ok(())
 }
 
 #[cfg(test)]
