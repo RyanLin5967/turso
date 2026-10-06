@@ -828,6 +828,20 @@ impl Session {
                     st.aborted = false;
                     return Ok(Response::Execution(Tag::new("ROLLBACK")));
                 }
+                // A failed block the engine holds no transaction for is one whose failing error
+                // made the engine roll the whole transaction back, savepoints and all (a failed
+                // block is otherwise still open in the engine): the savepoint does not exist, as
+                // PostgreSQL says of one that does not, and the block stays failed. It was XX000
+                // "no such savepoint" from the engine (wire review 3 item 10).
+                TxVerb::RollbackTo if !in_tx => {
+                    return Err(error(
+                        "3B001",
+                        "savepoint does not exist: the error that failed this transaction block \
+                         rolled the whole transaction back, its savepoints with it; end the block \
+                         with ROLLBACK"
+                            .to_string(),
+                    ))
+                }
                 TxVerb::RollbackTo => {}
                 _ => return Err(aborted_error()),
             }
