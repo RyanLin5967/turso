@@ -2274,6 +2274,20 @@ impl PostgreSQLTranslator {
         }
     }
 
+    /// The column name of `alias.column` when it reads an inlined LATERAL column.
+    fn inlined_lateral_name(&self, col_ref: &pg_query::protobuf::ColumnRef) -> Option<String> {
+        use pg_query::protobuf::node::Node;
+        match col_ref.fields.as_slice() {
+            [alias, column] => match (alias.node.as_ref(), column.node.as_ref()) {
+                (Some(Node::String(a)), Some(Node::String(c))) => self
+                    .lateral_column(&a.sval, &c.sval)
+                    .map(|_| c.sval.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn translate_join_expr(
         &self,
         join_expr: &pg_query::protobuf::JoinExpr,
@@ -2457,12 +2471,14 @@ impl PostgreSQLTranslator {
                             }
                             // Regular column reference. One that reads a correlated
                             // generate_series' column keeps PostgreSQL's name for it, not the
-                            // engine's `value`.
+                            // engine's `value`, and one that reads an inlined LATERAL column
+                            // the column's name, not its pasted expression's text.
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                self.series_column(col_ref).map(|(_, column)| {
-                                    ast::As::Elided(ast::Name::from_string(column))
-                                })
+                                self.series_column(col_ref)
+                                    .map(|(_, column)| column)
+                                    .or_else(|| self.inlined_lateral_name(col_ref))
+                                    .map(|column| ast::As::Elided(ast::Name::from_string(column)))
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
