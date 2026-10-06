@@ -43,15 +43,20 @@ ST_PID=
 # under 100 us apart); NAME_mono is their midpoint and NAME_err half their gap, so a preemption between the reads
 # widens the tolerance instead of refusing a correct window (second re-review, finding 3). The reads are served by
 # ONE long-lived python3 per shell (the STAMPER coproc), so a stamp costs a pipe round-trip, not an interpreter start
-# inside the window's boundary (second re-review, finding 4); a one-shot python3 is the fallback.
+# inside the window's boundary (second re-review, finding 4); a one-shot python3 is the fallback. Each stamp also
+# records NAME_src=coproc|oneshot, so the raw says which path served it (third re-review, finding 3).
+# Requests are "NONCE NAME" and replies "NONCE NAME=...": a reply left in the pipe by an earlier call that timed out is
+# skipped by its nonce instead of being taken as this call's. A shell whose coproc fds are not open (bash closes them
+# in ( ), & and pipeline subshells; only command substitutions keep them) uses the one-shot path and never touches the
+# stamper: the old desync rule killed the shared, healthy stamper from such a subshell (third re-review, finding 2).
 STAMP_PY='
 import sys, time
 # CLOCK_MONOTONIC itself, system-wide, so the coproc and a fallback process read the same clock: time.monotonic() has
 # an undefined reference point and on macOS CPython it starts near zero in each process (measured on the Mac).
 def mono():
     return time.clock_gettime(time.CLOCK_MONOTONIC)
-for name in sys.stdin:
-    name = name.strip()
+for req in sys.stdin:
+    nonce, name = req.split()
     best = None
     for _ in range(50):
         m1 = mono(); r = time.time(); m2 = mono()
@@ -60,22 +65,35 @@ for name in sys.stdin:
         if m2 - m1 < 1e-4:
             break
     m1, r, m2 = best
-    print("%s=%.9f %s_mono=%.9f %s_err=%.9f" % (name, r, name, (m1 + m2) / 2, name, (m2 - m1) / 2), flush=True)
+    print("%s %s=%.9f %s_mono=%.9f %s_err=%.9f" % (nonce, name, r, name, (m1 + m2) / 2, name, (m2 - m1) / 2),
+          flush=True)
 '
 coproc STAMPER { exec python3 -B -I -u -c "$STAMP_PY"; }
+STAMP_SEQ=0
 clock_pair() {
-  local line=""
-  if [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null; then
-    # In a command substitution, so a stamper that died between the check and the write costs that subshell its
-    # SIGPIPE, not the caller; a reply that does not answer THIS name (a desync) retires the stamper.
-    line=$( { printf '%s\n' "$1" >&"${STAMPER[1]}" && IFS= read -r -t 5 l <&"${STAMPER[0]}" && printf '%s' "$l"; } 2>/dev/null )
-    case $line in
-      "$1="*) ;;
-      *) kill "$STAMPER_PID" 2>/dev/null; STAMPER_PID=; line="" ;;
-    esac
+  local name=$1 line="" src=oneshot nonce
+  STAMP_SEQ=$((STAMP_SEQ + 1))
+  nonce="$BASHPID.$STAMP_SEQ.$RANDOM"
+  # The coproc only from a shell that still holds its fds (an fd test, not a pid test: a command substitution keeps
+  # them, a ( ) subshell does not), and only while it lives.
+  if [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && { : >&"${STAMPER[1]}"; } 2>/dev/null; then
+    # In a command substitution: a stamper that died between the check and the write costs that subshell its
+    # SIGPIPE, not the caller. Replies with another nonce (a late answer to an earlier, timed-out call) are skipped.
+    line=$( {
+      printf '%s %s\n' "$nonce" "$name" >&"${STAMPER[1]}" || exit 1
+      for ((k = 0; k < 8; k++)); do
+        IFS= read -r -t 5 l <&"${STAMPER[0]}" || exit 1
+        case $l in "$nonce $name="*) printf '%s' "${l#"$nonce "}"; exit 0 ;; esac
+      done
+      exit 1
+    } 2>/dev/null )
+    [ -n "$line" ] && src=coproc
   fi
-  [ -n "$line" ] || line=$(printf '%s\n' "$1" | python3 -B -I -c "$STAMP_PY")
-  printf '%s\n' "$line"
+  if [ -z "$line" ]; then
+    line=$(printf '%s %s\n' "$nonce" "$name" | python3 -B -I -c "$STAMP_PY")
+    line=${line#"$nonce "}
+  fi
+  printf '%s %s_src=%s\n' "$line" "$name" "$src"
 }
 
 descendants() { # descendants PID -> every live, non-zombie descendant pid of PID, one per line (children of children too)
