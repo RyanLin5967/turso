@@ -2229,9 +2229,9 @@ impl PostgreSQLTranslator {
                 {
                     let pg_jt =
                         PgJoinType::try_from(join_expr.jointype).unwrap_or(PgJoinType::Undefined);
-                    // A join condition of any form (ON, USING, NATURAL), or an alias of the join, would
-                    // be dropped with the join: only CROSS JOIN LATERAL has none (wire review 2
-                    // item 4).
+                    // A join condition of any form (ON, USING, NATURAL), or an alias of the join,
+                    // would be dropped with the join: only CROSS JOIN LATERAL has none (wire
+                    // review 2 item 4).
                     if pg_jt != PgJoinType::JoinInner
                         || join_expr.quals.is_some()
                         || join_expr.is_natural
