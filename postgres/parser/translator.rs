@@ -62,6 +62,34 @@ impl PostgreSQLTranslator {
         r
     }
 
+    /// Refuse `*` (alias None) once a LATERAL subselect is inlined into the current SELECT, and
+    /// `alias.*` of one: its join is dropped, so the star would lose its columns or name nothing.
+    fn refuse_star_over_lateral(&self, alias: Option<&str>) -> Result<(), ParseError> {
+        let scopes = self.lateral_scopes.borrow();
+        let Some(scope) = scopes.last() else {
+            return Ok(());
+        };
+        let reads_lateral = match alias {
+            None => !scope.columns.is_empty(),
+            Some(alias) => scope.columns.keys().any(|(a, _)| a == alias),
+        };
+        if reads_lateral {
+            return Err(ParseError::ParseError(
+                "* over a LATERAL subquery is not supported: name its columns as alias.column"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether `name` is a column of a LATERAL subselect inlined into the current SELECT.
+    fn is_current_lateral_column(&self, name: &str) -> bool {
+        self.lateral_scopes
+            .borrow()
+            .last()
+            .is_some_and(|scope| scope.columns.keys().any(|(_, c)| c == name))
+    }
+
     /// Record the name a FROM item of the current SELECT is known by.
     fn note_from_name(&self, name: &str) {
         if let Some(scope) = self.lateral_scopes.borrow_mut().last_mut() {
@@ -1907,8 +1935,11 @@ impl PostgreSQLTranslator {
 
     /// `CROSS JOIN LATERAL (SELECT e1, ..., ek) AS o(n1, ..., nk)`, a subselect with no FROM or any
     /// other clause, is one row of expressions over the outer row: the join is dropped and every
-    /// later `o.ni` reads `ei` (PostgreSQL's pgbench probes its tables this way). Any other
-    /// LATERAL subquery is refused, never run as an ordinary (uncorrelated) one.
+    /// later `o.ni` reads `ei` (PostgreSQL's pgbench probes its tables this way). That is the
+    /// subselect's value only when each `ei` is a scalar expression with one value per outer row,
+    /// however often it is read (`lateral_target_is_scalar`), and only through `o.ni`: `*`, `o.*`
+    /// and an unqualified `ni` are refused (wire review 2 item 5). Any other LATERAL subquery is
+    /// refused, never run as an ordinary (uncorrelated) one.
     fn inline_lateral(
         &self,
         range_sub: &pg_query::protobuf::RangeSubselect,
@@ -1916,7 +1947,8 @@ impl PostgreSQLTranslator {
         use pg_query::protobuf::node::Node;
         let refuse = || {
             ParseError::ParseError(
-                "LATERAL is supported only for a subquery of expressions with no FROM clause"
+                "LATERAL is supported only for a subquery of scalar expressions with no FROM \
+                 clause (no aggregate, window, volatile or set-returning function, or subquery)"
                     .into(),
             )
         };
@@ -1946,7 +1978,11 @@ impl PostgreSQLTranslator {
             let Some(Node::ResTarget(rt)) = target.node.as_ref() else {
                 return Err(refuse());
             };
-            let expr = self.translate_expr(rt.val.as_deref().ok_or_else(refuse)?)?;
+            let val = rt.val.as_deref().ok_or_else(refuse)?;
+            if !lateral_target_is_scalar(val) {
+                return Err(refuse());
+            }
+            let expr = self.translate_expr(val)?;
             let name = match alias.colnames.get(i).and_then(|n| n.node.as_ref()) {
                 Some(Node::String(s)) => s.sval.clone(),
                 _ if !rt.name.is_empty() => rt.name.clone(),
@@ -2393,6 +2429,7 @@ impl PostgreSQLTranslator {
                     if let Some(val) = &res_target.val {
                         // Check if this is a SELECT *
                         if let Some(pg_query::protobuf::node::Node::AStar(_)) = &val.node {
+                            self.refuse_star_over_lateral(None)?;
                             result_columns.push(ast::ResultColumn::Star);
                         } else if let Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) =
                             &val.node
@@ -2402,12 +2439,14 @@ impl PostgreSQLTranslator {
                                 if let Some(pg_query::protobuf::node::Node::AStar(_)) = &last.node {
                                     if col_ref.fields.len() == 1 {
                                         // SELECT *
+                                        self.refuse_star_over_lateral(None)?;
                                         result_columns.push(ast::ResultColumn::Star);
                                     } else if let Some(first) = col_ref.fields.first() {
                                         // SELECT table.* or alias.*
                                         if let Some(pg_query::protobuf::node::Node::String(s)) =
                                             &first.node
                                         {
+                                            self.refuse_star_over_lateral(Some(&s.sval))?;
                                             result_columns.push(ast::ResultColumn::TableStar(
                                                 ast::Name::from_string(&s.sval),
                                             ));
@@ -2465,7 +2504,16 @@ impl PostgreSQLTranslator {
                     match &field.node {
                         Some(pg_query::protobuf::node::Node::String(s)) => {
                             if col_ref.fields.len() == 1 {
-                                // Simple column reference
+                                // Simple column reference. One naming a column of a LATERAL
+                                // subselect inlined into this SELECT would name nothing, its join
+                                // dropped: refused (wire review 2 item 5).
+                                if self.is_current_lateral_column(&s.sval) {
+                                    return Err(ParseError::ParseError(format!(
+                                        "column \"{}\" of a LATERAL subquery must be qualified \
+                                         by the subquery's alias",
+                                        s.sval
+                                    )));
+                                }
                                 Ok(ast::Expr::Id(ast::Name::from_string(s.sval.clone())))
                             } else {
                                 // Qualified column reference (table.column)
@@ -5191,6 +5239,111 @@ fn pg_fk_defer_clause(fk: &PgForeignKey) -> Option<ast::DeferSubclause> {
         }),
     })
 }
+
+/// Whether a LATERAL target can be inlined at each reference to it (see
+/// `PostgreSQLTranslator::inline_lateral`): a scalar expression with one value per outer row,
+/// however often it is read. An allowlist: constants, parameters, column references, operators,
+/// casts, boolean and NULL tests, CASE, COALESCE, GREATEST/LEAST and calls of the stable scalar
+/// functions below. An aggregate, a window function, a volatile or set-returning function and a
+/// sublink are none of these (wire review 2 item 5).
+fn lateral_target_is_scalar(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+    let all = |nodes: &[pg_query::protobuf::Node]| nodes.iter().all(lateral_target_is_scalar);
+    let opt = |node: &Option<Box<pg_query::protobuf::Node>>| {
+        node.as_deref().is_none_or(lateral_target_is_scalar)
+    };
+    match &node.node {
+        Some(Node::AConst(_) | Node::ParamRef(_) | Node::SqlvalueFunction(_)) => true,
+        Some(Node::ColumnRef(c)) => c
+            .fields
+            .iter()
+            .all(|f| matches!(f.node, Some(Node::String(_)))),
+        Some(Node::AExpr(e)) => opt(&e.lexpr) && opt(&e.rexpr),
+        Some(Node::TypeCast(c)) => opt(&c.arg),
+        Some(Node::BoolExpr(b)) => all(&b.args),
+        Some(Node::NullTest(n)) => opt(&n.arg),
+        Some(Node::BooleanTest(b)) => opt(&b.arg),
+        Some(Node::CaseExpr(c)) => opt(&c.arg) && all(&c.args) && opt(&c.defresult),
+        Some(Node::CaseWhen(w)) => opt(&w.expr) && opt(&w.result),
+        Some(Node::CoalesceExpr(c)) => all(&c.args),
+        Some(Node::MinMaxExpr(m)) => all(&m.args),
+        Some(Node::List(l)) => all(&l.items),
+        Some(Node::FuncCall(f)) => {
+            let names: Vec<&str> = f
+                .funcname
+                .iter()
+                .filter_map(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let name = match names.as_slice() {
+                [name] | ["pg_catalog", name] => name.to_ascii_lowercase(),
+                _ => return false,
+            };
+            f.agg_order.is_empty()
+                && f.agg_filter.is_none()
+                && f.over.is_none()
+                && !f.agg_star
+                && !f.agg_distinct
+                && !f.agg_within_group
+                && STABLE_SCALAR_FUNCTIONS.contains(&name.as_str())
+                && all(&f.args)
+        }
+        _ => false,
+    }
+}
+
+/// Scalar functions whose value is fixed for a statement's given arguments (PostgreSQL's
+/// immutable and stable ones): the functions a LATERAL target may call and still be inlined.
+const STABLE_SCALAR_FUNCTIONS: &[&str] = &[
+    "abs",
+    "array_length",
+    "array_position",
+    "ascii",
+    "btrim",
+    "cardinality",
+    "ceil",
+    "ceiling",
+    "char_length",
+    "character_length",
+    "chr",
+    "concat",
+    "concat_ws",
+    "current_schema",
+    "current_schemas",
+    "exp",
+    "floor",
+    "initcap",
+    "left",
+    "length",
+    "ln",
+    "log",
+    "lower",
+    "lpad",
+    "ltrim",
+    "md5",
+    "mod",
+    "octet_length",
+    "position",
+    "power",
+    "repeat",
+    "replace",
+    "reverse",
+    "right",
+    "round",
+    "rpad",
+    "rtrim",
+    "sign",
+    "split_part",
+    "sqrt",
+    "strpos",
+    "substr",
+    "substring",
+    "translate",
+    "trunc",
+    "upper",
+];
 
 /// Deparse a PG expression node into a SQL string.
 /// Handles literals, column refs, comparisons, boolean ops, and function calls.
