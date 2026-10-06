@@ -1690,6 +1690,11 @@ fn a_keystamp_merge_refuses_a_row_the_trunk_wrote_through_an_attached_pager() {
         .unwrap()
     };
     let other = main_db.connect().unwrap();
+    // FLAGGED TEST EDIT (own test, d09a5981c): x is seeded at a 1024-byte page size and ATTACH
+    // refuses a page size other than main's, so the test stopped at its ATTACH and never reached
+    // its assertion; main is made at x's page size.
+    exec(&other, "PRAGMA page_size = 1024");
+    exec(&other, "CREATE TABLE m(i INTEGER)");
     exec(&other, &format!("ATTACH '{}' AS x", path.display()));
     let id = other.get_database_id_by_name("x").unwrap();
     assert!(Arc::ptr_eq(&other.get_source_database(id), &x), "premise: the attach shares x's instance");
