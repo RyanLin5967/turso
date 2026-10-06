@@ -39,6 +39,16 @@ require_port_free() {
   if lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; then
     die "REFUSED: port $1 already has a listener: $(lsof -nP -iTCP:"$1" -sTCP:LISTEN | sed -n 2p)"
   fi
+  # Linux: ANY socket bound to the port blocks the server's bind, not only a listener -- e.g. a client that drew it as
+  # its ephemeral source port (55432, 55433 and 53306 sit inside 32768-60999). Lane fastest-linux's T3 dry run
+  # 37256446468 failed "could not bind ... Address already in use" 80 ms after the listener-only check passed. The
+  # workflow also reserves these ports (net.ipv4.ip_local_reserved_ports). TIME-WAIT is left out: PG and Go set
+  # SO_REUSEADDR on their listeners, so it does not block them.
+  if command -v ss >/dev/null 2>&1; then
+    local s
+    s=$(ss -Htan "( sport = :$1 )" 2>/dev/null | grep -v '^TIME-WAIT')
+    [ -z "$s" ] || die "REFUSED: port $1 is bound by another socket: $(printf '%s\n' "$s" | head -1)"
+  fi
 }
 
 # launch PIDFILE LOG CWD [V1RUN|c1b:RUN|-] cmd...  -- detached, own session, cwd CWD; the recorded pid IS the

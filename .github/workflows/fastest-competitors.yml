@@ -112,6 +112,13 @@ jobs:
           sudo apt-get install -y -q postgresql-18 libpq5 mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
           sudo systemctl stop postgresql || true
           pg_lsclusters || true
+      # The servers' ports (PG 55432, Doltgres 55433, Dolt 53306) lie inside the ephemeral range 32768-60999, so a
+      # client socket could draw one as its source port and block the bind (lane fastest-linux's T3 dry run
+      # 37256446468). Reserved before anything else runs; common.sh's require_port_free also refuses any bound socket.
+      - name: Reserve the servers' ports from the ephemeral range
+        run: |
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=53306,55432-55433
+          sysctl net.ipv4.ip_local_reserved_ports | grep -q '53306' || { echo "port reservation not in effect"; exit 1; }
       - name: Run info
         run: |
           mkdir -p "$RAW"
