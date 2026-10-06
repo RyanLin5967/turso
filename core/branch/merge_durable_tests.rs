@@ -1660,3 +1660,46 @@ fn a_splice_arm_catalog_store_reopens_after_a_checkpoint_and_after_crash_state_s
 fn a_derived_write_set_equals_the_recorded_one_in_the_splice_arm() {
     d_t1(open_spliced, true);
 }
+
+/// Review 3 #20: a trunk commit made through an ATTACHED pager (the registry's instance of a
+/// database with a live branch) stamps its rows and closes its commit gate as a main pager's commit
+/// does. Under KeyStamp a merge of a branch that wrote the same row is then refused. Before, the
+/// attached commit path skipped the epilogue: no stamp, so the merge was admitted over the
+/// trunk's write (a lost update), and the gate it opened stayed open.
+#[test]
+fn a_keystamp_merge_refuses_a_row_the_trunk_wrote_through_an_attached_pager() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("x.db");
+    let x = open(&path, Mode::Catalog);
+    let trunk = x.connect().unwrap();
+    seed(&trunk, 100);
+    let b = trunk.fork_branch().unwrap();
+    exec(&b.connect().unwrap(), "UPDATE t SET v = 'branch' WHERE id = 9");
+    let b_id = b.into_id();
+    // Another database's connection attaches x and writes row 9 of x's trunk through it.
+    let main_db = {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        Database::open_file_with_flags(
+            io,
+            dir.path().join("main.db").to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_attach(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
+    };
+    let other = main_db.connect().unwrap();
+    exec(&other, &format!("ATTACH '{}' AS x", path.display()));
+    let id = other.get_database_id_by_name("x").unwrap();
+    assert!(Arc::ptr_eq(&other.get_source_database(id), &x), "premise: the attach shares x's instance");
+    exec(&other, "UPDATE x.t SET v = 'attached' WHERE id = 9");
+    assert_eq!(
+        x.branches.trunk_commit_seq() % 2,
+        0,
+        "the attached trunk commit left its commit gate open"
+    );
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let out = merger.merge(x.branch(b_id).unwrap(), policy(Validation::KeyStamp)).unwrap();
+    assert_eq!(out.refused, Some(Refusal::Key), "a merge was admitted over the trunk's attached write: {out:?}");
+}
