@@ -2420,6 +2420,18 @@ pub(crate) struct Confirm {
 }
 
 impl Confirm {
+    /// Test builds: a confirmation of a word 0 into `log`, `proved` as given (store unit tests of
+    /// the group, engine review 8 #9).
+    #[cfg(test)]
+    pub(crate) fn for_test(log: File, proved: bool) -> Self {
+        Self {
+            log,
+            word: 0,
+            proved,
+            fail: false,
+        }
+    }
+
     /// Whether the word may be written as is (`proved`).
     pub(crate) fn proved(&self) -> bool {
         self.proved

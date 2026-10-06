@@ -10402,6 +10402,35 @@ mod sota_tree_tests {
 }
 
 #[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    /// Engine review 8 #9 (its FIX half): an ordered flight's landing leaves no earlier flight's
+    /// confirmation queued. An ordered flight is barriered, not synced, so it has no confirmation
+    /// of its own, and the log's last flight is now it: the earlier word, written into page 0 by
+    /// the confirmation writer, could never match it. Mutant `ordered_keeps_confirm`.
+    #[test]
+    fn an_ordered_landing_leaves_no_earlier_confirmation_to_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = std::fs::File::create(dir.path().join("log")).unwrap();
+        let group = Group::new(0, Arc::new(AtomicBool::new(false)));
+        group.lock().flushing = true;
+        assert!(
+            group.land(10, SyncClass::FullFsync, true, Some(Confirm::for_test(log, true))),
+            "premise: the synced flight landed"
+        );
+        assert!(group.lock().confirm.is_some(), "premise: its confirmation is queued");
+        group.lock().flushing = true;
+        group.land_ordered(20, true);
+        assert_eq!(group.durable(SyncClass::Off), 20, "premise: the ordered flight landed");
+        assert!(
+            group.lock().confirm.is_none(),
+            "an ordered landing left an earlier flight's confirmation to be written"
+        );
+    }
+}
+
+#[cfg(test)]
 mod fail_stop_tests {
     use super::*;
 
