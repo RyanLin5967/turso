@@ -5790,6 +5790,12 @@ impl BranchStore {
             .map_or([0; 9], |c| c.ckpt.as_array())
     }
 
+    /// The log's sequence number: every byte buffered or written so far (tests only).
+    #[cfg(test)]
+    pub(crate) fn log_lsn_for_test(&self) -> u64 {
+        self.inner.lock().journal.as_ref().map_or(0, |j| j.lsn())
+    }
+
     /// A4.G's G-b red: `start_flight` called directly, past G-a (tests only).
     #[cfg(test)]
     pub(crate) fn start_flight_for_test(&self) -> bool {

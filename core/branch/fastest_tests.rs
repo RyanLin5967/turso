@@ -3489,3 +3489,27 @@ fn a_checkpoint_that_cannot_start_is_not_retried_by_the_next_create() {
         assert_eq!(entered(), after, "{fp:?}: the next creates retried the checkpoint's capture");
     }
 }
+
+/// Review 4 #2: a capture that fails has no effect on the log. Its checkpoint marker was buffered
+/// before the capture's fallible steps (the arena's sync handle, the catalog's read snapshot), so
+/// each failed attempt appended a marker that no checkpoint ever followed.
+#[test]
+fn a_capture_that_fails_appends_no_checkpoint_marker() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("capture-fails.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _first = trunk.fork_branch().unwrap().into_id();
+    db.branch_failpoint(Some(BranchFailpoint::CaptureFails));
+    let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+    let (lsn, before) = (db.branches.log_lsn_for_test(), entered());
+    assert!(!db.branch_checkpoint_fuzzy_now().unwrap(), "a checkpoint started through the failpoint");
+    assert_eq!(entered(), before + 1, "premise: the capture was entered");
+    assert_eq!(db.branches.log_lsn_for_test(), lsn, "the failed capture appended to the log");
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no checkpoint started after the failed one");
+    db.branch_checkpoint_wait();
+}
