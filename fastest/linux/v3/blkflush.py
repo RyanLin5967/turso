@@ -41,9 +41,11 @@ BODY = re.compile(r"^(?P<maj>\d+),(?P<min>\d+)\s+(?P<rwbs>[A-Z]+)\s+(?P<bytes>\d
                   r"(?P<sector>\d+)\s+\+\s+(?P<nr>\d+)(?P<rest>.*)$")
 ENTRIES = re.compile(r"^#\s*entries-in-buffer/entries-written:\s*(\d+)/(\d+)")
 MONO_RAW = getattr(time, "CLOCK_MONOTONIC_RAW", 4)
-PROVES = ("requests ISSUED to each device's driver (tracefs block:block_rq_issue), never persistence; on a device "
-          "reporting write-through the block layer strips flushes before issue, so 0 there by construction; other "
-          "processes' requests inside a window are counted too (a per-window upper bound; a zero is exact)")
+PROVES = ("flush requests and FUA writes ISSUED to each device's driver (tracefs block:block_rq_issue), never "
+          "persistence; on a device reporting write-through the block layer strips flushes before issue, so 0 there by "
+          "construction; other processes' requests inside a window are counted too, and a request an op causes after "
+          "its window closes is not, so a window's count is neither a strict upper nor lower bound on the op's own; a "
+          "zero is exact only for windows longer than 1 us (the trace prints microseconds)")
 
 
 class Refuse(Exception):
@@ -59,7 +61,7 @@ def tracefs():
 
 
 def sudo(args, inp=None, timeout=120):
-    r = subprocess.run(["sudo", "-n"] + args, input=inp, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(["sudo", "-n"] + args, input=inp, capture_output=True, text=True, errors="replace", timeout=timeout)
     if r.returncode != 0:
         raise Refuse("sudo %s: rc %d: %s" % (" ".join(args), r.returncode, r.stderr.strip()[:300]))
     return r.stdout
@@ -107,6 +109,10 @@ def start(out, buffer_kb):
     if os.path.lexists(out):
         raise Refuse("%s exists" % out)
     tr = tracefs()
+    leaked = [x for x in sudo(["ls", tr + "/instances"]).split() if x.startswith("v3blk_")]
+    if leaked:  # a leaked instance keeps tracing every later batch, unrecorded (fresh review B-L6)
+        raise Refuse("tracefs instance(s) %s already exist (a killed run?); remove them: sudo rmdir %s/instances/%s"
+                     % (", ".join(leaked), tr, leaked[0]))
     inst = "v3blk_%d_%d" % (os.getpid(), time.time_ns() % 1000000007)
     ip = tr + "/instances/" + inst
     if subprocess.run(["sudo", "-n", "test", "-e", ip], capture_output=True, timeout=30).returncode == 0:
@@ -165,14 +171,18 @@ def stop(out):
     if os.path.exists(os.path.join(out, "stop.json")):
         raise Refuse("%s was already stopped" % out)
     ip = s["instance_path"]
-    swrite(ip + "/tracing_on", "0")
-    stop_ns = time.clock_gettime_ns(MONO_RAW)  # after tracing_off: every event is earlier
-    text = sread(ip + "/trace")
-    stats = {}
-    for c in sudo(["ls", ip + "/per_cpu"]).split():
-        stats[c] = parse_stats(sread(ip + "/per_cpu/%s/stats" % c))
-    swrite(ip + "/" + EVENT + "/enable", "0")
-    sudo(["rmdir", ip])
+    try:
+        swrite(ip + "/tracing_on", "0")
+        stop_ns = time.clock_gettime_ns(MONO_RAW)  # after tracing_off: every event is earlier
+        text = sread(ip + "/trace")
+        stats = {}
+        for c in sudo(["ls", ip + "/per_cpu"]).split():
+            stats[c] = parse_stats(sread(ip + "/per_cpu/%s/stats" % c))
+    finally:  # the instance is removed whatever failed above
+        subprocess.run(["sudo", "-n", "tee", ip + "/" + EVENT + "/enable"], input="0", capture_output=True, text=True, timeout=30)
+        subprocess.run(["sudo", "-n", "rmdir", ip], capture_output=True, timeout=30)
+    if subprocess.run(["sudo", "-n", "test", "-e", ip], capture_output=True, timeout=30).returncode == 0:
+        raise Refuse("tracefs instance %s could not be removed" % ip)
     with gzip.open(os.path.join(out, "trace.txt.gz"), "wt") as f:
         f.write(text)
     with open(os.path.join(out, "stats.json"), "w") as f:
@@ -240,7 +250,10 @@ def parse_trace(text, devices):
         if "F" not in rwbs:
             probs.append("an event the filter should have dropped: " + line[:160])
             continue
-        events.append((t, hw, devices.get(dev, "dev:" + dev), rwbs, classify(rwbs), m.group("comm"), int(m.group("pid"))))
+        if dev not in devices:  # an unnamed device (a hidden NVMe path disk, a device made after start) cannot be
+            probs.append("an event on device %s, which the device map does not name" % dev)  # attributed (B-M3)
+            continue
+        events.append((t, hw, devices[dev], rwbs, classify(rwbs), m.group("comm"), int(m.group("pid"))))
     if entries is None:
         probs.append("no entries-in-buffer/entries-written header")
     elif entries[0] != entries[1]:
@@ -286,12 +299,25 @@ def attribute(events, windows):
         elif len(possible) == 1 and windows[possible[0]][0] <= lo and hi <= windows[possible[0]][1]:
             inside.setdefault(possible[0], []).append(e)
         else:
-            amb.append(e)
+            amb.append((e, possible))
     return inside, amb, outside
 
 
 def kinds():
     return {"flush": 0, "fua": 0, "preflush": 0, "preflush+fua": 0, "other": 0}
+
+
+def report_stats_problems(stats):
+    probs = []
+    if not stats:
+        probs.append("no per-CPU ring buffer stats")
+    for c, st in sorted(stats.items()):
+        for k in ("overrun", "commit overrun", "dropped events"):
+            if not isinstance(st.get(k), int):  # a missing or renamed key is not a zero (fresh review B-L7)
+                probs.append("per-CPU stats %s lack an integer '%s'" % (c, k))
+            elif st.get(k):
+                probs.append("events lost: %s %s = %s" % (c, k, st.get(k)))
+    return probs
 
 
 def report(out, device=None, windows=None):
@@ -307,10 +333,7 @@ def report(out, device=None, windows=None):
     except (OSError, ValueError) as e:
         raise Refuse("%s is not a stopped blkflush record: %r" % (out, e))
     events, probs = parse_trace(text, s.get("devices", {}))
-    for c, st in sorted(stats.items()):
-        for k in ("overrun", "commit overrun", "dropped events"):
-            if st.get(k, 0):
-                probs.append("events lost: %s %s = %s" % (c, k, st.get(k)))
+    probs += report_stats_problems(stats)
     lo, hi = s.get("start_mono_raw_ns", 0), stp.get("stop_mono_raw_ns", 0)
     early = [e for e in events if e[0] + e[1] < lo or e[0] - e[1] > hi]
     if early:
@@ -333,8 +356,12 @@ def report(out, device=None, windows=None):
         inside, amb, outside = attribute(events, w)
         arms = {}
         for k, (t0, t1, a, i) in enumerate(w):
-            r = arms.setdefault(a, {"ops": 0, "devices": {}})
+            r = arms.setdefault(a, {"ops": 0, "devices": {}, "ambiguous": 0, "windows_under_1us": 0})
             r["ops"] += 1
+            r["windows_under_1us"] += (t1 - t0) < 1000  # too short to hold an attributed event (trace prints us)
+        for e, poss in amb:
+            for a in sorted(set(w[j][2] for j in poss)):
+                arms[a]["ambiguous"] += 1
         for k, es in inside.items():
             a = w[k][2]
             for e in es:
@@ -355,9 +382,9 @@ def report(out, device=None, windows=None):
                 del d["windows_hit"], d["max"]
         rep["windows"] = {"source": windows, "n_windows": len(w), "arms": arms, "ambiguous": len(amb),
                           "outside": len(outside),
-                          "ambiguous_sample": [list(e[:5]) for e in amb[:5]],
+                          "ambiguous_sample": [list(e[:5]) for e, _ in amb[:5]],
                           "ambiguous_by_device": {}, "outside_by_device": {}}
-        for e in amb:
+        for e, _ in amb:
             rep["windows"]["ambiguous_by_device"][e[2]] = rep["windows"]["ambiguous_by_device"].get(e[2], 0) + 1
         for e in outside:
             rep["windows"]["outside_by_device"][e[2]] = rep["windows"]["outside_by_device"].get(e[2], 0) + 1
@@ -376,9 +403,12 @@ def gen(devpath, out_tsv, n):
         t0 = time.clock_gettime_ns(MONO_RAW)
         os.pwrite(fd, blk, 4096 * (i + 1))
         rows.append(("devwrite", i, time.clock_gettime_ns(MONO_RAW) - t0, t0))
-    for i in range(n):
+    for i in range(n):  # empty windows at least 20 us long, so an event inside one could be attributed (B-L9)
         t0 = time.clock_gettime_ns(MONO_RAW)
-        rows.append(("idle", i, time.clock_gettime_ns(MONO_RAW) - t0, t0))
+        t1 = t0
+        while t1 - t0 < 20000:
+            t1 = time.clock_gettime_ns(MONO_RAW)
+        rows.append(("idle", i, t1 - t0, t0))
     os.close(fd)
     with open(out_tsv, "w") as f:
         f.write("arm\ti\tns\tt0_ns\n")
@@ -437,6 +467,11 @@ def self_test():
     chk("refuses an event without F (the filter was not applied)",
         any("filter" in p for p in parse_trace(HDR % (1, 1) + ev("x", 1, 0, "0.001", "7:0", "WS") + "\n", devs)[1]), "")
     chk("refuses a trace with no header", any("header" in p for p in parse_trace("\n".join(lines) + "\n", devs)[1]), "")
+    chk("refuses an event on a device the map does not name",
+        any("does not name" in p for p in parse_trace(HDR % (1, 1) + ev("x", 1, 0, "0.001", "9:9", "FF") + "\n", devs)[1]), "")
+    chk("refuses per-CPU stats without the overrun keys", report_stats_problems({"cpu0": {"entries": 3}}) != [], "")
+    chk("accepts per-CPU stats with zero overruns",
+        report_stats_problems({"cpu0": {"overrun": 0, "commit overrun": 0, "dropped events": 0}}) == [], "")
     tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), "blkflush-selftest-%d.tsv" % os.getpid())
     with open(tmp, "w") as f:
         f.write("arm\ti\tns\tt0_ns\nappend25\t0\t100\t1000\nnosync25\t0\t100\t1050\n")
@@ -446,8 +481,9 @@ def self_test():
     except Refuse:
         chk("refuses overlapping windows", True)
     os.unlink(tmp)
-    print("BLKFLUSH SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if all(res) else "FAIL"))
-    return 0 if all(res) and res else 1
+    ok = all(res) and len(res) > 0
+    print("BLKFLUSH SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if ok else "FAIL"))
+    return 0 if ok else 1
 
 
 def main(argv):

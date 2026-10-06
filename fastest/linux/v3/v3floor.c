@@ -14,7 +14,8 @@
  *                directory: the durable-clone arm (B1's and PG18's file-clone shape)
  *   cfr2b        the same with copy_file_range(2) of the 1 MiB source in place of FICLONE (PG18's copy call)
  *   clone1b      clone2b without the clone's own fsync. REPORT-ONLY, never gated: on Linux a directory fsync does not
- *                make a FICLONE durable (PREREG crash model; review 2 item 3; crash.sh shows it)
+ *                guarantee a FICLONE durable (PREREG crash model; review 2 item 3; crash.sh: lost on btrfs, and on XFS
+ *                when the log was forced between the create and the FICLONE; it survives plain XFS by batching)
  *   clean        fsync of a file with nothing dirty (the dirty/clean control; never mutated)
  *   nosync25     the append25 write with no flush (D0): the flush control's reference
  *   Report-only extra: fdatasync4k (ow4k with fdatasync in place of fsync).
@@ -26,8 +27,8 @@
  *
  * Syscalls of op i, by definition (firecheck.sh checks counts with strace -f -c, and the exact sequence, files,
  * sizes and offsets inside each timed window with strace -f -y under --trace-clock):
- *   append25, nosync25   pwrite64(<arm>, 25, 25 + 25 i); append25 then fsync(<arm>)
- *   append64             pwrite64(<arm>, 64, 64 + 64 i); fsync(<arm>)
+ *   append25, nosync25   pwrite64(<arm>, 25, 4096 + 25 i); append25 then fsync(<arm>)
+ *   append64             pwrite64(<arm>, 64, 4096 + 64 i); fsync(<arm>)
  *   ow4k, ow64k, ow1m    pwrite64(<arm>, rec, (i mod cap/rec) x rec); fsync(<arm>)    cap 16 MiB (ow1m: 128 MiB)
  *   fdatasync4k          pwrite64 as ow4k; fdatasync(<arm>)
  *   clean                fsync(<arm>)
@@ -37,7 +38,8 @@
  *   cfr2b                openat as clone1b, copy_file_range(<arm>.src, [0], c<i>, NULL, 1 MiB, 0), fsync(c<i>), close,
  *                        fsync(<arm>.clones)
  *   Nothing runs between ops. The copy arms' teardown unlinks one clone per op, outside the timed window.
- * Setup per arm, before the loop: append/nosync arms write one record + fsync; ow*, fdatasync4k and clean
+ * Setup per arm, before the loop: append/nosync arms write one 4 KiB block + fsync (so no timed append crosses
+ *   btrfs's 2 KiB inline-data limit, and every append is the same kind of write all run); ow*, fdatasync4k and clean
  *   preallocate + fsync; copy arms preallocate the source + fsync, mkdir the clones' directory + fsync it. Every arm
  *   file is created with O_CREAT|O_EXCL|O_NOFOLLOW and fstat'd: it must be a new regular file on D's device. Teardown
  *   ends with one fsync of D, so the unlinks are durable before the next batch. Setup and teardown syncs are never
@@ -66,7 +68,9 @@
  *   gets none (the block layer strips REQ_PREFLUSH and REQ_FUA before a request exists), so its floor is labelled
  *   "no volatile cache: no drive flush" and can never back a drive-flush sentence. The kernel's view must agree with
  *   the drive's own report (NVMe Identify Controller VWC bit 0, read through NVME_IOCTL_ADMIN_CMD on the controller's
- *   character device; SCSI scsi_disk cache_type; virtio_blk cache_type), else the run is refused.
+ *   character device; SCSI MODE SENSE(10) caching page WCE through SG_IO -- not sd's cache_type, which is the kernel's
+ *   own copy; virtio_blk cache_type, from the device config), else the run is refused. On a VM (cpuinfo hypervisor
+ *   flag, /sys/hypervisor, DMI) a write-back leaf's floor is "virtual drive flush: reach to media unknown".
  *
  * Refusals (rc 2, nothing left behind):
  *   - the clocksource is not tsc or arch_sys_counter;
@@ -102,9 +106,12 @@
  *
  * Blind spots, stated: foreign I/O on the device and cgroup I/O throttling are not observed here (run.sh's stamps
  *   record /proc/diskstats and PSI around the batch); device-mapper, md and network block layers below D are not
- *   followed (only loop devices are; such a leaf refuses on its driver). A SCSI "temporary write back" written to
- *   cache_type changes the kernel's view and cache_type together, so the agreement check cannot see it. On Linux an
- *   fsync is per inode plus the filesystem's journal, not a device-wide cache flush as F_FULLFSYNC is on Apple.
+ *   followed (only loop devices are; such a leaf refuses on its driver), but network disks that present as SCSI
+ *   (iSCSI, FC, SRP) use sd and are accepted. NVMe VWC says a cache is present, not enabled (Get Features 06h needs
+ *   CAP_SYS_ADMIN). The VM test can miss a hypervisor that hides itself. On Linux an fsync is per inode plus the
+ *   filesystem's journal, not a device-wide cache flush as F_FULLFSYNC is on Apple.
+ * Also refused: LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH set (outside the fire-check), and inode flags on D or an arm
+ *   file outside {extents, directory index} (chattr +S/+D/+j/+C/+c/+x change what an fsync does).
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -112,9 +119,11 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
+#include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <linux/loop.h>
 #include <linux/nvme_ioctl.h>
+#include <scsi/sg.h>
 #include <sched.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -146,6 +155,7 @@
 #define MAXLAYERS 4 /* 3 nested loops and the leaf */
 #define OPTS 4096
 #define MAXCTRL 8
+#define APPEND_BASE 4096 /* the append arms' files start one block long */
 
 enum { APPEND25, APPEND64, OW4K, OW64K, OW1M, CLONE2B, CFR2B, CLONE1B, FDATASYNC4K, CLEAN, NOSYNC25, NARMS };
 static const char *NAMES[NARMS] = {"append25", "append64", "ow4k", "ow64k", "ow1m", "clone2b", "cfr2b", "clone1b",
@@ -158,8 +168,9 @@ static int is_copy(int a) { return a == CLONE1B || a == CLONE2B || a == CFR2B; }
 static int is_append(int a) { return a == APPEND25 || a == APPEND64 || a == NOSYNC25; }
 static size_t append_rec(int a) { return a == APPEND64 ? 64 : 25; }
 static const char *report_only_why(int a) {
-    return a == CLONE1B ? "report-only: on Linux a directory fsync does not make a FICLONE durable (PREREG crash model; "
-                          "review 2 item 3; crash.sh); clone2b is the durable-clone arm"
+    return a == CLONE1B ? "report-only: on Linux a directory fsync does not guarantee a FICLONE durable (PREREG crash "
+                          "model; review 2 item 3; crash.sh loses it on btrfs and on XFS-aimed); clone2b is the clone arm "
+                          "that survived every crash case"
          : a == FDATASYNC4K ? "report-only extra: ow4k with fdatasync in place of fsync"
          : a == CLEAN ? "the dirty/clean control, never mutated"
          : NULL;
@@ -224,7 +235,7 @@ static void jstr(FILE *f, const char *s) { /* a JSON string */
     fputc('"', f);
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         if (*p == '"' || *p == '\\') fprintf(f, "\\%c", *p);
-        else if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+        else if (*p < 0x20 || *p >= 0x7f) fprintf(f, "\\u%04x", *p); /* bytes, not code points: valid JSON always */
         else fputc(*p, f);
     }
     fputc('"', f);
@@ -349,14 +360,39 @@ static void sha256_file(const char *path, char hex[65]) {
 }
 
 /* ---- arm files ---- */
-static void check_new_fd(int fd, const char *p, int want_dir) { /* a new file or directory on D's device */
-    struct stat sb;
-    if (fstat(fd, &sb) != 0) die(p);
-    if (sb.st_dev != DIR_DEV || (want_dir ? !S_ISDIR(sb.st_mode) : !S_ISREG(sb.st_mode))) {
-        fprintf(stderr, "v3floor: %s is not a new %s on D's filesystem (dev %llx, D's %llx)\n", p, want_dir ? "directory" : "file",
-                (unsigned long long)sb.st_dev, (unsigned long long)DIR_DEV);
+/* Inode flags an arm file or D may carry (fresh review M4): extents and a directory's hashed index. Anything else
+ * (per-file sync S, dirsync D, data journaling j, no-COW C, compression c, DAX x, ...) changes what an fsync does
+ * without showing in any mount option, so it refuses. */
+#define FLAGS_OK ((unsigned)FS_EXTENT_FL | (unsigned)FS_INDEX_FL)
+static const char *inode_flags_problem(int fd, const char *what) {
+    int fl = 0;
+    if (ioctl(fd, FS_IOC_GETFLAGS, &fl) != 0) return whyf("cannot read the inode flags of %s: %s", what, strerror(errno));
+    unsigned bad = (unsigned)fl & ~FLAGS_OK;
+    if (bad)
+        return whyf("%s carries inode flags 0x%x (all 0x%x) outside the allowlist (extents, directory index): per-file sync, "
+                    "dirsync, data journaling, no-COW, compression or DAX change what an fsync does", what, bad, (unsigned)fl);
+    return NULL;
+}
+static uint64_t DIR_MNT;
+static void dir_identity(void) { /* D's device and mount id, from one statx */
+    struct statx sx;
+    if (statx(AT_FDCWD, DIR_, 0, STATX_BASIC_STATS | STATX_MNT_ID, &sx) != 0 || !(sx.stx_mask & STATX_MNT_ID)) die("statx D");
+    DIR_DEV = makedev(sx.stx_dev_major, sx.stx_dev_minor);
+    DIR_MNT = sx.stx_mnt_id;
+}
+static void check_new_fd(int fd, const char *p, int want_dir) { /* a new file or directory on D's device and mount */
+    struct statx sx;
+    if (statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS | STATX_MNT_ID, &sx) != 0) die(p);
+    dev_t dev = makedev(sx.stx_dev_major, sx.stx_dev_minor);
+    int kind_ok = want_dir ? S_ISDIR(sx.stx_mode) : S_ISREG(sx.stx_mode);
+    if (dev != DIR_DEV || !(sx.stx_mask & STATX_MNT_ID) || sx.stx_mnt_id != DIR_MNT || !kind_ok) {
+        fprintf(stderr, "v3floor: %s is not a new %s on D's filesystem and mount (dev %llx mount %llu, D's %llx %llu)\n", p,
+                want_dir ? "directory" : "file", (unsigned long long)dev, (unsigned long long)sx.stx_mnt_id,
+                (unsigned long long)DIR_DEV, (unsigned long long)DIR_MNT);
         exit(1);
     }
+    const char *why = inode_flags_problem(fd, p);
+    if (why) { fprintf(stderr, "v3floor: %s\n", why); exit(1); }
 }
 static int mkfile(const char *name) {
     char p[PATH_MAX];
@@ -378,9 +414,11 @@ static void setup(int a, armst *s, int crash) {
     if (is_append(a)) {
         s->fd = mkfile(NAMES[a]);
         s->rec = append_rec(a);
-        if (pwrite(s->fd, buf, s->rec, 0) != (ssize_t)s->rec) die("append init");
+        /* one whole 4 KiB block first: the timed appends then never cross btrfs's 2 KiB inline-data limit, which
+         * stepped append25 and append64 up mid-run on every btrfs cell of run 37476867864 (fresh review M3) */
+        if (pwrite(s->fd, buf, APPEND_BASE, 0) != APPEND_BASE) die("append init");
         setup_sync(s->fd, "append init fsync");
-        s->off = (off_t)s->rec;
+        s->off = APPEND_BASE;
     } else if (a == OW4K || a == OW64K || a == OW1M || a == FDATASYNC4K) {
         s->fd = mkfile(NAMES[a]);
         s->rec = a == OW64K ? 65536 : a == OW1M ? MIB : 4096;
@@ -547,7 +585,8 @@ static const char *EXT4_OPTS[] = {
     "inode_readahead_blks=", "init_itable=", "noinit_itable", "max_batch_time=", "min_batch_time=", "i_version",
     "prefetch_block_bitmaps", "no_prefetch_block_bitmaps", "block_validity", "noblock_validity", "bsddf", "minixdf",
     "grpid", "nogrpid", "bsdgroups", "sysvgroups", "resuid=", "resgid=", "barrier", "barrier=1", "journal_ioprio=",
-    "data_err=abort", "nowarn_on_error", "warn_on_error", "max_dir_size_kb=", "mb_optimize_scan=", NULL};
+    "data_err=abort", "nowarn_on_error", "warn_on_error", "max_dir_size_kb=", "mb_optimize_scan=", "dax=never",
+    "nombcache", NULL};
 static const char *XFS_OPTS[] = {"attr2", "inode64", "inode32", "logbufs=", "logbsize=", "noquota", "quota", "usrquota",
                                  "uquota", "grpquota", "gquota", "prjquota", "pquota", "sunit=", "swidth=", "largeio",
                                  "nolargeio", "allocsize=", "nouuid", "discard", "nodiscard", "ikeep", "noikeep",
@@ -705,6 +744,11 @@ static const char *layer_fs_checks(layer *l, int k) { /* options allowlist, ext4
             else if (!strcmp(t, "journal_async_commit")) l->ext4_async = 1;
             else if (!strcmp(t, "nobarrier"))
                 return whyf("the flush path has nobarrier: layer %d, %s (%s says nobarrier)", k, l->m.mnt, p);
+            /* the same allowlist over every effective option, defaults included: mountinfo omits options that match
+             * the superblock's defaults (tune2fs -o / -E mount_opts), this file does not (fresh review L3) */
+            if (!opt_in(t, GENERIC_OPTS) && !opt_in(t, EXT4_OPTS) && strcmp(t, "nobarrier"))
+                return whyf("layer %d (ext4 on %s at %s): effective option '%s' (%s) is not in the known-safe list for "
+                            "ext4", k, l->m.source, l->m.mnt, t, p);
         }
         DIR *d = opendir("/proc/fs/jbd2");
         if (!d) return whyf("layer %d: cannot list /proc/fs/jbd2", k);
@@ -745,7 +789,7 @@ static const char *layer_fs_checks(layer *l, int k) { /* options allowlist, ext4
 /* ---- the leaf: its driver (an allowlist) and the drive's own cache report ---- */
 typedef struct {
     char driver[64], kind[16]; /* kind: drive | brd */
-    char report[32], report_source[PATH_MAX + 64];
+    char report[32], report_source[PATH_MAX + 128], cache_type[64], model[64];
     char ctrls[MAXCTRL][32];
     int nctrl;
     char paths[MAXCTRL][64], pathdevs[MAXCTRL][32];
@@ -768,7 +812,7 @@ static void nvme_ctrls(const char *disk, leafinfo *li) {
     closedir(d);
 }
 
-static const char *nvme_vwc(const char *ctrl, int *vwc) {
+static const char *nvme_vwc(const char *ctrl, int *vwc, char *model, size_t mcap) {
     char node[64], p[PATH_MAX], dv[32];
     snprintf(node, sizeof node, "/dev/%s", ctrl);
     pathf(p, sizeof p, "/sys/class/nvme/%s/dev", ctrl);
@@ -793,8 +837,67 @@ static const char *nvme_vwc(const char *ctrl, int *vwc) {
     int r = ioctl(fd, NVME_IOCTL_ADMIN_CMD, &c), e = errno;
     close(fd);
     if (r != 0) return whyf("cannot read the drive's own cache report: Identify Controller on %s: %s", node, r < 0 ? strerror(e) : "NVMe status");
-    *vwc = id[525] & 1; /* VWC bit 0: a volatile write cache is present */
+    *vwc = id[525] & 1; /* VWC bit 0: a volatile write cache is PRESENT (whether it is enabled is Get Features 06h,
+                         * which needs CAP_SYS_ADMIN: a stated blind spot) */
+    size_t m = 0; /* MN, bytes 24-63, space padded */
+    for (int k = 24; k < 64 && m + 1 < mcap; k++) model[m++] = (char)(id[k] >= 0x20 && id[k] < 0x7f ? id[k] : '?');
+    while (m && model[m - 1] == ' ') m--;
+    model[m] = 0;
     return NULL;
+}
+
+/* SCSI: the drive's own caching mode page (MODE SENSE(10), page 08h, current values; WCE is byte 2 bit 2), read
+ * through SG_IO on a read-only fd -- a read-safe command the kernel allows any opener. sd's cache_type is NOT the
+ * drive's report: it and queue/write_cache both derive from sd's cached WCE bit, so "temporary write back|through"
+ * moves both together (fresh review H2). */
+static const char *scsi_wce(const layer *l, int *wce) {
+    char node[96];
+    unsigned maj = 0, mnr = 0;
+    struct stat sb;
+    snprintf(node, sizeof node, "/dev/%s", l->diskname);
+    if (sscanf(l->diskdev, "%u:%u", &maj, &mnr) != 2 || stat(node, &sb) != 0 || !S_ISBLK(sb.st_mode) ||
+        major(sb.st_rdev) != maj || minor(sb.st_rdev) != mnr)
+        return whyf("%s is not block device %s", node, l->diskdev);
+    int fd = open(node, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return whyf("cannot read the drive's own cache report: open %s: %s (MODE SENSE needs read access, e.g. setfacl "
+                    "-m u:$USER:r %s)", node, strerror(errno), node);
+    unsigned char cdb[10] = {0x5A, 0x08, 0x08, 0, 0, 0, 0, 0, 0xFC, 0}; /* DBD=1, PC=current, page 08h, 252 B */
+    unsigned char resp[252], sense[32];
+    memset(resp, 0, sizeof resp);
+    sg_io_hdr_t io;
+    memset(&io, 0, sizeof io);
+    io.interface_id = 'S';
+    io.cmdp = cdb;
+    io.cmd_len = sizeof cdb;
+    io.dxferp = resp;
+    io.dxfer_len = sizeof resp;
+    io.dxfer_direction = SG_DXFER_FROM_DEV;
+    io.sbp = sense;
+    io.mx_sb_len = sizeof sense;
+    io.timeout = 10000;
+    int r = ioctl(fd, SG_IO, &io), e = errno;
+    close(fd);
+    if (r != 0) return whyf("cannot read the drive's own cache report: SG_IO MODE SENSE(10) on %s: %s", node, strerror(e));
+    if ((io.info & SG_INFO_OK_MASK) != SG_INFO_OK || io.status || io.host_status || io.driver_status)
+        return whyf("cannot read the drive's own cache report: MODE SENSE(10) on %s failed (status 0x%x host 0x%x driver "
+                    "0x%x)", node, io.status, io.host_status, io.driver_status);
+    unsigned len = ((unsigned)resp[0] << 8 | resp[1]) + 2, bdl = (unsigned)resp[6] << 8 | resp[7], off = 8 + bdl;
+    if (off + 3 > len || off + 3 > sizeof resp || (resp[off] & 0x3F) != 0x08)
+        return whyf("cannot read the drive's own cache report: no caching mode page in %s's MODE SENSE reply", node);
+    *wce = (resp[off + 2] >> 2) & 1;
+    return NULL;
+}
+
+static void virt_record(int *vm, int *flag, char *hyp, char *vendor, char *product, size_t cap) {
+    static char ci[1 << 20];
+    *flag = 0;
+    if (read_all("/proc/cpuinfo", ci, sizeof ci) == 0 && (strstr(ci, " hypervisor ") || strstr(ci, " hypervisor\n"))) *flag = 1;
+    if (read_line("/sys/hypervisor/type", hyp, cap) != 0) hyp[0] = 0;
+    if (read_line("/sys/class/dmi/id/sys_vendor", vendor, cap) != 0) vendor[0] = 0;
+    if (read_line("/sys/class/dmi/id/product_name", product, cap) != 0) product[0] = 0;
+    *vm = *flag || hyp[0] || strstr(product, "Virtual") || strstr(product, "KVM") || strstr(product, "VMware") ||
+          strstr(vendor, "QEMU") || strstr(vendor, "Amazon EC2") || strstr(vendor, "Google") || strstr(vendor, "Xen");
 }
 
 static const char *leaf_checks(const layer *l) {
@@ -857,10 +960,16 @@ static const char *leaf_checks(const layer *l) {
             if (read_line(q, ct, sizeof ct) == 0) { nfound++; pathf(li->report_source, sizeof li->report_source, "%s", q); }
         }
         closedir(sd);
-        if (nfound != 1) return whyf("cannot read the drive's own cache report: %d cache_type files under %s", nfound, p);
-        if (strstr(ct, "write back")) snprintf(li->report, sizeof li->report, "write back");
-        else if (strstr(ct, "write through") || !strcmp(ct, "none")) snprintf(li->report, sizeof li->report, "write through");
-        else return whyf("cannot parse the drive's cache report '%s' (%s)", ct, li->report_source);
+        if (nfound != 1) return whyf("cannot read sd's cache_type: %d cache_type files under %s", nfound, p);
+        copy(li->cache_type, sizeof li->cache_type, ct);
+        int wce = -1;
+        const char *why = scsi_wce(l, &wce);
+        if (why) return why;
+        snprintf(li->report, sizeof li->report, "%s", wce ? "write back" : "write through");
+        snprintf(li->report_source, sizeof li->report_source, "SCSI MODE SENSE(10) caching page WCE=%d via SG_IO on /dev/%s "
+                 "(sd's cache_type, the kernel's copy, reads '%s')", wce, l->diskname, ct);
+        pathf(p, sizeof p, "%s/device/model", l->disk);
+        if (read_line(p, li->model, sizeof li->model) != 0) li->model[0] = 0;
     } else if (!strcmp(li->driver, "virtio_blk")) {
         char ct[32];
         pathf(li->report_source, sizeof li->report_source, "%s/cache_type", l->disk);
@@ -873,7 +982,7 @@ static const char *leaf_checks(const layer *l) {
         int first = -1;
         for (int c = 0; c < li->nctrl; c++) {
             int vwc = 0;
-            const char *why = nvme_vwc(li->ctrls[c], &vwc);
+            const char *why = nvme_vwc(li->ctrls[c], &vwc, li->model, sizeof li->model);
             if (why) return why;
             if (first >= 0 && vwc != first) return whyf("the controllers of %s disagree on VWC", l->diskname);
             first = vwc;
@@ -925,6 +1034,28 @@ static uint64_t xs(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; 
 
 static int firecheck_env(void) { const char *e = getenv("V3FLOOR_FIRECHECK"); return e && !strcmp(e, "1"); }
 
+/* after the loop, before teardown: does a copy arm's c0 share its extents with the source (a reflink) or not (a
+ * byte copy)? cfr2b is a reflink on xfs/btrfs and a copy on ext4 (fresh review L6). FIEMAP without SYNC. */
+static const char *shared_extents(int dfd) {
+    int fd = openat(dfd, "c0", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return "unknown (cannot open c0)";
+    struct fiemap *fm = calloc(1, sizeof *fm + 8 * sizeof(struct fiemap_extent));
+    if (!fm) die("calloc");
+    fm->fm_start = 0;
+    fm->fm_length = ~0ULL;
+    fm->fm_extent_count = 8;
+    int r = ioctl(fd, FS_IOC_FIEMAP, fm);
+    close(fd);
+    const char *out = "not shared (a byte copy)";
+    if (r != 0) out = "unknown (FIEMAP failed)";
+    else if (!fm->fm_mapped_extents) out = "no mapped extents";
+    else
+        for (unsigned k = 0; k < fm->fm_mapped_extents && k < 8; k++)
+            if (fm->fm_extents[k].fe_flags & FIEMAP_EXTENT_SHARED) out = "shared (a reflink)";
+    free(fm);
+    return out;
+}
+
 static void leftover_check(int a, int crash) { /* every name an arm would create must be absent (lstat: a symlink counts) */
     const char *suffix[4] = {"", ".src", ".clones", ".aim"};
     for (int k = 0; k < 4; k++) {
@@ -946,9 +1077,7 @@ static int crash_main(int arm, const char *out, const char *exe_sha) {
     if (magic != MAGIC_EXT4 && magic != MAGIC_XFS && magic != MAGIC_BTRFS) refuse("crash mode: %s is not ext4, xfs or btrfs", DIR_);
     if (!is_copy(arm)) refuse("--crash-op takes a copy arm (clone1b, clone2b, cfr2b), not %s", NAMES[arm]);
     if (is_ficlone(arm) && magic == MAGIC_EXT4) refuse("crash mode: %s needs FICLONE, which ext4 has not", NAMES[arm]);
-    struct stat ds;
-    if (stat(DIR_, &ds) != 0) die("stat D");
-    DIR_DEV = ds.st_dev;
+    dir_identity();
     leftover_check(arm, 1);
     if (mkdir(out, 0755) != 0) refuse("out dir %s must not exist: %s", out, strerror(errno));
     for (size_t i = 0; i < sizeof buf; i++) buf[i] = (char)xs();
@@ -995,6 +1124,13 @@ int main(int argc, char **argv) {
         refuse("%s is for the fire-check only (V3FLOOR_FIRECHECK=1, which only firecheck.sh sets, is unset)",
                crash_arm ? "--crash-op" : CRASH_AIM ? "--crash-aim" : MUTANT ? "--mutant-nosync" : "--trace-clock");
     if (CRASH_AIM && !crash_arm) refuse("--crash-aim needs --crash-op");
+    if (!firecheck_env()) {
+        static const char *LDV[] = {"LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", NULL};
+        for (int k = 0; LDV[k]; k++)
+            if (getenv(LDV[k]) && getenv(LDV[k])[0])
+                refuse("%s is set: an interposed library could change what the probe does under an unchanged exe_sha256",
+                       LDV[k]);
+    }
     if (!DIR_ || !out || (!crash_arm && (!have_n || n == 0))) {
         fprintf(stderr, "usage: v3floor --dir D --out O --n N (N >= 1) [--arms ...] [--seed S] | --crash-op ARM --dir D --out O\n");
         return 2;
@@ -1016,8 +1152,8 @@ int main(int argc, char **argv) {
     if (read_line("/sys/devices/system/clocksource/clocksource0/current_clocksource", clocksrc, sizeof clocksrc) != 0)
         refuse("cannot read the current clocksource");
     if (strcmp(clocksrc, "tsc") && strcmp(clocksrc, "arch_sys_counter"))
-        refuse("the clocksource is %s, not tsc or arch_sys_counter: CLOCK_MONOTONIC_RAW reads would not be the "
-               "vDSO's counter", clocksrc);
+        refuse("the clocksource is %s, not tsc or arch_sys_counter (review 2 item 16's rule for a credited batch: the "
+               "counter every latency here is read from)", clocksrc);
 
     /* the filesystem under D (its own mount, by mount id), then the flush path below it */
     static mrec top0;
@@ -1050,9 +1186,19 @@ int main(int argc, char **argv) {
                    "driver, so no flush reaches its backing file", k, L[k].diskname, L[k].wc);
     const layer *leaf = &L[NL - 1];
     if ((why = leaf_checks(leaf))) refuse("%s", why);
-    struct stat ds;
-    if (stat(DIR_, &ds) != 0) die("stat D");
-    DIR_DEV = ds.st_dev;
+    dir_identity();
+    if (DIR_MNT != top->id) refuse("D's mount changed between the lookup (mount id %llu) and now (%llu)",
+                                   (unsigned long long)top->id, (unsigned long long)DIR_MNT);
+    int dfd0 = open(DIR_, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd0 < 0) die("open D");
+    if ((why = inode_flags_problem(dfd0, DIR_))) refuse("%s", why);
+    char dflags[16];
+    {
+        int fl = 0;
+        if (ioctl(dfd0, FS_IOC_GETFLAGS, &fl) != 0) die("FS_IOC_GETFLAGS D");
+        snprintf(dflags, sizeof dflags, "0x%x", (unsigned)fl);
+    }
+    close(dfd0);
 
     errno = 0;
     int nice_v = getpriority(PRIO_PROCESS, 0);
@@ -1125,6 +1271,24 @@ int main(int argc, char **argv) {
             t0s[j][i] = t0;
         }
     }
+    /* stationarity, recorded: p50 of the first and the last quarter of each arm's ops, in op order (fresh review M3) */
+    uint64_t q1[NARMS] = {0}, q4[NARMS] = {0};
+    uint64_t qn = n / 4;
+    if (qn >= 2) {
+        uint64_t *tmp = calloc(qn, sizeof(uint64_t));
+        if (!tmp) die("calloc");
+        for (int j = 0; j < na; j++) {
+            memcpy(tmp, lat[j], qn * sizeof(uint64_t));
+            qsort(tmp, qn, sizeof(uint64_t), cmp_u64);
+            q1[j] = pct(tmp, qn, .5);
+            memcpy(tmp, lat[j] + (n - qn), qn * sizeof(uint64_t));
+            qsort(tmp, qn, sizeof(uint64_t), cmp_u64);
+            q4[j] = pct(tmp, qn, .5);
+        }
+        free(tmp);
+    }
+    const char *shared[NARMS] = {0};
+    for (int j = 0; j < na; j++) if (is_copy(sel[j])) shared[j] = shared_extents(st[j].dfd);
     for (int j = 0; j < na; j++) teardown(sel[j], &st[j], n);
     int dd = open(DIR_, O_RDONLY | O_DIRECTORY);
     if (dd < 0 || fsync(dd) != 0 || close(dd) != 0) die("teardown fsync of the dir");
@@ -1159,6 +1323,10 @@ int main(int argc, char **argv) {
             "\"trace_clock\":%d,\"clock\":\"CLOCK_MONOTONIC_RAW\",\"clocksource\":", (unsigned long long)n,
             (unsigned long long)seed_used, MUTANT, TRACE_CLOCK);
     jstr(f, clocksrc);
+    if (have_seed) fprintf(f, ",\"seed_arg\":%llu", (unsigned long long)seed);
+    else fprintf(f, ",\"seed_arg\":null");
+    fprintf(f, ",\"ld_env\":\"none (LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH refused outside the fire-check)\",\"dir_flags\":");
+    jstr(f, dflags);
     fprintf(f, ",\"barrier\":\"fsync(2)\",\"exe_sha256\":\"%s\",\"dir\":", exe_sha);
     jstr(f, DIR_);
     fprintf(f, ",\"realpath\":"); jstr(f, top->real);
@@ -1194,7 +1362,11 @@ int main(int argc, char **argv) {
             fprintf(f, ",\"commit_s\":"); jstr(f, l->ext4_commit);
             fprintf(f, ",\"journal_async_commit\":%s,\"journal\":", l->ext4_async ? "true" : "false");
             jstr(f, l->jbd2);
-            fprintf(f, ",\"label\":\"data=%s%s, commit=%s\"}", l->ext4_data, l->ext4_async ? ", async commit" : "", l->ext4_commit);
+            char lab[128];
+            snprintf(lab, sizeof lab, "data=%s%s, commit=%s", l->ext4_data, l->ext4_async ? ", async commit" : "", l->ext4_commit);
+            fprintf(f, ",\"label\":");
+            jstr(f, lab);
+            fprintf(f, "}");
         }
         if (!strcmp(l->m.fstype, "btrfs")) fprintf(f, ",\"btrfs_devices\":%d", l->btrfs_devices);
         fprintf(f, "}");
@@ -1208,6 +1380,11 @@ int main(int argc, char **argv) {
     fprintf(f, ",\"fua\":"); jstr(f, leaf->fua);
     fprintf(f, ",\"drive_reports\":"); jstr(f, LEAF.report);
     fprintf(f, ",\"drive_report_source\":"); jstr(f, LEAF.report_source);
+    fprintf(f, ",\"model\":"); jstr(f, LEAF.model);
+    fprintf(f, ",\"sd_cache_type\":"); jstr(f, LEAF.cache_type);
+    if (!strcmp(LEAF.driver, "nvme"))
+        fprintf(f, ",\"nvme_vwc_enabled\":\"not read: Get Features 06h needs CAP_SYS_ADMIN (VWC bit 0 says a cache is "
+                "present, not that it is on)\"");
     fprintf(f, ",\"nvme_controllers\":[");
     for (int c = 0; c < LEAF.nctrl; c++) { fprintf(f, "%s", c ? "," : ""); jstr(f, LEAF.ctrls[c]); }
     fprintf(f, "],\"multipath\":[");
@@ -1220,18 +1397,34 @@ int main(int argc, char **argv) {
     fprintf(f, ",\"leaf_write_cache\":"); jstr(f, wc);
     fprintf(f, ",\"leaf_fua\":"); jstr(f, leaf->fua);
     int wb = !strcmp(wc, "write back");
+    int vm = 0, vflag = 0;
+    char hyp[64], vendor[128], product[128];
+    virt_record(&vm, &vflag, hyp, vendor, product, sizeof vendor < sizeof hyp ? sizeof vendor : sizeof hyp);
+    fprintf(f, ",\"virtualization\":{\"virtualized\":%s,\"cpuinfo_hypervisor_flag\":%s,\"sys_hypervisor_type\":",
+            vm ? "true" : "false", vflag ? "true" : "false");
+    jstr(f, hyp);
+    fprintf(f, ",\"dmi_sys_vendor\":"); jstr(f, vendor);
+    fprintf(f, ",\"dmi_product_name\":"); jstr(f, product);
+    fprintf(f, "}");
     fprintf(f, ",\"flush_sent_to_device\":\"%s\"",
             brd ? "no: the leaf is brd (RAM, fire-check only), which has no cache"
-            : wb ? "yes: the leaf reports a volatile write cache, and the drive agrees, so each fsync sends it a flush"
-                 : "no: the leaf reports write-through, and the drive agrees, so the block layer sends it no flush");
+            : wb ? "yes: the leaf reports a volatile write cache and the drive agrees, so a flush the filesystem issues "
+                   "reaches it; how many each arm's op issues is the device flush record (device_flushes_per_op)"
+                 : "no: the leaf reports write-through and the drive agrees, so the block layer sends it no flush");
+    /* on a VM the "drive" is the hypervisor's: whether its flush reaches media is the host's business (fresh review M1) */
     fprintf(f, ",\"floor_kind\":\"%s\"", brd ? "brd: no drive (fire-check only, never credited)"
-            : wb ? "drive flush" : "no volatile cache: no drive flush");
+            : wb ? (vm ? "virtual drive flush: reach to media unknown" : "drive flush") : "no volatile cache: no drive flush");
+    /* the review's sentence is for ext4/XFS; btrfs's clean fsync issues no flush at all (run 37476867864), so it gets
+     * no bare-flush baseline; batchgate.py writes floor_claim_from_counts from the batch's own device flush counts */
     fprintf(f, ",\"floor_claim\":\"%s\"",
             brd ? "none: a brd floor backs no sentence"
-            : wb ? "per stack: a clean fsync (a bare flush) plus the measured delta; never 'one drive flush' without "
-                   "the device flush count (run.sh's blkflush record)"
-                 : "per stack: the cost of an fsync on a drive that receives no flush; neither 'one drive flush' nor "
-                   "'above a same-batch drive flush' may be written");
+            : !wb ? "per stack: the cost of an fsync on a drive that receives no flush; neither 'one drive flush' nor "
+                    "'above a same-batch drive flush' may be written"
+            : strcmp(top->fstype, "btrfs") ? "per stack: a clean fsync (a bare flush) plus the measured delta, only where "
+                                             "the device flush record shows the clean arm issuing a flush per op "
+                                             "(floor_claim_from_counts); never 'one drive flush' without that count"
+                                           : "per stack: the measured per-arm device flush counts only; on btrfs a clean "
+                                             "fsync can issue no flush, so no bare-flush baseline is claimed");
     fprintf(f, ",\"uname\":");
     char un[600];
     snprintf(un, sizeof un, "%s %s %s", u.sysname, u.release, u.machine);
@@ -1241,15 +1434,27 @@ int main(int argc, char **argv) {
     jstr(f, arms);
     fprintf(f, ",\"arms_gated\":[");
     for (int a = 0, k = 0; a < NARMS; a++) if (gated(a)) fprintf(f, "%s\"%s\"", k++ ? "," : "", NAMES[a]);
-    fprintf(f, "],\"arms_report_only\":{");
+    fprintf(f, "],\"arms_gated_run\":[");
+    for (int j = 0, k = 0; j < na; j++) if (gated(sel[j])) fprintf(f, "%s\"%s\"", k++ ? "," : "", NAMES[sel[j]]);
+    fprintf(f, "],\"copy_extents\":{");
+    for (int j = 0, k = 0; j < na; j++)
+        if (shared[j]) { fprintf(f, "%s\"%s\":", k++ ? "," : "", NAMES[sel[j]]); jstr(f, shared[j]); }
+    fprintf(f, "},\"arms_report_only\":{");
     for (int a = 0, k = 0; a < NARMS; a++)
         if (report_only_why(a)) { fprintf(f, "%s\"%s\":", k++ ? "," : "", NAMES[a]); jstr(f, report_only_why(a)); }
-    fprintf(f, "},\"durability\":{\"clone2b\":\"durability unverified on Linux by this probe; the fire-check's crash.sh "
-            "tests it on loops\",\"cfr2b\":\"durability unverified on Linux by this probe; the fire-check's crash.sh tests "
-            "it on loops\",\"clone1b\":\"not durable on Linux (report-only)\"}");
-    fprintf(f, ",\"frame_arm\":\"append64\",\"frame_bytes\":64,\"frame_rule\":\"PREREG section 4: the smallest bytes per "
-            "flush >= the M1 build's median create frame; review 2 item 11 puts a named create's flight at about 56-60 B "
-            "(unverified here)\"");
+    fprintf(f, "},\"durability\":{\"clone2b\":\"device durability unverified on Linux by this probe; the fire-check's "
+            "crash.sh shows it surviving a filesystem-level crash on loops, which cannot see a missing device flush\","
+            "\"cfr2b\":\"device durability unverified on Linux by this probe; the fire-check's crash.sh shows it surviving "
+            "a filesystem-level crash on loops, which cannot see a missing device flush\",\"clone1b\":\"not guaranteed on "
+            "Linux (report-only): crash.sh loses it on btrfs and on XFS when the log was forced between the create and the "
+            "FICLONE; it survived plain XFS by checkpoint batching\"}");
+    int frame_ran = 0;
+    for (int j = 0; j < na; j++) frame_ran |= sel[j] == APPEND64;
+    if (frame_ran)
+        fprintf(f, ",\"frame_arm\":\"append64\",\"frame_bytes\":64,\"frame_rule\":\"PREREG section 4: the smallest bytes "
+                "per flush >= the M1 build's median create frame; review 2 item 11 puts a named create's flight at about "
+                "56-60 B (unverified here)\"");
+    else fprintf(f, ",\"frame_arm\":null");
     fprintf(f, ",\"refused_arms\":{");
     for (int a = 0, k = 0; a < NARMS; a++)
         if (refused[a]) { fprintf(f, "%s\"%s\":", k++ ? "," : "", NAMES[a]); jstr(f, reason); }
@@ -1269,6 +1474,7 @@ int main(int argc, char **argv) {
                 j ? "," : "", NAMES[sel[j]], lat[j][0] / 1e3, pct(lat[j], n, .01) / 1e3, pct(lat[j], n, .10) / 1e3,
                 p50[j] / 1e3, pct(lat[j], n, .90) / 1e3, pct(lat[j], n, .99) / 1e3);
         if (n >= 10000) fprintf(f, "\"p999_us\":%.1f,", pct(lat[j], n, .999) / 1e3);
+        if (qn >= 2) fprintf(f, "\"p50_q1_us\":%.1f,\"p50_q4_us\":%.1f,", q1[j] / 1e3, q4[j] / 1e3);
         fprintf(f, "\"max_us\":%.1f,\"mean_us\":%.1f}", lat[j][n - 1] / 1e3, mean / 1e3);
     }
     fprintf(f, "}");

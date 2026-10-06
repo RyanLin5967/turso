@@ -19,9 +19,12 @@
 # Neither, or both: refused (rc 2) before anything runs.
 # V3_REQUIRE_T3=1: also refuse before anything runs unless the registered T3 preconditions hold (every CPU on the
 # "performance" governor, clocksource tsc or arch_sys_counter: review 2 items 16-17; batchgate.py t3pre).
+# LD_PRELOAD, LD_AUDIT or LD_LIBRARY_PATH in the environment refuses (an interposer would not change the sha256).
 # After the probe (batchgate.py post): refused (rc 2) if the summary carries mutant_nosync or trace_clock != 0, names
-# another binary (exe_sha256), another layout, or (bound) a brd or another leaf class; VOID (rc 3) if the leaf
-# reports write-back and its flush count is below n x gated arms, or a gated op issued it no flush request.
+# another binary (exe_sha256), another layout, no gated arm ran, or (bound) a brd leaf, another leaf class or another
+# layer stack than the verdict's; also refused when the gate itself fails (any rc but 0/2/3, or no gate.json), never
+# read as a pass. VOID (rc 3) if the leaf reports write-back and its flush count is below n x gated arms, or a gated
+# op issued it no flush request. A killed run.sh stops its tracefs instance (EXIT trap).
 # Exit: 2 refused or a record could not be taken; else the probe's rc (0 ok, 1 op failed, 3 void), or 3 from the gate.
 # Not a credited measurement unless the PREREG is registered with its T3 rules.
 set -uo pipefail
@@ -45,6 +48,9 @@ CELL=${V3_CELL:-}
 python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; sys.exit(0 if sys.argv[2] in v3cell.CELLS else 1)' "$HERE" "$CELL" \
   || refuse "V3_CELL='$CELL' is not a cell (ext4, xfs, btrfs on a block device; ext4loop, xfsloop, btrfsloop on a loop)"
 [ -z "${V3FLOOR_FIRECHECK:-}" ] || refuse "V3FLOOR_FIRECHECK is set: the probe's fire-check flags never pass through run.sh"
+for v in LD_PRELOAD LD_AUDIT LD_LIBRARY_PATH; do
+  [ -z "${!v:-}" ] || refuse "$v is set: an interposed library could change what the probe does under an unchanged sha256"
+done
 sha=$(sha256sum "$BIN" | cut -d' ' -f1) && [ -n "$sha" ] || refuse "cannot hash $BIN"
 fstype=$(findmnt -n -o FSTYPE -T "$DIR") || refuse "cannot find the filesystem of $DIR"
 arch=$(uname -m)
@@ -56,7 +62,8 @@ elif [ -n "${V3_FIRECHECK_VERDICT:-}" ]; then
   vj=$(python3 -B "$GATE" verdict "$V3_FIRECHECK_VERDICT" "$CELL" "$sha" "$arch" "$fstype")
   vrc=$?
   [ "$vrc" -eq 0 ] || refuse "$V3_FIRECHECK_VERDICT does not bind this batch (binary $sha, fs $fstype, arch $arch, cell $CELL): $vj"
-  read -r vsha vrun vleaf < <(python3 -B -c 'import json, sys; v = json.loads(sys.argv[1]); print(v["verdict_sha256"], v["run_id"], v["leaf_class"])' "$vj")
+  { read -r vsha; read -r vrun; read -r vleaf; } < <(python3 -B -c 'import json, sys; v = json.loads(sys.argv[1]); print("\n".join(str(v[k]) for k in ("verdict_sha256", "run_id", "leaf_class")))' "$vj")
+  { [ -n "$vsha" ] && [ -n "$vrun" ] && [ -n "$vleaf" ]; } || refuse "the binding fields could not be read back from: $vj"
   mode=bound
   bound="fire-checked: $V3_FIRECHECK_VERDICT"
 elif [ "${V3_SMOKE:-}" = 1 ]; then
@@ -72,10 +79,14 @@ TMP="$OUT.stamp_start.json" BLKD="$OUT.blkflush"
 { [ ! -e "$OUT" ] && [ ! -e "$TMP" ] && [ ! -e "$BLKD" ]; } || refuse "$OUT, $TMP or $BLKD exists"
 python3 -B "$STAMP" start "$TMP" --dir "$DIR" > /dev/null || { rm -f "$TMP"; refuse "the start stamp failed"; }
 python3 -B "$BLK" start "$BLKD" > /dev/null || { rm -f "$TMP"; rm -rf "$BLKD"; refuse "blkflush.py could not start (tracefs via sudo -n)"; }
+# a killed run.sh must not leave the tracefs instance tracing (fresh review B-L6)
+stopped=0
+trap '[ "$stopped" = 1 ] || python3 -B "$BLK" stop "$BLKD" > /dev/null 2>&1' EXIT
 env -u V3FLOOR_FIRECHECK "$BIN" --dir "$DIR" --out "$OUT" --n "$N" "${args[@]}"
 prc=$?
 python3 -B "$BLK" stop "$BLKD" > /dev/null
 brc=$?
+stopped=1
 src=2 rrc=2 grc=2
 if [ -d "$OUT" ]; then
   mv "$TMP" "$OUT/stamp_start.json"
@@ -89,8 +100,17 @@ if [ -d "$OUT" ]; then
   printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\n' \
     "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" > "$OUT/binary.txt"
   if [ -f "$OUT/summary.json" ]; then
-    python3 -B "$GATE" post "$OUT" "$CELL" "$sha" "$mode" ${vleaf:+"$vleaf"}
+    if [ "$mode" = bound ]; then
+      python3 -B "$GATE" post "$OUT" "$CELL" "$sha" "$mode" "$V3_FIRECHECK_VERDICT"
+    else
+      python3 -B "$GATE" post "$OUT" "$CELL" "$sha" "$mode"
+    fi
     grc=$?
+    case $grc in
+      0|2|3) ;;
+      *) echo "run.sh: REFUSED after the run: the batch gate failed (rc $grc), so nothing it would have refused is known" >&2; grc=2 ;;
+    esac
+    [ -f "$OUT/gate.json" ] || { echo "run.sh: REFUSED after the run: the batch gate failed: no gate.json" >&2; grc=2; }
   fi
 else
   rm -f "$TMP"

@@ -43,6 +43,7 @@ SETUP_FLUSH = {"append25": 1, "append64": 1, "nosync25": 1, "ow4k": 1, "ow64k": 
                "clean": 1, "clone1b": 2, "clone2b": 2, "cfr2b": 2}  # all fsync
 TEARDOWN_FLUSH = 1  # one fsync of D after the unlinks
 APPEND = {"append25": 25, "append64": 64, "nosync25": 25}
+APPEND_BASE = 4096  # the append arms' files start one 4 KiB block long (setup), so op i writes at 4096 + rec * i
 REC = {"ow4k": 4096, "ow64k": 65536, "ow1m": 1 << 20, "fdatasync4k": 4096}
 CAP = {"ow4k": 16 << 20, "ow64k": 16 << 20, "ow1m": 128 << 20, "fdatasync4k": 16 << 20}
 FLUSHED = ["append25", "append64", "ow4k", "ow64k", "ow1m", "fdatasync4k", "clone1b", "clone2b", "cfr2b"]
@@ -98,20 +99,41 @@ REFUSALS = {
     "R_dirsync": "not in the known-safe list", "R_logdev": "external log", "R_extjournal": "no internal journal",
     "R_multidev": "multi-device btrfs", "R_loop_wt": "above the leaf", "R_brd": "brd is fire-check only",
     "R_driver": "not in the leaf allowlist",
+    "R_chattr": "outside the allowlist (extents, directory index)", "R_ldpreload": "LD_PRELOAD is set",
 }
-# run.sh refusals: tag -> substring (rc 2, no out dir, no probe run).
+# run.sh refusals: tag -> the refusing rule's own reason PREFIX (rc 2, no out dir, no probe run). Every planted
+# verdict also carries "planted", so a bare word ("plan", "cell", "arch") would match whatever rule fired (fresh
+# review H2): each want is the start of its own rule's reason in batchgate.verdict_problems.
 RUNSH = {
-    "R_runsh_none": "V3_SMOKE=1", "R_runsh_both": "not both", "R_runsh_sha": "v3floor_sha256",
-    "R_runsh_fail": "all_pass", "R_runsh_fs": "fstype", "R_runsh_arch": "arch",
+    "R_runsh_none": "V3_SMOKE=1", "R_runsh_both": "not both", "R_runsh_sha": "v3floor_sha256: the verdict is for",
+    "R_runsh_fail": "all_pass is not true", "R_runsh_fs": "fstype: the verdict is for", "R_runsh_arch": "arch: the verdict is for",
     "R_runsh_mutant": "not allowed through run.sh", "R_runsh_traceclock": "not allowed through run.sh",
     "R_runsh_crashop": "not allowed through run.sh", "R_runsh_crashaim": "not allowed through run.sh",
     "R_runsh_dir": "not allowed through run.sh", "R_runsh_out": "not allowed through run.sh",
-    "R_runsh_n": "not allowed through run.sh", "R_runsh_fcenv": "V3FLOOR_FIRECHECK", "R_runsh_brdenv": "V3FLOOR_BRD",
-    "R_runsh_nocell": "V3_CELL", "R_runsh_badcell": "V3_CELL", "R_runsh_planted": "planted",
-    "R_runsh_shape": "pass", "R_runsh_count": "plan", "R_runsh_cellv": "cell",
+    "R_runsh_n": "not allowed through run.sh", "R_runsh_fcenv": "V3FLOOR_FIRECHECK is set", "R_runsh_brdenv": "V3FLOOR_BRD is set",
+    "R_runsh_nocell": "V3_CELL=''", "R_runsh_badcell": "V3_CELL='bogus'", "R_runsh_planted": "planted: a fixture verdict",
+    "R_runsh_shape": "pass/total:", "R_runsh_count": "plan: the check ids differ", "R_runsh_cellv": "cell: the verdict is for",
+    "R_runsh_harness": "harness: the verdict was made by", "R_runsh_ldpreload": "LD_PRELOAD is set",
     "R_runsh_t3": "T3 preconditions do not hold",
 }
-RUNSH_POST = {"R_runsh_post": ["exe_sha256", "mutant_nosync"]}  # the probe ran; run.sh refused after it (rc 2)
+# the probe ran; run.sh refused after it (rc 2): tag -> reasons that must all appear
+RUNSH_POST = {"R_runsh_post": ["exe_sha256: the probe that ran", "mutant_nosync=1"],
+              "R_runsh_nogated": ["no gated arm ran"], "R_runsh_gatecrash": ["the batch gate failed"]}
+# batchgate.py post on a copy of the F3 batch with one field planted (bound mode): tag -> its reason prefix
+POST_PLANTS = {"R_post_traceclock": "trace_clock=1 in the summary", "R_post_cell": "layout:",
+               "R_post_leaf": "leaf class: the batch's leaf is", "R_post_brd": "leaf brd:"}
+HARNESS = ["run.sh", "batchgate.py", "check.py", "blkflush.py", "stamp.py", "v3cell.py", "firecheck.sh", "crash.sh",
+           "mkfixtures.sh", "mkbrd.sh", "red.py"]
+
+
+def harness_sha256(here=HERE):
+    out = {}
+    for f in HARNESS:
+        try:
+            out[f] = hashlib.sha256(open(os.path.join(here, f), "rb").read()).hexdigest()
+        except OSError:
+            out[f] = None
+    return out
 
 
 def kind_of(cell):
@@ -162,19 +184,21 @@ def plan(cell, arch, leaf):
     ids.append("frame:append")
     if v3cell.is_loop(cell):
         ids += ["C:%s" % c for c, _ in CRASH[k]]
-    ids += ["B:selftest", "B:fsync", "B:quiet", "B:overflow", "B:misuse"]
+    ids += ["B:selftest", "B:fsync", "B:quiet", "B:overflow", "B:misuse", "S:batchgate"]
     for t in REFUSALS:
         ids.append("F4:" + t)
     ids.append("F4:P_nest3")
     ids.append("F4:R_ficlone_accept" if k == "ext4" else "F4:X_allclones")
     ids.append("F4:R_leftover")
-    if leaf == "wb":
+    if leaf != "brd":
         ids.append("F4:R_leaf_flip")
     if arch == "x86_64":
         ids.append("F4:R_clocksource")
     for t in RUNSH:
         ids.append("F4:" + t)
     for t in RUNSH_POST:
+        ids.append("F4:" + t)
+    for t in POST_PLANTS:
         ids.append("F4:" + t)
     ids.append("work:empty")
     return ids
@@ -436,7 +460,7 @@ def expected_op(a, i, mutant):
     fl = not mutant
     if a in APPEND:
         r = APPEND[a]
-        seq = ["pwrite64 <%s> %d %d = %d" % (f, r, r + r * i, r)]
+        seq = ["pwrite64 <%s> %d %d = %d" % (f, r, APPEND_BASE + r * i, r)]
         if a != "nosync25" and fl:
             seq.append("fsync <%s> = 0" % f)
     elif a in REC:
@@ -550,10 +574,11 @@ def plants(calls, text):
         out.append(("a syscall between two ops", c, None))
         out.append(("one timed window dropped", calls[:clocks[2]] + calls[clocks[3] + 1:], None))
     k = find(lambda t: t.startswith("pwrite64 <%s/append64> 64 " % W))
-    if k is not None:  # 64 B at append25's offset pattern (25 + 25 i) instead of 64 + 64 i
+    if k is not None:  # 64 B at append25's offset pattern (4096 + 25 i) instead of 4096 + 64 i
         parts = calls[k][1].split(" ")
-        i = (int(parts[3]) - 64) // 64
-        out.append(("append64 writes at append25's offset", with_text(k, "pwrite64 <%s/append64> 64 %d = 64" % (W, 25 + 25 * i)), None))
+        i = (int(parts[3]) - APPEND_BASE) // 64
+        out.append(("append64 writes at append25's offset",
+                    with_text(k, "pwrite64 <%s/append64> 64 %d = 64" % (W, APPEND_BASE + 25 * (i + 1))), None))
     k = find(lambda t: t.startswith("copy_file_range <%s/cfr2b.src>" % W))
     if k is not None:
         out.append(("cfr2b copies 4096 B", with_text(k, calls[k][1].replace(" 1048576 0 = 1048576", " 4096 0 = 4096")), None))
@@ -599,6 +624,11 @@ def summary_vs_raw(sj, rows, n):
         p50[a] = pct(x, .5)
         mine = {"min_us": x[0], "p1_us": pct(x, .01), "p10_us": pct(x, .1), "p50_us": pct(x, .5),
                 "p90_us": pct(x, .9), "p99_us": pct(x, .99), "max_us": x[-1], "mean_us": sum(x) / len(x)}
+        q = len(v) // 4
+        if q >= 2:  # stationarity: the first and last quarter of the arm's ops, in op order
+            by_i = [ns for _, ns, _ in sorted(v)]
+            mine["p50_q1_us"] = pct(sorted(by_i[:q]), .5)
+            mine["p50_q4_us"] = pct(sorted(by_i[-q:]), .5)
         theirs = sj.get("arms", {}).get(a, {})
         for k, ns in mine.items():
             if k not in theirs or abs(theirs[k] - ns / 1e3) > 0.051:
@@ -679,7 +709,7 @@ def main(argv):
     check("cell:fstype", kv.get("work_fstype") == KIND, {"work_fstype": kv.get("work_fstype"), "want": KIND},
           "the work dir is on the cell's filesystem type (findmnt)")
     src = kv.get("work_mount", "").split(" ")[0]
-    check("cell:source", src.startswith("/dev/loop") == v3cell.is_loop(CELL), {"source": src, "cell": CELL},
+    check("cell:source", src.startswith("/dev/") and src.startswith("/dev/loop") == v3cell.is_loop(CELL), {"source": src, "cell": CELL},
           "cell %s means %s" % (CELL, "a loop device" if v3cell.is_loop(CELL) else "a block device, no loop"))
     f3 = rj(os.path.join(OUT, "F3", "summary.probe.json")) or rj(os.path.join(OUT, "F3", "summary.json")) or {}
     lp = v3cell.layout_problems(CELL, f3.get("fstype"), f3.get("mount_source"), f3.get("flush_path"))
@@ -847,7 +877,10 @@ def main(argv):
             res = (r or {}).get("result")
             crash[case] = {"rule": rule, "result": res, "predicted": CRASH_PREDICT.get("%s/%s" % (KIND, case), rule),
                            "detail": r}
-            ok = r is not None and r.get("src_ok") is True and (
+            # the clone existed (1 MiB) before the crash, and the crash itself is shown by a sentinel written after the
+            # crash point that is absent after the remount (fresh reviews: I-L1, B-L10)
+            ok = r is not None and r.get("src_ok") is True and r.get("clone_size_before") == "1048576" and \
+                r.get("crash_proven") is True and (
                 res == "survived" if rule == "survive" else res == "lost" if rule == "lost" else res in ("survived", "lost"))
             check("C:" + case, ok, {"record": r},
                   "crash after one %s op (%s): %s" % (case, "xfs_io shutdown, no log flush" if KIND != "btrfs" else
@@ -857,8 +890,10 @@ def main(argv):
 
     # B: blkflush.py's own fire-check
     bt = rd(os.path.join(OUT, "B", "selftest.txt")) or ""
-    check("B:selftest", "BLKFLUSH SELF-TEST" in bt and bt.rstrip().endswith("PASS"), {"tail": bt[-300:]},
-          "blkflush.py self-test: the parser and the window attribution on planted text")
+    m = re.search(r"BLKFLUSH SELF-TEST (\d+)/(\d+) PASS\s*$", bt)
+    check("B:selftest", rc_of(os.path.join(OUT, "B", "selftest.rc")) == 0 and m is not None and m.group(1) == m.group(2)
+          and int(m.group(2)) > 0, {"tail": bt[-300:], "rc": rc_of(os.path.join(OUT, "B", "selftest.rc"))},
+          "blkflush.py self-test: the parser and the window attribution on planted text (rc 0, n/n with n > 0)")
     br = rj(os.path.join(OUT, "B", "report.json")) or {}
     lp_dev = (rd(os.path.join(OUT, "B", "loopdev.txt")) or "").strip().replace("/dev/", "")
     arms = (br.get("windows") or {}).get("arms") or {}
@@ -880,8 +915,9 @@ def main(argv):
             if dev == lp_dev or (dev == rootd and hit > SHARED_MAX_FRAC * r.get("ops", 50)):
                 qbad.append((a, dev, hit))
     ambd = (br.get("windows") or {}).get("ambiguous_by_device") or {}
-    check("B:quiet", not qbad and not ambd.get(lp_dev) and lp_dev != "",
-          {"bad": qbad, "windows_hit": qrec, "ambiguous_by_device": ambd, "root_disk": rootd},
+    lptotal = ((br.get("devices") or {}).get(lp_dev) or {}).get("total")
+    check("B:quiet", not qbad and not ambd.get(lp_dev) and lp_dev != "" and lptotal == 50,
+          {"bad": qbad, "windows_hit": qrec, "ambiguous_by_device": ambd, "root_disk": rootd, "loop_total": lptotal},
           "50 buffered writes and 50 empty windows: no flush request on the loop, at most %d%% of windows with a foreign "
           "one on the shared root drive (others' devices recorded); no event at a window edge on the loop"
           % int(SHARED_MAX_FRAC * 100))
@@ -892,6 +928,12 @@ def main(argv):
     mbad = [(t, rc_of(os.path.join(OUT, "B", t + ".rc"))) for t in ("stop_unstarted", "start_twice")
             if rc_of(os.path.join(OUT, "B", t + ".rc")) != 2]
     check("B:misuse", not mbad, {"bad": mbad}, "stop without start and start into an existing record both refuse (rc 2)")
+    st = rd(os.path.join(OUT, "B", "batchgate-selftest.txt")) or ""
+    m = re.search(r"BATCHGATE SELF-TEST (\d+)/(\d+) PASS\s*$", st)
+    check("S:batchgate", rc_of(os.path.join(OUT, "B", "batchgate-selftest.rc")) == 0 and m is not None
+          and m.group(1) == m.group(2) and int(m.group(2)) > 0, {"tail": st[-400:]},
+          "batchgate.py self-test in this cell (the flush gate on the banked cells, every verdict-shape refusal by its "
+          "own reason, the T3 rule): the binding's rules are tested in the verdict that relies on them")
 
     # F4: refusals
     for tag, want in REFUSALS.items():
@@ -916,7 +958,7 @@ def main(argv):
         check("F4:X_allclones", rc in (0, 3) and sorted(rows) == ["cfr2b", "clone1b", "clone2b", "nosync25"],
               {"rc": rc, "arms": sorted(rows)}, "on %s the copy arms with nosync25 run (rc 0/3, all in raw)" % KIND)
     refusal("R_leftover", "every flushed arm" if KIND == "ext4" else "left over")
-    if leaf == "wb":
+    if leaf != "brd":  # wb: the kernel's write_cache disabled; wt sd: sd's "temporary write back" (fresh review H2)
         refusal("R_leaf_flip", "but the drive reports")
     if arch == "x86_64":
         refusal("R_clocksource", "the clocksource is")
@@ -926,7 +968,13 @@ def main(argv):
         rc = rc_of(os.path.join(OUT, "F4", tag + ".rc"))
         txt = rd(os.path.join(OUT, "F4", tag + ".txt")) or ""
         check("F4:" + tag, rc == 2 and all(w in txt for w in wants), {"rc": rc, "text": txt[-400:]},
-              "run.sh refuses a batch whose summary names another binary and the mutant (rc 2, after the run): %s" % wants)
+              "run.sh refuses after the run (rc 2), for its own reason: %s" % wants)
+    for tag, want in POST_PLANTS.items():
+        rc = rc_of(os.path.join(OUT, "F4", tag + ".rc"))
+        g = rj(os.path.join(OUT, "F4", tag, "gate.json")) or {}
+        ok = rc == 2 and any(str(r).startswith(want) for r in g.get("refusals") or [])
+        check("F4:" + tag, ok, {"rc": rc, "refusals": g.get("refusals")},
+              "batchgate.py post on a copy of the F3 batch with one planted field refuses (rc 2) with '%s'" % want)
     left = rd(os.path.join(OUT, "work-leftover.txt"))
     check("work:empty", left is not None and left.strip() == "", {"leftover": (left or "MISSING")[:400]},
           "the work dir is empty after every run (teardown and the ext4 FICLONE trial clean up)")
@@ -949,7 +997,7 @@ def main(argv):
          "t3_positive": {"rule_holds_on_this_box": kv.get("t3_rule_holds"),
                          "P_runsh_t3_rc": rc_of(os.path.join(OUT, "F4", "P_runsh_t3.rc")),
                          "note": "recorded, not a check: only some runners expose cpufreq on 'performance'"},
-         "unplanted_refusals": unplanted(arch, leaf), "checks": results}
+         "unplanted_refusals": unplanted(arch, leaf), "harness_sha256": harness_sha256(), "checks": results}
     with open(os.path.join(OUT, "verdict.json"), "w") as f:
         json.dump(v, f, indent=1)
     red(kv, leaf, arch)
@@ -962,10 +1010,11 @@ def unplanted(arch, leaf):
     u = ["a mount whose mountinfo line is malformed or too long", "statx returning no mount id",
          "an unreadable /proc/fs/ext4 options file or /proc/fs/jbd2", "a SCSI or virtio cache_type that cannot be read "
          "or parsed", "NVMe controllers of one subsystem disagreeing on VWC", "a brd leaf whose write_cache is not "
-         "write-through", "the drive's report unreadable (a closed NVMe node; the CI grants read access)"]
-    if leaf != "wb":
-        u.append("the kernel's write_cache disagreeing with the drive (plantable only on a write-back leaf: on kernel "
-                 "6.17 queue/write_cache can only disable a cache, so a write-through sda cannot be made to claim one)")
+         "write-through", "the drive's report unreadable (a closed NVMe or sd node, MODE SENSE failing or without a "
+         "caching page; the CI grants read access)", "inode flags unreadable", "D's mount id changing between the "
+         "lookup and the run"]
+    if leaf == "brd":
+        u.append("the kernel's write_cache disagreeing with the drive (this cell's leaf is brd)")
     if arch != "x86_64":
         u.append("a clocksource other than tsc/arch_sys_counter (arm64 runners offer only arch_sys_counter)")
     return u
@@ -1056,13 +1105,14 @@ def check_real(o3, rc, kv, leaf):
         layers = sj.get("flush_path") or []
         leafinfo = sj.get("leaf") or {}
         amb = w.get("ambiguous_by_device") or {}
-        shared = []  # the leaf drive (and its multipath disks), unless the leaf is brd
+        rootd = (kv.get("root_disk") or "").split(" ")[0]
+        shared = []  # the leaf drive only when it is the runner's root disk (fresh review I-L6: a T3 data disk is private)
         for k, l in enumerate(layers):
             names = [l.get("disk")]
             if k == len(layers) - 1:
                 names += [p.get("disk") for p in leafinfo.get("multipath") or []]
             is_brd = k == len(layers) - 1 and leafinfo.get("kind") == "brd"
-            private = k < len(layers) - 1 or is_brd
+            private = k < len(layers) - 1 or is_brd or l.get("disk") != rootd
             if not private:
                 shared += names
             n0 = wa.get("nosync25", {})
@@ -1111,7 +1161,8 @@ def check_real(o3, rc, kv, leaf):
         mb.append("no summary.json")
     else:
         extra = sorted(set(merged) - set(sj))
-        if extra != ["device_flushes", "device_flushes_per_op", "flush_gate", "layer_device_flushes_per_op"]:
+        if extra != ["device_flushes", "device_flushes_per_op", "floor_claim_from_counts", "flush_gate",
+                     "layer_device_flushes_per_op"]:
             mb.append(("added keys", extra))
         if any(merged.get(k) != v for k, v in sj.items()):
             mb.append(("a probe field changed", [k for k, v in sj.items() if merged.get(k) != v][:5]))
@@ -1146,9 +1197,22 @@ def check_real(o3, rc, kv, leaf):
             e = l.get("ext4") or {}
             if not (e.get("data") and e.get("commit_s") and isinstance(e.get("journal_async_commit"), bool) and e.get("journal")):
                 rb.append(("ext4 layer lacks data=/commit=/journal_async_commit/journal", k, e))
-    fk = {"wb": "drive flush", "wt": "no volatile cache: no drive flush", "brd": "brd: no drive (fire-check only, never credited)"}.get(leaf)
-    if sj.get("floor_kind") != fk:
-        rb.append(("floor_kind", sj.get("floor_kind"), fk))
+    vm = (sj.get("virtualization") or {}).get("virtualized")
+    fk = {"wb": "virtual drive flush: reach to media unknown" if vm else "drive flush",
+          "wt": "no volatile cache: no drive flush", "brd": "brd: no drive (fire-check only, never credited)"}.get(leaf)
+    if sj.get("floor_kind") != fk or not isinstance(vm, bool):
+        rb.append(("floor_kind", sj.get("floor_kind"), fk, "virtualized", vm))
+    # the claim the batch may make, re-derived here from its own leaf counts (fresh reviews P-H1, B-H2)
+    clean = ((merged or {}).get("device_flushes_per_op") or {}).get("clean")
+    if leaf == "wb":
+        bare = isinstance(clean, (int, float)) and clean >= 0.95 and sj.get("fstype") in ("ext4", "xfs")
+        want_claim = "clean fsync (a bare flush" if bare else "no bare-flush baseline"
+    else:
+        want_claim = "none: a brd floor" if leaf == "brd" else "no drive flush"
+    if not str((merged or {}).get("floor_claim_from_counts", "")).startswith(want_claim):
+        rb.append(("floor_claim_from_counts", (merged or {}).get("floor_claim_from_counts"), want_claim, clean))
+    if sj.get("fstype") == "btrfs" and "bare flush" in str(sj.get("floor_claim", "")) and "no bare-flush" not in str(sj.get("floor_claim", "")):
+        rb.append(("btrfs floor_claim promises a bare flush", sj.get("floor_claim")))
     if not str(sj.get("flush_sent_to_device", "")).startswith("yes" if leaf == "wb" else "no"):
         rb.append(("flush_sent_to_device", sj.get("flush_sent_to_device")))
     if sj.get("arms_gated") != GATED:
@@ -1180,9 +1244,12 @@ def bind(out, cell):
         rc = rc_of(os.path.join(out, "F4", "P_runsh_ok.rc"))
         bt = rd(os.path.join(out, "F4", "P_runsh_ok.out", "binary.txt")) or ""
         vs = hashlib.sha256(open(os.path.join(out, "verdict.json"), "rb").read()).hexdigest() if v else None
-        g = rj(os.path.join(out, "F4", "P_runsh_ok.out", "gate.json")) or {}
+        g = rj(os.path.join(out, "F4", "P_runsh_ok.out", "gate.json"))
+        rcl = rd(os.path.join(out, "F4", "P_runsh_ok.out", "rc")) or ""
         ok = (rc in (0, 3) and "bound=fire-checked: " in bt and ("verdict_sha256=%s" % vs) in bt and
-              ("v3floor_sha256=%s" % v.get("v3floor_sha256")) in bt and ("cell=%s" % cell) in bt and not g.get("refusals"))
+              ("v3floor_sha256=%s" % v.get("v3floor_sha256")) in bt and ("cell=%s" % cell) in bt and
+              isinstance(g, dict) and g.get("refusals") == [] and re.search(r"gate_rc=(0|3) ", rcl) is not None)
+        g = g or {}
         res.append({"id": "bind:P_runsh_ok", "pass": ok, "detail": {"rc": rc, "binary.txt": bt, "gate": g},
                     "check": "run.sh binds a batch to this cell's real passing verdict and records its sha256 and run id"})
     b = {"cell": cell, "verdict_all_pass": v.get("all_pass"), "checks": res, "all_pass": all(r["pass"] for r in res)}
@@ -1197,7 +1264,7 @@ def bind(out, cell):
 RED = [  # tag, review item, what the base does that the fix stops, how the outcome is read
     ("red_1a_brd", "1(a)", "the base accepts a brd leaf", "rc0"),
     ("red_1a_driver", "1(a)", "the base accepts a dm leaf (no driver)", "rc0"),
-    ("red_1b_leafflip", "1(b)", "the base runs with the kernel's write_cache overridden against the drive", "rc0"),
+    ("red_1b_leafflip", "1(b)", "the base runs with the kernel's write_cache overridden against the drive", "rc0state"),
     ("red_2_devflush", "2", "the base summary has no device_flushes_per_op", "nodevflush"),
     ("red_3_clone1b_gated", "3", "the base gates clone1b", "clone1b_gated"),
     ("red_7_mutant", "7", "base run.sh forwards --mutant-nosync into a bound batch", "rc0bound"),
@@ -1207,19 +1274,20 @@ RED = [  # tag, review item, what the base does that the fix stops, how the outc
     ("red_9_loopwt", "9", "the base runs on a loop that reads write-through", "rc0"),
     ("red_10a_hidden_tmpfs", "10(a)", "predicted refused at base too (statfs magic)", "rc2"),
     ("red_10b_hidden_nobarrier", "10(b)", "the base runs on a nobarrier mount hidden behind a barrier one", "rc0"),
-    ("red_10c_lazy", "10", "the base follows a lazily unmounted loop's backing path to a decoy", "rc0"),
+    ("red_10c_lazy", "10", "the base follows a lazily unmounted loop's backing path to a decoy", "rc0decoy"),
     ("red_11_append64", "11", "the base has no append arm >= 60 B", "unknownarm"),
     ("red_12a_deleted", "12(a)", "predicted refused at base too (the plant was missing, not the refusal)", "rc2"),
     ("red_12b_nest4", "12(b)", "the base's message says 'more than 4 loop layers'", "oldmsg"),
     ("red_12d_shim", "12(d)", "predicted refused at base too", "rc2"),
-    ("red_13_symlink", "13", "the base follows a planted symlink out of D", "rc0"),
+    ("red_13_symlink", "13", "the base follows a planted symlink out of D", "rc0target"),
     ("red_15_dirsync", "15", "the base runs on a dirsync ext4", "rc0"),
     ("red_15_logdev", "15", "the base runs on XFS with an external log", "rc0"),
     ("red_15_extjournal", "15", "the base runs on ext4 with an external journal", "rc0"),
     ("red_15_multidev", "15", "the base runs on a two-device btrfs", "rc0"),
     ("red_15_fields", "15", "the base summary has no per-layer data=/commit=/async commit", "noext4fields"),
-    ("red_16_clocksource", "16", "the base runs on a non-TSC clocksource (x86 only)", "rc0"),
-    ("red_17_t3", "17", "base run.sh ignores V3_REQUIRE_T3 (no governor rule)", "rc0"),
+    ("red_15_chattr", "15", "the base runs on a directory carrying chattr +S (per-file sync)", "rc0"),
+    ("red_16_clocksource", "16", "the base runs on a non-TSC clocksource (x86 only)", "rc0state"),
+    ("red_17_t3", "17", "base run.sh ignores V3_REQUIRE_T3 while the T3 rule is false", "rc0"),
 ]
 
 
@@ -1241,8 +1309,17 @@ def red(kv, leaf, arch):
             continue
         sj = rj(os.path.join(d, tag + ".out", "summary.json")) or {}
         bt = rd(os.path.join(d, tag + ".out", "binary.txt")) or ""
+        state = rd(os.path.join(d, tag + ".state")) or ""
         if how == "rc0":
             r = rc in (0, 3)
+        elif how == "rc0state":  # the planted state was read back from sysfs while the base ran
+            r = rc in (0, 3) and "changed=1" in state
+        elif how == "rc0target":  # the base created the symlink's target outside D
+            r = rc in (0, 3) and (rd(os.path.join(d, tag + ".target")) or "").strip() == "present"
+        elif how == "rc0decoy":  # the base followed the stale backing path to the decoy
+            decoy = (rd(os.path.join(d, tag + ".decoy")) or "").strip()
+            fp = sj.get("flush_path") or []
+            r = rc in (0, 3) and bool(decoy) and bool(fp) and fp[0].get("loop_backing") == decoy
         elif how == "rc0bound":
             r = rc in (0, 3) and "bound=fire-checked" in bt
         elif how == "rc2":
@@ -1255,8 +1332,9 @@ def red(kv, leaf, arch):
             r = rc in (0, 3) and bool(sj) and "device_flushes_per_op" not in sj
         elif how == "clone1b_gated":
             r = bool(sj) and (sj.get("flush_control_arms") or {}).get("clone1b", {}).get("gated") is True
-        elif how == "noext4fields":
-            r = bool(sj) and not any("ext4" in l for l in sj.get("flush_path") or [])
+        elif how == "noext4fields":  # an ext4 layer exists, and none carries the fields
+            fp = sj.get("flush_path") or []
+            r = bool(sj) and any(l.get("fstype") == "ext4" for l in fp) and not any("ext4" in l for l in fp)
         else:
             r = None
         rows.append({"tag": tag, "item": item, "claim": claim, "rc": rc, "red": r, "text": txt[-240:]})
