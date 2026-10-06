@@ -1993,7 +1993,13 @@ fn a_volatile_open_needs_no_working_directory() {
     ) else {
         return;
     };
-    let gone = tempfile::TempDir::new().unwrap();
+    // FLAGGED TEST EDIT (fixture only, the premise and the assertion unchanged): the doomed working
+    // directory sits in a fresh, otherwise empty parent. macOS's getcwd of a deleted directory
+    // scans its parent's entries (sampled: realpath -> __private_getcwd -> readdir/fstatat), and
+    // under a shared TMPDIR of 166,390 entries that scan outlived the fresh process's 180 s
+    // deadline, so the test failed for the size of TMPDIR, not for the open.
+    let parent = tempfile::TempDir::new().unwrap();
+    let gone = tempfile::TempDir::new_in(parent.path()).unwrap();
     std::env::set_current_dir(gone.path()).unwrap();
     std::fs::remove_dir(gone.path()).unwrap();
     assert!(std::env::current_dir().is_err(), "premise: the working directory still resolves");
