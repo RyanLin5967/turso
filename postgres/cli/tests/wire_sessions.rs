@@ -1375,3 +1375,45 @@ fn pg_indexes_and_pg_database_size_answer() {
         .expect("a size in bytes");
     assert!(size > 0, "pg_database_size = {size}");
 }
+
+/// pgbench's table probe runs, as on PostgreSQL 18: a CROSS JOIN LATERAL of a FROM-less subselect
+/// (one row of expressions over the outer row), current_schemas(true) and array_position. pgbench
+/// stops when it fails, so pgbench cannot run without it.
+#[test]
+fn pgbench_table_probe_runs() {
+    let dir = Scratch::new("pgbenchprobe");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE pgbench_accounts(aid INT NOT NULL, bid INT, abalance INT, filler CHAR(84))")
+        .ok("create");
+    let probe = "select o.n, p.partstrat, pg_catalog.count(i.inhparent) \
+        from pg_catalog.pg_class as c \
+        join pg_catalog.pg_namespace as n on (n.oid = c.relnamespace) \
+        cross join lateral (select pg_catalog.array_position(pg_catalog.current_schemas(true), n.nspname)) as o(n) \
+        left join pg_catalog.pg_partitioned_table as p on (p.partrelid = c.oid) \
+        left join pg_catalog.pg_inherits as i on (c.oid = i.inhparent) \
+        where c.relname = 'pgbench_accounts' and o.n is not null \
+        group by 1, 2 \
+        order by 1 asc \
+        limit 1";
+    let r = a.q(probe).ok("pgbench's probe");
+    assert_eq!(r.rows, vec![vec![Some("2".into()), None, Some("0".into())]]);
+    assert_eq!(
+        a.q("SELECT current_schemas(false)")
+            .single("current_schemas(false)"),
+        "{public}"
+    );
+    // The same LATERAL shape over a user table, with two expressions.
+    a.q("CREATE TABLE lt(x INT)").ok("lt");
+    a.q("INSERT INTO lt VALUES (1), (2)").ok("rows");
+    let r = a
+        .q("SELECT t.x, o.d, o.s FROM lt AS t CROSS JOIN LATERAL (SELECT t.x * 2, t.x + 10) AS o(d, s) ORDER BY t.x")
+        .ok("lateral over a user table");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Some("1".into()), Some("2".into()), Some("11".into())],
+            vec![Some("2".into()), Some("4".into()), Some("12".into())]
+        ]
+    );
+}
