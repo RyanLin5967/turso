@@ -268,6 +268,21 @@ impl Wire {
         self.read_reply()
     }
 
+    /// [`Wire::x`] with no parameters and every result column in BINARY format, as tokio-postgres
+    /// asks for them. A binary value comes back in `rows` as its bytes, lossily as UTF-8.
+    fn x_binary(&mut self, sql: &str) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        self.send(b'P', &parse);
+        // unnamed portal and statement, no parameter formats, no parameters, one result format: 1
+        self.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 1, 0, 1]);
+        self.send(b'D', b"P\0");
+        self.send(b'E', &[0, 0, 0, 0, 0]);
+        self.send(b'S', &[]);
+        self.read_reply()
+    }
+
     /// Parse with no declared parameter types, Describe the statement, Sync: what asyncpg,
     /// tokio-postgres and pgx send to learn a statement's parameters.
     fn describe_statement(&mut self, sql: &str) -> Reply {
@@ -2249,4 +2264,62 @@ fn describe_statement_reports_undeclared_parameters() {
         let r = a.describe_statement(sql).ok(sql);
         assert_eq!(r.params, Some(want), "{sql}");
     }
+}
+
+/// Aggregates have PostgreSQL's result types, the same over both protocols and whatever the rows
+/// hold: count bigint, sum(int4) bigint, min/max(int4) integer, avg(int4) numeric (PostgreSQL's
+/// aggregate signatures, docs "Aggregate Functions"; the re-recording from PG18 with record_pg.sh is
+/// owed, item 17). At 472023b72 the simple protocol typed them from their values (max over an empty
+/// table was text) and the extended one called them all text (wire review 1 item 14).
+#[test]
+fn aggregates_have_postgres_types_on_both_protocols() {
+    let dir = Scratch::new("aggstatic");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("INSERT INTO t VALUES (2, 'x')").ok("insert");
+    a.q("CREATE TABLE e(id INT PRIMARY KEY)").ok("empty table");
+    let sql = "SELECT count(*), sum(id), min(id), max(id), avg(id) FROM t";
+    let want = Some(vec![20, 20, 23, 23, 1700]);
+    assert_eq!(a.q(sql).ok("simple").oids, want, "simple protocol");
+    assert_eq!(a.x(sql, &[]).ok("extended").oids, want, "extended protocol");
+    for r in [
+        a.q("SELECT max(id) FROM e"),
+        a.x("SELECT max(id) FROM e", &[]),
+    ] {
+        assert_eq!(r.ok("max over no rows").oids, Some(vec![23]));
+    }
+}
+
+/// A binary-format result value is encoded as the type its column is described with: bigint as 8
+/// bytes, integer as 4, a column described as text as the text's bytes. At 472023b72 a value was
+/// encoded by its engine storage class whatever the described type, so an integer in a column
+/// described as text went out as 8 binary bytes (wire review 1 item 14). numeric has no binary
+/// encoder here, so binary numeric is refused with 0A000 rather than sent as a float's bytes.
+#[test]
+fn binary_results_are_encoded_as_their_described_type() {
+    let dir = Scratch::new("binaryresults");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let bytes = |b: &[u8]| Some(String::from_utf8_lossy(b).into_owned());
+    let r = a
+        .x_binary("SELECT count(*), min(id) FROM t")
+        .ok("binary aggregates");
+    assert_eq!(r.oids, Some(vec![20, 23]));
+    assert_eq!(
+        r.rows,
+        vec![vec![bytes(&1i64.to_be_bytes()), bytes(&1i32.to_be_bytes())]]
+    );
+    let r = a
+        .x_binary("SELECT abs(id) FROM t WHERE id = 1")
+        .ok("binary function");
+    let oid = r.oids.clone().expect("a RowDescription")[0];
+    let want = match oid {
+        25 | 1043 => bytes(b"1"),
+        20 => bytes(&1i64.to_be_bytes()),
+        23 => bytes(&1i32.to_be_bytes()),
+        other => panic!("abs(int) described as type {other}"),
+    };
+    assert_eq!(r.rows, vec![vec![want]], "described as {oid}");
+    let r = a.x_binary("SELECT avg(id) FROM t");
+    assert_eq!(r.err("binary numeric").code, "0A000");
 }
