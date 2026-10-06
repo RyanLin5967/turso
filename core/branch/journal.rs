@@ -1935,6 +1935,14 @@ impl Journal {
         let fail = std::mem::take(&mut self.fail_next_write);
         self.check_live()?;
         let class = class.max(self.sync).max(self.pending_class);
+        // A raised flight in a D0 store makes its records durable where D0's never are: the slots
+        // they name are marked, so a later D0 free of one waits for a sync (review 5 #18). Marked at
+        // the take, whether or not the flight then succeeds: holding a free longer is safe.
+        if !self.sync.syncs() && class.syncs() {
+            for &slot in &self.pending_slots {
+                arena.mark_synced_named(slot);
+            }
+        }
         let end_lsn = self.lsn;
         if self.pending.is_empty() && !upgrade {
             return Ok(Flight {

@@ -766,6 +766,10 @@ struct StoreInner {
     /// Slots freed by an early-released operation whose records are not yet durable, under the log
     /// sequence number that makes them free (see [`Group`], rule 2).
     pending_free: VecDeque<(u64, Vec<Slot>)>,
+    /// D0 only (review 5 #18): frees whose Release was only written, of slots a synced record names
+    /// (`Arena::is_synced_named`), waiting for a sync to cover the Release, with its sequence
+    /// number.
+    held_synced_free: VecDeque<(u64, Vec<Slot>)>,
     /// Named server branches' names (fastest-engine M1 item 4).
     names: NameIndex,
     /// The trunk's epoch at the copy decisions of the trunk commit in flight (or the last one): the
@@ -3533,11 +3537,14 @@ impl BranchStore {
 
     /// Return the deferred frees a flight has covered (called under the store mutex).
     fn mature(&self, inner: &mut StoreInner) {
-        if inner.pending_free.is_empty() {
+        if inner.pending_free.is_empty() && inner.held_synced_free.is_empty() {
             return;
         }
-        let durable = self.group.durable(SyncClass::Off);
-        inner.mature_frees(durable);
+        // Durable in the store's class (review 5 #18): an ordered landing reaches durable(Off) and
+        // is durable only when the trunk's WAL flush returns. Mutant `free_at_off` (test builds
+        // only): durable(Off), as before.
+        let class = if fe_mutant("free_at_off") { SyncClass::Off } else { self.class };
+        inner.mature_frees(self.group.durable(class), self.group.durable(SyncClass::Fsync));
     }
 
     /// Make everything buffered durable and every deferred free mature, under the store mutex:
@@ -3545,8 +3552,7 @@ impl BranchStore {
     /// state no longer names (catalog mode has no reachability sweep at open).
     fn settle_durable(&self, inner: &mut StoreInner) -> Result<()> {
         self.flush_locked(inner, SyncClass::Off)?;
-        let durable = self.group.durable(SyncClass::Off);
-        inner.mature_frees(durable);
+        inner.mature_frees(self.group.durable(self.class), self.group.durable(SyncClass::Fsync));
         crate::turso_assert!(
             inner.pending_free.is_empty() || inner.journal.as_ref().is_some_and(Journal::is_poisoned),
             "deferred frees remain after everything buffered was made durable"
@@ -5900,6 +5906,7 @@ impl StoreInner {
             stamps: RowStamps::default(),
             merge_work: super::BranchMergeWork::default(),
             pending_free: VecDeque::new(),
+            held_synced_free: VecDeque::new(),
             names: NameIndex::default(),
             trunk_commit_epoch: 0,
             fail_stop: Arc::new(AtomicBool::new(false)),
@@ -6768,6 +6775,7 @@ impl StoreInner {
         self.arena = Some(arena);
         if !fe_mutant("restart_keeps_deferred") {
             self.pending_free.clear();
+            self.held_synced_free.clear();
         }
     }
 
@@ -7231,14 +7239,33 @@ impl StoreInner {
         }
     }
 
-    /// Return to the arena every deferred free a flight has covered.
-    fn mature_frees(&mut self, durable: u64) {
+    /// Return to the arena every deferred free whose Release is `durable` (in the store's class).
+    /// In D0, where that means only written, a slot a synced record names waits until a sync
+    /// (`synced`, durable in Fsync) covers its Release (review 5 #18).
+    fn mature_frees(&mut self, durable: u64, synced: u64) {
         while self
             .pending_free
             .front()
             .is_some_and(|&(lsn, _)| lsn <= durable)
         {
-            let (_, freed) = self.pending_free.pop_front().expect("just looked");
+            let (lsn, freed) = self.pending_free.pop_front().expect("just looked");
+            let (held, now): (Vec<Slot>, Vec<Slot>) = if self.sync.syncs() || lsn <= synced {
+                (Vec::new(), freed)
+            } else {
+                let arena = self.arena.as_ref().expect("slots were freed, so the arena exists");
+                freed.into_iter().partition(|&slot| arena.is_synced_named(slot))
+            };
+            self.release_slots(now);
+            if !held.is_empty() {
+                self.held_synced_free.push_back((lsn, held));
+            }
+        }
+        while self
+            .held_synced_free
+            .front()
+            .is_some_and(|&(lsn, _)| lsn <= synced)
+        {
+            let (_, freed) = self.held_synced_free.pop_front().expect("just looked");
             self.release_slots(freed);
         }
     }
