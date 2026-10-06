@@ -1034,6 +1034,7 @@ impl Journal {
     ) -> Result<Journal> {
         // Lock before touching anything, so a refused create has truncated nothing.
         let mut file = open_rw(&files.log, false)?;
+        pause_before_lock();
         if fail_lock {
             return Err(LimboError::LockingError(
                 "failpoint: the branch log was created but could not be locked".to_string(),
@@ -1188,7 +1189,9 @@ impl Journal {
         // Lock before reading anything (review N1). The log is opened, never created: a missing
         // log is refused once a snapshot or a catalog meta row says the store held state (review 5
         // #2), and otherwise there is nothing to recover.
-        let Some(mut file) = open_existing(&files.log)? else {
+        let opened = open_existing(&files.log)?;
+        pause_before_lock();
+        let Some(mut file) = opened else {
             let held = match catalog {
                 None => may_exist(&files.snap),
                 Some(base) => base.is_some(),
@@ -2661,6 +2664,24 @@ pub(crate) fn version_hint(version: u32, format: u32) -> String {
 /// fail-stops it), but while it keeps the descriptor the parent cannot reopen the database — a
 /// wedge inherent to flock and to OFD locks, refused loudly rather than raced. `exec` releases it
 /// (std opens files close-on-exec; recalled, not verified here).
+/// Test builds: while it holds 1, the next log open waits between its open(2) and its flock(2),
+/// having marked its arrival (`| HOLD_ARRIVED`); stored 0 to release it (review 5 #6).
+#[cfg(test)]
+pub(crate) static OPEN_LOCK_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn pause_before_lock() {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering as O;
+        let arrived = 1 | super::store::HOLD_ARRIVED;
+        if OPEN_LOCK_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+            while OPEN_LOCK_HOLD.load(O::Acquire) == arrived {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
     // fastest-engine mutant `no_log_lock` (test builds only): no lock is taken.
     if super::store::fe_mutant("no_log_lock") {
@@ -4178,5 +4199,33 @@ mod format_tests {
         }
         let bytes = std::fs::read(&files.log).unwrap();
         assert_eq!(header_raised(&bytes), SyncClass::FullFsync, "the raise was lost by the cut");
+    }
+
+    /// Review 5 #6: a second store that opens the log path just before the first store replaces the
+    /// log by a rename, and takes the lock just after, must not get the lock of the unlinked inode:
+    /// it would see no state and clobber the live log. The lock is taken on the file the path names
+    /// once it is held, and the second create is refused. (Hook: the next open waits between its
+    /// open(2) and its flock(2).)
+    #[test]
+    fn a_lock_taken_across_a_rename_of_the_log_is_refused() {
+        use std::sync::atomic::Ordering as O;
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        OPEN_LOCK_HOLD.store(1, O::Release);
+        let second = {
+            let files = files.clone();
+            std::thread::spawn(move || Journal::create(&files, 512, SyncClass::Off).map(|_| ()))
+        };
+        let t = std::time::Instant::now();
+        while OPEN_LOCK_HOLD.load(O::Acquire) != 1 | super::super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the second open never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The first store creates the log, replacing the file the second has open by a rename.
+        let first = Journal::create(&files, 512, SyncClass::Off).unwrap();
+        OPEN_LOCK_HOLD.store(0, O::Release);
+        let got = second.join().unwrap();
+        assert!(got.is_err(), "a second store took the lock of the log's old inode");
+        drop(first);
     }
 }
