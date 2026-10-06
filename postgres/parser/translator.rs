@@ -5419,10 +5419,14 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
     // can change the value (`::char`, `::varchar(2)`) or is no text at all, so the statement is
     // not a branch call and reaches the engine.
     fn to_text(t: &pg_query::protobuf::TypeName) -> bool {
-        let name = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
-            Some(Node::String(s)) => Some(s.sval.as_str()),
-            _ => None,
-        };
+        // A fn, not a closure: a closure's signature does not tie its output borrow to its
+        // argument (rust-lang/rust#58052), so the closure form does not compile.
+        fn name(n: &pg_query::protobuf::Node) -> Option<&str> {
+            match n.node.as_ref() {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            }
+        }
         let ty = match t.names.as_slice() {
             [ty] => name(ty),
             [schema, ty] if name(schema) == Some("pg_catalog") => name(ty),
