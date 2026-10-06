@@ -4384,3 +4384,66 @@ fn a_failed_capture_builds_no_row() {
     db.branch_checkpoint_wait();
     assert!(rows() - rows0 >= 20, "premise: the healthy capture wrote the 20 dirty branches' rows");
 }
+
+// ---- engine review 9 #2 and #5: which failed trunk WAL syncs fail-stop the branch store ----
+
+/// Engine review 9 #2: a failed F_FULLFSYNC of the trunk's WAL HEADER (a cache flush or a spill
+/// after the WAL was reset, not only a commit) is a failed drain of the branch files' device too:
+/// branch records written and not yet drained by a full flush (here a D1 fork, only plain-fsynced)
+/// may be lost with it, and a later successful flush would promote them as durable. The store
+/// fail-stops. Before, only the commit's own syncs did.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_wal_header_sync_in_a_cache_flush_fail_stops_a_store_with_undrained_records() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("hdrfail.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _b = trunk.fork_branch().unwrap().into_id();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        // The WAL is reset, so the next flush of a dirty page writes and syncs its header first.
+        trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        trunk.execute("BEGIN").unwrap();
+        trunk.execute("UPDATE t SET v = 'flushed' WHERE id = 7").unwrap();
+        armed.store(1, std::sync::atomic::Ordering::Release);
+        let flushed = trunk.cacheflush();
+        assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0, "catalog={catalog}: premise: the cache flush synced the WAL's header");
+        assert!(flushed.is_err(), "catalog={catalog}: premise: the header's sync failed the cache flush");
+        let _ = trunk.execute("ROLLBACK");
+        assert_fail_stopped(
+            db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+            &format!("catalog={catalog}: the next fork after a failed drain of undrained records"),
+        );
+    }
+}
+
+/// Engine review 9 #5: in D2 (the registered target: Apple, a fullfsync trunk on the branch files'
+/// device), a failed trunk WAL F_FULLFSYNC with no branch record undrained (every flight already
+/// F_FULLFSYNCed, nothing ordered, nothing in the air) puts nothing at risk, and the store goes
+/// on. Before, the frontier the commit noted was the Fsync-durable one, nonzero after any flight,
+/// so one WAL sync error refused every create until a restart.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_wal_sync_with_nothing_undrained_leaves_a_d2_store_running() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("d2ctl.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let x = trunk.fork_branch().unwrap();
+        x.reap().unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+        armed.store(1, std::sync::atomic::Ordering::Release);
+        let failed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+        assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0, "catalog={catalog}: premise: the WAL's sync was reached");
+        assert!(failed.is_err(), "catalog={catalog}: premise: the failed WAL sync failed the commit");
+        db.connect()
+            .unwrap()
+            .fork_branch()
+            .unwrap_or_else(|e| panic!("catalog={catalog}: one WAL sync error with nothing at risk refused the next create: {e}"));
+    }
+}
