@@ -4396,10 +4396,19 @@ impl BranchStore {
     pub(crate) fn branch_named(&self, name: &str) -> Result<Option<BranchId>> {
         self.refuse_if_trunk_only("looking a branch up by name")?;
         check_branch_name(name)?;
-        let found = self.inner.lock().name_lookup(name)?;
+        let (found, poisoned) = {
+            let mut inner = self.inner.lock();
+            (inner.name_lookup(name)?, inner.poisoned())
+        };
         // Not before its fork is durable (review C-F4): a crash would lose a branch already found.
         if let Some(id) = found {
             self.settle(id, false)?;
+        } else if !poisoned && !fe_mutant("lookup_no_release_wait") {
+            // Nor reported free before the Release that freed it is durable (review 3 #17): a crash
+            // would bring the branch back under the name. Any release since the last durable one
+            // may be it; with none pending this is one compare. Mutant `lookup_no_release_wait`
+            // (test builds only).
+            self.wait_durable(self.last_release_lsn.load(Ordering::Acquire), self.class)?;
         }
         Ok(found)
     }
@@ -4444,13 +4453,32 @@ impl BranchStore {
     /// builds the set once (`build_live_ids`: the same scan and query, under the mutex, counted).
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
-        let (durable_at, snapshot) = {
+        let (durable_at, snapshot, failed) = {
             let mut inner = self.inner.lock();
             // No fork is listed before it is durable (review C-F4): the listing waits for the
             // newest one, after the lock is released. A fail-stopped store makes nothing durable
             // again, and every fork it did not make durable was released by its creator, so it
             // lists without waiting (N4: a stopped store stays readable).
-            let durable_at = if inner.poisoned() { 0 } else { inner.last_fork_lsn };
+            // Nor without a branch whose Release is not yet durable (review 3 #17): a crash would
+            // bring it back. Mutant `list_no_durable_wait` (test builds only): no wait at all.
+            let durable_at = if inner.poisoned() || fe_mutant("list_no_durable_wait") {
+                0
+            } else {
+                inner.last_fork_lsn.max(self.last_release_lsn.load(Ordering::Acquire))
+            };
+            // A fail-stopped store lists no fork whose flight failed (review 3 #17): its creator was
+            // told it failed, and a reopen would not have it.
+            let failed: Vec<BranchId> = if inner.poisoned() {
+                let durable = self.group.durable(self.class);
+                inner
+                    .branches
+                    .iter()
+                    .filter(|(_, st)| st.fork_lsn > durable)
+                    .map(|(id, _)| *id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // githost-shape instrument (observing only).
             inner.shape.ids_calls += 1;
             if knob_off("fw1") {
@@ -4461,19 +4489,22 @@ impl BranchStore {
                 let rows = inner.shape.ids_build_rows - before;
                 inner.shape.ids_build_rows = before;
                 inner.shape.ids_catalog_rows += rows;
-                (durable_at, set)
+                (durable_at, set, failed)
             } else {
                 if inner.live_ids.is_none() {
                     let set = inner.build_live_ids()?;
                     inner.live_ids = Some(set);
                 }
-                (durable_at, inner.live_ids.clone().expect("built above"))
+                (durable_at, inner.live_ids.clone().expect("built above"), failed)
             }
         };
         self.wait_durable(durable_at, self.class)?;
         let mut ids = Vec::with_capacity(snapshot.len() as usize);
         let mut work = IdSetWork::default();
         snapshot.for_each(&mut work, &mut |key| ids.push(BranchId(u64::from(key))));
+        if !failed.is_empty() {
+            ids.retain(|id| !failed.contains(id));
+        }
         Ok(ids)
     }
 
