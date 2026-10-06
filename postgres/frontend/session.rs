@@ -666,23 +666,37 @@ fn handle_pg_add_constraints(
     let table = add.table.as_str();
     let mut definition = None;
     let mut dependents = Vec::new();
-    let mut stmt = conn.prepare_internal(
-        "SELECT type, sql FROM sqlite_schema WHERE tbl_name = ?1 AND sql IS NOT NULL \
-         ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, rowid",
-    )?;
-    stmt.bind_at(
-        NonZero::new(1).unwrap(),
-        Value::build_text(table.to_string()),
-    )?;
-    for row in stmt.run_collect_rows()? {
-        let (Some(Value::Text(kind)), Some(Value::Text(sql))) = (row.first(), row.get(1)) else {
-            continue;
-        };
-        match kind.as_str() {
-            "table" => definition = Some(sql.as_str().to_string()),
-            "index" | "trigger" => dependents.push(sql.as_str().to_string()),
-            _ => {}
+    // The catalog lookup is an internal helper statement, which keeps the connection nested until
+    // it is dropped; every statement of the rebuild run while nested opens no transaction of its
+    // own, and its DDL reaches SetCookie with none (wire review 2 item 1). So the lookup's rows are
+    // collected and the statement dropped here, before the rebuild's first statement.
+    {
+        let mut stmt = conn.prepare_internal(
+            "SELECT type, sql FROM sqlite_schema WHERE tbl_name = ?1 AND sql IS NOT NULL \
+             ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, rowid",
+        )?;
+        stmt.bind_at(
+            NonZero::new(1).unwrap(),
+            Value::build_text(table.to_string()),
+        )?;
+        for row in stmt.run_collect_rows()? {
+            let (Some(Value::Text(kind)), Some(Value::Text(sql))) = (row.first(), row.get(1))
+            else {
+                continue;
+            };
+            match kind.as_str() {
+                "table" => definition = Some(sql.as_str().to_string()),
+                "index" | "trigger" => dependents.push(sql.as_str().to_string()),
+                _ => {}
+            }
         }
+    }
+    if conn.is_nested_stmt() {
+        return Err(LimboError::InternalError(
+            "ALTER TABLE ADD CONSTRAINT: the connection is inside another statement, so the \
+             rebuild's statements would run without their own transaction"
+                .to_string(),
+        ));
     }
     let definition = definition
         .ok_or_else(|| LimboError::ParseError(format!("relation \"{table}\" does not exist")))?;
@@ -713,8 +727,22 @@ fn handle_pg_add_constraints(
     // The rows wait in a table of the same columns and types, so each value is decoded and
     // encoded by its own type both ways and reaches the rebuilt table as it was stored. (A copy
     // made by CREATE TABLE AS would take its column types from the decoded values.) The name is
-    // not under the engine's reserved prefixes, which a client statement may not create.
-    let aside_name = format!("{table}__turso_rebuild");
+    // not under the engine's reserved prefixes, which a client statement may not create, and not
+    // the name of any table that exists (a user's table of that name is never touched).
+    let schema = conn.current_schema();
+    let aside_name = (0..100)
+        .map(|n| match n {
+            0 => format!("{table}__turso_rebuild"),
+            n => format!("{table}__turso_rebuild_{n}"),
+        })
+        .find(|name| schema.get_table(name).is_none())
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "ALTER TABLE ADD CONSTRAINT: no free name for the rebuild's aside table of \
+                 \"{table}\""
+            ))
+        })?;
+    drop(schema);
     if let Some(turso_pg_parser::pg_query::protobuf::node::Node::CreateStmt(c)) = aside_tree
         .stmts
         .first_mut()
@@ -778,16 +806,28 @@ fn handle_pg_add_constraints(
             },
         ),
         Err(e) => {
-            if in_tx {
-                let _ = execute_root(conn, "ROLLBACK TO SAVEPOINT __turso_rebuild");
-                let _ = execute_root(conn, "RELEASE SAVEPOINT __turso_rebuild");
+            let undone = if in_tx {
+                execute_root(conn, "ROLLBACK TO SAVEPOINT __turso_rebuild")
+                    .and_then(|()| execute_root(conn, "RELEASE SAVEPOINT __turso_rebuild"))
             } else {
-                let _ = execute_root(conn, "ROLLBACK");
+                execute_root(conn, "ROLLBACK")
+            };
+            // An undo that failed leaves the table half rebuilt in a transaction nobody can name:
+            // the connection is broken, not merely the statement (the server ends the session).
+            match undone {
+                Ok(()) => Err(e),
+                Err(undo) => Err(LimboError::InternalError(format!(
+                    "{CONNECTION_BROKEN}: ALTER TABLE ADD CONSTRAINT failed ({e}) and undoing it \
+                     failed too ({undo})"
+                ))),
             }
-            Err(e)
         }
     }
 }
+
+/// The start of an engine error's text after which the connection's state is unknown: the server
+/// ends the session (FATAL 08006) rather than serve more statements on it.
+pub const CONNECTION_BROKEN: &str = "connection broken";
 
 /// Run one statement as the engine runs a client's (a root statement), in SQLite text.
 fn execute_root(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {

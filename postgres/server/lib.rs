@@ -38,6 +38,7 @@ use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
     attach_schema_files, branch_call, split_statements, PgBranchArg, PgBranchCall, PgConnection,
+    CONNECTION_BROKEN,
 };
 
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -1462,6 +1463,16 @@ fn fatal(code: &str, message: &str) -> PgWireError {
 /// The SQLSTATE an engine error is reported with. Lock contention is PostgreSQL's
 /// lock_not_available, and a stale snapshot its serialization_failure: both tell a client to retry.
 fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
+    // The frontend could not undo a failed statement: the connection's state is unknown, so the
+    // session ends (FATAL; pgwire closes the socket after sending it, and the engine connection
+    // goes with the session) instead of serving more statements on it (wire review 2 item 1).
+    if let LimboError::InternalError(m) = e {
+        if m.starts_with(CONNECTION_BROKEN) {
+            let mut info = error("08006", e.to_string());
+            info.severity = "FATAL".to_string();
+            return info;
+        }
+    }
     error(sqlstate(e), e.to_string())
 }
 
@@ -1593,6 +1604,11 @@ impl SimpleQueryHandler for Session {
                     client
                         .feed(PgWireBackendMessage::CommandComplete(tag.into()))
                         .await?;
+                }
+                // A FATAL error ends the session: pgwire sends it, flushes what is fed before it
+                // and closes the socket (process_error).
+                Response::Error(e) if e.severity == "FATAL" => {
+                    return Err(PgWireError::UserError(e));
                 }
                 Response::Error(e) => {
                     client
