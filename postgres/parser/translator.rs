@@ -26,6 +26,10 @@ pub struct PostgreSQLTranslator {
     /// The columns of the LATERAL subselects inlined so far (see `inline_lateral`): a reference
     /// `alias.column` translates to the expression the subselect computes for it.
     lateral_columns: std::cell::RefCell<std::collections::HashMap<(String, String), ast::Expr>>,
+    /// The output column of each generate_series call in FROM that reads another FROM item's
+    /// columns, by PostgreSQL's name for it, with the call's table name (see
+    /// `translate_range_function`): `g` and `g.g` translate to the engine's `g.value`.
+    series_columns: std::cell::RefCell<std::collections::HashMap<String, String>>,
 }
 
 impl PostgreSQLTranslator {
@@ -1897,6 +1901,11 @@ impl PostgreSQLTranslator {
                 "LATERAL is not supported on a function in FROM".into(),
             ));
         }
+        if range_func.ordinality {
+            return Err(ParseError::ParseError(
+                "WITH ORDINALITY is not supported on a function in FROM".into(),
+            ));
+        }
         // RangeFunction.functions is a list of function-call items.
         // Each item is a List node whose first element is the FuncCall.
         let func_item = range_func
@@ -2005,10 +2014,21 @@ impl PostgreSQLTranslator {
             return Ok(ast::SelectTable::Select(select, alias));
         }
 
+        let colnames = range_func.alias.as_ref().map_or(0, |a| a.colnames.len());
+
         // generate_series returns one column, which PostgreSQL names after the alias (`AS x`), the
         // alias's column list (`AS g(x)`), or else the function; the engine's table-valued
-        // generate_series names it `value`. Select it under PostgreSQL's name.
+        // generate_series names it `value`. With constant arguments it is selected under
+        // PostgreSQL's name from a subselect. A call that reads another FROM item's columns
+        // (`FROM t, generate_series(1, t.x) AS g`, implicitly LATERAL in PostgreSQL) stays a table
+        // call the engine joins, since a FROM subselect cannot see its siblings, and references to
+        // its column are translated to `value` instead (`series_columns`).
         if func_name.eq_ignore_ascii_case("generate_series") {
+            if colnames > 1 {
+                return Err(ParseError::ParseError(
+                    "too many column aliases specified for function generate_series".into(),
+                ));
+            }
             let range_alias = range_func.alias.as_ref();
             let column_name = range_alias
                 .and_then(|a| {
@@ -2022,6 +2042,23 @@ impl PostgreSQLTranslator {
             let table_name = range_alias
                 .map(|a| a.aliasname.clone())
                 .unwrap_or_else(|| "generate_series".to_string());
+            let reads_columns = func_call.args.iter().any(|arg| {
+                arg.node.as_ref().is_some_and(|n| {
+                    n.nodes()
+                        .iter()
+                        .any(|(r, ..)| matches!(r, pg_query::NodeRef::ColumnRef(_)))
+                })
+            });
+            if reads_columns {
+                self.series_columns
+                    .borrow_mut()
+                    .insert(column_name, table_name.clone());
+                return Ok(ast::SelectTable::TableCall(
+                    ast::QualifiedName::single(ast::Name::from_string(func_name)),
+                    args,
+                    Some(ast::As::As(ast::Name::from_string(&table_name))),
+                ));
+            }
             let select = ast::Select {
                 with: None,
                 body: ast::SelectBody {
@@ -2054,11 +2091,41 @@ impl PostgreSQLTranslator {
             ));
         }
 
+        // The engine names a table function's columns itself; a column list would rename them, and
+        // dropping it silently would answer under the wrong names.
+        if colnames > 0 {
+            return Err(ParseError::ParseError(format!(
+                "column aliases are not supported on function {func_name} in FROM"
+            )));
+        }
         Ok(ast::SelectTable::TableCall(
             ast::QualifiedName::single(ast::Name::from_string(func_name)),
             args,
             alias,
         ))
+    }
+
+    /// PostgreSQL's name for a reference to a correlated generate_series' column (see
+    /// `series_columns`), if `col_ref` is one: `g` or `g.g`.
+    fn series_column(&self, col_ref: &pg_query::protobuf::ColumnRef) -> Option<(String, String)> {
+        use pg_query::protobuf::node::Node;
+        let name = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+            Some(Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        };
+        let series = self.series_columns.borrow();
+        match col_ref.fields.as_slice() {
+            [column] => {
+                let column = name(column)?;
+                let table = series.get(&column)?.clone();
+                Some((table, column))
+            }
+            [table, column] => {
+                let (table, column) = (name(table)?, name(column)?);
+                (series.get(&column) == Some(&table)).then_some((table, column))
+            }
+            _ => None,
+        }
     }
 
     fn translate_join_expr(
@@ -2230,10 +2297,14 @@ impl PostgreSQLTranslator {
                                     continue;
                                 }
                             }
-                            // Regular column reference
+                            // Regular column reference. One that reads a correlated
+                            // generate_series' column keeps PostgreSQL's name for it, not the
+                            // engine's `value`.
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                None
+                                self.series_column(col_ref).map(|(_, column)| {
+                                    ast::As::Elided(ast::Name::from_string(column))
+                                })
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
@@ -2264,6 +2335,12 @@ impl PostgreSQLTranslator {
     fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
         match &node.node {
             Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
+                if let Some((table, _)) = self.series_column(col_ref) {
+                    return Ok(ast::Expr::Qualified(
+                        ast::Name::from_string(table),
+                        ast::Name::from_string("value"),
+                    ));
+                }
                 // Extract column name from fields
                 if let Some(field) = col_ref.fields.first() {
                     match &field.node {

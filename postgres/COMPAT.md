@@ -60,7 +60,7 @@ Basics not enumerated by the official feature matrix.
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
 | Operators: `\|\|`, `%`, bitwise, ILIKE, SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; case-insensitive variants treated as sensitive |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
-| generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
+| generate_series | ✅ Supported | In FROM, with joins, and reading the row it is joined to (`FROM t, generate_series(1, t.x) AS g`); its column is named as in PostgreSQL (the alias, `AS g(x)`'s column, or `generate_series`). WITH ORDINALITY and a second column alias are rejected with an error. In the joined form `SELECT *` names the column `value`, and a bare reference to the column's name resolves to the series even where another FROM item has a column of that name (PostgreSQL reports it ambiguous) |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
 | SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs (e.g. `SHOW search_path` returns nothing) |
 
@@ -199,7 +199,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | ❌ Not supported | Silently dropped; ordered-set aggregates (percentile_cont) missing |
-| WITH ORDINALITY clause | ❌ Not supported | |
+| WITH ORDINALITY clause | ❌ Not supported | Rejected with an error; column aliases on a table function other than generate_series are rejected too |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 
