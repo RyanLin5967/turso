@@ -411,6 +411,8 @@ struct SessionState {
     /// A statement failed inside a transaction block: as in PostgreSQL, everything but the block's
     /// end (or a ROLLBACK TO SAVEPOINT) is refused with 25P02 until then.
     aborted: bool,
+    /// The branch a switch just left, released in [`Shared`]'s map when the switch's statement ends.
+    left: Option<String>,
 }
 
 /// pgwire's handler set for one session: every handler is the session itself.
@@ -589,6 +591,13 @@ impl Session {
                 r
             }
         };
+        let in_tx = !conn.inner().get_auto_commit();
+        // A switch's branch is free for a delete once the last handle on its connection is gone:
+        // this statement's.
+        drop(conn);
+        if let Some(left) = st.left.take() {
+            self.shared.release(&left);
+        }
         match result {
             Ok(r) => {
                 if verb == TxVerb::RollbackTo {
@@ -598,7 +607,7 @@ impl Session {
             }
             Err(e) => {
                 // Inside a transaction block any error aborts the block, as in PostgreSQL.
-                if !conn.inner().get_auto_commit() {
+                if in_tx {
                     st.aborted = true;
                 }
                 Err(e)
@@ -712,10 +721,11 @@ impl Session {
                     next.adopt_session_of(conn);
                     st.branch.replace((name.clone(), next))
                 };
-                // The branch left is free for a delete once its connection is closed.
+                // The branch left is free for a delete once its connection is closed: `run`
+                // releases it after the statement's own handle on the connection goes.
                 if let Some((left, left_conn)) = left {
                     drop(left_conn);
-                    self.shared.release(&left);
+                    st.left = Some(left);
                 }
                 Ok(one_text(f, &name, format))
             }
