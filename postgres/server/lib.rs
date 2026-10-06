@@ -141,12 +141,16 @@ impl Backoff {
     }
 }
 
-/// Run `stmt` to its end, `row` called with each row it returns. A Busy at any step (a lock another
-/// session holds, or a commit refused part-way) is waited out on `backoff` by stepping the SAME
-/// statement again: the engine resumes it where it stopped (core fastest_tests.rs,
-/// a_trunk_commit_retried_after_a_busy_decision_pass_retains_every_page). Dropped there, it would
-/// commit what it did, and prepared anew it would run again in full: a write applied twice, its
-/// rows returned twice (wire review 5 item 2). Past the lock wait the Busy is the statement's.
+/// Run `stmt` to its end, `row` called with each row it returns. A Busy after the statement changed
+/// rows (its commit refused part-way) is waited out on `backoff` by stepping the SAME statement
+/// again: the engine resumes it where it stopped (core fastest_tests.rs,
+/// a_trunk_commit_retried_after_a_busy_decision_pass_retains_every_page). Dropped there, a write
+/// whose RETURNING rows went out is committed by the engine's reset, and prepared anew it ran
+/// again in full: applied twice, its rows returned twice (wire review 5 item 2). A Busy before it
+/// changed anything is the statement's, for [`Session::engine_statement`] to run it anew: stepped
+/// again there, a read came back done with no rows (gate suite at 0b803949e,
+/// a_conflicting_write_fails_with_a_retryable_sqlstate_or_serialises). Past the lock wait the
+/// Busy is the statement's.
 fn run_waiting(
     stmt: &mut turso_core::Statement,
     backoff: &mut Backoff,
@@ -154,7 +158,7 @@ fn run_waiting(
 ) -> turso_core::Result<()> {
     loop {
         match stmt.run_with_row_callback(&mut row) {
-            Err(LimboError::Busy) if backoff.wait() => {}
+            Err(LimboError::Busy) if stmt.n_change() > 0 && backoff.wait() => {}
             r => return r,
         }
     }
@@ -636,9 +640,11 @@ struct SessionState {
 
 /// An engine statement's failure, with whether it got as far as running: a COMMIT or ROLLBACK that
 /// failed to prepare (a syntax error) is a failed statement like any other, while one that ran and
-/// failed ended or did not end the block by its outcome (wire review 3 item 5).
+/// failed ended or did not end the block by its outcome (wire review 3 item 5). `rerunnable`: it
+/// changed nothing before it failed, so running it anew cannot apply it twice.
 struct StatementFailure {
     prepared: bool,
+    rerunnable: bool,
     info: Box<ErrorInfo>,
 }
 
@@ -1129,14 +1135,15 @@ impl Session {
 
     /// One statement through the engine. A statement that meets a lock another session holds waits
     /// for it, up to the server's lock wait, as a PostgreSQL row lock waits, instead of failing at
-    /// once with 55P03 (wire review 1 item 9). Once prepared, a statement refused Busy is stepped
-    /// again where it stopped ([`run_waiting`]), never dropped and run anew: a Busy can come at its
-    /// commit, after it changed rows and returned them (wire review 5 item 2). Only a refusal before
-    /// it ran (at prepare) prepares it again. A stale snapshot (40001) is run again only outside a
-    /// block, where nothing was written yet; in one the snapshot is the block's, and waiting cannot
-    /// cure it. Not the engine's own busy timeout: its blocking loops (run_ignore_rows and the like)
-    /// answer its Sleep with an IO step that returns at once on this platform, so they would spin a
-    /// core for the whole wait. The statement's waits share one lock wait.
+    /// once with 55P03 (wire review 1 item 9). A statement refused Busy after it changed rows is
+    /// stepped again where it stopped ([`run_waiting`]), never dropped and run anew: a Busy can come
+    /// at its commit, after it changed rows and returned them (wire review 5 item 2). One refused
+    /// before it changed anything (at prepare, or at its first lock) is prepared and run anew. A
+    /// stale snapshot (40001) is run again only outside a block, where nothing was written yet; in
+    /// one the snapshot is the block's, and waiting cannot cure it. Not the engine's own busy
+    /// timeout: its blocking loops (run_ignore_rows and the like) answer its Sleep with an IO step
+    /// that returns at once on this platform, so they would spin a core for the whole wait. The
+    /// statement's waits share one lock wait.
     fn engine_statement(
         &self,
         conn: &PgConnection,
@@ -1150,8 +1157,8 @@ impl Session {
             // sqlstate() gives 55P03 to LimboError::Busy alone and 40001 to BusySnapshot alone.
             match self.engine_statement_once(conn, sql, portal, format, &mut backoff) {
                 Err(f)
-                    if (!f.prepared && f.info.code == "55P03")
-                        || (!in_tx && f.info.code == "40001") =>
+                    if f.rerunnable
+                        && (f.info.code == "55P03" || (!in_tx && f.info.code == "40001")) =>
                 {
                     if !backoff.wait() {
                         return self.engine_statement_once(conn, sql, portal, format, &mut backoff);
@@ -1172,6 +1179,7 @@ impl Session {
     ) -> Result<Response, StatementFailure> {
         let unprepared = |info: Box<ErrorInfo>| StatementFailure {
             prepared: false,
+            rerunnable: true,
             info,
         };
         let described = portal.and_then(|_| self.take_described(conn, sql));
@@ -1200,6 +1208,7 @@ impl Session {
         };
         r.map_err(|e| StatementFailure {
             prepared: true,
+            rerunnable: stmt.n_change() == 0,
             info: wire_info(e),
         })
     }
