@@ -8010,4 +8010,59 @@ mod tests {
                 .unwrap();
         assert!(out.contains("(t.x * 2)"), "{out}");
     }
+
+    /// An inlined LATERAL column is its expression pasted at every reference, which is the
+    /// subselect's value only for a deterministic scalar expression of the outer row. Aggregates
+    /// (count(*) made the outer query an aggregate), window functions (OVER numbered the outer
+    /// rows), volatile functions (random() ran once per reference, nextval() never when
+    /// unreferenced), set-returning functions and sublinks are refused; and so are the references
+    /// that would need the dropped join: `*` and `o.*` lost the lateral's columns, and an
+    /// unqualified lateral column was never mapped (wire review 2 item 5).
+    #[test]
+    fn a_lateral_is_inlined_only_for_scalar_expressions_read_by_qualified_name() {
+        for sql in [
+            "SELECT o.c FROM t CROSS JOIN LATERAL (SELECT count(*)) AS o(c)",
+            "SELECT o.c FROM t CROSS JOIN LATERAL (SELECT sum(t.x)) AS o(c)",
+            "SELECT o.r FROM t CROSS JOIN LATERAL (SELECT row_number() OVER ()) AS o(r)",
+            "SELECT o.r, o.r FROM t CROSS JOIN LATERAL (SELECT random()) AS o(r)",
+            "SELECT t.x FROM t CROSS JOIN LATERAL (SELECT nextval('s')) AS o(n)",
+            "SELECT o.g FROM t CROSS JOIN LATERAL (SELECT generate_series(1, t.x)) AS o(g)",
+            "SELECT o.e FROM t CROSS JOIN LATERAL (SELECT (SELECT 1)) AS o(e)",
+            "SELECT o.e FROM t CROSS JOIN LATERAL (SELECT EXISTS (SELECT 1 FROM u)) AS o(e)",
+            "SELECT * FROM t CROSS JOIN LATERAL (SELECT t.x) AS o(y)",
+            "SELECT o.* FROM t CROSS JOIN LATERAL (SELECT t.x) AS o(y)",
+            "SELECT y FROM t CROSS JOIN LATERAL (SELECT t.x) AS o(y)",
+            "SELECT t.x FROM t CROSS JOIN LATERAL (SELECT t.x) AS o(y) WHERE y > 0",
+        ] {
+            let r = translated_sql(sql);
+            assert!(r.is_err(), "{sql} was translated: {r:?}");
+        }
+        // Scalar expressions of the outer row still inline: operators, casts, CASE, COALESCE,
+        // NULL tests, and pgbench's probe (array_position over current_schemas).
+        for (sql, inlined) in [
+            (
+                "SELECT o.d, o.s FROM t CROSS JOIN LATERAL (SELECT t.x * 2, t.x + 10) AS o(d, s)",
+                "(t.x * 2)",
+            ),
+            (
+                "SELECT o.a FROM t CROSS JOIN LATERAL (SELECT CAST(t.x AS text)) AS o(a)",
+                "CAST",
+            ),
+            (
+                "SELECT o.a FROM t CROSS JOIN LATERAL \
+                 (SELECT CASE WHEN t.x IS NULL THEN 0 ELSE coalesce(t.y, 1) END) AS o(a)",
+                "CASE",
+            ),
+            (
+                "SELECT o.n FROM pg_catalog.pg_namespace AS n CROSS JOIN LATERAL \
+                 (SELECT pg_catalog.array_position(pg_catalog.current_schemas(true), n.nspname)) \
+                 AS o(n) WHERE o.n IS NOT NULL",
+                "array_position",
+            ),
+        ] {
+            let out = translated_sql(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(out.contains(inlined), "{sql}: {out}");
+            assert!(!out.to_uppercase().contains("LATERAL"), "{sql}: {out}");
+        }
+    }
 }
