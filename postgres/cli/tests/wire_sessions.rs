@@ -958,3 +958,91 @@ fn a_branch_held_by_another_session_is_refused_with_55006() {
         .expect("admitted on held");
     assert_eq!(e.code, "55006", "{e:?}");
 }
+
+/// END and ABORT complete with PostgreSQL's tags, COMMIT and ROLLBACK (pgbench ends every
+/// transaction with END).
+#[test]
+fn end_and_abort_report_commit_and_rollback() {
+    let dir = Scratch::new("endabort");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'a')").ok("insert");
+    let r = a.q("END;").ok("end");
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
+    assert_eq!(r.status, b'I');
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (3, 'a')").ok("insert");
+    let r = a.q("ABORT").ok("abort");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(a.q("SELECT count(*) FROM t").single("count"), "2");
+}
+
+/// A branch call that meets a held lock waits for it, as PostgreSQL's statements wait on locks,
+/// rather than failing: here the trunk's first child is forked under the WAL write lock while
+/// another session's transaction holds it, and the create completes once that transaction
+/// commits.
+#[test]
+fn a_branch_create_waits_for_a_held_write_lock() {
+    let dir = Scratch::new("waitlock");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'a')").ok("insert");
+    let committer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        a.q("COMMIT").ok("commit");
+        a
+    });
+    let t0 = Instant::now();
+    let r = b.q("SELECT turso_branch_create('w')");
+    let waited = t0.elapsed();
+    let mut a = committer.join().unwrap();
+    assert!(
+        r.error.is_none(),
+        "the create failed instead of waiting: {:?}",
+        r.error
+    );
+    assert!(
+        waited >= Duration::from_millis(250),
+        "the create did not wait for the lock ({waited:?})"
+    );
+    b.q("SELECT turso_branch_switch('w')").ok("switch");
+    assert_eq!(
+        b.q("SELECT count(*) FROM t").single("rows on w"),
+        "2",
+        "the branch forked before the commit it waited for"
+    );
+    a.q("SELECT 1").ok("a is fine");
+}
+
+/// Foreign keys are enforced, as PostgreSQL always enforces them, on the trunk and on a branch:
+/// a child row with no parent is refused, and ON DELETE CASCADE removes the children.
+#[test]
+fn foreign_keys_are_enforced_on_the_trunk_and_on_a_branch() {
+    let dir = Scratch::new("fk");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("parent");
+    a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) ON DELETE CASCADE)")
+        .ok("child");
+    a.q("INSERT INTO p VALUES (1)").ok("parent row");
+    a.q("INSERT INTO c VALUES (10, 1)").ok("child row");
+    assert!(
+        a.q("INSERT INTO c VALUES (11, 99)").error.is_some(),
+        "a child row with no parent was accepted on the trunk"
+    );
+    a.q("SELECT turso_branch_create('fk')").ok("create");
+    a.q("SELECT turso_branch_switch('fk')").ok("switch");
+    assert!(
+        a.q("INSERT INTO c VALUES (12, 98)").error.is_some(),
+        "a child row with no parent was accepted on a branch"
+    );
+    a.q("DELETE FROM p WHERE id = 1").ok("delete parent");
+    assert_eq!(
+        a.q("SELECT count(*) FROM c").single("children"),
+        "0",
+        "ON DELETE CASCADE did not remove the child"
+    );
+}
