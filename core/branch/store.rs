@@ -377,6 +377,10 @@ pub(crate) struct Group {
     durable_now: [AtomicU64; 3],
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
+    /// Observation only (review 6 #1): confirmation words written into the log's header, and those
+    /// whose write failed; counted without the group's lock (engine review 8 #11).
+    confirms_written: AtomicU64,
+    confirm_failures: AtomicU64,
     /// Test hook (engine review 8 #11): while it holds `HOLD_CONFIRM_WRITE`, the confirmation
     /// writer waits once it has taken a word to write and before it writes it. Per store.
     #[cfg(test)]
@@ -421,10 +425,6 @@ struct GroupState {
     already_durable: u64,
     upgrades: u64,
     riders: u64,
-    /// Observation only (review 6 #1): confirmation words written into the log's header, and those
-    /// whose write failed.
-    confirms_written: u64,
-    confirm_failures: u64,
     /// The confirmation of the last flight that landed, and when it landed (review 6 #1): written
     /// by the confirmation writer once no flight has landed for `confirm_quiet()`, or at close.
     confirm: Option<(Instant, Confirm)>,
@@ -460,6 +460,8 @@ impl Group {
             confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
             failed,
+            confirms_written: AtomicU64::new(0),
+            confirm_failures: AtomicU64::new(0),
             #[cfg(test)]
             confirm_hold: AtomicU8::new(0),
         }
@@ -626,13 +628,16 @@ impl Group {
     /// (review 6 #1). Mutant `confirm_error_fails_flight` (test builds only): it fail-stops the store.
     fn write_confirm(&self, confirm: &Confirm, at_close: bool) {
         let written = if at_close { confirm.write_at_close() } else { confirm.write() };
-        let mut g = self.lock();
+        // Counted without the group's lock (engine review 8 #11).
         match written {
-            Ok(()) => g.confirms_written += 1,
+            Ok(()) => {
+                self.confirms_written.fetch_add(1, Ordering::Relaxed);
+            }
             Err(e) => {
-                g.confirm_failures += 1;
+                self.confirm_failures.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("branch log: a flight's confirmation word was not written: {e}");
                 if fe_mutant("confirm_error_fails_flight") {
+                    let mut g = self.lock();
                     self.fail(&mut g);
                 }
             }
@@ -658,9 +663,9 @@ fn confirm_quiet() -> Duration {
 
 /// The confirmation writer, one thread per durable store (review 6 #1; listed in the PREREG annex
 /// as background work). It writes the last landed flight's confirmation word into the log's
-/// header once no flight has landed for `confirm_quiet()` and none is in the air — holding the
-/// group's flight slot (`flushing`) for its one unsynced pwrite, so the word never sits inside an
-/// acknowledgement window and no flight's sync is taken while it is written. A flight whose sync
+/// header once no flight has landed for `confirm_quiet()` and none is in the air, so the word is
+/// never written inside an acknowledgement window; its one unsynced pwrite takes no flight slot
+/// on unix (engine review 8 #11), and off unix it holds the slot (`SlotRelease`). A flight whose sync
 /// did not prove stable storage (`Confirm::proved`) waits for the close. Nothing is written once
 /// the store is fail-stopped.
 fn run_confirm_writer(group: Arc<Group>) {
@@ -699,17 +704,37 @@ fn run_confirm_writer(group: Arc<Group>) {
             continue;
         }
         let (_, confirm) = g.confirm.take().expect("checked above");
-        g.flushing = true;
+        // The word names a flight whose sync has returned, and on unix every replacement of the
+        // log is a rename, so a word written while a flight or a rewrite runs reaches the old file
+        // at most: the writer takes no flight slot, so no create waits on it, and it wakes no one
+        // (engine review 8 #11). Off unix a log can be rewritten in place, through a shared file
+        // cursor, so there the word is written holding the slot, released by a guard even if the
+        // write panics. Mutant `confirm_holds_slot` (test builds only): held on unix too.
+        let hold = !cfg!(unix) || fe_mutant("confirm_holds_slot");
+        if hold {
+            g.flushing = true;
+        }
         drop(g);
-        #[cfg(test)]
-        pause_at(Some(&group.confirm_hold), HOLD_CONFIRM_WRITE);
-        group.write_confirm(&confirm, false);
-        g = group.lock();
-        g.flushing = false;
-        group.cv.notify_all();
-        drop(g);
+        {
+            let _slot = hold.then(|| SlotRelease(&group));
+            #[cfg(test)]
+            pause_at(Some(&group.confirm_hold), HOLD_CONFIRM_WRITE);
+            group.write_confirm(&confirm, false);
+        }
         drop(confirm);
         g = group.lock();
+    }
+}
+
+/// The confirmation writer's hold of the flight slot, off unix (`run_confirm_writer`): released,
+/// and the group woken, when dropped, a panic in the write included.
+struct SlotRelease<'a>(&'a Group);
+
+impl Drop for SlotRelease<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.lock();
+        g.flushing = false;
+        self.0.cv.notify_all();
     }
 }
 
@@ -6516,8 +6541,10 @@ impl BranchStore {
     /// Confirmation words written into the log's header, and those whose write failed (review 6 #1;
     /// observing only).
     pub(crate) fn confirm_counts(&self) -> [u64; 2] {
-        let g = self.group.lock();
-        [g.confirms_written, g.confirm_failures]
+        [
+            self.group.confirms_written.load(Ordering::Relaxed),
+            self.group.confirm_failures.load(Ordering::Relaxed),
+        ]
     }
 
     /// The log's sequence number: every byte buffered or written so far (tests only).
