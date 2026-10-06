@@ -2505,7 +2505,7 @@ fn checkpoint_over_a_failed_flight(path: &Path, fork: bool) -> (BranchId, usize,
     let (x_id, op) = if fork {
         let x_id = x.into_id();
         let db = db.clone();
-        (x_id, std::thread::spawn(move || db.connect()?.fork_branch().map(|b| drop(b.into_id()))))
+        (x_id, std::thread::spawn(move || db.connect()?.fork_branch().map(|b| { let _ = b.into_id(); })))
     } else {
         (x.id(), std::thread::spawn(move || x.reap().map(|_| ())))
     };
@@ -2846,7 +2846,7 @@ fn an_arena_sync_failure_in_a_compaction_or_checkpoint_fail_stops() {
             hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
             let writer = std::thread::spawn(move || {
                 let r = y.connect()?.execute("UPDATE t SET v = 'y' WHERE id = 5");
-                drop(y.into_id());
+                let _ = y.into_id();
                 r
             });
             wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
