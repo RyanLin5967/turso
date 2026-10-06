@@ -1514,13 +1514,15 @@ impl Database {
 /// journal locks until it exits, and a neighbour that drops a store and relocks its log inside that
 /// window fails. In a process that runs one test there is no neighbour.
 ///
-/// GATE: `cfg(unix)`, and nothing narrower is needed. The tests close no descriptors (the fresh
-/// process has no neighbour whose lock a child could hold), so `getdtablesize`, which Android's
-/// libc lacks, is no longer called anywhere. Every libc call they make — `fork`, `waitpid`,
-/// `WIFEXITED`/`WEXITSTATUS`, `kill`, `_exit` — is declared for every unix target in libc 0.2.186,
-/// Android included (READ: `src/unix/mod.rs`'s unconditional `extern` block, and
-/// `src/unix/linux_like/mod.rs`).
-#[cfg(all(test, unix))]
+/// GATE: `alone` and `finished` need only `std::process`, so every test build has them: a test that
+/// runs alone for a process-wide hook (`R11_CKPT`, `CUT_PANICS`) runs on every target (engine
+/// review 7 #13's judge). `exit_code` is `cfg(unix)`, and nothing narrower is needed. The tests
+/// close no descriptors (the fresh process has no neighbour whose lock a child could hold), so
+/// `getdtablesize`, which Android's libc lacks, is no longer called anywhere. Every libc call they
+/// make — `fork`, `waitpid`, `WIFEXITED`/`WEXITSTATUS`, `kill`, `_exit` — is declared for every unix
+/// target in libc 0.2.186, Android included (READ: `src/unix/mod.rs`'s unconditional `extern`
+/// block, and `src/unix/linux_like/mod.rs`).
+#[cfg(test)]
 pub(crate) mod fork_driver {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -1567,6 +1569,7 @@ pub(crate) mod fork_driver {
 
     /// The exit code of a forked child. Waits at most 60 s; on the deadline it SIGKILLs and reaps
     /// the child and fails.
+    #[cfg(unix)]
     pub(crate) fn exit_code(pid: libc::pid_t) -> i32 {
         let mut status = 0;
         let deadline = Instant::now() + Duration::from_secs(60);

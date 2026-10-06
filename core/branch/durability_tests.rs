@@ -2339,7 +2339,9 @@ fn a_registry_hit_of_another_checkpoint_mode_is_refused() {
 ///
 /// FLAGGED TEST EDIT (engine review 7 #13): the variable is process-wide (every open in the binary
 /// reads it), so the test runs alone in a fresh process (`fork_driver::alone`).
-#[cfg(unix)]
+///
+/// FLAGGED TEST EDIT (engine review 7 #13's judge): no longer `cfg(unix)`; `fork_driver::alone`
+/// needs only `std::process`, so the test runs on every target.
 #[test]
 fn an_unknown_checkpoint_mode_in_the_environment_refuses_the_open() {
     let Some(sentinel) = crate::branch::fork_driver::alone(

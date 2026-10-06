@@ -2978,10 +2978,19 @@ pub(crate) static OPEN_LOCK_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomi
 #[cfg(test)]
 static OPEN_LOCK_HOLD_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Test builds: opens of a log that found its path renamed to another file once locked, and were
-/// made again (`open_log_locked`): engine review 7 #13 asks that the rename race be shown to happen.
+/// Test builds: opens of a log that found its path naming another file once locked
+/// (`open_log_locked`), per log path: engine review 7 #13 asks that the rename race be shown to
+/// happen. Counted before the lock is accepted or the open made again, so a mutant that accepts
+/// the stale lock still shows the race happened (its judge: it must die on its claim, not on this).
 #[cfg(test)]
-pub(crate) static LOCK_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOCK_RENAMED: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds: how many opens of the log at `path` found it renamed under their lock.
+#[cfg(test)]
+pub(crate) fn lock_renamed(path: &Path) -> u64 {
+    let seen = LOCK_RENAMED.lock().unwrap_or_else(|e| e.into_inner());
+    seen.iter().find(|(p, _)| p.as_path() == path).map_or(0, |&(_, n)| n)
+}
 
 /// Test builds: `OPEN_LOCK_HOLD` armed for one log path while this lives; dropped, it releases and
 /// disarms the hold whatever the test did (a panic while armed no longer hangs later opens).
@@ -3038,12 +3047,19 @@ fn open_log_locked(path: &Path, open: impl Fn(&Path) -> Result<Option<File>>) ->
         };
         pause_before_lock(path);
         lock_exclusive(&file, path)?;
+        let names = still_names(&file, path)?;
+        #[cfg(test)]
+        if !names {
+            let mut seen = LOCK_RENAMED.lock().unwrap_or_else(|e| e.into_inner());
+            match seen.iter_mut().find(|(p, _)| p.as_path() == path) {
+                Some((_, n)) => *n += 1,
+                None => seen.push((path.to_path_buf(), 1)),
+            }
+        }
         // Mutant `lock_any_inode` (test builds only): the lock is taken on whatever was opened.
-        if still_names(&file, path)? || super::store::fe_mutant("lock_any_inode") {
+        if names || super::store::fe_mutant("lock_any_inode") {
             return Ok(Some(file));
         }
-        #[cfg(test)]
-        LOCK_RETRIES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
     Err(LimboError::LockingError(format!(
         "branch log {} was replaced {LOCK_ATTEMPTS} times while this store opened it: another branch \
@@ -4837,12 +4853,15 @@ mod format_tests {
     /// FLAGGED TEST EDIT (engine review 7 #13): the hook is armed for this test's log path only and
     /// disarmed by a guard (a panic while armed hung every later log open in the binary), and the
     /// race is shown to have happened: the second open found the path renamed once it was locked.
+    /// FLAGGED TEST EDIT (its judge, 2026-10-06T14:45:43Z): that premise is counted per log path
+    /// (`lock_renamed`) and before the lock is accepted, so mutant `lock_any_inode` passes it and
+    /// dies on the claim below, not on the premise.
     #[test]
     fn a_lock_taken_across_a_rename_of_the_log_is_refused() {
         use std::sync::atomic::Ordering as O;
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
-        let retries = LOCK_RETRIES.load(O::Acquire);
+        let retries = lock_renamed(&files.log);
         let _hold = OpenLockHold::arm(&files.log);
         let second = {
             let files = files.clone();
@@ -4858,8 +4877,8 @@ mod format_tests {
         OPEN_LOCK_HOLD.store(0, O::Release);
         let got = second.join().unwrap();
         assert!(
-            LOCK_RETRIES.load(O::Acquire) > retries,
-            "premise: the second open found the log renamed under its lock and opened it again"
+            lock_renamed(&files.log) > retries,
+            "premise: the second open found the log renamed under its lock"
         );
         assert!(got.is_err(), "a second store took the lock of the log's old inode");
         drop(first);

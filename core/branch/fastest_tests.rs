@@ -3334,7 +3334,9 @@ fn a_fail_stopped_store_lists_no_fork_whose_flight_failed() {
 /// FLAGGED TEST EDIT (engine review 7 #13): `CUT_PANICS` is process-wide, so the test runs alone in
 /// a fresh process (`fork_driver::alone`), where no neighbour can consume the hook or be hit by it,
 /// and a Drop guard disarms it whatever happens.
-#[cfg(unix)]
+///
+/// FLAGGED TEST EDIT (engine review 7 #13's judge): no longer `cfg(unix)`; `fork_driver::alone`
+/// needs only `std::process`, so the test runs on every target.
 #[test]
 fn a_panic_in_a_fuzzy_checkpoints_cut_does_not_stop_checkpoints() {
     struct Disarm;
