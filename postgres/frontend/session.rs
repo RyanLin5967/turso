@@ -341,6 +341,13 @@ impl Iterator for PgQueryRunner<'_> {
 }
 
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
+    // Text with no separator but a trailing one is one statement: no literal, comment or dollar
+    // quote can make it two, so libpg_query is not asked.
+    let trimmed = sql.trim();
+    let body = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    if !body.is_empty() && !body.contains(';') {
+        return Ok(vec![body.to_string()]);
+    }
     match turso_pg_parser::split_statements(sql) {
         Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => Ok(vec![sql.trim().to_string()]),
         Ok(stmts) => Ok(stmts),
@@ -358,12 +365,13 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
 
     reject_sqlite_catalog_access(sql)?;
 
-    if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
+    // One parse serves both the special forms and the translation (it was two).
+    let parse_result =
+        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
         return Ok(stmt);
     }
 
-    let parse_result =
-        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
@@ -429,12 +437,10 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
     Ok(())
 }
 
-fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Option<Statement>> {
-    let parse_result = match turso_pg_parser::parse(sql) {
-        Ok(result) => result,
-        Err(_) => return Ok(None),
-    };
-
+fn try_prepare_special(
+    pg_conn: &Arc<PgConnectionInner>,
+    parse_result: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<Option<Statement>> {
     if let Some(set_stmt) = try_extract_set(&parse_result) {
         let stmt = handle_pg_set(pg_conn, &set_stmt)?;
         return Ok(Some(stmt));
