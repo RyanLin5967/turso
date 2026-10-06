@@ -140,6 +140,8 @@ struct Reply {
     oids: Option<Vec<u32>>,
     tags: Vec<String>,
     error: Option<WireError>,
+    /// Every NoticeResponse of the reply, in order.
+    notices: Vec<WireError>,
     /// The ReadyForQuery transaction status byte: b'I' idle, b'T' in a transaction, b'E' failed.
     status: u8,
 }
@@ -322,6 +324,7 @@ impl Wire {
                     r.rows.push(row);
                 }
                 b'C' => r.tags.push(cstr(&body)),
+                b'N' => r.notices.push(error_fields(&body)),
                 b'E' => {
                     // Only the first error of a reply is kept.
                     if r.error.is_none() {
@@ -1848,4 +1851,72 @@ fn generate_series_may_read_the_row_it_joins() {
             .is_some(),
         "a second column alias was dropped"
     );
+}
+
+/// The server's count of CHECKPOINTs skipped inside a block (turso_branch_stats' fifth column).
+fn checkpoints_skipped(a: &mut Wire) -> i64 {
+    let r = a.q("SELECT turso_branch_stats()").ok("stats");
+    r.rows[0][4]
+        .as_deref()
+        .expect("the skip count is never NULL")
+        .parse()
+        .unwrap()
+}
+
+/// Inside a block CHECKPOINT does not wait (the block may hold the lock it needs), so when the
+/// WAL is busy it is skipped, and says so: a NOTICE before the tag, and one more in
+/// turso_branch_stats' skip count. A tag alone would recreate the lie wire review 1 item 4
+/// flagged (lead ruling, 2026-10-06T13:47Z). One it can run sends no notice and counts nothing.
+/// Busy here: once a TRUNCATE checkpoint has emptied the WAL, a reader holds read mark 0 (the
+/// engine's SQLite rule, core/storage/wal.rs), which every checkpoint mode needs exclusively.
+#[test]
+fn a_busy_checkpoint_inside_a_block_says_it_was_skipped() {
+    let dir = Scratch::new("ckptskip");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    // Runnable: the WAL holds frames, no other reader.
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert");
+    let before = checkpoints_skipped(&mut a);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (3, 'three')")
+        .ok("insert in block");
+    let r = a.q("CHECKPOINT").ok("checkpoint in a block");
+    assert_eq!(r.tags, vec!["CHECKPOINT".to_string()]);
+    assert!(
+        r.notices.is_empty(),
+        "a checkpoint that ran sent {:?}",
+        r.notices
+    );
+    a.q("COMMIT").ok("commit");
+    assert_eq!(
+        checkpoints_skipped(&mut a),
+        before,
+        "a checkpoint that ran was counted"
+    );
+    // Busy: the WAL emptied, then b reads from read mark 0.
+    a.q("CHECKPOINT").ok("checkpoint outside a block");
+    assert_eq!(wal_bytes(&dir.db()), 0, "premise: the WAL is empty");
+    b.q("BEGIN").ok("b begin");
+    b.q("SELECT count(*) FROM t").ok("b reads");
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (4, 'four')")
+        .ok("insert in block");
+    let r = a.q("CHECKPOINT").ok("busy checkpoint in a block");
+    assert_eq!(r.tags, vec!["CHECKPOINT".to_string()]);
+    assert_eq!(r.notices.len(), 1, "notices {:?}", r.notices);
+    assert!(
+        r.notices[0].message.contains("checkpoint skipped"),
+        "notice {:?}",
+        r.notices[0]
+    );
+    assert_eq!(r.status, b'T', "the block goes on");
+    a.q("COMMIT").ok("commit");
+    b.q("COMMIT").ok("b commit");
+    assert_eq!(
+        checkpoints_skipped(&mut a),
+        before + 1,
+        "the skip was not counted"
+    );
+    assert_eq!(a.q("SELECT count(*) FROM t").single("rows"), "4");
 }
