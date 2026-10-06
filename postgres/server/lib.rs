@@ -35,7 +35,7 @@ use futures::sink::{Sink, SinkExt};
 use futures::stream::{self, StreamExt};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
-use turso_core::{Database, LimboError, Value};
+use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
     attach_schema_files, branch_call, split_statements, PgBranchArg, PgBranchCall, PgConnection,
 };
@@ -577,6 +577,7 @@ impl Session {
         }
         let result = match call {
             Some(call) => self.branch(&mut st, &conn, &call, portal, format),
+            None if is_checkpoint(sql) => self.checkpoint(&mut st, in_tx),
             None => {
                 drop(st);
                 let r = self.engine_statement(&conn, sql, portal, format);
@@ -613,6 +614,36 @@ impl Session {
             st.aborted = false;
         }
         result
+    }
+
+    /// CHECKPOINT is the trunk's, as PostgreSQL's is the cluster's, so a session on a branch runs it
+    /// on its trunk connection. Outside a block it is a TRUNCATE checkpoint that waits for writers
+    /// and readers within the lock timeout and fails with 55P03 after it. Inside a block the
+    /// session's own transaction may hold the very locks a TRUNCATE waits for, so it is a PASSIVE
+    /// checkpoint on a connection of its own, which never waits: it backfills what no reader pins,
+    /// and a busy answer leaves the rest to the next checkpoint (committed data is durable in the
+    /// WAL either way). Any other failure is the statement's (wire review 1 item 4).
+    fn checkpoint(&self, st: &mut SessionState, in_tx: bool) -> SqlResult<Response> {
+        if in_tx {
+            let conn = self.shared.db.connect().map_err(|e| engine_info(&e))?;
+            return match conn.checkpoint(CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            }) {
+                Ok(_) | Err(LimboError::Busy) => Ok(Response::Execution(Tag::new("CHECKPOINT"))),
+                Err(e) => Err(engine_info(&e)),
+            };
+        }
+        if st.trunk.is_none() {
+            st.trunk = Some(self.open_trunk()?);
+        }
+        let trunk = st.trunk.as_ref().expect("opened above").inner().clone();
+        self.waiting(|| {
+            trunk.checkpoint(CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            })
+        })
+        .map_err(|e| engine_info(&e))?;
+        Ok(Response::Execution(Tag::new("CHECKPOINT")))
     }
 
     /// As in PostgreSQL, a failed block refuses to describe anything but its own end (25P02).
@@ -930,6 +961,18 @@ impl TxVerb {
     fn ends_block(self) -> bool {
         matches!(self, TxVerb::Commit | TxVerb::Rollback | TxVerb::RollbackTo)
     }
+}
+
+/// Whether `sql` is a bare CHECKPOINT (the server runs it itself, see [`Session::checkpoint`]). A
+/// form this does not read, e.g. one behind a comment, reaches the engine's PRAGMA path.
+fn is_checkpoint(sql: &str) -> bool {
+    let mut words = sql
+        .split(|c: char| c.is_ascii_whitespace() || c == ';')
+        .filter(|w| !w.is_empty());
+    words
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("CHECKPOINT"))
+        && words.next().is_none()
 }
 
 fn arity(call: &PgBranchCall, n: usize) -> SqlResult<()> {
@@ -1265,6 +1308,9 @@ impl ExtendedQueryHandler for Session {
             let fields = branch_call_fields(&call, &Format::UnifiedText);
             return Ok(DescribeStatementResponse::new(param_types, fields));
         }
+        if is_checkpoint(&target.statement) {
+            return Ok(DescribeStatementResponse::new(param_types, vec![]));
+        }
         let stmt = self.describe_prepare(&target.statement)?;
         let fields = build_field_info(&stmt, &Format::UnifiedText);
         Ok(DescribeStatementResponse::new(param_types, fields))
@@ -1282,6 +1328,9 @@ impl ExtendedQueryHandler for Session {
         if let Some(call) = branch_call(&portal.statement.statement) {
             let fields = branch_call_fields(&call, &portal.result_column_format);
             return Ok(DescribePortalResponse::new(fields));
+        }
+        if is_checkpoint(&portal.statement.statement) {
+            return Ok(DescribePortalResponse::new(vec![]));
         }
         let stmt = self.describe_prepare(&portal.statement.statement)?;
         let fields = build_field_info(&stmt, &portal.result_column_format);
