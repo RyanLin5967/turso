@@ -376,6 +376,12 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
             other["io_submit"] += 1
     out["flush_by_syscall"] = flush
     out["t0"], out["calls_before_t0"] = t0, before_t0
+    # A launch window's command stderr (strace_run's OUT.cmd.err): recorded, never a verdict -- a command may warn and
+    # still succeed, and its exit status is checked through strace_rc (fourth review, finding 6: it was looked at by
+    # nothing).
+    ce = window[: -len(".window")] + ".cmd.err" if launched and window and window.endswith(".window") else None
+    out["command_stderr"] = (open(ce, errors="replace").read().splitlines()[:5]
+                             if ce and os.path.exists(ce) else None)
     out["flushes"] = sum(flush.values())
     out.update(other)
     out["by_class"] = by_class
