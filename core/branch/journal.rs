@@ -4734,6 +4734,59 @@ mod format_tests {
         );
     }
 
+    /// Engine review 7 #2 (a): review 5 #26's rule (damage under one whole later synced flight lies
+    /// in an acknowledged flight) rests on the WRITER syncing every flight before the next, so it
+    /// holds for a log D1/D2 flights were synced into whatever class reopens it. Before, a D0 open
+    /// of such a log cut it silently: TrunkRetains dropped, children reading newer trunk pages.
+    #[test]
+    fn damage_under_a_whole_later_flight_of_a_syncing_writer_is_refused_at_a_d0_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Fsync);
+        // The middle flight's end frame is lost; the last flight is whole.
+        overwrite(&files.log, starts[2] - END_FRAME_LEN as u64, &[0u8; END_FRAME_LEN]);
+        let got = Journal::recover(&files, SyncClass::Off);
+        assert!(
+            matches!(got, Err(LimboError::Corrupt(_))),
+            "an acknowledged flight lost under one whole later flight was cut at a D0 open: {:?}",
+            got.map(|r| r.map(|r| forks(&r.records)))
+        );
+    }
+
+    /// Engine review 7 #2 (b): in a D0 log, a flight written unsynced followed by a raised, synced
+    /// one proves nothing about the first: it was never synced before the second was written, and a
+    /// crash before the second's sync returned can keep the second whole and tear the first. So a
+    /// torn D0 flight under a whole raised flight is a torn tail, cut, at any open; the evidence is
+    /// the log's own (the unsynced flight's end frame), not the opener's class. Before, a syncing
+    /// open refused it: "every branch is lost".
+    #[test]
+    fn a_torn_d0_flight_under_a_raised_flight_is_cut_at_a_syncing_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let second;
+        {
+            let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+            let mut arena = Arena::new(512);
+            journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+            journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+            second = journal.len;
+            journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+            journal.raise_pending_class(SyncClass::FullFsync);
+            journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+        }
+        // The first flight's record frame is torn; its end frame (tagged unsynced) and the raised
+        // flight after it are whole.
+        overwrite(&files.log, LOG_HEADER_LEN as u64 + 2, &[0u8; 4]);
+        let got = Journal::recover(&files, SyncClass::Fsync);
+        match got {
+            Ok(Some(r)) => assert!(forks(&r.records).is_empty(), "the torn tail was not cut: {:?}", forks(&r.records)),
+            other => panic!(
+                "a torn D0 flight under a raised flight (from byte {second}) was refused or lost the state: {:?}",
+                other.map(|r| r.map(|r| forks(&r.records)))
+            ),
+        }
+    }
+
     /// Engine review 7 #1: framing kept flights again keeps a flight tagged unsynced unsynced,
     /// whatever class the rewrite syncs in (its slots were never synced); a flight tagged synced
     /// stays synced only when the rewrite syncs too.
