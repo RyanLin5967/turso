@@ -1,62 +1,106 @@
 #!/usr/bin/env bash
-# run.sh V3FLOOR_BIN DIR OUT N [extra v3floor args...] -- one V3 device-floor batch with Linux stamps
-# (port of frontier/fastest/tools/v3/run.sh). Writes OUT/stamp_start.json, the probe's OUT/raw.tsv +
-# OUT/summary.json, OUT/stamp_end.json, OUT/binary.txt (the binary's sha256 and what binds it), OUT/rc.
+# run.sh V3FLOOR_BIN DIR OUT N [--arms A] [--seed S] -- one V3 device-floor batch with Linux stamps and the device
+# flush record (port of frontier/fastest/tools/v3/run.sh). Writes OUT/stamp_start.json, the probe's OUT/raw.tsv and
+# OUT/summary.probe.json, OUT/summary.json (the probe's plus device_flushes, device_flushes_per_op,
+# layer_device_flushes_per_op and flush_gate), OUT/blkflush/ (blkflush.py's record and report.json),
+# OUT/stamp_end.json, OUT/gate.json, OUT/binary.txt (what binds it), OUT/rc.
 #
-# Binding (tools review 1 item 5: the per-arm flush identity is the fire-check's strace check, so a batch must
-# come from a binary that passed it). Exactly one of:
-#   V3_FIRECHECK_VERDICT=<verdict.json>  a fire-check verdict with all_pass true for THIS binary (sha256), this
-#                                        machine's arch (uname -m) and DIR's filesystem type; anything else refuses
+# Arguments (review 2 item 7): only --arms and --seed pass through, each at most once; anything else refuses
+# (--mutant-nosync, --trace-clock, --crash-op, --crash-aim, --dir, --out, --n ...). V3FLOOR_FIRECHECK in the
+# environment refuses (the probe's fire-check flags never pass through run.sh), and the probe runs without it.
+# Cell (review 2 item 4): V3_CELL=<ext4|xfs|btrfs|ext4loop|xfsloop|btrfsloop> is required; the batch's layout must
+# match it (batchgate.py post), and a bound batch's verdict must be for it.
+# Binding (review 2 item 8). Exactly one of:
+#   V3_FIRECHECK_VERDICT=<verdict.json>  check.py's whole verdict shape (batchgate.py verdict): every planned check
+#                                        passing, for THIS binary (sha256), arch, DIR's fstype and V3_CELL, no
+#                                        "planted" key, a leaf that is not brd; V3FLOOR_BRD in the env refuses.
+#                                        binary.txt records the verdict's sha256 and run id
 #   V3_SMOKE=1                           an explicitly unbound smoke batch, recorded as such, never credited
 # Neither, or both: refused (rc 2) before anything runs.
-# Exit: 2 refused or a stamp could not take a required record; else the probe's rc (0 ok, 1 op failed, 3 void).
-# The Linux stamps are record-only (stamp.py says why), so nothing here voids a batch except the probe's own control.
+# V3_REQUIRE_T3=1: also refuse before anything runs unless the registered T3 preconditions hold (every CPU on the
+# "performance" governor, clocksource tsc or arch_sys_counter: review 2 items 16-17; batchgate.py t3pre).
+# After the probe (batchgate.py post): refused (rc 2) if the summary carries mutant_nosync or trace_clock != 0, names
+# another binary (exe_sha256), another layout, or (bound) a brd or another leaf class; VOID (rc 3) if the leaf
+# reports write-back and its flush count is below n x gated arms, or a gated op issued it no flush request.
+# Exit: 2 refused or a record could not be taken; else the probe's rc (0 ok, 1 op failed, 3 void), or 3 from the gate.
 # Not a credited measurement unless the PREREG is registered with its T3 rules.
 set -uo pipefail
-[ $# -ge 4 ] || { echo "usage: run.sh V3FLOOR_BIN DIR OUT N [v3floor args...]" >&2; exit 2; }
+refuse() { echo "run.sh: REFUSED: $*" >&2; exit 2; }
+[ $# -ge 4 ] || refuse "usage: run.sh V3FLOOR_BIN DIR OUT N [--arms A] [--seed S] (V3_CELL=..., V3_SMOKE=1 or V3_FIRECHECK_VERDICT=...)"
 BIN=$1 DIR=$2 OUT=$3 N=$4
 shift 4
+args=()
+seen_arms=0 seen_seed=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --arms) { [ $seen_arms = 0 ] && [ $# -ge 2 ]; } || refuse "--arms takes one value, once"; args+=(--arms "$2"); seen_arms=1; shift 2 ;;
+    --seed) { [ $seen_seed = 0 ] && [ $# -ge 2 ]; } || refuse "--seed takes one value, once"; args+=(--seed "$2"); seen_seed=1; shift 2 ;;
+    *) refuse "argument '$1' is not allowed through run.sh (only --arms A and --seed S; the probe's fire-check flags never pass)" ;;
+  esac
+done
+case $N in ''|*[!0-9]*) refuse "N '$N' is not a whole number" ;; esac
 HERE="$(cd "$(dirname "$0")" && pwd)"
-STAMP="$HERE/stamp.py"
-sha=$(sha256sum "$BIN" | cut -d' ' -f1) || { echo "run.sh: REFUSED: cannot hash $BIN" >&2; exit 2; }
-fstype=$(findmnt -n -o FSTYPE -T "$DIR") || { echo "run.sh: REFUSED: cannot find the filesystem of $DIR" >&2; exit 2; }
+STAMP="$HERE/stamp.py" GATE="$HERE/batchgate.py" BLK="$HERE/blkflush.py"
+CELL=${V3_CELL:-}
+python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import v3cell; sys.exit(0 if sys.argv[2] in v3cell.CELLS else 1)' "$HERE" "$CELL" \
+  || refuse "V3_CELL='$CELL' is not a cell (ext4, xfs, btrfs on a block device; ext4loop, xfsloop, btrfsloop on a loop)"
+[ -z "${V3FLOOR_FIRECHECK:-}" ] || refuse "V3FLOOR_FIRECHECK is set: the probe's fire-check flags never pass through run.sh"
+sha=$(sha256sum "$BIN" | cut -d' ' -f1) && [ -n "$sha" ] || refuse "cannot hash $BIN"
+fstype=$(findmnt -n -o FSTYPE -T "$DIR") || refuse "cannot find the filesystem of $DIR"
 arch=$(uname -m)
+vsha="" vrun="" vleaf=""
 if [ -n "${V3_FIRECHECK_VERDICT:-}" ] && [ -n "${V3_SMOKE:-}" ]; then
-  echo "run.sh: REFUSED: set V3_FIRECHECK_VERDICT or V3_SMOKE=1, not both" >&2; exit 2
+  refuse "set V3_FIRECHECK_VERDICT or V3_SMOKE=1, not both"
 elif [ -n "${V3_FIRECHECK_VERDICT:-}" ]; then
-  why=$(python3 -B -c '
-import json, sys
-p, sha, fs, arch = sys.argv[1:5]
-try:
-    v = json.load(open(p))
-except Exception as e:
-    print("unreadable verdict: %r" % e); sys.exit(1)
-bad = [k for k, ok in (("all_pass", v.get("all_pass") is True), ("v3floor_sha256", v.get("v3floor_sha256") == sha),
-                       ("fstype", v.get("fstype") == fs), ("arch", v.get("arch") == arch)) if not ok]
-print(",".join(bad)); sys.exit(1 if bad else 0)' "$V3_FIRECHECK_VERDICT" "$sha" "$fstype" "$arch")
+  [ -z "${V3FLOOR_BRD:-}" ] || refuse "V3FLOOR_BRD is set: brd is fire-check only, never a bound batch"
+  vj=$(python3 -B "$GATE" verdict "$V3_FIRECHECK_VERDICT" "$CELL" "$sha" "$arch" "$fstype")
   vrc=$?
-  [ "$vrc" -eq 0 ] || { echo "run.sh: REFUSED: $V3_FIRECHECK_VERDICT does not bind this batch (mismatch: $why; binary $sha, fs $fstype, arch $arch)" >&2; exit 2; }
+  [ "$vrc" -eq 0 ] || refuse "$V3_FIRECHECK_VERDICT does not bind this batch (binary $sha, fs $fstype, arch $arch, cell $CELL): $vj"
+  read -r vsha vrun vleaf < <(python3 -B -c 'import json, sys; v = json.loads(sys.argv[1]); print(v["verdict_sha256"], v["run_id"], v["leaf_class"])' "$vj")
+  mode=bound
   bound="fire-checked: $V3_FIRECHECK_VERDICT"
 elif [ "${V3_SMOKE:-}" = 1 ]; then
+  mode=smoke
   bound="smoke: V3_SMOKE=1, not bound to a fire-check, never credited"
 else
-  echo "run.sh: REFUSED: set V3_FIRECHECK_VERDICT=<a passing fire-check verdict.json for this binary> or V3_SMOKE=1" >&2
-  exit 2
+  refuse "set V3_FIRECHECK_VERDICT=<a passing fire-check verdict.json for this binary and cell> or V3_SMOKE=1"
 fi
-TMP="$OUT.stamp_start.json"
-python3 -B "$STAMP" start "$TMP" --dir "$DIR" || { echo "run.sh: start stamp failed" >&2; rm -f "$TMP"; exit 2; }
-"$BIN" --dir "$DIR" --out "$OUT" --n "$N" "$@"
+if [ "${V3_REQUIRE_T3:-}" = 1 ]; then
+  tj=$(python3 -B "$GATE" t3pre) || refuse "V3_REQUIRE_T3=1 and the registered T3 preconditions do not hold: $tj"
+fi
+TMP="$OUT.stamp_start.json" BLKD="$OUT.blkflush"
+{ [ ! -e "$OUT" ] && [ ! -e "$TMP" ] && [ ! -e "$BLKD" ]; } || refuse "$OUT, $TMP or $BLKD exists"
+python3 -B "$STAMP" start "$TMP" --dir "$DIR" > /dev/null || { rm -f "$TMP"; refuse "the start stamp failed"; }
+python3 -B "$BLK" start "$BLKD" > /dev/null || { rm -f "$TMP"; rm -rf "$BLKD"; refuse "blkflush.py could not start (tracefs via sudo -n)"; }
+env -u V3FLOOR_FIRECHECK "$BIN" --dir "$DIR" --out "$OUT" --n "$N" "${args[@]}"
 prc=$?
+python3 -B "$BLK" stop "$BLKD" > /dev/null
+brc=$?
+src=2 rrc=2 grc=2
 if [ -d "$OUT" ]; then
   mv "$TMP" "$OUT/stamp_start.json"
+  mv "$BLKD" "$OUT/blkflush"
   python3 -B "$STAMP" end "$OUT/stamp_start.json" "$OUT/stamp_end.json"
   src=$?
-  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\nbound=%s\n' "$sha" "$fstype" "$arch" "$bound" > "$OUT/binary.txt"
+  if [ -f "$OUT/raw.tsv" ]; then
+    python3 -B "$BLK" report "$OUT/blkflush" --windows "$OUT/raw.tsv" > "$OUT/blkflush/report.json"
+    rrc=$?
+  fi
+  printf 'v3floor_sha256=%s\nfstype=%s\narch=%s\ncell=%s\nbound=%s\nverdict_sha256=%s\nverdict_run_id=%s\nverdict_leaf_class=%s\n' \
+    "$sha" "$fstype" "$arch" "$CELL" "$bound" "$vsha" "$vrun" "$vleaf" > "$OUT/binary.txt"
+  if [ -f "$OUT/summary.json" ]; then
+    python3 -B "$GATE" post "$OUT" "$CELL" "$sha" "$mode" ${vleaf:+"$vleaf"}
+    grc=$?
+  fi
 else
   rm -f "$TMP"
-  src=2
+  rm -rf "$BLKD"
 fi
 rc=$prc
-[ "$rc" -eq 0 ] && rc=$src
-[ -d "$OUT" ] && echo "probe_rc=$prc stamp_rc=$src rc=$rc" > "$OUT/rc"
+if [ "$prc" -eq 0 ] || [ "$prc" -eq 3 ]; then
+  [ "$grc" -eq 2 ] && rc=2
+  [ "$prc" -eq 0 ] && [ "$grc" -eq 3 ] && rc=3
+  if [ "$rc" -ne 2 ] && { [ "$src" -ne 0 ] || [ "$brc" -ne 0 ] || [ "$rrc" -ne 0 ]; }; then rc=2; fi
+fi
+[ -d "$OUT" ] && echo "probe_rc=$prc stamp_rc=$src blkflush_stop_rc=$brc blkflush_report_rc=$rrc gate_rc=$grc rc=$rc" > "$OUT/rc"
 exit "$rc"
