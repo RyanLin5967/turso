@@ -3916,7 +3916,10 @@ impl PostgreSQLTranslator {
         group_clause: &[pg_query::protobuf::Node],
         having_clause: &Option<Box<pg_query::protobuf::Node>>,
     ) -> Result<Option<GroupBy>, ParseError> {
-        if group_clause.is_empty() {
+        // HAVING without GROUP BY filters the one aggregate row; it was dropped with the empty
+        // GROUP BY, so the row came back whatever the condition. The engine takes it as a GROUP BY
+        // with no expressions, as its own parser reads `HAVING` alone.
+        if group_clause.is_empty() && having_clause.is_none() {
             return Ok(None);
         }
 
