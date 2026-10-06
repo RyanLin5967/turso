@@ -2976,3 +2976,49 @@ fn primary_key_columns_are_reported_not_null() {
     }
     assert_eq!(notnull("pk2", "v"), no);
 }
+
+/// information_schema's catalog columns name the database current_database() and pg_database
+/// name (the file's stem), so `WHERE table_catalog = current_database()` keeps every row; they
+/// said "turso" whatever the file (wire review 2 item 10).
+#[test]
+fn information_schema_catalog_is_the_current_database() {
+    let dir = Scratch::new("infocatalog");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
+    a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id))")
+        .ok("c");
+    assert_eq!(
+        a.q("SELECT current_database()").single("current_database"),
+        "w",
+        "premise: the database is named after its file"
+    );
+    for (view, catalogs) in [
+        ("tables", &["table_catalog"][..]),
+        ("columns", &["table_catalog", "udt_catalog"][..]),
+        (
+            "table_constraints",
+            &["constraint_catalog", "table_catalog"][..],
+        ),
+        (
+            "key_column_usage",
+            &["constraint_catalog", "table_catalog"][..],
+        ),
+    ] {
+        let all = a
+            .q(&format!(
+                "SELECT count(*) FROM information_schema.{view} WHERE table_name IN ('p', 'c')"
+            ))
+            .single("all rows");
+        assert_ne!(all, "0", "premise: {view} has rows");
+        for column in catalogs {
+            let kept = a
+                .q(&format!(
+                    "SELECT count(*) FROM information_schema.{view} \
+                     WHERE table_name IN ('p', 'c') AND {column} = current_database()"
+                ))
+                .single("kept rows");
+            assert_eq!(kept, all, "{view}.{column}");
+        }
+    }
+}
