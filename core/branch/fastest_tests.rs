@@ -3778,16 +3778,20 @@ fn a_word_not_bound_to_the_last_flights_end_confirms_nothing() {
 // ---- review 6 #2: a failed trunk WAL sync, or a replacement's, fail-stops the store ----
 
 /// An IO whose WAL file's next sync fails, once (review 6 #2): `armed` 1 fails it at once, as
-/// UnixIO's F_FULLFSYNC does on Apple, 2 fails its completion; it reads 0 once spent. Every other
-/// file, and every other call, is the platform's.
+/// UnixIO's F_FULLFSYNC does on Apple, 2 fails its completion before returning it, 3 returns it
+/// unfinished and fails it at the IO's next step, after the statement yielded on it (engine review
+/// 9 #10); it reads 0 once spent. Every other file, and every other call, is the platform's.
 struct FailWalSyncIo {
     inner: Arc<dyn IO>,
     armed: Arc<std::sync::atomic::AtomicU8>,
+    /// Mode 3's sync, failed at the next `step`.
+    held: Arc<std::sync::Mutex<Option<crate::Completion>>>,
 }
 
 struct FailWalSyncFile {
     inner: Arc<dyn crate::io::File>,
     armed: Option<Arc<std::sync::atomic::AtomicU8>>,
+    held: Arc<std::sync::Mutex<Option<crate::Completion>>>,
 }
 
 impl crate::io::Clock for FailWalSyncIo {
@@ -3804,12 +3808,16 @@ impl IO for FailWalSyncIo {
         Ok(Arc::new(FailWalSyncFile {
             inner: self.inner.open_file(path, flags, direct)?,
             armed: path.ends_with("-wal").then(|| self.armed.clone()),
+            held: self.held.clone(),
         }))
     }
     fn remove_file(&self, path: &str) -> crate::Result<()> {
         self.inner.remove_file(path)
     }
     fn step(&self) -> crate::Result<()> {
+        if let Some(c) = self.held.lock().unwrap().take() {
+            c.error(crate::CompletionError::IOError(std::io::ErrorKind::Other, "sync"));
+        }
         self.inner.step()
     }
     fn file_id(&self, path: &str) -> crate::Result<crate::io::FileId> {
@@ -3841,6 +3849,10 @@ impl crate::io::File for FailWalSyncFile {
                 c.error(failed());
                 Ok(c)
             }
+            3 => {
+                *self.held.lock().unwrap() = Some(c.clone());
+                Ok(c)
+            }
             _ => self.inner.sync(c, sync_type),
         }
     }
@@ -3861,6 +3873,7 @@ fn open_failing_wal(path: &Path, opts: DatabaseOpts) -> (Arc<Database>, Arc<std:
     let io: Arc<dyn IO> = Arc::new(FailWalSyncIo {
         inner: Arc::new(PlatformIO::new().unwrap()),
         armed: armed.clone(),
+        held: Arc::new(std::sync::Mutex::new(None)),
     });
     let db = Database::open_file_with_flags(io, path.to_str().unwrap(), OpenFlags::Create, opts, None, Arc::new(SqliteDialect))
         .unwrap();
@@ -3909,6 +3922,64 @@ fn a_failed_trunk_wal_sync_under_an_ordered_barrier_fail_stops_the_store() {
                 db.connect().unwrap().execute("UPDATE t SET v = 'later' WHERE id = 9"),
                 &format!("{what}: the next trunk commit with a live child"),
             );
+            drop(b);
+        }
+    }
+}
+
+/// Engine review 9 #10: each site that acts on a failed trunk WAL sync is reached on its own, so
+/// none can be lost behind another (the arms above all reach the commit's own two):
+/// * mode 2, data_sync_retry off: the completion fails before the commit waits on it, and the
+///   commit's inline check fail-stops the store before its panic;
+/// * mode 3: the sync fails after the commit yielded on it, so the statement aborts without coming
+///   back to the commit, and the commit gate's close acts on the noted sync;
+/// * the WAL header's sync, reached by emptying the WAL first: at its issue (mode 1), and noted
+///   (mode 2: the commit yields on the failed completion, as in mode 3).
+///
+/// Mutants (test builds only): `wal_fail_stop_not_inline` (the mode 2 commit arm) and
+/// `wal_fail_stop_not_at_close` (mode 3 and the header's mode 2).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn every_trunk_wal_sync_failure_site_fail_stops_on_its_own() {
+    let _s = serial();
+    for catalog in [false, true] {
+        for (header, mode, retry) in [
+            (false, 2u8, false),
+            (false, 3, false),
+            (false, 3, true),
+            (true, 1, true),
+            (true, 2, true),
+        ] {
+            let what = format!("catalog={catalog} header={header} mode={mode} retry={retry}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let (db, armed) = open_failing_wal(&dir.path().join("walsite.db"), opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            if retry {
+                trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+            }
+            if header {
+                // The WAL is reset, so the next commit writes and syncs its header first.
+                trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            armed.store(mode, std::sync::atomic::Ordering::Release);
+            let before = sync_counts();
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                trunk.execute("UPDATE t SET v = 'new' WHERE id = 7")
+            }));
+            let after = sync_counts();
+            assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0, "{what}: premise: the WAL's sync was reached");
+            match failed {
+                Ok(r) => assert!(r.is_err(), "{what}: premise: the failed WAL sync failed the commit"),
+                Err(_) => assert!(
+                    mode == 2 && !retry && !header,
+                    "{what}: premise: only the commit's inline check panics (data_sync_retry off)"
+                ),
+            }
+            assert!(after.barrier > before.barrier, "{what}: premise: the commit's pre-image was ordered, not flushed");
+            assert_fail_stopped(db.connect().unwrap().fork_branch().map(|x| x.into_id()), &format!("{what}: the next fork"));
             drop(b);
         }
     }
