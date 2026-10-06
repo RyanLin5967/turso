@@ -1455,20 +1455,31 @@ struct NameIndex {
     releases: u64,
 }
 
-/// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store ever
-/// held, so a create of a NEW name — every successful server create — is answered "free" without a
-/// catalog query under the store mutex. Insert-only: a released name stays in it, and costs one
-/// query if it is ever looked up again; a hash collision costs the same. Built off the mutex after
-/// open from the catalog's names (`BranchStore::start_name_filter`) plus every name applied while
-/// the build ran (`pending`); until then, lookups query the catalog as before. Empty and built at
+/// A catalog store's name filter (lead review 1 item 2): a keyed hash of every name the store held
+/// since the filter was last built, so a create of a NEW name — every successful server create — is
+/// answered "free" without a catalog query under the store mutex. Insert-only between builds: a
+/// released name stays in it, and costs one query if it is ever looked up again; a hash collision
+/// costs the same. So it never says "absent" of a held name.
+///
+/// Built off the mutex from the catalog's names, read on a connection of the builder's own
+/// (`BranchStore::start_name_filter`), plus the names held but not yet checkpointed when the build
+/// starts (the seed) and every name noted while it runs (`pending`); until the first build lands,
+/// lookups query the catalog as before. Rebuilt the same way once more names were noted since the
+/// last build than it then held (and at least `NAME_REBUILD_MIN`), so it stays near twice the
+/// names held (review 3 #7); the old set answers until the new one is installed. Empty and built at
 /// once for a store with no catalog yet.
 #[derive(Default)]
 struct NameFilter {
     hasher: std::collections::hash_map::RandomState,
-    built: Option<HashSet<u64, BuildIdHasher>>,
+    built: Option<NameShards>,
     pending: Option<HashSet<u64, BuildIdHasher>>,
-    /// Observation (review 3 #7): the most entries one insert moved (a resize), builds installed,
-    /// and catalog scans that failed.
+    /// Entries `built` held when installed, and names noted into it since: the rebuild trigger.
+    base: u64,
+    noted: u64,
+    /// A rebuild is due (set here, under the store mutex; read by `BranchStore` without it).
+    wanted: Arc<std::sync::atomic::AtomicBool>,
+    /// Observation (review 3 #7): the most entries one insert moved (a shard's resize), builds
+    /// installed, and catalog scans that failed.
     moved_max: u64,
     builds: u64,
     failed_scans: u64,
@@ -1487,23 +1498,98 @@ impl NameFilter {
         }
         let h = self.hash(name);
         if let Some(built) = self.built.as_mut() {
-            if built.len() == built.capacity() {
-                self.moved_max = self.moved_max.max(built.len() as u64);
+            // fastest-engine mutant `no_note_built` (test builds only).
+            if !fe_mutant("no_note_built") {
+                let moved = built.insert(h);
+                self.moved_max = self.moved_max.max(moved);
             }
-            built.insert(h);
+            self.noted += 1;
+            if self.pending.is_none() && self.noted > self.base.max(NAME_REBUILD_MIN) {
+                self.wanted.store(true, std::sync::atomic::Ordering::Release);
+            }
         }
         if let Some(pending) = self.pending.as_mut() {
-            pending.insert(h);
+            // fastest-engine mutant `no_note_pending` (test builds only).
+            if !fe_mutant("no_note_pending") {
+                pending.insert(h);
+            }
         }
     }
 
-    /// No branch ever held `name` (`false` while the filter is not built: ask the catalog).
+    /// No branch held `name` since the filter was built, nor at its build (`false` while it is not
+    /// built: ask the catalog).
     fn says_absent(&self, name: &str) -> bool {
         // fastest-engine mutant `filter_says_absent` (test builds only).
         if fe_mutant("filter_says_absent") {
             return self.built.is_some();
         }
-        self.built.as_ref().is_some_and(|built| !built.contains(&self.hash(name)))
+        self.built.as_ref().is_some_and(|built| !built.contains(self.hash(name)))
+    }
+
+    /// Install a set built from the catalog's names, adding what was noted while it was read.
+    fn install(&mut self, mut built: NameShards) {
+        let pending = self.pending.take().unwrap_or_default();
+        // fastest-engine mutant `no_pending_merge` (test builds only).
+        if !fe_mutant("no_pending_merge") {
+            for h in pending {
+                let moved = built.insert(h);
+                self.moved_max = self.moved_max.max(moved);
+            }
+        }
+        self.base = built.len;
+        self.noted = 0;
+        self.builds += 1;
+        self.built = Some(built);
+    }
+}
+
+/// The name filter's shards: one insert's resize moves one shard's entries, about 1/`NAME_SHARDS`
+/// of them, never the whole set (review 3 #7).
+const NAME_SHARDS: usize = 256;
+/// A rebuild is due once more names were noted since the last build than it held, and at least
+/// this many.
+const NAME_REBUILD_MIN: u64 = 4096;
+/// A failed catalog scan is tried again, with a growing pause, this many times in all.
+const NAME_SCAN_ATTEMPTS: u64 = 6;
+
+/// The name filter's set of keyed hashes, sharded by bits 32..40 of the hash: bits the shard's own
+/// table does not use (hashbrown indexes buckets by the low bits and tags them by the top seven).
+struct NameShards {
+    shards: Box<[HashSet<u64, BuildIdHasher>]>,
+    len: u64,
+}
+
+impl NameShards {
+    /// A set of `hashes`, each shard sized for its share with room for a quarter more.
+    fn from_hashes(hashes: Vec<u64>) -> Self {
+        let per = hashes.len() / NAME_SHARDS + hashes.len() / (4 * NAME_SHARDS) + 8;
+        let shards = (0..NAME_SHARDS)
+            .map(|_| HashSet::with_capacity_and_hasher(per, BuildIdHasher::default()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut set = Self { shards, len: 0 };
+        for h in hashes {
+            set.insert(h);
+        }
+        set
+    }
+
+    fn shard(h: u64) -> usize {
+        ((h >> 32) as usize) % NAME_SHARDS
+    }
+
+    /// Insert `h`; returns how many entries a resize of its shard moved (0: none).
+    fn insert(&mut self, h: u64) -> u64 {
+        let shard = &mut self.shards[Self::shard(h)];
+        let moved = if shard.len() == shard.capacity() { shard.len() as u64 } else { 0 };
+        if shard.insert(h) {
+            self.len += 1;
+        }
+        moved
+    }
+
+    fn contains(&self, h: u64) -> bool {
+        self.shards[Self::shard(h)].contains(&h)
     }
 }
 
@@ -5318,7 +5404,7 @@ impl BranchStore {
         let f = &inner.names.filter;
         (
             f.built.is_some(),
-            f.built.as_ref().map_or(0, |b| b.len() as u64),
+            f.built.as_ref().map_or(0, |b| b.len),
             f.moved_max,
             f.builds,
             f.failed_scans,
@@ -5331,36 +5417,35 @@ impl BranchStore {
         }
     }
 
-    /// Build a catalog store's name filter (`NameFilter`) after open, off the store mutex: the
-    /// names in the catalog, read on a connection of its own, plus every name applied while the
-    /// read ran — those held now (the resident and since-checkpoint names, seeded here under the
-    /// mutex) and those created from now on (`NameFilter::note`). A failed read leaves the filter
-    /// unbuilt: lookups keep asking the catalog.
+    /// Build a catalog store's name filter (`NameFilter`), after open and again whenever a rebuild
+    /// is due, off the store mutex: the names in the catalog, read in pages on a connection the
+    /// builder opens itself, plus every name held but not yet checkpointed now (the seed, the only
+    /// work done here under the mutex: O(names since the last checkpoint)) and every name noted
+    /// while the read runs (`NameFilter::note`). A failed read is tried again with a growing pause;
+    /// once every attempt failed the filter stays as it was (unbuilt: lookups keep asking the
+    /// catalog), counted and logged (review 3 #7).
     fn start_name_filter(&self) {
-        let reader = {
+        let (db, hasher) = {
             let mut inner = self.inner.lock();
-            let StoreInner { cat, names, sync, .. } = &mut *inner;
+            let StoreInner { cat, names, .. } = &mut *inner;
             let Some(cat) = cat.as_ref() else {
                 return;
             };
-            if names.filter.built.is_some() {
+            let filter = &mut names.filter;
+            let wanted = filter.wanted.swap(false, std::sync::atomic::Ordering::AcqRel);
+            if filter.pending.is_some() || (filter.built.is_some() && !wanted) {
                 return;
             }
-            let reader = match cat.catalog.writer(*sync) {
-                Ok(reader) => reader,
-                Err(e) => {
-                    tracing::warn!("branch name filter not built: {e}");
-                    return;
-                }
-            };
             let mut pending: HashSet<u64, BuildIdHasher> = HashSet::default();
-            for name in names.map.keys().chain(names.fresh.keys()) {
-                pending.insert(names.filter.hash(name));
+            // fastest-engine mutant `no_seed` (test builds only).
+            if !fe_mutant("no_seed") {
+                for name in names.fresh.keys() {
+                    pending.insert(filter.hash(name));
+                }
             }
-            names.filter.pending = Some(pending);
-            reader
+            filter.pending = Some(pending);
+            (cat.catalog.database(), filter.hasher.clone())
         };
-        let hasher = self.inner.lock().names.filter.hasher.clone();
         #[cfg(test)]
         let fail_scan = NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
         #[cfg(not(test))]
@@ -5371,27 +5456,44 @@ impl BranchStore {
             .name("branch-name-filter".to_string())
             .spawn(move || {
                 use std::hash::BuildHasher;
+                use std::sync::atomic::Ordering as O;
                 pause_name_scan();
-                let mut reader = reader;
-                let scanned = if fail_scan {
-                    Err(LimboError::InternalError("failpoint: the name scan failed".to_string()))
-                } else {
-                    reader.name_hashes(|name| hasher.hash_one(name), &stop)
+                let mut failed = 0u64;
+                let mut pause = Duration::from_millis(20);
+                let scanned = loop {
+                    let read = if fail_scan && failed == 0 {
+                        Err(LimboError::InternalError("failpoint: the name scan failed".to_string()))
+                    } else {
+                        super::catalog::NameReader::open(&db)
+                            .and_then(|mut reader| reader.hashes(|name| hasher.hash_one(name), &stop))
+                    };
+                    match read {
+                        Ok(hashes) => break Some(hashes),
+                        Err(LimboError::Interrupt) => break None,
+                        Err(e) => {
+                            failed += 1;
+                            if failed >= NAME_SCAN_ATTEMPTS || stop.load(O::Acquire) {
+                                tracing::warn!("branch name filter not built: {failed} catalog scans failed, the last: {e}");
+                                break None;
+                            }
+                            tracing::warn!("branch name filter: catalog scan {failed} failed, trying again: {e}");
+                            let until = Instant::now() + pause;
+                            while Instant::now() < until && !stop.load(O::Acquire) {
+                                crate::thread::sleep(Duration::from_millis(5));
+                            }
+                            pause = (pause * 4).min(Duration::from_secs(5));
+                        }
+                    }
                 };
+                // The set is built here, holding nothing; the mutex is taken only to add what was
+                // noted meanwhile and install it.
+                let built = scanned.map(NameShards::from_hashes);
                 let mut inner = shared.lock();
                 let filter = &mut inner.names.filter;
-                let pending = filter.pending.take().unwrap_or_default();
-                match scanned {
-                    Ok(hashes) => {
-                        let mut built: HashSet<u64, BuildIdHasher> = hashes.into_iter().collect();
-                        built.extend(pending);
-                        filter.built = Some(built);
-                        filter.builds += 1;
-                    }
-                    Err(e) => {
-                        filter.failed_scans += 1;
-                        tracing::debug!("branch name filter not built: {e}")
-                    }
+                filter.failed_scans += failed;
+                match built {
+                    Some(built) => filter.install(built),
+                    None => filter.pending = None,
                 }
             });
         match spawned {
@@ -5400,6 +5502,13 @@ impl BranchStore {
                 tracing::warn!("branch name filter thread not started: {e}");
                 self.inner.lock().names.filter.pending = None;
             }
+        }
+    }
+
+    /// After a named create, holding no lock: start the name filter's rebuild if one is due.
+    fn rebuild_name_filter_if_due(&self) {
+        if self.name_filter_wanted.load(std::sync::atomic::Ordering::Acquire) {
+            self.start_name_filter();
         }
     }
 
