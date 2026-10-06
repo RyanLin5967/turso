@@ -1116,8 +1116,8 @@ static const char *leaf_checks(const layer *l) {
         const char *why = scsi_wce(l, &wce, hex, sizeof hex);
         if (why) return why;
         snprintf(li->report, sizeof li->report, "%s", wce ? "write back" : "write through");
-        snprintf(li->report_source, sizeof li->report_source, "SCSI MODE SENSE(10) caching page WCE=%d via SG_IO on /dev/%s "
-                 "(reply %s; sd's cache_type, the kernel's copy, reads '%s')", wce, l->diskname, hex, ct);
+        snprintf(li->report_source, sizeof li->report_source, "SCSI MODE SENSE(10) caching page WCE=%d via SG_IO on /dev/%.63s "
+                 "(reply %.191s; sd's cache_type, the kernel's copy, reads '%.63s')", wce, l->diskname, hex, ct);
         pathf(p, sizeof p, "%s/device/model", l->disk);
         if (read_line(p, li->model, sizeof li->model) != 0) li->model[0] = 0;
         rtrim(li->model);
@@ -1140,7 +1140,8 @@ static const char *leaf_checks(const layer *l) {
             first = vwc;
         }
         snprintf(li->report, sizeof li->report, "%s", first ? "write back" : "write through");
-        snprintf(li->report_source, sizeof li->report_source, "NVMe Identify Controller VWC bit 0 via /dev/%s%s",
+        /* %.31s: ctrls[0] is char[32]; gcc's truncation analysis otherwise sizes it by the rest of the struct */
+        snprintf(li->report_source, sizeof li->report_source, "NVMe Identify Controller VWC bit 0 via /dev/%.31s%s",
                  li->ctrls[0], li->nctrl > 1 ? " (and every other controller of the subsystem)" : "");
     }
     if (strcmp(l->wc, li->report))
