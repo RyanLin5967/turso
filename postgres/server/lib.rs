@@ -328,6 +328,9 @@ impl TursoPgServer {
             "PostgreSQL server listening on {} (database: {}, at most {} sessions)",
             self.address, self.shared.db_file, self.shared.max_connections
         );
+        // The budget harness refuses a --plant split-reply run whose server does not say this.
+        #[cfg(feature = "budget-plant-split-reply")]
+        println!("PLANT split-reply: every simple-query reply goes out in two writes");
 
         loop {
             tokio::select! {
@@ -1930,6 +1933,11 @@ impl SimpleQueryHandler for Session {
         client.set_state(PgWireConnectionState::ReadyForQuery);
         let status = self.transaction_status();
         client.set_transaction_status(status);
+        // The wire budget's fire-check plant (feature budget-plant-split-reply, never in a default
+        // build): the results in one write and ReadyForQuery in a second, the double reply write
+        // its one-write-per-statement check must catch (gap review item 2, wire review 5 item 3).
+        #[cfg(feature = "budget-plant-split-reply")]
+        client.flush().await?;
         client
             .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                 status,

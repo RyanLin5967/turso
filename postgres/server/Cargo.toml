@@ -10,6 +10,11 @@ description = "PostgreSQL wire-protocol server support for Turso"
 [lib]
 path = "lib.rs"
 
+[features]
+# The wire budget's fire-check plant (lanes/wire/budget/budget.py --plant split-reply): never in a credited
+# build.
+budget-plant-split-reply = []
+
 [dependencies]
 anyhow.workspace = true
 async-trait = "0.1"
