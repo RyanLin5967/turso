@@ -3170,3 +3170,109 @@ fn a_reopened_arena_counts_as_unsynced_unless_its_flights_synced_it() {
         }
     }
 }
+
+// ---- review 3 #17: listings and lookups report nothing that is not yet durable ----
+
+/// Waits until `waiter` is blocked in `wait_durable` (the group counted its wait, not as already
+/// durable) or has finished; true when it is blocked.
+fn blocked_in_wait_durable(db: &Arc<Database>, before: [u64; 5], waiter: &std::thread::JoinHandle<impl Sized>) -> bool {
+    let t = std::time::Instant::now();
+    loop {
+        let now = db.branches.group_counters();
+        if now[2] > before[2] && now[3] == before[3] {
+            return !waiter.is_finished();
+        }
+        if waiter.is_finished() {
+            return false;
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "the waiter neither waited nor finished");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Review 3 #17 (C-F4's wait, untested until now): a listing does not return a fork before the
+/// fork's records are durable. With the fork's flight held after it was taken, a listing on
+/// another thread waits; once the flight lands it lists the fork. Mutant `list_no_durable_wait`.
+#[test]
+fn a_listing_waits_for_the_forks_it_lists() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("list-wait.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let listed: std::collections::HashSet<BranchId> = db.branch_ids().unwrap().into_iter().collect();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let creator = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect().unwrap().fork_branch().map(|b| b.into_id()))
+        };
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let before = db.branches.group_counters();
+        let lister = {
+            let db = db.clone();
+            std::thread::spawn(move || db.branch_ids())
+        };
+        let blocked = blocked_in_wait_durable(&db, before, &lister);
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        let id = creator.join().unwrap().unwrap();
+        let got: std::collections::HashSet<BranchId> = lister.join().unwrap().unwrap().into_iter().collect();
+        assert!(blocked, "catalog={catalog}: a listing returned while a fork it lists was not durable");
+        assert!(got.contains(&id) && got.is_superset(&listed), "catalog={catalog}: the listing after the flight");
+    }
+}
+
+/// Review 3 #17: a lookup by name does not report a dropped name free before the drop's Release
+/// is durable: after a crash the branch would come back under that name.
+#[test]
+fn a_lookup_by_name_waits_for_the_release_it_reports() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("name-wait.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("x").unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let dropper = {
+            let db = db.clone();
+            std::thread::spawn(move || db.drop_branch("x").map(|_| ()))
+        };
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let before = db.branches.group_counters();
+        let finder = {
+            let db = db.clone();
+            std::thread::spawn(move || db.branch_named("x"))
+        };
+        let blocked = blocked_in_wait_durable(&db, before, &finder);
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        dropper.join().unwrap().unwrap();
+        let found = finder.join().unwrap().unwrap();
+        assert!(blocked, "catalog={catalog}: a dropped name was reported free before its release was durable");
+        assert_eq!(found, None, "catalog={catalog}: after the release");
+    }
+}
+
+/// Review 3 #17: a fail-stopped store lists no fork whose flight failed (its creator was told it
+/// failed, and a reopen would not have it).
+#[test]
+fn a_fail_stopped_store_lists_no_fork_whose_flight_failed() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("list-failed.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let mut before = db.branch_ids().unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(trunk.fork_branch().is_err(), "catalog={catalog}: premise: the fork's flight failed");
+        let mut after = db.branch_ids().unwrap();
+        before.sort();
+        after.sort();
+        assert_eq!(after, before, "catalog={catalog}: a fork whose flight failed is listed");
+    }
+}
