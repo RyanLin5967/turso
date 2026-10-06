@@ -2082,6 +2082,44 @@ mod tests {
         );
     }
 
+    /// A switch to the branch the session is on is a no-op only while that branch is still the one
+    /// the name names: a branch released behind the session (by any path that does not pass this
+    /// server's in-use map) and re-created under its name is another branch, and the switch lands
+    /// on it. At 472023b72 the switch compared names and stayed on the released branch (wire
+    /// review 1 item 6).
+    #[test]
+    fn a_switch_to_a_recreated_name_lands_on_the_new_branch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY)");
+        ok(&s, "SELECT turso_branch_create('h')");
+        ok(&s, "SELECT turso_branch_switch('h')");
+        let on = |s: &Session| {
+            s.state()
+                .branch
+                .as_ref()
+                .and_then(|(_, c)| c.inner().branch_id())
+        };
+        let old = on(&s);
+        assert!(old.is_some(), "premise: the session is on branch h");
+        s.shared
+            .db
+            .drop_branch("h")
+            .expect("premise: the engine releases a branch a connection is open on");
+        let fresh = s.shared.db.connect().unwrap().create_branch("h").unwrap();
+        assert_ne!(
+            Some(fresh),
+            old,
+            "premise: the re-created h is another branch"
+        );
+        ok(&s, "SELECT turso_branch_switch('h')");
+        assert_eq!(
+            on(&s),
+            Some(fresh),
+            "the switch stayed on the released branch"
+        );
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {
