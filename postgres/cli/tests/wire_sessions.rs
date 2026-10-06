@@ -3313,3 +3313,26 @@ fn an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind() {
     let r = a.xt("SELECT 1", &[(0, 0, b"1")]);
     assert_eq!(r.err("an extra parameter").code, "08P01");
 }
+
+/// HAVING without GROUP BY filters the one aggregate row, as in PostgreSQL: `SELECT count(*) FROM t
+/// HAVING count(*) > 5` over 4 rows returns no row. The translator dropped a HAVING that had no
+/// GROUP BY, so the row came back whatever the condition (found by
+/// an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind's HAVING $1 case).
+#[test]
+fn having_without_group_by_filters_the_aggregate_row() {
+    let dir = Scratch::new("havingonly");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("INSERT INTO t VALUES (2, 'b'), (3, 'c'), (4, 'd')")
+        .ok("rows");
+    let r = a
+        .q("SELECT count(*) FROM t HAVING count(*) > 5")
+        .ok("having, false");
+    assert_eq!(r.rows.len(), 0, "a false HAVING kept the row: {:?}", r.rows);
+    let r = a
+        .q("SELECT count(*) FROM t HAVING count(*) > 3")
+        .ok("having, true");
+    assert_eq!(r.rows, vec![vec![Some("4".to_string())]]);
+    let r = a.x("SELECT count(*) FROM t HAVING count(*) > $1", &["5"]);
+    assert_eq!(r.ok("having $1, false").rows.len(), 0);
+}
