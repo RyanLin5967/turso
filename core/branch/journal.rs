@@ -1641,10 +1641,7 @@ impl Journal {
                 // Synced with the rest below: the kept last flight is confirmed, when that sync
                 // proves stable storage (review 6 #1) and no kept flight was written unsynced
                 // (engine review 7 #1).
-                if cut_confirms(class) && all_synced {
-                    let end = LOG_HEADER_LEN as u64 + suffix.len() as u64;
-                    write_at(&f, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
-                }
+                write_cut_word(&f, class, all_synced, last_crc, LOG_HEADER_LEN as u64 + suffix.len() as u64)?;
             }
             if class.syncs() {
                 sync_replacement(&f, class, self.take_replacement_sync_failure(), &self.poisoned)?;
@@ -1735,10 +1732,7 @@ impl Journal {
             write_at(&f, &log_header(src.format, src.page_size, generation, nonce, src.raised), 0)?;
             if !suffix.is_empty() {
                 write_at(&f, &suffix, LOG_HEADER_LEN as u64)?;
-                if cut_confirms(src.class) && all_synced {
-                    let end = LOG_HEADER_LEN as u64 + suffix.len() as u64;
-                    write_at(&f, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
-                }
+                write_cut_word(&f, src.class, all_synced, last_crc, LOG_HEADER_LEN as u64 + suffix.len() as u64)?;
             }
             if src.class.syncs() {
                 sync_replacement(&f, src.class, src.fail_sync, &src.poisoned)?;
@@ -1798,10 +1792,7 @@ impl Journal {
             let (frames, last_crc, delta_synced) = reframe_tagged(&delta, self.nonce, prep.nonce, class.syncs())?;
             if !frames.is_empty() {
                 write_at(&prep.file, &frames, len)?;
-                if cut_confirms(class) && prep.all_synced && delta_synced {
-                    let end = len + frames.len() as u64;
-                    write_at(&prep.file, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
-                }
+                write_cut_word(&prep.file, class, prep.all_synced && delta_synced, last_crc, len + frames.len() as u64)?;
                 if class.syncs() {
                     sync_replacement(&prep.file, class, self.take_replacement_sync_failure(), &self.poisoned)?;
                 }
@@ -2395,6 +2386,20 @@ pub(crate) fn proves_stable(class: SyncClass) -> bool {
 /// before.
 fn cut_confirms(class: SyncClass) -> bool {
     proves_stable(class) || super::store::fe_mutant("cut_confirms_unsynced")
+}
+
+/// Write a cut's confirmation of the flight it keeps last (checksum `last_crc`, ending at `end`)
+/// into `file`'s header, when it may: the cut's own sync proves stable storage (`cut_confirms`),
+/// and every flight it keeps was written synced (`all_synced`, engine review 7 #1). A raised D0
+/// log's rewrite class syncs, yet a D0 flight it keeps named slots no sync covered: by the class
+/// alone the cut confirmed it, and recovery then refused a lost slot of it as damage instead of
+/// dropping the flight (engine review 8 #4). The one copy of the rule, for the three cuts.
+/// Mutant `cut_confirms_by_class` (test builds only): the class alone.
+fn write_cut_word(file: &File, class: SyncClass, all_synced: bool, last_crc: u32, end: u64) -> Result<()> {
+    if cut_confirms(class) && (all_synced || super::store::fe_mutant("cut_confirms_by_class")) {
+        write_at(file, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
+    }
+    Ok(())
 }
 
 /// A landed flight's confirmation (review 6 #1): the word for the log's header and the log it goes

@@ -4093,6 +4093,64 @@ fn a_d0_cut_confirms_no_flight() {
     assert_eq!(word, 0, "a D0 cut confirmed a flight no sync proved");
 }
 
+/// Engine review 8 #4: once a D0 store's log is raised (here by a trunk commit under a fullfsync
+/// trunk), its rewrite class proves stable storage, so a cut confirmed whatever flight it kept
+/// last by the class alone: a plain D0 flight too, whose slot no sync covered (it landed after
+/// the checkpoint's arena sync). Recovery then took the flight as confirmed and refused its lost
+/// slot as damage. Now the cut confirms only a kept suffix whose flights were all written synced,
+/// so the D0 flight is checked at the open, its lost slot drops it, and the branch reads the row
+/// before it. Mutant `cut_confirms_by_class`.
+#[cfg(unix)]
+#[test]
+fn a_raised_d0_cut_confirms_no_d0_flight_it_keeps() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("raisedcut.db");
+    let (id, incarnation) = {
+        let db = open_at(&path, opts(true, SyncClass::Off).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _b = trunk.fork_branch().unwrap().into_id();
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        trunk.execute("UPDATE t SET v = 'trunk-new' WHERE id = 9").unwrap();
+        assert_eq!(db.branches.rewrite_class_for_test(), SyncClass::FullFsync, "premise: the trunk commit raised the log to F_FULLFSYNC");
+        let c = trunk.fork_branch().unwrap();
+        let cc = c.connect().unwrap();
+        write_v(&cc, 4, "kept");
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        eventually("the checkpoint never arrived", || {
+            db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+        });
+        // A D0 flight after the checkpoint's arena sync: the cut keeps it, as its last.
+        let before: std::collections::HashSet<u32> = c.owned_slots().into_iter().collect();
+        write_v(&cc, 4, "lost");
+        let fresh: Vec<u32> = c.owned_slots().into_iter().filter(|s| !before.contains(s)).collect();
+        assert_eq!(fresh.len(), 1, "premise: the D0 write took one fresh slot");
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        drop(cc);
+        let arena = arena_path(&db);
+        let id = c.into_id();
+        let incarnation = db.incarnation;
+        drop(trunk);
+        drop(db);
+        // Its slot never reached the device.
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new().write(true).open(&arena).unwrap();
+        f.write_all_at(&vec![0u8; 4096], fresh[0] as u64 * 4096).unwrap();
+        (id, incarnation)
+    };
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    let c = db.branch(id).unwrap();
+    let got = c.connect().and_then(|cc| cc.prepare("SELECT v FROM t WHERE id = 4").and_then(|mut s| s.run_collect_rows()));
+    match got {
+        Ok(rows) => assert_eq!(rows[0][0], crate::Value::from_text("kept"), "the dropped D0 flight's write was read"),
+        Err(e) => panic!("a raised D0 cut confirmed a D0 flight it kept, and its lost slot was refused: {e}"),
+    }
+}
+
 /// Review 6 #1: a header word that names the last flight's end frame but not where that flight
 /// ends (the word as it was written before) confirms nothing: the flight is checked, and its lost
 /// slot drops it, as for a flight never confirmed.
