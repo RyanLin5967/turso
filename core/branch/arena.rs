@@ -333,7 +333,10 @@ impl Arena {
     pub(crate) fn forget_listed(&mut self, slot: Slot) {
         turso_assert!(slot < self.high_water, "a listed slot past the high-water mark");
         turso_assert!(!self.is_free(slot), "a deferred slot was already free");
-        self.in_use -= 1;
+        // fastest-engine mutant `forget_listed_kept_in_use` (test builds only).
+        if !super::store::fe_mutant("forget_listed_kept_in_use") {
+            self.in_use -= 1;
+        }
     }
 
     /// Take `slots` off the in-memory free list if they are on it (a fuzzy checkpoint committed

@@ -3312,3 +3312,94 @@ fn a_panic_in_a_fuzzy_checkpoints_cut_does_not_stop_checkpoints() {
     db.branch_checkpoint_wait();
     assert!(db.branch_checkpoint_counters()[0] > installed, "the checkpoint after the panic did not install");
 }
+
+// ---- review 4 #11: the install's free accounting, every branch forced ----
+
+/// Review 4 #11: a fuzzy checkpoint captured while a release's flight is in the air lists that
+/// release's slots free in the catalog (deferred). Between the capture and the install, held at
+/// the commit: (a) the deferred free matures; (b) its slot is allocated again by a new branch's
+/// write; (c) another release, buffered after the capture, is still pending. The install must
+/// count every slot once: in use exactly when a live branch owns it, before and after the install
+/// and after a reopen, and no slot handed to two live branches. Mutants
+/// `forget_listed_kept_in_use`, `in_use_keeps_deferred`, `deferred_matured_at_capture`.
+#[test]
+fn the_installs_free_accounting_counts_every_slot_once() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("free-accounting.db");
+    let owned_all = |db: &Arc<Database>, live: &[BranchId]| -> std::collections::BTreeSet<u32> {
+        let mut out = std::collections::BTreeSet::new();
+        for &id in live {
+            let b = db.branch(id).unwrap();
+            for s in b.owned_slots() {
+                assert!(out.insert(s), "slot {s} owned by two live branches");
+            }
+            let _ = b.into_id();
+        }
+        out
+    };
+    let (live, incarnation) = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let anchor = trunk.fork_branch().unwrap();
+        write_v(&anchor.connect().unwrap(), 1, "anchor");
+        let anchor = anchor.into_id();
+        let x = trunk.fork_branch().unwrap();
+        write_v(&x.connect().unwrap(), 3, "x");
+        let y = trunk.fork_branch().unwrap();
+        write_v(&y.connect().unwrap(), 4, "y");
+        let y = y.into_id();
+        // x's release is in the air at the capture.
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, O::Release);
+        let release = std::thread::spawn(move || x.reap().map(|_| ()));
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        hold.store(0, O::Release);
+        release.join().unwrap().unwrap();
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "the checkpoint never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // (a) the deferred free matures; (b) a new branch's write takes a slot (the freed one, LIFO);
+        // (c) y's release is buffered after the capture.
+        let in_use_held = db.branch_slots_in_use();
+        let z = trunk.fork_branch().unwrap();
+        write_v(&z.connect().unwrap(), 5, "z");
+        let z = z.into_id();
+        db.branch(y).unwrap().reap().unwrap();
+        let live = vec![anchor, z];
+        let owned = owned_all(&db, &live);
+        let in_use: std::collections::BTreeSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        assert_eq!(in_use, owned, "before the install: in use is not what the live branches own ({in_use_held:?} at the hold)");
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        let in_use: std::collections::BTreeSet<u32> = db.branch_slots_in_use().into_iter().collect();
+        assert_eq!(in_use, owned_all(&db, &live), "after the install");
+        assert_eq!(
+            db.branch_stats().unwrap().arena_slots_in_use as usize,
+            in_use.len(),
+            "after the install: the in-use count disagrees with the slots in use"
+        );
+        (live, db.incarnation)
+    };
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    let owned = owned_all(&db, &live);
+    let in_use: std::collections::BTreeSet<u32> = db.branch_slots_in_use().into_iter().collect();
+    assert_eq!(in_use, owned, "after a reopen");
+    assert_eq!(db.branch_stats().unwrap().arena_slots_in_use as usize, in_use.len(), "after a reopen: the count");
+    // And new branches never share a slot with the live ones.
+    let trunk = db.connect().unwrap();
+    for i in 0..6 {
+        let b = trunk.fork_branch().unwrap();
+        write_v(&b.connect().unwrap(), 10 + i, "new");
+        for s in b.owned_slots() {
+            assert!(!owned.contains(&s), "slot {s} handed to a new branch while a live one owns it");
+        }
+        let _ = b.into_id();
+    }
+}

@@ -6925,10 +6925,10 @@ impl StoreInner {
             return Err(e);
         }
         let log_from = journal.mark();
-        let deferred: Vec<Slot> = self.pending_free.iter().flat_map(|(_, s)| s.iter().copied()).collect();
-        let deferred_lsn = journal.lsn();
         // fastest-engine mutant `deferred_matured_at_capture` (test builds only): the capture hands
         // the deferred frees to the allocator at once, before their releases are durable (rule 2).
+        // Before `deferred` is taken, so the mutant leaves none (review 4 #11: it died of a usize
+        // underflow in `in_use` below, not of the test's assertion).
         if fe_mutant("deferred_matured_at_capture") {
             for (_, slots) in std::mem::take(&mut self.pending_free) {
                 for slot in slots {
@@ -6936,6 +6936,8 @@ impl StoreInner {
                 }
             }
         }
+        let deferred: Vec<Slot> = self.pending_free.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+        let deferred_lsn = journal.lsn();
         let meta = Meta {
             generation,
             page_size: journal.page_size() as u32,
@@ -6944,7 +6946,10 @@ impl StoreInner {
             trunk_children: self.trunk.lineage.n_children,
             lease_now_ms: now,
             arena_hw: arena.high_water(),
-            in_use: (arena.in_use() - reserved.len() - deferred.len()) as u64,
+            // Mutant `in_use_keeps_deferred` (test builds only): the deferred frees counted in use.
+            in_use: (arena.in_use()
+                - reserved.len()
+                - if fe_mutant("in_use_keeps_deferred") { 0 } else { deferred.len() }) as u64,
             states: self.n_states,
             format: super::journal::format_version(self.splice),
         };
