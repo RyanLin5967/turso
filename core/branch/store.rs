@@ -5384,6 +5384,12 @@ impl BranchStore {
         )
     }
 
+    /// Test builds: whether the arena counts as holding writes no sync has covered (review 5 #10).
+    #[cfg(test)]
+    pub(crate) fn arena_dirty(&self) -> bool {
+        self.inner.lock().arena.as_ref().is_some_and(Arena::is_dirty)
+    }
+
     pub(crate) fn wait_name_filter(&self) {
         if let Some(build) = self.name_filter_build.lock().take() {
             let _ = build.join();

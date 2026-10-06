@@ -3021,3 +3021,34 @@ fn a_store_missing_its_log_or_arena_is_refused_at_open() {
         assert_eq!(read_v(&c, 4), "second", "{arm}");
     }
 }
+
+/// Review 5 #10: an arena whose last writes may never have reached the disk — a D0 store's, whose
+/// flights never sync it — counts as unsynced at the reopen, so the first flight, compaction or
+/// checkpoint that syncs syncs the arena too. Before, the mark started clear, and a raised flight
+/// naming no slot, a compaction or a checkpoint made the earlier D0 flight's records durable without
+/// its slots. A synced store's reopened arena stays clean (its flights synced it).
+#[test]
+fn a_reopened_arena_counts_as_unsynced_unless_its_flights_synced_it() {
+    let _s = serial();
+    for catalog in [false, true] {
+        for class in [SyncClass::Off, SyncClass::Fsync] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("arena-dirty.db");
+            let incarnation = {
+                let db = open_at(&path, opts(catalog, class));
+                let trunk = db.connect().unwrap();
+                seed(&trunk);
+                let b = trunk.fork_branch().unwrap();
+                write_v(&b.connect().unwrap(), 3, "x");
+                let _ = b.into_id();
+                db.incarnation
+            };
+            let db = reopen(&path, opts(catalog, class), incarnation);
+            assert_eq!(
+                db.branches.arena_dirty(),
+                class == SyncClass::Off,
+                "catalog={catalog} class={class:?}: the reopened arena's unsynced mark"
+            );
+        }
+    }
+}

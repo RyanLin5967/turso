@@ -3980,4 +3980,136 @@ mod format_tests {
             "the end frame names its flight's length"
         );
     }
+
+    // ---- review 5 #7, #8, #9, #11 ----
+
+    /// Review 5 #8: a whole header (its magic intact) that fails its checksum, with frames after
+    /// it, is damage, never a torn header: recovery refuses it (Corrupt, naming the files) and
+    /// changes nothing. Before, it was taken for a crash while the log was being created, and the
+    /// store started empty over every flight, with a snapshot and without one.
+    #[test]
+    fn a_damaged_header_over_flights_is_refused() {
+        for snapshot in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            {
+                let mut journal = Journal::create(&files, 512, SyncClass::Fsync).unwrap();
+                let mut arena = Arena::new(512);
+                if snapshot {
+                    journal.compact(&SnapshotState::default(), &mut arena, false).unwrap();
+                }
+                for child in 1..=2 {
+                    journal.buffer(&Record::Fork { child, parent: 0 }).unwrap();
+                    journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+                }
+            }
+            let mut bytes = std::fs::read(&files.log).unwrap();
+            bytes[20] ^= 0x01;
+            std::fs::write(&files.log, &bytes).unwrap();
+            let got = Journal::recover(&files, SyncClass::Fsync);
+            assert!(
+                matches!(got, Err(LimboError::Corrupt(_))),
+                "snapshot={snapshot}: a damaged header over flights was not refused: {:?}",
+                got.map(|r| r.map(|r| r.records))
+            );
+            assert!(std::fs::read(&files.log).unwrap() == bytes, "snapshot={snapshot}: the refusal changed the log");
+        }
+    }
+
+    /// Review 5 #7: under D0 a recovery that cuts a torn flight leaves its truncation unsynced;
+    /// should it be lost, the old bytes after the cut come back behind whatever is appended next.
+    /// The kept log is a NEW incarnation (a fresh nonce), so an appended flight of exactly the
+    /// length of the one cut cannot make the old flight after it valid again: a second recovery
+    /// never returns it. Before, the nonce was kept, and it was replayed.
+    #[test]
+    fn a_flight_cut_at_recovery_never_comes_back_under_d0() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut arena = Arena::new(512);
+        let mut starts = Vec::new();
+        {
+            let mut journal = Journal::create(&files, 512, SyncClass::Off).unwrap();
+            for child in 1..=3 {
+                starts.push(journal.len);
+                journal.buffer(&Record::Fork { child, parent: 0 }).unwrap();
+                journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+            }
+        }
+        // A hole inside the second flight: under D0 it is a torn flight, cut.
+        let mut bytes = std::fs::read(&files.log).unwrap();
+        for b in &mut bytes[starts[1] as usize + 2..starts[1] as usize + 6] {
+            *b = 0;
+        }
+        std::fs::write(&files.log, &bytes).unwrap();
+        let mut recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        assert_eq!(forks(&recovered.records), vec![1], "premise: the torn flight and what followed were cut");
+        // The truncation never reached the disk: the old tail is back. Then a flight of exactly the
+        // second flight's length lands where it was.
+        let tail = &bytes[starts[1] as usize..];
+        let kept = std::fs::read(&files.log).unwrap().len();
+        let f = OpenOptions::new().write(true).open(&files.log).unwrap();
+        write_at(&f, tail, kept as u64).unwrap();
+        recovered.journal.buffer(&Record::Fork { child: 4, parent: 0 }).unwrap();
+        recovered.journal.take_flight(&mut arena, SyncClass::Off, false).unwrap().write().unwrap();
+        drop(recovered);
+        let again = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        assert!(!forks(&again.records).contains(&3), "a flight cut at recovery came back: {:?}", forks(&again.records));
+        assert_eq!(forks(&again.records), vec![1, 4]);
+    }
+
+    /// Review 5 #9: a D0 store whose log holds a flight tagged synced (written by an earlier D1 or
+    /// D2 run, or raised by a trunk barrier) syncs the kept log once at recovery, so the tag is true
+    /// before D0 flights follow it (a later power cut could otherwise tear that flight under whole
+    /// D0 frames and read as an acknowledged flight lost: every branch refused). A D0 log of D0
+    /// flights alone syncs nothing.
+    #[test]
+    fn a_d0_recovery_syncs_a_log_holding_a_synced_flight() {
+        for synced in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            {
+                let class = if synced { SyncClass::Fsync } else { SyncClass::Off };
+                let mut journal = Journal::create(&files, 512, class).unwrap();
+                let mut arena = Arena::new(512);
+                journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+                journal.take_flight(&mut arena, class, false).unwrap().write().unwrap();
+            }
+            let before = super::super::sync_counts();
+            let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+            let after = super::super::sync_counts();
+            drop(recovered);
+            let synced_now = (after.fsync - before.fsync) + (after.full_fsync - before.full_fsync);
+            if synced {
+                assert!(synced_now >= 1, "a D0 recovery left a flight tagged synced unsynced");
+            } else {
+                assert_eq!(synced_now, 0, "a D0 recovery of D0 flights synced");
+            }
+        }
+    }
+
+    /// Review 5 #11 (= review 3 #12, review 4 #6, skill 2 #4): a class raise that lands in the old
+    /// log while a cut is being prepared (a flight raised to F_FULLFSYNC, on a D1 log) reaches the
+    /// new log's header, so the rewrite class is still raised after a reopen. Before, the header
+    /// copied at the cut's start was installed and the raise lost.
+    #[test]
+    fn a_raise_during_a_cut_reaches_the_new_header() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        {
+            let mut journal = Journal::create(&files, 512, SyncClass::Fsync).unwrap();
+            let mut arena = Arena::new(512);
+            journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+            journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+            let from = journal.len;
+            let src = journal.cut_source(from).unwrap().expect("a cut source");
+            let prep = Journal::prepare_cut(src, from, 1).unwrap();
+            journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+            journal.raise_pending_class(SyncClass::FullFsync);
+            journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+            assert_eq!(journal.rewrite_class(), SyncClass::FullFsync, "premise: the flight raised the class");
+            journal.finish_cut(prep, from, 1).unwrap();
+        }
+        let bytes = std::fs::read(&files.log).unwrap();
+        assert_eq!(header_raised(&bytes), SyncClass::FullFsync, "the raise was lost by the cut");
+    }
 }
