@@ -1852,6 +1852,42 @@ mod tests {
         }
     }
 
+    /// An ordinary statement is parsed by libpg_query exactly once on its way to the engine: the
+    /// server splits a query without a statement separator without asking libpg_query, and the
+    /// frontend reads the special forms (SET, SHOW, CHECKPOINT, COPY ...) from the same parse it
+    /// translates. Three calls before (split, the special-form check's parse, the translation's).
+    #[test]
+    fn an_ordinary_statement_is_parsed_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        ok(&s, "INSERT INTO t VALUES (1, 0)");
+        for sql in [
+            "SELECT 1",
+            "UPDATE t SET v = v + 1 WHERE id = 1",
+            "UPDATE t SET v = v + 1 WHERE id = 1;",
+            "SELECT v FROM t WHERE id = 1",
+            "INSERT INTO t VALUES (2, 0)",
+        ] {
+            let before = turso_pg_parser::libpg_query_calls();
+            ok(&s, sql);
+            assert_eq!(
+                turso_pg_parser::libpg_query_calls() - before,
+                1,
+                "libpg_query calls for {sql:?}"
+            );
+        }
+        // A query that holds a separator is still split by libpg_query, which alone knows where a
+        // literal, a comment or a dollar quote ends.
+        let before = turso_pg_parser::libpg_query_calls();
+        ok(&s, "SELECT 'a;b'; SELECT 2");
+        assert_eq!(
+            turso_pg_parser::libpg_query_calls() - before,
+            3,
+            "split + one parse each"
+        );
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {
