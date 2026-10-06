@@ -8317,4 +8317,30 @@ mod tests {
         let out = translated_sql(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         assert!(out.contains("u.k = (t.x + 100)"), "{sql}: {out}");
     }
+
+    /// A target reading an inlined LATERAL column is named after the column, as PostgreSQL names
+    /// `o.n` "n"; it was named by the pasted expression's text.
+    #[test]
+    fn an_inlined_lateral_column_keeps_its_name() {
+        let parsed =
+            crate::parse("SELECT o.n, o.n AS k FROM t CROSS JOIN LATERAL (SELECT t.x + 1) AS o(n)")
+                .unwrap();
+        let ast::Stmt::Select(select) = PostgreSQLTranslator::new().translate(&parsed).unwrap()
+        else {
+            panic!("Expected Select statement");
+        };
+        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+            panic!("Expected Select variant");
+        };
+        let names: Vec<Option<String>> = columns
+            .iter()
+            .map(|c| match c {
+                ast::ResultColumn::Expr(_, Some(ast::As::Elided(n) | ast::As::As(n))) => {
+                    Some(n.as_str().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec![Some("n".to_string()), Some("k".to_string())]);
+    }
 }
