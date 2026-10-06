@@ -347,12 +347,29 @@ fn writer_loop(db: Arc<Database>, shared: Arc<Shared>, seed: u64, quota: u64, ch
 
 /// Retry a fork that lost to a DDL commit in flight (`SchemaUpdated`) or to the WAL write lock.
 fn retrying<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
-    let mut tries = 0;
+    // DIAGNOSTIC (fastest-linux, not for landing): FE_C0_RETRY_MS=<ms> retries for that long (100 us sleeps)
+    // instead of 200 yields, and every give-up prints its count and elapsed time, to tell a transient window
+    // (a DDL commit between publishing its pages and its schema, preempted longer than 200 yields) from a schema
+    // that never catches up. Run 37518195105: all 24 escapes were create_branch/fork_branch on the trunk.
+    let deadline = std::env::var("FE_C0_RETRY_MS").ok().and_then(|v| v.parse::<u64>().ok());
+    let start = std::time::Instant::now();
+    let mut tries = 0u64;
     loop {
         match f() {
-            Err(LimboError::SchemaUpdated) | Err(LimboError::Busy) if tries < 200 => {
+            Err(e @ (LimboError::SchemaUpdated | LimboError::Busy)) => {
+                let more = match deadline {
+                    Some(ms) => start.elapsed() < std::time::Duration::from_millis(ms),
+                    None => tries < 200,
+                };
+                if !more {
+                    println!("C0 retrying gave up: {e} after {tries} tries in {:?} (deadline {deadline:?} ms)", start.elapsed());
+                    return Err(e);
+                }
                 tries += 1;
-                std::thread::yield_now();
+                match deadline {
+                    Some(_) => std::thread::sleep(std::time::Duration::from_micros(100)),
+                    None => std::thread::yield_now(),
+                }
             }
             other => return other,
         }
