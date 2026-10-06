@@ -23,24 +23,25 @@ pub struct TranslateResult {
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
-    /// The LATERAL scope of each SELECT being translated, innermost last (see `inline_lateral`):
-    /// a reference `alias.column` translates to the expression an inlined LATERAL subselect
-    /// computes for it, in its SELECT and in the subqueries under it that name no other relation
-    /// `alias` (wire review 2 item 6).
+    /// The scope of each SELECT being translated, innermost last: the names its FROM items are
+    /// known by, with the columns those names stand for that the engine does not have under them.
+    /// A reference `alias.column` translates by the innermost SELECT whose FROM names `alias`, so
+    /// a subquery naming another relation alike shadows it, and nothing outside the SELECT and the
+    /// subqueries under it sees it (wire review 2 item 6, gap review item 1).
     lateral_scopes: std::cell::RefCell<Vec<LateralScope>>,
-    /// The output column of each generate_series call in FROM that reads another FROM item's
-    /// columns, by PostgreSQL's name for it, with the call's table name (see
-    /// `translate_range_function`): `g` and `g.g` translate to the engine's `g.value`.
-    series_columns: std::cell::RefCell<std::collections::HashMap<String, String>>,
 }
 
-/// One SELECT's names for the LATERAL inlining (see `PostgreSQLTranslator::inline_lateral`).
+/// One SELECT's names for the reference rewrites (see `PostgreSQLTranslator::inline_lateral` and
+/// `PostgreSQLTranslator::series_column`).
 #[derive(Default)]
 struct LateralScope {
     /// The inlined LATERAL columns, (alias, column) to the expression.
     columns: std::collections::HashMap<(String, String), ast::Expr>,
     /// The names the SELECT's FROM items are known by, its inlined LATERAL aliases included.
     names: std::collections::HashSet<String>,
+    /// Each correlated generate_series call's (table name, PostgreSQL's name for its column),
+    /// which the engine names `value` (see `translate_range_function`).
+    series: Vec<(String, String)>,
 }
 
 impl PostgreSQLTranslator {
@@ -2168,7 +2169,7 @@ impl PostgreSQLTranslator {
         // PostgreSQL's name from a subselect. A call that reads another FROM item's columns
         // (`FROM t, generate_series(1, t.x) AS g`, implicitly LATERAL in PostgreSQL) stays a table
         // call the engine joins, since a FROM subselect cannot see its siblings, and references to
-        // its column are translated to `value` instead (`series_columns`).
+        // its column are translated to `value` instead (`series_column`).
         if func_name.eq_ignore_ascii_case("generate_series") {
             if colnames > 1 {
                 return Err(ParseError::ParseError(
@@ -2196,9 +2197,19 @@ impl PostgreSQLTranslator {
                 })
             });
             if reads_columns {
-                self.series_columns
-                    .borrow_mut()
-                    .insert(column_name, table_name.clone());
+                // Into the current SELECT's scope; a FROM outside any SELECT (UPDATE ... FROM,
+                // DELETE ... USING) has none, and is refused rather than left reading a column
+                // the engine names otherwise.
+                let mut scopes = self.lateral_scopes.borrow_mut();
+                let scope = scopes.last_mut().ok_or_else(|| {
+                    ParseError::ParseError(
+                        "generate_series reading another FROM item's columns is not supported \
+                         outside a SELECT"
+                            .into(),
+                    )
+                })?;
+                scope.series.push((table_name.clone(), column_name));
+                drop(scopes);
                 return Ok(ast::SelectTable::TableCall(
                     ast::QualifiedName::single(ast::Name::from_string(func_name)),
                     args,
@@ -2251,26 +2262,56 @@ impl PostgreSQLTranslator {
         ))
     }
 
-    /// PostgreSQL's name for a reference to a correlated generate_series' column (see
-    /// `series_columns`), if `col_ref` is one: `g` or `g.g`.
-    fn series_column(&self, col_ref: &pg_query::protobuf::ColumnRef) -> Option<(String, String)> {
+    /// The (table name, column) of the correlated generate_series call `col_ref` reads, if it reads
+    /// one (see `translate_range_function`). `alias.column` reads the innermost SELECT's whose FROM
+    /// names `alias`. A bare `column` reads only its own SELECT's: in a nested SELECT it may be a
+    /// column of that SELECT's own relations, which only the engine knows, so it is left to the
+    /// engine, which reads it from them or fails it as unknown, never from the outer series (which
+    /// the engine names `value`). Two series columns of one name in one SELECT make a bare reference
+    /// to it ambiguous (42702), as in PostgreSQL (gap review item 1).
+    fn series_column(
+        &self,
+        col_ref: &pg_query::protobuf::ColumnRef,
+    ) -> Result<Option<(String, String)>, ParseError> {
         use pg_query::protobuf::node::Node;
         let name = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
             Some(Node::String(s)) => Some(s.sval.clone()),
             _ => None,
         };
-        let series = self.series_columns.borrow();
+        let scopes = self.lateral_scopes.borrow();
         match col_ref.fields.as_slice() {
             [column] => {
-                let column = name(column)?;
-                let table = series.get(&column)?.clone();
-                Some((table, column))
+                let (Some(column), Some(scope)) = (name(column), scopes.last()) else {
+                    return Ok(None);
+                };
+                let mut tables = scope.series.iter().filter(|(_, c)| *c == column);
+                match (tables.next(), tables.next()) {
+                    (Some((table, _)), None) => Ok(Some((table.clone(), column))),
+                    (Some(_), Some(_)) => Err(ParseError::ParseError(format!(
+                        "column reference \"{column}\" is ambiguous"
+                    ))),
+                    _ => Ok(None),
+                }
             }
             [table, column] => {
-                let (table, column) = (name(table)?, name(column)?);
-                (series.get(&column) == Some(&table)).then_some((table, column))
+                let (Some(table), Some(column)) = (name(table), name(column)) else {
+                    return Ok(None);
+                };
+                for scope in scopes.iter().rev() {
+                    if scope
+                        .series
+                        .iter()
+                        .any(|(t, c)| *t == table && *c == column)
+                    {
+                        return Ok(Some((table, column)));
+                    }
+                    if scope.names.contains(&table) {
+                        return Ok(None);
+                    }
+                }
+                Ok(None)
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -2475,7 +2516,7 @@ impl PostgreSQLTranslator {
                             // the column's name, not its pasted expression's text.
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                self.series_column(col_ref)
+                                self.series_column(col_ref)?
                                     .map(|(_, column)| column)
                                     .or_else(|| self.inlined_lateral_name(col_ref))
                                     .map(|column| ast::As::Elided(ast::Name::from_string(column)))
@@ -2509,7 +2550,7 @@ impl PostgreSQLTranslator {
     fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
         match &node.node {
             Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
-                if let Some((table, _)) = self.series_column(col_ref) {
+                if let Some((table, _)) = self.series_column(col_ref)? {
                     return Ok(ast::Expr::Qualified(
                         ast::Name::from_string(table),
                         ast::Name::from_string("value"),

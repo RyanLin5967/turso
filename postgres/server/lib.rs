@@ -1800,6 +1800,11 @@ fn sqlstate(e: &LimboError) -> &'static str {
             "42P01"
         }
         LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
+        LimboError::ParseError(m)
+            if m.contains("is ambiguous") || m.starts_with("ambiguous column name") =>
+        {
+            "42702"
+        }
         LimboError::ParseError(m) if m.starts_with("no such function") => "42883",
         LimboError::ParseError(m) if m.contains("not supported") || m.contains("Unsupported") => {
             "0A000"
