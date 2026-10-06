@@ -603,3 +603,81 @@ pub(crate) fn emit_trigger_decode_registers(
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, Value, IO};
+    use std::sync::Arc;
+
+    fn open() -> Arc<crate::Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        db.connect().unwrap()
+    }
+
+    fn count(conn: &Arc<crate::Connection>, sql: &str, param: Option<Value>) -> crate::Result<i64> {
+        let mut stmt = conn.prepare(sql)?;
+        if let Some(value) = param {
+            stmt.bind_at(1.try_into().unwrap(), value)?;
+        }
+        let rows = stmt.run_collect_rows()?;
+        Ok(rows[0][0].as_int().expect("a count"))
+    }
+
+    /// fastest-wire (wire review 2 item 3, 6b (a)): a bound parameter compared with a custom-type
+    /// column got the plain comparison, not the type's operator, so a numeric column (stored
+    /// encoded) never equalled `?1` bound to the very value a literal finds. A parameter is treated
+    /// as a literal of the type's value input type: encoded and passed to the operator. Mutant
+    /// `param_skips_type_operator`.
+    #[test]
+    fn a_parameter_compared_with_a_custom_type_column_uses_its_operator() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5)").unwrap();
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM t WHERE x = 1.5", None).unwrap(),
+            1,
+            "premise: the literal finds the row"
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM t WHERE x = ?1", Some(Value::from_f64(1.5))).unwrap(),
+            1,
+            "a bound parameter did not find the row the same literal finds"
+        );
+    }
+
+    /// fastest-wire (6b (b)): a comparison operand was encoded with the column's own parameters,
+    /// so a value longer than a length-checked type's length raised 'value too long' where
+    /// PostgreSQL compares (a comparison operand is coerced to the type with no typmod) and answers
+    /// false. A user type's comparison operand is now encoded with its parameters NULL, and its
+    /// ENCODE takes a NULL parameter as unconstrained. Mutant `comparison_encodes_with_params`.
+    #[test]
+    fn an_over_length_comparison_operand_compares_instead_of_raising() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '=' glob",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v tag(3)) STRICT").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
+        assert!(
+            conn.execute("INSERT INTO t VALUES (2, 'abcdef')").is_err(),
+            "premise: the column's own length check refuses an over-length value"
+        );
+        assert_eq!(count(&conn, "SELECT count(*) FROM t WHERE v = 'abc'", None).unwrap(), 1, "premise: equal finds it");
+        let literal = count(&conn, "SELECT count(*) FROM t WHERE v = 'abcdef'", None);
+        assert!(matches!(literal, Ok(0)), "an over-length literal raised or matched: {literal:?}");
+        let param = count(&conn, "SELECT count(*) FROM t WHERE v = ?1", Some(Value::build_text("abcdef")));
+        assert!(matches!(param, Ok(0)), "an over-length parameter raised or matched: {param:?}");
+    }
+}
