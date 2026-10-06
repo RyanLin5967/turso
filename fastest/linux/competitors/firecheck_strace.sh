@@ -33,8 +33,9 @@
 #   F10d the same storm attached by strace_attach (freeze, enumeration, completeness): no untraced child fsync after
 #      t0, frozen=1, the traced pids = the trace's fsync pids, the count after the t0 cut inside the probe log's
 #      [started after t0, ended after t0] bounds while the cut left out >= 1 traced fsync (the parent's, between the
-#      thaw and t0), and at least one child alive at the seize (no clone line in the trace) fsyncing after t0, seen
-#      by the probe log and attributed by the trace to a process at attach.
+#      thaw and t0), every flush attributed to its class (main / child alive at the seize / child born in the window)
+#      within that class's bounds, none unmapped or elsewhere, and at least one child alive at the seize (no clone
+#      line in the trace) starting an fsync after t0.
 #   F11 one attach split by strace_mark: fsync x2, tsplit, fsync x3 -> --part pre counts 2 and --part post 3.
 #   F12 the t1 cut: the split probe with t1 stamped between its fsync x2 and fsync x3 -> counts 2, and >= 3 calls
 #      after t1 left out.
@@ -386,30 +387,50 @@ for ln in open(sys.argv[1]):
     if mine: traced += 1
 print(miss, traced)" "$@"
 }
-# storm_window_bounds LOG T0 STRACEPID TRACE MAIN -> 'LOWER UPPER PRE CUT BORN': the probe's own truth for the kept
-# trace's count. The counter keeps a call whose ENTRY stamp is >= t0, and that stamp lies between the process's clock
-# read before the fsync (field 4) and after it (field 3), so the count after the t0 cut must lie in [LOWER, UPPER]:
-# LOWER = fsyncs traced by STRACEPID that started after T0, UPPER = those that ended after T0 (10 us of slack each way
-# for the 6-decimal stamps). CUT = traced fsyncs that ended before T0: in the kept trace and left out by the cut, so
-# a count <= UPPER with CUT >= 1 shows the cut at work. PRE = the UPPER fsyncs of CHILDREN (not MAIN) whose creation
-# the trace never saw (no clone/fork returning their pid): alive at the seize and flushing inside the window, the
-# case F10d exists for (fifth review, findings 1 and 2). BORN = the pids the trace saw created.
-storm_window_bounds() {
+# storm_verdict LOG T0 STRACEPID TRACE MAIN JSON -> 'ok ...' or 'bad ...': the kept trace's count and its attribution
+# against the probe's own truth. The counter keeps a call whose ENTRY stamp is >= t0, and that stamp lies between the
+# process's clock read before the fsync (field 4) and after it (field 3), so per class of process the trace's flushes
+# after the t0 cut must lie in [fsyncs traced by STRACEPID that started after T0, those that ended after T0] (10 us of
+# slack each way for the 6-decimal stamps). The classes: MAIN (role 'main'); children whose creation the trace never
+# saw, i.e. alive at the seize (role 'process at attach: ...'); children it saw created (role 'other (born in the
+# window ...)'). Any other role, or an unmapped flush, is bad (fifth-review re-review, finding 3: one attributed
+# flush used to suffice). Also required: >= 1 pre-existing child STARTED an fsync after T0 (fifth review, finding 1)
+# and >= 1 traced fsync ended before T0, so the cut removed something (fifth review, finding 2).
+storm_verdict() {
   python3 -c "
-import re, sys
-t0 = float(sys.argv[2]); st = sys.argv[3]; main = sys.argv[5]; eps = 1e-5
+import json, re, sys
+log, t0, st, trace, main, js = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+eps = 1e-5
 spawn = re.compile(r'^\d+\s+[\d.]+\s+(?:<\.\.\. )?(?:clone3?|v?fork)\b.*\)\s+=\s+(\d+)')
-born = {m.group(1) for m in (spawn.match(ln) for ln in open(sys.argv[4], errors='replace')) if m}
-lo = hi = pre = cut = 0
-for ln in open(sys.argv[1]):
+born = {m.group(1) for m in (spawn.match(ln) for ln in open(trace, errors='replace')) if m}
+cls = {'main': [0, 0], 'at-attach': [0, 0], 'born': [0, 0]}
+cut = 0
+for ln in open(log):
     f = ln.split(); pid, tp, end = f[0], f[1], float(f[2]); start = float(f[3]) if len(f) > 3 else end
     if tp != st: continue
-    if start >= t0 + eps: lo += 1
-    if end < t0 - eps: cut += 1
-    if end >= t0 - eps:
-        hi += 1
-        if pid not in born and pid != main: pre += 1
-print(lo, hi, pre, cut, len(born))" "$@"
+    k = 'main' if pid == main else ('born' if pid in born else 'at-attach')
+    if start >= t0 + eps: cls[k][0] += 1
+    if end >= t0 - eps: cls[k][1] += 1
+    else: cut += 1
+r = json.load(open(js))
+roles = r.get('by_role', {})
+AT, BORN = 'process at attach', 'other (born in the window'
+got = {'main': roles.get('main', 0), 'at-attach': sum(n for k, n in roles.items() if k.startswith(AT)),
+       'born': sum(n for k, n in roles.items() if k.startswith(BORN))}
+other = {k: n for k, n in roles.items() if k != 'main' and not k.startswith((AT, BORN))}
+lo, hi = sum(v[0] for v in cls.values()), sum(v[1] for v in cls.values())
+why = []
+if r['verdict'] != 'ok': why.append('verdict ' + r['verdict'][:160])
+if not lo <= r['flushes'] <= hi: why.append(f\"count {r['flushes']} outside the probe's [{lo}, {hi}]\")
+for k, (a, b) in cls.items():
+    if not a <= got[k] <= b: why.append(f'{k}: the trace attributes {got[k]}, the probe bounds [{a}, {b}]')
+if cls['at-attach'][0] < 1: why.append('no child alive at the seize started an fsync after t0')
+if cut < 1: why.append('the t0 cut removed no traced fsync')
+if other: why.append(f'flushes in other roles {other}')
+if r.get('unmapped_flushes', 0): why.append(f\"unmapped_flushes {r['unmapped_flushes']}\")
+print('bad' if why else 'ok', f\"count {r['flushes']} in [{lo}, {hi}]; per role trace/[probe] \" +
+      ', '.join(f'{k} {got[k]}/[{a}, {b}]' for k, (a, b) in cls.items()) +
+      f'; {cut} traced fsync(s) before t0 cut; {len(born)} pids born in the trace' + ('; ' + '; '.join(why) if why else ''))" "$@" 2>&1
 }
 # storm_pids_match LOG TRACE STRACEPID -> exit 0 when the children that logged STRACEPID as their tracer are exactly
 # the pids with an fsync line in TRACE (fourth review, finding 4: a set check, not fsyncs >= traced).
@@ -463,21 +484,11 @@ if start_probe2 forkstorm; then
     read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0" "$kept")
     cp "$DIR/fc/forkstorm.log" "$OUT/f10d.forkstorm.log.txt" 2>/dev/null  # the probe's own record, kept with the raw
     match=$(storm_pids_match "$DIR/fc/forkstorm.log" "$OUT/f10d.strace" "$kept"); mrc=$?
-    read -r lo hi pre cut born < <(storm_window_bounds "$DIR/fc/forkstorm.log" "$t0" "$kept" "$OUT/f10d.strace" "$PP2")
-    # The count after the t0 cut must equal the probe's truth within [lo, hi] while the cut left out >= 1 traced fsync
-    # (the parent's, between the thaw and t0), and the trace itself must attribute a flush in the window to a CHILD
-    # present at the attach (role 'process at attach: ...': not the main, not born in the window).
-    got=$(python3 -c "
-import json, sys
-r = json.load(open(sys.argv[1]))
-print(r['verdict'][:200].replace(' ', '_'), r['flushes'], sum(n for k, n in r.get('by_role', {}).items() if k.startswith('process at attach')))" "$OUT/f10d.json" 2>&1)
-    read -r verdict flushes atpre <<<"$got"
-    if [ "$miss" = 0 ] && [ $mrc = 0 ] && grep -q ' frozen=1 ' "$OUT/f10d.window" && [ "$verdict" = ok ] &&
-      [ "${pre:-0}" -ge 1 ] && [ "${atpre:-0}" -ge 1 ] && [ "${cut:-0}" -ge 1 ] &&
-      [ "${lo:-x}" -le "${flushes:-y}" ] 2>/dev/null && [ "$flushes" -le "$hi" ] 2>/dev/null; then
-      log "PASS F10d-storm-attach-complete: 0 child fsyncs after t0 outside the kept trace, frozen=1, $traced fsyncs logged as traced by it, pids = the fsync pids in it ($match); count after t0 $flushes in the probe's [$lo, $hi] with $cut traced fsync(s) before t0 cut; $pre fsync(s) after t0 by children alive at the seize (probe log; the trace attributes $atpre flush(es) to them; $born pids born in the trace)"
+    sv=$(storm_verdict "$DIR/fc/forkstorm.log" "$t0" "$kept" "$OUT/f10d.strace" "$PP2" "$OUT/f10d.json")
+    if [ "$miss" = 0 ] && [ $mrc = 0 ] && grep -q ' frozen=1 ' "$OUT/f10d.window" && [ "${sv%% *}" = ok ]; then
+      log "PASS F10d-storm-attach-complete: 0 child fsyncs after t0 outside the kept trace, frozen=1, $traced fsyncs logged as traced by it, pids = the fsync pids in it ($match); ${sv#ok }"
     else
-      log "FAIL F10d-storm-attach-complete: miss=$miss traced=$traced pid-sets: $match bounds=[$lo, $hi] count=$flushes cut=$cut pre_probe=$pre pre_trace=$atpre born=$born window=[$(head -1 "$OUT/f10d.window" | cut -c1-200)] verdict=$verdict"
+      log "FAIL F10d-storm-attach-complete: miss=$miss traced=$traced pid-sets: $match; $(head -c 900 <<<"$sv") window=[$(head -1 "$OUT/f10d.window" | cut -c1-200)]"
       fails=$((fails + 1))
     fi
   else
