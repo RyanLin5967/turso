@@ -33,6 +33,8 @@ def layout_problems(cell, fstype, source, layers):
     p = []
     if fstype != c["fstype"]:
         p.append("fstype %s, cell %s means %s" % (fstype, cell, c["fstype"]))
+    if not str(source or "").startswith("/dev/"):
+        p.append("mount source %r is not a /dev block device path" % (source,))
     loop_src = str(source or "").startswith("/dev/loop")
     if loop_src != c["loop"]:
         p.append("mount source %s: cell %s means %s" % (source, cell, "a loop device" if c["loop"] else "a block device, no loop"))
