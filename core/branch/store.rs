@@ -2687,27 +2687,40 @@ impl BranchStore {
                 inner.splice = splice;
                 if files.exist() {
                     let t = Instant::now();
-                    let recovered = Journal::recover_as(&files, sync, format)?;
+                    let scanned = Journal::scan_as(&files, sync, format)?;
                     stats.recover_ns = ns(t);
-                    if let Some(mut recovered) = recovered {
-                        stats.snap_bytes = recovered.snap_bytes;
-                        stats.log_bytes = recovered.log_bytes;
+                    if let Some(mut scanned) = scanned {
+                        stats.snap_bytes = scanned.snap_bytes();
+                        stats.log_bytes = scanned.log_bytes();
+                        // Opened before anything is replayed or changed, never created over state:
+                        // a missing or unreadable arena is refused here (review 5 #2).
+                        let arena_file = scanned.open_arena(false)?;
+                        // Replay, then read the slots an unconfirmed last flight names that the
+                        // replayed state references, then decide (review 5 #1): a slot that fails
+                        // means the flight was never acknowledged, and it is replayed without.
+                        let check = scanned.last_flight_slots();
+                        let snapshot = scanned.take_snapshot();
+                        let again = (!check.is_empty()).then(|| (inner.fresh_again(), snapshot.clone()));
+                        Self::replay_snapshot_store(&mut inner, snapshot, scanned.records(), &mut stats)?;
+                        if let Some((fresh, snapshot)) = again {
+                            let referenced: HashSet<Slot> = inner.referenced_slots().into_iter().collect();
+                            // Mutant `check_all_named_slots` (test builds only): every slot the
+                            // flight names is read, as before review 5 #1.
+                            let named: Vec<(Slot, u32)> = check
+                                .into_iter()
+                                .filter(|(slot, _)| referenced.contains(slot) || fe_mutant("check_all_named_slots"))
+                                .collect();
+                            if !super::journal::slots_hold(&arena_file, scanned.page_size(), &named)? {
+                                scanned.drop_last_flight();
+                                inner = fresh;
+                                Self::replay_snapshot_store(&mut inner, snapshot, scanned.records(), &mut stats)?;
+                            }
+                        }
+                        let mut recovered = scanned.finish()?;
                         stats.records = recovered.records.len() as u64;
-                        let t = Instant::now();
-                        if let Some(snapshot) = recovered.snapshot {
-                            stats.snap_branches = snapshot.branches.len() as u64;
-                            inner.load_snapshot(snapshot)?;
-                        }
-                        stats.load_ns = ns(t);
-                        // Frees during replay are not acted on: the free set is derived below
-                        // from what the recovered state references.
+                        // Frees here are not acted on: the free set is derived below from what the
+                        // recovered state references.
                         let mut ignored = Vec::new();
-                        let t = Instant::now();
-                        for record in &recovered.records {
-                            kill_point("recover.replay");
-                            inner.replay(record, &mut ignored)?;
-                        }
-                        stats.replay_ns = ns(t);
                         // A snapshot or a `ReleaseOpen` can hold a released branch that was kept
                         // only by an open connection; after a restart nothing is open. Each close is
                         // logged (flushed below, once the arena is open).
@@ -2721,12 +2734,7 @@ impl BranchStore {
                         stats.referenced_ns = ns(t);
                         stats.referenced_slots = referenced.len() as u64;
                         let t = Instant::now();
-                        let arena = Arena::open_file(
-                            &files.arena,
-                            recovered.page_size,
-                            false,
-                            &referenced,
-                        )?;
+                        let arena = Arena::from_file(arena_file, recovered.page_size, &referenced)?;
                         stats.arena_ns = ns(t);
                         stats.arena_high_water = arena.in_use() as u64 + arena.free_count() as u64;
                         stats.arena_free = arena.free_count() as u64;
@@ -2849,6 +2857,93 @@ impl BranchStore {
         Ok(store)
     }
 
+    /// A catalog store's replay into a fresh `inner`, over `catalog` as of its checkpoint (`meta`):
+    /// every record in order, each loading only the state it touches. Returns every slot a record
+    /// named (in use) or its replay freed, the last word on each slot winning.
+    fn replay_catalog_store(
+        inner: &mut StoreInner,
+        catalog: Catalog,
+        meta: &Meta,
+        records: &[Record],
+        sync: SyncClass,
+        stats: &mut BranchOpenStats,
+    ) -> Result<HashMap<Slot, bool>> {
+        let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        inner.next_id = inner.next_id.max(meta.next_id);
+        inner.trunk.lineage.epoch = meta.trunk_epoch;
+        inner.trunk.lineage.n_children = meta.trunk_children;
+        inner.n_states = meta.states;
+        inner.lease.recovered(meta.lease_now_ms);
+        let mut cat = CatState::new(catalog, sync, meta.generation)?;
+        // Past every checkpoint marker the log still holds, committed or not (F-FZ).
+        let marked = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Checkpoint { generation } => Some(*generation),
+                _ => None,
+            })
+            .max();
+        if let Some(g) = marked {
+            cat.next_generation = cat.next_generation.max(g + 1);
+        }
+        cat.lease_floor = cat.catalog.lease_min()?;
+        inner.cat = Some(cat);
+        let t = Instant::now();
+        let mut touched: HashMap<Slot, bool> = HashMap::new();
+        for (pos, record) in records.iter().enumerate() {
+            let pos = pos as u64;
+            match record {
+                Record::Commit { pages, .. } => {
+                    for &(_, slot, _) in pages {
+                        touched.insert(slot, true);
+                        inner.named_at.insert(slot, pos);
+                    }
+                }
+                Record::TrunkRetain { slot, .. } => {
+                    touched.insert(*slot, true);
+                    inner.named_at.insert(*slot, pos);
+                }
+                _ => {}
+            }
+            inner.replay_pos = pos;
+            let mut freed = Vec::new();
+            kill_point("recover.replay");
+            inner.replay(record, &mut freed)?;
+            // A parked Commit applied during this record (C-R) freed its slots here, in order.
+            freed.append(&mut inner.deferred_freed);
+            for slot in freed {
+                touched.insert(slot, false);
+            }
+        }
+        stats.replay_ns = ns(t);
+        Ok(touched)
+    }
+
+    /// A snapshot store's replay: the snapshot, then every record, into a fresh `inner`. Frees are
+    /// not acted on: the free set is derived from what the recovered state references.
+    fn replay_snapshot_store(
+        inner: &mut StoreInner,
+        snapshot: Option<SnapshotState>,
+        records: &[Record],
+        stats: &mut BranchOpenStats,
+    ) -> Result<()> {
+        let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let t = Instant::now();
+        if let Some(snapshot) = snapshot {
+            stats.snap_branches = snapshot.branches.len() as u64;
+            inner.load_snapshot(snapshot)?;
+        }
+        stats.load_ns = ns(t);
+        let mut ignored = Vec::new();
+        let t = Instant::now();
+        for record in records {
+            kill_point("recover.replay");
+            inner.replay(record, &mut ignored)?;
+        }
+        stats.replay_ns = ns(t);
+        Ok(())
+    }
+
     /// Catalog-mode recovery (on demand): open the catalog and read its meta row, replay the log's
     /// tail — which loads only the branches and trunk pages its records touch — collect released
     /// branches the catalog kept for a connection that no longer exists, and rebuild the arena's
@@ -2884,97 +2979,65 @@ impl BranchStore {
                 }
             )));
         }
-        // A catalog that names branch state is never opened over a missing log or arena (review 2
-        // #12): it would open with every branch's slots gone, and say nothing.
-        if let Some(m) = meta.filter(|m| m.in_use > 0 || m.states > 0) {
-            for (what, path) in [("log", &files.log), ("arena", &files.arena)] {
-                if !path.exists() {
-                    return Err(LimboError::Corrupt(format!(
-                        "branch catalog {} names {} branch states, but the branch {what} {} is \
-                         missing: the branch files were moved apart; put all three back together \
-                         ({}, {}, {})",
-                        files.cat.display(),
-                        m.states,
-                        path.display(),
-                        files.log.display(),
-                        files.arena.display(),
-                        files.cat.display()
-                    )));
-                }
-            }
-        }
         // r12-catload: the catalog's prewarm, before the replay reads: its pages (`interior`,
         // `buffer`), or its files unless `R12_PREWARM_FILES` leaves the catalog out.
         if !warm.warms_files() || targets.catalog {
             catalog.prewarm(&files.cat, warm)?;
         }
         let t = Instant::now();
-        let recovered = Journal::recover_catalog_as(
+        // Nothing in the files changes until the scan is finished below (review 5 #2): a missing
+        // log (once the catalog has a meta row) or arena (once anything names state) is refused
+        // first, naming all three files.
+        let scanned = Journal::scan_catalog_as(
             files,
             sync,
             meta.map(|m| (m.page_size, m.generation)),
             format,
         )?;
         stats.recover_ns = ns(t);
-        let Some(mut recovered) = recovered else {
+        let Some(mut scanned) = scanned else {
             return Ok(());
         };
-        stats.log_bytes = recovered.log_bytes;
-        stats.records = recovered.records.len() as u64;
+        stats.log_bytes = scanned.log_bytes();
+        let arena_file = scanned.open_arena(meta.is_some_and(|m| m.in_use > 0 || m.states > 0))?;
         let meta = meta.unwrap_or(Meta {
-            page_size: recovered.page_size as u32,
+            page_size: scanned.page_size() as u32,
             ..Meta::default()
         });
-        inner.next_id = inner.next_id.max(meta.next_id);
-        inner.trunk.lineage.epoch = meta.trunk_epoch;
-        inner.trunk.lineage.n_children = meta.trunk_children;
-        inner.n_states = meta.states;
-        inner.lease.recovered(meta.lease_now_ms);
-        let mut cat = CatState::new(catalog, sync, meta.generation)?;
-        // Past every checkpoint marker the log still holds, committed or not (F-FZ).
-        let marked = recovered
-            .records
-            .iter()
-            .filter_map(|r| match r {
-                Record::Checkpoint { generation } => Some(*generation),
-                _ => None,
-            })
-            .max();
-        if let Some(g) = marked {
-            cat.next_generation = cat.next_generation.max(g + 1);
+        let page_size = scanned.page_size();
+        let file_len = super::journal::file_len(&arena_file)?;
+        let file_hw = u32::try_from(file_len / page_size as u64)
+            .map_err(|_| LimboError::Corrupt("branch arena is larger than 2^32 slots".into()))?;
+        if meta.in_use > u64::from(file_hw) {
+            return Err(LimboError::Corrupt(format!(
+                "branch catalog {} counts {} arena slots in use, but the arena {} holds {file_hw}",
+                files.cat.display(),
+                meta.in_use,
+                files.arena.display()
+            )));
         }
-        cat.lease_floor = cat.catalog.lease_min()?;
-        inner.cat = Some(cat);
-        // Replay, remembering every slot a record names (in use) and every slot its replay frees,
-        // in order: the last word on each slot wins.
-        let t = Instant::now();
-        let mut touched: HashMap<Slot, bool> = HashMap::new();
-        for (pos, record) in recovered.records.iter().enumerate() {
-            let pos = pos as u64;
-            match record {
-                Record::Commit { pages, .. } => {
-                    for &(_, slot, _) in pages {
-                        touched.insert(slot, true);
-                        inner.named_at.insert(slot, pos);
-                    }
-                }
-                Record::TrunkRetain { slot, .. } => {
-                    touched.insert(*slot, true);
-                    inner.named_at.insert(*slot, pos);
-                }
-                _ => {}
-            }
-            inner.replay_pos = pos;
-            let mut freed = Vec::new();
-            kill_point("recover.replay");
-            inner.replay(record, &mut freed)?;
-            // A parked Commit applied during this record (C-R) freed its slots here, in order.
-            freed.append(&mut inner.deferred_freed);
-            for slot in freed {
-                touched.insert(slot, false);
+        // Replay, then read the slots an unconfirmed last flight names that the replay left in use,
+        // then decide (review 5 #1): a slot that fails means the flight was never acknowledged,
+        // and the log is replayed again without it.
+        let check = scanned.last_flight_slots();
+        let again = (!check.is_empty()).then(|| inner.fresh_again());
+        let mut touched = Self::replay_catalog_store(inner, catalog, &meta, scanned.records(), sync, stats)?;
+        if let Some(fresh) = again {
+            // Mutant `check_all_named_slots` (test builds only): every slot the flight names is
+            // read, as before review 5 #1.
+            let named: Vec<(Slot, u32)> = check
+                .into_iter()
+                .filter(|(slot, _)| touched.get(slot) == Some(&true) || fe_mutant("check_all_named_slots"))
+                .collect();
+            if !super::journal::slots_hold(&arena_file, page_size, &named)? {
+                scanned.drop_last_flight();
+                let catalog = inner.cat.take().expect("the replay set it").catalog;
+                *inner = fresh;
+                touched = Self::replay_catalog_store(inner, catalog, &meta, scanned.records(), sync, stats)?;
             }
         }
-        stats.replay_ns = ns(t);
+        let mut recovered = scanned.finish()?;
+        stats.records = recovered.records.len() as u64;
         let t = Instant::now();
         let mut freed = Vec::new();
         // Branches a crash left held (catalog rows `released = 2`, or a replayed `ReleaseOpen`) are
@@ -2993,10 +3056,6 @@ impl BranchStore {
         // touched, plus every untouched slot past the checkpoint's high-water mark (written by an
         // operation whose record never became durable, or never written at all).
         let t = Instant::now();
-        let page_size = recovered.page_size;
-        let file_len = std::fs::metadata(&files.arena).map_or(0, |m| m.len());
-        let file_hw = u32::try_from(file_len / page_size as u64)
-            .map_err(|_| LimboError::Corrupt("branch arena is larger than 2^32 slots".into()))?;
         let cat = inner.cat.as_mut().expect("set above");
         let mut in_use = meta.in_use as i64;
         let mut free_mem = Vec::new();
@@ -3039,7 +3098,7 @@ impl BranchStore {
         cat.taken = taken;
         let in_use = u64::try_from(in_use)
             .map_err(|_| LimboError::Corrupt("branch catalog: negative arena use".into()))?;
-        let mut arena = Arena::open_file_catalog(&files.arena, page_size, high_water, in_use, free_mem)?;
+        let mut arena = Arena::from_file_catalog(arena_file, page_size, high_water, in_use, free_mem)?;
         inner.files_device(recovered.journal.device(), arena.device())?;
         if closed {
             recovered.journal.flush(&mut arena)?;
@@ -5767,6 +5826,17 @@ impl StoreInner {
             files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             last_fork_lsn: 0,
         }
+    }
+
+    /// A fresh state over the same files, in the same class, lease, mode and arm, sharing the same
+    /// fail-stop and device cells: what recovery replays into again when it drops the last flight
+    /// (review 5 #1).
+    fn fresh_again(&self) -> Self {
+        let mut inner = Self::fresh_mode(self.files.clone(), self.sync, self.default_lease, self.catalog_mode);
+        inner.splice = self.splice;
+        inner.fail_stop = self.fail_stop.clone();
+        inner.files_dev = self.files_dev.clone();
+        inner
     }
 
     /// Ruling 85a032f01's guard over the branch log and arena as opened (`one_device`), recording

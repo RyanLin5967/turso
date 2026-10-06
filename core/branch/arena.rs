@@ -74,7 +74,12 @@ impl Arena {
         truncate: bool,
         referenced: &[Slot],
     ) -> Result<Self> {
-        let file = open_rw(path, truncate)?;
+        Self::from_file(open_rw(path, truncate)?, page_size, referenced)
+    }
+
+    /// `open_file` over a file recovery already opened (review 5 #2: the same descriptor it read
+    /// the last flight's slots through, never reopened by path).
+    pub(crate) fn from_file(file: std::fs::File, page_size: usize, referenced: &[Slot]) -> Result<Self> {
         let len = super::journal::file_len(&file)?;
         // A partly written last slot is a slot whose record never became durable.
         let high = len / page_size as u64;
@@ -120,14 +125,13 @@ impl Arena {
     /// catalog's free table holds the rest, which `add_free` moves in as they are needed. The free
     /// bitmap starts zeroed ("not known free"), and a zeroed allocation costs no page until
     /// touched.
-    pub(crate) fn open_file_catalog(
-        path: &Path,
+    pub(crate) fn from_file_catalog(
+        file: std::fs::File,
         page_size: usize,
         high_water: u32,
         in_use: u64,
         free: Vec<Slot>,
     ) -> Result<Self> {
-        let file = open_rw(path, false)?;
         let mut arena = Self {
             page_size,
             backing: Backing::File { file, dirty: false },
