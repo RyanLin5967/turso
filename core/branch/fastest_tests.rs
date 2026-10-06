@@ -3993,3 +3993,64 @@ fn a_raised_d0_fuzzy_checkpoint_syncs_its_slots_through_the_group_before_its_com
     drop((b, c));
 }
 
+// ---- review 6 #6: a kernel that promotes an unsupported barrier itself gets no userland retry ----
+
+/// Forces the Darwin major version `barrier_file` takes the kernel for, for one test (review 6 #6).
+#[cfg(target_vendor = "apple")]
+struct DarwinMajor;
+
+#[cfg(target_vendor = "apple")]
+impl DarwinMajor {
+    fn force(major: u32) -> Self {
+        super::journal::DARWIN_MAJOR_FORCED.store(major, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Drop for DarwinMajor {
+    fn drop(&mut self) {
+        super::journal::DARWIN_MAJOR_FORCED.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Review 6 #6: from Darwin 23 (macOS 14) the kernel itself turns an F_BARRIERFSYNC the file
+/// system does not support into an F_FULLFSYNC, and latches that per mount (xnu-10002 on). So an
+/// ENOTSUP, EOPNOTSUPP, EINVAL or ENOTTY that reaches the store is that full sync's own failure,
+/// and the userland fallback re-issued it: the fsyncgate retry, which can report success for pages
+/// the failed call lost. On such a kernel every failed barrier fails its flight, the trunk commit
+/// relying on it is refused, and the store fail-stops; nothing falls back.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_barrier_on_a_kernel_that_promotes_it_fail_stops_whatever_its_errno() {
+    let _s = serial();
+    let _k = DarwinMajor::force(23);
+    for catalog in [false, true] {
+        for (errno, name) in [
+            (libc::ENOTSUP, "ENOTSUP"),
+            (libc::EOPNOTSUPP, "EOPNOTSUPP"),
+            (libc::EINVAL, "EINVAL"),
+            (libc::ENOTTY, "ENOTTY"),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db = open_at(&dir.path().join("barrier-new-kernel.db"), opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            super::journal::fail_next_barrier(errno);
+            let before = sync_counts();
+            let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+            let after = sync_counts();
+            assert_eq!(
+                after.barrier_fallback - before.barrier_fallback,
+                0,
+                "catalog={catalog} {name}: a failed barrier was retried on a kernel that promotes it"
+            );
+            assert!(committed.is_err(), "catalog={catalog} {name}: a trunk commit relied on a barrier that failed");
+            let mine = b.connect().and_then(|bc| bc.execute("UPDATE t SET v = 'mine' WHERE id = 3"));
+            assert!(mine.is_err(), "catalog={catalog} {name}: the store did not fail-stop after a failed barrier");
+        }
+    }
+}
+

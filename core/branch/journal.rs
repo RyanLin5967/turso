@@ -3342,6 +3342,11 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
 #[cfg(test)]
 static BARRIER_ERRNO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+/// Test builds: the Darwin major version `barrier_file` takes the kernel for (0: the running
+/// kernel's), so both of its kernel arms run on one machine (review 6 #6).
+#[cfg(test)]
+pub(crate) static DARWIN_MAJOR_FORCED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Test builds: make the next `F_BARRIERFSYNC` (`barrier_file`) fail with `errno`.
 #[cfg(test)]
 pub(crate) fn fail_next_barrier(errno: i32) {
