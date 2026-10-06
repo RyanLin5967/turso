@@ -3727,3 +3727,196 @@ fn a_word_not_bound_to_the_last_flights_end_confirms_nothing() {
     }
 }
 
+// ---- review 6 #2: a failed trunk WAL sync, or a replacement's, fail-stops the store ----
+
+/// An IO whose WAL file's next sync fails, once (review 6 #2): `armed` 1 fails it at once, as
+/// UnixIO's F_FULLFSYNC does on Apple, 2 fails its completion; it reads 0 once spent. Every other
+/// file, and every other call, is the platform's.
+struct FailWalSyncIo {
+    inner: Arc<dyn IO>,
+    armed: Arc<std::sync::atomic::AtomicU8>,
+}
+
+struct FailWalSyncFile {
+    inner: Arc<dyn crate::io::File>,
+    armed: Option<Arc<std::sync::atomic::AtomicU8>>,
+}
+
+impl crate::io::Clock for FailWalSyncIo {
+    fn current_time_monotonic(&self) -> crate::io::clock::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+    fn current_time_wall_clock(&self) -> crate::io::clock::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for FailWalSyncIo {
+    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> crate::Result<Arc<dyn crate::io::File>> {
+        Ok(Arc::new(FailWalSyncFile {
+            inner: self.inner.open_file(path, flags, direct)?,
+            armed: path.ends_with("-wal").then(|| self.armed.clone()),
+        }))
+    }
+    fn remove_file(&self, path: &str) -> crate::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn step(&self) -> crate::Result<()> {
+        self.inner.step()
+    }
+    fn file_id(&self, path: &str) -> crate::Result<crate::io::FileId> {
+        self.inner.file_id(path)
+    }
+}
+
+impl crate::io::File for FailWalSyncFile {
+    fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+    fn unlock_file(&self) -> crate::Result<()> {
+        self.inner.unlock_file()
+    }
+    fn pread(&self, pos: u64, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.pread(pos, c)
+    }
+    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.pwrite(pos, buffer, c)
+    }
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<crate::Buffer>>, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.pwritev(pos, buffers, c)
+    }
+    fn sync(&self, c: crate::Completion, sync_type: crate::io::FileSyncType) -> crate::Result<crate::Completion> {
+        let failed = || crate::CompletionError::IOError(std::io::ErrorKind::Other, "sync");
+        match self.armed.as_ref().map_or(0, |a| a.swap(0, std::sync::atomic::Ordering::AcqRel)) {
+            1 => Err(crate::LimboError::CompletionError(failed())),
+            2 => {
+                c.error(failed());
+                Ok(c)
+            }
+            _ => self.inner.sync(c, sync_type),
+        }
+    }
+    fn size(&self) -> crate::Result<u64> {
+        self.inner.size()
+    }
+    fn truncate(&self, len: u64, c: crate::Completion) -> crate::Result<crate::Completion> {
+        self.inner.truncate(len, c)
+    }
+    fn full_fsync_device(&self) -> Option<u64> {
+        self.inner.full_fsync_device()
+    }
+}
+
+/// A store opened through `FailWalSyncIo`, its WAL's next sync failing once `armed` is set.
+fn open_failing_wal(path: &Path, opts: DatabaseOpts) -> (Arc<Database>, Arc<std::sync::atomic::AtomicU8>) {
+    let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let io: Arc<dyn IO> = Arc::new(FailWalSyncIo {
+        inner: Arc::new(PlatformIO::new().unwrap()),
+        armed: armed.clone(),
+    });
+    let db = Database::open_file_with_flags(io, path.to_str().unwrap(), OpenFlags::Create, opts, None, Arc::new(SqliteDialect))
+        .unwrap();
+    (db, armed)
+}
+
+/// `what` was refused because the store is fail-stopped.
+fn assert_fail_stopped<T: std::fmt::Debug>(got: crate::Result<T>, what: &str) {
+    match got {
+        Err(e) => assert!(e.to_string().contains("fail-stopped"), "{what}: refused, but not as fail-stopped: {e}"),
+        Ok(v) => panic!("{what}: acknowledged after a failed drain of the branch files' device: {v:?}"),
+    }
+}
+
+/// Review 6 #2: a trunk commit whose barrier only ORDERED a pre-image ahead of its WAL F_FULLFSYNC
+/// relies on that flush to make the pre-image durable. When the flush fails, what the device's
+/// drain covered may be lost, and a later flush may report success over the loss: the store
+/// fail-stops, as after a failed flight. Before, the commit's gate cleared `pending_full` and the
+/// store went on: the next fork, and the next trunk commit, were acknowledged. Arms: the sync
+/// failing at once (data_sync_retry off and on) and its completion failing (data_sync_retry on).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_failed_trunk_wal_sync_under_an_ordered_barrier_fail_stops_the_store() {
+    let _s = serial();
+    for catalog in [false, true] {
+        for (mode, retry) in [(1u8, false), (1, true), (2, true)] {
+            let what = format!("catalog={catalog} mode={mode} retry={retry}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let (db, armed) = open_failing_wal(&dir.path().join("walfail.db"), opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            trunk.execute("PRAGMA fullfsync = ON").unwrap();
+            if retry {
+                trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+            }
+            armed.store(mode, std::sync::atomic::Ordering::Release);
+            let before = sync_counts();
+            let failed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+            let after = sync_counts();
+            assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0, "{what}: premise: the WAL's sync was reached");
+            assert!(failed.is_err(), "{what}: premise: the failed WAL sync failed the commit");
+            assert!(after.barrier > before.barrier, "{what}: premise: the commit's pre-image was ordered, not flushed");
+            assert_fail_stopped(db.connect().unwrap().fork_branch().map(|x| x.into_id()), &format!("{what}: the next fork"));
+            assert_fail_stopped(
+                db.connect().unwrap().execute("UPDATE t SET v = 'later' WHERE id = 9"),
+                &format!("{what}: the next trunk commit with a live child"),
+            );
+            drop(b);
+        }
+    }
+}
+
+/// Review 6 #2, the control: a trunk commit whose pre-image was made durable by a flush of its own
+/// (fullfsync off: nothing ordered, nothing noted to ride the WAL's sync) does not fail-stop the
+/// branch store when its WAL sync fails: the branch files never relied on it.
+#[test]
+fn a_failed_trunk_wal_sync_that_carried_nothing_leaves_the_store_running() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("walctl.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+        armed.store(1, std::sync::atomic::Ordering::Release);
+        let failed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+        assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0, "catalog={catalog}: premise: the WAL's sync was reached");
+        assert!(failed.is_err(), "catalog={catalog}: premise: the failed WAL sync failed the commit");
+        db.connect().unwrap().fork_branch().unwrap_or_else(|e| panic!("catalog={catalog}: the store stopped over a WAL sync it never relied on: {e}"));
+        assert_eq!(read_v(&b.connect().unwrap(), 7), "trunk-7", "catalog={catalog}: the child's fork point");
+    }
+}
+
+/// Review 6 #2: a temp file that is to replace a branch file failing its sync fail-stops the store.
+/// On Apple an F_FULLFSYNC that fails is a failed drain of the whole device, so what earlier flights
+/// only barriered or plain-fsynced may be lost with it, and a later sync would report success over
+/// the loss (PostgreSQL panics on any fsync failure for the same reason). Before, the rewrite
+/// failed, the old file stayed, and the store went on. A snapshot store's compaction; a catalog
+/// store's fuzzy checkpoint, whose cut is prepared off the mutex.
+#[test]
+fn a_replacement_that_fails_its_sync_fail_stops_the_store() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(
+            &dir.path().join("replfail.db"),
+            opts(catalog, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+        );
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let _second = trunk.fork_branch().unwrap().into_id();
+        db.branch_failpoint(Some(BranchFailpoint::ReplacementSyncFails));
+        if catalog {
+            let installed = db.branch_checkpoint_counters()[0];
+            assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+            db.branch_checkpoint_wait();
+            assert_eq!(db.branch_checkpoint_counters()[0], installed + 1, "premise: the checkpoint's catalog commit installed");
+        } else {
+            assert!(db.branch_compact_now().is_err(), "premise: the compaction's snapshot failed its sync");
+        }
+        assert_fail_stopped(trunk.fork_branch().map(|x| x.into_id()), &format!("catalog={catalog}: the next fork"));
+    }
+}
+

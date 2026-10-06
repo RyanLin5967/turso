@@ -5948,6 +5948,13 @@ impl BranchStore {
         let mut inner = self.inner.lock();
         inner.failpoint = failpoint;
         inner.orphans.clear();
+        // Armed in the journal at once: a replacement's sync may run off the store mutex.
+        if failpoint == Some(BranchFailpoint::ReplacementSyncFails) {
+            inner.failpoint = None;
+            if let Some(journal) = inner.journal.as_ref() {
+                journal.fail_next_replacement_sync();
+            }
+        }
     }
 
     pub(crate) fn failpoint_orphans(&self) -> Vec<u32> {

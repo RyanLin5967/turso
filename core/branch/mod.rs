@@ -500,6 +500,9 @@ pub enum BranchFailpoint {
     /// The confirmation word of the next group flight fails to reach the log's header, as an I/O
     /// error would (review 6 #1).
     ConfirmWriteFails,
+    /// The next sync of a temp file that is to replace a branch file (a cut's or rewrite's new
+    /// log, a reset log, a compaction's snapshot) fails as an I/O error would (review 6 #2).
+    ReplacementSyncFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.

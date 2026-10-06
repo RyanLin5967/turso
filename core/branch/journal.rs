@@ -943,6 +943,9 @@ pub(crate) struct Journal {
     fail_next_take: bool,
     /// See [`Journal::fail_next_confirm`].
     fail_next_confirm: bool,
+    /// See [`Journal::fail_next_replacement_sync`]: taken by the next replacement's sync, which may
+    /// run off the store mutex (`prepare_cut`, through its `CutSource`).
+    fail_next_replacement_sync: AtomicBool,
     /// The format version this journal writes and was read at (`format_version`).
     format: u32,
     /// Frame bytes ever buffered by this journal: the log sequence number a group flight makes
@@ -986,6 +989,8 @@ pub(crate) struct CutSource {
     class: SyncClass,
     tmp: PathBuf,
     nonce: u32,
+    /// The `ReplacementSyncFails` failpoint, taken when the source was.
+    fail_sync: bool,
 }
 
 /// A cut prepared off the store mutex (`Journal::prepare_cut`): the new log, as a temp file holding
@@ -1067,6 +1072,7 @@ impl Journal {
             fail_next_arena_sync: false,
             fail_next_take: false,
             fail_next_confirm: false,
+            fail_next_replacement_sync: AtomicBool::new(false),
             format: FORMAT_VERSION,
             lsn: 0,
             pending_class: SyncClass::Off,
@@ -1265,6 +1271,7 @@ impl Journal {
             fail_next_arena_sync: false,
             fail_next_take: false,
             fail_next_confirm: false,
+            fail_next_replacement_sync: AtomicBool::new(false),
             format,
             lsn: 0,
             pending_class: SyncClass::Off,
@@ -1497,6 +1504,17 @@ impl Journal {
         self.fail_next_confirm = true;
     }
 
+    /// Fail the next replacement's sync as an I/O error would (the `ReplacementSyncFails`
+    /// failpoint; review 6 #2).
+    pub(crate) fn fail_next_replacement_sync(&self) {
+        self.fail_next_replacement_sync.store(true, Ordering::Release);
+    }
+
+    /// Whether the next replacement sync fails (spends the failpoint).
+    fn take_replacement_sync_failure(&self) -> bool {
+        self.fail_next_replacement_sync.swap(false, Ordering::AcqRel)
+    }
+
     /// Fail the arena sync of the next compaction as an I/O error would (the `ArenaSyncFails`
     /// failpoint, snapshot stores).
     pub(crate) fn fail_next_arena_sync(&mut self) {
@@ -1572,7 +1590,7 @@ impl Journal {
                 }
             }
             if class.syncs() {
-                fsync_file(&f, class)?;
+                sync_replacement(&f, class, self.take_replacement_sync_failure())?;
             }
             Ok(f)
         })();
@@ -1630,6 +1648,7 @@ impl Journal {
             class: self.rewrite_class(),
             tmp: self.files.log_tmp(),
             nonce: self.nonce,
+            fail_sync: self.take_replacement_sync_failure(),
         }))
     }
 
@@ -1655,7 +1674,7 @@ impl Journal {
                 }
             }
             if src.class.syncs() {
-                fsync_file(&f, src.class)?;
+                sync_replacement(&f, src.class, src.fail_sync)?;
             }
             Ok(f)
         })();
@@ -1716,7 +1735,7 @@ impl Journal {
                     write_at(&prep.file, &confirm_word(last_crc, end).to_le_bytes(), HEADER_CONFIRM_AT)?;
                 }
                 if class.syncs() {
-                    fsync_file(&prep.file, class)?;
+                    sync_replacement(&prep.file, class, self.take_replacement_sync_failure())?;
                 }
                 len += frames.len() as u64;
             }
@@ -2142,7 +2161,7 @@ impl Journal {
             let f = open_rw(&tmp, true)?;
             write_at(&f, &out, 0)?;
             if class.syncs() {
-                fsync_file(&f, class)?;
+                sync_replacement(&f, class, self.take_replacement_sync_failure())?;
             }
         }
         std::fs::rename(&tmp, &self.files.snap).map_err(|e| {
@@ -2194,7 +2213,7 @@ impl Journal {
                 lock_exclusive(&f, &tmp)?;
                 write_at(&f, &header, 0)?;
                 if class.syncs() {
-                    fsync_file(&f, class)?;
+                    sync_replacement(&f, class, self.take_replacement_sync_failure())?;
                 }
                 Ok(f)
             })();
@@ -2742,6 +2761,17 @@ fn reframe(kept: &[u8], old: u32, new: u32, synced: bool) -> Result<(Vec<u8>, u3
         ));
     }
     Ok((out, last_crc))
+}
+
+/// Sync a temp file that is to replace a branch file, in `class`; `fail` is the
+/// `ReplacementSyncFails` failpoint (review 6 #2).
+fn sync_replacement(file: &File, class: SyncClass, fail: bool) -> Result<()> {
+    if fail {
+        return Err(LimboError::InternalError(
+            "failpoint: a branch file's replacement failed to sync".to_string(),
+        ));
+    }
+    fsync_file(file, class)
 }
 
 /// The flight checksum an end frame carries.
