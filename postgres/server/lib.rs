@@ -107,6 +107,60 @@ struct Shared {
     lock_wait: std::time::Duration,
     /// Sessions admitted and not yet ended.
     live: AtomicUsize,
+    /// The named branches a session is on, or that a delete is releasing: a delete is refused
+    /// while a session is on the branch (55006, as PostgreSQL refuses DROP DATABASE of a database in
+    /// use), and a switch while the branch is being deleted. One hash operation under the lock per
+    /// switch, per leave and two per delete; no engine call is made under it.
+    in_use: Mutex<std::collections::HashMap<String, BranchUse>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchUse {
+    Held,
+    Deleting,
+}
+
+impl Shared {
+    fn uses(&self) -> MutexGuard<'_, std::collections::HashMap<String, BranchUse>> {
+        self.in_use.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Claim `name` for a session about to connect to it.
+    fn claim(&self, name: &str, severity: &str) -> SqlResult<()> {
+        let mut uses = self.uses();
+        if let Some(u) = uses.get(name) {
+            let mut e = in_use_error(name, *u);
+            e.severity = severity.to_string();
+            return Err(e);
+        }
+        uses.insert(name.to_string(), BranchUse::Held);
+        Ok(())
+    }
+
+    /// A session left `name`, or never reached it, or a delete of it ended.
+    fn release(&self, name: &str) {
+        self.uses().remove(name);
+    }
+
+    /// Mark `name` as being deleted: refused while a session is on it.
+    fn begin_delete(&self, name: &str) -> SqlResult<()> {
+        let mut uses = self.uses();
+        if let Some(u) = uses.get(name) {
+            return Err(in_use_error(name, *u));
+        }
+        uses.insert(name.to_string(), BranchUse::Deleting);
+        Ok(())
+    }
+}
+
+fn in_use_error(name: &str, u: BranchUse) -> Box<ErrorInfo> {
+    match u {
+        BranchUse::Held => error(
+            "55006",
+            format!("branch \"{name}\" is in use by another session"),
+        ),
+        BranchUse::Deleting => error("55006", format!("branch \"{name}\" is being deleted")),
+    }
 }
 
 impl TursoPgServer {
@@ -126,6 +180,7 @@ impl TursoPgServer {
                 max_connections,
                 lock_wait,
                 live: AtomicUsize::new(0),
+                in_use: Mutex::new(std::collections::HashMap::new()),
             }),
             interrupt_count,
         }
@@ -432,9 +487,18 @@ impl Session {
         if branch.is_empty() || branch == TRUNK {
             return Ok(());
         }
-        let conn = self
-            .waiting(|| self.shared.db.connect_named(branch))
-            .map_err(|e| PgWireError::UserError(self.switch_error(branch, &e, "FATAL")))?;
+        self.shared
+            .claim(branch, "FATAL")
+            .map_err(PgWireError::UserError)?;
+        let conn = match self.waiting(|| self.shared.db.connect_named(branch)) {
+            Ok(conn) => conn,
+            Err(e) => {
+                self.shared.release(branch);
+                return Err(PgWireError::UserError(
+                    self.switch_error(branch, &e, "FATAL"),
+                ));
+            }
+        };
         self.state().branch = Some((branch.to_string(), PgConnection::new(conn)));
         Ok(())
     }
@@ -626,7 +690,7 @@ impl Session {
                 if on == name {
                     return Ok(one_text(f, &name, format));
                 }
-                if name == TRUNK {
+                let left = if name == TRUNK {
                     let trunk = match st.trunk.take() {
                         Some(t) => t,
                         None => self.open_trunk()?,
@@ -634,14 +698,24 @@ impl Session {
                     trunk.adopt_session_of(conn);
                     st.trunk = Some(trunk);
                     // Dropping the branch's connection closes the branch for connections.
-                    st.branch = None;
+                    st.branch.take()
                 } else {
-                    let opened = self
-                        .waiting(|| self.shared.db.connect_named(&name))
-                        .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
+                    self.shared.claim(&name, "ERROR")?;
+                    let opened = match self.waiting(|| self.shared.db.connect_named(&name)) {
+                        Ok(opened) => opened,
+                        Err(e) => {
+                            self.shared.release(&name);
+                            return Err(self.switch_error(&name, &e, "ERROR"));
+                        }
+                    };
                     let next = PgConnection::new(opened);
                     next.adopt_session_of(conn);
-                    st.branch = Some((name.clone(), next));
+                    st.branch.replace((name.clone(), next))
+                };
+                // The branch left is free for a delete once its connection is closed.
+                if let Some((left, left_conn)) = left {
+                    drop(left_conn);
+                    self.shared.release(&left);
                 }
                 Ok(one_text(f, &name, format))
             }
@@ -652,10 +726,15 @@ impl Session {
                      branch first"
                 ),
             )),
-            _ => match self.waiting(|| self.shared.db.drop_branch(&name)) {
-                Ok(_) => Ok(one_text(f, &name, format)),
-                Err(e) => Err(self.missing_or(&name, &e, "ERROR")),
-            },
+            _ => {
+                self.shared.begin_delete(&name)?;
+                let dropped = self.waiting(|| self.shared.db.drop_branch(&name));
+                self.shared.release(&name);
+                match dropped {
+                    Ok(_) => Ok(one_text(f, &name, format)),
+                    Err(e) => Err(self.missing_or(&name, &e, "ERROR")),
+                }
+            }
         }
     }
 
@@ -715,6 +794,17 @@ impl Session {
         };
         info.severity = severity.to_string();
         info
+    }
+}
+
+impl Drop for Session {
+    /// The session's branch is free once its connection is closed.
+    fn drop(&mut self) {
+        let left = self.state().branch.take();
+        if let Some((name, conn)) = left {
+            drop(conn);
+            self.shared.release(&name);
+        }
     }
 }
 
@@ -1813,6 +1903,7 @@ mod tests {
             max_connections: 1,
             lock_wait: std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
             live: AtomicUsize::new(0),
+            in_use: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
