@@ -3636,6 +3636,44 @@ fn a_held_free_survives_a_checkpoint_and_a_reopen_in_a_raised_d0_catalog_store()
     );
 }
 
+/// Sets `store::HOLD_BOUND_FORCED` for one test, and clears it when dropped.
+struct HoldBound;
+
+impl HoldBound {
+    fn set(slots: usize) -> Self {
+        super::store::HOLD_BOUND_FORCED.store(slots, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for HoldBound {
+    fn drop(&mut self) {
+        super::store::HOLD_BOUND_FORCED.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Engine review 8 #5's bound: a raised D0 store that then runs D0 alone held its frees for ever
+/// (no sync ever came). Past the bound of held slots (forced to 1 here; 4096 in a build), the next
+/// operation leads one upgrade flight in the rewrite class, and the held slots are free after it.
+/// Mutant `hold_unbounded`.
+#[test]
+fn a_raised_d0_store_holds_no_more_than_its_bound_for_a_sync() {
+    let _s = serial();
+    let _b = HoldBound::set(1);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, trunk, x, slots) = raised_d0_with_a_kept_pre_image(&dir.path().join("hold-bound.db"), catalog, true);
+        assert_eq!(slots.len(), 2, "catalog={catalog}: premise: x's release frees two slots, past the bound");
+        x.reap().unwrap();
+        for _ in 0..2 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        for &slot in &slots {
+            assert!(db.branch_slot_is_free(slot), "catalog={catalog}: slot {slot} is still held past the bound");
+        }
+    }
+}
+
 /// Engine review 8 #8: three free paths skipped the hold: a lease's expiry (every fork's expiry
 /// pass), `reap_if_due`, and a close's collection of a branch released while a connection was
 /// open. They logged the Release with a write only, then freed at once. Here a lease runs out and

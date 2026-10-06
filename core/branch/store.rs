@@ -323,6 +323,10 @@ pub(crate) struct BranchStore {
     /// every trunk commit's barrier covers it, since a commit retains nothing for a child released
     /// before its decisions (gc3's N1; lead review 1 item 10; skill review 2 #3).
     last_release_lsn: AtomicU64,
+    /// An upgrade flight a raised D0 store owes its held frees (engine review 8 #5's bound): the log
+    /// sequence number to make durable and the class to make it durable in, as `due_word` packs
+    /// them (0: none). Set by `mature` under the store mutex; led by the next `wait_durable`.
+    upgrade_due: AtomicU64,
     /// The log sequence number that makes the newest TrunkRetain durable: every trunk commit's
     /// barrier covers it too, since a pre-image kept by a decision pass that was then refused (or
     /// rolled back) is not decided again by the retry — the page's written epoch already is the
@@ -643,6 +647,52 @@ impl Group {
             }
         }
     }
+}
+
+/// Engine review 8 #5: the most slots a raised D0 store holds for a sync before the next
+/// operation leads an upgrade flight in the free class (`BranchStore::upgrade_if_due`).
+const HOLD_BOUND: usize = 4096;
+
+/// Test builds: `HOLD_BOUND` for one test (0: the constant).
+#[cfg(test)]
+pub(crate) static HOLD_BOUND_FORCED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn hold_bound() -> usize {
+    #[cfg(test)]
+    {
+        let forced = HOLD_BOUND_FORCED.load(Ordering::Acquire);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    HOLD_BOUND
+}
+
+/// The class a rewrite of the log (a compaction's snapshot, a checkpoint's catalog commit and cut,
+/// a page-size restart's empty state) made everything it kept durable in: the log's rewrite class,
+/// in which it syncs (engine review 8 #6: the store's own class understated it in a raised D0
+/// store, so no held free ever matured on a rewrite). Mutant `rewrite_marks_store_class` (test
+/// builds only): the store's class, as before.
+fn rewritten_class(journal: &Journal) -> SyncClass {
+    if fe_mutant("rewrite_marks_store_class") {
+        journal.sync_class()
+    } else {
+        journal.rewrite_class()
+    }
+}
+
+/// An owed upgrade flight (`BranchStore::upgrade_due`): `lsn` above, the class's index below.
+fn due_word(lsn: u64, class: SyncClass) -> u64 {
+    (lsn << 2) | class_index(class) as u64
+}
+
+fn from_due_word(word: u64) -> (u64, SyncClass) {
+    let class = match word & 3 {
+        0 => SyncClass::Off,
+        1 => SyncClass::Fsync,
+        _ => SyncClass::FullFsync,
+    };
+    (word >> 2, class)
 }
 
 /// How long the group must stay idle (no flight landed) before the confirmation writer writes the
@@ -1037,13 +1087,12 @@ struct StoreInner {
     stamps: RowStamps,
     /// The Merger's work since open (observing only).
     merge_work: super::BranchMergeWork,
-    /// Slots freed by an early-released operation whose records are not yet durable, under the log
-    /// sequence number that makes them free (see [`Group`], rule 2).
+    /// Slots freed by an early-released operation whose records are not yet durable in the free
+    /// class (`free_class`), under the log sequence number that makes them free (see [`Group`],
+    /// rule 2).
     pending_free: VecDeque<(u64, Vec<Slot>)>,
-    /// D0 only (review 5 #18): frees whose Release was only written, of slots a synced record names
-    /// (`Arena::is_synced_named`), waiting for a sync to cover the Release, with its sequence
-    /// number.
-    held_synced_free: VecDeque<(u64, Vec<Slot>)>,
+    /// The slots in `pending_free` (engine review 8 #5: the bound on a raised D0 store's hold).
+    pending_free_slots: usize,
     /// Early-released Releases applied in memory and not yet durable in the store's class, in log
     /// order (engine review 7 #3): a fail-stopped store still lists and finds these branches, as a
     /// reopen would. Pruned by `mature`. `u64::MAX`: never buffered (the buffer failed).
@@ -2628,7 +2677,7 @@ fn run_flight(
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
         if installed.is_ok() {
             if let Some(journal) = guard.journal.as_ref() {
-                group.mark_durable(journal.lsn() - journal.pending_len(), journal.sync_class());
+                group.mark_durable(journal.lsn() - journal.pending_len(), rewritten_class(journal));
             }
         }
         let hold_ns = ns(t);
@@ -3018,6 +3067,7 @@ impl BranchStore {
             files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
+            upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
             fuzzy: false,
         }
@@ -3236,6 +3286,7 @@ impl BranchStore {
             files_dev: inner.files_dev.clone(),
             barrier_locks: AtomicU64::new(0),
             last_release_lsn: AtomicU64::new(0),
+            upgrade_due: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
@@ -3845,7 +3896,9 @@ impl BranchStore {
         let hold = Some(&*self.trunk_commit_hold);
         #[cfg(not(test))]
         let hold = None;
-        Self::wait_durable_on(&self.inner, &self.group, hold, lsn, class)
+        Self::wait_durable_on(&self.inner, &self.group, hold, lsn, class)?;
+        self.upgrade_if_due();
+        Ok(())
     }
 
     /// `wait_durable` for a caller holding only the store's shared parts: a fuzzy checkpoint's
@@ -4061,24 +4114,74 @@ impl BranchStore {
                 inner.releases_in_air.pop_front();
             }
         }
-        if inner.pending_free.is_empty() && inner.held_synced_free.is_empty() {
+        if inner.pending_free.is_empty() {
             return;
         }
-        // Durable in the store's class (review 5 #18): an ordered landing reaches durable(Off) and
-        // is durable only when the trunk's WAL flush returns. Mutant `free_at_off` (test builds
-        // only): durable(Off), as before.
-        let class = if fe_mutant("free_at_off") { SyncClass::Off } else { self.class };
-        inner.mature_frees(self.group.durable(class), self.group.durable(SyncClass::Fsync));
+        // Durable in the free class (review 5 #18, engine review 8 #5): the store's, where an
+        // ordered landing reaches durable(Off) and is durable only when the trunk's WAL flush
+        // returns; a raised D0 store's rewrite class. Mutant `free_at_off` (test builds only):
+        // durable(Off), as before review 5 #18.
+        let class = if fe_mutant("free_at_off") { SyncClass::Off } else { inner.free_class() };
+        inner.mature_frees(self.group.durable(class));
+        // The bound (engine review 8 #5): a raised D0 store that then runs D0 alone would hold
+        // its frees for ever. Past `hold_bound()` held slots the next operation leads one upgrade
+        // flight in the free class (`upgrade_if_due`): one sync per bound's worth of frees.
+        // Mutant `hold_unbounded` (test builds only).
+        if class != self.class && inner.pending_free_slots > hold_bound() && !fe_mutant("hold_unbounded") {
+            if let Some(&(lsn, _)) = inner.pending_free.back() {
+                self.upgrade_due.fetch_max(due_word(lsn, class), Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Free what an operation that logged its Release through `log_all` freed (an expiry pass, a
+    /// due reap, a close's collection of a branch released while a connection was open): held
+    /// until its Release is durable in the free class, as an early-released Release's frees are
+    /// (engine review 8 #8). In D1 and D2 `log_all`'s flush already made it durable, and an
+    /// unraised D0 store frees what is written, so those free at once as before. Mutant
+    /// `expiry_frees_at_once` (test builds only): at once on every path.
+    fn free_after_log(&self, inner: &mut StoreInner, freed: Vec<Slot>) {
+        if fe_mutant("expiry_frees_at_once") {
+            inner.release_slots(freed);
+            return;
+        }
+        let lsn = inner.journal.as_ref().map_or(0, Journal::lsn);
+        inner.defer_frees(lsn, freed);
+        self.mature(inner);
+    }
+
+    /// Lead the upgrade flight `mature` found due (`upgrade_due`), if one is: called by an
+    /// operation holding no lock, after its own wait (engine review 8 #5's bound). Its outcome is
+    /// not the operation's, which is durable already: a failed upgrade fail-stops the store as any
+    /// failed flight does, and is only logged here.
+    fn upgrade_if_due(&self) {
+        let due = self.upgrade_due.load(Ordering::Acquire);
+        if due == 0
+            || self
+                .upgrade_due
+                .compare_exchange(due, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let (lsn, class) = from_due_word(due);
+        if let Err(e) = Self::wait_durable_on(&self.inner, &self.group, None, lsn, class) {
+            tracing::warn!("branch store: the upgrade flight for held frees failed: {e}");
+        }
     }
 
     /// Make everything buffered durable and every deferred free mature, under the store mutex:
     /// before a catalog checkpoint's capture, so the free table it writes lists every slot the
-    /// state no longer names (catalog mode has no reachability sweep at open).
+    /// state no longer names (catalog mode has no reachability sweep at open). Reachable only under
+    /// mutant `settle_at_capture`. A raised D0 store's frees wait for a sync this flush does not
+    /// make; the capture lists them as deferred (engine review 8 #7), so they may remain.
     fn settle_durable(&self, inner: &mut StoreInner) -> Result<()> {
         self.flush_locked(inner, SyncClass::Off)?;
-        inner.mature_frees(self.group.durable(self.class), self.group.durable(SyncClass::Fsync));
+        inner.mature_frees(self.group.durable(inner.free_class()));
         crate::turso_assert!(
-            inner.pending_free.is_empty() || inner.journal.as_ref().is_some_and(Journal::is_poisoned),
+            inner.pending_free.is_empty()
+                || inner.journal.as_ref().is_some_and(Journal::is_poisoned)
+                || inner.free_class() != inner.sync,
             "deferred frees remain after everything buffered was made durable"
         );
         Ok(())
@@ -4176,7 +4279,7 @@ impl BranchStore {
         if let Err(e) = inner.apply_release(id, &mut freed) {
             return Err(inner.fatal(e));
         }
-        inner.release_slots(freed);
+        self.free_after_log(inner, freed);
         self.sync_trunk_children(inner);
         self.sync_lease_flag(inner);
         Ok(())
@@ -4267,7 +4370,7 @@ impl BranchStore {
             }
         }
         let freed_pages = freed.len();
-        inner.release_slots(freed);
+        self.free_after_log(inner, freed);
         self.sync_trunk_children(inner);
         self.sync_lease_flag(inner);
         self.maybe_compact(inner);
@@ -4540,7 +4643,7 @@ impl BranchStore {
                 // The catalog holds what preceded the capture; the cut log holds, synced, what
                 // followed it in the file.
                 self.group
-                    .mark_durable(journal.lsn() - journal.pending_len(), journal.sync_class());
+                    .mark_durable(journal.lsn() - journal.pending_len(), rewritten_class(journal));
             }
             self.unsynced.store(false, Ordering::Release);
             return Ok(());
@@ -4560,7 +4663,7 @@ impl BranchStore {
             return Ok(());
         };
         journal.compact(&snapshot, arena, fail_after_rename)?;
-        self.group.mark_durable(journal.lsn(), journal.sync_class());
+        self.group.mark_durable(journal.lsn(), rewritten_class(journal));
         // The snapshot carries the clock, and it replaced every buffered stamp.
         lease.queued(snapshot.lease_now_ms);
         lease.flushed();
@@ -4662,7 +4765,7 @@ impl BranchStore {
         if restart {
             // It did (it refuses otherwise): the empty state supersedes everything buffered.
             if let Some(journal) = inner.journal.as_ref() {
-                self.group.mark_durable(journal.lsn(), journal.sync_class());
+                self.group.mark_durable(journal.lsn(), rewritten_class(journal));
             }
         }
         let (_, now) = self.expire(&mut inner, Stamp::Queue)?;
@@ -4893,7 +4996,7 @@ impl BranchStore {
             let _ = inner.fatal(e);
             return;
         }
-        inner.release_slots(freed);
+        self.free_after_log(&mut inner, freed);
         self.sync_trunk_children(&inner);
     }
 
@@ -6731,7 +6834,7 @@ impl StoreInner {
             stamps: RowStamps::default(),
             merge_work: super::BranchMergeWork::default(),
             pending_free: VecDeque::new(),
-            held_synced_free: VecDeque::new(),
+            pending_free_slots: 0,
             releases_in_air: VecDeque::new(),
             names: NameIndex::default(),
             trunk_commit_epoch: 0,
@@ -7639,7 +7742,7 @@ impl StoreInner {
         self.arena = Some(arena);
         if !fe_mutant("restart_keeps_deferred") {
             self.pending_free.clear();
-            self.held_synced_free.clear();
+            self.pending_free_slots = 0;
         }
         // A catalog store's free state needs nothing here (engine review 9 #9): the restart's
         // checkpoint committed an empty free table (`Captured::fresh_arena`), and its install left
@@ -7896,13 +7999,25 @@ impl StoreInner {
         // Before `deferred` is taken, so the mutant leaves none (review 4 #11: it died of a usize
         // underflow in `in_use` below, not of the test's assertion).
         if fe_mutant("deferred_matured_at_capture") {
+            self.pending_free_slots = 0;
             for (_, slots) in std::mem::take(&mut self.pending_free) {
                 for slot in slots {
                     arena.release(slot);
                 }
             }
         }
-        let deferred: Vec<Slot> = self.pending_free.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+        // Every free still waiting: a raised D0 store's frees written and held for a sync included
+        // (engine review 8 #7: they were in a side list the capture never read, so the catalog
+        // counted them in use, listed none free, and the cut dropped their Release: after a reopen
+        // they were lost). Mutant `capture_skips_held` (test builds only): those left out.
+        let written = journal.lsn() - journal.pending_len();
+        let skip_held = fe_mutant("capture_skips_held");
+        let deferred: Vec<Slot> = self
+            .pending_free
+            .iter()
+            .filter(|&&(lsn, _)| !(skip_held && lsn <= written))
+            .flat_map(|(_, s)| s.iter().copied())
+            .collect();
         let deferred_lsn = journal.lsn();
         let meta = Meta {
             generation,
@@ -8102,6 +8217,7 @@ impl StoreInner {
                 lsn <= cap.deferred_lsn || fe_mutant("install_forgets_after_capture")
             }) {
                 let (_, slots) = self.pending_free.pop_front().expect("just looked");
+                self.pending_free_slots = self.pending_free_slots.saturating_sub(slots.len());
                 for slot in slots {
                     arena.forget_listed(slot);
                     still_deferred.insert(slot);
@@ -8174,37 +8290,36 @@ impl StoreInner {
             return;
         }
         if !freed.is_empty() {
+            self.pending_free_slots += freed.len();
             self.pending_free.push_back((lsn, freed));
         }
     }
 
-    /// Return to the arena every deferred free whose Release is `durable` (in the store's class).
-    /// In D0, where that means only written, a slot a synced record names waits until a sync
-    /// (`synced`, durable in Fsync) covers its Release (review 5 #18).
-    fn mature_frees(&mut self, durable: u64, synced: u64) {
+    /// The class whose durability matures a deferred free (review 5 #18, engine review 8 #5): the
+    /// store's own; but in a D0 store whose log was ever raised (its rewrites sync: a synchronous
+    /// trunk made a record durable, now or before the last open) the rewrite class. A raised
+    /// flight's sync makes the whole log durable, so a record a power cut keeps may name any slot
+    /// such a store frees: the free waits until a sync covers its Release. A D0 store never raised
+    /// keeps nothing across a power cut, and frees what is written. Mutant `d0_frees_at_written`
+    /// (test builds only): the store's class.
+    fn free_class(&self) -> SyncClass {
+        let rewrite = self.journal.as_ref().map_or(self.sync, Journal::rewrite_class);
+        if !self.sync.syncs() && rewrite.syncs() && !fe_mutant("d0_frees_at_written") {
+            rewrite
+        } else {
+            self.sync
+        }
+    }
+
+    /// Return to the arena every deferred free whose Release is `durable` (in the free class).
+    fn mature_frees(&mut self, durable: u64) {
         while self
             .pending_free
             .front()
             .is_some_and(|&(lsn, _)| lsn <= durable)
         {
-            let (lsn, freed) = self.pending_free.pop_front().expect("just looked");
-            let (held, now): (Vec<Slot>, Vec<Slot>) = if self.sync.syncs() || lsn <= synced {
-                (Vec::new(), freed)
-            } else {
-                let arena = self.arena.as_ref().expect("slots were freed, so the arena exists");
-                freed.into_iter().partition(|&slot| arena.is_synced_named(slot))
-            };
-            self.release_slots(now);
-            if !held.is_empty() {
-                self.held_synced_free.push_back((lsn, held));
-            }
-        }
-        while self
-            .held_synced_free
-            .front()
-            .is_some_and(|&(lsn, _)| lsn <= synced)
-        {
-            let (_, freed) = self.held_synced_free.pop_front().expect("just looked");
+            let (_, freed) = self.pending_free.pop_front().expect("just looked");
+            self.pending_free_slots = self.pending_free_slots.saturating_sub(freed.len());
             self.release_slots(freed);
         }
     }
