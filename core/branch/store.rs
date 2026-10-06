@@ -9184,7 +9184,7 @@ mod sota_index_tests {
         let mut written: HashMap<u32, u64> = HashMap::new();
         let mut epoch = 0u64;
         let mut generation = 0u64;
-        let (mut freed_oldest, mut freed_newest, mut freed_middle, mut images) = (0, 0, 0, 0);
+        let (mut freed_oldest, mut freed_newest, mut freed_middle, mut images, mut fuzzy_images) = (0, 0, 0, 0, 0);
         for step in 0..1500 {
             match rng.below(10) {
                 0..=2 if live.len() < 40 => {
@@ -9311,7 +9311,7 @@ mod sota_index_tests {
                 // Review 4 #22: in a catalog store, sometimes a FUZZY checkpoint held mid-flight
                 // (before or after its catalog commit), the crash image taken while it is held,
                 // and the live store checked again after its install.
-                let held = (mode.catalog() && rng.below(2) == 0)
+                let held = (mode.catalog() && rng.below(2) == 0 && !splice_arm())
                     .then(|| if rng.below(2) == 0 { HOLD_BEFORE_COMMIT } else { HOLD_AFTER_COMMIT });
                 let in_flight = held.is_some_and(|stage| {
                     store.checkpoint_hold(stage);
@@ -9331,6 +9331,7 @@ mod sota_index_tests {
                 }
                 let recovered = crash_image(mode, dir.path(), "db", "image");
                 images += 1;
+                fuzzy_images += u64::from(in_flight);
                 recovered.check_indexes();
                 assert_eq!(
                     recovered.slots_in_use(),
@@ -9345,10 +9346,18 @@ mod sota_index_tests {
                 }
             }
         }
+        // FLAGGED TEST EDIT (engine review 7 #9): the fuzzy arm is gated off in the splice arm (it
+        // refuses fuzzy checkpoints; `checkpoint_fuzzy_now().unwrap()` panicked there), and a catalog
+        // run must have taken a crash image with a fuzzy checkpoint in flight at least once.
         assert!(
-            freed_oldest > 0 && freed_newest > 0 && freed_middle > 0 && (!durable || images > 10),
+            freed_oldest > 0
+                && freed_newest > 0
+                && freed_middle > 0
+                && (!durable || images > 10)
+                && (!durable || !mode.catalog() || splice_arm() || fuzzy_images > 0),
             "{mode:?} seed {seed:#x}: reaps that freed versions: oldest {freed_oldest}, newest \
-             {freed_newest}, middle {freed_middle}; crash images {images}"
+             {freed_newest}, middle {freed_middle}; crash images {images} ({fuzzy_images} with a fuzzy \
+             checkpoint in flight)"
         );
         for (id, _, _) in live {
             store.release_handle(id).unwrap();
@@ -9482,7 +9491,7 @@ mod sota_tree_tests {
         let mut trunk: HashMap<u32, u64> = (0..PAGES).map(|p| (p, 0)).collect();
         let mut nodes: Vec<Node> = Vec::new();
         let mut generation = 0u64;
-        let (mut deferred, mut max_depth, mut wrote_after_fork, mut images) = (0, 0, 0, 0);
+        let (mut deferred, mut max_depth, mut wrote_after_fork, mut images, mut fuzzy_images) = (0, 0, 0, 0, 0);
         for step in 0..2500 {
             let live: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].handle).collect();
             match rng.below(12) {
@@ -9581,7 +9590,7 @@ mod sota_tree_tests {
                 // Review 4 #22: in a catalog store, sometimes a FUZZY checkpoint held mid-flight
                 // (before or after its catalog commit), the crash image taken while it is held,
                 // and the live store checked again after its install.
-                let held = (mode.catalog() && rng.below(2) == 0)
+                let held = (mode.catalog() && rng.below(2) == 0 && !splice_arm())
                     .then(|| if rng.below(2) == 0 { HOLD_BEFORE_COMMIT } else { HOLD_AFTER_COMMIT });
                 let in_flight = held.is_some_and(|stage| {
                     store.checkpoint_hold(stage);
@@ -9601,6 +9610,7 @@ mod sota_tree_tests {
                 }
                 let recovered = crash_image(mode, dir.path(), "db", "image");
                 images += 1;
+                fuzzy_images += u64::from(in_flight);
                 recovered.check_indexes();
                 assert_eq!(
                     recovered.slots_in_use(),
@@ -9616,10 +9626,17 @@ mod sota_tree_tests {
             }
         }
         // The shapes the page maps exist for must have occurred, or a green run says nothing.
+        // FLAGGED TEST EDIT (engine review 7 #9): no fuzzy arm in the splice arm, and a catalog run's
+        // crash images include one with a fuzzy checkpoint in flight.
         assert!(
-            max_depth >= 10 && deferred > 0 && wrote_after_fork > 0 && (!durable || images > 20),
+            max_depth >= 10
+                && deferred > 0
+                && wrote_after_fork > 0
+                && (!durable || images > 20)
+                && (!durable || !mode.catalog() || splice_arm() || fuzzy_images > 0),
             "{mode:?} seed {seed:#x}: max depth {max_depth}, deferred reaps {deferred}, writes by a branch \
-             after its first fork {wrote_after_fork}, crash images {images}"
+             after its first fork {wrote_after_fork}, crash images {images} ({fuzzy_images} with a fuzzy \
+             checkpoint in flight)"
         );
         for n in nodes.iter().filter(|n| n.handle) {
             store.release_handle(n.id).unwrap();
