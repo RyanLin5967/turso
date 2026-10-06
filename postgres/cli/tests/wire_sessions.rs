@@ -2628,3 +2628,26 @@ fn terminate_ends_the_session_and_frees_its_branch_first() {
     a.q("SELECT turso_branch_delete('y')")
         .ok("a delete right after the close, first try");
 }
+
+/// A delete right after a session on the branch closed its socket (no Terminate, no retry)
+/// succeeds: the server waits, as PostgreSQL's DROP DATABASE waits up to 5 s for exiting backends,
+/// for the closing session to release the branch, instead of refusing 55006 because the release
+/// had not happened yet. Twenty rounds, so the race shows. The older retrying test stays as it is
+/// (wire review 3 item 4).
+#[test]
+fn a_delete_right_after_a_close_waits_for_the_release() {
+    let dir = Scratch::new("closedelete");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for i in 0..20 {
+        let name = format!("z{i}");
+        a.q(&format!("SELECT turso_branch_create('{name}')"))
+            .ok("create");
+        let c = server
+            .connect_to(&format!("postgres/{name}"))
+            .expect("startup on the branch");
+        drop(c);
+        a.q(&format!("SELECT turso_branch_delete('{name}')"))
+            .ok("a delete right after the close, first try");
+    }
+}
