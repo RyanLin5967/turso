@@ -1090,6 +1090,10 @@ pub(crate) const HOLD_TRUNK_BARRIER_DONE: u8 = 6;
 /// fork waits here, its read snapshot taken, before it registers.
 #[cfg(test)]
 pub(crate) const HOLD_FORK_REGISTERING: u8 = 7;
+/// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
+#[cfg(test)]
+pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
+
 /// Test builds: the next build of a name filter finds its first catalog scan failing, as an I/O
 /// error would (review 3 #7). Set before the open that starts the build.
 #[cfg(test)]
@@ -2268,6 +2272,10 @@ impl Drop for CutGate<'_> {
 /// (nothing prepared, the install cuts under the mutex as before): a poisoned store, a failed copy,
 /// or a log that changed under the capture.
 fn begin_cut<'a>(inner: &StoreMutex, group: &'a Group, cap: &Captured) -> Option<CutGate<'a>> {
+    #[cfg(test)]
+    if CUT_PANICS.swap(false, Ordering::AcqRel) {
+        panic!("test hook: the cut panicked");
+    }
     loop {
         let src = {
             let guard = inner.lock();

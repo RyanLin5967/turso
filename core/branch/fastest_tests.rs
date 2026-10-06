@@ -3286,3 +3286,29 @@ fn a_fail_stopped_store_lists_no_fork_whose_flight_failed() {
         assert_eq!(after, before, "catalog={catalog}: a fork whose flight failed is listed");
     }
 }
+
+/// Review 4 #16: a panic in a fuzzy checkpoint's cut (an unwinding build) still reaches the
+/// install, so the checkpoint is not left in flight for good: the next one starts and installs.
+/// Before, the cut ran outside the writer's panic guard, `flight` stayed set, and no checkpoint
+/// ever started again (and the catalog's read snapshot stayed pinned).
+#[test]
+fn a_panic_in_a_fuzzy_checkpoints_cut_does_not_stop_checkpoints() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cut-panic.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _a = trunk.fork_branch().unwrap().into_id();
+    super::store::CUT_PANICS.store(true, std::sync::atomic::Ordering::Release);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    assert!(
+        !super::store::CUT_PANICS.load(std::sync::atomic::Ordering::Acquire),
+        "premise: the cut panicked"
+    );
+    let installed = db.branch_checkpoint_counters()[0];
+    let _b = trunk.fork_branch().unwrap().into_id();
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no checkpoint started after a cut panicked");
+    db.branch_checkpoint_wait();
+    assert!(db.branch_checkpoint_counters()[0] > installed, "the checkpoint after the panic did not install");
+}
