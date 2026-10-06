@@ -95,6 +95,16 @@ impl PgConnection {
         prepare_statement(&self.inner, sql.as_ref())
     }
 
+    /// [`PgConnection::prepare`], with PostgreSQL's type OID for each result column the engine
+    /// cannot type itself, read from the same parse (aggregates; see
+    /// [`crate::result_types::aggregate_types`]). `None` (or a short list) where the engine types
+    /// the column.
+    pub fn prepare_typed(&self, sql: impl AsRef<str>) -> Result<(Statement, Vec<Option<u32>>)> {
+        let mut types = Vec::new();
+        let stmt = prepare_statement_typed(&self.inner, sql.as_ref(), Some(&mut types))?;
+        Ok((stmt, types))
+    }
+
     pub fn query(&self, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         let sql = sql.as_ref().trim();
         if sql.is_empty() {
@@ -368,6 +378,15 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>> {
 }
 
 fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Statement> {
+    prepare_statement_typed(pg_conn, sql, None)
+}
+
+/// [`prepare_statement`], filling `types` (when asked) with the result types the parse gives.
+fn prepare_statement_typed(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    types: Option<&mut Vec<Option<u32>>>,
+) -> Result<Statement> {
     let sql = sql.trim();
     if sql.is_empty() {
         return Err(LimboError::InvalidArgument(
@@ -382,6 +401,10 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
     if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
         return Ok(stmt);
+    }
+    if let Some(types) = types {
+        *types =
+            crate::result_types::aggregate_types(&parse_result, &pg_conn.conn.current_schema());
     }
 
     let translator = PostgreSQLTranslator::new();

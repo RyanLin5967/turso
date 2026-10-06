@@ -263,7 +263,7 @@ pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)>
 
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
-fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     let base = match ty_str.find('(') {
         Some(pos) => &ty_str[..pos],
         None => ty_str,

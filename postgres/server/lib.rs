@@ -436,6 +436,8 @@ struct Described {
     conn: Arc<turso_core::Connection>,
     sql: String,
     stmt: turso_core::Statement,
+    /// The result types the parse gave (see [`PgConnection::prepare_typed`]).
+    types: Vec<Option<u32>>,
 }
 
 /// CHECKPOINTs skipped inside a block because the WAL was busy (see [`Session::checkpoint`]),
@@ -802,12 +804,13 @@ impl Session {
             return Ok(());
         }
         let in_tx = !conn.inner().get_auto_commit();
-        match conn.prepare(sql) {
-            Ok(stmt) => {
+        match conn.prepare_typed(sql) {
+            Ok((stmt, types)) => {
                 self.state().described = Some(Described {
                     conn: conn.inner().clone(),
                     sql: sql.to_string(),
                     stmt,
+                    types,
                 });
                 Ok(())
             }
@@ -827,7 +830,7 @@ impl Session {
         self.state()
             .described
             .as_ref()
-            .map_or_else(Vec::new, |d| build_field_info(&d.stmt, format))
+            .map_or_else(Vec::new, |d| result_fields(&d.stmt, &d.types, format))
     }
 
     /// The highest $n the statement [`Session::describe_prepare`] kept uses (the engine names
@@ -849,10 +852,16 @@ impl Session {
     }
 
     /// The statement a Describe prepared for this Execute, if it is this text on this connection.
-    fn take_described(&self, conn: &PgConnection, sql: &str) -> Option<turso_core::Statement> {
+    fn take_described(
+        &self,
+        conn: &PgConnection,
+        sql: &str,
+    ) -> Option<(turso_core::Statement, Vec<Option<u32>>)> {
         let mut st = self.state();
         match st.described.take() {
-            Some(d) if d.sql == sql && Arc::ptr_eq(&d.conn, conn.inner()) => Some(d.stmt),
+            Some(d) if d.sql == sql && Arc::ptr_eq(&d.conn, conn.inner()) => {
+                Some((d.stmt, d.types))
+            }
             _ => None,
         }
     }
@@ -865,9 +874,9 @@ impl Session {
         format: &Format,
     ) -> SqlResult<Response> {
         let described = portal.and_then(|_| self.take_described(conn, sql));
-        let mut stmt = match described {
-            Some(stmt) => stmt,
-            None => conn.prepare(sql).map_err(|e| engine_info(&e))?,
+        let (mut stmt, types) = match described {
+            Some(kept) => kept,
+            None => conn.prepare_typed(sql).map_err(|e| engine_info(&e))?,
         };
         self.shared.cleanup_dropped_schema_file(sql);
         if let Some(portal) = portal {
@@ -876,14 +885,9 @@ impl Session {
         let r = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
             execute_non_query(&mut stmt, sql)
         } else {
-            // An extended-protocol client took the column types from Describe, which runs nothing:
-            // its rows keep those types. A simple-protocol reply carries its own RowDescription.
-            execute_query(
-                &mut stmt,
-                format,
-                portal.is_none(),
-                &conn.inner().current_schema(),
-            )
+            // The column types are the statement's alone, so Describe (which runs nothing) and
+            // this reply agree on both protocols (wire review 1 item 14).
+            execute_query(&mut stmt, format, &types, &conn.inner().current_schema())
         };
         r.map_err(wire_info)
     }
@@ -1899,9 +1903,26 @@ where
     Ok(true)
 }
 
-/// Build FieldInfo metadata from a prepared statement's column information.
-fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldInfo> {
-    field_info(stmt, format, |i| resolve_pg_type_for_column(stmt, i))
+/// A prepared statement's result columns, typed by [`column_type`]: what Describe reports and what
+/// the rows are encoded as, on both protocols.
+fn result_fields(
+    stmt: &turso_core::Statement,
+    types: &[Option<u32>],
+    format: &Format,
+) -> Vec<FieldInfo> {
+    field_info(stmt, format, |i| column_type(stmt, types, i))
+}
+
+/// A result column's type from the statement alone, never from its values: the type the parse
+/// gave (an aggregate, [`PgConnection::prepare_typed`]), else the engine's
+/// ([`resolve_pg_type_for_column`], text where it cannot tell).
+fn column_type(stmt: &turso_core::Statement, types: &[Option<u32>], idx: usize) -> Type {
+    types
+        .get(idx)
+        .copied()
+        .flatten()
+        .and_then(Type::from_oid)
+        .unwrap_or_else(|| resolve_pg_type_for_column(stmt, idx))
 }
 
 fn field_info(
@@ -1915,39 +1936,6 @@ fn field_info(
             FieldInfo::new(name, None, None, pg_type(i), format.format_for(i))
         })
         .collect()
-}
-
-/// A result column's type from the statement alone, if the engine can tell it (a table column, a
-/// literal, a cast, an operator over known types); `None` for one it cannot, such as an aggregate.
-fn static_pg_type(stmt: &turso_core::Statement, idx: usize) -> Option<Type> {
-    stmt.get_column_type_info(idx)
-        .ok()
-        .flatten()
-        .map(|_| resolve_pg_type_for_column(stmt, idx))
-}
-
-/// The type of a result column the statement could not type, from the values it returned: a
-/// SQLite value's storage class is its type. Integers only: bigint (PostgreSQL's type for count and
-/// for the sum of integers); any real among numbers: double precision; text: text; blobs: bytea.
-/// Mixed classes, or no non-null value at all, stay text.
-fn infer_pg_type(values: &[Vec<Value>], idx: usize) -> Type {
-    use turso_core::Numeric;
-    let (mut ints, mut reals, mut texts, mut blobs) = (0usize, 0usize, 0usize, 0usize);
-    for row in values {
-        match row.get(idx) {
-            Some(Value::Numeric(Numeric::Integer(_))) => ints += 1,
-            Some(Value::Numeric(Numeric::Float(_))) => reals += 1,
-            Some(Value::Text(_)) => texts += 1,
-            Some(Value::Blob(_)) => blobs += 1,
-            _ => {}
-        }
-    }
-    match (ints, reals, texts, blobs) {
-        (1.., 0, 0, 0) => Type::INT8,
-        (_, 1.., 0, 0) => Type::FLOAT8,
-        (0, 0, 0, 1..) => Type::BYTEA,
-        _ => Type::TEXT,
-    }
 }
 
 /// Decide the PG wire type for a result column.
@@ -2036,59 +2024,39 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
     }
 }
 
-/// Execute a query that returns rows and build a Query response.
-///
-/// With `infer`, a column the statement cannot type (see [`static_pg_type`]) is typed from its
-/// values ([`infer_pg_type`]), so the rows are kept as values until every row is read; a statement
-/// whose columns are all typed, or a reply without `infer`, encodes each row as it comes (an
-/// untyped column as text, as Describe reported it).
+/// Execute a query that returns rows and build a Query response. Each column has the type the
+/// statement gives it ([`column_type`]), the one Describe reported, and each row is encoded as it
+/// comes (wire review 1 item 14: no value inference, no row buffering beyond the reply's).
 fn execute_query(
     stmt: &mut turso_core::Statement,
     format: &Format,
-    infer: bool,
+    types: &[Option<u32>],
     schema: &turso_core::schema::Schema,
 ) -> PgWireResult<Response> {
-    let mut statics: Vec<Option<Type>> = (0..stmt.num_columns())
-        .map(|i| static_pg_type(stmt, i))
-        .collect();
-    if !infer {
-        for t in &mut statics {
-            t.get_or_insert(Type::TEXT);
-        }
+    let header = Arc::new(result_fields(stmt, types, format));
+    // No binary encoder for numeric here: refused before the statement runs, rather than sending
+    // a float's eight bytes as numeric.
+    if let Some(f) = header
+        .iter()
+        .find(|f| *f.datatype() == Type::NUMERIC && f.format() == FieldFormat::Binary)
+    {
+        return Err(PgWireError::UserError(error(
+            "0A000",
+            format!(
+                "binary format for numeric column \"{}\" is not supported; ask for text format",
+                f.name()
+            ),
+        )));
     }
     let pads: Vec<Option<usize>> = (0..stmt.num_columns())
         .map(|i| bpchar_width(stmt, schema, i))
         .collect();
-    if statics.iter().all(Option::is_some) {
-        let header = Arc::new(field_info(stmt, format, |i| {
-            statics[i].clone().expect("all typed")
-        }));
-        let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
-        stmt.run_with_row_callback(|row| {
-            rows.push(encode_row(&header, &pads, row.get_values()));
-            Ok(())
-        })
-        .map_err(engine_error)?;
-        return Ok(Response::Query(QueryResponse::new(
-            header,
-            stream::iter(rows),
-        )));
-    }
-    let mut values: Vec<Vec<Value>> = Vec::new();
+    let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     stmt.run_with_row_callback(|row| {
-        values.push(row.get_values().cloned().collect());
+        rows.push(encode_row(&header, &pads, row.get_values()));
         Ok(())
     })
     .map_err(engine_error)?;
-    let header = Arc::new(field_info(stmt, format, |i| {
-        statics[i]
-            .clone()
-            .unwrap_or_else(|| infer_pg_type(&values, i))
-    }));
-    let rows: Vec<PgWireResult<DataRow>> = values
-        .iter()
-        .map(|row| encode_row(&header, &pads, row.iter()))
-        .collect();
     Ok(Response::Query(QueryResponse::new(
         header,
         stream::iter(rows),
@@ -2144,6 +2112,15 @@ fn encode_row<'a>(
             .get(i)
             .map(|fi| fi.datatype().clone())
             .unwrap_or(Type::TEXT);
+        // A binary value is the described type's encoding, not the engine value's (wire review 1
+        // item 14); text format reads the same either way.
+        if header
+            .get(i)
+            .is_some_and(|fi| fi.format() == FieldFormat::Binary)
+        {
+            encode_binary(&mut encoder, val, &pg_type)?;
+            continue;
+        }
         if let (Some(Some(width)), Value::Text(t)) = (pads.get(i), val) {
             let chars = t.as_str().chars().count();
             if chars < *width {
@@ -2156,6 +2133,69 @@ fn encode_row<'a>(
         encode_value(&mut encoder, val, &pg_type).map_err(engine_error)?;
     }
     encoder.finish()
+}
+
+/// One value in binary format, encoded as its column's described type: an engine integer as int2,
+/// int4 or int8 (refused 22003 out of range), as float4 or float8, or as bool; a real as float4
+/// or float8; anything else, in a text-like column, as its text's bytes (binary text is the text).
+/// A value its column's type has no binary form for here is refused rather than sent as the
+/// engine's bytes under that type's name.
+fn encode_binary(encoder: &mut DataRowEncoder, val: &Value, pg_type: &Type) -> PgWireResult<()> {
+    use turso_core::Numeric;
+    let range = |_| {
+        PgWireError::UserError(error(
+            "22003",
+            format!("value out of range for type {pg_type}"),
+        ))
+    };
+    let t = pg_type;
+    let text_like = [
+        Type::TEXT,
+        Type::VARCHAR,
+        Type::BPCHAR,
+        Type::NAME,
+        Type::UNKNOWN,
+    ]
+    .contains(t);
+    match val {
+        Value::Null => encoder.encode_field(&None::<i8>),
+        Value::Numeric(Numeric::Integer(i)) => match t {
+            _ if *t == Type::BOOL => encoder.encode_field(&(*i != 0)),
+            _ if *t == Type::INT2 => encoder.encode_field(&i16::try_from(*i).map_err(range)?),
+            _ if *t == Type::INT4 => encoder.encode_field(&i32::try_from(*i).map_err(range)?),
+            _ if *t == Type::INT8 => encoder.encode_field(i),
+            _ if *t == Type::FLOAT4 => encoder.encode_field(&(*i as f32)),
+            _ if *t == Type::FLOAT8 => encoder.encode_field(&(*i as f64)),
+            _ if text_like => encoder.encode_field(&i.to_string().as_str()),
+            _ => Err(no_binary(val, t)),
+        },
+        Value::Numeric(Numeric::Float(f)) => match t {
+            _ if *t == Type::FLOAT8 => encoder.encode_field(&f64::from(*f)),
+            _ if *t == Type::FLOAT4 => encoder.encode_field(&(f64::from(*f) as f32)),
+            _ if text_like => encoder.encode_field(&f64::from(*f).to_string().as_str()),
+            _ => Err(no_binary(val, t)),
+        },
+        Value::Text(s) if text_like || *t == Type::JSON => encoder.encode_field(&s.as_str()),
+        Value::Blob(b) if *t == Type::BYTEA => encoder.encode_field(&b.as_slice()),
+        _ => Err(no_binary(val, t)),
+    }
+}
+
+fn no_binary(val: &Value, t: &Type) -> PgWireError {
+    let class = match val {
+        Value::Null => "null",
+        Value::Numeric(turso_core::Numeric::Integer(_)) => "integer",
+        Value::Numeric(turso_core::Numeric::Float(_)) => "real",
+        Value::Text(_) => "text",
+        Value::Blob(_) => "blob",
+    };
+    PgWireError::UserError(error(
+        "0A000",
+        format!(
+            "binary format for a {class} value in a column of type {t} is not supported; ask for \
+             text format"
+        ),
+    ))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
