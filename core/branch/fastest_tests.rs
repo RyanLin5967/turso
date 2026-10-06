@@ -4134,6 +4134,47 @@ fn a_snapshot_stores_open_copies_no_state_when_the_last_flight_checks_out() {
     }
 }
 
+/// Engine review 7 #4 (its confirm half): an open that checked an unconfirmed last flight's slots
+/// and found them whole confirmed nothing, so every later open read them again. When the open's
+/// own sync of the kept log proves stable storage and the arena holds no unsynced write, it now
+/// writes that flight's word, and the next open checks no slot. Here the word is lost once (zeroed
+/// after a clean close). Mutant `open_confirms_nothing`.
+#[cfg(unix)]
+#[test]
+fn an_open_that_checks_its_last_flight_whole_confirms_it_for_the_next() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("confirm-at-open.db");
+    let (log, incarnation) = {
+        let db = open_at(&path, opts(false, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let b = trunk.fork_branch().unwrap();
+        write_v(&b.connect().unwrap(), 3, "b");
+        let _ = b.into_id();
+        (db.branch_log_path().unwrap(), db.incarnation)
+    };
+    // The last flight's word is lost.
+    {
+        use std::os::unix::fs::FileExt;
+        let l = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+        l.write_all_at(&[0u8; 4], 36).unwrap();
+    }
+    let incarnation = {
+        let db = reopen(&path, opts(false, SyncClass::FullFsync), incarnation);
+        let stats = db.branch_open_stats();
+        assert!(stats.checked_slots > 0, "premise: the first open checked the unconfirmed last flight's slots");
+        assert_eq!(stats.replays, 1, "premise: the check passed");
+        db.incarnation
+    };
+    let db = reopen(&path, opts(false, SyncClass::FullFsync), incarnation);
+    assert_eq!(
+        db.branch_open_stats().checked_slots,
+        0,
+        "the next open checked again a last flight the previous open had found whole"
+    );
+}
+
 /// Engine review 8 #4: once a D0 store's log is raised (here by a trunk commit under a fullfsync
 /// trunk), its rewrite class proves stable storage, so a cut confirmed whatever flight it kept
 /// last by the class alone: a plain D0 flight too, whose slot no sync covered (it landed after

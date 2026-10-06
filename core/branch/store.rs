@@ -3202,13 +3202,28 @@ impl BranchStore {
                         // means the flight was never acknowledged, and it is replayed without.
                         let check = scanned.last_flight_slots();
                         let snapshot = scanned.take_snapshot();
-                        let again = (!check.is_empty()).then(|| (inner.fresh_again(), snapshot.clone()));
-                        if again.as_ref().is_some_and(|(_, s)| s.is_some()) {
+                        let had_snapshot = snapshot.is_some();
+                        // A fresh state to replay into again if the check fails. The snapshot is
+                        // not copied for it (engine review 7 #4: an O(state) copy at every such
+                        // open, though the check passes on nearly all): a failed check reads it
+                        // again. Mutant `snapshot_copied_at_open` (test builds only): copied first.
+                        let copy_first = fe_mutant("snapshot_copied_at_open");
+                        let again = (!check.is_empty()).then(|| {
+                            let copied = if copy_first { snapshot.clone() } else { None };
+                            (inner.fresh_again(), copied)
+                        });
+                        if copy_first && had_snapshot && again.is_some() {
                             stats.snapshot_copies += 1;
                         }
                         Self::replay_snapshot_store(&mut inner, snapshot, scanned.records(), &mut stats)?;
-                        if let Some((fresh, snapshot)) = again {
-                            let referenced: HashSet<Slot> = inner.referenced_slots().into_iter().collect();
+                        // What the recovered state references, computed once: the check filters by
+                        // it, and the arena is rebuilt from it below unless the collection there
+                        // closed something (engine review 7 #4).
+                        let mut checked_refs = None;
+                        let mut check_passed = false;
+                        if let Some((fresh, copied)) = again {
+                            let refs = inner.referenced_slots();
+                            let referenced: HashSet<Slot> = refs.iter().copied().collect();
                             // Mutant `check_all_named_slots` (test builds only): every slot the
                             // flight names is read, as before review 5 #1.
                             let named: Vec<(Slot, u32)> = check
@@ -3216,14 +3231,26 @@ impl BranchStore {
                                 .filter(|(slot, _)| referenced.contains(slot) || fe_mutant("check_all_named_slots"))
                                 .collect();
                             stats.checked_slots += named.len() as u64;
-                            if !super::journal::slots_hold(&arena_file, scanned.page_size(), &named)? {
+                            if super::journal::slots_hold(&arena_file, scanned.page_size(), &named)? {
+                                checked_refs = Some(refs);
+                                check_passed = true;
+                            } else {
                                 scanned.drop_last_flight();
                                 inner = fresh;
+                                let snapshot = match copied {
+                                    Some(copied) => Some(copied),
+                                    None if had_snapshot => {
+                                        stats.snapshot_copies += 1;
+                                        Some(super::journal::reread_snapshot(&files, format)?)
+                                    }
+                                    None => None,
+                                };
                                 Self::replay_snapshot_store(&mut inner, snapshot, scanned.records(), &mut stats)?;
                             }
                         }
                         let unsynced = scanned.arena_unsynced();
                         let mut recovered = scanned.finish()?;
+                        let confirmable = recovered.confirmable;
                         stats.records = recovered.records.len() as u64;
                         // Frees here are not acted on: the free set is derived below from what the
                         // recovered state references.
@@ -3237,7 +3264,10 @@ impl BranchStore {
                         stats.released_scanned = scanned;
                         stats.collect_ns = ns(t);
                         let t = Instant::now();
-                        let referenced = inner.referenced_slots();
+                        let referenced = match checked_refs {
+                            Some(refs) if !closed => refs,
+                            _ => inner.referenced_slots(),
+                        };
                         stats.referenced_ns = ns(t);
                         stats.referenced_slots = referenced.len() as u64;
                         let t = Instant::now();
@@ -3255,6 +3285,15 @@ impl BranchStore {
                         inner.arena = Some(arena);
                         let mut journal = recovered.journal;
                         journal.share_fail_stop(&inner.fail_stop);
+                        // The last flight checked out and nothing unsynced remains: confirmed now,
+                        // so the next open does not read its slots again (engine review 7 #4). A
+                        // failed write of the word changes nothing but that. Mutant
+                        // `open_confirms_nothing` (test builds only).
+                        if confirmable && check_passed && !unsynced && !closed && !fe_mutant("open_confirms_nothing") {
+                            if let Err(e) = journal.confirm_at_open() {
+                                tracing::warn!("branch log: the open could not confirm its last flight: {e}");
+                            }
+                        }
                         inner.journal = Some(journal);
                     }
                 }
@@ -3443,19 +3482,21 @@ impl BranchStore {
     ) -> Result<()> {
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
         stats.replays += 1;
+        // Accumulated: a second replay (the last flight's check failed) adds to the first's time
+        // (engine review 7 #4: it overwrote it).
         let t = Instant::now();
         if let Some(snapshot) = snapshot {
             stats.snap_branches = snapshot.branches.len() as u64;
             inner.load_snapshot(snapshot)?;
         }
-        stats.load_ns = ns(t);
+        stats.load_ns += ns(t);
         let mut ignored = Vec::new();
         let t = Instant::now();
         for record in records {
             kill_point("recover.replay");
             inner.replay(record, &mut ignored)?;
         }
-        stats.replay_ns = ns(t);
+        stats.replay_ns += ns(t);
         Ok(())
     }
 

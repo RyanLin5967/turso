@@ -622,6 +622,11 @@ pub(crate) struct Recovered {
     pub(crate) snapshot: Option<SnapshotState>,
     pub(crate) records: Vec<Record>,
     pub(crate) journal: Journal,
+    /// The kept log ends at its last whole flight, nothing was cut, and the open just synced it in
+    /// a class that proves stable storage (engine review 7 #4): once the store has read that
+    /// flight's slots back and the arena holds no unsynced write, the flight may be confirmed
+    /// (`Journal::confirm_at_open`), so the next open does not check it again.
+    pub(crate) confirmable: bool,
 }
 
 /// What a recovery scan read, before anything in the files was changed (review 5 #1, #2): the
@@ -798,6 +803,9 @@ impl Scanned {
         let from = self.from();
         let journal = &mut self.journal;
         let generation = journal.generation;
+        // The kept log ends at its last whole flight and was just synced in a class that proves
+        // stable storage (engine review 7 #4): see `Recovered::confirmable`.
+        let mut confirmable = false;
         match self.end {
             End::Keep { len, whole, log_gen, synced_end, .. } => {
                 journal.len = whole as u64;
@@ -866,6 +874,7 @@ impl Scanned {
                     // may have been written and never synced by the process that died, and a
                     // later flight's frames will prove it was.
                     fsync_file(&journal.file, class)?;
+                    confirmable = proves_stable(class);
                 }
             }
             End::Reset => journal.reset_log(generation)?,
@@ -876,6 +885,7 @@ impl Scanned {
             snapshot: self.snapshot,
             records: self.records,
             journal: self.journal,
+            confirmable,
         })
     }
 }
@@ -2416,6 +2426,22 @@ pub(crate) struct Confirm {
     fail: bool,
 }
 
+impl Journal {
+    /// Confirm the log's last flight at an open (engine review 7 #4; `Recovered::confirmable`):
+    /// its slots read back whole, the arena held no unsynced write, and the open's own sync of the
+    /// log proved stable storage, which drained the device the arena is on as well. The word is
+    /// bound to that flight's end frame and to where it ends, as a flight's own is (review 6 #1),
+    /// and written unsynced: its absence proves nothing.
+    pub(crate) fn confirm_at_open(&self) -> Result<()> {
+        if self.len < LOG_HEADER_LEN as u64 + 4 {
+            return Ok(());
+        }
+        let mut crc = [0u8; 4];
+        read_at(&self.file, &mut crc, self.len - 4)?;
+        write_at(&self.file, &confirm_word(u32::from_le_bytes(crc), self.len).to_le_bytes(), HEADER_CONFIRM_AT)
+    }
+}
+
 impl Confirm {
     /// Test builds: a confirmation of a word 0 into `log`, `proved` as given (store unit tests of
     /// the group, engine review 8 #9).
@@ -3155,6 +3181,14 @@ fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = (file, path);
     Ok(())
+}
+
+/// The snapshot state `scan_as` took, read again from its file (engine review 7 #4): a snapshot
+/// store's open replays a second time only when its last flight's check fails, and reads the
+/// snapshot again for that instead of copying it before every replay. The open holds the log's
+/// lock, so the file is the one the scan read.
+pub(crate) fn reread_snapshot(files: &BranchFiles, format: u32) -> Result<SnapshotState> {
+    read_snapshot(&files.snap, format).map(|(_, _, state, _)| state)
 }
 
 /// `(page_size, generation, state, file_len)`. A snapshot is only ever put in place by a rename
