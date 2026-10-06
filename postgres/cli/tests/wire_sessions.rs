@@ -1046,3 +1046,62 @@ fn foreign_keys_are_enforced_on_the_trunk_and_on_a_branch() {
         "ON DELETE CASCADE did not remove the child"
     );
 }
+
+/// A set-returning function in FROM names its one column after its alias, as PostgreSQL does
+/// (pgbench -I G: `insert into pgbench_branches(bid, bbalance) select bid, 0 from
+/// generate_series(1, 1) as bid`), or after the function with no alias.
+#[test]
+fn generate_series_in_from_names_its_column_after_the_alias() {
+    let dir = Scratch::new("genseries");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE b(bid INT, bbalance INT)").ok("create");
+    let r = a
+        .q("INSERT INTO b(bid, bbalance) SELECT bid, 0 FROM generate_series(1, 3) AS bid")
+        .ok("insert select from generate_series");
+    assert_eq!(r.tags, vec!["INSERT 0 3".to_string()]);
+    assert_eq!(a.q("SELECT sum(bid) FROM b").single("sum"), "6");
+    let r = a
+        .q("SELECT x * 2 FROM generate_series(1, 3) AS g(x) ORDER BY 1")
+        .ok("column alias list");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Some("2".into())],
+            vec![Some("4".into())],
+            vec![Some("6".into())]
+        ]
+    );
+    let r = a
+        .q("SELECT generate_series FROM generate_series(5, 6) ORDER BY 1")
+        .ok("no alias");
+    assert_eq!(r.rows, vec![vec![Some("5".into())], vec![Some("6".into())]]);
+}
+
+/// Row-value comparisons work, as in PostgreSQL (BranchBench's RANGE_READ and RANGE_UPDATE walk a
+/// composite key with `(a, b) >= (x, y) AND (a, b) <= (z, w)`).
+#[test]
+fn row_value_comparisons_work() {
+    let dir = Scratch::new("rowvalue");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE k(a INT, b INT, PRIMARY KEY (a, b))")
+        .ok("create");
+    a.q("INSERT INTO k VALUES (1, 1), (1, 2), (2, 1), (2, 2), (3, 1)")
+        .ok("insert");
+    let r = a
+        .q("SELECT a, b FROM k WHERE (a, b) >= (1, 2) AND (a, b) <= (2, 2) ORDER BY a, b")
+        .ok("range");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Some("1".into()), Some("2".into())],
+            vec![Some("2".into()), Some("1".into())],
+            vec![Some("2".into()), Some("2".into())],
+        ]
+    );
+    let r = a
+        .q("UPDATE k SET b = b + 10 WHERE (a, b) > (2, 1)")
+        .ok("update by row value");
+    assert_eq!(r.tags, vec!["UPDATE 2".to_string()]);
+}
