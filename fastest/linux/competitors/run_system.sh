@@ -10,8 +10,9 @@
 #   conncheck : C+16 connections opened at once and a SELECT 1 on each (amendment 27 (1)); untraced
 #   idle      : strace -f -C attached to every server process for FT_IDLE_S seconds with no client (the control)
 #   load      : the same attach around one bbload run of exactly N ops (FT_N1 at C=1, FT_N4 otherwise)
-#   deferred  : PG only -- the same attach around one CHECKPOINT: the flushes the ops left for later (WAL_LOG's
-#               data files, every op's dirty pages), reported apart from the window and never added to it
+#   deferred  : PG only -- one CHECKPOINT after the ops, in the LOAD window's own attach after a tsplit stamp
+#               (counted as the trace's "post" part): the flushes the ops left for later (WAL_LOG's data files, every
+#               op's dirty pages), reported apart from the window and never added to it
 #   cell.json : stracecount.py cell: flushes per op = (load - idle x load_s/idle_s) / ops, the raw count, and the
 #               split by process role (foreground: main, the load generator's backends, PG checkpointer/walwriter/
 #               bgwriter/io workers; background: everything else); background_free when the idle control and the
@@ -78,10 +79,18 @@ for spec in $SPECLIST; do  # a missing spec file is a harness defect, found befo
 done
 # The flush counter must have passed its fire-check on this runner and filesystem first (review finding 8).
 FC=${FT_FIRECHECK:?FT_FIRECHECK: the fire-check verdict file (firecheck_strace.sh OUT/firecheck.txt)}
-case "$(tail -1 "$FC" 2>/dev/null)" in
-  "VERDICT PASS"*) ;;
-  *) echo "REFUSED: the flush counter's fire-check did not pass: $FC ends [$(tail -1 "$FC" 2>/dev/null)]" | tee "$FUN"; exit 1 ;;
-esac
+# ALL of this tree's fire-check passed, not a verdict that merely starts with PASS (fifth review, finding 4): the last
+# line is "VERDICT PASS n/n" with n = firecheck_strace.sh's own NCHECK, n PASS lines with n distinct names, no FAIL.
+FC_N=$(sed -n 's/^NCHECK=\([0-9][0-9]*\)$/\1/p' "$HERE/firecheck_strace.sh")
+FC_LAST=$(tail -1 "$FC" 2>/dev/null) || FC_LAST=""
+FC_PASS=$(grep '^PASS ' "$FC" 2>/dev/null | cut -d: -f1 | sort | uniq | awk 'END {print NR}')
+FC_PASSL=$(grep '^PASS ' "$FC" 2>/dev/null | awk 'END {print NR}')
+FC_FAIL=$(grep '^FAIL' "$FC" 2>/dev/null | awk 'END {print NR}')
+if [ -z "$FC_N" ] || [ "$FC_LAST" != "VERDICT PASS $FC_N/$FC_N" ] || [ "$FC_PASS" != "$FC_N" ] ||
+  [ "$FC_PASSL" != "$FC_N" ] || [ "$FC_FAIL" != 0 ]; then
+  echo "REFUSED: the flush counter's fire-check did not pass all $FC_N checks: $FC ends [$FC_LAST], $FC_PASSL PASS line(s), $FC_PASS distinct, $FC_FAIL FAIL line(s)" | tee "$FUN"
+  exit 1
+fi
 # Every cell this run must produce, written BEFORE any runs: reduce.py reports a listed cell without a cell.json as
 # MISSING, so a cell that returns early cannot simply disappear (review finding 11).
 for spec in $SPECLIST; do
@@ -154,12 +163,13 @@ bbload() { # bbload SPEC C N OUT -> bbload's rc
 
 # count OUT -- stracecount over one window. A refused or crashed count FAILS the job (review finding 1: it used to
 # end in `|| true`, so a REFUSED window still left the job green); the cell carries the verdict too.
-count() {
-  local rc=0
-  local cl=()
+count() { # count OUT [CLIENTS [PART JSON]] -- PART pre|post counts one side of OUT's tsplit stamp into JSON
+  local rc=0 cl=() pt=() js="$1.json"
   [ -n "${2:-}" ] && cl=(--clients "$2")
-  python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" ${cl[@]+"${cl[@]}"} >"$1.json" || rc=$?
-  [ $rc -eq 0 ] || fail "count $1: stracecount rc=$rc ($(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$1.json" 2>&1 | tail -1))"
+  [ -n "${3:-}" ] && { pt=(--part "$3"); js=$4; }
+  python3 "$SC" count "$1.strace" --extra "$1.strace.err" --root "$DATA" --window "$1.window" ${cl[@]+"${cl[@]}"} \
+    ${pt[@]+"${pt[@]}"} >"$js" || rc=$?
+  [ $rc -eq 0 ] || fail "count $js: stracecount rc=$rc ($(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['verdict'])" "$js" 2>&1 | tail -1))"
 }
 # ops_of BBOUT CELLDIR -- "<total> <ok> <created>" into CELLDIR/ops.txt. A reader failure FAILS the job and writes
 # zero ops, which the cell then refuses (it used to turn silently into "0 0 0"). Called in the driver's own shell,
@@ -195,9 +205,21 @@ run_server_cell() { # run_server_cell SPEC C
   strace_attach "$d/load" "$(server_pid)" || { fail "$spec-c$c load attach"; return; }
   rc=0
   bbload "$spec" "$c" "$n" "$d/bb" || rc=$?
-  strace_detach "$d/load"
+  # Nothing but a stat between the ops and the window's end (tsplit for PG, the detach otherwise): fsused's
+  # `sync -f` and df ran inside the window and stretched load_s (third review, finding 5); it now runs after it.
   log1=$(stat -c %s "$DATA.log")
-  used1=$(fsused)
+  local defer=() tw=()
+  if [ "$KIND" = pg ]; then
+    # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost). It runs INSIDE the load
+    # window's attach, after a tsplit stamp, and is counted as that trace's "post" part (second review, finding 2:
+    # every strace state-mismatch message came from a separate second attach to a server it had just loaded). A failed
+    # CHECKPOINT FAILS the job, and the cell refuses without the deferred count (review finding 6).
+    defer=(--deferred "$d/deferred.json")
+    strace_mark "$d/load" tsplit
+    sqlq "CHECKPOINT" >"$d/deferred.checkpoint.txt" 2>&1 || fail "$spec-c$c deferred CHECKPOINT rc=$? ($(tail -1 "$d/deferred.checkpoint.txt"))"
+  fi
+  strace_detach "$d/load"
+  used1=$(fsused)  # PG: after the CHECKPOINT
   echo "fs_used_before=$used0 fs_used_after=$used1 delta=$((used1 - used0))" >"$d/space.txt"
   [ $rc -eq 0 ] || fail "$spec-c$c bbload rc=$rc ($(tail -1 "$d/bb.txt"))"
   # The server log written during the load window. PG (amendment 14 section 6): a CREATE DATABASE that found a backend
@@ -210,28 +232,21 @@ run_server_cell() { # run_server_cell SPEC C
     av=$(grep -c 'terminating autovacuum process due to administrator command' "$d/server_log_load.txt")
     busy=$(grep -c 'is being accessed by other users' "$d/server_log_load.txt")
     echo "autovacuum_terminated_in_window=$av template_busy_errors=$busy" >"$d/template_waits.txt"
+    tw=(--template-waits "$d/template_waits.txt")
     [ "$av" = 0 ] && [ "$busy" = 0 ] || fun "FLAG $spec-c$c: creates waited on the template (CountOtherDBBackends): autovacuum workers terminated $av, busy-template errors $busy"
   fi
-  local defer=()
-  if [ "$KIND" = pg ]; then
-    # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost): a failed attach or a failed
-    # CHECKPOINT FAILS the job, and the cell refuses without it (review finding 6: both used to drop it silently).
-    defer=(--deferred "$d/deferred.json")
-    if strace_attach "$d/deferred" "$(server_pid)"; then
-      sqlq "CHECKPOINT" >"$d/deferred.checkpoint.txt" 2>&1 || fail "$spec-c$c deferred CHECKPOINT rc=$? ($(tail -1 "$d/deferred.checkpoint.txt"))"
-      strace_detach "$d/deferred"
-      count "$d/deferred"
-    else
-      fail "$spec-c$c deferred attach"
-    fi
-  fi
   count "$d/idle"
-  count "$d/load" "$d/bb/backends.tsv"
+  if [ "$KIND" = pg ]; then
+    count "$d/load" "$d/bb/backends.tsv" pre "$d/load.json"
+    count "$d/load" "$d/bb/backends.tsv" post "$d/deferred.json"
+  else
+    count "$d/load" "$d/bb/backends.tsv"
+  fi
   ops_of "$d/bb" "$d"
   read -r total ok created <"$d/ops.txt"
   python3 "$SC" cell --name "$SYSTEM/$spec-c$c" --load "$d/load.json" --idle "$d/idle.json" \
     --load-s "$(window_s "$d/load")" --idle-s "$(window_s "$d/idle")" --ops "$total" --ops-ok "$ok" \
-    ${defer[@]+"${defer[@]}"} >"$d/cell.json"
+    ${defer[@]+"${defer[@]}"} ${tw[@]+"${tw[@]}"} >"$d/cell.json"
   judge_cell "$d"
   python3 -c "import json,sys; c=json.load(open(sys.argv[1])); p=c.get('per_op',{}); print('cell', c['name'], 'ops', c['ops'], 'flushes/op', p.get('flushes'), 'raw/op', p.get('flushes_raw'), 'foreground/op', p.get('foreground'), 'background/op', p.get('background'), 'background_free', c.get('background_free'), 'deferred/op', c.get('deferred',{}).get('per_op'), c['verdict'])" "$d/cell.json" | tee -a "$RAW/cells.txt"
 }
@@ -254,14 +269,16 @@ server_main() {
       pass "Linux PG refuses wal_sync_method=fsync_writethrough ($(grep -m1 'invalid value' "$RAW/fsync_writethrough-probe.txt" | cut -c1-160); $(tail -1 "$RAW/fsync_writethrough-probe.txt"))"
     fi
   fi
-  srv start "$DATA" | tee "$RAW/server-start.txt" || { fail "server start"; return; }
+  srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
   srv seed "$DATA" "$ROWS" | tee "$RAW/seed.txt" || { fail "seed"; return; }
   if [ "$KIND" = pg ]; then
     srv settings "$DATA" >"$RAW/pg_settings.tsv" || fail "pg_settings dump"
     expect "server wal_sync_method" "$(awk -F'\t' '$1 == "wal_sync_method" {print $2}' "$RAW/pg_settings.tsv")" fdatasync
     expect "server file_copy_method" "$(awk -F'\t' '$1 == "file_copy_method" {print $2}' "$RAW/pg_settings.tsv")" clone
   fi
-  [ "$KIND" = pg ] && sqlq "CHECKPOINT"
+  if [ "$KIND" = pg ]; then  # the seed's own checkpoint; a failure FAILS the job (second review, finding 9)
+    sqlq "CHECKPOINT" >"$RAW/seed-checkpoint.txt" 2>&1 || fail "pre-cell CHECKPOINT rc=$? ($(tail -1 "$RAW/seed-checkpoint.txt"))"
+  fi
   [ "$KIND" = pg ] || dolt_quiet_root "$ROOT/vroot"  # the version commands below run with metrics/version check off too
   case $KIND in
     pg) { "$FT_PG18/postgres" --version; sha256sum "$FT_PG18/postgres"; dpkg-query -W 'postgresql-18*' 'libpq5' 2>/dev/null; } >"$RAW/version.txt" ;;
@@ -348,7 +365,7 @@ b1_main() {
       strace_run "$d/load" "$CB" run --mode b1 --op "$op" --sync "$sync" --parent "$ROOT/parent.db" --dir "$bdir" \
         --clients "$c" --max-ops "$n" --rows "$ROWS" --out "$d/bb" >"$d/bb.txt" 2>&1 || rc=$?
       cat "$d/bb.txt"
-      [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"))"
+      [ $rc -eq 0 ] || fail "b1-$spec-c$c clonebench rc=$rc ($(tail -1 "$d/bb.txt"); stderr: $(tail -1 "$d/load.cmd.err" 2>/dev/null))"
       count "$d/load"
       ops_of "$d/bb" "$d"
       read -r total ok created <"$d/ops.txt"
@@ -381,10 +398,16 @@ b1_main() {
   else
     fail "clone proof: no m1c-d2 C=1 branch"
   fi
-  local fic
+  local fic created1
   fic=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['ficlone'])" "$RAW/cells/b1-m1c-d2-c1/load.json" 2>/dev/null)
-  expect "clone proof (strace): FICLONE calls in the m1c-d2 C=1 window = creates" "$fic" \
-    "$(cut -d' ' -f3 "$RAW/cells/b1-m1c-d2-c1/ops.txt" 2>/dev/null)"
+  created1=$(cut -d' ' -f3 "$RAW/cells/b1-m1c-d2-c1/ops.txt" 2>/dev/null)
+  # Both sides must exist and be positive: two empty strings used to compare equal and pass (second review, finding
+  # 8, e.g. FT_CLIENTS without 1). FICLONE counts only calls that returned 0.
+  if [ -n "$fic" ] && [ -n "$created1" ] && [ "$created1" -gt 0 ] 2>/dev/null; then
+    expect "clone proof (strace): successful FICLONE calls in the m1c-d2 C=1 window = creates" "$fic" "$created1"
+  else
+    fail "clone proof (strace): no m1c-d2 C=1 window to read (ficlone=[$fic], created=[$created1])"
+  fi
 }
 
 if [ "$KIND" = b1 ]; then b1_main; else server_main; fi

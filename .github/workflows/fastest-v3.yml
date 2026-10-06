@@ -1,12 +1,14 @@
 name: fastest-v3
 # Lane fastest-linux: fire-check the Linux V3 device-floor probe (fastest/linux/v3/v3floor.c) on ubuntu x86_64 and
-# arm64, each on ext4 (the runner's own disk), ext4, XFS and btrfs on loop devices (fastest/linux/fs/mkloop.sh):
-# F1 per-op syscall counts under strace -f -c and F1b the exact per-window sequence under strace -f -y equal each
-# arm's definition; F2 --mutant-nosync fails the flush control; F3 a real n=200 run (the control's verdict is
-# recorded, either way); F4 the refusals, including a barrier switched off on the flush path, and run.sh's binding.
-# The runners' root ext4 is mounted nobarrier (run 37243798049); the probe refuses that, so the job remounts it with
-# barrier first and keeps a nobarrier fixture (mkfixtures.sh) for the refusal checks.
-# Smoke only; nothing here is a credited latency. Raw output is uploaded per job (artifact v3-<runner>-<fs>).
+# arm64, on six explicit cells (fastest/linux/v3/v3cell.py): ext4 (the runner's own disk, no loop), ext4loop,
+# xfsloop, btrfsloop (loop devices, fastest/linux/fs/mkloop.sh), and xfs, btrfs on brd (mkbrd.sh: the hosted runners
+# have no spare disk, so these block-device cells are FIRE-CHECK ONLY; the probe refuses brd for credit).
+# Per cell: F1/F1b/F2 syscall identity under strace, F2b/F3 the flush control, F3 through run.sh with blkflush.py's
+# device flush record and the batch gate, the crash arms (loop cells), blkflush.py's own fire-check, the refusal
+# plants of review 2, run.sh's argument/environment/verdict rules, and the red column against the base df4b39e53.
+# The runners' root ext4 is mounted nobarrier; the job remounts it with barrier first (mkfixtures.sh keeps nobarrier
+# fixtures for the refusal checks). Smoke only; nothing here is a credited latency. On hosted write-through disks
+# a device flush count proves only what was ISSUED to the loop above them (blkflush.py). Raw per job: v3-<runner>-<cell>.
 
 on:
   workflow_dispatch:
@@ -30,51 +32,99 @@ defaults:
   run:
     shell: bash
 
+env:
+  V3_BASE_SHA: df4b39e535de7f3fefd36ee37fbb0c19ac0f4e35
+
 jobs:
+  selftest:
+    name: v3 self-tests (blkflush parser; batchgate on the banked cells, verdict shapes, cell layouts)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-tests
+        run: |
+          mkdir -p st
+          python3 -B fastest/linux/v3/blkflush.py self-test 2>&1 | tee st/blkflush-selftest.txt
+          python3 -B fastest/linux/v3/batchgate.py self-test fastest/linux/v3/testdata 2>&1 | tee st/batchgate-selftest.txt
+          for c in ext4 xfs btrfs ext4loop xfsloop btrfsloop; do for a in x86_64 aarch64; do for l in wb wt brd; do
+            echo "$c $a $l $(python3 -B fastest/linux/v3/check.py --plan "$c" "$a" "$l" | wc -l)"; done; done; done | tee st/plan-sizes.txt
+          grep -q '^BLKFLUSH SELF-TEST .* PASS$' st/blkflush-selftest.txt
+          grep -q '^BATCHGATE SELF-TEST .* PASS$' st/batchgate-selftest.txt
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v3-selftest
+          path: st/
+          retention-days: 90
+
   firecheck:
-    name: v3 fire-check (${{ matrix.runner }}, ${{ matrix.fs }})
+    name: v3 fire-check (${{ matrix.runner }}, ${{ matrix.cell }})
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        fs: [ext4, ext4loop, xfs, btrfs]
+        cell: [ext4, ext4loop, xfsloop, btrfsloop, xfs, btrfs]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
-      MNT: /mnt/fastest-v3-${{ matrix.fs }}
+      CELL: ${{ matrix.cell }}
+      MNT: /mnt/fastest-v3-${{ matrix.cell }}
       RAW: ${{ github.workspace }}/v3-raw
       V3_FX: /mnt/v3fx
+      V3_BASE: ${{ github.workspace }}/base
+      V3_SHIM: ${{ github.workspace }}/dist/statfs_shim.so
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Packages
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q xfsprogs btrfs-progs strace fio gcc
-      - name: Build v3floor
+          sudo apt-get install -y -q xfsprogs btrfs-progs strace fio gcc acl
+      - name: Build v3floor, the statfs shim, and the base (red column)
         run: |
-          mkdir -p "$RAW" dist
+          mkdir -p "$RAW" dist "$V3_BASE"
           gcc -O2 -std=gnu11 -Wall -Wextra -Werror -o dist/v3floor fastest/linux/v3/v3floor.c 2>&1 | tee "$RAW/build.txt"
-          { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }}";
-            echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
-            gcc --version | head -1; sha256sum dist/v3floor; strace -V | head -1; uname -a; } | tee "$RAW/run-info.txt"
+          gcc -O2 -shared -fPIC -o dist/statfs_shim.so fastest/linux/v3/statfs_shim.c -ldl 2>&1 | tee -a "$RAW/build.txt"
+          for f in v3floor.c run.sh stamp.py check.py; do git show "$V3_BASE_SHA:fastest/linux/v3/$f" > "$V3_BASE/$f"; done
+          gcc -O2 -std=gnu11 -Wall -Wextra -Werror -o "$V3_BASE/v3floor" "$V3_BASE/v3floor.c" 2>&1 | tee -a "$RAW/build.txt"
+          { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} cell=$CELL";
+            echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME base=$V3_BASE_SHA";
+            gcc --version | head -1; sha256sum dist/v3floor dist/statfs_shim.so "$V3_BASE/v3floor"; strace -V | head -1; uname -a; } | tee "$RAW/run-info.txt"
       - name: Barrier on the root filesystem (the image mounts it nobarrier)
         run: |
           echo "before: $(findmnt -n -o SOURCE,FSTYPE,OPTIONS /)" | tee "$RAW/root-barrier.txt"
           sudo mount -o remount,barrier /
           echo "after:  $(findmnt -n -o SOURCE,FSTYPE,OPTIONS /)" | tee -a "$RAW/root-barrier.txt"
           if findmnt -n -o OPTIONS / | tr , '\n' | grep -qx nobarrier; then echo "root is still nobarrier"; exit 1; fi
-      - name: Filesystem under test
-        run: bash fastest/linux/fs/mkloop.sh ${{ matrix.fs }} "$MNT" 8G 2>&1 | tee "$RAW/mkloop.txt"
-      - name: Refusal fixtures (nobarrier at the top layer and one layer down)
-        run: bash fastest/linux/v3/mkfixtures.sh "$V3_FX" 2>&1 | tee "$RAW/fixtures.txt"
-      - name: Hardware record (fio on the filesystem under test)
+      - name: Cell under test
+        run: |
+          case $CELL in
+            ext4|ext4loop) bash fastest/linux/fs/mkloop.sh "$CELL" "$MNT" 8G ;;
+            xfsloop) bash fastest/linux/fs/mkloop.sh xfs "$MNT" 8G ;;
+            btrfsloop) bash fastest/linux/fs/mkloop.sh btrfs "$MNT" 8G ;;
+            xfs|btrfs) bash fastest/linux/v3/mkbrd.sh "$CELL" "$MNT" ;;
+          esac 2>&1 | tee "$RAW/mkcell.txt"
+          test "${PIPESTATUS[0]}" -eq 0
+          # a fresh ext4's lazyinit thread zeroes inode tables and commits in the background: that would put flush
+          # requests on the cell's own (private) loop device inside the fire-check's windows. Stop it.
+          if [ "$CELL" = ext4loop ]; then sudo mount -o remount,noinit_itable "$MNT"; echo "remount: $(findmnt -n -o OPTIONS "$MNT")" | tee -a "$RAW/mkcell.txt"; fi
+      - name: Refusal fixtures
+        run: |
+          # a fixture that fails is recorded and its plant then fails in check.py; the fire-check still runs
+          rc=0; bash fastest/linux/v3/mkfixtures.sh "$V3_FX" > "$RAW/fixtures.txt" 2>&1 || rc=$?
+          echo "mkfixtures rc=$rc" >> "$RAW/fixtures.txt"
+          cat "$RAW/fixtures.txt"
+      - name: Hardware record (fio on the cell)
         run: bash fastest/linux/hw/record.sh "$RAW/hw" "$MNT/hw" 5
       - name: Fire-check
-        run: timeout 2700 bash fastest/linux/v3/firecheck.sh dist/v3floor ${{ matrix.fs }} "$MNT/work" "$RAW/firecheck" 2>&1 | tee "$RAW/firecheck.log"
+        run: timeout 3900 bash fastest/linux/v3/firecheck.sh dist/v3floor "$CELL" "$MNT/work" "$RAW/firecheck" 2>&1 | tee "$RAW/firecheck.log"; test "${PIPESTATUS[0]}" -eq 0
       - name: Upload raw
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v3-${{ matrix.runner }}-${{ matrix.fs }}
+          name: v3-${{ matrix.runner }}-${{ matrix.cell }}
           path: v3-raw/
           retention-days: 90

@@ -22,6 +22,7 @@
   },
   "syscalls_vs_base": {
     "window": "create",
+    "binds_at": "C=1 only; C>1 rows are INFO (run 37400090036: same engine both sides, arm64 C=64 getpid/create 3.21 vs 3.28)",
     "per_op_slack": 0.05,
     "timing_dependent_excluded": ["futex", "sched_yield", "nanosleep", "clock_nanosleep", "restart_syscall", "rt_sigreturn"]
   }

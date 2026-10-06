@@ -112,6 +112,13 @@ jobs:
           sudo apt-get install -y -q postgresql-18 libpq5 mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
           sudo systemctl stop postgresql || true
           pg_lsclusters || true
+      # The servers' ports (PG 55432, Doltgres 55433, Dolt 53306) lie inside the ephemeral range 32768-60999, so a
+      # client socket could draw one as its source port and block the bind (lane fastest-linux's T3 dry run
+      # 37256446468). Reserved before anything else runs; common.sh's require_port_free also refuses any bound socket.
+      - name: Reserve the servers' ports from the ephemeral range
+        run: |
+          sudo sysctl -w net.ipv4.ip_local_reserved_ports=53306,55432-55433
+          sysctl net.ipv4.ip_local_reserved_ports | grep -q '53306' || { echo "port reservation not in effect"; exit 1; }
       - name: Run info
         run: |
           mkdir -p "$RAW"
@@ -156,4 +163,43 @@ jobs:
         with:
           name: competitors-${{ matrix.system }}-${{ matrix.runner }}-${{ matrix.fs }}
           path: fastest-raw/
+          retention-days: 90
+
+  # The run's verdict, computed on CI from every job's raw (QUIET mode allows no local post-processing): reduce.py
+  # over the downloaded competitors-* artifacts, against the workflow at this commit and its pinned matrix, cells and
+  # fire-check names. Fails when an expected job or cell is missing or not ok (exit 1) or the expectation cannot be
+  # determined (exit 2); its output is uploaded as competitors-reduce, which bank.sh banks with the rest.
+  reduce:
+    name: reduce (every expected job and cell)
+    needs: run
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: competitors-*
+          path: ${{ runner.temp }}/runs
+      - name: reduce.py
+        run: |
+          mkdir -p "$RUNNER_TEMP/reduce"
+          rc=0
+          timeout 1200 python3 -B fastest/linux/competitors/reduce.py "$RUNNER_TEMP/runs" \
+            >"$RUNNER_TEMP/reduce/reduce.tsv" 2>"$RUNNER_TEMP/reduce/reduce.err" || rc=$?
+          echo "reduce_rc=$rc git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT" | tee "$RUNNER_TEMP/reduce/reduce-rc.txt"
+          grep '^JOBS' "$RUNNER_TEMP/reduce/reduce.tsv" | cut -f2-5 || true
+          echo "CELLS rows: $(grep '^CELLS' "$RUNNER_TEMP/reduce/reduce.tsv" | awk 'END {print NR - 1}')"
+          cat "$RUNNER_TEMP/reduce/reduce.err"
+          # SMOKE.md's tables, generated here from the same raw (smoke_table.py, C=1 and C=4)
+          for c in 1 4; do
+            timeout 600 python3 -B fastest/linux/competitors/smoke_table.py "$RUNNER_TEMP/runs" "$c" \
+              >"$RUNNER_TEMP/reduce/smoke-c$c.md" 2>"$RUNNER_TEMP/reduce/smoke-c$c.err" || rc=$(( rc == 0 ? 3 : rc ))
+          done
+          exit $rc
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: competitors-reduce
+          path: ${{ runner.temp }}/reduce/
           retention-days: 90

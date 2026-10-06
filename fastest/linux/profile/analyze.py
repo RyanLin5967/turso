@@ -219,8 +219,14 @@ def gates(head, base, budget, baseline):
             excl = set(sv["timing_dependent_excluded"])
             worse = {k: (bx.get(k, 0.0), v) for k, v in hx.items()
                      if k not in excl and v > bx.get(k, 0.0) + sv["per_op_slack"]}
-            row(f"syscalls-vs-base/{arm}", f"no create syscall above base + {sv['per_op_slack']}/op",
-                worse or "ok", "FAIL" if worse else "PASS")
+            # At C > 1 the counts move with contention, not with the code: run 37400090036 built the SAME
+            # engine on both sides and arm64 C=64 read getpid 3.21 -> 3.28 per create (a waiter's poll
+            # loop runs as often as the flight takes). So the gate binds at C=1, where counts are exact
+            # (getpid 4.005, run 37255309860), and C > 1 is recorded as INFO.
+            verdict = ("FAIL" if worse else "PASS") if h.get("clients", 1) == 1 else "INFO"
+            row(f"syscalls-vs-base/{arm}", f"no create syscall above base + {sv['per_op_slack']}/op"
+                + ("" if h.get("clients", 1) == 1 else " (C>1: contention-dependent, INFO)"),
+                worse or "ok", verdict)
     ins = budget["instructions"]
     arm = "full-snap-c1"
     h = head.get(arm, {}).get("ir_per_op", {}).get("create")
@@ -315,6 +321,11 @@ def self_test():
     hb["strace"]["windows"]["create"]["syscalls_per_op"]["fstat"] = 1.0
     v = verdicts({"full-snap-c1": hb}, {"full-snap-c1": arm_of(trace(1), 10)})
     cases.append(("a new syscall per create vs base FAILs", v.get("syscalls-vs-base/full-snap-c1") == "FAIL"))
+    hb64 = arm_of(trace(1), 10, clients=64)
+    hb64["strace"]["windows"]["create"]["syscalls_per_op"]["fstat"] = 1.0
+    v = verdicts({"full-snap-c64": hb64}, {"full-snap-c64": arm_of(trace(1), 10, clients=64)})
+    cases.append(("a syscall regression at C=64 is INFO (contention-dependent), not a verdict",
+                  v.get("syscalls-vs-base/full-snap-c64") == "INFO"))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")

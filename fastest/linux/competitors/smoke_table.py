@@ -8,6 +8,7 @@ per_op.flushes), with
   *  the cell is not background_free (the idle control or a background/unmapped process flushed; see the role table)
   ~  a one-process server: background work inside the process cannot be separated by process
   !  the idle-subtracted estimate went below zero (read the raw count)
+  #  some creates in the window waited on the template (CountOtherDBBackends; see the cell's template_waits)
   FAIL  the cell's verdict was not ok;  MISSING  no cell.json (or no such job)
 Then the PG deferred table (the CHECKPOINT after each cell: flushes the creates left for later, per op) and the
 per-role split of the load windows (raw flushes per op by role, no subtraction).
@@ -83,6 +84,8 @@ def fmt(cj):
         s += "~"
     if "below zero" in notes:
         s += "!"
+    if any(cj.get("template_waits", {}).values()):
+        s += "#"
     return s
 
 
