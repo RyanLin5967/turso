@@ -175,7 +175,7 @@ impl Shared {
         let held = |uses: &std::collections::HashMap<String, BranchUse>| {
             uses.get(name).is_some_and(|u| states.contains(u))
         };
-        if !held(&uses) {
+        if true {
             return uses;
         }
         self.in_use_waiters.fetch_add(1, Ordering::SeqCst);
