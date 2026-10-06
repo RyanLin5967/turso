@@ -1633,12 +1633,6 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CHECKPOINT")
     } else if upper.starts_with("RESET") {
         Tag::new("RESET")
-    } else if upper.starts_with("CREATE VIEW") {
-        Tag::new("CREATE VIEW")
-    } else if upper.starts_with("CREATE INDEX") {
-        Tag::new("CREATE INDEX")
-    } else if upper.starts_with("CREATE SCHEMA") {
-        Tag::new("CREATE SCHEMA")
     } else if is_create_table_as(&upper) {
         // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
         // rows inserted), except WITH NO DATA which skips the insert and
@@ -1648,14 +1642,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         } else {
             Tag::new("SELECT").with_rows(affected_rows)
         }
+    } else if let Some(tag) = ddl_tag(&upper) {
+        tag
     } else if upper.starts_with("CREATE") {
         Tag::new("CREATE TABLE")
-    } else if upper.starts_with("DROP VIEW") {
-        Tag::new("DROP VIEW")
-    } else if upper.starts_with("DROP INDEX") {
-        Tag::new("DROP INDEX")
-    } else if upper.starts_with("DROP SCHEMA") {
-        Tag::new("DROP SCHEMA")
     } else if upper.starts_with("DROP") {
         Tag::new("DROP TABLE")
     } else if upper.starts_with("ALTER") {
@@ -1685,6 +1675,30 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
     } else {
         Tag::new("OK")
     }
+}
+
+/// `CREATE|DROP|ALTER [modifiers] <object> ...`'s tag, as PostgreSQL reports it: the verb and the
+/// object, whatever modifiers come between (CREATE UNIQUE INDEX completes as CREATE INDEX, CREATE
+/// OR REPLACE VIEW as CREATE VIEW). `None` for an object not listed here.
+fn ddl_tag(upper: &str) -> Option<Tag> {
+    let mut words = upper
+        .split(|c: char| c.is_ascii_whitespace() || c == '(' || c == ';')
+        .filter(|w| !w.is_empty());
+    let verb = words.next()?;
+    if !matches!(verb, "CREATE" | "DROP" | "ALTER") {
+        return None;
+    }
+    for word in words {
+        match word {
+            "OR" | "REPLACE" | "UNIQUE" | "TEMP" | "TEMPORARY" | "UNLOGGED" | "GLOBAL"
+            | "LOCAL" | "RECURSIVE" => continue,
+            "TABLE" | "INDEX" | "VIEW" | "SEQUENCE" | "SCHEMA" | "TYPE" | "DOMAIN" | "TRIGGER" => {
+                return Some(Tag::new(&format!("{verb} {word}")));
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Whether the statement ends with `WITH NO DATA`, token-wise (ignoring
