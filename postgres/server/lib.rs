@@ -3593,4 +3593,25 @@ mod tests {
             "the block's write was kept"
         );
     }
+
+    /// A schema change that keeps landing under a branch call (SchemaUpdated, which the engine
+    /// leaves to its caller) is waited out on the busy schedule, up to the lock wait. It was retried
+    /// 50 times back to back, a few microseconds in all, after which the next one escaped as XX000
+    /// (wire review 5 item 9; branch_creates_racing_trunk_ddl_all_succeed failed 40 of 40 so in the
+    /// suite at 82cabdf5c).
+    #[test]
+    fn waiting_waits_out_schema_changes_on_the_busy_schedule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        let mut left = 55;
+        let r = s.waiting(|| {
+            if left > 0 {
+                left -= 1;
+                Err(LimboError::SchemaUpdated)
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(r.ok(), Some(7), "55 schema changes in a row escaped");
+    }
 }
