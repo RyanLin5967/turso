@@ -47,7 +47,11 @@
 #      after t1 left out.
 #   F13 the clock refusals forced to fire, each alone, on copies of F2's window: a call stamp 2 s back in the trace;
 #      tend's realtime 0.1 s off either way (monotonic untouched); every call stamp 5 s late; the t1 line repeated;
-#      the t1 line after strace_rc. Each is REFUSED for its own reason; the unmodified copy counts F2's 10.
+#      the t1 line after strace_rc; the fsync table row removed or bumped; a loose pair; a 1.2 ms step with and without
+#      err widening; a table with no call lines. Each is REFUSED for its own reason, or ok where the err widens the
+#      tolerance; the unmodified copy counts F2's 10; F2's stamps came from the stamper coproc.
+#   F14 clock_pair from a ( ) subshell and from a pipeline is served one-shot and leaves the stamper alive; a stale
+#      reply in its pipe is skipped; the next top-level calls are served by the coproc.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
 OUT=${1:?usage: firecheck_strace.sh OUT DIR}
@@ -55,7 +59,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=22
+NCHECK=23
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -664,13 +668,20 @@ stop_probe2 split
 #       (third re-review, finding 1: an attach window had none that fired);
 #   (j) t1_err raised to 0.8 ms -> refused for a loose clock pair; (k) tend's realtime moved +1.2 ms -> refused, and
 #       (l) the same with tend_err 0.4 ms -> ok with 10 flushes: the tolerance is 1 ms plus both pairs' err
-#       (third re-review, finding 4);
+#       (third re-review, finding 4); (m) the same +1.2 ms with t1_err 0.4 ms -> ok: the pair's FIRST stamp's err
+#       counts too (fourth re-review, finding 1);
+#   (n) every call line removed, the -c table kept -> refused for a table with zero call lines (fourth re-review,
+#       finding 7: the wlines fix turned that refusal back on for attach windows);
 #   (c) the unmodified copy -> ok with F2's exact 10 flushes, so the others fail for their edit;
 #   and F2's own window stamps were all served by the stamper coproc (clock_src; third re-review, finding 3).
 if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
-  for k in a b c d e f g h i j k l; do
+  for k in a b c d e f g h i j k l m n; do
     for x in strace strace.err window fdsync pids; do cp "$OUT/f2.$x" "$OUT/f13$k.$x" 2>/dev/null; done
   done
+  awk '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + 0.0012) }
+       /^t1=/ { for (i = 1; i <= NF; i++) if ($i ~ /^t1_err=/) $i = "t1_err=0.000400000" } { print }' \
+    "$OUT/f2.window" >"$OUT/f13m.window"
+  awk '!/^[0-9]+ +[0-9]+\.[0-9]+ / { print }' "$OUT/f2.strace" >"$OUT/f13n.strace"
   awk '!($NF == "fsync" && $1 ~ /^[0-9.]+$/ && NF >= 5) { print }' "$OUT/f2.strace" >"$OUT/f13h.strace"
   awk '$NF == "fsync" && $1 ~ /^[0-9.]+$/ && NF >= 5 { $4 = $4 + 1 } { print }' "$OUT/f2.strace" >"$OUT/f13i.strace"
   awk '/^t1=/ { for (i = 1; i <= NF; i++) if ($i ~ /^t1_err=/) $i = "t1_err=0.000800000" } { print }' \
@@ -686,11 +697,11 @@ if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
   awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { $2 = sprintf("%.6f", $2 + 5.0) } { print }' "$OUT/f2.strace" >"$OUT/f13d.strace"
   awk '{ print } /^t1=/ { dup = $0 } END { print dup }' "$OUT/f2.window" >"$OUT/f13f.window"
   awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f2.window" >"$OUT/f13g.window"
-  for k in a b c d e f g h i j k l; do count "f13$k"; done
+  for k in a b c d e f g h i j k l m n; do count "f13$k"; done
   if python3 -c "
 import json, sys
 o = sys.argv[1]
-J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijkl'}
+J = {k: json.load(open(f'{o}/f13{k}.json')) for k in 'abcdefghijklmn'}
 v = {k: r['verdict'] for k, r in J.items()}
 src = json.load(open(f'{o}/f2.json')).get('clock_src')
 BACK, STEP, OUTSIDE = 'stepped back', 'CLOCK_REALTIME stepped', 'outside the window'
@@ -699,11 +710,12 @@ def refused(k, why, *nots):
 ok = (refused('a', BACK) and refused('b', STEP) and refused('e', STEP) and
       refused('d', OUTSIDE, BACK, STEP) and refused('f', 'repeated stamp') and refused('g', 'out of order') and
       refused('h', 'fsync: summary 0 calls vs 6 completed') and refused('i', 'fsync: summary 7 calls vs 6 completed') and
-      refused('j', 'more than 0.5 ms', STEP) and refused('k', STEP) and
-      v['l'] == 'ok' and J['l']['flushes'] == 10 and v['c'] == 'ok' and J['c']['flushes'] == 10 and
+      refused('j', 'more than 0.5 ms', STEP) and refused('k', STEP) and refused('n', 'zero call lines') and
+      v['l'] == 'ok' and J['l']['flushes'] == 10 and v['m'] == 'ok' and J['m']['flushes'] == 10 and
+      v['c'] == 'ok' and J['c']['flushes'] == 10 and
       src == {'tseize': 'coproc', 't0': 'coproc', 't1': 'coproc', 'tend': 'coproc'})
-print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijk'), '| (l)', v['l'][:20], J['l']['flushes'], '| (c)', v['c'][:20],
-      J['c']['flushes'], '| F2 clock_src', src)
+print(' | '.join(f'({k}) {v[k][:90]}' for k in 'abdefghijkn'), '| (l)', v['l'][:20], J['l']['flushes'],
+      '| (m)', v['m'][:20], J['m']['flushes'], '| (c)', v['c'][:20], J['c']['flushes'], '| F2 clock_src', src)
 sys.exit(0 if ok else 1)" "$OUT" >"$OUT/f13.txt" 2>&1; then
     log "PASS F13-clock-step-refused: $(head -c 1600 "$OUT/f13.txt")"
   else
@@ -711,6 +723,24 @@ sys.exit(0 if ok else 1)" "$OUT" >"$OUT/f13.txt" 2>&1; then
   fi
 else
   log "FAIL F13-clock-step-refused: no F2 window to copy"; fails=$((fails + 1))
+fi
+
+# F14: clock_pair stays safe outside the shell that owns the stamper (fourth re-review, finding 2: fix 2 had no CI
+# check): a call from a ( ) subshell and one from a pipeline are served one-shot and leave the stamper alive; a stale
+# reply planted in its pipe (a request no one reads) is skipped by its nonce; the next two top-level calls are served
+# by the coproc.
+s1=$( (clock_pair f14a) ); s2=$(clock_pair f14b | cat)
+alive=0; [ -n "${STAMPER_PID:-}" ] && kill -0 "$STAMPER_PID" 2>/dev/null && alive=1
+# Planted from a command substitution, and only to a live stamper: a write to a dead one's pipe would SIGPIPE this
+# whole script from a builtin (measured with df75e84bc's clock_pair, which kills it).
+[ $alive = 1 ] && : "$( { printf '%s %s\n' "stale.0.0" "f14z" >&"${STAMPER[1]}"; } 2>/dev/null )"
+sleep 0.2
+s3=$(clock_pair f14c); s4=$(clock_pair f14d)
+if [[ $s1 == "f14a="*" f14a_src=oneshot" && $s2 == "f14b="*" f14b_src=oneshot" && $alive = 1 &&
+  $s3 == "f14c="*" f14c_src=coproc" && $s4 == "f14d="*" f14d_src=coproc" ]]; then
+  log "PASS F14-stamper-subshell-safe: subshell and pipeline served one-shot, stamper alive, stale reply skipped: [$s3]"
+else
+  log "FAIL F14-stamper-subshell-safe: [$s1] [$s2] alive=$alive [$s3] [$s4]"; fails=$((fails + 1))
 fi
 
 rm -rf "$DIR/fc"
