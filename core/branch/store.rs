@@ -7187,11 +7187,21 @@ impl StoreInner {
             // The catalog's meta row and the log header take the new page size in one checkpoint;
             // the arena is truncated only after it committed.
             let old = self.journal.as_ref().map(Journal::page_size);
+            let committed = self.cat.as_ref().map(|c| c.generation);
             if let Some(journal) = self.journal.as_mut() {
                 journal.set_page_size(page_size);
             }
             if let Err(e) = self.checkpoint_catalog_as(false, true) {
-                if let (Some(journal), Some(old)) = (self.journal.as_mut(), old) {
+                // Once the catalog committed the new page size, the store cannot go back to the old
+                // one: it fail-stops, and the next open rewrites the log at the new size (engine
+                // review 9 #4). Before the commit, nothing changed on disk, and the old size stays.
+                // Mutant `restart_reverts_after_commit` (test builds only): reverted either way.
+                let landed = self.cat.as_ref().map(|c| c.generation) != committed;
+                if landed && !fe_mutant("restart_reverts_after_commit") {
+                    if let Some(journal) = self.journal.as_mut() {
+                        journal.poison();
+                    }
+                } else if let (Some(journal), Some(old)) = (self.journal.as_mut(), old) {
                     journal.set_page_size(old);
                 }
                 return Err(e);

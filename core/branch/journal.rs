@@ -1318,7 +1318,17 @@ impl Journal {
         let replayable = |log_gen: u64| log_gen == generation || (catalog_store && log_gen < generation);
         let end = match header {
             Some((log_ps, log_gen, nonce)) if replayable(log_gen) => {
-                if log_ps != page_size {
+                // A log of the state's own generation must share its page size. An OLDER catalog
+                // log may not (engine review 9 #4): a page-size restart commits the catalog at the
+                // new size before it rewrites the log, so a crash, or a failed rewrite, between the
+                // two leaves the old log behind it; that log is accepted only if nothing in it
+                // follows the new generation's marker (checked below, once its records are read),
+                // and the open rewrites it at the new size. Mutant `older_log_page_size_refused`
+                // (test builds only): refused, as before.
+                let older_at_another_size = log_ps != page_size
+                    && log_gen < generation
+                    && !super::store::fe_mutant("older_log_page_size_refused");
+                if log_ps != page_size && !older_at_another_size {
                     return Err(corrupt(if catalog_store {
                         "log and catalog disagree on the page size"
                     } else {
@@ -1466,6 +1476,16 @@ impl Journal {
                 }
                 records.truncate(whole.1);
                 ends.truncate(whole.1);
+                if older_at_another_size {
+                    let marker = Record::Checkpoint { generation };
+                    let from = records.iter().rposition(|r| *r == marker).map_or(records.len(), |i| i + 1);
+                    if from < records.len() {
+                        return Err(corrupt(
+                            "the catalog is at another page size than the older log, and the log holds \
+                             records after the catalog's checkpoint",
+                        ));
+                    }
+                }
                 End::Keep {
                     len: bytes.len(),
                     whole: whole.0,
