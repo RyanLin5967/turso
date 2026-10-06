@@ -330,11 +330,14 @@ if start_probe2 fork-pre; then
   sp=$!
   for ((i = 0; i < 400; i++)); do traced_all "$sp" "$PP2" && break; sleep 0.05; done
   miss=$(untraced_tasks "$sp" $(descendants "$PP2") | tr '\n' ' ')
+  # traced_all over the parent AND its live untraced child must say "not all traced" too (fourth review, finding 8:
+  # nothing planted a live untraced task for traced_all to catch).
+  ta=caught; traced_all "$sp" "$PP2" $kids && ta=missed
   kill -INT "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
-  if [ -n "${kids// /}" ] && [ -n "${miss// /}" ]; then
-    log "PASS F10a-untraced-descendant-detected: children [$kids] untraced under a parent-only attach: [$miss]"
+  if [ -n "${kids// /}" ] && [ -n "${miss// /}" ] && [ $ta = caught ]; then
+    log "PASS F10a-untraced-descendant-detected: children [$kids] untraced under a parent-only attach: [$miss]; traced_all $ta it"
   else
-    log "FAIL F10a-untraced-descendant-detected: children [$kids], untraced [$miss]"; fails=$((fails + 1))
+    log "FAIL F10a-untraced-descendant-detected: children [$kids], untraced [$miss], traced_all $ta it"; fails=$((fails + 1))
   fi
   if run_probe2 f10b fork-pre; then
     check F10b-descendants-attached "$OUT/f10b.json" \

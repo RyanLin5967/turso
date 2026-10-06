@@ -127,7 +127,9 @@ def main(argv):
         fn = last_line(fpath, "VERDICT")
         fails = [l.strip() for l in open(fpath) if l.startswith(("FAIL", "REFUSED"))] if os.path.exists(fpath) else []
         print(f"JOBS\t{name}\t{fc}\t{fn}\t{' || '.join(fails)}")
-        if not fc.startswith("VERDICT PASS") or not fn.startswith("VERDICT PASS"):
+        # the fire-check must pass ALL its checks ("VERDICT PASS n/n"), not merely start with PASS (fourth review, 8)
+        fcm = re.match(r"VERDICT PASS (\d+)/(\d+)$", fc)
+        if not (fcm and fcm.group(1) == fcm.group(2)) or not fn.startswith("VERDICT PASS"):
             bad += 1
         exp_path = os.path.join(a, "run", "expected-cells.txt")
         if not os.path.exists(exp_path):
