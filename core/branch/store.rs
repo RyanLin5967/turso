@@ -2257,6 +2257,10 @@ struct Captured {
     trunk_gone: Vec<(u32, u64)>,
     free_cursor: Option<Slot>,
     taken: Vec<Slot>,
+    /// An empty store's page-size restart (`checkpoint_catalog_as`, review 6 #4): the arena is
+    /// replaced by an empty one once this commits, so the free table is cleared (every row deleted)
+    /// and none is written; `free_cursor`, `taken` and the lists are empty.
+    fresh_arena: bool,
     free_list: Vec<Slot>,
     reserved: Vec<Slot>,
     /// Slots freed by early-released operations whose records were not yet durable at the
@@ -2381,7 +2385,9 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         for (name, id) in &cap.names_fresh {
             catalog.name_put(name, id.0)?;
         }
-        if let Some(cursor) = cap.free_cursor {
+        if cap.fresh_arena {
+            catalog.free_clear()?;
+        } else if let Some(cursor) = cap.free_cursor {
             catalog.free_delete_upto(cursor)?;
         }
         for &slot in &cap.taken {
@@ -7470,13 +7476,10 @@ impl StoreInner {
             self.pending_free.clear();
             self.held_synced_free.clear();
         }
-        // The restart's checkpoint emptied the catalog's free table (`checkpoint_catalog_as`):
-        // nothing to read from it, and nothing of the old arena is taken (review 6 #4).
-        if let Some(cat) = self.cat.as_mut().filter(|_| !fe_mutant("restart_keeps_free_table")) {
-            cat.free_cursor = None;
-            cat.free_exhausted = true;
-            cat.taken.clear();
-        }
+        // A catalog store's free state needs nothing here (engine review 9 #9): the restart's
+        // checkpoint committed an empty free table (`Captured::fresh_arena`), and its install left
+        // nothing taken and the refill re-armed, so the first allocation reads that empty table
+        // once and takes the new arena's high-water mark.
     }
 
     /// Catalog mode's compaction, an incremental checkpoint: every branch and trunk page changed
@@ -7518,7 +7521,8 @@ impl StoreInner {
         let q0 = cat.catalog.counters.queries;
         let mut cap = self.checkpoint_capture(fail_after_commit)?;
         if fresh_arena && !fe_mutant("restart_keeps_free_table") {
-            cap.free_cursor = Some(Slot::MAX);
+            cap.fresh_arena = true;
+            cap.free_cursor = None;
             cap.taken.clear();
             cap.free_list.clear();
             cap.reserved.clear();
@@ -7776,6 +7780,7 @@ impl StoreInner {
             trunk_new,
             trunk_gone,
             free_cursor: cat.free_cursor,
+            fresh_arena: false,
             taken: cat.taken.iter().copied().collect(),
             free_list: arena.free_list().to_vec(),
             reserved,

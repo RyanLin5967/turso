@@ -1420,6 +1420,12 @@ impl Catalog {
         self.free_del_upto.exec(&[int(slot as u64)], &mut self.counters)
     }
 
+    /// Delete every row of the free table (an empty store's page-size restart; engine review 9
+    /// #9): every slot is at or below `Slot::MAX`, so the prepared range delete covers them all.
+    pub(crate) fn free_clear(&mut self) -> Result<()> {
+        self.free_delete_upto(Slot::MAX)
+    }
+
     pub(crate) fn free_delete(&mut self, slot: Slot) -> Result<()> {
         self.free_del.exec(&[int(slot as u64)], &mut self.counters)
     }
