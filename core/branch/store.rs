@@ -1205,6 +1205,9 @@ struct CkptCounters {
     fuzzy_refused_splice: u64,
     /// Fuzzy checkpoints started (a thread spawned).
     flights: u64,
+    /// Fuzzy checkpoint starts that failed (settle, capture or spawn) and backed off (engine
+    /// review 8 #3: a failed start was counted nowhere). Not in `as_array`, whose shape callers fix.
+    start_failures: u64,
     /// Store-mutex hold inside checkpoints: capture + install (+ the write, on the sharp path).
     hold_ns: u64,
     hold_max_ns: u64,
@@ -4259,6 +4262,9 @@ impl BranchStore {
             // (review 4 #2): not retried, under this mutex, by every operation until another
             // threshold's worth of log. Mutant `start_failure_retried` (test builds only).
             FlightStart::Failed => {
+                if let Some(cat) = inner.cat.as_mut() {
+                    cat.ckpt.start_failures += 1;
+                }
                 if let Some(journal) = inner.journal.as_mut().filter(|_| !fe_mutant("start_failure_retried")) {
                     journal.defer_compaction();
                 }
@@ -6435,6 +6441,12 @@ impl BranchStore {
             .cat
             .as_ref()
             .map_or([0; 9], |c| c.ckpt.as_array())
+    }
+
+    /// Fuzzy checkpoint starts that failed and backed off (engine review 8 #3; observing only).
+    /// Zero for a store that is not a catalog store.
+    pub(crate) fn checkpoint_start_failures(&self) -> u64 {
+        self.inner.lock().cat.as_ref().map_or(0, |c| c.ckpt.start_failures)
     }
 
     /// Confirmation words written into the log's header, and those whose write failed (review 6 #1;

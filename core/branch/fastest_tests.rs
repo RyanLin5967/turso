@@ -3608,6 +3608,7 @@ fn a_failed_checkpoint_start_backs_off_for_one_threshold_and_no_longer() {
             assert!(t.elapsed() < std::time::Duration::from_secs(30), "{fp:?}: premise: no checkpoint was attempted");
         }
         db.branch_checkpoint_wait();
+        assert_eq!(db.branch_checkpoint_start_failures(), 1, "{fp:?}: the failed start was not counted");
         let (failed_at, installed) = (len(), db.branch_checkpoint_counters()[0]);
         // The next capture comes about a threshold later, and starts.
         let tried = entered();

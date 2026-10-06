@@ -1421,6 +1421,13 @@ impl Database {
         self.branches.checkpoint_counters()
     }
 
+    /// Fuzzy branch catalog checkpoint starts that failed and backed off (engine review 8 #3;
+    /// observing only).
+    #[doc(hidden)]
+    pub fn branch_checkpoint_start_failures(&self) -> u64 {
+        self.branches.checkpoint_start_failures()
+    }
+
     /// Confirmation words written into the branch log's header, and those whose write failed
     /// (review 6 #1; observing only).
     #[doc(hidden)]
