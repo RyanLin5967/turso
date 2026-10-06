@@ -1515,3 +1515,66 @@ fn deleting_a_branch_another_session_is_on_is_refused_with_55006() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wire review 1 (frontier/fastest/reviews/REVIEW-1-wire-db11f642d..472023b72.md)
+// ---------------------------------------------------------------------------
+
+/// Review 1 item 1: an error the engine answers by rolling the whole transaction back itself (an
+/// integer overflow in sum()) still aborts the block as PostgreSQL does: 25P02 until its end,
+/// status 'E', and COMMIT answered ROLLBACK with nothing of the block kept. Before, the block's
+/// state was read from the engine after the error, saw autocommit, and the rest committed.
+#[test]
+fn an_engine_side_rollback_inside_a_block_still_aborts_it() {
+    let dir = Scratch::new("enginerollback");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("CREATE TABLE big(v BIGINT)").ok("big");
+    a.q("INSERT INTO big VALUES (9223372036854775807), (1)")
+        .ok("rows");
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
+    let r = a.q("SELECT sum(v) FROM big");
+    assert!(
+        r.error.is_some(),
+        "sum overflowed without an error: {:?}",
+        r.rows
+    );
+    assert_eq!(r.status, b'E', "the block is not marked failed");
+    let r = a.q("INSERT INTO t VALUES (3, 'three')");
+    assert_eq!(r.status, b'E');
+    assert_eq!(r.err("insert 3").code, "25P02");
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.status, b'I');
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id IN (2, 3)")
+            .single("rows"),
+        "0",
+        "part of a failed block committed"
+    );
+}
+
+/// Review 1 item 1: a COMMIT that fails ends the block (PostgreSQL rolls it back): the session is
+/// idle after it, not left inside the transaction.
+#[test]
+fn a_failed_commit_leaves_the_session_idle() {
+    let dir = Scratch::new("failedcommit");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
+    a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
+        .ok("c");
+    a.q("BEGIN").ok("begin");
+    let r = a.q("INSERT INTO c VALUES (1, 99)");
+    if r.error.is_none() {
+        // A deferred foreign key fails at COMMIT, as in PostgreSQL.
+        let r = a.q("COMMIT");
+        assert!(r.error.is_some(), "an orphan row committed");
+        assert_eq!(
+            r.status, b'I',
+            "a failed COMMIT left the session in a block"
+        );
+        assert_eq!(a.q("SELECT count(*) FROM c").single("rows"), "0");
+    }
+}
