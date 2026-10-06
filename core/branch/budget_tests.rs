@@ -324,15 +324,28 @@ fn measure<R>(db: &Arc<Database>, base: Option<u64>, f: impl FnOnce() -> R) -> (
     s.insert("confirms_written", confirms);
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
-    let absorbed = !synced || left || confirms == 1 || CONFIRM_QUIET_MS_SET.load(std::sync::atomic::Ordering::Acquire);
+    let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
     let quiet = settled && back && absorbed && c1[1] == c0[1] && (left || s["allocs_process"] == s["allocs"]);
     s.insert("background", u64::from(left));
     s.insert("quiet", u64::from(quiet));
     (r, s)
 }
 
-/// Set while a cell holds the confirmation word back on purpose (the confirm arm's held phase).
-static CONFIRM_QUIET_MS_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the confirmation word is held back now (`hold_word`).
+static WORD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Hold the flight confirmation word back (review 6 #1; the engine's test knob), or let the store's
+/// confirmation thread write it after `confirm_quiet()` (5 ms) of idle, the default. Held, the writer
+/// is woken by the first landing only and then sleeps with the word pending, so no background
+/// thread runs in any later window and every count is the operation's own: each landing replaces
+/// the pending word and closes its descriptor on the landing thread, as under load, when a later
+/// flight lands inside the quiet period. That is every cell's regime but `confirm_n10`'s, which
+/// measures the idle tail's write against it.
+fn hold_word(held: bool) {
+    use std::sync::atomic::Ordering::Release;
+    super::store::CONFIRM_QUIET_MS.store(if held { CONFIRM_HELD_MS } else { 0 }, Release);
+    WORD_HELD.store(held, Release);
+}
 
 /// The confirmation word (review 6 #1): after a flight whose sync proved stable storage, the
 /// store's confirmation thread writes the word once the group has been idle `confirm_quiet()`
@@ -342,7 +355,7 @@ static CONFIRM_QUIET_MS_SET: std::sync::atomic::AtomicBool = std::sync::atomic::
 fn absorb_confirm(s0: &probe::Snapshot) -> bool {
     let now = sync_counts();
     let synced = now.full_fsync != s0.full_fsync || now.fsync != s0.fsync;
-    if synced {
+    if synced && !WORD_HELD.load(std::sync::atomic::Ordering::Acquire) {
         let t = std::time::Instant::now();
         while t.elapsed() < std::time::Duration::from_millis(25) {
             std::hint::spin_loop();
@@ -627,24 +640,21 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
 /// pending word away with a checkpoint (`mark_durable`) and makes one unmeasured create (which pays
 /// the checkpoint's deferred directory sync and is written as usual).
 fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut String) {
-    use std::sync::atomic::Ordering::Release;
     let trunk = db.connect().unwrap();
     for i in 0..WARMUP + k {
-        super::store::CONFIRM_QUIET_MS.store(0, Release);
+        hold_word(false);
         db.branch_compact_now().unwrap();
         db.branch_checkpoint_wait();
         let (_, _) = measure(db, base, || trunk.create_branch(&format!("u-{i:04}")).unwrap());
         let (_, s_written) = measure(db, base, || trunk.create_branch(&format!("w-{i:04}")).unwrap());
-        super::store::CONFIRM_QUIET_MS.store(CONFIRM_HELD_MS, Release);
-        CONFIRM_QUIET_MS_SET.store(true, Release);
+        hold_word(true);
         let (_, s_held) = measure(db, base, || trunk.create_branch(&format!("h-{i:04}")).unwrap());
-        CONFIRM_QUIET_MS_SET.store(false, Release);
         if i >= WARMUP {
             line(out, cell, "confirm_written", i - WARMUP, &s_written);
             line(out, cell, "confirm_held", i - WARMUP, &s_held);
         }
     }
-    super::store::CONFIRM_QUIET_MS.store(0, Release);
+    hold_word(false);
 }
 
 /// A named create on `db`, so a checkpoint has a dirty branch to write.
@@ -850,10 +860,11 @@ fn budget_child() {
         return;
     };
     let k = env_u64("FE_BUDGET_K", 24);
-    // The flight confirmation word (review 6 #1) is written by the store's confirmation thread once
-    // the group has been idle `confirm_quiet()`, the default: every window that syncs a flight
-    // waits that out (`absorb_confirm`), so the word is counted in the window that caused it.
-    super::store::CONFIRM_QUIET_MS.store(0, std::sync::atomic::Ordering::Release);
+    // The flight confirmation word (review 6 #1): held back in every cell but `confirm_n10`
+    // (`hold_word`). base12 counted it where it was written instead, and the writer's wake and wait
+    // then landed inside the operation's own store-mutex holds as the timing made (first write's
+    // syscalls 17..19, held syscalls 4..6, in one cell).
+    hold_word(spec != "confirm_n10");
     let mut text = String::new();
     if spec == "instruments" {
         text = run_instruments(&spec);
@@ -1344,11 +1355,8 @@ fn create_logs_its_record_and_one_flight_end() {
 
 #[cfg(target_vendor = "apple")]
 #[test]
-fn create_issues_at_most_four_syscalls_with_its_confirmation_word() {
-    assert_budgets(
-        "create",
-        &[every("syscalls", Want::AtMost(4), "DESIGN §3 + review 1 #14: pwrite, F_FULLFSYNC, length guard; + review 6 #1's background confirmation pwrite")],
-    );
+fn create_issues_at_most_three_syscalls() {
+    assert_budgets("create", &[every("syscalls", Want::AtMost(3), "DESIGN §3 + review 1 #14: pwrite, F_FULLFSYNC, length guard")]);
 }
 
 #[cfg(target_vendor = "apple")]
@@ -1517,14 +1525,10 @@ fn first_write_takes_the_store_mutex_once_per_page_and_twice_more() {
 
 #[cfg(target_vendor = "apple")]
 #[test]
-fn first_write_issues_at_most_six_syscalls_beyond_its_page_reads_with_its_confirmation_word() {
+fn first_write_issues_at_most_five_syscalls_beyond_its_page_reads() {
     assert_budgets(
         "first_write",
-        &[every(
-            "syscalls",
-            Want::AtMostPlus("resolves", 6),
-            "slot pwrite, arena order, log pwrite, F_FULLFSYNC, length guard, review 6 #1's background confirmation pwrite + one read per page",
-        )],
+        &[every("syscalls", Want::AtMostPlus("resolves", 5), "slot pwrite, arena order, log pwrite, F_FULLFSYNC, length guard + one read per page")],
     );
 }
 
@@ -1632,11 +1636,8 @@ fn delete_logs_its_release_and_one_flight_end() {
 
 #[cfg(target_vendor = "apple")]
 #[test]
-fn delete_issues_at_most_four_syscalls_with_its_confirmation_word() {
-    assert_budgets(
-        "delete",
-        &[every("syscalls", Want::AtMost(4), "DESIGN §3 + review 1 #14: pwrite, F_FULLFSYNC, length guard; + review 6 #1's background confirmation pwrite")],
-    );
+fn delete_issues_at_most_three_syscalls() {
+    assert_budgets("delete", &[every("syscalls", Want::AtMost(3), "DESIGN §3 + review 1 #14: pwrite, F_FULLFSYNC, length guard")]);
 }
 
 #[cfg(target_vendor = "apple")]
@@ -2131,9 +2132,11 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
 }
 
 /// Review 6 #1's ruling: the flight's confirmation word leaves the create path for a background
-/// writer, written with ONE unsynced pwrite once the group is idle, under no store mutex. A create
-/// with the word released costs, beyond the same create with it held back, exactly one syscall and
-/// no sync, no store-mutex acquisition and no syscall under it, on any thread.
+/// writer, which writes it with ONE unsynced pwrite once the group is idle, under no store mutex.
+/// An idle-tail create whose word is written costs, beyond the same create with the word held, at
+/// most two syscalls (the pwrite, and the writer's one wait to park again) and no sync, no
+/// store-mutex acquisition and no syscall under it, on any thread. (A word that owns a descriptor
+/// of its own adds its close; review 1 #14 / review 2 #6 share the log's.)
 #[cfg(target_vendor = "apple")]
 #[test]
 fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
@@ -2146,11 +2149,15 @@ fn the_confirmation_word_costs_one_unsynced_pwrite_off_the_mutex() {
     assert!(held.iter().all(|s| s["confirms_written"] == 0), "premise: no held window wrote a word");
     let min = |v: &[&Map], k: &str| values(&c, "confirm", v, k).into_iter().min().unwrap();
     let mut failures = String::new();
-    for (k, extra) in [("syscalls", 1u64), ("full_fsync", 0), ("fsync", 0), ("barrier", 0), ("locks_process", 0), ("held_syscalls", 0)] {
+    for (k, extra) in [("full_fsync", 0u64), ("fsync", 0), ("barrier", 0), ("locks_process", 0), ("held_syscalls", 0)] {
         let (h, w) = (min(&held, k), min(&written, k));
         if w != h + extra {
             let _ = writeln!(failures, "  {k}: held {h}, written {w}; budget held + {extra}");
         }
+    }
+    let (h, w) = (min(&held, "syscalls"), min(&written, "syscalls"));
+    if w > h + 2 {
+        let _ = writeln!(failures, "  syscalls: held {h}, written {w}; budget held + 2 (one pwrite, one wait)");
     }
     assert!(failures.is_empty(), "the confirmation word's cost [review 6 #1]:\n{failures}");
 }
