@@ -10,7 +10,9 @@ What SHOULD be there is never taken from what is there (review finding 11):
     listed cell without a cell.json, or a job without the list, is a MISSING row;
   - and, independently of run_system.sh, PINNED below: amendment 14's registered cells per system at C in {1, 4}. A
     pinned cell the job did not list is MISSING too, so a spec dropped from run_system.sh's SPECLIST cannot vanish
-    (second review, finding 4). A system with no pin is MISSING (no expectation), never skipped.
+    (second review, finding 4). A system with no pin is MISSING (no expectation), never skipped. Likewise the pinned
+    matrix (PINNED_SPECS's systems x PINNED_RUNNERS x PINNED_FS) is added to the workflow's, so a job dropped from the
+    workflow is a MISSING row (third review, finding 6).
 A matrix with include:/exclude: entries is refused (this parser reads only the runner, fs and system lists).
 Prints, tab-separated:
   JOBS   artifact, firecheck verdict, functional verdict, failed functional lines
@@ -41,6 +43,14 @@ PINNED_SPECS = {
     "b1": [f"b1-{s}" for s in ("m1c-d2", "m1-d2", "m1c-d0", "m1-d0")],
 }
 PINNED_CLIENTS = ("1", "4")
+PINNED_RUNNERS = ("ubuntu-24.04", "ubuntu-24.04-arm")
+PINNED_FS = ("xfs", "btrfs")
+
+
+def refuse(msg):
+    """The expectation itself cannot be determined: say why and exit 2 (the docstring's promise; sys.exit(str) is 1)."""
+    print(msg, file=sys.stderr)
+    sys.exit(2)
 
 
 def last_line(path, prefix):
@@ -57,27 +67,31 @@ def expected_jobs(d, repo):
         if m:
             shas.add(m.group(1))
     if len(shas) != 1:
-        sys.exit(f"reduce: REFUSED: the jobs' run-info.txt name {len(shas)} commits ({sorted(shas)}), not one")
+        refuse(f"reduce: REFUSED: the jobs' run-info.txt name {len(shas)} commits ({sorted(shas)}), not one")
     sha = shas.pop()
     try:
         wf = subprocess.run(["git", "-C", repo, "show", f"{sha}:{WORKFLOW}"], capture_output=True, text=True,
                             check=True, timeout=60).stdout
     except (subprocess.SubprocessError, OSError) as e:
-        sys.exit(f"reduce: REFUSED: cannot read {WORKFLOW} at {sha} in {repo}: {e}")
+        refuse(f"reduce: REFUSED: cannot read {WORKFLOW} at {sha} in {repo}: {e}")
     # The `run` JOB, under the top-level jobs: key (a top-level `defaults: run:` also has a two-space "run:").
     jobs = re.search(r"^jobs:\n(.*)", wf, re.M | re.S)
     job = re.search(r"^  run:\n(.*?)(?=^  \S|\Z)", jobs.group(1), re.M | re.S) if jobs else None
     if not job:
-        sys.exit(f"reduce: REFUSED: no `run` job in {WORKFLOW} at {sha}")
+        refuse(f"reduce: REFUSED: no `run` job in {WORKFLOW} at {sha}")
     if re.search(r"^\s+(include|exclude):", job.group(1), re.M):
-        sys.exit(f"reduce: REFUSED: the run job's matrix at {sha} has include:/exclude: entries, which this parser does"
+        refuse(f"reduce: REFUSED: the run job's matrix at {sha} has include:/exclude: entries, which this parser does"
                  " not read")
     axes = {}
     for k in ("runner", "fs", "system"):
         m = re.search(rf"^\s+{k}: \[([^\]]*)\]", job.group(1), re.M)
         if not m:
-            sys.exit(f"reduce: REFUSED: the run job's matrix has no `{k}: [...]` axis at {sha}")
+            refuse(f"reduce: REFUSED: the run job's matrix has no `{k}: [...]` axis at {sha}")
         axes[k] = [v.strip() for v in m.group(1).split(",") if v.strip()]
+    # The pinned matrix too: a system, runner or filesystem dropped from the workflow is a MISSING job here, not an
+    # absent row (third review, finding 6).
+    for k, vals in (("system", list(PINNED_SPECS)), ("runner", PINNED_RUNNERS), ("fs", PINNED_FS)):
+        axes[k] = axes[k] + [v for v in vals if v not in axes[k]]
     names = [f"competitors-{s}-{r}-{f}" for s in axes["system"] for r in axes["runner"] for f in axes["fs"]]
     return sha, axes, names
 
