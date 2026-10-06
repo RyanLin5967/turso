@@ -2914,10 +2914,10 @@ fn alter_add_constraint_rebuilds_long_names_and_serial_tables_cleanly() {
     );
 }
 
-/// A primary key column is NOT NULL, as in PostgreSQL and in the engine's STRICT tables (a NULL in a
-/// composite key is refused with 23502): information_schema.columns says is_nullable NO and pg_attribute's
-/// attnotnull matches a NOT NULL column's for it, declared at column level, at table level, or
-/// SERIAL. Both reported a key column declared without NOT NULL as nullable, and ORM introspection
+/// A primary key column is NOT NULL, as in PostgreSQL and in the engine's STRICT tables (a NULL
+/// in a composite key is refused with 23502): information_schema.columns says is_nullable NO and
+/// pg_attribute's attnotnull matches a NOT NULL column's for it, declared at column level, at
+/// table level, or SERIAL. Both reported a key column declared without NOT NULL as nullable, and ORM introspection
 /// made nullable key fields of it (wire review 2 item 9).
 #[test]
 fn primary_key_columns_are_reported_not_null() {
