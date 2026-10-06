@@ -3920,3 +3920,76 @@ fn a_replacement_that_fails_its_sync_fail_stops_the_store() {
     }
 }
 
+// ---- review 6 #3: a fail-stop stops flights in the air; no checkpoint arena sync outside the group ----
+
+/// Review 6 #3 (b): a fuzzy checkpoint in a D1 or D2 store makes the slots it captured durable by
+/// waiting for the group's flights, which sync the arena themselves: it takes no arena handle of
+/// its own. Its own sync ran outside the group, beside a flight's sync of the same file — on Linux
+/// one fsync of an open file description can consume the error another would have reported, and the
+/// flight then lands as durable — and the capture paid a dup under the store mutex for it. Captured
+/// here with a branch commit's flight in the air, which made the capture take a handle.
+#[test]
+fn a_fuzzy_checkpoint_takes_no_arena_handle_of_its_own() {
+    let _s = serial();
+    for class in [SyncClass::Fsync, SyncClass::FullFsync] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(
+            &dir.path().join("nohandle.db"),
+            opts(true, class).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+        );
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let y = trunk.fork_branch().unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let writer = std::thread::spawn(move || {
+            let r = y.connect()?.execute("UPDATE t SET v = 'y' WHERE id = 5");
+            let _ = y.into_id();
+            r
+        });
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let handles = || super::store::CAPTURE_ARENA_HANDLES.with(|c| c.get());
+        let before = handles();
+        let started = db.branch_checkpoint_fuzzy_now();
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        assert!(started.unwrap(), "{class:?}: premise: a fuzzy checkpoint started");
+        writer.join().unwrap().unwrap();
+        db.branch_checkpoint_wait();
+        assert_eq!(handles(), before, "{class:?}: the fuzzy capture took an arena handle to sync outside the group");
+    }
+}
+
+/// Review 6 #3 (b): in a D0 store whose log was raised (a trunk commit under a synchronous trunk
+/// made its pre-image durable), the slots a fuzzy checkpoint captures were written by D0 flights,
+/// which sync nothing; the catalog commit must not name them before they are on the device. They
+/// are synced by a flight of the group, in Fsync, before the commit: at the commit the arena holds
+/// no write the group has not synced.
+#[test]
+fn a_raised_d0_fuzzy_checkpoint_syncs_its_slots_through_the_group_before_its_commit() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("d0raised.db"),
+        opts(true, SyncClass::Off).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let b = trunk.fork_branch().unwrap();
+    trunk.execute("UPDATE t SET v = 'trunk-new' WHERE id = 9").unwrap();
+    assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the log");
+    let c = trunk.fork_branch().unwrap();
+    write_v(&c.connect().unwrap(), 4, "d0");
+    assert!(db.branches.arena_dirty(), "premise: the D0 commit left its slot unsynced");
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("the checkpoint never arrived", || {
+        db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+    });
+    let dirty = db.branches.arena_dirty();
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert!(!dirty, "at the catalog commit the arena held D0 writes no flight of the group had synced");
+    drop((b, c));
+}
+

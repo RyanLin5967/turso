@@ -2583,6 +2583,9 @@ thread_local! {
     /// A4.G's G-b red: captures entered on this thread (a guard that stopped before the capture
     /// leaves it unchanged).
     pub(crate) static CAPTURE_ENTERED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Review 6 #3: captures on this thread that took an arena handle of their own, to sync the
+    /// arena outside the group's flights.
+    pub(crate) static CAPTURE_ARENA_HANDLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// r13-compose's registered mutants (PREREG §5, A6): `R13_MUTANT` names one deliberate defect, so
@@ -5733,6 +5736,12 @@ impl BranchStore {
         }
     }
 
+    /// Test builds: the class the log's rewrites sync in (the store's, or the raised one).
+    #[cfg(test)]
+    pub(crate) fn rewrite_class_for_test(&self) -> SyncClass {
+        self.inner.lock().journal.as_ref().map_or(SyncClass::Off, Journal::rewrite_class)
+    }
+
     /// Test builds: whether the arena counts as holding writes no sync has covered (review 5 #10).
     #[cfg(test)]
     pub(crate) fn arena_dirty(&self) -> bool {
@@ -7239,6 +7248,10 @@ impl StoreInner {
         } else {
             None
         };
+        #[cfg(test)]
+        if arena_file.is_some() {
+            CAPTURE_ARENA_HANDLES.with(|c| c.set(c.get() + 1));
+        }
         let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
             Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
         } else {
@@ -9673,3 +9686,49 @@ mod sota_tree_tests {
         assert!(max_depth >= 10, "{mode:?} seed {seed:#x}: max depth {max_depth}");
     }
 }
+
+#[cfg(test)]
+mod fail_stop_tests {
+    use super::*;
+
+    /// Review 6 #3: once the store is fail-stopped, nothing becomes durable in this process, however
+    /// the fail-stop was raised. A flight already in the air when it was raised outside the flight
+    /// (a checkpoint's failed arena sync, a failed trunk WAL sync) landed as if durable: its sync can
+    /// return 0 after another descriptor's fsync consumed the error (Linux errseq is per open file
+    /// description), and on every platform an acknowledgement after a fail-stop breaks the store's
+    /// own contract. So does an ordered landing, a rewrite's mark, and a trunk WAL flush's.
+    #[test]
+    fn nothing_becomes_durable_after_a_fail_stop() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let group = Group::new(10, failed.clone());
+        let durable = |g: &Group| [SyncClass::Off, SyncClass::Fsync, SyncClass::FullFsync].map(|c| g.durable(c));
+        group.lock().flushing = true;
+        // Raised outside the flight, as a checkpoint's arena sync or a trunk WAL sync raises it.
+        failed.store(true, Ordering::Release);
+        group.land(20, SyncClass::FullFsync, true, None);
+        assert_eq!(durable(&group), [10; 3], "a flight in the air landed durable after the fail-stop");
+        group.lock().flushing = true;
+        group.land_ordered(30, true);
+        assert_eq!(durable(&group), [10; 3], "an ordered flight landed after the fail-stop");
+        group.mark_durable(40, SyncClass::FullFsync);
+        assert_eq!(durable(&group), [10; 3], "a rewrite marked bytes durable after the fail-stop");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let store = BranchStore::open(
+            BranchDurability::Durable { sync: SyncClass::FullFsync },
+            None,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let before = store.group.durable(SyncClass::FullFsync);
+        store.group.failed.store(true, Ordering::Release);
+        store.trunk_wal_synced(before + 1000);
+        assert_eq!(
+            store.group.durable(SyncClass::FullFsync),
+            before,
+            "a trunk WAL flush made branch bytes durable after the fail-stop"
+        );
+    }
+}
+
