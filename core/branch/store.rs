@@ -607,6 +607,8 @@ impl Group {
         let mut g = self.lock();
         g.confirm_stop = true;
         self.confirm_cv.notify_all();
+        // The writer may be waiting for a flight on the group's condition variable.
+        self.cv.notify_all();
         g.confirm.take().map(|(_, c)| c)
     }
 
@@ -665,6 +667,18 @@ fn run_confirm_writer(group: Arc<Group>) {
             }
         };
         let idle = landed.elapsed();
+        // A flight or a cut in the air: wait for it on the group's condition variable, which its
+        // landing (or the cut's gate, or a failure, or the close) signals, rather than re-taking
+        // the lock its leader and riders need (engine review 8 #10). Mutant `confirm_poll_100us`
+        // (test builds only): every 100 us, as before.
+        if (g.flushing || g.cutting) && !fe_mutant("confirm_poll_100us") {
+            g = group.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            {
+                g.confirm_wakeups += 1;
+            }
+            continue;
+        }
         if idle < confirm_quiet() || g.flushing || g.cutting {
             let wait = confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100));
             g = group.confirm_cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner()).0;
