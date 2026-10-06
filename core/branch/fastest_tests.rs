@@ -30,6 +30,12 @@ fn open_at(path: &Path, opts: DatabaseOpts) -> Arc<Database> {
     .unwrap()
 }
 
+/// `open_at`, returning the refusal rather than panicking on it.
+fn try_open_at(path: &Path, opts: DatabaseOpts) -> crate::Result<Arc<Database>> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    Database::open_file_with_flags(io, path.to_str().unwrap(), OpenFlags::Create, opts, None, Arc::new(SqliteDialect))
+}
+
 fn opts(catalog: bool, sync: SyncClass) -> DatabaseOpts {
     DatabaseOpts::new().with_branch_durability(if catalog {
         BranchDurability::Catalog { sync }
@@ -2853,5 +2859,165 @@ fn every_held_name_reaches_the_name_filter() {
         db.branch_compact_now().unwrap();
         assert!(trunk.create_branch("x").is_err(), "{arm}: an evicted held name was given again");
         assert!(trunk.create_branch("old").is_err(), "{arm}: a checkpointed name was given again");
+    }
+}
+
+// ---- review 5 #1, #2: recovery replays, then checks the slots the replayed state references,
+// then decides; and it refuses before it changes anything ----
+
+/// Review 5 #1: a last flight that keeps a trunk pre-image (TrunkRetain{S}) and releases the only
+/// child it was kept for frees S inside that same flight. Once the flight lands, the next slot taken
+/// is S (the free list is LIFO), and a branch commit overwrites it. A power cut before that commit's
+/// flight leaves this flight last, its confirmation lost (written unsynced once its flush returned),
+/// and S holding newer bytes than the record says. The flight was acknowledged — the release
+/// returned — and nothing the replayed state references is bad, so it is kept: the released child
+/// stays released. Before, every slot the flight named was checked, the flight was dropped, and
+/// the child came back. Mutant `check_all_named_slots` (the old check) must fail it.
+#[test]
+fn a_last_flight_that_frees_a_slot_it_names_is_kept_when_the_slot_is_reused() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("freed-in-flight.db");
+        let (x_id, w_id, f_end, log, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed_wide(&trunk);
+            // W sees the trunk as of before row 3's first rewrite, so the second rewrite keeps a
+            // pre-image for X alone.
+            let w = trunk.fork_branch().unwrap();
+            write_v(&trunk, 3, "mid");
+            let x = trunk.fork_branch().unwrap();
+            let x_id = x.id();
+            let log = db.branch_log_path().unwrap();
+            let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
+            let hold = db.branches.trunk_commit_hold.clone();
+            hold.store(super::store::HOLD_TRUNK_DECIDED, std::sync::atomic::Ordering::Release);
+            let committer = {
+                let db = db.clone();
+                std::thread::spawn(move || db.connect()?.execute("UPDATE t SET v = 'new' WHERE id = 3"))
+            };
+            wait_hold(&hold, super::store::HOLD_TRUNK_DECIDED);
+            let kept: Vec<u32> =
+                db.branch_slots_in_use().into_iter().filter(|s| !before.contains(s)).collect();
+            assert_eq!(kept.len(), 1, "catalog={catalog}: premise: the commit kept one pre-image");
+            // X's release rides the flight that carries the pre-image's record, and frees its slot.
+            let released = x.reap();
+            hold.store(0, std::sync::atomic::Ordering::Release);
+            released.unwrap();
+            committer.join().unwrap().unwrap();
+            assert!(db.branch_slot_is_free(kept[0]), "catalog={catalog}: premise: the release freed the slot");
+            let f_end = std::fs::metadata(&log).unwrap().len();
+            let wc = w.connect().unwrap();
+            let owned: std::collections::HashSet<u32> = w.owned_slots().into_iter().collect();
+            write_v(&wc, 40, "w");
+            let fresh: Vec<u32> = w.owned_slots().into_iter().filter(|s| !owned.contains(s)).collect();
+            assert_eq!(fresh, kept, "catalog={catalog}: premise: W's commit took the freed slot");
+            drop(wc);
+            (x_id, w.into_id(), f_end, log, db.incarnation)
+        };
+        // The power cut: the log as that flight left it (W's commit never flew), and its
+        // confirmation lost with the power; the arena holds W's page in the slot.
+        let f = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+        f.set_len(f_end).unwrap();
+        use std::os::unix::fs::FileExt;
+        f.write_all_at(&[0u8; 4], 36).unwrap();
+        drop(f);
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        assert!(db.branch(x_id).is_err(), "catalog={catalog}: a child whose release was acknowledged came back");
+        let w = db.branch(w_id).unwrap();
+        let wc = w.connect().unwrap();
+        assert_eq!(read_wide(&wc, 3), "trunk-3", "catalog={catalog}: W's fork point");
+        assert_eq!(read_wide(&wc, 40), "trunk-40", "catalog={catalog}: W's unflown commit");
+    }
+}
+
+/// Review 5 #2: an arena recovery cannot open (no permission) is an error, never a lost slot: the
+/// open fails with the log byte-for-byte as it was, and once the arena can be opened again the
+/// last flight's write is there. The confirmation is lost first, as after a power cut, so the
+/// last flight's slots are checked. Before, the unopenable arena counted as a lost slot: the flight
+/// was cut from the log, then the open failed anyway.
+#[cfg(unix)]
+#[test]
+fn an_unopenable_arena_refuses_the_open_and_leaves_the_log_alone() {
+    use std::os::unix::fs::{FileExt, PermissionsExt};
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("arena-eacces.db");
+        let (id, log, arena, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            write_v(&b.connect().unwrap(), 3, "kept");
+            (b.into_id(), db.branch_log_path().unwrap(), arena_path(&db), db.incarnation)
+        };
+        std::fs::OpenOptions::new().write(true).open(&log).unwrap().write_all_at(&[0u8; 4], 36).unwrap();
+        let bytes = std::fs::read(&log).unwrap();
+        std::fs::set_permissions(&arena, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let opened = try_open_at(&path, opts(catalog, SyncClass::Fsync));
+        std::fs::set_permissions(&arena, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(opened.is_err(), "catalog={catalog}: a store opened over an arena it cannot open");
+        drop(opened);
+        assert!(std::fs::read(&log).unwrap() == bytes, "catalog={catalog}: the refused open changed the log");
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let b = db.branch(id).unwrap();
+        assert_eq!(read_v(&b.connect().unwrap(), 3), "kept", "catalog={catalog}: the last flight's write");
+    }
+}
+
+/// Review 5 #2: a store whose log or arena is missing is refused at open, before anything is changed,
+/// and the refusal names the missing file: a catalog store before its first checkpoint (its meta row
+/// names no state yet; the log holds all of it) and after one, each file alone, and a snapshot store
+/// whose log is missing since its last compaction. Before, a missing file was created empty and the
+/// store opened with what it held gone, or was refused only once a checkpoint had counted states.
+/// Once the file is back, the store opens with every write.
+#[test]
+fn a_store_missing_its_log_or_arena_is_refused_at_open() {
+    let _s = serial();
+    for (catalog, checkpointed, missing) in [
+        (true, false, "-branch-arena"),
+        (true, false, "-branch-log"),
+        (true, true, "-branch-arena"),
+        (true, true, "-branch-log"),
+        (false, true, "-branch-log"),
+    ] {
+        let arm = format!("catalog={catalog} checkpointed={checkpointed} missing={missing}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("missing.db");
+        let (id, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::Fsync));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            let b = trunk.fork_branch().unwrap();
+            let bc = b.connect().unwrap();
+            write_v(&bc, 3, "first");
+            if checkpointed {
+                db.branch_compact_now().unwrap();
+            }
+            write_v(&bc, 4, "second");
+            drop(bc);
+            (b.into_id(), db.incarnation)
+        };
+        let base = path.to_str().unwrap();
+        let gone = format!("{base}{missing}");
+        let log = format!("{base}-branch-log");
+        std::fs::rename(&gone, format!("{gone}.aside")).unwrap();
+        let log_bytes = (missing != "-branch-log").then(|| std::fs::read(&log).unwrap());
+        let refused = match try_open_at(&path, opts(catalog, SyncClass::Fsync)) {
+            Ok(_) => panic!("{arm}: the store opened"),
+            Err(e) => e.to_string(),
+        };
+        assert!(refused.contains(&gone), "{arm}: the refusal does not name the missing file: {refused}");
+        if let Some(bytes) = log_bytes {
+            assert!(std::fs::read(&log).unwrap() == bytes, "{arm}: the refused open changed the log");
+        }
+        assert!(!std::path::Path::new(&gone).exists(), "{arm}: the refused open created the missing file");
+        std::fs::rename(format!("{gone}.aside"), &gone).unwrap();
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        let c = db.branch(id).unwrap().connect().unwrap();
+        assert_eq!(read_v(&c, 3), "first", "{arm}");
+        assert_eq!(read_v(&c, 4), "second", "{arm}");
     }
 }
