@@ -101,16 +101,24 @@ fdsync_scan() {
   local out=$1 p f k v fl n
   shift
   : >"$out.fdsync"
+  local fdd t
   for p in "$@"; do
-    if [ ! -d "/proc/$p/fdinfo" ]; then echo "gone $p" >>"$out.fdsync"; continue; fi
+    if [ ! -d "/proc/$p" ]; then echo "gone $p" >>"$out.fdsync"; continue; fi
+    # The fd table is shared by the threads: read it through a LIVE task, since a leader that called pthread_exit
+    # shows an empty /proc/PID/fdinfo while its other threads still hold every fd (fifth review, finding 5).
+    fdd="/proc/$p/fdinfo"
+    for t in /proc/"$p"/task/*; do
+      [ -e "$t" ] || continue
+      dead_task "$t" || { fdd="$t/fdinfo"; break; }
+    done
     n=0
-    for f in /proc/"$p"/fdinfo/*; do
+    for f in "$fdd"/*; do
       fl=
       { while read -r k v _; do [ "$k" = "flags:" ] && { fl=$v; break; }; done; } 2>/dev/null <"$f" || continue
       [ -n "$fl" ] || continue
       n=$((n + 1))
       if (((8#$fl & 8#04010000) != 0)); then
-        echo "hit $p ${f##*/} $fl $(readlink "/proc/$p/fd/${f##*/}" 2>/dev/null)" >>"$out.fdsync"
+        echo "hit $p ${f##*/} $fl $(readlink "${fdd%/fdinfo}/fd/${f##*/}" 2>/dev/null)" >>"$out.fdsync"
       fi
     done
     # A process caught exiting (zombie or dead, its files already closed) holds no fd and can write nothing: it is
