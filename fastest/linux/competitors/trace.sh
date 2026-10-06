@@ -170,6 +170,9 @@ fdsync_scan() {
         { while read -r k v _; do [ "$k" = "flags:" ] && { fl=$v; break; }; done; } 2>/dev/null <"$f" || continue
         [ -n "$fl" ] || continue
         n=$((n + 1))
+        # FDSYNC_SCAN_HOOK (the fire-check's F6d only; unset everywhere else) runs once per try after its first fd,
+        # with the fdinfo dir being read: F6d makes that task exit there to force the rescan and "unscanned" paths.
+        if [ "$n" = 1 ] && [ -n "${FDSYNC_SCAN_HOOK:-}" ]; then "$FDSYNC_SCAN_HOOK" "$fdd"; fi
         if (((8#$fl & 8#04010000) != 0)); then
           hits+="hit $p ${f##*/} $fl $(readlink "${fdd%/fdinfo}/fd/${f##*/}" 2>/dev/null)"$'\n'
         fi

@@ -19,6 +19,9 @@
 #      not in the trace, so only the pre-attach fd scan can see it. Expect INCOMPLETE with one O_DSYNC fd at attach.
 #   F6b the same with the O_DSYNC fd held by a CHILD of the attached pid: expect INCOMPLETE, the one fd at attach in
 #      the child, and every roster process scanned.
+#   F6c the fd scan alone on a process whose leader called pthread_exit (workers hold the fds): the O_DSYNC fd is
+#      found through a live worker, "scanned" with >= 200 fds.
+#   F6d the same scan with every task it reads through made to exit after its first fd: "unscanned", never "scanned".
 #   F7 threads that exist BEFORE the attach: a probe starts a thread, is attached, then the thread fsyncs x3 and the
 #      main thread x2. Expect exactly 5 fsyncs, verdict ok.
 #   F8 blind spot: pwritev2 with RWF_DSYNC (launch mode). Expect INCOMPLETE (rwf_sync_writes >= 1).
@@ -49,7 +52,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=19
+NCHECK=21
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -190,6 +193,24 @@ if mode == "dsync-child-pre":
     ready(); wait()
     os.waitpid(pid, 0)
     done_and_stay()
+if mode == "leader-exit":
+    # The leader calls pthread_exit (a zombie in /proc/PID/task/PID, its fdinfo empty) while five worker threads keep
+    # the process and its fds: an O_DSYNC fd plus 200 others, so a scan is long enough to lose its task mid-way. Each
+    # worker logs its tid and exits when DIR/leader-exit.exit.<tid> appears (F6c, F6d).
+    import ctypes
+    fd = os.open(f"{d}/leader-exit.dat", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DSYNC, 0o644)
+    extra = [os.open("/dev/null", os.O_RDONLY) for _ in range(200)]
+    def worker():
+        tid = threading.get_native_id()
+        open(f"{d}/{mode}.tid.{tid}", "w").close()
+        while not os.path.exists(f"{d}/{mode}.exit.{tid}"):
+            time.sleep(0.005)
+    for _ in range(5):
+        threading.Thread(target=worker).start()
+    while len([f for f in os.listdir(d) if f.startswith(f"{mode}.tid.")]) < 5:
+        time.sleep(0.01)
+    ready()
+    ctypes.CDLL(None).pthread_exit(None)
 if mode == "thread-pre":
     fd = os.open(f"{d}/thread-pre.dat", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     os.write(fd, b"x" * 4096)
@@ -324,6 +345,42 @@ else
   log "FAIL F6b-osync-in-a-descendant-refused: the probe or its attach failed"; fails=$((fails + 1))
 fi
 stop_probe2 dsync-child-pre
+
+# F6c and F6d: the pre-attach fd scan itself (fdsync_scan, no strace) on a process whose LEADER called pthread_exit
+# while five worker threads hold its fds (second re-review, finding 6: neither new path had ever run).
+#   F6c: the scan must read the table through a live worker: a "hit" on the O_DSYNC file and "scanned PID n" with
+#        n >= 200, though /proc/PID/task/PID/fdinfo is empty.
+#   F6d: FDSYNC_SCAN_HOOK makes the task being read exit after its first fd, on every try: three tries lose their
+#        task, two workers still live, so the process must be written "unscanned" (refused downstream), never
+#        "scanned" with the fds after the first silently skipped.
+f6d_hook() {
+  local task=${1%/fdinfo} j
+  touch "$DIR/fc/leader-exit.exit.${task##*/}"
+  for ((j = 0; j < 200; j++)); do [ -d "$task" ] || return 0; sleep 0.01; done
+}
+if start_probe2 leader-exit; then
+  for ((i = 0; i < 300; i++)); do [ "$(task_state "/proc/$PP2/task/$PP2/stat")" = Z ] && break; sleep 0.01; done
+  lz=$(task_state "/proc/$PP2/task/$PP2/stat")
+  fdsync_scan "$OUT/f6c" "$PP2"
+  if [ "$lz" = Z ] && grep -q "^hit $PP2 [0-9]* [0-7]* .*leader-exit\.dat$" "$OUT/f6c.fdsync" &&
+    awk -v p="$PP2" '$1 == "scanned" && $2 == p && $3 + 0 >= 200 { f = 1 } END { exit !f }' "$OUT/f6c.fdsync"; then
+    log "PASS F6c-dead-leader-scanned: leader state $lz; $(tr '\n' ' ' <"$OUT/f6c.fdsync" | cut -c1-240)"
+  else
+    log "FAIL F6c-dead-leader-scanned: leader state [$lz]; scan [$(tr '\n' ' ' <"$OUT/f6c.fdsync" | cut -c1-300)]"
+    fails=$((fails + 1))
+  fi
+  FDSYNC_SCAN_HOOK=f6d_hook fdsync_scan "$OUT/f6d" "$PP2"
+  left=$(ls -d /proc/"$PP2"/task/* 2>/dev/null | awk 'END {print NR}')
+  if grep -q "^unscanned $PP2 " "$OUT/f6d.fdsync" && ! grep -q "^scanned $PP2 " "$OUT/f6d.fdsync" && ! dead_proc "$PP2"; then
+    log "PASS F6d-scan-task-lost-unscanned: $(tr '\n' ' ' <"$OUT/f6d.fdsync" | cut -c1-200); $left task(s) left"
+  else
+    log "FAIL F6d-scan-task-lost-unscanned: scan [$(tr '\n' ' ' <"$OUT/f6d.fdsync" | cut -c1-300)]; $left task(s) left"
+    fails=$((fails + 1))
+  fi
+else
+  log "FAIL F6c/F6d: the leader-exit probe never became ready"; fails=$((fails + 2))
+fi
+stop_probe2 leader-exit
 
 # F7
 if start_probe2 thread-pre && run_probe2 f7 thread-pre; then
