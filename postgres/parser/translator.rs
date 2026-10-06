@@ -2229,7 +2229,16 @@ impl PostgreSQLTranslator {
                 {
                     let pg_jt =
                         PgJoinType::try_from(join_expr.jointype).unwrap_or(PgJoinType::Undefined);
-                    if pg_jt != PgJoinType::JoinInner || join_expr.quals.is_some() {
+                    // A join condition of any form (ON, USING, NATURAL), or an alias of the join, would
+                    // be dropped with the join: only CROSS JOIN LATERAL has none (wire review 2
+                    // item 4).
+                    if pg_jt != PgJoinType::JoinInner
+                        || join_expr.quals.is_some()
+                        || join_expr.is_natural
+                        || !join_expr.using_clause.is_empty()
+                        || join_expr.join_using_alias.is_some()
+                        || join_expr.alias.is_some()
+                    {
                         return Err(ParseError::ParseError(
                             "LATERAL is supported only as CROSS JOIN LATERAL".into(),
                         ));
