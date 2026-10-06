@@ -2646,14 +2646,26 @@ fn a_logged_release_is_durable_in_the_trunks_class_before_the_next_trunk_commit(
 /// Review 3 #4: an ordered flight's `F_BARRIERFSYNC` that fails as an I/O error does (EIO) is not
 /// retried as an F_FULLFSYNC that may report success for pages the failed call lost: the flight
 /// fails, the trunk commit relying on it is refused, and the store fail-stops (the next branch
-/// commit is refused). Only a barrier the file system does not support (ENOTSUP) falls back to the
-/// full sync, and the fallback is counted.
+/// commit is refused). Only a barrier the file system does not support (ENOTSUP, EOPNOTSUPP,
+/// EINVAL, ENOTTY) falls back to the full sync, and the fallback is counted.
+///
+/// FLAGGED TEST EDIT (own test, review 3 #4; review 6 #6): the fallback is right only on a kernel
+/// below Darwin 23, which does not promote an unsupported barrier itself; this test now forces
+/// that kernel (its new-kernel twin is a_failed_barrier_on_a_kernel_that_promotes_it_fail_stops_
+/// whatever_its_errno), and gains the EOPNOTSUPP, EINVAL and ENOTTY arms the review asked for.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_failed_barrier_fail_stops_and_only_an_unsupported_one_falls_back() {
     let _s = serial();
+    let _k = DarwinMajor::force(22);
     for catalog in [false, true] {
-        for (errno, name) in [(libc::EIO, "EIO"), (libc::ENOTSUP, "ENOTSUP")] {
+        for (errno, name) in [
+            (libc::EIO, "EIO"),
+            (libc::ENOTSUP, "ENOTSUP"),
+            (libc::EOPNOTSUPP, "EOPNOTSUPP"),
+            (libc::EINVAL, "EINVAL"),
+            (libc::ENOTTY, "ENOTTY"),
+        ] {
             let dir = tempfile::TempDir::new().unwrap();
             let db = open_at(&dir.path().join("barrier-errno.db"), opts(catalog, SyncClass::Fsync));
             let trunk = db.connect().unwrap();
@@ -2665,7 +2677,7 @@ fn a_failed_barrier_fail_stops_and_only_an_unsupported_one_falls_back() {
             let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
             let after = sync_counts();
             let fallbacks = after.barrier_fallback - before.barrier_fallback;
-            if errno == libc::ENOTSUP {
+            if errno != libc::EIO {
                 committed.unwrap();
                 assert_eq!(fallbacks, 1, "catalog={catalog} {name}: the fallback was not counted");
                 assert_eq!(read_v(&b.connect().unwrap(), 7), "trunk-7", "catalog={catalog} {name}");
