@@ -61,17 +61,30 @@ dead_proc() {
   return 0
 }
 
+# task_check TASKDIR STRACEPID -> "dead" (zombie, dead, or the task dir gone), "traced" (TracerPid is STRACEPID), or
+# "untraced" for everything else -- INCLUDING a status that could not be read while the task still exists: an
+# unreadable task fails closed (fifth review, finding 3: an empty read used to read as dead, or kept the previous
+# task's values).
+task_check() {
+  local s="" tp=""
+  read -r s tp < <(task_st "$1") || true
+  if [ -z "$s" ]; then
+    [ -e "$1" ] && echo untraced || echo dead
+    return
+  fi
+  if is_dead_state "$s"; then echo dead; elif [ "$tp" = "$2" ]; then echo traced; else echo untraced; fi
+}
+
 untraced_tasks() { # untraced_tasks STRACEPID PID... -> each live task "<pid>/task/<tid>" of PID... not traced by STRACEPID
-  local st=$1 p t s tp
+  local st=$1 p t
   shift
   for p in "$@"; do
     for t in /proc/"$p"/task/*; do
-      [ -e "$t/status" ] || continue
-      read -r s tp < <(task_st "$t")
-      is_dead_state "$s" && continue
-      [ -z "$tp" ] || [ "$tp" = "$st" ] || echo "${t#/proc/}"
+      [ -e "$t" ] || continue
+      [ "$(task_check "$t" "$st")" = untraced ] && echo "${t#/proc/}"
     done
   done
+  return 0
 }
 
 # fdsync_scan OUT PID... -- OUT.fdsync: every fd of each PID whose open-file flags hold O_DSYNC (0o10000) or __O_SYNC
@@ -128,11 +141,11 @@ traced_all() { # traced_all STRACEPID MAIN [PID...] -> 0 when MAIN is alive and 
   for p in "$@"; do
     [ -d "/proc/$p" ] || continue  # a descendant that exited between enumeration and attach: nothing left to trace
     for t in /proc/"$p"/task/*; do
-      [ -e "$t/status" ] || continue
-      local s tp
-      read -r s tp < <(task_st "$t")
-      is_dead_state "$s" && continue  # zombie, dead, or gone while we read it
-      [ "$tp" = "$st" ] || return 1
+      [ -e "$t" ] || continue
+      case $(task_check "$t" "$st") in
+        dead|traced) ;;  # zombie, dead or gone while we read it; or traced by us
+        *) return 1 ;;   # untraced, or unreadable while it exists (fails closed)
+      esac
     done
   done
 }
