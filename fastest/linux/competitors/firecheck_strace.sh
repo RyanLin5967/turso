@@ -36,6 +36,8 @@
 #      thaw and t0), and at least one child alive at the seize (no clone line in the trace) fsyncing after t0, seen
 #      by the probe log and attributed by the trace to a process at attach.
 #   F11 one attach split by strace_mark: fsync x2, tsplit, fsync x3 -> --part pre counts 2 and --part post 3.
+#   F13 the clock-step refusals forced to fire on copies of F2's window: a call stamp 2 s back in the trace, and
+#      t1_mono 2 s off in the window record, are each REFUSED; the unmodified copy counts F2's 10.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
 OUT=${1:?usage: firecheck_strace.sh OUT DIR}
@@ -43,7 +45,7 @@ DIR=${2:?usage: firecheck_strace.sh OUT DIR}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/trace.sh"
 SC="$HERE/stracecount.py"
-NCHECK=17
+NCHECK=18
 mkdir -p "$OUT" "$DIR/fc"
 fails=0
 log() { echo "$*" | tee -a "$OUT/firecheck.txt"; }
@@ -504,6 +506,35 @@ else
   log "FAIL F11-split: the probe or its attach failed"; fails=$((fails + 2))
 fi
 stop_probe2 split
+
+# F13: the clock-step refusals, forced to fire on copies of F2's passing window (fifth-review re-review, finding 2):
+# (a) one call stamp moved 2 s back in the trace -> refused for the -ttt back-step; (b) t1_mono moved 2 s back in the
+# window record, so realtime and monotonic disagree between t0 and t1 and between t1 and tend -> refused for a
+# CLOCK_REALTIME step; (c) the unmodified copy -> ok with F2's exact 10 flushes, so (a) and (b) fail for their edit.
+if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
+  for k in a b c; do
+    for x in strace strace.err window fdsync pids; do cp "$OUT/f2.$x" "$OUT/f13$k.$x" 2>/dev/null; done
+  done
+  awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { n++; if (n == 2) $2 = sprintf("%.6f", prev - 2.0); prev = $2 + 0 } { print }' \
+    "$OUT/f2.strace" >"$OUT/f13a.strace"
+  awk '/^t1=/ { for (i = 1; i <= NF; i++) if ($i ~ /^t1_mono=/) { split($i, a, "="); $i = sprintf("t1_mono=%.9f", a[2] - 2.0) } } { print }' \
+    "$OUT/f2.window" >"$OUT/f13b.window"
+  for k in a b c; do count "f13$k"; done
+  if python3 -c "
+import json, sys
+a, b, c = (json.load(open(p)) for p in sys.argv[1:4])
+ok = ('stepped back' in a['verdict'] and a['verdict'].startswith('REFUSED') and
+      'CLOCK_REALTIME stepped' in b['verdict'] and b['verdict'].startswith('REFUSED') and
+      c['verdict'] == 'ok' and c['flushes'] == 10)
+print('(a)', a['verdict'][:160], '| (b)', b['verdict'][:160], '| (c)', c['verdict'][:40], c['flushes'])
+sys.exit(0 if ok else 1)" "$OUT/f13a.json" "$OUT/f13b.json" "$OUT/f13c.json" >"$OUT/f13.txt" 2>&1; then
+    log "PASS F13-clock-step-refused: $(head -c 600 "$OUT/f13.txt")"
+  else
+    log "FAIL F13-clock-step-refused: $(head -c 600 "$OUT/f13.txt")"; fails=$((fails + 1))
+  fi
+else
+  log "FAIL F13-clock-step-refused: no F2 window to copy"; fails=$((fails + 1))
+fi
 
 rm -rf "$DIR/fc"
 if [ $fails -eq 0 ]; then log "VERDICT PASS $NCHECK/$NCHECK"; exit 0; fi

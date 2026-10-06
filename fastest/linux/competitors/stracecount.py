@@ -243,10 +243,12 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     calls = []  # (tid, name, args_and_rest, ts, completed)
     orphan_resumed, unstamped = 0, 0
     last_ts, back_steps, max_back = None, 0, 0.0  # -ttt stamps are written in event order: they must not run back
+    first_ts = None
     for line in text.splitlines():
         sm2 = RESUMED.match(line) or START.match(line)  # call lines only: the -c table's rows hold decimals too
         if sm2 and sm2.group(2):
             tsv = float(sm2.group(2))
+            first_ts = tsv if first_ts is None else min(first_ts, tsv)
             if last_ts is not None and tsv < last_ts:
                 back_steps += 1
                 max_back = max(max_back, last_ts - tsv)
@@ -309,6 +311,32 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     # detach request and strace's exit were counted with no time attached).
     t1m = re.search(r"^t1=(\d+\.\d+)", win, re.M)
     t1 = float(t1m.group(1)) if (attached and t1m) else None
+    # An attach window's stamps are clock pairs (trace.sh clock_pair): between consecutive ones, tseize -> t0
+    # [-> tsplit] -> t1 -> tend, the CLOCK_REALTIME delta must equal the CLOCK_MONOTONIC one within 1 ms, or the
+    # realtime clock stepped somewhere in the trace's life and the cuts cannot be trusted; and every call stamp must lie
+    # inside [tseize, tend]. Comparing call stamps with each other (above) misses a step before the first call or after
+    # the last (fifth-review re-review, finding 2). A missing pair refuses the window.
+    clock = {}
+    for name, mono, val in re.findall(r"(?:^|\s)(tseize|t0|tsplit|t1|tend)(_mono)?=(\d+\.\d+)", win, re.M):
+        clock.setdefault(name + mono, float(val))
+    out_clock = None
+    if attached:
+        chain = ["tseize", "t0"] + (["tsplit"] if "tsplit" in clock else []) + ["t1", "tend"]
+        absent = [k for n in chain for k in (n, n + "_mono") if k not in clock]
+        if absent:
+            problems.append(f"attach window without its clock pair(s) {absent}: a clock step could not be seen")
+        else:
+            steps = []
+            for a, b in zip(chain, chain[1:]):
+                dr, dm = clock[b] - clock[a], clock[b + "_mono"] - clock[a + "_mono"]
+                steps.append([a, b, round(dr - dm, 6)])
+                if dm < 0 or abs(dr - dm) > 0.001:
+                    problems.append(f"CLOCK_REALTIME stepped {dr - dm:+.6f} s between {a} and {b} (realtime {dr:.6f} s "
+                                    f"against monotonic {dm:.6f} s): the window cuts cannot be trusted")
+            if first_ts is not None and (first_ts < clock["tseize"] - 0.001 or last_ts > clock["tend"] + 0.001):
+                problems.append(f"call stamps {first_ts:.6f}..{last_ts:.6f} outside the window's life "
+                                f"[{clock['tseize']:.6f}, {clock['tend']:.6f}]: the clock or the stamps are wrong")
+            out_clock = steps
     before_t0, after_t1 = 0, 0
 
     def selected(ts):
@@ -398,6 +426,7 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     out["flush_by_syscall"] = flush
     out["t0"], out["calls_before_t0"], out["t1"], out["calls_after_t1"] = t0, before_t0, t1, after_t1
     out["clock_back_steps"], out["clock_max_back_s"] = back_steps, round(max_back, 6)
+    out["clock_pairs"] = out_clock  # [from, to, realtime minus monotonic delta in s] per consecutive pair (attach)
     # A launch window's command stderr (strace_run's OUT.cmd.err): recorded, never a verdict -- a command may warn and
     # still succeed, and its exit status is checked through strace_rc (fourth review, finding 6: it was looked at by
     # nothing).

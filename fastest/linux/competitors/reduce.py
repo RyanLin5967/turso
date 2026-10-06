@@ -47,14 +47,14 @@ PINNED_CLIENTS = ("1", "4")
 PINNED_RUNNERS = ("ubuntu-24.04", "ubuntu-24.04-arm")
 PINNED_FS = ("xfs", "btrfs")
 # The fire-check's checks, pinned (fifth review, finding 4): a job passes its fire-check only when firecheck.txt holds
-# exactly one PASS line for each of these, no FAIL line, and ends "VERDICT PASS 17/17" -- a fire-check that silently
-# lost a check (or a truncated, or an older, verdict file) cannot read as passed.
+# exactly one PASS line for each of these, no FAIL line, and one "VERDICT PASS n/n" (n = their count) -- a fire-check
+# that silently lost a check (or a truncated, or an older, verdict file) cannot read as passed.
 PINNED_FIRECHECK = (
     "F1-launch", "F2-attach", "F3-idle-attach", "F3b-unproven-empty-refused", "F4-osync-refused",
     "F5-io_uring-refused", "F6-osync-before-attach-refused", "F6b-osync-in-a-descendant-refused",
     "F7-threads-before-attach", "F8-rwf_dsync-refused", "F9-libaio-refused", "F10a-untraced-descendant-detected",
     "F10b-descendants-attached", "F10c-storm-control-misses", "F10d-storm-attach-complete", "F11-split-pre",
-    "F11-split-post",
+    "F11-split-post", "F13-clock-step-refused",
 )
 
 

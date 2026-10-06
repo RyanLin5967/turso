@@ -13,12 +13,15 @@
 #   strace_detach OUT          SIGINT to that strace (it detaches and writes the -c table), wait for it to exit.
 #                              Records whether the strace and MAIN were still alive when the detach was requested:
 #                              stracecount refuses the window if either was not (review finding 5).
-#   strace_mark OUT NAME       stamp NAME=<CLOCK_REALTIME now> into OUT.window inside an attach: stracecount --part
-#                              pre|post splits the trace there by each call's -ttt start stamp (the same clock), so
-#                              one attach holds the load window and the CHECKPOINT after it (second review, 2).
+#   strace_mark OUT NAME       stamp NAME=<CLOCK_REALTIME now> (with NAME_mono, clock_pair) into OUT.window inside an
+#                              attach: stracecount --part pre|post splits the trace there by each call's -ttt start
+#                              stamp (the same clock), so one attach holds the load window and the CHECKPOINT after
+#                              it (second review, 2).
 #   strace_run OUT CMD...      run CMD under the same strace from its first instruction.
 # Each window writes OUT.strace (per-call lines stamped -ttt, then the -c table), OUT.strace.err and OUT.window (the
-# window's CLOCK_REALTIME bounds, from `date +%s.%N`: attach-complete to detach-request, and strace's rc).
+# window's CLOCK_REALTIME bounds: t0 attach-complete to t1 detach-request, and strace's rc; an attach window's stamps
+# are clock pairs, tseize before strace starts and tend after it exits, see clock_pair; a launch window's are from
+# `date +%s.%N`).
 # kernel.yama.ptrace_scope must be 0 (the workflow sets it): the servers are not strace's descendants.
 TRACESET=fsync,fdatasync,sync_file_range,syncfs,sync,msync,copy_file_range,ioctl,openat,openat2,fcntl,pwritev2
 TRACESET=$TRACESET,io_submit,io_uring_setup,io_uring_enter,io_uring_register
@@ -28,6 +31,14 @@ TRACESET=$TRACESET,clone,clone3
 [ "$(uname -m)" = x86_64 ] && TRACESET=$TRACESET,open,creat,fork,vfork
 STRACE_OPTS=(-f -C -y -ttt -qq -s 160 -e signal=none -e "trace=$TRACESET")
 ST_PID=
+
+# clock_pair NAME -> "NAME=<CLOCK_REALTIME> NAME_mono=<CLOCK_MONOTONIC>", both read back to back in one process. The
+# window's cuts and strace's -ttt stamps read CLOCK_REALTIME, which a step (NTP, settimeofday) moves; MONOTONIC is
+# never stepped and runs at the same rate, so between two pairs the realtime and monotonic deltas differ only by a
+# step. stracecount compares them over the attach's whole life, tseize -> t0 [-> tsplit] -> t1 -> tend, and refuses
+# the window on a difference over 1 ms (fifth-review re-review, finding 2: comparing call stamps with each other
+# cannot see a step before the first call or after the last). No pair (python3 failed) is a refused window.
+clock_pair() { python3 -B -c 'import sys, time; r = time.time(); m = time.monotonic(); print("%s=%.9f %s_mono=%.9f" % (sys.argv[1], r, sys.argv[1], m))' "$1"; }
 
 descendants() { # descendants PID -> every live, non-zombie descendant pid of PID, one per line (children of children too)
   local c
@@ -180,7 +191,9 @@ strace_attach() {
   local out=$1 main=$2 try i p miss pids frozen
   [ -n "$main" ] || { echo "strace_attach: no main pid" >&2; return 2; }
   [ -d "/proc/$main" ] || { echo "strace_attach: main pid $main is not running" >&2; return 2; }
+  local tseize
   for ((try = 1; try <= 5; try++)); do
+    tseize=$(clock_pair tseize)  # before this try's strace starts: the first clock pair of the window (clock_pair)
     frozen=0
     freeze "$main" && frozen=1
     pids="$main $(descendants "$main" | tr '\n' ' ')"
@@ -208,7 +221,7 @@ strace_attach() {
       pids=$(printf '%s\n' $pids $(descendants "$main") | sort -un | tr '\n' ' ')
       fdsync_scan "$out" $pids
       pid_roster "$out" $pids
-      echo "main=$main pids=$pids strace_pid=$ST_PID attach_tries=$try frozen=$frozen attached_after_polls=$i t0=$(date +%s.%N)" >"$out.window"
+      echo "main=$main pids=$pids strace_pid=$ST_PID attach_tries=$try frozen=$frozen attached_after_polls=$i $tseize $(clock_pair t0)" >"$out.window"
       return 0
     fi
     echo "strace_attach: try $try incomplete, untraced descendants of $main: $miss" >&2
@@ -225,13 +238,14 @@ strace_attach() {
 
 strace_detach() {
   local out=$1 rc=0 sa=1 ma=1 main
-  echo "t1=$(date +%s.%N)" >>"$out.window"
+  clock_pair t1 >>"$out.window"
   main=$(sed -n 's/^main=\([0-9][0-9]*\) .*/\1/p' "$out.window" | head -1)
   kill -0 "$ST_PID" 2>/dev/null || sa=0
   { [ -n "$main" ] && kill -0 "$main" 2>/dev/null; } || ma=0
   kill -INT "$ST_PID" 2>/dev/null
   wait "$ST_PID" || rc=$?
   echo "strace_rc=$rc strace_alive_at_detach=$sa main_alive_at_detach=$ma" >>"$out.window"
+  clock_pair tend >>"$out.window"  # after strace exited: the last clock pair of the window (clock_pair)
   ST_PID=
 }
 
@@ -247,8 +261,8 @@ strace_run() {
   return $rc
 }
 
-strace_mark() { # strace_mark OUT NAME -- NAME=<now> into the open window's record
-  echo "$2=$(date +%s.%N)" >>"$1.window"
+strace_mark() { # strace_mark OUT NAME -- "NAME=<now> NAME_mono=<now>" (clock_pair) into the open window's record
+  clock_pair "$2" >>"$1.window"
 }
 
 window_s() { # window_s OUT -> seconds between t0 and tsplit when the window was split, else t0 and t1
