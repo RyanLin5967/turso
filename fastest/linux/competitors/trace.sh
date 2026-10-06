@@ -46,11 +46,15 @@ ST_PID=
 # inside the window's boundary (second re-review, finding 4); a one-shot python3 is the fallback.
 STAMP_PY='
 import sys, time
+# CLOCK_MONOTONIC itself, system-wide, so the coproc and a fallback process read the same clock: time.monotonic() has
+# an undefined reference point and on macOS CPython it starts near zero in each process (measured on the Mac).
+def mono():
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
 for name in sys.stdin:
     name = name.strip()
     best = None
     for _ in range(50):
-        m1 = time.monotonic(); r = time.time(); m2 = time.monotonic()
+        m1 = mono(); r = time.time(); m2 = mono()
         if best is None or m2 - m1 < best[2] - best[0]:
             best = (m1, r, m2)
         if m2 - m1 < 1e-4:
