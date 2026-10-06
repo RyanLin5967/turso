@@ -326,8 +326,12 @@ csalt() { # tag cmd...
 csalt "$OUT/F4/R_clocksource" refuse R_clocksource "$V3" --dir "$W" --out "$(o R_clocksource)" --n 5 --arms append25,nosync25
 
 echo "== F4: run.sh: the argument allowlist, the environment, the verdict binding"
+# The binding plants use a drive-leaf fixture on a brd cell too: a brd verdict is refused by its own rule (shown by
+# P_runsh_brd and batchgate's self-test), which would otherwise mask the plan rule (run 37515067945: R_runsh_count).
+FIXLEAF=$LEAF
+[ "$LEAF" = brd ] && FIXLEAF=wt
 fixture() { # name mod -> a planted full-shape verdict (batchgate.py fixture), path on stdout
-  python3 -B "$GATE" fixture "$OUT/F4/verdict-$1.json" "$CELL" "${4:-$ARCH}" "$LEAF" "${3:-$SHA}" "${5:-$WFS}" ${2:+"$2"}
+  python3 -B "$GATE" fixture "$OUT/F4/verdict-$1.json" "$CELL" "${4:-$ARCH}" "$FIXLEAF" "${3:-$SHA}" "${5:-$WFS}" ${2:+"$2"}
   echo "$OUT/F4/verdict-$1.json"
 }
 NB=(env -u V3FLOOR_BRD -u V3_SMOKE)
