@@ -3713,7 +3713,11 @@ mod tests {
             ("", u32::MAX),
             ("x.1", u32::MAX),
         ] {
-            assert_eq!(parse_darwin_major(release), major, "release {release:?}");
+            assert_eq!(
+                parse_darwin_major(release),
+                major,
+                "the major version was misread from Darwin release {release:?}"
+            );
         }
     }
 

@@ -6483,7 +6483,15 @@ impl BranchStore {
     /// this is not a catalog store).
     pub(crate) fn checkpoint_fuzzy_now(&self) -> Result<bool> {
         let mut inner = self.inner.lock();
-        if inner.cat.is_none() || inner.journal.is_none() || inner.arena.is_none() {
+        // Mutant `plant_premise_only` (test builds only): the mutant runner's planted control
+        // (its flagged-edit judge, 2026-10-06T14:45:43Z). It starts nothing, which trips only the
+        // "premise: a fuzzy checkpoint started" of the test it runs: the runner must read it as
+        // a PREMISE-DEATH, never as killed.
+        if inner.cat.is_none()
+            || inner.journal.is_none()
+            || inner.arena.is_none()
+            || fe_mutant("plant_premise_only")
+        {
             return Ok(false);
         }
         // G-a (r13-compose A2.R4a/A4.G): a splice-arm store takes no fuzzy checkpoint (S-12: a
