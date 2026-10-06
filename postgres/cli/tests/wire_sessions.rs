@@ -1691,3 +1691,117 @@ fn a_branch_name_parameter_must_be_text() {
         );
     }
 }
+
+/// The size of the trunk's WAL file beside `db` (0 when there is none).
+fn wal_bytes(db: &Path) -> u64 {
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    std::fs::metadata(PathBuf::from(wal)).map_or(0, |m| m.len())
+}
+
+/// CHECKPOINT does what it says or fails, judged by the trunk WAL rather than the tag: while
+/// another session holds a write transaction it waits for it, within the lock timeout, and then
+/// leaves the WAL empty. At 472023b72 the engine's busy answer was a row nobody read, and the tag
+/// was sent over a checkpoint that never ran (wire review 1 item 4 (a)).
+#[test]
+fn checkpoint_waits_for_a_writer_and_empties_the_wal() {
+    let dir = Scratch::new("ckptwait");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "20000"]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    b.q("BEGIN").ok("begin");
+    b.q("INSERT INTO t VALUES (2, 'b')").ok("insert");
+    assert!(
+        wal_bytes(&dir.db()) > 0,
+        "premise: the trunk WAL holds frames"
+    );
+    let committer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        b.q("COMMIT").ok("commit");
+        b
+    });
+    let t0 = Instant::now();
+    let r = a.q("CHECKPOINT");
+    let waited = t0.elapsed();
+    let _b = committer.join().unwrap();
+    let r = r.ok("checkpoint");
+    assert_eq!(r.tags, vec!["CHECKPOINT".to_string()]);
+    assert!(
+        waited >= Duration::from_millis(250),
+        "the checkpoint did not wait for the writer ({waited:?})"
+    );
+    assert_eq!(
+        wal_bytes(&dir.db()),
+        0,
+        "CHECKPOINT left frames in the trunk WAL"
+    );
+}
+
+/// A writer that outlasts the lock timeout fails the CHECKPOINT with 55P03, PostgreSQL's
+/// lock_not_available, instead of a CHECKPOINT tag over nothing (wire review 1 item 4 (a)).
+#[test]
+fn checkpoint_still_busy_at_the_lock_timeout_fails_with_55p03() {
+    let dir = Scratch::new("ckptbusy");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "300"]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    b.q("BEGIN").ok("begin");
+    b.q("INSERT INTO t VALUES (2, 'b')").ok("insert");
+    assert_eq!(a.q("CHECKPOINT").err("checkpoint").code, "55P03");
+    b.q("COMMIT").ok("commit");
+    a.q("CHECKPOINT").ok("checkpoint once the writer is gone");
+    assert_eq!(
+        wal_bytes(&dir.db()),
+        0,
+        "the trunk WAL after the checkpoint"
+    );
+}
+
+/// CHECKPOINT is the trunk's, as PostgreSQL's is the cluster's: from a session on a branch it
+/// empties the trunk WAL, and the session stays on its branch (wire review 1 item 4 (b)).
+#[test]
+fn checkpoint_from_a_branch_session_empties_the_trunk_wal() {
+    let dir = Scratch::new("ckptbranch");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "5000"]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('c')").ok("create");
+    a.q("SELECT turso_branch_switch('c')").ok("switch");
+    a.q("UPDATE t SET v = 'c' WHERE id = 1").ok("write on c");
+    assert!(
+        wal_bytes(&dir.db()) > 0,
+        "premise: the trunk WAL holds frames"
+    );
+    let r = a.q("CHECKPOINT").ok("checkpoint from a branch session");
+    assert_eq!(r.tags, vec!["CHECKPOINT".to_string()]);
+    assert_eq!(
+        wal_bytes(&dir.db()),
+        0,
+        "CHECKPOINT on a branch left the trunk WAL"
+    );
+    assert_eq!(a.q("SELECT turso_branch_current()").single("current"), "c");
+    assert_eq!(a.q("SELECT v FROM t WHERE id = 1").single("on c"), "c");
+}
+
+/// CHECKPOINT inside a block runs and leaves the block as it was, as in PostgreSQL 18.6 (the
+/// reviewer's measurement); at 472023b72 the engine refused it there (TableLocked), which
+/// aborted the block (wire review 1 item 4 (c)).
+#[test]
+fn checkpoint_inside_a_block_keeps_the_block() {
+    let dir = Scratch::new("ckptblock");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let r = a
+        .q("BEGIN; INSERT INTO t VALUES (2, 'two'); CHECKPOINT; COMMIT")
+        .ok("block with a checkpoint");
+    assert_eq!(
+        r.tags,
+        vec![
+            "BEGIN".to_string(),
+            "INSERT 0 1".to_string(),
+            "CHECKPOINT".to_string(),
+            "COMMIT".to_string()
+        ]
+    );
+    assert_eq!(r.status, b'I');
+    assert_eq!(a.q("SELECT count(*) FROM t").single("rows"), "2");
+}
