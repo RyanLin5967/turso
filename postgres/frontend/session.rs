@@ -737,6 +737,26 @@ fn handle_pg_add_constraints(
             }
         }
     }
+    // The aside table's name: not under the engine's reserved prefixes, which a client statement
+    // may not create; no longer than PostgreSQL's 63-byte identifiers, which libpg_query cuts in
+    // the aside's CREATE while the copy and the DROP below name it in full; and the name of no
+    // table, index, view or trigger in sqlite_schema (a user's object of that name is never
+    // touched). Probed here, before the rebuild, for the same reason as the lookup above (wire
+    // review 3 item 11).
+    let mut aside_table_name = None;
+    for n in 0..100 {
+        let name = aside_name_for(table, n);
+        let taken = {
+            let mut stmt =
+                conn.prepare_internal("SELECT 1 FROM sqlite_schema WHERE lower(name) = lower(?1)")?;
+            stmt.bind_at(NonZero::new(1).unwrap(), Value::build_text(name.clone()))?;
+            !stmt.run_collect_rows()?.is_empty()
+        };
+        if !taken && conn.current_schema().get_table(&name).is_none() {
+            aside_table_name = Some(name);
+            break;
+        }
+    }
     if conn.is_nested_stmt() {
         return Err(LimboError::InternalError(
             "ALTER TABLE ADD CONSTRAINT: the connection is inside another statement, so the \
@@ -772,23 +792,13 @@ fn handle_pg_add_constraints(
     create.if_not_exists = false;
     // The rows wait in a table of the same columns and types, so each value is decoded and
     // encoded by its own type both ways and reaches the rebuilt table as it was stored. (A copy
-    // made by CREATE TABLE AS would take its column types from the decoded values.) The name is
-    // not under the engine's reserved prefixes, which a client statement may not create, and not
-    // the name of any table that exists (a user's table of that name is never touched).
-    let schema = conn.current_schema();
-    let aside_name = (0..100)
-        .map(|n| match n {
-            0 => format!("{table}__turso_rebuild"),
-            n => format!("{table}__turso_rebuild_{n}"),
-        })
-        .find(|name| schema.get_table(name).is_none())
-        .ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "ALTER TABLE ADD CONSTRAINT: no free name for the rebuild's aside table of \
+    // made by CREATE TABLE AS would take its column types from the decoded values.)
+    let aside_name = aside_table_name.ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "ALTER TABLE ADD CONSTRAINT: no free name for the rebuild's aside table of \
                  \"{table}\""
-            ))
-        })?;
-    drop(schema);
+        ))
+    })?;
     if let Some(turso_pg_parser::pg_query::protobuf::node::Node::CreateStmt(c)) = aside_tree
         .stmts
         .first_mut()
@@ -799,6 +809,25 @@ fn handle_pg_add_constraints(
         if let Some(relation) = c.relation.as_mut() {
             relation.relname = aside_name.clone();
             relation.schemaname.clear();
+        }
+        // A serial column of the aside is its integer type: as serial it would create a sequence
+        // named after the aside, which the aside's DROP leaves behind (wire review 3 item 11).
+        for elt in &mut c.table_elts {
+            if let Some(turso_pg_parser::pg_query::protobuf::node::Node::ColumnDef(col)) =
+                elt.node.as_mut()
+            {
+                if let Some(type_name) = col.type_name.as_mut() {
+                    for part in &mut type_name.names {
+                        if let Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) =
+                            part.node.as_mut()
+                        {
+                            if let Some(base) = serial_base_type(&s.sval) {
+                                s.sval = base.to_string();
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     let aside_def =
@@ -868,6 +897,32 @@ fn handle_pg_add_constraints(
                 ))),
             }
         }
+    }
+}
+
+/// The rebuild's aside table name for `table`, attempt `n`: `<table>__turso_rebuild[_n]`, the
+/// table's part cut at a character boundary so the whole is at most 63 bytes, PostgreSQL's
+/// identifier limit (NAMEDATALEN - 1).
+fn aside_name_for(table: &str, n: usize) -> String {
+    const MAX_IDENTIFIER_BYTES: usize = 63;
+    let suffix = match n {
+        0 => "__turso_rebuild".to_string(),
+        n => format!("__turso_rebuild_{n}"),
+    };
+    let mut cut = table.len().min(MAX_IDENTIFIER_BYTES - suffix.len());
+    while !table.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &table[..cut])
+}
+
+/// The integer type a PostgreSQL serial type name stands for, or None for any other type.
+fn serial_base_type(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "serial" | "serial4" => Some("int4"),
+        "bigserial" | "serial8" => Some("int8"),
+        "smallserial" | "serial2" => Some("int2"),
+        _ => None,
     }
 }
 
