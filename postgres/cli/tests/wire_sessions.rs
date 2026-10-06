@@ -585,7 +585,9 @@ fn a_rollback_discards_only_its_own_sessions_writes() {
 #[test]
 fn a_conflicting_write_fails_with_a_retryable_sqlstate_or_serialises() {
     let dir = Scratch::new("conflict");
-    let server = Server::start(&dir.db(), &[]);
+    // A lock wait well inside the client's 30 s read timeout: at the default 60 s the blocked
+    // INSERT's reply came after the client gave up on it (wire review 1 item 9 added the wait).
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "2000"]);
     let mut a = seeded(&server);
     let mut b = server.connect();
     a.q("BEGIN").ok("begin a");
