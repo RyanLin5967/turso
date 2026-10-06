@@ -8939,6 +8939,38 @@ mod tests {
         assert_eq!(inner.alloc_slot().unwrap(), 0, "the reopened arena does not start empty");
     }
 
+    /// Engine review 9 #7: once its last branch is gone, a catalog store follows a page-size
+    /// change even when its catalog still holds rows the next checkpoint deletes: the trunk
+    /// version kept for a released child and reaped since the last checkpoint. Before, the
+    /// emptiness probe counted those rows and refused the change, and with it every create; replay
+    /// of the logged Releases recreated them at every reopen, so the refusal lasted.
+    #[test]
+    fn a_page_size_restart_is_not_refused_over_rows_the_next_checkpoint_deletes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let path = path.to_str().unwrap();
+        let store = BranchStore::open(BranchDurability::Catalog { sync: SyncClass::Fsync }, None, path).unwrap();
+        store.inner.lock().ensure_backing(512).unwrap();
+        let b = store.fork_trunk_locked(Arc::new(Schema::default()), 512).unwrap();
+        // A trunk write while b lives keeps its pre-image for b, in the catalog after a checkpoint.
+        store.first_write_trunk(1, &[7u8; 512]).unwrap();
+        store.compact_now().unwrap();
+        assert!(
+            store.inner.lock().catalog().unwrap().any_retained().unwrap(),
+            "premise: the catalog holds the trunk version kept for b"
+        );
+        store.release_handle(b).unwrap();
+        assert!(
+            store.inner.lock().catalog().unwrap().any_retained().unwrap(),
+            "premise: the reaped trunk version is still in the catalog until the next checkpoint"
+        );
+        let mut inner = store.inner.lock();
+        inner
+            .ensure_backing(1024)
+            .expect("a store with no branch refused a new page size over rows its next checkpoint deletes");
+        assert_eq!(inner.alloc_slot().unwrap(), 0, "the restarted arena does not start empty");
+    }
+
     /// The guard beside it: a store that still HOLDS something — here one branch — cannot follow
     /// a page-size change, and must keep refusing it.
     #[test]
