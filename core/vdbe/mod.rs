@@ -2691,9 +2691,17 @@ impl Program {
                     // WAL commit succeeded — publish the connection-local schema
                     // changes to the shared Database so other connections can see them.
                     connection.publish_database_schema(db_id);
+                    // The trunk commit's epilogue, as a main pager's (review 3 #20): its merge
+                    // writes stamped while its commit gate is open, then the gate closed. Mutant
+                    // `attached_unstamped` (test builds only).
+                    let stamped = !crate::branch::store::fe_mutant("attached_unstamped")
+                        && attached_pager.finish_trunk_write(true);
                     attached_pager.end_write_tx();
                     attached_pager.end_read_tx();
                     attached_pager.commit_wal_end();
+                    if stamped {
+                        attached_pager.prune_branch_stamps();
+                    }
                 } else {
                     // Discard any local schema changes on rollback
                     connection.database_schemas().write().remove(&db_id);

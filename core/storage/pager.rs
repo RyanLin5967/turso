@@ -1543,6 +1543,10 @@ pub struct Pager {
     /// What this commit's barrier must make durable, fixed at its decisions
     /// (`BranchStore::begin_trunk_commit`; lead review 1 item 10).
     trunk_required: AtomicU64,
+    /// This commit's barrier ordered the branch records ahead of its WAL flush (`pending_full` set
+    /// for it): cleared, with the store's `pending_full`, when the commit ends however it ends
+    /// (`close_trunk_gate`; review 3 #9).
+    trunk_ordered: AtomicBool,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1837,6 +1841,7 @@ impl Pager {
             trunk_gate_open: AtomicBool::new(false),
             trunk_sync_frontier: AtomicU64::new(0),
             trunk_required: AtomicU64::new(0),
+            trunk_ordered: AtomicBool::new(false),
         })
     }
 
@@ -3340,13 +3345,7 @@ impl Pager {
                     // were taken at) and the WAL write lock is still held (no merge validation, which
                     // runs inside a trunk write transaction, falls between the commit and its
                     // stamps). Then the gate closes.
-                    let stamped = if let Some(store) = self.branch_store.get() {
-                        let tx = std::mem::take(&mut *self.trunk_pending.lock());
-                        store.stamp_committed(tx)
-                    } else {
-                        false
-                    };
-                    self.close_trunk_gate();
+                    let stamped = self.finish_trunk_write(true);
                     crate::branch::store::kill_point("trunk.published");
 
                     wal.end_write_tx();
@@ -3896,6 +3895,16 @@ impl Pager {
         if crate::branch::store::fe_mutant("raw_gate_left_open") {
             return false;
         }
+        self.finish_trunk_write(committed)
+    }
+
+    /// The end of a trunk write transaction, still under its WAL write lock (review 3 #20): a commit
+    /// that `committed` has its merge writes stamped with the trunk's epoch while its commit gate is
+    /// open, then the gate closes; otherwise the pending writes and captures are dropped and a gate
+    /// a failed commit left open is closed. Every trunk commit path ends here: `commit_dirty_pages`,
+    /// a raw WAL session's end, and an attached pager's commit. Returns whether stamps were made,
+    /// for `prune_branch_stamps` once the lock is released.
+    pub(crate) fn finish_trunk_write(&self, committed: bool) -> bool {
         let tx = std::mem::take(&mut *self.trunk_pending.lock());
         self.trunk_pre_images.lock().clear();
         let stamped = match self.branch_store.get() {
@@ -3908,7 +3917,6 @@ impl Pager {
 
     /// Drop the merge stamps no live or future trunk child can be refused by (off the WAL write
     /// lock, as `commit_dirty_pages` does).
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub(crate) fn prune_branch_stamps(&self) {
         if let Some(store) = self.branch_store.get() {
             store.prune_stamps();
@@ -3918,9 +3926,17 @@ impl Pager {
     /// Close the branch store's commit gate if this pager's commit holds it open (F-L): once the
     /// commit's frames are published, or when the write lock is released after a failed commit.
     pub(crate) fn close_trunk_gate(&self) {
+        let ordered = self.trunk_ordered.swap(false, Ordering::AcqRel);
         if self.trunk_gate_open.swap(false, Ordering::AcqRel) {
             if let Some(store) = self.branch_store.get() {
                 store.end_trunk_commit();
+            }
+        } else if ordered && !crate::branch::store::fe_mutant("ordered_pending_kept") {
+            // A gate-less (childless) commit that ordered its barrier: no `end_trunk_commit` clears
+            // the `pending_full` it set (review 3 #9). Mutant `ordered_pending_kept` (test builds
+            // only).
+            if let Some(store) = self.branch_store.get() {
+                store.release_pending_full();
             }
         }
     }
@@ -4591,7 +4607,7 @@ impl Pager {
                 && self.trunk_pre_images.lock().is_empty()
                 && !crate::branch::store::fe_mutant("childless_commit_gated");
             if childless {
-                self.trunk_required.store(store.release_floor(), Ordering::Release);
+                self.trunk_required.store(store.barrier_floor(), Ordering::Release);
             } else if !self.trunk_gate_open.swap(true, Ordering::AcqRel) {
                 let captured = std::mem::take(&mut *self.trunk_pre_images.lock());
                 let decided = {
@@ -4629,10 +4645,15 @@ impl Pager {
         // durable before the commit that overwrites its page can be, or a crash after this commit
         // leaves the branch reading the NEW page. Idempotent across IO re-entry.
         if let Some(store) = self.branch_store.get() {
-            store.durability_barrier_to(
-                crate::branch::SyncClass::of_trunk(sync_mode, self.get_sync_type()),
-                self.trunk_required.load(Ordering::Acquire),
-            )?;
+            let trunk = crate::branch::SyncClass::of_trunk(sync_mode, self.get_sync_type());
+            // Whether this commit's WAL flush carries the branch files (ordered mode) is read from
+            // the WAL file it syncs, each time (review 3 #3).
+            if trunk == crate::branch::SyncClass::FullFsync {
+                store.note_trunk_wal(self.wal.as_ref().and_then(|wal| wal.full_fsync_device()));
+            }
+            if store.durability_barrier_ordered(trunk, self.trunk_required.load(Ordering::Acquire))? {
+                self.trunk_ordered.store(true, Ordering::Release);
+            }
         }
 
         let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);

@@ -266,13 +266,21 @@ pub enum BranchCheckpoint {
 
 impl BranchCheckpoint {
     /// The mode an open uses: `asked`, else `R11_CKPT`, else fuzzy (sharp in the splice arm).
-    pub(crate) fn resolve(asked: Option<BranchCheckpoint>, splice: bool) -> BranchCheckpoint {
-        asked.unwrap_or_else(|| match std::env::var("R11_CKPT").as_deref() {
-            Ok("fuzzy") => BranchCheckpoint::Fuzzy,
-            Ok("sharp") => BranchCheckpoint::Sharp,
-            _ if splice => BranchCheckpoint::Sharp,
-            _ => BranchCheckpoint::Fuzzy,
-        })
+    /// `R11_CKPT` names it exactly, "fuzzy" or "sharp"; any other value refuses the open, where it
+    /// silently meant fuzzy (review 4 #8).
+    pub(crate) fn resolve(asked: Option<BranchCheckpoint>, splice: bool) -> crate::Result<BranchCheckpoint> {
+        if let Some(asked) = asked {
+            return Ok(asked);
+        }
+        match std::env::var("R11_CKPT") {
+            Ok(v) if v == "fuzzy" => Ok(BranchCheckpoint::Fuzzy),
+            Ok(v) if v == "sharp" => Ok(BranchCheckpoint::Sharp),
+            Err(std::env::VarError::NotPresent) if splice => Ok(BranchCheckpoint::Sharp),
+            Err(std::env::VarError::NotPresent) => Ok(BranchCheckpoint::Fuzzy),
+            other => Err(crate::LimboError::InvalidArgument(format!(
+                "R11_CKPT={other:?}: the branch checkpoint mode is \"fuzzy\" or \"sharp\""
+            ))),
+        }
     }
 }
 
@@ -353,6 +361,9 @@ pub struct SyncCounts {
     pub fsync: u64,
     pub full_fsync: u64,
     pub barrier: u64,
+    /// `fcntl(F_BARRIERFSYNC)` calls the file system refused as unsupported, each replaced by a
+    /// full sync (counted in `full_fsync` too; review 3 #4).
+    pub barrier_fallback: u64,
 }
 
 /// A distribution of lock holds, in nanoseconds (fastest-engine M1 item 5; observing only): the
@@ -435,6 +446,7 @@ pub fn sync_counts() -> SyncCounts {
         fsync: crate::io::SYNC_COUNTS[0].load(Relaxed),
         full_fsync: crate::io::SYNC_COUNTS[1].load(Relaxed),
         barrier: crate::io::SYNC_COUNTS[2].load(Relaxed),
+        barrier_fallback: crate::io::SYNC_COUNTS[3].load(Relaxed),
     }
 }
 
@@ -474,6 +486,20 @@ pub enum BranchFailpoint {
     /// catalog read refused by the catalog's lock would; the statement retries the commit
     /// (fastest-engine review A-F2).
     TrunkDecisionBusy,
+    /// The next catalog probe that dates a trunk page's last write (`trunk_written_known`) returns
+    /// `Busy`, as a catalog read refused by the catalog's lock would (review 3 #2).
+    TrunkProbeBusy,
+    /// The next arena sync a compaction (snapshot store) or a catalog checkpoint makes fails as an
+    /// I/O error would (review 3 #5).
+    ArenaSyncFails,
+    /// The next fuzzy checkpoint's capture fails at its read snapshot, as a catalog error would
+    /// (review 4 #2).
+    CaptureFails,
+    /// The next fuzzy checkpoint's thread cannot be spawned (review 4 #2).
+    SpawnFails,
+    /// The confirmation word of the next group flight fails to reach the log's header, as an I/O
+    /// error would (review 6 #1).
+    ConfirmWriteFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -1157,6 +1183,20 @@ impl Database {
         self.branches.wait_name_filter();
     }
 
+    /// The checkpoint mode this database's branch store resolved at open (review 4 #8): what a
+    /// harness reports as its arm, rather than what it asked for.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_mode(&self) -> BranchCheckpoint {
+        self.branches.checkpoint_mode()
+    }
+
+    /// The name filter (observation, review 3 #7): `(built, entries, the most entries one insert
+    /// moved, builds installed, failed catalog scans)`.
+    #[doc(hidden)]
+    pub fn branch_name_filter_stats(&self) -> (bool, u64, u64, u64, u64) {
+        self.branches.name_filter_stats()
+    }
+
     /// What this open's prewarm did (r12-catload instrument, `R12_PREWARM`): `(mode, files warmed in
     /// the OS page cache, bytes read, bytes whose read-ahead was requested, catalog pages read
     /// through its page cache, interior pages among them, catalog page cache capacity after it,
@@ -1372,6 +1412,13 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_checkpoint_counters(&self) -> [u64; 9] {
         self.branches.checkpoint_counters()
+    }
+
+    /// Confirmation words written into the branch log's header, and those whose write failed
+    /// (review 6 #1; observing only).
+    #[doc(hidden)]
+    pub fn branch_confirm_counts(&self) -> [u64; 2] {
+        self.branches.confirm_counts()
     }
 
     /// Start a fuzzy catalog checkpoint now (F-FZ): its write runs on a thread of its own. `false`:

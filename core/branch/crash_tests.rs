@@ -731,6 +731,11 @@ const C1_POINTS: &[&str] = &[
     "ckpt.written",
     "ckpt.installed",
     "compact.renamed",
+    // Review 4 #10: the cut windows of a fuzzy checkpoint (catalog mode; `FE_C1_THRESHOLD` lowers
+    // the checkpoint threshold so they are reached within a trial).
+    "cut.prepared",
+    "cut.renamed",
+    "cut.dir_synced",
 ];
 
 const C1_TRIAL_SECS: u64 = 20;
@@ -918,6 +923,11 @@ fn c1_child() {
     let Ok(path) = std::env::var("FE_C1_CHILD") else {
         return;
     };
+    // Review 4 #10: a lowered checkpoint threshold, so fuzzy checkpoints (and their cut windows)
+    // run within a trial.
+    if let Some(bytes) = std::env::var("FE_C1_THRESHOLD").ok().and_then(|v| v.parse().ok()) {
+        super::journal::set_compact_threshold(bytes);
+    }
     let db = open_at(Path::new(&path), c1_opts());
     if std::env::var_os("FE_C1_RECOVER_ONLY").is_some() {
         // A recovery that the parent aims a kill into (phase 8); the open above was it.
@@ -1140,8 +1150,9 @@ fn verify_c1(db: &Arc<Database>, log: &C1Log, seed: &State) -> Vec<String> {
     bad
 }
 
-/// One C1 trial. Returns (landed, violations, what was aimed).
-fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: &str, n: u64, seed: u64, recover_kill: Option<u64>) -> (bool, Vec<String>, String) {
+/// One C1 trial. Returns (landed, violations, what was aimed, the operations that failed in the live
+/// child before the kill: its `ERR` lines).
+fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: &str, n: u64, seed: u64, recover_kill: Option<u64>) -> (bool, Vec<String>, String, Vec<String>) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("c1.db");
     let log_path = dir.path().join("c1.log");
@@ -1179,6 +1190,9 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
         }
         if let Ok(ms) = std::env::var("FE_KILL_DELAY_MS") {
             cmd.env("FE_KILL_DELAY_MS", ms);
+        }
+        if let Ok(bytes) = std::env::var("FE_C1_THRESHOLD") {
+            cmd.env("FE_C1_THRESHOLD", bytes);
         }
         cmd.spawn().unwrap()
     };
@@ -1222,6 +1236,14 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
         .take(2)
         .collect::<Vec<_>>()
         .join(" | ");
+    // `FE_C1_KEEP=<dir>` (lead, Linux I2): the crash image as the child left it, copied before any
+    // recovery touches it, kept when the trial found a violation or the child logged an error.
+    let image = std::env::var_os("FE_C1_KEEP").map(|keep| {
+        let to = Path::new(&keep).join(format!("s{seed}-{}", point.replace(['.', ':'], "_")));
+        let _ = std::fs::remove_dir_all(&to);
+        copy_dir(dir.path(), &to.join("crash"));
+        to
+    });
     if let Some(m) = recover_kill {
         // Phase 8: a second kill inside recovery's replay, then the parent's own recovery.
         let mut rec = spawn(format!("recover.replay:{m}"), true);
@@ -1238,7 +1260,33 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
     if !child_panic.is_empty() {
         bad.push(format!("the child panicked: {child_panic}"));
     }
-    (landed, bad, what)
+    let errs: Vec<String> = text.lines().filter(|l| l.starts_with("ERR ")).map(str::to_string).collect();
+    if let Some(to) = image {
+        if bad.is_empty() && errs.is_empty() {
+            let _ = std::fs::remove_dir_all(&to);
+        } else {
+            // The recovered state too, and what was wrong with it.
+            copy_dir(dir.path(), &to.join("recovered"));
+            let _ = std::fs::write(
+                to.join("violations.txt"),
+                format!("{what}\n{}\n{}\n", bad.join("\n"), errs.join("\n")),
+            );
+        }
+    }
+    (landed, bad, what, errs)
+}
+
+/// A recursive copy of `from` into `to` (created), for the kept crash images; best effort.
+fn copy_dir(from: &Path, to: &Path) {
+    let _ = std::fs::create_dir_all(to);
+    for entry in std::fs::read_dir(from).into_iter().flatten().flatten() {
+        let target = to.join(entry.file_name());
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            copy_dir(&entry.path(), &target);
+        } else {
+            let _ = std::fs::copy(entry.path(), &target);
+        }
+    }
 }
 
 /// C1: SIGKILLs aimed at every kill point, the database recovered and checked after each. Size
@@ -1261,6 +1309,9 @@ fn c1_sigkill_at_aimed_points() {
     let mut rng = Rng(seed | 1);
     let (mut landed, mut unaimed, mut violations) = (0u64, 0u64, Vec::new());
     let mut per_point: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    // Operations that failed in a live child before its kill, by message (the thread prefix cut):
+    // observation, reported beside the verdict (an operation the engine refused mid-run).
+    let mut in_run: BTreeMap<String, u64> = BTreeMap::new();
     for trial in 0..trials {
         let only = std::env::var("FE_C1_POINT").ok();
         let point: &str = match only.as_deref() {
@@ -1269,7 +1320,11 @@ fn c1_sigkill_at_aimed_points() {
         };
         let n = 1 + rng.below(40);
         let rk = (recover_kill && trial % 3 == 2).then(|| 1 + rng.below(20));
-        let (hit, bad, what) = c1_trial(&exe, catalog, class, threads, point, n, seed ^ trial, rk);
+        let (hit, bad, what, errs) = c1_trial(&exe, catalog, class, threads, point, n, seed ^ trial, rk);
+        for e in errs {
+            let message = e.split_once(": ").map_or(e.as_str(), |(_, m)| m).to_string();
+            *in_run.entry(message).or_default() += 1;
+        }
         let e = per_point.entry(point).or_default();
         if hit {
             landed += 1;
@@ -1288,11 +1343,15 @@ fn c1_sigkill_at_aimed_points() {
     let power = std::env::var("FE_C1_POWER").is_ok_and(|v| v == "1");
     let summary = format!(
         "C1 catalog={catalog} class={class:?} power_loss_simulated={power} threads={threads} \
-         trials={trials} landed={landed} unaimed={unaimed} violations={} per point (landed, \
-         unaimed): {per_point:?}",
-        violations.len()
+         trials={trials} landed={landed} unaimed={unaimed} violations={} in_run_errors={} per point \
+         (landed, unaimed): {per_point:?}",
+        violations.len(),
+        in_run.values().sum::<u64>()
     );
     println!("{summary}");
+    for (message, n) in &in_run {
+        println!("C1 in-run error x{n}: {message}");
+    }
     assert!(violations.is_empty(), "{summary}\n{}", violations.join("\n"));
     assert!(landed > 0, "{summary}: no kill landed where it was aimed");
 }
@@ -1301,6 +1360,7 @@ fn c1_sigkill_at_aimed_points() {
 
 /// The E3 child: create the named branch `FE_E3_NAME` from the trunk, write one row on it, record
 /// the acknowledgement, and SIGKILL itself (no destructor, flush or clean close runs).
+#[cfg(unix)]
 #[test]
 fn e3_child() {
     let Ok(path) = std::env::var("FE_E3_CHILD") else {
@@ -1328,6 +1388,7 @@ fn e3_child() {
 /// SIGKILL; then THIS process — a different one — opens the database (a recovery) and connects to
 /// the new branch by name, and to up to ten older ones, each reading its write, none carrying a
 /// lease. Every trial must pass.
+#[cfg(unix)]
 #[test]
 fn e3_kill9_restart_connect_by_name() {
     if std::env::var_os("FE_E3_CHILD").is_some() || std::env::var_os("FE_C1_CHILD").is_some() {

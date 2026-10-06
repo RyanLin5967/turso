@@ -63,6 +63,8 @@ impl IO for UnixIO {
         let unix_file = Arc::new(UnixFile {
             file,
             path: path.to_string(),
+            #[cfg(target_vendor = "apple")]
+            device: std::sync::OnceLock::new(),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
@@ -86,6 +88,9 @@ impl IO for UnixIO {
 pub struct UnixFile {
     file: std::fs::File,
     path: String,
+    /// `File::full_fsync_device`, read once: an open descriptor's device does not change.
+    #[cfg(target_vendor = "apple")]
+    device: std::sync::OnceLock<Option<u64>>,
 }
 
 pub(crate) struct UnixSharedWalMapping {
@@ -449,6 +454,20 @@ impl File for UnixFile {
         trace!("pwritev complete: wrote {total_written} bytes");
         c.complete(total_written as i32);
         Ok(c)
+    }
+
+    /// Apple: `sync(FullFsync)` is `fcntl(F_FULLFSYNC)` on this descriptor (see `sync`), so the
+    /// answer is the descriptor's own device (`fstat`). Elsewhere FullFsync is a plain fsync.
+    fn full_fsync_device(&self) -> Option<u64> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            *self
+                .device
+                .get_or_init(|| self.file.metadata().ok().map(|m| m.dev()))
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        None
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
