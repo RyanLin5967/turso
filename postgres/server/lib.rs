@@ -567,6 +567,14 @@ struct SessionState {
     notices: Vec<Box<ErrorInfo>>,
 }
 
+/// An engine statement's failure, with whether it got as far as running: a COMMIT or ROLLBACK that
+/// failed to prepare (a syntax error) is a failed statement like any other, while one that ran and
+/// failed ended or did not end the block by its outcome (wire review 3 item 5).
+struct StatementFailure {
+    prepared: bool,
+    info: Box<ErrorInfo>,
+}
+
 /// A statement Describe prepared: on which engine connection, from which text.
 struct Described {
     conn: Arc<turso_core::Connection>,
@@ -827,6 +835,9 @@ impl Session {
             TxVerb::Rollback if !in_tx => return Ok(Response::Execution(Tag::new("ROLLBACK"))),
             _ => {}
         }
+        // Whether a failed engine statement got as far as running (a branch call, a CHECKPOINT
+        // or a refusal here is a statement that ran).
+        let mut ran = true;
         let result = match call {
             Some(call) => {
                 // A statement a Describe kept holds its connection open: a switch away, or a
@@ -847,20 +858,25 @@ impl Session {
                 drop(st);
                 let r = self.engine_statement(&conn, sql, portal, format);
                 st = self.state();
-                r
+                r.map_err(|f| {
+                    ran = f.prepared;
+                    f.info
+                })
             }
         };
         if result.is_err() {
             match verb {
-                // A failed COMMIT ends the block, as in PostgreSQL: whatever the engine kept of
-                // the transaction is rolled back and the session is idle.
-                TxVerb::Commit => {
+                // A COMMIT that ran and failed ends the block, as in PostgreSQL: whatever the
+                // engine kept of the transaction is rolled back and the session is idle. If that
+                // rollback fails too the block is still open, and failed.
+                TxVerb::Commit if ran => {
                     if !conn.inner().get_auto_commit() {
                         let _ = conn.execute("ROLLBACK");
                     }
-                    st.aborted = false;
+                    st.aborted = !conn.inner().get_auto_commit();
                 }
-                TxVerb::Rollback => st.aborted = false,
+                // A ROLLBACK that ran: the block is over unless the engine still holds it.
+                TxVerb::Rollback if ran => st.aborted = !conn.inner().get_auto_commit(),
                 // Inside a block any other error aborts it. Whether the session was in a block is
                 // read from before the statement: some errors make the engine roll the whole
                 // transaction back itself, and reading autocommit after them would let the rest of
@@ -1035,12 +1051,12 @@ impl Session {
         sql: &str,
         portal: Option<&Portal<String>>,
         format: &Format,
-    ) -> SqlResult<Response> {
+    ) -> Result<Response, StatementFailure> {
         let in_tx = !conn.inner().get_auto_commit();
         // sqlstate() gives 55P03 to LimboError::Busy alone and 40001 to BusySnapshot alone.
         self.retrying(
             || self.engine_statement_once(conn, sql, portal, format),
-            |e: &Box<ErrorInfo>| e.code == "55P03" || (!in_tx && e.code == "40001"),
+            |f: &StatementFailure| f.info.code == "55P03" || (!in_tx && f.info.code == "40001"),
         )
     }
 
@@ -1050,15 +1066,21 @@ impl Session {
         sql: &str,
         portal: Option<&Portal<String>>,
         format: &Format,
-    ) -> SqlResult<Response> {
+    ) -> Result<Response, StatementFailure> {
+        let unprepared = |info: Box<ErrorInfo>| StatementFailure {
+            prepared: false,
+            info,
+        };
         let described = portal.and_then(|_| self.take_described(conn, sql));
         let (mut stmt, types) = match described {
             Some(kept) => kept,
-            None => conn.prepare_typed(sql).map_err(|e| engine_info(&e))?,
+            None => conn
+                .prepare_typed(sql)
+                .map_err(|e| unprepared(engine_info(&e)))?,
         };
         self.shared.cleanup_dropped_schema_file(sql);
         if let Some(portal) = portal {
-            bind_portal_parameters(&mut stmt, portal).map_err(wire_info)?;
+            bind_portal_parameters(&mut stmt, portal).map_err(|e| unprepared(wire_info(e)))?;
         }
         let r = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
             execute_non_query(&mut stmt, sql)
@@ -1067,7 +1089,10 @@ impl Session {
             // this reply agree on both protocols (wire review 1 item 14).
             execute_query(&mut stmt, format, &types, &conn.inner().current_schema())
         };
-        r.map_err(wire_info)
+        r.map_err(|e| StatementFailure {
+            prepared: true,
+            info: wire_info(e),
+        })
     }
 
     // ---- branch functions ----
