@@ -1482,3 +1482,36 @@ fn branch_stats_reports_the_servers_counters() {
     read(&mut a);
     a.q("COMMIT").ok("commit");
 }
+
+/// A branch another session is on cannot be deleted under it (PostgreSQL: DROP DATABASE of a
+/// database other sessions use fails with 55006), and once that session leaves, it can.
+#[test]
+fn deleting_a_branch_another_session_is_on_is_refused_with_55006() {
+    let dir = Scratch::new("delheld");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('x')").ok("create");
+    let mut b = server.connect_to("postgres/x").expect("b on x");
+    let e = a.q("SELECT turso_branch_delete('x')").err("delete under b");
+    assert_eq!(e.code, "55006", "{e:?}");
+    b.q("UPDATE t SET v = 'b' WHERE id = 1")
+        .ok("b's branch is still there");
+    b.q("SELECT turso_branch_switch('main')").ok("b leaves");
+    a.q("SELECT turso_branch_delete('x')")
+        .ok("delete once b left");
+    a.q("SELECT turso_branch_create('y')").ok("create y");
+    let mut c = server.connect_to("postgres/y").expect("c on y");
+    drop(c.q("SELECT 1"));
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = a.q("SELECT turso_branch_delete('y')");
+        match r.error {
+            None => break,
+            Some(e) if e.code == "55006" && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Some(e) => panic!("y stayed held after c disconnected: {e:?}"),
+        }
+    }
+}
