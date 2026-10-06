@@ -3323,28 +3323,19 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("UNKNOWN"), Type::TEXT);
     }
 
+    /// A parameter of unknown type is its text as given, as PostgreSQL resolves a parameter nothing
+    /// types: its context's type (result_types::parameter_types) is applied before this, never a
+    /// guess from the value. The guess this test pinned put '007' into a text column as 7 (wire
+    /// review 4 item 3; FLAGGED test edit, the guess is the ruled defect).
     #[test]
     fn test_unknown_type_inference() {
-        // UNKNOWN type should infer integers from numeric-looking strings
-        let val = pg_bytes_to_value(b"42", &Type::UNKNOWN).unwrap();
-        assert!(matches!(
-            val,
-            Value::Numeric(turso_core::Numeric::Integer(42))
-        ));
-
-        // UNKNOWN type should infer floats
-        let val = pg_bytes_to_value(b"3.14", &Type::UNKNOWN).unwrap();
-        if let Value::Numeric(turso_core::Numeric::Float(f)) = val {
-            #[allow(clippy::approx_constant)]
-            let expected = 3.14;
-            assert!((f64::from(f) - expected).abs() < 0.001);
-        } else {
-            panic!("Expected Float");
+        for text in ["42", "3.14", "007", "t", "1e3", "hello"] {
+            let val = pg_bytes_to_value(text.as_bytes(), &Type::UNKNOWN).unwrap();
+            assert!(
+                matches!(&val, Value::Text(t) if t.as_str() == text),
+                "{text}: {val:?}"
+            );
         }
-
-        // UNKNOWN type should keep text for non-numeric strings
-        let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN).unwrap();
-        assert!(matches!(val, Value::Text(_)));
     }
 
     #[test]
