@@ -844,8 +844,12 @@ impl Scanned {
                     // `cut_ignores_decided_class` (test builds only: every cut a fresh-nonce rewrite
                     // in the rewrite class, as before) and `cut_in_place` (in place even when
                     // nothing syncs, as before review 5 #7).
+                    // Mutant M-h (`apply_torn_flight`) cuts in place too, so the torn flight's whole
+                    // records are really replayed and the mutant dies on its test's assertion, not
+                    // on a refusal of the rewrite (engine review 7 #5).
                     let in_place = (class.syncs() && !super::store::fe_mutant("cut_ignores_decided_class"))
-                        || super::store::fe_mutant("cut_in_place");
+                        || super::store::fe_mutant("cut_in_place")
+                        || super::store::fe_mutant("apply_torn_flight");
                     if in_place {
                         set_file_len(&journal.file, whole as u64)?;
                         if class.syncs() {
@@ -4120,14 +4124,23 @@ mod flight_tests {
 
     /// A flight whose end did not reach the disk whole is dropped whole: none of it was
     /// acknowledged, and a whole record inside it is not replayed on its own (mutant M-h,
-    /// `apply_torn_flight`, must fail this).
+    /// `apply_torn_flight`, must fail this — on its assertion: the open returning its state is a
+    /// premise, so a mutant that makes the open fail shows as a premise failure, not a kill).
+    ///
+    /// FLAGGED TEST EDIT (engine review 7 #5): the `unwrap` became that premise.
     #[test]
     fn a_flight_whose_end_is_torn_is_dropped_whole() {
         let dir = tempfile::TempDir::new().unwrap();
         let (files, starts) = three_flights(dir.path(), SyncClass::Fsync);
         let len = std::fs::metadata(&files.log).unwrap().len();
         OpenOptions::new().write(true).open(&files.log).unwrap().set_len(len - 3).unwrap();
-        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        let recovered = match Journal::recover(&files, SyncClass::Off) {
+            Ok(Some(recovered)) => recovered,
+            other => panic!(
+                "premise: the open returned its state (a failure here is not this test's claim): {:?}",
+                other.map(|r| r.is_some())
+            ),
+        };
         assert_eq!(forks(&recovered.records), vec![1, 2], "a torn flight's whole record was replayed");
         drop(recovered);
         assert_eq!(std::fs::metadata(&files.log).unwrap().len(), starts[2]);
