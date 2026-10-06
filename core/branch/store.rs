@@ -4792,6 +4792,16 @@ impl BranchStore {
     /// it failed. Only the trunk's one writer (the WAL write lock's holder) calls it, so an odd count
     /// is this writer's open gate; an even one means its `begin_trunk_commit` refused before
     /// opening it.
+    /// A trunk commit whose barrier relied on its WAL flush (ordered) ends without that flush having
+    /// cleared `pending_full` (no frames to sync, a sync error, a gate-less commit): nothing waits on
+    /// it any more (review 3 #9). Waiters it covered lead their own flush at once.
+    pub(crate) fn release_pending_full(&self) {
+        let mut g = self.group.lock();
+        if g.pending_full.take().is_some() {
+            self.group.cv.notify_all();
+        }
+    }
+
     pub(crate) fn end_trunk_commit(&self) {
         // The WAL flush that would have made an ordered flight durable did not come, or came and
         // said so already: either way nothing waits on it any more.
@@ -4909,13 +4919,20 @@ impl BranchStore {
     /// While a lease is outstanding it also stamps the lease clock, at most once per
     /// `STAMP_EVERY_MS` (review N2), and flushes a stamp still only queued.
     pub(crate) fn durability_barrier_to(&self, trunk: SyncClass, required: u64) -> Result<()> {
+        self.durability_barrier_ordered(trunk, required).map(|_| ())
+    }
+
+    /// `durability_barrier_to`, saying whether it relied on the commit's WAL flush (an ORDERED flight,
+    /// `pending_full` possibly set): the pager then owns clearing it, whether or not that flush comes
+    /// (review 3 #9).
+    pub(crate) fn durability_barrier_ordered(&self, trunk: SyncClass, required: u64) -> Result<bool> {
         // Nothing to make durable, no stamp to write: no lock at all (lead review 1 item 10).
         let class = self.class.max(trunk);
         if !self.unsynced.load(Ordering::Acquire)
             && !self.leases_outstanding.load(Ordering::Acquire)
             && self.group.durable(class) >= required
         {
-            return Ok(());
+            return Ok(false);
         }
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
@@ -4933,7 +4950,7 @@ impl BranchStore {
             ..
         } = &mut *inner;
         let (Some(journal), Some(_)) = (journal.as_mut(), arena.as_ref()) else {
-            return Ok(());
+            return Ok(false);
         };
         if unsynced && *failpoint == Some(BranchFailpoint::BarrierBeforeRecords) {
             *failpoint = None;
@@ -4971,11 +4988,16 @@ impl BranchStore {
         drop(inner);
         if self.group.durable(class) >= required && !stamp_due {
             self.unsynced.store(false, Ordering::Release);
-            return Ok(());
+            return Ok(false);
         }
         // A commit that F_FULLFSYNCs its WAL on the branch files' device needs its pre-images only
         // ORDERED before its frames: that flush makes both durable (lead review 1 item 6).
-        let waited = if class == SyncClass::FullFsync && self.ordered_trunk() {
+        // Only a commit whose WAL WILL be F_FULLFSYNCed (`trunk`, not the store's class) can carry
+        // its records ordered (review 3 #9: at synchronous=NORMAL nothing would flush them, and
+        // `pending_full` stayed set). Mutant `ordered_by_store_class` (test builds only).
+        let ordered = (trunk == SyncClass::FullFsync || (fe_mutant("ordered_by_store_class") && class == SyncClass::FullFsync))
+            && self.ordered_trunk();
+        let waited = if ordered {
             self.order_for_trunk(target)
         } else {
             self.wait_durable(target, class)
@@ -4992,14 +5014,14 @@ impl BranchStore {
                 kill_point("trunk.barrier_done");
                 #[cfg(test)]
                 pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_BARRIER_DONE);
-                Ok(())
+                Ok(ordered)
             }
             // Only stamps were at stake: a trunk commit does not fail because its stamp could not
             // be written (a lost stamp lengthens leases and loses no data), though the failed
             // flight poisoned the store, as every failed flush does.
             Err(e) if self.group.durable(class) >= required => {
                 tracing::warn!("branch lease clock not stamped at a trunk commit: {e}");
-                Ok(())
+                Ok(ordered)
             }
             Err(e) => Err(e),
         }

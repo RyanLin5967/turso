@@ -1543,6 +1543,10 @@ pub struct Pager {
     /// What this commit's barrier must make durable, fixed at its decisions
     /// (`BranchStore::begin_trunk_commit`; lead review 1 item 10).
     trunk_required: AtomicU64,
+    /// This commit's barrier ordered the branch records ahead of its WAL flush (`pending_full` set
+    /// for it): cleared, with the store's `pending_full`, when the commit ends however it ends
+    /// (`close_trunk_gate`; review 3 #9).
+    trunk_ordered: AtomicBool,
 }
 
 /// Raw fat pointer to a registered cursor.
@@ -1837,6 +1841,7 @@ impl Pager {
             trunk_gate_open: AtomicBool::new(false),
             trunk_sync_frontier: AtomicU64::new(0),
             trunk_required: AtomicU64::new(0),
+            trunk_ordered: AtomicBool::new(false),
         })
     }
 
@@ -3921,9 +3926,17 @@ impl Pager {
     /// Close the branch store's commit gate if this pager's commit holds it open (F-L): once the
     /// commit's frames are published, or when the write lock is released after a failed commit.
     pub(crate) fn close_trunk_gate(&self) {
+        let ordered = self.trunk_ordered.swap(false, Ordering::AcqRel);
         if self.trunk_gate_open.swap(false, Ordering::AcqRel) {
             if let Some(store) = self.branch_store.get() {
                 store.end_trunk_commit();
+            }
+        } else if ordered && !crate::branch::store::fe_mutant("ordered_pending_kept") {
+            // A gate-less (childless) commit that ordered its barrier: no `end_trunk_commit` clears
+            // the `pending_full` it set (review 3 #9). Mutant `ordered_pending_kept` (test builds
+            // only).
+            if let Some(store) = self.branch_store.get() {
+                store.release_pending_full();
             }
         }
     }
@@ -4638,7 +4651,9 @@ impl Pager {
             if trunk == crate::branch::SyncClass::FullFsync {
                 store.note_trunk_wal(self.wal.as_ref().and_then(|wal| wal.full_fsync_device()));
             }
-            store.durability_barrier_to(trunk, self.trunk_required.load(Ordering::Acquire))?;
+            if store.durability_barrier_ordered(trunk, self.trunk_required.load(Ordering::Acquire))? {
+                self.trunk_ordered.store(true, Ordering::Release);
+            }
         }
 
         let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
