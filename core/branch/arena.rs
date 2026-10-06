@@ -293,6 +293,14 @@ impl Arena {
     }
 
     /// Whether a slot was written since the arena's last sync (or since a flight took its writes).
+    /// Count every slot as possibly unsynced (review 5 #10: a reopened arena whose last writes were
+    /// made by flights that never synced it), so the next sync of the arena is made.
+    pub(crate) fn mark_unsynced(&mut self) {
+        if let Backing::File { dirty, .. } = &mut self.backing {
+            *dirty = true;
+        }
+    }
+
     pub(crate) fn is_dirty(&self) -> bool {
         matches!(self.backing, Backing::File { dirty: true, .. })
     }

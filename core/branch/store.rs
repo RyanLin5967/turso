@@ -2716,6 +2716,7 @@ impl BranchStore {
                                 Self::replay_snapshot_store(&mut inner, snapshot, scanned.records(), &mut stats)?;
                             }
                         }
+                        let unsynced = scanned.arena_unsynced();
                         let mut recovered = scanned.finish()?;
                         stats.records = recovered.records.len() as u64;
                         // Frees here are not acted on: the free set is derived below from what the
@@ -2734,12 +2735,14 @@ impl BranchStore {
                         stats.referenced_ns = ns(t);
                         stats.referenced_slots = referenced.len() as u64;
                         let t = Instant::now();
-                        let arena = Arena::from_file(arena_file, recovered.page_size, &referenced)?;
+                        let mut arena = Arena::from_file(arena_file, recovered.page_size, &referenced)?;
+                        if unsynced {
+                            arena.mark_unsynced();
+                        }
                         stats.arena_ns = ns(t);
                         stats.arena_high_water = arena.in_use() as u64 + arena.free_count() as u64;
                         stats.arena_free = arena.free_count() as u64;
                         inner.files_device(recovered.journal.device(), arena.device())?;
-                        let mut arena = arena;
                         if closed {
                             recovered.journal.flush(&mut arena)?;
                         }
@@ -3036,6 +3039,7 @@ impl BranchStore {
                 touched = Self::replay_catalog_store(inner, catalog, &meta, scanned.records(), sync, stats)?;
             }
         }
+        let unsynced = scanned.arena_unsynced();
         let mut recovered = scanned.finish()?;
         stats.records = recovered.records.len() as u64;
         let t = Instant::now();
@@ -3099,6 +3103,9 @@ impl BranchStore {
         let in_use = u64::try_from(in_use)
             .map_err(|_| LimboError::Corrupt("branch catalog: negative arena use".into()))?;
         let mut arena = Arena::from_file_catalog(arena_file, page_size, high_water, in_use, free_mem)?;
+        if unsynced {
+            arena.mark_unsynced();
+        }
         inner.files_device(recovered.journal.device(), arena.device())?;
         if closed {
             recovered.journal.flush(&mut arena)?;
