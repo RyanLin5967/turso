@@ -905,6 +905,10 @@ struct StoreInner {
     /// (`Arena::is_synced_named`), waiting for a sync to cover the Release, with its sequence
     /// number.
     held_synced_free: VecDeque<(u64, Vec<Slot>)>,
+    /// Early-released Releases applied in memory and not yet durable in the store's class, in log
+    /// order (engine review 7 #3): a fail-stopped store still lists and finds these branches, as a
+    /// reopen would. Pruned by `mature`. `u64::MAX`: never buffered (the buffer failed).
+    releases_in_air: VecDeque<ReleaseInAir>,
     /// Named server branches' names (fastest-engine M1 item 4).
     names: NameIndex,
     /// The trunk's epoch at the copy decisions of the trunk commit in flight (or the last one): the
@@ -2120,6 +2124,17 @@ impl Lineage {
         out.sort_unstable();
         out
     }
+}
+
+/// A Release applied in memory whose record is not yet durable (`StoreInner::releases_in_air`).
+struct ReleaseInAir {
+    /// What makes it durable (`u64::MAX`: it was never buffered).
+    lsn: u64,
+    id: BranchId,
+    /// The branch's fork, durable or not: a branch whose fork is not durable either would not come
+    /// back at a reopen.
+    fork_lsn: u64,
+    name: Option<Arc<str>>,
 }
 
 /// What `BranchStore::start_flight` did (review 4 #2): only `Failed` backs the next attempt off.
@@ -3731,6 +3746,13 @@ impl BranchStore {
 
     /// Return the deferred frees a flight has covered (called under the store mutex).
     fn mature(&self, inner: &mut StoreInner) {
+        // Releases durable now no longer need reporting by a stopped store (engine review 7 #3).
+        if !inner.releases_in_air.is_empty() {
+            let durable = self.group.durable(self.class);
+            while inner.releases_in_air.front().is_some_and(|r| r.lsn <= durable) {
+                inner.releases_in_air.pop_front();
+            }
+        }
         if inner.pending_free.is_empty() && inner.held_synced_free.is_empty() {
             return;
         }
@@ -4575,6 +4597,7 @@ impl BranchStore {
             Handle::Attached | Handle::Detached => {}
         }
         let record = inner.release_record(id);
+        let (fork_lsn, name) = (st.fork_lsn, st.name.clone());
         // Early release (fastest-engine M1 item 2): buffered and applied under the mutex, durable
         // by `wait_durable` after it; the slots it frees wait for that (rule 2).
         let lsn = match self.buffer_records(&mut inner, &[record]) {
@@ -4587,8 +4610,11 @@ impl BranchStore {
                 if let Some(st) = inner.branches.get_mut(&id) {
                     st.handle = Handle::ReleasePending;
                 }
-                // F-W1: gone from the caller's point of view, so not listed (as `is_released` says).
+                // F-W1: gone from the caller's point of view, so not listed (as `is_released` says)
+                // by a running store; a stopped one lists it again, as a reopen would (engine
+                // review 7 #3).
                 inner.live_ids_remove(id);
+                inner.releases_in_air.push_back(ReleaseInAir { lsn: u64::MAX, id, fork_lsn, name });
                 return Err(LimboError::InternalError(format!(
                     "branch {} was not released durably ({e}); it is kept, and comes back at the \
                      next open",
@@ -4597,6 +4623,8 @@ impl BranchStore {
             }
         };
         self.last_release_lsn.fetch_max(lsn, Ordering::AcqRel);
+        // Until it is durable, a stopped store must still report the branch (engine review 7 #3).
+        inner.releases_in_air.push_back(ReleaseInAir { lsn, id, fork_lsn, name });
         let mut freed = Vec::new();
         let spliced = match inner.apply_release(id, &mut freed) {
             Ok(spliced) => spliced,
@@ -4682,7 +4710,19 @@ impl BranchStore {
         check_branch_name(name)?;
         let (found, poisoned) = {
             let mut inner = self.inner.lock();
-            (inner.name_lookup(name)?, inner.poisoned())
+            let found = inner.name_lookup(name)?;
+            let poisoned = inner.poisoned();
+            // A stopped store still finds a branch whose Release did not become durable: a reopen
+            // brings it back under its name (engine review 7 #3).
+            let found = match found {
+                None if poisoned => {
+                    let durable = self.group.durable(self.class);
+                    let mut unflown = inner.unflown_releases(durable);
+                    unflown.find(|r| r.name.as_deref() == Some(name)).map(|r| r.id)
+                }
+                found => found,
+            };
+            (found, poisoned)
         };
         // Not before its fork is durable (review C-F4): a crash would lose a branch already found.
         if let Some(id) = found {
@@ -4737,7 +4777,7 @@ impl BranchStore {
     /// builds the set once (`build_live_ids`: the same scan and query, under the mutex, counted).
     pub(crate) fn ids(&self) -> Result<Vec<BranchId>> {
         self.refuse_if_trunk_only("listing branches")?;
-        let (durable_at, snapshot, failed) = {
+        let (durable_at, snapshot, failed, unreleased) = {
             let mut inner = self.inner.lock();
             // No fork is listed before it is durable (review C-F4): the listing waits for the
             // newest one, after the lock is released. A fail-stopped store makes nothing durable
@@ -4751,17 +4791,21 @@ impl BranchStore {
                 inner.last_fork_lsn.max(self.last_release_lsn.load(Ordering::Acquire))
             };
             // A fail-stopped store lists no fork whose flight failed (review 3 #17): its creator was
-            // told it failed, and a reopen would not have it.
-            let failed: Vec<BranchId> = if inner.poisoned() {
+            // told it failed, and a reopen would not have it. And it lists every branch whose
+            // Release did not become durable, which a reopen brings back (engine review 7 #3).
+            let (failed, unreleased): (Vec<BranchId>, Vec<BranchId>) = if inner.poisoned() {
                 let durable = self.group.durable(self.class);
-                inner
-                    .branches
-                    .iter()
-                    .filter(|(_, st)| st.fork_lsn > durable)
-                    .map(|(id, _)| *id)
-                    .collect()
+                (
+                    inner
+                        .branches
+                        .iter()
+                        .filter(|(_, st)| st.fork_lsn > durable)
+                        .map(|(id, _)| *id)
+                        .collect(),
+                    inner.unflown_releases(durable).map(|r| r.id).collect(),
+                )
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             // githost-shape instrument (observing only).
             inner.shape.ids_calls += 1;
@@ -4773,13 +4817,13 @@ impl BranchStore {
                 let rows = inner.shape.ids_build_rows - before;
                 inner.shape.ids_build_rows = before;
                 inner.shape.ids_catalog_rows += rows;
-                (durable_at, set, failed)
+                (durable_at, set, failed, unreleased)
             } else {
                 if inner.live_ids.is_none() {
                     let set = inner.build_live_ids()?;
                     inner.live_ids = Some(set);
                 }
-                (durable_at, inner.live_ids.clone().expect("built above"), failed)
+                (durable_at, inner.live_ids.clone().expect("built above"), failed, unreleased)
             }
         };
         self.wait_durable(durable_at, self.class)?;
@@ -4788,6 +4832,13 @@ impl BranchStore {
         snapshot.for_each(&mut work, &mut |key| ids.push(BranchId(u64::from(key))));
         if !failed.is_empty() {
             ids.retain(|id| !failed.contains(id));
+        }
+        if !unreleased.is_empty() {
+            for id in unreleased {
+                if let Err(at) = ids.binary_search(&id) {
+                    ids.insert(at, id);
+                }
+            }
         }
         Ok(ids)
     }
@@ -6226,6 +6277,7 @@ impl StoreInner {
             merge_work: super::BranchMergeWork::default(),
             pending_free: VecDeque::new(),
             held_synced_free: VecDeque::new(),
+            releases_in_air: VecDeque::new(),
             names: NameIndex::default(),
             trunk_commit_epoch: 0,
             fail_stop: Arc::new(AtomicBool::new(false)),
@@ -6285,6 +6337,16 @@ impl StoreInner {
         if let Some(set) = self.live_ids.as_mut() {
             set.insert(id_key(id));
         }
+    }
+
+    /// The Releases applied in memory that are not durable at `durable`, of branches whose fork is:
+    /// a reopen brings each of them back (engine review 7 #3). Mutant
+    /// `poisoned_hides_unflown_release` (test builds only): none, as before.
+    fn unflown_releases(&self, durable: u64) -> impl Iterator<Item = &ReleaseInAir> {
+        let hide = fe_mutant("poisoned_hides_unflown_release");
+        self.releases_in_air
+            .iter()
+            .filter(move |r| !hide && r.lsn > durable && r.fork_lsn <= durable)
     }
 
     /// F-W1: `id` is not listed from now on (a release, durable or not), if the set exists.
