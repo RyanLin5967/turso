@@ -985,8 +985,19 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
     }
 
     let rows_inserted = rows.len();
-    let mut begin = conn.prepare_sqlite("BEGIN")?;
-    begin.run_ignore_rows()?;
+    // The rows go in atomically: in a transaction of their own, or, inside one already open (a
+    // client's block, or the implicit block of a multi-statement query or a pipeline), under a
+    // savepoint, so a failed COPY undoes its own rows and leaves the block to its owner. Its own
+    // BEGIN was refused inside any open transaction (wire review 4 item 2).
+    let in_tx = !conn.get_auto_commit();
+    execute_root(
+        conn,
+        if in_tx {
+            "SAVEPOINT __turso_copy"
+        } else {
+            "BEGIN"
+        },
+    )?;
 
     let result = (|| {
         let mut insert_stmt = conn.prepare_sqlite(&insert_sql)?;
@@ -1003,18 +1014,37 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
             insert_stmt.clear_bindings();
         }
 
-        let mut commit = conn.prepare_sqlite("COMMIT")?;
-        commit.run_ignore_rows()?;
+        execute_root(
+            conn,
+            if in_tx {
+                "RELEASE SAVEPOINT __turso_copy"
+            } else {
+                "COMMIT"
+            },
+        )?;
         Ok(rows_inserted)
     })();
 
-    if result.is_err() {
-        if let Ok(mut rollback) = conn.prepare_sqlite("ROLLBACK") {
-            let _ = rollback.run_ignore_rows();
-        }
+    let e = match result {
+        Ok(n) => return Ok(n),
+        Err(e) => e,
+    };
+    let undone = if in_tx {
+        execute_root(conn, "ROLLBACK TO SAVEPOINT __turso_copy")
+            .and_then(|()| execute_root(conn, "RELEASE SAVEPOINT __turso_copy"))
+    } else if !conn.get_auto_commit() {
+        execute_root(conn, "ROLLBACK")
+    } else {
+        Ok(())
+    };
+    // An undo that failed leaves some of the rows in a transaction nobody can name: the connection
+    // is broken, not merely the statement (the server ends the session), as for ALTER's rebuild.
+    match undone {
+        Ok(()) => Err(e),
+        Err(undo) => Err(LimboError::InternalError(format!(
+            "{CONNECTION_BROKEN}: COPY FROM failed ({e}) and undoing it failed too ({undo})"
+        ))),
     }
-
-    result
 }
 
 fn get_table_columns(
