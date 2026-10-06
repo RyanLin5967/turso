@@ -7082,10 +7082,28 @@ impl StoreInner {
             // holds a branch or a retained trunk version has pages of the old size and cannot.
             // (VACUUM and journal-mode changes are refused while a branch exists, so only the
             // empty case is reachable.)
-            let catalog_retains = match self.catalog() {
+            let mut catalog_retains = match self.catalog() {
                 Some(cat) => cat.any_retained()?,
                 None => false,
             };
+            // Rows the next checkpoint deletes (trunk versions reaped since the last one, rows of
+            // removed branches) are not state this store holds (engine review 9 #7): with no
+            // branch and no retained trunk version in memory, that checkpoint is taken now, sharp,
+            // and the catalog asked again. Only on a page-size change. Mutant
+            // `restart_guard_counts_reaped` (test builds only): refused over them, as before.
+            let deletable = self.cat.as_ref().is_some_and(|c| !c.trunk_gone.is_empty() || !c.removed.is_empty());
+            if catalog_retains
+                && deletable
+                && self.n_states == 0
+                && self.trunk.lineage.retained.is_empty()
+                && !fe_mutant("restart_guard_counts_reaped")
+            {
+                self.checkpoint_catalog(false)?;
+                catalog_retains = match self.catalog() {
+                    Some(cat) => cat.any_retained()?,
+                    None => false,
+                };
+            }
             if self.n_states > 0 || !self.trunk.lineage.retained.is_empty() || catalog_retains {
                 return Err(LimboError::InternalError(format!(
                     "branch arena holds {current}-byte pages but the database now uses {page_size}"
