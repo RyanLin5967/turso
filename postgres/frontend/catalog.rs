@@ -170,9 +170,16 @@ impl Dialect for PostgresDialect {
 /// in PostgreSQL: not in comparisons, not in length, not when cast to text), so the engine's own
 /// comparisons and functions see PostgreSQL's values; a value longer than n once trailing blanks are
 /// dropped is refused. The wire server pads a bpchar column back to n characters on output.
+/// `=` and `<` (and the `<>`, `>`, `<=`, `>=` the engine derives from them) are bpchareq and
+/// bpcharlt (functions.rs), which ignore trailing blanks on both sides, so a scan agrees with an
+/// index seek, whose key is encoded (wire review 2 item 3). Two engine limits remain (COMPAT.md):
+/// the engine applies a type's operators only against a column or a literal, not a bound
+/// parameter, and it encodes the literal with the column's length check, so comparing with a
+/// literal longer than n raises 'value too long' where PostgreSQL answers false.
 const BPCHAR_TYPE_SQL: &str = "CREATE TYPE bpchar(value text, maxlen integer) BASE text \
     ENCODE CASE WHEN length(rtrim(value, ' ')) <= maxlen THEN rtrim(value, ' ') \
-    ELSE RAISE(ABORT, 'value too long for type character') END DECODE value OPERATOR '<'";
+    ELSE RAISE(ABORT, 'value too long for type character') END DECODE value \
+    OPERATOR '=' bpchareq OPERATOR '<' bpcharlt";
 
 fn register_bpchar(schema: &mut Schema) -> Result<()> {
     use turso_parser::ast::{Cmd, Stmt};

@@ -24,7 +24,8 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         | "current_schemas" => &[1],
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
-        "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
+        "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
+        | "bpcharlt" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
         _ => return false,
     };
@@ -56,6 +57,21 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             args.first().unwrap_or(&Value::Null),
             &text_arg(1),
         )),
+        // character(n)'s `=` and `<` (catalog.rs BPCHAR_TYPE_SQL): trailing blanks are not
+        // significant, as PostgreSQL's bpchareq and bpcharlt (wire review 2 item 3). Both sides
+        // are trimmed, so an operand the engine did not encode compares the same.
+        "bpchareq" | "bpcharlt" => {
+            let trimmed = |v: Option<&Value>| match v {
+                None | Some(Value::Null) => None,
+                Some(Value::Text(t)) => Some(t.as_str().trim_end_matches(' ').to_string()),
+                Some(other) => Some(other.to_string().trim_end_matches(' ').to_string()),
+            };
+            Ok(match (trimmed(args.first()), trimmed(args.get(1))) {
+                (Some(a), Some(b)) if name == "bpchareq" => Value::from_i64((a == b) as i64),
+                (Some(a), Some(b)) => Value::from_i64((a < b) as i64),
+                _ => Value::Null,
+            })
+        }
         "booleq" => Ok(Value::from_i64((args.first() == args.get(1)) as i64)),
         "boolne" => Ok(Value::from_i64((args.first() != args.get(1)) as i64)),
         "version" => Ok(exec_version()),

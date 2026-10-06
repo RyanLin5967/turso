@@ -114,7 +114,12 @@ Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence. boolean,
 smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
 cidr, macaddr, macaddr8 map to Turso custom types. varchar(n)/char(n) and
-numeric(p,s) keep their type modifiers. interval, xml, tsvector/tsquery,
+numeric(p,s) keep their type modifiers. char(n) is stored without its trailing
+blanks and padded back on output; its comparisons ignore trailing blanks against
+a column or a literal (by scan and by index seek alike), but not yet against a
+bound parameter (`code = $1` compares as text), and comparing with a literal
+longer than n raises "value too long" where PostgreSQL answers false (both are
+the engine's: it encodes only literals, with the column's length check). interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
