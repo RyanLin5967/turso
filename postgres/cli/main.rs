@@ -101,6 +101,14 @@ struct Opts {
 
     #[clap(
         long,
+        default_value_t = turso_pg_server::DEFAULT_LOCK_WAIT_MS,
+        help = "With --server: how long a branch call waits for a lock another session holds \
+                before it fails with 55P03, in milliseconds"
+    )]
+    lock_timeout_ms: u64,
+
+    #[clap(
+        long,
         value_enum,
         default_value_t = BranchStore::Catalog,
         help = "Where named branches live: a catalog store beside the database (the default), a \
@@ -1053,6 +1061,7 @@ fn main() -> anyhow::Result<()> {
             db_file,
             db,
             opts.max_connections,
+            std::time::Duration::from_millis(opts.lock_timeout_ms),
             interrupt_count,
         );
         return server.run();

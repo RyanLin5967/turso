@@ -1922,6 +1922,55 @@ impl PostgreSQLTranslator {
             return Ok(ast::SelectTable::Select(select, alias));
         }
 
+        // generate_series returns one column, which PostgreSQL names after the alias (`AS x`), the
+        // alias's column list (`AS g(x)`), or else the function; the engine's table-valued
+        // generate_series names it `value`. Select it under PostgreSQL's name.
+        if func_name.eq_ignore_ascii_case("generate_series") {
+            let range_alias = range_func.alias.as_ref();
+            let column_name = range_alias
+                .and_then(|a| {
+                    a.colnames.first().and_then(|n| match &n.node {
+                        Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                })
+                .or_else(|| range_alias.map(|a| a.aliasname.clone()))
+                .unwrap_or_else(|| "generate_series".to_string());
+            let table_name = range_alias
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_else(|| "generate_series".to_string());
+            let select = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Expr(
+                            Box::new(ast::Expr::Id(ast::Name::from_string("value"))),
+                            Some(ast::As::As(ast::Name::from_string(&column_name))),
+                        )],
+                        from: Some(ast::FromClause {
+                            select: Box::new(ast::SelectTable::TableCall(
+                                ast::QualifiedName::single(ast::Name::from_string(func_name)),
+                                args,
+                                None,
+                            )),
+                            joins: vec![],
+                        }),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            return Ok(ast::SelectTable::Select(
+                select,
+                Some(ast::As::As(ast::Name::from_string(&table_name))),
+            ));
+        }
+
         Ok(ast::SelectTable::TableCall(
             ast::QualifiedName::single(ast::Name::from_string(func_name)),
             args,
@@ -2462,6 +2511,16 @@ impl PostgreSQLTranslator {
                     }
                 }
                 Ok(expr)
+            }
+            // A row constructor, `(a, b)` or `ROW(a, b)`: the engine's row value, which comparisons
+            // take element-wise (`(a, b) >= (1, 2)`), as PostgreSQL's do.
+            Some(pg_query::protobuf::node::Node::RowExpr(row)) => {
+                let items = row
+                    .args
+                    .iter()
+                    .map(|arg| Ok(Box::new(self.translate_expr(arg)?)))
+                    .collect::<Result<Vec<_>, ParseError>>()?;
+                Ok(ast::Expr::Parenthesized(items))
             }
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list

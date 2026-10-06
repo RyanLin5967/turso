@@ -76,6 +76,8 @@ pub fn open_database_with_io(
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
         aliases::install(&conn);
+        // PostgreSQL enforces every foreign key; the engine only under PRAGMA foreign_keys.
+        conn.set_foreign_keys_enabled(true);
         Self {
             inner: Arc::new(PgConnectionInner {
                 conn,

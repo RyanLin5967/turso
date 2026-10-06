@@ -67,6 +67,10 @@ pub const TRUNK: &str = "main";
 /// (PREREG v1 §6 Server configuration (1)).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 2048;
 
+/// How long a branch call waits, by default, for a lock another session holds before it fails
+/// with 55P03 (PostgreSQL's statements wait on locks; its default lock_timeout is no limit).
+pub const DEFAULT_LOCK_WAIT_MS: u64 = 60_000;
+
 /// The stack of a session thread: the main thread's default, since a session runs the same
 /// statements a REPL would.
 const SESSION_STACK: usize = 8 << 20;
@@ -97,6 +101,8 @@ struct Shared {
     db: Arc<Database>,
     db_file: String,
     max_connections: usize,
+    /// How long a branch call waits for a lock another session holds (see [`Session::waiting`]).
+    lock_wait: std::time::Duration,
     /// Sessions admitted and not yet ended.
     live: AtomicUsize,
 }
@@ -107,6 +113,7 @@ impl TursoPgServer {
         db_file: String,
         db: Arc<Database>,
         max_connections: usize,
+        lock_wait: std::time::Duration,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
@@ -115,6 +122,7 @@ impl TursoPgServer {
                 db,
                 db_file,
                 max_connections,
+                lock_wait,
                 live: AtomicUsize::new(0),
             }),
             interrupt_count,
@@ -423,9 +431,7 @@ impl Session {
             return Ok(());
         }
         let conn = self
-            .shared
-            .db
-            .connect_named(branch)
+            .waiting(|| self.shared.db.connect_named(branch))
             .map_err(|e| PgWireError::UserError(self.switch_error(branch, &e, "FATAL")))?;
         self.state().branch = Some((branch.to_string(), PgConnection::new(conn)));
         Ok(())
@@ -599,7 +605,7 @@ impl Session {
                         format!("branch name \"{TRUNK}\" is reserved for the trunk"),
                     ));
                 }
-                match conn.inner().create_branch(&name) {
+                match self.waiting(|| conn.inner().create_branch(&name)) {
                     Ok(id) => Ok(one_int8(f, id.0 as i64, format)),
                     Err(e) => Err(self.create_error(&name, &e)),
                 }
@@ -620,9 +626,7 @@ impl Session {
                     st.branch = None;
                 } else {
                     let opened = self
-                        .shared
-                        .db
-                        .connect_named(&name)
+                        .waiting(|| self.shared.db.connect_named(&name))
                         .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
                     let next = PgConnection::new(opened);
                     next.adopt_session_of(conn);
@@ -637,10 +641,35 @@ impl Session {
                      branch first"
                 ),
             )),
-            _ => match self.shared.db.drop_branch(&name) {
+            _ => match self.waiting(|| self.shared.db.drop_branch(&name)) {
                 Ok(_) => Ok(one_text(f, &name, format)),
                 Err(e) => Err(self.missing_or(&name, &e, "ERROR")),
             },
+        }
+    }
+
+    /// The engine call `f`, retried while a lock it needs is held by another session
+    /// ([`LimboError::Busy`], or a snapshot a concurrent commit outdated), sleeping on SQLite's
+    /// default busy schedule (1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50 ms, then 100 ms) for up to
+    /// the server's lock wait. Only this session's thread sleeps.
+    fn waiting<T>(&self, mut f: impl FnMut() -> turso_core::Result<T>) -> turso_core::Result<T> {
+        const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+        let deadline = std::time::Instant::now() + self.shared.lock_wait;
+        let mut attempt = 0;
+        loop {
+            match f() {
+                Err(LimboError::Busy | LimboError::BusySnapshot) => {
+                    let delay = std::time::Duration::from_millis(
+                        DELAYS_MS[attempt.min(DELAYS_MS.len() - 1)],
+                    );
+                    attempt += 1;
+                    if std::time::Instant::now() + delay > deadline {
+                        return f();
+                    }
+                    std::thread::sleep(delay);
+                }
+                r => return r,
+            }
         }
     }
 
@@ -1572,9 +1601,9 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("ALTER TABLE")
     } else if upper.starts_with("BEGIN") || upper.starts_with("START") {
         Tag::new("BEGIN")
-    } else if upper.starts_with("COMMIT") {
+    } else if upper.starts_with("COMMIT") || upper.starts_with("END") {
         Tag::new("COMMIT")
-    } else if upper.starts_with("ROLLBACK") {
+    } else if upper.starts_with("ROLLBACK") || upper.starts_with("ABORT") {
         Tag::new("ROLLBACK")
     } else if upper.starts_with("SAVEPOINT") {
         Tag::new("SAVEPOINT")
@@ -1667,6 +1696,7 @@ mod tests {
             db,
             db_file: path,
             max_connections: 1,
+            lock_wait: std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
             live: AtomicUsize::new(0),
         }))
     }
