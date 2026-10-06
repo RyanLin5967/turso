@@ -1805,3 +1805,47 @@ fn checkpoint_inside_a_block_keeps_the_block() {
     assert_eq!(r.status, b'I');
     assert_eq!(a.q("SELECT count(*) FROM t").single("rows"), "2");
 }
+
+/// generate_series in FROM may read the row it is joined to, as PostgreSQL's implicitly LATERAL
+/// function call does: `FROM s, generate_series(1, s.x) AS g` gives one row per x and g <= x
+/// (PostgreSQL 18.6 returns them, the reviewer measured); at 472023b72 the wrapped form could not
+/// see s. WITH ORDINALITY and a second column alias are refused, not dropped (wire review 1
+/// item 5).
+#[test]
+fn generate_series_may_read_the_row_it_joins() {
+    let dir = Scratch::new("genlateral");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE s(x INT)").ok("create");
+    a.q("INSERT INTO s VALUES (2), (3)").ok("insert");
+    let row = |x: &str, g: &str| vec![Some(x.to_string()), Some(g.to_string())];
+    let r = a
+        .q("SELECT s.x, g FROM s, generate_series(1, s.x) AS g ORDER BY 1, 2")
+        .ok("correlated, bare alias");
+    assert_eq!(
+        r.rows,
+        vec![
+            row("2", "1"),
+            row("2", "2"),
+            row("3", "1"),
+            row("3", "2"),
+            row("3", "3")
+        ]
+    );
+    let r = a
+        .q("SELECT s.x, g.y FROM s, generate_series(1, s.x) AS g(y) WHERE g.y = s.x ORDER BY 1")
+        .ok("correlated, column alias");
+    assert_eq!(r.rows, vec![row("2", "2"), row("3", "3")]);
+    assert!(
+        a.q("SELECT * FROM generate_series(1, 2) WITH ORDINALITY")
+            .error
+            .is_some(),
+        "WITH ORDINALITY was dropped"
+    );
+    assert!(
+        a.q("SELECT * FROM generate_series(1, 2) AS g(a, b)")
+            .error
+            .is_some(),
+        "a second column alias was dropped"
+    );
+}
