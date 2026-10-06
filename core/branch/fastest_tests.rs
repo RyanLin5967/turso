@@ -3335,6 +3335,44 @@ fn a_named_branch_with_an_open_connection_is_not_dropped() {
     }
 }
 
+/// fastest-wire: the named-branch refusals are typed, so a server answers each with its own code
+/// without matching message text: `NameTaken` from `create_branch`, `NoSuchBranch` from
+/// `connect_named` and `drop_branch`, `BranchInUse` (the name, quoted) from a second
+/// `connect_named` and from `drop_branch` while connected.
+#[test]
+fn named_branch_refusals_are_typed() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("typed.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("a").unwrap();
+        assert!(
+            matches!(trunk.create_branch("a"), Err(LimboError::NameTaken(ref n)) if n == "a"),
+            "catalog={catalog}: a taken name was not refused as NameTaken"
+        );
+        assert!(
+            matches!(db.connect_named("nope"), Err(LimboError::NoSuchBranch(ref n)) if n == "nope"),
+            "catalog={catalog}: connect_named of no branch was not refused as NoSuchBranch"
+        );
+        assert!(
+            matches!(db.drop_branch("nope"), Err(LimboError::NoSuchBranch(ref n)) if n == "nope"),
+            "catalog={catalog}: drop_branch of no branch was not refused as NoSuchBranch"
+        );
+        let c = db.connect_named("a").unwrap();
+        assert!(
+            matches!(db.connect_named("a"), Err(LimboError::BranchInUse(ref n)) if n == "\"a\""),
+            "catalog={catalog}: a second connection was not refused as BranchInUse"
+        );
+        assert!(
+            matches!(db.drop_branch("a"), Err(LimboError::BranchInUse(ref n)) if n == "\"a\""),
+            "catalog={catalog}: a drop while connected was not refused as BranchInUse"
+        );
+        drop(c);
+    }
+}
+
 /// Engine review 7 #11: a lookup miss was not "one compare". After the first Release in a process,
 /// every miss in `branch_named` (and so in `connect_named` and `drop_branch`) took the group's lock
 /// and counted a wait, and waited out whatever Release was in the air, another name's too, or led

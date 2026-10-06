@@ -4999,12 +4999,7 @@ impl BranchStore {
             )));
         }
         if st.open {
-            return Err(LimboError::InvalidArgument(format!(
-                "branch {} already has an open connection; a branch serves one connection at a \
-                 time, because a second one's page cache would silently miss the first one's \
-                 commits",
-                id.0
-            )));
+            return Err(in_use(id, st.name.as_deref()));
         }
         st.open = true;
         Ok(st.schema.clone())
@@ -5057,6 +5052,18 @@ impl BranchStore {
     /// An error when the release could not be made durable (review N4): the branch is then kept —
     /// nothing is freed in this process — and comes back, detached, at the next open.
     pub(crate) fn release_handle(&self, id: BranchId) -> Result<Reaped> {
+        self.release_checked(id, false)
+    }
+
+    /// `Database::drop_branch`'s release of a named branch: refused while the branch has an open
+    /// connection (`LimboError::BranchInUse`), as a database server refuses to drop a database in
+    /// use (fastest-wire). A handle's release keeps the branch whole until its connection closes
+    /// instead.
+    pub(crate) fn release_named(&self, id: BranchId) -> Result<Reaped> {
+        self.release_checked(id, true)
+    }
+
+    fn release_checked(&self, id: BranchId, refuse_open: bool) -> Result<Reaped> {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
@@ -5091,6 +5098,10 @@ impl BranchStore {
                 return Err(fail_stopped(inner.journal.as_ref(), id, "no release"))
             }
             Handle::Attached | Handle::Detached => {}
+        }
+        // Mutant `drop_while_open` (test builds only): a drop releases a branch in use, as before.
+        if refuse_open && st.open && !fe_mutant("drop_while_open") {
+            return Err(in_use(id, st.name.as_deref()));
         }
         let record = inner.release_record(id);
         let (fork_lsn, name) = (st.fork_lsn, st.name.clone());
@@ -6856,9 +6867,13 @@ fn injected_flush_failure(failpoint: &mut Option<BranchFailpoint>, journal: &mut
 }
 
 fn name_taken(name: &str) -> LimboError {
-    LimboError::InvalidArgument(format!(
-        "branch name {name:?} already names an unreleased branch"
-    ))
+    LimboError::NameTaken(name.to_string())
+}
+
+/// Branch `id` (named `name`, if it is) already has an open connection (fastest-wire's typed
+/// refusal, `LimboError::BranchInUse`): its name, quoted, or its id.
+fn in_use(id: BranchId, name: Option<&str>) -> LimboError {
+    LimboError::BranchInUse(name.map_or_else(|| id.0.to_string(), |n| format!("{n:?}")))
 }
 
 fn reaped(id: BranchId) -> LimboError {

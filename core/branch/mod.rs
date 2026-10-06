@@ -1348,25 +1348,31 @@ impl Database {
     }
 
     /// A connection on the branch named `name`, which needs no handle (fastest-engine M1 item 4).
+    /// Refused with `LimboError::NoSuchBranch` when no unreleased branch has the name, and with
+    /// `LimboError::BranchInUse` while the branch already has a connection.
     pub fn connect_named(self: &Arc<Database>, name: &str) -> Result<Arc<Connection>> {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
+            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
         self.connect_branch(id)
     }
 
     /// Release the branch named `name` (fastest-engine M1 item 4); its name is free from here on.
+    /// Refused with `LimboError::NoSuchBranch` when no unreleased branch has the name, and with
+    /// `LimboError::BranchInUse` while the branch has an open connection (fastest-wire: a server
+    /// refuses to drop a database in use; a `Branch` handle's release instead keeps the branch
+    /// whole until its connection closes).
     pub fn drop_branch(&self, name: &str) -> Result<Reaped> {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
+            .ok_or_else(|| LimboError::NoSuchBranch(name.to_string()))?;
         // A concurrent drop and re-create of the same name between the lookup and the release can
         // only make this release the OLD branch twice: the second release reports success once
         // the first one's Release is durable (both callers wanted it gone, and it is), and the new
         // branch is never touched (its id differs).
-        self.branches.release_handle(id)
+        self.branches.release_named(id)
     }
 
     /// Every unreleased branch, attached or not. Refused on a read-only handle of a database with
