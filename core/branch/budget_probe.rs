@@ -5,6 +5,8 @@
 //! * **Allocations**: a counting global allocator over `System` — every `alloc`, `alloc_zeroed` and
 //!   `realloc` call and its requested bytes, per thread and process-wide, and separately those made
 //!   while the calling thread holds a branch store's mutex; and every `dealloc` (reported only).
+//! * **Catalog statements** and the writes among them, per thread and process-wide, on every
+//!   catalog connection: three `cfg(test)` hook lines in `catalog::Stmt` (`catalog_statement`).
 //! * **Store-mutex acquisitions**: `StoreMutex::lock` calls [`store_locked`] and its guard's drop
 //!   [`store_unlocked`] (the only two edits to the engine's files), per thread and process-wide.
 //! * **Unix syscalls** (Apple only): the kernel's own count for this task (`task_info`
@@ -34,6 +36,8 @@ static ALLOCATOR: Counting = Counting;
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static FREES: AtomicU64 = AtomicU64::new(0);
+static CAT_STMTS: AtomicU64 = AtomicU64::new(0);
+static CAT_WRITES: AtomicU64 = AtomicU64::new(0);
 static LOCKS: AtomicU64 = AtomicU64::new(0);
 static HELD_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
@@ -42,6 +46,8 @@ thread_local! {
     static T_ALLOCS: Cell<u64> = const { Cell::new(0) };
     static T_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
     static T_FREES: Cell<u64> = const { Cell::new(0) };
+    static T_CAT_STMTS: Cell<u64> = const { Cell::new(0) };
+    static T_CAT_WRITES: Cell<u64> = const { Cell::new(0) };
     static T_FREE_BYTES: Cell<u64> = const { Cell::new(0) };
     static T_HELD_ALLOCS: Cell<u64> = const { Cell::new(0) };
     static T_HELD_ALLOC_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -126,6 +132,20 @@ pub(crate) fn store_unlocked() {
     }
 }
 
+/// A catalog statement ran on this thread (`catalog::Stmt::{rows, each_row, exec}`; `write` for
+/// `exec`), on ANY of the store's catalog connections — the store's own, the checkpoint writer's,
+/// the name filter's reader — unlike the catalog's own counters, which see one connection each.
+/// BLIND SPOT: transaction control and pragmas (`conn.execute("BEGIN")`, `wal_checkpoint`) are not
+/// statements of `Stmt` and are not counted.
+pub(crate) fn catalog_statement(write: bool) {
+    CAT_STMTS.fetch_add(1, Relaxed);
+    bump(&T_CAT_STMTS, 1);
+    if write {
+        CAT_WRITES.fetch_add(1, Relaxed);
+        bump(&T_CAT_WRITES, 1);
+    }
+}
+
 /// Sample the syscall count around store-mutex holds from now on (off by default: two Mach traps
 /// per hold would slow every other test).
 pub(crate) fn arm(on: bool) {
@@ -143,6 +163,10 @@ pub(crate) struct Snapshot {
     pub(crate) t_allocs: u64,
     pub(crate) t_alloc_bytes: u64,
     pub(crate) frees: u64,
+    pub(crate) cat_stmts: u64,
+    pub(crate) t_cat_stmts: u64,
+    pub(crate) cat_writes: u64,
+    pub(crate) t_cat_writes: u64,
     pub(crate) t_frees: u64,
     pub(crate) t_free_bytes: u64,
     pub(crate) t_held_allocs: u64,
@@ -196,6 +220,10 @@ fn user_counts() -> Snapshot {
         t_allocs: get(&T_ALLOCS),
         t_alloc_bytes: get(&T_ALLOC_BYTES),
         frees: FREES.load(Relaxed),
+        cat_stmts: CAT_STMTS.load(Relaxed),
+        t_cat_stmts: get(&T_CAT_STMTS),
+        cat_writes: CAT_WRITES.load(Relaxed),
+        t_cat_writes: get(&T_CAT_WRITES),
         t_frees: get(&T_FREES),
         t_free_bytes: get(&T_FREE_BYTES),
         t_held_allocs: get(&T_HELD_ALLOCS),

@@ -293,6 +293,9 @@ impl Stmt {
         let rows = rows?;
         counters.queries += 1;
         counters.rows_read += rows.len() as u64;
+        // fastest-budgets instrument (test builds): catalog statements per thread, every connection.
+        #[cfg(test)]
+        crate::branch::budget_probe::catalog_statement(false);
         Ok(rows)
     }
 
@@ -313,6 +316,8 @@ impl Stmt {
         ran?;
         counters.queries += 1;
         counters.rows_read += n;
+        #[cfg(test)]
+        crate::branch::budget_probe::catalog_statement(false);
         Ok(())
     }
 
@@ -327,6 +332,8 @@ impl Stmt {
         done?;
         counters.queries += 1;
         counters.rows_written += 1;
+        #[cfg(test)]
+        crate::branch::budget_probe::catalog_statement(true);
         Ok(())
     }
 }

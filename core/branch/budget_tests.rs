@@ -187,7 +187,6 @@ fn kernel_delta(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 struct Outside {
     log: Option<u64>,
     cat: (u64, u64, u64, u64),
-    cat_written: u64,
     ckpt: [u64; 9],
     reads: (u64, u64),
 }
@@ -197,7 +196,6 @@ impl Outside {
         Self {
             log: log_len(db),
             cat: db.branch_catalog_counters(),
-            cat_written: db.branch_catalog_rows_written(),
             ckpt: db.branch_checkpoint_counters(),
             reads: db.branch_read_counters(),
         }
@@ -207,7 +205,6 @@ impl Outside {
         Self {
             log,
             cat: (0, 0, 0, 0),
-            cat_written: 0,
             ckpt: [0; 9],
             reads: (0, 0),
         }
@@ -241,7 +238,10 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("catalog_loads", delta(o0.cat.0, o1.cat.0));
     s.insert("catalog_queries", delta(o0.cat.2, o1.cat.2));
     s.insert("catalog_rows", delta(o0.cat.3, o1.cat.3));
-    s.insert("catalog_writes", delta(o0.cat_written, o1.cat_written));
+    s.insert("catalog_stmts", delta(s0.t_cat_stmts, s1.t_cat_stmts));
+    s.insert("catalog_writes", delta(s0.t_cat_writes, s1.t_cat_writes));
+    s.insert("catalog_stmts_process", delta(s0.cat_stmts, s1.cat_stmts));
+    s.insert("catalog_writes_process", delta(s0.cat_writes, s1.cat_writes));
     s.insert("resolves", delta(o0.reads.0, o1.reads.0));
     s.insert("slot_reads", delta(o0.reads.1, o1.reads.1));
     s.insert("ckpt_started", delta(o0.ckpt[1], o1.ckpt[1]));
@@ -512,6 +512,11 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
     }
 }
 
+/// A named create on `db`, so a checkpoint has a dirty branch to write.
+fn trunk_for_fc(db: &Arc<Database>) {
+    db.connect().unwrap().create_branch("fc-dirty").unwrap();
+}
+
 /// The instruments' fire-checks, in the child (nothing else runs there): each counter moves by
 /// exactly what was done, and by nothing when nothing was.
 fn run_instruments(cell: &str) -> String {
@@ -620,7 +625,9 @@ fn run_instruments(cell: &str) -> String {
     put("fc_lookup_cataloged", &s);
     let (_, s) = measure(&db, base, || db.branch_named("never-seen").unwrap());
     put("fc_lookup_unseen", &s);
-    // The catalog's write counter: a checkpoint writes rows, a lookup none.
+    // The catalog statement counter: a sharp checkpoint of a dirty store writes rows (through the
+    // checkpoint writer's connection, on this thread), a lookup of an unseen name runs none.
+    trunk_for_fc(&db);
     let (_, s) = measure(&db, base, || db.branch_compact_now().unwrap());
     put("fc_checkpoint_writes", &s);
     // The log counter: a create appends, a lookup does not.
@@ -875,9 +882,10 @@ fn assert_budgets(op: &str, budgets: &[Budget]) {
 }
 
 /// Counters whose every sample is deterministic: compared as (min, max).
-const EXACT: [&str; 15] = [
+const EXACT: [&str; 16] = [
     "syscalls",
     "held_syncs",
+    "catalog_stmts",
     "catalog_writes",
     "fsync",
     "full_fsync",
@@ -1004,8 +1012,10 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_lookup_unseen", "catalog_queries"), 0, "a name the filter never saw was asked for");
     assert!(get("fc_create_logs", "log_bytes") > 0, "a create appended nothing to the log");
     assert_eq!(get("fc_lookup_unseen", "log_bytes"), 0, "a lookup appended to the log");
-    assert_eq!(get("fc_lookup_unseen", "catalog_writes"), 0, "a lookup wrote a catalog row");
-    assert!(get("fc_checkpoint_writes", "catalog_writes") >= 1, "a checkpoint of 50 branches wrote no catalog row");
+    assert_eq!(get("fc_lookup_unseen", "catalog_stmts"), 0, "a lookup of an unseen name ran a catalog statement");
+    assert!(get("fc_lookup_cataloged", "catalog_stmts") >= 1, "a cataloged name's lookup ran no catalog statement");
+    assert_eq!(get("fc_lookup_cataloged", "catalog_writes"), 0, "a lookup wrote the catalog");
+    assert!(get("fc_checkpoint_writes", "catalog_writes") >= 1, "a sharp checkpoint of a dirty store wrote no catalog row");
     assert_eq!(get("fc_thread_count", "with"), get("fc_thread_count", "base") + 1, "a live thread uncounted");
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
     #[cfg(target_vendor = "apple")]
@@ -1616,9 +1626,10 @@ fn assert_instructions(op: &str) {
 
 /// Every counter but instructions (what `assert_instructions` skips: the D2 cells check them).
 #[cfg(target_vendor = "apple")]
-const EXACT_AND_ALLOC: [&str; 19] = [
+const EXACT_AND_ALLOC: [&str; 20] = [
     "syscalls",
     "held_syncs",
+    "catalog_stmts",
     "catalog_writes",
     "fsync",
     "full_fsync",
@@ -1749,7 +1760,7 @@ fn leap_l4_the_branch_lifecycle_reads_and_writes_no_catalog() {
             assert_budgets(
                 op,
                 &[
-                    every("catalog_queries", Want::Exactly(0), "LEAP L4: no catalog read"),
+                    every("catalog_stmts", Want::Exactly(0), "LEAP L4: no catalog statement, any connection"),
                     every("catalog_writes", Want::Exactly(0), "LEAP L4: no catalog write"),
                 ],
             )
