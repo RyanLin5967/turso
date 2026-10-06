@@ -212,6 +212,16 @@ def gates(head, base, budget, baseline):
         allowed = spec["create_flush_files_allowed"]
         bad = {t: n for t, n in x["flush_targets"].items() if not any(t.endswith(a) for a in allowed)}
         row(f"budget-flush-files/{arm}", f"create flushes only on {allowed or 'nothing'}", bad or "ok", "FAIL" if bad else "PASS")
+        sb = budget.get("syscalls_per_create")
+        if sb:
+            # The ABSOLUTE budget (DECISIONS 2026-10-05T02:54:27Z): every syscall strace sees in the create window,
+            # all threads, per create, averaged over the window (the markers delimit it and are not counted).
+            # Binds at C=1; at C>1 waiters' polls scale with the flight's length, so the row is INFO.
+            tot = round(sum(x["syscalls_per_op"].values()), 4)
+            top = ", ".join(f"{k} {v:g}" for k, v in sorted(x["syscalls_per_op"].items(), key=lambda kv: (-kv[1], kv[0]))[:8])
+            v = ("PASS" if tot <= sb["max"] else "FAIL") if c == 1 else "INFO"
+            row(f"budget-syscalls/{arm}", f"<= {sb['max']} syscalls per create" + ("" if c == 1 else " (C>1: INFO)"),
+                f"{tot:g}/op: {top}", v)
         if base and arm in base and (base[arm].get("strace") or {}).get("windows", {}).get("create"):
             bx = base[arm]["strace"]["windows"]["create"]["syscalls_per_op"]
             hx = x["syscalls_per_op"]
@@ -254,7 +264,8 @@ def self_test():
                           "async": {"create_flushes_per_op_c1": [0, 0], "create_flushes_per_op_cn": [0, 0],
                                     "create_flush_files_allowed": []}},
               "instructions": {"create_growth_max": 0.05},
-              "syscalls_vs_base": {"per_op_slack": 0.05, "timing_dependent_excluded": ["futex"]}}
+              "syscalls_vs_base": {"per_op_slack": 0.05, "timing_dependent_excluded": ["futex"]},
+              "syscalls_per_create": {"max": 3}}
 
     def trace(per_create, extra_file=None, uring=False, dsync=False):
         L = []
@@ -326,10 +337,32 @@ def self_test():
     v = verdicts({"full-snap-c64": hb64}, {"full-snap-c64": arm_of(trace(1), 10, clients=64)})
     cases.append(("a syscall regression at C=64 is INFO (contention-dependent), not a verdict",
                   v.get("syscalls-vs-base/full-snap-c64") == "INFO"))
+    # the planted trace makes 1 fsync + 1 pwrite64 + 1 futex per create (2 + 1 per extra flush)
+    v = verdicts({"full-snap-c1": arm_of(trace(1), 10)})
+    cases.append(("3 syscalls per create passes the absolute budget", v.get("budget-syscalls/full-snap-c1") == "PASS"))
+    v = verdicts({"full-snap-c1": arm_of(trace(2), 20)})
+    cases.append(("4 syscalls per create FAILs the absolute budget", v.get("budget-syscalls/full-snap-c1") == "FAIL"))
+    v = verdicts({"full-snap-c64": arm_of(trace(2), 20, clients=64)})
+    cases.append(("4 syscalls per create at C=64 is INFO", v.get("budget-syscalls/full-snap-c64") == "INFO"))
+    hb = arm_of(trace(1), 10)
+    hb["strace"]["windows"]["create"]["syscalls_per_op"]["getpid"] = 4.0
+    rows = gates({"full-snap-c1": hb}, {"full-snap-c1": dict(hb)}, budget, None)
+    cases.append(("only the absolute budget red: regression_green is true (the baseline advances)",
+                  {g: v for g, _, _, v in rows}.get("budget-syscalls/full-snap-c1") == "FAIL" and regression_green(rows)))
+    rows = gates({"full-snap-c1": arm_of(trace(2), 20)}, None, budget, None)
+    cases.append(("a flush-budget FAIL makes regression_green false", not regression_green(rows)))
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")
     return not bad
+
+
+def regression_green(rows):
+    """Every gate but the absolute syscall budget passes. That budget is red at 675adbfb3 (10 per create) and
+    stays red until the engine meets it; if it blocked the baseline, no run would ever be green, and the
+    instruction and syscalls-vs-base regression gates would have no base at all. So the baseline advances on
+    regression-green runs while the job stays red (PROFILE.md)."""
+    return not [r for r in rows if r[3] == "FAIL" and not r[0].startswith("budget-syscalls/")]
 
 
 def main(argv):
@@ -379,6 +412,9 @@ def main(argv):
                         f"{r.get('busy_retries_per_op', {}).get('create')} |\n")
     for r in rows:
         print("\t".join(r))
+    rg = regression_green(rows)
+    open(os.path.join(out, "regression_green"), "w").write("1\n" if rg else "0\n")
+    print(f"analyze: regression_green={int(rg)} (every gate but budget-syscalls/*)")
     fails = [r for r in rows if r[3] == "FAIL"]
     counted = [r for r in rows if r[3] in ("PASS", "FAIL")]
     if not counted:
