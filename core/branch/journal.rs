@@ -1665,7 +1665,11 @@ impl Journal {
         // From here the new file is the log.
         self.file = f;
         self.rewrites += 1;
-        self.compact_after = 0;
+        // A rewrite ends any back-off. Mutant `no_backoff_reset` (test builds only; engine review 8
+        // #3): it keeps it, measured in the old log's length.
+        if !super::store::fe_mutant("no_backoff_reset") {
+            self.compact_after = 0;
+        }
         self.generation = generation;
         self.nonce = nonce;
         self.len = LOG_HEADER_LEN as u64 + suffix.len() as u64;
@@ -1812,7 +1816,10 @@ impl Journal {
         // From here the new file is the log.
         self.file = prep.file;
         self.rewrites += 1;
-        self.compact_after = 0;
+        // A cut ends any back-off. Mutant `no_backoff_reset`: it keeps it.
+        if !super::store::fe_mutant("no_backoff_reset") {
+            self.compact_after = 0;
+        }
         self.generation = generation;
         self.nonce = prep.nonce;
         self.len = len;
@@ -2183,7 +2190,13 @@ impl Journal {
     /// A checkpoint or compaction failed: the next is wanted only once another threshold's worth of
     /// log has been written (`compact_after`).
     pub(crate) fn defer_compaction(&mut self) {
-        self.compact_after = self.len + compact_min_log_bytes();
+        // Mutant `backoff_never_resumes` (test builds only; engine review 8 #3): the back-off never
+        // ends (half of u64::MAX, so the hard limit's sum cannot overflow).
+        self.compact_after = if super::store::fe_mutant("backoff_never_resumes") {
+            u64::MAX / 2
+        } else {
+            self.len + compact_min_log_bytes()
+        };
     }
 
     /// Twice the compaction threshold: while a fuzzy checkpoint is in flight, an operation that

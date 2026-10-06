@@ -3572,6 +3572,96 @@ fn a_capture_that_fails_appends_no_checkpoint_marker() {
     db.branch_checkpoint_wait();
 }
 
+/// Engine review 8 #3: the back-off after a failed checkpoint start ENDS. It lasts one threshold
+/// of log (`defer_compaction`), no less (every create would retry the capture) and no more: forks
+/// go on, a capture is entered again once the log grew by about a threshold past the failure, and
+/// that checkpoint starts and installs. Its cut ends the back-off, so the next start comes within
+/// a threshold of the cut. The earlier tests stop after five creates, or start checkpoints by hand
+/// past `wants_compaction`, so a back-off that never ended survived them. Mutants
+/// `backoff_never_resumes` and `no_backoff_reset` (a cut keeps the back-off, measured in the old
+/// log's length).
+#[test]
+fn a_failed_checkpoint_start_backs_off_for_one_threshold_and_no_longer() {
+    let _s = serial();
+    let threshold: u64 = 8 << 10;
+    for fp in [BranchFailpoint::CaptureFails, BranchFailpoint::SpawnFails] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(
+            &dir.path().join("backoff-ends.db"),
+            opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+        );
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let _t = Threshold::set(threshold);
+        let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+        let len = || db.branches.log_len_for_test();
+        let fork = || {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        };
+        // The failed start.
+        db.branch_failpoint(Some(fp));
+        let before = entered();
+        let t = std::time::Instant::now();
+        while entered() == before {
+            fork();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "{fp:?}: premise: no checkpoint was attempted");
+        }
+        db.branch_checkpoint_wait();
+        let (failed_at, installed) = (len(), db.branch_checkpoint_counters()[0]);
+        // The next capture comes about a threshold later, and starts.
+        let tried = entered();
+        while entered() == tried {
+            fork();
+            assert!(
+                len() - failed_at <= 4 * threshold,
+                "{fp:?}: the back-off never ended: no capture within four thresholds of log past the failure"
+            );
+        }
+        let grown = len() - failed_at;
+        assert!(
+            grown >= threshold / 2 && grown <= threshold + threshold / 2,
+            "{fp:?}: the back-off lasted {grown} bytes of log, not about one threshold ({threshold})"
+        );
+        db.branch_checkpoint_wait();
+        assert_eq!(db.branch_checkpoint_counters()[0], installed + 1, "{fp:?}: premise: the retried checkpoint installed");
+        // Its cut ended the back-off: the next start comes within a threshold of the cut.
+        let (cut_len, tried) = (len(), entered());
+        while entered() == tried {
+            fork();
+            assert!(
+                len() <= cut_len + 4 * threshold,
+                "{fp:?}: no checkpoint within four thresholds of log after the cut"
+            );
+        }
+        assert!(
+            len() <= threshold + threshold / 2,
+            "{fp:?}: the cut kept the back-off: the next start came at {} bytes of log (threshold {threshold})",
+            len()
+        );
+        db.branch_checkpoint_wait();
+    }
+}
+
+/// Engine review 8 #3 (review 4 #2): the capture's OTHER fallible step, its handle on the arena
+/// file, fails before the capture has any effect on the log, as a failed read snapshot does: no
+/// marker, no generation, and the next checkpoint goes through. Only a sharp checkpoint takes the
+/// handle, over slots no flight synced: a D0 store whose log was raised. Mutant
+/// `capture_marker_first`.
+#[test]
+fn a_capture_whose_arena_handle_fails_appends_no_checkpoint_marker() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, _trunk, _keep) = raised_d0_with_an_unsynced_slot(dir.path());
+    db.branch_failpoint(Some(BranchFailpoint::ArenaHandleFails));
+    let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+    let (lsn, before) = (db.branches.log_lsn_for_test(), entered());
+    assert!(db.branch_compact_now().is_err(), "premise: the capture's arena handle failed");
+    assert_eq!(entered(), before + 1, "premise: the capture was entered");
+    assert_eq!(db.branches.log_lsn_for_test(), lsn, "the failed capture appended to the log");
+    db.branch_compact_now().expect("no checkpoint went through after the failed one");
+}
+
 /// The branch log's header confirmation word, the checksum of its last end frame and its length
 /// (review 6 #1).
 fn log_confirmation_at(log: &Path) -> (u32, u32, u64) {

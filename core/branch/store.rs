@@ -6450,6 +6450,13 @@ impl BranchStore {
         self.inner.lock().journal.as_ref().map_or(0, |j| j.lsn())
     }
 
+    /// The log file's written length, what the compaction threshold and its back-off measure
+    /// (tests only; engine review 8 #3).
+    #[cfg(test)]
+    pub(crate) fn log_len_for_test(&self) -> u64 {
+        self.inner.lock().journal.as_ref().map_or(0, Journal::log_len)
+    }
+
     /// A4.G's G-b red: `start_flight` called directly, past G-a (tests only).
     #[cfg(test)]
     pub(crate) fn start_flight_for_test(&self) -> bool {
@@ -7693,7 +7700,14 @@ impl StoreInner {
             journal.sync_class()
         };
         let arena_file = if own_sync && rewrite_syncs && (arena.is_dirty() || flight_in_air) {
-            match arena.sync_handle() {
+            let handle = if self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaHandleFails).is_some() {
+                Err(LimboError::InternalError(
+                    "failpoint: the capture's arena handle could not be duplicated".to_string(),
+                ))
+            } else {
+                arena.sync_handle()
+            };
+            match handle {
                 Ok(f) => f,
                 Err(e) => {
                     if let Some((dirty, _)) = early {

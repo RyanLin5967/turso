@@ -503,6 +503,10 @@ pub enum BranchFailpoint {
     /// The next sync of a temp file that is to replace a branch file (a cut's or rewrite's new
     /// log, a reset log, a compaction's snapshot) fails as an I/O error would (review 6 #2).
     ReplacementSyncFails,
+    /// The next capture that takes a handle on the arena file to sync it (a sharp catalog
+    /// checkpoint over unsynced slots) cannot duplicate it, as `dup` failing would (engine review 8
+    /// #3: the capture's other fallible step, beside its read snapshot).
+    ArenaHandleFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
