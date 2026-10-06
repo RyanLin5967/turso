@@ -22,6 +22,8 @@
 //! session at a time. Transactions follow PostgreSQL: an error inside a transaction block aborts
 //! it, and ReadyForQuery reports the session's real state.
 
+pub mod counters;
+
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -583,13 +585,17 @@ impl Session {
             let name = st.branch.as_ref().map_or(TRUNK, |(n, _)| n.as_str());
             return Ok(one_text(f, name, format));
         }
+        if f == "turso_branch_stats" {
+            arity(call, 0)?;
+            return Ok(stats_row(format));
+        }
         if !matches!(
             f,
             "turso_branch_create" | "turso_branch_switch" | "turso_branch_delete"
         ) {
             return Err(error(
                 "42883",
-                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name) and turso_branch_current()"),
+                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current() and turso_branch_stats()"),
             ));
         }
         arity(call, 1)?;
@@ -858,8 +864,42 @@ fn one_int8(f: &str, value: i64, format: &Format) -> Response {
     one_row(f, Type::INT8, format, |e| e.encode_field(&value))
 }
 
+const STATS_COLUMNS: [&str; 4] = ["unix_syscalls", "mach_syscalls", "instructions", "cycles"];
+
+/// turso_branch_stats(): the server process's counters ([`counters::process_counters`]), read as
+/// the call runs; NULLs where the platform does not count them.
+fn stats_row(format: &Format) -> Response {
+    let header = Arc::new(stats_fields(format));
+    let mut encoder = DataRowEncoder::new(header.clone());
+    let values = counters::process_counters()
+        .map(|c| [c.unix_syscalls, c.mach_syscalls, c.instructions, c.cycles].map(|v| v as i64));
+    let row = (0..STATS_COLUMNS.len())
+        .try_for_each(|i| encoder.encode_field(&values.map(|v| v[i])))
+        .and_then(|()| encoder.finish());
+    Response::Query(QueryResponse::new(header, stream::iter(vec![row])))
+}
+
+fn stats_fields(format: &Format) -> Vec<FieldInfo> {
+    STATS_COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            FieldInfo::new(
+                name.to_string(),
+                None,
+                None,
+                Type::INT8,
+                format.format_for(i),
+            )
+        })
+        .collect()
+}
+
 /// The row a branch call returns, for Describe.
 fn branch_call_fields(call: &PgBranchCall, format: &Format) -> Vec<FieldInfo> {
+    if call.function == "turso_branch_stats" {
+        return stats_fields(format);
+    }
     let pg_type = if call.function == "turso_branch_create" {
         Type::INT8
     } else {

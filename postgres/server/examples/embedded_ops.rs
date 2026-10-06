@@ -15,8 +15,11 @@
 //! Before the ops it creates `t(id INT PRIMARY KEY, v INT)` with `--rows` rows and an empty `t2(id
 //! INT)`, as the wire side's seed does through the server.
 //!
-//! Output: TSV `seq phase step start_ns end_ns cpu_ns`, phase `warmup` or `measure`; `cpu_ns` is the
-//! calling thread's CPU time across the step (CLOCK_THREAD_CPUTIME_ID), for cpu_cost.py.
+//! Output: TSV `seq phase step start_ns end_ns cpu_ns unix_syscalls instructions`, phase `warmup`
+//! or `measure`; `cpu_ns` is the calling thread's CPU time across the step
+//! (CLOCK_THREAD_CPUTIME_ID), and the last two are the process's unix system calls and
+//! instructions retired across it (turso_pg_server::counters, 0 where not counted). Each op starts
+//! with a `noop` step, two probes and nothing between, whose counts the budgets subtract.
 
 use std::io::Write;
 use turso_core::branch::{BranchDurability, SyncClass};
@@ -51,6 +54,24 @@ fn thread_cpu_ns() -> u64 {
     };
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// One reading of the step clocks and counters.
+#[derive(Clone, Copy)]
+struct Probe {
+    ns: u64,
+    cpu_ns: u64,
+    counters: Option<turso_pg_server::counters::ProcessCounters>,
+}
+
+impl Probe {
+    fn now() -> Self {
+        Self {
+            ns: now_ns(),
+            cpu_ns: thread_cpu_ns(),
+            counters: turso_pg_server::counters::process_counters(),
+        }
+    }
 }
 
 struct Args {
@@ -123,46 +144,66 @@ fn main() {
     run(&trunk, "COMMIT");
 
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a.out).unwrap());
-    writeln!(out, "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns").unwrap();
-    let mut rec = |seq: u64, phase: &str, step: &str, t0: u64, t1: u64, cpu: u64| {
-        writeln!(out, "{seq}\t{phase}\t{step}\t{t0}\t{t1}\t{cpu}").unwrap();
+    writeln!(
+        out,
+        "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns\tunix_syscalls\tinstructions"
+    )
+    .unwrap();
+    let mut rec = |seq: u64, phase: &str, step: &str, t0: Probe, t1: Probe| {
+        let (s0, i0) = t0
+            .counters
+            .map_or((0, 0), |c| (c.unix_syscalls, c.instructions));
+        let (s1, i1) = t1
+            .counters
+            .map_or((0, 0), |c| (c.unix_syscalls, c.instructions));
+        writeln!(
+            out,
+            "{seq}\t{phase}\t{step}\t{}\t{}\t{}\t{}\t{}",
+            t0.ns,
+            t1.ns,
+            t1.cpu_ns - t0.cpu_ns,
+            s1 - s0,
+            i1 - i0
+        )
+        .unwrap();
     };
     for seq in 0..a.warmup + a.ops {
         let phase = if seq < a.warmup { "warmup" } else { "measure" };
         let name = format!("b_{seq}");
         let id = 1 + (seq * 7919) % a.rows;
 
-        let (t0, c0) = (now_ns(), thread_cpu_ns());
-        trunk.inner().create_branch(&name).unwrap();
-        let (t1, c1) = (now_ns(), thread_cpu_ns());
-        rec(seq, phase, "create", t0, t1, c1 - c0);
+        // Two probes with nothing between: what the probes themselves cost, for the budget to
+        // subtract (the wire side subtracts its empty query the same way).
+        let p0 = Probe::now();
+        let p1 = Probe::now();
+        rec(seq, phase, "noop", p0, p1);
 
-        let (t0, c0) = (now_ns(), thread_cpu_ns());
+        let p0 = Probe::now();
+        trunk.inner().create_branch(&name).unwrap();
+        rec(seq, phase, "create", p0, Probe::now());
+
+        let p0 = Probe::now();
         let branch = PgConnection::new(db.connect_named(&name).unwrap());
         branch.adopt_session_of(&trunk);
-        let (t1, c1) = (now_ns(), thread_cpu_ns());
-        rec(seq, phase, "switch", t0, t1, c1 - c0);
+        rec(seq, phase, "switch", p0, Probe::now());
 
-        let (t0, c0) = (now_ns(), thread_cpu_ns());
+        let p0 = Probe::now();
         let mut stmt = branch
             .prepare(format!("UPDATE t SET v = v + 1 WHERE id = {id}"))
             .unwrap();
         stmt.run_ignore_rows().unwrap();
         assert_eq!(stmt.n_change(), 1, "the write touched no row");
         drop(stmt);
-        let (t1, c1) = (now_ns(), thread_cpu_ns());
-        rec(seq, phase, "write", t0, t1, c1 - c0);
+        rec(seq, phase, "write", p0, Probe::now());
 
-        let (t0, c0) = (now_ns(), thread_cpu_ns());
+        let p0 = Probe::now();
         trunk.adopt_session_of(&branch);
         drop(branch);
-        let (t1, c1) = (now_ns(), thread_cpu_ns());
-        rec(seq, phase, "main", t0, t1, c1 - c0);
+        rec(seq, phase, "main", p0, Probe::now());
 
-        let (t0, c0) = (now_ns(), thread_cpu_ns());
+        let p0 = Probe::now();
         db.drop_branch(&name).unwrap();
-        let (t1, c1) = (now_ns(), thread_cpu_ns());
-        rec(seq, phase, "delete", t0, t1, c1 - c0);
+        rec(seq, phase, "delete", p0, Probe::now());
     }
     out.flush().unwrap();
 }
