@@ -2825,3 +2825,35 @@ fn deleting_a_branch_another_session_switched_onto_is_refused_with_55006() {
     a.q("SELECT turso_branch_delete('x')")
         .ok("delete once b left");
 }
+
+/// Inside a block, an error the engine answers by rolling the whole transaction back (an integer
+/// overflow in sum(): a read statement gets no statement savepoint) takes the block's savepoints
+/// with it. A later ROLLBACK TO one of them is refused as PostgreSQL refuses a savepoint that does
+/// not exist (3B001), and the block stays failed until its end; it was XX000 "no such savepoint".
+/// Keeping the work before the savepoint, as PostgreSQL does, is the engine's half (wire review 3
+/// item 10); once it lands this test needs another way to make the engine drop a block.
+#[test]
+fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
+    let dir = Scratch::new("discardedsavepoint");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("CREATE TABLE big(v BIGINT)").ok("big");
+    a.q("INSERT INTO big VALUES (9223372036854775807), (1)")
+        .ok("rows");
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
+    a.q("SAVEPOINT s").ok("savepoint");
+    let r = a.q("SELECT sum(v) FROM big");
+    assert!(r.error.is_some(), "sum did not overflow: {:?}", r.rows);
+    let r = a.q("ROLLBACK TO s");
+    assert_eq!(r.err("rollback to s").code, "3B001");
+    assert_eq!(r.status, b'E', "the block is no longer failed");
+    assert_eq!(a.q("SELECT 1").err("in the failed block").code, "25P02");
+    let r = a.q("COMMIT").ok("the block's end");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(r.status, b'I');
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
+        "0"
+    );
+}
