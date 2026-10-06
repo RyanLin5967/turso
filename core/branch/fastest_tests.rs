@@ -3306,6 +3306,59 @@ fn a_lookup_by_name_waits_for_the_release_it_reports() {
     }
 }
 
+/// Engine review 7 #11: a lookup miss was not "one compare". After the first Release in a process,
+/// every miss in `branch_named` (and so in `connect_named` and `drop_branch`) took the group's lock
+/// and counted a wait, and waited out whatever Release was in the air, another name's too, or led
+/// a flight itself. A miss waits only for a Release of its own name still in the air, and with
+/// nothing of the kind takes no lock. Mutant `lookup_waits_any_release`.
+#[test]
+fn a_lookup_miss_waits_only_for_its_own_names_release() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("miss-scope.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("gone").unwrap();
+        db.drop_branch("gone").unwrap();
+        // Budget: with no Release in the air, misses count no group wait.
+        let waits = db.branches.group_counters()[2];
+        for _ in 0..100 {
+            assert_eq!(db.branch_named("nobody").unwrap(), None, "catalog={catalog}: premise: a miss");
+        }
+        assert_eq!(
+            db.branches.group_counters()[2] - waits,
+            0,
+            "catalog={catalog}: 100 lookup misses with no Release in the air counted group waits"
+        );
+        // A miss of a fresh name while another name's Release is in the air returns at once.
+        trunk.create_branch("busy").unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let dropper = {
+            let db = db.clone();
+            std::thread::spawn(move || db.drop_branch("busy").map(|_| ()))
+        };
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let finder = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(db.branch_named("fresh").map_err(|e| e.to_string()));
+            })
+        };
+        let found = rx.recv_timeout(std::time::Duration::from_secs(10));
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        dropper.join().unwrap().unwrap();
+        finder.join().unwrap();
+        assert_eq!(
+            found,
+            Ok(Ok(None)),
+            "catalog={catalog}: a miss of a fresh name waited for another name's Release in the air (or failed)"
+        );
+    }
+}
+
 /// Review 3 #17: a fail-stopped store lists no fork whose flight failed (its creator was told it
 /// failed, and a reopen would not have it).
 #[test]
