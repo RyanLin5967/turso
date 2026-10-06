@@ -4036,6 +4036,102 @@ fn a_raised_d0_fuzzy_checkpoint_syncs_its_slots_through_the_group_before_its_com
     drop((b, c));
 }
 
+// ---- engine review 9 #8: a raised-D0 fuzzy checkpoint syncs the arena only, and only when dirty ----
+
+/// A D0 catalog store whose log a trunk commit raised (engine review 9 #8), with a D0 branch commit
+/// since: its slot is written and synced by no flight. Returns the database and its trunk, and the
+/// branches kept alive.
+fn raised_d0_with_an_unsynced_slot(dir: &Path) -> (Arc<Database>, Arc<Connection>, Vec<BranchId>) {
+    let db = open_at(
+        &dir.join("d0settle.db"),
+        opts(true, SyncClass::Off).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let b = trunk.fork_branch().unwrap();
+    trunk.execute("UPDATE t SET v = 'trunk-new' WHERE id = 9").unwrap();
+    assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the log");
+    let c = trunk.fork_branch().unwrap();
+    write_v(&c.connect().unwrap(), 4, "d0");
+    assert!(db.branches.arena_dirty(), "premise: the D0 commit left its slot unsynced");
+    (db, trunk, vec![b.into_id(), c.into_id()])
+}
+
+/// Engine review 9 #8: in a D0 store whose log was raised, a fuzzy checkpoint settled its capture by
+/// leading a flight of the group in Fsync: an fsync of the arena, which the catalog commit needs,
+/// and an fsync of the whole log, which nothing needs (the cut is about to supersede those bytes).
+/// It syncs the arena alone: one sync.
+#[cfg(unix)]
+#[test]
+fn a_raised_d0_fuzzy_checkpoint_settles_with_one_arena_sync_and_no_log_sync() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, _trunk, _keep) = raised_d0_with_an_unsynced_slot(dir.path());
+    let before = db.branches.settle_syncs_for_test();
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    assert_eq!(
+        db.branches.settle_syncs_for_test() - before,
+        1,
+        "the checkpoint's settle synced more than the arena it needs"
+    );
+}
+
+/// Engine review 9 #8: the same store with no slot written since the arena's last sync: the settle
+/// has nothing to sync (lead review 1 item 7(4)), yet it led an Fsync flight that synced the log.
+#[cfg(unix)]
+#[test]
+fn a_raised_d0_fuzzy_checkpoint_over_a_clean_arena_settles_with_no_sync() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, _keep) = raised_d0_with_an_unsynced_slot(dir.path());
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the first fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    assert!(!db.branches.arena_dirty(), "premise: the first checkpoint synced the arena");
+    // A fork writes no slot; it gives the next checkpoint a row to capture.
+    let _d = trunk.fork_branch().unwrap();
+    assert!(!db.branches.arena_dirty(), "premise: nothing was written into the arena since");
+    let before = db.branches.settle_syncs_for_test();
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the second fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    assert_eq!(
+        db.branches.settle_syncs_for_test() - before,
+        0,
+        "the checkpoint's settle synced a file with no slot to sync"
+    );
+}
+
+/// Engine review 9 #8: while a raised-D0 fuzzy checkpoint's settle sync is in progress, a D0 create
+/// waited for it: the settle was a flight of the group, so every operation needing a flight waited
+/// for its two fsyncs instead of writing its record. Held here at the settle's sync, a create on
+/// another connection must be acknowledged before the hold is released.
+#[test]
+fn a_d0_create_does_not_wait_for_a_raised_checkpoints_arena_sync() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, _trunk, _keep) = raised_d0_with_an_unsynced_slot(dir.path());
+    db.branch_checkpoint_hold(super::store::HOLD_FLIGHT_TAKEN);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("the checkpoint's settle never took its sync", || {
+        db.branch_checkpoint_held() == super::store::HOLD_FLIGHT_TAKEN | super::store::HOLD_ARRIVED
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let db2 = db.clone();
+    let creator = std::thread::spawn(move || {
+        let created = db2.connect().and_then(|t| t.fork_branch()).map(|x| x.into_id());
+        let _ = tx.send(created.is_ok());
+    });
+    let created = rx.recv_timeout(std::time::Duration::from_secs(10));
+    db.branch_checkpoint_hold(0);
+    creator.join().unwrap();
+    db.branch_checkpoint_wait();
+    assert_eq!(
+        created,
+        Ok(true),
+        "a D0 create waited for the checkpoint's settle sync (or failed)"
+    );
+}
+
 // ---- review 6 #6: a kernel that promotes an unsupported barrier itself gets no userland retry ----
 
 /// Forces the Darwin major version `barrier_file` takes the kernel for, for one test (review 6 #6).

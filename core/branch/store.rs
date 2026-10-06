@@ -416,6 +416,11 @@ struct GroupState {
     confirm: Option<(Instant, Confirm)>,
     /// The store is closing: the confirmation writer stops (the close writes what is left).
     confirm_stop: bool,
+    /// Test builds (engine review 9 #8): syncs of any file a fuzzy checkpoint's thread issued
+    /// settling its capture, from the start of its wait for what the capture covers to the end of
+    /// that step (`run_flight`).
+    #[cfg(test)]
+    settle_syncs: u64,
 }
 
 fn class_index(class: SyncClass) -> usize {
@@ -789,12 +794,25 @@ thread_local! {
 #[cfg(test)]
 static SYNCS_UNDER_STORE_MUTEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A sync was issued: counted if this thread holds a store mutex (test builds).
+/// A sync was issued: counted for this thread, and if it holds a store mutex (test builds).
 #[cfg(test)]
 pub(crate) fn note_sync() {
+    THREAD_SYNCS.with(|n| n.set(n.get() + 1));
     if STORE_HELD.with(|held| held.get()) > 0 {
         SYNCS_UNDER_STORE_MUTEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Syncs of any file this thread issued (test builds; engine review 9 #8).
+    static THREAD_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// See `THREAD_SYNCS`.
+#[cfg(test)]
+fn thread_syncs() -> u64 {
+    THREAD_SYNCS.with(std::cell::Cell::get)
 }
 
 /// See `SYNCS_UNDER_STORE_MUTEX`.
@@ -1237,7 +1255,8 @@ pub(crate) const HOLD_TRUNK_DECIDED: u8 = 4;
 
 /// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a group flight's leader
 /// waits here, its flight taken from the buffer and not yet written, so a test can act while an
-/// operation's records are in the air.
+/// operation's records are in the air. On a fuzzy checkpoint's hook (`checkpoint_hold`): the flight
+/// its thread leads to settle its capture (engine review 9 #8).
 #[cfg(test)]
 pub(crate) const HOLD_FLIGHT_TAKEN: u8 = 5;
 
@@ -2416,10 +2435,22 @@ fn run_flight(
         // a record still buffered or in the air at the capture belongs to an operation whose
         // caller may yet be told it failed, and then the catalog must not hold it. Waited for
         // holding no lock, but the store mutex for the moment it takes to lead a flight if none
-        // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once.
+        // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once. The
+        // test hook pauses the flight this wait leads, once taken (`HOLD_FLIGHT_TAKEN`).
         if !fe_mutant("commit_unsettled") {
-            let settled =
-                BranchStore::wait_durable_on(&inner, &group, None, cap.deferred_lsn, cap.settle_class);
+            #[cfg(test)]
+            let syncs = thread_syncs();
+            let settled = BranchStore::wait_durable_on(
+                &inner,
+                &group,
+                Some(&*hold),
+                cap.deferred_lsn,
+                cap.settle_class,
+            );
+            #[cfg(test)]
+            {
+                group.lock().settle_syncs += thread_syncs() - syncs;
+            }
             if let Err(e) = settled {
                 return (Err(e), 0);
             }
@@ -5947,6 +5978,13 @@ impl BranchStore {
         self.inner.lock().arena.as_ref().is_some_and(Arena::is_dirty)
     }
 
+    /// Test builds: the syncs fuzzy checkpoints' threads issued settling their captures before the
+    /// catalog commit (engine review 9 #8; `GroupState::settle_syncs`).
+    #[cfg(test)]
+    pub(crate) fn settle_syncs_for_test(&self) -> u64 {
+        self.group.lock().settle_syncs
+    }
+
     pub(crate) fn wait_name_filter(&self) {
         if let Some(build) = self.name_filter_build.lock().take() {
             let _ = build.join();
@@ -6291,7 +6329,7 @@ impl BranchStore {
         Ok(self.start_flight(&mut inner) == FlightStart::Started)
     }
 
-    /// Make a fuzzy checkpoint in flight wait at `stage` (`HOLD_BEFORE_COMMIT`,
+    /// Make a fuzzy checkpoint in flight wait at `stage` (`HOLD_FLIGHT_TAKEN`, `HOLD_BEFORE_COMMIT`,
     /// `HOLD_AFTER_COMMIT`) until this is called with another value (0 releases it).
     pub(crate) fn checkpoint_hold(&self, stage: u8) {
         self.flight_hold.store(stage, Ordering::Release);
