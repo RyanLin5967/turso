@@ -349,16 +349,19 @@ else
 fi
 stop_probe2 fork-pre
 
-# misses LOG T0 -> how many fork-storm children fsynced after T0 while untraced (TracerPid 0), then how many traced
+# storm_misses LOG T0 [STRACEPID] -> how many fork-storm children fsynced after T0 while untraced (TracerPid 0), then
+# how many fsynced while traced -- by STRACEPID only, when given: a strace_attach that needed a second try had a FIRST
+# strace whose traced children fsynced into its discarded trace (run 37400500051: 4 jobs, attach_tries=2, 112
+# "traced" children against 86 fsyncs in the kept trace).
 storm_misses() {
   python3 -c "
 import sys
-t0 = float(sys.argv[2]); miss = traced = 0
+t0 = float(sys.argv[2]); st = sys.argv[3] if len(sys.argv) > 3 else None; miss = traced = 0
 for ln in open(sys.argv[1]):
     pid, tp, t = ln.split()
     if tp == '0' and float(t) > t0: miss += 1
-    if tp != '0': traced += 1
-print(miss, traced)" "$1" "$2"
+    if tp != '0' and (st is None or tp == st): traced += 1
+print(miss, traced)" "$@"
 }
 # F10c, the negative control: a parent-only attach (no enumeration, no freeze) to a fork storm MUST miss children
 # that were alive at the seize and fsync after it -- or the storm does not exercise the race and F10d proves nothing.
@@ -375,6 +378,7 @@ if start_probe2 forkstorm; then
   for ((i = 0; i < 600; i++)); do [ -e "$DIR/fc/forkstorm.done" ] && break; sleep 0.05; done
   kill -INT "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
   read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0")
+  cp "$DIR/fc/forkstorm.log" "$OUT/f10c.forkstorm.log.txt" 2>/dev/null
   if [ $ctl_attached = 1 ] && [ "${miss:-0}" -ge 1 ]; then
     log "PASS F10c-storm-control-misses: a parent-only attach missed $miss untraced child fsync(s) after t0 ($traced traced)"
   else
@@ -397,7 +401,8 @@ if start_probe2 forkstorm; then
     sleep 0.2
     strace_detach "$OUT/f10d"
     count f10d
-    read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0")
+    read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0" "$(sed -n 's/.* strace_pid=\([0-9]*\) .*/\1/p' "$OUT/f10d.window")")
+    cp "$DIR/fc/forkstorm.log" "$OUT/f10d.forkstorm.log.txt" 2>/dev/null  # the probe's own record, kept with the raw
     if [ "$miss" = 0 ] && grep -q ' frozen=1 ' "$OUT/f10d.window" &&
       python3 -c "import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r['verdict']=='ok' and r['flush_by_syscall']['fsync'] >= int(sys.argv[2]) > 0 else 1)" "$OUT/f10d.json" "$traced"; then
       log "PASS F10d-storm-attach-complete: 0 untraced child fsyncs after t0, frozen=1, $traced traced children, trace fsyncs $(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['flush_by_syscall']['fsync'])" "$OUT/f10d.json")"
