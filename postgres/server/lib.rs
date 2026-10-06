@@ -866,7 +866,29 @@ impl Session {
         }
     }
 
+    /// One statement through the engine. A statement that meets a lock another session holds waits
+    /// for it, up to the server's lock wait, as a PostgreSQL row lock waits, instead of failing at
+    /// once with 55P03 (wire review 1 item 9): the engine refuses such a statement before it changes
+    /// anything, so it is run again. A stale snapshot (40001) is run again only outside a block; in
+    /// one the snapshot is the block's, and waiting cannot cure it. Not the engine's own busy
+    /// timeout: its blocking loops (run_ignore_rows and the like) answer its Sleep with an IO step
+    /// that returns at once on this platform, so they would spin a core for the whole wait.
     fn engine_statement(
+        &self,
+        conn: &PgConnection,
+        sql: &str,
+        portal: Option<&Portal<String>>,
+        format: &Format,
+    ) -> SqlResult<Response> {
+        let in_tx = !conn.inner().get_auto_commit();
+        // sqlstate() gives 55P03 to LimboError::Busy alone and 40001 to BusySnapshot alone.
+        self.retrying(
+            || self.engine_statement_once(conn, sql, portal, format),
+            |e: &Box<ErrorInfo>| e.code == "55P03" || (!in_tx && e.code == "40001"),
+        )
+    }
+
+    fn engine_statement_once(
         &self,
         conn: &PgConnection,
         sql: &str,
@@ -1016,13 +1038,26 @@ impl Session {
     /// ([`LimboError::Busy`], or a snapshot a concurrent commit outdated), sleeping on SQLite's
     /// default busy schedule (1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50 ms, then 100 ms) for up to
     /// the server's lock wait. Only this session's thread sleeps.
-    fn waiting<T>(&self, mut f: impl FnMut() -> turso_core::Result<T>) -> turso_core::Result<T> {
+    fn waiting<T>(&self, f: impl FnMut() -> turso_core::Result<T>) -> turso_core::Result<T> {
+        self.retrying(f, |e| {
+            matches!(e, LimboError::Busy | LimboError::BusySnapshot)
+        })
+    }
+
+    /// `f` run again while `busy` says its failure was a lock another session holds, on the
+    /// schedule of [`Session::waiting`], up to the server's lock wait; the attempt after the
+    /// deadline is final.
+    fn retrying<T, E>(
+        &self,
+        mut f: impl FnMut() -> Result<T, E>,
+        busy: impl Fn(&E) -> bool,
+    ) -> Result<T, E> {
         const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
         let deadline = std::time::Instant::now() + self.shared.lock_wait;
         let mut attempt = 0;
         loop {
             match f() {
-                Err(LimboError::Busy | LimboError::BusySnapshot) => {
+                Err(e) if busy(&e) => {
                     let delay = std::time::Duration::from_millis(
                         DELAYS_MS[attempt.min(DELAYS_MS.len() - 1)],
                     );
