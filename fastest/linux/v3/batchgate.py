@@ -8,7 +8,7 @@
   batchgate.py flushgate SUMMARY STAMP_END            the diskstats leaf flush gate alone (JSON)
   batchgate.py leafclass SUMMARY                      wb | wt | brd for a probe summary (exit 2 if it has none)
   batchgate.py fixture OUT CELL ARCH LEAF SHA FSTYPE [MOD]   a PLANTED full-shape verdict for firecheck.sh's F4 plants
-                                                      (MOD: fail-one | drop-one | cell=<c> | clean); always "planted": true
+                                                      (MOD: allfail | fail-one | drop-one | cell=<c> | clean); "planted": true
                                                       unless MOD is clean, which firecheck.sh never binds
   batchgate.py self-test DATA                         the gates on banked and planted inputs; exit 0 iff all as expected
 
@@ -271,7 +271,9 @@ def fixture(out, cell, arch, leaf, sha, fstype, mod):
     checks = [{"id": i, "check": i, "pass": True, "detail": "planted"} for i in ids]
     v = {"cell": cell, "fstype": fstype, "arch": arch, "leaf_class": leaf, "v3floor_sha256": sha, "run_id": "planted",
          "pass": len(checks), "total": len(checks), "all_pass": True, "unplanted_refusals": [], "checks": checks}
-    if mod == "fail-one":
+    if mod == "allfail":
+        v["all_pass"] = False
+    elif mod == "fail-one":
         checks[len(checks) // 2]["pass"] = False
     elif mod == "drop-one":
         del checks[len(checks) // 2]
