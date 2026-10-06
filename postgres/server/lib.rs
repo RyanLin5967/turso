@@ -38,7 +38,7 @@ use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
     attach_schema_files, branch_call, split_statements, PgBranchArg, PgBranchCall, PgConnection,
-    StatementTypes, CONNECTION_BROKEN,
+    StatementTypes,
 };
 
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -493,8 +493,24 @@ async fn serve_session(
         } else {
             socket.next().await
         };
-        let Some(Ok(msg)) = msg else {
-            break Ok(());
+        let msg = match msg {
+            Some(Ok(msg)) => msg,
+            // A message the codec cannot read: the stream is out of step, so the session ends with
+            // FATAL 08P01, as PostgreSQL ends it on an invalid frontend message (wire review 5
+            // item 4: it closed without a word).
+            Some(Err(e)) => {
+                error!("invalid frontend message: {}", e);
+                let info = ErrorInfo::new(
+                    "FATAL".to_string(),
+                    "08P01".to_string(),
+                    format!("invalid frontend message: {e}"),
+                );
+                let _ = socket
+                    .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                    .await;
+                break Ok(());
+            }
+            None => break Ok(()),
         };
         if matches!(msg, PgWireFrontendMessage::Terminate(_)) {
             break Ok(());
@@ -520,8 +536,24 @@ async fn serve_session(
             if is_extended_query {
                 session.fail_block();
             }
-            if let Err(io) =
-                pgwire::tokio::server::process_error(&mut socket, e, is_extended_query).await
+            // A FATAL error ends the session here: its ErrorResponse, no ReadyForQuery, and the
+            // session gone before anything more is read. pgwire's process_error answered it, shut
+            // only its write half and returned, so the loop read on: a pipelined query ran unseen
+            // (on the trunk, after a refused startup) and the branch's in-use entry stayed until
+            // the client's EOF (wire review 5 item 4).
+            let info = ErrorInfo::from(e);
+            if info.is_fatal() {
+                let sent = socket
+                    .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                    .await;
+                break sent.map_err(std::io::Error::other);
+            }
+            if let Err(io) = pgwire::tokio::server::process_error(
+                &mut socket,
+                PgWireError::UserError(Box::new(info)),
+                is_extended_query,
+            )
+            .await
             {
                 break Err(io);
             }
@@ -961,6 +993,18 @@ impl Session {
                     f.info
                 })
             }
+        };
+        // The frontend could not undo a failed statement: the connection's state is unknown, so the
+        // session ends (FATAL 08006, which serve_session ends the session on) instead of serving
+        // more statements on it (wire review 2 item 1). Read from the connection's flag, not the
+        // error's text (wire review 5 item 4).
+        let result = match result {
+            Err(mut info) if conn.is_broken() => {
+                info.code = "08006".to_string();
+                info.severity = "FATAL".to_string();
+                Err(info)
+            }
+            r => r,
         };
         if result.is_err() {
             match verb {
@@ -1757,16 +1801,6 @@ fn fatal(code: &str, message: &str) -> PgWireError {
 /// The SQLSTATE an engine error is reported with. Lock contention is PostgreSQL's
 /// lock_not_available, and a stale snapshot its serialization_failure: both tell a client to retry.
 fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
-    // The frontend could not undo a failed statement: the connection's state is unknown, so the
-    // session ends (FATAL; pgwire closes the socket after sending it, and the engine connection
-    // goes with the session) instead of serving more statements on it (wire review 2 item 1).
-    if let LimboError::InternalError(m) = e {
-        if m.starts_with(CONNECTION_BROKEN) {
-            let mut info = error("08006", e.to_string());
-            info.severity = "FATAL".to_string();
-            return info;
-        }
-    }
     error(sqlstate(e), e.to_string())
 }
 

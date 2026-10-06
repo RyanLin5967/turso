@@ -25,6 +25,10 @@ pub struct PgConnection {
 struct PgConnectionInner {
     conn: Arc<Connection>,
     session_state: Mutex<SessionState>,
+    /// A statement failed and undoing it failed too: the engine connection holds a transaction in
+    /// an unknown state, so the server must end the session (FATAL 08006) rather than serve more
+    /// on it. A flag the server reads, not a sentinel in an error's text (wire review 5 item 4).
+    broken: std::sync::atomic::AtomicBool,
 }
 
 impl PgConnectionInner {
@@ -84,12 +88,19 @@ impl PgConnection {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 session_state: Mutex::new(SessionState::default()),
+                broken: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    /// Whether a failed statement's undo failed too, leaving the engine connection in an unknown
+    /// transaction (see `PgConnectionInner::broken`): the session must end.
+    pub fn is_broken(&self) -> bool {
+        self.inner.broken.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
@@ -570,7 +581,7 @@ fn try_prepare_special(
     }
 
     if let Some(stmt) = try_extract_copy_from(&parse_result) {
-        let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
+        let rows_inserted = handle_pg_copy_from(pg_conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
         return Ok(Some(stmt));
@@ -897,10 +908,15 @@ fn handle_pg_add_constraints(
             // the connection is broken, not merely the statement (the server ends the session).
             match undone {
                 Ok(()) => Err(e),
-                Err(undo) => Err(LimboError::InternalError(format!(
-                    "{CONNECTION_BROKEN}: ALTER TABLE ADD CONSTRAINT failed ({e}) and undoing it \
-                     failed too ({undo})"
-                ))),
+                Err(undo) => {
+                    pg_conn
+                        .broken
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    Err(LimboError::InternalError(format!(
+                        "{CONNECTION_BROKEN}: ALTER TABLE ADD CONSTRAINT failed ({e}) and undoing \
+                         it failed too ({undo})"
+                    )))
+                }
             }
         }
     }
@@ -932,8 +948,8 @@ fn serial_base_type(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The start of an engine error's text after which the connection's state is unknown: the server
-/// ends the session (FATAL 08006) rather than serve more statements on it.
+/// The start of the error text of a statement whose undo failed too. The server ends the session on
+/// [`PgConnection::is_broken`], which is set with it, never on this text (wire review 5 item 4).
 pub const CONNECTION_BROKEN: &str = "connection broken";
 
 /// Run one statement as the engine runs a client's (a root statement), in SQLite text.
@@ -946,7 +962,8 @@ fn run_pg_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<()> {
     prepare_statement(pg_conn, sql)?.run_ignore_rows()
 }
 
-fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
+fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
+    let conn = &pg_conn.conn;
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
     })?;
@@ -1047,9 +1064,14 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
     // is broken, not merely the statement (the server ends the session), as for ALTER's rebuild.
     match undone {
         Ok(()) => Err(e),
-        Err(undo) => Err(LimboError::InternalError(format!(
-            "{CONNECTION_BROKEN}: COPY FROM failed ({e}) and undoing it failed too ({undo})"
-        ))),
+        Err(undo) => {
+            pg_conn
+                .broken
+                .store(true, std::sync::atomic::Ordering::Release);
+            Err(LimboError::InternalError(format!(
+                "{CONNECTION_BROKEN}: COPY FROM failed ({e}) and undoing it failed too ({undo})"
+            )))
+        }
     }
 }
 
