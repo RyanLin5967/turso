@@ -2126,6 +2126,35 @@ impl Lineage {
     }
 }
 
+/// The catalog rows of the dirty branches a capture writes (`checkpoint_capture_mode`): each
+/// resident branch's row, current page map and retained versions, with what changed in it.
+fn capture_rows(branches: &BranchTable<BranchState>, dirty: &HashMap<BranchId, u8>) -> Vec<(CatBranch, u8)> {
+    let rows: Vec<(CatBranch, u8)> = dirty
+        .iter()
+        .filter_map(|(id, &what)| branches.get(id).map(|st| (id, st, what)))
+        .map(|(&id, st, what)| (CatBranch {
+            id: id.0,
+            parent: st.parent.0,
+            fork_epoch: st.fork_epoch,
+            epoch: st.lineage.epoch,
+            released: st.handle == Handle::Released,
+            held_open: st.handle == Handle::Released && st.open,
+            lease: if st.handle == Handle::Released { None } else { st.lease },
+            n_children: st.lineage.n_children,
+            current: st
+                .current
+                .iter()
+                .map(|(&page, o)| (page, o.slot, o.born, o.crc))
+                .collect(),
+            retained: st.lineage.retained_list(),
+            name: None,
+        }, what))
+        .collect();
+    #[cfg(test)]
+    CAPTURE_ROWS_BUILT.with(|c| c.set(c.get() + rows.len() as u64));
+    rows
+}
+
 /// A Release applied in memory whose record is not yet durable (`StoreInner::releases_in_air`).
 struct ReleaseInAir {
     /// What makes it durable (`u64::MAX`: it was never buffered).
@@ -7309,30 +7338,76 @@ impl StoreInner {
         }
         // Consumed below, with the marker that names it.
         let generation = cat.next_generation;
-        let dirty = std::mem::take(&mut cat.dirty);
-        let rows: Vec<(CatBranch, u8)> = dirty
-            .iter()
-            .filter_map(|(id, &what)| self.branches.get(id).map(|st| (id, st, what)))
-            .map(|(&id, st, what)| (CatBranch {
-                id: id.0,
-                parent: st.parent.0,
-                fork_epoch: st.fork_epoch,
-                epoch: st.lineage.epoch,
-                released: st.handle == Handle::Released,
-                held_open: st.handle == Handle::Released && st.open,
-                lease: if st.handle == Handle::Released { None } else { st.lease },
-                n_children: st.lineage.n_children,
-                current: st
-                    .current
-                    .iter()
-                    .map(|(&page, o)| (page, o.slot, o.born, o.crc))
-                    .collect(),
-                retained: st.lineage.retained_list(),
-                name: None,
-            }, what))
-            .collect();
+        // Mutant `capture_marker_first` (test builds only): the marker buffered before the
+        // fallible steps, as before review 4 #2.
+        let marker_first = fe_mutant("capture_marker_first");
+        if marker_first {
+            let _ = journal.buffer(&Record::Checkpoint { generation });
+            cat.next_generation += 1;
+        }
+        // Mutant `capture_rows_first` (test builds only): the dirty set taken and its rows built
+        // before the fallible steps, as before engine review 8 #2; a failure then threw that O(dirty)
+        // work away, under this mutex, at every retry.
+        let early = fe_mutant("capture_rows_first").then(|| {
+            let dirty = std::mem::take(&mut cat.dirty);
+            let rows = capture_rows(&self.branches, &dirty);
+            (dirty, rows)
+        });
+        // The capture's fallible steps come before any of its work and before its first effect on
+        // the log (review 4 #2, engine review 8 #2): one that fails has built no row, buffered no
+        // marker and taken no generation, so a persistent fault costs a dup and a read snapshot per
+        // attempt, never O(dirty).
+        // A fuzzy checkpoint's slots are made durable by the group's own flights, which its wait
+        // before the commit waits for or leads in `settle_class` (review 6 #3 (b)): it syncs no
+        // arena outside the group, beside a flight's sync of the same file, and dups no handle
+        // under this mutex. A sharp one runs with no flight in the air and the store mutex held,
+        // so it syncs what no flight synced (D0 writes under a raised log) itself, and only if a
+        // slot was written since the arena's last sync (lead review 1 item 7(4)). Mutant
+        // `checkpoint_own_arena_sync` (test builds only): the fuzzy one takes its handle too and
+        // waits in the log's class, as before.
+        let rewrite_syncs = journal.rewrite_class().syncs();
+        let own_sync = !fuzzy || fe_mutant("checkpoint_own_arena_sync");
+        let settle_class = if rewrite_syncs && !own_sync {
+            journal.sync_class().max(SyncClass::Fsync)
+        } else {
+            journal.sync_class()
+        };
+        let arena_file = if own_sync && rewrite_syncs && (arena.is_dirty() || flight_in_air) {
+            match arena.sync_handle() {
+                Ok(f) => f,
+                Err(e) => {
+                    if let Some((dirty, _)) = early {
+                        cat.dirty = dirty;
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
         #[cfg(test)]
-        CAPTURE_ROWS_BUILT.with(|c| c.set(c.get() + rows.len() as u64));
+        if arena_file.is_some() {
+            CAPTURE_ARENA_HANDLES.with(|c| c.set(c.get() + 1));
+        }
+        let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
+            Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
+        } else {
+            cat.catalog.begin_read_snapshot()
+        };
+        if let Err(e) = snapshot {
+            if let Some((dirty, _)) = early {
+                cat.dirty = dirty;
+            }
+            return Err(e);
+        }
+        let (dirty, rows) = match early {
+            Some(taken) => taken,
+            None => {
+                let dirty = std::mem::take(&mut cat.dirty);
+                let rows = capture_rows(&self.branches, &dirty);
+                (dirty, rows)
+            }
+        };
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
         let trunk_new = self.trunk.lineage.retained_list();
@@ -7366,54 +7441,6 @@ impl StoreInner {
                 .flat_map(|id| branches[id].pending.values().copied())
                 .collect()
         };
-        // The capture's fallible steps come before its first effect on the log (review 4 #2): one
-        // that fails buffers no marker and takes no generation.
-        // A fuzzy checkpoint's slots are made durable by the group's own flights, which its wait
-        // before the commit waits for or leads in `settle_class` (review 6 #3 (b)): it syncs no
-        // arena outside the group, beside a flight's sync of the same file, and dups no handle
-        // under this mutex. A sharp one runs with no flight in the air and the store mutex held,
-        // so it syncs what no flight synced (D0 writes under a raised log) itself, and only if a
-        // slot was written since the arena's last sync (lead review 1 item 7(4)). Mutant
-        // `checkpoint_own_arena_sync` (test builds only): the fuzzy one takes its handle too and
-        // waits in the log's class, as before.
-        let rewrite_syncs = journal.rewrite_class().syncs();
-        let own_sync = !fuzzy || fe_mutant("checkpoint_own_arena_sync");
-        let settle_class = if rewrite_syncs && !own_sync {
-            journal.sync_class().max(SyncClass::Fsync)
-        } else {
-            journal.sync_class()
-        };
-        let arena_file = if own_sync && rewrite_syncs && (arena.is_dirty() || flight_in_air) {
-            match arena.sync_handle() {
-                Ok(f) => f,
-                Err(e) => {
-                    cat.dirty = dirty;
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-        #[cfg(test)]
-        if arena_file.is_some() {
-            CAPTURE_ARENA_HANDLES.with(|c| c.set(c.get() + 1));
-        }
-        let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
-            Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
-        } else {
-            cat.catalog.begin_read_snapshot()
-        };
-        // Mutant `capture_marker_first` (test builds only): the marker buffered before the
-        // fallible steps, as before.
-        let marker_first = fe_mutant("capture_marker_first");
-        if marker_first {
-            let _ = journal.buffer(&Record::Checkpoint { generation });
-            cat.next_generation += 1;
-        }
-        if let Err(e) = snapshot {
-            cat.dirty = dirty;
-            return Err(e);
-        }
         // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
         if !marker_first {
             if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
