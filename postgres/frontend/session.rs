@@ -1039,4 +1039,164 @@ mod tests {
             "the fast path read only {fast_hits} of {n}"
         );
     }
+
+    /// Every PostgreSQL keyword (libpg_query's kwlist.h, PostgreSQL 17: 491 words) as the cast of a
+    /// branch call's argument, in both argument forms: the fast path reads a call only where
+    /// libpg_query reads the same one, and `branch_call` answers as libpg_query does. At 472023b72
+    /// the fast path took any word after `::`, so the keywords libpg_query refuses as a type (78
+    /// reserved and 44 column-name keywords, 244 statements, as two reviewers measured) were calls
+    /// to it and syntax errors to PostgreSQL: `turso_branch_delete('prod'::where)` deleted the
+    /// branch (wire review 1 item 3).
+    #[test]
+    fn a_keyword_cast_is_read_as_libpg_query_reads_it() {
+        #[rustfmt::skip]
+        const KEYWORDS: [&str; 491] = [
+            "abort", "absent", "absolute", "access", "action", "add", "admin", "after", "aggregate",
+            "all", "also", "alter", "always", "analyse", "analyze", "and", "any", "array", "as",
+            "asc", "asensitive", "assertion", "assignment", "asymmetric", "at", "atomic", "attach",
+            "attribute", "authorization", "backward", "before", "begin", "between", "bigint",
+            "binary", "bit", "boolean", "both", "breadth", "by", "cache", "call", "called",
+            "cascade", "cascaded", "case", "cast", "catalog", "chain", "char", "character",
+            "characteristics", "check", "checkpoint", "class", "close", "cluster", "coalesce",
+            "collate", "collation", "column", "columns", "comment", "comments", "commit",
+            "committed", "compression", "concurrently", "conditional", "configuration", "conflict",
+            "connection", "constraint", "constraints", "content", "continue", "conversion", "copy",
+            "cost", "create", "cross", "csv", "cube", "current", "current_catalog", "current_date",
+            "current_role", "current_schema", "current_time", "current_timestamp", "current_user",
+            "cursor", "cycle", "data", "database", "day", "deallocate", "dec", "decimal", "declare",
+            "default", "defaults", "deferrable", "deferred", "definer", "delete", "delimiter",
+            "delimiters", "depends", "depth", "desc", "detach", "dictionary", "disable", "discard",
+            "distinct", "do", "document", "domain", "double", "drop", "each", "else", "empty",
+            "enable", "encoding", "encrypted", "end", "enum", "error", "escape", "event", "except",
+            "exclude", "excluding", "exclusive", "execute", "exists", "explain", "expression",
+            "extension", "external", "extract", "false", "family", "fetch", "filter", "finalize",
+            "first", "float", "following", "for", "force", "foreign", "format", "forward", "freeze",
+            "from", "full", "function", "functions", "generated", "global", "grant", "granted",
+            "greatest", "group", "grouping", "groups", "handler", "having", "header", "hold",
+            "hour", "identity", "if", "ilike", "immediate", "immutable", "implicit", "import", "in",
+            "include", "including", "increment", "indent", "index", "indexes", "inherit",
+            "inherits", "initially", "inline", "inner", "inout", "input", "insensitive", "insert",
+            "instead", "int", "integer", "intersect", "interval", "into", "invoker", "is", "isnull",
+            "isolation", "join", "json", "json_array", "json_arrayagg", "json_exists",
+            "json_object", "json_objectagg", "json_query", "json_scalar", "json_serialize",
+            "json_table", "json_value", "keep", "key", "keys", "label", "language", "large", "last",
+            "lateral", "leading", "leakproof", "least", "left", "level", "like", "limit", "listen",
+            "load", "local", "localtime", "localtimestamp", "location", "lock", "locked", "logged",
+            "mapping", "match", "matched", "materialized", "maxvalue", "merge", "merge_action",
+            "method", "minute", "minvalue", "mode", "month", "move", "name", "names", "national",
+            "natural", "nchar", "nested", "new", "next", "nfc", "nfd", "nfkc", "nfkd", "no", "none",
+            "normalize", "normalized", "not", "nothing", "notify", "notnull", "nowait", "null",
+            "nullif", "nulls", "numeric", "object", "of", "off", "offset", "oids", "old", "omit",
+            "on", "only", "operator", "option", "options", "or", "order", "ordinality", "others",
+            "out", "outer", "over", "overlaps", "overlay", "overriding", "owned", "owner",
+            "parallel", "parameter", "parser", "partial", "partition", "passing", "password",
+            "path", "placing", "plan", "plans", "policy", "position", "preceding", "precision",
+            "prepare", "prepared", "preserve", "primary", "prior", "privileges", "procedural",
+            "procedure", "procedures", "program", "publication", "quote", "quotes", "range", "read",
+            "real", "reassign", "recheck", "recursive", "ref", "references", "referencing",
+            "refresh", "reindex", "relative", "release", "rename", "repeatable", "replace",
+            "replica", "reset", "restart", "restrict", "return", "returning", "returns", "revoke",
+            "right", "role", "rollback", "rollup", "routine", "routines", "row", "rows", "rule",
+            "savepoint", "scalar", "schema", "schemas", "scroll", "search", "second", "security",
+            "select", "sequence", "sequences", "serializable", "server", "session", "session_user",
+            "set", "setof", "sets", "share", "show", "similar", "simple", "skip", "smallint",
+            "snapshot", "some", "source", "sql", "stable", "standalone", "start", "statement",
+            "statistics", "stdin", "stdout", "storage", "stored", "strict", "string", "strip",
+            "subscription", "substring", "support", "symmetric", "sysid", "system", "system_user",
+            "table", "tables", "tablesample", "tablespace", "target", "temp", "template",
+            "temporary", "text", "then", "ties", "time", "timestamp", "to", "trailing",
+            "transaction", "transform", "treat", "trigger", "trim", "true", "truncate", "trusted",
+            "type", "types", "uescape", "unbounded", "uncommitted", "unconditional", "unencrypted",
+            "union", "unique", "unknown", "unlisten", "unlogged", "until", "update", "user",
+            "using", "vacuum", "valid", "validate", "validator", "value", "values", "varchar",
+            "variadic", "varying", "verbose", "version", "view", "views", "volatile", "when",
+            "where", "whitespace", "window", "with", "within", "without", "work", "wrapper",
+            "write", "xml", "xmlattributes", "xmlconcat", "xmlelement", "xmlexists", "xmlforest",
+            "xmlnamespaces", "xmlparse", "xmlpi", "xmlroot", "xmlserialize", "xmltable", "year",
+            "yes", "zone",
+        ];
+        let mut wrong = Vec::new();
+        for kw in KEYWORDS {
+            for arg in ["'b'", "$1"] {
+                let sql = format!("SELECT turso_branch_delete({arg}::{kw})");
+                let slow = slow(&sql);
+                let fast = fast_branch_call(&sql);
+                if (fast.is_some() && fast != slow) || branch_call(&sql) != slow {
+                    wrong.push(sql);
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} keyword casts are read unlike libpg_query, e.g. {:?}",
+            wrong.len(),
+            2 * KEYWORDS.len(),
+            &wrong[..wrong.len().min(8)]
+        );
+    }
+
+    /// A cast that changes the value or the type is not dropped: the statement is not a branch
+    /// call, so it reaches the engine and fails there as PostgreSQL fails it (in PostgreSQL
+    /// `'feature'::char` is 'f' and `'abc'::varchar(2)` is 'ab'; `::int`, `::bytea` and an unknown
+    /// type are not text). A cast to text, or to varchar with no length, changes nothing and is
+    /// read through. A quoted function name keeps its case, as in PostgreSQL, so an uppercase one
+    /// names no branch function (wire review 1 item 3).
+    #[test]
+    fn only_a_cast_that_changes_nothing_is_read_through() {
+        use PgBranchArg::{Param, Text};
+        let refused = [
+            "SELECT turso_branch_create('abc'::varchar(2))",
+            "SELECT turso_branch_create('x'::char)",
+            "SELECT turso_branch_create('x'::character)",
+            "SELECT turso_branch_create('feature'::char(1))",
+            "SELECT turso_branch_create('b'::character varying(1))",
+            "SELECT turso_branch_create('b'::int)",
+            "SELECT turso_branch_create('b'::bytea)",
+            "SELECT turso_branch_create('b'::nosuchtype)",
+            "SELECT turso_branch_create('b'::text[])",
+            "SELECT turso_branch_create('b'::public.text)",
+            "SELECT turso_branch_create('b'::\"TEXT\")",
+            "SELECT turso_branch_create('b'::from)",
+            "SELECT turso_branch_create($1::int)",
+            "SELECT turso_branch_delete('prod'::where)",
+            "SELECT \"TURSO_BRANCH_CREATE\"('b')",
+            "SELECT \"turso_branch_Create\"('b')",
+        ];
+        for sql in refused {
+            assert_eq!(fast_branch_call(sql), None, "fast path, {sql:?}");
+            assert_eq!(slow(sql), None, "libpg_query, {sql:?}");
+            assert_eq!(branch_call(sql), None, "branch_call, {sql:?}");
+        }
+        let create = "turso_branch_create";
+        let b = || vec![Text("b".into())];
+        let fast_forms = [
+            "SELECT turso_branch_create('b'::text)",
+            "SELECT turso_branch_create('b'::TEXT)",
+            "SELECT turso_branch_create('b' :: varchar)",
+            "SELECT turso_branch_create('b'::character varying)",
+            "SELECT turso_branch_create('b'::CHARACTER\n VARYING)",
+        ];
+        for sql in fast_forms {
+            assert_eq!(
+                fast_branch_call(sql),
+                call(create, b()),
+                "fast path, {sql:?}"
+            );
+            assert_eq!(slow(sql), call(create, b()), "libpg_query, {sql:?}");
+        }
+        let slow_forms = [
+            ("SELECT turso_branch_create('b'::pg_catalog.text)", b()),
+            ("SELECT turso_branch_create('b'::\"text\")", b()),
+            ("SELECT turso_branch_create('b'::varchar::text)", b()),
+            (
+                "SELECT turso_branch_create(true::text)",
+                vec![Text("true".into())],
+            ),
+            ("SELECT turso_branch_create($1::varchar)", vec![Param(1)]),
+            ("SELECT \"turso_branch_create\"('b')", b()),
+        ];
+        for (sql, args) in slow_forms {
+            assert_eq!(branch_call(sql), call(create, args), "{sql:?}");
+        }
+    }
 }

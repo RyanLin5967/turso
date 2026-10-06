@@ -243,6 +243,37 @@ impl Wire {
         self.read_reply()
     }
 
+    /// [`Wire::x`] with each parameter's declared type OID (0: unspecified), format code (0 text,
+    /// 1 binary) and bytes.
+    fn xt(&mut self, sql: &str, params: &[(u32, i16, &[u8])]) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for (oid, _, _) in params {
+            parse.extend_from_slice(&oid.to_be_bytes());
+        }
+        self.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for (_, format, _) in params {
+            bind.extend_from_slice(&format.to_be_bytes());
+        }
+        bind.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for (_, _, value) in params {
+            bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            bind.extend_from_slice(value);
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes()); // all results text
+        self.send(b'B', &bind);
+        self.send(b'D', b"P\0");
+        let mut exec = vec![0u8];
+        exec.extend_from_slice(&0i32.to_be_bytes());
+        self.send(b'E', &exec);
+        self.send(b'S', &[]);
+        self.read_reply()
+    }
+
     /// Read messages up to and including ReadyForQuery (or the server closing the connection).
     fn read_reply(&mut self) -> Reply {
         let mut r = Reply::default();
@@ -1606,4 +1637,57 @@ fn a_describe_time_error_inside_a_block_aborts_it() {
         "0",
         "the block committed past its failed statement"
     );
+}
+
+/// A branch call's cast is read only when it changes nothing: `'b'::from` is a syntax error in
+/// PostgreSQL (42601), not a delete of b (wire review 1 item 3). The statement reaches the engine,
+/// whose syntax error is reported as 42601 once the SQLSTATE mapping lands (item 7).
+#[test]
+fn a_branch_call_with_a_keyword_cast_is_a_syntax_error() {
+    let dir = Scratch::new("keywordcast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('b')").ok("create");
+    let r = a.q("SELECT turso_branch_delete('b'::from)");
+    assert_eq!(r.err("delete 'b'::from").code, "42601");
+    assert_eq!(
+        a.q("SELECT turso_branch_switch('b')").single("b survives"),
+        "b"
+    );
+}
+
+/// A bound branch name is text: a parameter declared as another type is refused (42804) and names
+/// nothing. A text or varchar parameter, or one of unspecified type, is read as text in either
+/// format: PostgreSQL's textrecv takes a binary text value as its bytes (wire review 1 item 3).
+#[test]
+fn a_branch_name_parameter_must_be_text() {
+    const INT4: u32 = 23;
+    const TEXT: u32 = 25;
+    const VARCHAR: u32 = 1043;
+    let dir = Scratch::new("paramtype");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    let create = "SELECT turso_branch_create($1)";
+    let r = a.xt(create, &[(INT4, 0, b"5")]);
+    assert_eq!(r.err("create, $1 declared int4").code, "42804");
+    let r = a.xt(create, &[(INT4, 1, &5i32.to_be_bytes())]);
+    assert_eq!(r.err("create, $1 declared int4, binary").code, "42804");
+    let r = a.xt("SELECT turso_branch_create($1::text)", &[(INT4, 0, b"6")]);
+    assert_eq!(r.err("create, $1 declared int4 and cast").code, "42804");
+    for name in ["5", "6"] {
+        let r = a.q(&format!("SELECT turso_branch_switch('{name}')"));
+        assert!(r.error.is_some(), "an int4 parameter created branch {name}");
+    }
+    a.xt(create, &[(TEXT, 1, b"bin")])
+        .ok("create, text, binary");
+    a.xt(create, &[(VARCHAR, 0, b"vc")]).ok("create, varchar");
+    a.xt(create, &[(0, 0, b"untyped")])
+        .ok("create, unspecified");
+    for name in ["bin", "vc", "untyped"] {
+        assert_eq!(
+            a.q(&format!("SELECT turso_branch_switch('{name}')"))
+                .single("switch"),
+            name
+        );
+    }
 }
