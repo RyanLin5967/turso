@@ -52,8 +52,8 @@ use pgwire::api::results::{
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, ErrorHandler, PgWireConnectionState, PgWireServerHandlers, Type,
-    DEFAULT_NAME, METADATA_DATABASE,
+    ClientInfo, ClientPortalStore, ErrorHandler, NoopHandler, PgWireConnectionState,
+    PgWireServerHandlers, Type, DEFAULT_NAME, METADATA_DATABASE,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::{DataRow, NoData, ParameterDescription, RowDescription};
@@ -463,13 +463,16 @@ async fn serve_session(
     let Some(mut socket) = socket else {
         return Ok(());
     };
-    let handlers = SessionHandlers(session.clone());
-    let startup_handler = handlers.startup_handler();
-    let simple_query_handler = handlers.simple_query_handler();
-    let extended_query_handler = handlers.extended_query_handler();
-    let copy_handler = handlers.copy_handler();
-    let cancel_handler = handlers.cancel_handler();
-    let error_handler = handlers.error_handler();
+    // The handlers by their concrete types: the session, and pgwire's no-op ones for COPY FROM
+    // STDIN, cancel and error logging. Taken through PgWireServerHandlers' `impl Trait` returns,
+    // the codec's statement type borrowed the handler set, which the socket outlived (E0597 at
+    // the 376e950aa gate check).
+    let startup_handler = session.clone();
+    let simple_query_handler = session.clone();
+    let extended_query_handler = session.clone();
+    let copy_handler = Arc::new(NoopHandler);
+    let cancel_handler = Arc::new(NoopHandler);
+    let error_handler = NoopHandler;
     let result = loop {
         let msg = if matches!(
             socket.state(),
@@ -651,23 +654,6 @@ struct Described {
 /// CHECKPOINTs skipped inside a block because the WAL was busy (see [`Session::checkpoint`]),
 /// since the server started: turso_branch_stats' `checkpoints_skipped`.
 static CHECKPOINTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
-
-/// pgwire's handler set for one session: every handler is the session itself.
-struct SessionHandlers(Arc<Session>);
-
-impl PgWireServerHandlers for SessionHandlers {
-    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        self.0.clone()
-    }
-
-    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        self.0.clone()
-    }
-
-    fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        self.0.clone()
-    }
-}
 
 impl Session {
     fn new(shared: Arc<Shared>) -> Self {
