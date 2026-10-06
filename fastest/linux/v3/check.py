@@ -1304,8 +1304,9 @@ def fourth_review_plants(arch):
     txt = rd(os.path.join(f4, "R_leaf_remote.txt")) or ""
     what = (rd(os.path.join(f4, "R_leaf_remote.what")) or "").strip()
     prem = rd(os.path.join(f4, "R_leaf_remote.premise")) or ""
+    kind = what.split(" ")[0].split("=", 1)[-1]  # firecheck.sh writes "faked=<sd_host|nvme_transport> <host|ctrl>"
     exp = {"sd_host": ("proc_name=tcm_loopback", "is on SCSI host 'tcm_loopback'"),
-           "nvme_transport": ("transport=tcp", "has transport 'tcp', not pcie")}.get(what.split(" ")[0])
+           "nvme_transport": ("transport=tcp", "has transport 'tcp', not pcie")}.get(kind)
     check("F4:R_leaf_remote", exp is not None and rc == 2 and exp[0] in prem and exp[1] in txt
           and not os.path.exists(os.path.join(f4, "R_leaf_remote.out")),
           {"rc": rc, "faked": what, "premise": prem.strip(), "text": txt[-300:]},
