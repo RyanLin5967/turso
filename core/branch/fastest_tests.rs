@@ -3790,6 +3790,40 @@ fn the_confirmation_writer_does_not_poll_while_a_flight_is_in_the_air() {
     );
 }
 
+/// Engine review 8 #11: the confirmation writer held the group's flight slot (`flushing`) across
+/// its pwrite of the word, and that hold protected nothing: the word names a flight whose sync has
+/// returned, and on unix every replacement of the log is a rename, so a word written meanwhile
+/// reaches the old file only. Every create waited on it. Held here between taking the word and
+/// writing it, a create on another connection must be acknowledged. Mutant `confirm_holds_slot`.
+#[cfg(unix)]
+#[test]
+fn a_create_does_not_wait_for_a_confirmation_word_being_written() {
+    let _s = serial();
+    let _q = ConfirmQuiet::set(1);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("wordhold.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    db.branches.confirm_hold_for_test(super::store::HOLD_CONFIRM_WRITE);
+    // A proved word pending: the writer takes it once the log is idle, and waits there.
+    let _first = trunk.fork_branch().unwrap().into_id();
+    eventually("the confirmation writer never took the word", || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_CONFIRM_WRITE | super::store::HOLD_ARRIVED
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let creator = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let created = db.connect().and_then(|t| t.fork_branch()).map(|x| x.into_id());
+            let _ = tx.send(created.is_ok());
+        })
+    };
+    let created = rx.recv_timeout(std::time::Duration::from_secs(10));
+    db.branches.confirm_hold_for_test(0);
+    creator.join().unwrap();
+    assert_eq!(created, Ok(true), "a create waited for the confirmation writer's word (or failed)");
+}
+
 /// Review 6 #1: a confirmation word that cannot be written changes no flight's outcome. The flight
 /// is durable once its sync returned; its word only lets recovery tell damage from a lost write,
 /// so a failure to write it is counted and the store goes on.

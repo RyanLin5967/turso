@@ -377,7 +377,15 @@ pub(crate) struct Group {
     durable_now: [AtomicU64; 3],
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
+    /// Test hook (engine review 8 #11): while it holds `HOLD_CONFIRM_WRITE`, the confirmation
+    /// writer waits once it has taken a word to write and before it writes it. Per store.
+    #[cfg(test)]
+    confirm_hold: AtomicU8,
 }
+
+/// Test hook stage (`Group::confirm_hold`): the confirmation writer has taken a word to write.
+#[cfg(test)]
+pub(crate) const HOLD_CONFIRM_WRITE: u8 = 1;
 
 #[derive(Default)]
 struct GroupState {
@@ -452,6 +460,8 @@ impl Group {
             confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
             failed,
+            #[cfg(test)]
+            confirm_hold: AtomicU8::new(0),
         }
     }
 
@@ -691,6 +701,8 @@ fn run_confirm_writer(group: Arc<Group>) {
         let (_, confirm) = g.confirm.take().expect("checked above");
         g.flushing = true;
         drop(g);
+        #[cfg(test)]
+        pause_at(Some(&group.confirm_hold), HOLD_CONFIRM_WRITE);
         group.write_confirm(&confirm, false);
         g = group.lock();
         g.flushing = false;
@@ -6489,6 +6501,18 @@ impl BranchStore {
         self.group.lock().confirm_wakeups
     }
 
+    /// Test builds: hold this store's confirmation writer at `stage` (`HOLD_CONFIRM_WRITE`; 0
+    /// releases it), and read the hook (`HOLD_ARRIVED` or-ed in once it waits there).
+    #[cfg(test)]
+    pub(crate) fn confirm_hold_for_test(&self, stage: u8) {
+        self.group.confirm_hold.store(stage, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_held_for_test(&self) -> u8 {
+        self.group.confirm_hold.load(Ordering::Acquire)
+    }
+
     /// Confirmation words written into the log's header, and those whose write failed (review 6 #1;
     /// observing only).
     pub(crate) fn confirm_counts(&self) -> [u64; 2] {
@@ -6586,6 +6610,8 @@ impl Drop for BranchStore {
     /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files.
     fn drop(&mut self) {
         self.flight_hold.store(0, Ordering::Release);
+        #[cfg(test)]
+        self.group.confirm_hold.store(0, Ordering::Release);
         self.join_flights();
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
