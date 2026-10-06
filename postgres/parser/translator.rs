@@ -23,18 +23,64 @@ pub struct TranslateResult {
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
-    /// The columns of the LATERAL subselects inlined so far (see `inline_lateral`): a reference
-    /// `alias.column` translates to the expression the subselect computes for it.
-    lateral_columns: std::cell::RefCell<std::collections::HashMap<(String, String), ast::Expr>>,
+    /// The LATERAL scope of each SELECT being translated, innermost last (see `inline_lateral`):
+    /// a reference `alias.column` translates to the expression an inlined LATERAL subselect
+    /// computes for it, in its SELECT and in the subqueries under it that name no other relation
+    /// `alias` (wire review 2 item 6).
+    lateral_scopes: std::cell::RefCell<Vec<LateralScope>>,
     /// The output column of each generate_series call in FROM that reads another FROM item's
     /// columns, by PostgreSQL's name for it, with the call's table name (see
     /// `translate_range_function`): `g` and `g.g` translate to the engine's `g.value`.
     series_columns: std::cell::RefCell<std::collections::HashMap<String, String>>,
 }
 
+/// One SELECT's names for the LATERAL inlining (see `PostgreSQLTranslator::inline_lateral`).
+#[derive(Default)]
+struct LateralScope {
+    /// The inlined LATERAL columns, (alias, column) to the expression.
+    columns: std::collections::HashMap<(String, String), ast::Expr>,
+    /// The names the SELECT's FROM items are known by, its inlined LATERAL aliases included.
+    names: std::collections::HashSet<String>,
+}
+
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Run `f` in a LATERAL scope of its own: one SELECT's FROM names and inlined LATERAL columns,
+    /// dropped when it ends, on an error too.
+    fn in_select_scope<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        self.lateral_scopes
+            .borrow_mut()
+            .push(LateralScope::default());
+        let r = f();
+        self.lateral_scopes.borrow_mut().pop();
+        r
+    }
+
+    /// Record the name a FROM item of the current SELECT is known by.
+    fn note_from_name(&self, name: &str) {
+        if let Some(scope) = self.lateral_scopes.borrow_mut().last_mut() {
+            scope.names.insert(name.to_string());
+        }
+    }
+
+    /// The expression of the inlined LATERAL column `alias.column`, from the innermost SELECT
+    /// whose FROM names `alias`: None when that names an ordinary relation, or none does.
+    fn lateral_column(&self, alias: &str, column: &str) -> Option<ast::Expr> {
+        for scope in self.lateral_scopes.borrow().iter().rev() {
+            if let Some(expr) = scope.columns.get(&(alias.to_string(), column.to_string())) {
+                return Some(expr.clone());
+            }
+            if scope.names.contains(alias) {
+                return None;
+            }
+        }
+        None
     }
 
     /// Build a `QualifiedName` from a PG `RangeVar`, preserving schema qualifier.
@@ -1558,55 +1604,60 @@ impl PostgreSQLTranslator {
             });
         }
 
-        // Regular SELECT — translate FROM, columns, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT
-        let from_clause = if !select.from_clause.is_empty() {
-            Some(self.translate_from_items(&select.from_clause)?)
-        } else {
-            None
-        };
+        // Regular SELECT — translate FROM, columns, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, in
+        // a LATERAL scope of its own. The WITH clause, translated after it, is outside: a CTE does
+        // not see this SELECT's FROM items.
+        let (select_body, order_by, limit) = self.in_select_scope(|| {
+            let from_clause = if !select.from_clause.is_empty() {
+                Some(self.translate_from_items(&select.from_clause)?)
+            } else {
+                None
+            };
 
-        let target_list = &select.target_list;
-        if target_list.is_empty() {
-            return Err(ParseError::ParseError(
-                "SELECT requires at least one column or expression".to_string(),
-            ));
-        }
+            let target_list = &select.target_list;
+            if target_list.is_empty() {
+                return Err(ParseError::ParseError(
+                    "SELECT requires at least one column or expression".to_string(),
+                ));
+            }
 
-        let result_columns = self.translate_target_list(target_list)?;
+            let result_columns = self.translate_target_list(target_list)?;
 
-        let where_clause = if let Some(where_clause) = &select.where_clause {
-            Some(self.translate_expr(where_clause)?)
-        } else {
-            None
-        };
+            let where_clause = if let Some(where_clause) = &select.where_clause {
+                Some(self.translate_expr(where_clause)?)
+            } else {
+                None
+            };
 
-        let order_by = self.translate_order_by(&select.sort_clause)?;
+            let order_by = self.translate_order_by(&select.sort_clause)?;
 
-        let distinctness = if !select.distinct_clause.is_empty() {
-            Some(ast::Distinctness::Distinct)
-        } else {
-            None
-        };
+            let distinctness = if !select.distinct_clause.is_empty() {
+                Some(ast::Distinctness::Distinct)
+            } else {
+                None
+            };
 
-        let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
+            let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
-        let window_clause = self.translate_window_clause(&select.window_clause)?;
+            let window_clause = self.translate_window_clause(&select.window_clause)?;
 
-        let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+            let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
 
-        let one_select = ast::OneSelect::Select {
-            distinctness,
-            columns: result_columns,
-            from: from_clause,
-            where_clause: where_clause.map(Box::new),
-            group_by,
-            window_clause,
-        };
+            let one_select = ast::OneSelect::Select {
+                distinctness,
+                columns: result_columns,
+                from: from_clause,
+                where_clause: where_clause.map(Box::new),
+                group_by,
+                window_clause,
+            };
 
-        let select_body = ast::SelectBody {
-            select: one_select,
-            compounds: vec![],
-        };
+            let select_body = ast::SelectBody {
+                select: one_select,
+                compounds: vec![],
+            };
+            Ok((select_body, order_by, limit))
+        })?;
 
         let with = self.translate_with_clause(&select.with_clause)?;
 
@@ -1714,45 +1765,47 @@ impl PostgreSQLTranslator {
                 "SELECT ... INTO is not allowed here".into(),
             ));
         }
+        // Each leaf in a LATERAL scope of its own (wire review 2 item 6).
+        self.in_select_scope(|| {
+            let from_clause = if !select.from_clause.is_empty() {
+                Some(self.translate_from_items(&select.from_clause)?)
+            } else {
+                None
+            };
 
-        let from_clause = if !select.from_clause.is_empty() {
-            Some(self.translate_from_items(&select.from_clause)?)
-        } else {
-            None
-        };
+            let target_list = &select.target_list;
+            if target_list.is_empty() {
+                return Err(ParseError::ParseError(
+                    "SELECT requires at least one column or expression".to_string(),
+                ));
+            }
 
-        let target_list = &select.target_list;
-        if target_list.is_empty() {
-            return Err(ParseError::ParseError(
-                "SELECT requires at least one column or expression".to_string(),
-            ));
-        }
+            let result_columns = self.translate_target_list(target_list)?;
 
-        let result_columns = self.translate_target_list(target_list)?;
+            let where_clause = if let Some(where_clause) = &select.where_clause {
+                Some(self.translate_expr(where_clause)?)
+            } else {
+                None
+            };
 
-        let where_clause = if let Some(where_clause) = &select.where_clause {
-            Some(self.translate_expr(where_clause)?)
-        } else {
-            None
-        };
+            let distinctness = if !select.distinct_clause.is_empty() {
+                Some(ast::Distinctness::Distinct)
+            } else {
+                None
+            };
 
-        let distinctness = if !select.distinct_clause.is_empty() {
-            Some(ast::Distinctness::Distinct)
-        } else {
-            None
-        };
+            let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
-        let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
+            let window_clause = self.translate_window_clause(&select.window_clause)?;
 
-        let window_clause = self.translate_window_clause(&select.window_clause)?;
-
-        Ok(ast::OneSelect::Select {
-            distinctness,
-            columns: result_columns,
-            from: from_clause,
-            where_clause: where_clause.map(Box::new),
-            group_by,
-            window_clause,
+            Ok(ast::OneSelect::Select {
+                distinctness,
+                columns: result_columns,
+                from: from_clause,
+                where_clause: where_clause.map(Box::new),
+                group_by,
+                window_clause,
+            })
         })
     }
 
@@ -1842,6 +1895,12 @@ impl PostgreSQLTranslator {
             .alias
             .as_ref()
             .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+        self.note_from_name(
+            range_var
+                .alias
+                .as_ref()
+                .map_or(range_var.relname.as_str(), |a| a.aliasname.as_str()),
+        );
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
@@ -1882,6 +1941,7 @@ impl PostgreSQLTranslator {
         if !plain || select.target_list.is_empty() {
             return Err(refuse());
         }
+        let mut columns = Vec::new();
         for (i, target) in select.target_list.iter().enumerate() {
             let Some(Node::ResTarget(rt)) = target.node.as_ref() else {
                 return Err(refuse());
@@ -1892,10 +1952,14 @@ impl PostgreSQLTranslator {
                 _ if !rt.name.is_empty() => rt.name.clone(),
                 _ => return Err(refuse()),
             };
-            self.lateral_columns
-                .borrow_mut()
-                .insert((alias.aliasname.clone(), name), expr);
+            columns.push(((alias.aliasname.clone(), name), expr));
         }
+        // Into the current SELECT's scope; a FROM outside any SELECT (UPDATE ... FROM, DELETE ...
+        // USING) has none, and is refused rather than left reading names nothing maps.
+        let mut scopes = self.lateral_scopes.borrow_mut();
+        let scope = scopes.last_mut().ok_or_else(refuse)?;
+        scope.names.insert(alias.aliasname.clone());
+        scope.columns.extend(columns);
         Ok(())
     }
 
@@ -1922,6 +1986,9 @@ impl PostgreSQLTranslator {
             }
         };
         let select = self.translate_select(select_stmt)?;
+        if let Some(a) = &range_sub.alias {
+            self.note_from_name(&a.aliasname);
+        }
         let alias = range_sub
             .alias
             .as_ref()
@@ -1997,6 +2064,12 @@ impl PostgreSQLTranslator {
             .alias
             .as_ref()
             .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+        self.note_from_name(
+            range_func
+                .alias
+                .as_ref()
+                .map_or(func_name, |a| a.aliasname.as_str()),
+        );
 
         // PostgreSQL exposes scalar functions in FROM position as one-row,
         // one-column tables (clients issue `SELECT * FROM current_schema()`),
@@ -2413,23 +2486,17 @@ impl PostgreSQLTranslator {
                                             ast::Name::from_string(parts[2].clone()),
                                         ))
                                     }
-                                    2 if self
-                                        .lateral_columns
-                                        .borrow()
-                                        .contains_key(&(parts[0].clone(), parts[1].clone())) =>
-                                    {
-                                        let inlined = self.lateral_columns.borrow()
-                                            [&(parts[0].clone(), parts[1].clone())]
-                                            .clone();
-                                        Ok(ast::Expr::Parenthesized(vec![Box::new(inlined)]))
-                                    }
-                                    2 => {
+                                    2 => match self.lateral_column(&parts[0], &parts[1]) {
+                                        // An inlined LATERAL column (see `inline_lateral`).
+                                        Some(inlined) => {
+                                            Ok(ast::Expr::Parenthesized(vec![Box::new(inlined)]))
+                                        }
                                         // table.column
-                                        Ok(ast::Expr::Qualified(
+                                        None => Ok(ast::Expr::Qualified(
                                             ast::Name::from_string(parts[0].clone()),
                                             ast::Name::from_string(parts[1].clone()),
-                                        ))
-                                    }
+                                        )),
+                                    },
                                     _ => {
                                         Ok(ast::Expr::Id(ast::Name::from_string(parts[0].clone())))
                                     }
