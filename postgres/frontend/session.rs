@@ -9,8 +9,8 @@ use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_checkpoint, is_comment_on, is_refresh_matview, try_extract_branch_call,
     try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
-    try_extract_show, PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgSetStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
+    try_extract_show, PgBranchArg, PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -135,7 +135,10 @@ impl PgConnection {
 }
 
 /// The branch function call `sql` is, if it is one (see [`PgBranchCall`]). A statement whose text
-/// does not contain the branch-function prefix, in any case, is not parsed.
+/// does not contain the branch-function prefix, in any case, is not parsed. One that does is read
+/// by [`fast_branch_call`], the server's fast path (DECISIONS L5: a branch call reaches the engine
+/// with no libpg_query call); a form it does not cover — a comment, an escape or dollar-quoted
+/// string, a second argument, a quoted name — is parsed by libpg_query, which then decides.
 pub fn branch_call(sql: &str) -> Option<PgBranchCall> {
     let prefix = BRANCH_FUNCTION_PREFIX.as_bytes();
     if !sql
@@ -145,8 +148,124 @@ pub fn branch_call(sql: &str) -> Option<PgBranchCall> {
     {
         return None;
     }
+    if let Some(call) = fast_branch_call(sql) {
+        return Some(call);
+    }
     let parsed = turso_pg_parser::parse(sql).ok()?;
     try_extract_branch_call(&parsed)
+}
+
+/// The common forms of a branch call, read byte by byte with no allocation but the call itself:
+/// `SELECT turso_branch_<op>(<arg>?)` with an optional trailing `;`, where `<arg>` is a standard
+/// string literal (`''` for a quote; a backslash is an ordinary character, as PostgreSQL reads one
+/// with standard_conforming_strings on) or a `$n` parameter, either optionally cast with
+/// `::<type>` (the cast is ignored, as [`try_extract_branch_call`] ignores it). Keywords and the
+/// function name in any case; PostgreSQL's whitespace (space, tab, newline, carriage return, form
+/// feed, vertical tab) anywhere a token boundary allows it. `None` means only "not one of these
+/// forms": the caller asks libpg_query. Whatever this returns, [`try_extract_branch_call`] returns
+/// for the same statement (pinned by a differential test over a corpus).
+fn fast_branch_call(sql: &str) -> Option<PgBranchCall> {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let ws = |i: &mut usize| {
+        while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b) {
+            *i += 1;
+        }
+    };
+    // An identifier or keyword: [A-Za-z_][A-Za-z0-9_]*, ended by a byte that cannot continue one
+    // (PostgreSQL identifiers also take '$' and non-ASCII bytes after the first: those end the
+    // fast path, not the identifier).
+    let word = |i: &mut usize| -> Option<std::ops::Range<usize>> {
+        let start = *i;
+        if *i >= b.len() || !(b[*i].is_ascii_alphabetic() || b[*i] == b'_') {
+            return None;
+        }
+        while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'_') {
+            *i += 1;
+        }
+        if *i < b.len() && (b[*i] == b'$' || b[*i] >= 0x80) {
+            return None;
+        }
+        Some(start..*i)
+    };
+    ws(&mut i);
+    let select = word(&mut i)?;
+    if !b[select].eq_ignore_ascii_case(b"select") {
+        return None;
+    }
+    let before_name = i;
+    ws(&mut i);
+    if i == before_name {
+        return None;
+    }
+    let name = word(&mut i)?;
+    let function = sql[name].to_ascii_lowercase();
+    if !function.starts_with(BRANCH_FUNCTION_PREFIX) {
+        return None;
+    }
+    ws(&mut i);
+    if b.get(i) != Some(&b'(') {
+        return None;
+    }
+    i += 1;
+    ws(&mut i);
+    let mut args = Vec::new();
+    if b.get(i) != Some(&b')') {
+        let arg = match b.get(i)? {
+            b'\'' => {
+                i += 1;
+                let mut text = String::new();
+                let mut run = i;
+                loop {
+                    let q = i + b[i..].iter().position(|&c| c == b'\'')?;
+                    if b.get(q + 1) == Some(&b'\'') {
+                        text.push_str(&sql[run..q + 1]);
+                        i = q + 2;
+                        run = i;
+                    } else {
+                        text.push_str(&sql[run..q]);
+                        i = q + 1;
+                        break;
+                    }
+                }
+                PgBranchArg::Text(text)
+            }
+            b'$' => {
+                i += 1;
+                let start = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let n: usize = sql[start..i].parse().ok()?;
+                if n == 0 || (i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_')) {
+                    return None;
+                }
+                PgBranchArg::Param(n)
+            }
+            _ => return None,
+        };
+        ws(&mut i);
+        if b[i..].starts_with(b"::") {
+            i += 2;
+            ws(&mut i);
+            word(&mut i)?;
+            ws(&mut i);
+        }
+        args.push(arg);
+    }
+    if b.get(i) != Some(&b')') {
+        return None;
+    }
+    i += 1;
+    ws(&mut i);
+    if b.get(i) == Some(&b';') {
+        i += 1;
+        ws(&mut i);
+    }
+    if i != b.len() {
+        return None;
+    }
+    Some(PgBranchCall { function, args })
 }
 
 /// Attach every PostgreSQL schema database file (`turso-postgres-schema-<name>.db`) beside
@@ -595,4 +714,157 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(!rows.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slow(sql: &str) -> Option<PgBranchCall> {
+        try_extract_branch_call(&turso_pg_parser::parse(sql).ok()?)
+    }
+
+    fn call(function: &str, args: Vec<PgBranchArg>) -> Option<PgBranchCall> {
+        Some(PgBranchCall {
+            function: function.to_string(),
+            args,
+        })
+    }
+
+    /// The forms clients send are read on the fast path, to exactly the call they are.
+    #[test]
+    fn the_fast_path_reads_the_forms_clients_send() {
+        use PgBranchArg::{Param, Text};
+        let create = "turso_branch_create";
+        let cases = [
+            (
+                "SELECT turso_branch_create('b_1_0_17')",
+                call(create, vec![Text("b_1_0_17".into())]),
+            ),
+            (
+                "select turso_branch_switch('b');",
+                call("turso_branch_switch", vec![Text("b".into())]),
+            ),
+            (
+                "SELECT turso_branch_current()",
+                call("turso_branch_current", vec![]),
+            ),
+            (
+                "SELECT TURSO_BRANCH_DELETE ( 'b' ) ;",
+                call("turso_branch_delete", vec![Text("b".into())]),
+            ),
+            (
+                "SELECT turso_branch_create($1)",
+                call(create, vec![Param(1)]),
+            ),
+            (
+                "SELECT turso_branch_create($12::text)",
+                call(create, vec![Param(12)]),
+            ),
+            (
+                "SELECT turso_branch_create('it''s'::varchar)",
+                call(create, vec![Text("it's".into())]),
+            ),
+            (
+                "SELECT turso_branch_create('a\\b')",
+                call(create, vec![Text("a\\b".into())]),
+            ),
+            (
+                "SELECT turso_branch_create('')",
+                call(create, vec![Text(String::new())]),
+            ),
+            (
+                "\tSELECT\nturso_branch_create(\r'x'\x0b)\x0c;\n",
+                call(create, vec![Text("x".into())]),
+            ),
+            (
+                "SELECT turso_branch_create('é ü')",
+                call(create, vec![Text("é ü".into())]),
+            ),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(fast_branch_call(sql), want, "fast path, {sql:?}");
+            assert_eq!(branch_call(sql), want, "branch_call, {sql:?}");
+        }
+    }
+
+    /// Differential: whatever the fast path reads, libpg_query reads the same; every form it does
+    /// not read still reaches the same answer through libpg_query. The corpus crosses keyword case,
+    /// spacing, argument forms, casts, terminators and trailing junk.
+    #[test]
+    fn the_fast_path_agrees_with_libpg_query() {
+        let selects = ["SELECT", "select", "SeLeCt"];
+        let names = [
+            "turso_branch_create",
+            "TURSO_BRANCH_SWITCH",
+            "turso_branch_current",
+            "turso_branch_nope",
+            "\"turso_branch_create\"",
+            "public.turso_branch_create",
+            "turso_branch_create$x",
+            "turso_branchx",
+        ];
+        let gaps = ["", " ", "  ", "\n", "\t \r\n"];
+        let args = [
+            "",
+            "'b'",
+            "'it''s'",
+            "'a\\b'",
+            "''",
+            "''''",
+            "'x'::text",
+            "'x' :: text",
+            "'x'::text[]",
+            "'x'::character varying",
+            "$1",
+            "$1::text",
+            "$0",
+            "$1x",
+            "E'x'",
+            "$$x$$",
+            "'a'\n'b'",
+            "'a' 'b'",
+            "'a', 'b'",
+            "NULL",
+            "true",
+            "1",
+            "'a' || 'b'",
+            "'é'",
+        ];
+        let ends = [
+            "",
+            ";",
+            " ; ",
+            ";;",
+            "; SELECT 1",
+            " FROM t",
+            " -- c",
+            "/* c */",
+            ")",
+        ];
+        let mut fast_hits = 0;
+        let mut n = 0;
+        for sel in selects {
+            for name in names {
+                for g in gaps {
+                    for arg in args {
+                        for end in ends {
+                            let sql = format!("{sel} {name}{g}({g}{arg}{g}){end}");
+                            n += 1;
+                            let slow = slow(&sql);
+                            if let Some(fast) = fast_branch_call(&sql) {
+                                fast_hits += 1;
+                                assert_eq!(Some(fast), slow, "{sql:?}");
+                            }
+                            assert_eq!(branch_call(&sql), slow, "{sql:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            fast_hits > n / 20,
+            "the fast path read only {fast_hits} of {n}"
+        );
+    }
 }

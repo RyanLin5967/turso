@@ -434,6 +434,12 @@ impl Session {
     /// Every statement of one simple-protocol query, in order, up to and including the first that
     /// fails.
     fn simple(&self, query: &str) -> Vec<Response> {
+        // A query that is one branch call goes straight to the engine: no split, no parse (L5).
+        if let Some(call) = branch_call(query) {
+            return vec![self
+                .run(query, Some(call), None, &Format::UnifiedText)
+                .unwrap_or_else(Response::Error)];
+        }
         let statements = match split_statements(query) {
             Ok(s) => s,
             Err(e) => return vec![Response::Error(engine_info(&e))],
@@ -456,6 +462,17 @@ impl Session {
     fn statement(
         &self,
         sql: &str,
+        portal: Option<&Portal<String>>,
+        format: &Format,
+    ) -> SqlResult<Response> {
+        self.run(sql, branch_call(sql), portal, format)
+    }
+
+    /// [`Session::statement`] with the statement's branch call, if it is one, already read.
+    fn run(
+        &self,
+        sql: &str,
+        call: Option<PgBranchCall>,
         portal: Option<&Portal<String>>,
         format: &Format,
     ) -> SqlResult<Response> {
@@ -491,7 +508,7 @@ impl Session {
             TxVerb::Rollback if !in_tx => return Ok(Response::Execution(Tag::new("ROLLBACK"))),
             _ => {}
         }
-        let result = match branch_call(sql) {
+        let result = match call {
             Some(call) => self.branch(&mut st, &conn, &call, portal, format),
             None => {
                 drop(st);
