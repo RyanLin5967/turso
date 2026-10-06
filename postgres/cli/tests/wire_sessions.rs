@@ -2779,3 +2779,32 @@ fn a_deferred_foreign_key_is_checked_at_commit() {
         a.q("COMMIT").ok("the deferred check passes at COMMIT");
     }
 }
+
+/// A session that switched onto a branch holds it as one that started on it does: another
+/// session's delete of it is 55006 once the wait for its release runs out, and the switched
+/// session's writes still land on it. No test reached the switch path's claim, and removing it
+/// survived every test, while the engine deletes a branch a connection is open on (wire review 3
+/// item 7).
+#[test]
+fn deleting_a_branch_another_session_switched_onto_is_refused_with_55006() {
+    let dir = Scratch::new("delswitched");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('x')").ok("create");
+    let mut b = server.connect();
+    b.q("SELECT turso_branch_switch('x')")
+        .ok("b switches onto x");
+    let e = a.q("SELECT turso_branch_delete('x')").err("delete under b");
+    assert_eq!(e.code, "55006", "{e:?}");
+    b.q("UPDATE t SET v = 'b' WHERE id = 1")
+        .ok("b's branch is still there");
+    assert_eq!(
+        b.q("SELECT v FROM t WHERE id = 1")
+            .single("b reads its write"),
+        "b"
+    );
+    assert_eq!(b.q("SELECT turso_branch_current()").single("current"), "x");
+    b.q("SELECT turso_branch_switch('main')").ok("b leaves");
+    a.q("SELECT turso_branch_delete('x')")
+        .ok("delete once b left");
+}
