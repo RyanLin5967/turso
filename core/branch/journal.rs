@@ -2028,6 +2028,18 @@ impl Journal {
         self.pending_class = self.pending_class.max(class);
     }
 
+    /// The class a flight taken now for a wait in `class` would sync in: at least this journal's
+    /// own, and what is buffered raised it to (`pending_class`).
+    fn flight_class(&self, class: SyncClass) -> SyncClass {
+        class.max(self.sync).max(self.pending_class)
+    }
+
+    /// Whether a flight taken now for a wait in `class` would sync (engine review 9 #8: such a
+    /// flight is not taken while a checkpoint syncs the arena).
+    pub(crate) fn flight_syncs(&self, class: SyncClass) -> bool {
+        self.flight_class(class).syncs()
+    }
+
     /// Take everything buffered as one [`Flight`], for a group flush written outside the store
     /// mutex (fastest-engine M1 item 2; gc 389b474b4's `take_flight`). The log region is reserved
     /// here, so the next flight goes after it; the caller guarantees no other flight is in the air
@@ -2047,7 +2059,7 @@ impl Journal {
         let fail = std::mem::take(&mut self.fail_next_write);
         let fail_confirm = std::mem::take(&mut self.fail_next_confirm);
         self.check_live()?;
-        let class = class.max(self.sync).max(self.pending_class);
+        let class = self.flight_class(class);
         // A raised flight in a D0 store makes its records durable where D0's never are: the slots
         // they name are marked, so a later D0 free of one waits for a sync (review 5 #18). Marked at
         // the take, whether or not the flight then succeeds: holding a free longer is safe.

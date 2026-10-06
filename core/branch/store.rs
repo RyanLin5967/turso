@@ -398,6 +398,12 @@ struct GroupState {
     /// group flight starts until its install, so the bytes it copies stay the log's last ones.
     /// (A synchronous flush under the store mutex still may: the install copies what it wrote.)
     cutting: bool,
+    /// A fuzzy checkpoint of a D0 store whose log rewrites sync is syncing the arena, outside any
+    /// flight (`BranchStore::settle_arena`; engine review 9 #8): it cleared the arena's dirty mark,
+    /// so no flight that syncs may be taken until it lands — such a flight would find the arena
+    /// clean and land its records durable over slots not yet synced. Flights that only write (D0's
+    /// own) go on; so does the confirmation writer.
+    arena_syncing: bool,
     /// Observation only (fastest-engine M2): flights led outside the mutex, flushes taken under
     /// it, operations that waited, those already durable when they looked, upgrade flights, and
     /// the waits each flight released.
@@ -480,11 +486,18 @@ impl Group {
         self.cv.wait(g).unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Wait until no flight is in the air. Called under the store mutex (so none can start); a
-    /// flight's leader needs only this group's lock to land, so this cannot deadlock.
+    /// Wait until no flight is in the air, nor a checkpoint's arena sync (`arena_syncing`). Called
+    /// under the store mutex (so none can start); a flight's leader, and that sync, need only this
+    /// group's lock to land, so this cannot deadlock.
     fn quiesce(&self) -> std::sync::MutexGuard<'_, GroupState> {
+        self.quiesce_for(true)
+    }
+
+    /// `quiesce`, for a flush under the store mutex whose flight `syncs` or not: one that only
+    /// writes does not wait for a checkpoint's arena sync (engine review 9 #8).
+    fn quiesce_for(&self, syncs: bool) -> std::sync::MutexGuard<'_, GroupState> {
         let mut g = self.lock();
-        while g.flushing {
+        while g.flushing || (syncs && g.arena_syncing) {
             g = self.wait(g);
         }
         g
@@ -2257,11 +2270,14 @@ struct Captured {
     /// durable in `settle_class` (review 4 #1, review 6 #3 (b)); the deferred frees mature at it.
     deferred_lsn: u64,
     /// The class a fuzzy checkpoint waits for `deferred_lsn` in before its commit (review 6 #3 (b)):
-    /// the journal's own class (what an operation the capture covers was acknowledged in), raised
-    /// to Fsync when the log's rewrites sync, so a flight of the group (an
-    /// upgrade one when nothing is buffered, which takes the dirty arena) syncs every slot a D0
-    /// flight left unsynced before the catalog names it.
+    /// the journal's own class, what an operation the capture covers was acknowledged in. In a D1
+    /// or D2 store the flights that made those records durable synced the slots they name.
     settle_class: SyncClass,
+    /// A D0 store whose log rewrites sync (engine review 9 #8): its flights sync nothing, so once
+    /// what the capture covers is written the checkpoint syncs the arena itself, under group
+    /// exclusion and only if a slot was written since its last sync (`BranchStore::settle_arena`),
+    /// before the catalog commit names the slots. The log is not synced: the cut supersedes it.
+    settle_arena: bool,
     /// The store's fail-stop flag (shared with its journal and group): read just before the catalog
     /// commit, and set when the checkpoint's arena sync or its commit fails (review 4 #1).
     fail_stop: Arc<AtomicBool>,
@@ -2435,18 +2451,27 @@ fn run_flight(
         // a record still buffered or in the air at the capture belongs to an operation whose
         // caller may yet be told it failed, and then the catalog must not hold it. Waited for
         // holding no lock, but the store mutex for the moment it takes to lead a flight if none
-        // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once. The
-        // test hook pauses the flight this wait leads, once taken (`HOLD_FLIGHT_TAKEN`).
+        // is up. Mutant `commit_unsettled` (test builds only): the catalog commits at once. In a
+        // raised D0 store the arena is then synced alone (`settle_arena`; engine review 9 #8). The
+        // test hook pauses the step that syncs the slots, once taken (`HOLD_FLIGHT_TAKEN`): that
+        // arena sync, or else the flight this wait leads.
         if !fe_mutant("commit_unsettled") {
             #[cfg(test)]
             let syncs = thread_syncs();
             let settled = BranchStore::wait_durable_on(
                 &inner,
                 &group,
-                Some(&*hold),
+                (!cap.settle_arena).then_some(&*hold),
                 cap.deferred_lsn,
                 cap.settle_class,
-            );
+            )
+            .and_then(|()| {
+                if cap.settle_arena {
+                    BranchStore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync)
+                } else {
+                    Ok(())
+                }
+            });
             #[cfg(test)]
             {
                 group.lock().settle_syncs += thread_syncs() - syncs;
@@ -3670,7 +3695,11 @@ impl BranchStore {
     /// flight in the air goes first (its frames precede these in the log); its leader needs only
     /// the group's lock to land, never the store mutex, so waiting for it here cannot deadlock.
     fn flush_locked(&self, inner: &mut StoreInner, class: SyncClass) -> Result<()> {
-        let mut g = self.group.quiesce();
+        // A flight that only writes (D0's) need not wait for a checkpoint's arena sync, and must
+        // not: this holds the store mutex (engine review 9 #8). Mutant `arena_sync_ungated`.
+        let syncs = !fe_mutant("arena_sync_ungated")
+            && inner.journal.as_ref().is_some_and(|j| j.flight_syncs(class));
+        let mut g = self.group.quiesce_for(syncs);
         if self.group.poisoned() {
             return Err(group_poisoned());
         }
@@ -3736,6 +3765,12 @@ impl BranchStore {
         }
         let need = class_index(class);
         let mut first = true;
+        // Whether the flight this would lead syncs, so must not be taken while a checkpoint syncs
+        // the arena (`GroupState::arena_syncing`; engine review 9 #8): one in a syncing class
+        // does; one for a D0 wait does when what is buffered raised it, found at the take. Mutant
+        // `arena_sync_ungated` (test builds only): flights ignore it.
+        let ungated = fe_mutant("arena_sync_ungated");
+        let mut gated = need > 0 && !ungated;
         loop {
             {
                 let mut g = group.lock();
@@ -3752,6 +3787,7 @@ impl BranchStore {
                     if group.poisoned() {
                         return Err(group_poisoned());
                     }
+                    let blocked = g.flushing || g.cutting || (gated && g.arena_syncing);
                     // An ordered flight carries these bytes and a trunk commit's WAL flush is
                     // about to make them durable (lead review 1 item 6): waited for, briefly,
                     // rather than led past with an upgrade flight, a second flusher.
@@ -3766,12 +3802,13 @@ impl BranchStore {
                             && g.pending_full.is_some_and(|p| p >= lsn)
                             && !g.flushing
                             && !g.cutting
+                            && !(gated && g.arena_syncing)
                         {
                             break;
                         }
                         continue;
                     }
-                    if !g.flushing && !g.cutting {
+                    if !blocked {
                         break;
                     }
                     first = false;
@@ -3793,6 +3830,13 @@ impl BranchStore {
                     return Err(group_poisoned());
                 }
                 if g.flushing || g.cutting {
+                    continue;
+                }
+                if g.arena_syncing
+                    && !ungated
+                    && inner.journal.as_ref().is_some_and(|j| j.flight_syncs(class))
+                {
+                    gated = true;
                     continue;
                 }
                 // Written already in a weaker class: only an upgrade can make it durable in `class`.
@@ -3835,6 +3879,73 @@ impl BranchStore {
             group.land(end, flight_class, true, confirm);
             kill_point("flight.landed");
         }
+    }
+
+    /// A fuzzy checkpoint's arena sync in a D0 store whose log rewrites sync, once what its capture
+    /// covers is written (engine review 9 #8; `Captured::settle_arena`): the store's flights sync
+    /// nothing, so the slots those records name are made to reach the device here, before the
+    /// catalog commit names them, and the commit's flush makes them durable with it (ruling
+    /// 85a032f01: a plain fsync, as `checkpoint_write`'s). The arena alone: the log's bytes are
+    /// about to be superseded by the cut. Nothing is synced when no slot was written since the
+    /// arena's last sync. Under group exclusion: taken with no flight in the air, and while it runs
+    /// no flight that syncs is taken (`GroupState::arena_syncing`); D0's own flights, which only
+    /// write, go on. It holds the store mutex only to take the arena's dirty mark. A failed sync
+    /// fail-stops the store, as a failed flight does (review 3 #5); a descriptor that cannot be
+    /// duplicated leaves the mark set, and the checkpoint fails for a later one to retry. `hold` is
+    /// the test hook it pauses at once taken (`HOLD_FLIGHT_TAKEN`).
+    fn settle_arena(store: &StoreMutex, group: &Group, hold: &AtomicU8, fail: bool) -> Result<()> {
+        #[cfg(not(test))]
+        let _ = hold;
+        let file = loop {
+            {
+                let mut g = group.lock();
+                while g.flushing || g.arena_syncing {
+                    if group.poisoned() {
+                        return Err(group_poisoned());
+                    }
+                    g = group.wait(g);
+                }
+            }
+            let mut inner = store.lock();
+            let mut g = group.lock();
+            if group.poisoned() {
+                return Err(group_poisoned());
+            }
+            if g.flushing || g.arena_syncing {
+                continue;
+            }
+            let Some(arena) = inner.arena.as_mut() else {
+                return Ok(());
+            };
+            match arena.take_dirty_file()? {
+                Some(file) => {
+                    g.arena_syncing = true;
+                    break file;
+                }
+                None => return Ok(()),
+            }
+        };
+        #[cfg(test)]
+        pause_at(Some(hold), HOLD_FLIGHT_TAKEN);
+        let synced = if fail {
+            Err(LimboError::InternalError(
+                "failpoint: the checkpoint's arena sync failed".to_string(),
+            ))
+        } else {
+            super::journal::fsync_file(&file, SyncClass::Fsync)
+        };
+        let mut g = group.lock();
+        g.arena_syncing = false;
+        // Mutant `checkpoint_sync_error_kept` (test builds only): as before review 3 #5, the store
+        // goes on.
+        if synced.is_err() && !fe_mutant("checkpoint_sync_error_kept") {
+            group.fail(&mut g);
+        } else {
+            group.cv.notify_all();
+        }
+        drop(g);
+        drop(file);
+        synced
     }
 
     /// Return the deferred frees a flight has covered (called under the store mutex).
@@ -5209,10 +5320,11 @@ impl BranchStore {
     /// them, gets the error — exactly when it holds records the drain could have lost: written and
     /// not yet drained by a full flush in a class that claims durability (on Apple fsync(2) drains
     /// nothing, elsewhere it does), an ordered flight, one waiting for this very flush
-    /// (`pending_full`), or a flight in the air. With nothing at risk (a D2 store whose every
-    /// flight was F_FULLFSYNCed), it goes on. Mutants (test builds only): `no_wal_fail_stop` (it
-    /// never stops, as before review 6 #2) and `drain_failure_ignores_risk` (it always stops, as
-    /// before engine review 9 #5 in D2).
+    /// (`pending_full`), or a flight in the air, a fuzzy checkpoint's arena sync included (engine
+    /// review 9 #8: the flight it replaced counted here). With nothing at risk (a D2 store whose
+    /// every flight was F_FULLFSYNCed), it goes on. Mutants (test builds only): `no_wal_fail_stop`
+    /// (it never stops, as before review 6 #2) and `drain_failure_ignores_risk` (it always stops,
+    /// as before engine review 9 #5 in D2).
     pub(crate) fn trunk_wal_sync_failed(&self, drains: bool) {
         if fe_mutant("no_wal_fail_stop") {
             return;
@@ -5227,7 +5339,8 @@ impl BranchStore {
         let at_risk = (self.class.syncs() && g.durable[0] > drained)
             || g.ordered > full
             || g.pending_full.is_some()
-            || g.flushing;
+            || g.flushing
+            || g.arena_syncing;
         if !(drains && at_risk) && !fe_mutant("drain_failure_ignores_risk") {
             return;
         }
@@ -5493,6 +5606,9 @@ impl BranchStore {
     /// trunk commit in flight; the flight it leads is marked pending until its WAL is synced.
     fn order_for_trunk(&self, lsn: u64) -> Result<()> {
         let full = class_index(SyncClass::FullFsync);
+        // An ordered flight barriers the arena: not taken while a checkpoint syncs it (engine
+        // review 9 #8). Mutant `arena_sync_ungated`.
+        let gated = !fe_mutant("arena_sync_ungated");
         loop {
             {
                 let mut g = self.group.lock();
@@ -5503,7 +5619,7 @@ impl BranchStore {
                     if self.group.poisoned() {
                         return Err(group_poisoned());
                     }
-                    if !g.flushing && !g.cutting {
+                    if !g.flushing && !g.cutting && !(gated && g.arena_syncing) {
                         break;
                     }
                     g = self.group.wait(g);
@@ -5518,7 +5634,7 @@ impl BranchStore {
                 if self.group.poisoned() {
                     return Err(group_poisoned());
                 }
-                if g.flushing || g.cutting {
+                if g.flushing || g.cutting || (gated && g.arena_syncing) {
                     continue;
                 }
                 let upgrade = g.durable[0] >= lsn;
@@ -7499,15 +7615,22 @@ impl StoreInner {
         // attempt, never O(dirty).
         // A fuzzy checkpoint's slots are made durable by the group's own flights, which its wait
         // before the commit waits for or leads in `settle_class` (review 6 #3 (b)): it syncs no
-        // arena outside the group, beside a flight's sync of the same file, and dups no handle
-        // under this mutex. A sharp one runs with no flight in the air and the store mutex held,
-        // so it syncs what no flight synced (D0 writes under a raised log) itself, and only if a
-        // slot was written since the arena's last sync (lead review 1 item 7(4)). Mutant
-        // `checkpoint_own_arena_sync` (test builds only): the fuzzy one takes its handle too and
-        // waits in the log's class, as before.
+        // arena beside a flight's sync of the same file, and dups no handle under this mutex. In a
+        // D0 store whose rewrites sync, whose flights sync nothing, it then syncs the arena alone,
+        // under group exclusion (`settle_arena`; engine review 9 #8). A sharp one runs with no
+        // flight in the air and the store mutex held, so it syncs what no flight synced (D0 writes
+        // under a raised log) itself. Either syncs only if a slot was written since the arena's
+        // last sync (lead review 1 item 7(4)). Mutant `checkpoint_own_arena_sync` (test builds
+        // only): the fuzzy one takes its handle too and waits in the log's class, as before
+        // review 6 #3 (b). Mutant `checkpoint_settles_by_flight` (test builds only): a raised D0
+        // one waits in Fsync instead, leading a flight of the group that syncs the arena and the
+        // log, as before engine review 9 #8.
         let rewrite_syncs = journal.rewrite_class().syncs();
         let own_sync = !fuzzy || fe_mutant("checkpoint_own_arena_sync");
-        let settle_class = if rewrite_syncs && !own_sync {
+        let raised_d0 = rewrite_syncs && !own_sync && !journal.sync_class().syncs();
+        let by_flight = raised_d0 && fe_mutant("checkpoint_settles_by_flight");
+        let settle_arena = raised_d0 && !by_flight;
+        let settle_class = if by_flight {
             journal.sync_class().max(SyncClass::Fsync)
         } else {
             journal.sync_class()
@@ -7642,7 +7765,7 @@ impl StoreInner {
             );
         }
         cat.flight = true;
-        let fail_arena_sync = arena_file.is_some()
+        let fail_arena_sync = (arena_file.is_some() || settle_arena)
             && self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some();
         Ok(Box::new(Captured {
             generation,
@@ -7665,6 +7788,7 @@ impl StoreInner {
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: self.journal.as_ref().map_or(self.sync, Journal::rewrite_class),
             settle_class,
+            settle_arena,
             fail_stop: self.fail_stop.clone(),
             // fastest-engine mutant `names_taken_at_capture` (test builds only): as before review
             // C-F1, the capture takes the names out of the index.

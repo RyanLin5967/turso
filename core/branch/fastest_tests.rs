@@ -4006,8 +4006,12 @@ fn a_fuzzy_checkpoint_takes_no_arena_handle_of_its_own() {
 /// Review 6 #3 (b): in a D0 store whose log was raised (a trunk commit under a synchronous trunk
 /// made its pre-image durable), the slots a fuzzy checkpoint captures were written by D0 flights,
 /// which sync nothing; the catalog commit must not name them before they are on the device. They
-/// are synced by a flight of the group, in Fsync, before the commit: at the commit the arena holds
-/// no write the group has not synced.
+/// are synced before the commit, under the group's exclusion: at the commit the arena holds no
+/// write the group has not synced.
+///
+/// FLAGGED TEST EDIT (doc only; engine review 9 #8): this said a flight of the group in Fsync
+/// syncs them. Since engine review 9 #8 the checkpoint syncs the arena alone, under group
+/// exclusion (`settle_arena`). No assertion changed.
 #[test]
 fn a_raised_d0_fuzzy_checkpoint_syncs_its_slots_through_the_group_before_its_commit() {
     let _s = serial();
@@ -4129,6 +4133,57 @@ fn a_d0_create_does_not_wait_for_a_raised_checkpoints_arena_sync() {
         created,
         Ok(true),
         "a D0 create waited for the checkpoint's settle sync (or failed)"
+    );
+}
+
+/// Engine review 9 #8: while a raised-D0 checkpoint syncs the arena outside any flight, no flight
+/// that syncs is taken. The arena's dirty mark is cleared by then, so such a flight would sync the
+/// log alone and land its records durable over slots whose sync has not returned. Held at that
+/// arena sync, a wait for Fsync durability does not return; once released, it does. Mutant
+/// `arena_sync_ungated`.
+#[test]
+fn a_syncing_flight_waits_for_a_raised_checkpoints_arena_sync() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, _trunk, _keep) = raised_d0_with_an_unsynced_slot(dir.path());
+    db.branch_checkpoint_hold(super::store::HOLD_FLIGHT_TAKEN);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    eventually("the checkpoint never took its arena sync", || {
+        db.branch_checkpoint_held() == super::store::HOLD_FLIGHT_TAKEN | super::store::HOLD_ARRIVED
+    });
+    let lsn = db.branches.log_lsn_for_test();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let db2 = db.clone();
+    let waiter = std::thread::spawn(move || {
+        let _ = tx.send(db2.branches.wait_durable(lsn, SyncClass::Fsync).is_ok());
+    });
+    let early = rx.recv_timeout(std::time::Duration::from_millis(300));
+    db.branch_checkpoint_hold(0);
+    let late = rx.recv_timeout(std::time::Duration::from_secs(10));
+    waiter.join().unwrap();
+    db.branch_checkpoint_wait();
+    assert_eq!(
+        early,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+        "a flight that syncs landed while the checkpoint's arena sync was in progress"
+    );
+    assert_eq!(late, Ok(true), "the wait for Fsync did not return once the arena sync landed");
+}
+
+/// Engine review 9 #8 (review 3 #5): the arena sync a raised-D0 fuzzy checkpoint makes itself
+/// fail-stops the store when it fails, as a failed flight's does: a later sync of the file may
+/// report success for pages this one lost. Mutant `checkpoint_sync_error_kept`.
+#[test]
+fn a_failed_arena_sync_in_a_raised_d0_fuzzy_checkpoint_fail_stops() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, _keep) = raised_d0_with_an_unsynced_slot(dir.path());
+    db.branch_failpoint(Some(BranchFailpoint::ArenaSyncFails));
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    assert_fail_stopped(
+        trunk.fork_branch().map(|x| x.into_id()),
+        "the next fork after a checkpoint's arena sync failed",
     );
 }
 
