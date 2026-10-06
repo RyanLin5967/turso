@@ -586,7 +586,9 @@ impl Session {
         if st.implicit || st.aborted || TxVerb::of(sql) != TxVerb::Other {
             return Ok(());
         }
-        if pipeline && call.is_some() {
+        // A CHECKPOINT that would open the block runs at top level instead, as the full checkpoint
+        // (an in-block one is only a passive attempt, see `checkpoint`).
+        if (pipeline && call.is_some()) || is_checkpoint(sql) {
             return Ok(());
         }
         let conn = self.current(&mut st)?;
