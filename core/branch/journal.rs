@@ -4592,4 +4592,111 @@ mod format_tests {
         };
         assert!(!refused.contains("snapshot"), "a catalog store's refusal names a snapshot: {refused}");
     }
+
+    // ---- engine review 7 #1 and the arena truncation clause ----
+
+    /// Whether the log holds a whole flight tagged synced, and one tagged not synced, as a scan
+    /// reads them.
+    fn end_tags(files: &BranchFiles) -> (bool, bool) {
+        let scanned = Journal::scan_as(files, SyncClass::Fsync, FORMAT_VERSION).unwrap().expect("state");
+        match scanned.end {
+            End::Keep { synced_end, unsynced_end, .. } => (synced_end, unsynced_end),
+            End::Reset => (false, false),
+        }
+    }
+
+    /// Engine review 7 #1, and the arena truncation clause ("recovery truncates the log at the first
+    /// dropped or invalid record and makes that durable — ftruncate, F_FULLFSYNC of the log and of
+    /// its directory — before the next append"): a log that D1 or D2 flights were synced into and
+    /// whose tail is torn, reopened in D0, is cut IN PLACE and the cut synced, since the class
+    /// recovery decides for it syncs (the kept flights are tagged synced). Before, the cut ignored
+    /// that class: the durable log was copied into an unsynced temp file renamed over it, with no
+    /// directory sync, and every kept flight retagged unsynced.
+    #[cfg(unix)]
+    #[test]
+    fn a_synced_log_cut_at_a_d0_recovery_is_truncated_in_place_and_made_durable() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Fsync);
+        // A hole in the last flight: it was never acknowledged, and is cut.
+        overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
+        let inode = std::fs::metadata(&files.log).unwrap().ino();
+        let before = super::super::sync_counts();
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        let after = super::super::sync_counts();
+        assert_eq!(forks(&recovered.records), vec![1, 11], "premise: the torn last flight was cut");
+        drop(recovered);
+        let meta = std::fs::metadata(&files.log).unwrap();
+        assert_eq!(meta.ino(), inode, "the cut replaced the log instead of truncating it");
+        assert_eq!(meta.len(), starts[2], "the log was not truncated at the first dropped record");
+        // F_FULLFSYNC is Apple's; elsewhere the full sync is an fsync(2).
+        let full = after.full_fsync - before.full_fsync;
+        let synced = if cfg!(target_vendor = "apple") { full } else { full + after.fsync - before.fsync };
+        assert!(
+            synced >= 2,
+            "the cut was not made durable (a full sync of the log and of its directory) before the next \
+             append: {synced} full syncs"
+        );
+        assert_eq!(end_tags(&files), (true, false), "the cut retagged synced flights as unsynced");
+    }
+
+    /// Engine review 7 #1: a log of D0 flights cut at a D2 recovery keeps them tagged unsynced, so
+    /// every later open still counts the arena as holding writes no sync covered (review 5 #10)
+    /// and syncs it. Before, the cut retagged them synced in the class it rewrote in, and one more
+    /// reopen lost the mark.
+    #[test]
+    fn a_d0_written_log_cut_under_d2_keeps_its_flights_unsynced() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Off);
+        overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
+        let recovered = Journal::recover(&files, SyncClass::FullFsync).unwrap().expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 11], "premise: the torn last flight was cut");
+        drop(recovered);
+        for open in 0..2 {
+            assert!(end_tags(&files).1, "open {open}: the D0 flights lost their unsynced tag");
+            let again = Journal::recover(&files, SyncClass::FullFsync).unwrap().expect("state");
+            drop(again);
+        }
+    }
+
+    /// Engine review 7 #1: a D0 recovery cut of D0 flights (nothing ever synced) stays a new
+    /// incarnation, confirms no flight (no sync proved one), and leaves its rename for the next
+    /// flight that syncs (a raised one) to make durable, by syncing the log's directory first.
+    #[test]
+    fn a_d0_recovery_cut_confirms_nothing_and_leaves_its_rename_to_the_next_synced_flight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let starts = flights(&files, 0, &[1, 1, 1], SyncClass::Off);
+        overwrite(&files.log, starts[2] + 2, &[0u8; 4]);
+        let recovered = Journal::recover(&files, SyncClass::Off).unwrap().expect("state");
+        assert_eq!(forks(&recovered.records), vec![1, 11], "premise: the torn last flight was cut");
+        assert!(recovered.journal.dir_dirty, "a D0 cut's rename is left for no later sync to make durable");
+        drop(recovered);
+        let bytes = std::fs::read(&files.log).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[HEADER_CONFIRM_AT as usize..HEADER_CONFIRM_AT as usize + 4].try_into().unwrap()),
+            0,
+            "a D0 cut confirmed a flight no sync proved"
+        );
+    }
+
+    /// Engine review 7 #1: framing kept flights again keeps a flight tagged unsynced unsynced,
+    /// whatever class the rewrite syncs in (its slots were never synced); a flight tagged synced
+    /// stays synced only when the rewrite syncs too.
+    #[test]
+    fn reframe_keeps_a_flights_unsynced_tag() {
+        for (written, rewrite) in [(SyncClass::Off, true), (SyncClass::Fsync, true), (SyncClass::Fsync, false)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            let starts = flights(&files, 0, &[2], written);
+            let bytes = std::fs::read(&files.log).unwrap();
+            let nonce = tests::log_nonce(&files.log);
+            let (out, _) = reframe(&bytes[starts[0] as usize..], nonce, nonce ^ 1, rewrite).unwrap();
+            let tag = out[out.len() - END_FRAME_LEN + FRAME_HEADER_LEN];
+            let want = if written.syncs() && rewrite { END_SYNCED_TAG } else { END_TAG };
+            assert_eq!(tag, want, "written in {written:?}, rewritten syncing={rewrite}: the end frame's tag");
+        }
+    }
 }
