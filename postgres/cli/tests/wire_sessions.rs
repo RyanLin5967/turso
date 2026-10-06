@@ -1578,3 +1578,32 @@ fn a_failed_commit_leaves_the_session_idle() {
         assert_eq!(a.q("SELECT count(*) FROM c").single("rows"), "0");
     }
 }
+
+/// Review 1 item 2: a statement that fails at Describe (the extended protocol, as libpq's
+/// PQsendQueryParams, pgjdbc and tokio-postgres send every statement) aborts the block too: the
+/// Sync reports 'E', and COMMIT rolls the block back. Before, Describe set nothing, Sync said 'T',
+/// and COMMIT kept the writes made before the failed statement.
+#[test]
+fn a_describe_time_error_inside_a_block_aborts_it() {
+    let dir = Scratch::new("describeerror");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
+    let r = a.x("SELECT * FROM nope", &[]);
+    assert!(
+        r.error.is_some(),
+        "a missing table described without an error"
+    );
+    assert_eq!(r.status, b'E', "Sync after the failed statement");
+    let r = a.x("SELECT 1", &[]);
+    assert_eq!(r.err("a statement in the failed block").code, "25P02");
+    assert_eq!(r.status, b'E');
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    assert_eq!(
+        a.q("SELECT count(*) FROM t WHERE id = 2").single("rows"),
+        "0",
+        "the block committed past its failed statement"
+    );
+}
