@@ -3610,6 +3610,12 @@ fn darwin_major() -> u32 {
             return forced;
         }
     }
+    running_darwin_major()
+}
+
+/// `darwin_major` with no test override: the running kernel's, from `uname`, read once.
+#[cfg(target_vendor = "apple")]
+fn running_darwin_major() -> u32 {
     static MAJOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *MAJOR.get_or_init(|| {
         // SAFETY: `uname` fills the struct it is given; a zeroed `utsname` is a valid value.
@@ -3619,13 +3625,27 @@ fn darwin_major() -> u32 {
         }
         // SAFETY: `uname` NUL-terminates `release` within the array.
         let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
-        release
-            .to_str()
-            .ok()
-            .and_then(|r| r.split('.').next())
-            .and_then(|major| major.parse().ok())
-            .unwrap_or(u32::MAX)
+        release.to_str().map_or(u32::MAX, parse_darwin_major)
     })
+}
+
+/// A Darwin release string's major version ("25.6.0" -> 25, "23" -> 23); u32::MAX when it has
+/// none (engine review 9 #11). Mutants (test builds only): `darwin_major_parses_minor` (the
+/// second field: "25.6.0" -> 6) and `darwin_major_unreadable_old` (0 when unreadable, an old
+/// kernel: the userland barrier retry review 6 #6 removed from macOS 14 on).
+#[cfg(target_vendor = "apple")]
+fn parse_darwin_major(release: &str) -> u32 {
+    let field = if super::store::fe_mutant("darwin_major_parses_minor") { 1 } else { 0 };
+    let unreadable = if super::store::fe_mutant("darwin_major_unreadable_old") {
+        0
+    } else {
+        u32::MAX
+    };
+    release
+        .split('.')
+        .nth(field)
+        .and_then(|major| major.parse().ok())
+        .unwrap_or(unreadable)
 }
 
 /// Test builds: make the next `F_BARRIERFSYNC` (`barrier_file`) fail with `errno`.
@@ -3655,6 +3675,44 @@ pub(crate) fn fsync_dir_of(path: &Path, class: SyncClass) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Engine review 9 #11: a Darwin release's major version is its FIRST field, and a release
+    /// with none reads as a new kernel (u32::MAX), never an old one: an old one would retry a
+    /// failed barrier as a full sync (review 6 #6). The tests that force the version skip this.
+    /// Mutants `darwin_major_parses_minor`, `darwin_major_unreadable_old`.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_darwin_release_reads_as_its_major_version() {
+        for (release, major) in [
+            ("25.6.0", 25),
+            ("22.6.0", 22),
+            ("23", 23),
+            ("", u32::MAX),
+            ("x.1", u32::MAX),
+        ] {
+            assert_eq!(parse_darwin_major(release), major, "release {release:?}");
+        }
+    }
+
+    /// Engine review 9 #11: unforced, the store takes the running kernel for the major version
+    /// that `sysctl -n kern.osrelease` reports, a reader other than the subject's `uname`.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_running_kernels_darwin_major_is_the_one_sysctl_reports() {
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.osrelease"])
+            .output()
+            .expect("premise: sysctl ran");
+        assert!(out.status.success(), "premise: sysctl kern.osrelease succeeded");
+        let release = String::from_utf8(out.stdout).expect("premise: sysctl printed UTF-8");
+        let digits: String = release.trim().chars().take_while(char::is_ascii_digit).collect();
+        let expected: u32 = digits.parse().expect("premise: the release starts with its major version");
+        assert_eq!(
+            running_darwin_major(),
+            expected,
+            "the store reads kernel release {release:?} as another major version"
+        );
+    }
 
     /// The nonce in the header of the log at `path` (format 11).
     pub(super) fn log_nonce(path: &Path) -> u32 {
