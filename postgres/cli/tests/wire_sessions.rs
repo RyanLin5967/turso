@@ -2857,3 +2857,59 @@ fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
         "0"
     );
 }
+
+/// ALTER TABLE ADD CONSTRAINT rebuilds a table through an aside table named after it. A table name
+/// of 49 to 63 bytes gave an aside name over PostgreSQL's 63-byte identifier limit: libpg_query cut
+/// it in the aside's CREATE while the copy and the DROP named it in full (at 63 bytes the cut name
+/// was the table's own). A name already taken by an index made the aside's CREATE fail. A serial
+/// column made the aside's CREATE create a sequence of its own that the DROP left behind, one per
+/// ALTER (wire review 3 item 11).
+#[test]
+fn alter_add_constraint_rebuilds_long_names_and_serial_tables_cleanly() {
+    let dir = Scratch::new("asidename");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for len in [49, 55, 63] {
+        let t = format!("l{}", "x".repeat(len - 1));
+        assert_eq!(t.len(), len);
+        a.q(&format!("CREATE TABLE {t}(id INT, v INT)"))
+            .ok("long table");
+        a.q(&format!("INSERT INTO {t} VALUES (1, 10), (2, 20)"))
+            .ok("rows");
+        a.q(&format!("ALTER TABLE {t} ADD PRIMARY KEY (id)"))
+            .ok("add pk to a long name");
+        assert_eq!(
+            a.q(&format!("SELECT count(*) FROM {t}")).single("rows"),
+            "2",
+            "{len}-byte name"
+        );
+        let e = a
+            .q(&format!("INSERT INTO {t} VALUES (1, 99)"))
+            .err("the key is enforced");
+        assert_eq!(e.code, "23505", "{len}-byte name");
+    }
+    a.q("CREATE TABLE other(x INT)").ok("other");
+    a.q("CREATE TABLE ix(id INT, v INT)").ok("ix");
+    a.q("INSERT INTO ix VALUES (1, 1)").ok("row");
+    a.q("CREATE INDEX ix__turso_rebuild ON other(x)")
+        .ok("an index with the aside's name");
+    a.q("ALTER TABLE ix ADD PRIMARY KEY (id)")
+        .ok("the aside's name is taken by an index");
+    a.q("CREATE TABLE ser(id SERIAL, v INT)").ok("serial");
+    a.q("INSERT INTO ser(v) VALUES (1), (2)").ok("rows");
+    let sequences = |a: &mut Wire| {
+        a.q("SELECT count(*) FROM pg_sequences")
+            .single("pg_sequences")
+    };
+    let before = sequences(&mut a);
+    a.q("ALTER TABLE ser ADD PRIMARY KEY (id)").ok("add pk");
+    a.q("ALTER TABLE ser ADD UNIQUE (v)").ok("add unique");
+    assert_eq!(sequences(&mut a), before, "the rebuild left a sequence");
+    a.q("INSERT INTO ser(v) VALUES (3)")
+        .ok("the serial goes on");
+    assert_eq!(
+        a.q("SELECT id FROM ser WHERE v = 3").single("id"),
+        "3",
+        "the serial's sequence restarted"
+    );
+}
