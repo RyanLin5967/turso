@@ -591,28 +591,35 @@ impl Session {
                 r
             }
         };
-        let in_tx = !conn.inner().get_auto_commit();
+        if result.is_err() {
+            match verb {
+                // A failed COMMIT ends the block, as in PostgreSQL: whatever the engine kept of
+                // the transaction is rolled back and the session is idle.
+                TxVerb::Commit => {
+                    if !conn.inner().get_auto_commit() {
+                        let _ = conn.execute("ROLLBACK");
+                    }
+                    st.aborted = false;
+                }
+                TxVerb::Rollback => st.aborted = false,
+                // Inside a block any other error aborts it. Whether the session was in a block is
+                // read from before the statement: some errors make the engine roll the whole
+                // transaction back itself, and reading autocommit after them would let the rest of
+                // the block commit statement by statement (wire review 1 item 1).
+                _ if in_tx => st.aborted = true,
+                _ => {}
+            }
+        }
         // A switch's branch is free for a delete once the last handle on its connection is gone:
         // this statement's.
         drop(conn);
         if let Some(left) = st.left.take() {
             self.shared.release(&left);
         }
-        match result {
-            Ok(r) => {
-                if verb == TxVerb::RollbackTo {
-                    st.aborted = false;
-                }
-                Ok(r)
-            }
-            Err(e) => {
-                // Inside a transaction block any error aborts the block, as in PostgreSQL.
-                if in_tx {
-                    st.aborted = true;
-                }
-                Err(e)
-            }
+        if result.is_ok() && verb == TxVerb::RollbackTo {
+            st.aborted = false;
         }
+        result
     }
 
     fn engine_statement(
