@@ -2709,3 +2709,32 @@ fn char_n_compares_without_its_padding_by_scan_and_by_seek() {
         );
     }
 }
+
+/// A COMMIT or ROLLBACK that does not parse is a failed statement like any other: inside a block it
+/// aborts the block (status E), and the block then ends with ROLLBACK, its writes gone, as in
+/// PostgreSQL. 5b81204b3 classified a failure by the statement's first word, so a mistyped COMMIT
+/// rolled the block back and left the session idle (a retried COMMIT then answered COMMIT for
+/// discarded work), and a mistyped ROLLBACK left the block open, so a later COMMIT kept what the
+/// client meant to discard (wire review 3 item 5).
+#[test]
+fn a_mistyped_commit_or_rollback_aborts_the_block() {
+    let dir = Scratch::new("mistyped");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    for (typo, id) in [("COMMIT TRANSACTON", 2), ("ROLLBACK TRANSACTON", 3)] {
+        a.q("BEGIN").ok("begin");
+        a.q(&format!("INSERT INTO t VALUES ({id}, 'x')"))
+            .ok("insert");
+        let r = a.q(typo);
+        assert_eq!(r.err(typo).code, "42601", "{typo}");
+        assert_eq!(r.status, b'E', "{typo} left the block {}", r.status as char);
+        let r = a.q("COMMIT").ok("the block's end");
+        assert_eq!(r.tags, vec!["ROLLBACK".to_string()], "after {typo}");
+        assert_eq!(
+            a.q(&format!("SELECT count(*) FROM t WHERE id = {id}"))
+                .single("rows"),
+            "0",
+            "after {typo} the block's insert survived"
+        );
+    }
+}
