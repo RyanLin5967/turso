@@ -2158,8 +2158,18 @@ impl Journal {
     /// finds the log past this waits for its install (InnoDB's synchronous flush point beside its
     /// asynchronous one), so the log stays within twice the threshold plus the operations in
     /// flight (r11-restart-r2, F-FZ).
+    ///
+    /// Measured from where the checkpoint was due (engine review 8 #1): after a failed one,
+    /// `compact_after` defers the next by a threshold, so that retry starts past twice the
+    /// threshold from the last cut, and the absolute limit would make every operation during its
+    /// flight wait for its install. `compact_after` is 0 at open and after every cut, so otherwise
+    /// nothing changes. Mutant `hard_limit_absolute` (test builds only): as before.
     pub(crate) fn past_hard_limit(&self) -> bool {
-        self.len > 2 * compact_min_log_bytes().max(2 * self.snapshot_len)
+        let threshold = compact_min_log_bytes().max(2 * self.snapshot_len);
+        if super::store::fe_mutant("hard_limit_absolute") {
+            return self.len > 2 * threshold;
+        }
+        self.len > (2 * threshold).max(self.compact_after + threshold)
     }
 
     /// Replace the log with a snapshot of `state`. `fail_after_rename` is the crash failpoint.
