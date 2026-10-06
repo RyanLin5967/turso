@@ -134,10 +134,16 @@ if mode == "forkstorm":
     # The parent fsyncs and logs too, once per round: it is traced from the seize, so its fsyncs between the thaw and
     # t0 sit in the kept trace BEFORE t0 and must be cut, and its later ones counted -- the edge of the t0 cut, which
     # F10d otherwise never reaches now that no child flushes before t0 (fifth review, finding 2).
+    # The parent also logs each fork as "child tracer-before tracer-after" (forkstorm.forks): a child forked while the
+    # parent was traced by the kept strace (both reads) was born in the window, one forked while it was not (both
+    # reads) was alive at the seize, so F10d classes each child from the probe's own record, not from the trace's
+    # clone lines it is checking (second re-review, finding 7).
     fd = os.open(f"{d}/forkstorm.dat", os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
     os.write(fd, b"x" * 4096)
+    def tracer():
+        return [ln.split()[1] for ln in open("/proc/self/status") if ln.startswith("TracerPid:")][0]
     def flush_and_log():
-        tp = [ln.split()[1] for ln in open("/proc/self/status") if ln.startswith("TracerPid:")][0]
+        tp = tracer()
         t0c = time.time()
         os.fsync(fd)
         t = time.time()
@@ -146,12 +152,17 @@ if mode == "forkstorm":
     stop = trig + ".stop"
     ready()
     while not os.path.exists(stop):
-        if os.fork() == 0:
+        tpb = tracer()
+        child = os.fork()
+        if child == 0:
             try:  # a child never returns into the parent's loop, whatever flush_and_log raises
                 time.sleep(2.0)
                 flush_and_log()
             finally:
                 os._exit(0)
+        tpa = tracer()
+        with open(f"{d}/forkstorm.forks", "a") as f:
+            f.write(f"{child} {tpb} {tpa}\n")
         flush_and_log()
         try:
             while os.waitpid(-1, os.WNOHANG)[0]:
@@ -445,28 +456,38 @@ for ln in open(sys.argv[1]):
     if mine: traced += 1
 print(miss, traced)" "$@"
 }
-# storm_verdict LOG T0 STRACEPID TRACE MAIN JSON -> 'ok ...' or 'bad ...': the kept trace's count and its attribution
-# against the probe's own truth. The counter keeps a call whose ENTRY stamp is >= t0, and that stamp lies between the
-# process's clock read before the fsync (field 4) and after it (field 3), so per class of process the trace's flushes
-# after the t0 cut must lie in [fsyncs traced by STRACEPID that started after T0, those that ended after T0] (10 us of
-# slack each way for the 6-decimal stamps). The classes: MAIN (role 'main'); children whose creation the trace never
-# saw, i.e. alive at the seize (role 'process at attach: ...'); children it saw created (role 'other (born in the
-# window ...)'). Any other role, or an unmapped flush, is bad (fifth-review re-review, finding 3: one attributed
-# flush used to suffice). Also required: >= 1 pre-existing child STARTED an fsync after T0 (fifth review, finding 1)
-# and >= 1 traced fsync ended before T0, so the cut removed something (fifth review, finding 2).
+# storm_verdict LOG T0 STRACEPID TRACE MAIN JSON FORKS -> 'ok ...' or 'bad ...': the kept trace's count and its
+# attribution against the probe's own truth. The counter keeps a call whose ENTRY stamp is >= t0, and that stamp lies
+# between the process's clock read before the fsync (field 4) and after it (field 3), so per class of process the
+# trace's flushes after the t0 cut must lie in [fsyncs traced by STRACEPID that started after T0, those that ended
+# after T0] (10 us of slack each way for the 6-decimal stamps). The classes come from the PROBE (FORKS: "child
+# tracer-before tracer-after" per fork, read by the parent around each fork), never from the trace being checked
+# (second re-review, finding 7): MAIN (role 'main'); a child forked while the parent was not yet traced by STRACEPID
+# was alive at the seize (role 'process at attach: ...'); one forked while it was, born in the window (role 'other
+# (born in the window ...)'); one forked across the seize (the two reads differ) may be either, so its fsyncs widen
+# both upper bounds. The trace's own clone lines must agree with that classing (born children have one, children
+# alive at the seize none). Any other role, an unmapped flush, or a traced fsync of a pid the parent never forked is
+# bad (fifth-review re-review, finding 3: one attributed flush used to suffice). Also required: >= 1 child alive at
+# the seize STARTED an fsync after T0 (fifth review, finding 1) and >= 1 traced fsync ended before T0, so the cut
+# removed something (fifth review, finding 2).
 storm_verdict() {
   python3 -c "
 import json, re, sys
-log, t0, st, trace, main, js = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+log, t0, st, trace, main, js, forks = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7]
 eps = 1e-5
 spawn = re.compile(r'^\d+\s+[\d.]+\s+(?:<\.\.\. )?(?:clone3?|v?fork)\b.*\)\s+=\s+(\d+)')
-born = {m.group(1) for m in (spawn.match(ln) for ln in open(trace, errors='replace')) if m}
-cls = {'main': [0, 0], 'at-attach': [0, 0], 'born': [0, 0]}
+cloned = {m.group(1) for m in (spawn.match(ln) for ln in open(trace, errors='replace')) if m}
+klass = {}
+for ln in open(forks):
+    f = ln.split()
+    if len(f) != 3: continue
+    klass[f[0]] = 'ambiguous' if f[1] != f[2] else ('born' if f[1] == st else 'at-attach')
+cls = {'main': [0, 0], 'at-attach': [0, 0], 'born': [0, 0], 'ambiguous': [0, 0], 'never-forked': [0, 0]}
 cut = 0
 for ln in open(log):
     f = ln.split(); pid, tp, end = f[0], f[1], float(f[2]); start = float(f[3]) if len(f) > 3 else end
     if tp != st: continue
-    k = 'main' if pid == main else ('born' if pid in born else 'at-attach')
+    k = 'main' if pid == main else klass.get(pid, 'never-forked')
     if start >= t0 + eps: cls[k][0] += 1
     if end >= t0 - eps: cls[k][1] += 1
     else: cut += 1
@@ -477,18 +498,26 @@ got = {'main': roles.get('main', 0), 'at-attach': sum(n for k, n in roles.items(
        'born': sum(n for k, n in roles.items() if k.startswith(BORN))}
 other = {k: n for k, n in roles.items() if k != 'main' and not k.startswith((AT, BORN))}
 lo, hi = sum(v[0] for v in cls.values()), sum(v[1] for v in cls.values())
+amb = cls['ambiguous'][1]
 why = []
 if r['verdict'] != 'ok': why.append('verdict ' + r['verdict'][:160])
 if not lo <= r['flushes'] <= hi: why.append(f\"count {r['flushes']} outside the probe's [{lo}, {hi}]\")
-for k, (a, b) in cls.items():
+for k in ('main', 'at-attach', 'born'):
+    a, b = cls[k][0], cls[k][1] + (amb if k != 'main' else 0)
     if not a <= got[k] <= b: why.append(f'{k}: the trace attributes {got[k]}, the probe bounds [{a}, {b}]')
+wrong_born = sorted(p for p, k in klass.items() if k == 'born' and p not in cloned)
+wrong_pre = sorted(p for p, k in klass.items() if k == 'at-attach' and p in cloned)
+if wrong_born: why.append(f'children forked under the trace with no clone line in it {wrong_born[:5]}')
+if wrong_pre: why.append(f'children forked before the seize with a clone line in the trace {wrong_pre[:5]}')
+if cls['never-forked'][1]: why.append(f\"{cls['never-forked'][1]} traced fsync(s) after t0 by pids the parent never forked\")
 if cls['at-attach'][0] < 1: why.append('no child alive at the seize started an fsync after t0')
 if cut < 1: why.append('the t0 cut removed no traced fsync')
 if other: why.append(f'flushes in other roles {other}')
 if r.get('unmapped_flushes', 0): why.append(f\"unmapped_flushes {r['unmapped_flushes']}\")
-print('bad' if why else 'ok', f\"count {r['flushes']} in [{lo}, {hi}]; per role trace/[probe] \" +
-      ', '.join(f'{k} {got[k]}/[{a}, {b}]' for k, (a, b) in cls.items()) +
-      f'; {cut} traced fsync(s) before t0 cut; {len(born)} pids born in the trace' + ('; ' + '; '.join(why) if why else ''))" "$@" 2>&1
+print('bad' if why else 'ok', f\"count {r['flushes']} in [{lo}, {hi}]; per class trace/[probe] \" +
+      ', '.join(f'{k} {got[k]}/[{cls[k][0]}, {cls[k][1]}]' for k in ('main', 'at-attach', 'born')) +
+      f'; {amb} fsync(s) by children forked across the seize; {cut} traced fsync(s) before t0 cut; '
+      f'{len(klass)} forks logged, {len(cloned)} clone lines' + ('; ' + '; '.join(why) if why else ''))" "$@" 2>&1
 }
 # storm_pids_match LOG TRACE STRACEPID -> exit 0 when the children that logged STRACEPID as their tracer are exactly
 # the pids with an fsync line in TRACE (fourth review, finding 4: a set check, not fsyncs >= traced).
@@ -542,7 +571,8 @@ if start_probe2 forkstorm; then
     read -r miss traced < <(storm_misses "$DIR/fc/forkstorm.log" "$t0" "$kept")
     cp "$DIR/fc/forkstorm.log" "$OUT/f10d.forkstorm.log.txt" 2>/dev/null  # the probe's own record, kept with the raw
     match=$(storm_pids_match "$DIR/fc/forkstorm.log" "$OUT/f10d.strace" "$kept"); mrc=$?
-    sv=$(storm_verdict "$DIR/fc/forkstorm.log" "$t0" "$kept" "$OUT/f10d.strace" "$PP2" "$OUT/f10d.json")
+    cp "$DIR/fc/forkstorm.forks" "$OUT/f10d.forkstorm.forks.txt" 2>/dev/null
+    sv=$(storm_verdict "$DIR/fc/forkstorm.log" "$t0" "$kept" "$OUT/f10d.strace" "$PP2" "$OUT/f10d.json" "$DIR/fc/forkstorm.forks")
     if [ "$miss" = 0 ] && [ $mrc = 0 ] && grep -q ' frozen=1 ' "$OUT/f10d.window" && [ "${sv%% *}" = ok ]; then
       log "PASS F10d-storm-attach-complete: 0 child fsyncs after t0 outside the kept trace, frozen=1, $traced fsyncs logged as traced by it, pids = the fsync pids in it ($match); ${sv#ok }"
     else
