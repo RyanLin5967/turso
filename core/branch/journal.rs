@@ -2927,32 +2927,49 @@ pub(crate) fn version_hint(version: u32, format: u32) -> String {
     }
 }
 
-/// Hold an exclusive advisory lock on the branch log for as long as `file` stays open (review N1):
-/// one branch store per set of branch files, in this process or another. A second store is
-/// refused at open instead of racing the first one's appends.
-///
-/// `flock(2)`, not `fcntl`: an `fcntl` lock belongs to the PROCESS, so two stores in one process
-/// (`Database::do_open`, which skips the registry, or a reopen inside the registry's `Weak`
-/// window) would both get it. An `flock` lock belongs to the open file description.
-///
-/// BLIND SPOTS: non-unix targets take no lock, and `write_pending`'s length check is their only
-/// guard. The lock is advisory, so a writer that never asks is not stopped (the length check
-/// again). On Linux over NFS, `flock` is emulated with `fcntl` locks (flock(2), recalled, not
-/// verified here), which two stores in one process would share. And fork(2) without exec SHARES
-/// the lock with the child (macOS flock(2) NOTES: descriptors duplicated "through dup(2) or
-/// fork(2)" hold "multiple references to a single lock"): the child cannot write (`Journal::pid`
-/// fail-stops it), but while it keeps the descriptor the parent cannot reopen the database — a
-/// wedge inherent to flock and to OFD locks, refused loudly rather than raced. `exec` releases it
-/// (std opens files close-on-exec; recalled, not verified here).
-/// Test builds: while it holds 1, the next log open waits between its open(2) and its flock(2),
-/// having marked its arrival (`| HOLD_ARRIVED`); stored 0 to release it (review 5 #6).
+/// Test builds: while it holds 1, the next open of the log at `OPEN_LOCK_HOLD_PATH` waits between
+/// its open(2) and its flock(2), having marked its arrival (`| HOLD_ARRIVED`); stored 0 to release
+/// it (review 5 #6). Keyed to that one path (engine review 7 #13), so a neighbouring test's open
+/// neither consumes nor waits on it; armed and disarmed by `OpenLockHold`.
 #[cfg(test)]
 pub(crate) static OPEN_LOCK_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+static OPEN_LOCK_HOLD_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-fn pause_before_lock() {
+/// Test builds: opens of a log that found its path renamed to another file once locked, and were
+/// made again (`open_log_locked`): engine review 7 #13 asks that the rename race be shown to happen.
+#[cfg(test)]
+pub(crate) static LOCK_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test builds: `OPEN_LOCK_HOLD` armed for one log path while this lives; dropped, it releases and
+/// disarms the hold whatever the test did (a panic while armed no longer hangs later opens).
+#[cfg(test)]
+pub(crate) struct OpenLockHold;
+
+#[cfg(test)]
+impl OpenLockHold {
+    pub(crate) fn arm(path: &Path) -> Self {
+        *OPEN_LOCK_HOLD_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+        OPEN_LOCK_HOLD.store(1, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for OpenLockHold {
+    fn drop(&mut self) {
+        OPEN_LOCK_HOLD.store(0, std::sync::atomic::Ordering::Release);
+        *OPEN_LOCK_HOLD_PATH.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+fn pause_before_lock(path: &Path) {
     #[cfg(test)]
     {
         use std::sync::atomic::Ordering as O;
+        if OPEN_LOCK_HOLD_PATH.lock().unwrap_or_else(|e| e.into_inner()).as_deref() != Some(path) {
+            return;
+        }
         let arrived = 1 | super::store::HOLD_ARRIVED;
         if OPEN_LOCK_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
             while OPEN_LOCK_HOLD.load(O::Acquire) == arrived {
@@ -2960,6 +2977,8 @@ fn pause_before_lock() {
             }
         }
     }
+    #[cfg(not(test))]
+    let _ = path;
 }
 
 /// How many times a log replaced under an open is opened again before the open is refused.
@@ -2975,12 +2994,14 @@ fn open_log_locked(path: &Path, open: impl Fn(&Path) -> Result<Option<File>>) ->
         let Some(file) = open(path)? else {
             return Ok(None);
         };
-        pause_before_lock();
+        pause_before_lock(path);
         lock_exclusive(&file, path)?;
         // Mutant `lock_any_inode` (test builds only): the lock is taken on whatever was opened.
         if still_names(&file, path)? || super::store::fe_mutant("lock_any_inode") {
             return Ok(Some(file));
         }
+        #[cfg(test)]
+        LOCK_RETRIES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
     Err(LimboError::LockingError(format!(
         "branch log {} was replaced {LOCK_ATTEMPTS} times while this store opened it: another branch \
@@ -3009,6 +3030,23 @@ fn still_names(file: &File, path: &Path) -> Result<bool> {
     }
 }
 
+/// Hold an exclusive advisory lock on the branch log for as long as `file` stays open (review N1):
+/// one branch store per set of branch files, in this process or another. A second store is
+/// refused at open instead of racing the first one's appends.
+///
+/// `flock(2)`, not `fcntl`: an `fcntl` lock belongs to the PROCESS, so two stores in one process
+/// (`Database::do_open`, which skips the registry, or a reopen inside the registry's `Weak`
+/// window) would both get it. An `flock` lock belongs to the open file description.
+///
+/// BLIND SPOTS: non-unix targets take no lock, and `write_pending`'s length check is their only
+/// guard. The lock is advisory, so a writer that never asks is not stopped (the length check
+/// again). On Linux over NFS, `flock` is emulated with `fcntl` locks (flock(2), recalled, not
+/// verified here), which two stores in one process would share. And fork(2) without exec SHARES
+/// the lock with the child (macOS flock(2) NOTES: descriptors duplicated "through dup(2) or
+/// fork(2)" hold "multiple references to a single lock"): the child cannot write (`Journal::pid`
+/// fail-stops it), but while it keeps the descriptor the parent cannot reopen the database — a
+/// wedge inherent to flock and to OFD locks, refused loudly rather than raced. `exec` releases it
+/// (std opens files close-on-exec; recalled, not verified here).
 fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
     // fastest-engine mutant `no_log_lock` (test builds only): no lock is taken.
     if super::store::fe_mutant("no_log_lock") {
@@ -4685,14 +4723,19 @@ mod format_tests {
     /// Review 5 #6: a second store that opens the log path just before the first store replaces the
     /// log by a rename, and takes the lock just after, must not get the lock of the unlinked inode:
     /// it would see no state and clobber the live log. The lock is taken on the file the path names
-    /// once it is held, and the second create is refused. (Hook: the next open waits between its
-    /// open(2) and its flock(2).)
+    /// once it is held, and the second create is refused. (Hook: the next open of this log waits
+    /// between its open(2) and its flock(2).)
+    ///
+    /// FLAGGED TEST EDIT (engine review 7 #13): the hook is armed for this test's log path only and
+    /// disarmed by a guard (a panic while armed hung every later log open in the binary), and the
+    /// race is shown to have happened: the second open found the path renamed once it was locked.
     #[test]
     fn a_lock_taken_across_a_rename_of_the_log_is_refused() {
         use std::sync::atomic::Ordering as O;
         let dir = tempfile::TempDir::new().unwrap();
         let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
-        OPEN_LOCK_HOLD.store(1, O::Release);
+        let retries = LOCK_RETRIES.load(O::Acquire);
+        let _hold = OpenLockHold::arm(&files.log);
         let second = {
             let files = files.clone();
             std::thread::spawn(move || Journal::create(&files, 512, SyncClass::Off).map(|_| ()))
@@ -4706,6 +4749,10 @@ mod format_tests {
         let first = Journal::create(&files, 512, SyncClass::Off).unwrap();
         OPEN_LOCK_HOLD.store(0, O::Release);
         let got = second.join().unwrap();
+        assert!(
+            LOCK_RETRIES.load(O::Acquire) > retries,
+            "premise: the second open found the log renamed under its lock and opened it again"
+        );
         assert!(got.is_err(), "a second store took the lock of the log's old inode");
         drop(first);
     }

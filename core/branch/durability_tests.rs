@@ -2336,8 +2336,17 @@ fn a_registry_hit_of_another_checkpoint_mode_is_refused() {
 
 /// Review 4 #8: `R11_CKPT` names the mode exactly ("fuzzy" or "sharp"); anything else refuses the
 /// open, where it silently meant fuzzy. A guard restores the variable.
+///
+/// FLAGGED TEST EDIT (engine review 7 #13): the variable is process-wide (every open in the binary
+/// reads it), so the test runs alone in a fresh process (`fork_driver::alone`).
+#[cfg(unix)]
 #[test]
 fn an_unknown_checkpoint_mode_in_the_environment_refuses_the_open() {
+    let Some(sentinel) = crate::branch::fork_driver::alone(
+        "branch::durability_tests::an_unknown_checkpoint_mode_in_the_environment_refuses_the_open",
+    ) else {
+        return;
+    };
     struct Restore(Option<std::ffi::OsString>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -2358,6 +2367,7 @@ fn an_unknown_checkpoint_mode_in_the_environment_refuses_the_open() {
         Ok(_) => panic!("R11_CKPT=Sharp opened (as fuzzy)"),
         Err(e) => assert!(matches!(e, LimboError::InvalidArgument(_)), "refused for another reason: {e}"),
     }
+    crate::branch::fork_driver::finished(&sentinel);
 }
 
 /// Review 4 #8: S-12's refusal (the F7 splice arm and fuzzy checkpoints together) holds for a

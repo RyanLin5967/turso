@@ -8836,9 +8836,18 @@ mod tests {
     /// opens the arena: snapshot and catalog recovery, a fresh store's first backing, and an empty
     /// store's page-size restart, which reopened the arena unchecked. Hook: every arena reports
     /// another device.
+    ///
+    /// FLAGGED TEST EDIT (engine review 7 #13): the hook is process-wide, so every arena opened by a
+    /// neighbouring test while it was armed was refused too; the test runs alone in a fresh process
+    /// (`fork_driver::alone`).
+    #[cfg(unix)]
     #[test]
     fn every_arena_open_refuses_another_device() {
         use std::sync::atomic::Ordering as O;
+        let Some(sentinel) = crate::branch::fork_driver::alone("branch::store::tests::every_arena_open_refuses_another_device")
+        else {
+            return;
+        };
         struct Shifted;
         impl Drop for Shifted {
             fn drop(&mut self) {
@@ -8887,6 +8896,7 @@ mod tests {
                 assert!(refused, "{arm} catalog={catalog}: an arena on another device than the log was taken");
             }
         }
+        crate::branch::fork_driver::finished(&sentinel);
     }
 
     /// Review 5 #13: a branch file that is a symbolic link is refused at open. A rename (a reset, a

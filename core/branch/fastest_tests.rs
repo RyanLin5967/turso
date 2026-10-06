@@ -3317,14 +3317,30 @@ fn a_fail_stopped_store_lists_no_fork_whose_flight_failed() {
 /// install, so the checkpoint is not left in flight for good: the next one starts and installs.
 /// Before, the cut ran outside the writer's panic guard, `flight` stayed set, and no checkpoint
 /// ever started again (and the catalog's read snapshot stayed pinned).
+///
+/// FLAGGED TEST EDIT (engine review 7 #13): `CUT_PANICS` is process-wide, so the test runs alone in
+/// a fresh process (`fork_driver::alone`), where no neighbour can consume the hook or be hit by it,
+/// and a Drop guard disarms it whatever happens.
+#[cfg(unix)]
 #[test]
 fn a_panic_in_a_fuzzy_checkpoints_cut_does_not_stop_checkpoints() {
-    let _s = serial();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            super::store::CUT_PANICS.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let Some(sentinel) =
+        super::fork_driver::alone("branch::fastest_tests::a_panic_in_a_fuzzy_checkpoints_cut_does_not_stop_checkpoints")
+    else {
+        return;
+    };
     let dir = tempfile::TempDir::new().unwrap();
     let db = open_at(&dir.path().join("cut-panic.db"), opts(true, SyncClass::Fsync));
     let trunk = db.connect().unwrap();
     seed(&trunk);
     let _a = trunk.fork_branch().unwrap().into_id();
+    let _disarm = Disarm;
     super::store::CUT_PANICS.store(true, std::sync::atomic::Ordering::Release);
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
     db.branch_checkpoint_wait();
@@ -3337,6 +3353,7 @@ fn a_panic_in_a_fuzzy_checkpoints_cut_does_not_stop_checkpoints() {
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "no checkpoint started after a cut panicked");
     db.branch_checkpoint_wait();
     assert!(db.branch_checkpoint_counters()[0] > installed, "the checkpoint after the panic did not install");
+    super::fork_driver::finished(&sentinel);
 }
 
 // ---- review 4 #11: the install's free accounting, every branch forced ----
