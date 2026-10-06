@@ -456,7 +456,6 @@ impl File for UnixFile {
         Ok(c)
     }
 
-    #[instrument(err, skip_all, level = Level::TRACE)]
     /// Apple: `sync(FullFsync)` is `fcntl(F_FULLFSYNC)` on this descriptor (see `sync`), so the
     /// answer is the descriptor's own device (`fstat`). Elsewhere FullFsync is a plain fsync.
     fn full_fsync_device(&self) -> Option<u64> {
@@ -471,6 +470,7 @@ impl File for UnixFile {
         None
     }
 
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
         let result = unsafe {
             #[cfg(target_vendor = "apple")]

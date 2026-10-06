@@ -6831,6 +6831,8 @@ impl StoreInner {
             return Err(e);
         }
         cat.flight = true;
+        let fail_arena_sync = arena_file.is_some()
+            && self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some();
         Ok(Box::new(Captured {
             generation,
             log_from,
@@ -6867,8 +6869,7 @@ impl StoreInner {
                 .failpoint
                 .take_if(|f| *f == BranchFailpoint::CheckpointWriteFails)
                 .is_some(),
-            fail_arena_sync: arena_file.is_some()
-                && self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some(),
+            fail_arena_sync,
             shape_started: started,
             shape_rows: n_rows,
             shape_trunk_new: n_trunk_new,
