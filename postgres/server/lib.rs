@@ -3297,4 +3297,52 @@ mod tests {
             assert_eq!(s.in_use_waiters.load(Ordering::SeqCst), 0);
         }
     }
+
+    /// An autocommit write whose commit meets Busy after its rows went out is finished by stepping
+    /// the same statement again, the engine's contract (core fastest_tests.rs,
+    /// a_trunk_commit_retried_after_a_busy_decision_pass_retains_every_page). It was dropped, which
+    /// committed it, then prepared and run again: applied twice, its row returned twice (wire
+    /// review 5 item 2).
+    #[test]
+    fn a_write_whose_commit_meets_busy_is_applied_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        // No key, so a second application is a second row rather than a refusal.
+        ok(&s, "CREATE TABLE t(id INT, v TEXT)");
+        ok(&s, "INSERT INTO t VALUES (1, 'a')");
+        // A live child, so the trunk commit decides the pages it overwrites.
+        ok(&s, "SELECT turso_branch_create('c')");
+        s.shared
+            .db
+            .branch_failpoint(Some(turso_core::branch::BranchFailpoint::TrunkDecisionBusy));
+        let mut replies = s.simple("INSERT INTO t VALUES (9, 'x') RETURNING id");
+        assert_eq!(replies.len(), 1);
+        let rows = match replies.pop() {
+            Some(Response::Query(mut q)) => tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut n = 0;
+                    while let Some(row) = q.data_rows().next().await {
+                        row.unwrap();
+                        n += 1;
+                    }
+                    n
+                }),
+            Some(Response::Error(e)) => panic!("{} {}", e.code, e.message),
+            _ => panic!("not a query reply"),
+        };
+        assert_eq!(rows, 1, "the RETURNING row went out {rows} times");
+        let conn = s.shared.db.connect().unwrap();
+        let count = conn
+            .prepare("SELECT count(*) FROM t WHERE id = 9")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            count,
+            vec![vec![Value::from_i64(1)]],
+            "the INSERT was applied more than once"
+        );
+    }
 }
