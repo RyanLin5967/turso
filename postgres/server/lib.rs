@@ -1197,6 +1197,22 @@ impl Session {
         loop {
             // sqlstate() gives 55P03 to LimboError::Busy alone and 40001 to BusySnapshot alone.
             match self.engine_statement_once(conn, sql, portal, format, &mut backoff) {
+                // The block the statement ran in ended with its failure: a COMMIT refused at the
+                // trunk's commit rolls the block back. Run anew it would run outside the block (a
+                // COMMIT that finds no transaction: XX000), so the failure is the block's, a
+                // serialization failure the client retries (wire review 5 item 8).
+                Err(mut f)
+                    if in_tx
+                        && conn.inner().get_auto_commit()
+                        && matches!(f.info.code.as_str(), "55P03" | "40001") =>
+                {
+                    f.info.code = "40001".to_string();
+                    f.info.message = format!(
+                        "could not serialize access: the transaction was rolled back ({})",
+                        f.info.message
+                    );
+                    return Err(f);
+                }
                 Err(f)
                     if f.rerunnable
                         && (f.info.code == "55P03" || (!in_tx && f.info.code == "40001")) =>
