@@ -415,6 +415,10 @@ struct SessionState {
     aborted: bool,
     /// The branch a switch just left, released in [`Shared`]'s map when the switch's statement ends.
     left: Option<String>,
+    /// The session's connection is in the implicit transaction block PostgreSQL wraps a
+    /// multi-statement query, or a pipeline up to Sync, in: an engine BEGIN the client did not send
+    /// (see [`Session::begin_implicit`]).
+    implicit: bool,
     /// Notices the session's statements raised and the client has not been sent yet: the simple
     /// protocol sends each before its statement's result, the extended one before ReadyForQuery.
     notices: Vec<Box<ErrorInfo>>,
@@ -538,8 +542,20 @@ impl Session {
             Err(e) => return vec![(Vec::new(), Response::Error(engine_info(&e)))],
         };
         let mut responses = Vec::with_capacity(statements.len());
+        // More than one statement: one implicit transaction, as in PostgreSQL (wire review 1 item 8).
+        let multi = statements.len() > 1;
         for sql in &statements {
-            match self.statement(sql, None, &Format::UnifiedText) {
+            let call = branch_call(sql);
+            let result = if multi {
+                self.begin_implicit(sql, call.as_ref(), false)
+            } else {
+                Ok(())
+            }
+            .and_then(|()| self.run(sql, call, None, &Format::UnifiedText));
+            if multi {
+                self.after_implicit(sql, result.is_err());
+            }
+            match result {
                 Ok(r) => responses.push(with_notices(r)),
                 Err(e) => {
                     responses.push(with_notices(Response::Error(e)));
@@ -547,21 +563,84 @@ impl Session {
                 }
             }
         }
+        if let Err(e) = self.end_implicit() {
+            responses.push(with_notices(Response::Error(e)));
+        }
         responses
     }
 
-    /// Run one statement on the session, `portal` carrying its bound parameters (extended
-    /// protocol).
-    fn statement(
+    /// Open the implicit transaction block PostgreSQL runs a multi-statement query, or a pipeline
+    /// up to Sync, in, before `sql`: an engine BEGIN the client did not send, when the session is
+    /// in no block. Not for the block verbs themselves (BEGIN makes the block the client's, COMMIT
+    /// and ROLLBACK end it), and not for a branch call that opens a pipeline (`pipeline`), which
+    /// runs and commits at once as CREATE DATABASE does in PostgreSQL; inside an open block a
+    /// branch call is refused with 25001 like any other. Through the engine connection itself, so
+    /// it costs no libpg_query call (wire review 1 item 8).
+    fn begin_implicit(
         &self,
         sql: &str,
-        portal: Option<&Portal<String>>,
-        format: &Format,
-    ) -> SqlResult<Response> {
-        self.run(sql, branch_call(sql), portal, format)
+        call: Option<&PgBranchCall>,
+        pipeline: bool,
+    ) -> SqlResult<()> {
+        let mut st = self.state();
+        if st.implicit || st.aborted || TxVerb::of(sql) != TxVerb::Other {
+            return Ok(());
+        }
+        if pipeline && call.is_some() {
+            return Ok(());
+        }
+        let conn = self.current(&mut st)?;
+        if !conn.inner().get_auto_commit() {
+            return Ok(());
+        }
+        engine_tx(&conn, TxStmt::Begin).map_err(|e| engine_info(&e))?;
+        st.implicit = true;
+        Ok(())
     }
 
-    /// [`Session::statement`] with the statement's branch call, if it is one, already read.
+    /// After a statement of an open implicit block: a failure rolls the whole block back and leaves
+    /// the session idle, as PostgreSQL does; a block verb (BEGIN, COMMIT, ROLLBACK) has made the
+    /// block the client's or ended it.
+    fn after_implicit(&self, sql: &str, failed: bool) {
+        let mut st = self.state();
+        if !st.implicit {
+            return;
+        }
+        st.implicit = false;
+        if failed {
+            st.aborted = false;
+            if let Ok(conn) = self.current(&mut st) {
+                if !conn.inner().get_auto_commit() {
+                    let _ = engine_tx(&conn, TxStmt::Rollback);
+                }
+            }
+        } else if TxVerb::of(sql) == TxVerb::Other {
+            st.implicit = true;
+        }
+    }
+
+    /// Commit an open implicit block: after a multi-statement query's last statement, or at Sync. A
+    /// failed commit (a deferred constraint) is the query's error, and nothing of it is kept.
+    fn end_implicit(&self) -> SqlResult<()> {
+        let mut st = self.state();
+        if !std::mem::take(&mut st.implicit) {
+            return Ok(());
+        }
+        let conn = self.current(&mut st)?;
+        if conn.inner().get_auto_commit() {
+            return Ok(());
+        }
+        if let Err(e) = engine_tx(&conn, TxStmt::Commit) {
+            if !conn.inner().get_auto_commit() {
+                let _ = engine_tx(&conn, TxStmt::Rollback);
+            }
+            return Err(engine_info(&e));
+        }
+        Ok(())
+    }
+
+    /// Run one statement on the session, `call` its branch call if it is one (already read), and
+    /// `portal` carrying its bound parameters (extended protocol).
     fn run(
         &self,
         sql: &str,
@@ -696,8 +775,12 @@ impl Session {
             .map_err(PgWireError::UserError)?;
         let in_tx = !conn.inner().get_auto_commit();
         let stmt = conn.prepare(sql);
-        if stmt.is_err() && in_tx {
-            self.state().aborted = true;
+        if stmt.is_err() {
+            if in_tx {
+                self.state().aborted = true;
+            }
+            // In a pipeline's implicit block the failure rolls the whole pipeline back.
+            self.after_implicit(sql, true);
         }
         stmt.map_err(engine_error)
     }
@@ -1008,6 +1091,40 @@ impl TxVerb {
     fn ends_block(self) -> bool {
         matches!(self, TxVerb::Commit | TxVerb::Rollback | TxVerb::RollbackTo)
     }
+}
+
+/// A transaction-control statement the client did not send: an implicit block's own.
+#[derive(Debug, Clone, Copy)]
+enum TxStmt {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+/// Run `tx` on `conn` from the engine's AST: no SQL text is parsed, so an implicit block costs no
+/// libpg_query call (and keeps an_ordinary_statement_is_parsed_once's count).
+fn engine_tx(conn: &PgConnection, tx: TxStmt) -> turso_core::Result<()> {
+    use turso_parser::ast::Stmt;
+    let (stmt, text) = match tx {
+        TxStmt::Begin => (
+            Stmt::Begin {
+                typ: None,
+                name: None,
+            },
+            "BEGIN",
+        ),
+        TxStmt::Commit => (Stmt::Commit { name: None }, "COMMIT"),
+        TxStmt::Rollback => (
+            Stmt::Rollback {
+                tx_name: None,
+                savepoint_name: None,
+            },
+            "ROLLBACK",
+        ),
+    };
+    conn.inner()
+        .prepare_translated_stmt(stmt, text)?
+        .run_ignore_rows()
 }
 
 /// Whether `sql` is a bare CHECKPOINT (the server runs it itself, see [`Session::checkpoint`]). A
@@ -1376,12 +1493,14 @@ impl ExtendedQueryHandler for Session {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        self.statement(
-            &portal.statement.statement,
-            Some(portal),
-            &portal.result_column_format,
-        )
-        .map_err(PgWireError::UserError)
+        // Executes up to Sync are one implicit transaction, as in PostgreSQL (wire review 1 item 8).
+        let sql = &portal.statement.statement;
+        let call = branch_call(sql);
+        let result = self
+            .begin_implicit(sql, call.as_ref(), true)
+            .and_then(|()| self.run(sql, call, Some(portal), &portal.result_column_format));
+        self.after_implicit(sql, result.is_err());
+        result.map_err(PgWireError::UserError)
     }
 
     async fn do_describe_statement<C>(
@@ -1438,6 +1557,13 @@ impl ExtendedQueryHandler for Session {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // A pipeline's implicit block commits here; a failed commit is reported before
+        // ReadyForQuery (wire review 1 item 8).
+        if let Err(e) = self.end_implicit() {
+            client
+                .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
+                .await?;
+        }
         // The extended protocol's results went out as each Execute ran; its notices go out here.
         let notices = std::mem::take(&mut self.state().notices);
         for notice in notices {
