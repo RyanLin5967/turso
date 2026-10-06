@@ -3306,6 +3306,35 @@ fn a_lookup_by_name_waits_for_the_release_it_reports() {
     }
 }
 
+/// fastest-wire (the typed branch errors): `Database::drop_branch` released a named branch that
+/// still had an open connection, as a handle's release does (the branch kept whole until the
+/// connection closes). A server's DROP of a database in use must be refused instead, as
+/// PostgreSQL refuses it: refused while the connection is open, dropped once it has closed.
+/// Mutant `drop_while_open`.
+#[test]
+fn a_named_branch_with_an_open_connection_is_not_dropped() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("drop-in-use.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("busy").unwrap();
+        let c = db.connect_named("busy").unwrap();
+        match db.drop_branch("busy") {
+            Ok(_) => panic!("catalog={catalog}: a branch with an open connection was dropped"),
+            Err(e) => assert!(
+                e.to_string().contains("already has an open connection"),
+                "catalog={catalog}: refused for another reason: {e}"
+            ),
+        }
+        assert!(db.branch_named("busy").unwrap().is_some(), "catalog={catalog}: the refused drop released the branch");
+        drop(c);
+        db.drop_branch("busy").unwrap_or_else(|e| panic!("catalog={catalog}: a branch whose connection closed was not dropped: {e}"));
+        assert_eq!(db.branch_named("busy").unwrap(), None, "catalog={catalog}: after the drop");
+    }
+}
+
 /// Engine review 7 #11: a lookup miss was not "one compare". After the first Release in a process,
 /// every miss in `branch_named` (and so in `connect_named` and `drop_branch`) took the group's lock
 /// and counted a wait, and waited out whatever Release was in the air, another name's too, or led
