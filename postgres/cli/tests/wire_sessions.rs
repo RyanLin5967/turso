@@ -1727,8 +1727,8 @@ fn a_describe_time_error_inside_a_block_aborts_it() {
 }
 
 /// A branch call's cast is read only when it changes nothing: `'b'::from` is a syntax error in
-/// PostgreSQL (42601), not a delete of b (wire review 1 item 3). The statement reaches the engine,
-/// whose syntax error is reported as 42601 once the SQLSTATE mapping lands (item 7).
+/// PostgreSQL, not a delete of b (wire review 1 item 3). Its SQLSTATE is the next test's, so a
+/// SQLSTATE regression (item 7) is not reported under this one (wire review 3 item 9).
 #[test]
 fn a_branch_call_with_a_keyword_cast_is_a_syntax_error() {
     let dir = Scratch::new("keywordcast");
@@ -1736,11 +1736,28 @@ fn a_branch_call_with_a_keyword_cast_is_a_syntax_error() {
     let mut a = seeded(&server);
     a.q("SELECT turso_branch_create('b')").ok("create");
     let r = a.q("SELECT turso_branch_delete('b'::from)");
-    assert_eq!(r.err("delete 'b'::from").code, "42601");
+    assert!(
+        r.error.is_some(),
+        "delete 'b'::from succeeded: {:?}",
+        r.rows
+    );
     assert_eq!(
         a.q("SELECT turso_branch_switch('b')").single("b survives"),
         "b"
     );
+}
+
+/// The syntax error of a branch call with a keyword cast is 42601, as PostgreSQL reports it: the
+/// statement reaches the engine through libpg_query, whose errors are 42601 (wire review 1 items 3
+/// and 7).
+#[test]
+fn a_keyword_cast_in_a_branch_call_reports_42601() {
+    let dir = Scratch::new("keywordcast42601");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('b')").ok("create");
+    let r = a.q("SELECT turso_branch_delete('b'::from)");
+    assert_eq!(r.err("delete 'b'::from").code, "42601");
 }
 
 /// A bound branch name is text: a parameter declared as another type is refused (42804) and names
