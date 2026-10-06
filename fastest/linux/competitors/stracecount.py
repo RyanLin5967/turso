@@ -242,7 +242,15 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     pending = {}  # tid -> (name, rest, ts): started, not (yet) returned
     calls = []  # (tid, name, args_and_rest, ts, completed)
     orphan_resumed, unstamped = 0, 0
+    last_ts, back_steps, max_back = None, 0, 0.0  # -ttt stamps are written in event order: they must not run back
     for line in text.splitlines():
+        sm2 = RESUMED.match(line) or START.match(line)  # call lines only: the -c table's rows hold decimals too
+        if sm2 and sm2.group(2):
+            tsv = float(sm2.group(2))
+            if last_ts is not None and tsv < last_ts:
+                back_steps += 1
+                max_back = max(max_back, last_ts - tsv)
+            last_ts = tsv if last_ts is None else max(last_ts, tsv)
         m = RESUMED.match(line)
         if m:
             pid, _, name, rest = m.groups()
@@ -275,6 +283,12 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
         calls.append((pid, name, rest, tsf, False))
     if part is not None and unstamped:
         problems.append(f"{unstamped} call line(s) without a -ttt stamp: the split cannot place them")
+    # A stamp that runs BACK by more than 1 ms is a CLOCK_REALTIME step (NTP, settimeofday): the t0/tsplit/t1 cuts read
+    # that clock, so they cannot be trusted (fifth review, finding 2: none in 396 banked traces). Sub-millisecond
+    # disorder is reported only.
+    if max_back > 0.001:
+        problems.append(f"the -ttt clock stepped back {max_back:.6f} s ({back_steps} step(s)): the window cuts cannot "
+                        "be trusted")
     # strace allocates its -c counters at the first counted call, so a window in which no traced syscall happened
     # prints NO table. That is a true zero only when the attach was proven (trace.sh's TracerPid check wrote
     # attached_after_polls= into the window file) and strace said nothing on stderr; otherwise it stays refused.
@@ -291,12 +305,19 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
     # fsyncs there). A window whose calls are unstamped cannot be cut and is counted from the seize, as before.
     t0m = re.search(r"\bt0=(\d+\.\d+)", win)
     t0 = float(t0m.group(1)) if (attached and t0m) else None
-    before_t0 = 0
+    # ...and they end at t1, the detach request, where load_s/idle_s end (fifth review, finding 6: calls between the
+    # detach request and strace's exit were counted with no time attached).
+    t1m = re.search(r"^t1=(\d+\.\d+)", win, re.M)
+    t1 = float(t1m.group(1)) if (attached and t1m) else None
+    before_t0, after_t1 = 0, 0
 
     def selected(ts):
-        nonlocal before_t0
+        nonlocal before_t0, after_t1
         if t0 is not None and ts is not None and ts < t0:
             before_t0 += 1
+            return False
+        if t1 is not None and ts is not None and ts > t1:
+            after_t1 += 1
             return False
         if tsplit is None or ts is None:
             return part is None
@@ -375,7 +396,8 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None):
         elif name == "io_submit":
             other["io_submit"] += 1
     out["flush_by_syscall"] = flush
-    out["t0"], out["calls_before_t0"] = t0, before_t0
+    out["t0"], out["calls_before_t0"], out["t1"], out["calls_after_t1"] = t0, before_t0, t1, after_t1
+    out["clock_back_steps"], out["clock_max_back_s"] = back_steps, round(max_back, 6)
     # A launch window's command stderr (strace_run's OUT.cmd.err): recorded, never a verdict -- a command may warn and
     # still succeed, and its exit status is checked through strace_rc (fourth review, finding 6: it was looked at by
     # nothing).
