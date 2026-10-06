@@ -2738,3 +2738,44 @@ fn a_mistyped_commit_or_rollback_aborts_the_block() {
         );
     }
 }
+
+/// A foreign key declared DEFERRABLE INITIALLY DEFERRED is checked at COMMIT, as in PostgreSQL: an
+/// orphan insert inside the block succeeds, the COMMIT fails with 23503, and nothing is kept; the
+/// session is idle after it. Column-level and table-level declarations alike. At 15e96b3a9 the
+/// translator dropped the deferral, so the insert failed at once and the existing
+/// a_failed_commit_leaves_the_session_idle never reached its assertions (wire review 3 item 6).
+#[test]
+fn a_deferred_foreign_key_is_checked_at_commit() {
+    let dir = Scratch::new("deferredfk");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE dp(id INT PRIMARY KEY)").ok("parent");
+    a.q("CREATE TABLE dc1(id INT PRIMARY KEY, pid INT REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)")
+        .ok("column-level deferred");
+    a.q("CREATE TABLE dc2(id INT PRIMARY KEY, pid INT, \
+         FOREIGN KEY (pid) REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)")
+        .ok("table-level deferred");
+    for t in ["dc1", "dc2"] {
+        a.q("BEGIN").ok("begin");
+        a.q(&format!("INSERT INTO {t} VALUES (1, 99)"))
+            .ok("an orphan insert is deferred");
+        let r = a.q("COMMIT");
+        assert_eq!(r.err("commit with an orphan").code, "23503", "{t}");
+        assert_eq!(
+            r.status, b'I',
+            "{t}: the failed COMMIT left the session in a block"
+        );
+        assert_eq!(
+            a.q(&format!("SELECT count(*) FROM {t}")).single("rows"),
+            "0",
+            "{t}: the failed COMMIT kept the orphan"
+        );
+        // Fixed up before the end, the block commits.
+        a.q("BEGIN").ok("begin");
+        a.q(&format!("INSERT INTO {t} VALUES (2, 7)"))
+            .ok("orphan for now");
+        a.q("INSERT INTO dp VALUES (7) ON CONFLICT DO NOTHING")
+            .ok("its parent, later in the block");
+        a.q("COMMIT").ok("the deferred check passes at COMMIT");
+    }
+}
