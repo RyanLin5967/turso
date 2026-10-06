@@ -4293,3 +4293,61 @@ fn a_listing_waits_out_a_release_in_the_air() {
         }
     }
 }
+
+// ---- engine review 8 #1: a retried checkpoint does not stall every operation ----
+
+/// Engine review 8 #1: after a fuzzy checkpoint fails to start (its capture or its spawn), the
+/// retry, a threshold's worth of log later, starts past twice the threshold, which was measured
+/// from the last cut. Every guarded operation then found the store past its hard limit and waited
+/// in back-pressure for that whole checkpoint's install (up to 60 s). The hard limit is measured
+/// from where the retry was due: an operation during the retry's flight does not wait. Held at
+/// its commit, the retry is in flight; a create from another thread returns within 1 s.
+#[test]
+fn a_retried_checkpoint_does_not_stall_every_operation() {
+    let _s = serial();
+    for fp in [BranchFailpoint::CaptureFails, BranchFailpoint::SpawnFails] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(
+            &dir.path().join("retry-stall.db"),
+            opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+        );
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        let _t = Threshold::set(8 << 10);
+        db.branch_failpoint(Some(fp));
+        let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+        let failed_at = entered();
+        let t = std::time::Instant::now();
+        while entered() == failed_at {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "{fp:?}: premise: no checkpoint was attempted");
+        }
+        // The retry: held at its commit once it starts.
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+        let started = db.branch_checkpoint_counters()[1];
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_counters()[1] == started {
+            let _ = trunk.fork_branch().unwrap().into_id();
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "{fp:?}: premise: the checkpoint was never retried");
+        }
+        eventually(&format!("{fp:?}: the retry never reached its hold"), || {
+            db.branch_checkpoint_held() == super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED
+        });
+        let other = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect().and_then(|c| c.fork_branch()).map(|b| b.into_id()))
+        };
+        let t = std::time::Instant::now();
+        while !other.is_finished() && t.elapsed() < std::time::Duration::from_secs(1) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let finished = other.is_finished();
+        let stalled = db.branches.over_hard_for_test();
+        db.branch_checkpoint_hold(0);
+        other.join().unwrap().unwrap();
+        db.branch_checkpoint_wait();
+        assert!(finished, "{fp:?}: a create waited for the retried checkpoint's install");
+        assert!(!stalled, "{fp:?}: the retried checkpoint started past the hard limit");
+    }
+}

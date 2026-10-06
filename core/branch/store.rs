@@ -5811,6 +5811,12 @@ impl BranchStore {
         }
     }
 
+    /// Test builds: whether operations wait for the fuzzy checkpoint in flight (`over_hard`).
+    #[cfg(test)]
+    pub(crate) fn over_hard_for_test(&self) -> bool {
+        self.over_hard.load(Ordering::Acquire)
+    }
+
     /// Test builds: the slots deferred frees wait on, read without maturing any (engine review 7
     /// #7: the accessors that list slots in use mature them first).
     #[cfg(test)]
