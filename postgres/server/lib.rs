@@ -105,6 +105,61 @@ pub struct TursoPgServer {
     interrupt_count: Arc<AtomicUsize>,
 }
 
+/// One statement's waits on a lock another session holds: SQLite's default busy schedule (1, 2,
+/// 5, 10, 15, 20, 25, 25, 25, 50, 50 ms, then 100 ms) up to the server's lock wait. The clock is
+/// first read at the first wait, so a statement that meets no lock reads it not at all (wire
+/// review 5 item 20: every create read it).
+struct Backoff {
+    lock_wait: std::time::Duration,
+    deadline: Option<std::time::Instant>,
+    attempt: usize,
+}
+
+impl Backoff {
+    fn new(lock_wait: std::time::Duration) -> Self {
+        Self {
+            lock_wait,
+            deadline: None,
+            attempt: 0,
+        }
+    }
+
+    /// Sleep the schedule's next delay and say so, or say false, without sleeping, when the delay
+    /// would end past the lock wait: then the next attempt is the last.
+    fn wait(&mut self) -> bool {
+        const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+        let now = std::time::Instant::now();
+        let deadline = *self.deadline.get_or_insert(now + self.lock_wait);
+        let delay =
+            std::time::Duration::from_millis(DELAYS_MS[self.attempt.min(DELAYS_MS.len() - 1)]);
+        self.attempt += 1;
+        if now + delay > deadline {
+            return false;
+        }
+        std::thread::sleep(delay);
+        true
+    }
+}
+
+/// Run `stmt` to its end, `row` called with each row it returns. A Busy at any step (a lock another
+/// session holds, or a commit refused part-way) is waited out on `backoff` by stepping the SAME
+/// statement again: the engine resumes it where it stopped (core fastest_tests.rs,
+/// a_trunk_commit_retried_after_a_busy_decision_pass_retains_every_page). Dropped there, it would
+/// commit what it did, and prepared anew it would run again in full: a write applied twice, its
+/// rows returned twice (wire review 5 item 2). Past the lock wait the Busy is the statement's.
+fn run_waiting(
+    stmt: &mut turso_core::Statement,
+    backoff: &mut Backoff,
+    mut row: impl FnMut(&turso_core::Row) -> turso_core::Result<()>,
+) -> turso_core::Result<()> {
+    loop {
+        match stmt.run_with_row_callback(&mut row) {
+            Err(LimboError::Busy) if backoff.wait() => {}
+            r => return r,
+        }
+    }
+}
+
 /// What every session of one server shares.
 struct Shared {
     db: Arc<Database>,
@@ -1058,11 +1113,14 @@ impl Session {
 
     /// One statement through the engine. A statement that meets a lock another session holds waits
     /// for it, up to the server's lock wait, as a PostgreSQL row lock waits, instead of failing at
-    /// once with 55P03 (wire review 1 item 9): the engine refuses such a statement before it changes
-    /// anything, so it is run again. A stale snapshot (40001) is run again only outside a block; in
-    /// one the snapshot is the block's, and waiting cannot cure it. Not the engine's own busy
-    /// timeout: its blocking loops (run_ignore_rows and the like) answer its Sleep with an IO step
-    /// that returns at once on this platform, so they would spin a core for the whole wait.
+    /// once with 55P03 (wire review 1 item 9). Once prepared, a statement refused Busy is stepped
+    /// again where it stopped ([`run_waiting`]), never dropped and run anew: a Busy can come at its
+    /// commit, after it changed rows and returned them (wire review 5 item 2). Only a refusal before
+    /// it ran (at prepare) prepares it again. A stale snapshot (40001) is run again only outside a
+    /// block, where nothing was written yet; in one the snapshot is the block's, and waiting cannot
+    /// cure it. Not the engine's own busy timeout: its blocking loops (run_ignore_rows and the like)
+    /// answer its Sleep with an IO step that returns at once on this platform, so they would spin a
+    /// core for the whole wait. The statement's waits share one lock wait.
     fn engine_statement(
         &self,
         conn: &PgConnection,
@@ -1071,11 +1129,21 @@ impl Session {
         format: &Format,
     ) -> Result<Response, StatementFailure> {
         let in_tx = !conn.inner().get_auto_commit();
-        // sqlstate() gives 55P03 to LimboError::Busy alone and 40001 to BusySnapshot alone.
-        self.retrying(
-            || self.engine_statement_once(conn, sql, portal, format),
-            |f: &StatementFailure| f.info.code == "55P03" || (!in_tx && f.info.code == "40001"),
-        )
+        let mut backoff = Backoff::new(self.shared.lock_wait);
+        loop {
+            // sqlstate() gives 55P03 to LimboError::Busy alone and 40001 to BusySnapshot alone.
+            match self.engine_statement_once(conn, sql, portal, format, &mut backoff) {
+                Err(f)
+                    if (!f.prepared && f.info.code == "55P03")
+                        || (!in_tx && f.info.code == "40001") =>
+                {
+                    if !backoff.wait() {
+                        return self.engine_statement_once(conn, sql, portal, format, &mut backoff);
+                    }
+                }
+                r => return r,
+            }
+        }
     }
 
     fn engine_statement_once(
@@ -1084,6 +1152,7 @@ impl Session {
         sql: &str,
         portal: Option<&Portal<String>>,
         format: &Format,
+        backoff: &mut Backoff,
     ) -> Result<Response, StatementFailure> {
         let unprepared = |info: Box<ErrorInfo>| StatementFailure {
             prepared: false,
@@ -1101,11 +1170,17 @@ impl Session {
             bind_portal_parameters(&mut stmt, portal).map_err(|e| unprepared(wire_info(e)))?;
         }
         let r = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-            execute_non_query(&mut stmt, sql)
+            execute_non_query(&mut stmt, sql, backoff)
         } else {
             // The column types are the statement's alone, so Describe (which runs nothing) and
             // this reply agree on both protocols (wire review 1 item 14).
-            execute_query(&mut stmt, format, &types, &conn.inner().current_schema())
+            execute_query(
+                &mut stmt,
+                format,
+                &types,
+                &conn.inner().current_schema(),
+                backoff,
+            )
         };
         r.map_err(|e| StatementFailure {
             prepared: true,
@@ -1263,20 +1338,13 @@ impl Session {
         mut f: impl FnMut() -> Result<T, E>,
         busy: impl Fn(&E) -> bool,
     ) -> Result<T, E> {
-        const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
-        let deadline = std::time::Instant::now() + self.shared.lock_wait;
-        let mut attempt = 0;
+        let mut backoff = Backoff::new(self.shared.lock_wait);
         loop {
             match f() {
                 Err(e) if busy(&e) => {
-                    let delay = std::time::Duration::from_millis(
-                        DELAYS_MS[attempt.min(DELAYS_MS.len() - 1)],
-                    );
-                    attempt += 1;
-                    if std::time::Instant::now() + delay > deadline {
+                    if !backoff.wait() {
                         return f();
                     }
-                    std::thread::sleep(delay);
                 }
                 r => return r,
             }
@@ -2332,6 +2400,7 @@ fn execute_query(
     format: &Format,
     types: &[Option<u32>],
     schema: &turso_core::schema::Schema,
+    backoff: &mut Backoff,
 ) -> PgWireResult<Response> {
     let header = Arc::new(result_fields(stmt, types, format));
     // No binary encoder for numeric here: refused before the statement runs, rather than sending
@@ -2352,7 +2421,7 @@ fn execute_query(
         .map(|i| bpchar_width(stmt, schema, i))
         .collect();
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
-    stmt.run_with_row_callback(|row| {
+    run_waiting(stmt, backoff, |row| {
         rows.push(encode_row(&header, &pads, row.get_values()));
         Ok(())
     })
@@ -2499,8 +2568,12 @@ fn no_binary(val: &Value, t: &Type) -> PgWireError {
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
-    stmt.run_ignore_rows().map_err(engine_error)?;
+fn execute_non_query(
+    stmt: &mut turso_core::Statement,
+    query: &str,
+    backoff: &mut Backoff,
+) -> PgWireResult<Response> {
+    run_waiting(stmt, backoff, |_| Ok(())).map_err(engine_error)?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
