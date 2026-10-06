@@ -1033,14 +1033,14 @@ impl Journal {
         fail_lock: bool,
     ) -> Result<Journal> {
         // Lock before touching anything, so a refused create has truncated nothing.
-        let mut file = open_rw(&files.log, false)?;
-        pause_before_lock();
         if fail_lock {
+            open_rw(&files.log, false)?;
             return Err(LimboError::LockingError(
                 "failpoint: the branch log was created but could not be locked".to_string(),
             ));
         }
-        lock_exclusive(&file, &files.log)?;
+        let mut file = open_log_locked(&files.log, |path| open_rw(path, false).map(Some))?
+            .expect("a creating open returns a file");
         let existing = read_all(&mut file)?;
         // A header of either arm's version is state (`parse_log_header` errs on the other one).
         if files.snap.exists()
@@ -1189,9 +1189,7 @@ impl Journal {
         // Lock before reading anything (review N1). The log is opened, never created: a missing
         // log is refused once a snapshot or a catalog meta row says the store held state (review 5
         // #2), and otherwise there is nothing to recover.
-        let opened = open_existing(&files.log)?;
-        pause_before_lock();
-        let Some(mut file) = opened else {
+        let Some(mut file) = open_log_locked(&files.log, open_existing)? else {
             let held = match catalog {
                 None => may_exist(&files.snap),
                 Some(base) => base.is_some(),
@@ -1201,7 +1199,6 @@ impl Journal {
             }
             return Ok(None);
         };
-        lock_exclusive(&file, &files.log)?;
         let snapshot = match catalog {
             None if files.snap.exists() => Some(read_snapshot(&files.snap, format)?),
             None => None,
@@ -2679,6 +2676,53 @@ fn pause_before_lock() {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+    }
+}
+
+/// How many times a log replaced under an open is opened again before the open is refused.
+const LOCK_ATTEMPTS: u32 = 8;
+
+/// Open the log at `path` with `open` (`None`: it is not there) and take its exclusive lock — on the
+/// file the path names once the lock is held (review 5 #6). A log is replaced by a rename (a reset,
+/// a cut, a compaction), so a descriptor opened just before such a rename and locked just after
+/// holds the lock of an unlinked inode while the live log's is held by its store: that open is
+/// made again, and refused after `LOCK_ATTEMPTS`. One `stat` more per open.
+fn open_log_locked(path: &Path, open: impl Fn(&Path) -> Result<Option<File>>) -> Result<Option<File>> {
+    for _ in 0..LOCK_ATTEMPTS {
+        let Some(file) = open(path)? else {
+            return Ok(None);
+        };
+        pause_before_lock();
+        lock_exclusive(&file, path)?;
+        // Mutant `lock_any_inode` (test builds only): the lock is taken on whatever was opened.
+        if still_names(&file, path)? || super::store::fe_mutant("lock_any_inode") {
+            return Ok(Some(file));
+        }
+    }
+    Err(LimboError::LockingError(format!(
+        "branch log {} was replaced {LOCK_ATTEMPTS} times while this store opened it: another branch \
+         store is rewriting it; close that one first",
+        path.display()
+    )))
+}
+
+/// Whether `path` names `file` (the same device and inode). Off unix there is no rename of an open
+/// log to race (Windows refuses it), so the answer is yes.
+fn still_names(file: &File, path: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let held = file.metadata().map_err(|e| io_error(e, "stat branch log"))?;
+        match std::fs::metadata(path) {
+            Ok(named) => Ok(held.dev() == named.dev() && held.ino() == named.ino()),
+            Err(e) if cannot_exist(&e) => Ok(false),
+            Err(e) => Err(io_error(e, "stat branch log")),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        Ok(true)
     }
 }
 
