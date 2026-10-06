@@ -597,7 +597,9 @@ static const char *GENERIC_OPTS[] = {"rw", "relatime", "noatime", "nodiratime", 
                                      "nodev", "noexec", "nosymfollow", "seclabel", NULL};
 static const char *EXT4_OPTS[] = {
     "errors=", "commit=", "data=ordered", "data=writeback", "journal_async_commit", "journal_checksum", "discard",
-    "nodiscard", "delalloc", "nodelalloc", "dioread_nolock", "dioread_lock", "auto_da_alloc", "noauto_da_alloc",
+    "nodiscard", "delalloc", "nodelalloc", "dioread_nolock", "dioread_lock",
+    "nodioread_nolock", /* the kernel's own spelling of dioread_lock in mountinfo (a data=journal mount shows it) */
+    "auto_da_alloc", "noauto_da_alloc",
     "user_xattr", "nouser_xattr", "acl", "noacl", "noquota", "quota", "usrquota", "grpquota", "stripe=",
     "inode_readahead_blks=", "init_itable=", "noinit_itable", "max_batch_time=", "min_batch_time=", "i_version",
     "prefetch_block_bitmaps", "no_prefetch_block_bitmaps", "block_validity", "noblock_validity", "bsddf", "minixdf",
