@@ -4687,6 +4687,18 @@ pub fn is_refresh_matview(parse_result: &ParseResult) -> bool {
     matches!(&nodes[0].0, NodeRef::RefreshMatViewStmt(_))
 }
 
+/// Returns true if the parse result is exactly one CHECKPOINT statement.
+pub fn is_checkpoint(parse_result: &ParseResult) -> bool {
+    use pg_query::protobuf::node::Node;
+    matches!(
+        parse_result.protobuf.stmts.as_slice(),
+        [raw] if matches!(
+            raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
+            Some(Node::CheckPointStmt(_))
+        )
+    )
+}
+
 /// Returns true if the parse result is a COMMENT ON statement.
 /// Comments are accepted for PostgreSQL compatibility but are not persisted.
 pub fn is_comment_on(parse_result: &ParseResult) -> bool {

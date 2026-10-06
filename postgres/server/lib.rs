@@ -532,8 +532,9 @@ impl Session {
         let r = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
             execute_non_query(&mut stmt, sql)
         } else {
-            let header = Arc::new(build_field_info(&stmt, format));
-            execute_query(&mut stmt, header)
+            // An extended-protocol client took the column types from Describe, which runs nothing:
+            // its rows keep those types. A simple-protocol reply carries its own RowDescription.
+            execute_query(&mut stmt, format, portal.is_none())
         };
         r.map_err(wire_info)
     }
@@ -612,6 +613,13 @@ impl Session {
                 }
                 Ok(one_text(f, &name, format))
             }
+            _ if st.branch.as_ref().is_some_and(|(on, _)| *on == name) => Err(error(
+                "55006",
+                format!(
+                    "cannot delete branch \"{name}\": this session is on it; switch to another \
+                     branch first"
+                ),
+            )),
             _ => match self.shared.db.drop_branch(&name) {
                 Ok(_) => Ok(one_text(f, &name, format)),
                 Err(e) => Err(self.missing_or(&name, &e, "ERROR")),
@@ -632,10 +640,20 @@ impl Session {
         self.missing_or(name, e, severity)
     }
 
-    /// A branch call on a name with no branch: 3D000, as for a database that does not exist.
+    /// A branch call on a name with no branch: 3D000, as for a database that does not exist; on a
+    /// branch another session holds: 55006 (object_in_use), as for a database in use. Classified on
+    /// the error path only.
     fn missing_or(&self, name: &str, e: &LimboError, severity: &str) -> Box<ErrorInfo> {
         let mut info = match self.shared.db.branch_named(name) {
             Ok(None) => error("3D000", format!("branch \"{name}\" does not exist")),
+            Ok(Some(_)) if e.to_string().contains("already has an open connection") => {
+                let mut info = error(
+                    "55006",
+                    format!("branch \"{name}\" is in use by another session"),
+                );
+                info.detail = Some(e.to_string());
+                info
+            }
             _ => engine_info(e),
         };
         info.severity = severity.to_string();
@@ -1051,13 +1069,53 @@ impl ExtendedQueryHandler for Session {
 
 /// Build FieldInfo metadata from a prepared statement's column information.
 fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldInfo> {
+    field_info(stmt, format, |i| resolve_pg_type_for_column(stmt, i))
+}
+
+fn field_info(
+    stmt: &turso_core::Statement,
+    format: &Format,
+    pg_type: impl Fn(usize) -> Type,
+) -> Vec<FieldInfo> {
     (0..stmt.num_columns())
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
-            let pg_type = resolve_pg_type_for_column(stmt, i);
-            FieldInfo::new(name, None, None, pg_type, format.format_for(i))
+            FieldInfo::new(name, None, None, pg_type(i), format.format_for(i))
         })
         .collect()
+}
+
+/// A result column's type from the statement alone, if the engine can tell it (a table column, a
+/// literal, a cast, an operator over known types); `None` for one it cannot, such as an aggregate.
+fn static_pg_type(stmt: &turso_core::Statement, idx: usize) -> Option<Type> {
+    stmt.get_column_type_info(idx)
+        .ok()
+        .flatten()
+        .map(|_| resolve_pg_type_for_column(stmt, idx))
+}
+
+/// The type of a result column the statement could not type, from the values it returned: a
+/// SQLite value's storage class is its type. Integers only: bigint (PostgreSQL's type for count and
+/// for the sum of integers); any real among numbers: double precision; text: text; blobs: bytea.
+/// Mixed classes, or no non-null value at all, stay text.
+fn infer_pg_type(values: &[Vec<Value>], idx: usize) -> Type {
+    use turso_core::Numeric;
+    let (mut ints, mut reals, mut texts, mut blobs) = (0usize, 0usize, 0usize, 0usize);
+    for row in values {
+        match row.get(idx) {
+            Some(Value::Numeric(Numeric::Integer(_))) => ints += 1,
+            Some(Value::Numeric(Numeric::Float(_))) => reals += 1,
+            Some(Value::Text(_)) => texts += 1,
+            Some(Value::Blob(_)) => blobs += 1,
+            _ => {}
+        }
+    }
+    match (ints, reals, texts, blobs) {
+        (1.., 0, 0, 0) => Type::INT8,
+        (_, 1.., 0, 0) => Type::FLOAT8,
+        (0, 0, 0, 1..) => Type::BYTEA,
+        _ => Type::TEXT,
+    }
 }
 
 /// Decide the PG wire type for a result column.
@@ -1147,29 +1205,73 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 }
 
 /// Execute a query that returns rows and build a Query response.
+///
+/// With `infer`, a column the statement cannot type (see [`static_pg_type`]) is typed from its
+/// values ([`infer_pg_type`]), so the rows are kept as values until every row is read; a statement
+/// whose columns are all typed, or a reply without `infer`, encodes each row as it comes (an
+/// untyped column as text, as Describe reported it).
 fn execute_query(
     stmt: &mut turso_core::Statement,
-    header: Arc<Vec<FieldInfo>>,
+    format: &Format,
+    infer: bool,
 ) -> PgWireResult<Response> {
-    let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
-    let header_clone = header.clone();
-
-    stmt.run_with_row_callback(|row| {
-        let mut encoder = DataRowEncoder::new(header_clone.clone());
-        for (i, val) in row.get_values().enumerate() {
-            let pg_type = header_clone
-                .get(i)
-                .map(|fi| fi.datatype().clone())
-                .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+    let mut statics: Vec<Option<Type>> = (0..stmt.num_columns())
+        .map(|i| static_pg_type(stmt, i))
+        .collect();
+    if !infer {
+        for t in &mut statics {
+            t.get_or_insert(Type::TEXT);
         }
-        rows.push(encoder.finish());
+    }
+    if statics.iter().all(Option::is_some) {
+        let header = Arc::new(field_info(stmt, format, |i| {
+            statics[i].clone().expect("all typed")
+        }));
+        let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(encode_row(&header, row.get_values()));
+            Ok(())
+        })
+        .map_err(engine_error)?;
+        return Ok(Response::Query(QueryResponse::new(
+            header,
+            stream::iter(rows),
+        )));
+    }
+    let mut values: Vec<Vec<Value>> = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        values.push(row.get_values().cloned().collect());
         Ok(())
     })
     .map_err(engine_error)?;
+    let header = Arc::new(field_info(stmt, format, |i| {
+        statics[i]
+            .clone()
+            .unwrap_or_else(|| infer_pg_type(&values, i))
+    }));
+    let rows: Vec<PgWireResult<DataRow>> = values
+        .iter()
+        .map(|row| encode_row(&header, row.iter()))
+        .collect();
+    Ok(Response::Query(QueryResponse::new(
+        header,
+        stream::iter(rows),
+    )))
+}
 
-    let data_stream = stream::iter(rows);
-    Ok(Response::Query(QueryResponse::new(header, data_stream)))
+fn encode_row<'a>(
+    header: &Arc<Vec<FieldInfo>>,
+    values: impl Iterator<Item = &'a Value>,
+) -> PgWireResult<DataRow> {
+    let mut encoder = DataRowEncoder::new(header.clone());
+    for (i, val) in values.enumerate() {
+        let pg_type = header
+            .get(i)
+            .map(|fi| fi.datatype().clone())
+            .unwrap_or(Type::TEXT);
+        encode_value(&mut encoder, val, &pg_type).map_err(engine_error)?;
+    }
+    encoder.finish()
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
@@ -1405,6 +1507,9 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
+        || upper.starts_with("CHECKPOINT")
+        || upper.starts_with("SET ")
+        || upper.starts_with("RESET ")
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
@@ -1413,8 +1518,14 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("INSERT").with_oid(0).with_rows(affected_rows)
     } else if upper.starts_with("UPDATE") {
         Tag::new("UPDATE").with_rows(affected_rows)
-    } else if upper.starts_with("DELETE") || upper.starts_with("TRUNCATE") {
+    } else if upper.starts_with("DELETE") {
         Tag::new("DELETE").with_rows(affected_rows)
+    } else if upper.starts_with("TRUNCATE") {
+        Tag::new("TRUNCATE TABLE")
+    } else if upper.starts_with("CHECKPOINT") {
+        Tag::new("CHECKPOINT")
+    } else if upper.starts_with("RESET") {
+        Tag::new("RESET")
     } else if upper.starts_with("CREATE VIEW") {
         Tag::new("CREATE VIEW")
     } else if upper.starts_with("CREATE INDEX") {

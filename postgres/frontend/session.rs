@@ -7,10 +7,10 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, try_extract_branch_call, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
-    PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
+    is_checkpoint, is_comment_on, is_refresh_matview, try_extract_branch_call,
+    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_show, PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgSetStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -339,6 +339,14 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
 
     if is_comment_on(&parse_result) {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
+    }
+
+    // PostgreSQL's CHECKPOINT writes every dirty page to the data files; a WAL checkpoint that
+    // copies every frame back into the database file and truncates the log is the same act here.
+    if is_checkpoint(&parse_result) {
+        return Ok(Some(
+            pg_conn.conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?,
+        ));
     }
 
     if let Some(stmt) = try_extract_copy_from(&parse_result) {
