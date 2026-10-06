@@ -1981,6 +1981,27 @@ impl Lineage {
     }
 }
 
+/// What `BranchStore::start_flight` did (review 4 #2): only `Failed` backs the next attempt off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlightStart {
+    /// A fuzzy checkpoint is in flight now, on a thread of its own.
+    Started,
+    /// Not a catalog store.
+    NotCatalog,
+    /// One was in flight already.
+    InFlight,
+    /// Parked Commits remain after this call's settle batch: the next call continues.
+    Parked,
+    /// A catalog WAL truncation runs: none starts during it.
+    Truncating,
+    /// The store is fail-stopped.
+    Poisoned,
+    /// A splice-arm store takes no fuzzy checkpoint (G-b).
+    Refused,
+    /// The settle, the capture or the thread's spawn failed.
+    Failed,
+}
+
 /// F-FZ: what a catalog checkpoint captured under the store mutex (phase 1), for its writer (phase
 /// 2, no store mutex) and its install (phase 3). See `catalog.rs`, "The fuzzy checkpoint".
 struct Captured {
@@ -3818,23 +3839,38 @@ impl BranchStore {
         // cleared by the install under the same mutex, so it is never left set with no flight.
         // (During a WAL truncation no checkpoint starts and none waits: the log can pass twice the
         // threshold by what that truncation's time appends.)
-        if !self.start_flight(inner)
-            && inner.cat.as_ref().is_some_and(|c| c.flight)
-            && inner.journal.as_ref().is_some_and(|j| j.past_hard_limit())
-        {
-            self.over_hard.store(true, Ordering::Release);
+        match self.start_flight(inner) {
+            // A start that failed (settle, capture or spawn) backs off as a failed write does
+            // (review 4 #2): not retried, under this mutex, by every operation until another
+            // threshold's worth of log. Mutant `start_failure_retried` (test builds only).
+            FlightStart::Failed => {
+                if let Some(journal) = inner.journal.as_mut().filter(|_| !fe_mutant("start_failure_retried")) {
+                    journal.defer_compaction();
+                }
+            }
+            FlightStart::InFlight
+                if inner.journal.as_ref().is_some_and(|j| j.past_hard_limit()) =>
+            {
+                self.over_hard.store(true, Ordering::Release);
+            }
+            _ => {}
         }
     }
 
     /// F-FZ: start a fuzzy checkpoint unless one is in flight. Parked Commits (C-R) are settled
     /// first, at most `SETTLE_BATCH` branches per call, and the checkpoint waits for the next call
-    /// while any remain. Returns whether a checkpoint started.
-    fn start_flight(&self, inner: &mut StoreInner) -> bool {
-        if inner.cat.as_ref().is_none_or(|c| c.flight)
-            || inner.poisoned()
-            || self.truncating.load(Ordering::Acquire)
-        {
-            return false;
+    /// while any remain. Returns whether a checkpoint started, or why not.
+    fn start_flight(&self, inner: &mut StoreInner) -> FlightStart {
+        match inner.cat.as_ref() {
+            None => return FlightStart::NotCatalog,
+            Some(c) if c.flight => return FlightStart::InFlight,
+            Some(_) => {}
+        }
+        if inner.poisoned() {
+            return FlightStart::Poisoned;
+        }
+        if self.truncating.load(Ordering::Acquire) {
+            return FlightStart::Truncating;
         }
         // G-b (r13-compose A4.G): every fuzzy path reaches here; a splice-arm store is refused and
         // counted (a nonzero count in a census run is a FINDING: the census runs sharp only).
@@ -3842,7 +3878,7 @@ impl BranchStore {
             if let Some(cat) = inner.cat.as_mut() {
                 cat.ckpt.fuzzy_refused_splice += 1;
             }
-            return false;
+            return FlightStart::Refused;
         }
         let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if !inner.parked.is_empty() {
@@ -3850,13 +3886,13 @@ impl BranchStore {
             if let Err(e) = inner.settle_batch(SETTLE_BATCH) {
                 tracing::warn!("branch store: parked commits not applied: {e}");
                 let _ = inner.fatal(e);
-                return false;
+                return FlightStart::Failed;
             }
             if let Some(cat) = inner.cat.as_mut() {
                 cat.ckpt.hold(ns(t));
             }
             if !inner.parked.is_empty() {
-                return false;
+                return FlightStart::Parked;
             }
         }
         // Nothing is flushed for the capture (lead review 1 item 7): what is buffered is in it, and
@@ -3866,7 +3902,7 @@ impl BranchStore {
         if fe_mutant("settle_at_capture") {
             if let Err(e) = self.settle_durable(inner) {
                 tracing::warn!("branch catalog checkpoint not started: {e}");
-                return false;
+                return FlightStart::Failed;
             }
         }
         self.mature(inner);
@@ -3877,13 +3913,12 @@ impl BranchStore {
             Ok(cap) => cap,
             Err(e) => {
                 tracing::warn!("branch catalog checkpoint not started: {e}");
-                return false;
+                return FlightStart::Failed;
             }
         };
         let cat = inner.cat.as_mut().expect("captured above");
         cat.ckpt.hold(ns(t));
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
-        cat.ckpt.flights += 1;
         let writer = cat.writer.clone();
         let dirty = cap.dirty.clone();
         let shared = self.inner.clone();
@@ -3910,11 +3945,15 @@ impl BranchStore {
         match spawned {
             Ok(handle) => {
                 flights.push(handle);
-                true
+                if let Some(cat) = inner.cat.as_mut() {
+                    cat.ckpt.flights += 1;
+                }
+                FlightStart::Started
             }
             Err(e) => {
-                // Nothing was written: undo the capture (the thread's closure, and the capture
-                // with it, are gone).
+                // Nothing was written but the capture's marker, which no catalog generation
+                // commits (recovery cuts only at a committed one): undo the capture (the thread's
+                // closure, and the capture with it, are gone).
                 tracing::warn!("branch catalog checkpoint thread not started: {e}");
                 let cat = inner.cat.as_mut().expect("captured above");
                 cat.catalog.end_read_snapshot();
@@ -3922,7 +3961,7 @@ impl BranchStore {
                 for (id, what) in dirty {
                     *cat.dirty.entry(id).or_insert(0) |= what;
                 }
-                false
+                FlightStart::Failed
             }
         }
     }
@@ -5800,7 +5839,7 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn start_flight_for_test(&self) -> bool {
         let mut inner = self.inner.lock();
-        self.start_flight(&mut inner)
+        self.start_flight(&mut inner) == FlightStart::Started
     }
 
     /// A4.G's G-c red: a FUZZY capture called directly, past G-a and G-b (tests only). A capture
@@ -5839,7 +5878,7 @@ impl BranchStore {
                 "fuzzy checkpoint refused: splice arm (r13-compose S-12)".to_string(),
             ));
         }
-        Ok(self.start_flight(&mut inner))
+        Ok(self.start_flight(&mut inner) == FlightStart::Started)
     }
 
     /// Make a fuzzy checkpoint in flight wait at `stage` (`HOLD_BEFORE_COMMIT`,
@@ -6921,8 +6960,8 @@ impl StoreInner {
                     .to_string(),
             ));
         }
+        // Consumed below, with the marker that names it.
         let generation = cat.next_generation;
-        cat.next_generation += 1;
         let dirty = std::mem::take(&mut cat.dirty);
         let rows: Vec<(CatBranch, u8)> = dirty
             .iter()
@@ -6978,10 +7017,48 @@ impl StoreInner {
                 .flat_map(|id| branches[id].pending.values().copied())
                 .collect()
         };
-        // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
-        if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
+        // The capture's fallible steps come before its first effect on the log (review 4 #2): one
+        // that fails buffers no marker and takes no generation.
+        // The arena is synced before the catalog commit only if a slot was written since its last
+        // sync, or a flight that took its last unsynced writes may not have synced them yet (lead
+        // review 1 item 7(4)): a clean arena costs the checkpoint no sync.
+        let rewrite_syncs = journal.rewrite_class().syncs();
+        let arena_file = if rewrite_syncs && (arena.is_dirty() || flight_in_air) {
+            match arena.sync_handle() {
+                Ok(f) => f,
+                Err(e) => {
+                    cat.dirty = dirty;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
+            Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
+        } else {
+            cat.catalog.begin_read_snapshot()
+        };
+        // Mutant `capture_marker_first` (test builds only): the marker buffered before the
+        // fallible steps, as before.
+        let marker_first = fe_mutant("capture_marker_first");
+        if marker_first {
+            let _ = journal.buffer(&Record::Checkpoint { generation });
+            cat.next_generation += 1;
+        }
+        if let Err(e) = snapshot {
             cat.dirty = dirty;
             return Err(e);
+        }
+        // ARIES's begin-checkpoint record: the capture covers the log up to and including it.
+        if !marker_first {
+            if let Err(e) = journal.buffer(&Record::Checkpoint { generation }) {
+                cat.catalog.end_read_snapshot();
+                cat.dirty = dirty;
+                return Err(e);
+            }
+            // Taken with its marker: no two markers in a log share a generation.
+            cat.next_generation += 1;
         }
         let log_from = journal.mark();
         // fastest-engine mutant `deferred_matured_at_capture` (test builds only): the capture hands
@@ -7032,30 +7109,6 @@ impl StoreInner {
                 arena.high_water(),
                 arena.in_use()
             );
-        }
-        // The arena is synced before the catalog commit only if a slot was written since its last
-        // sync, or a flight that took its last unsynced writes may not have synced them yet (lead
-        // review 1 item 7(4)): a clean arena costs the checkpoint no sync.
-        let rewrite_syncs = journal.rewrite_class().syncs();
-        let arena_file = if rewrite_syncs && (arena.is_dirty() || flight_in_air) {
-            match arena.sync_handle() {
-                Ok(f) => f,
-                Err(e) => {
-                    cat.dirty = dirty;
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-        let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
-            Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
-        } else {
-            cat.catalog.begin_read_snapshot()
-        };
-        if let Err(e) = snapshot {
-            cat.dirty = dirty;
-            return Err(e);
         }
         cat.flight = true;
         let fail_arena_sync = arena_file.is_some()
