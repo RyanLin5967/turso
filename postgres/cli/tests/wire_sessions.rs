@@ -1920,3 +1920,40 @@ fn a_busy_checkpoint_inside_a_block_says_it_was_skipped() {
     );
     assert_eq!(a.q("SELECT count(*) FROM t").single("rows"), "4");
 }
+
+/// Engine errors carry PostgreSQL's SQLSTATE, so a driver raises the right exception class
+/// (psycopg's IntegrityError, not InternalError): at 472023b72 every one but Busy and
+/// BusySnapshot was XX000 (wire review 1 item 7). The codes are PostgreSQL's (errcodes.txt).
+#[test]
+fn engine_errors_carry_postgres_sqlstates() {
+    let dir = Scratch::new("sqlstate");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("parent");
+    a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id))")
+        .ok("child");
+    a.q("CREATE TABLE n(id INT PRIMARY KEY, v INT NOT NULL)")
+        .ok("not null");
+    a.q("CREATE TABLE k(id INT PRIMARY KEY, v INT CHECK (v > 0))")
+        .ok("check");
+    for (sql, code) in [
+        ("INSERT INTO t VALUES (1, 'again')", "23505"),
+        ("INSERT INTO c VALUES (1, 99)", "23503"),
+        ("INSERT INTO n VALUES (1, NULL)", "23502"),
+        ("INSERT INTO k VALUES (1, 0)", "23514"),
+        ("SELECT * FROM nope", "42P01"),
+        ("SELECT nope FROM t", "42703"),
+        ("SELECT FROM WHERE", "42601"),
+        (
+            "SELECT * FROM generate_series(1, 2) WITH ORDINALITY",
+            "0A000",
+        ),
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, code, "{sql}");
+    }
+    assert_eq!(
+        a.q("SELECT count(*) FROM t").single("t after"),
+        "1",
+        "a refused insert left a row"
+    );
+}
