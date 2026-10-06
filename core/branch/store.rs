@@ -4788,7 +4788,13 @@ impl BranchStore {
             let durable_at = if inner.poisoned() || fe_mutant("list_no_durable_wait") {
                 0
             } else {
-                inner.last_fork_lsn.max(self.last_release_lsn.load(Ordering::Acquire))
+                // Mutant `list_no_release_wait` (test builds only, engine review 7 #12): forks only.
+                let releases = if fe_mutant("list_no_release_wait") {
+                    0
+                } else {
+                    self.last_release_lsn.load(Ordering::Acquire)
+                };
+                inner.last_fork_lsn.max(releases)
             };
             // A fail-stopped store lists no fork whose flight failed (review 3 #17): its creator was
             // told it failed, and a reopen would not have it. And it lists every branch whose
