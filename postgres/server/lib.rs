@@ -505,6 +505,11 @@ async fn serve_session(
         .await
         {
             error_handler.on_error(&socket, &mut e);
+            // Whatever raised it, an extended-protocol error fails the block it is in (wire
+            // review 4 item 1).
+            if is_extended_query {
+                session.fail_block();
+            }
             if let Err(io) =
                 pgwire::tokio::server::process_error(&mut socket, e, is_extended_query).await
             {
@@ -837,6 +842,31 @@ impl Session {
             }
         } else if TxVerb::of(sql) == TxVerb::Other {
             st.implicit = true;
+        }
+    }
+
+    /// An extended-protocol message failed, whatever raised the error: a statement's run, a refused
+    /// binary encoding, a Bind or Execute of a portal that does not exist, pgwire itself. As in
+    /// PostgreSQL the failure rolls back the pipeline's implicit block, or fails the client's block
+    /// (25P02 until its end, which answers ROLLBACK), so neither commits at Sync or at the block's
+    /// COMMIT. Errors raised outside `run` reached neither (wire review 4 item 1). A block the
+    /// statement's own failure already ended or failed is left as it is. The session's open
+    /// connection is read, never opened: a session with none has no block.
+    fn fail_block(&self) {
+        let mut st = self.state();
+        let implicit = std::mem::take(&mut st.implicit);
+        let open = |st: &SessionState| match &st.branch {
+            Some((_, conn)) => Some(conn.clone()),
+            None => st.trunk.clone(),
+        };
+        let Some(conn) = open(&st).filter(|conn| !conn.inner().get_auto_commit()) else {
+            return;
+        };
+        if implicit {
+            st.aborted = false;
+            let _ = engine_tx(&conn, TxStmt::Rollback);
+        } else {
+            st.aborted = true;
         }
     }
 
@@ -2403,17 +2433,20 @@ fn execute_query(
     backoff: &mut Backoff,
 ) -> PgWireResult<Response> {
     let header = Arc::new(result_fields(stmt, types, format));
-    // No binary encoder for numeric here: refused before the statement runs, rather than sending
-    // a float's eight bytes as numeric.
+    // A binary column of a type encode_binary has no encoding for (numeric, date, timestamp,
+    // uuid, ...) is refused before the statement runs, by its type alone: refused at its first
+    // row, a write's RETURNING was refused after the write (wire review 4 item 1), and a numeric
+    // would have gone out as a float's eight bytes.
     if let Some(f) = header
         .iter()
-        .find(|f| *f.datatype() == Type::NUMERIC && f.format() == FieldFormat::Binary)
+        .find(|f| f.format() == FieldFormat::Binary && !BINARY_ENCODED.contains(f.datatype()))
     {
         return Err(PgWireError::UserError(error(
             "0A000",
             format!(
-                "binary format for numeric column \"{}\" is not supported; ask for text format",
-                f.name()
+                "binary format for column \"{}\" of type {} is not supported; ask for text format",
+                f.name(),
+                f.datatype()
             ),
         )));
     }
@@ -2421,11 +2454,28 @@ fn execute_query(
         .map(|i| bpchar_width(stmt, schema, i))
         .collect();
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
-    run_waiting(stmt, backoff, |row| {
-        rows.push(encode_row(&header, &pads, row.get_values()));
-        Ok(())
-    })
-    .map_err(engine_error)?;
+    // A row that cannot be encoded (a value out of its binary type's range) fails the statement
+    // there, so its block fails with it, instead of going out as an error after the statement
+    // succeeded (wire review 4 item 1).
+    let mut unencodable = None;
+    let ran = run_waiting(stmt, backoff, |row| {
+        match encode_row(&header, &pads, row.get_values()) {
+            Ok(encoded) => {
+                rows.push(Ok(encoded));
+                Ok(())
+            }
+            Err(e) => {
+                unencodable = Some(e);
+                Err(LimboError::InternalError(
+                    "a row could not be encoded".to_string(),
+                ))
+            }
+        }
+    });
+    if let Some(e) = unencodable {
+        return Err(e);
+    }
+    ran.map_err(engine_error)?;
     Ok(Response::Query(QueryResponse::new(
         header,
         stream::iter(rows),
@@ -2509,6 +2559,24 @@ fn encode_row<'a>(
 /// or float8; anything else, in a text-like column, as its text's bytes (binary text is the text).
 /// A value its column's type has no binary form for here is refused rather than sent as the
 /// engine's bytes under that type's name.
+/// The column types [`encode_binary`] encodes; a binary column of any other type is refused before
+/// its statement runs.
+const BINARY_ENCODED: [Type; 13] = [
+    Type::BOOL,
+    Type::INT2,
+    Type::INT4,
+    Type::INT8,
+    Type::FLOAT4,
+    Type::FLOAT8,
+    Type::TEXT,
+    Type::VARCHAR,
+    Type::BPCHAR,
+    Type::NAME,
+    Type::UNKNOWN,
+    Type::JSON,
+    Type::BYTEA,
+];
+
 fn encode_binary(encoder: &mut DataRowEncoder, val: &Value, pg_type: &Type) -> PgWireResult<()> {
     use turso_core::Numeric;
     let range = |_| {
