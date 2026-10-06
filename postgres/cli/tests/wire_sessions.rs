@@ -2358,3 +2358,38 @@ fn a_write_waits_for_another_sessions_commit() {
         "0ab"
     );
 }
+
+/// Branch creates racing trunk DDL all succeed: the engine answers a fork that met a schema change
+/// with SchemaUpdated, documented as "the caller retries" (fork_trunk_registered), and the server
+/// now does. At 472023b72 waiting() retried only Busy, so such a create failed with XX000, against
+/// PREREG's trunk writers committing DDL during the gate (wire review 1 item 11).
+#[test]
+fn branch_creates_racing_trunk_ddl_all_succeed() {
+    let dir = Scratch::new("ddlrace");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "20000"]);
+    let mut a = seeded(&server);
+    let mut b = server.connect();
+    let ddl = std::thread::spawn(move || {
+        for i in 0..40 {
+            a.q(&format!("ALTER TABLE t ADD COLUMN c{i} INT"))
+                .ok("trunk DDL");
+        }
+        a
+    });
+    let mut failures = Vec::new();
+    for i in 0..40 {
+        let name = format!("r{i}");
+        if let Some(e) = b.q(&format!("SELECT turso_branch_create('{name}')")).error {
+            failures.push((name, e));
+            continue;
+        }
+        b.q(&format!("SELECT turso_branch_delete('{name}')"))
+            .ok("delete");
+    }
+    let _a = ddl.join().unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} of 40 creates failed beside trunk DDL: {failures:?}",
+        failures.len()
+    );
+}
