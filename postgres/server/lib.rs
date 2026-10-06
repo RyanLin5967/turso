@@ -1180,7 +1180,6 @@ impl Session {
                     // Dropping the branch's connection closes the branch for connections.
                     st.branch.take()
                 } else {
-                    self.shared.claim(&name, "ERROR")?;
                     let opened = match self.waiting(|| self.shared.db.connect_named(&name)) {
                         Ok(opened) => opened,
                         Err(e) => {
