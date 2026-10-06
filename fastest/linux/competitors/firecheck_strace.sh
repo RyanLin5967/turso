@@ -250,10 +250,13 @@ if strace_attach "$OUT/f3" "$PP"; then
   check F3-idle-attach "$OUT/f3.json" 'r["verdict"]=="ok" and r["flushes"]==0 and r["summary_found"]'
   log "F3 note: empty_window=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['empty_window'])" "$OUT/f3.json") strace_rc=$(grep -o 'strace_rc=[0-9]*' "$OUT/f3.window")"
   # F3b: the same table-less window WITHOUT the attach proof must not read as zero. Its precondition (F3's window
-  # had no table and no call lines) is part of the check: an untested F3b fails.
-  python3 "$SC" count "$OUT/f3.strace" --extra "$OUT/f3.strace.err" --root "$DIR" >"$OUT/f3b.json"
+  # had no table and no call lines) is part of the check: an untested F3b fails. The window given is a well-formed
+  # LAUNCH record (strace_rc 0), so the only thing missing is the attach proof, and the refusal must be the missing
+  # table, not a malformed record (third review, finding 7: without any window it was refused for the record alone).
+  printf 'cmd=f3b-control t0=%s\nt1=%s\nstrace_rc=0\n' "$(date +%s.%N)" "$(date +%s.%N)" >"$OUT/f3b.window"
+  python3 "$SC" count "$OUT/f3.strace" --extra "$OUT/f3.strace.err" --root "$DIR" --window "$OUT/f3b.window" >"$OUT/f3b.json"
   check F3b-unproven-empty-refused "$OUT/f3b.json" \
-    'not r["lines"] and not r["summary"] and r["verdict"].startswith("REFUSED")'
+    'not r["lines"] and not r["summary"] and r["problems"]==["no -c summary table found"]'
 else
   log "FAIL F3-idle-attach: strace_attach failed"; fails=$((fails + 1))
   log "FAIL F3b-unproven-empty-refused: not tested (no F3 window)"; fails=$((fails + 1))
