@@ -820,7 +820,12 @@ impl PgAttributeCursor {
                 let col_name = col.name.clone().unwrap_or_default();
                 let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
                 let attnum = (i + 1) as i64; // 1-based
-                let notnull = if col.notnull() { 1i64 } else { 0i64 };
+                                             // A key column is NOT NULL (see information_schema's is_nullable).
+                let notnull = if col.notnull() || col.primary_key() {
+                    1i64
+                } else {
+                    0i64
+                };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
 
                 self.rows.push(vec![
