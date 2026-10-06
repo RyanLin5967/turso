@@ -830,6 +830,24 @@ impl Session {
             .map_or_else(Vec::new, |d| build_field_info(&d.stmt, format))
     }
 
+    /// The highest $n the statement [`Session::describe_prepare`] kept uses (the engine names
+    /// each PostgreSQL parameter `$n`), 0 for none.
+    fn described_parameters(&self) -> usize {
+        let st = self.state();
+        let Some(d) = st.described.as_ref() else {
+            return 0;
+        };
+        let params = d.stmt.parameters();
+        (1..=params.count())
+            .filter_map(|i| {
+                let name = params.name(NonZero::new(i)?)?;
+                let n = name.strip_prefix('$').or_else(|| name.strip_prefix('?'))?;
+                n.parse::<usize>().ok()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The statement a Describe prepared for this Execute, if it is this text on this connection.
     fn take_described(&self, conn: &PgConnection, sql: &str) -> Option<turso_core::Statement> {
         let mut st = self.state();
@@ -1755,24 +1773,37 @@ impl ExtendedQueryHandler for Session {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let param_types: Vec<Type> = target
-            .parameter_types
-            .iter()
-            .map(|t| t.clone().unwrap_or(Type::TEXT))
-            .collect();
+        // Every parameter, $1 up to the highest $n the statement uses or the client declared:
+        // declared ones as declared, the rest as text (wire review 1 item 13).
+        let param_types = |used: usize| -> Vec<Type> {
+            let declared = &target.parameter_types;
+            (0..used.max(declared.len()))
+                .map(|i| declared.get(i).cloned().flatten().unwrap_or(Type::TEXT))
+                .collect()
+        };
         self.refuse_describe_if_aborted(&target.statement)?;
         if let Some(call) = branch_call(&target.statement) {
             let fields = branch_call_fields(&call, &Format::UnifiedText);
-            return Ok(DescribeStatementResponse::new(param_types, fields));
+            let used = call
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    PgBranchArg::Param(n) => Some(*n),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            return Ok(DescribeStatementResponse::new(param_types(used), fields));
         }
         // The special statements return no rows, and preparing one runs it (COPY FROM loads its
         // file at prepare): Describe answers them from the text alone (wire review 1 item 12).
         if is_pg_non_query(&target.statement) {
-            return Ok(DescribeStatementResponse::new(param_types, vec![]));
+            return Ok(DescribeStatementResponse::new(param_types(0), vec![]));
         }
         self.describe_prepare(&target.statement)?;
         let fields = self.described_fields(&Format::UnifiedText);
-        Ok(DescribeStatementResponse::new(param_types, fields))
+        let used = self.described_parameters();
+        Ok(DescribeStatementResponse::new(param_types(used), fields))
     }
 
     async fn do_describe_portal<C>(
