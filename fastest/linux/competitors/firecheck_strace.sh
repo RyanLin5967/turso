@@ -40,8 +40,8 @@
 #   F12 the t1 cut: the split probe with t1 stamped between its fsync x2 and fsync x3 -> counts 2, and >= 3 calls
 #      after t1 left out.
 #   F13 the clock refusals forced to fire, each alone, on copies of F2's window: a call stamp 2 s back in the trace;
-#      tend's realtime 0.1 s off either way (monotonic untouched); every call stamp 5 s late. Each is REFUSED for its
-#      own reason; the unmodified copy counts F2's 10.
+#      tend's realtime 0.1 s off either way (monotonic untouched); every call stamp 5 s late; the t1 line repeated;
+#      the t1 line after strace_rc. Each is REFUSED for its own reason; the unmodified copy counts F2's 10.
 # Exit 0 only if all NCHECK pass; the verdict line is the last line of OUT/firecheck.txt.
 set -uo pipefail
 OUT=${1:?usage: firecheck_strace.sh OUT DIR}
@@ -548,9 +548,11 @@ stop_probe2 split
 #       branch also refuses, so deleting the comparison went unseen);
 #   (d) every call stamp moved +5 s, uniformly (no back-step, no pair touched) -> refused only for calls outside
 #       [tseize, tend];
+#   (f) the t1 line repeated -> refused for a repeated stamp; (g) the t1 line moved after strace_rc -> refused for
+#       the stamps' order (second re-review, finding 5);
 #   (c) the unmodified copy -> ok with F2's exact 10 flushes, so the others fail for their edit.
 if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
-  for k in a b c d e; do
+  for k in a b c d e f g; do
     for x in strace strace.err window fdsync pids; do cp "$OUT/f2.$x" "$OUT/f13$k.$x" 2>/dev/null; done
   done
   awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { n++; if (n == 2) $2 = sprintf("%.6f", prev - 2.0); prev = $2 + 0 } { print }' \
@@ -558,21 +560,26 @@ if [ -s "$OUT/f2.window" ] && [ -s "$OUT/f2.strace" ]; then
   awk -v D=0.1 '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + D) } { print }' "$OUT/f2.window" >"$OUT/f13b.window"
   awk -v D=-0.1 '/^tend=/ { split($1, a, "="); $1 = sprintf("tend=%.9f", a[2] + D) } { print }' "$OUT/f2.window" >"$OUT/f13e.window"
   awk '/^[0-9]+ +[0-9]+\.[0-9]+ / { $2 = sprintf("%.6f", $2 + 5.0) } { print }' "$OUT/f2.strace" >"$OUT/f13d.strace"
-  for k in a b c d e; do count "f13$k"; done
+  awk '{ print } /^t1=/ { dup = $0 } END { print dup }' "$OUT/f2.window" >"$OUT/f13f.window"
+  awk '/^t1=/ { held = $0; next } { print } /^strace_rc=/ { print held }' "$OUT/f2.window" >"$OUT/f13g.window"
+  for k in a b c d e f g; do count "f13$k"; done
   if python3 -c "
 import json, sys
-a, b, c, d, e = (json.load(open(p))['verdict'] for p in sys.argv[1:6])
+a, b, c, d, e, f, g = (json.load(open(p))['verdict'] for p in sys.argv[1:8])
 cf = json.load(open(sys.argv[3]))['flushes']
 BACK, STEP, OUTSIDE = 'stepped back', 'CLOCK_REALTIME stepped', 'outside the window'
 ok = (a.startswith('REFUSED') and BACK in a and
       b.startswith('REFUSED') and STEP in b and e.startswith('REFUSED') and STEP in e and
       d.startswith('REFUSED') and OUTSIDE in d and BACK not in d and STEP not in d and
+      f.startswith('REFUSED') and 'repeated stamp' in f and g.startswith('REFUSED') and 'out of order' in g and
       c == 'ok' and cf == 10)
-print('(a)', a[:120], '| (b)', b[:120], '| (e)', e[:120], '| (d)', d[:120], '| (c)', c[:20], cf)
-sys.exit(0 if ok else 1)" "$OUT/f13a.json" "$OUT/f13b.json" "$OUT/f13c.json" "$OUT/f13d.json" "$OUT/f13e.json" >"$OUT/f13.txt" 2>&1; then
-    log "PASS F13-clock-step-refused: $(head -c 600 "$OUT/f13.txt")"
+print('(a)', a[:100], '| (b)', b[:100], '| (e)', e[:100], '| (d)', d[:100], '| (f)', f[:100], '| (g)', g[:100],
+      '| (c)', c[:20], cf)
+sys.exit(0 if ok else 1)" "$OUT/f13a.json" "$OUT/f13b.json" "$OUT/f13c.json" "$OUT/f13d.json" "$OUT/f13e.json" \
+    "$OUT/f13f.json" "$OUT/f13g.json" >"$OUT/f13.txt" 2>&1; then
+    log "PASS F13-clock-step-refused: $(head -c 1200 "$OUT/f13.txt")"
   else
-    log "FAIL F13-clock-step-refused: $(head -c 600 "$OUT/f13.txt")"; fails=$((fails + 1))
+    log "FAIL F13-clock-step-refused: $(head -c 1200 "$OUT/f13.txt")"; fails=$((fails + 1))
   fi
 else
   log "FAIL F13-clock-step-refused: no F2 window to copy"; fails=$((fails + 1))
