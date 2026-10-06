@@ -731,6 +731,11 @@ const C1_POINTS: &[&str] = &[
     "ckpt.written",
     "ckpt.installed",
     "compact.renamed",
+    // Review 4 #10: the cut windows of a fuzzy checkpoint (catalog mode; `FE_C1_THRESHOLD` lowers
+    // the checkpoint threshold so they are reached within a trial).
+    "cut.prepared",
+    "cut.renamed",
+    "cut.dir_synced",
 ];
 
 const C1_TRIAL_SECS: u64 = 20;
@@ -918,6 +923,11 @@ fn c1_child() {
     let Ok(path) = std::env::var("FE_C1_CHILD") else {
         return;
     };
+    // Review 4 #10: a lowered checkpoint threshold, so fuzzy checkpoints (and their cut windows)
+    // run within a trial.
+    if let Some(bytes) = std::env::var("FE_C1_THRESHOLD").ok().and_then(|v| v.parse().ok()) {
+        super::journal::set_compact_threshold(bytes);
+    }
     let db = open_at(Path::new(&path), c1_opts());
     if std::env::var_os("FE_C1_RECOVER_ONLY").is_some() {
         // A recovery that the parent aims a kill into (phase 8); the open above was it.
@@ -1180,6 +1190,9 @@ fn c1_trial(exe: &Path, catalog: bool, class: SyncClass, threads: usize, point: 
         }
         if let Ok(ms) = std::env::var("FE_KILL_DELAY_MS") {
             cmd.env("FE_KILL_DELAY_MS", ms);
+        }
+        if let Ok(bytes) = std::env::var("FE_C1_THRESHOLD") {
+            cmd.env("FE_C1_THRESHOLD", bytes);
         }
         cmd.spawn().unwrap()
     };

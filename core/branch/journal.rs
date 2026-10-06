@@ -1707,6 +1707,7 @@ impl Journal {
             let _ = std::fs::remove_file(self.files.log_tmp());
             return Err(io_error(e, "rename branch log rewrite"));
         }
+        super::store::kill_point("cut.renamed");
         // From here the new file is the log.
         self.file = prep.file;
         self.rewrites += 1;
@@ -1888,6 +1889,7 @@ impl Journal {
         write_at(&self.file, frames, self.len)?;
         if let Some(dir) = dir {
             fsync_file(dir, SyncClass::Fsync)?;
+            super::store::kill_point("cut.dir_synced");
         }
         if class.syncs() {
             fsync_file(&self.file, class)?;
@@ -2027,7 +2029,10 @@ impl Journal {
 
     /// The log's directory, to sync before a log sync in `class` that follows a cut (`dir_dirty`).
     fn take_dirty_dir(&mut self, class: SyncClass) -> Result<Option<File>> {
-        if !self.dir_dirty || !class.syncs() {
+        // Mutant `no_cut_dir_sync` (test builds only, review 4 #10): the directory entry a cut's
+        // rename made is never synced. Only a crash model that undoes an unsynced rename (C1b)
+        // can see it; C1's power-loss simulation does not model renames.
+        if !self.dir_dirty || !class.syncs() || super::store::fe_mutant("no_cut_dir_sync") {
             return Ok(None);
         }
         let dir = match self.files.log.parent() {
@@ -2377,6 +2382,7 @@ impl Flight {
         super::store::kill_point("flight.before_log_sync");
         if let Some(dir) = &self.dir {
             fsync_file(dir, SyncClass::Fsync)?;
+            super::store::kill_point("cut.dir_synced");
         }
         if syncs && !self.ordered {
             fsync_file(&log, self.class)?;

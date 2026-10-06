@@ -2317,7 +2317,10 @@ fn begin_cut<'a>(inner: &StoreMutex, group: &'a Group, cap: &Captured) -> Option
             prep: std::cell::Cell::new(None),
         };
         match Journal::prepare_cut(src, cap.log_from, cap.generation) {
-            Ok(prep) => gate.prep.set(Some(prep)),
+            Ok(prep) => {
+                gate.prep.set(Some(prep));
+                kill_point("cut.prepared");
+            }
             Err(e) => {
                 tracing::warn!("branch log cut not prepared off the store mutex: {e}");
                 return None;
